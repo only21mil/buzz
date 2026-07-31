@@ -31,7 +31,7 @@ use buzz_core::observer::{
 };
 use clap::Parser;
 use config::{
-    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
+    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, ChannelFilter, Config, DedupMode, ModelsArgs,
     MultipleEventHandling, RespondTo, SubscribeMode,
 };
 use filter::SubscriptionRule;
@@ -352,6 +352,34 @@ pub(crate) async fn is_dm_channel(
             true
         }
     }
+}
+
+/// A DM message is inherently addressed to the participants. Only relax the
+/// relay's `#p` filter when metadata positively identifies the channel as a DM;
+/// unknown channels keep the explicit-mention subscription.
+fn allow_implicit_dm_messages(
+    subscribe_mode: &SubscribeMode,
+    channel_type: Option<&str>,
+    filter: &mut ChannelFilter,
+) {
+    let includes_messages = filter
+        .kinds
+        .as_ref()
+        .is_none_or(|kinds| kinds.contains(&KIND_STREAM_MESSAGE));
+    if subscribe_mode == &SubscribeMode::Mentions && channel_type == Some("dm") && includes_messages
+    {
+        filter.require_mention = false;
+    }
+}
+
+fn is_implicitly_addressed_dm_message(
+    subscribe_mode: &SubscribeMode,
+    kind: u32,
+    channel_type: Option<&str>,
+) -> bool {
+    subscribe_mode == &SubscribeMode::Mentions
+        && kind == KIND_STREAM_MESSAGE
+        && channel_type == Some("dm")
 }
 
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
@@ -1823,7 +1851,16 @@ async fn tokio_main() -> Result<()> {
         }
     };
 
-    let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    let mut channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    for (channel_id, channel_filter) in &mut channel_filters {
+        allow_implicit_dm_messages(
+            &config.subscribe_mode,
+            channel_info_map
+                .get(channel_id)
+                .map(|info| info.channel_type.as_str()),
+            channel_filter,
+        );
+    }
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
@@ -2350,7 +2387,17 @@ async fn tokio_main() -> Result<()> {
 
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
-                                    } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
+                                    } else if let Some(mut filter) =
+                                        config::resolve_dynamic_channel_filter(&config, ch, &rules)
+                                    {
+                                        let channel_info = ctx.channel_info.resolve(ch).await;
+                                        allow_implicit_dm_messages(
+                                            &config.subscribe_mode,
+                                            channel_info
+                                                .as_ref()
+                                                .map(|info| info.channel_type.as_str()),
+                                            &mut filter,
+                                        );
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
@@ -2526,13 +2573,22 @@ async fn tokio_main() -> Result<()> {
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
+                            let channel_info =
+                                ctx.channel_info.resolve(buzz_event.channel_id).await;
                             {
                                 let author = buzz_event.event.pubkey.to_hex();
                                 // DM hardening: resolve channel type (fail-closed
                                 // to DM) so allowlist/anyone modes cannot be
                                 // exercised by non-owner authors inside DMs.
-                                let is_dm =
-                                    is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await;
+                                // The author gate fails closed for unresolved
+                                // channel metadata, preserving existing DM
+                                // owner/sibling restrictions. Reuse the
+                                // channel_info resolved above instead of a
+                                // second fetch.
+                                let is_dm = channel_info
+                                    .as_ref()
+                                    .map(|info| info.channel_type == "dm")
+                                    .unwrap_or(true);
                                 let decision = author_gate_decision(
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
@@ -2553,7 +2609,21 @@ async fn tokio_main() -> Result<()> {
                                 }
                             }
 
-                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
+                            let implicitly_addressed = is_implicitly_addressed_dm_message(
+                                &config.subscribe_mode,
+                                kind_u32,
+                                channel_info
+                                    .as_ref()
+                                    .map(|info| info.channel_type.as_str()),
+                            );
+                            let matched = filter::match_event_with_addressing(
+                                &buzz_event.event,
+                                buzz_event.channel_id,
+                                &rules,
+                                &pubkey_hex,
+                                implicitly_addressed,
+                            )
+                            .await;
                             let prompt_tag = match matched {
                                 Some(m) => m.prompt_tag,
                                 None => {
@@ -4956,6 +5026,60 @@ mod author_gate_tests {
                 None,
                 "transport failures must remain retryable"
             );
+        }
+    }
+
+    #[test]
+    fn implicit_dm_subscription_only_relaxes_mentions_for_confirmed_dms() {
+        let base = ChannelFilter {
+            kinds: Some(vec![KIND_STREAM_MESSAGE]),
+            require_mention: true,
+        };
+
+        let mut dm = base.clone();
+        allow_implicit_dm_messages(&SubscribeMode::Mentions, Some("dm"), &mut dm);
+        assert!(!dm.require_mention);
+
+        for channel_type in [Some("stream"), Some("forum"), Some("workflow"), None] {
+            let mut non_dm = base.clone();
+            allow_implicit_dm_messages(&SubscribeMode::Mentions, channel_type, &mut non_dm);
+            assert!(
+                non_dm.require_mention,
+                "{channel_type:?} must retain the explicit-mention subscription"
+            );
+        }
+
+        let mut all_mode_dm = base;
+        allow_implicit_dm_messages(&SubscribeMode::All, Some("dm"), &mut all_mode_dm);
+        assert!(all_mode_dm.require_mention, "other modes remain unchanged");
+
+        let mut no_messages = ChannelFilter {
+            kinds: Some(vec![KIND_STREAM_REMINDER]),
+            require_mention: true,
+        };
+        allow_implicit_dm_messages(&SubscribeMode::Mentions, Some("dm"), &mut no_messages);
+        assert!(
+            no_messages.require_mention,
+            "a subscription that excludes kind 9 must remain mention-gated"
+        );
+
+        assert!(is_implicitly_addressed_dm_message(
+            &SubscribeMode::Mentions,
+            KIND_STREAM_MESSAGE,
+            Some("dm")
+        ));
+        for (mode, kind, channel_type) in [
+            (SubscribeMode::All, KIND_STREAM_MESSAGE, Some("dm")),
+            (SubscribeMode::Config, KIND_STREAM_MESSAGE, Some("dm")),
+            (SubscribeMode::Mentions, KIND_STREAM_REMINDER, Some("dm")),
+            (SubscribeMode::Mentions, KIND_STREAM_MESSAGE, Some("stream")),
+            (SubscribeMode::Mentions, KIND_STREAM_MESSAGE, None),
+        ] {
+            assert!(!is_implicitly_addressed_dm_message(
+                &mode,
+                kind,
+                channel_type
+            ));
         }
     }
 
