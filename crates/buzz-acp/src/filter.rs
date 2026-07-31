@@ -350,7 +350,8 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 5;
 /// 1. **channels** — if not `"all"`, the event's channel UUID must be in the list.
 /// 2. **kinds** — if non-empty, the event kind must be in the list.
 /// 3. **require_mention** — if `true`, a `p` tag matching `agent_pubkey_hex` must
-///    exist. Tag kind is checked via `tag.as_slice()` for stable, library-independent
+///    exist unless the caller has independently established implicit addressing.
+///    Tag kind is checked via `tag.as_slice()` for stable, library-independent
 ///    access.
 /// 4. **filter** — if `Some`, the evalexpr expression must evaluate to `true`.
 ///
@@ -371,6 +372,19 @@ pub async fn match_event(
     rules: &[SubscriptionRule],
     agent_pubkey_hex: &str,
 ) -> Option<MatchedRule> {
+    match_event_with_addressing(event, channel_id, rules, agent_pubkey_hex, false).await
+}
+
+/// Match an event while allowing the caller to establish that it is already
+/// addressed to the agent without a `p` tag (for example, a message in a
+/// definitively resolved DM channel).
+pub async fn match_event_with_addressing(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+    implicitly_addressed: bool,
+) -> Option<MatchedRule> {
     let filter_ctx = FilterContext::from_event(event, channel_id);
 
     for (index, rule) in rules.iter().enumerate() {
@@ -387,7 +401,7 @@ pub async fn match_event(
         // 3. Mention check — look for a `p` tag whose first element equals
         //    agent_pubkey_hex. Uses tag.as_slice() for stable, library-independent
         //    access — avoids relying on the Display impl of tag kind.
-        if rule.require_mention {
+        if rule.require_mention && !implicitly_addressed {
             let mentioned = event.tags.iter().any(|tag| {
                 let s = tag.as_slice();
                 s.first().map(|k| k.as_str()) == Some("p")
@@ -661,6 +675,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched.prompt_tag, "mentioned");
+    }
+
+    #[tokio::test]
+    async fn test_match_event_implicit_address_satisfies_mention_rule() {
+        let event = make_event(9, "hello");
+        let rules = vec![make_rule(
+            "mention-only",
+            ChannelScope::All("all".into()),
+            vec![9],
+            true,
+            None,
+            Some("dm-message"),
+        )];
+
+        let matched = match_event_with_addressing(&event, any_channel(), &rules, "agent", true)
+            .await
+            .expect("a caller-confirmed implicit address should satisfy the mention rule");
+        assert_eq!(matched.prompt_tag, "dm-message");
     }
 
     #[tokio::test]
