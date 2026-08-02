@@ -179,6 +179,16 @@ export function useMentions(
       ),
     [relayAgentsQuery.data],
   );
+  const relayAgentRespondToByPubkey = React.useMemo(
+    () =>
+      new Map(
+        (relayAgentsQuery.data ?? []).map((agent) => [
+          normalizePubkey(agent.pubkey),
+          agent.respondTo,
+        ]),
+      ),
+    [relayAgentsQuery.data],
+  );
   const directoryAgentPubkeys = React.useMemo(
     () =>
       new Set(
@@ -246,7 +256,13 @@ export function useMentions(
       if (isArchivedDiscovery(pubkey)) {
         return;
       }
-      if (!isAgentIdentityInManagedList(candidate, managedAgentPubkeys)) {
+      if (
+        !isAgentIdentityInManagedList(
+          candidate,
+          managedAgentPubkeys,
+          currentPubkey,
+        )
+      ) {
         return;
       }
       if (
@@ -254,6 +270,9 @@ export function useMentions(
           isAgent: candidate.isAgent === true,
           isMember: candidate.isMember === true,
           pubkey,
+          ownerPubkey: candidate.ownerPubkey,
+          currentPubkey,
+          respondTo: relayAgentRespondToByPubkey.get(pubkey),
           mentionableAgentPubkeys,
           directoryAgentPubkeys,
         })
@@ -428,6 +447,7 @@ export function useMentions(
     personaNameByPubkey,
     profiles,
     relayAgentNamesByPubkey,
+    relayAgentRespondToByPubkey,
     relayAgentsQuery.data,
   ]);
 
