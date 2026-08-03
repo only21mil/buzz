@@ -39,12 +39,87 @@ make_apk() {
   )
 }
 
+make_dex_apk() {
+  local output="$1"
+  local descriptor="$2"
+  local harmless_text="${3:-}"
+  rm -f "$output"
+  python3 - "$output" "$descriptor" "$harmless_text" <<'PY'
+import struct
+import sys
+import zipfile
+
+output, descriptor, harmless_text = sys.argv[1:]
+strings = [descriptor]
+if harmless_text:
+    strings.append(harmless_text)
+
+header_size = 0x70
+string_ids_offset = header_size
+type_ids_offset = string_ids_offset + 4 * len(strings)
+class_defs_offset = type_ids_offset + 4
+data_offset = class_defs_offset + 32
+
+def uleb128(value: int) -> bytes:
+    result = bytearray()
+    while True:
+        byte = value & 0x7f
+        value >>= 7
+        result.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(result)
+
+string_data = bytearray()
+string_offsets = []
+for value in strings:
+    encoded = value.encode("ascii")
+    string_offsets.append(data_offset + len(string_data))
+    string_data.extend(uleb128(len(value)))
+    string_data.extend(encoded)
+    string_data.append(0)
+
+file_size = data_offset + len(string_data)
+dex = bytearray(file_size)
+dex[:8] = b"dex\n035\0"
+struct.pack_into("<I", dex, 0x20, file_size)
+struct.pack_into("<I", dex, 0x24, header_size)
+struct.pack_into("<I", dex, 0x28, 0x12345678)
+struct.pack_into("<II", dex, 0x38, len(strings), string_ids_offset)
+struct.pack_into("<II", dex, 0x40, 1, type_ids_offset)
+struct.pack_into("<II", dex, 0x60, 1, class_defs_offset)
+struct.pack_into("<II", dex, 0x68, len(string_data), data_offset)
+for index, offset in enumerate(string_offsets):
+    struct.pack_into("<I", dex, string_ids_offset + index * 4, offset)
+struct.pack_into("<I", dex, type_ids_offset, 0)
+struct.pack_into("<IIIIIIII", dex, class_defs_offset, 0, 1, 0xffffffff, 0, 0xffffffff, 0, 0, 0)
+dex[data_offset:] = string_data
+
+with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("classes.dex", dex)
+PY
+}
+
 manifest="$tmp/dependencies.tsv"
 apk="$tmp/app.apk"
 write_clean_manifest "$manifest"
-make_apk "$apk" classes.dex 'Lxyz/block/buzz/mobile/MainActivity;'
+make_dex_apk "$apk" 'Lxyz/block/buzz/mobile/MainActivity;'
 "$checker" --apk "$apk" --dependency-manifest "$manifest" > "$tmp/pass-output"
 grep -Fq 'Android Google SDK-free check passed' "$tmp/pass-output" || fail "clean fixture did not pass"
+
+make_dex_apk \
+  "$apk" \
+  'Landroidx/activity/result/contract/ActivityResultContracts$PickVisualMedia;' \
+  'com.google.android.gms.provider.action.PICK_IMAGES'
+"$checker" --apk "$apk" --dependency-manifest "$manifest" > "$tmp/pass-output"
+grep -Fq 'Android Google SDK-free check passed' "$tmp/pass-output" || \
+  fail "harmless Google API action string in a non-Google class did not pass"
+
+make_apk "$apk" classes.dex 'not-a-dex'
+if "$checker" --apk "$apk" --dependency-manifest "$manifest" > "$tmp/output" 2>&1; then
+  fail "malformed DEX entry passed"
+fi
+grep -Fq 'DEX entry has an invalid header' "$tmp/output" || \
+  fail "malformed DEX failure was not explicit"
 
 for group in com.google.android.gms com.google.firebase com.google.mlkit; do
   write_clean_manifest "$manifest"
@@ -57,7 +132,7 @@ done
 
 write_clean_manifest "$manifest"
 for marker in com/google/android/gms com/google/firebase com/google/mlkit; do
-  make_apk "$apk" classes.dex "L$marker/Forbidden;"
+  make_dex_apk "$apk" "L$marker/Forbidden;"
   if "$checker" --apk "$apk" --dependency-manifest "$manifest" > "$tmp/output" 2>&1; then
     fail "forbidden APK class passed: $marker"
   fi
@@ -77,7 +152,7 @@ fi
 grep -Fq 'assets/mlkit_barcode_models/model.tflite' "$tmp/output" || \
   fail "ML Kit asset failure did not name entry"
 
-make_apk "$apk" classes.dex 'Lxyz/block/buzz/mobile/MainActivity;'
+make_dex_apk "$apk" 'Lxyz/block/buzz/mobile/MainActivity;'
 grep -v $'configuration\tprofileRuntimeClasspath' "$manifest" > "$tmp/missing.tsv"
 if "$checker" --apk "$apk" --dependency-manifest "$tmp/missing.tsv" > "$tmp/output" 2>&1; then
   fail "missing runtime configuration passed"
