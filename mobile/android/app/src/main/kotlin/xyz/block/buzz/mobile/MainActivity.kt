@@ -119,13 +119,18 @@ class MainActivity : FlutterActivity() {
         notificationBridge?.handleIntent(intent) ?: setIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        notificationBridge?.handleResume()
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        notificationBridge?.handlePermissionResult(requestCode)
+        notificationBridge?.handlePermissionResult(requestCode, permissions, grantResults)
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {

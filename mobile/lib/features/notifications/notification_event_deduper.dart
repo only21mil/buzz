@@ -15,4 +15,7 @@ class NotificationEventDeduper {
     _eventIds.add(eventId);
     return true;
   }
+
+  /// Forgets [eventId] after a failed delivery so a later relay copy can retry.
+  void remove(String eventId) => _eventIds.remove(eventId);
 }

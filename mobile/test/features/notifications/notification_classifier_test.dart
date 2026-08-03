@@ -87,6 +87,20 @@ void main() {
       expect(notification, isNull);
     });
 
+    test('rejects an event routed through the wrong channel', () {
+      final notification = classifyNotificationEvent(
+        event: event(
+          tags: const [
+            ['h', 'channel-2'],
+          ],
+        ),
+        channel: channel(),
+        myPubkey: 'me',
+      );
+
+      expect(notification, isNull);
+    });
+
     test('relevant thread reply is preserved as activity', () {
       final notification = classifyNotificationEvent(
         event: event(
@@ -155,6 +169,10 @@ void main() {
 
     expect(body.runes.length, notificationBodyMaxCharacters);
     expect(body, '😀' * notificationBodyMaxCharacters);
+  });
+
+  test('trimNotificationBody collapses private multi-line preview text', () {
+    expect(trimNotificationBody('  hello\n\tthere  '), 'hello there');
   });
 
   test('notificationIdForEvent is deterministic and Android-safe', () {

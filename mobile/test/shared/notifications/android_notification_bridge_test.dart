@@ -21,7 +21,7 @@ void main() {
               'priorityChannelEnabled': true,
               'activityChannelEnabled': false,
             },
-            'getInitialRoute' => 'buzz://message?id=initial',
+            'getInitialRoute' => 'buzz://message?channel=channel-1&id=initial',
             _ => null,
           };
         });
@@ -76,7 +76,7 @@ void main() {
       channel: 'priority',
       title: 'Sats',
       body: 'Ping',
-      route: 'buzz://message?id=abc',
+      route: 'buzz://message?channel=channel-1&id=abc',
     );
 
     expect(calls.single.method, 'show');
@@ -85,27 +85,99 @@ void main() {
       'channel': 'priority',
       'title': 'Sats',
       'body': 'Ping',
-      'route': 'buzz://message?id=abc',
+      'route': 'buzz://message?channel=channel-1&id=abc',
     });
   });
 
   test('exposes initial and incoming tap routes', () async {
-    expect(await bridge.getInitialRoute(), 'buzz://message?id=initial');
+    expect(
+      await bridge.getInitialRoute(),
+      'buzz://message?channel=channel-1&id=initial',
+    );
 
     final tapped = bridge.notificationTaps.first;
     await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .handlePlatformMessage(
           _channel.name,
           const StandardMethodCodec().encodeMethodCall(
-            const MethodCall('notificationTapped', 'buzz://message?id=tapped'),
+            const MethodCall(
+              'notificationTapped',
+              'buzz://message?channel=channel-1&id=tapped',
+            ),
           ),
           (_) {},
         );
 
     expect(
       await tapped.timeout(const Duration(seconds: 1)),
-      'buzz://message?id=tapped',
+      'buzz://message?channel=channel-1&id=tapped',
     );
+  });
+
+  test('rejects non-canonical outgoing notification routes', () {
+    expect(
+      () => bridge.show(
+        id: 21,
+        channel: 'priority',
+        title: 'Sats',
+        body: 'Ping',
+        route: 'https://example.com/message?id=abc',
+      ),
+      throwsArgumentError,
+    );
+    expect(calls, isEmpty);
+  });
+
+  test('drops malformed initial and incoming notification routes', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          calls.add(call);
+          return call.method == 'getInitialRoute'
+              ? 'buzz://message?id=missing-channel'
+              : null;
+        });
+
+    expect(await bridge.getInitialRoute(), isNull);
+    var delivered = false;
+    final subscription = bridge.notificationTaps.listen(
+      (_) => delivered = true,
+    );
+    addTearDown(subscription.cancel);
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+          _channel.name,
+          const StandardMethodCodec().encodeMethodCall(
+            const MethodCall(
+              'notificationTapped',
+              'buzz://message?channel=one&id=two&extra=three',
+            ),
+          ),
+          (_) {},
+        );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(delivered, isFalse);
+  });
+
+  test('exposes refreshed native notification status', () async {
+    final changed = bridge.statusChanges.first;
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+          _channel.name,
+          const StandardMethodCodec().encodeMethodCall(
+            const MethodCall('notificationStatusChanged', <String, Object>{
+              'permission': 'denied',
+              'priorityChannelEnabled': false,
+              'activityChannelEnabled': true,
+            }),
+          ),
+          (_) {},
+        );
+
+    final status = await changed.timeout(const Duration(seconds: 1));
+    expect(status.permission, AndroidNotificationPermission.denied);
+    expect(status.priorityChannelEnabled, isFalse);
+    expect(status.activityChannelEnabled, isTrue);
   });
 
   test('opens Android settings through the frozen method', () async {

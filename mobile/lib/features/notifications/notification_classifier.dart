@@ -21,6 +21,14 @@ NotificationEvent? classifyNotificationEvent({
   Set<String> mutedRootIds = const {},
   Set<String> mutedChannelIds = const {},
 }) {
+  if (event.id.trim().isEmpty ||
+      channel.id.trim().isEmpty ||
+      event.channelId != channel.id ||
+      !channel.isMember ||
+      channel.isArchived) {
+    return null;
+  }
+
   if (!shouldNotifyForEvent(
     event,
     myPubkey,
@@ -65,7 +73,7 @@ NotificationEvent? classifyNotificationEvent({
 }
 
 String trimNotificationBody(String content) {
-  final trimmed = content.trim();
+  final trimmed = content.trim().replaceAll(RegExp(r'\s+', unicode: true), ' ');
   final runes = trimmed.runes;
   if (runes.length <= notificationBodyMaxCharacters) return trimmed;
   return String.fromCharCodes(

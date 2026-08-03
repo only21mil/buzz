@@ -148,6 +148,21 @@ class _NotificationSettingsSection extends ConsumerWidget {
                 : null,
           ),
         ),
+        AppListRow(
+          icon: LucideIcons.eye,
+          title: 'Message previews',
+          subtitle: settings.previewsEnabled
+              ? 'Show sender, channel, and message text in notifications.'
+              : 'Hide sender, channel, and message text in notifications.',
+          trailing: Switch.adaptive(
+            value: settings.previewsEnabled,
+            onChanged: settings.alertsEnabled
+                ? (enabled) => ref
+                      .read(notificationSettingsProvider.notifier)
+                      .setPreviewsEnabled(enabled)
+                : null,
+          ),
+        ),
         const AppListRow(
           icon: LucideIcons.wifiOff,
           title: 'Background alerts',

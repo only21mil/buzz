@@ -16,6 +16,8 @@ import android.provider.Settings
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import xyz.block.buzz.mobile.AndroidNotificationContract.NOTIFICATION_ROUTE_EXTRA
+import xyz.block.buzz.mobile.AndroidNotificationContract.NOTIFICATION_TAP_ACTION
 
 internal class AndroidNotificationBridge(
     private val activity: MainActivity,
@@ -37,15 +39,41 @@ internal class AndroidNotificationBridge(
         channel.invokeMethod(NOTIFICATION_TAPPED_METHOD, route)
     }
 
-    fun handlePermissionResult(requestCode: Int) {
+    fun handleResume() {
+        channel.invokeMethod(STATUS_CHANGED_METHOD, status())
+    }
+
+    fun handlePermissionResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
         if (requestCode != NOTIFICATION_PERMISSION_REQUEST_CODE) return
         val result = pendingPermissionResult ?: return
         pendingPermissionResult = null
+        if (!AndroidNotificationContract.isValidPermissionCallback(
+                permissions = permissions,
+                grantResultCount = grantResults.size,
+                notificationPermission = Manifest.permission.POST_NOTIFICATIONS,
+            )
+        ) {
+            result.error(
+                "invalid_permission_result",
+                "Android returned an invalid notification permission result.",
+                null,
+            )
+            return
+        }
         result.success(status())
     }
 
     fun dispose() {
         channel.setMethodCallHandler(null)
+        pendingPermissionResult?.error(
+            "activity_unavailable",
+            "The notification permission request was interrupted.",
+            null,
+        )
         pendingPermissionResult = null
     }
 
@@ -86,6 +114,10 @@ internal class AndroidNotificationBridge(
     }
 
     private fun status(): Map<String, Any> {
+        // Creating an existing channel refreshes app-owned metadata without
+        // overwriting the user's importance choice. It also makes every status
+        // read authoritative after a channel was deleted in Android settings.
+        ensureChannels()
         return mapOf(
             "permission" to permissionStatus(),
             "priorityChannelEnabled" to channelEnabled(PRIORITY_CHANNEL_ID),
@@ -122,10 +154,19 @@ internal class AndroidNotificationBridge(
 
         markPermissionRequested()
         pendingPermissionResult = result
-        activity.requestPermissions(
-            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-            NOTIFICATION_PERMISSION_REQUEST_CODE,
-        )
+        try {
+            activity.requestPermissions(
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                NOTIFICATION_PERMISSION_REQUEST_CODE,
+            )
+        } catch (_: RuntimeException) {
+            pendingPermissionResult = null
+            result.error(
+                "permission_request_failed",
+                "Android could not start the notification permission request.",
+                null,
+            )
+        }
     }
 
     private fun ensureChannels() {
@@ -218,7 +259,7 @@ internal class AndroidNotificationBridge(
             Notification.Builder(activity)
         }
         builder
-            .setSmallIcon(activity.applicationInfo.icon)
+            .setSmallIcon(R.drawable.ic_stat_buzz)
             .setContentTitle(request.title)
             .setContentText(request.body)
             .setStyle(Notification.BigTextStyle().bigText(request.body))
@@ -279,10 +320,20 @@ internal class AndroidNotificationBridge(
         activity.getSharedPreferences(NOTIFICATION_PREFERENCES, Context.MODE_PRIVATE)
 
     private fun consumeNotificationRoute(intent: Intent): String? {
-        if (intent.action != NOTIFICATION_TAP_ACTION) return null
         val route = intent.getStringExtra(NOTIFICATION_ROUTE_EXTRA)
         intent.removeExtra(NOTIFICATION_ROUTE_EXTRA)
-        return route
+        val component = intent.component
+        if (!AndroidNotificationContract.isTrustedTapIntent(
+                action = intent.action,
+                componentPackage = component?.packageName,
+                componentClass = component?.className,
+                applicationPackage = activity.packageName,
+                mainActivityClass = MainActivity::class.java.name,
+            )
+        ) {
+            return null
+        }
+        return AndroidNotificationContract.validatedMessageRoute(route)
     }
 
     private fun invalidArguments(
@@ -304,10 +355,8 @@ internal class AndroidNotificationBridge(
         const val OPEN_SETTINGS_METHOD = "openSettings"
         const val GET_INITIAL_ROUTE_METHOD = "getInitialRoute"
         const val NOTIFICATION_TAPPED_METHOD = "notificationTapped"
+        const val STATUS_CHANGED_METHOD = "notificationStatusChanged"
 
-        const val NOTIFICATION_TAP_ACTION =
-            "xyz.block.buzz.mobile.action.NOTIFICATION_TAP"
-        const val NOTIFICATION_ROUTE_EXTRA = "notification_route"
         const val NOTIFICATION_PREFERENCES = "buzz_notifications"
         const val PERMISSION_REQUESTED_KEY = "permission_requested"
         const val NOTIFICATION_PERMISSION_REQUEST_CODE = 28031
@@ -326,6 +375,7 @@ internal class AndroidNotificationBridge(
             val title = payload["title"] as? String ?: return null
             val body = payload["body"] as? String ?: return null
             val route = payload["route"] as? String ?: return null
+            if (AndroidNotificationContract.validatedMessageRoute(route) == null) return null
             return ShowRequest(id, channel, title, body, route)
         }
     }

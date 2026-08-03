@@ -18,4 +18,12 @@ void main() {
     expect(deduper.add('two'), isFalse);
     expect(deduper.add('one'), isTrue);
   });
+
+  test('allows a failed delivery to release its reservation', () {
+    final deduper = NotificationEventDeduper();
+
+    expect(deduper.add('one'), isTrue);
+    deduper.remove('one');
+    expect(deduper.add('one'), isTrue);
+  });
 }

@@ -56,6 +56,7 @@ void main() {
       expect(find.text('Notifications'), findsOneWidget);
       expect(find.text('Paused'), findsOneWidget);
       expect(find.text('Background alerts'), findsOneWidget);
+      expect(find.text('Message previews'), findsOneWidget);
       expect(find.text('Not available'), findsOneWidget);
       expect(
         find.text(
