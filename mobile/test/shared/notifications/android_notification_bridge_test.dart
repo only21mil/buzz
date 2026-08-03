@@ -53,6 +53,23 @@ void main() {
     ]);
   });
 
+  test('treats pre-Android-13 permission as granted', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          calls.add(call);
+          if (call.method != 'getStatus') return null;
+          return <String, Object>{
+            'permission': 'notRequired',
+            'priorityChannelEnabled': true,
+            'activityChannelEnabled': true,
+          };
+        });
+
+    final status = await bridge.getStatus();
+
+    expect(status.permission, AndroidNotificationPermission.granted);
+  });
+
   test('show sends exactly the frozen argument keys', () async {
     await bridge.show(
       id: 21,

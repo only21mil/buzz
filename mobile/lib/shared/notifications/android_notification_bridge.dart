@@ -36,7 +36,9 @@ class AndroidNotificationStatus {
 
 AndroidNotificationPermission _parsePermission(Object? value) {
   return switch (value) {
-    'granted' || 'authorized' => AndroidNotificationPermission.granted,
+    'granted' ||
+    'authorized' ||
+    'notRequired' => AndroidNotificationPermission.granted,
     'denied' ||
     'blocked' ||
     'permanentlyDenied' => AndroidNotificationPermission.denied,

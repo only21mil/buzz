@@ -74,18 +74,20 @@ class _NotificationSettingsSection extends ConsumerWidget {
     final selectedChannelDisabled =
         (settings.priorityEnabled && !settings.priorityChannelEnabled) ||
         (settings.activityEnabled && !settings.activityChannelEnabled);
-    final status = switch ((
-      settings.alertsEnabled,
-      isBlocked,
-      isConnected,
-      selectedChannelDisabled,
-    )) {
-      (_, true, _, _) => 'Blocked',
-      (false, _, _, _) => 'Off',
-      (true, _, false, _) => 'Paused',
-      (true, _, true, true) => 'Limited',
-      _ => 'On',
-    };
+    final status = settings.isRequesting
+        ? 'Waiting for Android…'
+        : switch ((
+            settings.alertsEnabled,
+            isBlocked,
+            isConnected,
+            selectedChannelDisabled,
+          )) {
+            (_, true, _, _) => 'Blocked',
+            (false, _, _, _) => 'Off',
+            (true, _, false, _) => 'Paused',
+            (true, _, true, true) => 'Limited',
+            _ => 'On',
+          };
 
     return AppListCard(
       label: 'Notifications',
@@ -93,7 +95,11 @@ class _NotificationSettingsSection extends ConsumerWidget {
         AppListRow(
           icon: LucideIcons.bell,
           title: 'Alerts',
-          subtitle: status == 'Paused'
+          subtitle: status == 'Waiting for Android…'
+              ? 'Waiting for Android…'
+              : status == 'Blocked'
+              ? 'Android has blocked Buzz notifications.'
+              : status == 'Paused'
               ? 'Paused while Buzz reconnects.'
               : status == 'Limited'
               ? 'A notification category is disabled in Android settings.'
@@ -108,15 +114,18 @@ class _NotificationSettingsSection extends ConsumerWidget {
                 )
               : Switch.adaptive(
                   value: settings.alertsEnabled,
-                  onChanged: (enabled) => ref
-                      .read(notificationSettingsProvider.notifier)
-                      .setAlertsEnabled(enabled),
+                  onChanged: settings.isRequesting
+                      ? null
+                      : (enabled) => ref
+                            .read(notificationSettingsProvider.notifier)
+                            .setAlertsEnabled(enabled),
                 ),
         ),
         AppListRow(
           icon: LucideIcons.circleAlert,
-          title: 'Priority',
-          subtitle: 'Mentions and direct attention.',
+          title: 'Mentions & direct messages',
+          subtitle:
+              'Alert when someone mentions you or sends you a direct message.',
           trailing: Switch.adaptive(
             value: settings.priorityEnabled,
             onChanged: settings.alertsEnabled
@@ -128,8 +137,8 @@ class _NotificationSettingsSection extends ConsumerWidget {
         ),
         AppListRow(
           icon: LucideIcons.activity,
-          title: 'Activity',
-          subtitle: 'General channel activity.',
+          title: 'Channel activity',
+          subtitle: 'Alert for new top-level messages in unmuted channels.',
           trailing: Switch.adaptive(
             value: settings.activityEnabled,
             onChanged: settings.alertsEnabled

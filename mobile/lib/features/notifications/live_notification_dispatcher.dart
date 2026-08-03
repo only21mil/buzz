@@ -4,7 +4,6 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/notifications/notifications.dart';
 import '../../shared/relay/relay.dart';
-import '../../shared/relay/nostr_models.dart';
 import '../channels/channel.dart';
 import 'notification_classifier.dart';
 import 'notification_event.dart';

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:buzz/shared/notifications/notifications.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
@@ -27,10 +29,11 @@ void main() {
       priorityChannelEnabled: true,
       activityChannelEnabled: true,
     ),
+    _FakeBridge? fakeBridge,
   }) async {
     SharedPreferences.setMockInitialValues(preferences);
     final prefs = await SharedPreferences.getInstance();
-    final bridge = _FakeBridge(status);
+    final bridge = fakeBridge ?? _FakeBridge(status);
     final result = ProviderContainer(
       overrides: [
         savedPrefsProvider.overrideWithValue(prefs),
@@ -79,6 +82,31 @@ void main() {
     expect(scope.read(notificationSettingsProvider).alertsEnabled, isTrue);
   });
 
+  test('ignores a duplicate enable while Android is prompting', () async {
+    final permissionCompleter = Completer<AndroidNotificationStatus>();
+    final bridge = _FakeBridge(
+      const AndroidNotificationStatus(
+        permission: AndroidNotificationPermission.granted,
+        priorityChannelEnabled: true,
+        activityChannelEnabled: true,
+      ),
+      permissionCompleter: permissionCompleter,
+    );
+    final scope = await container(fakeBridge: bridge);
+    final notifier = scope.read(notificationSettingsProvider.notifier);
+
+    final first = notifier.setAlertsEnabled(true);
+    await Future<void>.delayed(Duration.zero);
+    expect(scope.read(notificationSettingsProvider).isRequesting, isTrue);
+
+    await notifier.setAlertsEnabled(true);
+    expect(bridge.permissionRequests, 1);
+
+    permissionCompleter.complete(bridge.status);
+    await first;
+    expect(scope.read(notificationSettingsProvider).isRequesting, isFalse);
+  });
+
   test('denied permission leaves the master disabled', () async {
     final scope = await container(
       status: const AndroidNotificationStatus(
@@ -125,9 +153,10 @@ void main() {
 }
 
 class _FakeBridge extends AndroidNotificationBridge {
-  _FakeBridge(this.status);
+  _FakeBridge(this.status, {this.permissionCompleter});
 
   final AndroidNotificationStatus status;
+  final Completer<AndroidNotificationStatus>? permissionCompleter;
   int permissionRequests = 0;
   int channelEnsures = 0;
 
@@ -137,7 +166,7 @@ class _FakeBridge extends AndroidNotificationBridge {
   @override
   Future<AndroidNotificationStatus> requestPermission() async {
     permissionRequests++;
-    return status;
+    return permissionCompleter?.future ?? status;
   }
 
   @override

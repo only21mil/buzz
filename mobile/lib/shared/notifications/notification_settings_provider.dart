@@ -20,6 +20,7 @@ class NotificationSettingsState {
     this.permission = AndroidNotificationPermission.notDetermined,
     this.priorityChannelEnabled = false,
     this.activityChannelEnabled = false,
+    this.isRequesting = false,
   });
 
   final bool alertsEnabled;
@@ -28,6 +29,7 @@ class NotificationSettingsState {
   final AndroidNotificationPermission permission;
   final bool priorityChannelEnabled;
   final bool activityChannelEnabled;
+  final bool isRequesting;
 
   NotificationSettingsState copyWith({
     bool? alertsEnabled,
@@ -36,6 +38,7 @@ class NotificationSettingsState {
     AndroidNotificationPermission? permission,
     bool? priorityChannelEnabled,
     bool? activityChannelEnabled,
+    bool? isRequesting,
   }) {
     return NotificationSettingsState(
       alertsEnabled: alertsEnabled ?? this.alertsEnabled,
@@ -46,6 +49,7 @@ class NotificationSettingsState {
           priorityChannelEnabled ?? this.priorityChannelEnabled,
       activityChannelEnabled:
           activityChannelEnabled ?? this.activityChannelEnabled,
+      isRequesting: isRequesting ?? this.isRequesting,
     );
   }
 }
@@ -89,7 +93,9 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
       return;
     }
     if (defaultTargetPlatform != TargetPlatform.android) return;
+    if (state.isRequesting) return;
 
+    state = state.copyWith(isRequesting: true);
     try {
       final bridge = ref.read(androidNotificationBridgeProvider);
       var status = await bridge.requestPermission();
@@ -110,6 +116,8 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
       // The native half may not be present in test/development builds.
     } on PlatformException {
       // A native failure must not turn the persisted master preference on.
+    } finally {
+      if (ref.mounted) state = state.copyWith(isRequesting: false);
     }
   }
 
