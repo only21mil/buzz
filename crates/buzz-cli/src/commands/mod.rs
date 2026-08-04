@@ -13,6 +13,7 @@ pub mod pack;
 pub mod patches;
 pub mod pr;
 pub mod reactions;
+pub mod repo_sync;
 pub mod repos;
 pub mod social;
 pub mod upload;

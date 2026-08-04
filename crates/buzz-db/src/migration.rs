@@ -596,6 +596,17 @@ mod tests {
             .as_str()
             .contains("CREATE TABLE git_repo_names"));
         assert!(!migrations[0].sql.as_str().contains("git_repo_names"));
+        let desired_schema = include_str!("../../../schema/schema.sql");
+        assert!(
+            desired_schema.contains("CREATE TABLE git_repo_names"),
+            "fresh desired-state installs must include the repo-name registry",
+        );
+        assert!(
+            desired_schema.contains(
+                "CREATE INDEX idx_git_repo_names_owner ON git_repo_names (community_id, owner_pubkey)"
+            ),
+            "fresh desired-state installs must include the repo-owner quota index",
+        );
 
         // Same additive-migration rule for the per-community workspace icon
         // (NIP-11 `icon`): its own version, never folded into 0001.
