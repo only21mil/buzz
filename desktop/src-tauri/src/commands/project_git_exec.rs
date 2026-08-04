@@ -128,6 +128,20 @@ pub(crate) fn run_git(
     Ok(stdout)
 }
 
+pub(crate) fn count_commits(
+    repo_dir: &std::path::Path,
+    auth: &GitAuthConfig,
+    revision: &str,
+    has_head: bool,
+) -> Option<usize> {
+    if !has_head {
+        return Some(0);
+    }
+    run_git(&["rev-list", "--count", revision], Some(repo_dir), auth)
+        .ok()
+        .and_then(|output| output.trim().parse::<usize>().ok())
+}
+
 fn configure_git_auth(command: &mut Command, auth: &GitAuthConfig, needs_credentials: bool) {
     command.env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_CONFIG_NOSYSTEM", "1");

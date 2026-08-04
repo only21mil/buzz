@@ -50,6 +50,7 @@ type RawProjectRepoContributor = {
 
 type RawProjectRepoSnapshot = {
   latest_commit: RawProjectRepoCommit | null;
+  commit_count?: number | null;
   commits?: RawProjectRepoCommit[];
   files: RawProjectRepoFile[];
   contributors?: RawProjectRepoContributor[];
@@ -126,6 +127,7 @@ function fromRawProjectRepoSnapshot(
     latestCommit: snapshot.latest_commit
       ? fromRawProjectRepoCommit(snapshot.latest_commit)
       : null,
+    commitCount: snapshot.commit_count ?? null,
     commits: (snapshot.commits ?? []).map(fromRawProjectRepoCommit),
     files: snapshot.files.map((file) => ({
       path: file.path,

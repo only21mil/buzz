@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { relativeTime } from "./projectsViewHelpers.ts";
+import {
+  relativeTime,
+  resolveProjectCommitCount,
+  resolveProjectRepoSnapshot,
+} from "./projectsViewHelpers.ts";
 
 const DAY_SECONDS = 24 * 60 * 60;
 
@@ -41,5 +45,44 @@ test("relativeTime includes the year only across a year boundary", () => {
   assert.equal(
     relativeTime(crossYearCreatedAt, crossYearNow),
     crossYearExpected,
+  );
+});
+
+test("resolveProjectCommitCount prefers the exact repository snapshot count", () => {
+  assert.equal(
+    resolveProjectCommitCount({ commitCount: 0 }, { commitCount: 137 }),
+    137,
+  );
+});
+
+test("resolveProjectCommitCount falls back to relay activity without a snapshot", () => {
+  assert.equal(resolveProjectCommitCount({ commitCount: 4 }, undefined), 4);
+  assert.equal(
+    resolveProjectCommitCount({ commitCount: 4 }, { commitCount: null }),
+    4,
+  );
+  assert.equal(resolveProjectCommitCount(undefined, undefined), 0);
+});
+
+test("resolveProjectRepoSnapshot aliases duplicate project announcements by repository", () => {
+  const snapshot = { commitCount: 137 };
+  const representative = {
+    id: "owner-a:repo",
+    cloneUrls: ["HTTPS://EXAMPLE.COM/owner/repo.git/"],
+    dtag: "repo",
+    name: "Repository",
+  };
+  const visibleDuplicate = {
+    id: "owner-b:repo",
+    cloneUrls: ["https://example.com/owner/repo"],
+    dtag: "repo",
+    name: "Repository fork",
+  };
+
+  assert.equal(
+    resolveProjectRepoSnapshot(visibleDuplicate, [representative], {
+      [representative.id]: snapshot,
+    }),
+    snapshot,
   );
 });

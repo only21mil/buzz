@@ -25,6 +25,7 @@ export type ProjectRepoContributor = {
 
 export type ProjectRepoSnapshot = {
   latestCommit: ProjectRepoCommit | null;
+  commitCount: number | null;
   commits: ProjectRepoCommit[];
   files: ProjectRepoFile[];
   contributors: ProjectRepoContributor[];
