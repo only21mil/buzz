@@ -1123,7 +1123,8 @@ pub enum ReposCmd {
         /// Repository description
         #[arg(long)]
         description: Option<String>,
-        /// Clone URL(s) — can be specified multiple times
+        /// Existing clone location(s). Buzz derives its own URL; at most one
+        /// GitHub mirror is retained after it.
         #[arg(long = "clone")]
         clone_urls: Vec<String>,
         /// Web browsing URL
@@ -1132,11 +1133,10 @@ pub enum ReposCmd {
         /// Preferred Nostr relay(s) for repo discovery — can be specified multiple times
         #[arg(long = "nostr-relay")]
         relays: Vec<String>,
-        /// Channel UUID to bind the repo to. The `buzz-channel` tag is the
-        /// git ACL: without it the relay 404s every clone/fetch/push until
-        /// the author runs `buzz repos bind` (issue #3527).
+        /// Channel UUID to bind the repo to. Repository creation converges the
+        /// binding and protected-main rule before any later content push.
         #[arg(long)]
-        channel: Option<String>,
+        channel: String,
     },
     /// Get a repository announcement
     Get {
@@ -1155,6 +1155,33 @@ pub enum ReposCmd {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// Compare GitHub and Buzz `main` without changing either remote.
+    Status {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+    },
+    /// Initialize Buzz `main` from the exact current GitHub `main` commit.
+    ImportMain {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Exact 40-hex commit required at GitHub `main`.
+        #[arg(long)]
+        commit: String,
+    },
+    /// Fast-forward Buzz `main` to the exact current GitHub `main` commit.
+    MirrorMain {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Exact 40-hex commit required at GitHub `main`.
+        #[arg(long)]
+        commit: String,
+        /// Exact previously observed Buzz `main` commit used as the push lease.
+        #[arg(long)]
+        expected_buzz_main: String,
     },
     /// Bind (or rebind) one of your repositories to a channel.
     ///
@@ -2044,6 +2071,67 @@ mod tests {
     }
 
     #[test]
+    fn repo_create_requires_channel_and_keeps_clone_as_announcement_metadata() {
+        assert!(Cli::try_parse_from(["buzz", "repos", "create", "--id", "demo"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "create",
+            "--id",
+            "demo",
+            "--channel",
+            "11111111-1111-4111-8111-111111111111",
+            "--clone",
+            "https://github.com/example/demo.git",
+        ])
+        .expect("desired repository announcement arguments should parse");
+
+        let Cmd::Repos(ReposCmd::Create {
+            channel,
+            clone_urls,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected repos create");
+        };
+        assert_eq!(channel, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(
+            clone_urls,
+            vec!["https://github.com/example/demo.git".to_string()]
+        );
+    }
+
+    #[test]
+    fn repo_sync_commands_parse_direct_flags() {
+        let commit = "a".repeat(40);
+        let expected = "b".repeat(40);
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "mirror-main",
+            "--id",
+            "repo",
+            "--commit",
+            &commit,
+            "--expected-buzz-main",
+            &expected,
+        ])
+        .expect("mirror-main flags should parse");
+        let Cmd::Repos(ReposCmd::MirrorMain {
+            id,
+            commit: parsed_commit,
+            expected_buzz_main,
+        }) = cli.command
+        else {
+            panic!("expected repos mirror-main");
+        };
+        assert_eq!(id, "repo");
+        assert_eq!(parsed_commit, commit);
+        assert_eq!(expected_buzz_main, expected);
+    }
+
+    #[test]
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
             "agents",
@@ -2191,7 +2279,16 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "repos"),
-            vec!["bind", "create", "get", "list", "protect"]
+            vec![
+                "bind",
+                "create",
+                "get",
+                "import-main",
+                "list",
+                "mirror-main",
+                "protect",
+                "status"
+            ]
         );
         let repos = cmd
             .get_subcommands()
@@ -2254,7 +2351,7 @@ mod tests {
             ("patches", 4),
             ("pr", 5),
             ("reactions", 3),
-            ("repos", 5),
+            ("repos", 8),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

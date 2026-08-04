@@ -64,6 +64,21 @@ CREATE TABLE communities (
 
 CREATE UNIQUE INDEX idx_communities_host ON communities (lower(host));
 
+-- ── Git repository name registry ────────────────────────────────────────────
+-- Desired-state counterpart of migrations/0002_git_repo_names.sql. Runtime
+-- migrations keep brownfield databases additive; fresh pgschema installs need
+-- the same registry before kind:30617 provisioning can reserve a repository.
+
+CREATE TABLE git_repo_names (
+    community_id  UUID NOT NULL REFERENCES communities(id),
+    repo_id       TEXT NOT NULL,
+    owner_pubkey  TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, repo_id)
+);
+
+CREATE INDEX idx_git_repo_names_owner ON git_repo_names (community_id, owner_pubkey);
+
 -- ── Channels ──────────────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". `community_id` immutable.
 -- Channel UUIDs stay valid wire identifiers, but they are NOT globally unique:
