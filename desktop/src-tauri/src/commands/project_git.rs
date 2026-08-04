@@ -1,6 +1,6 @@
 use super::project_git_exec::{
-    build_git_auth_config, clean_branch, clean_target_ref, run_git, validate_workspace_clone_url,
-    GitAuthConfig,
+    build_git_auth_config, clean_branch, clean_target_ref, count_commits, run_git,
+    validate_workspace_clone_url, GitAuthConfig,
 };
 use super::project_git_push::push_project_local_repository_blocking;
 use super::project_repo_paths::{canonical_repos_roots, find_local_repo_dir};
@@ -36,6 +36,7 @@ pub struct ProjectRepoContributorInfo {
 #[derive(Serialize)]
 pub struct ProjectRepoSnapshotInfo {
     pub latest_commit: Option<ProjectRepoCommitInfo>,
+    pub commit_count: Option<usize>,
     pub commits: Vec<ProjectRepoCommitInfo>,
     pub files: Vec<ProjectRepoFileInfo>,
     pub contributors: Vec<ProjectRepoContributorInfo>,
@@ -358,6 +359,7 @@ fn snapshot_from_repo(
     .and_then(|output| parse_latest_commit(&output));
     let branch_activity_range = branch_activity_range(repo_dir, auth, branch_name, base_branch);
     let branch_activity_ref = branch_activity_range.as_deref().unwrap_or("HEAD");
+    let commit_count = count_commits(repo_dir, auth, branch_activity_ref, latest_commit.is_some());
     let (commits, contributors) = if latest_commit.is_some() {
         let commits = run_git(
             &[
@@ -407,6 +409,7 @@ fn snapshot_from_repo(
 
     ProjectRepoSnapshotInfo {
         latest_commit,
+        commit_count,
         commits,
         files,
         contributors,
@@ -428,6 +431,7 @@ fn snapshot_from_worktree(
     .and_then(|output| parse_latest_commit(&output));
     let branch_activity_range = branch_activity_range(repo_dir, auth, branch_name, base_branch);
     let branch_activity_ref = branch_activity_range.as_deref().unwrap_or("HEAD");
+    let commit_count = count_commits(repo_dir, auth, branch_activity_ref, latest_commit.is_some());
     let (commits, contributors, latest_commit_by_path) = if latest_commit.is_some() {
         let commits = run_git(
             &[
@@ -482,6 +486,7 @@ fn snapshot_from_worktree(
 
     ProjectRepoSnapshotInfo {
         latest_commit,
+        commit_count,
         commits,
         files,
         contributors,
@@ -986,3 +991,7 @@ pub async fn pull_project_local_repository(
     .await
     .map_err(|error| format!("repo pull task failed: {error}"))?
 }
+
+#[cfg(test)]
+#[path = "project_git_tests.rs"]
+mod tests;

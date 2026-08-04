@@ -56,6 +56,7 @@ import {
   readStoredRepositoryScope,
   readStoredSort,
   readStoredViewMode,
+  resolveProjectRepoSnapshot,
   uniqueRepositories,
   writeStoredFilter,
   writeStoredIssueScope,
@@ -164,10 +165,13 @@ export function ProjectsView() {
   const projectsWorkItemsQuery = useProjectsWorkItemsQuery(
     filter === "all" || filter === "prs" || filter === "issues" ? projects : [],
   );
-  // One blobless clone per unique repository — only scan while the overview
-  // header (filter === "all") is actually visible.
+  // One blobless clone per unique repository. Repository cards consume the
+  // exact snapshot commit count; work-item-only views do not need git scans.
   const snapshotProjects = React.useMemo(
-    () => (filter === "all" ? uniqueRepositories(projects) : []),
+    () =>
+      filter === "prs" || filter === "issues"
+        ? []
+        : uniqueRepositories(projects),
     [filter, projects],
   );
   const repoSnapshotsQuery = useProjectsRepoSnapshotsQuery(
@@ -475,6 +479,11 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
+              repoSnapshot={resolveProjectRepoSnapshot(
+                project,
+                snapshotProjects,
+                repoSnapshotsQuery.data,
+              )}
               summary={summary}
             />
           );
@@ -499,6 +508,11 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
+              repoSnapshot={resolveProjectRepoSnapshot(
+                project,
+                snapshotProjects,
+                repoSnapshotsQuery.data,
+              )}
               summary={summary}
             />
           );

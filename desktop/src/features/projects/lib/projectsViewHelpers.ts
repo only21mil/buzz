@@ -19,6 +19,13 @@ export type ProjectsFilter =
   | "users";
 export type ProjectsSort = "updated" | "created" | "name";
 
+export function resolveProjectCommitCount(
+  summary: Pick<ProjectActivitySummary, "commitCount"> | undefined,
+  snapshot: { commitCount: number | null } | undefined,
+): number {
+  return snapshot?.commitCount ?? summary?.commitCount ?? 0;
+}
+
 const PROJECTS_VIEW_MODE_STORAGE_KEY = "buzz.projects.viewMode";
 const PROJECTS_FILTER_STORAGE_KEY = "buzz.projects.filter";
 const PROJECTS_REPOSITORY_SCOPE_STORAGE_KEY = "buzz.projects.repositoryScope";
@@ -280,10 +287,22 @@ export function getClonePathLabel(project: Project) {
   }
 }
 
-function repositoryIdentityKey(project: Project) {
+function repositoryIdentityKey(project: Pick<Project, "cloneUrls" | "id">) {
   const cloneUrl = project.cloneUrls[0];
   if (cloneUrl) return normalizeRepositoryUrl(cloneUrl);
-  return (project.name || project.dtag).trim().toLowerCase();
+  return project.id;
+}
+
+export function resolveProjectRepoSnapshot<T>(
+  project: Pick<Project, "cloneUrls" | "id">,
+  snapshotProjects: Project[],
+  snapshots: Record<string, T> | undefined,
+): T | undefined {
+  const repositoryKey = repositoryIdentityKey(project);
+  const snapshotProject = snapshotProjects.find(
+    (candidate) => repositoryIdentityKey(candidate) === repositoryKey,
+  );
+  return snapshotProject ? snapshots?.[snapshotProject.id] : undefined;
 }
 
 export function uniqueRepositories(projects: Project[]) {

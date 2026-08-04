@@ -21,7 +21,9 @@ import {
   formatExactTimestamp,
   getProjectUpdatedAt,
   relativeTime,
+  resolveProjectCommitCount,
 } from "@/features/projects/lib/projectsViewHelpers";
+import type { ProjectRepoSnapshot } from "@/shared/api/types";
 import { projectTerminalLabel } from "@/features/projects/ui/useOpenProjectTerminal";
 import {
   PROJECT_LIST_ROW_CLASS,
@@ -169,9 +171,11 @@ const PROJECT_STAT_ITEMS = [
 
 function ProjectStatsRow({
   summary,
+  repoSnapshot,
   fixedColumns = false,
 }: {
   summary: ProjectActivitySummary | undefined;
+  repoSnapshot: Pick<ProjectRepoSnapshot, "commitCount"> | undefined;
   /** Give each stat a fixed width so stats align vertically across list rows. */
   fixedColumns?: boolean;
 }) {
@@ -185,7 +189,10 @@ function ProjectStatsRow({
     >
       {PROJECT_STAT_ITEMS.map(
         ({ key, icon: Icon, iconClass, label, columnClass }) => {
-          const count = summary?.[key] ?? 0;
+          const count =
+            key === "commitCount"
+              ? resolveProjectCommitCount(summary, repoSnapshot)
+              : (summary?.[key] ?? 0);
           return (
             <span
               className={cn(
@@ -209,11 +216,16 @@ function ProjectStatsRow({
 // Hovering thickens the bar and reveals a tooltip with the exact breakdown.
 function ProjectActivityBar({
   summary,
+  repoSnapshot,
 }: {
   summary: ProjectActivitySummary | undefined;
+  repoSnapshot: Pick<ProjectRepoSnapshot, "commitCount"> | undefined;
 }) {
   const items = PROJECT_STAT_ITEMS.map(({ key, barClass, label }) => {
-    const count = summary?.[key] ?? 0;
+    const count =
+      key === "commitCount"
+        ? resolveProjectCommitCount(summary, repoSnapshot)
+        : (summary?.[key] ?? 0);
     return { barClass, count, text: label(count) };
   });
   const total = items.reduce((sum, item) => sum + item.count, 0);
@@ -399,6 +411,7 @@ type ProjectItemProps = {
   people: string[];
   profiles?: UserProfileLookup;
   summary: ProjectActivitySummary | undefined;
+  repoSnapshot?: Pick<ProjectRepoSnapshot, "commitCount">;
   hasLocal: boolean;
   canDelete: boolean;
   deleteDisabled: boolean;
@@ -412,6 +425,7 @@ export function ProjectGridCard({
   people,
   profiles,
   summary,
+  repoSnapshot,
   hasLocal,
   canDelete,
   deleteDisabled,
@@ -468,10 +482,10 @@ export function ProjectGridCard({
 
         <div className="mt-auto">
           <div className="flex min-w-0 items-center px-4 pb-2 pt-1">
-            <ProjectStatsRow summary={summary} />
+            <ProjectStatsRow repoSnapshot={repoSnapshot} summary={summary} />
           </div>
           <div className="px-4 pb-3">
-            <ProjectActivityBar summary={summary} />
+            <ProjectActivityBar repoSnapshot={repoSnapshot} summary={summary} />
           </div>
         </div>
       </div>
@@ -484,6 +498,7 @@ export function ProjectListRow({
   people,
   profiles,
   summary,
+  repoSnapshot,
   hasLocal,
   canDelete,
   deleteDisabled,
@@ -520,9 +535,16 @@ export function ProjectListRow({
             className="hidden items-center gap-3 xl:flex"
             data-testid="projects-row-summary"
           >
-            <ProjectStatsRow fixedColumns summary={summary} />
+            <ProjectStatsRow
+              fixedColumns
+              repoSnapshot={repoSnapshot}
+              summary={summary}
+            />
             <div className="w-20 shrink-0">
-              <ProjectActivityBar summary={summary} />
+              <ProjectActivityBar
+                repoSnapshot={repoSnapshot}
+                summary={summary}
+              />
             </div>
           </div>
           <div
@@ -583,7 +605,7 @@ export function ProjectRailRow({
               slot (24px + 6px gap) short of the section edge, keeping it
               within the width of the People avatar row above. */}
           <div className="relative z-10 mt-1.5 w-full max-w-[calc(100%-1.875rem)]">
-            <ProjectActivityBar summary={summary} />
+            <ProjectActivityBar repoSnapshot={undefined} summary={summary} />
           </div>
         </div>
       </div>
