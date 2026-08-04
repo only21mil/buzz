@@ -86,3 +86,25 @@ test("resolveProjectRepoSnapshot aliases duplicate project announcements by repo
     snapshot,
   );
 });
+
+test("resolveProjectRepoSnapshot keeps clone-less repository announcements distinct", () => {
+  const representative = {
+    id: "owner-a:repo",
+    cloneUrls: [],
+    dtag: "repo",
+    name: "Repository",
+  };
+  const differentRepository = {
+    id: "owner-b:repo",
+    cloneUrls: [],
+    dtag: "repo",
+    name: "Repository",
+  };
+
+  assert.equal(
+    resolveProjectRepoSnapshot(differentRepository, [representative], {
+      [representative.id]: { commitCount: 137 },
+    }),
+    undefined,
+  );
+});

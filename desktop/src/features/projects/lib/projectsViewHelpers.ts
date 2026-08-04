@@ -287,16 +287,14 @@ export function getClonePathLabel(project: Project) {
   }
 }
 
-function repositoryIdentityKey(
-  project: Pick<Project, "cloneUrls" | "dtag" | "name">,
-) {
+function repositoryIdentityKey(project: Pick<Project, "cloneUrls" | "id">) {
   const cloneUrl = project.cloneUrls[0];
   if (cloneUrl) return normalizeRepositoryUrl(cloneUrl);
-  return (project.name || project.dtag).trim().toLowerCase();
+  return project.id;
 }
 
 export function resolveProjectRepoSnapshot<T>(
-  project: Pick<Project, "cloneUrls" | "dtag" | "name">,
+  project: Pick<Project, "cloneUrls" | "id">,
   snapshotProjects: Project[],
   snapshots: Record<string, T> | undefined,
 ): T | undefined {
