@@ -1,0 +1,54 @@
+name: Publish only21mil Android Release Tag
+run-name: Publish ${{ inputs.source_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Immutable only21mil-android-vX.Y.Z-rc.N tag
+        required: true
+        type: string
+      target_sha:
+        description: Exact current only21mil/buzz main commit
+        required: true
+        type: string
+
+concurrency:
+  group: android-fork-release-tag-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: android-release
+    steps:
+      - name: Require reviewed fork main
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$REPOSITORY" = "only21mil/buzz" || {
+            echo "::error::Fork Android tags may run only in only21mil/buzz"
+            exit 1
+          }
+          test "$DISPATCH_REF" = "refs/heads/main" || {
+            echo "::error::Dispatch this workflow from main, not $DISPATCH_REF"
+            exit 1
+          }
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Publish immutable annotated tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: scripts/publish-android-fork-release-candidate.sh "$SOURCE_TAG" "$TARGET_SHA"
