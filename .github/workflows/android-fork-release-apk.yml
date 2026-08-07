@@ -1,0 +1,193 @@
+name: Build only21mil Android Release APK
+run-name: Build ${{ inputs.source_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Existing immutable only21mil-android-vX.Y.Z-rc.N tag
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit peeled from the annotated source tag
+        required: true
+        type: string
+
+concurrency:
+  group: android-fork-release-apk-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: android-release
+    steps:
+      - name: Require reviewed fork main dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$REPOSITORY" = "only21mil/buzz" || {
+            echo "::error::Fork Android APKs may run only in only21mil/buzz"
+            exit 1
+          }
+          test "$DISPATCH_REF" = "refs/heads/main" || {
+            echo "::error::Dispatch this workflow from main, not $DISPATCH_REF"
+            exit 1
+          }
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ inputs.source_tag }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Derive and verify immutable source metadata
+        id: release
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          scripts/android-fork-release-metadata.py "$SOURCE_TAG" --format github-output >> "$GITHUB_OUTPUT"
+          scripts/verify-android-fork-release-ref.sh "$SOURCE_TAG" "$SOURCE_SHA"
+          echo "source_short=${SOURCE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616  # v1
+
+      - name: Prime pinned Flutter SDK
+        run: flutter --version
+
+      - name: Setup Gradle 8.14.5 without release caching
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb  # v6.3.0
+        with:
+          gradle-version: '8.14.5'
+          cache-disabled: true
+
+      - name: Expose Android verification tools
+        run: |
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          test -n "$build_tools"
+          echo "$build_tools" >> "$GITHUB_PATH"
+          command -v apkanalyzer >/dev/null
+
+      - name: Install locked Flutter dependencies
+        run: cd mobile && flutter pub get
+
+      - name: Materialize the protected release keystore
+        id: keystore
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.BUZZ_ANDROID_RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${KEYSTORE_BASE64:-}" || {
+            echo "::error::BUZZ_ANDROID_RELEASE_KEYSTORE_BASE64 is required"
+            exit 1
+          }
+          signing_dir="$RUNNER_TEMP/buzz-android-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$signing_dir"
+          mkdir -m 700 "$signing_dir"
+          keystore="$signing_dir/release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore" || {
+            echo "::error::The protected Android keystore is not valid base64"
+            exit 1
+          }
+          chmod 600 "$keystore"
+          test -s "$keystore"
+          echo "path=$keystore" >> "$GITHUB_OUTPUT"
+
+      - name: Validate protected key and pinned public certificate
+        env:
+          BUZZ_ANDROID_RELEASE_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          BUZZ_ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.BUZZ_ANDROID_RELEASE_KEY_ALIAS }}
+          BUZZ_ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.BUZZ_ANDROID_RELEASE_KEY_PASSWORD }}
+          BUZZ_ANDROID_RELEASE_CERT_SHA256: ${{ vars.BUZZ_ANDROID_RELEASE_CERT_SHA256 }}
+        run: scripts/validate-android-release-keystore.sh
+
+      - name: Run Android release policy gates
+        run: |
+          scripts/test-check-android-google-free.sh
+          gradle -p mobile/android \
+            :app:testDebugUnitTest \
+            :app:writeBuzzRuntimeDependencyManifest \
+            --no-daemon \
+            --console=plain
+
+      - name: Build the signed direct-release APK
+        env:
+          BUZZ_ANDROID_RELEASE_SIGNING: direct-release
+          BUZZ_ANDROID_RELEASE_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          BUZZ_ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.BUZZ_ANDROID_RELEASE_KEY_ALIAS }}
+          BUZZ_ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.BUZZ_ANDROID_RELEASE_KEY_PASSWORD }}
+          VERSION_NAME: ${{ steps.release.outputs.version_name }}
+          VERSION_CODE: ${{ steps.release.outputs.version_code }}
+        run: |
+          cd mobile
+          flutter build apk --release --no-pub \
+            --build-name "$VERSION_NAME" \
+            --build-number "$VERSION_CODE"
+
+      - name: Verify, bind, and stage the release artifact
+        id: artifact
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION_NAME: ${{ steps.release.outputs.version_name }}
+          VERSION_CODE: ${{ steps.release.outputs.version_code }}
+          SOURCE_SHORT: ${{ steps.release.outputs.source_short }}
+          CERT_SHA256: ${{ vars.BUZZ_ANDROID_RELEASE_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          scripts/verify-android-fork-release-ref.sh "$SOURCE_TAG" "$SOURCE_SHA"
+          source_apk=mobile/build/app/outputs/flutter-apk/app-release.apk
+          dependencies=mobile/build/app/reports/buzz-runtime-dependencies.tsv
+          scripts/verify-android-fork-release-apk.sh \
+            "$source_apk" "$dependencies" "$VERSION_NAME" "$VERSION_CODE" "$CERT_SHA256"
+
+          stage="$RUNNER_TEMP/buzz-android-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$stage"
+          apk_sha="$(sha256sum "$source_apk" | awk '{print $1}')"
+          filename="buzz-${SOURCE_TAG}-vc${VERSION_CODE}-${SOURCE_SHORT}-sha256_${apk_sha}.apk"
+          install -m 600 "$source_apk" "$stage/$filename"
+          install -m 600 "$dependencies" "$stage/buzz-runtime-dependencies.tsv"
+          scripts/write-android-fork-release-provenance.py \
+            --tag "$SOURCE_TAG" \
+            --commit "$SOURCE_SHA" \
+            --version-name "$VERSION_NAME" \
+            --version-code "$VERSION_CODE" \
+            --certificate-sha256 "$CERT_SHA256" \
+            --apk "$stage/$filename" \
+            --dependencies "$stage/buzz-runtime-dependencies.tsv" \
+            --output "$stage/provenance.json"
+          {
+            echo "path=$stage"
+            echo "name=buzz-${SOURCE_TAG}-vc${VERSION_CODE}-${SOURCE_SHORT}"
+            echo "apk_sha256=$apk_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Remove and prove absence of signing material
+        if: always()
+        run: |
+          signing_dir="$RUNNER_TEMP/buzz-android-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [ -e "$signing_dir" ]; then
+            rm -rf -- "$signing_dir"
+          fi
+          test ! -e "$signing_dir"
+
+      - name: Upload verified APK and provenance
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
