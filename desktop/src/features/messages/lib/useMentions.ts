@@ -37,6 +37,7 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { flushMentionDebounce } from "./flushMentionDebounce";
 import { hasMention } from "./hasMention";
+import { useCandidateProfiles } from "./useMentionCandidateProfiles";
 import { useDraftMentionRouting } from "./useDraftMentionRouting";
 import { rankMentionCandidates } from "./mentionRanking";
 import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping";
@@ -52,9 +53,6 @@ const MENTION_SUGGESTION_LIMIT = 50;
 export type PersonaMentionTarget = {
   displayName: string;
   persona: AgentPersona;
-};
-type UseMentionsOptions = {
-  channelType?: ChannelType | null;
 };
 function formatSearchUserDisplayName(user: UserSearchResult) {
   return user.displayName?.trim() || user.nip05Handle?.trim() || null;
@@ -78,7 +76,7 @@ export function useMentions(
   channelId: string | null,
   externalMembers?: ChannelMember[],
   profiles?: UserProfileLookup,
-  options?: UseMentionsOptions,
+  options?: { channelType?: ChannelType | null },
 ) {
   const [mentionQuery, setMentionQuery] = React.useState<string | null>(null);
   const [mentionStartIndex, setMentionStartIndex] = React.useState(0);
@@ -232,10 +230,11 @@ export function useMentions(
     () => new Set(activePersonas.map((persona) => persona.id)),
     [activePersonas],
   );
-  const memberPubkeys = React.useMemo(
-    () =>
-      new Set((members ?? []).map((member) => normalizePubkey(member.pubkey))),
-    [members],
+  const { candidateProfiles, memberPubkeys } = useCandidateProfiles(
+    members,
+    managedAgentsQuery.data,
+    relayAgentsQuery.data,
+    profiles,
   );
   const mentionCandidates = React.useMemo<MentionCandidate[]>(() => {
     const candidatesByPubkey = new Map<string, MentionCandidate>();
@@ -286,7 +285,7 @@ export function useMentions(
           current.ownerPubkey ??
           candidate.ownerPubkey ??
           (candidate.isAgent && candidate.pubkey
-            ? profiles?.[pubkey]?.ownerPubkey
+            ? candidateProfiles[pubkey]?.ownerPubkey
             : null) ??
           null,
         isManagedAgent: current.isManagedAgent || candidate.isManagedAgent,
@@ -301,7 +300,7 @@ export function useMentions(
         managedAgentNamesByPubkey.get(pubkey) ??
         relayAgentNamesByPubkey.get(pubkey) ??
         null;
-      const profile = profiles?.[pubkey] ?? null;
+      const profile = candidateProfiles[pubkey] ?? null;
       addCandidate({
         kind: "identity",
         pubkey,
@@ -412,6 +411,7 @@ export function useMentions(
   }, [
     activePersonaById,
     activePersonas,
+    candidateProfiles,
     userSearchResults,
     canSearchGlobalUsers,
     currentPubkey,
@@ -426,7 +426,6 @@ export function useMentions(
     members,
     mentionableAgentPubkeys,
     personaNameByPubkey,
-    profiles,
     relayAgentNamesByPubkey,
     relayAgentsQuery.data,
   ]);
