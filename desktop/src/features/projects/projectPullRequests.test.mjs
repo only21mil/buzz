@@ -49,37 +49,13 @@ test("preserves an optional source channel from the pull request", () => {
   assert.equal(eventToProjectPullRequest(pullRequestEvent()).channelId, null);
 });
 
-test("preserves advisory PR linkage tags with stable valid selection", () => {
-  const firstIssueId = "a".repeat(64);
-  const secondIssueId = "b".repeat(64);
+test("preserves a private-safe agent origin without a channel ID", () => {
   const event = pullRequestEvent();
-  event.tags.push(
-    ["e", "not-an-event-id", "", "issue"],
-    ["e", firstIssueId.toUpperCase(), "", "issue"],
-    ["e", secondIssueId, "", "issue"],
-    ["e", "3".repeat(64), "", "root"],
-    ["i", "bad\nexternal-id"],
-    ["i", "  github:pull:block/buzz#99  "],
-    ["i", "github:pull:block/buzz#100"],
-  );
+  event.tags.push(["buzz-origin-agent", "Builder"]);
 
   const pullRequest = eventToProjectPullRequest(event);
-  assert.equal(pullRequest.linkedIssueId, firstIssueId);
-  assert.equal(pullRequest.externalId, "github:pull:block/buzz#99");
-});
-
-test("drops malformed or unmarked PR linkage tags", () => {
-  const event = pullRequestEvent();
-  event.tags.push(
-    ["e", "4".repeat(64), "", "root"],
-    ["e", "short", "", "issue"],
-    ["e", "5".repeat(64), "", "Issue"],
-    ["i", "\u0000external-id"],
-  );
-
-  const pullRequest = eventToProjectPullRequest(event);
-  assert.equal(pullRequest.linkedIssueId, null);
-  assert.equal(pullRequest.externalId, null);
+  assert.equal(pullRequest.channelId, null);
+  assert.equal(pullRequest.originAgentName, "Builder");
 });
 
 function updateEvent({ pubkey, createdAt, commit, cloneUrl }) {

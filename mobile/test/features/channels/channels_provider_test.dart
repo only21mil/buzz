@@ -58,6 +58,174 @@ void main() {
     },
   );
 
+  test(
+    'refreshing an unchanged channel set issues zero new live REQs',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [
+          _membership(_channelA, myPk),
+          _membership(_channelB, myPk),
+        ],
+        metadata: [
+          _meta(id: _channelA, name: 'general'),
+          _meta(id: _channelB, name: 'random'),
+        ],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+
+      await container.read(channelsProvider.future);
+      final initialSubscribeCount = session.totalSubscribeCount;
+
+      await container.read(channelsProvider.notifier).refresh();
+
+      expect(session.totalSubscribeCount, initialSubscribeCount);
+      expect(session.unsubscribeCount, 0);
+      expect(session.subscribeFilters, hasLength(2));
+    },
+  );
+
+  test(
+    'live subscription diff only removes and adds changed channels',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [
+          _membership(_channelA, myPk),
+          _membership(_channelB, myPk),
+        ],
+        metadata: [
+          _meta(id: _channelA, name: 'general'),
+          _meta(id: _channelB, name: 'random'),
+        ],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+
+      await container.read(channelsProvider.future);
+      session.memberships = [
+        _membership(_channelB, myPk),
+        _membership(_channelD, myPk),
+      ];
+      session.metadata = [
+        _meta(id: _channelB, name: 'random'),
+        _meta(id: _channelD, name: 'support'),
+      ];
+
+      await container.read(channelsProvider.notifier).refresh();
+
+      expect(session.totalSubscribeCount, 3);
+      expect(session.unsubscribeCount, 1);
+      expect(
+        session.subscribeFilters
+            .map((filter) => filter.tags['#h']!.single)
+            .toSet(),
+        {_channelB, _channelD},
+      );
+    },
+  );
+
+  test(
+    'empty channel refresh removes every retained live subscription',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [
+          _membership(_channelA, myPk),
+          _membership(_channelB, myPk),
+        ],
+        metadata: [
+          _meta(id: _channelA, name: 'general'),
+          _meta(id: _channelB, name: 'random'),
+        ],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+
+      await container.read(channelsProvider.future);
+      session.memberships = [];
+      session.metadata = [];
+
+      await container.read(channelsProvider.notifier).refresh();
+
+      expect(session.activeChannels, isEmpty);
+      expect(session.activeSubscriptionCount, 0);
+      expect(session.unsubscribeCount, 2);
+    },
+  );
+
+  test(
+    'overlapping refreshes retain one live subscription per desired channel',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [
+          _membership(_channelA, myPk),
+          _membership(_channelB, myPk),
+        ],
+        metadata: [
+          _meta(id: _channelA, name: 'general'),
+          _meta(id: _channelB, name: 'random'),
+        ],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+
+      await container.read(channelsProvider.future);
+      session.pauseNextSubscribe();
+      session.memberships = [
+        _membership(_channelA, myPk),
+        _membership(_channelB, myPk),
+        _membership(_channelD, myPk),
+      ];
+      session.metadata = [
+        _meta(id: _channelA, name: 'general'),
+        _meta(id: _channelB, name: 'random'),
+        _meta(id: _channelD, name: 'support'),
+      ];
+
+      final firstRefresh = container.read(channelsProvider.notifier).refresh();
+      await session.nextSubscribeStarted;
+      final secondRefresh = container.read(channelsProvider.notifier).refresh();
+      session.resumePausedSubscribe();
+      await Future.wait([firstRefresh, secondRefresh]);
+
+      expect(session.activeChannels, {_channelA, _channelB, _channelD});
+      expect(session.activeSubscriptionCount, 3);
+    },
+  );
+
+  test(
+    'community switch replaces retained live subscriptions on the new relay',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [_membership(_channelA, myPk)],
+        metadata: [_meta(id: _channelA, name: 'general')],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+
+      await container.read(channelsProvider.future);
+      expect(session.activeChannels, {_channelA});
+
+      session.setStatus(SessionStatus.disconnected);
+      session.memberships = [_membership(_channelB, myPk)];
+      session.metadata = [_meta(id: _channelB, name: 'random')];
+      container
+          .read(relayConfigProvider.notifier)
+          .update(baseUrl: 'https://new-community.example');
+      await Future<void>.delayed(Duration.zero);
+      session.setStatus(SessionStatus.connected);
+      await container.read(channelsProvider.future);
+      await _waitUntil(
+        () =>
+            session.activeChannels.length == 1 &&
+            session.activeChannels.contains(_channelB),
+      );
+
+      expect(session.activeChannels, {_channelB});
+      expect(session.activeSubscriptionCount, 1);
+      expect(session.unsubscribeCount, 1);
+    },
+  );
+
   test('live channel events update channel lastMessageAt', () async {
     final session = _FakeRelaySession(
       memberships: [_membership(_channelA, myPk)],
@@ -115,16 +283,15 @@ void main() {
     await Future<void>.delayed(Duration.zero);
     expect(bridge.eventIds, ['before-reconnect']);
 
-    final replacementEose = Completer<void>();
-    session.subscriptionGates.add(replacementEose);
+    session.pauseNextSubscribe();
     session.setStatus(SessionStatus.connected);
-    await _waitUntil(() => session.subscribeCallCount >= 2);
+    await session.nextSubscribeStarted;
 
     session.emit(_messageEvent(id: 'before-eose', createdAt: 12));
     await Future<void>.delayed(Duration.zero);
     expect(bridge.eventIds, ['before-reconnect']);
 
-    replacementEose.complete();
+    session.resumePausedSubscribe();
     await _waitUntil(() => session.unsubscribeCount >= 1);
     await Future<void>.delayed(Duration.zero);
     session.emit(_messageEvent(id: 'after-eose', createdAt: 13));
@@ -479,6 +646,14 @@ ProviderContainer _buildContainer({
   );
 }
 
+Future<void> _waitUntil(bool Function() predicate) async {
+  for (var i = 0; i < 100; i++) {
+    if (predicate()) return;
+    await Future<void>.delayed(Duration.zero);
+  }
+  fail('Timed out waiting for asynchronous provider work');
+}
+
 /// Fake [RelaySessionNotifier] that returns canned events from [fetchHistory]
 /// and records subscribe calls.
 class _FakeRelaySession extends RelaySessionNotifier {
@@ -496,10 +671,40 @@ class _FakeRelaySession extends RelaySessionNotifier {
 
   final List<NostrFilter> historyFilters = [];
   final List<NostrFilter> subscribeFilters = [];
-  final List<void Function(NostrEvent)> _listeners = [];
-  final List<Completer<void>> subscriptionGates = [];
+  final Map<int, (NostrFilter, void Function(NostrEvent))> _subscriptions = {};
+  int _nextSubscriptionKey = 0;
+  Completer<void>? _pausedSubscribe;
+  Completer<void>? _subscribeStarted;
   int unsubscribeCount = 0;
-  int subscribeCallCount = 0;
+  int totalSubscribeCount = 0;
+
+  Set<String> get activeChannels => {
+    for (final (filter, _) in _subscriptions.values) ?filter.tags['#h']?.single,
+  };
+
+  int get activeSubscriptionCount => _subscriptions.length;
+
+  Future<void> get nextSubscribeStarted async {
+    final started = _subscribeStarted;
+    if (started == null) {
+      throw StateError('No paused subscription is pending');
+    }
+    await started.future;
+  }
+
+  void pauseNextSubscribe() {
+    if (_pausedSubscribe != null) {
+      throw StateError('A subscription is already paused');
+    }
+    _pausedSubscribe = Completer<void>();
+    _subscribeStarted = Completer<void>();
+  }
+
+  void resumePausedSubscribe() {
+    final paused = _pausedSubscribe;
+    if (paused == null) throw StateError('No subscription is paused');
+    paused.complete();
+  }
 
   @override
   SessionState build() => const SessionState(status: SessionStatus.connected);
@@ -541,16 +746,24 @@ class _FakeRelaySession extends RelaySessionNotifier {
     void Function(NostrEvent) onEvent, {
     void Function(String message)? onClosed,
   }) async {
-    subscribeCallCount++;
+    totalSubscribeCount++;
     subscribeFilters.add(filter);
-    _listeners.add(onEvent);
-    if (subscriptionGates.isNotEmpty) {
-      await subscriptionGates.removeAt(0).future;
+    final subscriptionKey = ++_nextSubscriptionKey;
+    // RelaySession registers the callback before awaiting EOSE, so replayed
+    // events can be delivered while this fake subscription is paused.
+    _subscriptions[subscriptionKey] = (filter, onEvent);
+    final paused = _pausedSubscribe;
+    if (paused != null) {
+      _subscribeStarted!.complete();
+      await paused.future;
+      _pausedSubscribe = null;
+      _subscribeStarted = null;
     }
     return () {
+      final subscription = _subscriptions.remove(subscriptionKey);
+      if (subscription == null) return;
       unsubscribeCount++;
-      subscribeFilters.remove(filter);
-      _listeners.remove(onEvent);
+      subscribeFilters.remove(subscription.$1);
     };
   }
 
@@ -560,7 +773,7 @@ class _FakeRelaySession extends RelaySessionNotifier {
 
   /// Emit a live event to all subscribers.
   void emit(NostrEvent event) {
-    for (final listener in List.of(_listeners)) {
+    for (final (_, listener) in List.of(_subscriptions.values)) {
       listener(event);
     }
   }
@@ -606,14 +819,6 @@ NostrEvent _messageEvent({required String id, required int createdAt}) =>
       content: 'message',
       sig: 'sig',
     );
-
-Future<void> _waitUntil(bool Function() condition) async {
-  for (var attempt = 0; attempt < 100; attempt++) {
-    if (condition()) return;
-    await Future<void>.delayed(Duration.zero);
-  }
-  fail('condition was not reached');
-}
 
 class _FakeAppLifecycleNotifier extends AppLifecycleNotifier {
   @override

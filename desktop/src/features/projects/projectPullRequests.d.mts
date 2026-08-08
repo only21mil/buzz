@@ -78,10 +78,8 @@ export type ProjectPullRequest = {
   repoAddress: string | null;
   /** Channel where the pull request originated (`h` tag), when provided. */
   channelId: string | null;
-  /** Author-claimed issue event (`e` tag with `issue` marker), when provided. */
-  linkedIssueId: string | null;
-  /** Advisory transport-origin identifier (`i` tag), when provided. */
-  externalId: string | null;
+  /** Agent display name retained instead of a private conversation ID. */
+  originAgentName: string | null;
   labels: string[];
   recipients: string[];
   /** Requested reviewers (root `p` tags + trusted review-request comments). */

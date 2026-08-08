@@ -24,10 +24,8 @@ export type ProjectIssue = {
   author: string;
   createdAt: number;
   repoAddress: string | null;
-  /** Author-claimed source channel (`h` tag), when provided. */
   channelId: string | null;
-  /** Advisory transport-origin identifier (`i` tag), when provided. */
-  externalId: string | null;
+  originAgentName: string | null;
   labels: string[];
   recipients: string[];
   status: ProjectIssueStatus;
@@ -48,8 +46,6 @@ export const PROJECT_ISSUE_STATUS: {
 export function getTag(event: RelayEvent, name: string): string | undefined;
 export function getAllTags(event: RelayEvent, name: string): string[];
 export function getImetaTags(event: RelayEvent): string[][];
-export function getExternalId(event: RelayEvent): string | null;
-export function getAdvisoryLink(event: RelayEvent, name: string): string | null;
 export function eventToProjectIssue(
   issue: RelayEvent,
   statusEvents?: RelayEvent[],
@@ -60,6 +56,11 @@ export function projectIssueEventsToIssues(
   statusEvents?: RelayEvent[],
   commentEvents?: RelayEvent[],
 ): ProjectIssue[];
+export function nextProjectIssueCommentCreatedAt(
+  issue: ProjectIssue,
+  now: number,
+  author: string,
+): number;
 export function buildGitIssueTags(input: {
   repoAddress: string;
   repoOwner: string;
