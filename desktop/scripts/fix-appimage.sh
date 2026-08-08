@@ -3,6 +3,7 @@
 # on Mesa 25+ / GLib 2.88 distros (Ubuntu 26.04, Fedora 42+, etc.).
 #
 # Usage: fix-appimage.sh <path-to.AppImage>
+#        fix-appimage.sh --normalize-root-symlinks <extracted-AppDir>
 #
 # Set TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD to
 # re-sign after repacking (CI release builds). Without them the script
@@ -55,6 +56,96 @@
 # remove/symlink), and bundleXdgOpen.
 
 set -euo pipefail
+
+fail() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+normalize_root_metadata_symlinks() {
+  local appdir="$1"
+  local appdir_abs
+
+  if ! appdir_abs="$(realpath -e -- "$appdir")" || [[ ! -d "$appdir_abs" ]]; then
+    fail "extracted AppDir not found: $appdir"
+  fi
+
+  # Keep this allowlist identical to validate-linux-appimage.sh.  The pass is
+  # deliberately one loop so every root metadata link is observable together.
+  local -a root_links=()
+  mapfile -d '' -t root_links < <(
+    find "$appdir_abs" -maxdepth 1 -type l \
+      \( -name '.DirIcon' -o -name '*.desktop' -o -name '*.png' \) -print0 | sort -z
+  )
+
+  local failure_count=0
+  local link rel_link original_target outcome detail suffix candidate resolved relative
+  for link in "${root_links[@]}"; do
+    rel_link="${link#"$appdir_abs/"}"
+    original_target=""
+    outcome="failed"
+    detail=""
+    suffix=""
+    candidate=""
+    resolved=""
+    relative=""
+
+    if ! original_target="$(readlink -- "$link")"; then
+      detail="could not read symlink target"
+    elif [[ "$original_target" != /* ]]; then
+      outcome="skipped-relative"
+    elif [[ "$original_target" != *.AppDir/* ]]; then
+      detail="absolute target does not name a path beneath an original *.AppDir/ root"
+    else
+      # `${var#*.AppDir/}` removes the shortest prefix, selecting the first
+      # original *.AppDir/ root in the absolute target.  The suffix is the
+      # path to reuse inside the extracted AppDir.
+      suffix="${original_target#*.AppDir/}"
+      relative="$suffix"
+      if [[ -z "$suffix" ]]; then
+        detail="absolute target has no path beneath its original *.AppDir/ root"
+      elif [[ "$suffix" == /* ]]; then
+        detail="computed relative path is absolute"
+      elif [[ "/$suffix/" == */../* ]]; then
+        detail="computed relative path contains path traversal (..)"
+      else
+        candidate="$appdir_abs/$suffix"
+        if ! resolved="$(realpath -e -- "$candidate" 2>/dev/null)"; then
+          detail="internal suffix does not resolve in extracted AppDir"
+        elif [[ "$resolved" != "$appdir_abs"/* ]]; then
+          detail="target resolves outside extracted AppDir"
+        elif [[ ! -f "$resolved" ]]; then
+          detail="target does not resolve to a regular file"
+        elif [[ "$relative" == /* || "/$relative/" == */../* ]]; then
+          detail="computed relative path is unsafe"
+        elif ! ln -sfn -- "$relative" "$link"; then
+          detail="could not rewrite symlink"
+        else
+          outcome="rewritten"
+        fi
+      fi
+    fi
+
+    if [[ "$outcome" == "failed" ]]; then
+      printf 'AppImage root metadata symlink: %s -> %s (failed): %s\n' \
+        "$rel_link" "$original_target" "$detail"
+      ((failure_count += 1))
+    else
+      printf 'AppImage root metadata symlink: %s -> %s (%s)\n' \
+        "$rel_link" "$original_target" "$outcome"
+    fi
+  done
+
+  if (( failure_count > 0 )); then
+    fail "root metadata symlink normalization failed for $failure_count link(s)"
+  fi
+}
+
+if [[ "${1:-}" == "--normalize-root-symlinks" ]]; then
+  [[ $# -eq 2 ]] || fail "usage: $0 --normalize-root-symlinks <extracted-AppDir>"
+  normalize_root_metadata_symlinks "$2"
+  exit 0
+fi
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: fix-appimage.sh <path-to.AppImage>" >&2
@@ -163,6 +254,9 @@ done
 exec -a "buzz-desktop" "$here/buzz-desktop.bin" "$@"
 SHIM
 chmod +x "$APP_BIN"
+
+echo "==> Normalizing root AppImage metadata symlinks"
+normalize_root_metadata_symlinks "$WORKDIR/squashfs-root"
 
 echo "==> Repacking AppImage"
 # Pass a pinned type2 runtime when provided (CI sets APPIMAGETOOL_RUNTIME_FILE);
