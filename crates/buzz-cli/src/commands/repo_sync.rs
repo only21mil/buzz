@@ -37,6 +37,28 @@ struct RemoteState {
     head_target: Option<String>,
 }
 
+impl RemoteState {
+    /// The state of a remote whose repository does not exist yet.
+    fn absent() -> Self {
+        Self {
+            main: None,
+            head: None,
+            head_target: None,
+        }
+    }
+}
+
+/// Whether git failed because the remote repository does not exist.
+///
+/// Match on the message rather than the exit status: git reports every fatal
+/// error as exit 128, so the code alone cannot distinguish "no such repository"
+/// from an authentication or transport failure.
+fn remote_is_absent(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("repository not found")
+        || stderr.contains("does not appear to be a git repository")
+}
+
 #[derive(Debug, serde::Serialize)]
 struct StatusOutput<'a> {
     repo_id: &'a str,
@@ -273,10 +295,15 @@ impl GitRepo {
         self.output(authenticated, operation, args).map(|_| ())
     }
 
-    fn ls_remote(&self, url: &str, authenticated: bool) -> Result<RemoteState, CliError> {
+    fn ls_remote(
+        &self,
+        url: &str,
+        authenticated: bool,
+        remote: &str,
+    ) -> Result<RemoteState, CliError> {
         let output = self.output(
             authenticated,
-            "read remote refs",
+            &format!("read {remote} remote refs"),
             ["ls-remote", "--symref", url, "HEAD", MAIN_REF],
         )?;
         let stdout = std::str::from_utf8(&output.stdout)
@@ -284,8 +311,41 @@ impl GitRepo {
         parse_remote_state(stdout)
     }
 
+    /// Read a remote, treating a repository that does not exist yet as empty.
+    ///
+    /// Announcing a repository does not create its git storage, so the first
+    /// `import-main` for a repo legitimately finds no remote at all. Paths that
+    /// initialize or merely report on a repository must see that as an empty
+    /// remote; every other failure stays fatal.
+    fn ls_remote_allowing_absent(
+        &self,
+        url: &str,
+        authenticated: bool,
+        remote: &str,
+    ) -> Result<RemoteState, CliError> {
+        let output = self
+            .command(authenticated)
+            .args(["ls-remote", "--symref", url, "HEAD", MAIN_REF])
+            .output()
+            .map_err(|_| {
+                CliError::Other(format!("failed to run git for read {remote} remote refs"))
+            })?;
+        if !output.status.success() {
+            if remote_is_absent(&String::from_utf8_lossy(&output.stderr)) {
+                return Ok(RemoteState::absent());
+            }
+            return Err(CliError::Other(format!(
+                "git read {remote} remote refs failed (exit {})",
+                output.status.code().unwrap_or(-1)
+            )));
+        }
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CliError::Other("git returned invalid ref data".into()))?;
+        parse_remote_state(stdout)
+    }
+
     fn github_main(&self, url: &str) -> Result<String, CliError> {
-        self.ls_remote(url, false)?
+        self.ls_remote(url, false, "GitHub")?
             .main
             .ok_or_else(|| CliError::NotFound("GitHub main is absent".into()))
     }
@@ -414,7 +474,7 @@ fn execute_import(
         ));
     }
     repo.fetch_github_main(&remotes.github_url, commit)?;
-    let buzz_before = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz_before = repo.ls_remote_allowing_absent(&remotes.buzz_url, true, "Buzz")?;
     let changed = match buzz_before.main.as_deref() {
         None => {
             if buzz_before.head.is_some()
@@ -452,7 +512,7 @@ fn execute_import(
             "GitHub main changed during synchronization".into(),
         ));
     }
-    let buzz_after = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz_after = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
     require_exact_head(&buzz_after, commit)?;
     let buzz_main = buzz_after
         .main
@@ -484,7 +544,7 @@ fn execute_mirror(
         ));
     }
     repo.fetch_github_main(&remotes.github_url, commit)?;
-    let buzz_before = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz_before = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
     if buzz_before.main.as_deref() != Some(expected_buzz_main) {
         return Err(CliError::Conflict(
             "Buzz main is absent or does not equal --expected-buzz-main; no write was attempted"
@@ -515,7 +575,7 @@ fn execute_mirror(
             "GitHub main changed during synchronization".into(),
         ));
     }
-    let buzz_after = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz_after = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
     require_exact_head(&buzz_after, commit)?;
     let buzz_main = buzz_after
         .main
@@ -538,7 +598,7 @@ pub async fn cmd_status(client: &BuzzClient, announcement: &Event) -> Result<(),
     let remotes = derive_remotes(client, announcement)?;
     let repo = GitRepo::new(auth_from_client(client))?;
     let github_main = repo.github_main(&remotes.github_url)?;
-    let buzz = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz = repo.ls_remote_allowing_absent(&remotes.buzz_url, true, "Buzz")?;
     let output = StatusOutput {
         repo_id: &remotes.repo_id,
         direction: "github-to-buzz",
@@ -831,5 +891,36 @@ mod tests {
         assert_eq!(state.main.as_deref(), Some(oid.as_str()));
         assert_eq!(state.head.as_deref(), Some(oid.as_str()));
         assert_eq!(state.head_target.as_deref(), Some(MAIN_REF));
+    }
+
+    #[test]
+    fn absent_remote_is_distinguished_from_other_failures() {
+        // A repository that was announced but never pushed: `import-main` must
+        // treat this as an empty remote, because creating it is its whole job.
+        assert!(remote_is_absent(
+            "remote: repository not found\n\
+             fatal: repository 'https://relay.example/git/owner/repo/' not found\n"
+        ));
+
+        // Every case below is also exit 128. None may be read as absence, or a
+        // failed write would be reported as a successful initialization.
+        assert!(!remote_is_absent(
+            "remote: restricted: not a relay member\n\
+             fatal: unable to access 'https://relay.example/git/owner/repo/': \
+             The requested URL returned error: 403\n"
+        ));
+        assert!(!remote_is_absent(
+            "fatal: could not read Username for 'https://relay.example': \
+             terminal prompts disabled\n"
+        ));
+        assert!(!remote_is_absent(
+            "fatal: unable to access 'https://relay.example/': Could not resolve host\n"
+        ));
+    }
+
+    #[test]
+    fn absent_remote_state_is_empty() {
+        let state = RemoteState::absent();
+        assert_eq!(state, parse_remote_state("").expect("parse empty refs"));
     }
 }
