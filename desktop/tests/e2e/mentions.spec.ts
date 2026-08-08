@@ -7,6 +7,9 @@ import {
 } from "../helpers/bridge";
 
 const MOCK_VIEWER_PUBKEY = "deadbeef".repeat(8);
+const AGENTS_CHANNEL_ID = "94a444a4-c0a3-5966-ab05-530c6ddc2301";
+const OWNED_RELAY_AGENT_PUBKEY =
+  "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
 
 test.beforeEach(async ({ page }) => {
   await installMockBridge(page);
@@ -239,6 +242,84 @@ test("@ trigger prioritizes channel members before runnable personas and other m
   expect(outsiderIndex).toEqual(-1);
   expect(bobIndex).toBeLessThan(fizzIndex);
   expect(fizzIndex).toBeLessThan(charlieIndex);
+});
+
+test("channel and Inbox composers offer the same owned agent member", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-agents").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("agents");
+
+  const channelInput = page.getByTestId("message-input");
+  await channelInput.fill("@nad");
+  await expect(autocomplete(page)).toBeVisible();
+  const channelCandidates = await autocomplete(page)
+    .locator("button")
+    .evaluateAll((buttons) => buttons.map((button) => button.dataset.testid));
+  expect(channelCandidates).toEqual([
+    `mention-suggestion-${OWNED_RELAY_AGENT_PUBKEY}`,
+  ]);
+
+  const inboxItemId = "inbox-mention-autocomplete-parity";
+  await page.evaluate(
+    ({ channelId, currentPubkey, itemId, senderPubkey }) => {
+      const pushFeedItem = (
+        window as Window & {
+          __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: {
+            category: "mention";
+            channel_id: string;
+            channel_name: string;
+            channel_type: "stream";
+            content: string;
+            created_at: number;
+            id: string;
+            kind: number;
+            pubkey: string;
+            tags: string[][];
+          }) => unknown;
+        }
+      ).__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__;
+      if (!pushFeedItem) throw new Error("Mock feed helper is not installed.");
+      pushFeedItem({
+        category: "mention",
+        channel_id: channelId,
+        channel_name: "agents",
+        channel_type: "stream",
+        content: "Please check mention autocomplete parity.",
+        created_at: Math.floor(Date.now() / 1000),
+        id: itemId,
+        kind: 9,
+        pubkey: senderPubkey,
+        tags: [
+          ["h", channelId],
+          ["p", currentPubkey],
+        ],
+      });
+    },
+    {
+      channelId: AGENTS_CHANNEL_ID,
+      currentPubkey: MOCK_VIEWER_PUBKEY,
+      itemId: inboxItemId,
+      senderPubkey: TEST_IDENTITIES.charlie.pubkey,
+    },
+  );
+
+  await page.getByRole("button", { name: "Inbox", exact: true }).click();
+  await page.getByTestId(`home-inbox-item-${inboxItemId}`).click();
+  const inboxDetail = page.getByTestId("home-inbox-detail");
+  const inboxInput = inboxDetail.getByTestId("message-input");
+  await inboxInput.fill("@nad");
+  await expect
+    .poll(() =>
+      inboxDetail
+        .getByTestId("mention-autocomplete")
+        .locator("button")
+        .evaluateAll((buttons) =>
+          buttons.map((button) => button.dataset.testid),
+        ),
+    )
+    .toEqual(channelCandidates);
 });
 
 test("thread autocomplete keeps multiple long names readable in a narrow panel", async ({
