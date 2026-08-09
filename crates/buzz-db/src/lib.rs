@@ -5549,6 +5549,81 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn repo_tombstone_sql_failure_rolls_back_event_and_coordinate_change() {
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let owner = nostr::Keys::generate();
+        let signer = nostr::Keys::generate();
+        let repo_id = format!("sql-failure-{}", Uuid::new_v4().simple());
+        let base = nostr::Timestamp::now().as_secs();
+        let announcement = repo_announcement(&owner, &repo_id, base, "live");
+        assert!(
+            db.replace_parameterized_event(community, &announcement, &repo_id, None)
+                .await
+                .expect("store repo announcement")
+                .1
+        );
+        let tombstone = repo_tombstone(&signer, &owner, &repo_id, base + 1);
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let function_name = format!("repo_delete_fail_{suffix}");
+        let trigger_name = format!("repo_delete_fail_{suffix}");
+        let create_function = format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF OLD.community_id = '{}'::uuid AND OLD.d_tag = '{}' THEN \
+             RAISE EXCEPTION 'injected repository deletion failure'; END IF; RETURN NEW; END $$",
+            community.as_uuid(),
+            repo_id
+        );
+        // All interpolated identifiers and values below come from UUIDs plus
+        // the test's fixed safe repository prefix.
+        sqlx::query(sqlx::AssertSqlSafe(create_function))
+            .execute(&db.pool)
+            .await
+            .expect("create failure injection function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF deleted_at ON events \
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        )))
+        .execute(&db.pool)
+        .await
+        .expect("create failure injection trigger");
+
+        let result = db
+            .store_repo_deletion_tombstone(community, &tombstone, None)
+            .await;
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER {trigger_name} ON events"
+        )))
+        .execute(&db.pool)
+        .await
+        .expect("drop failure injection trigger");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP FUNCTION {function_name}()"
+        )))
+        .execute(&db.pool)
+        .await
+        .expect("drop failure injection function");
+
+        assert!(
+            result.is_err(),
+            "injected SQL failure must reach the caller"
+        );
+        assert_eq!(
+            event_row_count(&db, community, &tombstone).await,
+            0,
+            "the tombstone insert must roll back with the failed coordinate update"
+        );
+        assert_eq!(
+            live_repo_count(&db, community, &owner, &repo_id).await,
+            1,
+            "the live repository head must survive the failed transaction"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn repo_tombstone_shares_target_coordinate_lock_with_replacement() {
         let db = setup_db().await;
         let community = CommunityId::from_uuid(make_community(&db.pool).await);
