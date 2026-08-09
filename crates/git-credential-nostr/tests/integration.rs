@@ -11,7 +11,7 @@ use nostr::{Keys, ToBech32};
 
 /// Spawn the binary, write `input` to stdin, collect output.
 /// `env_vars` are added on top of the inherited environment.
-/// `NOSTR_PRIVATE_KEY` is always cleared first to prevent test pollution.
+/// Private-key variables are always cleared first to prevent test pollution.
 fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_git-credential-nostr");
     let mut cmd = Command::new(bin);
@@ -20,6 +20,7 @@ fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
         .stderr(Stdio::piped())
         .current_dir(std::env::temp_dir())
         .env_remove("NOSTR_PRIVATE_KEY")
+        .env_remove("BUZZ_PRIVATE_KEY")
         .env_remove("BUZZ_AUTH_TAG")
         .env_remove("GIT_CONFIG_COUNT")
         // Prevent git config on the test machine from supplying credentials.
@@ -120,6 +121,82 @@ fn happy_path() {
     assert!(event["tags"].is_array(), "event missing 'tags'");
 }
 
+/// Buzz-managed agent shells expose `BUZZ_PRIVATE_KEY`; the helper must accept
+/// that identity without requiring a duplicate env var or keyfile.
+#[test]
+fn buzz_private_key_happy_path() {
+    let keys = Keys::generate();
+    let nsec = keys.secret_key().to_bech32().unwrap();
+    let out = run_helper(&valid_input(), &[("BUZZ_PRIVATE_KEY", &nsec)]);
+
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains(&nsec), "private key leaked to stdout");
+    assert!(!stderr.contains(&nsec), "private key leaked to stderr");
+    let credential = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("credential="))
+        .expect("credential output");
+    let event_json = base64::engine::general_purpose::STANDARD
+        .decode(credential)
+        .expect("base64 credential");
+    let event: nostr::Event = serde_json::from_slice(&event_json).expect("NIP-98 event");
+
+    assert_eq!(event.pubkey, keys.public_key());
+    assert!(event.verify().is_ok());
+}
+
+/// Preserve the established explicit override: when both variables are set,
+/// `NOSTR_PRIVATE_KEY` wins over the Buzz-managed fallback.
+#[test]
+fn nostr_private_key_takes_precedence_over_buzz_private_key() {
+    let nostr_keys = Keys::generate();
+    let nostr_nsec = nostr_keys.secret_key().to_bech32().unwrap();
+    let buzz_nsec = fresh_nsec();
+    let out = run_helper(
+        &valid_input(),
+        &[
+            ("NOSTR_PRIVATE_KEY", &nostr_nsec),
+            ("BUZZ_PRIVATE_KEY", &buzz_nsec),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(&nostr_nsec) && !stdout.contains(&buzz_nsec),
+        "private key leaked to stdout"
+    );
+    assert!(
+        !stderr.contains(&nostr_nsec) && !stderr.contains(&buzz_nsec),
+        "private key leaked to stderr"
+    );
+    let credential = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("credential="))
+        .expect("credential output");
+    let event_json = base64::engine::general_purpose::STANDARD
+        .decode(credential)
+        .expect("base64 credential");
+    let event: nostr::Event = serde_json::from_slice(&event_json).expect("NIP-98 event");
+
+    assert_eq!(event.pubkey, nostr_keys.public_key());
+    assert!(event.verify().is_ok());
+}
+
 /// A Buzz-managed agent must carry its NIP-OA owner attestation inside the
 /// signed NIP-98 event so the relay can admit it through the owner's membership.
 #[test]
@@ -216,8 +293,8 @@ fn old_git_no_authtype_capability() {
 /// No key configured at all → exit 1, stderr mentions "no nostr key configured".
 #[test]
 fn missing_key() {
-    // run_helper already clears NOSTR_PRIVATE_KEY and points HOME at a temp dir
-    // that has no git config, so no keyfile will be found.
+    // run_helper already clears both private-key variables and points HOME at a
+    // temp dir that has no git config, so no keyfile will be found.
     let out = run_helper(&valid_input(), &[]);
 
     assert_eq!(
