@@ -299,6 +299,47 @@ pub enum IngestError {
     Internal(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepoDeletionIngestOutcome {
+    accepted: bool,
+    message: &'static str,
+    dispatch: bool,
+    write_trace: bool,
+}
+
+fn repo_deletion_ingest_outcome(
+    outcome: buzz_db::RepoDeletionOutcome,
+) -> RepoDeletionIngestOutcome {
+    use buzz_db::RepoDeletionOutcome;
+
+    match outcome {
+        RepoDeletionOutcome::Deleted => RepoDeletionIngestOutcome {
+            accepted: true,
+            message: "repo-delete:deleted",
+            dispatch: true,
+            write_trace: true,
+        },
+        RepoDeletionOutcome::AlreadyAbsent => RepoDeletionIngestOutcome {
+            accepted: true,
+            message: "repo-delete:already-absent",
+            dispatch: false,
+            write_trace: true,
+        },
+        RepoDeletionOutcome::NotFound => RepoDeletionIngestOutcome {
+            accepted: false,
+            message: "repo-delete:not-found",
+            dispatch: false,
+            write_trace: false,
+        },
+        RepoDeletionOutcome::StaleHead => RepoDeletionIngestOutcome {
+            accepted: false,
+            message: "repo-delete:stale-head",
+            dispatch: false,
+            write_trace: false,
+        },
+    }
+}
+
 fn map_relay_admin_error(error: super::relay_admin::RelayAdminError) -> IngestError {
     use super::relay_admin::RelayAdminError;
     match error {
@@ -2760,6 +2801,62 @@ async fn ingest_event_inner(
         validate_custom_emoji_tags(&event)?;
     }
 
+    // Repository deletion has a stronger acknowledgement contract than generic
+    // kind-5 ingestion: accepted=true proves the writer committed both the
+    // tombstone and its kind-30617 coordinate transition. Route it before the
+    // ordinary insert/duplicate/side-effect pipeline so an exact replay can
+    // reconcile a legacy storage-only tombstone instead of returning `duplicate:`.
+    if let Some(target) = crate::handlers::side_effects::repo_deletion_target(&event)
+        .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?
+    {
+        crate::handlers::side_effects::validate_repo_deletion_target(
+            tenant, &event, &target, state,
+        )
+        .await
+        .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+
+        let (stored_event, db_outcome) = state
+            .db
+            .store_repo_deletion_tombstone(tenant.community(), &event, None)
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: {error}")))?;
+        let outcome = repo_deletion_ingest_outcome(db_outcome);
+
+        let trace_action = if outcome.write_trace {
+            TraceAction::WriteInsertGlobal {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                claimed_community: claimed_community_from_event(&event),
+            }
+        } else {
+            TraceAction::SanitizedError {
+                reason: conf::SanitizedReason::Invalid,
+            }
+        };
+        emit(
+            tracer,
+            trace_action,
+            state_for_request(tenant, auth.pubkey()),
+        );
+
+        if outcome.dispatch {
+            dispatch_persistent_event(
+                tenant,
+                state,
+                &stored_event,
+                kind_u32,
+                &auth.pubkey().to_hex(),
+                None,
+            )
+            .await;
+        }
+
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: outcome.accepted,
+            message: outcome.message.into(),
+        });
+    }
+
     // Resolve the target reference, then use one DB transaction to upsert the
     // reaction row (dedup via ON CONFLICT) with reaction_event_id already set and
     // store the kind:7 event. This replaces the post-storage side-effect handler.
@@ -3031,6 +3128,50 @@ mod tests {
         KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
+
+    #[test]
+    fn repository_deletion_outcomes_have_closed_wire_and_trace_contract() {
+        use buzz_db::RepoDeletionOutcome;
+
+        let cases = [
+            (
+                RepoDeletionOutcome::Deleted,
+                true,
+                "repo-delete:deleted",
+                true,
+                true,
+            ),
+            (
+                RepoDeletionOutcome::AlreadyAbsent,
+                true,
+                "repo-delete:already-absent",
+                false,
+                true,
+            ),
+            (
+                RepoDeletionOutcome::NotFound,
+                false,
+                "repo-delete:not-found",
+                false,
+                false,
+            ),
+            (
+                RepoDeletionOutcome::StaleHead,
+                false,
+                "repo-delete:stale-head",
+                false,
+                false,
+            ),
+        ];
+
+        for (db_outcome, accepted, message, dispatch, write_trace) in cases {
+            let result = repo_deletion_ingest_outcome(db_outcome);
+            assert_eq!(result.accepted, accepted);
+            assert_eq!(result.message, message);
+            assert_eq!(result.dispatch, dispatch);
+            assert_eq!(result.write_trace, write_trace);
+        }
+    }
 
     #[test]
     fn reaction_validation_accepts_wrapped_max_shortcode() {

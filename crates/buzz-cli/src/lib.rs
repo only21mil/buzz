@@ -1179,6 +1179,16 @@ pub enum ReposCmd {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Remove one of your repository announcements via NIP-09 (kind:5).
+    ///
+    /// This unpublishes the repository and disables Git access; it does not
+    /// purge stored Git objects or release the reserved name.
+    #[command(visible_alias = "delete")]
+    Rm {
+        /// Repository identifier (d-tag). Only your own announcement can be removed.
+        #[arg(long)]
+        id: String,
+    },
     /// Compare GitHub and Buzz `main` without changing either remote.
     Status {
         /// Repository identifier (d-tag).
@@ -2243,6 +2253,18 @@ mod tests {
     }
 
     #[test]
+    fn repo_rm_and_delete_alias_parse_to_the_same_variant() {
+        for spelling in ["rm", "delete"] {
+            let cli = Cli::try_parse_from(["buzz", "repos", spelling, "--id", "vogel-vault"])
+                .unwrap_or_else(|error| panic!("repos {spelling} --id should parse: {error}"));
+            assert!(matches!(
+                cli.command,
+                Cmd::Repos(ReposCmd::Rm { id }) if id == "vogel-vault"
+            ));
+        }
+    }
+
+    #[test]
     fn repo_sync_commands_parse_direct_flags() {
         let commit = "a".repeat(40);
         let expected = "b".repeat(40);
@@ -2428,6 +2450,7 @@ mod tests {
                 "list",
                 "mirror-main",
                 "protect",
+                "rm",
                 "status"
             ]
         );
@@ -2505,7 +2528,7 @@ mod tests {
             ("pr", 5),
             ("projects", 7),
             ("reactions", 3),
-            ("repos", 8),
+            ("repos", 9),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

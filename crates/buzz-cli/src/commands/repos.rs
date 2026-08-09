@@ -2,7 +2,7 @@ use buzz_core::{
     git_perms::{parse_protection_tag, parse_protection_tags, RefPattern},
     kind::KIND_GIT_REPO_ANNOUNCEMENT,
 };
-use nostr::{Event, EventBuilder, Tag, Timestamp};
+use nostr::{Event, EventBuilder, Kind, PublicKey, Tag, Timestamp};
 
 use crate::client::BuzzClient;
 use crate::commands::parse_write_response;
@@ -191,6 +191,66 @@ fn validate_write_response(raw: &str) -> Result<String, CliError> {
         raw,
         "repository changed concurrently; fetch the latest rules and retry",
     )
+}
+
+fn build_rm_event(
+    owner: &PublicKey,
+    repo_id: &str,
+    head_created_at: Timestamp,
+    now: Timestamp,
+) -> Result<EventBuilder, CliError> {
+    validate_repo_id(repo_id)?;
+    let coordinate = format!("{KIND_GIT_REPO_ANNOUNCEMENT}:{}:{repo_id}", owner.to_hex());
+    let a_tag = Tag::parse(["a", coordinate.as_str()]).map_err(tag_error)?;
+
+    // Do not clamp a future observed head: a clamped tombstone could be
+    // accepted while remaining too old to delete the head we just observed.
+    // Equality satisfies the inclusive deletion cutoff, while the receiving
+    // relay remains authoritative for its own ±900-second clock gate.
+    Ok(EventBuilder::new(Kind::EventDeletion, "")
+        .tags([a_tag])
+        .custom_created_at(std::cmp::max(now, head_created_at)))
+}
+
+fn validate_rm_response(raw: &str) -> Result<String, CliError> {
+    let response: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| CliError::Other(format!("relay response is not JSON: {error} ({raw})")))?;
+    let accepted = response
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let message = response
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !accepted {
+        return Err(CliError::Other(format!(
+            "relay rejected repository deletion: {message}"
+        )));
+    }
+    if !matches!(
+        message,
+        "repo-delete:deleted" | "repo-delete:already-absent"
+    ) {
+        return Err(CliError::Other(format!(
+            "relay did not prove repository deletion: {message}"
+        )));
+    }
+    Ok(crate::client::normalize_write_response(raw))
+}
+
+async fn cmd_rm(client: &BuzzClient, repo_id: &str) -> Result<(), CliError> {
+    let head = current_repo(client, repo_id).await?;
+    let owner = client.keys().public_key();
+    let event = client.sign_event(build_rm_event(
+        &owner,
+        repo_id,
+        head.created_at,
+        Timestamp::now(),
+    )?)?;
+    let raw = client.submit_event(event).await?;
+    println!("{}", validate_rm_response(&raw)?);
+    Ok(())
 }
 
 async fn submit_repo_update(client: &BuzzClient, builder: EventBuilder) -> Result<(), CliError> {
@@ -433,6 +493,7 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
         }
         ReposCmd::Get { id, owner } => cmd_get_repo(client, &id, owner.as_deref()).await,
         ReposCmd::List { owner, limit } => cmd_list_repos(client, owner.as_deref(), limit).await,
+        ReposCmd::Rm { id } => cmd_rm(client, &id).await,
         ReposCmd::Status { id } => {
             let announcement = current_repo(client, &id).await?;
             crate::commands::repo_sync::cmd_status(client, &announcement).await
@@ -489,8 +550,9 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     use super::{
-        build_create_announcement, build_protection_tag, build_updated_repo_announcement,
-        protection_rules_json, validate_write_response, RepoChange,
+        build_create_announcement, build_protection_tag, build_rm_event,
+        build_updated_repo_announcement, protection_rules_json, validate_rm_response,
+        validate_write_response, RepoChange,
     };
 
     fn signed_repo(tags: Vec<Tag>, content: &str, created_at: u64) -> nostr::Event {
@@ -503,6 +565,104 @@ mod tests {
 
     fn tag(parts: &[&str]) -> Tag {
         Tag::parse(parts.iter().copied()).expect("valid test tag")
+    }
+
+    #[test]
+    fn rm_event_is_a_tag_only_and_uses_now_for_an_old_head() {
+        let keys = Keys::generate();
+        let event = build_rm_event(
+            &keys.public_key(),
+            "demo",
+            Timestamp::from(100),
+            Timestamp::from(200),
+        )
+        .expect("build deletion")
+        .sign_with_keys(&keys)
+        .expect("sign deletion");
+
+        assert_eq!(event.kind, Kind::EventDeletion);
+        assert_eq!(event.created_at, Timestamp::from(200));
+        assert!(event.content.is_empty());
+        assert_eq!(event.tags.len(), 1);
+        assert_eq!(
+            event.tags.iter().next().expect("one tag").as_slice(),
+            ["a", &format!("30617:{}:demo", keys.public_key().to_hex())]
+        );
+        assert!(!event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice().first().map(String::as_str) == Some("e")));
+    }
+
+    #[test]
+    fn rm_event_uses_an_observed_future_head_without_clamping() {
+        let keys = Keys::generate();
+        let event = build_rm_event(
+            &keys.public_key(),
+            "demo",
+            Timestamp::from(300),
+            Timestamp::from(200),
+        )
+        .expect("build deletion")
+        .sign_with_keys(&keys)
+        .expect("sign deletion");
+
+        assert_eq!(event.created_at, Timestamp::from(300));
+    }
+
+    #[test]
+    fn rm_response_requires_exact_relay_proof_tokens() {
+        for message in ["repo-delete:deleted", "repo-delete:already-absent"] {
+            let raw = serde_json::json!({
+                "event_id": "abc",
+                "accepted": true,
+                "message": message,
+            })
+            .to_string();
+            assert!(validate_rm_response(&raw).is_ok(), "rejected {message}");
+        }
+
+        for message in [
+            "",
+            "saved",
+            "duplicate",
+            "duplicate: already processed",
+            "repo-delete:deleted:spoofed",
+            "repo-delete:already-absent ",
+        ] {
+            let raw = serde_json::json!({
+                "event_id": "abc",
+                "accepted": true,
+                "message": message,
+            })
+            .to_string();
+            assert!(validate_rm_response(&raw).is_err(), "accepted {message:?}");
+        }
+
+        for raw in [
+            r#"{}"#,
+            r#"{"accepted":"true","message":"repo-delete:deleted"}"#,
+            r#"{"accepted":true,"message":7}"#,
+            "not-json",
+        ] {
+            assert!(
+                validate_rm_response(raw).is_err(),
+                "accepted malformed response {raw:?}"
+            );
+        }
+
+        for message in ["not-found", "stale"] {
+            let raw = serde_json::json!({
+                "event_id": "abc",
+                "accepted": false,
+                "message": message,
+            })
+            .to_string();
+            assert!(
+                validate_rm_response(&raw).is_err(),
+                "accepted denial {message}"
+            );
+        }
     }
 
     #[test]

@@ -259,6 +259,24 @@ relay emits exactly these client-bound messages:
   cardinality. The rule: `n` is the count of B-labeled rows matching the filter,
   full stop.
 
+#### Semantic write acknowledgements
+
+Operations registered as requiring a semantic side effect strengthen the
+`O.WS.OK` contract: `accepted=true` means the writer transaction committed both
+the event and its promised state transition. The acknowledgement message is an
+exact token from that operation's closed outcome set; clients match those tokens
+and must not infer success from a later read, which may reach a stale replica.
+
+Repository deletion uses these outcomes:
+
+- `accepted=true, message="repo-delete:deleted"`
+- `accepted=true, message="repo-delete:already-absent"`
+- `accepted=false, message="repo-delete:not-found"`
+- `accepted=false, message="repo-delete:stale-head"`
+
+Other kind-5 deletions retain their existing best-effort semantics unless their
+operation is explicitly registered as requiring a semantic side effect.
+
 **O.REST — HTTP API surface.**
 
 - **`O.REST.BODY`** — JSON response: row content, projection results, and audit
