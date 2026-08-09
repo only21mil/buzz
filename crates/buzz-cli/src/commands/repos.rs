@@ -2,7 +2,7 @@ use buzz_core::{
     git_perms::{parse_protection_tag, parse_protection_tags, RefPattern},
     kind::KIND_GIT_REPO_ANNOUNCEMENT,
 };
-use nostr::{Event, EventBuilder, Kind, PublicKey, Tag, Timestamp};
+use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, Tag, Timestamp};
 
 use crate::client::BuzzClient;
 use crate::commands::parse_write_response;
@@ -103,10 +103,34 @@ const MAIN_PROTECTION: [&str; 5] = [
 
 enum RepoAnnouncementPlan {
     Replay(Event),
-    Publish(EventBuilder),
+    Publish {
+        builder: EventBuilder,
+        expected_head: Option<EventId>,
+    },
 }
 
 const CREATE_RECONCILED_MESSAGE: &str = "reconciled: repository provisioning ready";
+
+fn next_repo_update_timestamp(existing: Timestamp, now: Timestamp) -> Result<Timestamp, CliError> {
+    let advanced = existing
+        .as_secs()
+        .checked_add(1)
+        .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
+    Ok(Timestamp::from(advanced.max(now.as_secs())))
+}
+
+fn ensure_repo_head_unchanged(
+    repo_id: &str,
+    expected_head: EventId,
+    observed: &Event,
+) -> Result<(), CliError> {
+    if observed.id != expected_head {
+        return Err(CliError::Conflict(format!(
+            "repository {repo_id:?} changed while preparing the update; rerun the command against the latest announcement"
+        )));
+    }
+    Ok(())
+}
 
 fn tag_values(tag: &Tag) -> &[String] {
     tag.as_slice()
@@ -328,15 +352,17 @@ fn plan_repo_announcement(
     let content = existing.map(|event| event.content.as_str()).unwrap_or("");
     let mut builder = buzz_sdk::build_repo_announcement_with_tags(repo_id, content, tags)
         .map_err(|error| CliError::Other(format!("failed to build repository update: {error}")))?;
+    let expected_head = existing.map(|event| event.id);
     if let Some(existing) = existing {
-        let next_created_at = existing
-            .created_at
-            .as_secs()
-            .checked_add(1)
-            .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
-        builder = builder.custom_created_at(Timestamp::from(next_created_at));
+        builder = builder.custom_created_at(next_repo_update_timestamp(
+            existing.created_at,
+            Timestamp::now(),
+        )?);
     }
-    Ok(RepoAnnouncementPlan::Publish(builder))
+    Ok(RepoAnnouncementPlan::Publish {
+        builder,
+        expected_head,
+    })
 }
 
 fn build_updated_repo_announcement(
@@ -389,16 +415,13 @@ fn build_updated_repo_announcement(
         ))
     })?;
 
-    // Advance only the observed head. Using wall-clock time here would let a
-    // delayed writer leapfrog an intervening update and silently erase metadata.
-    let next_created_at = existing
-        .created_at
-        .as_secs()
-        .checked_add(1)
-        .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
+    // Keep the update acceptable to relays that enforce wall-clock drift while
+    // still advancing a future observed head. Callers re-read the head just
+    // before publishing so an intervening update fails loudly.
+    let next_created_at = next_repo_update_timestamp(existing.created_at, Timestamp::now())?;
     buzz_sdk::build_repo_announcement_with_tags(repo_id, &existing.content, tags)
         .map_err(|error| CliError::Other(format!("failed to build repository update: {error}")))
-        .map(|builder| builder.custom_created_at(Timestamp::from(next_created_at)))
+        .map(|builder| builder.custom_created_at(next_created_at))
 }
 
 fn protection_rules_json(event: &Event) -> Result<serde_json::Value, CliError> {
@@ -527,8 +550,15 @@ async fn cmd_rm(client: &BuzzClient, repo_id: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn submit_repo_update(client: &BuzzClient, builder: EventBuilder) -> Result<(), CliError> {
+async fn submit_repo_update(
+    client: &BuzzClient,
+    repo_id: &str,
+    expected_head: EventId,
+    builder: EventBuilder,
+) -> Result<(), CliError> {
     let event = client.sign_event(builder)?;
+    let observed = current_repo(client, repo_id).await?;
+    ensure_repo_head_unchanged(repo_id, expected_head, &observed)?;
     let raw = client.submit_event(event).await?;
     println!("{}", validate_write_response(&raw)?);
     Ok(())
@@ -567,8 +597,15 @@ pub async fn cmd_create_repo(
             let raw = client.submit_event(event).await?;
             validate_create_replay_response(&raw)?
         }
-        RepoAnnouncementPlan::Publish(builder) => {
+        RepoAnnouncementPlan::Publish {
+            builder,
+            expected_head,
+        } => {
             let event = client.sign_event(builder)?;
+            if let Some(expected_head) = expected_head {
+                let observed = current_repo(client, repo_id).await?;
+                ensure_repo_head_unchanged(repo_id, expected_head, &observed)?;
+            }
             let raw = client.submit_event(event).await?;
             validate_write_response(&raw)?
         }
@@ -670,7 +707,7 @@ async fn cmd_protect_set(
     let event = current_repo(client, repo_id).await?;
     let builder =
         build_updated_repo_announcement(&event, RepoChange::SetProtection(Box::new(tag)))?;
-    submit_repo_update(client, builder).await
+    submit_repo_update(client, repo_id, event.id, builder).await
 }
 
 async fn cmd_protect_remove(
@@ -694,7 +731,7 @@ async fn cmd_protect_remove(
         &event,
         RepoChange::RemoveProtection(ref_pattern.to_string()),
     )?;
-    submit_repo_update(client, builder).await
+    submit_repo_update(client, repo_id, event.id, builder).await
 }
 
 /// Bind (or rebind) a repository to a channel — the fix path for issue
@@ -711,7 +748,7 @@ async fn cmd_bind_repo(client: &BuzzClient, repo_id: &str, channel: &str) -> Res
     let event = current_repo(client, repo_id).await?;
     let builder =
         build_updated_repo_announcement(&event, RepoChange::BindChannel(channel.to_string()))?;
-    submit_repo_update(client, builder).await
+    submit_repo_update(client, repo_id, event.id, builder).await
 }
 
 pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), CliError> {
@@ -798,8 +835,9 @@ mod tests {
 
     use super::{
         build_protection_tag, build_rm_event, build_updated_repo_announcement,
-        plan_repo_announcement, protection_rules_json, validate_create_replay_response,
-        validate_rm_response, validate_write_response, RepoAnnouncementPlan, RepoChange,
+        ensure_repo_head_unchanged, next_repo_update_timestamp, plan_repo_announcement,
+        protection_rules_json, validate_create_replay_response, validate_rm_response,
+        validate_write_response, RepoAnnouncementPlan, RepoChange,
     };
 
     fn signed_repo(tags: Vec<Tag>, content: &str, created_at: u64) -> nostr::Event {
@@ -929,6 +967,7 @@ mod tests {
         );
         let replacement = build_protection_tag("refs/heads/main", Some("admin"), true, true, false)
             .expect("valid replacement");
+        let before = Timestamp::now();
 
         let updated = build_updated_repo_announcement(
             &existing,
@@ -939,7 +978,8 @@ mod tests {
         .expect("sign update");
 
         assert_eq!(updated.content, "repository content");
-        assert_eq!(updated.created_at.as_secs(), 101);
+        assert!(updated.created_at >= before);
+        assert!(updated.created_at <= Timestamp::now());
         assert!(!updated
             .tags
             .iter()
@@ -1125,6 +1165,7 @@ mod tests {
             "repository content",
             100,
         );
+        let before = Timestamp::now();
 
         let updated =
             build_updated_repo_announcement(&existing, RepoChange::BindChannel(channel.clone()))
@@ -1133,7 +1174,8 @@ mod tests {
                 .expect("sign bind update");
 
         assert_eq!(updated.content, "repository content");
-        assert_eq!(updated.created_at.as_secs(), 101);
+        assert!(updated.created_at >= before);
+        assert!(updated.created_at <= Timestamp::now());
         // Exactly one binding remains, and it is the requested one.
         let bindings: Vec<_> = updated
             .tags
@@ -1190,12 +1232,62 @@ mod tests {
     }
 
     #[test]
+    fn old_repo_update_uses_a_relay_acceptable_wall_clock_timestamp() {
+        let now = Timestamp::now();
+        let old_created_at = now.as_secs().saturating_sub(10_000);
+        let existing = signed_repo(vec![tag(&["d", "demo"])], "", old_created_at);
+
+        let updated = build_updated_repo_announcement(
+            &existing,
+            RepoChange::BindChannel(uuid::Uuid::new_v4().to_string()),
+        )
+        .expect("build update for old repository")
+        .sign_with_keys(&Keys::generate())
+        .expect("sign old repository update");
+
+        assert!(updated.created_at.as_secs() >= now.as_secs());
+        assert!(updated.created_at.as_secs() <= Timestamp::now().as_secs());
+    }
+
+    #[test]
+    fn future_repo_update_still_advances_the_observed_head() {
+        let next = next_repo_update_timestamp(Timestamp::from(300), Timestamp::from(200))
+            .expect("advance future head");
+
+        assert_eq!(next, Timestamp::from(301));
+    }
+
+    #[test]
+    fn moved_repo_head_aborts_the_update() {
+        let expected = signed_repo(vec![tag(&["d", "demo"])], "first", 100);
+        let observed = signed_repo(vec![tag(&["d", "demo"])], "second", 101);
+
+        let error = ensure_repo_head_unchanged("demo", expected.id, &observed)
+            .expect_err("moved head must abort");
+
+        assert!(matches!(error, crate::error::CliError::Conflict(_)));
+        assert!(error.to_string().contains("changed while preparing"));
+        assert!(error.to_string().contains("rerun"));
+    }
+
+    #[test]
+    fn unchanged_repo_head_allows_the_update() {
+        let expected = signed_repo(vec![tag(&["d", "demo"])], "", 100);
+
+        ensure_repo_head_unchanged("demo", expected.id, &expected)
+            .expect("unchanged head should pass");
+    }
+
+    #[test]
     fn desired_create_is_buzz_first_and_atomically_protected() {
         let channel = uuid::Uuid::new_v4().to_string();
         let keys = Keys::generate();
         let owner = keys.public_key().to_hex();
         let mirror = "https://github.com/example/demo.git".to_string();
-        let RepoAnnouncementPlan::Publish(builder) = plan_repo_announcement(
+        let RepoAnnouncementPlan::Publish {
+            builder,
+            expected_head,
+        } = plan_repo_announcement(
             None,
             "demo",
             &owner,
@@ -1207,9 +1299,11 @@ mod tests {
             &[],
             &channel,
         )
-        .expect("plan create") else {
+        .expect("plan create")
+        else {
             panic!("new repository must publish");
         };
+        assert!(expected_head.is_none());
         let event = builder.sign_with_keys(&keys).expect("sign create");
 
         assert_eq!(event.kind, Kind::Custom(30617));
@@ -1262,7 +1356,11 @@ mod tests {
             "repository content",
             50,
         );
-        let RepoAnnouncementPlan::Publish(builder) = plan_repo_announcement(
+        let before = Timestamp::now();
+        let RepoAnnouncementPlan::Publish {
+            builder,
+            expected_head,
+        } = plan_repo_announcement(
             Some(&existing),
             "demo",
             &owner,
@@ -1274,15 +1372,19 @@ mod tests {
             &[],
             &channel,
         )
-        .expect("plan update") else {
+        .expect("plan update")
+        else {
             panic!("legacy repository needs an update")
         };
+        let after = Timestamp::now();
+        assert_eq!(expected_head, Some(existing.id));
         let event = builder
             .sign_with_keys(&Keys::generate())
             .expect("sign update");
 
         assert_eq!(event.content, "repository content");
-        assert_eq!(event.created_at.as_secs(), 51);
+        assert!(event.created_at >= before);
+        assert!(event.created_at <= after);
         assert!(event
             .tags
             .iter()
@@ -1359,7 +1461,7 @@ mod tests {
             "",
             50,
         );
-        let RepoAnnouncementPlan::Publish(builder) = plan_repo_announcement(
+        let RepoAnnouncementPlan::Publish { builder, .. } = plan_repo_announcement(
             Some(&existing),
             "demo",
             &"a".repeat(64),
@@ -1388,7 +1490,7 @@ mod tests {
     fn semantically_exact_desired_state_replays_the_exact_fetched_event() {
         let channel = uuid::Uuid::new_v4().to_string();
         let owner = "a".repeat(64);
-        let RepoAnnouncementPlan::Publish(builder) = plan_repo_announcement(
+        let RepoAnnouncementPlan::Publish { builder, .. } = plan_repo_announcement(
             None,
             "demo",
             &owner,
