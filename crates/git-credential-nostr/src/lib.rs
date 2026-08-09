@@ -53,8 +53,14 @@ fn load_key() -> Result<String, String> {
             return Ok(val);
         }
     }
+    if let Ok(val) = std::env::var("BUZZ_PRIVATE_KEY") {
+        if !val.is_empty() {
+            return Ok(val);
+        }
+    }
     let path = git_config("nostr.keyfile").ok_or_else(|| {
-        "no nostr key configured. Set $NOSTR_PRIVATE_KEY or git config nostr.keyfile".to_string()
+        "no nostr key configured. Set $NOSTR_PRIVATE_KEY, $BUZZ_PRIVATE_KEY, or git config nostr.keyfile"
+            .to_string()
     })?;
     check_keyfile_permissions(&path)?;
     let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat keyfile {path}: {e}"))?;

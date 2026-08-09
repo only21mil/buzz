@@ -30,8 +30,10 @@ That's it. Use git normally — `git clone`, `git push`, `git fetch`.
 
 ## CI / CD
 
-Set `$NOSTR_PRIVATE_KEY` instead of a key file. The env var takes precedence
-over `nostr.keyfile` and avoids touching the filesystem:
+Set `$NOSTR_PRIVATE_KEY` or `$BUZZ_PRIVATE_KEY` instead of a key file. Buzz
+managed-agent shells already provide `$BUZZ_PRIVATE_KEY`. Environment variables
+avoid touching the filesystem; when both are set, `$NOSTR_PRIVATE_KEY` takes
+precedence, followed by `$BUZZ_PRIVATE_KEY`, then `nostr.keyfile`:
 
 ```bash
 export NOSTR_PRIVATE_KEY=nsec1...
@@ -61,7 +63,7 @@ git ──stdin──▶ git-credential-nostr ──stdout──▶ git
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `no nostr key configured` | Neither `$NOSTR_PRIVATE_KEY` nor `nostr.keyfile` is set | Follow the Setup steps above |
+| `no nostr key configured` | Neither `$NOSTR_PRIVATE_KEY`, `$BUZZ_PRIVATE_KEY`, nor `nostr.keyfile` is set | Follow the Setup steps above |
 | `insecure permissions` | Key file is readable by group/others | `chmod 600 ~/.nostr/key` |
 | `method hint` | Server's `WWW-Authenticate` header is missing `method="..."` | Upgrade the Buzz server |
 | `useHttpPath` | `credential.useHttpPath` is not set | `git config --global credential.useHttpPath true` |
