@@ -65,6 +65,94 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
+/// Result of atomically storing a repository deletion tombstone and applying it
+/// to the current kind-30617 announcement head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoDeletionOutcome {
+    /// A live announcement at or before the tombstone timestamp was deleted.
+    Deleted,
+    /// The tombstone was an exact replay and no live announcement remains.
+    AlreadyAbsent,
+    /// A new tombstone named no live announcement, so the tombstone was rolled back.
+    NotFound,
+    /// The live announcement is newer than the tombstone, so no change was committed.
+    StaleHead,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RepoDeletionTarget {
+    owner_pubkey: Vec<u8>,
+    repo_id: String,
+}
+
+fn repo_deletion_target(tombstone: &nostr::Event) -> Result<RepoDeletionTarget> {
+    const REPO_ANNOUNCEMENT_KIND: &str = "30617";
+
+    if buzz_core::kind::event_kind_i32(tombstone) != 5 {
+        return Err(DbError::InvalidData(format!(
+            "repository deletion tombstone must be kind 5, got {}",
+            buzz_core::kind::event_kind_i32(tombstone)
+        )));
+    }
+
+    let mut coordinate: Option<&str> = None;
+    for tag in tombstone.tags.iter() {
+        let parts = tag.as_slice();
+        match parts.first().map(String::as_str) {
+            Some("a") => {
+                if coordinate.is_some() || parts.len() != 2 {
+                    return Err(DbError::InvalidData(
+                        "repository deletion tombstone must contain exactly one canonical a tag"
+                            .into(),
+                    ));
+                }
+                coordinate = Some(parts[1].as_str());
+            }
+            Some("e") => {
+                return Err(DbError::InvalidData(
+                    "repository deletion tombstone must not contain e tags".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let coordinate = coordinate.ok_or_else(|| {
+        DbError::InvalidData(
+            "repository deletion tombstone must contain exactly one canonical a tag".into(),
+        )
+    })?;
+    let mut parts = coordinate.splitn(3, ':');
+    let (Some(kind), Some(owner_hex), Some(repo_id)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(DbError::InvalidData(
+            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>".into(),
+        ));
+    };
+    if kind != REPO_ANNOUNCEMENT_KIND
+        || owner_hex.len() != 64
+        || owner_hex
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        || repo_id.is_empty()
+        || repo_id.len() > event::D_TAG_MAX_LEN
+    {
+        return Err(DbError::InvalidData(
+            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>".into(),
+        ));
+    }
+    let owner = nostr::PublicKey::from_hex(owner_hex).map_err(|error| {
+        DbError::InvalidData(format!(
+            "repository deletion target contains an invalid owner pubkey: {error}"
+        ))
+    })?;
+
+    Ok(RepoDeletionTarget {
+        owner_pubkey: owner.to_bytes().to_vec(),
+        repo_id: repo_id.to_owned(),
+    })
+}
+
 fn event_replacement_lock_key(
     community_id: CommunityId,
     kind: i32,
@@ -5010,6 +5098,134 @@ impl Db {
             true,
         ))
     }
+
+    /// Atomically store a kind-5 tombstone and delete its repository announcement.
+    ///
+    /// The target is derived from the tombstone's sole canonical `a` tag; callers
+    /// cannot supply a different owner or repository id. Consequently the lock
+    /// key is always `(community, 30617, a-tag owner, repository d-tag)`, never
+    /// `(community, 5, tombstone signer, ...)`.
+    ///
+    /// The transaction takes the exact same advisory lock as
+    /// [`Self::replace_parameterized_event`] for the target kind-30617 coordinate.
+    /// This prevents a replacement and deletion from observing half of each
+    /// other's work. Exact tombstone replays still execute the delete, repairing
+    /// a legacy state where the tombstone committed before its side effect.
+    ///
+    /// A new tombstone is committed only when it deletes a live head. Missing
+    /// targets and heads newer than the tombstone roll the insertion back. An
+    /// exact replay after a successful deletion returns
+    /// [`RepoDeletionOutcome::AlreadyAbsent`].
+    pub async fn store_repo_deletion_tombstone(
+        &self,
+        community_id: CommunityId,
+        tombstone: &nostr::Event,
+        channel_id: Option<Uuid>,
+    ) -> Result<(StoredEvent, RepoDeletionOutcome)> {
+        const REPO_ANNOUNCEMENT_KIND: i32 = 30_617;
+
+        let target = repo_deletion_target(tombstone)?;
+        let owner_pubkey = target.owner_pubkey.as_slice();
+        let repo_id = target.repo_id.as_str();
+        let tombstone_kind = buzz_core::kind::event_kind_i32(tombstone);
+
+        let tombstone_created_at_secs = tombstone.created_at.as_secs() as i64;
+        let tombstone_created_at = chrono::DateTime::from_timestamp(tombstone_created_at_secs, 0)
+            .ok_or(DbError::InvalidTimestamp(tombstone_created_at_secs))?;
+        let lock_key = event_replacement_lock_key(
+            community_id,
+            REPO_ANNOUNCEMENT_KIND,
+            owner_pubkey,
+            Some(repo_id.as_bytes()),
+        );
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await?;
+
+        let received_at = chrono::Utc::now();
+        let tags_json = serde_json::to_value(&tombstone.tags)?;
+        let sig_bytes = tombstone.sig.serialize();
+        let insert_result = sqlx::query(
+            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(tombstone.id.as_bytes().as_slice())
+        .bind(tombstone.pubkey.to_bytes().as_slice())
+        .bind(tombstone_created_at)
+        .bind(tombstone_kind)
+        .bind(&tags_json)
+        .bind(&tombstone.content)
+        .bind(sig_bytes.as_slice())
+        .bind(received_at)
+        .bind(channel_id)
+        .bind(event::extract_not_before(tombstone))
+        .execute(&mut *tx)
+        .await?;
+        let tombstone_inserted = insert_result.rows_affected() > 0;
+
+        let live_head: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT created_at FROM events \
+             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
+               AND deleted_at IS NULL \
+             ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(REPO_ANNOUNCEMENT_KIND)
+        .bind(owner_pubkey)
+        .bind(repo_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let stored = |was_inserted| {
+            StoredEvent::with_received_at(tombstone.clone(), received_at, channel_id, was_inserted)
+        };
+
+        let Some(head_created_at) = live_head else {
+            tx.rollback().await?;
+            let outcome = if tombstone_inserted {
+                RepoDeletionOutcome::NotFound
+            } else {
+                RepoDeletionOutcome::AlreadyAbsent
+            };
+            return Ok((stored(false), outcome));
+        };
+
+        if head_created_at > tombstone_created_at {
+            tx.rollback().await?;
+            return Ok((stored(false), RepoDeletionOutcome::StaleHead));
+        }
+
+        let delete_result = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
+               AND deleted_at IS NULL AND created_at <= $5",
+        )
+        .bind(community_id.as_uuid())
+        .bind(REPO_ANNOUNCEMENT_KIND)
+        .bind(owner_pubkey)
+        .bind(repo_id)
+        .bind(tombstone_created_at)
+        .execute(&mut *tx)
+        .await?;
+        debug_assert!(delete_result.rows_affected() > 0);
+
+        tx.commit().await?;
+
+        if tombstone_inserted {
+            if let Err(error) =
+                crate::insert_mentions(&self.pool, community_id, tombstone, channel_id).await
+            {
+                tracing::warn!(event_id = %tombstone.id, "Failed to insert mentions: {error}");
+            }
+        }
+
+        Ok((stored(tombstone_inserted), RepoDeletionOutcome::Deleted))
+    }
 }
 
 /// A full API token record.
@@ -5121,6 +5337,329 @@ mod tests {
             .await
             .expect("insert community");
         id
+    }
+
+    fn repo_announcement(
+        keys: &nostr::Keys,
+        repo_id: &str,
+        created_at: u64,
+        content: &str,
+    ) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(30_617), content)
+            .tags(vec![nostr::Tag::parse(["d", repo_id]).expect("repo d tag")])
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("sign repo announcement")
+    }
+
+    fn repo_tombstone(
+        signer: &nostr::Keys,
+        owner: &nostr::Keys,
+        repo_id: &str,
+        created_at: u64,
+    ) -> nostr::Event {
+        let coordinate = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
+        nostr::EventBuilder::new(nostr::Kind::EventDeletion, "")
+            .tags(vec![
+                nostr::Tag::parse(["a", coordinate.as_str()]).expect("repo a tag")
+            ])
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(signer)
+            .expect("sign repo tombstone")
+    }
+
+    #[test]
+    fn repository_deletion_target_is_derived_from_the_canonical_a_tag() {
+        let owner = nostr::Keys::generate();
+        let signer = nostr::Keys::generate();
+        let repo_id = "repo:with:colons";
+        let tombstone = repo_tombstone(&signer, &owner, repo_id, 1_700_000_000);
+
+        let target = repo_deletion_target(&tombstone).expect("parse canonical target");
+        assert_eq!(target.owner_pubkey, owner.public_key().to_bytes());
+        assert_eq!(target.repo_id, repo_id);
+        assert_ne!(target.owner_pubkey, signer.public_key().to_bytes());
+    }
+
+    #[test]
+    fn repository_deletion_target_rejects_ambiguous_shapes() {
+        let owner = nostr::Keys::generate();
+        let signer = nostr::Keys::generate();
+        let coordinate = format!("30617:{}:repo", owner.public_key().to_hex());
+        let empty_repo_coordinate = format!("30617:{}:", owner.public_key().to_hex());
+        let build = |tags: Vec<nostr::Tag>| {
+            nostr::EventBuilder::new(nostr::Kind::EventDeletion, "")
+                .tags(tags)
+                .custom_created_at(nostr::Timestamp::from(1_700_000_000))
+                .sign_with_keys(&signer)
+                .expect("sign malformed tombstone")
+        };
+
+        let cases = [
+            build(Vec::new()),
+            build(vec![
+                nostr::Tag::parse(["a", coordinate.as_str()]).expect("first a tag"),
+                nostr::Tag::parse(["a", coordinate.as_str()]).expect("second a tag"),
+            ]),
+            build(vec![
+                nostr::Tag::parse(["a", coordinate.as_str()]).expect("a tag"),
+                nostr::Tag::parse(["e", "00"]).expect("e tag"),
+            ]),
+            build(vec![
+                nostr::Tag::parse(["a", "5:owner:repo"]).expect("wrong kind")
+            ]),
+            build(vec![
+                nostr::Tag::parse(["a", "30617:ABC:repo"]).expect("bad owner")
+            ]),
+            build(vec![nostr::Tag::parse([
+                "a",
+                empty_repo_coordinate.as_str(),
+            ])
+            .expect("empty repo id")]),
+        ];
+
+        for malformed in cases {
+            assert!(repo_deletion_target(&malformed).is_err());
+        }
+    }
+
+    async fn event_row_count(db: &Db, community: CommunityId, event: &nostr::Event) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE community_id = $1 AND id = $2 AND created_at = to_timestamp($3)",
+        )
+        .bind(community.as_uuid())
+        .bind(event.id.as_bytes().as_slice())
+        .bind(event.created_at.as_secs() as f64)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count event row")
+    }
+
+    async fn live_repo_count(
+        db: &Db,
+        community: CommunityId,
+        owner: &nostr::Keys,
+        repo_id: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND kind = 30617 AND pubkey = $2 AND d_tag = $3 \
+               AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(owner.public_key().to_bytes())
+        .bind(repo_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count live repo announcements")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn repo_tombstone_transaction_rolls_back_and_repairs_replays() {
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let owner = nostr::Keys::generate();
+        let signer = nostr::Keys::generate();
+        let base = nostr::Timestamp::now().as_secs();
+
+        let repo_id = format!("atomic-delete-{}", Uuid::new_v4().simple());
+        let announcement = repo_announcement(&owner, &repo_id, base, "live");
+        assert!(
+            db.replace_parameterized_event(community, &announcement, &repo_id, None)
+                .await
+                .expect("store repo announcement")
+                .1
+        );
+        let tombstone = repo_tombstone(&signer, &owner, &repo_id, base + 1);
+        let (_, outcome) = db
+            .store_repo_deletion_tombstone(community, &tombstone, None)
+            .await
+            .expect("delete repo announcement");
+        assert_eq!(outcome, RepoDeletionOutcome::Deleted);
+        assert_eq!(event_row_count(&db, community, &tombstone).await, 1);
+        assert_eq!(live_repo_count(&db, community, &owner, &repo_id).await, 0);
+
+        let (_, replay_outcome) = db
+            .store_repo_deletion_tombstone(community, &tombstone, None)
+            .await
+            .expect("replay successful tombstone");
+        assert_eq!(replay_outcome, RepoDeletionOutcome::AlreadyAbsent);
+        assert_eq!(event_row_count(&db, community, &tombstone).await, 1);
+
+        let missing_repo = format!("missing-{}", Uuid::new_v4().simple());
+        let missing_tombstone = repo_tombstone(&signer, &owner, &missing_repo, base + 2);
+        let (_, missing_outcome) = db
+            .store_repo_deletion_tombstone(community, &missing_tombstone, None)
+            .await
+            .expect("reject missing repo tombstone");
+        assert_eq!(missing_outcome, RepoDeletionOutcome::NotFound);
+        assert_eq!(
+            event_row_count(&db, community, &missing_tombstone).await,
+            0,
+            "new tombstone for a missing coordinate must roll back"
+        );
+
+        let stale_repo = format!("stale-{}", Uuid::new_v4().simple());
+        let newer_head = repo_announcement(&owner, &stale_repo, base + 20, "newer");
+        assert!(
+            db.replace_parameterized_event(community, &newer_head, &stale_repo, None)
+                .await
+                .expect("store newer repo head")
+                .1
+        );
+        let stale_tombstone = repo_tombstone(&signer, &owner, &stale_repo, base + 10);
+        let (_, stale_outcome) = db
+            .store_repo_deletion_tombstone(community, &stale_tombstone, None)
+            .await
+            .expect("reject stale tombstone");
+        assert_eq!(stale_outcome, RepoDeletionOutcome::StaleHead);
+        assert_eq!(event_row_count(&db, community, &stale_tombstone).await, 0);
+        assert_eq!(
+            live_repo_count(&db, community, &owner, &stale_repo).await,
+            1
+        );
+
+        let split_repo = format!("legacy-split-{}", Uuid::new_v4().simple());
+        let split_head = repo_announcement(&owner, &split_repo, base + 30, "legacy split");
+        assert!(
+            db.replace_parameterized_event(community, &split_head, &split_repo, None)
+                .await
+                .expect("store split repo head")
+                .1
+        );
+        let split_tombstone = repo_tombstone(&signer, &owner, &split_repo, base + 31);
+        assert!(
+            db.insert_event(community, &split_tombstone, None)
+                .await
+                .expect("store legacy split tombstone")
+                .1
+        );
+        let (_, repaired_outcome) = db
+            .store_repo_deletion_tombstone(community, &split_tombstone, None)
+            .await
+            .expect("repair legacy split");
+        assert_eq!(repaired_outcome, RepoDeletionOutcome::Deleted);
+        assert_eq!(event_row_count(&db, community, &split_tombstone).await, 1);
+        assert_eq!(
+            live_repo_count(&db, community, &owner, &split_repo).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn repo_tombstone_shares_target_coordinate_lock_with_replacement() {
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let owner = nostr::Keys::generate();
+        let different_signer = nostr::Keys::generate();
+        let repo_id = format!("lock-identity-{}", Uuid::new_v4().simple());
+        let base = nostr::Timestamp::now().as_secs();
+        let first = repo_announcement(&owner, &repo_id, base, "first");
+        let replacement = repo_announcement(&owner, &repo_id, base + 1, "replacement");
+        let tombstone = repo_tombstone(&different_signer, &owner, &repo_id, base + 2);
+        assert!(
+            db.replace_parameterized_event(community, &first, &repo_id, None)
+                .await
+                .expect("store first repo head")
+                .1
+        );
+
+        let target_lock = event_replacement_lock_key(
+            community,
+            30_617,
+            &owner.public_key().to_bytes(),
+            Some(repo_id.as_bytes()),
+        );
+        let mut barrier = db.pool.begin().await.expect("begin lock barrier");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(target_lock)
+            .execute(&mut *barrier)
+            .await
+            .expect("hold target-coordinate lock");
+
+        let replace_db = db.clone();
+        let replace_repo_id = repo_id.clone();
+        let replace_task = tokio::spawn(async move {
+            replace_db
+                .replace_parameterized_event(community, &replacement, &replace_repo_id, None)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !replace_task.is_finished(),
+            "real replacement must wait on target-coordinate lock"
+        );
+
+        let delete_db = db.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_db
+                .store_repo_deletion_tombstone(community, &tombstone, None)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !delete_task.is_finished(),
+            "delete signed by another key must still wait on the target owner's coordinate lock"
+        );
+
+        barrier
+            .commit()
+            .await
+            .expect("release target-coordinate lock");
+        let replaced = tokio::time::timeout(std::time::Duration::from_secs(2), replace_task)
+            .await
+            .expect("replacement timed out")
+            .expect("replacement task panicked")
+            .expect("replace repo head");
+        assert!(replaced.1, "queued replacement must install its head");
+        let (_, delete_outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), delete_task)
+                .await
+                .expect("repo deletion timed out")
+                .expect("repo deletion task panicked")
+                .expect("delete replacement head");
+        assert_eq!(delete_outcome, RepoDeletionOutcome::Deleted);
+        assert!(
+            live_repo_count(&db, community, &owner, &repo_id).await <= 1,
+            "either serialization order may win, but replacement semantics allow at most one live head"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn replacement_after_committed_repo_deletion_survives() {
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let owner = nostr::Keys::generate();
+        let signer = nostr::Keys::generate();
+        let repo_id = format!("delete-first-{}", Uuid::new_v4().simple());
+        let base = nostr::Timestamp::now().as_secs();
+        let first = repo_announcement(&owner, &repo_id, base, "first");
+        assert!(
+            db.replace_parameterized_event(community, &first, &repo_id, None)
+                .await
+                .expect("store first repo head")
+                .1
+        );
+
+        let tombstone = repo_tombstone(&signer, &owner, &repo_id, base + 1);
+        let (_, delete_outcome) = db
+            .store_repo_deletion_tombstone(community, &tombstone, None)
+            .await
+            .expect("delete first repo head");
+        assert_eq!(delete_outcome, RepoDeletionOutcome::Deleted);
+
+        let replacement = repo_announcement(&owner, &repo_id, base + 2, "replacement");
+        assert!(
+            db.replace_parameterized_event(community, &replacement, &repo_id, None)
+                .await
+                .expect("store post-delete replacement")
+                .1,
+            "no anti-resurrection watermark is part of the repository deletion contract"
+        );
+        assert_eq!(live_repo_count(&db, community, &owner, &repo_id).await, 1);
     }
 
     #[tokio::test]
