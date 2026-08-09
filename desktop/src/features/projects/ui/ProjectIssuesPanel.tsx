@@ -22,6 +22,7 @@ import {
   ProjectFeedRowCluster,
   ProjectFeedRowMonoCell,
 } from "./ProjectFeedRow";
+import { ProjectAdvisoryLinks } from "./ProjectAdvisoryLinks";
 import { ProjectIssueCommentTimeline } from "./ProjectIssueCommentTimeline";
 import { ProjectOriginReference } from "./ProjectOriginReference";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
@@ -302,6 +303,11 @@ function IssueMetaRail({
           </div>
         </OverviewRailSection>
       ) : null}
+      <ProjectAdvisoryLinks
+        externalId={issue.externalId}
+        primaryId={issue.channelId}
+        primaryLabel="Channel"
+      />
       <OverviewRailSection title="Activity">
         <dl className="space-y-1.5 text-xs text-muted-foreground">
           <div className="flex items-center justify-between gap-3">
