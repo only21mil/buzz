@@ -31,7 +31,10 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       await tester.pumpWidget(
         WidgetHelpers.testable(
-          child: const SettingsPage(profileHeader: SizedBox.shrink()),
+          child: SettingsPage(
+            profileHeader: const SizedBox.shrink(),
+            identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+          ),
           overrides: [
             savedPrefsProvider.overrideWithValue(prefs),
             relayConfigProvider.overrideWith(
@@ -75,7 +78,10 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       await tester.pumpWidget(
         WidgetHelpers.testable(
-          child: const SettingsPage(profileHeader: SizedBox.shrink()),
+          child: SettingsPage(
+            profileHeader: const SizedBox.shrink(),
+            identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+          ),
           overrides: [
             savedPrefsProvider.overrideWithValue(prefs),
             relayConfigProvider.overrideWith(
