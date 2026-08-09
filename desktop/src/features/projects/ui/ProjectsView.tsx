@@ -608,6 +608,7 @@ export function ProjectsView() {
       >
         {visibleProjects.map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
+          const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectGridCard
               canDelete={isProjectOwnedByCurrentUser(project, currentPubkey)}
@@ -620,6 +621,7 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
+              repoSnapshot={repoSnapshot}
               repositoryUnavailableReason={repositoryUnavailableReasonFor(
                 project,
               )}
@@ -635,6 +637,7 @@ export function ProjectsView() {
       >
         {visibleProjects.map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
+          const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectListRow
               canDelete={isProjectOwnedByCurrentUser(project, currentPubkey)}
@@ -647,6 +650,7 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
+              repoSnapshot={repoSnapshot}
               repositoryUnavailableReason={repositoryUnavailableReasonFor(
                 project,
               )}
