@@ -381,6 +381,7 @@ export function eventToProjectPullRequest(
     channelId: getAdvisoryLink(pullRequest, "h"),
     linkedIssueId: linkedIssueId(pullRequest),
     externalId: getExternalId(pullRequest),
+    originAgentName: getTag(pullRequest, "buzz-origin-agent") ?? null,
     labels: getAllTags(pullRequest, "t"),
     recipients: getAllTags(pullRequest, "p"),
     reviewers,

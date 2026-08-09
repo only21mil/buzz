@@ -28,6 +28,7 @@ export type ProjectIssue = {
   channelId: string | null;
   /** Advisory transport-origin identifier (`i` tag), when provided. */
   externalId: string | null;
+  originAgentName: string | null;
   labels: string[];
   recipients: string[];
   status: ProjectIssueStatus;
@@ -60,6 +61,11 @@ export function projectIssueEventsToIssues(
   statusEvents?: RelayEvent[],
   commentEvents?: RelayEvent[],
 ): ProjectIssue[];
+export function nextProjectIssueCommentCreatedAt(
+  issue: ProjectIssue,
+  now: number,
+  author: string,
+): number;
 export function buildGitIssueTags(input: {
   repoAddress: string;
   repoOwner: string;

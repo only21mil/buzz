@@ -1,29 +1,47 @@
 use crate::client::BuzzClient;
+use crate::commands::with_git_provenance;
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, sdk_err, validate_hex64, validate_repo_id};
 use buzz_sdk::{GitIssueMeta, GitRepoCoord, GitStatusMeta};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_create_issue(
     client: &BuzzClient,
     repo_owner: &str,
     repo_id: &str,
     subject: &str,
     content: &str,
-    meta: &GitIssueMeta,
+    labels: &[String],
+    to: &[String],
+    channel_id: Option<&str>,
+    external_id: Option<&str>,
 ) -> Result<(), CliError> {
     validate_hex64(repo_owner)?;
     validate_repo_id(repo_id)?;
     let body = read_or_stdin(content)?;
+
+    let meta = GitIssueMeta {
+        labels: labels.to_vec(),
+        recipients: to.to_vec(),
+        channel_id: channel_id.map(str::to_string),
+        external_id: external_id.map(str::to_string),
+    };
 
     let repo = GitRepoCoord {
         owner: repo_owner.to_string(),
         id: repo_id.to_string(),
     };
 
-    let builder = buzz_sdk::build_git_issue(&repo, subject, &body, meta).map_err(sdk_err)?;
+    let builder = with_git_provenance(
+        buzz_sdk::build_git_issue(&repo, subject, &body, &meta).map_err(sdk_err)?,
+    )?;
     let event = client.sign_event(builder)?;
+    let event_id = event.id.to_hex();
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    // `link` renders as a rich preview card in Buzz Desktop when included in
+    // a chat message — agents announce issues with it (see base_prompt.md).
+    let link = crate::links::issue_link(&event_id, repo_owner, repo_id);
+    crate::client::print_create_response(&resp, "link", &link);
     Ok(())
 }
 
@@ -131,7 +149,8 @@ pub async fn cmd_issue_status(
         applied_as_commits: vec![],
     };
 
-    let builder = buzz_sdk::build_git_status(status, &body, &meta).map_err(sdk_err)?;
+    let builder =
+        with_git_provenance(buzz_sdk::build_git_status(status, &body, &meta).map_err(sdk_err)?)?;
     let event = client.sign_event(builder)?;
     let resp = client.submit_event(event).await?;
     println!("{resp}");
@@ -151,13 +170,18 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             channel_id,
             external_id,
         } => {
-            let meta = GitIssueMeta {
-                labels: label,
-                recipients: to,
-                channel_id,
-                external_id,
-            };
-            cmd_create_issue(client, &repo_owner, &repo_id, &title, &content, &meta).await
+            cmd_create_issue(
+                client,
+                &repo_owner,
+                &repo_id,
+                &title,
+                &content,
+                &label,
+                &to,
+                channel_id.as_deref(),
+                external_id.as_deref(),
+            )
+            .await
         }
         IssuesCmd::Get { event } => cmd_get_issue(client, &event).await,
         IssuesCmd::List {
