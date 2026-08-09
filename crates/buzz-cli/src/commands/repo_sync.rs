@@ -273,10 +273,15 @@ impl GitRepo {
         self.output(authenticated, operation, args).map(|_| ())
     }
 
-    fn ls_remote(&self, url: &str, authenticated: bool) -> Result<RemoteState, CliError> {
+    fn ls_remote(
+        &self,
+        url: &str,
+        authenticated: bool,
+        remote: &str,
+    ) -> Result<RemoteState, CliError> {
         let output = self.output(
             authenticated,
-            "read remote refs",
+            &format!("read {remote} remote refs"),
             ["ls-remote", "--symref", url, "HEAD", MAIN_REF],
         )?;
         let stdout = std::str::from_utf8(&output.stdout)
@@ -285,7 +290,7 @@ impl GitRepo {
     }
 
     fn github_main(&self, url: &str) -> Result<String, CliError> {
-        self.ls_remote(url, false)?
+        self.ls_remote(url, false, "GitHub")?
             .main
             .ok_or_else(|| CliError::NotFound("GitHub main is absent".into()))
     }
@@ -341,23 +346,48 @@ impl GitRepo {
     }
 
     fn push_main(&self, url: &str, commit: &str, expected: Option<&str>) -> Result<(), CliError> {
+        // An empty `expected` (import-main) yields `--force-with-lease=main:`,
+        // which git honors as "the ref must not exist": the push creates main
+        // only on a fresh coordinate (the relay hydrates a bare repo on the
+        // first push) and is rejected once main exists. A non-empty `expected`
+        // (mirror-main) is an ordinary compare-and-swap on the observed head.
         let lease = format!(
             "--force-with-lease={MAIN_REF}:{}",
             expected.unwrap_or_default()
         );
         let refspec = format!("{commit}:{MAIN_REF}");
-        self.run(
-            true,
-            "push Buzz main",
-            [
+        let output = self
+            .command(true)
+            .args([
                 "push",
                 "--porcelain",
                 "--no-follow-tags",
                 lease.as_str(),
                 url,
                 refspec.as_str(),
-            ],
-        )
+            ])
+            .output()
+            .map_err(|_| CliError::Other("failed to run git for push Buzz main".into()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        // Distinguish a lease/ref rejection (main already exists, or moved since
+        // it was read) from a transport or authentication failure. `git push
+        // --porcelain` marks a rejected ref with a leading `!`; an auth or
+        // transport failure aborts before any per-ref status line is produced,
+        // so its real error must surface rather than a misleading "use
+        // mirror-main" hint.
+        let porcelain = String::from_utf8_lossy(&output.stdout);
+        if porcelain.lines().any(|line| line.starts_with('!')) {
+            return Err(CliError::Conflict(
+                "Buzz main already exists or moved since it was read; use mirror-main with an exact --expected-buzz-main lease"
+                    .into(),
+            ));
+        }
+        Err(CliError::Other(format!(
+            "git push Buzz main failed (exit {})",
+            output.status.code().unwrap_or(-1)
+        )))
     }
 }
 
@@ -414,45 +444,27 @@ fn execute_import(
         ));
     }
     repo.fetch_github_main(&remotes.github_url, commit)?;
-    let buzz_before = repo.ls_remote(&remotes.buzz_url, true)?;
-    let changed = match buzz_before.main.as_deref() {
-        None => {
-            if buzz_before.head.is_some()
-                || !matches!(buzz_before.head_target.as_deref(), None | Some(MAIN_REF))
-            {
-                return Err(CliError::Conflict(
-                    "Buzz main is absent but remote HEAD is not empty and main-directed; no write was attempted"
-                        .into(),
-                ));
-            }
-            true
-        }
-        Some(current) if current == commit => {
-            require_exact_head(&buzz_before, commit)?;
-            false
-        }
-        Some(_) => {
-            return Err(CliError::Conflict(
-                "Buzz main is already populated at a different commit; use mirror-main with an exact lease"
-                    .into(),
-            ))
-        }
-    };
-    if changed {
-        if repo.github_main(&remotes.github_url)? != commit {
-            return Err(CliError::Conflict(
-                "GitHub main changed before the Buzz write; no write was attempted".into(),
-            ));
-        }
-        repo.push_main(&remotes.buzz_url, commit, None)?;
+    // No client-side pre-read of the Buzz remote. The relay returns the same
+    // "repository not found" for a repository that does not exist yet and one
+    // the caller is not allowed to see (author-only remediation), so the CLI
+    // cannot tell them apart and must not try. `push_main` with an empty lease
+    // is authoritative: it creates main on a fresh coordinate (the relay
+    // hydrates a bare repo on the first push), is rejected once main already
+    // exists (use mirror-main), and fails with the real error when the caller
+    // is not authorized.
+    if repo.github_main(&remotes.github_url)? != commit {
+        return Err(CliError::Conflict(
+            "GitHub main changed before the Buzz write; no write was attempted".into(),
+        ));
     }
+    repo.push_main(&remotes.buzz_url, commit, None)?;
     let github_after = repo.github_main(&remotes.github_url)?;
     if github_after != commit {
         return Err(CliError::Conflict(
             "GitHub main changed during synchronization".into(),
         ));
     }
-    let buzz_after = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz_after = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
     require_exact_head(&buzz_after, commit)?;
     let buzz_main = buzz_after
         .main
@@ -464,7 +476,7 @@ fn execute_import(
         repo_id: remotes.repo_id.clone(),
         direction: "github-to-buzz",
         commit: commit.to_owned(),
-        changed,
+        changed: true,
         github_main: github_after,
         buzz_main,
         buzz_head,
@@ -484,7 +496,7 @@ fn execute_mirror(
         ));
     }
     repo.fetch_github_main(&remotes.github_url, commit)?;
-    let buzz_before = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz_before = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
     if buzz_before.main.as_deref() != Some(expected_buzz_main) {
         return Err(CliError::Conflict(
             "Buzz main is absent or does not equal --expected-buzz-main; no write was attempted"
@@ -515,7 +527,7 @@ fn execute_mirror(
             "GitHub main changed during synchronization".into(),
         ));
     }
-    let buzz_after = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz_after = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
     require_exact_head(&buzz_after, commit)?;
     let buzz_main = buzz_after
         .main
@@ -538,7 +550,7 @@ pub async fn cmd_status(client: &BuzzClient, announcement: &Event) -> Result<(),
     let remotes = derive_remotes(client, announcement)?;
     let repo = GitRepo::new(auth_from_client(client))?;
     let github_main = repo.github_main(&remotes.github_url)?;
-    let buzz = repo.ls_remote(&remotes.buzz_url, true)?;
+    let buzz = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
     let output = StatusOutput {
         repo_id: &remotes.repo_id,
         direction: "github-to-buzz",
