@@ -294,16 +294,34 @@ pub(crate) fn repo_deletion_target(event: &Event) -> anyhow::Result<Option<RepoD
         return Ok(None);
     }
 
-    let mut a_tags = event
+    let a_tags = event
         .tags
         .iter()
-        .filter(|tag| tag.kind().to_string() == "a");
-    let Some(a_tag) = a_tags.next() else {
-        return Ok(None);
-    };
-    if a_tags.next().is_some() || has_e_tag(event) {
+        .filter(|tag| tag.kind().to_string() == "a")
+        .collect::<Vec<_>>();
+    if a_tags.is_empty() {
         return Ok(None);
     }
+
+    // Once any a-tag claims the repository kind, fail closed on an ambiguous
+    // NIP-09 shape instead of falling through to the generic best-effort path.
+    // That path cannot provide the atomic acknowledgement contract required by
+    // repository deletion.
+    let claims_repository = a_tags.iter().any(|tag| {
+        tag.as_slice()
+            .get(1)
+            .and_then(|coordinate| coordinate.split(':').next())
+            == Some("30617")
+    });
+    if !claims_repository {
+        return Ok(None);
+    }
+    if a_tags.len() != 1 || has_e_tag(event) {
+        return Err(anyhow::anyhow!(
+            "repository deletion must contain exactly one a tag and no e tags"
+        ));
+    }
+    let a_tag = a_tags[0];
 
     let raw_tag = a_tag.as_slice();
     let Some(coordinate) = raw_tag.get(1) else {
@@ -3526,16 +3544,13 @@ mod tests {
             Tag::parse(["a", &format!("30617:{owner}:repo")]).expect("repo a tag"),
             Tag::parse(["e", &"0".repeat(64)]).expect("e tag"),
         ]);
-        assert_eq!(repo_deletion_target(&mixed).expect("mixed targets"), None);
+        assert!(repo_deletion_target(&mixed).is_err());
 
         let duplicate = deletion_event([
             Tag::parse(["a", &format!("30617:{owner}:repo")]).expect("first a tag"),
             Tag::parse(["a", &format!("30617:{owner}:repo")]).expect("second a tag"),
         ]);
-        assert_eq!(
-            repo_deletion_target(&duplicate).expect("duplicate targets"),
-            None
-        );
+        assert!(repo_deletion_target(&duplicate).is_err());
     }
 
     #[test]
