@@ -33,7 +33,6 @@ import type {
   AgentPersona,
   ChannelMember,
   ChannelType,
-  UserSearchResult,
 } from "@/shared/api/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
@@ -45,6 +44,11 @@ import { useCandidateProfiles } from "./useMentionCandidateProfiles";
 import { useDraftMentionRouting } from "./useDraftMentionRouting";
 import { rankMentionCandidates } from "./mentionRanking";
 import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping";
+import {
+  appendUniqueName,
+  formatSearchUserDisplayName,
+  formatSearchUserSecondaryLabel,
+} from "./mentionUserLabels";
 import {
   buildTeamMentionCandidates,
   formatTeamMention,
@@ -58,24 +62,6 @@ export type PersonaMentionTarget = {
   displayName: string;
   persona: AgentPersona;
 };
-function formatSearchUserDisplayName(user: UserSearchResult) {
-  return user.displayName?.trim() || user.nip05Handle?.trim() || null;
-}
-function formatSearchUserSecondaryLabel(user: UserSearchResult) {
-  const displayName = user.displayName?.trim();
-  const nip05Handle = user.nip05Handle?.trim();
-  if (displayName && nip05Handle) {
-    return nip05Handle;
-  }
-  return null;
-}
-function appendUniqueName(current: string[], name: string): string[] {
-  return current.some(
-    (candidate) => candidate.toLowerCase() === name.toLowerCase(),
-  )
-    ? current
-    : [...current, name];
-}
 export function useMentions(
   channelId: string | null,
   externalMembers?: ChannelMember[],
