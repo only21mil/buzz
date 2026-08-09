@@ -38,6 +38,17 @@ const PROJECTS_PULL_REQUEST_SCOPE_STORAGE_KEY =
 const PROJECTS_ISSUE_SCOPE_STORAGE_KEY = "buzz.projects.issueScope";
 const PROJECTS_SORT_STORAGE_KEY = "buzz.projects.sort";
 
+/**
+ * Exact commit count for a project card: prefer the authoritative git-snapshot
+ * count (blobless clone), fall back to the relay activity summary.
+ */
+export function resolveProjectCommitCount(
+  summary: Pick<ProjectActivitySummary, "commitCount"> | undefined,
+  snapshot: { commitCount: number | null } | undefined,
+): number {
+  return snapshot?.commitCount ?? summary?.commitCount ?? 0;
+}
+
 export function readStoredViewMode(): ProjectsViewMode | null {
   try {
     const value = globalThis.localStorage?.getItem(

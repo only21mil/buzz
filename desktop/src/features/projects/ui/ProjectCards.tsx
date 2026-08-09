@@ -22,7 +22,9 @@ import {
   formatExactTimestamp,
   getProjectUpdatedAt,
   relativeTime,
+  resolveProjectCommitCount,
 } from "@/features/projects/lib/projectsViewHelpers";
+import type { ProjectRepoSnapshot } from "@/shared/api/types";
 import type { ProjectRepoUnavailableReason } from "@/features/projects/lib/projectRepoAvailability";
 import { projectTerminalLabel } from "@/features/projects/ui/useOpenProjectTerminal";
 import {
@@ -171,9 +173,12 @@ const PROJECT_STAT_ITEMS = [
 
 export function ProjectStatsRow({
   summary,
+  repoSnapshot,
   fixedColumns = false,
 }: {
   summary: ProjectActivitySummary | undefined;
+  /** Optional by design: omitting it silently falls back to the relay-summary commit count with no type error — pass the git snapshot wherever the true count matters. */
+  repoSnapshot?: Pick<ProjectRepoSnapshot, "commitCount">;
   /** Give each stat a fixed width so stats align vertically across list rows. */
   fixedColumns?: boolean;
 }) {
@@ -187,7 +192,10 @@ export function ProjectStatsRow({
     >
       {PROJECT_STAT_ITEMS.map(
         ({ key, icon: Icon, iconClass, label, columnClass }) => {
-          const count = summary?.[key] ?? 0;
+          const count =
+            key === "commitCount"
+              ? resolveProjectCommitCount(summary, repoSnapshot)
+              : (summary?.[key] ?? 0);
           return (
             <span
               className={cn(
@@ -211,11 +219,17 @@ export function ProjectStatsRow({
 // Hovering thickens the bar and reveals a tooltip with the exact breakdown.
 export function ProjectActivityBar({
   summary,
+  repoSnapshot,
 }: {
   summary: ProjectActivitySummary | undefined;
+  /** Optional by design: omitting it silently falls back to the relay-summary commit count with no type error — pass the git snapshot wherever the true count matters. */
+  repoSnapshot?: Pick<ProjectRepoSnapshot, "commitCount">;
 }) {
   const items = PROJECT_STAT_ITEMS.map(({ key, barClass, label }) => {
-    const count = summary?.[key] ?? 0;
+    const count =
+      key === "commitCount"
+        ? resolveProjectCommitCount(summary, repoSnapshot)
+        : (summary?.[key] ?? 0);
     return { barClass, count, text: label(count) };
   });
   const total = items.reduce((sum, item) => sum + item.count, 0);
@@ -463,6 +477,8 @@ type ProjectItemProps = {
   people: string[];
   profiles?: UserProfileLookup;
   summary: ProjectActivitySummary | undefined;
+  /** Optional by design: omitting it silently falls back to the relay-summary commit count with no type error — pass the git snapshot wherever the true count matters. */
+  repoSnapshot?: Pick<ProjectRepoSnapshot, "commitCount">;
   repositoryUnavailableReason?: ProjectRepoUnavailableReason;
   hasLocal: boolean;
   canDelete: boolean;
@@ -477,6 +493,7 @@ export function ProjectGridCard({
   people,
   profiles,
   summary,
+  repoSnapshot,
   repositoryUnavailableReason,
   hasLocal,
   canDelete,
@@ -543,10 +560,10 @@ export function ProjectGridCard({
 
         <div className="mt-auto">
           <div className="flex min-w-0 items-center px-4 pb-2 pt-1">
-            <ProjectStatsRow summary={summary} />
+            <ProjectStatsRow repoSnapshot={repoSnapshot} summary={summary} />
           </div>
           <div className="px-4 pb-3">
-            <ProjectActivityBar summary={summary} />
+            <ProjectActivityBar repoSnapshot={repoSnapshot} summary={summary} />
           </div>
         </div>
       </div>
@@ -559,6 +576,7 @@ export function ProjectListRow({
   people,
   profiles,
   summary,
+  repoSnapshot,
   repositoryUnavailableReason,
   hasLocal,
   canDelete,
@@ -615,9 +633,16 @@ export function ProjectListRow({
             className="hidden items-center gap-3 xl:flex"
             data-testid="projects-row-summary"
           >
-            <ProjectStatsRow fixedColumns summary={summary} />
+            <ProjectStatsRow
+              fixedColumns
+              repoSnapshot={repoSnapshot}
+              summary={summary}
+            />
             <div className="w-20 shrink-0">
-              <ProjectActivityBar summary={summary} />
+              <ProjectActivityBar
+                repoSnapshot={repoSnapshot}
+                summary={summary}
+              />
             </div>
           </div>
           <div

@@ -835,3 +835,36 @@ test("survives malformed value-less tags", () => {
   assert.deepEqual(pullRequest.labels, []);
   assert.deepEqual(pullRequest.recipients, []);
 });
+
+test("preserves advisory PR linkage tags with stable valid selection", () => {
+  const firstIssueId = "a".repeat(64);
+  const secondIssueId = "b".repeat(64);
+  const event = pullRequestEvent();
+  event.tags.push(
+    ["e", "not-an-event-id", "", "issue"],
+    ["e", firstIssueId.toUpperCase(), "", "issue"],
+    ["e", secondIssueId, "", "issue"],
+    ["e", "3".repeat(64), "", "root"],
+    ["i", "bad\nexternal-id"],
+    ["i", "  github:pull:block/buzz#99  "],
+    ["i", "github:pull:block/buzz#100"],
+  );
+
+  const pullRequest = eventToProjectPullRequest(event);
+  assert.equal(pullRequest.linkedIssueId, firstIssueId);
+  assert.equal(pullRequest.externalId, "github:pull:block/buzz#99");
+});
+
+test("drops malformed or unmarked PR linkage tags", () => {
+  const event = pullRequestEvent();
+  event.tags.push(
+    ["e", "4".repeat(64), "", "root"],
+    ["e", "short", "", "issue"],
+    ["e", "5".repeat(64), "", "Issue"],
+    ["i", `${String.fromCharCode(0)}external-id`],
+  );
+
+  const pullRequest = eventToProjectPullRequest(event);
+  assert.equal(pullRequest.linkedIssueId, null);
+  assert.equal(pullRequest.externalId, null);
+});
