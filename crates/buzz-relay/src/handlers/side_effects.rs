@@ -277,6 +277,97 @@ pub async fn validate_standard_deletion_event(
     Ok(())
 }
 
+/// Canonical kind-30617 coordinate carried by a repository deletion tombstone.
+///
+/// `None` means this is not the repository-specialized kind-5 shape and the
+/// caller should retain generic NIP-09 handling. A malformed coordinate that
+/// claims kind 30617 is rejected so it cannot fall through to the post-storage
+/// generic side effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoDeletionTarget {
+    pub(crate) owner_pubkey: Vec<u8>,
+    pub(crate) repo_id: String,
+}
+
+pub(crate) fn repo_deletion_target(event: &Event) -> anyhow::Result<Option<RepoDeletionTarget>> {
+    if event_kind_u32(event) != 5 {
+        return Ok(None);
+    }
+
+    let mut a_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind().to_string() == "a");
+    let Some(a_tag) = a_tags.next() else {
+        return Ok(None);
+    };
+    if a_tags.next().is_some() || has_e_tag(event) {
+        return Ok(None);
+    }
+
+    let raw_tag = a_tag.as_slice();
+    let Some(coordinate) = raw_tag.get(1) else {
+        return Ok(None);
+    };
+    let mut parts = coordinate.splitn(3, ':');
+    let Some(target_kind) = parts.next() else {
+        return Ok(None);
+    };
+    if target_kind != "30617" {
+        return Ok(None);
+    }
+
+    if raw_tag.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "repository deletion must contain one canonical a tag"
+        ));
+    }
+    let (Some(owner_hex), Some(repo_id)) = (parts.next(), parts.next()) else {
+        return Err(anyhow::anyhow!(
+            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>"
+        ));
+    };
+    if owner_hex.len() != 64
+        || owner_hex
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        || repo_id.len() > buzz_db::event::D_TAG_MAX_LEN
+        || !validate_repo_id(repo_id)
+    {
+        return Err(anyhow::anyhow!(
+            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>"
+        ));
+    }
+    let owner = nostr::PublicKey::from_hex(owner_hex)
+        .map_err(|error| anyhow::anyhow!("invalid repository owner pubkey: {error}"))?;
+
+    Ok(Some(RepoDeletionTarget {
+        owner_pubkey: owner.to_bytes().to_vec(),
+        repo_id: repo_id.to_owned(),
+    }))
+}
+
+/// Authorize the canonical repository deletion immediately before its atomic
+/// database write. Match standard NIP-09 semantics: relay-signed REST events
+/// act as their attributed author, while user-signed events act as the signer.
+pub(crate) async fn validate_repo_deletion_target(
+    tenant: &TenantContext,
+    event: &Event,
+    target: &RepoDeletionTarget,
+    state: &Arc<AppState>,
+) -> anyhow::Result<()> {
+    let actor = effective_message_author(event, &state.relay_keypair.public_key());
+    if target.owner_pubkey != actor
+        && !state
+            .db
+            .is_agent_owner(tenant.community(), &target.owner_pubkey, &actor)
+            .await?
+    {
+        return Err(anyhow::anyhow!("must be repository owner"));
+    }
+    Ok(())
+}
+
 /// Returns `true` if `actor_bytes` is the NIP-OA owner of **any** active owner-role
 /// member in `members`. Used by kind:9002 and kind:9008 to authorize the owning
 /// human of a channel's agent-owner(s) even when the human is not a channel member.
@@ -2148,6 +2239,11 @@ async fn handle_a_tag_deletion(
                 }
             }
         }
+        KIND_GIT_REPO_ANNOUNCEMENT => {
+            return Err(anyhow::anyhow!(
+                "repository deletions require the atomic ingest path"
+            ));
+        }
         // Generic NIP-33 (parameterized-replaceable) soft-delete by coordinate.
         //
         // Listed after the workflow branch so workflow's bespoke deletion
@@ -3374,6 +3470,96 @@ fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deletion_event(tags: impl IntoIterator<Item = Tag>) -> Event {
+        EventBuilder::new(Kind::Custom(5), "")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign deletion")
+    }
+
+    #[test]
+    fn repository_deletion_target_accepts_canonical_coordinate() {
+        let owner = nostr::Keys::generate().public_key();
+        let coordinate = format!("30617:{}:repo-one", owner.to_hex());
+        let event = deletion_event([Tag::parse(["a", &coordinate]).expect("a tag")]);
+
+        assert_eq!(
+            repo_deletion_target(&event).expect("parse target"),
+            Some(RepoDeletionTarget {
+                owner_pubkey: owner.to_bytes().to_vec(),
+                repo_id: "repo-one".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn repository_deletion_target_rejects_noncanonical_claims() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let cases = [
+            Tag::parse(["a", &format!("30617:{}:", owner)]).expect("empty repo"),
+            Tag::parse(["a", &format!("30617:{}:.hidden", owner)]).expect("leading-dot repo"),
+            Tag::parse(["a", &format!("30617:{}:repo..name", owner)]).expect("double-dot repo"),
+            Tag::parse(["a", &format!("30617:{}:repo:name", owner)])
+                .expect("invalid-character repo"),
+            Tag::parse(["a", &format!("30617:{}:repo", "A".repeat(64))]).expect("uppercase owner"),
+            Tag::parse(["a", &format!("30617:{}:repo", "0".repeat(62))]).expect("short owner"),
+            Tag::parse(["a", &format!("30617:{}:repo", owner), "wss://relay.invalid"])
+                .expect("hinted a tag"),
+        ];
+
+        for tag in cases {
+            let event = deletion_event([tag]);
+            assert!(repo_deletion_target(&event).is_err());
+        }
+    }
+
+    #[test]
+    fn repository_deletion_target_does_not_capture_other_nip09_shapes() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let other = deletion_event([
+            Tag::parse(["a", &format!("30023:{owner}:article")]).expect("other a tag")
+        ]);
+        assert_eq!(repo_deletion_target(&other).expect("other kind"), None);
+
+        let mixed = deletion_event([
+            Tag::parse(["a", &format!("30617:{owner}:repo")]).expect("repo a tag"),
+            Tag::parse(["e", &"0".repeat(64)]).expect("e tag"),
+        ]);
+        assert_eq!(repo_deletion_target(&mixed).expect("mixed targets"), None);
+
+        let duplicate = deletion_event([
+            Tag::parse(["a", &format!("30617:{owner}:repo")]).expect("first a tag"),
+            Tag::parse(["a", &format!("30617:{owner}:repo")]).expect("second a tag"),
+        ]);
+        assert_eq!(
+            repo_deletion_target(&duplicate).expect("duplicate targets"),
+            None
+        );
+    }
+
+    #[test]
+    fn repository_deletion_actor_matches_standard_rest_and_websocket_semantics() {
+        let relay_keys = nostr::Keys::generate();
+        let attributed_actor = nostr::Keys::generate().public_key();
+        let relay_signed = EventBuilder::new(Kind::Custom(5), "")
+            .tags([Tag::parse(["actor", &attributed_actor.to_hex()]).expect("actor tag")])
+            .sign_with_keys(&relay_keys)
+            .expect("relay-signed deletion");
+        assert_eq!(
+            effective_message_author(&relay_signed, &relay_keys.public_key()),
+            attributed_actor.to_bytes().to_vec()
+        );
+
+        let user_keys = nostr::Keys::generate();
+        let user_signed = EventBuilder::new(Kind::Custom(5), "")
+            .sign_with_keys(&user_keys)
+            .expect("user-signed deletion");
+        assert_eq!(
+            effective_message_author(&user_signed, &relay_keys.public_key()),
+            user_keys.public_key().to_bytes().to_vec()
+        );
+    }
 
     #[test]
     fn delete_tombstone_omits_absent_moderation_metadata() {
