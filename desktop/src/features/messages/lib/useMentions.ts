@@ -433,6 +433,7 @@ export function useMentions(
     managedAgentNamesByPubkey,
     managedAgentPersonaIds,
     managedAgentPersonaIdsByPubkey,
+    managedAgentPubkeys,
     managedAgentsQuery.data,
     memberPubkeys,
     members,

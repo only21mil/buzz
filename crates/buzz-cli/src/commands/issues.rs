@@ -4,6 +4,7 @@ use crate::error::CliError;
 use crate::validate::{read_or_stdin, sdk_err, validate_hex64, validate_repo_id};
 use buzz_sdk::{GitIssueMeta, GitRepoCoord, GitStatusMeta};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_create_issue(
     client: &BuzzClient,
     repo_owner: &str,
@@ -12,6 +13,8 @@ pub async fn cmd_create_issue(
     content: &str,
     labels: &[String],
     to: &[String],
+    channel_id: Option<&str>,
+    external_id: Option<&str>,
 ) -> Result<(), CliError> {
     validate_hex64(repo_owner)?;
     validate_repo_id(repo_id)?;
@@ -20,6 +23,8 @@ pub async fn cmd_create_issue(
     let meta = GitIssueMeta {
         labels: labels.to_vec(),
         recipients: to.to_vec(),
+        channel_id: channel_id.map(str::to_string),
+        external_id: external_id.map(str::to_string),
     };
 
     let repo = GitRepoCoord {
@@ -162,7 +167,22 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             content,
             label,
             to,
-        } => cmd_create_issue(client, &repo_owner, &repo_id, &title, &content, &label, &to).await,
+            channel_id,
+            external_id,
+        } => {
+            cmd_create_issue(
+                client,
+                &repo_owner,
+                &repo_id,
+                &title,
+                &content,
+                &label,
+                &to,
+                channel_id.as_deref(),
+                external_id.as_deref(),
+            )
+            .await
+        }
         IssuesCmd::Get { event } => cmd_get_issue(client, &event).await,
         IssuesCmd::List {
             repo_owner,
