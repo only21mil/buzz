@@ -92,3 +92,4 @@ tempfile = "3"
 [dev-dependencies]
 # Minimal HTTP test server for retry/policy integration tests
 axum = { workspace = true }
+buzz-test-client = { path = "../buzz-test-client" }
