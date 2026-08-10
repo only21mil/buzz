@@ -40,6 +40,13 @@ export function projectRepoUnavailableReason(
     return "ref";
   }
   if (
+    /remote helper .* aborted session|error while loading shared libraries|version `openssl/.test(
+      message,
+    )
+  ) {
+    return "network";
+  }
+  if (
     /timed? out|could not resolve host|failed to connect|connection (?:refused|reset)|network is unreachable|offline/.test(
       message,
     )
