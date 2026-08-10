@@ -156,6 +156,12 @@ fn configure_git_auth(command: &mut Command, auth: &GitAuthConfig, needs_credent
     ] {
         command.env_remove(key);
     }
+    command.env_remove("LD_PRELOAD");
+    if let Ok(original_library_path) = std::env::var("APPIMAGE_ORIGINAL_LD_LIBRARY_PATH") {
+        command.env("LD_LIBRARY_PATH", original_library_path);
+    } else {
+        command.env_remove("LD_LIBRARY_PATH");
+    }
     // Git for Windows maps `/dev/null` to `NUL` internally, so this value
     // disables the global config file on every platform.
     command.env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -407,10 +413,46 @@ fn validate_clone_url_against_relay(clone_url: &str, relay_base: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_branch, clean_target_ref, credential_helper_config_value, git_needs_credentials,
-        git_subcommand, validate_clone_url, validate_clone_url_against_relay,
-        validate_local_clone_url,
+        clean_branch, clean_target_ref, configure_git_auth, credential_helper_config_value,
+        git_needs_credentials, git_subcommand, validate_clone_url,
+        validate_clone_url_against_relay, validate_local_clone_url, GitAuthConfig,
     };
+
+    #[test]
+    fn configure_git_auth_sanitizes_appimage_loader_environment() {
+        let original_appimage_path = std::env::var_os("APPIMAGE_ORIGINAL_LD_LIBRARY_PATH");
+        let auth = GitAuthConfig {
+            git_path: std::path::PathBuf::from("git"),
+            credential_helper: None,
+            nsec: String::new(),
+            allow_file_transport: false,
+        };
+
+        std::env::remove_var("APPIMAGE_ORIGINAL_LD_LIBRARY_PATH");
+        let mut command = std::process::Command::new("git");
+        configure_git_auth(&mut command, &auth, false);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "LD_LIBRARY_PATH" && value.is_none()));
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "LD_PRELOAD" && value.is_none()));
+
+        std::env::set_var("APPIMAGE_ORIGINAL_LD_LIBRARY_PATH", "/usr/lib:/lib");
+        let mut restored_command = std::process::Command::new("git");
+        configure_git_auth(&mut restored_command, &auth, false);
+        assert!(restored_command.get_envs().any(|(key, value)| {
+            key == "LD_LIBRARY_PATH" && value == Some(std::ffi::OsStr::new("/usr/lib:/lib"))
+        }));
+        assert!(restored_command
+            .get_envs()
+            .any(|(key, value)| key == "LD_PRELOAD" && value.is_none()));
+
+        match original_appimage_path {
+            Some(value) => std::env::set_var("APPIMAGE_ORIGINAL_LD_LIBRARY_PATH", value),
+            None => std::env::remove_var("APPIMAGE_ORIGINAL_LD_LIBRARY_PATH"),
+        }
+    }
 
     #[test]
     fn credential_helper_config_value_uses_forward_slashes() {
