@@ -22,7 +22,14 @@ function authorizationFromClient(client, url) {
   return new Promise((resolve) => {
     const requestId = crypto.randomUUID();
     const channel = new MessageChannel();
-    const timeout = setTimeout(() => resolve(undefined), MEDIA_AUTH_TIMEOUT_MS);
+    let timeout;
+    const finish = (authorization) => {
+      clearTimeout(timeout);
+      channel.port1.onmessage = null;
+      channel.port1.close();
+      resolve(authorization);
+    };
+    timeout = setTimeout(() => finish(undefined), MEDIA_AUTH_TIMEOUT_MS);
     channel.port1.onmessage = (event) => {
       const data = event.data;
       if (
@@ -33,8 +40,7 @@ function authorizationFromClient(client, url) {
       ) {
         return;
       }
-      clearTimeout(timeout);
-      resolve(data.authorization);
+      finish(data.authorization);
     };
     client.postMessage({ type: MEDIA_AUTH_REQUEST, requestId, url }, [
       channel.port2,
@@ -43,14 +49,8 @@ function authorizationFromClient(client, url) {
 }
 
 async function requestAuthorization(event) {
-  const direct = event.clientId
-    ? await self.clients.get(event.clientId)
-    : undefined;
-  const client =
-    direct ??
-    (
-      await self.clients.matchAll({ includeUncontrolled: true, type: "window" })
-    )[0];
+  if (!event.clientId) return undefined;
+  const client = await self.clients.get(event.clientId);
   return client
     ? authorizationFromClient(client, event.request.url)
     : undefined;

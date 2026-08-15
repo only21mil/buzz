@@ -75,6 +75,37 @@ test("missing signing fails closed without making a network request", async () =
   assert.equal(fetches, 0);
 });
 
+test("missing client identity fails closed without borrowing another tab", async () => {
+  let clientLookups = 0;
+  let crossTabLookups = 0;
+  globalThis.self.clients.get = async () => {
+    clientLookups += 1;
+    return undefined;
+  };
+  globalThis.self.clients.matchAll = async () => {
+    crossTabLookups += 1;
+    return [{ postMessage: () => assert.fail("must not borrow another tab") }];
+  };
+
+  const response = await authenticatedMediaFetch({
+    clientId: "",
+    request: new Request("https://relay.example/media/a.png"),
+  });
+
+  assert.equal(response.status, 401);
+  assert.equal(clientLookups, 0);
+  assert.equal(crossTabLookups, 0);
+
+  const missingClientResponse = await authenticatedMediaFetch({
+    clientId: "missing-client",
+    request: new Request("https://relay.example/media/a.png"),
+  });
+
+  assert.equal(missingClientResponse.status, 401);
+  assert.equal(clientLookups, 1);
+  assert.equal(crossTabLookups, 0);
+});
+
 test.after(() => {
   globalThis.self = previousSelf;
 });
