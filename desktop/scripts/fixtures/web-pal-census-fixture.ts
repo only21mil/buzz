@@ -7,12 +7,9 @@ const bytes = new Uint8Array([1, 2, 3]);
 
 invokeWrapper("fixture_single_line", { enabled: true });
 
-tauriInvoke(
-  "fixture_multi_line",
-  {
-    value: 1,
-  },
-);
+tauriInvoke("fixture_multi_line", {
+  value: 1,
+});
 
 invokeTauriRaw("fixture_raw_body", bytes, { headers: {} });
 coreAlias("fixture_inferred_raw", bytes);

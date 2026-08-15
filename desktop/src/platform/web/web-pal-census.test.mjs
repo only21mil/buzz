@@ -30,7 +30,7 @@ test("AST census extracts single-line, multi-line, aliased, and raw invocations"
   );
   assert.equal(result.invocationCount, 5);
   assert.deepEqual(result.dynamicCalls, [
-    "desktop/scripts/fixtures/web-pal-census-fixture.ts:20",
+    "desktop/scripts/fixtures/web-pal-census-fixture.ts:17",
   ]);
   assert.equal(result.commands[0].payloadStyle, "raw ArrayBuffer");
   assert.equal(
