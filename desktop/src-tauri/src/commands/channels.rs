@@ -1,11 +1,17 @@
-use tauri::State;
+use nostr::Keys;
+use tauri::{AppHandle, State};
 
 use crate::{
     app_state::AppState,
     events,
+    managed_agents::load_managed_agents,
     models::{ChannelDetailInfo, ChannelInfo, ChannelMembersResponse},
     nostr_convert,
-    relay::{query_relay, relay_api_base_url_with_override, submit_event, submit_event_with_keys},
+    relay::{
+        effective_agent_relay_url, query_relay, relay_api_base_url_with_override,
+        relay_ws_url_with_override, submit_event, submit_event_with_keys,
+        sync_managed_agent_profile_directory,
+    },
 };
 
 // ── Reads (pure-nostr via /query) ────────────────────────────────────────────
@@ -785,6 +791,7 @@ pub async fn add_channel_members(
     channel_id: String,
     pubkeys: Vec<String>,
     role: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let uuid = parse_channel_uuid(&channel_id)?;
@@ -808,7 +815,17 @@ pub async fn add_channel_members(
             }
         };
         match submit_event(builder, &state).await {
-            Ok(_) => added.push(pubkey.clone()),
+            Ok(_) => {
+                added.push(pubkey.clone());
+                if let Err(error) =
+                    refresh_managed_agent_profile_after_membership(&app, &state, &pubkey).await
+                {
+                    errors.push(serde_json::json!({
+                        "pubkey": pubkey,
+                        "error": format!("agent profile refresh failed: {error}"),
+                    }));
+                }
+            }
             Err(e) => errors.push(serde_json::json!({"pubkey": pubkey, "error": e})),
         }
     }
@@ -820,12 +837,51 @@ pub async fn add_channel_members(
 pub async fn remove_channel_member(
     channel_id: String,
     pubkey: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_remove_member(uuid, &pubkey)?;
     submit_event(builder, &state).await?;
+    refresh_managed_agent_profile_after_membership(&app, &state, &pubkey).await?;
     Ok(())
+}
+
+/// Refresh the kind:10100 projection only for agents whose private key is
+/// managed by this Desktop. Remote agents may be channel members too, but
+/// Desktop must never attempt to sign on their behalf.
+async fn refresh_managed_agent_profile_after_membership(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: &str,
+) -> Result<(), String> {
+    let record = {
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
+        load_managed_agents(app)?
+            .into_iter()
+            .find(|record| record.pubkey.eq_ignore_ascii_case(pubkey))
+    };
+    let Some(record) = record else {
+        return Ok(());
+    };
+
+    let agent_keys = Keys::parse(&record.private_key_nsec)
+        .map_err(|e| format!("failed to parse managed agent keys: {e}"))?;
+    let relay_url =
+        effective_agent_relay_url(&record.relay_url, &relay_ws_url_with_override(state));
+    sync_managed_agent_profile_directory(
+        state,
+        &relay_url,
+        &agent_keys,
+        &record.name,
+        record.avatar_url.as_deref(),
+        record.auth_tag.as_deref(),
+        false,
+    )
+    .await
 }
 
 #[tauri::command]
