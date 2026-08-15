@@ -5,6 +5,7 @@
     "get_channel_members",
     "get_channels",
     "get_profile",
+    "update_channel",
     "update_profile"
   ],
   "noop": [],

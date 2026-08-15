@@ -59,6 +59,15 @@ function optionalNumber(body: ObjectBody, field: string): number | undefined {
   return value;
 }
 
+function optionalNullableNumber(
+  body: ObjectBody,
+  field: string,
+): number | null | undefined {
+  if (!(field in body) || body[field] === undefined) return undefined;
+  if (body[field] === null) return null;
+  return optionalNumber(body, field);
+}
+
 function parseSignedEvent(value: string): RelayEvent {
   const event = JSON.parse(value) as RelayEvent;
   if (
@@ -251,6 +260,24 @@ function channelFromMetadata(
   };
 }
 
+function channelDetailFromMetadata(event: RelayEvent) {
+  const channel = channelFromMetadata(event, undefined, undefined);
+  const timestamp = isoTimestamp(event.created_at);
+  return {
+    ...channel,
+    created_by: event.pubkey,
+    created_at: timestamp,
+    updated_at: timestamp,
+    topic_set_by: null,
+    topic_set_at: null,
+    purpose_set_by: null,
+    purpose_set_at: null,
+    topic_required: false,
+    max_members: null,
+    nip29_group_id: null,
+  };
+}
+
 async function getChannels(
   identity: BrowserIdentityManager,
   client: RelayQueryClient,
@@ -398,6 +425,56 @@ async function ensureStarterChannels(
   return channels;
 }
 
+async function updateChannel(
+  body: unknown,
+  identity: BrowserIdentityManager,
+  client: RelayQueryClient,
+) {
+  const commandBody = objectBody(body, "update_channel");
+  const input = objectBody(commandBody.input, "update_channel input");
+  const channelId = requiredString(input, "channelId");
+  const name = optionalString(input, "name");
+  const description = optionalString(input, "description");
+  const visibility = optionalString(input, "visibility");
+  const ttlSeconds = optionalNullableNumber(input, "ttlSeconds");
+  if (
+    name === undefined &&
+    description === undefined &&
+    visibility === undefined &&
+    ttlSeconds === undefined
+  ) {
+    throw new Error(
+      "at least one of name, about, visibility, or ttl must be provided",
+    );
+  }
+  if (
+    visibility !== undefined &&
+    visibility !== "open" &&
+    visibility !== "private"
+  ) {
+    throw new Error('visibility must be "open" or "private"');
+  }
+  const canonicalName = name?.trim().toLowerCase();
+  if (canonicalName !== undefined && !canonicalName) {
+    throw new Error("channel name is required");
+  }
+  const tags: string[][] = [["h", channelId]];
+  if (canonicalName !== undefined) tags.push(["name", canonicalName]);
+  if (description !== undefined) tags.push(["about", description]);
+  if (visibility !== undefined) tags.push(["visibility", visibility]);
+  if (ttlSeconds !== undefined) {
+    tags.push(["ttl", ttlSeconds === null ? "" : String(ttlSeconds)]);
+  }
+  await publishSignedEvent(
+    identity,
+    client,
+    { kind: 9002, content: "", tags },
+    "updating the channel",
+  );
+  const metadata = await fetchChannelMetadata(client, channelId);
+  return channelDetailFromMetadata(metadata);
+}
+
 async function getChannelMembers(body: unknown, client: RelayQueryClient) {
   const channelId = requiredString(
     objectBody(body, "get_channel_members"),
@@ -444,5 +521,6 @@ export function registerRelayQueryCommands(
   register("ensure_starter_channels", () =>
     ensureStarterChannels(identity, client),
   );
+  register("update_channel", (body) => updateChannel(body, identity, client));
   register("get_channel_members", (body) => getChannelMembers(body, client));
 }

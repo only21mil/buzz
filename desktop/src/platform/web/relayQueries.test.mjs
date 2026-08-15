@@ -374,3 +374,61 @@ test("ensure_starter_channels joins an existing public starter channel", async (
     true,
   );
 });
+
+test("update_channel publishes kind 9002 and returns canonical details", async () => {
+  let metadata = event({
+    id: "before",
+    kind: 39000,
+    createdAt: 10,
+    tags: [
+      ["d", "welcome-id"],
+      ["name", "welcome"],
+      ["about", "Old description"],
+      ["private"],
+      ["ttl", "3600"],
+    ],
+  });
+  let published = null;
+  const client = {
+    async fetchEvents() {
+      return [];
+    },
+    async fetchFirstEvent() {
+      return metadata;
+    },
+    async publishEvent(signed) {
+      published = signed;
+      metadata = event({
+        id: "after",
+        kind: 39000,
+        createdAt: 20,
+        tags: [
+          ["d", "welcome-id"],
+          ["name", "welcome"],
+          ["about", "Private welcome"],
+          ["private"],
+        ],
+      });
+      return signed;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  const detail = await dispatch("update_channel", {
+    input: {
+      channelId: "welcome-id",
+      description: "Private welcome",
+      ttlSeconds: null,
+    },
+  });
+  assert.equal(published.kind, 9002);
+  assert.deepEqual(published.tags, [
+    ["h", "welcome-id"],
+    ["about", "Private welcome"],
+    ["ttl", ""],
+  ]);
+  assert.equal(detail.description, "Private welcome");
+  assert.equal(detail.ttl_seconds, null);
+  assert.equal(detail.created_by, PUBKEY);
+  assert.equal(detail.updated_at, new Date(20_000).toISOString());
+});
