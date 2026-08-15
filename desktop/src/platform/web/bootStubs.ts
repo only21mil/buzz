@@ -3,6 +3,7 @@ import { BrowserIdentityManager, registerIdentityCommands } from "./identity";
 import { registerRelayQueryCommands } from "./relayQueries";
 import { installMediaAuthServiceWorker } from "./mediaAuth";
 import { registerMediaCommands } from "./mediaUpload";
+import { registerOnboardingCommands } from "./onboarding";
 import { register } from "./registry";
 import { registerWebSocketCommands } from "./websocket";
 import { BrowserWorkspace, registerWorkspaceCommands } from "./workspace";
@@ -47,6 +48,7 @@ export function registerBootStubs(): void {
 export async function installBrowserPal(): Promise<void> {
   registerNoopCommands();
   registerBootStubs();
+  registerOnboardingCommands();
   registerWebSocketCommands();
   const identity = await BrowserIdentityManager.create();
   registerIdentityCommands(identity);
