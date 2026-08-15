@@ -118,11 +118,21 @@ async function installE2eBridgeIfConfigured() {
   maybeInstallE2eTauriMocks();
 }
 
+async function installBrowserPalIfConfigured() {
+  if (import.meta.env.MODE !== "web") {
+    return;
+  }
+
+  const { installBrowserPal } = await import("@/platform/web/bootStubs");
+  installBrowserPal();
+}
+
 async function bootstrap() {
   resetDevWebviewStateFromUrl();
   configureDevE2eBridgeFromUrl();
   recoverLocalStorageQuotaOnStartup();
   await installE2eBridgeIfConfigured();
+  await installBrowserPalIfConfigured();
   await migrateLegacyCommunityStorageBeforeRender();
   renderApp();
 }
