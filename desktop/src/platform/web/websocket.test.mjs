@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
+import { nsecEncode } from "nostr-tools/nip19";
 
+import { registerIdentitySecretForEgressGuard } from "../../shared/lib/keyBackupEgress.ts";
 import { Channel } from "./shims/core.ts";
 import { dispatch, resetRegistryForTests } from "./registry.ts";
 import { registerWebSocketCommands } from "./websocket.ts";
@@ -188,6 +190,35 @@ test("text and binary sends block encrypted backups before socket lookup", async
     }),
     /local key backup must never be transmitted/,
   );
+});
+
+test("text and binary sends block plaintext identity secrets", async () => {
+  const secret = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+  const rawSecret = Array.from(secret, (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  registerIdentitySecretForEgressGuard(secret);
+  await install();
+
+  for (const value of [nsecEncode(secret), rawSecret]) {
+    await assert.rejects(
+      dispatch("plugin:websocket|send", {
+        id: 999,
+        message: { type: "Text", data: value },
+      }),
+      /local identity secret must never be transmitted/,
+    );
+    await assert.rejects(
+      dispatch("plugin:websocket|send", {
+        id: 999,
+        message: {
+          type: "Binary",
+          data: Array.from(new TextEncoder().encode(value)),
+        },
+      }),
+      /local identity secret must never be transmitted/,
+    );
+  }
 });
 
 test("close blocks encrypted key backups in the reason before teardown", async () => {

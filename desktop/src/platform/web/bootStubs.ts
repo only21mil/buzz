@@ -1,6 +1,9 @@
 import { registerNoopCommands } from "./noops";
+import { BrowserIdentityManager, registerIdentityCommands } from "./identity";
+import { registerRelayQueryCommands } from "./relayQueries";
 import { register } from "./registry";
 import { registerWebSocketCommands } from "./websocket";
+import { BrowserWorkspace, registerWorkspaceCommands } from "./workspace";
 
 export const INACTIVE_HUDDLE_STATE = {
   phase: "idle",
@@ -39,8 +42,12 @@ export function registerBootStubs(): void {
   });
 }
 
-export function installBrowserPal(): void {
+export async function installBrowserPal(): Promise<void> {
   registerNoopCommands();
   registerBootStubs();
   registerWebSocketCommands();
+  const identity = await BrowserIdentityManager.create();
+  registerIdentityCommands(identity);
+  registerWorkspaceCommands(new BrowserWorkspace(), identity);
+  registerRelayQueryCommands(identity);
 }

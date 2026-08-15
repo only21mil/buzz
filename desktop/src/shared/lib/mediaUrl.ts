@@ -30,7 +30,17 @@ let portPromise: Promise<number | null> | null = null;
  * Cached relay origin (e.g. "https://buzz-oss.stage.blox.sqprod.co"),
  * canonicalized via {@link canonicalOrigin} so comparisons are stable.
  */
-let cachedRelayOrigin: string | null = null;
+export function isWebMediaBuild(mode: string | undefined): boolean {
+  return mode === "web";
+}
+
+const browserRuntime =
+  typeof window !== "undefined" &&
+  typeof window.location?.href === "string" &&
+  isWebMediaBuild(import.meta.env?.MODE);
+let cachedRelayOrigin: string | null = browserRuntime
+  ? canonicalOrigin(window.location.href)
+  : null;
 
 /**
  * Canonicalize a URL to its origin with a lowercased scheme/host.
@@ -239,6 +249,10 @@ async function fetchProxyPort(): Promise<number | null> {
  * classification independent from incidental image/video rendering.
  */
 export function ensureRelayOriginFetch(): void {
+  if (browserRuntime) {
+    setRelayOrigin(window.location.origin, cacheGeneration);
+    return;
+  }
   if (!portPromise && typeof window !== "undefined") {
     portPromise = fetchProxyPort();
   }
@@ -247,7 +261,7 @@ export function ensureRelayOriginFetch(): void {
 /** Eagerly fetch the port at module load so it's ready by first render. */
 // The try/catch inside fetchProxyPort handles non-Tauri environments gracefully
 // (invoke will throw, we retry until timeout, then give up — no side effects).
-if (typeof window !== "undefined") {
+if (typeof window !== "undefined" && !browserRuntime) {
   portPromise = fetchProxyPort();
 }
 
@@ -268,8 +282,11 @@ export function resetMediaCaches(): void {
   if (hadCachedPort) {
     notifyMediaProxyPortListeners();
   }
-  if (cachedRelayOrigin !== null) {
-    cachedRelayOrigin = null;
+  const nextRelayOrigin = browserRuntime
+    ? canonicalOrigin(window.location.href)
+    : null;
+  if (cachedRelayOrigin !== nextRelayOrigin) {
+    cachedRelayOrigin = nextRelayOrigin;
     notifyRelayOriginListeners();
   }
 }
@@ -310,6 +327,7 @@ export function mediaProxyUrl(port: number, mediaPath: string): string {
  * Falls back to buzz-media:// if the proxy port isn't available yet.
  */
 export function rewriteRelayUrl(url: string): string {
+  if (browserRuntime) return url;
   const m = RELAY_MEDIA_RE.exec(url);
   if (!m) return url;
 
