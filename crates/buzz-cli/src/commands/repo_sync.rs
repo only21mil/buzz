@@ -1,11 +1,14 @@
-//! One-way, exact-ref synchronization from GitHub `main` to Buzz `main`.
+//! Buzz-authoritative, exact-ref synchronization to a GitHub CI mirror.
 //!
 //! These commands intentionally do not publish Nostr status events. The
 //! caller-owned kind:30617 announcement is the only source of remote URLs,
-//! while GitHub remains the final authority for the commit to copy.
+//! Buzz is the source for every ongoing write; `import-main` is bootstrap-only.
 
 use std::ffi::OsStr;
 use std::process::{Command, Output};
+
+#[cfg(unix)]
+use std::{io::Write, os::unix::fs::OpenOptionsExt};
 
 use nostr::Event;
 use tempfile::TempDir;
@@ -14,20 +17,49 @@ use crate::client::BuzzClient;
 use crate::error::CliError;
 
 const MAIN_REF: &str = "refs/heads/main";
-const GITHUB_TRACKING_REF: &str = "refs/remotes/github/main";
 const BUZZ_TRACKING_REF: &str = "refs/remotes/buzz/main";
+const BUZZ_SOURCE_TRACKING_REF: &str = "refs/remotes/buzz/source";
+const GITHUB_ACTIONS_APP_ID: u64 = 15_368;
+const GITHUB_ASKPASS: &str = r#"#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' 'x-access-token' ;;
+  *Password*)
+    if test -n "${GH_TOKEN:-}"; then
+      printf '%s\n' "$GH_TOKEN"
+    elif test -n "${GITHUB_TOKEN:-}"; then
+      printf '%s\n' "$GITHUB_TOKEN"
+    else
+      exit 1
+    fi
+    ;;
+  *) exit 1 ;;
+esac
+"#;
 
 #[derive(Debug, Clone)]
 struct RepoRemotes {
     repo_id: String,
     buzz_url: String,
-    github_url: String,
+    github: GitHubRepo,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubRepo {
+    clone_url: String,
+    owner: String,
+    repo: String,
 }
 
 #[derive(Clone)]
 struct GitAuth {
     private_key: String,
     auth_tag: Option<String>,
+}
+
+#[derive(Clone)]
+struct GitHubAuth {
+    variable: &'static str,
+    token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,9 +75,9 @@ struct StatusOutput<'a> {
     direction: &'static str,
     github_url: &'a str,
     buzz_url: &'a str,
-    github_main: &'a str,
-    buzz_main: Option<&'a str>,
+    buzz_main: &'a str,
     buzz_head: Option<&'a str>,
+    github_main: Option<&'a str>,
     in_sync: bool,
 }
 
@@ -58,6 +90,59 @@ struct WriteOutput {
     github_main: String,
     buzz_main: String,
     buzz_head: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StageOutput {
+    repo_id: String,
+    direction: &'static str,
+    source_ref: String,
+    commit: String,
+    github_ci_ref: String,
+    changed: bool,
+    github_ci_commit: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PromoteOutput {
+    repo_id: String,
+    direction: &'static str,
+    base: String,
+    head: String,
+    source_ref: String,
+    github_ci_ref: String,
+    required_checks: Vec<String>,
+    resumed_after_buzz_advance: bool,
+    buzz_main_changed: bool,
+    github_main_changed: bool,
+    buzz_main: String,
+    buzz_head: String,
+    github_main: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckRunsResponse {
+    check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CheckRun {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    head_sha: String,
+    app: CheckApp,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CheckApp {
+    id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromoteStart {
+    Initial,
+    ResumeAfterBuzzAdvance,
 }
 
 fn exact_oid(value: &str, flag: &str) -> Result<String, CliError> {
@@ -87,16 +172,13 @@ fn exact_tag_values<'a>(event: &'a Event, name: &str) -> Result<Option<Vec<&'a s
     ))
 }
 
-pub(super) fn validate_github_clone(value: &str) -> Result<(), CliError> {
+fn github_repo(value: &str) -> Result<GitHubRepo, CliError> {
     let url = url::Url::parse(value)
         .map_err(|_| CliError::Usage("GitHub clone URL must be a valid HTTPS URL".into()))?;
-    let path_is_repo = url
+    let parts = url
         .path_segments()
-        .map(|parts| {
-            let parts: Vec<&str> = parts.collect();
-            parts.len() == 2 && parts.iter().all(|part| !part.is_empty())
-        })
-        .unwrap_or(false);
+        .map(|parts| parts.collect::<Vec<_>>())
+        .unwrap_or_default();
     if url.scheme() != "https"
         || url
             .host_str()
@@ -106,14 +188,91 @@ pub(super) fn validate_github_clone(value: &str) -> Result<(), CliError> {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !path_is_repo
+        || parts.len() != 2
     {
         return Err(CliError::Usage(
             "GitHub clone URL must be https://github.com/<owner>/<repo>[.git] without credentials, query, or fragment"
                 .into(),
         ));
     }
-    Ok(())
+    let owner = parts[0];
+    let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+    let valid_component = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    if !valid_component(owner) || !valid_component(repo) {
+        return Err(CliError::Usage(
+            "GitHub owner and repository must use only ASCII letters, digits, '.', '-', or '_'"
+                .into(),
+        ));
+    }
+    Ok(GitHubRepo {
+        clone_url: value.to_owned(),
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+    })
+}
+
+pub(super) fn validate_github_clone(value: &str) -> Result<(), CliError> {
+    github_repo(value).map(|_| ())
+}
+
+fn validate_branch_ref(value: &str, flag: &str) -> Result<String, CliError> {
+    let Some(branch) = value.strip_prefix("refs/heads/") else {
+        return Err(CliError::Usage(format!(
+            "{flag} must be a full refs/heads/<branch> ref"
+        )));
+    };
+    let invalid_byte = |byte: u8| {
+        byte <= b' '
+            || byte == 0x7f
+            || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    };
+    if branch.is_empty()
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.bytes().any(invalid_byte)
+        || branch
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return Err(CliError::Usage(format!("{flag} is not a safe branch ref")));
+    }
+    Ok(value.to_owned())
+}
+
+fn ci_ref_for(commit: &str) -> String {
+    format!("refs/heads/buzz-ci/{commit}")
+}
+
+fn expected_ref(value: &str, flag: &str) -> Result<Option<String>, CliError> {
+    if value == "absent" {
+        Ok(None)
+    } else {
+        exact_oid(value, flag).map(Some)
+    }
+}
+
+fn github_auth_from_env() -> Result<GitHubAuth, CliError> {
+    for variable in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Some(token) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            let token = token
+                .into_string()
+                .map_err(|_| CliError::Auth(format!("{variable} must contain valid UTF-8 text")))?;
+            return Ok(GitHubAuth { variable, token });
+        }
+    }
+    Err(CliError::Auth(
+        "GH_TOKEN or GITHUB_TOKEN is required for GitHub repository synchronization".into(),
+    ))
 }
 
 fn derive_remotes(client: &BuzzClient, announcement: &Event) -> Result<RepoRemotes, CliError> {
@@ -167,7 +326,7 @@ fn derive_remotes(client: &BuzzClient, announcement: &Event) -> Result<RepoRemot
         [url] => (*url).to_owned(),
         [] => {
             return Err(CliError::Usage(
-                "one GitHub clone URL is required for GitHub-to-Buzz sync".into(),
+                "one GitHub clone URL is required for repository synchronization".into(),
             ))
         }
         _ => {
@@ -176,23 +335,54 @@ fn derive_remotes(client: &BuzzClient, announcement: &Event) -> Result<RepoRemot
             ))
         }
     };
-    validate_github_clone(&github_url)?;
+    let github = github_repo(&github_url)?;
 
     Ok(RepoRemotes {
         repo_id,
         buzz_url,
-        github_url,
+        github,
     })
 }
 
 struct GitRepo {
     _temp: TempDir,
     git_dir: std::path::PathBuf,
-    auth: GitAuth,
+    buzz_auth: GitAuth,
+    github_auth: GitHubAuth,
+    askpass: std::path::PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum RemoteAuth {
+    None,
+    Buzz,
+    GitHub,
+}
+
+fn write_github_askpass(path: &std::path::Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(path)
+            .map_err(|_| CliError::Other("failed to prepare GitHub authentication".into()))?;
+        file.write_all(GITHUB_ASKPASS.as_bytes())
+            .map_err(|_| CliError::Other("failed to prepare GitHub authentication".into()))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(CliError::Other(
+            "GitHub synchronization requires a mode-protected askpass platform".into(),
+        ))
+    }
 }
 
 impl GitRepo {
-    fn new(auth: GitAuth) -> Result<Self, CliError> {
+    fn new(buzz_auth: GitAuth, github_auth: GitHubAuth) -> Result<Self, CliError> {
         let work_root = dirs::home_dir()
             .ok_or_else(|| CliError::Other("home directory is unavailable".into()))?
             .join("work");
@@ -203,16 +393,24 @@ impl GitRepo {
             .tempdir_in(work_root)
             .map_err(|_| CliError::Other("failed to create private temporary repository".into()))?;
         let git_dir = temp.path().join("repo.git");
+        let askpass = temp.path().join("github-askpass");
+        write_github_askpass(&askpass)?;
         let repo = Self {
             _temp: temp,
             git_dir,
-            auth,
+            buzz_auth,
+            github_auth,
+            askpass,
         };
-        repo.run(false, "initialize temporary repository", ["init", "--bare"])?;
+        repo.run(
+            RemoteAuth::None,
+            "initialize temporary repository",
+            ["init", "--bare"],
+        )?;
         Ok(repo)
     }
 
-    fn command(&self, authenticated: bool) -> Command {
+    fn command(&self, auth: RemoteAuth) -> Command {
         let mut command = Command::new("git");
         let path = std::env::var_os("PATH").unwrap_or_default();
         command
@@ -230,29 +428,33 @@ impl GitRepo {
             ))
             .args(["-c", "credential.helper="])
             .args(["-c", "credential.useHttpPath=true"]);
-        if authenticated {
-            command
-                .args(["-c", "credential.helper=nostr"])
-                .env("NOSTR_PRIVATE_KEY", &self.auth.private_key);
-            if let Some(auth_tag) = &self.auth.auth_tag {
-                command.env("BUZZ_AUTH_TAG", auth_tag);
+        match auth {
+            RemoteAuth::None => {}
+            RemoteAuth::Buzz => {
+                command
+                    .args(["-c", "credential.helper=nostr"])
+                    .env("NOSTR_PRIVATE_KEY", &self.buzz_auth.private_key);
+                if let Some(auth_tag) = &self.buzz_auth.auth_tag {
+                    command.env("BUZZ_AUTH_TAG", auth_tag);
+                }
+            }
+            RemoteAuth::GitHub => {
+                command
+                    .env("GIT_ASKPASS", &self.askpass)
+                    .env("GIT_ASKPASS_REQUIRE", "force")
+                    .env(&self.github_auth.variable, &self.github_auth.token);
             }
         }
         command
     }
 
-    fn output<I, S>(
-        &self,
-        authenticated: bool,
-        operation: &str,
-        args: I,
-    ) -> Result<Output, CliError>
+    fn output<I, S>(&self, auth: RemoteAuth, operation: &str, args: I) -> Result<Output, CliError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         let output = self
-            .command(authenticated)
+            .command(auth)
             .args(args)
             .output()
             .map_err(|_| CliError::Other(format!("failed to run git for {operation}")))?;
@@ -265,22 +467,22 @@ impl GitRepo {
         Ok(output)
     }
 
-    fn run<I, S>(&self, authenticated: bool, operation: &str, args: I) -> Result<(), CliError>
+    fn run<I, S>(&self, auth: RemoteAuth, operation: &str, args: I) -> Result<(), CliError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.output(authenticated, operation, args).map(|_| ())
+        self.output(auth, operation, args).map(|_| ())
     }
 
     fn ls_remote(
         &self,
         url: &str,
-        authenticated: bool,
+        auth: RemoteAuth,
         remote: &str,
     ) -> Result<RemoteState, CliError> {
         let output = self.output(
-            authenticated,
+            auth,
             &format!("read {remote} remote refs"),
             ["ls-remote", "--symref", url, "HEAD", MAIN_REF],
         )?;
@@ -289,40 +491,78 @@ impl GitRepo {
         parse_remote_state(stdout)
     }
 
-    fn github_main(&self, url: &str) -> Result<String, CliError> {
-        self.ls_remote(url, false, "GitHub")?
-            .main
-            .ok_or_else(|| CliError::NotFound("GitHub main is absent".into()))
+    fn remote_ref(
+        &self,
+        url: &str,
+        auth: RemoteAuth,
+        remote: &str,
+        reference: &str,
+    ) -> Result<Option<String>, CliError> {
+        let output = self.output(
+            auth,
+            &format!("read {remote} ref"),
+            ["ls-remote", "--refs", url, reference],
+        )?;
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CliError::Other("git returned invalid ref data".into()))?;
+        let mut values = stdout.lines().map(|line| {
+            let (oid, name) = line
+                .split_once('\t')
+                .ok_or_else(|| CliError::Other("git returned malformed ref data".into()))?;
+            if name != reference {
+                return Err(CliError::Other("git returned an unexpected ref".into()));
+            }
+            exact_oid(oid, "remote ref")
+        });
+        let first = values.next().transpose()?;
+        if values.next().is_some() {
+            return Err(CliError::Other("git returned duplicate remote refs".into()));
+        }
+        Ok(first)
     }
 
-    fn fetch_github_main(&self, url: &str, commit: &str) -> Result<(), CliError> {
-        let refspec = format!("+{MAIN_REF}:{GITHUB_TRACKING_REF}");
+    fn github_main(&self, url: &str) -> Result<Option<String>, CliError> {
+        self.remote_ref(url, RemoteAuth::GitHub, "GitHub", MAIN_REF)
+    }
+
+    fn fetch_ref(
+        &self,
+        url: &str,
+        auth: RemoteAuth,
+        remote: &str,
+        source: &str,
+        tracking: &str,
+        expected: &str,
+    ) -> Result<(), CliError> {
+        let refspec = format!("+{source}:{tracking}");
         self.run(
-            false,
-            "fetch GitHub main",
+            auth,
+            &format!("fetch {remote} ref"),
             ["fetch", "--no-tags", "--force", url, refspec.as_str()],
         )?;
-        let fetched = self.rev_parse(GITHUB_TRACKING_REF)?;
-        if fetched != commit {
-            return Err(CliError::Conflict(
-                "GitHub main changed while it was being fetched; retry with the new commit".into(),
-            ));
+        let fetched = self.rev_parse(tracking)?;
+        if fetched != expected {
+            return Err(CliError::Conflict(format!(
+                "{remote} ref changed while it was being fetched; no write was attempted"
+            )));
         }
         Ok(())
     }
 
-    fn fetch_buzz_main(&self, url: &str) -> Result<(), CliError> {
-        let refspec = format!("+{MAIN_REF}:{BUZZ_TRACKING_REF}");
-        self.run(
-            true,
-            "fetch Buzz main",
-            ["fetch", "--no-tags", "--force", url, refspec.as_str()],
+    fn fetch_github_main(&self, url: &str, commit: &str) -> Result<(), CliError> {
+        self.fetch_ref(
+            url,
+            RemoteAuth::GitHub,
+            "GitHub main",
+            MAIN_REF,
+            "refs/remotes/github/main",
+            commit,
         )
     }
 
     fn rev_parse(&self, reference: &str) -> Result<String, CliError> {
         let output = self.output(
-            false,
+            RemoteAuth::None,
             "resolve commit",
             ["rev-parse", "--verify", reference],
         )?;
@@ -334,7 +574,7 @@ impl GitRepo {
 
     fn is_ancestor(&self, older: &str, newer: &str) -> Result<bool, CliError> {
         let output = self
-            .command(false)
+            .command(RemoteAuth::None)
             .args(["merge-base", "--is-ancestor", older, newer])
             .output()
             .map_err(|_| CliError::Other("failed to run git for ancestry proof".into()))?;
@@ -345,19 +585,22 @@ impl GitRepo {
         }
     }
 
-    fn push_main(&self, url: &str, commit: &str, expected: Option<&str>) -> Result<bool, CliError> {
-        // An empty `expected` (import-main) yields `--force-with-lease=main:`,
-        // which git honors as "the ref must not exist": the push creates main
-        // only on a fresh coordinate (the relay hydrates a bare repo on the
-        // first push) and is rejected once main exists. A non-empty `expected`
-        // (mirror-main) is an ordinary compare-and-swap on the observed head.
+    fn push_ref(
+        &self,
+        url: &str,
+        auth: RemoteAuth,
+        remote: &str,
+        reference: &str,
+        commit: &str,
+        expected: Option<&str>,
+    ) -> Result<bool, CliError> {
         let lease = format!(
-            "--force-with-lease={MAIN_REF}:{}",
+            "--force-with-lease={reference}:{}",
             expected.unwrap_or_default()
         );
-        let refspec = format!("{commit}:{MAIN_REF}");
+        let refspec = format!("{commit}:{reference}");
         let output = self
-            .command(true)
+            .command(auth)
             .args([
                 "push",
                 "--porcelain",
@@ -367,28 +610,12 @@ impl GitRepo {
                 refspec.as_str(),
             ])
             .output()
-            .map_err(|_| CliError::Other("failed to run git for push Buzz main".into()))?;
+            .map_err(|_| CliError::Other(format!("failed to run git for push {remote} ref")))?;
         if output.status.success() {
-            // `git push --porcelain` marks an unchanged ref with the `=` flag;
-            // a create (`*`), fast-forward (` `), or forced update (`+`) all
-            // move it. Report whether the push actually changed Buzz main so a
-            // no-op re-import (main already at `commit`) does not claim a write.
             let porcelain = String::from_utf8_lossy(&output.stdout);
             let changed = !porcelain.lines().any(|line| line.starts_with('='));
             return Ok(changed);
         }
-        // Two rejection shapes reach here and they mean opposite things:
-        //   `!  ...  [rejected] (stale info)`        the empty lease refused
-        //       because Buzz main already exists -> a real conflict, mirror-main.
-        //   `!  ...  [remote rejected] (...declined)` the relay's pre-receive
-        //       policy hook (buzz-relay api/git/hook.rs) said no -> authorization,
-        //       NOT a conflict; the real reason (e.g. "push denied by policy
-        //       (HTTP 403)") is on stderr. `[remote rejected]` does not contain
-        //       the substring `[rejected]`, so the two split cleanly.
-        // Misclassifying an auth decline as a conflict would send an unauthorized
-        // caller to mirror-main (which needs an ls_remote they are equally
-        // denied) and leak "it exists" for a repo they may not see -- exactly
-        // what dropping the client-side pre-read was meant to stop.
         let porcelain = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if porcelain.lines().any(|line| {
@@ -396,20 +623,19 @@ impl GitRepo {
                 && line.contains("[rejected]")
                 && !line.contains("[remote rejected]")
         }) {
-            return Err(CliError::Conflict(
-                "Buzz main already exists or moved since it was read; use mirror-main with an exact --expected-buzz-main lease"
-                    .into(),
-            ));
+            return Err(CliError::Conflict(format!(
+                "{remote} ref is absent, present, or moved contrary to its exact lease"
+            )));
         }
         let stderr = stderr.trim();
+        let detail = if matches!(auth, RemoteAuth::GitHub) || stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
         Err(CliError::Other(format!(
-            "git push Buzz main failed (exit {}){}",
+            "git push {remote} ref failed (exit {}){detail}",
             output.status.code().unwrap_or(-1),
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            },
         )))
     }
 }
@@ -457,37 +683,46 @@ fn auth_from_client(client: &BuzzClient) -> GitAuth {
 
 fn execute_import(
     remotes: &RepoRemotes,
-    auth: GitAuth,
+    buzz_auth: GitAuth,
+    github_auth: GitHubAuth,
     commit: &str,
 ) -> Result<WriteOutput, CliError> {
-    let repo = GitRepo::new(auth)?;
-    if repo.github_main(&remotes.github_url)? != commit {
+    let repo = GitRepo::new(buzz_auth, github_auth)?;
+    if repo.github_main(&remotes.github.clone_url)?.as_deref() != Some(commit) {
         return Err(CliError::Conflict(
             "GitHub main does not equal --commit; no write was attempted".into(),
         ));
     }
-    repo.fetch_github_main(&remotes.github_url, commit)?;
-    // No client-side pre-read of the Buzz remote. The relay returns the same
-    // "repository not found" for a repository that does not exist yet and one
-    // the caller is not allowed to see (author-only remediation), so the CLI
-    // cannot tell them apart and must not try. `push_main` with an empty lease
-    // is authoritative: it creates main on a fresh coordinate (the relay
-    // hydrates a bare repo on the first push), is rejected once main already
-    // exists (use mirror-main), and fails with the real error when the caller
-    // is not authorized.
-    if repo.github_main(&remotes.github_url)? != commit {
+    repo.fetch_github_main(&remotes.github.clone_url, commit)?;
+    // Re-read GitHub after the fetch, then use an empty lease so a concurrent
+    // Buzz main creation loses the race. Git reports an existing main already
+    // at `commit` as unchanged without exercising the lease, so an unchanged
+    // push is also a bootstrap conflict.
+    if repo.github_main(&remotes.github.clone_url)?.as_deref() != Some(commit) {
         return Err(CliError::Conflict(
             "GitHub main changed before the Buzz write; no write was attempted".into(),
         ));
     }
-    let changed = repo.push_main(&remotes.buzz_url, commit, None)?;
-    let github_after = repo.github_main(&remotes.github_url)?;
-    if github_after != commit {
+    let changed = repo.push_ref(
+        &remotes.buzz_url,
+        RemoteAuth::Buzz,
+        "Buzz main",
+        MAIN_REF,
+        commit,
+        None,
+    )?;
+    if !changed {
+        return Err(CliError::Conflict(
+            "Buzz main already exists; import-main is bootstrap-only".into(),
+        ));
+    }
+    let github_after = repo.github_main(&remotes.github.clone_url)?;
+    if github_after.as_deref() != Some(commit) {
         return Err(CliError::Conflict(
             "GitHub main changed during synchronization".into(),
         ));
     }
-    let buzz_after = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
+    let buzz_after = repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?;
     require_exact_head(&buzz_after, commit)?;
     let buzz_main = buzz_after
         .main
@@ -497,93 +732,409 @@ fn execute_import(
         .ok_or_else(|| CliError::Other("Buzz HEAD missing after exact readback".into()))?;
     Ok(WriteOutput {
         repo_id: remotes.repo_id.clone(),
-        direction: "github-to-buzz",
+        direction: "github-to-buzz-bootstrap-only",
         commit: commit.to_owned(),
         changed,
-        github_main: github_after,
+        github_main: github_after
+            .ok_or_else(|| CliError::Other("GitHub main missing after exact readback".into()))?,
         buzz_main,
         buzz_head,
     })
 }
 
-fn execute_mirror(
+fn execute_stage(
     remotes: &RepoRemotes,
-    auth: GitAuth,
+    buzz_auth: GitAuth,
+    github_auth: GitHubAuth,
+    source_ref: &str,
     commit: &str,
-    expected_buzz_main: &str,
-) -> Result<WriteOutput, CliError> {
-    let repo = GitRepo::new(auth)?;
-    if repo.github_main(&remotes.github_url)? != commit {
+    expected_ci: Option<&str>,
+) -> Result<StageOutput, CliError> {
+    let repo = GitRepo::new(buzz_auth, github_auth)?;
+    let source = repo.remote_ref(
+        &remotes.buzz_url,
+        RemoteAuth::Buzz,
+        "Buzz source",
+        source_ref,
+    )?;
+    if source.as_deref() != Some(commit) {
         return Err(CliError::Conflict(
-            "GitHub main does not equal --commit; no write was attempted".into(),
+            "Buzz source ref does not equal --commit; no write was attempted".into(),
         ));
     }
-    repo.fetch_github_main(&remotes.github_url, commit)?;
-    let buzz_before = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
-    if buzz_before.main.as_deref() != Some(expected_buzz_main) {
+    repo.fetch_ref(
+        &remotes.buzz_url,
+        RemoteAuth::Buzz,
+        "Buzz source",
+        source_ref,
+        BUZZ_SOURCE_TRACKING_REF,
+        commit,
+    )?;
+    let ci_ref = ci_ref_for(commit);
+    let github_before = repo.remote_ref(
+        &remotes.github.clone_url,
+        RemoteAuth::GitHub,
+        "GitHub CI",
+        &ci_ref,
+    )?;
+    if github_before.as_deref() != expected_ci {
         return Err(CliError::Conflict(
-            "Buzz main is absent or does not equal --expected-buzz-main; no write was attempted"
-                .into(),
+            "GitHub CI ref does not match --expected-github-ci; no write was attempted".into(),
         ));
     }
-    require_exact_head(&buzz_before, expected_buzz_main)?;
-    repo.fetch_buzz_main(&remotes.buzz_url)?;
-    if repo.rev_parse(BUZZ_TRACKING_REF)? != expected_buzz_main
-        || !repo.is_ancestor(expected_buzz_main, commit)?
-    {
+    let changed = repo.push_ref(
+        &remotes.github.clone_url,
+        RemoteAuth::GitHub,
+        "GitHub CI",
+        &ci_ref,
+        commit,
+        expected_ci,
+    )?;
+    if !changed && expected_ci != Some(commit) {
         return Err(CliError::Conflict(
-            "requested mirror is not a proven fast-forward from --expected-buzz-main".into(),
+            "GitHub CI ref reached --commit without exercising the requested lease".into(),
         ));
     }
-    let changed = commit != expected_buzz_main;
-    if changed {
-        if repo.github_main(&remotes.github_url)? != commit {
-            return Err(CliError::Conflict(
-                "GitHub main changed before the Buzz write; no write was attempted".into(),
+    let github_after = repo.remote_ref(
+        &remotes.github.clone_url,
+        RemoteAuth::GitHub,
+        "GitHub CI",
+        &ci_ref,
+    )?;
+    if github_after.as_deref() != Some(commit) {
+        return Err(CliError::Conflict(
+            "GitHub CI ref did not read back at the exact Buzz commit".into(),
+        ));
+    }
+    Ok(StageOutput {
+        repo_id: remotes.repo_id.clone(),
+        direction: "buzz-to-github-ci",
+        source_ref: source_ref.to_owned(),
+        commit: commit.to_owned(),
+        github_ci_ref: ci_ref,
+        changed,
+        github_ci_commit: github_after
+            .ok_or_else(|| CliError::Other("GitHub CI ref missing after exact readback".into()))?,
+    })
+}
+
+fn evaluate_required_checks(
+    required: &[String],
+    runs: &[CheckRun],
+    commit: &str,
+) -> Result<(), CliError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in required {
+        if name.is_empty() || name.trim() != name {
+            return Err(CliError::Usage(
+                "--required-check names must be non-empty and have no surrounding whitespace"
+                    .into(),
             ));
         }
-        repo.push_main(&remotes.buzz_url, commit, Some(expected_buzz_main))?;
+        if !seen.insert(name) {
+            return Err(CliError::Usage(format!(
+                "--required-check was provided more than once: {name}"
+            )));
+        }
+        let matching: Vec<&CheckRun> = runs.iter().filter(|run| run.name == *name).collect();
+        let [run] = matching.as_slice() else {
+            return Err(CliError::Conflict(if matching.is_empty() {
+                format!("required GitHub check is missing at {commit}: {name}")
+            } else {
+                format!("required GitHub check is not unique at {commit}: {name}")
+            }));
+        };
+        if exact_oid(&run.head_sha, "GitHub check head_sha")? != commit
+            || run.app.id != GITHUB_ACTIONS_APP_ID
+            || run.status != "completed"
+            || run.conclusion.as_deref() != Some("success")
+        {
+            return Err(CliError::Conflict(format!(
+                "required GitHub Actions check is not trusted+completed+success at {commit}: {name}"
+            )));
+        }
     }
-    let github_after = repo.github_main(&remotes.github_url)?;
-    if github_after != commit {
-        return Err(CliError::Conflict(
-            "GitHub main changed during synchronization".into(),
+    Ok(())
+}
+
+async fn github_check_runs(
+    github: &GitHubRepo,
+    auth: &GitHubAuth,
+    commit: &str,
+) -> Result<Vec<CheckRun>, CliError> {
+    let client = reqwest::Client::new();
+    let mut all = Vec::new();
+    for page in 1..=100_u16 {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/commits/{commit}/check-runs?per_page=100&page={page}",
+            github.owner, github.repo
+        );
+        let response = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header(reqwest::header::USER_AGENT, "buzz-cli-repo-sync")
+            .bearer_auth(&auth.token)
+            .send()
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(CliError::Auth(format!(
+                "GitHub checks request was rejected (HTTP {})",
+                status.as_u16()
+            )));
+        }
+        if !status.is_success() {
+            return Err(CliError::Other(format!(
+                "GitHub checks request failed (HTTP {})",
+                status.as_u16()
+            )));
+        }
+        let page: CheckRunsResponse = response.json().await?;
+        let count = page.check_runs.len();
+        all.extend(page.check_runs);
+        if count < 100 {
+            return Ok(all);
+        }
+    }
+    Err(CliError::Other(
+        "GitHub returned more than 10,000 check runs for the exact commit".into(),
+    ))
+}
+
+fn classify_promote_start(
+    buzz_main: Option<&str>,
+    github_main: Option<&str>,
+    base: &str,
+    head: &str,
+) -> Result<PromoteStart, CliError> {
+    match (buzz_main, github_main) {
+        (Some(buzz), Some(github)) if buzz == base && github == base => Ok(PromoteStart::Initial),
+        (Some(buzz), Some(github)) if buzz == head && github == base => {
+            Ok(PromoteStart::ResumeAfterBuzzAdvance)
+        }
+        _ => Err(CliError::Conflict(
+            "expected both mains at --base, or retry state Buzz main at --head and GitHub main at --base"
+                .into(),
+        )),
+    }
+}
+
+fn partial_success(head: &str, error: CliError) -> CliError {
+    CliError::Other(format!(
+        "Buzz main is at {head}, but GitHub main completion is unproven ({error}); run repos status, then retry the same promote command only if GitHub main remains --base"
+    ))
+}
+
+async fn execute_promote(
+    remotes: &RepoRemotes,
+    buzz_auth: GitAuth,
+    github_auth: GitHubAuth,
+    base: &str,
+    head: &str,
+    source_ref: &str,
+    ci_ref: &str,
+    required_checks: &[String],
+) -> Result<PromoteOutput, CliError> {
+    if required_checks.is_empty() {
+        return Err(CliError::Usage(
+            "at least one --required-check must be provided".into(),
         ));
     }
-    let buzz_after = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
-    require_exact_head(&buzz_after, commit)?;
-    let buzz_main = buzz_after
-        .main
-        .ok_or_else(|| CliError::Other("Buzz main missing after exact readback".into()))?;
-    let buzz_head = buzz_after
-        .head
-        .ok_or_else(|| CliError::Other("Buzz HEAD missing after exact readback".into()))?;
-    Ok(WriteOutput {
+    let repo = GitRepo::new(buzz_auth, github_auth.clone())?;
+    let buzz_before = repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?;
+    let github_before = repo.github_main(&remotes.github.clone_url)?;
+    let start = classify_promote_start(
+        buzz_before.main.as_deref(),
+        github_before.as_deref(),
+        base,
+        head,
+    )?;
+    let expected_buzz_main = match start {
+        PromoteStart::Initial => base,
+        PromoteStart::ResumeAfterBuzzAdvance => head,
+    };
+    require_exact_head(&buzz_before, expected_buzz_main)?;
+    if repo
+        .remote_ref(
+            &remotes.buzz_url,
+            RemoteAuth::Buzz,
+            "Buzz source",
+            source_ref,
+        )?
+        .as_deref()
+        != Some(head)
+    {
+        return Err(CliError::Conflict(
+            "Buzz source ref does not equal --head; no write was attempted".into(),
+        ));
+    }
+    if repo
+        .remote_ref(
+            &remotes.github.clone_url,
+            RemoteAuth::GitHub,
+            "GitHub CI",
+            ci_ref,
+        )?
+        .as_deref()
+        != Some(head)
+    {
+        return Err(CliError::Conflict(
+            "GitHub CI ref does not equal --head; no write was attempted".into(),
+        ));
+    }
+    repo.fetch_ref(
+        &remotes.buzz_url,
+        RemoteAuth::Buzz,
+        "Buzz source",
+        source_ref,
+        BUZZ_SOURCE_TRACKING_REF,
+        head,
+    )?;
+    repo.fetch_ref(
+        &remotes.buzz_url,
+        RemoteAuth::Buzz,
+        "Buzz main",
+        MAIN_REF,
+        BUZZ_TRACKING_REF,
+        expected_buzz_main,
+    )?;
+    if !repo.is_ancestor(base, head)? {
+        return Err(CliError::Conflict(
+            "--base is not an ancestor of --head in the Buzz-fetched object graph".into(),
+        ));
+    }
+    let checks = github_check_runs(&remotes.github, &github_auth, head).await?;
+    evaluate_required_checks(required_checks, &checks, head)?;
+
+    // Checks may take long enough for refs to move. Re-read every lease input
+    // immediately before the first mutation.
+    let buzz_ready = repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?;
+    require_exact_head(&buzz_ready, expected_buzz_main)?;
+    if repo
+        .remote_ref(
+            &remotes.buzz_url,
+            RemoteAuth::Buzz,
+            "Buzz source",
+            source_ref,
+        )?
+        .as_deref()
+        != Some(head)
+        || repo
+            .remote_ref(
+                &remotes.github.clone_url,
+                RemoteAuth::GitHub,
+                "GitHub CI",
+                ci_ref,
+            )?
+            .as_deref()
+            != Some(head)
+        || repo.github_main(&remotes.github.clone_url)?.as_deref() != Some(base)
+    {
+        return Err(CliError::Conflict(
+            "a Buzz or GitHub ref moved after checks were evaluated; no write was attempted".into(),
+        ));
+    }
+
+    let buzz_main_changed = if start == PromoteStart::Initial {
+        let changed = repo.push_ref(
+            &remotes.buzz_url,
+            RemoteAuth::Buzz,
+            "Buzz main",
+            MAIN_REF,
+            head,
+            Some(base),
+        )?;
+        if !changed {
+            return Err(partial_success(
+                head,
+                CliError::Conflict(
+                    "Buzz main reached --head without exercising the --base lease".into(),
+                ),
+            ));
+        }
+        true
+    } else {
+        false
+    };
+    let buzz_after = repo
+        .ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")
+        .map_err(|error| partial_success(head, error))?;
+    require_exact_head(&buzz_after, head).map_err(|error| partial_success(head, error))?;
+
+    let github_main_changed = repo
+        .push_ref(
+            &remotes.github.clone_url,
+            RemoteAuth::GitHub,
+            "GitHub main",
+            MAIN_REF,
+            head,
+            Some(base),
+        )
+        .map_err(|error| partial_success(head, error))?;
+    if !github_main_changed {
+        return Err(partial_success(
+            head,
+            CliError::Conflict(
+                "GitHub main reached --head without exercising the --base lease".into(),
+            ),
+        ));
+    }
+    let github_after = repo
+        .github_main(&remotes.github.clone_url)
+        .map_err(|error| partial_success(head, error))?;
+    if github_after.as_deref() != Some(head) {
+        return Err(partial_success(
+            head,
+            CliError::Conflict("GitHub main did not read back at --head".into()),
+        ));
+    }
+    let buzz_final = repo
+        .ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")
+        .map_err(|error| partial_success(head, error))?;
+    require_exact_head(&buzz_final, head).map_err(|error| partial_success(head, error))?;
+
+    Ok(PromoteOutput {
         repo_id: remotes.repo_id.clone(),
-        direction: "github-to-buzz",
-        commit: commit.to_owned(),
-        changed,
-        github_main: github_after,
-        buzz_main,
-        buzz_head,
+        direction: "buzz-to-github",
+        base: base.to_owned(),
+        head: head.to_owned(),
+        source_ref: source_ref.to_owned(),
+        github_ci_ref: ci_ref.to_owned(),
+        required_checks: required_checks.to_vec(),
+        resumed_after_buzz_advance: start == PromoteStart::ResumeAfterBuzzAdvance,
+        buzz_main_changed,
+        github_main_changed,
+        buzz_main: buzz_final
+            .main
+            .ok_or_else(|| CliError::Other("Buzz main missing after promotion".into()))?,
+        buzz_head: buzz_final
+            .head
+            .ok_or_else(|| CliError::Other("Buzz HEAD missing after promotion".into()))?,
+        github_main: github_after
+            .ok_or_else(|| CliError::Other("GitHub main missing after promotion".into()))?,
     })
 }
 
 pub async fn cmd_status(client: &BuzzClient, announcement: &Event) -> Result<(), CliError> {
     let remotes = derive_remotes(client, announcement)?;
-    let repo = GitRepo::new(auth_from_client(client))?;
-    let github_main = repo.github_main(&remotes.github_url)?;
-    let buzz = repo.ls_remote(&remotes.buzz_url, true, "Buzz")?;
+    let repo = GitRepo::new(auth_from_client(client), github_auth_from_env()?)?;
+    let buzz = repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?;
+    let buzz_main = buzz
+        .main
+        .as_deref()
+        .ok_or_else(|| CliError::NotFound("Buzz canonical main is absent".into()))?;
+    let github_main = repo.github_main(&remotes.github.clone_url)?;
     let output = StatusOutput {
         repo_id: &remotes.repo_id,
-        direction: "github-to-buzz",
-        github_url: &remotes.github_url,
+        direction: "buzz-to-github",
+        github_url: &remotes.github.clone_url,
         buzz_url: &remotes.buzz_url,
-        github_main: &github_main,
-        buzz_main: buzz.main.as_deref(),
+        buzz_main,
         buzz_head: buzz.head.as_deref(),
-        in_sync: buzz.main.as_deref() == Some(github_main.as_str())
-            && buzz.head.as_deref() == Some(github_main.as_str())
+        github_main: github_main.as_deref(),
+        in_sync: github_main.as_deref() == Some(buzz_main)
+            && buzz.head.as_deref() == Some(buzz_main)
             && buzz.head_target.as_deref() == Some(MAIN_REF),
     };
     println!(
@@ -601,7 +1152,12 @@ pub async fn cmd_import_main(
 ) -> Result<(), CliError> {
     let commit = exact_oid(commit, "--commit")?;
     let remotes = derive_remotes(client, announcement)?;
-    let output = execute_import(&remotes, auth_from_client(client), &commit)?;
+    let output = execute_import(
+        &remotes,
+        auth_from_client(client),
+        github_auth_from_env()?,
+        &commit,
+    )?;
     println!(
         "{}",
         serde_json::to_string(&output)
@@ -610,16 +1166,67 @@ pub async fn cmd_import_main(
     Ok(())
 }
 
-pub async fn cmd_mirror_main(
+pub async fn cmd_stage_ci(
     client: &BuzzClient,
     announcement: &Event,
+    source_ref: &str,
     commit: &str,
-    expected_buzz_main: &str,
+    expected_github_ci: &str,
 ) -> Result<(), CliError> {
     let commit = exact_oid(commit, "--commit")?;
-    let expected = exact_oid(expected_buzz_main, "--expected-buzz-main")?;
+    let source_ref = validate_branch_ref(source_ref, "--source-ref")?;
+    let expected = expected_ref(expected_github_ci, "--expected-github-ci")?;
     let remotes = derive_remotes(client, announcement)?;
-    let output = execute_mirror(&remotes, auth_from_client(client), &commit, &expected)?;
+    let output = execute_stage(
+        &remotes,
+        auth_from_client(client),
+        github_auth_from_env()?,
+        &source_ref,
+        &commit,
+        expected.as_deref(),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string(&output)
+            .map_err(|_| CliError::Other("failed to serialize repository sync result".into()))?
+    );
+    Ok(())
+}
+
+pub async fn cmd_promote(
+    client: &BuzzClient,
+    announcement: &Event,
+    base: &str,
+    head: &str,
+    source_ref: &str,
+    ci_ref: &str,
+    required_checks: &[String],
+) -> Result<(), CliError> {
+    let base = exact_oid(base, "--base")?;
+    let head = exact_oid(head, "--head")?;
+    if base == head {
+        return Err(CliError::Usage("--base and --head must differ".into()));
+    }
+    let source_ref = validate_branch_ref(source_ref, "--source-ref")?;
+    let ci_ref = validate_branch_ref(ci_ref, "--ci-ref")?;
+    if ci_ref != ci_ref_for(&head) {
+        return Err(CliError::Usage(format!(
+            "--ci-ref must be the deterministic exact-head ref {}",
+            ci_ref_for(&head)
+        )));
+    }
+    let remotes = derive_remotes(client, announcement)?;
+    let output = execute_promote(
+        &remotes,
+        auth_from_client(client),
+        github_auth_from_env()?,
+        &base,
+        &head,
+        &source_ref,
+        &ci_ref,
+        required_checks,
+    )
+    .await?;
     println!(
         "{}",
         serde_json::to_string(&output)
@@ -696,8 +1303,12 @@ mod tests {
         fn remotes(&self) -> RepoRemotes {
             RepoRemotes {
                 repo_id: "fixture".into(),
-                github_url: self.github.clone(),
                 buzz_url: self.buzz.clone(),
+                github: GitHubRepo {
+                    clone_url: self.github.clone(),
+                    owner: "fixture-owner".into(),
+                    repo: "fixture-repo".into(),
+                },
             }
         }
 
@@ -708,16 +1319,18 @@ mod tests {
             }
         }
 
+        fn github_auth() -> GitHubAuth {
+            GitHubAuth {
+                variable: "GH_TOKEN",
+                token: "fixture-secret-token".into(),
+            }
+        }
+
         fn next_commit(&self) -> String {
             std::fs::write(self.work.join("file.txt"), "two\n").expect("write fixture");
             git(&self.work, ["add", "file.txt"]);
             git(&self.work, ["commit", "-m", "two"]);
-            let commit = git(&self.work, ["rev-parse", "HEAD"]);
-            git(
-                &self.work,
-                ["push", self.github.as_str(), "HEAD:refs/heads/main"],
-            );
-            commit
+            git(&self.work, ["rev-parse", "HEAD"])
         }
     }
 
@@ -748,7 +1361,12 @@ mod tests {
         .expect("sign announcement");
         let remotes = derive_remotes(&client, &event).expect("canonical remotes");
         assert_eq!(remotes.buzz_url, buzz);
-        assert_eq!(remotes.github_url, "https://github.com/block/buzz.git");
+        assert_eq!(
+            remotes.github.clone_url,
+            "https://github.com/block/buzz.git"
+        );
+        assert_eq!(remotes.github.owner, "block");
+        assert_eq!(remotes.github.repo, "buzz");
 
         let wrong_order = buzz_sdk::build_repo_announcement(
             "fixture",
@@ -813,46 +1431,121 @@ mod tests {
     }
 
     #[test]
-    fn import_then_mirror_moves_only_main_by_fast_forward() {
+    fn import_is_bootstrap_only_and_stage_sources_buzz_without_moving_mains() {
         let fixture = Fixture::new();
-        let imported = execute_import(&fixture.remotes(), Fixture::auth(), &fixture.first)
-            .expect("import main");
+        let imported = execute_import(
+            &fixture.remotes(),
+            Fixture::auth(),
+            Fixture::github_auth(),
+            &fixture.first,
+        )
+        .expect("import main");
         assert!(imported.changed);
+        assert_eq!(imported.direction, "github-to-buzz-bootstrap-only");
         assert_eq!(
             git(Path::new(&fixture.buzz), ["show-ref"]),
             format!("{} refs/heads/main", fixture.first)
         );
 
         let second = fixture.next_commit();
-        let mirrored = execute_mirror(&fixture.remotes(), Fixture::auth(), &second, &fixture.first)
-            .expect("mirror main");
-        assert!(mirrored.changed);
+        git(
+            &fixture.work,
+            ["push", fixture.buzz.as_str(), "HEAD:refs/heads/pr/9"],
+        );
+        let staged = execute_stage(
+            &fixture.remotes(),
+            Fixture::auth(),
+            Fixture::github_auth(),
+            "refs/heads/pr/9",
+            &second,
+            None,
+        )
+        .expect("stage Buzz commit");
+        assert!(staged.changed);
+        assert_eq!(staged.direction, "buzz-to-github-ci");
+        assert_eq!(staged.github_ci_ref, ci_ref_for(&second));
         assert_eq!(
-            git(Path::new(&fixture.buzz), ["show-ref"]),
-            format!("{second} refs/heads/main")
+            git(Path::new(&fixture.github), ["rev-parse", MAIN_REF]),
+            fixture.first
+        );
+        assert_eq!(
+            git(Path::new(&fixture.buzz), ["rev-parse", MAIN_REF]),
+            fixture.first
+        );
+        assert_eq!(
+            git(
+                Path::new(&fixture.github),
+                ["rev-parse", ci_ref_for(&second).as_str()]
+            ),
+            second
         );
     }
 
     #[test]
-    fn import_refuses_populated_buzz_and_mirror_refuses_stale_lease() {
+    fn import_refuses_populated_buzz_and_stage_refuses_stale_lease() {
         let fixture = Fixture::new();
         git(
             &fixture.work,
             ["push", fixture.buzz.as_str(), "HEAD:refs/heads/main"],
         );
-        let second = fixture.next_commit();
         assert!(matches!(
-            execute_import(&fixture.remotes(), Fixture::auth(), &second),
-            Err(CliError::Conflict(_))
-        ));
-        assert!(matches!(
-            execute_mirror(
+            execute_import(
                 &fixture.remotes(),
                 Fixture::auth(),
-                &second,
-                &"f".repeat(40)
+                Fixture::github_auth(),
+                &fixture.first
             ),
             Err(CliError::Conflict(_))
+        ));
+
+        let second = fixture.next_commit();
+        git(
+            &fixture.work,
+            ["push", fixture.buzz.as_str(), "HEAD:refs/heads/pr/9"],
+        );
+        execute_stage(
+            &fixture.remotes(),
+            Fixture::auth(),
+            Fixture::github_auth(),
+            "refs/heads/pr/9",
+            &second,
+            None,
+        )
+        .expect("initial stage");
+        assert!(matches!(
+            execute_stage(
+                &fixture.remotes(),
+                Fixture::auth(),
+                Fixture::github_auth(),
+                "refs/heads/pr/9",
+                &second,
+                Some(&"f".repeat(40))
+            ),
+            Err(CliError::Conflict(_))
+        ));
+
+        std::fs::write(fixture.work.join("file.txt"), "three\n").expect("write fixture");
+        git(&fixture.work, ["add", "file.txt"]);
+        git(&fixture.work, ["commit", "-m", "three"]);
+        git(
+            &fixture.work,
+            [
+                "push",
+                "--force",
+                fixture.buzz.as_str(),
+                "HEAD:refs/heads/pr/9",
+            ],
+        );
+        assert!(matches!(
+            execute_stage(
+                &fixture.remotes(),
+                Fixture::auth(),
+                Fixture::github_auth(),
+                "refs/heads/pr/9",
+                &second,
+                Some(&second)
+            ),
+            Err(CliError::Conflict(message)) if message.contains("Buzz source")
         ));
     }
 
@@ -862,8 +1555,8 @@ mod tests {
         // api/git/hook.rs): a non-200 policy decision writes the reason to
         // stderr and exits 1, which git reports as `[remote rejected]`. That
         // must surface as an auth failure carrying the real reason, NOT as a
-        // Conflict -- a Conflict would push an unauthorized caller toward
-        // mirror-main and leak that the repo exists.
+        // Conflict -- a Conflict would misreport an authorization failure as
+        // an ordinary ref lease race.
         let fixture = Fixture::new();
         let hook = Path::new(&fixture.buzz).join("hooks").join("pre-receive");
         std::fs::create_dir_all(hook.parent().unwrap()).expect("hooks dir");
@@ -878,7 +1571,12 @@ mod tests {
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod hook");
         }
-        match execute_import(&fixture.remotes(), Fixture::auth(), &fixture.first) {
+        match execute_import(
+            &fixture.remotes(),
+            Fixture::auth(),
+            Fixture::github_auth(),
+            &fixture.first,
+        ) {
             Err(CliError::Other(msg)) => assert!(
                 msg.contains("push denied by policy"),
                 "auth decline must carry the real reason; got: {msg}"
@@ -899,5 +1597,122 @@ mod tests {
         assert_eq!(state.main.as_deref(), Some(oid.as_str()));
         assert_eq!(state.head.as_deref(), Some(oid.as_str()));
         assert_eq!(state.head_target.as_deref(), Some(MAIN_REF));
+    }
+
+    #[test]
+    fn github_url_and_branch_ref_validation_fail_closed() {
+        let parsed = github_repo("https://github.com/block/buzz.git").expect("valid URL");
+        assert_eq!(
+            (parsed.owner.as_str(), parsed.repo.as_str()),
+            ("block", "buzz")
+        );
+        for invalid in [
+            "http://github.com/block/buzz.git",
+            "https://token@github.com/block/buzz.git",
+            "https://github.com/block/.git",
+            "https://github.com/block/buzz/extra",
+            "https://github.com/block%2Fother/buzz.git",
+        ] {
+            assert!(github_repo(invalid).is_err(), "accepted {invalid}");
+        }
+        assert!(validate_branch_ref("refs/heads/pr/9", "--source-ref").is_ok());
+        for invalid in [
+            "main",
+            "refs/tags/v1",
+            "refs/heads/../main",
+            "refs/heads/a:main",
+            "refs/heads/a.lock",
+        ] {
+            assert!(validate_branch_ref(invalid, "--source-ref").is_err());
+        }
+    }
+
+    fn run(name: &str, status: &str, conclusion: Option<&str>, head: &str) -> CheckRun {
+        CheckRun {
+            name: name.into(),
+            status: status.into(),
+            conclusion: conclusion.map(str::to_owned),
+            head_sha: head.into(),
+            app: CheckApp {
+                id: GITHUB_ACTIONS_APP_ID,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_required_checks_must_be_unique_completed_and_successful() {
+        let head = "a".repeat(40);
+        let required = vec!["test".to_owned(), "lint".to_owned()];
+        let passing = vec![
+            run("test", "completed", Some("success"), &head),
+            run("lint", "completed", Some("success"), &head),
+            run("unrelated", "completed", Some("failure"), &head),
+        ];
+        assert!(evaluate_required_checks(&required, &passing, &head).is_ok());
+
+        let missing = &passing[..1];
+        assert!(matches!(
+            evaluate_required_checks(&required, missing, &head),
+            Err(CliError::Conflict(message)) if message.contains("missing")
+        ));
+        let duplicate = vec![passing[0].clone(), passing[0].clone(), passing[1].clone()];
+        assert!(matches!(
+            evaluate_required_checks(&required, &duplicate, &head),
+            Err(CliError::Conflict(message)) if message.contains("not unique")
+        ));
+        for bad in [
+            run("test", "queued", None, &head),
+            run("test", "completed", Some("failure"), &head),
+            run("test", "completed", Some("success"), &"b".repeat(40)),
+        ] {
+            assert!(evaluate_required_checks(&["test".into()], &[bad], &head).is_err());
+        }
+        let mut untrusted = run("test", "completed", Some("success"), &head);
+        untrusted.app.id = 1;
+        assert!(evaluate_required_checks(&["test".into()], &[untrusted], &head).is_err());
+        assert!(matches!(
+            evaluate_required_checks(&["test".into(), "test".into()], &passing, &head),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn partial_success_retry_state_is_narrow() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        assert_eq!(
+            classify_promote_start(Some(&base), Some(&base), &base, &head).unwrap(),
+            PromoteStart::Initial
+        );
+        assert_eq!(
+            classify_promote_start(Some(&head), Some(&base), &base, &head).unwrap(),
+            PromoteStart::ResumeAfterBuzzAdvance
+        );
+        assert!(classify_promote_start(Some(&base), Some(&head), &base, &head).is_err());
+        assert!(classify_promote_start(Some(&head), Some(&head), &base, &head).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_auth_helper_and_argv_never_contain_the_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let secret = "fixture-secret-token";
+        let repo = GitRepo::new(Fixture::auth(), Fixture::github_auth()).expect("git repo");
+        let helper = std::fs::read_to_string(&repo.askpass).expect("read helper");
+        assert_eq!(helper, GITHUB_ASKPASS);
+        assert!(!helper.contains(secret));
+        assert_eq!(
+            std::fs::metadata(&repo.askpass)
+                .expect("helper metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let command = repo.command(RemoteAuth::GitHub);
+        assert!(!command
+            .get_args()
+            .any(|argument| argument.to_string_lossy().contains(secret)));
     }
 }
