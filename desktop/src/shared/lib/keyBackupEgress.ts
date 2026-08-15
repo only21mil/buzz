@@ -67,6 +67,12 @@ export function registerIdentitySecretForEgressGuard(secret: Uint8Array): void {
   }
 }
 
+/** Zero and forget retained identity secrets after explicit sign-out. */
+export function clearIdentitySecretsForEgressGuard(): void {
+  for (const secret of registeredSecrets) secret.fill(0);
+  registeredSecrets.length = 0;
+}
+
 /** Reject identity secrets in browser WebSocket and HTTP request fields. */
 export function assertNoIdentityKeyEgress(
   value: string,

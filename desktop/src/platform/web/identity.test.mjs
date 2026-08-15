@@ -23,6 +23,11 @@ class MemoryIdentityStore {
     if (this.failSave) throw new Error("storage write failed");
     this.value = { ...identity, deviceKey };
   }
+
+  async clear() {
+    if (this.failSave) throw new Error("storage write failed");
+    this.value = null;
+  }
 }
 
 afterEach(() => resetRegistryForTests());
@@ -131,6 +136,35 @@ test("egress guard retains current and prior raw identity secrets only", async (
   assert.doesNotThrow(() =>
     assertNoIdentityKeyEgress(unrelated, "test event id"),
   );
+});
+
+test("sign_out zeroes and forgets retained identity secrets", async () => {
+  const store = new MemoryIdentityStore();
+  const manager = await BrowserIdentityManager.create(
+    store,
+    new DirectNip49Codec(),
+  );
+  const secret = "04".padStart(64, "0");
+  await manager.importIdentity(secret);
+  assert.throws(
+    () => assertNoIdentityKeyEgress(secret, "test payload"),
+    /local identity secret must never be transmitted/,
+  );
+
+  let reloads = 0;
+  registerIdentityCommands(manager, () => {
+    reloads += 1;
+  });
+  await dispatch("sign_out");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(store.value, null);
+  assert.equal(manager.identity().lost, true);
+  assert.throws(() => manager.getNsec(), /import your identity first/);
+  assert.doesNotThrow(() =>
+    assertNoIdentityKeyEgress(secret, "signed-out test payload"),
+  );
+  assert.equal(reloads, 1);
 });
 
 test("ncryptsec import decrypts then re-encrypts under the device key", async () => {

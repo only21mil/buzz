@@ -1,5 +1,8 @@
 import { register, type InvokeBody } from "./registry";
-import { registerIdentitySecretForEgressGuard } from "@/shared/lib/keyBackupEgress";
+import {
+  clearIdentitySecretsForEgressGuard,
+  registerIdentitySecretForEgressGuard,
+} from "@/shared/lib/keyBackupEgress";
 import {
   displayNameForPubkey,
   generateSecretKey,
@@ -237,10 +240,21 @@ export class BrowserIdentityManager {
       ),
     };
     await this.store.save(identity, key);
+    registerIdentitySecretForEgressGuard(this.secret);
     this.deviceKey = key;
     this.durable = true;
     this.recovery = false;
     return this.identity();
+  }
+
+  async signOut(): Promise<void> {
+    await this.store.clear();
+    this.secret.fill(0);
+    this.secret = generateSecretKey();
+    this.deviceKey = null;
+    this.durable = false;
+    this.recovery = true;
+    clearIdentitySecretsForEgressGuard();
   }
 
   async createBackup(password: string): Promise<string> {
@@ -269,10 +283,15 @@ export class BrowserIdentityManager {
 
 export function registerIdentityCommands(
   manager: BrowserIdentityManager,
+  reload: () => void = () => window.location.reload(),
 ): void {
   register("get_identity", () => manager.identity());
   register("get_nsec", () => manager.getNsec());
   register("persist_current_identity", () => manager.persistCurrentIdentity());
+  register("sign_out", async () => {
+    await manager.signOut();
+    globalThis.setTimeout(reload, 0);
+  });
   register("import_identity", async (body) => {
     const record = objectBody(body);
     return manager.importIdentity(

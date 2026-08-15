@@ -11,6 +11,7 @@ export type IdentityStore = {
     identity: Omit<StoredIdentity, "deviceKey">,
     deviceKey: CryptoKey,
   ): Promise<void>;
+  clear(): Promise<void>;
 };
 
 const DB_NAME = "buzz-browser-identity";
@@ -82,6 +83,13 @@ export class IndexedDbIdentityStore implements IdentityStore {
     const store = transaction.objectStore(STORE_NAME);
     store.put(identity, IDENTITY_KEY);
     store.put(deviceKey, DEVICE_KEY);
+    await transactionDone(transaction);
+  }
+
+  async clear(): Promise<void> {
+    const database = await this.database;
+    const transaction = database.transaction(STORE_NAME, "readwrite");
+    transaction.objectStore(STORE_NAME).clear();
     await transactionDone(transaction);
   }
 }
