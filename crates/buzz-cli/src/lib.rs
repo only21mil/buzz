@@ -2565,7 +2565,7 @@ mod tests {
             ("pr", 5),
             ("projects", 7),
             ("reactions", 3),
-            ("repos", 9),
+            ("repos", 10),
             ("social", 7),
             ("upload", 1),
             ("users", 5),
