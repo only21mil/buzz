@@ -93,6 +93,49 @@ test("NIP-98 fetch hashes and sends the same body bytes", async () => {
   assert.equal(observed.init.headers.get("Content-Type"), "application/json");
 });
 
+test("NIP-98 snapshots a mutable body once for signing and transmission", async () => {
+  const body = new TextEncoder().encode("original body");
+  let signedTemplate;
+  register("sign_event", async (template) => {
+    signedTemplate = template;
+    body.fill(120);
+    await Promise.resolve();
+    return JSON.stringify({
+      ...template,
+      created_at: 1_786_799_999,
+      id: "1".repeat(64),
+      pubkey: "2".repeat(64),
+      sig: "3".repeat(128),
+    });
+  });
+  let transmitted;
+
+  await nip98Fetch(
+    {
+      url: "https://relay.example.test/events",
+      method: "POST",
+      body,
+    },
+    {
+      nonce: () => "snapshot-nonce",
+      fetch: async (_url, init) => {
+        transmitted = init.body;
+        return new Response(null, { status: 204 });
+      },
+    },
+  );
+
+  const payloadTag = signedTemplate.tags.find(([name]) => name === "payload");
+  assert.ok(payloadTag);
+  assert.ok(transmitted instanceof Uint8Array);
+  assert.notEqual(transmitted, body);
+  assert.equal(
+    payloadTag[1],
+    createHash("sha256").update(transmitted).digest("hex"),
+  );
+  assert.equal(new TextDecoder().decode(transmitted), "original body");
+});
+
 test("NIP-98 blocks encrypted key backups before signing or fetching", async () => {
   let calls = 0;
   register("sign_event", () => {
@@ -104,6 +147,31 @@ test("NIP-98 blocks encrypted key backups before signing or fetching", async () 
       url: "https://relay.example.test/events",
       method: "POST",
       body: ["NCR", "YPTSEC1", "SECRET"].join(""),
+    }),
+    /local key backup must never be transmitted/,
+  );
+  assert.equal(calls, 0);
+});
+
+test("NIP-98 blocks encrypted key backups in URLs and caller headers", async () => {
+  let calls = 0;
+  register("sign_event", () => {
+    calls += 1;
+    throw new Error("must not sign");
+  });
+
+  await assert.rejects(
+    buildNip98Authorization({
+      url: `https://relay.example.test/${["ncr", "yptsec1secret"].join("")}`,
+      method: "GET",
+    }),
+    /local key backup must never be transmitted/,
+  );
+  await assert.rejects(
+    nip98Fetch({
+      url: "https://relay.example.test/events",
+      method: "POST",
+      headers: { "X-Key-Material": ["NCR", "YPTSEC1SECRET"].join("") },
     }),
     /local key backup must never be transmitted/,
   );

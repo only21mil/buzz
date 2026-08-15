@@ -94,6 +94,7 @@ async function connect(body: InvokeBody): Promise<number> {
   if (typeof payload.url !== "string" || payload.url.length === 0) {
     throw new TypeError("plugin:websocket|connect requires a url");
   }
+  assertNoEncryptedKeyBackupEgress(payload.url, "websocket URL");
   const handler = resolveHandler(payload.onMessage);
   const socket = new WebSocket(payload.url);
   socket.binaryType = "arraybuffer";
@@ -233,12 +234,12 @@ function send(body: InvokeBody): void {
     return;
   }
 
-  const connection = connectionFor(payload.id);
   if (type === "Close") {
-    connection.locallyClosed = true;
-    connection.terminal = true;
-    connections.delete(connection.id);
+    const connection = connectionFor(payload.id);
     if (data === undefined || data === null) {
+      connection.locallyClosed = true;
+      connection.terminal = true;
+      connections.delete(connection.id);
       connection.socket.close();
       return;
     }
@@ -251,10 +252,15 @@ function send(body: InvokeBody): void {
     ) {
       throw new TypeError("WebSocket Close data must contain code and reason");
     }
+    assertNoEncryptedKeyBackupEgress(data.reason, "websocket close reason");
+    connection.locallyClosed = true;
+    connection.terminal = true;
+    connections.delete(connection.id);
     connection.socket.close(data.code, data.reason);
     return;
   }
 
+  connectionFor(payload.id);
   if (type === "Ping" || type === "Pong") {
     throw new Error(`Browser WebSocket does not support ${type} frames`);
   }

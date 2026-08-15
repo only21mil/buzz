@@ -24,6 +24,13 @@ type Nip98Options = {
   nonce?: () => string;
 };
 
+type PreparedRequest = {
+  url: string;
+  method: string;
+  bytes: Uint8Array<ArrayBuffer> | undefined;
+  body: string | Uint8Array<ArrayBuffer> | undefined;
+};
+
 function requestBytes(
   body: Nip98Request["body"],
 ): Uint8Array<ArrayBuffer> | undefined {
@@ -37,6 +44,10 @@ function assertNoKeyBackup(bytes: Uint8Array | undefined): void {
   if (!bytes) return;
   const text = new TextDecoder().decode(bytes);
   assertNoEncryptedKeyBackupEgress(text, "relay HTTP request");
+}
+
+function assertNoKeyBackupText(value: string, context: string): void {
+  assertNoEncryptedKeyBackupEgress(value, context);
 }
 
 async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
@@ -59,6 +70,19 @@ function exactHttpUrl(value: string): string {
     throw new TypeError("NIP-98 requires an absolute HTTP(S) URL");
   }
   return parsed.href;
+}
+
+function prepareRequest(request: Nip98Request): PreparedRequest {
+  const url = exactHttpUrl(request.url);
+  assertNoKeyBackupText(url, "relay HTTP URL");
+  const bytes = requestBytes(request.body);
+  assertNoKeyBackup(bytes);
+  return {
+    url,
+    method: request.method.toUpperCase(),
+    bytes,
+    body: typeof request.body === "string" ? request.body : bytes,
+  };
 }
 
 async function defaultSignEvent(template: EventTemplate): Promise<string> {
@@ -92,20 +116,15 @@ function assertSignedTemplate(
   }
 }
 
-export async function buildNip98Authorization(
-  request: Nip98Request,
+async function buildAuthorization(
+  request: PreparedRequest,
   options: Nip98Options = {},
 ): Promise<string> {
-  const url = exactHttpUrl(request.url);
-  const method = request.method.toUpperCase();
-  const bytes = requestBytes(request.body);
-  assertNoKeyBackup(bytes);
-
   const tags: string[][] = [
-    ["u", url],
-    ["method", method],
+    ["u", request.url],
+    ["method", request.method],
   ];
-  if (bytes) tags.push(["payload", await sha256Hex(bytes)]);
+  if (request.bytes) tags.push(["payload", await sha256Hex(request.bytes)]);
   tags.push(["nonce", (options.nonce ?? crypto.randomUUID.bind(crypto))()]);
 
   const template: EventTemplate = { kind: NIP98_KIND, content: "", tags };
@@ -116,6 +135,13 @@ export async function buildNip98Authorization(
   return `Nostr ${utf8Base64(JSON.stringify(event))}`;
 }
 
+export async function buildNip98Authorization(
+  request: Nip98Request,
+  options: Nip98Options = {},
+): Promise<string> {
+  return buildAuthorization(prepareRequest(request), options);
+}
+
 export async function nip98Fetch(
   request: Nip98Request & {
     headers?: HeadersInit;
@@ -123,15 +149,19 @@ export async function nip98Fetch(
   },
   options: Nip98Options & { fetch?: typeof fetch } = {},
 ): Promise<Response> {
-  const authorization = await buildNip98Authorization(request, options);
+  const prepared = prepareRequest(request);
   const headers = new Headers(request.headers);
+  for (const [name, value] of headers) {
+    assertNoKeyBackupText(name, "relay HTTP header name");
+    assertNoKeyBackupText(value, "relay HTTP header value");
+  }
+  const authorization = await buildAuthorization(prepared, options);
   headers.set("Authorization", authorization);
-  const body = requestBytes(request.body);
 
-  return (options.fetch ?? fetch)(exactHttpUrl(request.url), {
-    method: request.method.toUpperCase(),
+  return (options.fetch ?? fetch)(prepared.url, {
+    method: prepared.method,
     headers,
-    body: typeof request.body === "string" ? request.body : body,
+    body: prepared.body,
     signal: request.signal,
   });
 }

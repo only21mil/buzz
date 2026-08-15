@@ -118,6 +118,18 @@ test("failed connects reject without exposing a socket id", async () => {
   assert.deepEqual(socket.closeCalls, [{ code: 1005, reason: "" }]);
 });
 
+test("connect blocks encrypted key backups in the URL", async () => {
+  await install();
+  await assert.rejects(
+    dispatch("plugin:websocket|connect", {
+      url: `wss://relay.example.test/${["ncr", "yptsec1secret"].join("")}`,
+      onMessage: new Channel(),
+    }),
+    /local key backup must never be transmitted/,
+  );
+  assert.equal(FakeWebSocket.instances.length, 0);
+});
+
 test("remote terminal events preserve native payloads and remove ownership", async () => {
   await install();
   const received = [];
@@ -176,4 +188,36 @@ test("text and binary sends block encrypted backups before socket lookup", async
     }),
     /local key backup must never be transmitted/,
   );
+});
+
+test("close blocks encrypted key backups in the reason before teardown", async () => {
+  await install();
+  const connect = dispatch("plugin:websocket|connect", {
+    url: "wss://relay.example.test",
+    onMessage: new Channel(),
+  });
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  const id = await connect;
+
+  await assert.rejects(
+    dispatch("plugin:websocket|send", {
+      id,
+      message: {
+        type: "Close",
+        data: {
+          code: 1000,
+          reason: ["NCR", "YPTSEC1SECRET"].join(""),
+        },
+      },
+    }),
+    /local key backup must never be transmitted/,
+  );
+  assert.deepEqual(socket.closeCalls, []);
+
+  await dispatch("plugin:websocket|send", {
+    id,
+    message: { type: "Close", data: { code: 1000, reason: "done" } },
+  });
+  assert.deepEqual(socket.closeCalls, [{ code: 1000, reason: "done" }]);
 });

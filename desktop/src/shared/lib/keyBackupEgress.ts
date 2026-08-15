@@ -2,7 +2,7 @@ const ENCRYPTED_KEY_BACKUP_PREFIX = "ncryptsec1";
 const ENCRYPTED_KEY_BACKUP_PREFIX_UPPER =
   ENCRYPTED_KEY_BACKUP_PREFIX.toUpperCase();
 
-/** Reject encrypted identity backups before any browser relay egress. */
+/** Reject encrypted backups in browser WebSocket and HTTP request fields. */
 export function assertNoEncryptedKeyBackupEgress(
   value: string,
   context: string,
