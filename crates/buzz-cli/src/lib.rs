@@ -1189,13 +1189,15 @@ pub enum ReposCmd {
         #[arg(long)]
         id: String,
     },
-    /// Compare GitHub and Buzz `main` without changing either remote.
+    /// Compare canonical Buzz `main` to the GitHub `main` mirror.
     Status {
         /// Repository identifier (d-tag).
         #[arg(long)]
         id: String,
     },
-    /// Initialize Buzz `main` from the exact current GitHub `main` commit.
+    /// Bootstrap an absent Buzz `main` from exact GitHub `main` once.
+    ///
+    /// This is not an ongoing synchronization direction.
     ImportMain {
         /// Repository identifier (d-tag).
         #[arg(long)]
@@ -1204,17 +1206,41 @@ pub enum ReposCmd {
         #[arg(long)]
         commit: String,
     },
-    /// Fast-forward Buzz `main` to the exact current GitHub `main` commit.
-    MirrorMain {
+    /// Mirror an exact Buzz source commit to its deterministic GitHub CI ref.
+    StageCi {
         /// Repository identifier (d-tag).
         #[arg(long)]
         id: String,
-        /// Exact 40-hex commit required at GitHub `main`.
+        /// Full Buzz source branch ref, e.g. refs/heads/pr/123.
+        #[arg(long)]
+        source_ref: String,
+        /// Exact 40-hex commit required at the Buzz source ref.
         #[arg(long)]
         commit: String,
-        /// Exact previously observed Buzz `main` commit used as the push lease.
+        /// Expected GitHub CI ref value: `absent` or an exact 40-hex commit.
         #[arg(long)]
-        expected_buzz_main: String,
+        expected_github_ci: String,
+    },
+    /// Promote an exact checked Buzz commit to both mains by leased fast-forward.
+    Promote {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Exact 40-hex current main commit used as both main leases.
+        #[arg(long)]
+        base: String,
+        /// Exact 40-hex tested Buzz source commit promoted to both mains.
+        #[arg(long)]
+        head: String,
+        /// Full Buzz source branch ref that must still equal --head.
+        #[arg(long)]
+        source_ref: String,
+        /// Deterministic GitHub CI ref returned by `repos stage-ci`.
+        #[arg(long)]
+        ci_ref: String,
+        /// Exact GitHub check name required uniquely at --head. Repeatable.
+        #[arg(long = "required-check", required = true)]
+        required_checks: Vec<String>,
     },
     /// Bind (or rebind) one of your repositories to a channel.
     ///
@@ -2266,31 +2292,41 @@ mod tests {
 
     #[test]
     fn repo_sync_commands_parse_direct_flags() {
-        let commit = "a".repeat(40);
-        let expected = "b".repeat(40);
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        let ci_ref = format!("refs/heads/buzz-ci/{head}");
         let cli = Cli::try_parse_from([
             "buzz",
             "repos",
-            "mirror-main",
+            "promote",
             "--id",
             "repo",
-            "--commit",
-            &commit,
-            "--expected-buzz-main",
-            &expected,
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--source-ref",
+            "refs/heads/pr/9",
+            "--ci-ref",
+            &ci_ref,
+            "--required-check",
+            "test",
         ])
-        .expect("mirror-main flags should parse");
-        let Cmd::Repos(ReposCmd::MirrorMain {
+        .expect("promote flags should parse");
+        let Cmd::Repos(ReposCmd::Promote {
             id,
-            commit: parsed_commit,
-            expected_buzz_main,
+            base: parsed_base,
+            head: parsed_head,
+            required_checks,
+            ..
         }) = cli.command
         else {
-            panic!("expected repos mirror-main");
+            panic!("expected repos promote");
         };
         assert_eq!(id, "repo");
-        assert_eq!(parsed_commit, commit);
-        assert_eq!(expected_buzz_main, expected);
+        assert_eq!(parsed_base, base);
+        assert_eq!(parsed_head, head);
+        assert_eq!(required_checks, vec!["test"]);
     }
 
     #[test]
@@ -2448,9 +2484,10 @@ mod tests {
                 "get",
                 "import-main",
                 "list",
-                "mirror-main",
+                "promote",
                 "protect",
                 "rm",
+                "stage-ci",
                 "status"
             ]
         );

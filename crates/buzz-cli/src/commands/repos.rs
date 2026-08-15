@@ -786,17 +786,39 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
             let announcement = current_repo(client, &id).await?;
             crate::commands::repo_sync::cmd_import_main(client, &announcement, &commit).await
         }
-        ReposCmd::MirrorMain {
+        ReposCmd::StageCi {
             id,
+            source_ref,
             commit,
-            expected_buzz_main,
+            expected_github_ci,
         } => {
             let announcement = current_repo(client, &id).await?;
-            crate::commands::repo_sync::cmd_mirror_main(
+            crate::commands::repo_sync::cmd_stage_ci(
                 client,
                 &announcement,
+                &source_ref,
                 &commit,
-                &expected_buzz_main,
+                &expected_github_ci,
+            )
+            .await
+        }
+        ReposCmd::Promote {
+            id,
+            base,
+            head,
+            source_ref,
+            ci_ref,
+            required_checks,
+        } => {
+            let announcement = current_repo(client, &id).await?;
+            crate::commands::repo_sync::cmd_promote(
+                client,
+                &announcement,
+                &base,
+                &head,
+                &source_ref,
+                &ci_ref,
+                &required_checks,
             )
             .await
         }
