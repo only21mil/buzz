@@ -20,6 +20,9 @@ export async function uploadMediaFile(
 ): Promise<BlobDescriptor> {
   const headers: Record<string, string> = {
     "x-buzz-filename": encodeRawIpcHeader(file.name),
+    "x-buzz-content-type": encodeRawIpcHeader(
+      file.type || "application/octet-stream",
+    ),
   };
   if (progressId) {
     headers["x-buzz-progress-id"] = encodeRawIpcHeader(progressId);

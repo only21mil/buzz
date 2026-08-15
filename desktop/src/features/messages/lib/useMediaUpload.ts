@@ -8,6 +8,7 @@ import {
 import { uploadMediaFile } from "@/shared/api/tauriMedia";
 import type { QueuedMediaAttachment } from "./backgroundMediaUploadStore";
 import { applyImetaUpdate, compactImetaSlots } from "./imetaSlots";
+import { releaseObjectUrl, waitForVisiblePaint } from "./objectUrlLifecycle";
 import { isVideoFile, videoMimeForFile } from "./videoFileType";
 
 /**
@@ -125,7 +126,7 @@ async function captureVideoPosterFrame(
       );
     }
 
-    await new Promise((resolve) => requestAnimationFrame(resolve));
+    await waitForVisiblePaint(document.visibilityState, requestAnimationFrame);
 
     if (video.videoWidth === 0 || video.videoHeight === 0) return null;
 
@@ -186,6 +187,9 @@ export function useMediaUpload({
   >([]);
   const queuedAttachmentsRef = React.useRef(queuedAttachments);
   queuedAttachmentsRef.current = queuedAttachments;
+  const releasedPreviewUrlsRef = React.useRef(new Set<string>());
+  const ownedPreviewUrlsRef = React.useRef(new Map<number, string>());
+  const activeQueuedIdsRef = React.useRef(new Set<number>());
   React.useEffect(() => {
     let unlisten: (() => void) | null = null;
     let cancelled = false;
@@ -301,6 +305,15 @@ export function useMediaUpload({
 
   const updateQueuedVideoPoster = React.useCallback(
     (id: number, posterUrl: string) => {
+      if (!activeQueuedIdsRef.current.has(id)) {
+        releaseObjectUrl(posterUrl, releasedPreviewUrlsRef.current);
+        return;
+      }
+      releaseObjectUrl(
+        ownedPreviewUrlsRef.current.get(id),
+        releasedPreviewUrlsRef.current,
+      );
+      ownedPreviewUrlsRef.current.set(id, posterUrl);
       setQueuedAttachmentsState((current) =>
         current.map((attachment) =>
           attachment.id === id
@@ -322,6 +335,8 @@ export function useMediaUpload({
         const previewUrl = file.type.startsWith("image/")
           ? URL.createObjectURL(file)
           : undefined;
+        activeQueuedIdsRef.current.add(id);
+        if (previewUrl) ownedPreviewUrlsRef.current.set(id, previewUrl);
         if (isVideoFile(file)) {
           void captureVideoPosterFrame(file).then((poster) => {
             if (poster) updateQueuedVideoPoster(id, poster.posterUrl);
@@ -336,24 +351,24 @@ export function useMediaUpload({
   );
 
   const removeQueuedAttachment = React.useCallback((id: number) => {
+    activeQueuedIdsRef.current.delete(id);
+    releaseObjectUrl(
+      ownedPreviewUrlsRef.current.get(id),
+      releasedPreviewUrlsRef.current,
+    );
+    ownedPreviewUrlsRef.current.delete(id);
     setQueuedAttachmentsState((current) => {
-      const removed = current.find((attachment) => attachment.id === id);
-      if (removed?.previewUrl?.startsWith("blob:")) {
-        URL.revokeObjectURL(removed.previewUrl);
-      }
       return current.filter((attachment) => attachment.id !== id);
     });
   }, []);
 
   const clearQueuedAttachments = React.useCallback(() => {
-    setQueuedAttachmentsState((current) => {
-      for (const attachment of current) {
-        if (attachment.previewUrl?.startsWith("blob:")) {
-          URL.revokeObjectURL(attachment.previewUrl);
-        }
-      }
-      return [];
-    });
+    for (const previewUrl of ownedPreviewUrlsRef.current.values()) {
+      releaseObjectUrl(previewUrl, releasedPreviewUrlsRef.current);
+    }
+    ownedPreviewUrlsRef.current.clear();
+    activeQueuedIdsRef.current.clear();
+    setQueuedAttachmentsState(() => []);
   }, []);
 
   const restoreQueuedAttachments = React.useCallback(
@@ -382,11 +397,11 @@ export function useMediaUpload({
 
   React.useEffect(
     () => () => {
-      for (const attachment of queuedAttachmentsRef.current) {
-        if (attachment.previewUrl?.startsWith("blob:")) {
-          URL.revokeObjectURL(attachment.previewUrl);
-        }
+      for (const previewUrl of ownedPreviewUrlsRef.current.values()) {
+        releaseObjectUrl(previewUrl, releasedPreviewUrlsRef.current);
       }
+      ownedPreviewUrlsRef.current.clear();
+      activeQueuedIdsRef.current.clear();
     },
     [],
   );
