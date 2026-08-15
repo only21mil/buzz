@@ -1,4 +1,5 @@
 import { register, type InvokeBody } from "./registry";
+import { registerIdentitySecretForEgressGuard } from "@/shared/lib/keyBackupEgress";
 import {
   displayNameForPubkey,
   generateSecretKey,
@@ -106,6 +107,7 @@ export class BrowserIdentityManager {
     this.deviceKey = deviceKey;
     this.durable = durable;
     this.recovery = recovery;
+    registerIdentitySecretForEgressGuard(secret);
   }
 
   static async create(
@@ -211,6 +213,7 @@ export class BrowserIdentityManager {
       await this.store.save(identity, key);
       this.secret.fill(0);
       this.secret = Uint8Array.from(imported);
+      registerIdentitySecretForEgressGuard(this.secret);
       this.deviceKey = key;
       this.durable = true;
       this.recovery = false;

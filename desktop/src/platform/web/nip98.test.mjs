@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { afterEach, test } from "node:test";
+import { nsecEncode } from "nostr-tools/nip19";
 
+import { registerIdentitySecretForEgressGuard } from "../../shared/lib/keyBackupEgress.ts";
 import { buildNip98Authorization, nip98Fetch } from "./nip98.ts";
 import { register, resetRegistryForTests } from "./registry.ts";
 
@@ -150,6 +152,31 @@ test("NIP-98 blocks encrypted key backups before signing or fetching", async () 
     }),
     /local key backup must never be transmitted/,
   );
+  assert.equal(calls, 0);
+});
+
+test("NIP-98 blocks plaintext identity secrets in request bodies", async () => {
+  const secret = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+  const rawSecret = Array.from(secret, (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  registerIdentitySecretForEgressGuard(secret);
+  let calls = 0;
+  register("sign_event", () => {
+    calls += 1;
+    throw new Error("must not sign");
+  });
+
+  for (const body of [nsecEncode(secret), rawSecret]) {
+    await assert.rejects(
+      buildNip98Authorization({
+        url: "https://relay.example.test/events",
+        method: "POST",
+        body,
+      }),
+      /local identity secret must never be transmitted/,
+    );
+  }
   assert.equal(calls, 0);
 });
 

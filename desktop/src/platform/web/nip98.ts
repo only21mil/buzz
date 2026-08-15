@@ -1,5 +1,5 @@
 import type { RelayEvent } from "@/shared/api/types";
-import { assertNoEncryptedKeyBackupEgress } from "@/shared/lib/keyBackupEgress";
+import { assertNoIdentityKeyEgress } from "@/shared/lib/keyBackupEgress";
 
 import { dispatch } from "./registry";
 
@@ -40,14 +40,14 @@ function requestBytes(
     : Uint8Array.from(body);
 }
 
-function assertNoKeyBackup(bytes: Uint8Array | undefined): void {
+function assertNoIdentityKey(bytes: Uint8Array | undefined): void {
   if (!bytes) return;
   const text = new TextDecoder().decode(bytes);
-  assertNoEncryptedKeyBackupEgress(text, "relay HTTP request");
+  assertNoIdentityKeyEgress(text, "relay HTTP request");
 }
 
-function assertNoKeyBackupText(value: string, context: string): void {
-  assertNoEncryptedKeyBackupEgress(value, context);
+function assertNoIdentityKeyText(value: string, context: string): void {
+  assertNoIdentityKeyEgress(value, context);
 }
 
 async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
@@ -74,9 +74,9 @@ function exactHttpUrl(value: string): string {
 
 function prepareRequest(request: Nip98Request): PreparedRequest {
   const url = exactHttpUrl(request.url);
-  assertNoKeyBackupText(url, "relay HTTP URL");
+  assertNoIdentityKeyText(url, "relay HTTP URL");
   const bytes = requestBytes(request.body);
-  assertNoKeyBackup(bytes);
+  assertNoIdentityKey(bytes);
   return {
     url,
     method: request.method.toUpperCase(),
@@ -152,8 +152,8 @@ export async function nip98Fetch(
   const prepared = prepareRequest(request);
   const headers = new Headers(request.headers);
   for (const [name, value] of headers) {
-    assertNoKeyBackupText(name, "relay HTTP header name");
-    assertNoKeyBackupText(value, "relay HTTP header value");
+    assertNoIdentityKeyText(name, "relay HTTP header name");
+    assertNoIdentityKeyText(value, "relay HTTP header value");
   }
   const authorization = await buildAuthorization(prepared, options);
   headers.set("Authorization", authorization);

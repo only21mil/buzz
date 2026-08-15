@@ -1,4 +1,4 @@
-import { assertNoEncryptedKeyBackupEgress } from "@/shared/lib/keyBackupEgress";
+import { assertNoIdentityKeyEgress } from "@/shared/lib/keyBackupEgress";
 
 import { register, type InvokeBody } from "./registry";
 
@@ -94,7 +94,7 @@ async function connect(body: InvokeBody): Promise<number> {
   if (typeof payload.url !== "string" || payload.url.length === 0) {
     throw new TypeError("plugin:websocket|connect requires a url");
   }
-  assertNoEncryptedKeyBackupEgress(payload.url, "websocket URL");
+  assertNoIdentityKeyEgress(payload.url, "websocket URL");
   const handler = resolveHandler(payload.onMessage);
   const socket = new WebSocket(payload.url);
   socket.binaryType = "arraybuffer";
@@ -199,7 +199,7 @@ function send(body: InvokeBody): void {
     if (typeof data !== "string") {
       throw new TypeError("WebSocket Text data must be a string");
     }
-    assertNoEncryptedKeyBackupEgress(data, "websocket text frame");
+    assertNoIdentityKeyEgress(data, "websocket text frame");
     const connection = connectionFor(payload.id);
     if (connection.socket.readyState !== WebSocket.OPEN) {
       throw new Error("WebSocket connection closed");
@@ -222,7 +222,7 @@ function send(body: InvokeBody): void {
       throw new TypeError("WebSocket Binary data must be a byte array");
     }
     const bytes = Uint8Array.from(data);
-    assertNoEncryptedKeyBackupEgress(
+    assertNoIdentityKeyEgress(
       new TextDecoder().decode(bytes),
       "websocket binary frame",
     );
@@ -252,7 +252,7 @@ function send(body: InvokeBody): void {
     ) {
       throw new TypeError("WebSocket Close data must contain code and reason");
     }
-    assertNoEncryptedKeyBackupEgress(data.reason, "websocket close reason");
+    assertNoIdentityKeyEgress(data.reason, "websocket close reason");
     connection.locallyClosed = true;
     connection.terminal = true;
     connections.delete(connection.id);

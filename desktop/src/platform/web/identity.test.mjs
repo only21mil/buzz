@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
 import { verifyEvent } from "nostr-tools/pure";
+import { assertNoIdentityKeyEgress } from "../../shared/lib/keyBackupEgress.ts";
 import {
   BrowserIdentityManager,
   registerIdentityCommands,
@@ -105,6 +106,31 @@ test("identity import persists before replacing the active signer", async () => 
     /storage write failed/,
   );
   assert.equal(manager.pubkey(), originalPubkey);
+});
+
+test("egress guard retains current and prior raw identity secrets only", async () => {
+  const manager = await BrowserIdentityManager.create(
+    new MemoryIdentityStore(),
+    new DirectNip49Codec(),
+  );
+  const prior = "01".padStart(64, "0");
+  const current = "02".padStart(64, "0");
+  const unrelated = "03".padStart(64, "0");
+
+  await manager.importIdentity(prior);
+  await manager.importIdentity(current);
+
+  assert.throws(
+    () => assertNoIdentityKeyEgress(prior, "test payload"),
+    /local identity secret must never be transmitted/,
+  );
+  assert.throws(
+    () => assertNoIdentityKeyEgress(current.toUpperCase(), "test payload"),
+    /local identity secret must never be transmitted/,
+  );
+  assert.doesNotThrow(() =>
+    assertNoIdentityKeyEgress(unrelated, "test event id"),
+  );
 });
 
 test("ncryptsec import decrypts then re-encrypts under the device key", async () => {
