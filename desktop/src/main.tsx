@@ -124,7 +124,7 @@ async function installBrowserPalIfConfigured() {
   }
 
   const { installBrowserPal } = await import("@/platform/web/bootStubs");
-  installBrowserPal();
+  await installBrowserPal();
 }
 
 async function bootstrap() {

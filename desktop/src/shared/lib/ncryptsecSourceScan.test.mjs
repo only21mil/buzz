@@ -40,6 +40,14 @@ const ALLOWLIST = [
   "features/settings/ui/BackupTestFlow.tsx",
   "features/settings/ui/EncryptedBackupCreator.tsx",
   "features/settings/ui/ProfileSettingsCard.tsx",
+  // Browser PAL identity boundary. These files encrypt/decrypt only inside the
+  // identity worker/store; relay egress remains guarded by keyBackupEgress.
+  "platform/web/identity.ts",
+  "platform/web/identity.worker.ts",
+  "platform/web/identityCrypto.ts",
+  "platform/web/identityStore.ts",
+  "platform/web/nip49Client.ts",
+  "platform/web/identity.test.mjs",
   // e2e-only mock bridge (never in the production bundle):
   "testing/e2eBridge.ts",
   // this scan:

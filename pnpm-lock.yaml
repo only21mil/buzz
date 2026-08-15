@@ -195,6 +195,9 @@ importers:
       motion:
         specifier: ^12.38.0
         version: 12.40.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+      nostr-tools:
+        specifier: ^2.23.3
+        version: 2.23.12(typescript@6.0.3)
       qrcode:
         specifier: ^1.5.4
         version: 1.5.4
@@ -277,9 +280,6 @@ importers:
       jsdom:
         specifier: ^27.4.0
         version: 27.4.0(@noble/hashes@2.2.0)
-      nostr-tools:
-        specifier: ^2.23.3
-        version: 2.23.12(typescript@6.0.3)
       postcss:
         specifier: ^8.5.8
         version: 8.5.19

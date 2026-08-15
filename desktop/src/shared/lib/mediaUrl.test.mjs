@@ -27,6 +27,28 @@ test("mediaProxyUrl: uses the IPv4 loopback literal for the localhost proxy", ()
   );
 });
 
+test("browser mode keeps relay media URLs direct and never starts the Tauri proxy", async () => {
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    location: {
+      href: "https://community.example/app/",
+      origin: "https://community.example",
+    },
+  };
+
+  try {
+    const mediaUrl = await import(`./mediaUrl.ts?browser=${Date.now()}`);
+    const source = `https://community.example/media/${HASH}.png`;
+    assert.equal(mediaUrl.rewriteRelayUrl(source), source);
+    assert.equal(mediaUrl.getCachedRelayOrigin(), "https://community.example");
+    assert.equal(mediaUrl.getCachedMediaProxyPort(), null);
+    mediaUrl.ensureRelayOriginFetch();
+    assert.equal(mediaUrl.getCachedMediaProxyPort(), null);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
 test("media-proxy port store: resolved port publishes and reset notifies subscribers", async () => {
   const previousWindow = globalThis.window;
   let notifications = 0;
