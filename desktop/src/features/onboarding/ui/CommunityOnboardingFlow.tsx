@@ -27,6 +27,7 @@ import { listPersonas } from "@/shared/api/tauriPersonas";
 import { relayClient } from "@/shared/api/relayClient";
 import type { AgentPersona } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
+import { publicAssetUrl } from "@/shared/lib/publicAssetUrl";
 import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
 import { Button } from "@/shared/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/shared/ui/dialog";
@@ -50,9 +51,9 @@ function isRelayMembershipDeniedError(error: unknown): boolean {
 }
 
 const STARTER_PERSONA_ANIMATIONS: Record<string, string> = {
-  Fizz: "/onboarding/starter-team/fizz.png",
-  Honey: "/onboarding/starter-team/honey.png",
-  Bumble: "/onboarding/starter-team/bumble.png",
+  Fizz: publicAssetUrl("onboarding/starter-team/fizz.png"),
+  Honey: publicAssetUrl("onboarding/starter-team/honey.png"),
+  Bumble: publicAssetUrl("onboarding/starter-team/bumble.png"),
 };
 
 /** Fade duration for the "entering" curtain over the mounting app. */

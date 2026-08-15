@@ -1,4 +1,5 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { publicAssetUrl } from "@/shared/lib/publicAssetUrl";
 
 /**
  * Raw binary invoke — uses Tauri's internal IPC for zero-copy ArrayBuffer transfer.
@@ -61,7 +62,7 @@ export async function setupAudioWorklet(
   }
 
   // Load the worklet processor (must live in public/ for Vite to serve it)
-  await audioContext.audioWorklet.addModule("/worklet.js");
+  await audioContext.audioWorklet.addModule(publicAssetUrl("worklet.js"));
 
   const source = audioContext.createMediaStreamSource(
     new MediaStream([audioTrack]),

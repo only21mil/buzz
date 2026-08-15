@@ -1,4 +1,5 @@
 import React, { type CSSProperties, useEffect, useRef, useState } from "react";
+import { publicAssetUrl } from "@/shared/lib/publicAssetUrl";
 
 export const POOF_TRIGGER_CLASS = "buzz-poof-trigger";
 export const POOF_ORIGIN_CLASS = "buzz-poof-origin";
@@ -6,14 +7,14 @@ export const POOF_POINTER_ORIGIN_CLASS = "buzz-poof-pointer-origin";
 
 export const POOF_DURATION_MS = 430;
 
-const POOF_SOUND_URL = "/pow/plop.m4a";
+const POOF_SOUND_URL = publicAssetUrl("pow/plop.m4a");
 const POOF_SIZE_SCALE = 0.6375;
 const POOF_FRAMES = [
-  { id: "poof-1", src: "/pow/poof1@3x.png" },
-  { id: "poof-2", src: "/pow/poof2@3x.png" },
-  { id: "poof-3", src: "/pow/poof3@3x.png" },
-  { id: "poof-4", src: "/pow/poof4@3x.png" },
-  { id: "poof-5", src: "/pow/poof5@3x.png" },
+  { id: "poof-1", src: publicAssetUrl("pow/poof1@3x.png") },
+  { id: "poof-2", src: publicAssetUrl("pow/poof2@3x.png") },
+  { id: "poof-3", src: publicAssetUrl("pow/poof3@3x.png") },
+  { id: "poof-4", src: publicAssetUrl("pow/poof4@3x.png") },
+  { id: "poof-5", src: publicAssetUrl("pow/poof5@3x.png") },
 ] as const;
 
 let poofAudio: HTMLAudioElement | null = null;

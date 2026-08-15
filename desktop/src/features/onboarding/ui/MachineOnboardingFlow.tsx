@@ -9,6 +9,7 @@ import {
   persistCurrentIdentity,
 } from "@/shared/api/tauriIdentity";
 import type { IdentityStorage } from "@/shared/api/types";
+import { publicAssetUrl } from "@/shared/lib/publicAssetUrl";
 import { Button } from "@/shared/ui/button";
 import {
   Dialog,
@@ -251,7 +252,7 @@ export function MachineOnboardingFlow({
               <img
                 alt="Buzz"
                 className="w-full max-w-[600px]"
-                src="/landing/buzz-wordmark.png"
+                src={publicAssetUrl("landing/buzz-wordmark.png")}
               />
               <p className="mt-2 max-w-[560px] text-center text-2xl font-normal leading-none text-foreground">
                 Your people, your agents, your projects —<br />
