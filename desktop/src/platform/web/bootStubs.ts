@@ -1,5 +1,6 @@
 import { registerNoopCommands } from "./noops";
 import { register } from "./registry";
+import { registerWebSocketCommands } from "./websocket";
 
 export const INACTIVE_HUDDLE_STATE = {
   phase: "idle",
@@ -41,4 +42,5 @@ export function registerBootStubs(): void {
 export function installBrowserPal(): void {
   registerNoopCommands();
   registerBootStubs();
+  registerWebSocketCommands();
 }

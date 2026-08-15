@@ -21,6 +21,9 @@ const SRC_ROOT = path.resolve(
 
 const ALLOWLIST = [
   "shared/api/tauriIdentity.ts",
+  // Central browser egress boundary; transport modules call this guard without
+  // learning the encrypted-backup representation.
+  "shared/lib/keyBackupEgress.ts",
   "features/onboarding/lib/encryptedBackup.ts",
   "features/onboarding/lib/encryptedBackup.test.mjs",
   "features/onboarding/lib/keyImportInput.ts",
