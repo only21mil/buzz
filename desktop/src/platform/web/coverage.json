@@ -1,5 +1,12 @@
 {
-  "implemented": [],
+  "implemented": [
+    "create_channel",
+    "ensure_starter_channels",
+    "get_channel_members",
+    "get_channels",
+    "get_profile",
+    "update_profile"
+  ],
   "noop": [],
   "capability-off": []
 }

@@ -5,7 +5,18 @@ import { registerRelayQueryCommands } from "./relayQueries.ts";
 import { dispatch, resetRegistryForTests } from "./registry.ts";
 
 const PUBKEY = "a".repeat(64);
-const identity = { pubkey: () => PUBKEY };
+const identity = {
+  pubkey: () => PUBKEY,
+  sign(request) {
+    return JSON.stringify({
+      ...request,
+      id: "signed-event",
+      pubkey: PUBKEY,
+      created_at: 100,
+      sig: "f".repeat(128),
+    });
+  },
+};
 
 function event({
   id,
@@ -60,6 +71,61 @@ test("get_profile returns authoritative kind-0 metadata", async () => {
     owner_pubkey: null,
     has_profile_event: true,
   });
+});
+
+test("update_profile read-merges, signs, publishes, and returns canonical metadata", async () => {
+  let profile = event({
+    id: "prior",
+    kind: 0,
+    createdAt: 10,
+    content: JSON.stringify({
+      display_name: "Old name",
+      name: "legacy-alias",
+      about: "kept",
+      nip05: "sats@example.test",
+    }),
+  });
+  const published = [];
+  const client = {
+    async fetchFirstEvent(filter) {
+      assert.deepEqual(filter, { kinds: [0], authors: [PUBKEY], limit: 1 });
+      return profile;
+    },
+    async fetchEvents() {
+      return [];
+    },
+    async publishEvent(signed, timeoutMessage, sendErrorMessage) {
+      published.push({ signed, timeoutMessage, sendErrorMessage });
+      profile = signed;
+      return signed;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(
+    await dispatch("update_profile", {
+      displayName: "Sats",
+      avatarUrl: "https://example.test/new.png",
+    }),
+    {
+      pubkey: PUBKEY,
+      display_name: "Sats",
+      avatar_url: "https://example.test/new.png",
+      about: "kept",
+      nip05_handle: "sats@example.test",
+      owner_pubkey: null,
+      has_profile_event: true,
+    },
+  );
+  assert.deepEqual(JSON.parse(published[0].signed.content), {
+    display_name: "Sats",
+    name: "legacy-alias",
+    picture: "https://example.test/new.png",
+    about: "kept",
+    nip05: "sats@example.test",
+  });
+  assert.equal(published[0].signed.kind, 0);
+  assert.deepEqual(published[0].signed.tags, []);
 });
 
 test("get_channels merges membership, metadata, visibility, and last-message events", async () => {
@@ -163,4 +229,148 @@ test("get_channels merges membership, metadata, visibility, and last-message eve
   assert.equal(channels[1].id, "open-channel");
   assert.equal(channels[1].is_member, false);
   assert.equal(calls.length, 4);
+});
+
+test("create_channel publishes kind 9007 and returns canonical metadata", async () => {
+  let createdId = null;
+  const client = {
+    async fetchEvents() {
+      return [];
+    },
+    async fetchFirstEvent(filter) {
+      if (filter.kinds[0] === 39000 && createdId) {
+        return event({
+          id: "metadata",
+          kind: 39000,
+          createdAt: 101,
+          tags: [
+            ["d", createdId],
+            ["name", "welcome"],
+            ["about", "Private welcome"],
+            ["private"],
+          ],
+        });
+      }
+      return null;
+    },
+    async publishEvent(signed) {
+      assert.equal(signed.kind, 9007);
+      createdId = signed.tags.find((tag) => tag[0] === "h")?.[1];
+      return signed;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  const channel = await dispatch("create_channel", {
+    name: "Welcome",
+    channelType: "stream",
+    visibility: "private",
+    description: "Private welcome",
+  });
+  assert.equal(channel.id, createdId);
+  assert.equal(channel.name, "welcome");
+  assert.equal(channel.visibility, "private");
+  assert.equal(channel.is_member, true);
+});
+
+test("get_channel_members maps NIP-29 p-tag roles", async () => {
+  const client = {
+    async fetchEvents() {
+      return [];
+    },
+    async fetchFirstEvent(filter) {
+      assert.deepEqual(filter, {
+        kinds: [39002],
+        "#d": ["channel-id"],
+        limit: 1,
+      });
+      return event({
+        id: "members",
+        kind: 39002,
+        createdAt: 10,
+        tags: [
+          ["d", "channel-id"],
+          ["p", PUBKEY, "", "owner"],
+          ["p", "b".repeat(64), "", "bot"],
+        ],
+      });
+    },
+    async publishEvent(signed) {
+      return signed;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(
+    await dispatch("get_channel_members", { channelId: "channel-id" }),
+    {
+      members: [
+        {
+          pubkey: PUBKEY,
+          role: "owner",
+          is_agent: false,
+          joined_at: null,
+          display_name: null,
+        },
+        {
+          pubkey: "b".repeat(64),
+          role: "bot",
+          is_agent: true,
+          joined_at: null,
+          display_name: null,
+        },
+      ],
+      next_cursor: null,
+    },
+  );
+});
+
+test("ensure_starter_channels joins an existing public starter channel", async () => {
+  const published = [];
+  const client = {
+    async fetchEvents(filter) {
+      if (filter.kinds[0] === 39000) {
+        return [
+          event({
+            id: "general-metadata",
+            kind: 39000,
+            createdAt: 10,
+            tags: [["d", "general-id"], ["name", "general"], ["public"]],
+          }),
+          event({
+            id: "welcome-metadata",
+            kind: 39000,
+            createdAt: 10,
+            tags: [
+              ["d", "welcome-id"],
+              ["name", "welcome-everyone"],
+              ["public"],
+            ],
+          }),
+        ];
+      }
+      return [];
+    },
+    async fetchFirstEvent() {
+      return null;
+    },
+    async publishEvent(signed) {
+      published.push(signed);
+      return signed;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  const channels = await dispatch("ensure_starter_channels");
+  assert.deepEqual(
+    published.map((event) => [event.kind, event.tags]),
+    [
+      [9021, [["h", "general-id"]]],
+      [9021, [["h", "welcome-id"]]],
+    ],
+  );
+  assert.equal(
+    channels.every((channel) => channel.is_member),
+    true,
+  );
 });
