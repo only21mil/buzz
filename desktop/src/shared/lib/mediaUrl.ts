@@ -15,7 +15,7 @@
  * (the Buzz relay), resulting in 404s.
  */
 
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 
 // Matches: https://anything.com/media/{64-hex}.{ext}
 // Also matches thumbnails: /media/{64-hex}.thumb.jpg
@@ -30,10 +30,14 @@ let portPromise: Promise<number | null> | null = null;
  * Cached relay origin (e.g. "https://buzz-oss.stage.blox.sqprod.co"),
  * canonicalized via {@link canonicalOrigin} so comparisons are stable.
  */
+export function isWebMediaBuild(mode: string | undefined): boolean {
+  return mode === "web";
+}
+
 const browserRuntime =
   typeof window !== "undefined" &&
   typeof window.location?.href === "string" &&
-  !isTauri();
+  isWebMediaBuild(import.meta.env?.MODE);
 let cachedRelayOrigin: string | null = browserRuntime
   ? canonicalOrigin(window.location.href)
   : null;
