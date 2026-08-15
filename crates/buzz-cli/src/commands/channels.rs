@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use buzz_core::kind::{KIND_MANAGED_AGENT, KIND_TEAM};
+use buzz_core::kind::{KIND_AGENT_PROFILE, KIND_MANAGED_AGENT, KIND_TEAM};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1032,18 +1032,126 @@ pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(),
         }
     }
 
-    let content = serde_json::json!({ "channel_add_policy": policy }).to_string();
-    use nostr::{EventBuilder, Kind};
-    let builder = EventBuilder::new(
-        Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
-        &content,
-    )
-    .tags([]);
+    let author = client.keys().public_key().to_hex();
+    let events = client
+        .query_all(serde_json::json!({
+            "authors": [author],
+            "kinds": [KIND_AGENT_PROFILE],
+        }))
+        .await?;
+    let existing = latest_agent_profile_event(&events);
+    let (content, mut tags) = merge_agent_profile_policy(existing, policy)?;
+    // `sign_event` injects the configured owner auth tag. Drop only a stale
+    // copied auth tag so the republished event contains one current attestation
+    // while retaining every other existing tag verbatim.
+    if client.auth_tag_owner_hex().is_some() {
+        tags.retain(|tag| tag.as_slice().first().map(String::as_str) != Some("auth"));
+    }
+    use nostr::{EventBuilder, Kind, Timestamp};
+    let mut builder =
+        EventBuilder::new(Kind::Custom(KIND_AGENT_PROFILE as u16), &content).tags(tags);
+    if let Some(existing) = existing {
+        if let Some(created_at) = existing
+            .get("created_at")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let created_at = created_at.saturating_add(1).max(Timestamp::now().as_secs());
+            builder = builder.custom_created_at(Timestamp::from(created_at));
+        }
+    }
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
+}
+
+fn latest_agent_profile_event(events: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    events.iter().max_by(|left, right| {
+        left.get("created_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .cmp(
+                &right
+                    .get("created_at")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+            .then_with(|| {
+                left.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .cmp(
+                        right
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                    )
+            })
+    })
+}
+
+/// Merge a policy update into the latest kind:10100 content while retaining
+/// every other field and tag. A missing profile starts with the bare policy
+/// record, preserving the existing command's first-publish behavior.
+fn merge_agent_profile_policy(
+    existing: Option<&serde_json::Value>,
+    policy: &str,
+) -> Result<(String, Vec<nostr::Tag>), CliError> {
+    let mut content = match existing {
+        Some(event) => {
+            let raw = event
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| CliError::Other("kind:10100 event is missing content".into()))?;
+            serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
+                CliError::Other(format!(
+                    "existing kind:10100 content is invalid JSON: {error}"
+                ))
+            })?
+        }
+        None => serde_json::json!({}),
+    };
+    let object = content.as_object_mut().ok_or_else(|| {
+        CliError::Other("existing kind:10100 content must be a JSON object".into())
+    })?;
+    object.insert(
+        "channel_add_policy".to_string(),
+        serde_json::Value::String(policy.to_string()),
+    );
+
+    let tags = existing
+        .map(|event| {
+            let raw_tags = event
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| CliError::Other("kind:10100 event is missing tags".into()))?;
+            raw_tags
+                .iter()
+                .map(|raw_tag| {
+                    let values = raw_tag.as_array().ok_or_else(|| {
+                        CliError::Other("kind:10100 event contains an invalid tag".into())
+                    })?;
+                    let values = values
+                        .iter()
+                        .map(|value| {
+                            value.as_str().map(str::to_string).ok_or_else(|| {
+                                CliError::Other(
+                                    "kind:10100 event contains a non-string tag value".into(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    nostr::Tag::parse(values).map_err(|error| {
+                        CliError::Other(format!("invalid kind:10100 tag: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, CliError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok((content.to_string(), tags))
 }
 
 pub async fn cmd_set_canvas(
@@ -1177,9 +1285,9 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
 mod tests {
     use super::{
         apply_cardinality_rule, build_template_report, cmd_set_add_policy,
-        finalize_roster_resolution, name_matches, resolve_roster_with_archive_filter,
-        validate_ttl_seconds, ArchivedExclusion, ChannelSummary, ResolvedAgent, RosterResolution,
-        SkippedSlug,
+        finalize_roster_resolution, merge_agent_profile_policy, name_matches,
+        resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion,
+        ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
     };
     use crate::client::BuzzClient;
     use crate::CliError;
@@ -1340,6 +1448,28 @@ mod tests {
             result.is_ok(),
             "empty allowed list should permit any policy: {result:?}"
         );
+    }
+
+    #[test]
+    fn set_add_policy_merges_existing_profile_and_preserves_tags() {
+        let existing = json!({
+            "id": "a".repeat(64),
+            "created_at": 10,
+            "content": "{\"display_name\":\"Scout\",\"channel_ids\":[\"channel-1\"],\"custom\":{\"keep\":true}}",
+            "tags": [["d", "profile"], ["custom", "preserve"]]
+        });
+
+        let (content, tags) = merge_agent_profile_policy(Some(&existing), "nobody")
+            .expect("existing profile should merge");
+        let content: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+
+        assert_eq!(content["channel_add_policy"], "nobody");
+        assert_eq!(content["display_name"], "Scout");
+        assert_eq!(content["channel_ids"], json!(["channel-1"]));
+        assert_eq!(content["custom"]["keep"], true);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].as_slice(), ["d", "profile"]);
+        assert_eq!(tags[1].as_slice(), ["custom", "preserve"]);
     }
 
     // --- Integration test: full env-var → cmd_set_add_policy() path ---
