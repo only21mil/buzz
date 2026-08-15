@@ -120,6 +120,14 @@ struct PromoteOutput {
     github_main: String,
 }
 
+struct PromoteRequest<'a> {
+    base: &'a str,
+    head: &'a str,
+    source_ref: &'a str,
+    ci_ref: &'a str,
+    required_checks: &'a [String],
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct CheckRunsResponse {
     check_runs: Vec<CheckRun>,
@@ -370,7 +378,7 @@ fn write_github_askpass(path: &std::path::Path) -> Result<(), CliError> {
             .map_err(|_| CliError::Other("failed to prepare GitHub authentication".into()))?;
         file.write_all(GITHUB_ASKPASS.as_bytes())
             .map_err(|_| CliError::Other("failed to prepare GitHub authentication".into()))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -442,7 +450,7 @@ impl GitRepo {
                 command
                     .env("GIT_ASKPASS", &self.askpass)
                     .env("GIT_ASKPASS_REQUIRE", "force")
-                    .env(&self.github_auth.variable, &self.github_auth.token);
+                    .env(self.github_auth.variable, &self.github_auth.token);
             }
         }
         command
@@ -930,12 +938,15 @@ async fn execute_promote(
     remotes: &RepoRemotes,
     buzz_auth: GitAuth,
     github_auth: GitHubAuth,
-    base: &str,
-    head: &str,
-    source_ref: &str,
-    ci_ref: &str,
-    required_checks: &[String],
+    request: PromoteRequest<'_>,
 ) -> Result<PromoteOutput, CliError> {
+    let PromoteRequest {
+        base,
+        head,
+        source_ref,
+        ci_ref,
+        required_checks,
+    } = request;
     if required_checks.is_empty() {
         return Err(CliError::Usage(
             "at least one --required-check must be provided".into(),
@@ -1220,11 +1231,13 @@ pub async fn cmd_promote(
         &remotes,
         auth_from_client(client),
         github_auth_from_env()?,
-        &base,
-        &head,
-        &source_ref,
-        &ci_ref,
-        required_checks,
+        PromoteRequest {
+            base: &base,
+            head: &head,
+            source_ref: &source_ref,
+            ci_ref: &ci_ref,
+            required_checks,
+        },
     )
     .await?;
     println!(
