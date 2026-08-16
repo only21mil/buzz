@@ -150,6 +150,49 @@ test("relay canonicalization normalizes authority but preserves path and query c
   );
 });
 
+test("credential-bearing relay authorities cannot collide with an uncredentialed scope", () => {
+  const plainRelay = canonicalSnapshotRelayUrl(RELAY);
+  assert.equal(plainRelay, RELAY);
+
+  for (const relayUrl of [
+    "wss://:pass@relay.example.com",
+    "wss://user@relay.example.com",
+    "wss://user:pass@relay.example.com",
+    "wss://@relay.example.com",
+  ]) {
+    const credentialRelay = canonicalSnapshotRelayUrl(relayUrl);
+    assert.equal(credentialRelay, "");
+    assert.notEqual(credentialRelay, plainRelay);
+    assert.equal(
+      captureMessageSnapshotScope(relayUrl, SIGNER_A, "chan-1"),
+      null,
+    );
+  }
+});
+
+test("malformed Unicode is rejected before key construction without rejecting safe Unicode", () => {
+  for (const malformed of ["channel-\ud800", "channel-\udc00"]) {
+    let captured;
+    assert.doesNotThrow(() => {
+      captured = captureMessageSnapshotScope(RELAY, SIGNER_A, malformed);
+    });
+    assert.equal(captured, null);
+  }
+
+  assert.equal(
+    canonicalSnapshotRelayUrl("wss://relay.example.com/path/\ud800"),
+    "",
+  );
+
+  const channelId = "caf\u00e9/\ud83d\ude80:\u6771\u4eac";
+  const captured = scope(SIGNER_A, channelId);
+  assert.doesNotThrow(() => messageSnapshotKey(captured));
+  assert.equal(
+    messageSnapshotKey(captured),
+    `buzz-channel-messages.v3:${encodeURIComponent(RELAY)}:${SIGNER_A}:${encodeURIComponent(channelId)}`,
+  );
+});
+
 test("scope capture rejects malformed identity or empty channel input", () => {
   assert.equal(
     captureMessageSnapshotScope(RELAY, "not-a-pubkey", "chan"),

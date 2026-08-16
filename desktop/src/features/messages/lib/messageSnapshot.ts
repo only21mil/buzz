@@ -22,6 +22,7 @@ const PREVIOUS_STORAGE_KEY_PREFIX = "buzz-channel-messages.v2";
 const LEGACY_STORAGE_KEY_PREFIX = "buzz-channel-messages.v1";
 const HEX_64_RE = /^[0-9a-f]{64}$/;
 const HEX_128_RE = /^[0-9a-f]{128}$/;
+const AUTHORITY_USERINFO_RE = /^[a-z][a-z\d+.-]*:\/\/[^/?#\\]*@/i;
 const EVENT_KEYS = new Set([
   "id",
   "pubkey",
@@ -70,8 +71,18 @@ type SnapshotPayload = {
   events: RelayEvent[];
 };
 
+function isUriComponentEncodable(value: string): boolean {
+  try {
+    encodeURIComponent(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Canonical relay identity for snapshots without lowercasing path/query data. */
 export function canonicalSnapshotRelayUrl(relayUrl: string): string {
+  if (!isUriComponentEncodable(relayUrl)) return "";
   const trimmed = relayUrl.trim();
   if (trimmed.length === 0) return "";
   const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed)
@@ -79,13 +90,15 @@ export function canonicalSnapshotRelayUrl(relayUrl: string): string {
     : `wss://${trimmed}`;
   try {
     const parsed = new URL(candidate);
-    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return "";
+    if (
+      (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") ||
+      AUTHORITY_USERINFO_RE.test(candidate)
+    ) {
+      return "";
+    }
     parsed.protocol = parsed.protocol.toLowerCase();
     parsed.hostname = parsed.hostname.toLowerCase();
-    const credentials = parsed.username
-      ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ""}@`
-      : "";
-    const authority = `${parsed.protocol}//${credentials}${parsed.host}`;
+    const authority = `${parsed.protocol}//${parsed.host}`;
     const path = parsed.pathname === "/" ? "" : parsed.pathname;
     return `${authority}${path}${parsed.search}${parsed.hash}`;
   } catch {
@@ -104,7 +117,8 @@ function canonicalScope(
     canonicalRelay.length === 0 ||
     !HEX_64_RE.test(canonicalSigner) ||
     channelId.length === 0 ||
-    channelId !== channelId.trim()
+    channelId !== channelId.trim() ||
+    !isUriComponentEncodable(channelId)
   ) {
     return null;
   }
