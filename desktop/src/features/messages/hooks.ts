@@ -427,6 +427,11 @@ export function useChannelSubscription(channel: Channel | null) {
     useState<ChannelSubscriptionGeneration | null>(null);
   const refreshNewestWindow = useEffectEvent(
     async (token: ChannelSubscriptionGeneration) => {
+      await queryClient.cancelQueries({
+        queryKey: channelMessagesKey(token.channelId),
+        exact: true,
+      });
+      if (!token.guard.current) return;
       await refreshChannelWindowMessages(
         queryClient,
         token.channelId,

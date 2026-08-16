@@ -363,6 +363,68 @@ test("channel windows wait for subscription readiness and reconnect once", async
   await harness.unmount();
 });
 
+test("reconnect during a cold head request starts a fresh authoritative request", async () => {
+  const selected = channel("channel-a");
+  const staleEvent = relayEvent(selected.id, "1");
+  const freshEvent = relayEvent(selected.id, "2");
+  const firstRequest = deferred();
+  const secondRequest = deferred();
+  let windowCalls = 0;
+  installChannelWindowInvoke(async () => {
+    windowCalls += 1;
+    return windowCalls === 1 ? firstRequest.promise : secondRequest.promise;
+  });
+  const relay = installRelayStub();
+  const harness = mountHarness(selected);
+
+  await harness.mount();
+  await relay.markReady(selected.id);
+  await waitForCondition(
+    () => windowCalls === 1,
+    "initial cold head request did not start",
+  );
+
+  await relay.reconnect();
+  await waitForCondition(
+    () => windowCalls === 2,
+    "reconnect did not start a distinct head request",
+  );
+
+  await resolveDeferred(
+    firstRequest,
+    channelWindowResponse(selected.id, [staleEvent]),
+  );
+  const messagesAfterStale =
+    harness.queryClient.getQueryData(["channel-messages", selected.id]) ?? [];
+  assert.equal(
+    messagesAfterStale.some((event) => event.id === staleEvent.id),
+    false,
+    "the cancelled pre-reconnect request must not update the cache",
+  );
+
+  await resolveDeferred(
+    secondRequest,
+    channelWindowResponse(selected.id, [freshEvent]),
+  );
+  await waitForCondition(
+    () => harness.queryClient.isFetching() === 0,
+    "fresh reconnect head request did not settle",
+  );
+  const settledMessages = harness.queryClient.getQueryData([
+    "channel-messages",
+    selected.id,
+  ]);
+  assert.equal(
+    settledMessages.filter((event) => event.id === freshEvent.id).length,
+    1,
+  );
+  assert.equal(
+    settledMessages.some((event) => event.id === staleEvent.id),
+    false,
+  );
+  await harness.unmount();
+});
+
 test("StrictMode effect replay keeps only the current subscription generation", async () => {
   const windowCalls = [];
   installChannelWindowInvoke(async (args) => {
