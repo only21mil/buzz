@@ -29,7 +29,6 @@ const COMMANDS = [
     name: "get_project_repo_diff",
     value: { files: [], additions: 0, deletions: 0, commit_body: null },
   },
-  { name: "get_project_repo_snapshot", mode: "throw" },
   {
     name: "get_project_repo_sync_status",
     value: {
