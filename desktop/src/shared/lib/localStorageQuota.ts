@@ -9,6 +9,7 @@
 
 const PURE_CACHE_KEY_PREFIXES = [
   "buzz-channel-messages.v1:",
+  "buzz-channel-messages.v2:",
   "buzz-channels.v1:",
   "buzz-observed-unread.v1:",
   "buzz-sidebar-skeleton-shape.v1:",

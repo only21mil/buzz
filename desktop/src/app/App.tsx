@@ -438,11 +438,12 @@ function CommunityApp({
     if (transaction.previousCommunityId) {
       await transitionCommunity(transaction.previousCommunityId);
     }
-    removeCommunity(transaction.communityId);
+    removeCommunity(transaction.communityId, currentPubkey ?? "");
   }, [
     clearCommunities,
     communities.length,
     communityOnboarding,
+    currentPubkey,
     removeCommunity,
     transitionCommunity,
   ]);

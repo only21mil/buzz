@@ -37,6 +37,7 @@ test("startup recovery removes disposable caches but preserves user state", () =
   const ls = makeQuotaLocalStorage({ maxEntries: 6 });
   install(ls);
   ls.store.set("buzz-channel-messages.v1:relay:chan", "big");
+  ls.store.set("buzz-channel-messages.v2:relay:signer:chan", "big");
   ls.store.set("buzz-channels.v1:relay", "big");
   ls.store.set("buzz-timeline-skeleton-shape.v1:chan", "small");
   ls.store.set("buzz-sidebar-skeleton-shape.v1:community:user", "small");
@@ -46,6 +47,7 @@ test("startup recovery removes disposable caches but preserves user state", () =
   recoverLocalStorageQuotaOnStartup();
 
   assert.equal(ls.getItem("buzz-channel-messages.v1:relay:chan"), null);
+  assert.equal(ls.getItem("buzz-channel-messages.v2:relay:signer:chan"), null);
   assert.equal(ls.getItem("buzz-channels.v1:relay"), null);
   assert.equal(ls.getItem("buzz-timeline-skeleton-shape.v1:chan"), null);
   assert.equal(
