@@ -15,7 +15,13 @@ import { registerRelayQueryCommands } from "./relayQueries";
 import { installMediaAuthServiceWorker } from "./mediaAuth";
 import { registerMediaCommands } from "./mediaUpload";
 import { registerOnboardingCommands } from "./onboarding";
+import { registerRelayCanvasCommands } from "./relayCanvas";
+import { registerRelayDmCommands } from "./relayDms";
+import { registerRelayPeopleCommands } from "./relayPeople";
 import { register } from "./registry";
+import { registerRelaySocialCommands } from "./relaySocial";
+import { registerLinkPreviewCommands } from "./webLinkPreview";
+import { registerWebMediaTransferCommands } from "./webMediaTransfer";
 import { registerWebSocketCommands } from "./websocket";
 import { BrowserWorkspace, registerWorkspaceCommands } from "./workspace";
 
@@ -70,6 +76,10 @@ export async function installBrowserPal(): Promise<void> {
   registerRelayDiscoveryCommands();
   registerRelayMembershipCommands(identity);
   registerRelayMessageReadCommands();
+  registerRelayPeopleCommands(identity);
+  registerRelayDmCommands(identity);
+  registerRelayCanvasCommands(identity);
+  registerRelaySocialCommands(identity);
   registerMediaCommands();
   registerTerminalGitMeshPairingCommands();
   registerHuddleVoiceTtsCommands();
@@ -77,5 +87,7 @@ export async function installBrowserPal(): Promise<void> {
   registerRelaySocialConfigCommands(identity);
   registerRelayWorkflowsMembersCommands(identity);
   registerRelayCryptoSocialCommands(identity);
+  registerWebMediaTransferCommands();
+  registerLinkPreviewCommands();
   await installMediaAuthServiceWorker();
 }
