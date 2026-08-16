@@ -27,8 +27,8 @@ function harness(events = []) {
     },
   };
   const client = {
-    async fetchEvents(filter) {
-      filters.push(filter);
+    async queryEvents(queryFilters) {
+      filters.push(queryFilters);
       return events;
     },
     async publishEvent(event, timeoutMessage, sendErrorMessage) {
@@ -169,16 +169,26 @@ test("remove_reaction queries the caller's reaction and deletes its event", asyn
       content: " 👍 ",
       sig: "f".repeat(128),
     },
+    {
+      id: "1".repeat(64),
+      pubkey: PUBKEY,
+      created_at: 80,
+      kind: 7,
+      tags: [["e", EVENT_ID]],
+      content: "👍",
+      sig: "f".repeat(128),
+    },
   ]);
   await dispatch("remove_reaction", { eventId: ` ${EVENT_ID} `, emoji: "👍" });
 
   assert.deepEqual(filters, [
-    {
-      kinds: [7],
-      "#e": [EVENT_ID],
-      authors: [PUBKEY],
-      limit: 1000,
-    },
+    [
+      {
+        kinds: [7],
+        "#e": [EVENT_ID],
+        authors: [PUBKEY],
+      },
+    ],
   ]);
   assert.deepEqual(signed[0], {
     kind: 5,

@@ -1,12 +1,11 @@
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
+import { queryBridge, type QueryBridgeClient } from "./relayQueries";
 import { register, type InvokeBody } from "./registry";
 
-type MutationRelayClient = Pick<
-  typeof relayClient,
-  "fetchEvents" | "publishEvent"
->;
+type MutationRelayClient = Pick<typeof relayClient, "publishEvent"> &
+  QueryBridgeClient;
 
 type ObjectBody = Record<string, unknown>;
 
@@ -318,12 +317,13 @@ async function removeReaction(
   const input = objectBody(body, "remove_reaction");
   const target = requiredString(input, "eventId").trim();
   const emoji = requiredString(input, "emoji").trim();
-  const reactions = await client.fetchEvents({
-    kinds: [7],
-    "#e": [target],
-    authors: [identity.pubkey()],
-    limit: 1000,
-  });
+  const reactions = await queryBridge(client, [
+    {
+      kinds: [7],
+      "#e": [target],
+      authors: [identity.pubkey()],
+    },
+  ]);
   const reaction = reactions.find((event) => event.content.trim() === emoji);
   if (!reaction) {
     throw new Error("could not find your reaction event for this emoji");

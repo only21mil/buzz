@@ -4,14 +4,17 @@ import type { BrowserIdentityManager } from "./identity";
 import { nip98Fetch } from "./nip98";
 import { dispatch, register } from "./registry";
 
-type RelayQueryClient = Pick<
-  typeof relayClient,
-  "fetchEvents" | "fetchFirstEvent" | "publishEvent"
-> & {
+export type QueryBridgeClient = {
   queryEvents?: (
     filters: Array<Record<string, unknown>>,
   ) => Promise<RelayEvent[]>;
 };
+
+type RelayQueryClient = Pick<
+  typeof relayClient,
+  "fetchEvents" | "fetchFirstEvent" | "publishEvent"
+> &
+  QueryBridgeClient;
 
 type ObjectBody = Record<string, unknown>;
 
@@ -165,8 +168,8 @@ function isoTimestamp(seconds: number): string {
   return new Date(seconds * 1000).toISOString();
 }
 
-async function queryBridge(
-  client: RelayQueryClient,
+export async function queryBridge(
+  client: QueryBridgeClient,
   filters: Array<Record<string, unknown>>,
 ): Promise<RelayEvent[]> {
   if (client.queryEvents) return client.queryEvents(filters);

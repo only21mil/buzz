@@ -1,12 +1,10 @@
 import { relayClient } from "@/shared/api/relayClient";
-import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
+import { queryBridge, type QueryBridgeClient } from "./relayQueries";
 import { register } from "./registry";
 
-type RelayDiscoveryClient = Pick<typeof relayClient, "fetchEvents">;
+type RelayDiscoveryClient = QueryBridgeClient;
 type ObjectBody = Record<string, unknown>;
-
-const FORUM_QUERY_LIMIT = 500;
 
 function objectBody(body: unknown, command: string): ObjectBody {
   if (
@@ -56,14 +54,6 @@ function firstTagValue(event: RelayEvent, name: string): string | null {
   return event.tags.find((tag) => tag[0] === name)?.[1] ?? null;
 }
 
-function byNewestFirst(left: RelayEvent, right: RelayEvent): number {
-  return right.created_at - left.created_at || left.id.localeCompare(right.id);
-}
-
-function byOldestFirst(left: RelayEvent, right: RelayEvent): number {
-  return left.created_at - right.created_at || left.id.localeCompare(right.id);
-}
-
 function suppressionTargets(
   originals: RelayEvent[],
   edits: RelayEvent[],
@@ -79,6 +69,8 @@ function suppressionTargets(
     }
     const targetId = firstTagValue(edit, "e");
     const target = targetId ? originalsById.get(targetId) : undefined;
+    // The browser can verify author-signed suppression. Unlike the Rust path,
+    // it cannot also verify a NIP-OA owner without an owner key in this API.
     if (target && target.pubkey === edit.pubkey) suppressed.add(target.id);
   }
   return suppressed;
@@ -101,11 +93,12 @@ async function fetchSuppressedTargets(
 ): Promise<Set<string>> {
   if (events.length === 0) return new Set();
   try {
-    const edits = await client.fetchEvents({
-      kinds: [40003],
-      "#e": events.map((event) => event.id),
-      limit: Math.min(FORUM_QUERY_LIMIT, Math.max(100, events.length * 4)),
-    });
+    const edits = await queryBridge(client, [
+      {
+        kinds: [40003],
+        "#e": events.map((event) => event.id),
+      },
+    ]);
     return suppressionTargets(events, edits);
   } catch {
     // Link-preview edits are optional enrichment in the desktop command.
@@ -176,7 +169,7 @@ export async function getForumPosts(
 ) {
   const input = objectBody(body, "get_forum_posts");
   const channelId = requiredString(input, "channelId");
-  const filter: RelaySubscriptionFilter = {
+  const filter: Record<string, unknown> = {
     kinds: [45001],
     "#h": [channelId],
     limit: optionalLimit(input, 20),
@@ -184,7 +177,7 @@ export async function getForumPosts(
   const before = optionalInteger(input, "before");
   if (before !== undefined) filter.until = before;
 
-  const events = (await client.fetchEvents(filter)).sort(byNewestFirst);
+  const events = await queryBridge(client, [filter]);
   const suppressed = await fetchSuppressedTargets(events, client);
   const messages = events.map((event) =>
     forumPost(event, channelId, suppressed),
@@ -202,30 +195,25 @@ export async function getForumThread(
   const input = objectBody(body, "get_forum_thread");
   const channelId = requiredString(input, "channelId");
   const eventId = requiredString(input, "eventId");
-  // The desktop command currently ignores its limit/cursor arguments. Keep
-  // that contract while bounding the WebSocket REQ at the relay maximum.
+  // The desktop command currently ignores its limit/cursor arguments.
   optionalLimit(input, 20);
   optionalString(input, "cursor");
-  const [roots, replyEvents] = await Promise.all([
-    client.fetchEvents({
+  const events = await queryBridge(client, [
+    {
       ids: [eventId],
       kinds: [9, 40002, 45001, 45003],
       limit: 1,
-    }),
-    client.fetchEvents({
+    },
+    {
       kinds: [9, 45003],
       "#e": [eventId],
       "#h": [channelId],
-      limit: FORUM_QUERY_LIMIT,
-    }),
+    },
   ]);
-  const root = roots.find((event) => event.id === eventId);
+  const root = events.find((event) => event.id === eventId);
   if (!root) throw new Error("forum thread root event not found");
 
-  const replies = replyEvents
-    .filter((event) => event.id !== eventId)
-    .sort(byOldestFirst);
-  const events = [root, ...replies];
+  const replies = events.filter((event) => event.id !== eventId);
   const suppressed = await fetchSuppressedTargets(events, client);
   return {
     root: forumPost(root, channelId, suppressed),
@@ -238,7 +226,7 @@ export async function getForumThread(
 }
 
 export function registerRelayDiscoveryCommands(
-  client: RelayDiscoveryClient = relayClient,
+  client: RelayDiscoveryClient = relayClient as RelayDiscoveryClient,
 ): void {
   register("get_forum_posts", (body) => getForumPosts(body, client));
   register("get_forum_thread", (body) => getForumThread(body, client));

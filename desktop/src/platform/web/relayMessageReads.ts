@@ -1,13 +1,11 @@
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
-import type { RelayEvent } from "@/shared/api/types";
 import { KIND_HUDDLE_STARTED } from "@/shared/constants/kinds";
+import { queryBridge, type QueryBridgeClient } from "./relayQueries";
 import { register } from "./registry";
 
-type RelayMessageReadClient = Pick<
-  typeof relayClient,
-  "fetchEvents" | "fetchFirstEvent"
->;
+type RelayMessageReadClient = Pick<typeof relayClient, "fetchFirstEvent"> &
+  QueryBridgeClient;
 
 type ObjectBody = Record<string, unknown>;
 
@@ -20,10 +18,6 @@ type MessageReadFilter = RelaySubscriptionFilter & {
   depth_limit?: number;
   thread_cursor?: number;
   thread_cursor_id?: string;
-  top_level?: boolean;
-  include_summaries?: boolean;
-  include_aux?: boolean;
-  before_id?: string;
 };
 
 const TIMELINE_KINDS = [
@@ -132,7 +126,7 @@ export async function getThreadReplies(
     filter.thread_cursor_id = cursor.event_id;
   }
 
-  const events = await client.fetchEvents(filter);
+  const events = await queryBridge(client, [filter]);
   const lastEvent = events.at(-1);
   return {
     events,
@@ -141,28 +135,6 @@ export async function getThreadReplies(
         ? { created_at: lastEvent.created_at, event_id: lastEvent.id }
         : null,
   };
-}
-
-export async function getChannelWindow(
-  body: unknown,
-  client: RelayMessageReadClient,
-): Promise<RelayEvent[]> {
-  const input = objectBody(body, "get_channel_window");
-  const cap = Math.min(optionalUnsignedInteger(input, "limitRows") ?? 50, 200);
-  const cursor = optionalCursor(input);
-  const filter: MessageReadFilter = {
-    "#h": [requiredString(input, "channelId")],
-    kinds: [...TIMELINE_KINDS],
-    limit: cap,
-    top_level: true,
-    include_summaries: true,
-    include_aux: true,
-  };
-  if (cursor) {
-    filter.until = cursor.created_at;
-    filter.before_id = cursor.event_id;
-  }
-  return client.fetchEvents(filter);
 }
 
 export async function getEvent(
@@ -183,6 +155,5 @@ export function registerRelayMessageReadCommands(
   client: RelayMessageReadClient = relayClient,
 ): void {
   register("get_thread_replies", (body) => getThreadReplies(body, client));
-  register("get_channel_window", (body) => getChannelWindow(body, client));
   register("get_event", (body) => getEvent(body, client));
 }

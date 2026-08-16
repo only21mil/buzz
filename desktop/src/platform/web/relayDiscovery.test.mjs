@@ -27,7 +27,7 @@ function event({
 
 afterEach(() => resetRegistryForTests());
 
-test("get_forum_posts pages newest-first and applies author link suppression", async () => {
+test("get_forum_posts preserves relay order and applies author link suppression", async () => {
   const calls = [];
   const older = event({
     id: "older",
@@ -44,9 +44,9 @@ test("get_forum_posts pages newest-first and applies author link suppression", a
     content: "Newer",
   });
   const client = {
-    async fetchEvents(filter) {
-      calls.push(filter);
-      if (filter.kinds[0] === 40003) {
+    async queryEvents(filters) {
+      calls.push(filters);
+      if (filters[0].kinds[0] === 40003) {
         return [
           event({
             id: "edit",
@@ -54,6 +54,16 @@ test("get_forum_posts pages newest-first and applies author link suppression", a
             createdAt: 30,
             tags: [
               ["e", "newer"],
+              ["link-preview", "none"],
+            ],
+          }),
+          event({
+            id: "owner-edit",
+            kind: 40003,
+            createdAt: 31,
+            pubkey: "b".repeat(64),
+            tags: [
+              ["e", "older"],
               ["link-preview", "none"],
             ],
           }),
@@ -70,22 +80,29 @@ test("get_forum_posts pages newest-first and applies author link suppression", a
     before: 100,
   });
 
-  assert.deepEqual(calls[0], {
-    kinds: [45001],
-    "#h": ["forum"],
-    limit: 50,
-    until: 100,
-  });
-  assert.deepEqual(calls[1], {
-    kinds: [40003],
-    "#e": ["newer", "older"],
-    limit: 100,
-  });
+  assert.deepEqual(calls[0], [
+    {
+      kinds: [45001],
+      "#h": ["forum"],
+      limit: 50,
+      until: 100,
+    },
+  ]);
+  assert.deepEqual(calls[1], [
+    {
+      kinds: [40003],
+      "#e": ["older", "newer"],
+    },
+  ]);
   assert.deepEqual(
     result.messages.map((post) => post.event_id),
-    ["newer", "older"],
+    ["older", "newer"],
   );
-  assert.deepEqual(result.messages[0].tags.at(-1), ["link-preview", "none"]);
+  assert.deepEqual(result.messages[1].tags.at(-1), ["link-preview", "none"]);
+  assert.equal(
+    result.messages[0].tags.some((tag) => tag[0] === "link-preview"),
+    false,
+  );
   assert.deepEqual(result.messages[0].thread_summary, {
     reply_count: 0,
     descendant_count: 0,
@@ -93,10 +110,10 @@ test("get_forum_posts pages newest-first and applies author link suppression", a
     participants: [],
   });
   assert.equal(result.messages[0].sig, "f".repeat(128));
-  assert.equal(result.next_cursor, 10);
+  assert.equal(result.next_cursor, 20);
 });
 
-test("get_forum_thread maps NIP-10 parents, depth, and chronological replies", async () => {
+test("get_forum_thread atomically queries and preserves relay reply order", async () => {
   const calls = [];
   const root = event({
     id: "root",
@@ -125,11 +142,10 @@ test("get_forum_thread maps NIP-10 parents, depth, and chronological replies", a
     ],
   });
   const client = {
-    async fetchEvents(filter) {
-      calls.push(filter);
-      if (filter.ids) return [root];
-      if (filter.kinds[0] === 40003) return [];
-      return [nested, direct];
+    async queryEvents(filters) {
+      calls.push(filters);
+      if (filters[0].kinds[0] === 40003) return [];
+      return [nested, root, direct];
     },
   };
   registerRelayDiscoveryCommands(client);
@@ -141,13 +157,16 @@ test("get_forum_thread maps NIP-10 parents, depth, and chronological replies", a
     cursor: "ignored",
   });
 
-  assert.deepEqual(calls.slice(0, 2), [
+  assert.deepEqual(calls[0], [
     { ids: ["root"], kinds: [9, 40002, 45001, 45003], limit: 1 },
-    { kinds: [9, 45003], "#e": ["root"], "#h": ["forum"], limit: 500 },
+    { kinds: [9, 45003], "#e": ["root"], "#h": ["forum"] },
+  ]);
+  assert.deepEqual(calls[1], [
+    { kinds: [40003], "#e": ["nested", "root", "direct"] },
   ]);
   assert.deepEqual(
     result.replies.map((reply) => reply.event_id),
-    ["direct", "nested"],
+    ["nested", "direct"],
   );
   assert.deepEqual(
     result.replies.map((reply) => ({
@@ -156,8 +175,8 @@ test("get_forum_thread maps NIP-10 parents, depth, and chronological replies", a
       depth: reply.depth,
     })),
     [
-      { parent: "root", root: "root", depth: 1 },
       { parent: "direct", root: "root", depth: 2 },
+      { parent: "root", root: "root", depth: 1 },
     ],
   );
   assert.equal(result.total_replies, 2);
@@ -166,7 +185,7 @@ test("get_forum_thread maps NIP-10 parents, depth, and chronological replies", a
 
 test("get_forum_thread rejects a missing root with the desktop error", async () => {
   registerRelayDiscoveryCommands({
-    async fetchEvents() {
+    async queryEvents() {
       return [];
     },
   });

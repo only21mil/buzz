@@ -26,8 +26,8 @@ test("get_thread_replies mirrors filters, caps, and full-page cursor shape", asy
   const calls = [];
   const events = [event("reply-a", 10), event("reply-b", 10)];
   registerRelayMessageReadCommands({
-    async fetchEvents(filter) {
-      calls.push(filter);
+    async queryEvents(filters) {
+      calls.push(filters);
       return events;
     },
     async fetchFirstEvent() {
@@ -48,22 +48,24 @@ test("get_thread_replies mirrors filters, caps, and full-page cursor shape", asy
       next_cursor: { created_at: 10, event_id: "reply-b" },
     },
   );
-  assert.deepEqual(calls[0], {
-    "#e": ["root"],
-    kinds: TIMELINE_KINDS,
-    depth_limit: 8,
-    limit: 2,
-    "#h": ["channel"],
-    thread_cursor: 9,
-    thread_cursor_id: "prior",
-  });
+  assert.deepEqual(calls[0], [
+    {
+      "#e": ["root"],
+      kinds: TIMELINE_KINDS,
+      depth_limit: 8,
+      limit: 2,
+      "#h": ["channel"],
+      thread_cursor: 9,
+      thread_cursor_id: "prior",
+    },
+  ]);
 });
 
 test("get_thread_replies applies native defaults and omits optional filters", async () => {
   let seen;
   registerRelayMessageReadCommands({
-    async fetchEvents(filter) {
-      seen = filter;
+    async queryEvents(filters) {
+      seen = filters;
       return [];
     },
     async fetchFirstEvent() {
@@ -75,54 +77,20 @@ test("get_thread_replies applies native defaults and omits optional filters", as
     await dispatch("get_thread_replies", { rootEventId: "root" }),
     { events: [], next_cursor: null },
   );
-  assert.deepEqual(seen, {
-    "#e": ["root"],
-    kinds: TIMELINE_KINDS,
-    depth_limit: 64,
-    limit: 200,
-  });
-});
-
-test("get_channel_window returns the flat relay array with composite cursor", async () => {
-  const response = [event("row"), event("summary")];
-  let seen;
-  registerRelayMessageReadCommands({
-    async fetchEvents(filter) {
-      seen = filter;
-      return response;
+  assert.deepEqual(seen, [
+    {
+      "#e": ["root"],
+      kinds: TIMELINE_KINDS,
+      depth_limit: 64,
+      limit: 200,
     },
-    async fetchFirstEvent() {
-      return null;
-    },
-  });
-
-  assert.strictEqual(
-    await dispatch("get_channel_window", {
-      channelId: "channel",
-      limitRows: 999,
-      cursor: { created_at: 88, event_id: "cursor-id" },
-    }),
-    response,
-  );
-  assert.deepEqual(seen, {
-    "#h": ["channel"],
-    kinds: TIMELINE_KINDS,
-    limit: 200,
-    top_level: true,
-    include_summaries: true,
-    include_aux: true,
-    until: 88,
-    before_id: "cursor-id",
-  });
+  ]);
 });
 
 test("get_event uses the native kind allowlist and returns JSON", async () => {
   const found = event("target");
   let seen;
   registerRelayMessageReadCommands({
-    async fetchEvents() {
-      return [];
-    },
     async fetchFirstEvent(filter) {
       seen = filter;
       return found;
@@ -145,9 +113,6 @@ test("get_event uses the native kind allowlist and returns JSON", async () => {
 
 test("get_event preserves the native missing-event error", async () => {
   registerRelayMessageReadCommands({
-    async fetchEvents() {
-      return [];
-    },
     async fetchFirstEvent() {
       return null;
     },
