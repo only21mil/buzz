@@ -233,6 +233,62 @@ test("gate armed by rate-limited history CLOSED defers the next REQ until expiry
   assert.ok(sentAt[0] >= 5_001, "REQ must fire only after gate expiry");
 });
 
+test("multi-filter history uses one REQ and one CLOSE lifecycle", async () => {
+  resetAll(0);
+  const subscriptions = new Map();
+  const sent = [];
+  const closed = [];
+  const filters = [
+    { kinds: [39002], "#p": ["a".repeat(64)], limit: 1000 },
+    { kinds: [39000], limit: 1000 },
+    { kinds: [30622], authors: ["a".repeat(64)], limit: 10 },
+  ];
+  const historyPromise = requestHistoryGated(
+    subscriptions,
+    async (payload) => sent.push(payload),
+    async (subId) => closed.push(subId),
+    filters,
+    25_000,
+  );
+
+  await Promise.resolve();
+  assert.equal(sent.length, 1);
+  const subId = sent[0][1];
+  assert.deepEqual(sent[0], ["REQ", subId, ...filters]);
+
+  handleSubscriptionEose({
+    subscriptions,
+    subId,
+    closeSubscription: async (id) => closed.push(id),
+  });
+  handleSubscriptionEose({
+    subscriptions,
+    subId,
+    closeSubscription: async (id) => closed.push(id),
+  });
+
+  assert.deepEqual(await historyPromise, []);
+  assert.deepEqual(closed, [subId]);
+});
+
+test("history rejects an empty filter list before issuing a REQ", async () => {
+  resetAll(0);
+  let sendCalls = 0;
+  await assert.rejects(
+    requestHistoryGated(
+      new Map(),
+      async () => {
+        sendCalls += 1;
+      },
+      async () => {},
+      [],
+      25_000,
+    ),
+    /at least one filter/,
+  );
+  assert.equal(sendCalls, 0);
+});
+
 test("first-event request resolves null when EOSE arrives without an event", async () => {
   resetAll(0);
   const subscriptions = new Map();

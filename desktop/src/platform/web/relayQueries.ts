@@ -409,17 +409,23 @@ async function getChannels(
   client: RelayQueryClient,
 ) {
   const pubkey = identity.pubkey();
-  const [membershipEvents, metadataEvents, visibilityEvents] =
-    await Promise.all([
-      client.fetchEvents({ kinds: [39002], "#p": [pubkey], limit: 1000 }),
-      client.fetchEvents({ kinds: [39000], limit: 1000 }),
-      client.fetchEvents({
-        kinds: [30622],
-        authors: [pubkey],
-        "#p": [pubkey],
-        limit: 10,
-      }),
-    ]);
+  const initialEvents = await client.fetchEvents([
+    { kinds: [39002], "#p": [pubkey], limit: 1000 },
+    { kinds: [39000], limit: 1000 },
+    {
+      kinds: [30622],
+      authors: [pubkey],
+      "#p": [pubkey],
+      limit: 10,
+    },
+  ]);
+  const membershipEvents = initialEvents.filter(
+    (event) => event.kind === 39002,
+  );
+  const metadataEvents = initialEvents.filter((event) => event.kind === 39000);
+  const visibilityEvents = initialEvents.filter(
+    (event) => event.kind === 30622,
+  );
   const memberships = latestByTag(membershipEvents, "d");
   const metadata = latestByTag(metadataEvents, "d");
   const latestVisibility = visibilityEvents.reduce<RelayEvent | null>(

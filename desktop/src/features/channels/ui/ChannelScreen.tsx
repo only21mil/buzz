@@ -34,8 +34,8 @@ import { useWelcomeKickoffStagePresence } from "@/features/onboarding/useWelcome
 import { useWelcomeAgentCreate } from "@/features/channels/useWelcomeAgentCreate";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
-  useChannelMessagesQuery,
-  useChannelSubscription,
+  snapshotContext,
+  useSubscribedMessages,
   useChannelWindowQuery,
   useDeleteMessageMutation,
   useEditMessageMutation,
@@ -191,13 +191,13 @@ export function ChannelScreen({
         : current;
     });
   }, [activeChannelId, openThreadHeadId]);
-  const messagesQuery = useChannelMessagesQuery(activeChannel);
+  const snapshot = snapshotContext(activeCommunity?.relayUrl, currentPubkey);
+  const messagesQuery = useSubscribedMessages(activeChannel, snapshot);
   const windowQuery = useChannelWindowQuery(activeChannel);
   const threadRepliesQuery = useThreadReplies(
     activeChannel,
     effectiveOpenThreadHeadId,
   );
-  useChannelSubscription(activeChannel);
   const { fetchOlder, hasOlderMessages, historyExhausted, isFetchingOlder } =
     useFetchOlderMessages(activeChannel);
   const latestActiveMessage = React.useMemo(() => {

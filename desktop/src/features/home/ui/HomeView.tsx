@@ -5,6 +5,7 @@ import { useAppShell } from "@/app/AppShellContext";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { useChannelsQuery, useOpenDmMutation } from "@/features/channels/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
 import { ChannelManagementSheet } from "@/features/channels/ui/ChannelManagementSheet";
 import {
@@ -48,6 +49,7 @@ import { InboxDetailPane } from "@/features/home/ui/InboxDetailPane";
 import { InboxListPane } from "@/features/home/ui/InboxListPane";
 import { HomePersonalInboxDetail } from "@/features/home/ui/HomePersonalInboxDetail";
 import {
+  snapshotContext,
   useChannelMessagesQuery,
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
@@ -103,6 +105,7 @@ export function HomeView({
   onOpenContext,
   onRefresh,
 }: HomeViewProps) {
+  const { activeCommunity } = useCommunities();
   const relaySelfPubkey = useRelaySelfQuery().data;
   const [homeInboxRef, homeInboxWidthPx] = useElementWidth<HTMLDivElement>();
   const isNarrowHomeViewport =
@@ -295,7 +298,13 @@ export function HomeView({
     homeInboxWidthPx > 0 &&
     homeInboxWidthPx < AUXILIARY_PANEL_SINGLE_COLUMN_BREAKPOINT_PX;
 
-  const channelMessagesQuery = useChannelMessagesQuery(selectedChannel);
+  // Inbox thread context is a bounded history read and does not own a live
+  // subscription gap, so it can fetch immediately.
+  const channelMessagesQuery = useChannelMessagesQuery(
+    selectedChannel,
+    true,
+    snapshotContext(activeCommunity?.relayUrl, currentPubkey),
+  );
   const toggleReactionMutation = useToggleReactionMutation();
   const channelMessages = channelMessagesQuery.data;
   const threadContext = useInboxThreadContext(

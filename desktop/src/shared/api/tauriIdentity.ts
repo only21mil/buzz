@@ -1,5 +1,7 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import type { Identity, IdentityStorage } from "@/shared/api/types";
+import { removeAllMessageSnapshots } from "@/features/messages/lib/messageSnapshot";
+import { invalidateProfileBatchCoalescer } from "@/features/profile/lib/profileBatchCoalescer";
 
 type RawIdentity = {
   pubkey: string;
@@ -33,15 +35,24 @@ export async function importIdentity(
   nsec: string,
   password?: string,
 ): Promise<Identity> {
-  return fromRawIdentity(
+  const identity = fromRawIdentity(
     await invokeTauri<RawIdentity>("import_identity", { nsec, password }),
   );
+  // The old pubkey is not reliably available on every replacement path. Purge
+  // every identity bucket after native replacement succeeds, before callers
+  // can remount against the new signer.
+  removeAllMessageSnapshots();
+  invalidateProfileBatchCoalescer();
+  return identity;
 }
 
 export async function persistCurrentIdentity(): Promise<Identity> {
-  return fromRawIdentity(
+  const identity = fromRawIdentity(
     await invokeTauri<RawIdentity>("persist_current_identity"),
   );
+  removeAllMessageSnapshots();
+  invalidateProfileBatchCoalescer();
+  return identity;
 }
 
 /**
@@ -52,6 +63,10 @@ export async function persistCurrentIdentity(): Promise<Identity> {
  * state until the process exits and only handle errors (e.g. display a toast).
  */
 export async function signOut(): Promise<void> {
+  // The native command may relaunch before its promise resolves. Invalidate
+  // captured writes and purge plaintext snapshots before invoking it.
+  removeAllMessageSnapshots();
+  invalidateProfileBatchCoalescer();
   await invokeTauri("sign_out");
 }
 

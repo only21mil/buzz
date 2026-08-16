@@ -15,7 +15,6 @@ import {
   getProfile,
   searchUsers,
   getUserProfile,
-  getUsersBatch,
   updateProfile,
 } from "@/shared/api/tauriProfiles";
 import { getContactList, setContactList } from "@/shared/api/social";
@@ -46,6 +45,11 @@ import {
 } from "@/features/profile/lib/userLabelStorage";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { updateCachedChannelMemberDisplayName } from "@/features/channels/channelMemberProfileCache";
+import {
+  captureProfileBatchEpoch,
+  commitCurrentProfileBatchEpoch,
+  getUsersBatchCoalesced,
+} from "@/features/profile/lib/profileBatchCoalescer";
 
 export const profileQueryKey = ["profile"] as const;
 export const contactListQueryKey = (pubkey: string) =>
@@ -321,7 +325,9 @@ export function useUsersBatchQuery(
 ) {
   const queryClient = useQueryClient();
   const { activeCommunity } = useCommunities();
+  const identityQuery = useIdentityQuery();
   const relayUrl = activeCommunity?.relayUrl ?? "";
+  const identityPubkey = identityQuery.data?.pubkey ?? "";
   const normalizedPubkeys = [
     ...new Set(pubkeys.map((pubkey) => pubkey.toLowerCase())),
   ]
@@ -356,19 +362,26 @@ export function useUsersBatchQuery(
         }
       }
       if (toFetch.length > 0) {
-        const fresh = await getUsersBatch(toFetch);
-        if (relayUrl) {
-          writeCachedUserLabels(relayUrl, fresh.profiles, fresh.missing);
-        }
-        for (const pubkey of toFetch) {
-          const summary = fresh.profiles[pubkey] ?? null;
-          queryClient.setQueryData<UsersBatchEntry>(
-            usersBatchEntryKey(pubkey),
-            { summary, fetchedAt: now },
-          );
-          if (summary) profiles[pubkey] = summary;
-          else missing.push(pubkey);
-        }
+        const batchEpoch = captureProfileBatchEpoch();
+        const fresh = await getUsersBatchCoalesced(
+          relayUrl,
+          identityPubkey,
+          toFetch,
+        );
+        commitCurrentProfileBatchEpoch(batchEpoch, () => {
+          if (relayUrl) {
+            writeCachedUserLabels(relayUrl, fresh.profiles, fresh.missing);
+          }
+          for (const pubkey of toFetch) {
+            const summary = fresh.profiles[pubkey] ?? null;
+            queryClient.setQueryData<UsersBatchEntry>(
+              usersBatchEntryKey(pubkey),
+              { summary, fetchedAt: now },
+            );
+            if (summary) profiles[pubkey] = summary;
+            else missing.push(pubkey);
+          }
+        });
       }
       return { profiles, missing };
     },
