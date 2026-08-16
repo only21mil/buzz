@@ -10,7 +10,9 @@ import {
   emptyChannelWindowStore,
   mergeHeadTransactionChannelWindowEvent,
   mergeLiveChannelWindowEvent,
+  mergeLiveThreadSummary,
   type ChannelWindowStore,
+  type LiveThreadSummary,
 } from "./channelWindowStore";
 import { reconcileChannelWindowMessages } from "./channelWindowReconciliation";
 
@@ -48,6 +50,19 @@ export function mergeHeadTransactionChannelWindowEvents(
       return mergeHeadTransactionChannelWindowEvent(current, event, false);
     }
     return current;
+  }, store);
+}
+
+/** Carry only summaries that changed after the authoritative head read began. */
+export function mergeHeadTransactionLiveSummaries(
+  store: ChannelWindowStore,
+  baseline: Record<string, LiveThreadSummary>,
+  latest: Record<string, LiveThreadSummary>,
+): ChannelWindowStore {
+  return Object.entries(latest).reduce((current, [rootId, summary]) => {
+    return baseline[rootId]?.eventId === summary.eventId
+      ? current
+      : mergeLiveThreadSummary(current, rootId, summary);
   }, store);
 }
 

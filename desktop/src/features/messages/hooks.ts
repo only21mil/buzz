@@ -1,6 +1,7 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import {
   CancelledError,
+  type QueryClient,
   useMutation,
   useQuery,
   useQueryClient,
@@ -10,16 +11,14 @@ import { toast } from "sonner";
 import {
   channelMessagesKey,
   channelWindowKey,
-  threadRepliesKey,
 } from "@/features/messages/lib/messageQueryKeys";
 import {
   buildReplyTags,
-  getThreadReference,
-  isBroadcastReply,
   normalizeMentionPubkeys,
   resolveReplyRootId,
 } from "@/features/messages/lib/threading";
 import {
+  mergeHeadTransactionLiveSummaries,
   mergeChannelWindowOverlayEvents,
   projectChannelWindowMessages,
   refreshChannelWindowMessages,
@@ -27,14 +26,13 @@ import {
 } from "@/features/messages/lib/projectChannelWindow";
 import {
   beginHeadTransaction,
-  bufferHeadTransactionEvent,
   clearHeadTransaction,
   createHeadTransactionAccess,
   finishHeadTransaction,
   type ChannelSubscriptionGeneration,
 } from "@/features/messages/lib/headWindowTransaction";
 import { reconcileChannelWindowMessages } from "@/features/messages/lib/channelWindowReconciliation";
-import { reconcileLiveThreadSummary } from "@/features/messages/lib/threadSummaryReconciliation";
+import { appendChannelSubscriptionEvent } from "@/features/messages/lib/channelSubscriptionEvent";
 import {
   mergeMessages,
   mergeTimelineCacheMessages,
@@ -80,13 +78,7 @@ import {
   writeMessageSnapshot,
 } from "@/features/messages/lib/messageSnapshot";
 import { parseChannelWindowResponse } from "@/features/messages/lib/channelWindowResponse";
-import {
-  CHANNEL_AUX_EVENT_KINDS,
-  CHANNEL_TIMELINE_CONTENT_KINDS,
-  KIND_CHANNEL_THREAD_SUMMARY,
-  KIND_STREAM_MESSAGE,
-  KIND_SYSTEM_MESSAGE,
-} from "@/shared/constants/kinds";
+import { KIND_STREAM_MESSAGE } from "@/shared/constants/kinds";
 
 type MessageQueryContext = {
   optimisticId: string;
@@ -98,8 +90,43 @@ type MessageQueryContext = {
 
 export type { ChannelSubscriptionGeneration };
 
-const CHANNEL_TIMELINE_KINDS = new Set<number>(CHANNEL_TIMELINE_CONTENT_KINDS);
-const CHANNEL_AUX_KINDS = new Set<number>(CHANNEL_AUX_EVENT_KINDS);
+type ChannelHistoryRequest = Readonly<{
+  channelId: string;
+  queryClient: QueryClient;
+  token: symbol;
+}>;
+
+const channelHistoryRequests = new WeakMap<QueryClient, Map<string, symbol>>();
+
+function beginChannelHistoryRequest(
+  queryClient: QueryClient,
+  channelId: string,
+): ChannelHistoryRequest {
+  let requests = channelHistoryRequests.get(queryClient);
+  if (!requests) {
+    requests = new Map();
+    channelHistoryRequests.set(queryClient, requests);
+  }
+  const token = Symbol(channelId);
+  requests.set(channelId, token);
+  return { channelId, queryClient, token };
+}
+
+function isChannelHistoryRequestCurrent(
+  request: ChannelHistoryRequest,
+): boolean {
+  return (
+    channelHistoryRequests.get(request.queryClient)?.get(request.channelId) ===
+    request.token
+  );
+}
+
+function finishChannelHistoryRequest(request: ChannelHistoryRequest): void {
+  if (!isChannelHistoryRequestCurrent(request)) return;
+  const requests = channelHistoryRequests.get(request.queryClient);
+  requests?.delete(request.channelId);
+  if (requests?.size === 0) channelHistoryRequests.delete(request.queryClient);
+}
 
 export function snapshotContext(
   relayUrl?: string | null,
@@ -278,18 +305,6 @@ export function useChannelMessagesQuery(
     [snapshotChannelId, snapshotRelayUrl, snapshotSignerPubkey],
   );
 
-  const isRequestCurrent = () =>
-    (snapshotScope === null || isMessageSnapshotScopeCurrent(snapshotScope)) &&
-    (subscriptionGeneration === true ||
-      (subscriptionGeneration !== null &&
-        subscriptionGeneration.channelId === snapshotChannelId &&
-        subscriptionGeneration.guard.current));
-  const requireCurrentRequest = () => {
-    if (!isRequestCurrent()) {
-      throw new CancelledError({ silent: true });
-    }
-  };
-
   return useQuery({
     enabled:
       subscriptionGeneration !== null &&
@@ -302,6 +317,20 @@ export function useChannelMessagesQuery(
       if (!channel) throw new Error("No channel selected.");
       const generationToken =
         subscriptionGeneration === true ? null : subscriptionGeneration;
+      const historyRequest = beginChannelHistoryRequest(
+        queryClient,
+        channel.id,
+      );
+      const requireCurrentRequest = () => {
+        const isCurrent =
+          (snapshotScope === null ||
+            isMessageSnapshotScopeCurrent(snapshotScope)) &&
+          isChannelHistoryRequestCurrent(historyRequest) &&
+          (generationToken === null ||
+            (generationToken.channelId === snapshotChannelId &&
+              generationToken.guard.current));
+        if (!isCurrent) throw new CancelledError({ silent: true });
+      };
       const headTransaction = createHeadTransactionAccess(
         generationToken,
         requireCurrentRequest,
@@ -316,6 +345,7 @@ export function useChannelMessagesQuery(
         let currentWindow =
           queryClient.getQueryData<ChannelWindowStore>(windowKey) ??
           seedChannelWindowStoreFromSnapshot(snapshot ?? []);
+        const liveSummaryBaseline = currentWindow.liveSummaries;
         if (!queryClient.getQueryData<ChannelWindowStore>(windowKey)) {
           headTransaction.requireCurrent();
           queryClient.setQueryData(windowKey, currentWindow);
@@ -328,7 +358,11 @@ export function useChannelMessagesQuery(
           queryClient.getQueryData<ChannelWindowStore>(windowKey) ??
           currentWindow;
         const freshWindow = headTransaction.merge(
-          replaceNewestChannelWindow(currentWindow, page),
+          mergeHeadTransactionLiveSummaries(
+            replaceNewestChannelWindow(currentWindow, page),
+            liveSummaryBaseline,
+            currentWindow.liveSummaries,
+          ),
         );
         const freshMessages = reconcileChannelWindowMessages(
           freshWindow,
@@ -391,6 +425,7 @@ export function useChannelMessagesQuery(
         return closedMessages;
       } finally {
         headTransaction.finish();
+        finishChannelHistoryRequest(historyRequest);
       }
     },
     initialData: () => {
@@ -442,66 +477,7 @@ export function useChannelSubscription(channel: Channel | null) {
 
   const appendMessage = useEffectEvent(
     (event: RelayEvent, generationToken: ChannelSubscriptionGeneration) => {
-      if (!channelId) return;
-      if (event.kind === KIND_CHANNEL_THREAD_SUMMARY) {
-        // Relay-pushed live badge recount — window-store overlay only, never a
-        // timeline row (mirrors the page path, where 39005 is metadata).
-        reconcileLiveThreadSummary(queryClient, channelId, event);
-        return;
-      }
-      const isTimelineRow = CHANNEL_TIMELINE_KINDS.has(event.kind);
-      const threadReference = isTimelineRow
-        ? getThreadReference(event.tags)
-        : null;
-      if (threadReference?.parentId != null) {
-        const rootId = threadReference?.rootId;
-        if (rootId) {
-          queryClient.setQueryData<RelayEvent[]>(
-            threadRepliesKey(channelId, rootId),
-            (current = []) => mergeMessages(current, event),
-          );
-        }
-        if (!isBroadcastReply(event.tags)) return;
-      }
-      if (!isTimelineRow && !CHANNEL_AUX_KINDS.has(event.kind)) return;
-      if (!isTimelineRow) {
-        queryClient.setQueriesData<RelayEvent[]>(
-          { queryKey: ["thread-replies", channelId] },
-          (current = []) => mergeMessages(current, event),
-        );
-      }
-      bufferHeadTransactionEvent(generationToken, event);
-
-      const windowKey = channelWindowKey(channelId);
-      const current =
-        queryClient.getQueryData<ChannelWindowStore>(windowKey) ??
-        emptyChannelWindowStore();
-      const next = mergeLiveChannelWindowEvent(current, event, isTimelineRow);
-      if (next !== current) {
-        queryClient.setQueryData(windowKey, next);
-        projectChannelWindowMessages(queryClient, channelId);
-      }
-
-      if (event.kind === KIND_SYSTEM_MESSAGE) {
-        try {
-          const payload = JSON.parse(event.content) as { type?: string };
-          if (
-            payload.type === "member_joined" ||
-            payload.type === "member_left" ||
-            payload.type === "member_removed"
-          ) {
-            void queryClient.invalidateQueries({
-              queryKey: ["channels", channelId, "members"],
-            });
-            void queryClient.invalidateQueries({
-              queryKey: ["channels"],
-              exact: true,
-            });
-          }
-        } catch {
-          // Non-JSON system message — ignore.
-        }
-      }
+      appendChannelSubscriptionEvent(queryClient, event, generationToken);
     },
   );
 

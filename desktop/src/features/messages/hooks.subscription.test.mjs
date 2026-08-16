@@ -19,6 +19,7 @@ let readMessageSnapshot;
 let removeAllMessageSnapshots;
 let writeMessageSnapshot;
 let flattenChannelWindowEvents;
+let channelWindowThreadSummaries;
 let useChannelMessagesQuery;
 let useChannelSubscription;
 const EVENT_SECRET = new Uint8Array(32).fill(11);
@@ -50,7 +51,7 @@ before(async () => {
   ({ useChannelMessagesQuery, useChannelSubscription } = await import(
     "./hooks.ts"
   ));
-  ({ flattenChannelWindowEvents } = await import(
+  ({ channelWindowThreadSummaries, flattenChannelWindowEvents } = await import(
     "./lib/channelWindowStore.ts"
   ));
 });
@@ -225,7 +226,11 @@ function installRelayStub({ fetchAux, fetchAuxDeletions } = {}) {
 function mountHarness(
   initialChannel,
   initialSnapshotContext = null,
-  { strictMode = false, suspendedChannelId = null } = {},
+  {
+    immediateHistory = false,
+    strictMode = false,
+    suspendedChannelId = null,
+  } = {},
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -234,11 +239,11 @@ function mountHarness(
   document.body.appendChild(container);
   const root = createRoot(container);
 
-  function Harness({ activeChannel, snapshotContext }) {
+  function Harness({ activeChannel, immediateHistory, snapshotContext }) {
     const subscriptionGeneration = useChannelSubscription(activeChannel);
     const query = useChannelMessagesQuery(
       activeChannel,
-      subscriptionGeneration,
+      immediateHistory ? true : subscriptionGeneration,
       snapshotContext,
     );
     if (activeChannel?.id === suspendedChannelId) throw NEVER_SETTLES;
@@ -255,10 +260,12 @@ function mountHarness(
     activeChannel,
     snapshotContext = initialSnapshotContext,
     transition = false,
+    renderImmediateHistory = immediateHistory,
   ) {
     await act(async () => {
       const harness = React.createElement(Harness, {
         activeChannel,
+        immediateHistory: renderImmediateHistory,
         snapshotContext,
       });
       const tree = React.createElement(
@@ -284,6 +291,9 @@ function mountHarness(
       await render(initialChannel);
     },
     render,
+    renderSubscribed(activeChannel) {
+      return render(activeChannel, initialSnapshotContext, false, false);
+    },
     renderTransition(activeChannel) {
       return render(activeChannel, initialSnapshotContext, true);
     },
@@ -299,6 +309,124 @@ function mountHarness(
     },
   };
 }
+
+test("a superseded immediate history request cannot clobber a fresher cache", async () => {
+  const selected = channel("channel-a");
+  const staleEvent = relayEvent(selected.id, "stale");
+  const freshEvent = relayEvent(selected.id, "fresh");
+  const firstRequest = deferred();
+  const secondRequest = deferred();
+  let windowCalls = 0;
+  installChannelWindowInvoke(async () => {
+    windowCalls += 1;
+    return windowCalls === 1 ? firstRequest.promise : secondRequest.promise;
+  });
+  installRelayStub();
+  const harness = mountHarness(selected, null, { immediateHistory: true });
+
+  await harness.mount();
+  await waitForCondition(
+    () => windowCalls === 1,
+    "initial immediate history request did not start",
+  );
+  await act(async () => {
+    await harness.queryClient.cancelQueries({
+      queryKey: ["channel-messages", selected.id],
+      exact: true,
+    });
+    void harness.queryClient.refetchQueries({
+      queryKey: ["channel-messages", selected.id],
+      exact: true,
+    });
+  });
+  await waitForCondition(
+    () => windowCalls === 2,
+    "replacement immediate history request did not start",
+  );
+
+  await resolveDeferred(
+    secondRequest,
+    channelWindowResponse(selected.id, [freshEvent]),
+  );
+  await resolveDeferred(
+    firstRequest,
+    channelWindowResponse(selected.id, [staleEvent]),
+  );
+  await waitForCondition(
+    () => harness.queryClient.isFetching() === 0,
+    "immediate history requests did not settle",
+  );
+
+  const messages = harness.queryClient.getQueryData([
+    "channel-messages",
+    selected.id,
+  ]);
+  assert.equal(
+    messages.some((event) => event.id === freshEvent.id),
+    true,
+  );
+  assert.equal(
+    messages.some((event) => event.id === staleEvent.id),
+    false,
+  );
+  await harness.unmount();
+});
+
+test("a subscribed request supersedes pending immediate history", async () => {
+  const selected = channel("channel-a");
+  const staleImmediateEvent = relayEvent(selected.id, "stale-immediate");
+  const freshSubscribedEvent = relayEvent(selected.id, "fresh-subscribed");
+  const immediateRequest = deferred();
+  const subscribedRequest = deferred();
+  let windowCalls = 0;
+  installChannelWindowInvoke(async () => {
+    windowCalls += 1;
+    return windowCalls === 1
+      ? immediateRequest.promise
+      : subscribedRequest.promise;
+  });
+  const relay = installRelayStub();
+  const harness = mountHarness(selected, null, { immediateHistory: true });
+
+  await harness.mount();
+  await waitForCondition(
+    () => windowCalls === 1,
+    "immediate history request did not start",
+  );
+  await harness.renderSubscribed(selected);
+  await relay.markReady(selected.id);
+  await waitForCondition(
+    () => windowCalls === 2,
+    "subscribed history request did not start",
+  );
+
+  await resolveDeferred(
+    subscribedRequest,
+    channelWindowResponse(selected.id, [freshSubscribedEvent]),
+  );
+  await resolveDeferred(
+    immediateRequest,
+    channelWindowResponse(selected.id, [staleImmediateEvent]),
+  );
+  await waitForCondition(
+    () => harness.queryClient.isFetching() === 0,
+    "cross-type history requests did not settle",
+  );
+
+  const messages = harness.queryClient.getQueryData([
+    "channel-messages",
+    selected.id,
+  ]);
+  assert.equal(
+    messages.some((event) => event.id === freshSubscribedEvent.id),
+    true,
+  );
+  assert.equal(
+    messages.some((event) => event.id === staleImmediateEvent.id),
+    false,
+  );
+  await harness.unmount();
+});
 
 beforeEach(() => {
   dom.window.__TAURI_INTERNALS__ = {
@@ -709,6 +837,63 @@ for (const responseContainsLiveEvent of [false, true]) {
     await harness.unmount();
   });
 }
+
+test("a live thread summary during the window await survives head replacement", async () => {
+  const selected = channel("channel-a");
+  const rootEvent = relayEvent(selected.id, "root");
+  const liveSummary = relayEvent(selected.id, "summary", 39005, {
+    content: JSON.stringify({
+      reply_count: 4,
+      descendant_count: 6,
+      last_reply_at: rootEvent.created_at + 1,
+      participants: ["c".repeat(64)],
+    }),
+    tags: [
+      ["h", selected.id],
+      ["e", rootEvent.id],
+      ["d", rootEvent.id],
+    ],
+  });
+  const windowRequest = deferred();
+  let windowCalls = 0;
+  installChannelWindowInvoke(async () => {
+    windowCalls += 1;
+    return windowRequest.promise;
+  });
+  const relay = installRelayStub();
+  const harness = mountHarness(selected);
+
+  await harness.mount();
+  await relay.markReady(selected.id);
+  await waitForCondition(
+    () => windowCalls === 1,
+    "summary-race head query did not start",
+  );
+  await relay.emit(selected.id, liveSummary);
+  for (let index = 0; index < 80; index += 1) {
+    await relay.emit(selected.id, relayEvent(selected.id, `noise-${index}`));
+  }
+  await resolveDeferred(
+    windowRequest,
+    channelWindowResponse(selected.id, [rootEvent]),
+  );
+  await waitForCondition(
+    () => harness.queryClient.isFetching() === 0,
+    "summary-race head query did not settle",
+  );
+
+  const window = harness.queryClient.getQueryData([
+    "channel-window",
+    selected.id,
+  ]);
+  assert.deepEqual(channelWindowThreadSummaries(window).get(rootEvent.id), {
+    replyCount: 4,
+    descendantCount: 6,
+    lastReplyAt: rootEvent.created_at + 1,
+    participantPubkeys: ["c".repeat(64)],
+  });
+  await harness.unmount();
+});
 
 for (const responseContainsLiveEvent of [false, true]) {
   test(`a backdated live event during auxiliary closure is retained once when the response ${

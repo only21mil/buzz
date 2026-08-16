@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 
 import {
+  captureProfileBatchEpoch,
+  commitCurrentProfileBatchEpoch,
   getUsersBatchCoalesced,
   invalidateProfileBatchCoalescer,
 } from "./profileBatchCoalescer.ts";
@@ -254,4 +256,47 @@ test("identity invalidation rejects old work and fences its late completion", as
   ]);
   assert.equal(currentResult.profiles[CAROL].displayName, "Current");
   assert.equal(overlappingResult.profiles[CAROL].displayName, "Current");
+});
+
+test("identity invalidation after transport resolution rejects the old aggregate", async () => {
+  const oldRequest = deferred();
+  let calls = 0;
+  window.__TAURI_INTERNALS__.invoke = async () => {
+    calls += 1;
+    if (calls === 1) return oldRequest.promise;
+    return { profiles: { [CAROL]: rawProfile("Current") }, missing: [] };
+  };
+
+  const stale = getUsersBatchCoalesced("wss://relay.example", ALICE, [CAROL]);
+  await flushMicrotasks();
+  oldRequest.resolve({
+    profiles: { [CAROL]: rawProfile("Stale") },
+    missing: [],
+  });
+  // Let flushBatch resolve its entries, but invalidate before the aggregate
+  // Promise.all continuation can escape to the caller.
+  await Promise.resolve();
+  invalidateProfileBatchCoalescer();
+
+  await assert.rejects(stale, /identity change/);
+  const current = await getUsersBatchCoalesced("wss://relay.example", BOB, [
+    CAROL,
+  ]);
+  assert.equal(calls, 2);
+  assert.equal(current.profiles[CAROL].displayName, "Current");
+});
+
+test("identity invalidation blocks the hook commit boundary", () => {
+  const epoch = captureProfileBatchEpoch();
+  let committed = false;
+  invalidateProfileBatchCoalescer();
+
+  assert.throws(
+    () =>
+      commitCurrentProfileBatchEpoch(epoch, () => {
+        committed = true;
+      }),
+    /identity change/,
+  );
+  assert.equal(committed, false);
 });

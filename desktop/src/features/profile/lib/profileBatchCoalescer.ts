@@ -18,6 +18,30 @@ const pendingBatches = new Map<string, PendingBatch>();
 const inFlightByScope = new Map<string, Map<string, InFlightEntry>>();
 let identityEpoch = 0;
 
+export type ProfileBatchEpoch = Readonly<{ value: number }>;
+
+function identityInvalidationError(): Error {
+  return new Error("Profile batch scope invalidated by identity change");
+}
+
+export function captureProfileBatchEpoch(): ProfileBatchEpoch {
+  return { value: identityEpoch };
+}
+
+export function requireCurrentProfileBatchEpoch(
+  epoch: ProfileBatchEpoch,
+): void {
+  if (epoch.value !== identityEpoch) throw identityInvalidationError();
+}
+
+export function commitCurrentProfileBatchEpoch(
+  epoch: ProfileBatchEpoch,
+  commit: () => void,
+): void {
+  requireCurrentProfileBatchEpoch(epoch);
+  commit();
+}
+
 function batchScopeKey(relayScope: string, identityScope: string): string {
   return `${identityEpoch}\0${relayScope}\0${identityScope.toLowerCase()}`;
 }
@@ -52,7 +76,7 @@ function createInFlightEntry(): InFlightEntry {
 /** Fence pending profile work before the active signer can be replaced. */
 export function invalidateProfileBatchCoalescer(): void {
   identityEpoch += 1;
-  const error = new Error("Profile batch scope invalidated by identity change");
+  const error = identityInvalidationError();
   for (const scopedEntries of inFlightByScope.values()) {
     for (const entry of scopedEntries.values()) entry.reject(error);
   }
@@ -90,6 +114,7 @@ export function getUsersBatchCoalesced(
   identityScope: string,
   pubkeys: string[],
 ): Promise<UsersBatchResponse> {
+  const requestEpoch = captureProfileBatchEpoch();
   const normalizedPubkeys = normalizePubkeys(pubkeys);
   if (normalizedPubkeys.length === 0) {
     return Promise.resolve({ profiles: {}, missing: [] });
@@ -123,6 +148,7 @@ export function getUsersBatchCoalesced(
 
   return Promise.all(requestedEntries.map((entry) => entry.promise)).then(
     (results) => {
+      requireCurrentProfileBatchEpoch(requestEpoch);
       const profiles: UsersBatchResponse["profiles"] = {};
       const missing: string[] = [];
       for (const [index, pubkey] of normalizedPubkeys.entries()) {
