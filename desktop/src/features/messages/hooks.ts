@@ -1,5 +1,10 @@
-import { useEffect, useEffectEvent, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import {
+  CancelledError,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import {
@@ -15,8 +20,10 @@ import {
   resolveReplyRootId,
 } from "@/features/messages/lib/threading";
 import {
+  mergeChannelWindowOverlayEvents,
   projectChannelWindowMessages,
   refreshChannelWindowMessages,
+  seedChannelWindowStoreFromSnapshot,
 } from "@/features/messages/lib/projectChannelWindow";
 import { reconcileChannelWindowMessages } from "@/features/messages/lib/channelWindowReconciliation";
 import { reconcileLiveThreadSummary } from "@/features/messages/lib/threadSummaryReconciliation";
@@ -51,11 +58,19 @@ import type { Channel, Identity, RelayEvent } from "@/shared/api/types";
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
 import {
   emptyChannelWindowStore,
+  flattenChannelWindowEvents,
   mapChannelWindowEvents,
   mergeLiveChannelWindowEvent,
   replaceNewestChannelWindow,
   type ChannelWindowStore,
 } from "@/features/messages/lib/channelWindowStore";
+import { fetchAuxBackfillEvents } from "@/features/messages/lib/auxBackfill";
+import {
+  captureMessageSnapshotScope,
+  isMessageSnapshotScopeCurrent,
+  readMessageSnapshot,
+  writeMessageSnapshot,
+} from "@/features/messages/lib/messageSnapshot";
 import { parseChannelWindowResponse } from "@/features/messages/lib/channelWindowResponse";
 import {
   CHANNEL_AUX_EVENT_KINDS,
@@ -75,6 +90,13 @@ type MessageQueryContext = {
 
 const CHANNEL_TIMELINE_KINDS = new Set<number>(CHANNEL_TIMELINE_CONTENT_KINDS);
 const CHANNEL_AUX_KINDS = new Set<number>(CHANNEL_AUX_EVENT_KINDS);
+
+export function snapshotContext(
+  relayUrl?: string | null,
+  signerPubkey?: string | null,
+): { relayUrl: string; signerPubkey: string } | null {
+  return relayUrl && signerPubkey ? { relayUrl, signerPubkey } : null;
+}
 
 export function createOptimisticMessage(
   channelId: string,
@@ -226,10 +248,33 @@ export function useChannelWindowQuery(channel: Channel | null) {
 export function useChannelMessagesQuery(
   channel: Channel | null,
   isSubscriptionReady: boolean,
+  snapshotContext: { relayUrl: string; signerPubkey: string } | null,
 ) {
   const queryClient = useQueryClient();
-  const queryKey = channelMessagesKey(channel?.id ?? "none");
-  const windowKey = channelWindowKey(channel?.id ?? "none");
+  const snapshotChannelId = channel?.id ?? null;
+  const snapshotRelayUrl = snapshotContext?.relayUrl ?? null;
+  const snapshotSignerPubkey = snapshotContext?.signerPubkey ?? null;
+  const queryKey = channelMessagesKey(snapshotChannelId ?? "none");
+  const windowKey = channelWindowKey(snapshotChannelId ?? "none");
+  const snapshotScope = useMemo(
+    () =>
+      snapshotChannelId && snapshotRelayUrl && snapshotSignerPubkey
+        ? captureMessageSnapshotScope(
+            snapshotRelayUrl,
+            snapshotSignerPubkey,
+            snapshotChannelId,
+          )
+        : null,
+    [snapshotChannelId, snapshotRelayUrl, snapshotSignerPubkey],
+  );
+
+  const isScopeCurrent = () =>
+    snapshotScope === null || isMessageSnapshotScopeCurrent(snapshotScope);
+  const requireCurrentScope = () => {
+    if (!isScopeCurrent()) {
+      throw new CancelledError({ silent: true });
+    }
+  };
 
   return useQuery({
     enabled:
@@ -239,17 +284,97 @@ export function useChannelMessagesQuery(
     queryKey,
     queryFn: async () => {
       if (!channel) throw new Error("No channel selected.");
-      const previousMessages =
-        queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [];
-      const events = await getChannelWindowEvents(channel.id);
-      const page = parseChannelWindowResponse(events, channel.id, null);
-      const current =
+      requireCurrentScope();
+
+      const snapshot = snapshotScope
+        ? readMessageSnapshot(snapshotScope)
+        : null;
+      let currentWindow =
         queryClient.getQueryData<ChannelWindowStore>(windowKey) ??
-        emptyChannelWindowStore();
-      const next = replaceNewestChannelWindow(current, page);
-      queryClient.setQueryData(windowKey, next);
-      return reconcileChannelWindowMessages(next, previousMessages);
+        seedChannelWindowStoreFromSnapshot(snapshot ?? []);
+      if (!queryClient.getQueryData<ChannelWindowStore>(windowKey)) {
+        requireCurrentScope();
+        queryClient.setQueryData(windowKey, currentWindow);
+      }
+
+      const events = await getChannelWindowEvents(channel.id);
+      requireCurrentScope();
+      const page = parseChannelWindowResponse(events, channel.id, null);
+      currentWindow =
+        queryClient.getQueryData<ChannelWindowStore>(windowKey) ??
+        currentWindow;
+      const freshWindow = replaceNewestChannelWindow(currentWindow, page);
+      const freshMessages = reconcileChannelWindowMessages(
+        freshWindow,
+        queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [],
+      );
+      requireCurrentScope();
+      queryClient.setQueryData(windowKey, freshWindow);
+      queryClient.setQueryData(queryKey, freshMessages);
+
+      let auxEvents: RelayEvent[];
+      try {
+        const mergedWindow = flattenChannelWindowEvents(freshWindow);
+        auxEvents = await fetchAuxBackfillEvents(
+          channel.id,
+          mergedWindow,
+          mergedWindow,
+        );
+      } catch (error) {
+        requireCurrentScope();
+        console.error(
+          "Failed to backfill auxiliary events for channel",
+          channel.id,
+          error,
+        );
+        const latestWindow =
+          queryClient.getQueryData<ChannelWindowStore>(windowKey) ??
+          freshWindow;
+        return reconcileChannelWindowMessages(
+          latestWindow,
+          queryClient.getQueryData<RelayEvent[]>(queryKey) ?? freshMessages,
+        );
+      }
+
+      requireCurrentScope();
+      const latestWindow =
+        queryClient.getQueryData<ChannelWindowStore>(windowKey) ?? freshWindow;
+      const closedWindow = mergeChannelWindowOverlayEvents(
+        latestWindow,
+        auxEvents,
+      );
+      const closedMessages = reconcileChannelWindowMessages(
+        closedWindow,
+        queryClient.getQueryData<RelayEvent[]>(queryKey) ?? freshMessages,
+      );
+      requireCurrentScope();
+      queryClient.setQueryData(windowKey, closedWindow);
+      queryClient.setQueryData(queryKey, closedMessages);
+      if (snapshotScope && isMessageSnapshotScopeCurrent(snapshotScope)) {
+        writeMessageSnapshot(
+          snapshotScope,
+          flattenChannelWindowEvents(closedWindow),
+        );
+      }
+      return closedMessages;
     },
+    initialData: () => {
+      if (!snapshotScope) return undefined;
+      const snapshot = readMessageSnapshot(snapshotScope);
+      if (!snapshot || !isMessageSnapshotScopeCurrent(snapshotScope)) {
+        return undefined;
+      }
+      const currentWindow =
+        queryClient.getQueryData<ChannelWindowStore>(windowKey);
+      queryClient.setQueryData(
+        windowKey,
+        currentWindow
+          ? mergeChannelWindowOverlayEvents(currentWindow, snapshot)
+          : seedChannelWindowStoreFromSnapshot(snapshot),
+      );
+      return snapshot;
+    },
+    initialDataUpdatedAt: 0,
     staleTime: 5 * 60 * 1_000,
     gcTime: 60 * 60 * 1_000,
   });
@@ -259,7 +384,21 @@ export function useChannelSubscription(channel: Channel | null) {
   const queryClient = useQueryClient();
   const channelId = channel?.id ?? null;
   const channelType = channel?.channelType ?? null;
-  const [readyChannelId, setReadyChannelId] = useState<string | null>(null);
+  const renderedSubscriptionRef = useRef({
+    channelId,
+    generation: 0,
+  });
+  if (renderedSubscriptionRef.current.channelId !== channelId) {
+    renderedSubscriptionRef.current = {
+      channelId,
+      generation: renderedSubscriptionRef.current.generation + 1,
+    };
+  }
+  const renderedGeneration = renderedSubscriptionRef.current.generation;
+  const [readySubscription, setReadySubscription] = useState<{
+    channelId: string;
+    generation: number;
+  } | null>(null);
   const refreshNewestWindow = useEffectEvent(async () => {
     if (!channelId) return;
     await refreshChannelWindowMessages(queryClient, channelId);
@@ -344,6 +483,7 @@ export function useChannelSubscription(channel: Channel | null) {
     }
 
     let isDisposed = false;
+    const generation = renderedGeneration;
     let cleanup: (() => Promise<void>) | undefined;
     const disposeReconnectListener = relayClient.subscribeToReconnects(() => {
       void refreshNewestWindow().catch((error) => {
@@ -370,7 +510,7 @@ export function useChannelSubscription(channel: Channel | null) {
         }
 
         cleanup = dispose;
-        setReadyChannelId(channelId);
+        setReadySubscription({ channelId, generation });
       })
       .catch((error) => {
         console.error("Failed to subscribe to channel", channelId, error);
@@ -378,19 +518,27 @@ export function useChannelSubscription(channel: Channel | null) {
 
     return () => {
       isDisposed = true;
-      setReadyChannelId((current) => (current === channelId ? null : current));
       disposeReconnectListener();
       if (cleanup) {
         void cleanup();
       }
     };
-  }, [channelId, channelType]);
+  }, [channelId, channelType, renderedGeneration]);
 
   return (
     channelId !== null &&
     channelType !== "forum" &&
-    readyChannelId === channelId
+    readySubscription?.channelId === channelId &&
+    readySubscription.generation === renderedGeneration
   );
+}
+
+export function useSubscribedMessages(
+  channel: Channel | null,
+  context: { relayUrl: string; signerPubkey: string } | null,
+) {
+  const isSubscriptionReady = useChannelSubscription(channel);
+  return useChannelMessagesQuery(channel, isSubscriptionReady, context);
 }
 
 export function useSendMessageMutation(

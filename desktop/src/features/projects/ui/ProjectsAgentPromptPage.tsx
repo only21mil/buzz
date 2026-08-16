@@ -21,9 +21,10 @@ import {
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { useChannelsQuery, useOpenDmMutation } from "@/features/channels/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import {
-  useChannelMessagesQuery,
-  useChannelSubscription,
+  snapshotContext,
+  useSubscribedMessages,
 } from "@/features/messages/hooks";
 import { useLinkEditor } from "@/features/messages/lib/useLinkEditor";
 import {
@@ -201,11 +202,9 @@ function ConversationThread({
   selfAvatarUrl: string | null;
   visibleAfter: number;
 }) {
-  const isChannelSubscriptionReady = useChannelSubscription(channel);
-  const messagesQuery = useChannelMessagesQuery(
-    channel,
-    isChannelSubscriptionReady,
-  );
+  const { activeCommunity } = useCommunities();
+  const snapshot = snapshotContext(activeCommunity?.relayUrl, currentPubkey);
+  const messagesQuery = useSubscribedMessages(channel, snapshot);
   const agentWorking = useAgentWorking(agent.pubkey, channel.id);
   const bottomRef = React.useRef<HTMLDivElement>(null);
 

@@ -79,12 +79,6 @@ export function useCommunityNavigationTransitions({
         (community) => community.id === id,
       );
       if (!target) return;
-      if (!currentSignerPubkey) {
-        throw new Error(
-          "Cannot remove a community without an active identity.",
-        );
-      }
-
       const fallback = communities.communities.find(
         (community) => community.id !== id,
       );

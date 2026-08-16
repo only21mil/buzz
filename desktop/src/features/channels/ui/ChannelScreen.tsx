@@ -34,8 +34,8 @@ import { useWelcomeKickoffStagePresence } from "@/features/onboarding/useWelcome
 import { useWelcomeAgentCreate } from "@/features/channels/useWelcomeAgentCreate";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
-  useChannelMessagesQuery,
-  useChannelSubscription,
+  snapshotContext,
+  useSubscribedMessages,
   useChannelWindowQuery,
   useDeleteMessageMutation,
   useEditMessageMutation,
@@ -191,11 +191,8 @@ export function ChannelScreen({
         : current;
     });
   }, [activeChannelId, openThreadHeadId]);
-  const isChannelSubscriptionReady = useChannelSubscription(activeChannel);
-  const messagesQuery = useChannelMessagesQuery(
-    activeChannel,
-    isChannelSubscriptionReady,
-  );
+  const snapshot = snapshotContext(activeCommunity?.relayUrl, currentPubkey);
+  const messagesQuery = useSubscribedMessages(activeChannel, snapshot);
   const windowQuery = useChannelWindowQuery(activeChannel);
   const threadRepliesQuery = useThreadReplies(
     activeChannel,

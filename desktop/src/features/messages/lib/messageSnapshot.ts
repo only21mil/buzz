@@ -111,7 +111,9 @@ function currentScopeGeneration(
   );
 }
 
-function isCurrentScope(scope: MessageSnapshotScope): boolean {
+export function isMessageSnapshotScopeCurrent(
+  scope: MessageSnapshotScope,
+): boolean {
   const canonical = canonicalScope(
     scope.relayUrl,
     scope.signerPubkey,
@@ -235,7 +237,7 @@ function parseSnapshotPayload(
 export function readMessageSnapshot(
   scope: MessageSnapshotScope,
 ): RelayEvent[] | null {
-  if (!isCurrentScope(scope)) return null;
+  if (!isMessageSnapshotScopeCurrent(scope)) return null;
   const key = messageSnapshotKey(scope);
   try {
     // V1 had no identity dimension, so none of it can be attributed safely.
@@ -292,7 +294,7 @@ export function writeMessageSnapshot(
   events: RelayEvent[],
 ): boolean {
   try {
-    if (!isCurrentScope(scope)) return false;
+    if (!isMessageSnapshotScopeCurrent(scope)) return false;
     removeKeysWithPrefix(`${LEGACY_STORAGE_KEY_PREFIX}:`);
     if (
       events.length === 0 ||
@@ -327,7 +329,7 @@ export function writeMessageSnapshot(
       events: persistable,
     } satisfies SnapshotPayload);
 
-    if (!isCurrentScope(scope)) return false;
+    if (!isMessageSnapshotScopeCurrent(scope)) return false;
     return setLocalStorageItemWithRecovery(key, serialized);
   } catch {
     return false;
@@ -341,21 +343,37 @@ export function removeMessageSnapshotsForIdentity(
 ): void {
   try {
     const canonical = canonicalScope(relayUrl, signerPubkey, "purge");
-    if (canonical) {
-      generationSequence += 1;
-      identityScopeGenerations.set(
-        identityGenerationKey(canonical.relayUrl, canonical.signerPubkey),
-        generationSequence,
-      );
-      removeKeysWithPrefix(
-        identityPrefix(canonical.relayUrl, canonical.signerPubkey),
-      );
+    if (!canonical) {
+      removeAllMessageSnapshots();
+      return;
     }
+    generationSequence += 1;
+    identityScopeGenerations.set(
+      identityGenerationKey(canonical.relayUrl, canonical.signerPubkey),
+      generationSequence,
+    );
+    removeKeysWithPrefix(
+      identityPrefix(canonical.relayUrl, canonical.signerPubkey),
+    );
     removeKeysWithPrefix(
       `${LEGACY_STORAGE_KEY_PREFIX}:${normalizeRelayUrl(relayUrl)}:`,
     );
   } catch {
     // Storage access failures are non-fatal.
+  }
+}
+
+/** Purge every removed community exactly when possible, otherwise fail safe. */
+export function removeMessageSnapshotsForCommunities(
+  relayUrls: string[],
+  signerPubkey?: string | null,
+): void {
+  if (!signerPubkey || relayUrls.length === 0) {
+    removeAllMessageSnapshots();
+    return;
+  }
+  for (const relayUrl of relayUrls) {
+    removeMessageSnapshotsForIdentity(relayUrl, signerPubkey);
   }
 }
 

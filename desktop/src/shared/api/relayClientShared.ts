@@ -40,7 +40,7 @@ export type RelaySubscriptionFilter = {
 
 export type RelayHistoryFilters =
   | RelaySubscriptionFilter
-  | readonly RelaySubscriptionFilter[];
+  | readonly [RelaySubscriptionFilter, ...RelaySubscriptionFilter[]];
 
 type HistorySubscription = {
   mode: "history";

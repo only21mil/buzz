@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  backfillAuxForMessages,
   collectAuxEventIdsForDeletionBackfill,
   collectMessageIdsForAuxBackfill,
   fetchAuxBackfillEvents,
   fetchStructuralAuxForMessages,
   mergeAuxEventsWithDeletionBackfill,
 } from "./auxBackfill.ts";
+import { relayClient } from "@/shared/api/relayClient.ts";
+import { buildChannelStructuralAuxFilter } from "@/shared/api/relayChannelFilters.ts";
 
 const CHANNEL_ID = "36411e44-0e2d-4cfe-bd6e-567eb169db9f";
 
@@ -263,5 +266,41 @@ test("fetchAuxBackfillEvents rejects so snapshot persistence can detect failure"
       fetchAuxDeletionEventsForAuxEvents: async () => [],
     }),
     failure,
+  );
+});
+
+test("legacy backfill wrapper keeps one structural-only auxiliary request", async (t) => {
+  const message = event(hex("1"), 9);
+  const calls = [];
+  t.mock.method(
+    relayClient,
+    "fetchAuxEventsByReference",
+    async (channelId, messageIds, buildFilter) => {
+      calls.push({ channelId, messageIds, buildFilter });
+      return [];
+    },
+  );
+  t.mock.method(relayClient, "fetchAuxDeletionEventsForAuxEvents", async () => {
+    throw new Error("no deletion request is needed without structural aux");
+  });
+
+  await backfillAuxForMessages(
+    {
+      getQueryData: () => [],
+      setQueryData: () => {
+        throw new Error("an empty backfill must not update the cache");
+      },
+    },
+    CHANNEL_ID,
+    [message],
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].channelId, CHANNEL_ID);
+  assert.deepEqual(calls[0].messageIds, [message.id]);
+  assert.equal(calls[0].buildFilter, buildChannelStructuralAuxFilter);
+  assert.equal(
+    calls[0].buildFilter(CHANNEL_ID, [message.id]).kinds.includes(7),
+    false,
   );
 });

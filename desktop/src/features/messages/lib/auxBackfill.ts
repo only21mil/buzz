@@ -155,10 +155,10 @@ export async function fetchAuxBackfillEvents(
 }
 
 /**
- * After a content-kinds-only history fetch, pull auxiliary events (reactions,
- * edits, and deletions) that reference the loaded messages — keyed by `#e`
+ * After a content-kinds-only history fetch, pull structural auxiliary events
+ * (edits and deletions) that reference the loaded messages — keyed by `#e`
  * over their ids, not by a time window — and merge them into the same channel
- * cache.
+ * cache. Reaction hydration remains on its separate compatibility path.
  *
  * History fetches request content kinds only so the `limit` budget buys
  * visible message depth. The cost is that an edit/deletion for a visible
@@ -181,11 +181,9 @@ export async function backfillAuxForMessages(
 
   try {
     const cacheKey = channelMessagesKey(channelId);
-    const cachedEvents = queryClient.getQueryData<RelayEvent[]>(cacheKey) ?? [];
-    const mergedAuxEvents = await fetchAuxBackfillEvents(
+    const mergedAuxEvents = await fetchStructuralAuxForMessages(
       channelId,
-      historyEvents,
-      cachedEvents,
+      messageIds,
     );
     if (mergedAuxEvents.length === 0) {
       return;

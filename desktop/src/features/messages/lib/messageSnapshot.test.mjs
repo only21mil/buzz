@@ -7,6 +7,7 @@ import {
   messageSnapshotKey,
   readMessageSnapshot,
   removeAllMessageSnapshots,
+  removeMessageSnapshotsForCommunities,
   removeMessageSnapshotsForIdentity,
   writeMessageSnapshot,
 } from "./messageSnapshot.ts";
@@ -236,6 +237,51 @@ test("community removal purges the exact relay+identity bucket", () => {
   assert.equal(storage.has(messageSnapshotKey(a)), false);
   assert.equal(writeMessageSnapshot(a, [makeEvent()]), false);
   assert.notEqual(readMessageSnapshot(b), null);
+});
+
+test("clearCommunities purges every removed relay for the current identity", () => {
+  resetStorage();
+  const secondRelay = "wss://second.example.com";
+  const firstA = scope(SIGNER_A, "first", RELAY);
+  const secondA = scope(SIGNER_A, "second", secondRelay);
+  const firstB = scope(SIGNER_B, "first", RELAY);
+  assert.equal(
+    writeMessageSnapshot(firstA, [makeEvent({ channelId: "first" })]),
+    true,
+  );
+  assert.equal(
+    writeMessageSnapshot(secondA, [makeEvent({ channelId: "second" })]),
+    true,
+  );
+  assert.equal(
+    writeMessageSnapshot(firstB, [makeEvent({ channelId: "first" })]),
+    true,
+  );
+
+  removeMessageSnapshotsForCommunities([RELAY, secondRelay], SIGNER_A);
+
+  assert.equal(readMessageSnapshot(firstA), null);
+  assert.equal(readMessageSnapshot(secondA), null);
+  assert.notEqual(readMessageSnapshot(firstB), null);
+});
+
+test("clear or removal without a valid signer fails safe with a broad purge", () => {
+  for (const signerPubkey of [null, "not-a-pubkey"]) {
+    resetStorage();
+    const a = scope(SIGNER_A);
+    const b = scope(SIGNER_B);
+    assert.equal(writeMessageSnapshot(a, [makeEvent()]), true);
+    assert.equal(writeMessageSnapshot(b, [makeEvent()]), true);
+
+    if (signerPubkey === null) {
+      removeMessageSnapshotsForCommunities([RELAY], signerPubkey);
+    } else {
+      removeMessageSnapshotsForIdentity(RELAY, signerPubkey);
+    }
+
+    assert.equal(readMessageSnapshot(a), null);
+    assert.equal(readMessageSnapshot(b), null);
+  }
 });
 
 test("two identities on one origin cannot cross-read or resurrect stale data", () => {
