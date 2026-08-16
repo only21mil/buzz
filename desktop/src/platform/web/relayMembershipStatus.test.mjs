@@ -55,10 +55,40 @@ test("relay membership discovery reads NIP-11 /info with an optional relay overr
   assert.equal(requests[0].init.headers.Accept, "application/nostr+json");
 });
 
-test("relay membership discovery fails open on network and status errors", async () => {
+test("relay membership discovery distinguishes relay failures from a parsed false", async () => {
   assert.equal(
-    await relayRequiresMembership({}, workspace, async () => response({}, 503)),
+    await relayRequiresMembership({}, workspace, async () =>
+      response({ supported_nips: [1] }),
+    ),
     false,
+  );
+  await assert.rejects(
+    relayRequiresMembership({}, workspace, async () => {
+      throw new Error("network down");
+    }),
+    /relay information request failed/i,
+  );
+  await assert.rejects(
+    relayRequiresMembership({}, workspace, async () => response({}, 503)),
+    /relay information request failed.*503/i,
+  );
+  await assert.rejects(
+    relayRequiresMembership(
+      {},
+      workspace,
+      async () => new Response("{", { status: 200 }),
+    ),
+    /malformed NIP-11 document/i,
+  );
+  await assert.rejects(
+    relayRequiresMembership({}, workspace, async () => response([])),
+    /malformed NIP-11 document/i,
+  );
+  await assert.rejects(
+    relayRequiresMembership({}, workspace, async () =>
+      response({ supported_nips: "43" }),
+    ),
+    /malformed NIP-11 document/i,
   );
 });
 
@@ -101,6 +131,7 @@ test("resolve_oa_owner verifies the NIP-OA attestation before naming the owner",
     utf8ToBytes(`nostr:agent-auth:${targetPubkey}:${conditions}`),
   );
   const signature = bytesToHex(schnorr.sign(message, ownerSecret));
+  const validAuthTag = ["auth", owner, conditions, signature];
   const event = {
     id: "profile",
     pubkey: targetPubkey,
@@ -108,7 +139,7 @@ test("resolve_oa_owner verifies the NIP-OA attestation before naming the owner",
     kind: 0,
     content: "{}",
     sig: "f".repeat(128),
-    tags: [["auth", owner, conditions, signature]],
+    tags: [["auth", owner, conditions, "0".repeat(128)], validAuthTag],
   };
   const client = {
     async fetchFirstEvent(filter) {
@@ -125,7 +156,7 @@ test("resolve_oa_owner verifies the NIP-OA attestation before naming the owner",
     await resolveOaOwner({ targetPubkey }, { pubkey: () => owner }, client),
     { owner, is_me: true },
   );
-  event.tags[0][3] = "0".repeat(128);
+  event.tags[1][3] = "0".repeat(128);
   assert.equal(
     await resolveOaOwner({ targetPubkey }, { pubkey: () => owner }, client),
     null,

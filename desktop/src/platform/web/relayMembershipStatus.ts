@@ -50,7 +50,7 @@ function relayHttpUrl(relayUrl: string): string {
 async function fetchRelayInformation(
   url: string,
   fetchImpl: BrowserFetch,
-): Promise<Record<string, unknown> | null> {
+): Promise<{ supported_nips: number[] }> {
   let response: Response;
   try {
     response = await fetchImpl(url, {
@@ -58,18 +58,39 @@ async function fetchRelayInformation(
       credentials: "omit",
       headers: { Accept: "application/nostr+json" },
     });
-  } catch {
-    return null;
+  } catch (error) {
+    const detail = error instanceof Error ? `: ${error.message}` : "";
+    throw new Error(`Relay information request failed${detail}`);
   }
-  if (!response.ok) return null;
+  if (!response.ok) {
+    throw new Error(
+      `Relay information request failed (HTTP ${response.status})`,
+    );
+  }
+  let value: unknown;
   try {
-    const value = (await response.json()) as unknown;
-    return value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : null;
+    value = (await response.json()) as unknown;
   } catch {
-    return null;
+    throw new Error("Relay returned malformed NIP-11 document");
   }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Relay returned malformed NIP-11 document");
+  }
+  const supportedNips = (value as Record<string, unknown>).supported_nips;
+  if (supportedNips === undefined) return { supported_nips: [] };
+  if (
+    !Array.isArray(supportedNips) ||
+    !supportedNips.every(
+      (nip) =>
+        typeof nip === "number" &&
+        Number.isInteger(nip) &&
+        nip >= 0 &&
+        nip <= 4_294_967_295,
+    )
+  ) {
+    throw new Error("Relay returned malformed NIP-11 document");
+  }
+  return { supported_nips: supportedNips };
 }
 
 export async function relayRequiresMembership(
@@ -84,9 +105,7 @@ export async function relayRequiresMembership(
   }
   const base = override ? relayHttpUrl(override) : workspace.httpUrl();
   const info = await fetchRelayInformation(`${base}/info`, fetchImpl);
-  return (
-    Array.isArray(info?.supported_nips) && info.supported_nips.includes(43)
-  );
+  return info.supported_nips.includes(43);
 }
 
 function relayMembersFromEvent(event: RelayEvent): Array<{
@@ -158,28 +177,29 @@ export async function resolveOaOwner(
     kinds: [0],
     limit: 1,
   });
-  const auth = event?.tags.find((tag) => tag[0] === "auth" && tag.length === 4);
-  if (!auth) return null;
-
-  const [, owner, conditions, signature] = auth;
-  if (
-    !owner ||
-    conditions === undefined ||
-    !signature ||
-    !/^[0-9a-f]{64}$/.test(owner) ||
-    !/^[0-9a-f]{128}$/.test(signature) ||
-    owner === targetPubkey ||
-    !validNipOaConditions(conditions)
-  ) {
-    return null;
+  for (const auth of event?.tags ?? []) {
+    if (auth[0] !== "auth" || auth.length !== 4) continue;
+    const [, owner, conditions, signature] = auth;
+    if (
+      !owner ||
+      conditions === undefined ||
+      !signature ||
+      !/^[0-9a-f]{64}$/.test(owner) ||
+      !/^[0-9a-f]{128}$/.test(signature) ||
+      owner === targetPubkey ||
+      !validNipOaConditions(conditions)
+    ) {
+      continue;
+    }
+    const message = sha256(
+      utf8ToBytes(`nostr:agent-auth:${targetPubkey}:${conditions}`),
+    );
+    if (!schnorr.verify(hexToBytes(signature), message, hexToBytes(owner))) {
+      continue;
+    }
+    return { owner, is_me: owner === identity.pubkey().toLowerCase() };
   }
-  const message = sha256(
-    utf8ToBytes(`nostr:agent-auth:${targetPubkey}:${conditions}`),
-  );
-  if (!schnorr.verify(hexToBytes(signature), message, hexToBytes(owner))) {
-    return null;
-  }
-  return { owner, is_me: owner === identity.pubkey().toLowerCase() };
+  return null;
 }
 
 export async function showNativeNotification(body: InvokeBody): Promise<void> {
