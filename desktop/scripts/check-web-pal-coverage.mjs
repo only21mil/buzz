@@ -75,7 +75,7 @@ function coverageClaimsFromFile(coverage) {
     invalid.push(`${PENDING_FIELD} must be an object of name -> owner`);
   } else {
     for (const [name, owner] of Object.entries(pendingEntries)) {
-      if (typeof owner !== "string" || owner.length === 0) {
+      if (typeof owner !== "string" || owner.trim().length === 0) {
         invalid.push(`${PENDING_FIELD}.${name} must name an owning lane`);
         continue;
       }

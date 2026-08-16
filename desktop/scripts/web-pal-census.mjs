@@ -31,7 +31,10 @@ function modulePathForImport(specifier, sourcePath) {
   }
   if (!specifier.startsWith(".")) return null;
 
-  const candidate = path.resolve(path.dirname(sourcePath), specifier);
+  const absoluteSourcePath = path.isAbsolute(sourcePath)
+    ? sourcePath
+    : path.resolve(REPO_DIR, sourcePath);
+  const candidate = path.resolve(path.dirname(absoluteSourcePath), specifier);
   const candidates = [
     candidate,
     `${candidate}.ts`,
@@ -521,14 +524,56 @@ export function buildManifest(renderer, rustCommands) {
   };
 }
 
-export async function generateManifest({ outputPath = MANIFEST_PATH } = {}) {
+export async function createManifest() {
   const [renderer, rustCommands] = await Promise.all([
     extractRendererCommands(),
     extractRustCommands(),
   ]);
-  const manifest = buildManifest(renderer, rustCommands);
+  return buildManifest(renderer, rustCommands);
+}
+
+export async function generateManifest({ outputPath = MANIFEST_PATH } = {}) {
+  const manifest = await createManifest();
   await writeFile(outputPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   return manifest;
+}
+
+function namesForSection(manifest, section) {
+  const commands = manifest?.[section]?.commands;
+  if (!Array.isArray(commands)) {
+    throw new Error(`Manifest is missing ${section}.commands`);
+  }
+  return commands.map((command) =>
+    typeof command === "string" ? command : command?.name,
+  );
+}
+
+function describeNameDrift(section, committedNames, currentNames) {
+  const committed = new Set(committedNames);
+  const current = new Set(currentNames);
+  const added = currentNames.filter((name) => !committed.has(name));
+  const removed = committedNames.filter((name) => !current.has(name));
+  return `${section} command drift (added: ${added.join(", ") || "none"}; removed: ${removed.join(", ") || "none"})`;
+}
+
+export async function checkCommittedManifest({
+  manifestPath = MANIFEST_PATH,
+} = {}) {
+  const [committed, current] = await Promise.all([
+    readFile(manifestPath, "utf8").then(JSON.parse),
+    createManifest(),
+  ]);
+  for (const section of ["renderer", "rust"]) {
+    const committedNames = namesForSection(committed, section);
+    const currentNames = namesForSection(current, section);
+    if (
+      committedNames.length !== currentNames.length ||
+      committedNames.some((name, index) => name !== currentNames[index])
+    ) {
+      throw new Error(describeNameDrift(section, committedNames, currentNames));
+    }
+  }
+  return current;
 }
 
 function printSummary(manifest) {
@@ -560,10 +605,21 @@ const isMain =
   process.argv[1] &&
   pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 if (isMain) {
-  generateManifest()
-    .then(printSummary)
-    .catch((error) => {
-      console.error(error instanceof Error ? error.message : error);
-      process.exitCode = 1;
-    });
+  const args = process.argv.slice(2);
+  const unknownArgs = args.filter((argument) => argument !== "--check");
+  const action =
+    unknownArgs.length > 0
+      ? Promise.reject(
+          new Error(`Unknown argument(s): ${unknownArgs.join(", ")}`),
+        )
+      : args.includes("--check")
+        ? checkCommittedManifest().then((manifest) => {
+            printSummary(manifest);
+            console.log("Committed manifest matches current command names");
+          })
+        : generateManifest().then(printSummary);
+  action.catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
 }
