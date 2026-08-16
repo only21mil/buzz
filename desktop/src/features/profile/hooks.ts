@@ -321,7 +321,9 @@ export function useUsersBatchQuery(
 ) {
   const queryClient = useQueryClient();
   const { activeCommunity } = useCommunities();
+  const identityQuery = useIdentityQuery();
   const relayUrl = activeCommunity?.relayUrl ?? "";
+  const identityPubkey = identityQuery.data?.pubkey ?? "";
   const normalizedPubkeys = [
     ...new Set(pubkeys.map((pubkey) => pubkey.toLowerCase())),
   ]
@@ -356,7 +358,11 @@ export function useUsersBatchQuery(
         }
       }
       if (toFetch.length > 0) {
-        const fresh = await getUsersBatchCoalesced(relayUrl, toFetch);
+        const fresh = await getUsersBatchCoalesced(
+          relayUrl,
+          identityPubkey,
+          toFetch,
+        );
         if (relayUrl) {
           writeCachedUserLabels(relayUrl, fresh.profiles, fresh.missing);
         }

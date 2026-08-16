@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 
-import { getUsersBatchCoalesced } from "./profileBatchCoalescer.ts";
+import {
+  getUsersBatchCoalesced,
+  invalidateProfileBatchCoalescer,
+} from "./profileBatchCoalescer.ts";
 
 const ALICE = "a".repeat(64);
 const BOB = "b".repeat(64);
@@ -31,6 +34,7 @@ async function flushMicrotasks() {
 }
 
 beforeEach(() => {
+  invalidateProfileBatchCoalescer();
   globalThis.window = {
     __TAURI_INTERNALS__: {
       invoke: async () => {
@@ -54,9 +58,15 @@ test("overlapping same-turn profile batches share one union transport call", asy
     };
   };
 
-  const header = getUsersBatchCoalesced("wss://relay.example", [ALICE, BOB]);
-  const messages = getUsersBatchCoalesced("wss://relay.example", [BOB, CAROL]);
-  const owners = getUsersBatchCoalesced("wss://relay.example", [ALICE]);
+  const header = getUsersBatchCoalesced("wss://relay.example", ALICE, [
+    ALICE,
+    BOB,
+  ]);
+  const messages = getUsersBatchCoalesced("wss://relay.example", ALICE, [
+    BOB,
+    CAROL,
+  ]);
+  const owners = getUsersBatchCoalesced("wss://relay.example", ALICE, [ALICE]);
   const [headerResult, messageResult, ownerResult] = await Promise.all([
     header,
     messages,
@@ -85,11 +95,16 @@ test("an overlapping caller reuses covered pubkeys while transport is unresolved
     return request.promise;
   };
 
-  const first = getUsersBatchCoalesced("wss://relay.example", [ALICE, BOB]);
+  const first = getUsersBatchCoalesced("wss://relay.example", ALICE, [
+    ALICE,
+    BOB,
+  ]);
   await flushMicrotasks();
   assert.deepEqual(calls, [[ALICE, BOB]]);
 
-  const overlapping = getUsersBatchCoalesced("wss://relay.example", [BOB]);
+  const overlapping = getUsersBatchCoalesced("wss://relay.example", ALICE, [
+    BOB,
+  ]);
   await flushMicrotasks();
   assert.deepEqual(calls, [[ALICE, BOB]]);
 
@@ -118,9 +133,12 @@ test("an overlapping caller transports only its uncovered pubkeys", async () => 
     return calls.length === 1 ? firstRequest.promise : uncoveredRequest.promise;
   };
 
-  const first = getUsersBatchCoalesced("wss://relay.example", [ALICE, BOB]);
+  const first = getUsersBatchCoalesced("wss://relay.example", ALICE, [
+    ALICE,
+    BOB,
+  ]);
   await flushMicrotasks();
-  const overlapping = getUsersBatchCoalesced("wss://relay.example", [
+  const overlapping = getUsersBatchCoalesced("wss://relay.example", ALICE, [
     BOB,
     CAROL,
   ]);
@@ -154,8 +172,8 @@ test("a failed coalesced batch rejects every caller and a later request retries"
     return { profiles: { [ALICE]: rawProfile("Alice") }, missing: [] };
   };
 
-  const first = getUsersBatchCoalesced("wss://relay.example", [ALICE]);
-  const overlapping = getUsersBatchCoalesced("wss://relay.example", [
+  const first = getUsersBatchCoalesced("wss://relay.example", ALICE, [ALICE]);
+  const overlapping = getUsersBatchCoalesced("wss://relay.example", ALICE, [
     ALICE,
     BOB,
   ]);
@@ -165,7 +183,75 @@ test("a failed coalesced batch rejects every caller and a later request retries"
     ["rejected", "rejected"],
   );
 
-  const retry = await getUsersBatchCoalesced("wss://relay.example", [ALICE]);
+  const retry = await getUsersBatchCoalesced("wss://relay.example", ALICE, [
+    ALICE,
+  ]);
   assert.equal(calls, 2);
   assert.equal(retry.profiles[ALICE].displayName, "Alice");
+});
+
+test("identity scopes on one relay do not reuse unresolved work", async () => {
+  const firstRequest = deferred();
+  const secondRequest = deferred();
+  const calls = [];
+  window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+    calls.push(args.pubkeys);
+    return calls.length === 1 ? firstRequest.promise : secondRequest.promise;
+  };
+
+  const first = getUsersBatchCoalesced("wss://relay.example", ALICE, [CAROL]);
+  await flushMicrotasks();
+  const second = getUsersBatchCoalesced("wss://relay.example", BOB, [CAROL]);
+  await flushMicrotasks();
+  assert.deepEqual(calls, [[CAROL], [CAROL]]);
+
+  firstRequest.resolve({
+    profiles: { [CAROL]: rawProfile("Alice's view") },
+    missing: [],
+  });
+  secondRequest.resolve({
+    profiles: { [CAROL]: rawProfile("Bob's view") },
+    missing: [],
+  });
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult.profiles[CAROL].displayName, "Alice's view");
+  assert.equal(secondResult.profiles[CAROL].displayName, "Bob's view");
+});
+
+test("identity invalidation rejects old work and fences its late completion", async () => {
+  const oldRequest = deferred();
+  const currentRequest = deferred();
+  const calls = [];
+  window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+    calls.push(args.pubkeys);
+    return calls.length === 1 ? oldRequest.promise : currentRequest.promise;
+  };
+
+  const stale = getUsersBatchCoalesced("wss://relay.example", ALICE, [CAROL]);
+  await flushMicrotasks();
+  invalidateProfileBatchCoalescer();
+  await assert.rejects(stale, /identity change/);
+
+  const current = getUsersBatchCoalesced("wss://relay.example", BOB, [CAROL]);
+  await flushMicrotasks();
+  oldRequest.resolve({
+    profiles: { [CAROL]: rawProfile("Stale") },
+    missing: [],
+  });
+  await flushMicrotasks();
+  const overlapping = getUsersBatchCoalesced("wss://relay.example", BOB, [
+    CAROL,
+  ]);
+  assert.deepEqual(calls, [[CAROL], [CAROL]]);
+
+  currentRequest.resolve({
+    profiles: { [CAROL]: rawProfile("Current") },
+    missing: [],
+  });
+  const [currentResult, overlappingResult] = await Promise.all([
+    current,
+    overlapping,
+  ]);
+  assert.equal(currentResult.profiles[CAROL].displayName, "Current");
+  assert.equal(overlappingResult.profiles[CAROL].displayName, "Current");
 });

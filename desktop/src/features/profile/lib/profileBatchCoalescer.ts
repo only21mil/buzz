@@ -16,6 +16,11 @@ type PendingBatch = {
 
 const pendingBatches = new Map<string, PendingBatch>();
 const inFlightByScope = new Map<string, Map<string, InFlightEntry>>();
+let identityEpoch = 0;
+
+function batchScopeKey(relayScope: string, identityScope: string): string {
+  return `${identityEpoch}\0${relayScope}\0${identityScope.toLowerCase()}`;
+}
 
 function normalizePubkeys(pubkeys: string[]): string[] {
   return [...new Set(pubkeys.map((pubkey) => pubkey.toLowerCase()))]
@@ -24,15 +29,35 @@ function normalizePubkeys(pubkeys: string[]): string[] {
 }
 
 function createInFlightEntry(): InFlightEntry {
-  let resolve!: InFlightEntry["resolve"];
-  let reject!: InFlightEntry["reject"];
-  const promise = new Promise<UserProfileSummary | null>(
-    (resolvePromise, rejectPromise) => {
-      resolve = resolvePromise;
-      reject = rejectPromise;
-    },
-  );
+  let settled = false;
+  let resolvePromise!: InFlightEntry["resolve"];
+  let rejectPromise!: InFlightEntry["reject"];
+  const promise = new Promise<UserProfileSummary | null>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  const resolve: InFlightEntry["resolve"] = (profile) => {
+    if (settled) return;
+    settled = true;
+    resolvePromise(profile);
+  };
+  const reject: InFlightEntry["reject"] = (error) => {
+    if (settled) return;
+    settled = true;
+    rejectPromise(error);
+  };
   return { promise, reject, resolve };
+}
+
+/** Fence pending profile work before the active signer can be replaced. */
+export function invalidateProfileBatchCoalescer(): void {
+  identityEpoch += 1;
+  const error = new Error("Profile batch scope invalidated by identity change");
+  for (const scopedEntries of inFlightByScope.values()) {
+    for (const entry of scopedEntries.values()) entry.reject(error);
+  }
+  pendingBatches.clear();
+  inFlightByScope.clear();
 }
 
 async function flushBatch(scope: string, batch: PendingBatch): Promise<void> {
@@ -50,37 +75,44 @@ async function flushBatch(scope: string, batch: PendingBatch): Promise<void> {
     for (const [pubkey, entry] of batch.entries) {
       if (scopedEntries?.get(pubkey) === entry) scopedEntries.delete(pubkey);
     }
-    if (scopedEntries?.size === 0) inFlightByScope.delete(scope);
+    if (
+      scopedEntries?.size === 0 &&
+      inFlightByScope.get(scope) === scopedEntries
+    ) {
+      inFlightByScope.delete(scope);
+    }
   }
 }
 
-/** Coalesce same-turn misses and reuse unresolved per-pubkey relay work. */
+/** Coalesce same-turn misses within one relay and active identity scope. */
 export function getUsersBatchCoalesced(
   relayScope: string,
+  identityScope: string,
   pubkeys: string[],
 ): Promise<UsersBatchResponse> {
   const normalizedPubkeys = normalizePubkeys(pubkeys);
   if (normalizedPubkeys.length === 0) {
     return Promise.resolve({ profiles: {}, missing: [] });
   }
+  const scope = batchScopeKey(relayScope, identityScope);
 
-  let scopedEntries = inFlightByScope.get(relayScope);
+  let scopedEntries = inFlightByScope.get(scope);
   if (!scopedEntries) {
     scopedEntries = new Map();
-    inFlightByScope.set(relayScope, scopedEntries);
+    inFlightByScope.set(scope, scopedEntries);
   }
 
   const requestedEntries = normalizedPubkeys.map((pubkey) => {
     let entry = scopedEntries.get(pubkey);
     if (entry) return entry;
 
-    let batch = pendingBatches.get(relayScope);
+    let batch = pendingBatches.get(scope);
     if (!batch) {
       batch = { entries: new Map() };
-      pendingBatches.set(relayScope, batch);
+      pendingBatches.set(scope, batch);
       const scheduledBatch = batch;
       queueMicrotask(() => {
-        void flushBatch(relayScope, scheduledBatch);
+        void flushBatch(scope, scheduledBatch);
       });
     }
     entry = createInFlightEntry();
