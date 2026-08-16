@@ -131,16 +131,16 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         let tenant = crate::tenant::bind_community(&state.db, raw_host)
             .await
             .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
-        let expected_url = git_expected_url(
-            &state.config.relay_url,
-            &tenant,
-            parts
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or(parts.uri.path()),
-        )
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "unrecognized git endpoint").into_response())?;
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(parts.uri.path());
+        let is_snapshot = parts.uri.path().ends_with("/snapshot");
+        let expected_url = git_expected_url(&state.config.relay_url, &tenant, path_and_query)
+            .ok_or_else(|| {
+                (StatusCode::BAD_REQUEST, "unrecognized git endpoint").into_response()
+            })?;
 
         // Repo-root URL verification.
         //
@@ -165,22 +165,26 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         // Security is provided by: service-binding in the URL (clone vs push scoped),
         // ±60s timestamp, and the pre-receive hook for push authorization.
         // We pass the method from the event itself so verify_nip98_event always accepts.
-        let event_method = serde_json::from_str::<serde_json::Value>(&event_json)
-            .ok()
-            .and_then(|v| {
-                v["tags"]
-                    .as_array()?
-                    .iter()
-                    .find(|t| t[0].as_str() == Some("method"))?[1]
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| method.to_owned());
+        let event_method = if is_snapshot {
+            method.to_owned()
+        } else {
+            serde_json::from_str::<serde_json::Value>(&event_json)
+                .ok()
+                .and_then(|v| {
+                    v["tags"]
+                        .as_array()?
+                        .iter()
+                        .find(|t| t[0].as_str() == Some("method"))?[1]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| method.to_owned())
+        };
 
-        // SECURITY: method intentionally not verified for git routes. The tautological
-        // check (event.method == event.method) is deliberate — see comment block above.
-        // Git's credential protocol signs once with GET and reuses for POST. The URL tag
-        // provides the real security boundary (±60s timestamp + URL lock + HTTPS).
+        // SECURITY: method is intentionally not verified for Smart HTTP. The
+        // tautological check (event.method == event.method) is deliberate — see
+        // the comment block above. The snapshot REST route is different: it
+        // verifies the actual GET method and exact URL, including the query.
 
         // body=None: can't buffer streaming pack data to verify payload hash.
         // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
@@ -330,7 +334,15 @@ fn git_expected_url(
     } else {
         "http"
     };
-    let repo_path = if let Some((prefix, _query)) = path_and_query.split_once("/info/refs") {
+    let repo_path = if path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path)
+        .ends_with("/snapshot")
+    {
+        // Unlike Smart HTTP's reusable repo-root credential, the REST
+        // snapshot signs the exact GET URL, including its query string.
+        return Some(format!("{scheme}://{}{path_and_query}", tenant.host()));
+    } else if let Some((prefix, _query)) = path_and_query.split_once("/info/refs") {
         prefix
     } else if let Some(prefix) = path_and_query.strip_suffix("/git-upload-pack") {
         prefix
@@ -351,7 +363,7 @@ fn git_expected_url(
 /// repo root — but the *name* validation stays because owner/repo are
 /// still used as object-store key components via `manifest::pointer_key`.
 #[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
-fn validate_repo_id<'a>(owner: &str, repo: &'a str) -> Result<&'a str, Response> {
+pub(crate) fn validate_repo_id<'a>(owner: &str, repo: &'a str) -> Result<&'a str, Response> {
     // Owner must be exactly 64 lowercase hex chars.
     if owner.len() != 64
         || !owner
@@ -426,7 +438,7 @@ fn acquire_git_permit(
 /// Convert a [`HydrateError`] to the HTTP response shape the read+write
 /// paths share. Below-pointer failure ⇒ 5xx; pointer-absent is signalled
 /// via `Ok(None)` from [`hydrate_for_read`] and never reaches this fn.
-fn hydrate_error_to_response(owner: &str, repo: &str, err: HydrateError) -> Response {
+pub(crate) fn hydrate_error_to_response(owner: &str, repo: &str, err: HydrateError) -> Response {
     error!(error = %err, owner = %owner, repo = %repo, "hydrate failed");
     if matches!(err, HydrateError::ResourceLimit(_)) {
         return (
@@ -472,7 +484,7 @@ fn hydrate_error_to_response(owner: &str, repo: &str, err: HydrateError) -> Resp
 /// — so the remediation body leaks nothing, and only the author can rebind
 /// (kind:30617 is keyed by `(author, d)`). A *broken* binding stays generic
 /// even for the author: ambiguity fails closed.
-async fn authorize_git_read(
+pub(crate) async fn authorize_git_read(
     db: &buzz_db::Db,
     community: buzz_core::CommunityId,
     caller: &nostr::PublicKey,
@@ -572,8 +584,8 @@ pub struct InfoRefsQuery {
 #[derive(Deserialize)]
 /// Path parameters for git repo routes: `{owner}/{repo}`.
 pub struct GitRepoParams {
-    owner: String,
-    repo: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
 }
 
 /// Longest refname the fast path will emit. `is_safe_refname` enforces an
@@ -2017,6 +2029,10 @@ pub fn git_router(state: Arc<AppState>) -> Router {
     let body_limit = state.config.git_max_pack_bytes as usize;
 
     Router::new()
+        .route(
+            "/git/{owner}/{repo}/snapshot",
+            get(super::snapshot::repository_snapshot),
+        )
         .route("/git/{owner}/{repo}/info/refs", get(info_refs))
         .route("/git/{owner}/{repo}/git-upload-pack", post(upload_pack))
         .route("/git/{owner}/{repo}/git-receive-pack", post(receive_pack))
@@ -2489,6 +2505,56 @@ mod track_c_tests {
         )
         .expect("recognized upload-pack path");
         assert_eq!(url_a_alt_config, "https://host-a.example/git/owner/repo");
+    }
+
+    #[test]
+    fn git_snapshot_expected_url_preserves_the_exact_query() {
+        let tenant = tenant("host-a.example", 1);
+        let expected = git_expected_url(
+            "wss://config-host.example",
+            &tenant,
+            "/git/owner/repo/snapshot?ref=refs%2Fheads%2Fmain&commits=7",
+        )
+        .expect("recognized snapshot path");
+
+        assert_eq!(
+            expected,
+            "https://host-a.example/git/owner/repo/snapshot?ref=refs%2Fheads%2Fmain&commits=7"
+        );
+    }
+
+    #[test]
+    fn git_snapshot_nip98_rejects_queryless_url_and_wrong_method() {
+        let keys = Keys::generate();
+        let tenant = tenant("host-a.example", 1);
+        let exact_url = git_expected_url(
+            "wss://config-host.example",
+            &tenant,
+            "/git/owner/repo/snapshot?ref=refs%2Fheads%2Fmain&commits=7",
+        )
+        .expect("recognized snapshot path");
+
+        let queryless_event = git_nip98_event_json(
+            &keys,
+            "https://host-a.example/git/owner/repo/snapshot",
+            "GET",
+        );
+        let query_error =
+            buzz_auth::nip98::verify_nip98_event(&queryless_event, &exact_url, "GET", None)
+                .expect_err("snapshot token without the request query must be rejected");
+        assert!(
+            query_error.to_string().contains("URL mismatch"),
+            "expected URL-mismatch rejection, got {query_error}"
+        );
+
+        let get_event = git_nip98_event_json(&keys, &exact_url, "GET");
+        let method_error =
+            buzz_auth::nip98::verify_nip98_event(&get_event, &exact_url, "POST", None)
+                .expect_err("GET-signed snapshot token must be rejected for POST");
+        assert!(
+            method_error.to_string().contains("method mismatch"),
+            "expected method-mismatch rejection, got {method_error}"
+        );
     }
 
     /// GitAuth host-bind bite: a token signed for community A's repo URL must

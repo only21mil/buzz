@@ -90,6 +90,50 @@ store layer and retries *only* pre-classification network errors — never
 `Ok(2xx)`, `LostRace(412)`, or `NotFound(404)`. Retrying a classified
 outcome would change the TLA action and break the proof.
 
+### Repository snapshot endpoint
+
+Browser clients that cannot read Buzz's SHA-256 Git object format directly can
+request a bounded repository view from the relay:
+
+```text
+GET /git/{owner}/{repo}/snapshot?ref=<revision>&commits=<count>
+```
+
+`ref` is optional and defaults to the hydrated repository's `HEAD`. It accepts
+a branch, a `refs/heads/...` ref, a tag, or a commit object ID after strict
+refname validation. `commits` defaults to 20 and must be in `1..=50`. The
+NIP-98 event signs `GET` and the exact request URL, including the query string.
+The handler then applies the same `authorize_git_read` channel-membership gate
+as clone/fetch. A missing repository and every authorization denial return the
+same `404` JSON marker:
+`{"error":"repository_unavailable","message":"repository not found"}`. The
+author-only unbound-repository remediation response uses
+`{"error":"repository_unbound","message":"<remediation text>"}`; its status
+remains 404.
+
+The JSON body has the desktop `RawProjectRepoSnapshot` fields:
+`latest_commit`, `commit_count`, `commits`, `files`, and `contributors`. Recent
+commits are newest-first along the selected revision's first-parent history.
+Files use Git tree order and are capped at 250; a root `README` (optionally with
+an extension) remains included if it sorts beyond that cap. Blob previews are
+included only at 64 KiB or smaller and only when their content is UTF-8 with no
+NUL byte. Per-file `last_changed_at` and `latest_commit` are `null` in v1 so
+the request can stay within its wall budget. The response also includes the
+allowed extra top-level boolean `truncated`, set when the tree or serialized
+response was shortened.
+
+The endpoint reuses read hydration's pack cache and repository byte limits and
+holds one global Git subprocess permit for the request. Its total handler wall
+budget is 10 seconds and its serialized JSON limit is 2 MiB. If necessary, the
+relay removes files from the end of Git tree order (while retaining the root
+README) until the body fits and reports `"truncated": true`. Parameter errors
+return 400, permit exhaustion 429 with `Retry-After: 5`, hydration/resource or
+snapshot-size excess 413, and a subprocess or hydration deadline 504. Git runs
+only against the ephemeral hydrated bare repository, with inherited environment
+variables cleared; the validated client revision is resolved once with
+`--end-of-options`, and subsequent commands use the resolved object ID followed
+by Git's `--` revision/path separator.
+
 ## System Model
 
 A **repository** `R` has the following state in the object store:
