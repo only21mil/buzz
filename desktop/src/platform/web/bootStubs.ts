@@ -1,4 +1,10 @@
 import { registerNoopCommands } from "./noops";
+import { registerAgentsRuntimeBuilderlabCommands } from "./desktopOnly/agentsRuntimeBuilderlab";
+import { registerHuddleVoiceTtsCommands } from "./desktopOnly/huddleVoiceTts";
+import { registerRelayCryptoSocialCommands } from "./desktopOnly/relayCryptoSocial";
+import { registerRelaySocialConfigCommands } from "./desktopOnly/relaySocialConfig";
+import { registerRelayWorkflowsMembersCommands } from "./desktopOnly/relayWorkflowsMembers";
+import { registerTerminalGitMeshPairingCommands } from "./desktopOnly/terminalGitMeshPairing";
 import { BrowserIdentityManager, registerIdentityCommands } from "./identity";
 import { registerMessageMutationCommands } from "./messageMutations";
 import { registerRelayChannelAdminCommands } from "./relayChannelAdmin";
@@ -30,7 +36,7 @@ export const INACTIVE_HUDDLE_STATE = {
 export function registerBootStubs(): void {
   register("get_os_idle_seconds", () => null);
   register("get_huddle_state", () => INACTIVE_HUDDLE_STATE);
-  register("get_audio_output_device", () => null);
+  register("get_audio_output_device", () => ""); // "" = system default
   register("list_audio_output_devices", () => []);
   register("check_pipeline_hotstart", () => undefined);
   register("is_shared_identity", () => false);
@@ -65,5 +71,11 @@ export async function installBrowserPal(): Promise<void> {
   registerRelayMembershipCommands(identity);
   registerRelayMessageReadCommands();
   registerMediaCommands();
+  registerTerminalGitMeshPairingCommands();
+  registerHuddleVoiceTtsCommands();
+  registerAgentsRuntimeBuilderlabCommands();
+  registerRelaySocialConfigCommands(identity);
+  registerRelayWorkflowsMembersCommands(identity);
+  registerRelayCryptoSocialCommands(identity);
   await installMediaAuthServiceWorker();
 }
