@@ -1,7 +1,9 @@
 import { registerNoopCommands } from "./noops";
 import { registerAgentsRuntimeBuilderlabCommands } from "./desktopOnly/agentsRuntimeBuilderlab";
 import { registerHuddleVoiceTtsCommands } from "./desktopOnly/huddleVoiceTts";
+import { registerRelayCryptoSocialCommands } from "./desktopOnly/relayCryptoSocial";
 import { registerRelaySocialConfigCommands } from "./desktopOnly/relaySocialConfig";
+import { registerRelayWorkflowsMembersCommands } from "./desktopOnly/relayWorkflowsMembers";
 import { registerTerminalGitMeshPairingCommands } from "./desktopOnly/terminalGitMeshPairing";
 import { BrowserIdentityManager, registerIdentityCommands } from "./identity";
 import { registerRelayQueryCommands } from "./relayQueries";
@@ -63,5 +65,7 @@ export async function installBrowserPal(): Promise<void> {
   registerHuddleVoiceTtsCommands();
   registerAgentsRuntimeBuilderlabCommands();
   registerRelaySocialConfigCommands(identity);
+  registerRelayWorkflowsMembersCommands(identity);
+  registerRelayCryptoSocialCommands(identity);
   await installMediaAuthServiceWorker();
 }
