@@ -13,6 +13,10 @@ const COVERAGE_PATH = path.join(
   "coverage.json",
 );
 const COVERAGE_FIELDS = ["implemented", "noop", "capability-off"];
+// `pending` maps command name -> owning lane. It marks commands whose browser
+// implementation is in flight elsewhere; they count as accounted-for but a
+// real class (above) always supersedes a pending entry without a duplicate.
+const PENDING_FIELD = "pending";
 
 function compareStrings(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -61,8 +65,26 @@ function coverageClaimsFromFile(coverage) {
       claims.set(name, field);
     }
   }
+  const pending = new Map();
+  const pendingEntries = coverage[PENDING_FIELD] ?? {};
+  if (
+    !pendingEntries ||
+    typeof pendingEntries !== "object" ||
+    Array.isArray(pendingEntries)
+  ) {
+    invalid.push(`${PENDING_FIELD} must be an object of name -> owner`);
+  } else {
+    for (const [name, owner] of Object.entries(pendingEntries)) {
+      if (typeof owner !== "string" || owner.length === 0) {
+        invalid.push(`${PENDING_FIELD}.${name} must name an owning lane`);
+        continue;
+      }
+      if (!claims.has(name)) pending.set(name, owner);
+    }
+  }
   return {
     claims,
+    pending,
     invalid,
     duplicates: [...new Set(duplicates)].sort(compareStrings),
   };
@@ -70,15 +92,19 @@ function coverageClaimsFromFile(coverage) {
 
 export function checkCoverage(manifest, coverage) {
   const rendererNames = rendererNamesFromManifest(manifest);
-  const { claims, invalid, duplicates } = coverageClaimsFromFile(coverage);
+  const { claims, pending, invalid, duplicates } =
+    coverageClaimsFromFile(coverage);
   const rendererSet = new Set(rendererNames);
-  const missing = rendererNames.filter((name) => !claims.has(name));
-  const unknown = [...claims.keys()]
+  const missing = rendererNames.filter(
+    (name) => !claims.has(name) && !pending.has(name),
+  );
+  const unknown = [...claims.keys(), ...pending.keys()]
     .filter((name) => !rendererSet.has(name))
     .sort(compareStrings);
   return {
     rendererNames,
     claimedNames: [...claims.keys()].sort(compareStrings),
+    pendingNames: [...pending.keys()].sort(compareStrings),
     missing,
     unknown,
     invalid,
@@ -129,6 +155,11 @@ async function run() {
   const result = checkCoverage(manifest, coverage);
   console.log(`Renderer commands: ${result.rendererNames.length}`);
   console.log(`Claimed coverage: ${result.claimedNames.length}`);
+  if (result.pendingNames.length > 0) {
+    console.log(
+      `Pending (owned by in-flight lanes): ${result.pendingNames.length}`,
+    );
+  }
   if (result.ok) {
     console.log("Web PAL coverage: PASS");
     return;
