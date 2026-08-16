@@ -5,10 +5,6 @@ import { register } from "./registry";
 
 type RelayDiscoveryClient = Pick<typeof relayClient, "fetchEvents">;
 type ObjectBody = Record<string, unknown>;
-type SearchFilter = RelaySubscriptionFilter & {
-  search: string;
-  search_mode: "prefix";
-};
 
 const FORUM_QUERY_LIMIT = 500;
 
@@ -54,19 +50,6 @@ function optionalLimit(body: ObjectBody, fallback: number): number {
     throw new TypeError("limit must be a non-negative integer");
   }
   return Math.min(value ?? fallback, 100);
-}
-
-function optionalAuthors(body: ObjectBody): string[] | undefined {
-  const value = body.authors;
-  if (value === undefined || value === null) return undefined;
-  if (
-    !Array.isArray(value) ||
-    value.some((author) => typeof author !== "string")
-  ) {
-    throw new TypeError("authors must be an array of strings");
-  }
-  const authors = value.map((author) => author.trim()).filter(Boolean);
-  return authors.length > 0 ? authors : undefined;
 }
 
 function firstTagValue(event: RelayEvent, name: string): string | null {
@@ -187,43 +170,6 @@ function forumReply(
   };
 }
 
-export async function searchMessages(
-  body: unknown,
-  client: RelayDiscoveryClient,
-) {
-  const input = objectBody(body, "search_messages");
-  const filter: SearchFilter = {
-    kinds: [9, 40002, 45001, 45003],
-    search: requiredString(input, "q").trim(),
-    search_mode: "prefix",
-    limit: optionalLimit(input, 20),
-  };
-  const channelId = optionalString(input, "channelId");
-  const authors = optionalAuthors(input);
-  const since = optionalInteger(input, "since");
-  const until = optionalInteger(input, "until");
-  if (channelId !== undefined) filter["#h"] = [channelId];
-  if (authors !== undefined) filter.authors = authors;
-  if (since !== undefined) filter.since = since;
-  if (until !== undefined) filter.until = until;
-
-  const events = await client.fetchEvents(filter);
-  const total = events.length;
-  return {
-    hits: events.map((event, index) => ({
-      event_id: event.id,
-      content: event.content,
-      kind: event.kind,
-      pubkey: event.pubkey,
-      channel_id: firstTagValue(event, "h"),
-      channel_name: null,
-      created_at: event.created_at,
-      score: total <= 1 ? 1 : 1 - index / total,
-    })),
-    found: total,
-  };
-}
-
 export async function getForumPosts(
   body: unknown,
   client: RelayDiscoveryClient,
@@ -294,7 +240,6 @@ export async function getForumThread(
 export function registerRelayDiscoveryCommands(
   client: RelayDiscoveryClient = relayClient,
 ): void {
-  register("search_messages", (body) => searchMessages(body, client));
   register("get_forum_posts", (body) => getForumPosts(body, client));
   register("get_forum_thread", (body) => getForumThread(body, client));
 }
