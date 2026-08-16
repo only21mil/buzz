@@ -18,8 +18,4 @@ export function registerNoopCommands(): void {
   register("requeue_tray_actions", () => undefined);
   register("is_auto_update_supported", () => false);
   register("relay_reconnect_hook_configured", () => false);
-  // Optional desktop-only enrichment mounted by the channel screen. The
-  // managed-agent/persona/relay-agent commands are owned by the desktopOnly
-  // modules (lane 3); only the relay-self stub remains here.
-  register("get_relay_self", () => null);
 }

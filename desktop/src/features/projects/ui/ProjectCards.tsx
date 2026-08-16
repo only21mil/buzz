@@ -312,6 +312,11 @@ function RepositoryUnavailableIndicator({
       description: "The advertised branch is missing from the git remote.",
       label: "Branch missing",
     },
+    browser: {
+      description:
+        "Repository contents aren’t available in the web app yet; open it in the desktop app.",
+      label: "Desktop app only",
+    },
     unknown: {
       description: "Buzz could not load this repository.",
       label: "Unavailable",

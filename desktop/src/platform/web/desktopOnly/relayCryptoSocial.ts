@@ -383,6 +383,32 @@ async function activeRelayHttpUrl(): Promise<string> {
   return relayHttpUrl(await dispatch<string>("get_relay_http_url"));
 }
 
+/**
+ * Read the active relay's NIP-11 `self` pubkey. Mirrors Rust
+ * `fetch_relay_self` (identity_archive.rs): non-2xx → null; malformed document
+ * → error; missing or non-hex `self` → null; otherwise lowercase hex.
+ * Network failures reject so callers treat the relay identity as untrusted.
+ */
+async function fetchRelaySelf(): Promise<string | null> {
+  const response = await fetch(await activeRelayHttpUrl(), {
+    headers: { Accept: "application/nostr+json" },
+  });
+  if (!response.ok) return null;
+  let document: unknown;
+  try {
+    document = await response.json();
+  } catch {
+    throw new Error("relay returned malformed NIP-11 document");
+  }
+  const value =
+    document && typeof document === "object"
+      ? (document as { self?: unknown }).self
+      : undefined;
+  if (typeof value !== "string") return null;
+  const normalized = value.toLowerCase();
+  return HEX_64.test(normalized) ? normalized : null;
+}
+
 function validateBindingRequest(body: ObjectBody) {
   const challengeId = requiredString(body, "challengeId");
   const nonce = requiredString(body, "nonce");
@@ -723,20 +749,12 @@ export function registerRelayCryptoSocialCommands(
     return false;
   });
 
+  register("get_relay_self", () => fetchRelaySelf());
+
   register("list_archived_identities", async () => {
-    let relaySelf: string | undefined;
+    let relaySelf: string | null;
     try {
-      const response = await fetch(await activeRelayHttpUrl(), {
-        headers: { Accept: "application/nostr+json" },
-      });
-      if (!response.ok) return { archived: [] };
-      const document: unknown = await response.json();
-      const value =
-        document && typeof document === "object"
-          ? (document as { self?: unknown }).self
-          : undefined;
-      if (typeof value === "string" && HEX_64.test(value.toLowerCase()))
-        relaySelf = value.toLowerCase();
+      relaySelf = await fetchRelaySelf();
     } catch {
       return { archived: [] };
     }

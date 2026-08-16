@@ -245,6 +245,12 @@ export function ReadmePanel({
         icon: GitBranch,
         title: "Branch unavailable",
       },
+      browser: {
+        description:
+          "README, files, and commits aren’t available in the web app yet — branches, issues, and pull requests are. Open this repository in the Buzz desktop app to browse its contents.",
+        icon: Globe,
+        title: "Repository browsing needs the desktop app",
+      },
       unknown: {
         description:
           "Buzz could not load this repository. Try again or contact the project owner.",

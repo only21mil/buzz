@@ -5,6 +5,7 @@ export type ProjectRepoUnavailableReason =
   | "authentication"
   | "network"
   | "ref"
+  | "browser"
   | "unknown";
 
 export function projectRepoUnavailableReason(
@@ -18,6 +19,9 @@ export function projectRepoUnavailableReason(
         : "";
 
   if (!message) return "missing";
+  // The browser build has no git client yet; its PAL rejects repository
+  // snapshot reads with BrowserUnavailableError (see platform/web/desktopOnly).
+  if (/not available in the browser build/.test(message)) return "browser";
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied/.test(
       message,
