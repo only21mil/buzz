@@ -1,3 +1,4 @@
+import { relayClient } from "@/shared/api/relayClient";
 import { registerNoopCommands } from "./noops";
 import { registerAgentsRuntimeBuilderlabCommands } from "./desktopOnly/agentsRuntimeBuilderlab";
 import { registerHuddleVoiceTtsCommands } from "./desktopOnly/huddleVoiceTts";
@@ -11,6 +12,7 @@ import { registerMessageMutationCommands } from "./messageMutations";
 import { registerRelayChannelAdminCommands } from "./relayChannelAdmin";
 import { registerRelayDiscoveryCommands } from "./relayDiscovery";
 import { registerRelayMembershipCommands } from "./relayMembership";
+import { registerRelayMembershipStatusCommands } from "./relayMembershipStatus";
 import { registerRelayMessageReadCommands } from "./relayMessageReads";
 import { registerRelayQueryCommands } from "./relayQueries";
 import { installMediaAuthServiceWorker } from "./mediaAuth";
@@ -70,12 +72,14 @@ export async function installBrowserPal(): Promise<void> {
   registerWebSocketCommands();
   const identity = await BrowserIdentityManager.create();
   registerIdentityCommands(identity);
-  registerWorkspaceCommands(new BrowserWorkspace(), identity);
+  const workspace = new BrowserWorkspace();
+  registerWorkspaceCommands(workspace, identity);
   registerRelayQueryCommands(identity);
   registerMessageMutationCommands(identity);
   registerRelayChannelAdminCommands(identity);
   registerRelayDiscoveryCommands();
   registerRelayMembershipCommands(identity);
+  registerRelayMembershipStatusCommands(workspace, identity, relayClient);
   registerRelayMessageReadCommands();
   registerRelayPeopleCommands(identity);
   registerRelayDmCommands(identity);
