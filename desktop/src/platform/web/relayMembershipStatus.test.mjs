@@ -3,6 +3,7 @@ import { afterEach, test } from "node:test";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
+import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 
 import { listen } from "./shims/event.ts";
 import {
@@ -122,7 +123,9 @@ test("get_my_relay_membership mirrors current member and legacy p-tag shapes", a
 });
 
 test("resolve_oa_owner verifies the NIP-OA attestation before naming the owner", async () => {
-  const targetPubkey = PUBKEY;
+  const targetSecret = new Uint8Array(32);
+  targetSecret[31] = 2;
+  const targetPubkey = getPublicKey(targetSecret);
   const ownerSecret = new Uint8Array(32);
   ownerSecret[31] = 1;
   const owner = bytesToHex(schnorr.getPublicKey(ownerSecret));
@@ -132,15 +135,15 @@ test("resolve_oa_owner verifies the NIP-OA attestation before naming the owner",
   );
   const signature = bytesToHex(schnorr.sign(message, ownerSecret));
   const validAuthTag = ["auth", owner, conditions, signature];
-  const event = {
-    id: "profile",
-    pubkey: targetPubkey,
-    created_at: 1,
-    kind: 0,
-    content: "{}",
-    sig: "f".repeat(128),
-    tags: [["auth", owner, conditions, "0".repeat(128)], validAuthTag],
-  };
+  const signedProfile = (tags) =>
+    finalizeEvent(
+      { created_at: 1, kind: 0, content: "{}", tags },
+      targetSecret,
+    );
+  let event = signedProfile([
+    ["auth", owner, conditions, "0".repeat(128)],
+    validAuthTag,
+  ]);
   const client = {
     async fetchFirstEvent(filter) {
       assert.deepEqual(filter, {
@@ -156,7 +159,24 @@ test("resolve_oa_owner verifies the NIP-OA attestation before naming the owner",
     await resolveOaOwner({ targetPubkey }, { pubkey: () => owner }, client),
     { owner, is_me: true },
   );
-  event.tags[1][3] = "0".repeat(128);
+  event = signedProfile([
+    ["auth", owner, conditions, "0".repeat(128)],
+    ["auth", owner, conditions, "0".repeat(128)],
+  ]);
+  assert.equal(
+    await resolveOaOwner({ targetPubkey }, { pubkey: () => owner }, client),
+    null,
+  );
+  event = signedProfile([validAuthTag]);
+  event = {
+    id: event.id,
+    pubkey: event.pubkey,
+    created_at: event.created_at,
+    kind: event.kind,
+    tags: event.tags,
+    content: "tampered",
+    sig: event.sig,
+  };
   assert.equal(
     await resolveOaOwner({ targetPubkey }, { pubkey: () => owner }, client),
     null,

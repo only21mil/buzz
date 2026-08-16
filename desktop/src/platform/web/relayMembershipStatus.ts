@@ -2,6 +2,7 @@ import { emit } from "./shims/event";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
+import { verifyEvent } from "nostr-tools/pure";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { register, type InvokeBody } from "./registry";
@@ -177,6 +178,13 @@ export async function resolveOaOwner(
     kinds: [0],
     limit: 1,
   });
+  if (
+    event?.kind !== 0 ||
+    event.pubkey.toLowerCase() !== targetPubkey ||
+    !verifyEvent(event)
+  ) {
+    return null;
+  }
   for (const auth of event?.tags ?? []) {
     if (auth[0] !== "auth" || auth.length !== 4) continue;
     const [, owner, conditions, signature] = auth;
