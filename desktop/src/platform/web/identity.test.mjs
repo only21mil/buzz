@@ -77,6 +77,23 @@ test("sign_event preserves the camelCase contract and explicit epoch zero", asyn
   assert.equal(verifyEvent(event), true);
 });
 
+test("nip44 self encryption round-trips read-state payloads", async () => {
+  const manager = await BrowserIdentityManager.create(
+    new MemoryIdentityStore(),
+    new DirectNip49Codec(),
+  );
+  registerIdentityCommands(manager);
+
+  const ciphertext = await dispatch("nip44_encrypt_to_self", {
+    plaintext: '{"v":1,"contexts":{"channel:general":42}}',
+  });
+  assert.notEqual(ciphertext.includes("channel:general"), true);
+  assert.equal(
+    await dispatch("nip44_decrypt_from_self", { ciphertext }),
+    '{"v":1,"contexts":{"channel:general":42}}',
+  );
+});
+
 test("create_auth_event signs the exact relay and challenge tags", async () => {
   const manager = await BrowserIdentityManager.create(
     new MemoryIdentityStore(),
