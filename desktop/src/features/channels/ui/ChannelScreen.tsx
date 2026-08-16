@@ -191,13 +191,16 @@ export function ChannelScreen({
         : current;
     });
   }, [activeChannelId, openThreadHeadId]);
-  const messagesQuery = useChannelMessagesQuery(activeChannel);
+  const isChannelSubscriptionReady = useChannelSubscription(activeChannel);
+  const messagesQuery = useChannelMessagesQuery(
+    activeChannel,
+    isChannelSubscriptionReady,
+  );
   const windowQuery = useChannelWindowQuery(activeChannel);
   const threadRepliesQuery = useThreadReplies(
     activeChannel,
     effectiveOpenThreadHeadId,
   );
-  useChannelSubscription(activeChannel);
   const { fetchOlder, hasOlderMessages, historyExhausted, isFetchingOlder } =
     useFetchOlderMessages(activeChannel);
   const latestActiveMessage = React.useMemo(() => {

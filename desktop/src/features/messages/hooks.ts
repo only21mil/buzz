@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent } from "react";
+import { useEffect, useEffectEvent, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -223,13 +223,19 @@ export function useChannelWindowQuery(channel: Channel | null) {
   });
 }
 
-export function useChannelMessagesQuery(channel: Channel | null) {
+export function useChannelMessagesQuery(
+  channel: Channel | null,
+  isSubscriptionReady: boolean,
+) {
   const queryClient = useQueryClient();
   const queryKey = channelMessagesKey(channel?.id ?? "none");
   const windowKey = channelWindowKey(channel?.id ?? "none");
 
   return useQuery({
-    enabled: channel !== null && channel.channelType !== "forum",
+    enabled:
+      isSubscriptionReady &&
+      channel !== null &&
+      channel.channelType !== "forum",
     queryKey,
     queryFn: async () => {
       if (!channel) throw new Error("No channel selected.");
@@ -253,6 +259,7 @@ export function useChannelSubscription(channel: Channel | null) {
   const queryClient = useQueryClient();
   const channelId = channel?.id ?? null;
   const channelType = channel?.channelType ?? null;
+  const [readyChannelId, setReadyChannelId] = useState<string | null>(null);
   const refreshNewestWindow = useEffectEvent(async () => {
     if (!channelId) return;
     await refreshChannelWindowMessages(queryClient, channelId);
@@ -363,15 +370,7 @@ export function useChannelSubscription(channel: Channel | null) {
         }
 
         cleanup = dispose;
-        void refreshNewestWindow().catch((error) => {
-          if (!isDisposed) {
-            console.error(
-              "Failed to refresh channel window after subscribing",
-              channelId,
-              error,
-            );
-          }
-        });
+        setReadyChannelId(channelId);
       })
       .catch((error) => {
         console.error("Failed to subscribe to channel", channelId, error);
@@ -379,12 +378,19 @@ export function useChannelSubscription(channel: Channel | null) {
 
     return () => {
       isDisposed = true;
+      setReadyChannelId((current) => (current === channelId ? null : current));
       disposeReconnectListener();
       if (cleanup) {
         void cleanup();
       }
     };
   }, [channelId, channelType]);
+
+  return (
+    channelId !== null &&
+    channelType !== "forum" &&
+    readyChannelId === channelId
+  );
 }
 
 export function useSendMessageMutation(

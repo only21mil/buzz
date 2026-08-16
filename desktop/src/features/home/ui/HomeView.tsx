@@ -295,7 +295,9 @@ export function HomeView({
     homeInboxWidthPx > 0 &&
     homeInboxWidthPx < AUXILIARY_PANEL_SINGLE_COLUMN_BREAKPOINT_PX;
 
-  const channelMessagesQuery = useChannelMessagesQuery(selectedChannel);
+  // Inbox thread context is a bounded history read and does not own a live
+  // subscription gap, so it can fetch immediately.
+  const channelMessagesQuery = useChannelMessagesQuery(selectedChannel, true);
   const toggleReactionMutation = useToggleReactionMutation();
   const channelMessages = channelMessagesQuery.data;
   const threadContext = useInboxThreadContext(

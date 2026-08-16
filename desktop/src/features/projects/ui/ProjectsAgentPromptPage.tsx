@@ -201,8 +201,11 @@ function ConversationThread({
   selfAvatarUrl: string | null;
   visibleAfter: number;
 }) {
-  useChannelSubscription(channel);
-  const messagesQuery = useChannelMessagesQuery(channel);
+  const isChannelSubscriptionReady = useChannelSubscription(channel);
+  const messagesQuery = useChannelMessagesQuery(
+    channel,
+    isChannelSubscriptionReady,
+  );
   const agentWorking = useAgentWorking(agent.pubkey, channel.id);
   const bottomRef = React.useRef<HTMLDivElement>(null);
 
