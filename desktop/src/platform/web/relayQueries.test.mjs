@@ -432,3 +432,260 @@ test("update_channel publishes kind 9002 and returns canonical details", async (
   assert.equal(detail.created_by, PUBKEY);
   assert.equal(detail.updated_at, new Date(20_000).toISOString());
 });
+
+test("get_user_profile resolves another pubkey and get_users_batch maps profile summaries", async () => {
+  const other = "b".repeat(64);
+  const missing = "c".repeat(64);
+  const profile = event({
+    id: "other-profile",
+    kind: 0,
+    createdAt: 20,
+    pubkey: other,
+    content: JSON.stringify({
+      display_name: "Other user",
+      picture: "https://example.test/other.png",
+      about: "hello",
+      nip05: "other@example.test",
+    }),
+  });
+  const client = {
+    async fetchFirstEvent(filter) {
+      assert.deepEqual(filter, { kinds: [0], authors: [other], limit: 1 });
+      return profile;
+    },
+    async fetchEvents(filter) {
+      assert.deepEqual(filter, {
+        kinds: [0],
+        authors: [other, missing],
+        limit: 2,
+      });
+      return [profile];
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(await dispatch("get_user_profile", { pubkey: other }), {
+    pubkey: other,
+    display_name: "Other user",
+    avatar_url: "https://example.test/other.png",
+    about: "hello",
+    nip05_handle: "other@example.test",
+    owner_pubkey: null,
+    has_profile_event: true,
+  });
+  assert.deepEqual(
+    await dispatch("get_users_batch", { pubkeys: [other, missing] }),
+    {
+      profiles: {
+        [other]: {
+          display_name: "Other user",
+          name: null,
+          avatar_url: "https://example.test/other.png",
+          nip05_handle: "other@example.test",
+          owner_pubkey: null,
+          is_agent: false,
+        },
+      },
+      missing: [missing],
+    },
+  );
+});
+
+test("get_channel_messages_before forwards the composite keyset and returns the oldest cursor", async () => {
+  const page = [
+    event({ id: "1".repeat(64), kind: 9, createdAt: 50 }),
+    event({ id: "2".repeat(64), kind: 40002, createdAt: 49 }),
+  ];
+  const client = {
+    async fetchFirstEvent() {
+      return null;
+    },
+    async fetchEvents() {
+      return [];
+    },
+    async queryEvents(filters) {
+      assert.deepEqual(filters, [
+        {
+          "#h": ["channel-id"],
+          kinds: [
+            9, 40002, 40008, 40099, 43001, 43002, 43003, 43004, 43005, 43006,
+            48100,
+          ],
+          until: 51,
+          limit: 2,
+          before_id: "0".repeat(64),
+        },
+      ]);
+      return page;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(
+    await dispatch("get_channel_messages_before", {
+      channelId: "channel-id",
+      before: 51,
+      beforeId: "0".repeat(64),
+      limit: 2,
+    }),
+    {
+      events: page,
+      next_cursor: { created_at: 49, event_id: "2".repeat(64) },
+    },
+  );
+});
+
+test("get_channel_window mirrors the relay bridge read-model filter", async () => {
+  const response = [event({ id: "window", kind: 39006, createdAt: 60 })];
+  const client = {
+    async fetchFirstEvent() {
+      return null;
+    },
+    async fetchEvents() {
+      return [];
+    },
+    async queryEvents(filters) {
+      assert.deepEqual(filters, [
+        {
+          "#h": ["channel-id"],
+          kinds: [
+            9, 40002, 40008, 40099, 43001, 43002, 43003, 43004, 43005, 43006,
+            48100,
+          ],
+          limit: 50,
+          top_level: true,
+          include_summaries: true,
+          include_aux: true,
+        },
+      ]);
+      return response;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(
+    await dispatch("get_channel_window", {
+      channelId: "channel-id",
+      limitRows: 50,
+      cursor: null,
+    }),
+    response,
+  );
+});
+
+test("send_channel_message resolves NIP-10 roots, signs, publishes, and returns raw result", async () => {
+  const rootId = "1".repeat(64);
+  const parentId = "2".repeat(64);
+  const mention = "b".repeat(64);
+  let published = null;
+  const client = {
+    async fetchFirstEvent(filter) {
+      assert.deepEqual(filter, {
+        ids: [parentId],
+        kinds: [9, 40002, 45001, 45003, 48100],
+        limit: 1,
+      });
+      return event({
+        id: parentId,
+        kind: 9,
+        createdAt: 90,
+        tags: [["e", rootId, "", "root"]],
+      });
+    },
+    async fetchEvents() {
+      return [];
+    },
+    async publishEvent(signed) {
+      published = signed;
+      return signed;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(
+    await dispatch("send_channel_message", {
+      channelId: "11111111-1111-4111-8111-111111111111",
+      content: "  hello  ",
+      parentEventId: parentId,
+      mentionPubkeys: [mention.toUpperCase(), mention],
+      mediaTags: [["imeta", "url https://example.test/file.png"]],
+      emojiTags: [["emoji", "wave", "https://example.test/wave.png"]],
+      mentionTags: [["mention", mention]],
+      linkPreviewTags: [["link-preview", "none"]],
+      kind: null,
+    }),
+    {
+      event_id: "signed-event",
+      parent_event_id: parentId,
+      root_event_id: rootId,
+      depth: 2,
+      created_at: 100,
+    },
+  );
+  assert.equal(published.kind, 9);
+  assert.equal(published.content, "hello");
+  assert.deepEqual(published.tags, [
+    ["h", "11111111-1111-4111-8111-111111111111"],
+    ["e", rootId, "", "root"],
+    ["e", parentId, "", "reply"],
+    ["p", mention],
+    ["imeta", "url https://example.test/file.png"],
+    ["mention", mention],
+    ["emoji", "wave", "https://example.test/wave.png"],
+    ["link-preview", "none"],
+  ]);
+});
+
+test("search_messages forwards prefix search and maps raw relay events", async () => {
+  const hit = event({
+    id: "hit",
+    kind: 9,
+    createdAt: 42,
+    content: "hello world",
+    tags: [["h", "channel-id"]],
+  });
+  const client = {
+    async fetchFirstEvent() {
+      return null;
+    },
+    async fetchEvents() {
+      return [];
+    },
+    async queryEvents(filters) {
+      assert.deepEqual(filters, [
+        {
+          kinds: [9, 40002, 45001, 45003],
+          search: "hello",
+          search_mode: "prefix",
+          limit: 10,
+          "#h": ["channel-id"],
+        },
+      ]);
+      return [hit];
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(
+    await dispatch("search_messages", {
+      q: " hello ",
+      channelId: "channel-id",
+      limit: 10,
+    }),
+    {
+      hits: [
+        {
+          event_id: "hit",
+          content: "hello world",
+          kind: 9,
+          pubkey: PUBKEY,
+          channel_id: "channel-id",
+          channel_name: null,
+          created_at: 42,
+          score: 1,
+        },
+      ],
+      found: 1,
+    },
+  );
+});
