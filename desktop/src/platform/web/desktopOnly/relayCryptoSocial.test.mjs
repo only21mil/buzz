@@ -324,6 +324,34 @@ const cases = [
     },
   },
   {
+    command: "get_relay_self",
+    async run() {
+      registerRelayCryptoSocialCommands(identity(), fakeClient());
+      globalThis.fetch = async (url, options) => {
+        assert.equal(String(url), RELAY_HTTP);
+        assert.equal(options.headers.Accept, "application/nostr+json");
+        return new Response(JSON.stringify({ self: RELAY.toUpperCase() }), {
+          status: 200,
+        });
+      };
+      assert.equal(await dispatch("get_relay_self"), RELAY);
+      globalThis.fetch = async () => new Response("nope", { status: 404 });
+      assert.equal(await dispatch("get_relay_self"), null);
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ self: "not-hex" }), { status: 200 });
+      assert.equal(await dispatch("get_relay_self"), null);
+      globalThis.fetch = async () => new Response("{", { status: 200 });
+      await assert.rejects(dispatch("get_relay_self"), /malformed NIP-11/);
+      for (const body of ["[]", "null", '{"self": 42}']) {
+        globalThis.fetch = async () => new Response(body, { status: 200 });
+        await assert.rejects(dispatch("get_relay_self"), /malformed NIP-11/);
+      }
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ name: "no self" }), { status: 200 });
+      assert.equal(await dispatch("get_relay_self"), null);
+    },
+  },
+  {
     command: "list_archived_identities",
     async run() {
       const snapshot = signedEvent(RELAY_SECRET, {

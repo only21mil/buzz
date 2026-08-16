@@ -132,12 +132,15 @@ export function ActivityPanel({
   profiles,
   pullRequests,
   repoContributors,
+  unavailableMessage,
   viewerGitIdentity,
 }: {
   branch?: string;
   snapshot: ProjectRepoSnapshot | null | undefined;
   isLoading: boolean;
   error: unknown;
+  /** Explicit reason the git data cannot load (e.g. browser build); shown instead of the generic error copy. */
+  unavailableMessage?: string;
   onSelectCommit?: (commit: ProjectRepoCommit) => void;
   profiles?: UserProfileLookup;
   pullRequests?: ProjectPullRequest[];
@@ -166,9 +169,11 @@ export function ActivityPanel({
         className={PROJECT_DETAIL_PANEL_MESSAGE_CLASS}
         data-project-detail-panel
       >
-        {error
-          ? "Could not load repository activity from git."
-          : "No commits are available yet."}
+        {unavailableMessage
+          ? unavailableMessage
+          : error
+            ? "Could not load repository activity from git."
+            : "No commits are available yet."}
       </p>
     );
   }

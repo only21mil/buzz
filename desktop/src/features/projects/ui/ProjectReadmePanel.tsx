@@ -14,7 +14,10 @@ import {
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import type { ProjectRepoFile } from "@/features/projects/hooks";
-import type { ProjectRepoUnavailableReason } from "@/features/projects/lib/projectRepoAvailability";
+import {
+  BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE,
+  type ProjectRepoUnavailableReason,
+} from "@/features/projects/lib/projectRepoAvailability";
 import { Button } from "@/shared/ui/button";
 import { Markdown, SyntaxHighlightedCode } from "@/shared/ui/markdown";
 import {
@@ -245,6 +248,11 @@ export function ReadmePanel({
         icon: GitBranch,
         title: "Branch unavailable",
       },
+      browser: {
+        description: BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE,
+        icon: Globe,
+        title: "Repository browsing needs the desktop app",
+      },
       unknown: {
         description:
           "Buzz could not load this repository. Try again or contact the project owner.",
@@ -299,7 +307,9 @@ export function ReadmePanel({
             </a>
           ) : null}
           <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-            {!externalHost && sourceControls?.onFetch ? (
+            {!externalHost &&
+            reason !== "browser" &&
+            sourceControls?.onFetch ? (
               <Button
                 disabled={sourceControls.fetchPending}
                 onClick={sourceControls.onFetch}

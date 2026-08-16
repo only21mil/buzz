@@ -5,7 +5,12 @@ export type ProjectRepoUnavailableReason =
   | "authentication"
   | "network"
   | "ref"
+  | "browser"
   | "unknown";
+
+/** Copy for the `browser` reason, shared by the files, activity and README surfaces. */
+export const BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE =
+  "README, files, and commits aren’t available in the web app yet — branches, issues, and pull requests are. Open this repository in the Buzz desktop app to browse its contents.";
 
 export function projectRepoUnavailableReason(
   error: unknown,
@@ -18,6 +23,9 @@ export function projectRepoUnavailableReason(
         : "";
 
   if (!message) return "missing";
+  // The browser build has no git client yet; its PAL rejects repository
+  // snapshot reads with BrowserUnavailableError (see platform/web/desktopOnly).
+  if (/not available in the browser build/.test(message)) return "browser";
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied/.test(
       message,

@@ -24,6 +24,7 @@ import {
 } from "@/features/projects/lib/projectContributorMatching";
 import type { ProjectRepoHost } from "@/features/projects/lib/projectRepoHost";
 import {
+  BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE,
   projectRepoUnavailableReason,
   refineRepoUnavailableReason,
 } from "@/features/projects/lib/projectRepoAvailability";
@@ -462,6 +463,11 @@ export function WorkspaceTabs({
           <ActivityPanel
             branch={sourceControls?.branch}
             error={displayedSnapshotError}
+            unavailableMessage={
+              unavailableReason === "browser"
+                ? BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE
+                : undefined
+            }
             isLoading={displayedSnapshotLoading}
             onSelectCommit={(commit) => onSelectedCommitHashChange(commit.hash)}
             profiles={profiles}
@@ -544,7 +550,9 @@ export function WorkspaceTabs({
           unavailableMessage={
             externalHost
               ? `Not mirrored on Buzz. Repository files are hosted on ${externalHost}.`
-              : undefined
+              : unavailableReason === "browser"
+                ? BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE
+                : undefined
           }
         />
       </TabsContent>
