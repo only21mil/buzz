@@ -243,7 +243,7 @@ test("sidebar stalled relay state uses the reconnect card", async ({
   await expectGenericReconnectCard(page);
 });
 
-test("sidebar application auth disconnects stay on the error path", async ({
+test("sidebar application auth disconnects keep their detail on the reconnect card", async ({
   page,
 }) => {
   await installMockBridge(page, { channelsReadError: RELAY_AUTH_ERROR });
@@ -251,8 +251,9 @@ test("sidebar application auth disconnects stay on the error path", async ({
   await page.goto("/");
   await setRelayConnectionState(page, "disconnected");
 
-  await expect(page.getByText(RELAY_AUTH_ERROR)).toBeVisible();
-  await expect(page.getByTestId("sidebar-relay-unreachable")).toHaveCount(0);
+  const card = page.getByTestId("sidebar-relay-unreachable");
+  await expect(card).toBeVisible();
+  await expect(card).toContainText(RELAY_AUTH_ERROR);
 });
 
 test("sidebar reconnect action shows connected before hiding", async ({
