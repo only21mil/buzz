@@ -5,7 +5,10 @@ import {
   sortMessages,
 } from "@/features/messages/lib/messageQueryKeys";
 import { relayClient } from "@/shared/api/relayClient";
-import { buildChannelStructuralAuxFilter } from "@/shared/api/relayChannelFilters";
+import {
+  buildChannelAuxFilter,
+  buildChannelStructuralAuxFilter,
+} from "@/shared/api/relayChannelFilters";
 import type { RelayEvent } from "@/shared/api/types";
 import {
   CHANNEL_TIMELINE_CONTENT_KINDS,
@@ -96,6 +99,19 @@ const defaultStructuralAuxDeps: StructuralAuxFetchDeps = {
     relayClient.fetchAuxDeletionEventsForAuxEvents(channelId, auxEventIds),
 };
 
+export type AuxBackfillFetchDeps = StructuralAuxFetchDeps;
+
+const defaultAuxBackfillDeps: AuxBackfillFetchDeps = {
+  fetchAuxEventsForMessages: (channelId, messageIds) =>
+    relayClient.fetchAuxEventsByReference(
+      channelId,
+      messageIds,
+      buildChannelAuxFilter,
+    ),
+  fetchAuxDeletionEventsForAuxEvents: (channelId, auxEventIds) =>
+    relayClient.fetchAuxDeletionEventsForAuxEvents(channelId, auxEventIds),
+};
+
 export async function fetchStructuralAuxForMessages(
   channelId: string,
   messageIds: string[],
@@ -114,10 +130,35 @@ export async function fetchStructuralAuxForMessages(
 }
 
 /**
- * After a content-kinds-only history fetch, pull structural auxiliary events
- * (edits/deletions) that reference the loaded messages — keyed by `#e` over
- * their ids, not by a time window — and merge them into the same channel cache.
- * Reactions are hydrated separately for the rows the GUI renders.
+ * Fetch the complete aux closure for a bounded timeline window without
+ * mutating caches. Rejections remain visible so snapshot activation can avoid
+ * persisting a stale durable snapshot; the legacy wrapper below stays
+ * best-effort for existing callers.
+ */
+export async function fetchAuxBackfillEvents(
+  channelId: string,
+  historyEvents: RelayEvent[],
+  cachedEvents: RelayEvent[] = [],
+  deps: AuxBackfillFetchDeps = defaultAuxBackfillDeps,
+): Promise<RelayEvent[]> {
+  const messageIds = collectMessageIdsForAuxBackfill(historyEvents);
+  const auxEvents =
+    messageIds.length > 0
+      ? await deps.fetchAuxEventsForMessages(channelId, messageIds)
+      : [];
+  return mergeAuxEventsWithDeletionBackfill({
+    channelId,
+    cachedEvents,
+    fetchedAuxEvents: auxEvents,
+    fetchAuxEventsForMessages: deps.fetchAuxDeletionEventsForAuxEvents,
+  });
+}
+
+/**
+ * After a content-kinds-only history fetch, pull auxiliary events (reactions,
+ * edits, and deletions) that reference the loaded messages — keyed by `#e`
+ * over their ids, not by a time window — and merge them into the same channel
+ * cache.
  *
  * History fetches request content kinds only so the `limit` budget buys
  * visible message depth. The cost is that an edit/deletion for a visible
@@ -141,18 +182,11 @@ export async function backfillAuxForMessages(
   try {
     const cacheKey = channelMessagesKey(channelId);
     const cachedEvents = queryClient.getQueryData<RelayEvent[]>(cacheKey) ?? [];
-    const auxEvents = await relayClient.fetchAuxEventsByReference(
+    const mergedAuxEvents = await fetchAuxBackfillEvents(
       channelId,
-      messageIds,
-      buildChannelStructuralAuxFilter,
-    );
-    const mergedAuxEvents = await mergeAuxEventsWithDeletionBackfill({
-      channelId,
+      historyEvents,
       cachedEvents,
-      fetchedAuxEvents: auxEvents,
-      fetchAuxEventsForMessages: (...args) =>
-        relayClient.fetchAuxDeletionEventsForAuxEvents(...args),
-    });
+    );
     if (mergedAuxEvents.length === 0) {
       return;
     }

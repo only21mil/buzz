@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   collectAuxEventIdsForDeletionBackfill,
   collectMessageIdsForAuxBackfill,
+  fetchAuxBackfillEvents,
   fetchStructuralAuxForMessages,
   mergeAuxEventsWithDeletionBackfill,
 } from "./auxBackfill.ts";
@@ -177,4 +178,90 @@ test("fetchStructuralAuxForMessages skips all fetches for no message ids", async
     },
   });
   assert.deepEqual(auxEvents, []);
+});
+
+test("fetchAuxBackfillEvents returns reactions, edits, and tombstone closure", async () => {
+  const snapshotMessage = event(hex("1"), 9);
+  const cachedReaction = event(hex("2"), 7);
+  const fetchedReaction = event(hex("3"), 7);
+  const fetchedEdit = event(hex("4"), 40003);
+  const messageDeletion = event(hex("5"), 9005);
+  const cachedReactionDeletion = event(hex("6"), 5);
+  const fetchedReactionDeletion = event(hex("7"), 5);
+  const fetchedEditDeletion = event(hex("8"), 9005);
+  const auxCalls = [];
+  const deletionCalls = [];
+
+  const events = await fetchAuxBackfillEvents(
+    CHANNEL_ID,
+    [snapshotMessage],
+    [cachedReaction],
+    {
+      fetchAuxEventsForMessages: async (channelId, ids) => {
+        auxCalls.push({ channelId, ids });
+        return [fetchedReaction, fetchedEdit, messageDeletion];
+      },
+      fetchAuxDeletionEventsForAuxEvents: async (channelId, ids) => {
+        deletionCalls.push({ channelId, ids });
+        return [
+          cachedReactionDeletion,
+          fetchedReactionDeletion,
+          fetchedEditDeletion,
+        ];
+      },
+    },
+  );
+
+  assert.deepEqual(auxCalls, [
+    { channelId: CHANNEL_ID, ids: [snapshotMessage.id] },
+  ]);
+  assert.deepEqual(deletionCalls, [
+    {
+      channelId: CHANNEL_ID,
+      ids: [cachedReaction.id, fetchedReaction.id, fetchedEdit.id],
+    },
+  ]);
+  assert.deepEqual(
+    events.map((auxEvent) => auxEvent.id),
+    [
+      fetchedReaction.id,
+      fetchedEdit.id,
+      messageDeletion.id,
+      cachedReactionDeletion.id,
+      fetchedReactionDeletion.id,
+      fetchedEditDeletion.id,
+    ],
+  );
+});
+
+test("fetchAuxBackfillEvents closes cached aux even without timeline ids", async () => {
+  const cachedEdit = event(hex("2"), 40003);
+  const cachedEditDeletion = event(hex("3"), 5);
+
+  const events = await fetchAuxBackfillEvents(CHANNEL_ID, [], [cachedEdit], {
+    fetchAuxEventsForMessages: async () => {
+      throw new Error("must not fetch aux for an empty timeline");
+    },
+    fetchAuxDeletionEventsForAuxEvents: async (_channelId, ids) => {
+      assert.deepEqual(ids, [cachedEdit.id]);
+      return [cachedEditDeletion];
+    },
+  });
+
+  assert.deepEqual(events, [cachedEditDeletion]);
+});
+
+test("fetchAuxBackfillEvents rejects so snapshot persistence can detect failure", async () => {
+  const snapshotMessage = event(hex("1"), 9);
+  const failure = new Error("aux unavailable");
+
+  await assert.rejects(
+    fetchAuxBackfillEvents(CHANNEL_ID, [snapshotMessage], [], {
+      fetchAuxEventsForMessages: async () => {
+        throw failure;
+      },
+      fetchAuxDeletionEventsForAuxEvents: async () => [],
+    }),
+    failure,
+  );
 });
