@@ -6,6 +6,11 @@ import { registerRelaySocialConfigCommands } from "./desktopOnly/relaySocialConf
 import { registerRelayWorkflowsMembersCommands } from "./desktopOnly/relayWorkflowsMembers";
 import { registerTerminalGitMeshPairingCommands } from "./desktopOnly/terminalGitMeshPairing";
 import { BrowserIdentityManager, registerIdentityCommands } from "./identity";
+import { registerMessageMutationCommands } from "./messageMutations";
+import { registerRelayChannelAdminCommands } from "./relayChannelAdmin";
+import { registerRelayDiscoveryCommands } from "./relayDiscovery";
+import { registerRelayMembershipCommands } from "./relayMembership";
+import { registerRelayMessageReadCommands } from "./relayMessageReads";
 import { registerRelayQueryCommands } from "./relayQueries";
 import { installMediaAuthServiceWorker } from "./mediaAuth";
 import { registerMediaCommands } from "./mediaUpload";
@@ -60,6 +65,11 @@ export async function installBrowserPal(): Promise<void> {
   registerIdentityCommands(identity);
   registerWorkspaceCommands(new BrowserWorkspace(), identity);
   registerRelayQueryCommands(identity);
+  registerMessageMutationCommands(identity);
+  registerRelayChannelAdminCommands(identity);
+  registerRelayDiscoveryCommands();
+  registerRelayMembershipCommands(identity);
+  registerRelayMessageReadCommands();
   registerMediaCommands();
   registerTerminalGitMeshPairingCommands();
   registerHuddleVoiceTtsCommands();
