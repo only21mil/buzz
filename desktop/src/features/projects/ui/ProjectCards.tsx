@@ -174,11 +174,14 @@ const PROJECT_STAT_ITEMS = [
 export function ProjectStatsRow({
   summary,
   repoSnapshot,
+  commitCountUnavailable = false,
   fixedColumns = false,
 }: {
   summary: ProjectActivitySummary | undefined;
   /** Optional by design: omitting it silently falls back to the relay-summary commit count with no type error — pass the git snapshot wherever the true count matters. */
   repoSnapshot?: Pick<ProjectRepoSnapshot, "commitCount">;
+  /** True when git data cannot load in this build (browser); shows "—" instead of a fabricated 0. */
+  commitCountUnavailable?: boolean;
   /** Give each stat a fixed width so stats align vertically across list rows. */
   fixedColumns?: boolean;
 }) {
@@ -192,6 +195,7 @@ export function ProjectStatsRow({
     >
       {PROJECT_STAT_ITEMS.map(
         ({ key, icon: Icon, iconClass, label, columnClass }) => {
+          const unavailable = key === "commitCount" && commitCountUnavailable;
           const count =
             key === "commitCount"
               ? resolveProjectCommitCount(summary, repoSnapshot)
@@ -205,8 +209,10 @@ export function ProjectStatsRow({
               key={key}
             >
               <Icon className={cn("h-3.5 w-3.5 shrink-0", iconClass)} />
-              <span className="font-medium text-foreground">{count}</span>
-              {label(count)}
+              <span className="font-medium text-foreground">
+                {unavailable ? "—" : count}
+              </span>
+              {unavailable ? "commits" : label(count)}
             </span>
           );
         },
@@ -220,15 +226,20 @@ export function ProjectStatsRow({
 export function ProjectActivityBar({
   summary,
   repoSnapshot,
+  commitCountUnavailable = false,
 }: {
   summary: ProjectActivitySummary | undefined;
   /** Optional by design: omitting it silently falls back to the relay-summary commit count with no type error — pass the git snapshot wherever the true count matters. */
   repoSnapshot?: Pick<ProjectRepoSnapshot, "commitCount">;
+  /** True when git data cannot load in this build (browser); commits are left out of the bar. */
+  commitCountUnavailable?: boolean;
 }) {
   const items = PROJECT_STAT_ITEMS.map(({ key, barClass, label }) => {
     const count =
       key === "commitCount"
-        ? resolveProjectCommitCount(summary, repoSnapshot)
+        ? commitCountUnavailable
+          ? 0
+          : resolveProjectCommitCount(summary, repoSnapshot)
         : (summary?.[key] ?? 0);
     return { barClass, count, text: label(count) };
   });
@@ -565,10 +576,18 @@ export function ProjectGridCard({
 
         <div className="mt-auto">
           <div className="flex min-w-0 items-center px-4 pb-2 pt-1">
-            <ProjectStatsRow repoSnapshot={repoSnapshot} summary={summary} />
+            <ProjectStatsRow
+              commitCountUnavailable={repositoryUnavailableReason === "browser"}
+              repoSnapshot={repoSnapshot}
+              summary={summary}
+            />
           </div>
           <div className="px-4 pb-3">
-            <ProjectActivityBar repoSnapshot={repoSnapshot} summary={summary} />
+            <ProjectActivityBar
+              commitCountUnavailable={repositoryUnavailableReason === "browser"}
+              repoSnapshot={repoSnapshot}
+              summary={summary}
+            />
           </div>
         </div>
       </div>
@@ -639,12 +658,16 @@ export function ProjectListRow({
             data-testid="projects-row-summary"
           >
             <ProjectStatsRow
+              commitCountUnavailable={repositoryUnavailableReason === "browser"}
               fixedColumns
               repoSnapshot={repoSnapshot}
               summary={summary}
             />
             <div className="w-20 shrink-0">
               <ProjectActivityBar
+                commitCountUnavailable={
+                  repositoryUnavailableReason === "browser"
+                }
                 repoSnapshot={repoSnapshot}
                 summary={summary}
               />

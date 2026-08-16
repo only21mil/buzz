@@ -8,6 +8,10 @@ export type ProjectRepoUnavailableReason =
   | "browser"
   | "unknown";
 
+/** Copy for the `browser` reason, shared by the files, activity and README surfaces. */
+export const BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE =
+  "README, files, and commits aren’t available in the web app yet — branches, issues, and pull requests are. Open this repository in the Buzz desktop app to browse its contents.";
+
 export function projectRepoUnavailableReason(
   error: unknown,
 ): ProjectRepoUnavailableReason {

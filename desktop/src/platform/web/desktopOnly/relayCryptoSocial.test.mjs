@@ -342,6 +342,13 @@ const cases = [
       assert.equal(await dispatch("get_relay_self"), null);
       globalThis.fetch = async () => new Response("{", { status: 200 });
       await assert.rejects(dispatch("get_relay_self"), /malformed NIP-11/);
+      for (const body of ["[]", "null", '{"self": 42}']) {
+        globalThis.fetch = async () => new Response(body, { status: 200 });
+        await assert.rejects(dispatch("get_relay_self"), /malformed NIP-11/);
+      }
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ name: "no self" }), { status: 200 });
+      assert.equal(await dispatch("get_relay_self"), null);
     },
   },
   {

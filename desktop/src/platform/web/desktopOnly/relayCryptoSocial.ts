@@ -400,11 +400,18 @@ async function fetchRelaySelf(): Promise<string | null> {
   } catch {
     throw new Error("relay returned malformed NIP-11 document");
   }
-  const value =
-    document && typeof document === "object"
-      ? (document as { self?: unknown }).self
-      : undefined;
-  if (typeof value !== "string") return null;
+  // Rust deserializes into RelayInformationDocument: a non-object root or a
+  // non-string `self` is a deserialization error, a missing `self` is None.
+  if (
+    document === null ||
+    typeof document !== "object" ||
+    Array.isArray(document)
+  )
+    throw new Error("relay returned malformed NIP-11 document");
+  const value = (document as { self?: unknown }).self;
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string")
+    throw new Error("relay returned malformed NIP-11 document");
   const normalized = value.toLowerCase();
   return HEX_64.test(normalized) ? normalized : null;
 }

@@ -14,7 +14,10 @@ import {
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import type { ProjectRepoFile } from "@/features/projects/hooks";
-import type { ProjectRepoUnavailableReason } from "@/features/projects/lib/projectRepoAvailability";
+import {
+  BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE,
+  type ProjectRepoUnavailableReason,
+} from "@/features/projects/lib/projectRepoAvailability";
 import { Button } from "@/shared/ui/button";
 import { Markdown, SyntaxHighlightedCode } from "@/shared/ui/markdown";
 import {
@@ -246,8 +249,7 @@ export function ReadmePanel({
         title: "Branch unavailable",
       },
       browser: {
-        description:
-          "README, files, and commits aren’t available in the web app yet — branches, issues, and pull requests are. Open this repository in the Buzz desktop app to browse its contents.",
+        description: BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE,
         icon: Globe,
         title: "Repository browsing needs the desktop app",
       },
@@ -305,7 +307,9 @@ export function ReadmePanel({
             </a>
           ) : null}
           <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-            {!externalHost && sourceControls?.onFetch ? (
+            {!externalHost &&
+            reason !== "browser" &&
+            sourceControls?.onFetch ? (
               <Button
                 disabled={sourceControls.fetchPending}
                 onClick={sourceControls.onFetch}
