@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { finalizeEvent } from "nostr-tools/pure";
 
 const storage = new Map();
 let invokeHandler = async () => undefined;
@@ -26,17 +27,18 @@ const identityApi = await import("./tauriIdentity.ts");
 const RELAY = "wss://relay.example.com";
 const SIGNER_A = "a".repeat(64);
 const SIGNER_B = "b".repeat(64);
+const EVENT_SECRET = new Uint8Array(32).fill(13);
 
 function makeEvent(channelId = "private") {
-  return {
-    id: "c".repeat(64),
-    pubkey: SIGNER_A,
-    created_at: 1_700_000_000,
-    kind: 9,
-    tags: [["h", channelId]],
-    content: "private message",
-    sig: "d".repeat(128),
-  };
+  return finalizeEvent(
+    {
+      created_at: 1_700_000_000,
+      kind: 9,
+      tags: [["h", channelId]],
+      content: "private message",
+    },
+    EVENT_SECRET,
+  );
 }
 
 function rawIdentity(pubkey) {
@@ -75,12 +77,14 @@ test("failed identity import leaves the current identity snapshot intact", async
   snapshots.removeAllMessageSnapshots();
   storage.clear();
   const current = seed();
+  const before = snapshots.readMessageSnapshot(current);
+  assert.ok(before);
   invokeHandler = async () => {
     throw new Error("import failed");
   };
 
   await assert.rejects(identityApi.importIdentity("bad-nsec"));
-  assert.deepEqual(snapshots.readMessageSnapshot(current), [makeEvent()]);
+  assert.deepEqual(snapshots.readMessageSnapshot(current), before);
 });
 
 test("successful identity replacement purges snapshots before resolving", async () => {

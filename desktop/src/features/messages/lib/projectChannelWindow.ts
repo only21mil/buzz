@@ -8,6 +8,7 @@ import {
 import { channelMessagesKey, channelWindowKey } from "./messageQueryKeys";
 import {
   emptyChannelWindowStore,
+  mergeHeadTransactionChannelWindowEvent,
   mergeLiveChannelWindowEvent,
   type ChannelWindowStore,
 } from "./channelWindowStore";
@@ -29,6 +30,22 @@ export function mergeChannelWindowOverlayEvents(
     }
     if (AUX_KINDS.has(event.kind)) {
       return mergeLiveChannelWindowEvent(current, event, false);
+    }
+    return current;
+  }, store);
+}
+
+/** Replay only events captured during the exact active head transaction. */
+export function mergeHeadTransactionChannelWindowEvents(
+  store: ChannelWindowStore,
+  events: RelayEvent[],
+): ChannelWindowStore {
+  return events.reduce((current, event) => {
+    if (TIMELINE_KINDS.has(event.kind)) {
+      return mergeHeadTransactionChannelWindowEvent(current, event);
+    }
+    if (AUX_KINDS.has(event.kind)) {
+      return mergeHeadTransactionChannelWindowEvent(current, event, false);
     }
     return current;
   }, store);

@@ -46,6 +46,9 @@ const PERSISTABLE_EVENT_KINDS: ReadonlySet<number> = new Set([
   ...CHANNEL_TIMELINE_CONTENT_KINDS,
   ...CHANNEL_AUX_EVENT_KINDS,
 ]);
+const TIMELINE_EVENT_KINDS: ReadonlySet<number> = new Set(
+  CHANNEL_TIMELINE_CONTENT_KINDS,
+);
 
 let generationSequence = 0;
 let globalScopeGeneration = 0;
@@ -197,12 +200,19 @@ function removeStoredKey(key: string): null {
   return null;
 }
 
-function isPersistableEvent(
+type ValidatedPersistableEvent = {
+  event: RelayEvent;
+  isTimeline: boolean;
+  hasScopedChannelTag: boolean;
+  referencedEventIds: string[];
+};
+
+function validatePersistableEvent(
   value: unknown,
   channelId: string,
-): value is RelayEvent {
+): ValidatedPersistableEvent | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
+    return null;
   }
   const event = value as Record<string, unknown>;
   if (
@@ -220,9 +230,10 @@ function isPersistableEvent(
     !Array.isArray(event.tags) ||
     "localKey" in event ||
     "pending" in event ||
+    Object.keys(event).length !== EVENT_KEYS.size ||
     !Object.keys(event).every((key) => EVENT_KEYS.has(key))
   ) {
-    return false;
+    return null;
   }
 
   const tags = event.tags as unknown[];
@@ -232,31 +243,82 @@ function isPersistableEvent(
         Array.isArray(tag) && tag.every((part) => typeof part === "string"),
     )
   ) {
-    return false;
+    return null;
   }
   const channelTags = (tags as string[][]).filter((tag) => tag[0] === "h");
+  const hasScopedChannelTag =
+    channelTags.length === 1 &&
+    channelTags[0]?.length === 2 &&
+    channelTags[0][1] === channelId;
+  const isTimeline = TIMELINE_EVENT_KINDS.has(event.kind as number);
   if (
-    channelTags.length !== 1 ||
-    channelTags[0]?.length !== 2 ||
-    channelTags[0][1] !== channelId
+    isTimeline
+      ? !hasScopedChannelTag
+      : channelTags.length > 0 && !hasScopedChannelTag
   ) {
-    return false;
+    return null;
   }
   try {
     // Reconstruct the canonical event so verifier cache metadata attached to a
     // previously finalized object cannot survive a post-signature mutation.
-    return verifyEvent({
-      id: event.id as string,
-      pubkey: event.pubkey as string,
-      created_at: event.created_at as number,
-      kind: event.kind as number,
-      tags: event.tags as string[][],
-      content: event.content as string,
-      sig: event.sig as string,
-    });
+    if (
+      !verifyEvent({
+        id: event.id as string,
+        pubkey: event.pubkey as string,
+        created_at: event.created_at as number,
+        kind: event.kind as number,
+        tags: event.tags as string[][],
+        content: event.content as string,
+        sig: event.sig as string,
+      })
+    ) {
+      return null;
+    }
   } catch {
-    return false;
+    return null;
   }
+  return {
+    event: event as RelayEvent,
+    isTimeline,
+    hasScopedChannelTag,
+    referencedEventIds: (tags as string[][])
+      .filter((tag) => tag[0] === "e" && typeof tag[1] === "string")
+      .map((tag) => tag[1]),
+  };
+}
+
+function isPersistableEventBatch(
+  events: unknown[],
+  channelId: string,
+): events is RelayEvent[] {
+  const validated = events.map((event) =>
+    validatePersistableEvent(event, channelId),
+  );
+  if (validated.some((event) => event === null)) return false;
+
+  const acceptedIds = new Set(
+    validated.flatMap((event) => (event?.isTimeline ? [event.event.id] : [])),
+  );
+  let unresolved = validated.filter(
+    (event): event is ValidatedPersistableEvent =>
+      event !== null && !event.isTimeline,
+  );
+
+  while (unresolved.length > 0) {
+    const next = unresolved.filter((event) => {
+      if (
+        event.hasScopedChannelTag ||
+        event.referencedEventIds.some((id) => acceptedIds.has(id))
+      ) {
+        acceptedIds.add(event.event.id);
+        return false;
+      }
+      return true;
+    });
+    if (next.length === unresolved.length) return false;
+    unresolved = next;
+  }
+  return true;
 }
 
 function parseSnapshotPayload(
@@ -282,9 +344,7 @@ function parseSnapshotPayload(
     payload.events.length === 0 ||
     payload.events.length > MAX_EVENTS_PER_SNAPSHOT ||
     (validateEvents &&
-      !payload.events.every((event) =>
-        isPersistableEvent(event, scope.channelId),
-      ))
+      !isPersistableEventBatch(payload.events, scope.channelId))
   ) {
     return null;
   }
@@ -356,12 +416,13 @@ export function writeMessageSnapshot(
     removeObsoleteSnapshotNamespaces();
     if (
       events.length === 0 ||
-      !events.every((event) => isPersistableEvent(event, scope.channelId))
+      !isPersistableEventBatch(events, scope.channelId)
     ) {
       return false;
     }
 
     const persistable = events.slice(-MAX_EVENTS_PER_SNAPSHOT);
+    if (!isPersistableEventBatch(persistable, scope.channelId)) return false;
     const key = messageSnapshotKey(scope);
     const previous = window.localStorage.getItem(key);
     if (previous !== null) {

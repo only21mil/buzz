@@ -85,12 +85,14 @@ function channel(id) {
   };
 }
 
-async function flushMicrotasks() {
-  await act(async () => {
-    for (let index = 0; index < 6; index += 1) {
-      await Promise.resolve();
-    }
-  });
+async function waitForCondition(condition, message) {
+  const deadline = Date.now() + 5_000;
+  while (!condition()) {
+    if (Date.now() >= deadline) assert.fail(message);
+    await act(async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+  }
 }
 
 function deferred() {
@@ -101,6 +103,14 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, reject, resolve };
+}
+
+async function resolveDeferred(request, value) {
+  await act(async () => request.resolve(value));
+}
+
+async function rejectDeferred(request, error) {
+  await act(async () => request.reject(error));
 }
 
 function relayEvent(channelId, id, kind = 9, overrides = {}) {
@@ -117,17 +127,36 @@ function relayEvent(channelId, id, kind = 9, overrides = {}) {
   );
 }
 
-function channelWindowResponse(channelId, events = []) {
+function channelWindowResponse(
+  channelId,
+  events = [],
+  { hasMore = false } = {},
+) {
+  const oldest = events.at(-1);
   return [
     ...events,
     relayEvent(channelId, "f", 39006, {
-      content: JSON.stringify({ has_more: false, next_cursor: null }),
+      content: JSON.stringify({
+        has_more: hasMore,
+        next_cursor:
+          hasMore && oldest
+            ? { created_at: oldest.created_at, id: oldest.id }
+            : null,
+      }),
       tags: [
         ["h", channelId],
         ["d", `${channelId}:head`],
       ],
     }),
   ];
+}
+
+function installChannelWindowInvoke(handler) {
+  dom.window.__TAURI_INTERNALS__.invoke = async (command, args) => {
+    if (command !== "get_channel_window") return undefined;
+    assert.ok(args, "channel-window invoke args are required");
+    return handler(args);
+  };
 }
 
 function installRelayStub({ fetchAux, fetchAuxDeletions } = {}) {
@@ -167,12 +196,13 @@ function installRelayStub({ fetchAux, fetchAuxDeletions } = {}) {
       });
       assert.ok(subscription, `missing subscription for ${channelId}`);
       subscription.ready = true;
-      subscription.resolve(async () => {
-        subscription.disposed = true;
+      await act(async () => {
+        subscription.resolve(async () => {
+          subscription.disposed = true;
+        });
       });
-      await flushMicrotasks();
     },
-    emit(channelId, event) {
+    async emit(channelId, event) {
       const subscription = [...subscriptions]
         .reverse()
         .find(
@@ -182,11 +212,12 @@ function installRelayStub({ fetchAux, fetchAuxDeletions } = {}) {
             !candidate.disposed,
         );
       assert.ok(subscription, `missing ready subscription for ${channelId}`);
-      subscription.onEvent(event);
+      await act(async () => subscription.onEvent(event));
     },
     async reconnect() {
-      for (const listener of [...reconnectListeners]) listener();
-      await flushMicrotasks();
+      await act(async () => {
+        for (const listener of [...reconnectListeners]) listener();
+      });
     },
   };
 }
@@ -256,7 +287,13 @@ function mountHarness(
     renderTransition(activeChannel) {
       return render(activeChannel, initialSnapshotContext, true);
     },
-    async unmount() {
+    async unmount({ waitForIdle = true } = {}) {
+      if (waitForIdle) {
+        await waitForCondition(
+          () => queryClient.isFetching() === 0,
+          "channel query did not settle before unmount",
+        );
+      }
       await act(async () => root.unmount());
       queryClient.clear();
     },
@@ -274,13 +311,10 @@ beforeEach(() => {
 
 test("channel windows wait for subscription readiness and reconnect once", async () => {
   const windowCalls = [];
-  dom.window.__TAURI_INTERNALS__.invoke = async (command, args) => {
-    if (command !== "get_channel_window") {
-      throw new Error(`unexpected Tauri command: ${command}`);
-    }
+  installChannelWindowInvoke(async (args) => {
     windowCalls.push(args.channelId);
     return channelWindowResponse(args.channelId);
-  };
+  });
 
   const relay = installRelayStub();
   const firstChannel = channel("channel-a");
@@ -295,6 +329,10 @@ test("channel windows wait for subscription readiness and reconnect once", async
   );
 
   await relay.markReady(firstChannel.id);
+  await waitForCondition(
+    () => windowCalls.length === 1,
+    "channel A head query did not start",
+  );
   assert.deepEqual(windowCalls, [firstChannel.id]);
 
   await harness.render(secondChannel);
@@ -305,9 +343,17 @@ test("channel windows wait for subscription readiness and reconnect once", async
   );
 
   await relay.markReady(secondChannel.id);
+  await waitForCondition(
+    () => windowCalls.length === 2,
+    "channel B head query did not start",
+  );
   assert.deepEqual(windowCalls, [firstChannel.id, secondChannel.id]);
 
   await relay.reconnect();
+  await waitForCondition(
+    () => windowCalls.length === 3,
+    "reconnect head query did not start",
+  );
   assert.deepEqual(windowCalls, [
     firstChannel.id,
     secondChannel.id,
@@ -319,10 +365,10 @@ test("channel windows wait for subscription readiness and reconnect once", async
 
 test("StrictMode effect replay keeps only the current subscription generation", async () => {
   const windowCalls = [];
-  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+  installChannelWindowInvoke(async (args) => {
     windowCalls.push(args.channelId);
     return channelWindowResponse(args.channelId);
-  };
+  });
   const relay = installRelayStub();
   const selected = channel("channel-a");
   const harness = mountHarness(selected, null, { strictMode: true });
@@ -330,6 +376,10 @@ test("StrictMode effect replay keeps only the current subscription generation", 
   await harness.mount();
   assert.deepEqual(windowCalls, []);
   await relay.markReady(selected.id);
+  await waitForCondition(
+    () => windowCalls.length === 1,
+    "StrictMode head query did not start",
+  );
   assert.deepEqual(windowCalls, [selected.id]);
   assert.match(harness.container.textContent, /^ready:/);
   await harness.unmount();
@@ -337,10 +387,10 @@ test("StrictMode effect replay keeps only the current subscription generation", 
 
 test("an abandoned B render cannot poison the committed A generation", async () => {
   const windowCalls = [];
-  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+  installChannelWindowInvoke(async (args) => {
     windowCalls.push(args.channelId);
     return channelWindowResponse(args.channelId);
-  };
+  });
   const relay = installRelayStub();
   const firstChannel = channel("channel-a");
   const suspendedChannel = channel("channel-b");
@@ -350,6 +400,10 @@ test("an abandoned B render cannot poison the committed A generation", async () 
 
   await harness.mount();
   await relay.markReady(firstChannel.id);
+  await waitForCondition(
+    () => windowCalls.length === 1,
+    "initial A head query did not start",
+  );
   assert.deepEqual(windowCalls, [firstChannel.id]);
 
   await harness.renderTransition(suspendedChannel);
@@ -359,6 +413,10 @@ test("an abandoned B render cannot poison the committed A generation", async () 
     "the committed A tree must remain visible while B is abandoned",
   );
   await relay.reconnect();
+  await waitForCondition(
+    () => windowCalls.length === 2,
+    "committed A reconnect query did not start",
+  );
   assert.deepEqual(
     windowCalls,
     [firstChannel.id, firstChannel.id],
@@ -369,10 +427,10 @@ test("an abandoned B render cannot poison the committed A generation", async () 
 
 test("rapid A to B to A does not reuse the old A subscription readiness", async () => {
   const windowCalls = [];
-  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+  installChannelWindowInvoke(async (args) => {
     windowCalls.push(args.channelId);
     return channelWindowResponse(args.channelId);
-  };
+  });
   const relay = installRelayStub();
   const firstChannel = channel("channel-a");
   const secondChannel = channel("channel-b");
@@ -381,6 +439,10 @@ test("rapid A to B to A does not reuse the old A subscription readiness", async 
   await harness.mount();
   assert.deepEqual(windowCalls, []);
   await relay.markReady(firstChannel.id);
+  await waitForCondition(
+    () => windowCalls.length === 1,
+    "first A head query did not start",
+  );
   assert.match(harness.container.textContent, /^ready:/);
   assert.deepEqual(windowCalls, [firstChannel.id]);
 
@@ -400,6 +462,10 @@ test("rapid A to B to A does not reuse the old A subscription readiness", async 
   );
 
   await relay.markReady(firstChannel.id);
+  await waitForCondition(
+    () => windowCalls.length === 2,
+    "reopened A head query did not start",
+  );
   assert.match(harness.container.textContent, /^ready:/);
   assert.deepEqual(
     windowCalls,
@@ -417,7 +483,7 @@ test("a pending earlier A generation cannot mutate reopened A caches", async () 
   const firstRequest = deferred();
   const secondRequest = deferred();
   let firstChannelCalls = 0;
-  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+  installChannelWindowInvoke(async (args) => {
     if (args.channelId !== firstChannel.id) {
       return channelWindowResponse(args.channelId);
     }
@@ -425,21 +491,31 @@ test("a pending earlier A generation cannot mutate reopened A caches", async () 
     return firstChannelCalls === 1
       ? firstRequest.promise
       : secondRequest.promise;
-  };
+  });
   const relay = installRelayStub();
   const harness = mountHarness(firstChannel);
 
   await harness.mount();
   await relay.markReady(firstChannel.id);
+  await waitForCondition(
+    () => firstChannelCalls === 1,
+    "stale A request did not start",
+  );
   assert.equal(firstChannelCalls, 1);
   await harness.render(secondChannel);
   await harness.render(firstChannel);
   assert.equal(firstChannelCalls, 1);
   await relay.markReady(firstChannel.id);
+  await waitForCondition(
+    () => firstChannelCalls === 2,
+    "current A request did not start",
+  );
   assert.equal(firstChannelCalls, 2);
 
-  firstRequest.resolve(channelWindowResponse(firstChannel.id, [staleEvent]));
-  await flushMicrotasks();
+  await resolveDeferred(
+    firstRequest,
+    channelWindowResponse(firstChannel.id, [staleEvent]),
+  );
   const messagesAfterStale =
     harness.queryClient.getQueryData(["channel-messages", firstChannel.id]) ??
     [];
@@ -460,8 +536,14 @@ test("a pending earlier A generation cannot mutate reopened A caches", async () 
     false,
   );
 
-  secondRequest.resolve(channelWindowResponse(firstChannel.id, [currentEvent]));
-  await flushMicrotasks();
+  await resolveDeferred(
+    secondRequest,
+    channelWindowResponse(firstChannel.id, [currentEvent]),
+  );
+  await waitForCondition(
+    () => harness.queryClient.isFetching() === 0,
+    "current A request did not settle",
+  );
   const settledMessages = harness.queryClient.getQueryData([
     "channel-messages",
     firstChannel.id,
@@ -502,10 +584,10 @@ test("a warm scoped snapshot paints synchronously while readiness is pending", a
   const snapshotEvent = relayEvent(selected.id, "1");
   assert.equal(writeMessageSnapshot(scope, [snapshotEvent]), true);
   const windowCalls = [];
-  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+  installChannelWindowInvoke(async (args) => {
     windowCalls.push(args.channelId);
     return channelWindowResponse(args.channelId);
-  };
+  });
   installRelayStub();
   const harness = mountHarness(selected, snapshotContext);
 
@@ -526,25 +608,33 @@ for (const responseContainsLiveEvent of [false, true]) {
     });
     const windowRequest = deferred();
     const windowCalls = [];
-    dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+    installChannelWindowInvoke(async (args) => {
       windowCalls.push(args.channelId);
       return windowRequest.promise;
-    };
+    });
     const relay = installRelayStub();
     const harness = mountHarness(selected);
 
     await harness.mount();
     assert.deepEqual(windowCalls, []);
     await relay.markReady(selected.id);
+    await waitForCondition(
+      () => windowCalls.length === 1,
+      "live-race head query did not start",
+    );
     assert.deepEqual(windowCalls, [selected.id]);
-    relay.emit(selected.id, liveEvent);
-    windowRequest.resolve(
+    await relay.emit(selected.id, liveEvent);
+    await resolveDeferred(
+      windowRequest,
       channelWindowResponse(
         selected.id,
         responseContainsLiveEvent ? [liveEvent, freshEvent] : [freshEvent],
       ),
     );
-    await flushMicrotasks();
+    await waitForCondition(
+      () => harness.queryClient.isFetching() === 0,
+      "live-race head query did not settle",
+    );
 
     const messages = harness.queryClient.getQueryData([
       "channel-messages",
@@ -558,31 +648,53 @@ for (const responseContainsLiveEvent of [false, true]) {
   });
 }
 
-test("a live event while auxiliary closure is pending remains exactly once", async () => {
-  const selected = channel("channel-a");
-  const historyEvent = relayEvent(selected.id, "1");
-  const liveEvent = relayEvent(selected.id, "2");
-  const auxiliaryRequest = deferred();
-  dom.window.__TAURI_INTERNALS__.invoke = async () =>
-    channelWindowResponse(selected.id, [historyEvent]);
-  const relay = installRelayStub({
-    fetchAux: async () => auxiliaryRequest.promise,
+for (const responseContainsLiveEvent of [false, true]) {
+  test(`a backdated live event during auxiliary closure is retained once when the response ${
+    responseContainsLiveEvent ? "contains" : "omits"
+  } it`, async () => {
+    const selected = channel("channel-a");
+    const historyEvent = relayEvent(selected.id, "1");
+    const liveEvent = relayEvent(selected.id, "2", 9, {
+      created_at: historyEvent.created_at - 100,
+    });
+    const auxiliaryRequest = deferred();
+    let auxStarted = false;
+    installChannelWindowInvoke(async () =>
+      channelWindowResponse(
+        selected.id,
+        responseContainsLiveEvent ? [historyEvent, liveEvent] : [historyEvent],
+        { hasMore: true },
+      ),
+    );
+    const relay = installRelayStub({
+      fetchAux: async () => {
+        auxStarted = true;
+        return auxiliaryRequest.promise;
+      },
+    });
+    const harness = mountHarness(selected);
+
+    await harness.mount();
+    await relay.markReady(selected.id);
+    await waitForCondition(() => auxStarted, "auxiliary closure did not start");
+    await relay.emit(selected.id, liveEvent);
+    await resolveDeferred(auxiliaryRequest, []);
+    await waitForCondition(
+      () => harness.queryClient.isFetching() === 0,
+      "buffered backdated event query did not settle",
+    );
+
+    const messages = harness.queryClient.getQueryData([
+      "channel-messages",
+      selected.id,
+    ]);
+    assert.equal(
+      messages.filter((event) => event.id === liveEvent.id).length,
+      1,
+    );
+    await harness.unmount();
   });
-  const harness = mountHarness(selected);
-
-  await harness.mount();
-  await relay.markReady(selected.id);
-  relay.emit(selected.id, liveEvent);
-  auxiliaryRequest.resolve([]);
-  await flushMicrotasks();
-
-  const messages = harness.queryClient.getQueryData([
-    "channel-messages",
-    selected.id,
-  ]);
-  assert.equal(messages.filter((event) => event.id === liveEvent.id).length, 1);
-  await harness.unmount();
-});
+}
 
 test("auxiliary closure lands before durable snapshot persistence", async () => {
   const selected = channel("channel-a");
@@ -592,25 +704,17 @@ test("auxiliary closure lands before durable snapshot persistence", async () => 
   };
   const message = relayEvent(selected.id, "1");
   const reaction = relayEvent(selected.id, "2", 7, {
-    tags: [
-      ["h", selected.id],
-      ["e", message.id],
-    ],
+    tags: [["e", message.id]],
   });
   const tombstone = relayEvent(selected.id, "3", 5, {
-    tags: [
-      ["h", selected.id],
-      ["e", message.id],
-    ],
+    tags: [["e", message.id]],
   });
   const reactionDeletion = relayEvent(selected.id, "4", 5, {
-    tags: [
-      ["h", selected.id],
-      ["e", reaction.id],
-    ],
+    tags: [["e", reaction.id]],
   });
-  dom.window.__TAURI_INTERNALS__.invoke = async () =>
-    channelWindowResponse(selected.id, [message]);
+  installChannelWindowInvoke(async () =>
+    channelWindowResponse(selected.id, [message]),
+  );
   const relay = installRelayStub({
     fetchAux: async () => [reaction, tombstone],
     fetchAuxDeletions: async () => [reactionDeletion],
@@ -619,7 +723,10 @@ test("auxiliary closure lands before durable snapshot persistence", async () => 
 
   await harness.mount();
   await relay.markReady(selected.id);
-  await flushMicrotasks();
+  await waitForCondition(
+    () => harness.queryClient.isFetching() === 0,
+    "auxiliary snapshot query did not settle",
+  );
 
   const scope = captureMessageSnapshotScope(
     snapshotContext.relayUrl,
@@ -650,12 +757,19 @@ test("auxiliary failure keeps the fresh page but skips durable rewrite", async (
   assert.ok(scope);
   const snapshotEvent = relayEvent(selected.id, "1");
   const freshEvent = relayEvent(selected.id, "2");
+  const backdatedLiveEvent = relayEvent(selected.id, "3", 9, {
+    created_at: freshEvent.created_at - 100,
+  });
+  const auxiliaryRequest = deferred();
+  let auxStarted = false;
   assert.equal(writeMessageSnapshot(scope, [snapshotEvent]), true);
-  dom.window.__TAURI_INTERNALS__.invoke = async () =>
-    channelWindowResponse(selected.id, [freshEvent]);
+  installChannelWindowInvoke(async () =>
+    channelWindowResponse(selected.id, [freshEvent], { hasMore: true }),
+  );
   const relay = installRelayStub({
     fetchAux: async () => {
-      throw new Error("aux unavailable");
+      auxStarted = true;
+      return auxiliaryRequest.promise;
     },
   });
   const consoleError = mock.method(console, "error", () => {});
@@ -663,13 +777,26 @@ test("auxiliary failure keeps the fresh page but skips durable rewrite", async (
 
   await harness.mount();
   await relay.markReady(selected.id);
-  await flushMicrotasks();
+  await waitForCondition(
+    () => auxStarted,
+    "failing auxiliary closure did not start",
+  );
+  await relay.emit(selected.id, backdatedLiveEvent);
+  await rejectDeferred(auxiliaryRequest, new Error("aux unavailable"));
+  await waitForCondition(
+    () => harness.queryClient.isFetching() === 0,
+    "failing auxiliary closure did not settle",
+  );
 
   const messages = harness.queryClient.getQueryData([
     "channel-messages",
     selected.id,
   ]);
   assert.ok(messages.some((event) => event.id === freshEvent.id));
+  assert.equal(
+    messages.filter((event) => event.id === backdatedLiveEvent.id).length,
+    1,
+  );
   assert.deepEqual(
     readMessageSnapshot(scope).map((event) => event.id),
     [snapshotEvent.id],
@@ -678,7 +805,7 @@ test("auxiliary failure keeps the fresh page but skips durable rewrite", async (
   await harness.unmount();
 });
 
-test("an invalidated snapshot scope no-ops after the window await", async () => {
+test("an invalidated snapshot scope no-ops after the window await", async (t) => {
   const selected = channel("channel-a");
   const snapshotContext = {
     relayUrl: "wss://relay.example.com",
@@ -694,15 +821,26 @@ test("an invalidated snapshot scope no-ops after the window await", async () => 
   const staleFreshEvent = relayEvent(selected.id, "2");
   assert.equal(writeMessageSnapshot(scope, [snapshotEvent]), true);
   const windowRequest = deferred();
-  dom.window.__TAURI_INTERNALS__.invoke = async () => windowRequest.promise;
+  let windowStarted = false;
+  installChannelWindowInvoke(async () => {
+    windowStarted = true;
+    return windowRequest.promise;
+  });
   const relay = installRelayStub();
   const harness = mountHarness(selected, snapshotContext);
+  t.after(() => harness.unmount({ waitForIdle: false }));
 
   await harness.mount();
   await relay.markReady(selected.id);
+  await waitForCondition(
+    () => windowStarted,
+    "snapshot-scoped head query did not start",
+  );
   removeAllMessageSnapshots();
-  windowRequest.resolve(channelWindowResponse(selected.id, [staleFreshEvent]));
-  await flushMicrotasks();
+  await resolveDeferred(
+    windowRequest,
+    channelWindowResponse(selected.id, [staleFreshEvent]),
+  );
 
   const messages = harness.queryClient.getQueryData([
     "channel-messages",
@@ -713,5 +851,4 @@ test("an invalidated snapshot scope no-ops after the window await", async () => 
     false,
   );
   assert.equal(readMessageSnapshot(scope), null);
-  await harness.unmount();
 });

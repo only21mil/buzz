@@ -18,6 +18,7 @@ import {
   CHANNEL_TIMELINE_CONTENT_KINDS,
   KIND_CHANNEL_THREAD_SUMMARY,
   KIND_CHANNEL_WINDOW_BOUNDS,
+  KIND_STREAM_MESSAGE_EDIT,
 } from "@/shared/constants/kinds";
 
 const storage = new Map();
@@ -66,6 +67,33 @@ function makeEvent({
     ...(tagsAreCanonical ? {} : { tags: eventTags }),
     ...overrides,
   };
+}
+
+function makeReaction(target, overrides = {}) {
+  return makeEvent({
+    kind: 7,
+    tags: [["e", target.id]],
+    content: "+",
+    ...overrides,
+  });
+}
+
+function makeDeletion(target, overrides = {}) {
+  return makeEvent({
+    kind: 5,
+    tags: [["e", target.id]],
+    content: "",
+    ...overrides,
+  });
+}
+
+function makeEdit(target, overrides = {}) {
+  return makeEvent({
+    kind: KIND_STREAM_MESSAGE_EDIT,
+    tags: [["e", target.id]],
+    content: "edited",
+    ...overrides,
+  });
 }
 
 function scope(
@@ -156,6 +184,69 @@ test("all existing timeline and auxiliary kinds remain persistable", () => {
   );
 });
 
+test("production-shaped e-only auxiliary closure persists order-independently", async (t) => {
+  for (const reversed of [false, true]) {
+    await t.test(reversed ? "reversed" : "relay order", () => {
+      resetStorage();
+      const captured = scope();
+      const message = makeEvent();
+      const reaction = makeReaction(message);
+      const reactionRemoval = makeDeletion(reaction);
+      const messageTombstone = makeDeletion(message);
+      const edit = makeEdit(message);
+      const editRemoval = makeDeletion(edit);
+      const closure = [
+        message,
+        reaction,
+        reactionRemoval,
+        messageTombstone,
+        edit,
+        editRemoval,
+      ];
+      const events = reversed ? closure.toReversed() : closure;
+
+      assert.equal(writeMessageSnapshot(captured, events), true);
+      assert.deepEqual(
+        readMessageSnapshot(captured),
+        JSON.parse(JSON.stringify(events)),
+      );
+    });
+  }
+});
+
+test("isolated, cross-scope, and mismatched-h auxiliary events are rejected", async (t) => {
+  const cases = [
+    ["isolated e-only reaction", () => makeReaction(makeEvent())],
+    [
+      "cross-scope e-only tombstone",
+      () => makeDeletion(makeEvent({ channelId: "chan-2" })),
+    ],
+    [
+      "mismatched h reaction",
+      (message) =>
+        makeReaction(message, {
+          tags: [
+            ["h", "chan-2"],
+            ["e", message.id],
+          ],
+        }),
+    ],
+  ];
+
+  for (const [name, makeAux] of cases) {
+    await t.test(name, () => {
+      resetStorage();
+      const captured = scope();
+      const message = makeEvent();
+      assert.equal(
+        writeMessageSnapshot(captured, [message, makeAux(message)]),
+        false,
+      );
+      assert.equal(storage.has(messageSnapshotKey(captured)), false);
+    });
+  }
+});
+
 test("write rejects pending, local, unsigned, malformed, and wrong-channel events", async (t) => {
   const cases = [
     ["pending", { pending: true }],
@@ -197,18 +288,12 @@ test("write rejects pending, local, unsigned, malformed, and wrong-channel event
 test("write rejects a valid-shape forged tombstone", () => {
   resetStorage();
   const captured = scope();
-  const tombstone = makeEvent({
-    kind: 5,
-    tags: [
-      ["h", captured.channelId],
-      ["e", "1".repeat(64)],
-    ],
-    content: "",
-  });
+  const message = makeEvent();
+  const tombstone = makeDeletion(message);
   const forgedTombstone = { ...tombstone, content: "forged deletion" };
 
   assert.equal(
-    writeMessageSnapshot(captured, [makeEvent(), forgedTombstone]),
+    writeMessageSnapshot(captured, [message, forgedTombstone]),
     false,
   );
   assert.equal(storage.has(messageSnapshotKey(captured)), false);
@@ -217,18 +302,27 @@ test("write rejects a valid-shape forged tombstone", () => {
 test("read deletes a manually inserted snapshot with a forged canonical event", () => {
   resetStorage();
   const captured = scope();
-  const tombstone = makeEvent({
-    kind: 5,
-    tags: [
-      ["h", captured.channelId],
-      ["e", "2".repeat(64)],
-    ],
-    content: "",
-  });
-  assert.equal(writeMessageSnapshot(captured, [makeEvent(), tombstone]), true);
+  const message = makeEvent();
+  const tombstone = makeDeletion(message);
+  assert.equal(writeMessageSnapshot(captured, [message, tombstone]), true);
   const key = messageSnapshotKey(captured);
   const payload = JSON.parse(storage.get(key));
   payload.events[1] = { ...payload.events[1], content: "forged deletion" };
+  storage.set(key, JSON.stringify(payload));
+
+  assert.equal(readMessageSnapshot(captured), null);
+  assert.equal(storage.has(key), false);
+});
+
+test("read deletes a canonical but unresolved e-only auxiliary closure", () => {
+  resetStorage();
+  const captured = scope();
+  const message = makeEvent();
+  const tombstone = makeDeletion(message);
+  assert.equal(writeMessageSnapshot(captured, [message, tombstone]), true);
+  const key = messageSnapshotKey(captured);
+  const payload = JSON.parse(storage.get(key));
+  payload.events[1] = makeDeletion(makeEvent({ channelId: "chan-2" }));
   storage.set(key, JSON.stringify(payload));
 
   assert.equal(readMessageSnapshot(captured), null);
