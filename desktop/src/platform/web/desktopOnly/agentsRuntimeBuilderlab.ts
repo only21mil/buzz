@@ -40,6 +40,10 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
     "agent snapshot imports need the desktop app",
   ],
   [
+    "preview_agent_snapshot_import",
+    "agent snapshot imports need the desktop app",
+  ],
+  [
     "encode_agent_snapshot_for_send",
     "agent snapshot exports need the desktop app",
   ],
@@ -103,24 +107,6 @@ const CAPABILITY_OFF_READS: ReadonlyArray<readonly [string, DefaultFactory]> = [
   ["card_mint_key_status", () => "none"],
   ["list_agent_cards", () => []],
   ["load_agent_card", () => ""],
-  [
-    "preview_agent_snapshot_import",
-    () => ({
-      displayName: "",
-      isBuiltIn: false,
-      model: null,
-      runtime: null,
-      systemPrompt: null,
-      avatarUrl: null,
-      memoryLevel: "none",
-      memoryEntryCount: 0,
-      hasSourceAllowlist: false,
-      sourceAllowlistCount: 0,
-      sourceAllowlist: [],
-      manifestJson: "{}",
-      locked: false,
-    }),
-  ],
 
   // Agent discovery and runtime state reads.
   ["discover_acp_auth_methods", () => ({ methods: [] })],

@@ -6,6 +6,7 @@ import { verifyEvent } from "nostr-tools/pure";
 
 import type { BrowserIdentityManager } from "../identity";
 import { dispatch, register, type InvokeBody } from "../registry";
+import { registerOffMutation } from "./capabilityOff";
 
 type RelayCryptoSocialClient = Pick<
   typeof relayClient,
@@ -58,18 +59,15 @@ function requiredString(body: ObjectBody, field: string): string {
   return value;
 }
 
+const RFC3339_WITH_OFFSET =
+  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+
 function optionalInteger(body: ObjectBody, field: string): number | undefined {
   const value = body[field];
   if (value === undefined || value === null) return undefined;
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-    throw new TypeError(`${field} must be an integer`);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative integer`);
   }
-  return value;
-}
-
-function requiredInteger(body: ObjectBody, field: string): number {
-  const value = optionalInteger(body, field);
-  if (value === undefined) throw new TypeError(`${field} must be an integer`);
   return value;
 }
 
@@ -385,87 +383,6 @@ async function activeRelayHttpUrl(): Promise<string> {
   return relayHttpUrl(await dispatch<string>("get_relay_http_url"));
 }
 
-function base64Url(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replace(/=+$/, "");
-}
-
-function mediaGetAuthorization(
-  identity: BrowserIdentityManager,
-  relayBase: string,
-): string {
-  const now = Math.floor(Date.now() / 1_000);
-  const server = new URL(relayBase).host.toLowerCase();
-  const event = identity.sign({
-    kind: 24242,
-    content: "Get buzz-media",
-    tags: [
-      ["t", "get"],
-      ["expiration", String(now + 600)],
-      ["server", server],
-    ],
-  });
-  return `Nostr ${base64Url(event)}`;
-}
-
-function snapshotKind(filename: string): {
-  png: boolean;
-  cap: number;
-  label: string;
-} {
-  const base =
-    filename
-      .split(/[\\/]/)
-      .at(-1)
-      ?.trim()
-      .replace(/[\p{Cc}]/gu, "")
-      .slice(0, 255) || "file";
-  const lower = base.toLowerCase();
-  if (lower.endsWith(".agent.json"))
-    return { png: false, cap: 5 * 1024 * 1024, label: ".agent.json" };
-  if (lower.endsWith(".agent.png"))
-    return { png: true, cap: 10 * 1024 * 1024, label: ".agent.png" };
-  if (lower.endsWith(".team.json"))
-    return { png: false, cap: 25 * 1024 * 1024, label: ".team.json" };
-  if (lower.endsWith(".team.png"))
-    return { png: true, cap: 50 * 1024 * 1024, label: ".team.png" };
-  throw new Error(`"${base}" is not a snapshot filename`);
-}
-
-async function boundedResponseBytes(
-  response: Response,
-  cap: number,
-): Promise<Uint8Array> {
-  const declared = response.headers.get("content-length");
-  if (declared !== null && Number(declared) > cap)
-    throw new Error(`file too large (max ${cap / 1024 / 1024} MiB)`);
-  if (!response.body) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.length > cap)
-      throw new Error(`file too large (max ${cap / 1024 / 1024} MiB)`);
-    return bytes;
-  }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    length += value.length;
-    if (length > cap) {
-      await reader.cancel();
-      throw new Error(`file too large (max ${cap / 1024 / 1024} MiB)`);
-    }
-    chunks.push(value);
-  }
-  return concatBytes(...chunks);
-}
-
 function validateBindingRequest(body: ObjectBody) {
   const challengeId = requiredString(body, "challengeId");
   const nonce = requiredString(body, "nonce");
@@ -494,6 +411,9 @@ function validateBindingRequest(body: ObjectBody) {
   ) {
     throw new Error("invalid origin");
   }
+  // Rust parses RFC3339 strictly (date, time, and offset all required).
+  if (!RFC3339_WITH_OFFSET.test(expiresAt))
+    throw new Error("invalid expires_at");
   const expiry = Date.parse(expiresAt);
   if (!Number.isFinite(expiry)) throw new Error("invalid expires_at");
   if (expiry <= Date.now()) throw new Error("expires_at is expired");
@@ -621,58 +541,13 @@ export function registerRelayCryptoSocialCommands(
     }
   });
 
-  register("fetch_snapshot_bytes", async (rawBody) => {
-    const body = objectBody(rawBody, "fetch_snapshot_bytes");
-    const urlValue = requiredString(body, "url");
-    const filename = requiredString(body, "filename");
-    const expectedSha256 = requiredString(body, "expectedSha256").toLowerCase();
-    const expectedSize = requiredInteger(body, "expectedSize");
-    const kind = snapshotKind(filename);
-    if (!HEX_64.test(expectedSha256))
-      throw new Error(
-        "invalid expected sha256 — must be a 64-hex-digit lowercase string",
-      );
-    if (expectedSize <= 0)
-      throw new Error("missing or zero expected size (imeta size field)");
-    if (expectedSize > kind.cap)
-      throw new Error(
-        `declared size ${expectedSize} exceeds the ${kind.cap / 1024 / 1024} MiB cap for this format`,
-      );
-    const relayBase = await activeRelayHttpUrl();
-    const url = new URL(urlValue);
-    if (
-      url.origin !== new URL(relayBase).origin ||
-      !url.pathname.startsWith("/media/")
-    ) {
-      throw new Error(
-        "download URL must match the relay origin and use a /media/ path",
-      );
-    }
-    const response = await fetch(url, {
-      headers: { Authorization: mediaGetAuthorization(identity, relayBase) },
-      redirect: "error",
-    });
-    if (!response.ok)
-      throw new Error(`snapshot fetch failed: HTTP ${response.status}`);
-    const bytes = await boundedResponseBytes(response, kind.cap);
-    if (bytes.length !== expectedSize)
-      throw new Error(
-        `size mismatch: fetched ${bytes.length} bytes but imeta declared ${expectedSize}`,
-      );
-    if (bytesToHex(await sha256(bytes)) !== expectedSha256)
-      throw new Error(
-        "hash mismatch: fetched bytes do not match the declared SHA-256",
-      );
-    const isPng = PNG_MAGIC.every((byte, index) => bytes[index] === byte);
-    if (kind.png !== isPng)
-      throw new Error(`format mismatch: filename is ${kind.label}`);
-    if (!kind.png)
-      JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-    const result = new Uint8Array(bytes.length);
-    result.set(bytes);
-    return result.buffer;
-  });
-
+  // Snapshot import (preview/confirm) is desktop-only, so the fetched bytes
+  // would have no truthful consumer in the browser; fail clearly at the Import
+  // button instead of returning bytes we cannot validate like Rust does.
+  registerOffMutation(
+    "fetch_snapshot_bytes",
+    "importing agent/team snapshots needs the desktop app",
+  );
   register("fetch_workspace_icon", async (rawBody) => {
     const body = objectBody(rawBody, "fetch_workspace_icon");
     try {

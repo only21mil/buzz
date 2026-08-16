@@ -71,13 +71,6 @@ function fakeClient(overrides = {}) {
   };
 }
 
-async function sha256Hex(bytes) {
-  const digest = await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes));
-  return Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
 const cases = [
   {
     command: "archive_identity",
@@ -162,24 +155,16 @@ const cases = [
   {
     command: "fetch_snapshot_bytes",
     async run() {
-      const bytes = new TextEncoder().encode(
-        JSON.stringify({ format: "buzz-agent-snapshot", version: 1 }),
-      );
-      const expectedSha256 = await sha256Hex(bytes);
-      globalThis.fetch = async (url, options) => {
-        assert.equal(String(url), `${RELAY_HTTP}/media/${"c".repeat(64)}.json`);
-        assert.match(options.headers.Authorization, /^Nostr /);
-        assert.equal(options.redirect, "error");
-        return new Response(bytes, { status: 200 });
-      };
       registerRelayCryptoSocialCommands(identity(), fakeClient());
-      const result = await dispatch("fetch_snapshot_bytes", {
-        url: `${RELAY_HTTP}/media/${"c".repeat(64)}.json`,
-        filename: "eva.agent.json",
-        expectedSha256,
-        expectedSize: bytes.length,
-      });
-      assert.deepEqual(new Uint8Array(result), bytes);
+      await assert.rejects(
+        dispatch("fetch_snapshot_bytes", {
+          url: `${RELAY_HTTP}/media/${"c".repeat(64)}.json`,
+          filename: "eva.agent.json",
+          expectedSha256: "c".repeat(64),
+          expectedSize: 1,
+        }),
+        (error) => error.name === "BrowserUnavailableError",
+      );
     },
   },
   {

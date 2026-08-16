@@ -31,7 +31,7 @@ export const INACTIVE_HUDDLE_STATE = {
 export function registerBootStubs(): void {
   register("get_os_idle_seconds", () => null);
   register("get_huddle_state", () => INACTIVE_HUDDLE_STATE);
-  register("get_audio_output_device", () => null);
+  register("get_audio_output_device", () => ""); // "" = system default
   register("list_audio_output_devices", () => []);
   register("check_pipeline_hotstart", () => undefined);
   register("is_shared_identity", () => false);
