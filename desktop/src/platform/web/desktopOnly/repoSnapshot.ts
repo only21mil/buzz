@@ -11,6 +11,19 @@ const BROWSER_UNAVAILABLE_HINT =
 
 type ObjectBody = Record<string, unknown>;
 
+type RepoSnapshotOptions = {
+  timeoutMs?: number;
+};
+
+type RepoSnapshotCommit = {
+  hash: string;
+  short_hash: string;
+  author_name: string;
+  author_email: string;
+  subject: string;
+  timestamp: number;
+};
+
 function objectBody(body: InvokeBody): ObjectBody {
   if (
     !body ||
@@ -62,13 +75,18 @@ function snapshotUrl(
   try {
     cloneUrl = new URL(cloneUrlValue.trim());
   } catch {
-    throw new TypeError("cloneUrl must be an absolute HTTPS URL");
-  }
-  if (cloneUrl.protocol !== "https:") {
-    throw new TypeError("cloneUrl must use HTTPS");
+    throw new TypeError("cloneUrl must be an absolute HTTP(S) URL");
   }
 
   const relayUrl = new URL(relayUrlValue);
+  if (
+    !["http:", "https:"].includes(cloneUrl.protocol) ||
+    cloneUrl.protocol !== relayUrl.protocol
+  ) {
+    throw new TypeError(
+      "cloneUrl must use HTTPS unless the active relay uses HTTP",
+    );
+  }
   if (cloneUrl.origin !== relayUrl.origin) {
     throw new TypeError("cloneUrl must use the active relay origin");
   }
@@ -121,41 +139,117 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCommit(value: unknown): value is RepoSnapshotCommit {
+  return (
+    isRecord(value) &&
+    typeof value.hash === "string" &&
+    typeof value.short_hash === "string" &&
+    typeof value.author_name === "string" &&
+    typeof value.author_email === "string" &&
+    typeof value.subject === "string" &&
+    typeof value.timestamp === "number"
+  );
+}
+
+function isSnapshot(value: unknown): value is Record<string, unknown> & {
+  latest_commit: RepoSnapshotCommit | null;
+  files: Record<string, unknown>[];
+} {
+  if (
+    !isRecord(value) ||
+    !(value.latest_commit === null || isCommit(value.latest_commit)) ||
+    !Array.isArray(value.files) ||
+    !value.files.every(
+      (file) =>
+        isRecord(file) &&
+        typeof file.path === "string" &&
+        typeof file.kind === "string",
+    )
+  ) {
+    return false;
+  }
+  if (
+    value.commits !== undefined &&
+    (!Array.isArray(value.commits) || !value.commits.every(isCommit))
+  ) {
+    return false;
+  }
+  return (
+    value.contributors === undefined ||
+    (Array.isArray(value.contributors) &&
+      value.contributors.every(
+        (contributor) =>
+          isRecord(contributor) &&
+          typeof contributor.name === "string" &&
+          typeof contributor.email === "string" &&
+          typeof contributor.commit_count === "number" &&
+          typeof contributor.last_commit_at === "number",
+      ))
+  );
+}
+
 async function getProjectRepoSnapshot(
   bodyValue: InvokeBody,
   identity: BrowserIdentityManager,
+  options: RepoSnapshotOptions,
 ): Promise<unknown> {
   const body = objectBody(bodyValue);
   const cloneUrl = optionalString(body, "cloneUrl", true) as string;
   const ref =
-    optionalString(body, "targetCommit") ??
     optionalString(body, "targetRef") ??
-    optionalString(body, "baseBranch") ??
+    optionalString(body, "targetCommit") ??
     optionalString(body, "defaultBranch");
+  const targetCommit = optionalString(body, "targetCommit");
   const url = snapshotUrl(cloneUrl, await activeRelayHttpUrl(), ref);
   const controller = new AbortController();
   const timeout = globalThis.setTimeout(
     () => controller.abort(),
-    SNAPSHOT_TIMEOUT_MS,
+    options.timeoutMs ?? SNAPSHOT_TIMEOUT_MS,
   );
 
   try {
     let response: Response;
+    let fetchIssued = false;
     try {
       response = await nip98Fetch(
         { url, method: "GET", signal: controller.signal },
-        { signEvent: async (template) => identity.sign(template) },
+        {
+          signEvent: async (template) => identity.sign(template),
+          fetch: (input, init) => {
+            fetchIssued = true;
+            return fetch(input, init);
+          },
+        },
       );
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
         throw new Error("snapshot request timed out");
+      }
+      if (!fetchIssued) {
+        throw new Error(
+          `snapshot request could not be signed: ${errorMessage(error)}`,
+        );
       }
       throw new Error(
         `snapshot request failed to connect: ${errorMessage(error)}`,
       );
     }
 
-    if ([404, 405, 501].includes(response.status)) {
+    if (response.status === 404) {
+      const marker = await response.json().catch(() => null);
+      if (isRecord(marker) && typeof marker.message === "string") {
+        throw new Error(marker.message);
+      }
+      throw new BrowserUnavailableError(
+        "get_project_repo_snapshot",
+        BROWSER_UNAVAILABLE_HINT,
+      );
+    }
+    if ([405, 501].includes(response.status)) {
       throw new BrowserUnavailableError(
         "get_project_repo_snapshot",
         BROWSER_UNAVAILABLE_HINT,
@@ -165,6 +259,12 @@ async function getProjectRepoSnapshot(
       throw new Error(
         `snapshot request authentication failed (HTTP ${response.status})`,
       );
+    }
+    if (response.status === 429) {
+      throw new Error("relay is busy generating the snapshot; timed out");
+    }
+    if (response.status === 504) {
+      throw new Error("relay timed out generating the snapshot");
     }
     if (!response.ok) {
       const responseBody = (await response.text().catch(() => "")).slice(
@@ -185,13 +285,16 @@ async function getProjectRepoSnapshot(
       }
       throw new Error("snapshot response was not valid JSON");
     }
+    if (!isSnapshot(snapshot)) {
+      throw new Error("snapshot response has an unexpected shape");
+    }
     if (
-      typeof snapshot !== "object" ||
-      snapshot === null ||
-      !("files" in snapshot) ||
-      !Array.isArray(snapshot.files)
+      targetCommit !== undefined &&
+      (snapshot.latest_commit === null ||
+        snapshot.latest_commit.hash.toLowerCase() !==
+          targetCommit.toLowerCase())
     ) {
-      throw new Error("snapshot response must be an object with a files array");
+      throw new Error("the requested repository ref changed");
     }
     return snapshot;
   } finally {
@@ -201,8 +304,9 @@ async function getProjectRepoSnapshot(
 
 export function registerRepoSnapshotCommands(
   identity: BrowserIdentityManager,
+  options: RepoSnapshotOptions = {},
 ): void {
   register("get_project_repo_snapshot", (body) =>
-    getProjectRepoSnapshot(body, identity),
+    getProjectRepoSnapshot(body, identity, options),
   );
 }
