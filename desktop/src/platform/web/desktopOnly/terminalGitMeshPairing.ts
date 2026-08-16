@@ -80,14 +80,6 @@ export function registerTerminalGitMeshPairingCommands(): void {
     deletions: 0,
     commit_body: null,
   }));
-  // README, file listing and commit history all ride the repository snapshot,
-  // which the desktop builds from a local git clone. Failing closed here (rather
-  // than an empty snapshot) lets the UI show its explicit "needs the desktop
-  // app" state instead of a repository that looks empty or commit-less.
-  registerOffMutation(
-    "get_project_repo_snapshot",
-    "repository README, files and commits are not available in the web app yet",
-  );
   registerOffRead("get_project_repo_sync_status", () => ({
     local_path: null,
     local_branch: null,
