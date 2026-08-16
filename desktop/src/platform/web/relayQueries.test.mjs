@@ -134,9 +134,19 @@ test("get_channels merges membership, metadata, visibility, and last-message eve
     async fetchFirstEvent() {
       return null;
     },
-    async fetchEvents(filter) {
-      calls.push(filter);
-      if (filter.kinds[0] === 39002) {
+    async fetchEvents(filters) {
+      calls.push(filters);
+      if (Array.isArray(filters)) {
+        assert.deepEqual(filters, [
+          { kinds: [39002], "#p": [PUBKEY], limit: 1000 },
+          { kinds: [39000], limit: 1000 },
+          {
+            kinds: [30622],
+            authors: [PUBKEY],
+            "#p": [PUBKEY],
+            limit: 10,
+          },
+        ]);
         return [
           event({
             id: "membership",
@@ -148,10 +158,6 @@ test("get_channels merges membership, metadata, visibility, and last-message eve
               ["p", "b".repeat(64)],
             ],
           }),
-        ];
-      }
-      if (filter.kinds[0] === 39000) {
-        return [
           event({
             id: "metadata-member",
             kind: 39000,
@@ -178,11 +184,6 @@ test("get_channels merges membership, metadata, visibility, and last-message eve
               ["t", "dm"],
             ],
           }),
-        ];
-      }
-      if (filter.kinds[0] === 30622) {
-        assert.deepEqual(filter.authors, [PUBKEY]);
-        return [
           event({
             id: "visibility",
             kind: 30622,
@@ -228,7 +229,30 @@ test("get_channels merges membership, metadata, visibility, and last-message eve
   });
   assert.equal(channels[1].id, "open-channel");
   assert.equal(channels[1].is_member, false);
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], {
+    kinds: [9, 40002],
+    "#h": ["member-channel", "open-channel", "hidden-dm"],
+    limit: 100,
+  });
+});
+
+test("get_channels skips the dependent request when metadata is absent", async () => {
+  let fetchEventsCalls = 0;
+  const client = {
+    async fetchFirstEvent() {
+      return null;
+    },
+    async fetchEvents(filters) {
+      fetchEventsCalls += 1;
+      assert.equal(Array.isArray(filters), true);
+      return [];
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(await dispatch("get_channels"), []);
+  assert.equal(fetchEventsCalls, 1);
 });
 
 test("create_channel publishes kind 9007 and returns canonical metadata", async () => {
@@ -329,7 +353,7 @@ test("ensure_starter_channels joins an existing public starter channel", async (
   const published = [];
   const client = {
     async fetchEvents(filter) {
-      if (filter.kinds[0] === 39000) {
+      if (Array.isArray(filter)) {
         return [
           event({
             id: "general-metadata",
@@ -489,6 +513,35 @@ test("get_user_profile resolves another pubkey and get_users_batch maps profile 
       missing: [missing],
     },
   );
+});
+
+test("get_users_batch uses one history request for N sender pubkeys", async () => {
+  const pubkeys = ["b".repeat(64), "c".repeat(64), "d".repeat(64)];
+  let fetchEventsCalls = 0;
+  let fetchFirstEventCalls = 0;
+  const client = {
+    async fetchFirstEvent() {
+      fetchFirstEventCalls += 1;
+      return null;
+    },
+    async fetchEvents(filter) {
+      fetchEventsCalls += 1;
+      assert.deepEqual(filter, {
+        kinds: [0],
+        authors: pubkeys,
+        limit: pubkeys.length,
+      });
+      return [];
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(await dispatch("get_users_batch", { pubkeys }), {
+    profiles: {},
+    missing: pubkeys,
+  });
+  assert.equal(fetchEventsCalls, 1);
+  assert.equal(fetchFirstEventCalls, 0);
 });
 
 test("get_channel_messages_before forwards the composite keyset and returns the oldest cursor", async () => {

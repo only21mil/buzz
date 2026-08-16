@@ -9,6 +9,7 @@ import { collectWithConcurrency } from "@/shared/api/concurrency";
 import { AUX_BACKFILL_CHUNK_SIZE } from "@/shared/api/relayChannelFilters";
 import { waitForRateLimit } from "@/shared/api/relayRateLimitGate";
 import type {
+  RelayHistoryFilters,
   RelaySubscription,
   RelaySubscriptionFilter,
 } from "@/shared/api/relayClientShared";
@@ -25,9 +26,13 @@ export async function requestHistoryGated(
   subscriptions: Map<string, RelaySubscription>,
   sendRaw: (payload: unknown[]) => Promise<void>,
   closeSubscription: (subId: string) => Promise<void>,
-  filter: RelaySubscriptionFilter,
+  filters: RelayHistoryFilters,
   historyTimeoutMs: number,
 ): Promise<RelayEvent[]> {
+  const requestFilters = Array.isArray(filters) ? filters : [filters];
+  if (requestFilters.length === 0) {
+    throw new TypeError("History requests require at least one filter.");
+  }
   // Await the gate before issuing REQ; op timeout starts after the wait.
   await waitForRateLimit();
 
@@ -47,7 +52,7 @@ export async function requestHistoryGated(
       timeout,
     });
 
-    void sendRaw(["REQ", subId, filter]).catch((error) => {
+    void sendRaw(["REQ", subId, ...requestFilters]).catch((error) => {
       window.clearTimeout(timeout);
       subscriptions.delete(subId);
       reject(
