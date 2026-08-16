@@ -9,8 +9,13 @@
 
 import { mergeTimelineHistoryMessages } from "@/features/messages/lib/messageQueryKeys";
 import type { RelayEvent } from "@/shared/api/types";
+import {
+  CHANNEL_AUX_EVENT_KINDS,
+  CHANNEL_TIMELINE_CONTENT_KINDS,
+} from "@/shared/constants/kinds";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { verifyEvent } from "nostr-tools/pure";
 
 const STORAGE_KEY_PREFIX = "buzz-channel-messages.v3";
 const PREVIOUS_STORAGE_KEY_PREFIX = "buzz-channel-messages.v2";
@@ -25,7 +30,6 @@ const EVENT_KEYS = new Set([
   "tags",
   "content",
   "sig",
-  "pending",
 ]);
 const PAYLOAD_KEYS = new Set([
   "version",
@@ -38,6 +42,10 @@ const PAYLOAD_KEYS = new Set([
 
 const MAX_EVENTS_PER_SNAPSHOT = 80;
 const MAX_CHANNELS_PER_IDENTITY = 20;
+const PERSISTABLE_EVENT_KINDS: ReadonlySet<number> = new Set([
+  ...CHANNEL_TIMELINE_CONTENT_KINDS,
+  ...CHANNEL_AUX_EVENT_KINDS,
+]);
 
 let generationSequence = 0;
 let globalScopeGeneration = 0;
@@ -208,9 +216,10 @@ function isPersistableEvent(
     typeof event.kind !== "number" ||
     !Number.isSafeInteger(event.kind) ||
     event.kind < 0 ||
+    !PERSISTABLE_EVENT_KINDS.has(event.kind) ||
     !Array.isArray(event.tags) ||
     "localKey" in event ||
-    (event.pending !== undefined && event.pending !== false) ||
+    "pending" in event ||
     !Object.keys(event).every((key) => EVENT_KEYS.has(key))
   ) {
     return false;
@@ -226,16 +235,34 @@ function isPersistableEvent(
     return false;
   }
   const channelTags = (tags as string[][]).filter((tag) => tag[0] === "h");
-  return (
-    channelTags.length === 1 &&
-    channelTags[0]?.length === 2 &&
-    channelTags[0][1] === channelId
-  );
+  if (
+    channelTags.length !== 1 ||
+    channelTags[0]?.length !== 2 ||
+    channelTags[0][1] !== channelId
+  ) {
+    return false;
+  }
+  try {
+    // Reconstruct the canonical event so verifier cache metadata attached to a
+    // previously finalized object cannot survive a post-signature mutation.
+    return verifyEvent({
+      id: event.id as string,
+      pubkey: event.pubkey as string,
+      created_at: event.created_at as number,
+      kind: event.kind as number,
+      tags: event.tags as string[][],
+      content: event.content as string,
+      sig: event.sig as string,
+    });
+  } catch {
+    return false;
+  }
 }
 
 function parseSnapshotPayload(
   value: unknown,
   scope: MessageSnapshotScope,
+  validateEvents = true,
 ): SnapshotPayload | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
@@ -254,7 +281,10 @@ function parseSnapshotPayload(
     !Array.isArray(payload.events) ||
     payload.events.length === 0 ||
     payload.events.length > MAX_EVENTS_PER_SNAPSHOT ||
-    !payload.events.every((event) => isPersistableEvent(event, scope.channelId))
+    (validateEvents &&
+      !payload.events.every((event) =>
+        isPersistableEvent(event, scope.channelId),
+      ))
   ) {
     return null;
   }
@@ -335,7 +365,9 @@ export function writeMessageSnapshot(
     const key = messageSnapshotKey(scope);
     const previous = window.localStorage.getItem(key);
     if (previous !== null) {
-      const parsed = parseSnapshotPayload(JSON.parse(previous), scope);
+      // Incoming events were verified above. A byte-equivalent previous event
+      // array is therefore canonical without repeating signature verification.
+      const parsed = parseSnapshotPayload(JSON.parse(previous), scope, false);
       if (
         parsed &&
         JSON.stringify(parsed.events) === JSON.stringify(persistable)

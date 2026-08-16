@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { finalizeEvent } from "nostr-tools/pure";
 
 import {
   canonicalSnapshotRelayUrl,
@@ -12,6 +13,12 @@ import {
   removeMessageSnapshotsForIdentity,
   writeMessageSnapshot,
 } from "./messageSnapshot.ts";
+import {
+  CHANNEL_AUX_EVENT_KINDS,
+  CHANNEL_TIMELINE_CONTENT_KINDS,
+  KIND_CHANNEL_THREAD_SUMMARY,
+  KIND_CHANNEL_WINDOW_BOUNDS,
+} from "@/shared/constants/kinds";
 
 const storage = new Map();
 globalThis.window = {
@@ -29,18 +36,34 @@ globalThis.window = {
 const RELAY = "wss://relay.example.com";
 const SIGNER_A = "a".repeat(64);
 const SIGNER_B = "b".repeat(64);
+const EVENT_SECRET = new Uint8Array(32).fill(7);
 let eventSequence = 1;
 
-function makeEvent({ channelId = "chan-1", ...overrides } = {}) {
+function makeEvent({
+  channelId = "chan-1",
+  content = "hello",
+  created_at,
+  kind = 9,
+  tags,
+  ...overrides
+} = {}) {
   const sequence = eventSequence++;
+  const eventTags = tags ?? [["h", channelId]];
+  const tagsAreCanonical = eventTags.every(
+    (tag) =>
+      Array.isArray(tag) && tag.every((part) => typeof part === "string"),
+  );
   return {
-    id: sequence.toString(16).padStart(64, "0"),
-    pubkey: "c".repeat(64),
-    created_at: 1_700_000_000 + sequence,
-    kind: 9,
-    tags: [["h", channelId]],
-    content: "hello",
-    sig: "d".repeat(128),
+    ...finalizeEvent(
+      {
+        created_at: created_at ?? 1_700_000_000 + sequence,
+        kind,
+        tags: tagsAreCanonical ? eventTags : [["h", channelId]],
+        content,
+      },
+      EVENT_SECRET,
+    ),
+    ...(tagsAreCanonical ? {} : { tags: eventTags }),
     ...overrides,
   };
 }
@@ -113,12 +136,30 @@ test("read after write returns the exact identity-scoped events", () => {
   const captured = scope();
   const events = [makeEvent(), makeEvent()];
   assert.equal(writeMessageSnapshot(captured, events), true);
-  assert.deepEqual(readMessageSnapshot(captured), events);
+  assert.deepEqual(
+    readMessageSnapshot(captured),
+    JSON.parse(JSON.stringify(events)),
+  );
+});
+
+test("all existing timeline and auxiliary kinds remain persistable", () => {
+  resetStorage();
+  const captured = scope();
+  const kinds = [
+    ...new Set([...CHANNEL_TIMELINE_CONTENT_KINDS, ...CHANNEL_AUX_EVENT_KINDS]),
+  ];
+  const events = kinds.map((kind) => makeEvent({ kind }));
+  assert.equal(writeMessageSnapshot(captured, events), true);
+  assert.deepEqual(
+    readMessageSnapshot(captured).map((event) => event.kind),
+    kinds,
+  );
 });
 
 test("write rejects pending, local, unsigned, malformed, and wrong-channel events", async (t) => {
   const cases = [
     ["pending", { pending: true }],
+    ["pending false", { pending: false }],
     ["localKey", { localKey: "optimistic-1" }],
     ["optimistic id", { id: "optimistic-1" }],
     ["empty signature", { sig: "" }],
@@ -127,6 +168,8 @@ test("write rejects pending, local, unsigned, malformed, and wrong-channel event
     ["unknown event field", { unexpected: true }],
     ["missing channel tag", { tags: [["p", SIGNER_A]] }],
     ["wrong channel", { tags: [["h", "chan-2"]] }],
+    ["thread-summary metadata", { kind: KIND_CHANNEL_THREAD_SUMMARY }],
+    ["window-bounds metadata", { kind: KIND_CHANNEL_WINDOW_BOUNDS }],
     [
       "ambiguous channel",
       {
@@ -149,6 +192,47 @@ test("write rejects pending, local, unsigned, malformed, and wrong-channel event
       assert.equal(storage.get(messageSnapshotKey(captured)), undefined);
     });
   }
+});
+
+test("write rejects a valid-shape forged tombstone", () => {
+  resetStorage();
+  const captured = scope();
+  const tombstone = makeEvent({
+    kind: 5,
+    tags: [
+      ["h", captured.channelId],
+      ["e", "1".repeat(64)],
+    ],
+    content: "",
+  });
+  const forgedTombstone = { ...tombstone, content: "forged deletion" };
+
+  assert.equal(
+    writeMessageSnapshot(captured, [makeEvent(), forgedTombstone]),
+    false,
+  );
+  assert.equal(storage.has(messageSnapshotKey(captured)), false);
+});
+
+test("read deletes a manually inserted snapshot with a forged canonical event", () => {
+  resetStorage();
+  const captured = scope();
+  const tombstone = makeEvent({
+    kind: 5,
+    tags: [
+      ["h", captured.channelId],
+      ["e", "2".repeat(64)],
+    ],
+    content: "",
+  });
+  assert.equal(writeMessageSnapshot(captured, [makeEvent(), tombstone]), true);
+  const key = messageSnapshotKey(captured);
+  const payload = JSON.parse(storage.get(key));
+  payload.events[1] = { ...payload.events[1], content: "forged deletion" };
+  storage.set(key, JSON.stringify(payload));
+
+  assert.equal(readMessageSnapshot(captured), null);
+  assert.equal(storage.has(key), false);
 });
 
 test("read deletes corrupt or scope-mismatched payloads", async (t) => {

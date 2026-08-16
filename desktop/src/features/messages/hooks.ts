@@ -92,6 +92,7 @@ type SubscriptionGenerationGuard = { current: boolean };
 
 export type ChannelSubscriptionGeneration = Readonly<{
   channelId: string;
+  channelType: Channel["channelType"];
   generation: number;
   guard: SubscriptionGenerationGuard;
 }>;
@@ -399,26 +400,10 @@ export function useChannelSubscription(channel: Channel | null) {
   const queryClient = useQueryClient();
   const channelId = channel?.id ?? null;
   const channelType = channel?.channelType ?? null;
-  const renderedSubscriptionRef = useRef({
-    channelId,
-    channelType,
-  });
   const activeSubscriptionRef = useRef<ChannelSubscriptionGeneration | null>(
     null,
   );
   const subscriptionSequenceRef = useRef(0);
-  if (
-    renderedSubscriptionRef.current.channelId !== channelId ||
-    renderedSubscriptionRef.current.channelType !== channelType
-  ) {
-    if (activeSubscriptionRef.current) {
-      activeSubscriptionRef.current.guard.current = false;
-    }
-    renderedSubscriptionRef.current = {
-      channelId,
-      channelType,
-    };
-  }
   const [readySubscription, setReadySubscription] =
     useState<ChannelSubscriptionGeneration | null>(null);
   const refreshNewestWindow = useEffectEvent(
@@ -505,7 +490,7 @@ export function useChannelSubscription(channel: Channel | null) {
   }, [channelId, channelType]);
 
   useEffect(() => {
-    if (!channelId || channelType === "forum") {
+    if (!channelId || !channelType || channelType === "forum") {
       return;
     }
 
@@ -514,6 +499,7 @@ export function useChannelSubscription(channel: Channel | null) {
     subscriptionSequenceRef.current += 1;
     const generationToken = Object.freeze({
       channelId,
+      channelType,
       generation: subscriptionSequenceRef.current,
       guard: { current: true },
     });
@@ -590,8 +576,13 @@ export function useChannelSubscription(channel: Channel | null) {
   }, [channelId, channelType, queryClient]);
 
   const activeSubscription = activeSubscriptionRef.current;
+  // Render only compares current props with committed subscription state.
+  // Guard invalidation belongs exclusively to effect cleanup so abandoned
+  // renders cannot poison the subscription that remains committed.
   return readySubscription === activeSubscription &&
-    activeSubscription?.guard.current
+    activeSubscription?.guard.current &&
+    activeSubscription.channelId === channelId &&
+    activeSubscription.channelType === channelType
     ? activeSubscription
     : null;
 }

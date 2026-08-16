@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, afterEach, before, beforeEach, mock, test } from "node:test";
 
 import { JSDOM } from "jsdom";
+import { finalizeEvent } from "nostr-tools/pure";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -20,6 +21,9 @@ let writeMessageSnapshot;
 let flattenChannelWindowEvents;
 let useChannelMessagesQuery;
 let useChannelSubscription;
+const EVENT_SECRET = new Uint8Array(32).fill(11);
+const NEVER_SETTLES = new Promise(() => {});
+let eventSequence = 0;
 
 before(async () => {
   Object.assign(globalThis, {
@@ -100,16 +104,17 @@ function deferred() {
 }
 
 function relayEvent(channelId, id, kind = 9, overrides = {}) {
-  return {
-    id: id.repeat(64),
-    pubkey: "c".repeat(64),
-    created_at: 1_700_000_000,
-    kind,
-    tags: [["h", channelId]],
-    content: "hello",
-    sig: "d".repeat(128),
-    ...overrides,
-  };
+  eventSequence += 1;
+  return finalizeEvent(
+    {
+      created_at: 1_700_000_000 + eventSequence,
+      kind,
+      tags: [["h", channelId]],
+      content: `hello-${id}`,
+      ...overrides,
+    },
+    EVENT_SECRET,
+  );
 }
 
 function channelWindowResponse(channelId, events = []) {
@@ -189,7 +194,7 @@ function installRelayStub({ fetchAux, fetchAuxDeletions } = {}) {
 function mountHarness(
   initialChannel,
   initialSnapshotContext = null,
-  { strictMode = false } = {},
+  { strictMode = false, suspendedChannelId = null } = {},
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -205,6 +210,7 @@ function mountHarness(
       subscriptionGeneration,
       snapshotContext,
     );
+    if (activeChannel?.id === suspendedChannelId) throw NEVER_SETTLES;
     return React.createElement(
       "output",
       null,
@@ -217,21 +223,26 @@ function mountHarness(
   async function render(
     activeChannel,
     snapshotContext = initialSnapshotContext,
+    transition = false,
   ) {
     await act(async () => {
       const harness = React.createElement(Harness, {
         activeChannel,
         snapshotContext,
       });
-      root.render(
+      const tree = React.createElement(
+        QueryClientProvider,
+        { client: queryClient },
         React.createElement(
-          QueryClientProvider,
-          { client: queryClient },
+          React.Suspense,
+          { fallback: React.createElement("output", null, "suspended") },
           strictMode
             ? React.createElement(React.StrictMode, null, harness)
             : harness,
         ),
       );
+      if (transition) React.startTransition(() => root.render(tree));
+      else root.render(tree);
     });
   }
 
@@ -242,6 +253,9 @@ function mountHarness(
       await render(initialChannel);
     },
     render,
+    renderTransition(activeChannel) {
+      return render(activeChannel, initialSnapshotContext, true);
+    },
     async unmount() {
       await act(async () => root.unmount());
       queryClient.clear();
@@ -318,6 +332,38 @@ test("StrictMode effect replay keeps only the current subscription generation", 
   await relay.markReady(selected.id);
   assert.deepEqual(windowCalls, [selected.id]);
   assert.match(harness.container.textContent, /^ready:/);
+  await harness.unmount();
+});
+
+test("an abandoned B render cannot poison the committed A generation", async () => {
+  const windowCalls = [];
+  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+    windowCalls.push(args.channelId);
+    return channelWindowResponse(args.channelId);
+  };
+  const relay = installRelayStub();
+  const firstChannel = channel("channel-a");
+  const suspendedChannel = channel("channel-b");
+  const harness = mountHarness(firstChannel, null, {
+    suspendedChannelId: suspendedChannel.id,
+  });
+
+  await harness.mount();
+  await relay.markReady(firstChannel.id);
+  assert.deepEqual(windowCalls, [firstChannel.id]);
+
+  await harness.renderTransition(suspendedChannel);
+  assert.match(
+    harness.container.textContent,
+    /^ready:/,
+    "the committed A tree must remain visible while B is abandoned",
+  );
+  await relay.reconnect();
+  assert.deepEqual(
+    windowCalls,
+    [firstChannel.id, firstChannel.id],
+    "committed A must retain its live generation after abandoned B render",
+  );
   await harness.unmount();
 });
 
