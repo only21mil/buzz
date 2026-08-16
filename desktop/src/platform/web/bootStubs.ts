@@ -4,6 +4,7 @@ import { registerHuddleVoiceTtsCommands } from "./desktopOnly/huddleVoiceTts";
 import { registerRelayCryptoSocialCommands } from "./desktopOnly/relayCryptoSocial";
 import { registerRelaySocialConfigCommands } from "./desktopOnly/relaySocialConfig";
 import { registerRelayWorkflowsMembersCommands } from "./desktopOnly/relayWorkflowsMembers";
+import { registerRepoSnapshotCommands } from "./desktopOnly/repoSnapshot";
 import { registerTerminalGitMeshPairingCommands } from "./desktopOnly/terminalGitMeshPairing";
 import { BrowserIdentityManager, registerIdentityCommands } from "./identity";
 import { registerMessageMutationCommands } from "./messageMutations";
@@ -82,6 +83,7 @@ export async function installBrowserPal(): Promise<void> {
   registerRelaySocialCommands(identity);
   registerMediaCommands();
   registerTerminalGitMeshPairingCommands();
+  registerRepoSnapshotCommands(identity);
   registerHuddleVoiceTtsCommands();
   registerAgentsRuntimeBuilderlabCommands();
   registerRelaySocialConfigCommands(identity);

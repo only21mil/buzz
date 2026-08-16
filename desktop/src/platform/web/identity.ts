@@ -17,6 +17,7 @@ import {
   type IdentityStore,
   type StoredIdentity,
 } from "./identityStore";
+import { purgeRepoSnapshotCache } from "./desktopOnly/repoSnapshot";
 import { WorkerNip49Codec, type Nip49Codec } from "./nip49Client";
 import { v2 as nip44 } from "nostr-tools/nip44";
 
@@ -96,6 +97,7 @@ export class BrowserIdentityManager {
   private deviceKey: CryptoKey | null;
   private durable: boolean;
   private recovery: boolean;
+  private repoSnapshotGeneration = 0;
 
   private constructor(
     store: IdentityStore,
@@ -180,6 +182,10 @@ export class BrowserIdentityManager {
     return getPublicKey(this.secret);
   }
 
+  repoSnapshotScope(): string {
+    return `${this.repoSnapshotGeneration}:${this.pubkey()}`;
+  }
+
   sign(request: EventRequest): string {
     if (this.recovery) {
       throw new Error(
@@ -225,6 +231,7 @@ export class BrowserIdentityManager {
       };
       // Persistence must succeed before the active signer changes.
       await this.store.save(identity, key);
+      this.repoSnapshotGeneration += 1;
       this.secret.fill(0);
       this.secret = Uint8Array.from(imported);
       registerIdentitySecretForEgressGuard(this.secret);
@@ -259,7 +266,10 @@ export class BrowserIdentityManager {
   }
 
   async signOut(): Promise<void> {
+    const outgoingPubkey = this.pubkey();
+    this.repoSnapshotGeneration += 1;
     await this.store.clear();
+    await purgeRepoSnapshotCache(outgoingPubkey);
     this.secret.fill(0);
     this.secret = generateSecretKey();
     this.deviceKey = null;

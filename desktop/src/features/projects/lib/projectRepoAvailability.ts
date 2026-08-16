@@ -10,7 +10,7 @@ export type ProjectRepoUnavailableReason =
 
 /** Copy for the `browser` reason, shared by the files, activity and README surfaces. */
 export const BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE =
-  "README, files, and commits aren’t available in the web app yet — branches, issues, and pull requests are. Open this repository in the Buzz desktop app to browse its contents.";
+  "This repository is too large to browse in the web app yet. Open it in the Buzz desktop app to browse its README, files, and commits.";
 
 export function projectRepoUnavailableReason(
   error: unknown,
@@ -23,8 +23,8 @@ export function projectRepoUnavailableReason(
         : "";
 
   if (!message) return "missing";
-  // The browser build has no git client yet; its PAL rejects repository
-  // snapshot reads with BrowserUnavailableError (see platform/web/desktopOnly).
+  // The browser PAL uses BrowserUnavailableError for repositories that exceed
+  // its bounded shallow-fetch budget (see platform/web/desktopOnly).
   if (/not available in the browser build/.test(message)) return "browser";
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied/.test(
