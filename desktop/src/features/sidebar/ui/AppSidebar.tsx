@@ -867,12 +867,12 @@ export function AppSidebar({
               testId="sidebar-more-unread-below"
             />
           ) : null}
-
           <SidebarFooter>
             {relayConnectionCard.showSidebarRelayConnectionCard &&
             (isMobile ? openMobile : sidebarOpen) ? (
               <SidebarRelayConnectionCard
                 className="mb-2"
+                errorMessage={relayConnectionCard.relayErrorMessage}
                 isConnected={relayConnectionCard.isRelayConnectionSuccess}
                 isReconnectPending={relayConnectionCard.isRelayReconnectPending}
                 isWaitingOnReconnectHook={

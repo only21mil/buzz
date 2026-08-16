@@ -49,6 +49,7 @@
     "get_identity",
     "get_legacy_workspace_storage",
     "get_liked_notes",
+    "get_my_relay_membership",
     "get_note",
     "get_note_reactions",
     "get_notes_timeline",
@@ -81,9 +82,11 @@
     "plugin:websocket|send",
     "publish_note",
     "read_clipboard_text",
+    "relay_requires_membership",
     "remove_channel_member",
     "remove_reaction",
     "remove_relay_member",
+    "resolve_oa_owner",
     "save_agent_card",
     "save_ncryptsec_copy",
     "search_messages",
@@ -93,6 +96,7 @@
     "set_channel_purpose",
     "set_channel_topic",
     "set_contact_list",
+    "show_native_notification",
     "sign_event",
     "sign_nostr_identity_binding",
     "sign_out",
@@ -295,10 +299,5 @@
     "upload_media",
     "validate_repos_dir"
   ],
-  "pending": {
-    "get_my_relay_membership": "lane4 liveness+membership (Sats Hermes)",
-    "relay_requires_membership": "lane4 liveness+membership (Sats Hermes)",
-    "resolve_oa_owner": "lane4 liveness+membership (Sats Hermes)",
-    "show_native_notification": "lane4 liveness+membership (Sats Hermes)"
-  }
+  "pending": {}
 }
