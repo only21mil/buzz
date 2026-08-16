@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 
 import type { BrowserIdentityManager } from "../identity";
 import { register } from "../registry";
+import { BrowserUnavailableError } from "./capabilityOff";
 
 type RelayFilter = {
   kinds: number[];
@@ -221,18 +222,9 @@ function workflowFromEvent(event: RelayEvent): WorkflowWire {
   );
 }
 
-function webhookSecret(message: string): string | undefined {
-  const json = message.startsWith("response:")
-    ? message.slice("response:".length)
-    : message;
-  try {
-    const value = asRecord(JSON.parse(json));
-    return typeof value?.webhook_secret === "string"
-      ? value.webhook_secret
-      : undefined;
-  } catch {
-    return undefined;
-  }
+function isWebhookTriggered(yamlDefinition: string): boolean {
+  const trigger = asRecord(parseDefinition(yamlDefinition).trigger);
+  return trigger?.on === "webhook" || trigger?.type === "webhook";
 }
 
 function stringArray(
@@ -399,8 +391,18 @@ async function createWorkflow(
   const yamlDefinition = validateWorkflowContent(
     requiredString(input, "yamlDefinition"),
   );
+  // The relay hands back the one-time webhook secret only in the OK message,
+  // which the browser relayClient.publishEvent seam discards. Creating a
+  // webhook workflow here would look successful and silently lose the secret,
+  // so fail closed until that seam exists.
+  if (isWebhookTriggered(yamlDefinition)) {
+    throw new BrowserUnavailableError(
+      "create_workflow",
+      "create webhook workflows from the desktop app (the browser cannot receive the one-time webhook secret)",
+    );
+  }
   const workflowId = crypto.randomUUID();
-  const { response } = await publishSignedEvent(
+  await publishSignedEvent(
     identity,
     client,
     {
@@ -422,8 +424,7 @@ async function createWorkflow(
     now,
     now,
   );
-  const secret = webhookSecret(response.message);
-  return secret ? { ...workflow, webhook_secret: secret } : workflow;
+  return workflow;
 }
 
 async function updateWorkflow(

@@ -206,18 +206,13 @@ test("workflow mutations publish create/update/delete/trigger wire events", asyn
   await t.test("create_workflow", async () => {
     resetRegistryForTests();
     const client = clientFixture({
-      publishResult: {
-        event_id: "created-event",
-        accepted: true,
-        message:
-          'response:{"workflow_id":"new-id","webhook_secret":"secret-1"}',
-      },
+      publishResult: { event_id: "created-event", accepted: true },
     });
     registerRelayWorkflowsMembersCommands(identity, client);
 
     const result = await dispatch("create_workflow", {
       channelId: "channel-one",
-      yamlDefinition: "name: Hook\ntrigger:\n  type: webhook",
+      yamlDefinition: "name: Hook\ntrigger:\n  on: message_posted",
     });
 
     const published = client.calls.published[0].signed;
@@ -226,10 +221,43 @@ test("workflow mutations publish create/update/delete/trigger wire events", asyn
     assert.deepEqual(published.tags[1], ["h", "channel-one"]);
     assert.equal(result.id, published.tags[0][1]);
     assert.equal(result.name, "Hook");
-    assert.equal(result.webhook_secret, "secret-1");
+    assert.equal("webhook_secret" in result, false);
     assert.equal(result.owner_pubkey, PUBKEY);
     assert.equal(getUnregisteredCommandMissCount(), 0);
   });
+
+  await t.test(
+    "create_workflow with a webhook trigger fails closed",
+    async () => {
+      resetRegistryForTests();
+      const client = clientFixture({
+        publishResult: {
+          event_id: "created-event",
+          accepted: true,
+          message:
+            'response:{"workflow_id":"new-id","webhook_secret":"secret-1"}',
+        },
+      });
+      registerRelayWorkflowsMembersCommands(identity, client);
+
+      for (const yamlDefinition of [
+        "name: Hook\ntrigger:\n  on: webhook",
+        "name: Hook\ntrigger:\n  type: webhook",
+      ]) {
+        await assert.rejects(
+          dispatch("create_workflow", {
+            channelId: "channel-one",
+            yamlDefinition,
+          }),
+          (error) =>
+            error.name === "BrowserUnavailableError" &&
+            /webhook/.test(error.message),
+        );
+      }
+      assert.deepEqual(client.calls.published, []);
+      assert.equal(getUnregisteredCommandMissCount(), 0);
+    },
+  );
 
   await t.test("update_workflow", async () => {
     resetRegistryForTests();
