@@ -2,12 +2,26 @@
   "implemented": [
     "create_channel",
     "ensure_starter_channels",
+    "get_channel_messages_before",
     "get_channel_members",
+    "get_channel_window",
     "get_channels",
     "get_profile",
+    "get_user_profile",
+    "get_users_batch",
+    "nip44_decrypt_from_self",
+    "nip44_encrypt_to_self",
+    "search_messages",
+    "send_channel_message",
     "update_channel",
     "update_profile"
   ],
-  "noop": [],
+  "noop": [
+    "get_relay_self",
+    "has_managed_agent_channel_message_marker",
+    "list_managed_agents",
+    "list_personas",
+    "list_relay_agents"
+  ],
   "capability-off": []
 }

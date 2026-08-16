@@ -18,6 +18,7 @@ import {
   type StoredIdentity,
 } from "./identityStore";
 import { WorkerNip49Codec, type Nip49Codec } from "./nip49Client";
+import { v2 as nip44 } from "nostr-tools/nip44";
 
 const DEVICE_PASSWORD_CONTEXT = new TextEncoder().encode(
   "buzz-browser-identity:nip49:v1",
@@ -188,6 +189,16 @@ export class BrowserIdentityManager {
     return signEvent(this.secret, request);
   }
 
+  nip44EncryptToSelf(plaintext: string): string {
+    const key = nip44.utils.getConversationKey(this.secret, this.pubkey());
+    return nip44.encrypt(plaintext, key);
+  }
+
+  nip44DecryptFromSelf(ciphertext: string): string {
+    const key = nip44.utils.getConversationKey(this.secret, this.pubkey());
+    return nip44.decrypt(ciphertext, key);
+  }
+
   getNsec(): string {
     if (this.recovery) {
       throw new Error(
@@ -300,6 +311,16 @@ export function registerIdentityCommands(
     );
   });
   register("sign_event", (body) => manager.sign(eventRequest(body)));
+  register("nip44_encrypt_to_self", (body) =>
+    manager.nip44EncryptToSelf(
+      stringField(objectBody(body), "plaintext") as string,
+    ),
+  );
+  register("nip44_decrypt_from_self", (body) =>
+    manager.nip44DecryptFromSelf(
+      stringField(objectBody(body), "ciphertext") as string,
+    ),
+  );
   register("create_auth_event", (body) => {
     const record = objectBody(body);
     return manager.sign({

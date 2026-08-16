@@ -18,4 +18,12 @@ export function registerNoopCommands(): void {
   register("requeue_tray_actions", () => undefined);
   register("is_auto_update_supported", () => false);
   register("relay_reconnect_hook_configured", () => false);
+  // Optional desktop-only enrichment mounted by the channel screen. Empty
+  // values preserve the browser's message/profile path without advertising
+  // local managed-agent capabilities.
+  register("list_managed_agents", () => []);
+  register("list_personas", () => []);
+  register("list_relay_agents", () => []);
+  register("get_relay_self", () => null);
+  register("has_managed_agent_channel_message_marker", () => false);
 }
