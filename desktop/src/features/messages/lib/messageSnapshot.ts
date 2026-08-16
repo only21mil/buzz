@@ -8,12 +8,12 @@
  */
 
 import { mergeTimelineHistoryMessages } from "@/features/messages/lib/messageQueryKeys";
-import { normalizeRelayUrl } from "@/features/profile/lib/selfProfileStorage";
 import type { RelayEvent } from "@/shared/api/types";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
-const STORAGE_KEY_PREFIX = "buzz-channel-messages.v2";
+const STORAGE_KEY_PREFIX = "buzz-channel-messages.v3";
+const PREVIOUS_STORAGE_KEY_PREFIX = "buzz-channel-messages.v2";
 const LEGACY_STORAGE_KEY_PREFIX = "buzz-channel-messages.v1";
 const HEX_64_RE = /^[0-9a-f]{64}$/;
 const HEX_128_RE = /^[0-9a-f]{128}$/;
@@ -51,7 +51,7 @@ export type MessageSnapshotScope = Readonly<{
 }>;
 
 type SnapshotPayload = {
-  version: 2;
+  version: 3;
   relayUrl: string;
   signerPubkey: string;
   channelId: string;
@@ -59,12 +59,35 @@ type SnapshotPayload = {
   events: RelayEvent[];
 };
 
+/** Canonical relay identity for snapshots without lowercasing path/query data. */
+export function canonicalSnapshotRelayUrl(relayUrl: string): string {
+  const trimmed = relayUrl.trim();
+  if (trimmed.length === 0) return "";
+  const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed)
+    ? trimmed
+    : `wss://${trimmed}`;
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return "";
+    parsed.protocol = parsed.protocol.toLowerCase();
+    parsed.hostname = parsed.hostname.toLowerCase();
+    const credentials = parsed.username
+      ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ""}@`
+      : "";
+    const authority = `${parsed.protocol}//${credentials}${parsed.host}`;
+    const path = parsed.pathname === "/" ? "" : parsed.pathname;
+    return `${authority}${path}${parsed.search}${parsed.hash}`;
+  } catch {
+    return "";
+  }
+}
+
 function canonicalScope(
   relayUrl: string,
   signerPubkey: string,
   channelId: string,
 ): Omit<MessageSnapshotScope, "generation"> | null {
-  const canonicalRelay = normalizeRelayUrl(relayUrl);
+  const canonicalRelay = canonicalSnapshotRelayUrl(relayUrl);
   const canonicalSigner = normalizePubkey(signerPubkey);
   if (
     canonicalRelay.length === 0 ||
@@ -130,11 +153,11 @@ export function isMessageSnapshotScopeCurrent(
 }
 
 export function messageSnapshotKey(scope: MessageSnapshotScope): string {
-  return `${STORAGE_KEY_PREFIX}:${scope.relayUrl}:${scope.signerPubkey}:${scope.channelId}`;
+  return `${STORAGE_KEY_PREFIX}:${encodeURIComponent(scope.relayUrl)}:${encodeURIComponent(scope.signerPubkey)}:${encodeURIComponent(scope.channelId)}`;
 }
 
 function identityPrefix(relayUrl: string, signerPubkey: string): string {
-  return `${STORAGE_KEY_PREFIX}:${normalizeRelayUrl(relayUrl)}:${normalizePubkey(signerPubkey)}:`;
+  return `${STORAGE_KEY_PREFIX}:${encodeURIComponent(relayUrl)}:${encodeURIComponent(signerPubkey)}:`;
 }
 
 function collectKeysWithPrefix(prefix: string): string[] {
@@ -150,6 +173,11 @@ function removeKeysWithPrefix(prefix: string): void {
   for (const key of collectKeysWithPrefix(prefix)) {
     window.localStorage.removeItem(key);
   }
+}
+
+function removeObsoleteSnapshotNamespaces(): void {
+  removeKeysWithPrefix(`${LEGACY_STORAGE_KEY_PREFIX}:`);
+  removeKeysWithPrefix(`${PREVIOUS_STORAGE_KEY_PREFIX}:`);
 }
 
 function removeStoredKey(key: string): null {
@@ -216,7 +244,7 @@ function parseSnapshotPayload(
   if (
     !Object.keys(payload).every((key) => PAYLOAD_KEYS.has(key)) ||
     Object.keys(payload).length !== PAYLOAD_KEYS.size ||
-    payload.version !== 2 ||
+    payload.version !== 3 ||
     payload.relayUrl !== scope.relayUrl ||
     payload.signerPubkey !== scope.signerPubkey ||
     payload.channelId !== scope.channelId ||
@@ -240,8 +268,8 @@ export function readMessageSnapshot(
   if (!isMessageSnapshotScopeCurrent(scope)) return null;
   const key = messageSnapshotKey(scope);
   try {
-    // V1 had no identity dimension, so none of it can be attributed safely.
-    removeKeysWithPrefix(`${LEGACY_STORAGE_KEY_PREFIX}:`);
+    // V1 had no identity dimension and branch-local V2 used ambiguous keys.
+    removeObsoleteSnapshotNamespaces();
     const raw = window.localStorage.getItem(key);
     if (raw === null) return null;
     const parsed = parseSnapshotPayload(JSON.parse(raw), scope);
@@ -295,7 +323,7 @@ export function writeMessageSnapshot(
 ): boolean {
   try {
     if (!isMessageSnapshotScopeCurrent(scope)) return false;
-    removeKeysWithPrefix(`${LEGACY_STORAGE_KEY_PREFIX}:`);
+    removeObsoleteSnapshotNamespaces();
     if (
       events.length === 0 ||
       !events.every((event) => isPersistableEvent(event, scope.channelId))
@@ -321,7 +349,7 @@ export function writeMessageSnapshot(
       key,
     );
     const serialized = JSON.stringify({
-      version: 2,
+      version: 3,
       relayUrl: scope.relayUrl,
       signerPubkey: scope.signerPubkey,
       channelId: scope.channelId,
@@ -355,9 +383,7 @@ export function removeMessageSnapshotsForIdentity(
     removeKeysWithPrefix(
       identityPrefix(canonical.relayUrl, canonical.signerPubkey),
     );
-    removeKeysWithPrefix(
-      `${LEGACY_STORAGE_KEY_PREFIX}:${normalizeRelayUrl(relayUrl)}:`,
-    );
+    removeObsoleteSnapshotNamespaces();
   } catch {
     // Storage access failures are non-fatal.
   }
@@ -377,14 +403,14 @@ export function removeMessageSnapshotsForCommunities(
   }
 }
 
-/** Invalidate every captured scope and remove all v1/v2 message snapshots. */
+/** Invalidate every captured scope and remove all message snapshot namespaces. */
 export function removeAllMessageSnapshots(): void {
   generationSequence += 1;
   globalScopeGeneration = generationSequence;
   identityScopeGenerations.clear();
   try {
     removeKeysWithPrefix(`${STORAGE_KEY_PREFIX}:`);
-    removeKeysWithPrefix(`${LEGACY_STORAGE_KEY_PREFIX}:`);
+    removeObsoleteSnapshotNamespaces();
   } catch {
     // Storage access failures are non-fatal.
   }

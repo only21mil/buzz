@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  canonicalSnapshotRelayUrl,
   captureMessageSnapshotScope,
   mergeHistoryOverSnapshot,
   messageSnapshotKey,
@@ -75,7 +76,26 @@ test("scope and key canonicalize relay and signer while preserving channel", () 
   assert.equal(captured.channelId, "channel:private");
   assert.equal(
     messageSnapshotKey(captured),
-    `buzz-channel-messages.v2:${RELAY}:${SIGNER_A}:channel:private`,
+    `buzz-channel-messages.v3:${encodeURIComponent(RELAY)}:${SIGNER_A}:channel%3Aprivate`,
+  );
+});
+
+test("relay canonicalization normalizes authority but preserves path and query case", () => {
+  assert.equal(
+    canonicalSnapshotRelayUrl(" WSS://Relay.Example.com:443/ "),
+    RELAY,
+  );
+  assert.equal(
+    canonicalSnapshotRelayUrl("WS://Relay.Example.com:80/Path?Token=ABC"),
+    "ws://relay.example.com/Path?Token=ABC",
+  );
+  assert.notEqual(
+    canonicalSnapshotRelayUrl("wss://relay.example.com/Path?Token=ABC"),
+    canonicalSnapshotRelayUrl("wss://relay.example.com/path?Token=ABC"),
+  );
+  assert.notEqual(
+    canonicalSnapshotRelayUrl("wss://relay.example.com/Path?Token=ABC"),
+    canonicalSnapshotRelayUrl("wss://relay.example.com/Path?Token=abc"),
   );
 });
 
@@ -133,7 +153,7 @@ test("write rejects pending, local, unsigned, malformed, and wrong-channel event
 
 test("read deletes corrupt or scope-mismatched payloads", async (t) => {
   const mutations = [
-    ["wrong schema", (payload) => ({ ...payload, version: 1 })],
+    ["wrong schema", (payload) => ({ ...payload, version: 2 })],
     [
       "wrong relay",
       (payload) => ({ ...payload, relayUrl: "wss://other.test" }),
@@ -174,21 +194,79 @@ test("read deletes corrupt or scope-mismatched payloads", async (t) => {
   });
 });
 
-test("legacy v1 entries are deleted and never migrated", () => {
+test("read purges v1 and ambiguous v2 entries without migration", () => {
   resetStorage();
   const captured = scope();
   const legacyKey = `buzz-channel-messages.v1:${RELAY}:chan-1`;
+  const previousKey = `buzz-channel-messages.v2:${RELAY}:${SIGNER_A}:chan-1`;
   storage.set(
     legacyKey,
     JSON.stringify({ version: 1, updatedAt: 1, events: [makeEvent()] }),
+  );
+  storage.set(
+    previousKey,
+    JSON.stringify({ version: 2, updatedAt: 1, events: [makeEvent()] }),
   );
   const unrelatedLegacyKey =
     "buzz-channel-messages.v1:wss://other.example.com:other-channel";
   storage.set(unrelatedLegacyKey, "legacy");
   assert.equal(readMessageSnapshot(captured), null);
   assert.equal(storage.has(legacyKey), false);
+  assert.equal(storage.has(previousKey), false);
   assert.equal(storage.has(unrelatedLegacyKey), false);
   assert.equal(storage.has(messageSnapshotKey(captured)), false);
+});
+
+test("write and identity lifecycle reset purge both old namespaces", () => {
+  resetStorage();
+  const captured = scope();
+  const oldKeys = [
+    `buzz-channel-messages.v1:${RELAY}:chan-1`,
+    `buzz-channel-messages.v2:${RELAY}:${SIGNER_A}:chan-1`,
+  ];
+  for (const key of oldKeys) storage.set(key, "old");
+  assert.equal(writeMessageSnapshot(captured, [makeEvent()]), true);
+  assert.ok(oldKeys.every((key) => !storage.has(key)));
+
+  for (const key of oldKeys) storage.set(key, "old-again");
+  removeMessageSnapshotsForIdentity(RELAY, SIGNER_A);
+  assert.ok(oldKeys.every((key) => !storage.has(key)));
+
+  for (const key of oldKeys) storage.set(key, "old-globally");
+  removeAllMessageSnapshots();
+  assert.ok(oldKeys.every((key) => !storage.has(key)));
+});
+
+test("escaped keys prevent accepted-scope collisions and isolate purges", () => {
+  resetStorage();
+  const suffix = "room:private";
+  const left = scope(
+    SIGNER_A,
+    suffix,
+    `wss://relay.example.com/path:${SIGNER_B}`,
+  );
+  const right = scope(
+    SIGNER_B,
+    `${SIGNER_A}:${suffix}`,
+    "wss://relay.example.com/path",
+  );
+  const leftV2Key = `buzz-channel-messages.v2:${left.relayUrl}:${left.signerPubkey}:${left.channelId}`;
+  const rightV2Key = `buzz-channel-messages.v2:${right.relayUrl}:${right.signerPubkey}:${right.channelId}`;
+  assert.equal(leftV2Key, rightV2Key);
+  assert.notEqual(messageSnapshotKey(left), messageSnapshotKey(right));
+
+  assert.equal(
+    writeMessageSnapshot(left, [makeEvent({ channelId: left.channelId })]),
+    true,
+  );
+  assert.equal(
+    writeMessageSnapshot(right, [makeEvent({ channelId: right.channelId })]),
+    true,
+  );
+  removeMessageSnapshotsForIdentity(left.relayUrl, left.signerPubkey);
+
+  assert.equal(readMessageSnapshot(left), null);
+  assert.notEqual(readMessageSnapshot(right), null);
 });
 
 test("snapshot keeps only the newest bounded slice", () => {

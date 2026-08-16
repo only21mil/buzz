@@ -15,7 +15,6 @@ import {
   getProfile,
   searchUsers,
   getUserProfile,
-  getUsersBatch,
   updateProfile,
 } from "@/shared/api/tauriProfiles";
 import { getContactList, setContactList } from "@/shared/api/social";
@@ -46,6 +45,7 @@ import {
 } from "@/features/profile/lib/userLabelStorage";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { updateCachedChannelMemberDisplayName } from "@/features/channels/channelMemberProfileCache";
+import { getUsersBatchCoalesced } from "@/features/profile/lib/profileBatchCoalescer";
 
 export const profileQueryKey = ["profile"] as const;
 export const contactListQueryKey = (pubkey: string) =>
@@ -356,7 +356,7 @@ export function useUsersBatchQuery(
         }
       }
       if (toFetch.length > 0) {
-        const fresh = await getUsersBatch(toFetch);
+        const fresh = await getUsersBatchCoalesced(relayUrl, toFetch);
         if (relayUrl) {
           writeCachedUserLabels(relayUrl, fresh.profiles, fresh.missing);
         }

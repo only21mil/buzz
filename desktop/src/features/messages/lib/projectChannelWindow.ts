@@ -58,11 +58,13 @@ export function projectChannelWindowMessages(
 export async function refreshChannelWindowMessages(
   queryClient: QueryClient,
   channelId: string,
+  isCurrent: () => boolean = () => true,
 ) {
   await queryClient.invalidateQueries({
     queryKey: channelMessagesKey(channelId),
     exact: true,
     refetchType: "active",
   });
+  if (!isCurrent()) return;
   projectChannelWindowMessages(queryClient, channelId);
 }

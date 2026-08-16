@@ -17,6 +17,7 @@ let captureMessageSnapshotScope;
 let readMessageSnapshot;
 let removeAllMessageSnapshots;
 let writeMessageSnapshot;
+let flattenChannelWindowEvents;
 let useChannelMessagesQuery;
 let useChannelSubscription;
 
@@ -44,6 +45,9 @@ before(async () => {
   } = await import("./lib/messageSnapshot.ts"));
   ({ useChannelMessagesQuery, useChannelSubscription } = await import(
     "./hooks.ts"
+  ));
+  ({ flattenChannelWindowEvents } = await import(
+    "./lib/channelWindowStore.ts"
   ));
 });
 
@@ -182,7 +186,11 @@ function installRelayStub({ fetchAux, fetchAuxDeletions } = {}) {
   };
 }
 
-function mountHarness(initialChannel, initialSnapshotContext = null) {
+function mountHarness(
+  initialChannel,
+  initialSnapshotContext = null,
+  { strictMode = false } = {},
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -191,16 +199,16 @@ function mountHarness(initialChannel, initialSnapshotContext = null) {
   const root = createRoot(container);
 
   function Harness({ activeChannel, snapshotContext }) {
-    const isSubscriptionReady = useChannelSubscription(activeChannel);
+    const subscriptionGeneration = useChannelSubscription(activeChannel);
     const query = useChannelMessagesQuery(
       activeChannel,
-      isSubscriptionReady,
+      subscriptionGeneration,
       snapshotContext,
     );
     return React.createElement(
       "output",
       null,
-      `${isSubscriptionReady ? "ready" : "waiting"}:${(query.data ?? [])
+      `${subscriptionGeneration ? "ready" : "waiting"}:${(query.data ?? [])
         .map((event) => event.id)
         .join(",")}`,
     );
@@ -211,11 +219,17 @@ function mountHarness(initialChannel, initialSnapshotContext = null) {
     snapshotContext = initialSnapshotContext,
   ) {
     await act(async () => {
+      const harness = React.createElement(Harness, {
+        activeChannel,
+        snapshotContext,
+      });
       root.render(
         React.createElement(
           QueryClientProvider,
           { client: queryClient },
-          React.createElement(Harness, { activeChannel, snapshotContext }),
+          strictMode
+            ? React.createElement(React.StrictMode, null, harness)
+            : harness,
         ),
       );
     });
@@ -289,29 +303,141 @@ test("channel windows wait for subscription readiness and reconnect once", async
   await harness.unmount();
 });
 
+test("StrictMode effect replay keeps only the current subscription generation", async () => {
+  const windowCalls = [];
+  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+    windowCalls.push(args.channelId);
+    return channelWindowResponse(args.channelId);
+  };
+  const relay = installRelayStub();
+  const selected = channel("channel-a");
+  const harness = mountHarness(selected, null, { strictMode: true });
+
+  await harness.mount();
+  assert.deepEqual(windowCalls, []);
+  await relay.markReady(selected.id);
+  assert.deepEqual(windowCalls, [selected.id]);
+  assert.match(harness.container.textContent, /^ready:/);
+  await harness.unmount();
+});
+
 test("rapid A to B to A does not reuse the old A subscription readiness", async () => {
-  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) =>
-    channelWindowResponse(args.channelId);
+  const windowCalls = [];
+  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+    windowCalls.push(args.channelId);
+    return channelWindowResponse(args.channelId);
+  };
   const relay = installRelayStub();
   const firstChannel = channel("channel-a");
   const secondChannel = channel("channel-b");
   const harness = mountHarness(firstChannel);
 
   await harness.mount();
+  assert.deepEqual(windowCalls, []);
   await relay.markReady(firstChannel.id);
   assert.match(harness.container.textContent, /^ready:/);
+  assert.deepEqual(windowCalls, [firstChannel.id]);
 
   await harness.render(secondChannel);
   assert.match(harness.container.textContent, /^waiting:/);
+  assert.deepEqual(windowCalls, [firstChannel.id]);
   await harness.render(firstChannel);
   assert.match(
     harness.container.textContent,
     /^waiting:/,
     "the new A render must not inherit the first A generation",
   );
+  assert.deepEqual(
+    windowCalls,
+    [firstChannel.id],
+    "the reopened A generation must not fetch before its own readiness",
+  );
 
   await relay.markReady(firstChannel.id);
   assert.match(harness.container.textContent, /^ready:/);
+  assert.deepEqual(
+    windowCalls,
+    [firstChannel.id, firstChannel.id],
+    "a fresh cached A query must fetch exactly once for the new generation",
+  );
+  await harness.unmount();
+});
+
+test("a pending earlier A generation cannot mutate reopened A caches", async () => {
+  const firstChannel = channel("channel-a");
+  const secondChannel = channel("channel-b");
+  const staleEvent = relayEvent(firstChannel.id, "1");
+  const currentEvent = relayEvent(firstChannel.id, "2");
+  const firstRequest = deferred();
+  const secondRequest = deferred();
+  let firstChannelCalls = 0;
+  dom.window.__TAURI_INTERNALS__.invoke = async (_command, args) => {
+    if (args.channelId !== firstChannel.id) {
+      return channelWindowResponse(args.channelId);
+    }
+    firstChannelCalls += 1;
+    return firstChannelCalls === 1
+      ? firstRequest.promise
+      : secondRequest.promise;
+  };
+  const relay = installRelayStub();
+  const harness = mountHarness(firstChannel);
+
+  await harness.mount();
+  await relay.markReady(firstChannel.id);
+  assert.equal(firstChannelCalls, 1);
+  await harness.render(secondChannel);
+  await harness.render(firstChannel);
+  assert.equal(firstChannelCalls, 1);
+  await relay.markReady(firstChannel.id);
+  assert.equal(firstChannelCalls, 2);
+
+  firstRequest.resolve(channelWindowResponse(firstChannel.id, [staleEvent]));
+  await flushMicrotasks();
+  const messagesAfterStale =
+    harness.queryClient.getQueryData(["channel-messages", firstChannel.id]) ??
+    [];
+  const windowAfterStale = harness.queryClient.getQueryData([
+    "channel-window",
+    firstChannel.id,
+  ]);
+  assert.equal(
+    messagesAfterStale.some((event) => event.id === staleEvent.id),
+    false,
+  );
+  assert.equal(
+    windowAfterStale
+      ? flattenChannelWindowEvents(windowAfterStale).some(
+          (event) => event.id === staleEvent.id,
+        )
+      : false,
+    false,
+  );
+
+  secondRequest.resolve(channelWindowResponse(firstChannel.id, [currentEvent]));
+  await flushMicrotasks();
+  const settledMessages = harness.queryClient.getQueryData([
+    "channel-messages",
+    firstChannel.id,
+  ]);
+  const settledWindow = harness.queryClient.getQueryData([
+    "channel-window",
+    firstChannel.id,
+  ]);
+  assert.equal(
+    settledMessages.filter((event) => event.id === currentEvent.id).length,
+    1,
+  );
+  assert.equal(
+    settledMessages.some((event) => event.id === staleEvent.id),
+    false,
+  );
+  assert.equal(
+    flattenChannelWindowEvents(settledWindow).filter(
+      (event) => event.id === currentEvent.id,
+    ).length,
+    1,
+  );
   await harness.unmount();
 });
 
@@ -385,6 +511,32 @@ for (const responseContainsLiveEvent of [false, true]) {
     await harness.unmount();
   });
 }
+
+test("a live event while auxiliary closure is pending remains exactly once", async () => {
+  const selected = channel("channel-a");
+  const historyEvent = relayEvent(selected.id, "1");
+  const liveEvent = relayEvent(selected.id, "2");
+  const auxiliaryRequest = deferred();
+  dom.window.__TAURI_INTERNALS__.invoke = async () =>
+    channelWindowResponse(selected.id, [historyEvent]);
+  const relay = installRelayStub({
+    fetchAux: async () => auxiliaryRequest.promise,
+  });
+  const harness = mountHarness(selected);
+
+  await harness.mount();
+  await relay.markReady(selected.id);
+  relay.emit(selected.id, liveEvent);
+  auxiliaryRequest.resolve([]);
+  await flushMicrotasks();
+
+  const messages = harness.queryClient.getQueryData([
+    "channel-messages",
+    selected.id,
+  ]);
+  assert.equal(messages.filter((event) => event.id === liveEvent.id).length, 1);
+  await harness.unmount();
+});
 
 test("auxiliary closure lands before durable snapshot persistence", async () => {
   const selected = channel("channel-a");
