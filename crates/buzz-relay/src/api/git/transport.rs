@@ -376,10 +376,13 @@ pub(crate) fn validate_repo_id<'a>(owner: &str, repo: &'a str) -> Result<&'a str
     // Strip trailing .git if present.
     let repo_name = repo.strip_suffix(".git").unwrap_or(repo);
 
-    // Repo name: [a-zA-Z0-9._-]{1,64}, no leading dots, no "..".
+    // Repo name: [a-zA-Z0-9._-]{1,64}, no leading dots, no "..", and no
+    // remaining `.git` suffix. Rejecting a second suffix keeps the name used
+    // for authorization identical to the name passed into `pointer_key`.
     if repo_name.is_empty()
         || repo_name.len() > 64
         || repo_name.starts_with('.')
+        || repo_name.ends_with(".git")
         || repo_name.contains("..")
         || !repo_name
             .chars()
@@ -2043,7 +2046,7 @@ pub fn git_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod track_c_tests {
     use super::*;
-    use crate::api::git::manifest::Manifest;
+    use crate::api::git::manifest::{pointer_key, Manifest};
     use buzz_core::CommunityId;
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::collections::BTreeMap;
@@ -2052,6 +2055,31 @@ mod track_c_tests {
 
     fn oid_sha1() -> String {
         "cb09a769da1c01f458fa6959d4e8eded38fac8d3".to_string()
+    }
+
+    #[test]
+    fn repo_id_rejects_a_second_dot_git_suffix() {
+        let owner = "a".repeat(64);
+        let response = validate_repo_id(&owner, "secret.git.git")
+            .expect_err("a second .git suffix must be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn accepted_repo_ids_are_pointer_key_canonical() {
+        let owner = "a".repeat(64);
+        let community = CommunityId::from_uuid(uuid::Uuid::from_u128(1));
+
+        for raw in ["x", "x.git", "x.git.git", ".git", "x..git"] {
+            if let Ok(canonical) = validate_repo_id(&owner, raw) {
+                assert_eq!(
+                    pointer_key(community, &owner, canonical),
+                    format!("repos/{community}/{owner}/{canonical}/pointer"),
+                    "pointer_key must not further canonicalize accepted input {raw:?}"
+                );
+            }
+        }
     }
 
     fn run_test_git(cwd: &Path, args: &[&str], extra_env: &[(&str, String)]) -> Output {

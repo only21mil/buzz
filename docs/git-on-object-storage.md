@@ -134,6 +134,13 @@ variables cleared; the validated client revision is resolved once with
 `--end-of-options`, and subsequent commands use the resolved object ID followed
 by Git's `--` revision/path separator.
 
+Known limits: the shared NIP-98 verifier normalizes URLs by removing trailing
+slashes from paths before comparison, so its URL binding is not byte-exact for
+that distinction. Generic repository-read denials also do not have constant
+timing: a missing or unbound announcement and a bound announcement denied by
+the membership lookup traverse different database paths even though their
+external status and generic body remain the same.
+
 ## System Model
 
 A **repository** `R` has the following state in the object store:

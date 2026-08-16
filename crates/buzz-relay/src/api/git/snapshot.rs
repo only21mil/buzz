@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{error, warn};
 
@@ -132,7 +132,7 @@ async fn repository_snapshot_inner(
     query: SnapshotQuery,
     started_at: Instant,
 ) -> Response {
-    let repo_name = match validate_repo_id(&params.owner, &params.repo) {
+    let repo_name = match validate_snapshot_repo_params(params) {
         Ok(repo_name) => repo_name,
         Err(response) => return response,
     };
@@ -233,6 +233,11 @@ async fn repository_snapshot_inner(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
         .expect("static snapshot response")
+}
+
+#[allow(clippy::result_large_err)] // Response is the natural axum handler error type
+fn validate_snapshot_repo_params(params: &GitRepoParams) -> Result<&str, Response> {
+    validate_repo_id(&params.owner, &params.repo)
 }
 
 async fn map_snapshot_response(response: Response) -> Response {
@@ -512,16 +517,24 @@ fn parse_tree(output: &[u8]) -> Result<(Vec<TreeEntry>, bool), Box<Response>> {
     let mut selected = Vec::new();
     let mut readme_beyond_limit = None;
     let mut total = 0usize;
+    let mut omitted_non_utf8 = false;
     for record in output
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
     {
         total += 1;
-        let record = std::str::from_utf8(record)
-            .map_err(|_| boxed_git_error_response("git tree contained a non-UTF-8 path"))?;
-        let (metadata, path) = record
-            .split_once('\t')
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'\t')
             .ok_or_else(|| boxed_git_error_response("git returned malformed tree metadata"))?;
+        let (metadata, path_with_separator) = record.split_at(separator);
+        let path = &path_with_separator[1..];
+        let metadata = std::str::from_utf8(metadata)
+            .map_err(|_| boxed_git_error_response("git returned malformed tree metadata"))?;
+        let Ok(path) = std::str::from_utf8(path) else {
+            omitted_non_utf8 = true;
+            continue;
+        };
         let mut fields = metadata.split_whitespace();
         let mode = fields
             .next()
@@ -560,7 +573,7 @@ fn parse_tree(output: &[u8]) -> Result<(Vec<TreeEntry>, bool), Box<Response>> {
     if let Some(readme) = readme_beyond_limit {
         selected.push(readme);
     }
-    Ok((selected, total > SNAPSHOT_FILE_LIMIT))
+    Ok((selected, omitted_non_utf8 || total > SNAPSHOT_FILE_LIMIT))
 }
 
 fn is_root_readme(path: &str) -> bool {
@@ -718,60 +731,100 @@ async fn run_git_bounded(
     if remaining(deadline).is_zero() {
         return Err(GitRunError::Timeout);
     }
-    let temp_parent = repo_path.parent().unwrap_or(repo_path);
-    let stdout_tmp = tempfile::NamedTempFile::new_in(temp_parent)
-        .map_err(|error| GitRunError::Internal(format!("create git stdout tempfile: {error}")))?;
+    let mut command = Command::new("git");
+    command.arg("--git-dir").arg(repo_path).args(args);
+    harden_git_env(&mut command);
+    run_command_bounded(command, input, max_stdout_bytes, deadline, repo_path).await
+}
+
+async fn run_command_bounded(
+    mut command: Command,
+    input: Option<&[u8]>,
+    max_stdout_bytes: u64,
+    deadline: Instant,
+    temp_parent: &Path,
+) -> Result<GitOutput, GitRunError> {
+    let temp_parent = temp_parent.parent().unwrap_or(temp_parent);
     let stderr_tmp = tempfile::NamedTempFile::new_in(temp_parent)
         .map_err(|error| GitRunError::Internal(format!("create git stderr tempfile: {error}")))?;
-    let stdout_file = stdout_tmp
-        .reopen()
-        .map_err(|error| GitRunError::Internal(format!("reopen git stdout tempfile: {error}")))?;
     let stderr_file = stderr_tmp
         .reopen()
         .map_err(|error| GitRunError::Internal(format!("reopen git stderr tempfile: {error}")))?;
 
-    let mut command = Command::new("git");
     command
-        .arg("--git-dir")
-        .arg(repo_path)
-        .args(args)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::from(stdout_file))
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true);
-    harden_git_env(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| GitRunError::Internal(format!("spawn git: {error}")))?;
-    if let Some(input) = input {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| GitRunError::Internal("git stdin unavailable".to_string()))?;
-        tokio::time::timeout(remaining(deadline), async {
-            stdin.write_all(input).await?;
-            stdin.shutdown().await
-        })
-        .await
-        .map_err(|_| GitRunError::Timeout)?
-        .map_err(|error| GitRunError::Internal(format!("write git stdin: {error}")))?;
-    }
-    let status = tokio::time::timeout(remaining(deadline), child.wait())
-        .await
-        .map_err(|_| GitRunError::Timeout)?
-        .map_err(|error| GitRunError::Internal(format!("wait for git: {error}")))?;
-    let stdout_len = std::fs::metadata(stdout_tmp.path())
-        .map_err(|error| GitRunError::Internal(format!("stat git stdout: {error}")))?
-        .len();
-    if stdout_len > max_stdout_bytes {
-        return Err(GitRunError::OutputTooLarge);
-    }
-    let stdout = std::fs::read(stdout_tmp.path())
-        .map_err(|error| GitRunError::Internal(format!("read git stdout: {error}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitRunError::Internal("git stdout unavailable".to_string()))?;
+    let mut stdin = child.stdin.take();
+    let io_result = tokio::time::timeout(remaining(deadline), async {
+        let write_input =
+            async {
+                if let (Some(input), Some(mut stdin)) = (input, stdin.take()) {
+                    stdin.write_all(input).await.map_err(|error| {
+                        GitRunError::Internal(format!("write git stdin: {error}"))
+                    })?;
+                    stdin.shutdown().await.map_err(|error| {
+                        GitRunError::Internal(format!("close git stdin: {error}"))
+                    })?;
+                }
+                Ok(())
+            };
+        let read_output = async {
+            let mut output = Vec::with_capacity(
+                usize::try_from(max_stdout_bytes.min(64 * 1024)).unwrap_or(64 * 1024),
+            );
+            let mut buffer = [0u8; 8192];
+            loop {
+                let read = stdout.read(&mut buffer).await.map_err(|error| {
+                    GitRunError::Internal(format!("read git stdout stream: {error}"))
+                })?;
+                if read == 0 {
+                    return Ok(output);
+                }
+                if output.len() as u64 + read as u64 > max_stdout_bytes {
+                    return Err(GitRunError::OutputTooLarge);
+                }
+                output.extend_from_slice(&buffer[..read]);
+            }
+        };
+        let (_, output) = tokio::try_join!(write_input, read_output)?;
+        Ok::<Vec<u8>, GitRunError>(output)
+    })
+    .await;
+    let stdout = match io_result {
+        Ok(Ok(stdout)) => stdout,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(GitRunError::Timeout);
+        }
+    };
+    let status = match tokio::time::timeout(remaining(deadline), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            return Err(GitRunError::Internal(format!("wait for git: {error}")));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(GitRunError::Timeout);
+        }
+    };
     let stderr = std::fs::read(stderr_tmp.path())
         .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(64 * 1024)]).into_owned())
         .unwrap_or_default();
@@ -968,6 +1021,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_front_door_rejects_a_second_dot_git_suffix() {
+        let owner = "a".repeat(64);
+        let invalid = GitRepoParams {
+            owner: owner.clone(),
+            repo: "secret.git.git".to_string(),
+        };
+        let other_invalid = GitRepoParams {
+            owner,
+            repo: ".git".to_string(),
+        };
+
+        let invalid_response =
+            validate_snapshot_repo_params(&invalid).expect_err("double suffix must fail");
+        let other_response =
+            validate_snapshot_repo_params(&other_invalid).expect_err("empty repo id must fail");
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid_response.status(), other_response.status());
+        let invalid_body = to_bytes(invalid_response.into_body(), SNAPSHOT_ERROR_BODY_LIMIT)
+            .await
+            .expect("read invalid response");
+        let other_body = to_bytes(other_response.into_body(), SNAPSHOT_ERROR_BODY_LIMIT)
+            .await
+            .expect("read comparison response");
+        assert_eq!(invalid_body, other_body);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_command_stops_while_stdout_is_streaming() {
+        let temp = tempfile::TempDir::new().expect("fixture tempdir");
+        let mut command = Command::new("sh");
+        command.args(["-c", "while :; do printf 0123456789abcdef; done"]);
+        let result = run_command_bounded(
+            command,
+            None,
+            1024,
+            Instant::now() + Duration::from_secs(5),
+            temp.path(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(GitRunError::OutputTooLarge)));
+    }
+
     fn git(cwd: &Path, args: &[&str]) -> std::process::Output {
         StdCommand::new("git")
             .current_dir(cwd)
@@ -1059,5 +1157,53 @@ mod tests {
         assert_eq!(readme.preview_content.as_deref(), Some("# Snapshot\n"));
         assert!(readme.last_changed_at.is_none());
         assert!(readme.latest_commit.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_omits_non_utf8_tree_paths_and_marks_truncated() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::TempDir::new().expect("fixture tempdir");
+        let source = temp.path().join("source");
+        assert_git(git(
+            temp.path(),
+            &[
+                "init",
+                "--object-format=sha256",
+                "--initial-branch=main",
+                source.to_str().expect("source path"),
+            ],
+        ));
+        assert_git(git(&source, &["config", "user.name", "Snapshot Test"]));
+        assert_git(git(
+            &source,
+            &["config", "user.email", "snapshot@example.com"],
+        ));
+        std::fs::write(source.join("README.md"), "# Snapshot\n").expect("write README");
+        let raw_name = std::ffi::OsString::from_vec(b"invalid-\xff.txt".to_vec());
+        std::fs::write(source.join(raw_name), "hidden\n").expect("write non-UTF-8 fixture");
+        assert_git(git(&source, &["add", "--all"]));
+        assert_git(git(&source, &["commit", "-m", "non-UTF-8 path"]));
+
+        let snapshot = snapshot_from_repo(
+            &source.join(".git"),
+            "HEAD",
+            false,
+            SNAPSHOT_DEFAULT_COMMITS,
+            Instant::now() + SNAPSHOT_TIMEOUT,
+        )
+        .await
+        .expect("build snapshot");
+
+        assert!(snapshot.truncated);
+        assert_eq!(
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["README.md"]
+        );
     }
 }
