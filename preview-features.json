@@ -11,7 +11,8 @@
       "id": "projects",
       "name": "Projects",
       "description": "Git repository browser and collaboration",
-      "platforms": ["desktop"]
+      "platforms": ["desktop"],
+      "defaultEnabled": true
     },
     {
       "id": "pulse",
