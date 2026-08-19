@@ -118,6 +118,11 @@ export function resolveUserLabel(input: {
     return displayName;
   }
 
+  const name = profile?.name?.trim();
+  if (name) {
+    return name;
+  }
+
   const nip05Handle = profile?.nip05Handle?.trim();
   if (nip05Handle) {
     return nip05Handle;
