@@ -818,7 +818,7 @@ pub async fn add_channel_members(
             Ok(_) => {
                 added.push(pubkey.clone());
                 if let Err(error) =
-                    refresh_managed_agent_profile_after_membership(&app, &state, &pubkey).await
+                    refresh_managed_agent_profile_after_membership(&app, &state, pubkey).await
                 {
                     errors.push(serde_json::json!({
                         "pubkey": pubkey,

@@ -233,4 +233,48 @@ mod tests {
         assert_eq!(tags[0].as_slice(), ["d", "profile"]);
         assert_eq!(tags[1].as_slice(), ["custom", "preserve"]);
     }
+
+    #[test]
+    fn membership_only_refresh_updates_channel_ids_and_keeps_desktop_metadata() {
+        // Round trip of the refresh-on-membership path: an agent already has a
+        // published record with two channels; the desktop adds it to a third.
+        // The refresh must carry the new membership set and must NOT let the
+        // desktop-side display name / avatar overwrite the relay record.
+        let agent_keys = nostr::Keys::generate();
+        let existing = nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core_pkg::kind::KIND_AGENT_PROFILE as u16),
+            r#"{"display_name":"RelayName","name":"RelayName","picture":"https://relay/avatar.png","channel_ids":["a","b"]}"#,
+        )
+        .sign_with_keys(&agent_keys)
+        .expect("event should sign");
+
+        let (content, _tags) = merge_agent_profile_channel_ids(
+            Some(&existing),
+            "DesktopName",
+            Some("https://desktop/other.png"),
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            None,
+            false,
+        )
+        .expect("profile merge should succeed");
+        let content: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert_eq!(content["channel_ids"], serde_json::json!(["a", "b", "c"]));
+        assert_eq!(content["display_name"], "RelayName");
+        assert_eq!(content["picture"], "https://relay/avatar.png");
+
+        // First-ever record (no existing kind:10100): the desktop metadata seeds it.
+        let (content, _tags) = merge_agent_profile_channel_ids(
+            None,
+            "DesktopName",
+            Some("https://desktop/other.png"),
+            &["c".to_string()],
+            None,
+            false,
+        )
+        .expect("initial merge should succeed");
+        let content: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert_eq!(content["channel_ids"], serde_json::json!(["c"]));
+        assert_eq!(content["display_name"], "DesktopName");
+        assert_eq!(content["picture"], "https://desktop/other.png");
+    }
 }
