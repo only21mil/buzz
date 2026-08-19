@@ -126,6 +126,7 @@ verified_sha="$(git -C "$verify_author" rev-parse HEAD)"
 git -C "$verify_author" tag -a only21mil-android-v0.1.0-rc.1 -m "candidate one"
 git -C "$verify_author" remote add origin "$verify_remote"
 git -C "$verify_author" push --quiet origin main only21mil-android-v0.1.0-rc.1
+git --git-dir="$verify_remote" symbolic-ref HEAD refs/heads/main
 git clone --quiet --no-tags "$verify_remote" "$verify_trusted"
 GITHUB_REPOSITORY=only21mil/buzz \
   "$verify_trusted/scripts/verify-android-fork-release-ref.sh" \
