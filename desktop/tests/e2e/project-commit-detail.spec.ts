@@ -17,6 +17,22 @@ async function enableProjectsFeature(page: import("@playwright/test").Page) {
   });
 }
 
+test("projects is visible by default with fresh feature storage", async ({
+  page,
+}) => {
+  await installMockBridge(page, undefined, {
+    seedPreviewFeatures: false,
+  });
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+
+  await expect(page.getByTestId("open-projects-view")).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem("buzz-feature-overrides-v1"),
+    ),
+  ).toBeNull();
+});
+
 test("top-level project lists align dates and overflow actions", async ({
   page,
 }) => {
