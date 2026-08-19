@@ -20,6 +20,7 @@ const MAIN_REF: &str = "refs/heads/main";
 const BUZZ_TRACKING_REF: &str = "refs/remotes/buzz/main";
 const BUZZ_SOURCE_TRACKING_REF: &str = "refs/remotes/buzz/source";
 const GITHUB_ACTIONS_APP_ID: u64 = 15_368;
+#[cfg(unix)]
 const GITHUB_ASKPASS: &str = r#"#!/bin/sh
 case "$1" in
   *Username*) printf '%s\n' 'x-access-token' ;;
