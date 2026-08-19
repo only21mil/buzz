@@ -19,10 +19,18 @@ def digest(path: Path) -> str:
     return value.hexdigest()
 
 
+def digest_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 def git(*args: str) -> str:
     return subprocess.run(
         ["git", *args], check=True, text=True, capture_output=True
     ).stdout.strip()
+
+
+def git_bytes(*args: str) -> bytes:
+    return subprocess.run(["git", *args], check=True, capture_output=True).stdout
 
 
 def main() -> None:
@@ -56,9 +64,7 @@ def main() -> None:
 
     lockfiles = {}
     for relative in ("mobile/pubspec.lock", "mobile/android/gradle/wrapper/gradle-wrapper.properties"):
-        path = Path(relative)
-        if path.is_file():
-            lockfiles[relative] = digest(path)
+        lockfiles[relative] = digest_bytes(git_bytes("show", f"{commit}:{relative}"))
 
     receipt = {
         "schema": "buzz-android-direct-release-provenance-v1",

@@ -21,23 +21,6 @@ val uploadSigningValues =
     )
 val missingUploadSigningValues = uploadSigningValues.filterValues { it.isNullOrBlank() }.keys
 val hasUploadSigning = missingUploadSigningValues.isEmpty()
-val directReleaseKeystorePath =
-    providers.environmentVariable("BUZZ_ANDROID_RELEASE_KEYSTORE_PATH").orNull
-val directReleaseKeystorePassword =
-    providers.environmentVariable("BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD").orNull
-val directReleaseKeyAlias = providers.environmentVariable("BUZZ_ANDROID_RELEASE_KEY_ALIAS").orNull
-val directReleaseKeyPassword =
-    providers.environmentVariable("BUZZ_ANDROID_RELEASE_KEY_PASSWORD").orNull
-val directReleaseSigningValues =
-    mapOf(
-        "BUZZ_ANDROID_RELEASE_KEYSTORE_PATH" to directReleaseKeystorePath,
-        "BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD" to directReleaseKeystorePassword,
-        "BUZZ_ANDROID_RELEASE_KEY_ALIAS" to directReleaseKeyAlias,
-        "BUZZ_ANDROID_RELEASE_KEY_PASSWORD" to directReleaseKeyPassword,
-    )
-val missingDirectReleaseSigningValues =
-    directReleaseSigningValues.filterValues { it.isNullOrBlank() }.keys
-val hasDirectReleaseSigning = missingDirectReleaseSigningValues.isEmpty()
 
 // Worktree-aware debug identity (gitignored, written by
 // scripts/mobile-worktree-overrides.sh): debug builds from a git worktree get a
@@ -70,31 +53,19 @@ if (worktreeIdSuffix != null && !worktreeIdSuffix.matches(Regex("""\.[a-z][a-z0-
 //   - "external": deliberately produce an UNSIGNED release bundle for a
 //     pipeline that signs through the central APK Signer service (Cashkite,
 //     BOT-1234). No keystore material may be present in this mode.
-//   - "direct-release": sign a direct-download APK with Victor's persistent
-//     fork distribution key. This is a separate lineage from Block's upload
-//     key and must use only BUZZ_ANDROID_RELEASE_* credentials.
 val releaseSigningMode =
     providers.environmentVariable("BUZZ_ANDROID_RELEASE_SIGNING").orNull ?: "upload-keystore"
 val externalReleaseSigning = releaseSigningMode == "external"
-val directReleaseSigning = releaseSigningMode == "direct-release"
-if (releaseSigningMode !in setOf("upload-keystore", "external", "direct-release")) {
+if (releaseSigningMode !in setOf("upload-keystore", "external")) {
     throw GradleException(
-        "BUZZ_ANDROID_RELEASE_SIGNING must be \"upload-keystore\", \"external\", or " +
-            "\"direct-release\", got: $releaseSigningMode",
+        "BUZZ_ANDROID_RELEASE_SIGNING must be \"upload-keystore\" or \"external\", got: " +
+            releaseSigningMode,
     )
 }
-if ((externalReleaseSigning || directReleaseSigning) &&
-    uploadSigningValues.values.any { !it.isNullOrBlank() }
-) {
+if (externalReleaseSigning && uploadSigningValues.values.any { !it.isNullOrBlank() }) {
     throw GradleException(
-        "BUZZ_ANDROID_RELEASE_SIGNING=$releaseSigningMode must not be combined with " +
-            "BUZZ_ANDROID_UPLOAD_* credentials.",
-    )
-}
-if (!directReleaseSigning && directReleaseSigningValues.values.any { !it.isNullOrBlank() }) {
-    throw GradleException(
-        "BUZZ_ANDROID_RELEASE_* credentials require " +
-            "BUZZ_ANDROID_RELEASE_SIGNING=direct-release.",
+        "BUZZ_ANDROID_RELEASE_SIGNING=external must not be combined with " +
+            "BUZZ_ANDROID_UPLOAD_* credentials; unset one of them.",
     )
 }
 
@@ -133,14 +104,6 @@ android {
                 keyPassword = uploadKeyPassword
             }
         }
-        if (hasDirectReleaseSigning) {
-            create("directRelease") {
-                storeFile = file(requireNotNull(directReleaseKeystorePath))
-                storePassword = directReleaseKeystorePassword
-                keyAlias = directReleaseKeyAlias
-                keyPassword = directReleaseKeyPassword
-            }
-        }
     }
 
     buildTypes {
@@ -155,9 +118,7 @@ android {
             }
         }
         release {
-            if (directReleaseSigning && hasDirectReleaseSigning) {
-                signingConfig = signingConfigs.getByName("directRelease")
-            } else if (!directReleaseSigning && hasUploadSigning) {
+            if (hasUploadSigning) {
                 signingConfig = signingConfigs.getByName("upload")
             }
         }
@@ -311,45 +272,30 @@ gradle.taskGraph.whenReady {
         // guard above already rejected any BUZZ_ANDROID_UPLOAD_* values.
         return@whenReady
     }
-    val selectedSigningValues =
-        if (directReleaseSigning) directReleaseSigningValues else uploadSigningValues
-    val selectedMissingValues =
-        if (directReleaseSigning) missingDirectReleaseSigningValues else missingUploadSigningValues
-    val hasSelectedSigning =
-        if (directReleaseSigning) hasDirectReleaseSigning else hasUploadSigning
-    val selectedKeystorePath =
-        if (directReleaseSigning) directReleaseKeystorePath else uploadKeystorePath
-    val selectedPathVariable =
-        if (directReleaseSigning) {
-            "BUZZ_ANDROID_RELEASE_KEYSTORE_PATH"
-        } else {
-            "BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH"
-        }
-    if (buildsRelease && !hasSelectedSigning) {
+    if (buildsRelease && !hasUploadSigning) {
         throw GradleException(
-            "Release builds require complete Android signing credentials. Missing: " +
-                selectedMissingValues.sorted().joinToString(", ") +
+            "Release builds require Android upload signing credentials. Missing: " +
+                missingUploadSigningValues.sorted().joinToString(", ") +
                 ". For central APK Signer pipelines set BUZZ_ANDROID_RELEASE_SIGNING=external.",
         )
     }
     if (buildsRelease) {
-        check(selectedSigningValues.values.all { !it.isNullOrBlank() })
-        val configuredKeystore = File(requireNotNull(selectedKeystorePath))
+        val configuredKeystore = File(requireNotNull(uploadKeystorePath))
         if (!configuredKeystore.isAbsolute) {
             throw GradleException(
-                "$selectedPathVariable must be absolute: $configuredKeystore",
+                "BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH must be absolute: $configuredKeystore",
             )
         }
         val keystore = file(configuredKeystore)
         val repositoryRoot = rootProject.projectDir.parentFile.parentFile.canonicalFile
         if (keystore.canonicalFile.toPath().startsWith(repositoryRoot.toPath())) {
             throw GradleException(
-                "$selectedPathVariable must be outside the repository: $keystore",
+                "BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH must be outside the repository: $keystore",
             )
         }
         if (!keystore.isFile || !keystore.canRead()) {
             throw GradleException(
-                "$selectedPathVariable is not a readable file: $keystore",
+                "BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH is not a readable file: $keystore",
             )
         }
     }

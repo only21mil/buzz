@@ -14,7 +14,7 @@ on:
         type: string
 
 concurrency:
-  group: android-fork-release-tag-${{ inputs.source_tag }}
+  group: android-fork-release-tag-publication
   cancel-in-progress: false
 
 permissions:
