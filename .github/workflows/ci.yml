@@ -168,15 +168,23 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30
-          sudo apt-get install -y --no-install-recommends \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 \
-            -o DPkg::Lock::Timeout=120 \
+          # A slow-but-alive Azure apt mirror is not cured by Acquire::Retries
+          # (it retries failures, not stalls). Bound each attempt hard with
+          # timeout(1) + a minimum-speed cutoff, fall back to archive.ubuntu.com,
+          # and retry the whole install up to 3 times.
+          apt_attempt() {
+            sudo timeout --kill-after=15s 300s apt-get update \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              -o Acquire::http::Dl-Limit=0 \
+              -o Acquire::Min-Speed=10000 && \
+            sudo timeout --kill-after=15s 480s apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              -o Acquire::Min-Speed=10000 \
+              -o DPkg::Lock::Timeout=120 \
             build-essential \
             curl \
             file \
@@ -189,6 +197,17 @@ jobs:
             libxdo-dev \
             patchelf \
             wget
+          }
+          for _attempt in 1 2 3; do
+            apt_attempt && exit 0
+            echo "::warning::apt attempt $_attempt stalled or failed; switching mirror and retrying"
+            sudo dpkg --configure -a || true
+            sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+            sleep 10
+          done
+          echo "::error::apt install failed after 3 bounded attempts (mirror outage)"
+          exit 1
       - name: Get pnpm store directory
         id: pnpm-cache
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
@@ -277,7 +296,23 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: cd desktop && pnpm exec playwright install chromium
       - name: Install Playwright system dependencies
-        run: cd desktop && pnpm exec playwright install-deps chromium
+        run: |
+          # Bounded attempts: playwright install-deps is apt underneath and
+          # inherits the same slow-mirror stalls (see Tauri deps step).
+          for _attempt in 1 2 3; do
+            (cd desktop && timeout --kill-after=15s 480s pnpm exec playwright install-deps chromium) && exit 0
+            echo "::warning::playwright install-deps attempt $_attempt stalled or failed; switching mirror and retrying"
+            # a timed-out install-deps can orphan its internal apt/dpkg holding the lock
+            sudo pkill -x apt-get 2>/dev/null || true
+            sudo pkill -x dpkg 2>/dev/null || true
+            sleep 5
+            sudo dpkg --configure -a || true
+            sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+            sleep 10
+          done
+          echo "::error::playwright install-deps failed after 3 bounded attempts (mirror outage)"
+          exit 1
       - name: Save Playwright browser cache
         if: steps.playwright-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && matrix.shard == 1
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -411,7 +446,7 @@ jobs:
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - name: Start integration services
         run: |
-          for attempt in 1 2 3; do
+          for _attempt in 1 2 3; do
             if docker compose up -d postgres redis minio minio-init; then
               break
             fi
@@ -446,7 +481,23 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: cd desktop && pnpm exec playwright install chromium
       - name: Install Playwright system dependencies
-        run: cd desktop && pnpm exec playwright install-deps chromium
+        run: |
+          # Bounded attempts: playwright install-deps is apt underneath and
+          # inherits the same slow-mirror stalls (see Tauri deps step).
+          for _attempt in 1 2 3; do
+            (cd desktop && timeout --kill-after=15s 480s pnpm exec playwright install-deps chromium) && exit 0
+            echo "::warning::playwright install-deps attempt $_attempt stalled or failed; switching mirror and retrying"
+            # a timed-out install-deps can orphan its internal apt/dpkg holding the lock
+            sudo pkill -x apt-get 2>/dev/null || true
+            sudo pkill -x dpkg 2>/dev/null || true
+            sleep 5
+            sudo dpkg --configure -a || true
+            sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+            sleep 10
+          done
+          echo "::error::playwright install-deps failed after 3 bounded attempts (mirror outage)"
+          exit 1
       - name: Save Playwright browser cache
         if: steps.playwright-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && matrix.shard == 1
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -604,7 +655,7 @@ jobs:
           tool: cargo-nextest@0.9.136
       - name: Start integration services
         run: |
-          for attempt in 1 2 3; do
+          for _attempt in 1 2 3; do
             if docker compose up -d postgres redis minio minio-init; then
               break
             fi
