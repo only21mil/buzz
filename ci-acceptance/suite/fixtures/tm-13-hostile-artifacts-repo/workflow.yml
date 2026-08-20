@@ -1,0 +1,11 @@
+name: buzz-ci-tm-13-hostile-artifacts
+
+on:
+  workflow_dispatch:
+
+jobs:
+  hostile-artifacts:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/hostile-artifacts.sh

@@ -1,0 +1,19 @@
+name: TM-08 malicious implicit inputs
+on:
+  workflow_dispatch:
+    inputs:
+      TM08_INPUT:
+        required: false
+jobs:
+  trivial:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo trivial
+  actrc_only:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          printf '%s\n' '${{ secrets.TM08_SECRET }}'
+          printf '%s\n' '${{ vars.TM08_VAR }}'
+          printf '%s\n' '${{ env.TM08_ENV }}'
+          printf '%s\n' '${{ inputs.TM08_INPUT }}'

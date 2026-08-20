@@ -1,0 +1,19 @@
+name: matrix-selection
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo prepare
+
+  test:
+    needs: prepare
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo "${{ matrix.os }} ${{ matrix.rust }}"

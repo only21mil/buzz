@@ -69,6 +69,21 @@ else
   failed=1
 fi
 
+suite_output="$temp_dir/suite-output.log"
+suite_error="$temp_dir/suite-error.log"
+set +e
+"$ROOT/suite/selftest.sh" >"$suite_output" 2>"$suite_error"
+suite_rc=$?
+set -e
+if ((suite_rc == 0)) && grep -q 'suite selftest: GREEN' "$suite_output"; then
+  printf 'suite orchestrator: pass\n'
+else
+  printf 'suite orchestrator: FAIL (exit %d)\n' "$suite_rc"
+  tail -n 20 "$suite_error"
+  tail -n 20 "$suite_output"
+  failed=1
+fi
+
 if ((failed == 0)); then
   printf 'selftest: GREEN\n'
   exit 0
