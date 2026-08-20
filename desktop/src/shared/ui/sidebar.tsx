@@ -6,6 +6,7 @@ import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { cn } from "@/shared/lib/cn";
 import { performSidebarDefaultHaptic } from "@/shared/lib/haptics";
 import { hasPrimaryShortcutModifier } from "@/shared/lib/platform";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import { useIsMobile } from "@/shared/hooks/use-mobile";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
@@ -125,7 +126,7 @@ function readSidebarWidth() {
   }
 
   const storedWidth = Number.parseInt(
-    window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY) ?? "",
+    getStorageItem(SIDEBAR_WIDTH_STORAGE_KEY) ?? "",
     10,
   );
 
@@ -187,10 +188,7 @@ const SidebarProvider = React.forwardRef<
           );
 
           if (typeof window !== "undefined") {
-            window.localStorage.setItem(
-              SIDEBAR_WIDTH_STORAGE_KEY,
-              String(nextWidth),
-            );
+            setStorageItem(SIDEBAR_WIDTH_STORAGE_KEY, String(nextWidth));
           }
 
           return nextWidth;

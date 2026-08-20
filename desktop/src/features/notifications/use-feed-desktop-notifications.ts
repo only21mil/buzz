@@ -7,6 +7,7 @@ import {
 } from "@/features/profile/lib/identity";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import type { FeedItem, HomeFeedResponse } from "@/shared/api/types";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import {
   collectHomeAlertItems,
   eligibleFeedNotificationItems,
@@ -39,7 +40,7 @@ export function readStoredSeenFeedIds(pubkey: string): string[] {
     return [];
   }
 
-  const rawValue = window.localStorage.getItem(homeFeedSeenStorageKey(pubkey));
+  const rawValue = getStorageItem(homeFeedSeenStorageKey(pubkey));
   if (!rawValue) {
     return [];
   }
@@ -63,7 +64,7 @@ export function writeStoredSeenFeedIds(pubkey: string, ids: string[]) {
     return;
   }
 
-  window.localStorage.setItem(
+  setStorageItem(
     homeFeedSeenStorageKey(pubkey),
     JSON.stringify(ids.slice(-HOME_FEED_SEEN_MAX_ITEMS)),
   );
