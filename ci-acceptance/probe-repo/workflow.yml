@@ -1,0 +1,38 @@
+name: buzz-ci-phase2-probe
+
+# Signed-manifest stanza: required_jobs=flaky; optional_jobs=ok,never,slowpoke.
+# The single required job is deliberate: slowpoke must exercise timed_out
+# without preventing the attempt-2 verdict from becoming green.
+manifest:
+  workflow_digest: buzz-ci-phase2-probe-v1
+  required_jobs: [flaky]
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ok:
+    runs-on: linux
+    timeout-minutes: 1
+    required: false
+    steps:
+      - run: ./jobs/ok.sh
+  flaky:
+    runs-on: linux
+    timeout-minutes: 1
+    required: true
+    steps:
+      - run: ./jobs/flaky.sh
+  never:
+    runs-on: linux
+    timeout-minutes: 1
+    required: false
+    steps:
+      - run: ./jobs/never.sh
+  slowpoke:
+    runs-on: linux
+    timeout-minutes: 1
+    required: false
+    steps:
+      - run: ./jobs/slowpoke.sh
+

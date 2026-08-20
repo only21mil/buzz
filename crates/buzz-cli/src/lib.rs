@@ -201,6 +201,9 @@ enum Cmd {
     /// Create, trigger, and manage workflows
     #[command(subcommand)]
     Workflows(WorkflowsCmd),
+    /// Trigger and inspect CI runs
+    #[command(subcommand)]
+    Ci(commands::ci::CiCmd),
     /// Read the activity feed
     #[command(subcommand)]
     Feed(FeedCmd),
@@ -1189,13 +1192,15 @@ pub enum ReposCmd {
         #[arg(long)]
         id: String,
     },
-    /// Compare GitHub and Buzz `main` without changing either remote.
+    /// Compare canonical Buzz `main` to the GitHub `main` mirror.
     Status {
         /// Repository identifier (d-tag).
         #[arg(long)]
         id: String,
     },
-    /// Initialize Buzz `main` from the exact current GitHub `main` commit.
+    /// Bootstrap an absent Buzz `main` from exact GitHub `main` once.
+    ///
+    /// This is not an ongoing synchronization direction.
     ImportMain {
         /// Repository identifier (d-tag).
         #[arg(long)]
@@ -1204,17 +1209,41 @@ pub enum ReposCmd {
         #[arg(long)]
         commit: String,
     },
-    /// Fast-forward Buzz `main` to the exact current GitHub `main` commit.
-    MirrorMain {
+    /// Mirror an exact Buzz source commit to its deterministic GitHub CI ref.
+    StageCi {
         /// Repository identifier (d-tag).
         #[arg(long)]
         id: String,
-        /// Exact 40-hex commit required at GitHub `main`.
+        /// Full Buzz source branch ref, e.g. refs/heads/pr/123.
+        #[arg(long)]
+        source_ref: String,
+        /// Exact 40-hex commit required at the Buzz source ref.
         #[arg(long)]
         commit: String,
-        /// Exact previously observed Buzz `main` commit used as the push lease.
+        /// Expected GitHub CI ref value: `absent` or an exact 40-hex commit.
         #[arg(long)]
-        expected_buzz_main: String,
+        expected_github_ci: String,
+    },
+    /// Promote an exact checked Buzz commit to both mains by leased fast-forward.
+    Promote {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Exact 40-hex current main commit used as both main leases.
+        #[arg(long)]
+        base: String,
+        /// Exact 40-hex tested Buzz source commit promoted to both mains.
+        #[arg(long)]
+        head: String,
+        /// Full Buzz source branch ref that must still equal --head.
+        #[arg(long)]
+        source_ref: String,
+        /// Deterministic GitHub CI ref returned by `repos stage-ci`.
+        #[arg(long)]
+        ci_ref: String,
+        /// Exact GitHub check name required uniquely at --head. Repeatable.
+        #[arg(long = "required-check", required = true)]
+        required_checks: Vec<String>,
     },
     /// Bind (or rebind) one of your repositories to a channel.
     ///
@@ -2049,6 +2078,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
+        Cmd::Ci(_) => Err(CliError::Other(
+            "CI command execution is not available in this parser-only build".into(),
+        )),
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
@@ -2119,6 +2151,144 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn ci_required_command_arguments_parse() {
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "run",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["buzz", "ci", "status", "--run", "run-id"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "logs",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "rerun",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "verdict",
+            "--run",
+            "run-id",
+            "--expect-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["buzz", "ci", "watch", "--run", "run-id"]).is_ok());
+    }
+
+    #[test]
+    fn ci_run_parses_optional_workflow_and_jobs() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "run",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--workflow",
+            "required-ci",
+            "--jobs",
+            "unit_linux,unit_macos",
+        ])
+        .expect("CI run options should parse");
+
+        let Cmd::Ci(commands::ci::CiCmd::Run { workflow, jobs, .. }) = cli.command else {
+            panic!("expected CI run");
+        };
+        assert_eq!(workflow.as_deref(), Some("required-ci"));
+        assert_eq!(jobs, ["unit_linux", "unit_macos"]);
+    }
+
+    #[test]
+    fn ci_logs_parses_optional_attempt_and_raw() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "logs",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
+            "--attempt",
+            "2",
+            "--raw",
+        ])
+        .expect("CI log options should parse");
+
+        let Cmd::Ci(commands::ci::CiCmd::Logs { attempt, raw, .. }) = cli.command else {
+            panic!("expected CI logs");
+        };
+        assert_eq!(attempt, Some(2));
+        assert!(raw);
+    }
+
+    #[test]
+    fn ci_rejects_missing_required_arguments() {
+        for args in [
+            vec!["buzz", "ci", "run"],
+            vec![
+                "buzz",
+                "ci",
+                "run",
+                "--repo-owner",
+                "owner",
+                "--repo-id",
+                "repo",
+            ],
+            vec!["buzz", "ci", "status"],
+            vec!["buzz", "ci", "logs", "--run", "run-id"],
+            vec!["buzz", "ci", "rerun", "--job", "unit_linux"],
+            vec!["buzz", "ci", "verdict", "--run", "run-id"],
+            vec!["buzz", "ci", "watch"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "missing required CI arguments must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_rejects_unknown_commands_and_arguments() {
+        assert!(Cli::try_parse_from(["buzz", "ci", "unknown"]).is_err());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "status",
+            "--run",
+            "run-id",
+            "--unknown",
+            "value",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2266,31 +2436,41 @@ mod tests {
 
     #[test]
     fn repo_sync_commands_parse_direct_flags() {
-        let commit = "a".repeat(40);
-        let expected = "b".repeat(40);
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        let ci_ref = format!("refs/heads/buzz-ci/{head}");
         let cli = Cli::try_parse_from([
             "buzz",
             "repos",
-            "mirror-main",
+            "promote",
             "--id",
             "repo",
-            "--commit",
-            &commit,
-            "--expected-buzz-main",
-            &expected,
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--source-ref",
+            "refs/heads/pr/9",
+            "--ci-ref",
+            &ci_ref,
+            "--required-check",
+            "test",
         ])
-        .expect("mirror-main flags should parse");
-        let Cmd::Repos(ReposCmd::MirrorMain {
+        .expect("promote flags should parse");
+        let Cmd::Repos(ReposCmd::Promote {
             id,
-            commit: parsed_commit,
-            expected_buzz_main,
+            base: parsed_base,
+            head: parsed_head,
+            required_checks,
+            ..
         }) = cli.command
         else {
-            panic!("expected repos mirror-main");
+            panic!("expected repos promote");
         };
         assert_eq!(id, "repo");
-        assert_eq!(parsed_commit, commit);
-        assert_eq!(expected_buzz_main, expected);
+        assert_eq!(parsed_base, base);
+        assert_eq!(parsed_head, head);
+        assert_eq!(required_checks, vec!["test"]);
     }
 
     #[test]
@@ -2299,6 +2479,7 @@ mod tests {
             "agents",
             "canvas",
             "channels",
+            "ci",
             "dms",
             "emoji",
             "feed",
@@ -2404,6 +2585,10 @@ mod tests {
             ]
         );
         assert_eq!(names(&cmd, "canvas"), vec!["get", "set"]);
+        assert_eq!(
+            names(&cmd, "ci"),
+            vec!["logs", "rerun", "run", "status", "verdict", "watch"]
+        );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
         assert_eq!(
             names(&cmd, "emoji"),
@@ -2448,9 +2633,10 @@ mod tests {
                 "get",
                 "import-main",
                 "list",
-                "mirror-main",
+                "promote",
                 "protect",
                 "rm",
+                "stage-ci",
                 "status"
             ]
         );
@@ -2528,7 +2714,7 @@ mod tests {
             ("pr", 5),
             ("projects", 7),
             ("reactions", 3),
-            ("repos", 9),
+            ("repos", 10),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

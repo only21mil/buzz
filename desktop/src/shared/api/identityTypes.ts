@@ -2,6 +2,7 @@ export type IdentityStorage =
   | "system-keyring"
   | "local-file"
   | "environment"
+  | "indexed-db"
   | "ephemeral";
 
 export type Identity = {

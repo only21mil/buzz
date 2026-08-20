@@ -124,11 +124,11 @@ class ThreadDetailPage extends HookConsumerWidget {
     // Item 0 is the thread head; reply `i` lives at `i + 1`.
     const headIndex = 0;
     int indexForReply(int chronologicalIndex) => chronologicalIndex + 1;
+    int threadTailIndex() =>
+        replies.isEmpty ? headIndex : indexForReply(replies.length - 1);
 
     bool threadTailIsVisible() {
-      final lastIndex = replies.isEmpty
-          ? headIndex
-          : indexForReply(replies.length - 1);
+      final lastIndex = threadTailIndex();
       return itemPositionsListener.itemPositions.value.any(
         (position) =>
             position.index == lastIndex && position.itemTrailingEdge <= 1.001,
@@ -178,15 +178,23 @@ class ThreadDetailPage extends HookConsumerWidget {
     // while the last item is on screen, scroll it into view. If the user has
     // scrolled up to read, leave them where they are.
     final hasFetchedReplies = fetchedReplies != null;
-    final didEstablishInitialReplies = useRef(hasFetchedReplies);
+    final didEstablishInitialReplies = useRef(false);
     final previousReplyCount = useRef(replies.length);
     useEffect(() {
       // The first authoritative query result is hydration, not a live arrival.
-      // Establish the baseline without moving the user away from the head.
+      // Open ordinary thread navigation at the newest reply. A deep link owns
+      // its one-shot positioning above and must not race this tail jump.
       if (!hasFetchedReplies) return null;
       if (!didEstablishInitialReplies.value) {
         didEstablishInitialReplies.value = true;
         previousReplyCount.value = replies.length;
+        if (initialMessageId != null) return null;
+        followsThreadTail.value = true;
+        final lastIndex = threadTailIndex();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!context.mounted || !itemScrollController.isAttached) return;
+          itemScrollController.jumpTo(index: lastIndex);
+        });
         return null;
       }
 
@@ -272,9 +280,7 @@ class ThreadDetailPage extends HookConsumerWidget {
         pendingTailAlignment.value = null;
         return;
       }
-      final lastIndex = replies.isEmpty
-          ? headIndex
-          : indexForReply(replies.length - 1);
+      final lastIndex = threadTailIndex();
       final lastPosition = itemPositionsListener.itemPositions.value
           .where((position) => position.index == lastIndex)
           .firstOrNull;
@@ -309,9 +315,7 @@ class ThreadDetailPage extends HookConsumerWidget {
             !followsThreadTail.value) {
           return;
         }
-        final lastIndex = replies.isEmpty
-            ? headIndex
-            : indexForReply(replies.length - 1);
+        final lastIndex = threadTailIndex();
         itemScrollController.scrollTo(
           index: lastIndex,
           duration: const Duration(milliseconds: 220),

@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# A deterministic, file-backed stand-in for the frozen buzz ci surface. It
+# deliberately keeps attempt state in each run record and never uses a
+# cross-attempt marker in the probe workflow.
+
+STATE_DIR="${MOCK_STATE_DIR:-$PWD/.mock-state}"
+RUNS_DIR="$STATE_DIR/runs"
+DEFAULT_SHA=1111111111111111111111111111111111111111
+mkdir -p -- "$RUNS_DIR"
+
+now() {
+  date +%s
+}
+
+run_file() {
+  printf '%s/%s.json' "$RUNS_DIR" "$1"
+}
+
+is_oid() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ || "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+error_json() {
+  local exit_code=$1
+  local error_code=$2
+  local message=$3
+  jq -cn --arg error "$error_code" --arg message "$message" '{error:$error,message:$message}'
+  exit "$exit_code"
+}
+
+relay_is_dead() {
+  local relay="${BUZZ_RELAY_URL:-}"
+  [[ "$relay" == *127.0.0.1:9* || "$relay" == *localhost:9* || "$relay" == *dead-relay* ]]
+}
+
+if relay_is_dead; then
+  retry_count="${BUZZ_CI_RETRIES:-3}"
+  [[ "$retry_count" =~ ^[1-9][0-9]*$ ]] || retry_count=3
+  for ((attempt = 1; attempt <= retry_count; attempt++)); do
+    printf 'attempt %d/%d: relay unreachable at %s\n' "$attempt" "$retry_count" "${BUZZ_RELAY_URL:-unknown}" >&2
+    sleep 0.01
+  done
+  jq -cn --argjson attempts "$retry_count" --arg relay "${BUZZ_RELAY_URL:-unknown}" '{error:"relay_unreachable",attempts:$attempts,relay:$relay}' >&2
+  exit 2
+fi
+
+[[ $# -ge 2 && $1 == ci ]] || error_json 1 invalid_command 'expected buzz ci <command>'
+command_name=$2
+shift 2
+
+snapshot() {
+  local file=$1
+  jq -c 'del(.phase,.failure_mode,.rerun_target) | .jobs |= map(del(.logs))' "$file"
+}
+
+append_log() {
+  local file=$1
+  local job=$2
+  local attempt=$3
+  local content=$4
+  local log_file hash size ts tmp
+  log_file=$(mktemp "$STATE_DIR/.log.XXXXXX")
+  printf '%s' "$content" >"$log_file"
+  hash=$(sha256sum "$log_file" | cut -d' ' -f1)
+  size=$(wc -c <"$log_file")
+  ts=$(now)
+  rm -f -- "$log_file"
+  tmp="$file.tmp.$$"
+  jq --arg job "$job" --argjson attempt "$attempt" --arg content "$content" --arg hash "$hash" --argjson size "$size" --argjson ts "$ts" '
+    .jobs |= map(if .name == $job then .logs += [{attempt:$attempt,content:$content,log_sha256:$hash,size:$size,created_at:$ts}] else . end)
+  ' "$file" >"$tmp"
+  mv -f -- "$tmp" "$file"
+}
+
+progress_run() {
+  local file=$1
+  local phase failure_mode target ts tmp
+  phase=$(jq -r '.phase' "$file")
+  failure_mode=$(jq -r '.failure_mode' "$file")
+  target=$(jq -r '.rerun_target // empty' "$file")
+  ts=$(now)
+  tmp="$file.tmp.$$"
+  if [[ "$phase" == 0 ]]; then
+    if [[ -n "$target" ]]; then
+      jq --arg target "$target" --argjson ts "$ts" '
+        .state = "running" | .phase = 1 |
+        .jobs |= map(if .name == $target then .state = "running" | .started_at = $ts else . end)
+      ' "$file" >"$tmp"
+    else
+      jq --argjson ts "$ts" '
+        .state = "running" | .phase = 1 |
+        .jobs |= map(.state = "running" | .started_at = $ts)
+      ' "$file" >"$tmp"
+    fi
+    mv -f -- "$tmp" "$file"
+    return 0
+  fi
+  [[ "$phase" == 1 ]] || return 0
+  if [[ "$failure_mode" == true ]]; then
+    jq --argjson ts "$ts" '
+      .state = "infrastructure_failure" |
+      .reason = "runner service dropped during the attempt" |
+      .phase = 2 |
+      .jobs |= map(if .state == "queued" or .state == "running" then .state = "cancelled" | .finished_at = $ts else . end)
+    ' "$file" >"$tmp"
+    mv -f -- "$tmp" "$file"
+    return 0
+  fi
+  if [[ -n "$target" ]]; then
+    jq --arg target "$target" --argjson ts "$ts" '
+      .state = "success" | .reason = null | .phase = 2 | .rerun_target = null |
+      .jobs |= map(if .name == $target then .state = "success" | .finished_at = $ts else . end) |
+      .attempt = ([.jobs[].attempt] | max)
+    ' "$file" >"$tmp"
+    mv -f -- "$tmp" "$file"
+    append_log "$file" "$target" "$(jq -r --arg target "$target" '.jobs[] | select(.name == $target) | .attempt' "$file")" 'flaky attempt 2 success: BUZZ_CI_ATTEMPT=2'
+    return 0
+  fi
+  jq --argjson ts "$ts" '
+    .state = "failure" | .reason = null | .phase = 2 |
+    .jobs |= map(
+      if .name == "ok" then .state = "success" | .finished_at = $ts
+      elif .name == "flaky" then .state = "failure" | .finished_at = $ts
+      elif .name == "never" then .state = "success" | .finished_at = $ts
+      elif .name == "slowpoke" then .state = "timed_out" | .finished_at = $ts
+      else . end
+    )
+  ' "$file" >"$tmp"
+  mv -f -- "$tmp" "$file"
+  append_log "$file" ok 1 'ok completed successfully'
+  append_log "$file" flaky 1 'flaky attempt 1 failure: BUZZ_CI_ATTEMPT=1'
+  append_log "$file" never 1 'never completed after five seconds'
+  append_log "$file" slowpoke 1 'slowpoke exceeded its configured timeout'
+}
+
+run_command() {
+  local repo_owner='' repo_id='' requested_sha='' workflow=''
+  while (($# > 0)); do
+    case "$1" in
+      --repo-owner) repo_owner=${2-}; shift 2 ;;
+      --repo-id) repo_id=${2-}; shift 2 ;;
+      --sha) requested_sha=${2-}; shift 2 ;;
+      --workflow) workflow=${2-}; shift 2 ;;
+      --jobs) shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$repo_owner" && -n "$repo_id" && -n "$requested_sha" ]] || error_json 1 invalid_request 'repo owner, repo id, and sha are required'
+  is_oid "$requested_sha" || error_json 1 invalid_sha 'sha must be a full lowercase OID'
+  local accepted_sha="${BUZZ_CI_SHA:-$DEFAULT_SHA}"
+  if [[ "$requested_sha" != "$accepted_sha" ]]; then
+    jq -cn --arg requested "$requested_sha" --arg resolved "$accepted_sha" '{error:"sha_mismatch",requested:$requested,resolved:$resolved}'
+    exit 1
+  fi
+  local counter_file="$STATE_DIR/next-run-id"
+  local counter=1
+  if [[ -f "$counter_file" ]]; then counter=$(<"$counter_file"); fi
+  printf '%d' "$((counter + 1))" >"$counter_file"
+  local run_id="mock-run-$counter"
+  local file
+  file="$(run_file "$run_id")"
+  local infra_json=false
+  if [[ "${MOCK_CI_INFRASTRUCTURE_FAILURE:-0}" == 1 || "${MOCK_CI_DROPPED_RUNNER:-0}" == 1 ]]; then infra_json=true; fi
+  jq -cn --arg run_id "$run_id" --arg sha "$requested_sha" --arg workflow "${workflow:-phase2-probe-workflow-v1}" --argjson infra "$infra_json" '{
+    run_id:$run_id,sha:$sha,workflow_digest:$workflow,state:"queued",attempt:1,phase:0,
+    failure_mode:$infra,reason:null,rerun_target:null,
+    jobs:[
+      {job_id:"ok",name:"ok",required:false,state:"queued",attempt:1,started_at:null,finished_at:null,logs:[]},
+      {job_id:"flaky",name:"flaky",required:true,state:"queued",attempt:1,started_at:null,finished_at:null,logs:[]},
+      {job_id:"never",name:"never",required:false,state:"queued",attempt:1,started_at:null,finished_at:null,logs:[]},
+      {job_id:"slowpoke",name:"slowpoke",required:false,state:"queued",attempt:1,started_at:null,finished_at:null,logs:[]}
+    ]
+  }' >"$file"
+  jq -c '{run_id,sha,workflow_digest,jobs:[.jobs[] | {job_id,name}],attempt,state}' "$file"
+}
+
+status_command() {
+  local run_id='' file=''
+  while (($# > 0)); do
+    case "$1" in
+      --run) run_id=${2-}; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$run_id" ]] || error_json 1 invalid_request 'run is required'
+  file=$(run_file "$run_id")
+  [[ -f "$file" ]] || error_json 1 run_not_found 'unknown run'
+  progress_run "$file"
+  snapshot "$file"
+}
+
+logs_command() {
+  local run_id='' job_id='' requested_attempt=''
+  while (($# > 0)); do
+    case "$1" in
+      --run) run_id=${2-}; shift 2 ;;
+      --job) job_id=${2-}; shift 2 ;;
+      --attempt) requested_attempt=${2-}; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$run_id" && -n "$job_id" ]] || error_json 1 invalid_request 'run and job are required'
+  local file
+  file=$(run_file "$run_id")
+  [[ -f "$file" ]] || error_json 1 run_not_found 'unknown run'
+  local attempt
+  if [[ -n "$requested_attempt" ]]; then
+    attempt=$requested_attempt
+  else
+    attempt=$(jq -r --arg job "$job_id" '.jobs[] | select(.name == $job) | .attempt' "$file")
+  fi
+  local log_json
+  log_json=$(jq -c --arg job "$job_id" --argjson attempt "$attempt" '.jobs[] | select(.name == $job) | .logs[] | select(.attempt == $attempt)' "$file" | tail -n 1)
+  [[ -n "$log_json" ]] || error_json 1 log_not_found 'requested attempt log is unavailable'
+  local inline
+  inline=$(jq -j '.content' <<<"$log_json" | base64 | tr -d '\n')
+  jq -cn --arg run_id "$run_id" --arg sha "$(jq -r '.sha' "$file")" --arg job_id "$job_id" --arg inline "$inline" --argjson log "$log_json" '{
+    run_id:$run_id,sha:$sha,job_id:$job_id,attempt:$log.attempt,log_sha256:$log.log_sha256,size:$log.size,
+    cap_bytes:1048576,truncated:false,url_or_inline:$inline
+  }'
+}
+
+rerun_command() {
+  local run_id='' job_id=''
+  while (($# > 0)); do
+    case "$1" in
+      --run) run_id=${2-}; shift 2 ;;
+      --job) job_id=${2-}; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$run_id" && -n "$job_id" ]] || error_json 1 invalid_request 'run and job are required'
+  local file
+  file=$(run_file "$run_id")
+  [[ -f "$file" ]] || error_json 1 run_not_found 'unknown run'
+  local job_state job_attempt
+  job_state=$(jq -r --arg job "$job_id" '.jobs[] | select(.name == $job) | .state' "$file")
+  job_attempt=$(jq -r --arg job "$job_id" '.jobs[] | select(.name == $job) | .attempt' "$file")
+  [[ -n "$job_state" ]] || error_json 1 job_not_found 'unknown job'
+  [[ "$job_state" == success || "$job_state" == failure || "$job_state" == cancelled || "$job_state" == timed_out || "$job_state" == skipped ]] || error_json 1 job_not_terminal 'job is not terminal'
+  if [[ "$job_state" != failure ]]; then
+    jq -cn --arg error job_not_failed --arg run_id "$run_id" --arg job_id "$job_id" --argjson attempt "$job_attempt" --arg state "$job_state" '{error:$error,run_id:$run_id,job_id:$job_id,attempt:$attempt,state:$state}'
+    exit 1
+  fi
+  ((job_attempt < 5)) || error_json 1 attempt_limit 'job attempt limit reached'
+  local next_attempt=$((job_attempt + 1))
+  local tmp="$file.tmp.$$"
+  jq --arg job "$job_id" --argjson attempt "$next_attempt" '
+    .state = "queued" | .phase = 0 | .reason = null | .rerun_target = $job | .attempt = $attempt |
+    .jobs |= map(if .name == $job then .state = "queued" | .attempt = $attempt | .started_at = null | .finished_at = null else . end)
+  ' "$file" >"$tmp"
+  mv -f -- "$tmp" "$file"
+  jq -cn --arg run_id "$run_id" --arg sha "$(jq -r '.sha' "$file")" --arg job_id "$job_id" --argjson attempt "$next_attempt" --argjson parent_attempt "$job_attempt" '{run_id:$run_id,sha:$sha,job_id:$job_id,attempt:$attempt,state:"queued",parent_attempt:$parent_attempt,also_reruns:[]}'
+}
+
+verdict_command() {
+  local run_id='' expected_sha=''
+  while (($# > 0)); do
+    case "$1" in
+      --run) run_id=${2-}; shift 2 ;;
+      --expect-sha) expected_sha=${2-}; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$run_id" && -n "$expected_sha" ]] || error_json 1 invalid_request 'run and expect-sha are required'
+  is_oid "$expected_sha" || error_json 1 invalid_sha 'expect-sha must be a full lowercase OID'
+  local file
+  file=$(run_file "$run_id")
+  [[ -f "$file" ]] || error_json 1 run_not_found 'unknown run'
+  local actual_sha
+  actual_sha=$(jq -r '.sha' "$file")
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    jq -cn --arg requested "$expected_sha" --arg resolved "$actual_sha" '{error:"sha_mismatch",requested:$requested,resolved:$resolved}'
+    exit 1
+  fi
+  local state terminal_count total_count attempt reason required_failing
+  state=$(jq -r '.state' "$file")
+  terminal_count=$(jq '[.jobs[] | select(.state == "success" or .state == "failure" or .state == "cancelled" or .state == "timed_out" or .state == "skipped")] | length' "$file")
+  total_count=$(jq '.jobs | length' "$file")
+  attempt=$(jq -r '.attempt' "$file")
+  if [[ "$state" == infrastructure_failure ]]; then
+    reason=$(jq -r '.reason // empty' "$file")
+    jq -cn --arg run_id "$run_id" --arg sha "$actual_sha" --argjson attempt "$attempt" --arg verdict infrastructure_failure --argjson jobs_terminal "$terminal_count" --argjson jobs_total "$total_count" --arg reason "$reason" '{run_id:$run_id,sha:$sha,attempt:$attempt,verdict:$verdict,jobs_terminal:$jobs_terminal,jobs_total:$jobs_total,required_failing:[],reason:$reason}'
+    exit 4
+  fi
+  required_failing=$(jq -c '[.jobs[] | select(.required == true and (.state != "success" and .state != "skipped")) | .name]' "$file")
+  local verdict=pending
+  if [[ "$state" == success || "$state" == failure || "$state" == cancelled ]]; then
+    if [[ "$required_failing" == "[]" ]]; then verdict=green; else verdict=red; fi
+  fi
+  jq -cn --arg run_id "$run_id" --arg sha "$actual_sha" --arg verdict "$verdict" --arg jobs_terminal "$terminal_count/$total_count" --argjson required_failing "$required_failing" '{run_id:$run_id,sha:$sha,verdict:$verdict,jobs_terminal:$jobs_terminal,required_failing:$required_failing}'
+}
+
+watch_command() {
+  local run_id='' file='' current next
+  while (($# > 0)); do
+    case "$1" in
+      --run) run_id=${2-}; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$run_id" ]] || error_json 1 invalid_request 'run is required'
+  file=$(run_file "$run_id")
+  [[ -f "$file" ]] || error_json 1 run_not_found 'unknown run'
+  current=$(jq -r '.state' "$file")
+  snapshot "$file"
+  for _ in 1 2 3; do
+    [[ "$current" == success || "$current" == failure || "$current" == cancelled || "$current" == infrastructure_failure ]] && return 0
+    progress_run "$file"
+    next=$(jq -r '.state' "$file")
+    if [[ "$next" != "$current" ]]; then snapshot "$file"; fi
+    current=$next
+  done
+  [[ "$current" == success || "$current" == failure || "$current" == cancelled || "$current" == infrastructure_failure ]] || error_json 2 infrastructure_failure 'watch transition budget exhausted'
+}
+
+case "$command_name" in
+  run) run_command "$@" ;;
+  status) status_command "$@" ;;
+  logs) logs_command "$@" ;;
+  rerun) rerun_command "$@" ;;
+  verdict) verdict_command "$@" ;;
+  watch) watch_command "$@" ;;
+  *) error_json 1 unknown_command "unknown ci command: $command_name" ;;
+esac

@@ -432,17 +432,18 @@ function CommunityApp({
       if (transaction.source === "first-community") {
         setResumeFirstCommunityPage(transaction.firstCommunityPage ?? "join");
       }
-      clearCommunities();
+      clearCommunities(currentPubkey);
       return;
     }
     if (transaction.previousCommunityId) {
       await transitionCommunity(transaction.previousCommunityId);
     }
-    removeCommunity(transaction.communityId);
+    removeCommunity(transaction.communityId, currentPubkey);
   }, [
     clearCommunities,
     communities.length,
     communityOnboarding,
+    currentPubkey,
     removeCommunity,
     transitionCommunity,
   ]);

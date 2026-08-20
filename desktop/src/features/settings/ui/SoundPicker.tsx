@@ -7,6 +7,7 @@ import {
   type SoundName,
 } from "@/features/notifications/lib/sound";
 import { cn } from "@/shared/lib/cn";
+import { publicAssetUrl } from "@/shared/lib/publicAssetUrl";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -32,7 +33,7 @@ function Waveform({
   name: SoundName;
   className?: string;
 }) {
-  const maskImage = `url(/sounds/${name}.svg)`;
+  const maskImage = `url(${publicAssetUrl(`sounds/${name}.svg`)})`;
   return (
     <span
       aria-hidden="true"

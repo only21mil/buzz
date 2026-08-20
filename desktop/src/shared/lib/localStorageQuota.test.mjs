@@ -37,6 +37,8 @@ test("startup recovery removes disposable caches but preserves user state", () =
   const ls = makeQuotaLocalStorage({ maxEntries: 6 });
   install(ls);
   ls.store.set("buzz-channel-messages.v1:relay:chan", "big");
+  ls.store.set("buzz-channel-messages.v2:relay:signer:chan", "big");
+  ls.store.set("buzz-channel-messages.v3:relay:signer:chan", "big");
   ls.store.set("buzz-channels.v1:relay", "big");
   ls.store.set("buzz-timeline-skeleton-shape.v1:chan", "small");
   ls.store.set("buzz-sidebar-skeleton-shape.v1:community:user", "small");
@@ -46,6 +48,8 @@ test("startup recovery removes disposable caches but preserves user state", () =
   recoverLocalStorageQuotaOnStartup();
 
   assert.equal(ls.getItem("buzz-channel-messages.v1:relay:chan"), null);
+  assert.equal(ls.getItem("buzz-channel-messages.v2:relay:signer:chan"), null);
+  assert.equal(ls.getItem("buzz-channel-messages.v3:relay:signer:chan"), null);
   assert.equal(ls.getItem("buzz-channels.v1:relay"), null);
   assert.equal(ls.getItem("buzz-timeline-skeleton-shape.v1:chan"), null);
   assert.equal(
@@ -60,11 +64,14 @@ test("startup recovery removes disposable caches but preserves user state", () =
 test("healthy startup preserves disposable caches", () => {
   const ls = makeQuotaLocalStorage({ maxEntries: 10 });
   install(ls);
-  ls.store.set("buzz-channel-messages.v1:relay:new", "snapshot");
+  ls.store.set("buzz-channel-messages.v3:relay:signer:new", "snapshot");
 
   recoverLocalStorageQuotaOnStartup();
 
-  assert.equal(ls.getItem("buzz-channel-messages.v1:relay:new"), "snapshot");
+  assert.equal(
+    ls.getItem("buzz-channel-messages.v3:relay:signer:new"),
+    "snapshot",
+  );
   assert.equal(ls.getItem("buzz-local-storage-quota-recovery.v1"), "1");
 });
 
@@ -86,11 +93,11 @@ test("startup recovery runs only once", () => {
   install(ls);
 
   recoverLocalStorageQuotaOnStartup();
-  ls.store.set("buzz-channel-messages.v1:relay:new", "new snapshot");
+  ls.store.set("buzz-channel-messages.v3:relay:signer:new", "new snapshot");
   recoverLocalStorageQuotaOnStartup();
 
   assert.equal(
-    ls.getItem("buzz-channel-messages.v1:relay:new"),
+    ls.getItem("buzz-channel-messages.v3:relay:signer:new"),
     "new snapshot",
   );
 });
@@ -104,10 +111,10 @@ test("startup recovery retries after marker write fails", () => {
   assert.equal(ls.getItem("buzz-local-storage-quota-recovery.v1"), null);
 
   ls.store.delete("buzz-communities");
-  ls.store.set("buzz-channel-messages.v1:relay:chan", "big");
+  ls.store.set("buzz-channel-messages.v3:relay:signer:chan", "big");
   recoverLocalStorageQuotaOnStartup();
 
-  assert.equal(ls.getItem("buzz-channel-messages.v1:relay:chan"), null);
+  assert.equal(ls.getItem("buzz-channel-messages.v3:relay:signer:chan"), null);
   assert.equal(ls.getItem("buzz-local-storage-quota-recovery.v1"), "1");
 });
 
@@ -117,9 +124,9 @@ test("global cache byte budget evicts only oldest entries needed", () => {
   ls.store.set("buzz-communities", "keep");
   const snapshot = (updatedAt) =>
     JSON.stringify({ updatedAt, payload: "x".repeat(400_000) });
-  const oldestKey = "buzz-channel-messages.v1:relay:oldest";
+  const oldestKey = "buzz-channel-messages.v3:relay:signer:oldest";
   const newerKey = "buzz-channels.v1:relay-newer";
-  const newestKey = "buzz-channel-messages.v1:relay:newest";
+  const newestKey = "buzz-channel-messages.v3:relay:signer:newest";
 
   assert.equal(setLocalStorageItemWithRecovery(oldestKey, snapshot(1)), true);
   assert.equal(setLocalStorageItemWithRecovery(newerKey, snapshot(2)), true);
@@ -139,22 +146,25 @@ test("global cache byte budget spans relays and preserves durable state", () => 
 
   assert.equal(
     setLocalStorageItemWithRecovery(
-      "buzz-channel-messages.v1:relay-one:chan",
+      "buzz-channel-messages.v3:relay-one:signer-a:chan",
       largeSnapshot,
     ),
     true,
   );
   assert.equal(
     setLocalStorageItemWithRecovery(
-      "buzz-channel-messages.v1:relay-two:chan",
+      "buzz-channel-messages.v3:relay-two:signer-b:chan",
       largeSnapshot,
     ),
     true,
   );
 
-  assert.equal(ls.getItem("buzz-channel-messages.v1:relay-one:chan"), null);
   assert.equal(
-    ls.getItem("buzz-channel-messages.v1:relay-two:chan"),
+    ls.getItem("buzz-channel-messages.v3:relay-one:signer-a:chan"),
+    null,
+  );
+  assert.equal(
+    ls.getItem("buzz-channel-messages.v3:relay-two:signer-b:chan"),
     largeSnapshot,
   );
   assert.equal(ls.getItem("buzz-communities"), "keep");
@@ -163,7 +173,7 @@ test("global cache byte budget spans relays and preserves durable state", () => 
 test("rejects a single cache entry larger than the global byte budget", () => {
   const ls = makeQuotaLocalStorage({ maxEntries: 10 });
   install(ls);
-  const key = "buzz-channel-messages.v1:relay:oversized";
+  const key = "buzz-channel-messages.v3:relay:signer:oversized";
   ls.store.set(key, "previous snapshot");
 
   assert.equal(
@@ -183,12 +193,12 @@ test("writes normally when under quota", () => {
 test("evicts pure caches and retries on quota failure", () => {
   const ls = makeQuotaLocalStorage({ maxEntries: 2 });
   install(ls);
-  ls.store.set("buzz-channel-messages.v1:relay:chan", "big");
+  ls.store.set("buzz-channel-messages.v3:relay:signer:chan", "big");
   ls.store.set("buzz-channels.v1:relay", "big");
 
   assert.equal(setLocalStorageItemWithRecovery("k", "v"), true);
   assert.equal(ls.getItem("k"), "v");
-  assert.equal(ls.getItem("buzz-channel-messages.v1:relay:chan"), null);
+  assert.equal(ls.getItem("buzz-channel-messages.v3:relay:signer:chan"), null);
   assert.equal(ls.getItem("buzz-channels.v1:relay"), null);
 });
 
@@ -213,8 +223,8 @@ test("buzz-observed-unread.v1: prefix participates in LRU eviction and durable s
   const snapshot = (updatedAt) =>
     JSON.stringify({ updatedAt, payload: "x".repeat(400_000) });
   const observedKey = "buzz-observed-unread.v1:wss://relay.example.com:pk1";
-  const olderKey = "buzz-channel-messages.v1:relay:older";
-  const newestKey = "buzz-channel-messages.v1:relay:newest";
+  const olderKey = "buzz-channel-messages.v3:relay:signer:older";
+  const newestKey = "buzz-channel-messages.v3:relay:signer:newest";
 
   // Seed observed-unread (oldest updatedAt=1) and a sibling channel-messages entry (updatedAt=2).
   assert.equal(setLocalStorageItemWithRecovery(observedKey, snapshot(1)), true);

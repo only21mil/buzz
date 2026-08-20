@@ -73,8 +73,19 @@ jobs:
               - 'scripts/release-rulesets.sh'
               - 'scripts/test-mobile-release-contract.sh'
               - 'scripts/test-mobile-release-candidate-publisher.sh'
+              - 'scripts/android-fork-release-metadata.py'
+              - 'scripts/publish-android-fork-release-candidate.sh'
+              - 'scripts/verify-android-fork-release-ref.sh'
+              - 'scripts/validate-android-release-keystore.sh'
+              - 'scripts/sign-android-fork-release-apk.sh'
+              - 'scripts/verify-android-fork-release-apk.sh'
+              - 'scripts/verify-android-fork-release-unsigned-apk.sh'
+              - 'scripts/write-android-fork-release-provenance.py'
+              - 'scripts/test-android-fork-release-contract.sh'
               - 'scripts/test-mobile-worktree-overrides.sh'
               - '.github/workflows/mobile-release-candidate.yml'
+              - '.github/workflows/android-fork-release-tag.yml'
+              - '.github/workflows/android-fork-release-apk.yml'
               - '.github/workflows/ci.yml'
       - name: Release workflow source contract
         run: scripts/test-release-ref-contract.sh
@@ -84,6 +95,7 @@ jobs:
         run: |
           scripts/test-mobile-release-contract.sh
           scripts/test-mobile-release-candidate-publisher.sh
+          scripts/test-android-fork-release-contract.sh
       - name: Mobile worktree identity contract
         run: scripts/test-mobile-worktree-overrides.sh
       - name: File size ratchet unit tests
@@ -1017,9 +1029,16 @@ jobs:
             touch "desktop/src-tauri/binaries/${bin}-${TARGET}.exe"
           done
       - name: Clippy (workspace)
-        run: cargo clippy --workspace --all-targets --target $env:TARGET -- -D warnings
+        run: >-
+          cargo clippy --workspace --all-targets --target $env:TARGET
+          --exclude buzz-ci-materializer
+          --exclude buzz-ci-policy-proxy
+          -- -D warnings
       - name: Check (workspace)
-        run: cargo check --workspace --all-targets --target $env:TARGET
+        run: >-
+          cargo check --workspace --all-targets --target $env:TARGET
+          --exclude buzz-ci-materializer
+          --exclude buzz-ci-policy-proxy
       - name: Test (buzz-dev-mcp)
         # The Windows-only bash resolver lives in buzz-dev-mcp; its unit tests
         # only gate if this crate is tested ON Windows.

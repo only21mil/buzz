@@ -1,0 +1,41 @@
+name: buzz-ci-tm-12-exhaustion
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cpu-burn:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/cpu-burn.sh
+  memory-balloon:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/memory-balloon.sh
+  pid-fork-storm:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/pid-fork-storm.sh
+  disk-fill:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/disk-fill.sh
+  log-flood:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/log-flood.sh
+  wall-time-overrun:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/wall-time-overrun.sh
+  artifact-overrun:
+    runs-on: linux
+    timeout-minutes: 1
+    steps:
+      - run: ./jobs/artifact-overrun.sh

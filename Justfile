@@ -298,6 +298,9 @@ test-unit:
         cargo nextest run -p buzz-core -p buzz-auth --lib
         cargo nextest run -p buzz-voice --lib
         cargo nextest run -p buzz-cli
+        # Buzz CI control-plane boundary: fixed-schema broker wire, zero-capacity
+        # keyless executor, and authorized public-to-private normalization.
+        cargo nextest run -p buzz-ci-broker-protocol -p buzz-ci-execd -p buzz-ci-runner
         # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).
         # They guard the embedded-migrator invariant (exactly the consolidated
         # 0001; cutover/backfill stays an operator script, not startup state)
@@ -319,6 +322,10 @@ test-unit:
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
+        # Buzz-native CI isolation decision layers are infra-free and must stay
+        # in both the nextest and cargo-test fallback paths. Host/root
+        # qualification remains a separate gated smoke suite.
+        cargo nextest run -p buzz-ci-isolation-contract -p buzz-ci-materializer -p buzz-ci-policy-proxy
     else
         ./scripts/run-tests.sh unit
     fi

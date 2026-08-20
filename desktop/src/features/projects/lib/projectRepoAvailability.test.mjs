@@ -14,6 +14,23 @@ test("classifies a missing repository", () => {
   assert.equal(projectRepoUnavailableReason(null), "missing");
 });
 
+test("classifies the relay's explicit unbound remediation and the browser stale-ref error", () => {
+  assert.equal(
+    projectRepoUnavailableReason(
+      new Error(
+        'run: buzz repos bind --id demo --channel <channel-uuid> — repository "demo" has no channel binding, so the relay cannot authorize access',
+      ),
+    ),
+    "unbound",
+  );
+  assert.equal(
+    projectRepoUnavailableReason(
+      new Error("the requested repository ref changed"),
+    ),
+    "ref",
+  );
+});
+
 test("classifies authentication failures before generic availability errors", () => {
   assert.equal(
     projectRepoUnavailableReason(

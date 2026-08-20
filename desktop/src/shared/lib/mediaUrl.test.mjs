@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   beginRelayOriginFetch,
   getCachedRelayOrigin,
+  isWebMediaBuild,
   mediaProxyUrl,
   resetMediaCaches,
   subscribeRelayOrigin,
@@ -25,6 +26,59 @@ test("mediaProxyUrl: uses the IPv4 loopback literal for the localhost proxy", ()
     mediaProxyUrl(54321, `${HASH}.png`),
     `http://127.0.0.1:54321/media/${HASH}.png`,
   );
+});
+
+test("media build mode: only the explicit web build selects direct relay media", () => {
+  assert.equal(isWebMediaBuild("web"), true);
+  assert.equal(isWebMediaBuild("e2e"), false);
+  assert.equal(isWebMediaBuild("production"), false);
+  assert.equal(isWebMediaBuild(undefined), false);
+});
+
+test("desktop build recovers the media proxy when the Tauri bridge installs after module load", async () => {
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    location: {
+      href: "http://localhost:3000/",
+      origin: "http://localhost:3000",
+    },
+  };
+
+  try {
+    const mediaUrl = await import(`./mediaUrl.ts?delayedBridge=${Date.now()}`);
+
+    // Match the desktop E2E initialization order: the desktop module loads in
+    // Chromium before the mock Tauri bridge is installed. Build identity, not
+    // transient bridge presence, must keep this on the proxy path.
+    globalThis.window.__TAURI_INTERNALS__ = {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return Promise.resolve("http://localhost:3000");
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    };
+    mediaUrl.ensureRelayOriginFetch();
+
+    const deadline = Date.now() + 1000;
+    while (
+      mediaUrl.getCachedMediaProxyPort() === null &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const source = `http://localhost:3000/media/${HASH}.png`;
+    assert.equal(mediaUrl.getCachedRelayOrigin(), "http://localhost:3000");
+    assert.equal(mediaUrl.getCachedMediaProxyPort(), 54321);
+    assert.equal(
+      mediaUrl.rewriteRelayUrl(source),
+      `http://127.0.0.1:54321/media/${HASH}.png`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
 });
 
 test("media-proxy port store: resolved port publishes and reset notifies subscribers", async () => {

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.invalid/ci-acceptance/evidence/record.schema.json",
+  "title": "Buzz CI acceptance evidence record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "suite",
+    "test_id",
+    "title",
+    "candidate_sha",
+    "pass",
+    "evidence_ref",
+    "executor",
+    "host",
+    "started_at",
+    "finished_at"
+  ],
+  "properties": {
+    "suite": { "enum": ["security", "probe"] },
+    "test_id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "candidate_sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "pass": { "type": "boolean" },
+    "run": { "type": "integer", "enum": [1, 2] },
+    "evidence_ref": { "type": "string", "minLength": 1 },
+    "executor": { "type": "string", "minLength": 1 },
+    "host": { "type": "string", "minLength": 1 },
+    "started_at": { "type": "integer", "minimum": 0 },
+    "finished_at": { "type": "integer", "minimum": 0 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "suite": { "const": "probe" } } },
+      "then": { "required": ["run"] },
+      "else": { "not": { "required": ["run"] } }
+    }
+  ]
+}

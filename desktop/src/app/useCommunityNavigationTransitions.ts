@@ -22,11 +22,13 @@ type GoHome = ReturnType<typeof useAppNavigation>["goHome"];
 
 export function useCommunityNavigationTransitions({
   communities,
+  currentSignerPubkey,
   goHome,
   selectedChannelId,
   selectedView,
 }: {
   communities: Communities;
+  currentSignerPubkey: string | null | undefined;
   goHome: GoHome;
   selectedChannelId: ShellRoute["selectedChannelId"];
   selectedView: ShellRoute["selectedView"];
@@ -77,7 +79,6 @@ export function useCommunityNavigationTransitions({
         (community) => community.id === id,
       );
       if (!target) return;
-
       const fallback = communities.communities.find(
         (community) => community.id !== id,
       );
@@ -91,7 +92,7 @@ export function useCommunityNavigationTransitions({
       );
 
       if (id !== communities.activeCommunity?.id) {
-        communities.removeCommunity(id);
+        communities.removeCommunity(id, currentSignerPubkey);
         return leaveResult;
       }
 
@@ -102,7 +103,7 @@ export function useCommunityNavigationTransitions({
           );
         }
         await goHome({ replace: true });
-        communities.removeCommunity(id);
+        communities.removeCommunity(id, currentSignerPubkey);
         return leaveResult;
       }
 
@@ -117,11 +118,17 @@ export function useCommunityNavigationTransitions({
             router.history,
           );
         }
-        communities.removeCommunity(id);
+        communities.removeCommunity(id, currentSignerPubkey);
       });
       return leaveResult;
     },
-    [communities, goHome, router.history, saveActiveDestination],
+    [
+      communities,
+      currentSignerPubkey,
+      goHome,
+      router.history,
+      saveActiveDestination,
+    ],
   );
 
   return { removeCommunity, switchCommunity };

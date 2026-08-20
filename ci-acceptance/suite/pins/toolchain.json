@@ -1,0 +1,22 @@
+{
+  "act": {
+    "version": "0.2.89",
+    "sha256": "6be37b104430efc210d5130495bedcff2dc7cd6780a38d88f3d205e7f1185cc1",
+    "source": "https://github.com/nektos/act/releases/download/v0.2.89/act_Linux_x86_64.tar.gz",
+    "upstream_checksum_verified": true,
+    "upstream_checksum_asset": "act_Linux_x86_64.tar.gz",
+    "upstream_checksums_source": "https://github.com/nektos/act/releases/download/v0.2.89/checksums.txt",
+    "upstream_archive_sha256": "0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0",
+    "trust_basis": "The upstream act checksum file was not signature-verified; trust is limited to the downloaded checksum and archive hash readbacks.",
+    "verification": "Fetched the v0.2.89 checksums.txt and Linux x86_64 release archive; the archive matched its published checksum and its extracted act binary matched the installed binary byte-for-byte."
+  },
+  "podman": {
+    "version": "5.8.4"
+  },
+  "runner_image": {
+    "digest": "sha256:0385872e2126185df5bef04f9b47c04d81b59d48b8d98ee95bac0928adc08c85",
+    "pull_coordinate": "ghcr.io/catthehacker/ubuntu@sha256:be3b065b90a7a029ea30aa8ce897a62bfc8bd4d6698951b2527e1f11ba70cc6c",
+    "architecture": "amd64",
+    "note": "digest is the image config ID (podman image inspect .Id) bound by isolation_profile.image_digest; the seeder pulls by the manifest digest in pull_coordinate and verifies it resolves to this config ID; tags are not part of the pin (Alpheus Codex, event 561c40a1)"
+  }
+}

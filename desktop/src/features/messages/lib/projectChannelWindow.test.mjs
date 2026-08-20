@@ -11,8 +11,10 @@ import {
   replaceNewestChannelWindow,
 } from "./channelWindowStore.ts";
 import {
+  mergeChannelWindowOverlayEvents,
   projectChannelWindowMessages,
   refreshChannelWindowMessages,
+  seedChannelWindowStoreFromSnapshot,
 } from "./projectChannelWindow.ts";
 import { reconcileChannelWindowMessages } from "./channelWindowReconciliation.ts";
 
@@ -272,4 +274,70 @@ test("test_live_projection_retains_pending_send_and_non_broadcast_thread_reply",
     "thread-reply",
     "live",
   ]);
+});
+
+test("snapshot seed uses live overlays and ignores window metadata", () => {
+  const message = event("snapshot-message", 100);
+  const reaction = { ...event("snapshot-reaction", 101), kind: 7 };
+  const deletion = { ...event("snapshot-deletion", 102), kind: 9005 };
+  const metadata = { ...event("snapshot-bounds", 103), kind: 39006 };
+
+  const store = seedChannelWindowStoreFromSnapshot([
+    reaction,
+    metadata,
+    message,
+    deletion,
+  ]);
+
+  assert.deepEqual(store.pages, []);
+  assert.deepEqual(store.liveOverlay, [message]);
+  assert.deepEqual(store.liveAux, [reaction, deletion]);
+  assert.deepEqual(
+    flattenChannelWindowEvents(store).map((item) => item.id),
+    [message.id, reaction.id, deletion.id],
+  );
+});
+test("aux backfill merges into a snapshot seed without duplicate ids", () => {
+  const message = event("snapshot-message", 100);
+  const edit = {
+    ...event("snapshot-edit", 101),
+    kind: 40003,
+    content: "edited",
+  };
+  const seeded = seedChannelWindowStoreFromSnapshot([message, edit]);
+  const merged = mergeChannelWindowOverlayEvents(seeded, [edit]);
+
+  assert.equal(merged, seeded);
+  assert.equal(
+    flattenChannelWindowEvents(merged).filter((item) => item.id === edit.id)
+      .length,
+    1,
+  );
+});
+
+test("newest and older pages absorb snapshot rows without rendered duplicates", () => {
+  const newest = event("snapshot-newest", 110);
+  const older = event("snapshot-older", 100);
+  const snapshot = seedChannelWindowStoreFromSnapshot([newest, older]);
+  const nextCursor = { createdAt: newest.created_at, eventId: newest.id };
+  const withHead = replaceNewestChannelWindow(snapshot, {
+    startCursor: null,
+    rows: [{ event: newest, thread: null }],
+    aux: [],
+    nextCursor,
+    hasMore: true,
+  });
+  const complete = appendOlderChannelWindow(withHead, {
+    startCursor: nextCursor,
+    rows: [{ event: older, thread: null }],
+    aux: [],
+    nextCursor: null,
+    hasMore: false,
+  });
+
+  assert.deepEqual(complete.liveOverlay, []);
+  assert.deepEqual(
+    flattenChannelWindowEvents(complete).map((item) => item.id),
+    [older.id, newest.id],
+  );
 });

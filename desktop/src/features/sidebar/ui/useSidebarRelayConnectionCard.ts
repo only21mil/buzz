@@ -69,16 +69,15 @@ export function useSidebarRelayConnectionCard(
   const hasRelayUnreachableError = errorMessage
     ? isRelayUnreachableError(errorMessage)
     : false;
-  // True when the error is an application-level issue (e.g. auth rejection)
-  // rather than a network-level relay-unreachable error. In this case, the
-  // disconnected state should NOT trigger the reconnect card — the app shows
-  // a dedicated error path instead.
+  // Application-level disconnects (notably an AUTH rejection) also need the
+  // explicit reconnect action: `preconnect()` is what clears the terminal
+  // session latch after the user has been invited or relay policy changes.
   const hasNonUnreachableError =
     Boolean(errorMessage) && !hasRelayUnreachableError;
   const isRelayConnectionStateDegraded =
     relayConnectionState === "reconnecting" ||
     relayConnectionState === "stalled" ||
-    (relayConnectionState === "disconnected" && !hasNonUnreachableError);
+    relayConnectionState === "disconnected";
   const isRelayConnectionConnected = relayConnectionState === "connected";
   const [isDismissed, setIsDismissed] = React.useState(false);
   const hasSuccess = React.useSyncExternalStore(
@@ -234,6 +233,7 @@ export function useSidebarRelayConnectionCard(
 
   return {
     hasRelayUnreachableError,
+    relayErrorMessage: hasNonUnreachableError ? errorMessage : undefined,
     isRelayConnectionSuccess,
     isRelayReconnectPending,
     isWaitingOnReconnectHook,

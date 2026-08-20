@@ -6,7 +6,7 @@ import { tanstackRouter } from "@tanstack/router-plugin/vite";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
-export default defineConfig(async () => ({
+export default defineConfig(async ({ mode }) => ({
   plugins: [
     tanstackRouter({
       target: "react",
@@ -25,8 +25,62 @@ export default defineConfig(async () => ({
     alias: {
       "@": "/src",
       "@features-manifest": path.resolve(__dirname, "../preview-features.json"),
+      ...(mode === "web"
+        ? {
+            "@tauri-apps/api/app": path.resolve(
+              __dirname,
+              "src/platform/web/shims/app.ts",
+            ),
+            "@tauri-apps/api/core": path.resolve(
+              __dirname,
+              "src/platform/web/shims/core.ts",
+            ),
+            "@tauri-apps/api/event": path.resolve(
+              __dirname,
+              "src/platform/web/shims/event.ts",
+            ),
+            "@tauri-apps/api/mocks": path.resolve(
+              __dirname,
+              "src/platform/web/shims/mocks.ts",
+            ),
+            "@tauri-apps/api/path": path.resolve(
+              __dirname,
+              "src/platform/web/shims/path.ts",
+            ),
+            "@tauri-apps/api/webview": path.resolve(
+              __dirname,
+              "src/platform/web/shims/webview.ts",
+            ),
+            "@tauri-apps/api/window": path.resolve(
+              __dirname,
+              "src/platform/web/shims/window.ts",
+            ),
+            "@tauri-apps/plugin-clipboard-manager": path.resolve(
+              __dirname,
+              "src/platform/web/shims/clipboard.ts",
+            ),
+            "@tauri-apps/plugin-notification": path.resolve(
+              __dirname,
+              "src/platform/web/shims/notification.ts",
+            ),
+            "@tauri-apps/plugin-opener": path.resolve(
+              __dirname,
+              "src/platform/web/shims/opener.ts",
+            ),
+            "@tauri-apps/plugin-process": path.resolve(
+              __dirname,
+              "src/platform/web/shims/process.ts",
+            ),
+            "@tauri-apps/plugin-updater": path.resolve(
+              __dirname,
+              "src/platform/web/shims/updater.ts",
+            ),
+          }
+        : {}),
     },
   },
+
+  base: mode === "web" ? "/app/" : undefined,
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

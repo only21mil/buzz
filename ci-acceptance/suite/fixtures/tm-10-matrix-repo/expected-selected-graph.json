@@ -1,0 +1,25 @@
+{
+  "workflow": ".github/workflows/ci.yml",
+  "requested": {
+    "job": "test",
+    "matrix": {
+      "os": "ubuntu-latest",
+      "rust": "stable"
+    }
+  },
+  "jobs": [
+    {
+      "id": "prepare",
+      "needs": [],
+      "matrix": {}
+    },
+    {
+      "id": "test",
+      "needs": ["prepare"],
+      "matrix": {
+        "os": "ubuntu-latest",
+        "rust": "stable"
+      }
+    }
+  ]
+}

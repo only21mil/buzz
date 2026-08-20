@@ -1,0 +1,287 @@
+name: Build only21mil Android Release APK
+run-name: Build ${{ inputs.source_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Existing immutable only21mil-android-vX.Y.Z-rc.N tag
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit peeled from the annotated source tag
+        required: true
+        type: string
+
+concurrency:
+  group: android-fork-release-apk-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      source_short: ${{ steps.release.outputs.source_short }}
+      version_name: ${{ steps.release.outputs.version_name }}
+      version_code: ${{ steps.release.outputs.version_code }}
+    steps:
+      - name: Require reviewed fork main dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$REPOSITORY" = "only21mil/buzz" || {
+            echo "::error::Fork Android APKs may run only in only21mil/buzz"
+            exit 1
+          }
+          test "$DISPATCH_REF" = "refs/heads/main" || {
+            echo "::error::Dispatch this workflow from main, not $DISPATCH_REF"
+            exit 1
+          }
+
+      - name: Check out trusted release policy from main
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-release
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Independently fetch and verify annotated source tag
+        id: release
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          trusted-release/scripts/verify-android-fork-release-ref.sh "$SOURCE_TAG" "$SOURCE_SHA"
+          trusted-release/scripts/android-fork-release-metadata.py \
+            "$SOURCE_TAG" --format github-output >> "$GITHUB_OUTPUT"
+          {
+            echo "source_sha=$SOURCE_SHA"
+            echo "source_short=${SOURCE_SHA:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+  build-unsigned:
+    needs: verify-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out only the verified peeled source commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ needs.verify-source.outputs.source_sha }}
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+
+      - name: Check out trusted handoff policy from main
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-release
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616  # v1
+
+      - name: Prime pinned Flutter SDK
+        run: flutter --version
+
+      - name: Setup Gradle 8.14.5 without release caching
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb  # v6.3.0
+        with:
+          gradle-version: '8.14.5'
+          cache-disabled: true
+
+      - name: Expose Android verification tools
+        run: |
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          test -n "$build_tools"
+          echo "$build_tools" >> "$GITHUB_PATH"
+          command -v apksigner >/dev/null
+          command -v apkanalyzer >/dev/null
+
+      - name: Install locked Flutter dependencies
+        run: cd mobile && flutter pub get
+
+      - name: Run Android release policy gates
+        run: |
+          scripts/test-check-android-google-free.sh
+          gradle -p mobile/android \
+            :app:testDebugUnitTest \
+            :app:writeBuzzRuntimeDependencyManifest \
+            --no-daemon \
+            --console=plain
+
+      - name: Build unsigned release APK without signing variables
+        env:
+          BUZZ_ANDROID_RELEASE_SIGNING: external
+          VERSION_NAME: ${{ needs.verify-source.outputs.version_name }}
+          VERSION_CODE: ${{ needs.verify-source.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          for variable in \
+            BUZZ_ANDROID_RELEASE_KEYSTORE_BASE64 \
+            BUZZ_ANDROID_RELEASE_KEYSTORE_PATH \
+            BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD \
+            BUZZ_ANDROID_RELEASE_KEY_ALIAS \
+            BUZZ_ANDROID_RELEASE_KEY_PASSWORD \
+            BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH \
+            BUZZ_ANDROID_UPLOAD_KEYSTORE_PASSWORD \
+            BUZZ_ANDROID_UPLOAD_KEY_ALIAS \
+            BUZZ_ANDROID_UPLOAD_KEY_PASSWORD; do
+            if [[ -v "$variable" ]]; then
+              echo "::error::$variable must not exist in the unsigned build"
+              exit 1
+            fi
+          done
+          cd mobile
+          flutter build apk --release --no-pub \
+            --build-name "$VERSION_NAME" \
+            --build-number "$VERSION_CODE"
+
+      - name: Prove unsigned artifact and stage handoff
+        env:
+          VERSION_NAME: ${{ needs.verify-source.outputs.version_name }}
+          VERSION_CODE: ${{ needs.verify-source.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          unsigned_apk=mobile/build/app/outputs/flutter-apk/app-release.apk
+          dependencies=mobile/build/app/reports/buzz-runtime-dependencies.tsv
+          trusted-release/scripts/verify-android-fork-release-unsigned-apk.sh \
+            "$unsigned_apk" "$dependencies" "$VERSION_NAME" "$VERSION_CODE"
+          stage="$RUNNER_TEMP/buzz-android-unsigned-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$stage"
+          mkdir -m 700 "$stage"
+          install -m 600 "$unsigned_apk" "$stage/app-release-unsigned.apk"
+          install -m 600 "$dependencies" "$stage/buzz-runtime-dependencies.tsv"
+
+      - name: Hand off unsigned APK to protected signing job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: unsigned-android-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/buzz-android-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  sign:
+    needs: [verify-source, build-unsigned]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: android-release
+    steps:
+      - name: Check out trusted signing policy from main
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-release
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Re-verify immutable source from trusted main
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ needs.verify-source.outputs.source_sha }}
+        run: trusted-release/scripts/verify-android-fork-release-ref.sh "$SOURCE_TAG" "$SOURCE_SHA"
+
+      - name: Expose Android signing tools
+        run: |
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          test -n "$build_tools"
+          echo "$build_tools" >> "$GITHUB_PATH"
+          command -v apksigner >/dev/null
+          command -v apkanalyzer >/dev/null
+          command -v zipalign >/dev/null
+          command -v unshare >/dev/null
+
+      - name: Receive unsigned build handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: unsigned-android-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/buzz-android-unsigned-handoff
+
+      - name: Verify handed-off APK is unsigned
+        env:
+          VERSION_NAME: ${{ needs.verify-source.outputs.version_name }}
+          VERSION_CODE: ${{ needs.verify-source.outputs.version_code }}
+        run: |
+          trusted-release/scripts/verify-android-fork-release-unsigned-apk.sh \
+            "$RUNNER_TEMP/buzz-android-unsigned-handoff/app-release-unsigned.apk" \
+            "$RUNNER_TEMP/buzz-android-unsigned-handoff/buzz-runtime-dependencies.tsv" \
+            "$VERSION_NAME" "$VERSION_CODE"
+
+      - name: Sign with protected key in an isolated network namespace
+        env:
+          BUZZ_ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.BUZZ_ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          BUZZ_ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.BUZZ_ANDROID_RELEASE_KEY_ALIAS }}
+          BUZZ_ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.BUZZ_ANDROID_RELEASE_KEY_PASSWORD }}
+          BUZZ_ANDROID_RELEASE_CERT_SHA256: ${{ vars.BUZZ_ANDROID_RELEASE_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          signed_stage="$RUNNER_TEMP/buzz-android-signed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$signed_stage"
+          mkdir -m 700 "$signed_stage"
+          host_network_namespace="$(readlink /proc/self/ns/net)"
+          export HOST_NETWORK_NAMESPACE="$host_network_namespace"
+          sudo --preserve-env=RUNNER_TEMP,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,HOST_NETWORK_NAMESPACE,BUZZ_ANDROID_RELEASE_KEYSTORE_BASE64,BUZZ_ANDROID_RELEASE_KEYSTORE_PASSWORD,BUZZ_ANDROID_RELEASE_KEY_ALIAS,BUZZ_ANDROID_RELEASE_KEY_PASSWORD,BUZZ_ANDROID_RELEASE_CERT_SHA256 \
+            env "PATH=$PATH" unshare --net -- \
+            "$GITHUB_WORKSPACE/trusted-release/scripts/sign-android-fork-release-apk.sh" \
+            "$RUNNER_TEMP/buzz-android-unsigned-handoff/app-release-unsigned.apk" \
+            "$signed_stage/app-release.apk"
+
+      - name: Prove signing material was destroyed
+        if: always()
+        run: |
+          signing_dir="$RUNNER_TEMP/buzz-android-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$signing_dir"
+
+      - name: Verify, bind, and stage signed artifact
+        id: artifact
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ needs.verify-source.outputs.source_sha }}
+          VERSION_NAME: ${{ needs.verify-source.outputs.version_name }}
+          VERSION_CODE: ${{ needs.verify-source.outputs.version_code }}
+          SOURCE_SHORT: ${{ needs.verify-source.outputs.source_short }}
+          CERT_SHA256: ${{ vars.BUZZ_ANDROID_RELEASE_CERT_SHA256 }}
+        working-directory: trusted-release
+        run: |
+          set -euo pipefail
+          source_apk="$RUNNER_TEMP/buzz-android-signed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/app-release.apk"
+          dependencies="$RUNNER_TEMP/buzz-android-unsigned-handoff/buzz-runtime-dependencies.tsv"
+          scripts/verify-android-fork-release-apk.sh \
+            "$source_apk" "$dependencies" "$VERSION_NAME" "$VERSION_CODE" "$CERT_SHA256"
+          apk_sha="$(sha256sum "$source_apk" | awk '{print $1}')"
+          filename="buzz-${SOURCE_TAG}-vc${VERSION_CODE}-${SOURCE_SHORT}-sha256_${apk_sha}.apk"
+          mv "$source_apk" "$(dirname "$source_apk")/$filename"
+          scripts/write-android-fork-release-provenance.py \
+            --tag "$SOURCE_TAG" \
+            --commit "$SOURCE_SHA" \
+            --version-name "$VERSION_NAME" \
+            --version-code "$VERSION_CODE" \
+            --certificate-sha256 "$CERT_SHA256" \
+            --apk "$(dirname "$source_apk")/$filename" \
+            --dependencies "$dependencies" \
+            --output "$(dirname "$source_apk")/provenance.json"
+          install -m 600 "$dependencies" "$(dirname "$source_apk")/buzz-runtime-dependencies.tsv"
+          {
+            echo "path=$(dirname "$source_apk")"
+            echo "name=buzz-${SOURCE_TAG}-vc${VERSION_CODE}-${SOURCE_SHORT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified APK and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0

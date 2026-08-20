@@ -1,0 +1,5 @@
+results.jsonl
+summary.json
+suite/evidence/
+suite/.selftest.*
+suite/.evidence/

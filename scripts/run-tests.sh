@@ -90,6 +90,11 @@ run_unit_tests() {
   run_test_step "buzz-cli tests" \
     cargo test -p buzz-cli -- --nocapture
 
+  # Buzz CI control-plane boundary: fixed-schema broker wire, zero-capacity
+  # keyless executor, and authorized public-to-private normalization.
+  run_test_step "buzz-ci control-plane tests" \
+    cargo test -p buzz-ci-broker-protocol -p buzz-ci-execd -p buzz-ci-runner -- --nocapture
+
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
   # script, not startup state) and the tenant-scoping lints. The Postgres-backed
@@ -112,6 +117,11 @@ run_unit_tests() {
   # the two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
+
+  # Buzz-native CI materialization and Docker admission are pure fail-closed
+  # decision layers. Root-owned host qualification is intentionally separate.
+  run_test_step "buzz CI isolation tests" \
+    cargo test -p buzz-ci-isolation-contract -p buzz-ci-materializer -p buzz-ci-policy-proxy --all-targets -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

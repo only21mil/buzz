@@ -230,6 +230,34 @@ export function mergeLiveChannelWindowEvent(
 }
 
 /**
+ * Replay a live timeline row captured by the active head-fetch transaction.
+ * Unlike the steady-state live path, this narrowly bypasses the pagination
+ * boundary because the event was observed after subscribing. Page and overlay
+ * ids remain authoritative for deduplication.
+ */
+export function mergeHeadTransactionChannelWindowEvent(
+  current: ChannelWindowStore,
+  event: RelayEvent,
+  isTimelineRow = true,
+): ChannelWindowStore {
+  if (!isTimelineRow) {
+    return mergeLiveChannelWindowEvent(current, event, false);
+  }
+  if (
+    current.liveOverlay.some((candidate) => candidate.id === event.id) ||
+    current.pages.some((page) =>
+      page.rows.some((row) => row.event.id === event.id),
+    )
+  ) {
+    return current;
+  }
+  return {
+    ...current,
+    liveOverlay: [...current.liveOverlay, event].sort(compareRelayOrder),
+  };
+}
+
+/**
  * Apply a per-event transform across every event the store holds (page rows,
  * page aux, live overlay, live aux), returning the same store reference when
  * nothing changed.
