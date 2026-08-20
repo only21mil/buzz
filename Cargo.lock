@@ -951,6 +951,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-ci-isolation-contract"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-ci-materializer"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-isolation-contract",
+ "hex",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-ci-policy-proxy"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-isolation-contract",
+ "hex",
+ "nix 0.31.3",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
 name = "buzz-ci-runner"
 version = "0.1.0"
 dependencies = [
@@ -5763,6 +5805,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

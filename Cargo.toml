@@ -31,6 +31,9 @@ members = [
     "crates/buzz-ci-broker-protocol",
     "crates/buzz-ci-execd",
     "crates/buzz-ci-runner",
+    "crates/buzz-ci-isolation-contract",
+    "crates/buzz-ci-materializer",
+    "crates/buzz-ci-policy-proxy",
     "examples/countdown-bot",
 ]
 exclude = ["desktop/src-tauri"]
@@ -112,6 +115,7 @@ base64    = "0.22"
 
 # Randomness
 rand = "0.10"
+rustix = { version = "1.1", features = ["fs"] }
 subtle = "2.6"
 zeroize = "1.8"
 
