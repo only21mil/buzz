@@ -10,7 +10,11 @@ evidence_dir=""
 plan=0
 checks=()
 evidence_files=()
-preconditions=("Rust toolchain and candidate broker crates" "buzz ci CLI + broker admission path live")
+preconditions=(
+  "Rust toolchain and candidate broker crates"
+  "substrate wiring has published root-owned /etc/buzzci/harness.env"
+  "the published runner control admit command supports --acceptance-case unaccepted and external_fork"
+)
 saw_fail=0
 saw_not_runnable=0
 
@@ -46,7 +50,8 @@ done
 if ((plan)); then
   add_check accepted_reviewed_only plan "Inspect TrustClass decoding and request normalization."
   add_check refusal_unit_tests plan "Run broker-protocol and runner unit tests."
-  add_check live_unaccepted_refusal plan "Submit unaccepted and external-fork requests through the live CLI and broker."
+  add_check live_unaccepted_refusal plan "Submit an unaccepted request through the live runner control and require unaccepted_trust_class."
+  add_check live_external_fork_refusal plan "Submit an external-fork request through the live runner control and require unaccepted_trust_class."
   emit_result plan false "Plan only; no tests, commands, or filesystem writes were performed." 0
 fi
 
@@ -92,7 +97,57 @@ else
   add_check refusal_unit_tests fail "Runner or broker-protocol tests failed or timed out."
 fi
 
-add_check live_unaccepted_refusal not_runnable "The buzz ci CLI and live broker admission path are not provisioned."
+dynamic_names=(live_unaccepted_refusal live_external_fork_refusal)
+if [[ ! -e /etc/buzzci/harness.env ]]; then
+  for name in "${dynamic_names[@]}"; do add_check "$name" not_runnable "Substrate wiring has not published /etc/buzzci/harness.env."; done
+elif {
+  SUDO=()
+  if [[ -n ${SUITE_SUDO+x} ]]; then read -r -a SUDO <<<"$SUITE_SUDO"; elif timeout 5 sudo -n true >/dev/null 2>&1; then SUDO=(sudo -n); fi
+  ((${#SUDO[@]} == 0)) && [[ ! -r /etc/buzzci/harness.env ]]
+}; then
+  for name in "${dynamic_names[@]}"; do add_check "$name" not_runnable "harness.env is unreadable without SUITE_SUDO or passwordless sudo."; done
+else
+  if ((${#SUDO[@]})); then
+    harness_text=$(timeout "$timeout_seconds" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || harness_text=''
+  else
+    harness_text=$(timeout "$timeout_seconds" cat /etc/buzzci/harness.env 2>/dev/null) || harness_text=''
+  fi
+  env_get() {
+    local key=$1
+    printf '%s\n' "$harness_text" | timeout "$timeout_seconds" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'
+  }
+  runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
+  fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
+  if [[ -z $harness_text || ! -x $runner_ctl || -z $fixture_repo ]]; then
+    for name in "${dynamic_names[@]}"; do add_check "$name" fail "Published harness.env lacks an executable runner control or fixture coordinate."; done
+  else
+    help_file=$tm_dir/runner-help.txt
+    timeout "$timeout_seconds" "$runner_ctl" admit --help >"$help_file" 2>&1 || true
+    evidence_files+=("$TEST_ID/runner-help.txt")
+    if ! timeout 10 grep -Fq -- '--acceptance-case' "$help_file"; then
+      for name in "${dynamic_names[@]}"; do add_check "$name" not_runnable "The published runner control does not advertise --acceptance-case."; done
+    else
+      live_refusal() {
+        local name=$1 acceptance_case=$2 rc=0
+        local output=$tm_dir/$name.json error=$tm_dir/$name.stderr
+        timeout "$timeout_seconds" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
+          --workflow ci-acceptance/probe-repo/workflow.yml --job ok --attempt 1 \
+          --acceptance-case "$acceptance_case" >"$output" 2>"$error" || rc=$?
+        evidence_files+=("$TEST_ID/$name.json" "$TEST_ID/$name.stderr")
+        if ((rc != 0)) && {
+          timeout 10 jq -e '.error == "unaccepted_trust_class"' "$output" >/dev/null 2>&1 \
+            || timeout 10 jq -e '.error == "unaccepted_trust_class"' "$error" >/dev/null 2>&1
+        }; then
+          add_check "$name" pass "Live admission refused $acceptance_case with stable error unaccepted_trust_class."
+        else
+          add_check "$name" fail "Live admission did not refuse $acceptance_case with stable error unaccepted_trust_class."
+        fi
+      }
+      live_refusal live_unaccepted_refusal unaccepted
+      live_refusal live_external_fork_refusal external_fork
+    fi
+  fi
+fi
 
 if ((saw_fail)); then emit_result fail false "Accepted-only admission has a failed static or unit control." 1; fi
 if ((saw_not_runnable)); then emit_result not_runnable false "Static and unit refusal controls passed; live broker refusal is not yet runnable." 3; fi
