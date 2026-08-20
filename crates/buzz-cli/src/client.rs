@@ -2309,9 +2309,44 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        BuzzClient,
+        normalize_relay_url, BuzzClient,
     };
+    use buzz_core::ci::{CiLogReferenceEnvelope, CI_SCHEMA_VERSION};
     use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn normalized_client_relay_url_validates_ci_log_origin() {
+        let relay_url = normalize_relay_url("wss://relay.example");
+        let client = BuzzClient::new(relay_url, Keys::generate(), None, None).unwrap();
+        let log = CiLogReferenceEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_event_id: "a".repeat(64),
+            run_id: "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd45".into(),
+            workflow_id: "ci".into(),
+            target_repo_a: format!("30617:{}:buzz", "b".repeat(64)),
+            tip_oid: "c".repeat(40),
+            job_id: "rust_lint".into(),
+            attempt: 1,
+            log_sha256: "d".repeat(64),
+            byte_length: 12,
+            cap_bytes: 1024,
+            truncated: false,
+            url: Some(format!(
+                "https://relay.example/ci/logs/{}/{}/{}/{}/{}",
+                "a".repeat(64),
+                "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd45",
+                "rust_lint",
+                1,
+                "d".repeat(64)
+            )),
+            inline: None,
+            created_at: 1_800_000_001,
+            relay_signer: "e".repeat(64),
+        };
+
+        log.validate_url_for_relay(client.relay_url())
+            .expect("normalized BuzzClient relay URL must preserve the CI log origin");
+    }
 
     #[test]
     fn query_cursor_uses_last_events_composite_sort_key() {

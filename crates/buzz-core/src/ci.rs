@@ -1,5 +1,9 @@
 //! Typed, zero-I/O envelopes for Buzz-native CI events.
 
+use crate::kind::{
+    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
+    KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use nostr::Tag;
 use serde::{Deserialize, Serialize};
@@ -11,9 +15,11 @@ use uuid::Uuid;
 
 /// Current CI envelope schema version.
 pub const CI_SCHEMA_VERSION: u32 = 1;
-/// SHA-256 of `BUZZ_CI_PROTOCOL_CONTRACT.md` v1.2 implemented by this module.
+/// Largest integer represented exactly by JavaScript consumers.
+pub const CI_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+/// SHA-256 of `BUZZ_CI_PROTOCOL_CONTRACT.md` v1.3 implemented by this module.
 pub const CI_PROTOCOL_CONTRACT_SHA256: &str =
-    "50bb013fe1af573a000ba8c47eb9d0a42be69ab2dde2a5a0b1c12afe81e501fe";
+    "ef411f5733b563d9b0804601cbe061ca94e5b225343025482dc25636ac6537f0";
 
 /// Validation failure for a CI envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -140,6 +146,7 @@ pub struct CiRequestEnvelope {
     /// Root pull-request event ID.
     pub pr_root_event_id: String,
     /// Effective pull-request update event ID, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_update_event_id: Option<String>,
     /// Authorized source clone URL.
     pub source_clone_url: String,
@@ -164,8 +171,10 @@ pub struct CiRequestEnvelope {
     /// One-based attempt number.
     pub attempt: u32,
     /// Parent attempt for a rerun.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_attempt: Option<u32>,
     /// Parent run identifier for a rerun.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
     /// Effective PR source event ID.
     pub trigger_event_id: String,
@@ -197,13 +206,28 @@ impl CiRequestEnvelope {
         validate_hex(&self.base_oid, self.tip_oid.len(), "invalid base OID")?;
         validate_hex(&self.trigger_event_id, 64, "invalid trigger event ID")?;
         validate_hex(&self.actor, 64, "invalid actor pubkey")?;
-        if self.job_ids.is_empty() || self.job_ids.iter().any(|id| id.is_empty()) {
-            return Err(CiValidationError("job IDs must be non-empty"));
+        validate_repository_coordinate(&self.target_repo_a)?;
+        validate_non_empty(&self.workflow_id, "workflow ID must be non-empty")?;
+        validate_non_empty(
+            &self.immutable_source_ref,
+            "immutable source ref must be non-empty",
+        )?;
+        validate_non_empty(&self.source_branch, "source branch must be non-empty")?;
+        validate_non_empty(&self.base_ref, "base ref must be non-empty")?;
+        validate_clone_url(&self.source_clone_url)?;
+        validate_job_ids(&self.job_ids, "request jobs must be non-empty and unique")?;
+        let expected_trigger = self
+            .pr_update_event_id
+            .as_deref()
+            .unwrap_or(self.pr_root_event_id.as_str());
+        if self.trigger_event_id != expected_trigger {
+            return Err(CiValidationError(
+                "trigger event must equal effective PR event",
+            ));
         }
-        let unique: HashSet<&str> = self.job_ids.iter().map(String::as_str).collect();
-        if unique.len() != self.job_ids.len() {
-            return Err(CiValidationError("job IDs must be unique"));
-        }
+        validate_safe_integer(self.timeout_seconds, "timeout exceeds safe integer")?;
+        validate_safe_integer(self.issued_at, "issued_at exceeds safe integer")?;
+        validate_safe_integer(self.expires_at, "expires_at exceeds safe integer")?;
         if self.timeout_seconds == 0 || self.expires_at <= self.issued_at {
             return Err(CiValidationError("invalid timeout or expiry"));
         }
@@ -228,8 +252,10 @@ impl CiRequestEnvelope {
                 let parent_attempt = self
                     .parent_attempt
                     .ok_or(CiValidationError("rerun requires parent attempt"))?;
-                if parent_attempt >= self.attempt {
-                    return Err(CiValidationError("rerun parent attempt must be earlier"));
+                if parent_attempt == 0 || self.attempt != parent_attempt.saturating_add(1) {
+                    return Err(CiValidationError(
+                        "rerun attempt must follow parent contiguously",
+                    ));
                 }
                 if self.parent_run_id.as_deref() != Some(self.run_id.as_str()) {
                     return Err(CiValidationError("rerun parent run must equal run ID"));
@@ -264,12 +290,16 @@ pub struct CiRunStatusEnvelope {
     /// Closed run state.
     pub state: CiRunState,
     /// Optional closed-form conclusion text.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
     /// Optional infrastructure or state reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Start time in Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
     /// Finish time in Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<u64>,
     /// Static jobs in the run.
     pub job_ids: Vec<String>,
@@ -290,10 +320,13 @@ impl CiRunStatusEnvelope {
             self.sequence,
             &self.relay_signer,
         )?;
-        if self.job_ids.is_empty() {
-            return Err(CiValidationError("run status requires jobs"));
-        }
-        validate_terminal_time(self.state.is_terminal(), self.finished_at)
+        validate_repository_coordinate(&self.target_repo_a)?;
+        validate_non_empty(&self.workflow_id, "workflow ID must be non-empty")?;
+        validate_job_ids(
+            &self.job_ids,
+            "run status jobs must be non-empty and unique",
+        )?;
+        validate_times(self.state.is_terminal(), self.started_at, self.finished_at)
     }
 }
 
@@ -321,14 +354,17 @@ pub struct CiJobStatusEnvelope {
     /// Attempt number.
     pub attempt: u32,
     /// Parent attempt for a rerun.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_attempt: Option<u32>,
     /// Monotonic stream sequence.
     pub sequence: u64,
     /// Closed job state.
     pub state: CiJobState,
     /// Optional conclusion text.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
     /// Optional failure or state reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Whether the signed manifest requires the job.
     pub required: bool,
@@ -339,10 +375,13 @@ pub struct CiJobStatusEnvelope {
     /// Broker-computed dependency reruns.
     pub also_reruns: Vec<String>,
     /// Start time in Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
     /// Finish time in Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<u64>,
     /// Finalized log event ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log_ref: Option<String>,
     /// Finalized artifact event IDs.
     pub artifact_refs: Vec<String>,
@@ -363,15 +402,31 @@ impl CiJobStatusEnvelope {
             self.sequence,
             &self.relay_signer,
         )?;
-        if self.job_id.is_empty() || self.name.is_empty() || self.selected_job_instance.is_empty() {
+        validate_repository_coordinate(&self.target_repo_a)?;
+        validate_non_empty(&self.workflow_id, "workflow ID must be non-empty")?;
+        validate_job_id(&self.job_id)?;
+        if self.name.is_empty() || self.selected_job_instance.is_empty() {
             return Err(CiValidationError("job identity must be non-empty"));
         }
-        if let Some(parent) = self.parent_attempt {
-            if parent >= self.attempt {
-                return Err(CiValidationError("parent attempt must be earlier"));
+        match (self.attempt, self.parent_attempt) {
+            (1, None) => {}
+            (1, Some(_)) => return Err(CiValidationError("attempt one forbids parent")),
+            (_, Some(parent)) if parent >= 1 && self.attempt == parent.saturating_add(1) => {}
+            _ => {
+                return Err(CiValidationError(
+                    "later attempts require contiguous parent",
+                ))
             }
         }
-        validate_terminal_time(self.state.is_terminal(), self.finished_at)
+        validate_fanout(&self.also_reruns, &self.job_id)?;
+        if let Some(log_ref) = &self.log_ref {
+            validate_hex(log_ref, 64, "invalid log reference event ID")?;
+        }
+        validate_unique_event_ids(
+            &self.artifact_refs,
+            "invalid or duplicate artifact reference",
+        )?;
+        validate_times(self.state.is_terminal(), self.started_at, self.finished_at)
     }
 }
 
@@ -403,8 +458,10 @@ pub struct CiLogReferenceEnvelope {
     /// Whether evidence was truncated.
     pub truncated: bool,
     /// Authenticated same-relay log URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Canonical padded RFC 4648 base64 log bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inline: Option<String>,
     /// Creation time in Unix seconds.
     pub created_at: u64,
@@ -425,6 +482,11 @@ impl CiLogReferenceEnvelope {
             &self.log_sha256,
             &self.relay_signer,
         )?;
+        validate_repository_coordinate(&self.target_repo_a)?;
+        validate_non_empty(&self.workflow_id, "workflow ID must be non-empty")?;
+        validate_safe_integer(self.byte_length, "log byte length exceeds safe integer")?;
+        validate_safe_integer(self.cap_bytes, "log cap exceeds safe integer")?;
+        validate_safe_integer(self.created_at, "log timestamp exceeds safe integer")?;
         if self.url.is_some() == self.inline.is_some() {
             return Err(CiValidationError("exactly one log location is required"));
         }
@@ -434,6 +496,14 @@ impl CiLogReferenceEnvelope {
             ));
         }
         if let Some(inline) = &self.inline {
+            let max_encoded = self
+                .cap_bytes
+                .div_ceil(3)
+                .checked_mul(4)
+                .ok_or(CiValidationError("inline log encoded bound overflow"))?;
+            if inline.len() as u64 > max_encoded {
+                return Err(CiValidationError("inline log exceeds encoded bound"));
+            }
             let bytes = BASE64_STANDARD
                 .decode(inline)
                 .map_err(|_| CiValidationError("inline log is not canonical base64"))?;
@@ -463,7 +533,13 @@ impl CiLogReferenceEnvelope {
         let http_scheme = match expected_origin.scheme() {
             "wss" => "https",
             "ws" => "http",
-            _ => return Err(CiValidationError("active relay must use ws or wss")),
+            "https" => "https",
+            "http" => "http",
+            _ => {
+                return Err(CiValidationError(
+                    "active relay must use http, https, ws, or wss",
+                ));
+            }
         };
         expected_origin
             .set_scheme(http_scheme)
@@ -545,6 +621,13 @@ impl CiArtifactReferenceEnvelope {
             &self.sha256,
             &self.relay_signer,
         )?;
+        validate_repository_coordinate(&self.target_repo_a)?;
+        validate_non_empty(&self.workflow_id, "workflow ID must be non-empty")?;
+        validate_safe_integer(
+            self.byte_length,
+            "artifact byte length exceeds safe integer",
+        )?;
+        validate_safe_integer(self.created_at, "artifact timestamp exceeds safe integer")?;
         if self.artifact_id.is_empty()
             || self.name.is_empty()
             || self.media_type.is_empty()
@@ -553,6 +636,225 @@ impl CiArtifactReferenceEnvelope {
             return Err(CiValidationError("artifact fields must be non-empty"));
         }
         Ok(())
+    }
+}
+
+/// One selected job attempt whose durable evidence has been finalized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiFinalizedJobAttempt {
+    /// Static job identifier.
+    pub job_id: String,
+    /// Selected one-based job attempt.
+    pub attempt: u32,
+    /// Finalized log-reference event ID.
+    pub log_ref: String,
+    /// Finalized artifact-reference event IDs.
+    pub artifact_refs: Vec<String>,
+}
+
+/// Evidence-finalized fact for kind 46105.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiEvidenceFinalizedEnvelope {
+    /// Envelope schema version.
+    pub schema_version: u32,
+    /// Request event ID.
+    pub request_event_id: String,
+    /// Stable run UUID.
+    pub run_id: String,
+    /// Workflow identifier.
+    pub workflow_id: String,
+    /// Repository coordinate.
+    pub target_repo_a: String,
+    /// Exact source tip object ID.
+    pub tip_oid: String,
+    /// Top-level selected attempt.
+    pub attempt: u32,
+    /// Every selected required job attempt, exactly once.
+    pub finalized_job_attempts: Vec<CiFinalizedJobAttempt>,
+    /// Finalization time in Unix seconds.
+    pub finalized_at: u64,
+    /// Authorized evidence signer pubkey.
+    pub relay_signer: String,
+}
+
+impl CiEvidenceFinalizedEnvelope {
+    /// Validate the context-free evidence-finalized fact shape.
+    pub fn validate(&self) -> Result<(), CiValidationError> {
+        validate_fact_common(
+            self.schema_version,
+            &self.request_event_id,
+            &self.run_id,
+            &self.workflow_id,
+            &self.target_repo_a,
+            &self.tip_oid,
+            self.attempt,
+            self.finalized_at,
+            &self.relay_signer,
+        )?;
+        if self.finalized_job_attempts.is_empty() {
+            return Err(CiValidationError("evidence fact requires finalized jobs"));
+        }
+        let mut jobs = HashSet::new();
+        let mut event_ids = HashSet::new();
+        for job in &self.finalized_job_attempts {
+            validate_job_id(&job.job_id)?;
+            if job.attempt == 0 || !jobs.insert(job.job_id.as_str()) {
+                return Err(CiValidationError("invalid or duplicate finalized job"));
+            }
+            validate_hex(&job.log_ref, 64, "invalid finalized log reference")?;
+            if !event_ids.insert(job.log_ref.as_str()) {
+                return Err(CiValidationError("duplicate finalized evidence reference"));
+            }
+            validate_unique_event_ids(
+                &job.artifact_refs,
+                "invalid or duplicate finalized artifact reference",
+            )?;
+            if job
+                .artifact_refs
+                .iter()
+                .any(|event_id| !event_ids.insert(event_id.as_str()))
+            {
+                return Err(CiValidationError("duplicate finalized evidence reference"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Lease-empty teardown fact for kind 46106.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiTeardownAttestationEnvelope {
+    /// Envelope schema version.
+    pub schema_version: u32,
+    /// Request event ID.
+    pub request_event_id: String,
+    /// Stable run UUID.
+    pub run_id: String,
+    /// Workflow identifier.
+    pub workflow_id: String,
+    /// Repository coordinate.
+    pub target_repo_a: String,
+    /// Exact source tip object ID.
+    pub tip_oid: String,
+    /// Top-level selected attempt.
+    pub attempt: u32,
+    /// Attempt-scoped isolation lease identifier.
+    pub lease_id: String,
+    /// Must be true: the attempt lease is proven empty.
+    pub lease_empty: bool,
+    /// Teardown proof time in Unix seconds.
+    pub teardown_at: u64,
+    /// Authorized control-plane signer pubkey.
+    pub relay_signer: String,
+}
+
+impl CiTeardownAttestationEnvelope {
+    /// Validate the context-free lease-empty teardown fact shape.
+    pub fn validate(&self) -> Result<(), CiValidationError> {
+        validate_fact_common(
+            self.schema_version,
+            &self.request_event_id,
+            &self.run_id,
+            &self.workflow_id,
+            &self.target_repo_a,
+            &self.tip_oid,
+            self.attempt,
+            self.teardown_at,
+            &self.relay_signer,
+        )?;
+        if self.lease_id.is_empty() || !self.lease_empty {
+            return Err(CiValidationError("teardown must prove a named lease empty"));
+        }
+        Ok(())
+    }
+}
+
+/// A signature-verified, kind-bound CI event envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedCiEnvelope {
+    /// Kind 46100 request authored by its actor.
+    Request(CiRequestEnvelope),
+    /// Kind 46101 run status authored by an authorized control-plane signer.
+    RunStatus(CiRunStatusEnvelope),
+    /// Kind 46102 job status authored by an authorized control-plane signer.
+    JobStatus(CiJobStatusEnvelope),
+    /// Kind 46103 log reference authored by an authorized control-plane signer.
+    LogReference(CiLogReferenceEnvelope),
+    /// Kind 46104 artifact reference authored by an authorized control-plane signer.
+    ArtifactReference(CiArtifactReferenceEnvelope),
+    /// Kind 46105 evidence-finalized fact.
+    EvidenceFinalized(CiEvidenceFinalizedEnvelope),
+    /// Kind 46106 lease-empty teardown fact.
+    TeardownAttestation(CiTeardownAttestationEnvelope),
+}
+
+/// Verify a signed CI event, bind its kind to the exact envelope and tags, and enforce signer trust.
+pub fn validate_signed_ci_event(
+    event: &nostr::Event,
+    channel_id: &str,
+    authorized_status_signers: &HashSet<String>,
+) -> Result<ValidatedCiEnvelope, CiValidationError> {
+    event
+        .verify()
+        .map_err(|_| CiValidationError("invalid CI event ID or signature"))?;
+    let signer = event.pubkey.to_hex();
+    let tags: Vec<Tag> = event.tags.iter().cloned().collect();
+    match event.kind.as_u16() as u32 {
+        KIND_CI_REQUEST => {
+            let envelope: CiRequestEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI request content"))?;
+            envelope.validate()?;
+            if envelope.actor != signer {
+                return Err(CiValidationError(
+                    "request actor does not match event signer",
+                ));
+            }
+            validate_request_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::Request(envelope))
+        }
+        KIND_CI_RUN_STATUS => {
+            let envelope: CiRunStatusEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI run status content"))?;
+            validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
+            validate_run_status_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::RunStatus(envelope))
+        }
+        KIND_CI_JOB_STATUS => {
+            let envelope: CiJobStatusEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI job status content"))?;
+            validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
+            validate_job_status_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::JobStatus(envelope))
+        }
+        KIND_CI_LOG_REFERENCE => {
+            let envelope: CiLogReferenceEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI log reference content"))?;
+            validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
+            validate_log_reference_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::LogReference(envelope))
+        }
+        KIND_CI_ARTIFACT_REFERENCE => {
+            let envelope: CiArtifactReferenceEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI artifact reference content"))?;
+            validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
+            validate_artifact_reference_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::ArtifactReference(envelope))
+        }
+        KIND_CI_EVIDENCE_FINALIZED => {
+            let envelope: CiEvidenceFinalizedEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI evidence-finalized content"))?;
+            validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
+            validate_evidence_finalized_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::EvidenceFinalized(envelope))
+        }
+        KIND_CI_TEARDOWN_ATTESTATION => {
+            let envelope: CiTeardownAttestationEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI teardown attestation content"))?;
+            validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
+            validate_teardown_attestation_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::TeardownAttestation(envelope))
+        }
+        _ => Err(CiValidationError("event kind is not a CI envelope kind")),
     }
 }
 
@@ -651,6 +953,44 @@ pub fn validate_artifact_reference_tags(
     validate_tags(tags, channel_id, TagFields::artifact_reference(envelope))
 }
 
+/// Build the required index tags for a kind 46105 evidence-finalized fact.
+pub fn evidence_finalized_tags(
+    channel_id: &str,
+    envelope: &CiEvidenceFinalizedEnvelope,
+) -> Result<Vec<Tag>, CiValidationError> {
+    envelope.validate()?;
+    build_tags(channel_id, TagFields::evidence_finalized(envelope))
+}
+
+/// Validate required index tags against a kind 46105 evidence-finalized fact.
+pub fn validate_evidence_finalized_tags(
+    tags: &[Tag],
+    channel_id: &str,
+    envelope: &CiEvidenceFinalizedEnvelope,
+) -> Result<(), CiValidationError> {
+    envelope.validate()?;
+    validate_tags(tags, channel_id, TagFields::evidence_finalized(envelope))
+}
+
+/// Build the required index tags for a kind 46106 teardown attestation.
+pub fn teardown_attestation_tags(
+    channel_id: &str,
+    envelope: &CiTeardownAttestationEnvelope,
+) -> Result<Vec<Tag>, CiValidationError> {
+    envelope.validate()?;
+    build_tags(channel_id, TagFields::teardown_attestation(envelope))
+}
+
+/// Validate required index tags against a kind 46106 teardown attestation.
+pub fn validate_teardown_attestation_tags(
+    tags: &[Tag],
+    channel_id: &str,
+    envelope: &CiTeardownAttestationEnvelope,
+) -> Result<(), CiValidationError> {
+    envelope.validate()?;
+    validate_tags(tags, channel_id, TagFields::teardown_attestation(envelope))
+}
+
 struct TagFields<'a> {
     target_repo_a: &'a str,
     run_id: &'a str,
@@ -677,6 +1017,32 @@ impl<'a> TagFields<'a> {
     }
 
     fn run_status(envelope: &'a CiRunStatusEnvelope) -> Self {
+        Self {
+            target_repo_a: &envelope.target_repo_a,
+            run_id: &envelope.run_id,
+            workflow_id: &envelope.workflow_id,
+            tip_oid: &envelope.tip_oid,
+            attempt: envelope.attempt,
+            job_id: None,
+            request_event_id: Some(&envelope.request_event_id),
+            digest: None,
+        }
+    }
+
+    fn evidence_finalized(envelope: &'a CiEvidenceFinalizedEnvelope) -> Self {
+        Self {
+            target_repo_a: &envelope.target_repo_a,
+            run_id: &envelope.run_id,
+            workflow_id: &envelope.workflow_id,
+            tip_oid: &envelope.tip_oid,
+            attempt: envelope.attempt,
+            job_id: None,
+            request_event_id: Some(&envelope.request_event_id),
+            digest: None,
+        }
+    }
+
+    fn teardown_attestation(envelope: &'a CiTeardownAttestationEnvelope) -> Self {
         Self {
             target_repo_a: &envelope.target_repo_a,
             run_id: &envelope.run_id,
@@ -760,6 +1126,19 @@ fn validate_tags(
     fields: TagFields<'_>,
 ) -> Result<(), CiValidationError> {
     let expected = build_tags(channel_id, fields)?;
+    let expected_names: HashSet<&str> = expected
+        .iter()
+        .filter_map(|tag| tag.as_slice().first().map(|part| part.as_str()))
+        .collect();
+    const RESERVED: &[&str] = &["h", "a", "run", "workflow", "c", "attempt", "job", "e", "x"];
+    for tag in tags {
+        let Some(name) = tag.as_slice().first().map(|part| part.as_str()) else {
+            continue;
+        };
+        if RESERVED.contains(&name) && !expected_names.contains(name) {
+            return Err(CiValidationError("forbidden reserved CI tag"));
+        }
+    }
     for expected_tag in expected {
         let expected_parts = expected_tag.as_slice();
         let name = expected_parts[0].as_str();
@@ -815,13 +1194,18 @@ fn validate_status_common(
     sequence: u64,
     relay_signer: &str,
 ) -> Result<(), CiValidationError> {
-    validate_common(schema_version, run_id, tip_oid, &"0".repeat(64))?;
+    if schema_version != CI_SCHEMA_VERSION {
+        return Err(CiValidationError("unsupported schema version"));
+    }
+    Uuid::parse_str(run_id).map_err(|_| CiValidationError("invalid run UUID"))?;
+    validate_git_oid(tip_oid, "invalid tip object ID")?;
     validate_hex(request_event_id, 64, "invalid request event ID")?;
     validate_hex(base_oid, tip_oid.len(), "invalid base OID")?;
     validate_hex(relay_signer, 64, "invalid relay signer")?;
     if attempt == 0 || sequence == 0 {
         return Err(CiValidationError("attempt and sequence begin at one"));
     }
+    validate_safe_integer(sequence, "sequence exceeds safe integer")?;
     Ok(())
 }
 
@@ -839,18 +1223,172 @@ fn validate_reference_common(
     validate_common(schema_version, run_id, tip_oid, digest)?;
     validate_hex(request_event_id, 64, "invalid request event ID")?;
     validate_hex(relay_signer, 64, "invalid relay signer")?;
-    if job_id.is_empty() || attempt == 0 {
-        return Err(CiValidationError("job ID and attempt are required"));
+    validate_job_id(job_id)?;
+    if attempt == 0 {
+        return Err(CiValidationError("attempt is required"));
     }
     Ok(())
 }
 
-fn validate_terminal_time(
+fn validate_times(
     terminal: bool,
+    started_at: Option<u64>,
     finished_at: Option<u64>,
 ) -> Result<(), CiValidationError> {
     if terminal != finished_at.is_some() {
         return Err(CiValidationError("finished_at must match terminal state"));
+    }
+    if let Some(started) = started_at {
+        validate_safe_integer(started, "started_at exceeds safe integer")?;
+    }
+    if let Some(finished) = finished_at {
+        validate_safe_integer(finished, "finished_at exceeds safe integer")?;
+    }
+    if matches!((started_at, finished_at), (Some(started), Some(finished)) if finished < started) {
+        return Err(CiValidationError("finished_at precedes started_at"));
+    }
+    Ok(())
+}
+
+fn validate_repository_coordinate(value: &str) -> Result<(), CiValidationError> {
+    let mut parts = value.splitn(3, ':');
+    if parts.next() != Some("30617") {
+        return Err(CiValidationError("invalid repository coordinate kind"));
+    }
+    let owner = parts
+        .next()
+        .ok_or(CiValidationError("invalid repository coordinate"))?;
+    validate_hex(owner, 64, "invalid repository coordinate owner")?;
+    let repo_id = parts
+        .next()
+        .ok_or(CiValidationError("invalid repository coordinate"))?;
+    validate_non_empty(repo_id, "repository d-tag must be non-empty")
+}
+
+fn validate_clone_url(value: &str) -> Result<(), CiValidationError> {
+    let url = Url::parse(value).map_err(|_| CiValidationError("invalid source clone URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(CiValidationError("unsafe source clone URL"));
+    }
+    Ok(())
+}
+
+fn validate_non_empty(value: &str, message: &'static str) -> Result<(), CiValidationError> {
+    if value.is_empty() {
+        return Err(CiValidationError(message));
+    }
+    Ok(())
+}
+
+fn validate_job_id(value: &str) -> Result<(), CiValidationError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(CiValidationError("invalid static job ID"));
+    }
+    Ok(())
+}
+
+fn validate_git_oid(value: &str, message: &'static str) -> Result<(), CiValidationError> {
+    if !matches!(value.len(), 40 | 64) {
+        return Err(CiValidationError(message));
+    }
+    validate_hex(value, value.len(), message)
+}
+
+fn validate_job_ids(values: &[String], message: &'static str) -> Result<(), CiValidationError> {
+    if values.is_empty() || values.iter().any(|value| validate_job_id(value).is_err()) {
+        return Err(CiValidationError(message));
+    }
+    let unique: HashSet<&str> = values.iter().map(String::as_str).collect();
+    if unique.len() != values.len() {
+        return Err(CiValidationError(message));
+    }
+    Ok(())
+}
+
+fn validate_fanout(values: &[String], selected: &str) -> Result<(), CiValidationError> {
+    if values.iter().any(|value| value == selected) {
+        return Err(CiValidationError("rerun fan-out contains selected job"));
+    }
+    if values.is_empty() {
+        return Ok(());
+    }
+    validate_job_ids(values, "rerun fan-out must contain unique static job IDs")
+}
+
+fn validate_unique_event_ids(
+    values: &[String],
+    message: &'static str,
+) -> Result<(), CiValidationError> {
+    if values
+        .iter()
+        .any(|value| validate_hex(value, 64, message).is_err())
+    {
+        return Err(CiValidationError(message));
+    }
+    let unique: HashSet<&str> = values.iter().map(String::as_str).collect();
+    if unique.len() != values.len() {
+        return Err(CiValidationError(message));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_fact_common(
+    schema_version: u32,
+    request_event_id: &str,
+    run_id: &str,
+    workflow_id: &str,
+    target_repo_a: &str,
+    tip_oid: &str,
+    attempt: u32,
+    timestamp: u64,
+    relay_signer: &str,
+) -> Result<(), CiValidationError> {
+    if schema_version != CI_SCHEMA_VERSION {
+        return Err(CiValidationError("unsupported schema version"));
+    }
+    Uuid::parse_str(run_id).map_err(|_| CiValidationError("invalid run UUID"))?;
+    validate_git_oid(tip_oid, "invalid tip object ID")?;
+    validate_hex(request_event_id, 64, "invalid request event ID")?;
+    validate_non_empty(workflow_id, "workflow ID is required")?;
+    validate_repository_coordinate(target_repo_a)?;
+    validate_hex(relay_signer, 64, "invalid relay signer")?;
+    if attempt == 0 {
+        return Err(CiValidationError("fact attempt must be one-based"));
+    }
+    validate_safe_integer(timestamp, "fact timestamp exceeds JavaScript safe integer")
+}
+
+fn validate_safe_integer(value: u64, message: &'static str) -> Result<(), CiValidationError> {
+    if value > CI_MAX_SAFE_INTEGER {
+        return Err(CiValidationError(message));
+    }
+    Ok(())
+}
+
+fn validate_status_signer(
+    event_signer: &str,
+    envelope_signer: &str,
+    authorized_status_signers: &HashSet<String>,
+) -> Result<(), CiValidationError> {
+    if event_signer != envelope_signer {
+        return Err(CiValidationError(
+            "status signer does not match event signer",
+        ));
+    }
+    if !authorized_status_signers.contains(event_signer) {
+        return Err(CiValidationError("unauthorized CI status signer"));
     }
     Ok(())
 }
