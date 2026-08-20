@@ -8,7 +8,9 @@
 #![forbid(unsafe_code)]
 
 pub mod activation;
+#[cfg(unix)]
 pub mod evidence;
+#[cfg(unix)]
 pub mod harness;
 
 use buzz_ci_broker_protocol::{
