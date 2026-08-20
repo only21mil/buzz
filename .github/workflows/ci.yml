@@ -446,7 +446,7 @@ jobs:
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - name: Start integration services
         run: |
-          for _attempt in 1 2 3; do
+          for attempt in 1 2 3; do
             if docker compose up -d postgres redis minio minio-init; then
               break
             fi
@@ -655,7 +655,7 @@ jobs:
           tool: cargo-nextest@0.9.136
       - name: Start integration services
         run: |
-          for _attempt in 1 2 3; do
+          for attempt in 1 2 3; do
             if docker compose up -d postgres redis minio minio-init; then
               break
             fi
