@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod activation;
+pub mod dns_isolation;
 #[cfg(unix)]
 pub mod evidence;
 #[cfg(unix)]
