@@ -1,12 +1,12 @@
 # BUZZ_CI_PROTOCOL_CONTRACT.md — Phase-1 signed envelopes and CLI wire contract
 
-Status: **CORRECTED ENVELOPES + RELAY/API BINDING FROZEN v1.3 (2026-08-20)**
+Status: **CORRECTED ENVELOPES + RELAY/API BINDING CANDIDATE v1.4 (2026-08-20)**
 
 Inputs:
 
 - `PLANS/BUZZ_CI_DESIGN.md` v1.2, SHA-256 `094b9a66036d9763bdb433942fca21a78a3bb7619c5285271ee2d68be596c8ab`
 - `PLANS/BUZZ_CI_AGENT_LOOP.md` v1.6, SHA-256 `306a9631a374ce4fe3d326311aecc48abe35feacd07c84c8dc07bd2852e2a4d2`
-- `PLANS/BUZZ_CI_RELAY_API_CONTRACT.md` v1.0, SHA-256 `34268ffeda6470b6a4c5946aacceeca7e0cd9a1cf0eabd1c35b595bcb90786e6`
+- `docs/ci/BUZZ_CI_RELAY_API_CONTRACT.md` v1.1, SHA-256 `9e4727a55599150de762d26ec04186ca6a002ee79a9cf6d8a8dcd072fa7960f3`
 - `/home/victor/work/alpheus/Agent-Shared/PLANS/BUZZ_CI_THREAT_MODEL.md`, SHA-256 `2f127ef24dfe4b89a88e5b1d406287d7fb4e3de64c029c0c5aa127ce55a118be`
 - product source baseline `660f83c55de5190b0ec2fcb3d6bca43715c8cdbf`
 
@@ -215,7 +215,7 @@ A `url` is accepted only when it has the HTTP(S) origin corresponding to the act
 }
 ```
 
-Only allowlisted, quarantined, safely extracted, scanned, sanitized artifacts may receive a durable reference. No terminal green state may be signed before durable evidence publication and successful teardown. Kinds 46105 and 46106 are the explicit signed, run/attempt-bound evidence-finalized and lease-empty facts defined by the companion relay/API contract; terminal run `success` alone is insufficient for green.
+Only allowlisted, quarantined, safely extracted, scanned, sanitized artifacts may receive a durable reference. No terminal green state may be signed before durable evidence publication and successful teardown. Kinds 46105 and 46106 are the explicit signed evidence-finalized and lease-empty facts defined by the companion relay/API contract; terminal run `success` alone is insufficient for green. Kind 46106 binds the complete selected per-job attempt graph rather than one run-wide lease.
 
 ## 7. State transitions and verdict
 
@@ -235,7 +235,7 @@ running -> success | failure | cancelled | timed_out | infrastructure_failure
 
 Terminal states never transition. A rerun creates a new job-attempt stream; it never mutates prior attempts. Unknown states or illegal transitions fail closed.
 
-Verdict is green only when the requested `expect_sha` equals `tip_oid`, all signed-manifest required jobs are terminal-good at their selected attempt lineage, each required skip is permitted by signed `skip_policy`, and the reducer independently verifies the authorized kind-46105 evidence-finalized and kind-46106 lease-empty facts before terminal run success. Any non-terminal required job is pending. Required `failure`, `cancelled`, or `timed_out` is red. Infrastructure failure is separately reported and never presented as a code failure. Mixed-attempt selection, next-attempt derivation, transport routes, unique run lookup, signer authority, and watch replay/order are bound by `BUZZ_CI_RELAY_API_CONTRACT.md` v1.0.
+Verdict is green only when the requested `expect_sha` equals `tip_oid`, all signed-manifest required jobs are terminal-good at their selected attempt lineage, each required skip is permitted by signed `skip_policy`, and the reducer independently verifies the authorized kind-46105 evidence-finalized fact and kind-46106 exact selected-job lease-set fact before terminal run success. Any non-terminal required job is pending. Required `failure`, `cancelled`, or `timed_out` is red. Infrastructure failure is separately reported and never presented as a code failure. Mixed-attempt selection, next-attempt derivation, transport routes, unique run lookup, signer authority, and watch replay/order are bound by `BUZZ_CI_RELAY_API_CONTRACT.md` v1.1.
 
 ## 8. Frozen CLI contract
 

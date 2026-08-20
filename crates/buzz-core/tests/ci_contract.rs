@@ -7,8 +7,8 @@ use buzz_core::{
         validate_teardown_attestation_tags, CiArtifactReferenceEnvelope,
         CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope,
         CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState, CiRunStatusEnvelope,
-        CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope, CI_MAX_SAFE_INTEGER,
-        CI_PROTOCOL_CONTRACT_SHA256, CI_SCHEMA_VERSION,
+        CiSkipPolicy, CiTeardownAttestationEnvelope, CiTeardownLease, ValidatedCiEnvelope,
+        CI_MAX_SAFE_INTEGER, CI_PROTOCOL_CONTRACT_SHA256, CI_SCHEMA_VERSION,
     },
     kind::{
         is_workflow_execution_kind, ALL_KINDS, KIND_CI_ARTIFACT_REFERENCE,
@@ -168,8 +168,21 @@ fn valid_teardown_attestation() -> CiTeardownAttestationEnvelope {
         workflow_id: "required-ci".into(),
         target_repo_a: format!("30617:{}:buzz", "a".repeat(64)),
         tip_oid: "b".repeat(40),
-        attempt: 1,
-        lease_id: "lease-018f47a2-attempt-1".into(),
+        base_oid: "c".repeat(40),
+        workflow_digest: "e".repeat(64),
+        attempt: 2,
+        leases: vec![
+            CiTeardownLease {
+                job_id: "unit_linux".into(),
+                attempt: 1,
+                lease_id: "lease-unit-linux-attempt-1".into(),
+            },
+            CiTeardownLease {
+                job_id: "unit_macos".into(),
+                attempt: 2,
+                lease_id: "lease-unit-macos-attempt-2".into(),
+            },
+        ],
         lease_empty: true,
         teardown_at: 1_700_000_011,
         relay_signer: "d".repeat(64),
@@ -180,7 +193,7 @@ fn valid_teardown_attestation() -> CiTeardownAttestationEnvelope {
 fn ci_kinds_are_dedicated_and_outside_workflow_lifecycle() {
     assert_eq!(
         CI_PROTOCOL_CONTRACT_SHA256,
-        "ef411f5733b563d9b0804601cbe061ca94e5b225343025482dc25636ac6537f0"
+        "8b9715d719b057d5d297074c3d019e40d1d2104eeafa2b6033f17b465e7d5a1c"
     );
     assert_eq!(KIND_CI_REQUEST, 46100);
     assert_eq!(KIND_CI_RUN_STATUS, 46101);
@@ -655,6 +668,32 @@ fn explicit_terminal_facts_are_nonempty_unique_tag_bound_and_signer_authorized()
     not_empty.lease_empty = false;
     assert!(not_empty.validate().is_err());
 
+    let mut unsorted = teardown.clone();
+    unsorted.leases.swap(0, 1);
+    assert!(unsorted.validate().is_err());
+    let mut duplicate_job_attempt = teardown.clone();
+    duplicate_job_attempt.leases[1].job_id = duplicate_job_attempt.leases[0].job_id.clone();
+    duplicate_job_attempt.leases[1].attempt = duplicate_job_attempt.leases[0].attempt;
+    assert!(duplicate_job_attempt.validate().is_err());
+    let mut duplicate_lease = teardown.clone();
+    duplicate_lease.leases[1].lease_id = duplicate_lease.leases[0].lease_id.clone();
+    assert!(duplicate_lease.validate().is_err());
+    let mut invalid_job = teardown.clone();
+    invalid_job.leases[0].job_id = "bad-job".into();
+    assert!(invalid_job.validate().is_err());
+    let mut zero_attempt = teardown.clone();
+    zero_attempt.leases[0].attempt = 0;
+    assert!(zero_attempt.validate().is_err());
+    let mut empty_lease = teardown.clone();
+    empty_lease.leases[0].lease_id.clear();
+    assert!(empty_lease.validate().is_err());
+    let mut empty_lease_set = teardown.clone();
+    empty_lease_set.leases.clear();
+    assert!(empty_lease_set.validate().is_err());
+    let mut wrong_max_attempt = teardown.clone();
+    wrong_max_attempt.attempt = 1;
+    assert!(wrong_max_attempt.validate().is_err());
+
     let keys = Keys::generate();
     let mut signed_evidence = evidence;
     signed_evidence.relay_signer = keys.public_key().to_hex();
@@ -670,4 +709,62 @@ fn explicit_terminal_facts_are_nonempty_unique_tag_bound_and_signer_authorized()
         validate_signed_ci_event(&event, channel, &authorized).expect("authorized evidence"),
         ValidatedCiEnvelope::EvidenceFinalized(_)
     ));
+}
+
+#[test]
+fn teardown_context_binds_request_provenance_and_exact_selected_graph() {
+    let request_event_id = "1".repeat(64);
+    let mut request = valid_run_request();
+    request.run_id = "018f47a2-7f0f-7cc1-9a55-01f93e42b1e0".into();
+    request.workflow_id = "required-ci".into();
+    request.workflow_digest = "e".repeat(64);
+    request.target_repo_a = format!("30617:{}:buzz", "a".repeat(64));
+    request.tip_oid = "b".repeat(40);
+    request.base_oid = "c".repeat(40);
+    let teardown = valid_teardown_attestation();
+    let selected = vec![("unit_linux".into(), 1), ("unit_macos".into(), 2)];
+
+    teardown
+        .validate_context(&request_event_id, &request, &selected)
+        .expect("matching request and selected graph");
+
+    let mut wrong_provenance = teardown.clone();
+    wrong_provenance.workflow_digest = "f".repeat(64);
+    assert!(wrong_provenance
+        .validate_context(&request_event_id, &request, &selected)
+        .is_err());
+    assert!(teardown
+        .validate_context(&request_event_id, &request, &[("unit_linux".into(), 1)])
+        .is_err());
+    assert!(teardown
+        .validate_context(
+            &request_event_id,
+            &request,
+            &[("unit_linux".into(), 1), ("unit_linux".into(), 1)],
+        )
+        .is_err());
+    assert!(teardown
+        .validate_context(
+            &request_event_id,
+            &request,
+            &[("unit_linux".into(), 1), ("unit_linux".into(), 2)],
+        )
+        .is_err());
+}
+
+#[test]
+fn teardown_wire_shape_pins_provenance_and_canonical_lease_tuple_spelling() {
+    let json = serde_json::to_string(&valid_teardown_attestation()).expect("serialize teardown");
+    assert_eq!(
+        json,
+        format!(
+            "{{\"schema_version\":1,\"request_event_id\":\"{}\",\"run_id\":\"018f47a2-7f0f-7cc1-9a55-01f93e42b1e0\",\"workflow_id\":\"required-ci\",\"target_repo_a\":\"30617:{}:buzz\",\"tip_oid\":\"{}\",\"base_oid\":\"{}\",\"workflow_digest\":\"{}\",\"attempt\":2,\"leases\":[{{\"job_id\":\"unit_linux\",\"attempt\":1,\"lease_id\":\"lease-unit-linux-attempt-1\"}},{{\"job_id\":\"unit_macos\",\"attempt\":2,\"lease_id\":\"lease-unit-macos-attempt-2\"}}],\"lease_empty\":true,\"teardown_at\":1700000011,\"relay_signer\":\"{}\"}}",
+            "1".repeat(64),
+            "a".repeat(64),
+            "b".repeat(40),
+            "c".repeat(40),
+            "e".repeat(64),
+            "d".repeat(64),
+        )
+    );
 }

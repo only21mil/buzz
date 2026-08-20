@@ -1,8 +1,8 @@
 # BUZZ_CI_RELAY_API_CONTRACT.md — Phase-1 relay/API and reducer contract
 
-Status: **FROZEN v1.0 (2026-08-20)**
+Status: **CORRECTED TERMINAL-ATTESTATION BINDING v1.1 (2026-08-20)**
 
-Companion to `PLANS/BUZZ_CI_PROTOCOL_CONTRACT.md` v1.3. This artifact freezes the context-aware transport, trust, indexing, replay, attempt-selection, and terminal-attestation rules that the typed envelopes alone cannot enforce.
+Companion to `BUZZ_CI_PROTOCOL_CONTRACT.md` v1.4. This artifact freezes the context-aware transport, trust, indexing, replay, attempt-selection, and terminal-attestation rules that the typed envelopes alone cannot enforce.
 
 ## 1. Authority and authentication
 
@@ -121,17 +121,21 @@ Kind 46106 content:
   workflow_id,
   target_repo_a,
   tip_oid,
+  base_oid,
+  workflow_digest,
   attempt,
-  lease_id,
+  leases:[{job_id,attempt,lease_id}],
   lease_empty:true,
   teardown_at,
   relay_signer
 }
 ```
 
-The attestation is emitted only after the isolation substrate proves the attempt lease has no surviving workspace, process, mount, namespace, network rule, secret material, or writable state. `lease_empty=false` is invalid and cannot satisfy teardown.
+`leases` is a non-empty set encoded in strict ascending `(job_id,attempt,lease_id)` order. Job IDs use the static job grammar, attempts are one-based, every `{job_id,attempt}` occurs once, and every non-empty `lease_id` occurs once. The top-level `attempt` equals the maximum selected job attempt. The reducer derives the complete selected `{job_id,attempt}` graph from the accepted request and gap-free status lineage and requires exact set equality and cardinality: no missing, extra, duplicated, or stale lease can satisfy green.
 
-A terminal run `success` event alone is never green. The reducer independently verifies one authorized, run/attempt-bound evidence-finalized event and one authorized, run/attempt-bound lease-empty teardown event, both stored before the terminal success event. Missing, malformed, unauthorized, conflicting, or out-of-order facts produce `pending` while facts may still arrive, or `infrastructure_failure` once the run is terminal/fact deadline expires; they never produce green.
+The context-aware validator resolves `request_event_id` to the accepted kind-46100 request and requires exact equality of `run_id`, repository `a`, `tip_oid`, `base_oid`, `workflow_id`, and `workflow_digest`; `tip_oid` and `base_oid` must use the same supported OID width. The attestation is emitted only after the isolation substrate proves every listed per-job lease has no surviving workspace, process, mount, namespace, network rule, secret material, or writable state across its dedicated materializer, executor, and runtime principals. `lease_empty=false` is invalid and cannot satisfy teardown.
+
+A terminal run `success` event alone is never green. The reducer independently verifies one authorized evidence-finalized event and one authorized exact-selected-graph lease-empty teardown event, both stored before the terminal success event. Missing, malformed, unauthorized, conflicting, or out-of-order facts produce `pending` while facts may still arrive, or `infrastructure_failure` once the run is terminal/fact deadline expires; they never produce green.
 
 ## 6. Mixed attempts and reruns
 
@@ -169,4 +173,4 @@ Inline base64 encoded length is bounded from `cap_bytes` before allocation or de
 
 ## 9. Reducer green rule
 
-Green requires one immutable request identity, exact expected tip, legal and gap-free status histories, all signed-manifest required jobs terminal-good at their selected attempts, authorized durable evidence references, one valid kind-46105 fact, one valid kind-46106 fact, and terminal run success ordered after both facts. Any equivocation, signer failure, immutable-coordinate mismatch, evidence failure, teardown failure, or terminal missing-fact deadline becomes `infrastructure_failure`; required code/test failure remains red; non-terminal work remains pending.
+Green requires one immutable request identity, exact expected tip, legal and gap-free status histories, all signed-manifest required jobs terminal-good at their selected attempts, authorized durable evidence references, one valid kind-46105 fact, one valid kind-46106 fact whose lease tuples exactly equal the selected job-attempt graph, and terminal run success ordered after both facts. Any equivocation, signer failure, immutable-coordinate mismatch, evidence failure, teardown failure, or terminal missing-fact deadline becomes `infrastructure_failure`; required code/test failure remains red; non-terminal work remains pending.

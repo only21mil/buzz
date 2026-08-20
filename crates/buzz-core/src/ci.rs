@@ -17,9 +17,9 @@ use uuid::Uuid;
 pub const CI_SCHEMA_VERSION: u32 = 1;
 /// Largest integer represented exactly by JavaScript consumers.
 pub const CI_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-/// SHA-256 of `BUZZ_CI_PROTOCOL_CONTRACT.md` v1.3 implemented by this module.
+/// SHA-256 of `BUZZ_CI_PROTOCOL_CONTRACT.md` v1.4 implemented by this module.
 pub const CI_PROTOCOL_CONTRACT_SHA256: &str =
-    "ef411f5733b563d9b0804601cbe061ca94e5b225343025482dc25636ac6537f0";
+    "8b9715d719b057d5d297074c3d019e40d1d2104eeafa2b6033f17b465e7d5a1c";
 
 /// Validation failure for a CI envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -721,6 +721,17 @@ impl CiEvidenceFinalizedEnvelope {
     }
 }
 
+/// One selected job attempt and its dedicated isolation lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiTeardownLease {
+    /// Static job identifier.
+    pub job_id: String,
+    /// Selected one-based job attempt.
+    pub attempt: u32,
+    /// Job-attempt-scoped isolation lease identifier.
+    pub lease_id: String,
+}
+
 /// Lease-empty teardown fact for kind 46106.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTeardownAttestationEnvelope {
@@ -736,11 +747,15 @@ pub struct CiTeardownAttestationEnvelope {
     pub target_repo_a: String,
     /// Exact source tip object ID.
     pub tip_oid: String,
-    /// Top-level selected attempt.
+    /// Trusted base object ID.
+    pub base_oid: String,
+    /// SHA-256 of trusted-base workflow bytes.
+    pub workflow_digest: String,
+    /// Maximum selected job attempt.
     pub attempt: u32,
-    /// Attempt-scoped isolation lease identifier.
-    pub lease_id: String,
-    /// Must be true: the attempt lease is proven empty.
+    /// Every selected job attempt and its isolation lease, in canonical order.
+    pub leases: Vec<CiTeardownLease>,
+    /// Must be true: every listed lease is proven empty.
     pub lease_empty: bool,
     /// Teardown proof time in Unix seconds.
     pub teardown_at: u64,
@@ -762,8 +777,112 @@ impl CiTeardownAttestationEnvelope {
             self.teardown_at,
             &self.relay_signer,
         )?;
-        if self.lease_id.is_empty() || !self.lease_empty {
-            return Err(CiValidationError("teardown must prove a named lease empty"));
+        validate_hex(
+            &self.base_oid,
+            self.tip_oid.len(),
+            "invalid teardown base OID",
+        )?;
+        validate_hex(
+            &self.workflow_digest,
+            64,
+            "invalid teardown workflow digest",
+        )?;
+        if self.leases.is_empty() || !self.lease_empty {
+            return Err(CiValidationError(
+                "teardown must prove a non-empty lease set empty",
+            ));
+        }
+        let mut job_attempts = HashSet::new();
+        let mut lease_ids = HashSet::new();
+        let mut previous: Option<(&str, u32, &str)> = None;
+        for lease in &self.leases {
+            validate_job_id(&lease.job_id)?;
+            if lease.attempt == 0 || lease.lease_id.is_empty() {
+                return Err(CiValidationError("invalid teardown lease tuple"));
+            }
+            if !job_attempts.insert((lease.job_id.as_str(), lease.attempt)) {
+                return Err(CiValidationError("duplicate teardown job attempt"));
+            }
+            if !lease_ids.insert(lease.lease_id.as_str()) {
+                return Err(CiValidationError("duplicate teardown lease ID"));
+            }
+            let current = (
+                lease.job_id.as_str(),
+                lease.attempt,
+                lease.lease_id.as_str(),
+            );
+            if previous.is_some_and(|prior| prior >= current) {
+                return Err(CiValidationError(
+                    "teardown leases are not canonically sorted",
+                ));
+            }
+            previous = Some(current);
+        }
+        if self.attempt
+            != self
+                .leases
+                .iter()
+                .map(|lease| lease.attempt)
+                .max()
+                .unwrap_or(0)
+        {
+            return Err(CiValidationError(
+                "teardown attempt must equal maximum selected job attempt",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bind this fact to the accepted request and the reducer's selected job-attempt graph.
+    pub fn validate_context(
+        &self,
+        request_event_id: &str,
+        request: &CiRequestEnvelope,
+        selected_job_attempts: &[(String, u32)],
+    ) -> Result<(), CiValidationError> {
+        self.validate()?;
+        request.validate()?;
+        if self.request_event_id != request_event_id
+            || self.run_id != request.run_id
+            || self.workflow_id != request.workflow_id
+            || self.workflow_digest != request.workflow_digest
+            || self.target_repo_a != request.target_repo_a
+            || self.tip_oid != request.tip_oid
+            || self.base_oid != request.base_oid
+        {
+            return Err(CiValidationError(
+                "teardown provenance does not match accepted request",
+            ));
+        }
+        validate_hex(request_event_id, 64, "invalid accepted request event ID")?;
+        if selected_job_attempts.is_empty() {
+            return Err(CiValidationError("selected job-attempt graph is empty"));
+        }
+        let selected: HashSet<(&str, u32)> = selected_job_attempts
+            .iter()
+            .map(|(job_id, attempt)| (job_id.as_str(), *attempt))
+            .collect();
+        let selected_job_ids: HashSet<&str> = selected_job_attempts
+            .iter()
+            .map(|(job_id, _)| job_id.as_str())
+            .collect();
+        if selected.len() != selected_job_attempts.len()
+            || selected_job_ids.len() != selected_job_attempts.len()
+            || selected
+                .iter()
+                .any(|(job_id, attempt)| *attempt == 0 || validate_job_id(job_id).is_err())
+        {
+            return Err(CiValidationError("invalid selected job-attempt graph"));
+        }
+        let attested: HashSet<(&str, u32)> = self
+            .leases
+            .iter()
+            .map(|lease| (lease.job_id.as_str(), lease.attempt))
+            .collect();
+        if attested != selected {
+            return Err(CiValidationError(
+                "teardown leases do not exactly match selected job attempts",
+            ));
         }
         Ok(())
     }
