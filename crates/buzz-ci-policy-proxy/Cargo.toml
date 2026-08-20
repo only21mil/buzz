@@ -1,0 +1,21 @@
+[package]
+name = "buzz-ci-policy-proxy"
+description = "Fail-closed Docker API admission proxy for Buzz CI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }
+hex = { workspace = true }
+nix = { version = "0.31", default-features = false, features = ["socket", "user"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
