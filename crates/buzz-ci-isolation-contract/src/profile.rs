@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::ContractError;
 
+/// Exact Phase-1 seccomp profile path provisioned by the trusted broker.
+pub const PHASE1_SECCOMP_PROFILE_PATH: &str = "/var/lib/buzzci/seccomp/v1/sha256/2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4.json";
+
+/// SHA-256 digest of the exact Phase-1 seccomp profile bytes.
+pub const PHASE1_SECCOMP_PROFILE_DIGEST: &str =
+    "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4";
+
 /// Qualified container engine implementation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +83,10 @@ pub struct IsolationProfile {
     pub engine_version: String,
     /// Exact canonical architecture qualified by host acceptance tests.
     pub arch: String,
+    /// Broker-provisioned content-addressed seccomp profile path.
+    pub seccomp_profile_path: String,
+    /// SHA-256 digest of the broker-provisioned seccomp profile bytes.
+    pub seccomp_profile_digest: String,
     /// Resource limits that must equal the cgroup lease limits.
     pub limits: ResourceLimits,
     /// Execution-network policy.
@@ -105,6 +116,18 @@ impl IsolationProfile {
             return Err(ContractError::mismatch(
                 "isolation_profile.arch",
                 "profile does not match the qualified host architecture",
+            ));
+        }
+        if self.seccomp_profile_path != PHASE1_SECCOMP_PROFILE_PATH {
+            return Err(ContractError::mismatch(
+                "isolation_profile.seccomp_profile_path",
+                "profile does not match the Phase-1 seccomp path",
+            ));
+        }
+        if self.seccomp_profile_digest != PHASE1_SECCOMP_PROFILE_DIGEST {
+            return Err(ContractError::mismatch(
+                "isolation_profile.seccomp_profile_digest",
+                "profile does not match the Phase-1 seccomp digest",
             ));
         }
         self.limits.validate()?;

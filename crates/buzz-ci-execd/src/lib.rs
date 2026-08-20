@@ -11,6 +11,8 @@ use buzz_ci_broker_protocol::{
     BrokerResponse, BrokerState, Conclusion, FrameHeader, Request, ResponseCode,
 };
 
+pub mod seccomp;
+
 pub const FORBIDDEN_ENVIRONMENT_KEYS: &[&str] = &[
     "BUZZ_RELAY_PRIVATE_KEY",
     "BUZZ_PRIVATE_KEY",
