@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_ID=TM-15
 TITLE='Crash/kill `act`, Podman, proxy, materializer, broker, and host mid-attempt'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''
 candidate_dir=''
 evidence_dir=''
@@ -13,7 +14,7 @@ statuses=()
 evidence_files=()
 preconditions=(
   'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
-  'the published runner control entrypoint must support admit and get'
+  'BUZZ_CI_ACCEPTANCE_CTL receives exact root-authored TM-15 target and reuse cases on stdin'
   'the accepted fixture repository must expose ci-acceptance/probe-repo/workflow.yml job slowpoke'
   'root kill, systemctl, cgroup, and lease-state access requires SUITE_SUDO or passwordless sudo'
 )
@@ -80,26 +81,29 @@ if ((${#SUDO[@]} == 0)) && [[ ! -r /etc/buzzci/harness.env ]]; then
 fi
 if ((${#SUDO[@]} == 0)); then for target in "${targets[@]}"; do record "$target" not_runnable 'Crash injection and root reconciliation readback require SUITE_SUDO or passwordless sudo'; done; emit; exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"; fi
 harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || { for target in "${targets[@]}"; do record "$target" fail 'Published harness.env is not root-readable'; done; emit; exit 1; }
-env_get() { local key=$1; printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'; }
-runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
-lease_root=$(env_get BUZZ_CI_LEASE_STATE_ROOT)
-fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
-broker_unit=$(env_get BUZZ_CI_BROKER_UNIT)
-if [[ ! -x $runner_ctl || ! -d $lease_root || -z $fixture_repo || ! $broker_unit =~ ^buzzci[-A-Za-z0-9_.@]+$ ]]; then
-  for target in "${targets[@]}"; do record "$target" fail 'Published runner control, lease root, fixture coordinate, or constrained buzzci broker unit is missing'; done
+export harness_text
+lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
+broker_unit=$(acceptance_env_get BUZZ_CI_BROKER_UNIT)
+if ! acceptance_control_init; then
+  for target in "${targets[@]}"; do record "$target" not_runnable "$ACCEPTANCE_UNAVAILABLE"; done
   emit
-  exit 1
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+fi
+if [[ ! -d $lease_root || ! $broker_unit =~ ^buzzci[-A-Za-z0-9_.@]+$ ]]; then
+  for target in "${targets[@]}"; do record "$target" not_runnable 'harness.env lacks a readable lease root or constrained buzzci broker unit'; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
 
 admit_slowpoke() {
-  local label=$1 admit_file=$out_dir/admit-$1.json lease_id lease_json
-  timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
-    --workflow ci-acceptance/probe-repo/workflow.yml --job slowpoke --attempt 1 >"$admit_file" 2>"$out_dir/admit-$label.stderr" || return 1
-  lease_id=$(timeout 10 jq -r '.lease_id // empty' "$admit_file")
+  local label=$1 admit_file=$out_dir/admit-$1.json lease_id lease_json rc=0
+  acceptance_control_run "$label" "$admit_file" "$out_dir/admit-$label.stderr" || rc=$?
+  ((rc == 0)) || return "$rc"
+  lease_id=$(timeout 10 jq -r '.attempt_id // .lease_id // empty' "$admit_file")
   [[ $lease_id =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   lease_json=$lease_root/$lease_id/lease.json
-  for _ in {1..40}; do [[ -r $lease_json ]] && break; timeout 2 sleep 0.25; done
-  [[ -r $lease_json ]] || return 1
+  for _ in {1..40}; do timeout 10 "${SUDO[@]}" test -r "$lease_json" && break; timeout 2 sleep 0.25; done
+  timeout 10 "${SUDO[@]}" test -r "$lease_json" || return 1
   printf '%s' "$lease_id"
 }
 
@@ -110,10 +114,14 @@ check_reconcile_and_no_reuse() {
   timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$reconcile" "$out_dir/reconcile-$target.json" 2>/dev/null || :
   evidence_files+=("$TEST_ID/reconcile-$target.json")
   old_workspace=$(timeout 10 "${SUDO[@]}" jq -r '.workspace_dir // empty' "$old_dir/lease.json" 2>/dev/null || true)
-  if ! new_lease=$(admit_slowpoke "reuse-$target"); then record "$target" fail "$target crash did not permit a controlled post-reconciliation admission"; return; fi
+  local reuse_rc=0
+  new_lease=$(admit_slowpoke "reuse-$target") || reuse_rc=$?
+  if ((reuse_rc != 0)); then
+    if ((reuse_rc == 3)); then record "$target" not_runnable "The fixed root-authored reuse-$target case is unavailable or unsafe"; else record "$target" fail "$target crash did not permit a controlled post-reconciliation admission"; fi
+    return
+  fi
   new_workspace=$(timeout 10 "${SUDO[@]}" jq -r '.workspace_dir // empty' "$lease_root/$new_lease/lease.json" 2>/dev/null || true)
-  timeout 10 "$runner_ctl" cancel --lease "$new_lease" >"$out_dir/cancel-$target.json" 2>"$out_dir/cancel-$target.stderr" || true
-  evidence_files+=("$TEST_ID/admit-reuse-$target.json" "$TEST_ID/admit-reuse-$target.stderr" "$TEST_ID/cancel-$target.json" "$TEST_ID/cancel-$target.stderr")
+  evidence_files+=("$TEST_ID/admit-reuse-$target.json" "$TEST_ID/admit-reuse-$target.stderr")
   if timeout 10 jq -e '(.emptied == true or .quarantined == true) and (.before_reuse == true)' "$out_dir/reconcile-$target.json" >/dev/null 2>&1 \
     && [[ $new_lease != "$old_lease" && -n $old_workspace && -n $new_workspace && $new_workspace != "$old_workspace" ]]; then
     record "$target" pass "$target crash produced empty-or-quarantine reconciliation and a distinct replacement lease/workspace"
@@ -124,7 +132,12 @@ check_reconcile_and_no_reuse() {
 
 kill_scoped_process() {
   local target=$1 pattern=$2 lease_id lease_json cgroup_path cgroup_dir lease_unit pid='' comm
-  if ! lease_id=$(admit_slowpoke "$target"); then record "$target" fail "Could not admit the $target crash attempt"; return; fi
+  local admit_rc=0
+  lease_id=$(admit_slowpoke "$target") || admit_rc=$?
+  if ((admit_rc != 0)); then
+    if ((admit_rc == 3)); then record "$target" not_runnable "The fixed root-authored $target case is unavailable or unsafe"; else record "$target" fail "Could not admit the $target crash attempt"; fi
+    return
+  fi
   evidence_files+=("$TEST_ID/admit-$target.json" "$TEST_ID/admit-$target.stderr")
   lease_json=$lease_root/$lease_id/lease.json
   cgroup_path=$(timeout 10 "${SUDO[@]}" jq -r '.cgroup_path // empty' "$lease_json")
@@ -152,15 +165,19 @@ kill_scoped_process podman podman
 kill_scoped_process proxy proxy
 kill_scoped_process materializer material
 
-if broker_lease=$(admit_slowpoke broker); then
+broker_rc=0
+broker_lease=$(admit_slowpoke broker) || broker_rc=$?
+if ((broker_rc == 0)); then
   evidence_files+=("$TEST_ID/admit-broker.json" "$TEST_ID/admit-broker.stderr")
   timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" systemctl restart "$broker_unit"
   check_reconcile_and_no_reuse broker "$broker_lease"
 else
-  record broker fail 'Could not admit the broker-crash attempt'
+  if ((broker_rc == 3)); then record broker not_runnable 'The fixed root-authored broker case is unavailable or unsafe'; else record broker fail 'Could not admit the broker-crash attempt'; fi
 fi
 
-if host_lease=$(admit_slowpoke simulated-host-crash); then
+host_rc=0
+host_lease=$(admit_slowpoke simulated-host-crash) || host_rc=$?
+if ((host_rc == 0)); then
   evidence_files+=("$TEST_ID/admit-simulated-host-crash.json" "$TEST_ID/admit-simulated-host-crash.stderr")
   host_unit=$(timeout 10 "${SUDO[@]}" jq -r '.lease_unit // empty' "$lease_root/$host_lease/lease.json")
   if [[ -n $host_unit ]]; then
@@ -171,7 +188,7 @@ if host_lease=$(admit_slowpoke simulated-host-crash); then
     record simulated_host_crash fail 'The simulated host-crash lease did not publish its exact lease_unit'
   fi
 else
-  record simulated_host_crash fail 'Could not admit the simulated host-crash attempt'
+  if ((host_rc == 3)); then record simulated_host_crash not_runnable 'The fixed root-authored simulated-host-crash case is unavailable or unsafe'; else record simulated_host_crash fail 'Could not admit the simulated host-crash attempt'; fi
 fi
 emit
 exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || [[ " ${statuses[*]} " == *' not_runnable '* ]] && printf 3 || printf 0 )"

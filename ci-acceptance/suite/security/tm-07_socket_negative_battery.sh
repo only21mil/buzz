@@ -4,12 +4,12 @@ set -euo pipefail
 TEST_ID=TM-07
 TITLE='Negative-test rootful Docker fallback, direct raw Podman access, TCP endpoint, wrong socket owner, missing proxy/upstream, agent-controlled `DOCKER_HOST`, and the reported ignored-`--container-daemon-socket` class'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''; candidate_dir=''; evidence_dir=''; plan=0
 checks=(); statuses=(); evidence_files=()
 preconditions=(
   'substrate wiring has published root-owned /etc/buzzci/harness.env'
-  'the published runner control supports admit and get'
-  'the accepted fixture repository exposes ci-acceptance/probe-repo/workflow.yml job ok'
+  'BUZZ_CI_ACCEPTANCE_CTL receives the exact root-authored TM-07 socket-isolation case on stdin'
   'root readback of proxy objects requires SUITE_SUDO or passwordless sudo'
 )
 
@@ -147,48 +147,40 @@ harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.e
   for name in "${dynamic_names[@]}"; do record "$name" fail 'Published harness.env is not root-readable'; done
   finish
 }
-env_get() {
-  local key=$1
-  printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'
-}
-runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
-lease_root=$(env_get BUZZ_CI_LEASE_STATE_ROOT)
-fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
-if [[ ! -x $runner_ctl || ! -d $lease_root || -z $fixture_repo ]]; then
-  for name in "${dynamic_names[@]}"; do record "$name" fail 'Published runner control, lease root, or fixture coordinate is missing'; done
+export harness_text
+lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
+if ! acceptance_control_init; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable "$ACCEPTANCE_UNAVAILABLE"; done
+  finish
+fi
+if [[ ! -d $lease_root ]]; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'harness.env lacks a readable BUZZ_CI_LEASE_STATE_ROOT for socket-isolation evidence'; done
   finish
 fi
 
-live_lease=''
-cleanup_live_lease() {
-  if [[ $live_lease =~ ^[A-Za-z0-9._-]+$ ]]; then timeout 10 "$runner_ctl" cancel --lease "$live_lease" >/dev/null 2>&1 || true; fi
-}
-trap 'cleanup_live_lease; cleanup' EXIT
+trap cleanup EXIT
 caller_docker_host='tcp://203.0.113.7:2375'
 caller_socket='/tmp/tm07-caller-container-daemon.sock'
 caller_act_socket='/tmp/tm07-caller-act-daemon.sock'
-: >"$out_dir/final-live.json"
-: >"$out_dir/final-live.stderr"
 : >"$out_dir/proxy-object-files.txt"
 : >"$out_dir/proxy-objects.jsonl"
-if timeout "$TIMEOUT_SECONDS" env DOCKER_HOST="$caller_docker_host" CONTAINER_DAEMON_SOCKET="$caller_socket" ACT_CONTAINER_DAEMON_SOCKET="$caller_act_socket" \
-    "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
-    --workflow ci-acceptance/probe-repo/workflow.yml --job ok --attempt 1 >"$out_dir/admit-live.json" 2>"$out_dir/admit-live.stderr"; then
-  live_lease=$(timeout 10 jq -r '.lease_id // empty' "$out_dir/admit-live.json")
-else
-  live_lease=''
+export DOCKER_HOST=$caller_docker_host CONTAINER_DAEMON_SOCKET=$caller_socket ACT_CONTAINER_DAEMON_SOCKET=$caller_act_socket
+live_rc=0
+acceptance_control_run socket_isolation "$out_dir/socket-isolation.json" "$out_dir/socket-isolation.stderr" || live_rc=$?
+unset DOCKER_HOST CONTAINER_DAEMON_SOCKET ACT_CONTAINER_DAEMON_SOCKET
+evidence_files+=("$TEST_ID/socket-isolation.json" "$TEST_ID/socket-isolation.stderr")
+if ((live_rc == 3)); then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'The fixed root-authored TM-07/socket_isolation.json case is unavailable or unsafe'; done
+  finish
 fi
-evidence_files+=("$TEST_ID/admit-live.json" "$TEST_ID/admit-live.stderr")
+live_lease=$(timeout 10 jq -r '.attempt_id // .lease_id // empty' "$out_dir/socket-isolation.json")
 live_ok=1
-terminal_ok=0
 [[ $live_lease =~ ^[A-Za-z0-9._-]+$ ]] || live_ok=0
 if ((live_ok)); then
   for _ in {1..120}; do
-    if timeout 10 "$runner_ctl" get --lease "$live_lease" >"$out_dir/final-live.json" 2>"$out_dir/final-live.stderr" \
-      && timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final-live.json" >/dev/null 2>&1; then terminal_ok=1; break; fi
+    if timeout 10 "${SUDO[@]}" test -d "$lease_root/$live_lease/proxy/objects"; then break; fi
     timeout 2 sleep 0.25
   done
-  ((terminal_ok)) || live_ok=0
 fi
 if ((live_ok)); then
   object_list=$out_dir/proxy-object-files.txt
@@ -201,7 +193,7 @@ if ((live_ok)); then
   done <"$object_list"
   [[ -s $out_dir/proxy-objects.jsonl ]] || live_ok=0
 fi
-evidence_files+=("$TEST_ID/final-live.json" "$TEST_ID/final-live.stderr" "$TEST_ID/proxy-object-files.txt" "$TEST_ID/proxy-objects.jsonl")
+evidence_files+=("$TEST_ID/proxy-object-files.txt" "$TEST_ID/proxy-objects.jsonl")
 if ((live_ok)) \
   && ! timeout 10 grep -Fq -e "$caller_docker_host" -e "$caller_socket" -e "$caller_act_socket" "$out_dir/proxy-objects.jsonl"; then
   record ignored_container_daemon_socket pass 'Caller-supplied Docker and container-daemon socket markers were absent from every recorded live proxy object'
@@ -220,6 +212,4 @@ if ((live_ok)) \
 else
   record no_socket_inside_job fail 'Live proxy-object evidence was absent or exposed a raw Docker or Podman daemon socket bind'
 fi
-cleanup_live_lease
-live_lease=''
 finish

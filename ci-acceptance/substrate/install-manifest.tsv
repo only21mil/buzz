@@ -1,0 +1,12 @@
+# source	destination	owner	group	mode	kind
+-	/etc/buzzci	root	root	0755	directory
+-	/etc/buzzci/qualification-cases	root	root	0755	directory
+cargo-bin:buzz-ci-execd	/usr/libexec/buzz-ci-execd	root	root	0755	compiled-binary
+cargo-bin:buzz-ci-acceptance-ctl	/usr/libexec/buzz-ci-acceptance-ctl	root	buzzci-ctl	0750	compiled-binary
+buzz-ci-execd.service	/etc/systemd/system/buzz-ci-execd.service	root	root	0644	file
+buzz-ci-execd.socket	/etc/systemd/system/buzz-ci-execd.socket	root	root	0644	file
+buzz-ci-acceptance-ctl.sudoers	/etc/sudoers.d/buzz-ci-acceptance-ctl	root	root	0440	file
+buzzci-control.tmpfiles	/usr/lib/tmpfiles.d/buzzci-control.conf	root	root	0644	file
+rendered:harness.env.plan	/etc/buzzci/harness.env	root	root	0400	rendered-file
+principals.tsv	/usr/share/buzzci/substrate/principals.tsv	root	root	0444	file
+qualification-cases.plan	/usr/share/buzzci/substrate/qualification-cases.plan	root	root	0444	file

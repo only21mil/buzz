@@ -8,13 +8,13 @@ fn main() -> ExitCode {
             println!("buzz-ci-runner {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        (None, None) => {
-            eprintln!(r#"{{"error":"not_provisioned","capacity":0}}"#);
-            ExitCode::from(4)
+        (Some(arg), None) if arg == "--help" || arg == "-h" => {
+            println!("usage: buzz-ci-runner [--help|--version]");
+            ExitCode::SUCCESS
         }
         _ => {
-            eprintln!(r#"{{"error":"usage","expected":"--version"}}"#);
-            ExitCode::from(1)
+            eprintln!(r#"{{"error":"service_wiring_unavailable"}}"#);
+            ExitCode::from(4)
         }
     }
 }
