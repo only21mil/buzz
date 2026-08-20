@@ -10,7 +10,7 @@ evidence_dir=""
 plan=0
 checks=()
 evidence_files=()
-preconditions=("Rust toolchain and candidate broker crates" "buzz-ci-execd listening socket and broker config path published by the substrate wiring")
+preconditions=("Rust toolchain and candidate broker crates" "root-readable /etc/buzzci/harness.env publishing BUZZ_CI_EXECD_SOCKET")
 saw_fail=0
 saw_not_runnable=0
 
@@ -51,7 +51,7 @@ if ((plan)); then
   add_check dependency_posture plan "Inspect normal dependencies for network, TLS, HTTP, and key crates."
   add_check static_capability_scan plan "Scan execd source for network, process launch, HTTP, and relay-key access."
   add_check protocol_zero_dependencies plan "Require zero normal dependencies in broker-protocol."
-  add_check broker_ipc_unreachable plan "Verify agents cannot reach published broker IPC and configuration."
+  add_check broker_ipc_unreachable plan "Read the root-owned harness and verify agents cannot write the published execd socket."
   emit_result plan false "Plan only; no build, command, or filesystem write was performed." 0
 fi
 
@@ -188,19 +188,37 @@ else
   add_check protocol_zero_dependencies fail "buzz-ci-broker-protocol has one or more normal dependencies."
 fi
 
-if [[ -z ${BUZZ_CI_BROKER_SOCKET:-} || -z ${BUZZ_CI_BROKER_CONFIG:-} ]]; then
-  add_check broker_ipc_unreachable not_runnable "Broker socket and config paths have not been published by substrate wiring."
+harness=/etc/buzzci/harness.env
+sudo_cmd=()
+if [[ -n ${SUITE_SUDO+x} ]]; then
+  read -r -a sudo_cmd <<<"$SUITE_SUDO"
+elif timeout 5 sudo -n true >/dev/null 2>&1; then
+  sudo_cmd=(sudo -n)
+fi
+if [[ ! -e $harness ]]; then
+  add_check broker_ipc_unreachable not_runnable "Substrate wiring has not published /etc/buzzci/harness.env."
+elif ((${#sudo_cmd[@]} == 0)); then
+  add_check broker_ipc_unreachable not_runnable "Root harness readback requires SUITE_SUDO or passwordless sudo."
 else
-  ipc_file="$tm_dir/ipc-permissions.txt"
   set +e
-  timeout "$timeout_seconds" stat -Lc '%n mode=%a uid=%u gid=%g type=%F' "$BUZZ_CI_BROKER_SOCKET" "$BUZZ_CI_BROKER_CONFIG" >"$ipc_file" 2>&1
-  ipc_rc=$?
+  harness_text=$(timeout "$timeout_seconds" "${sudo_cmd[@]}" cat "$harness" 2>/dev/null)
+  harness_rc=$?
   set -e
-  evidence_files+=("$TEST_ID/ipc-permissions.txt")
-  if ((ipc_rc == 0)) && [[ ! -r $BUZZ_CI_BROKER_CONFIG && ! -w $BUZZ_CI_BROKER_SOCKET ]]; then
-    add_check broker_ipc_unreachable pass "Published broker configuration is unreadable and socket is unwritable by this account."
+  execd_socket=$(printf '%s\n' "$harness_text" | timeout 10 awk -F= '$1=="BUZZ_CI_EXECD_SOCKET"{print substr($0,index($0,"=")+1); exit}')
+  if ((harness_rc != 0)) || [[ -z $execd_socket ]]; then
+    add_check broker_ipc_unreachable fail "The root harness is unreadable or omits BUZZ_CI_EXECD_SOCKET."
   else
-    add_check broker_ipc_unreachable fail "This account can reach broker configuration or IPC, or paths are invalid."
+    ipc_file="$tm_dir/ipc-permissions.txt"
+    set +e
+    timeout "$timeout_seconds" stat -Lc '%n mode=%a uid=%u gid=%g type=%F' "$execd_socket" >"$ipc_file" 2>&1
+    ipc_rc=$?
+    set -e
+    evidence_files+=("$TEST_ID/ipc-permissions.txt")
+    if ((ipc_rc == 0)) && [[ ! -w $execd_socket ]]; then
+      add_check broker_ipc_unreachable pass "The published execd socket is unwritable by this account."
+    else
+      add_check broker_ipc_unreachable fail "This account can write the published execd socket, or the socket path is invalid."
+    fi
   fi
 fi
 

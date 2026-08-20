@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 pub mod activation;
+pub mod evidence;
+pub mod harness;
 
 use buzz_ci_broker_protocol::{
     BrokerResponse, BrokerState, Conclusion, FrameHeader, Request, ResponseCode,

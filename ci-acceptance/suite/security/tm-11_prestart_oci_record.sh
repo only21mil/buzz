@@ -69,7 +69,7 @@ else
       timeout "$TIMEOUT_SECONDS" jq -c '{object_id:(.object_id//.container_id//.id),recorded_ns:(.recorded_ns//.recorded_at_ns//.timestamp_ns),start_ns:(.start_ns//.started_at_ns),effective_spec:(.effective_spec//.effective//.approved_spec)}' "$f" >>"$live" 2>&1||live_ok=0
       object_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.object_id//.container_id//.id//empty' "$f" 2>/dev/null||true)
       recorded_ns=$(timeout "$TIMEOUT_SECONDS" jq -r '.recorded_ns//.recorded_at_ns//.timestamp_ns//empty' "$f" 2>/dev/null||true)
-      start_ns=$(timeout "$TIMEOUT_SECONDS" jq -r --arg id "$object_id" '[select((.event//.name//"")|test("start")) | select(($id=="") or ((.object_id//.container_id//"")==$id)) | (.timestamp_ns//.monotonic_ns//.unix_ns)] | min // empty' "$ordering" 2>/dev/null||true)
+      start_ns=$(timeout "$TIMEOUT_SECONDS" jq -r --arg id "$object_id" '[select((.event//.name//"")|test("start")) | select(($id=="") or ((.object_id//.container_id//"")==$id)) | (.timestamp_unix_ns//.timestamp_ns//.monotonic_ns//.unix_ns)] | min // empty' "$ordering" 2>/dev/null||true)
       [[ $recorded_ns =~ ^[0-9]+$ && $start_ns =~ ^[0-9]+$ && $recorded_ns -lt $start_ns ]]||live_ok=0
       timeout "$TIMEOUT_SECONDS" jq -e '
         (.effective_spec//.effective//.approved_spec) as $s |
