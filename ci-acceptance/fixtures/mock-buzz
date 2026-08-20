@@ -214,9 +214,11 @@ logs_command() {
   local log_json
   log_json=$(jq -c --arg job "$job_id" --argjson attempt "$attempt" '.jobs[] | select(.name == $job) | .logs[] | select(.attempt == $attempt)' "$file" | tail -n 1)
   [[ -n "$log_json" ]] || error_json 1 log_not_found 'requested attempt log is unavailable'
-  jq -cn --arg run_id "$run_id" --arg sha "$(jq -r '.sha' "$file")" --arg job_id "$job_id" --argjson log "$log_json" '{
+  local inline
+  inline=$(jq -j '.content' <<<"$log_json" | base64 | tr -d '\n')
+  jq -cn --arg run_id "$run_id" --arg sha "$(jq -r '.sha' "$file")" --arg job_id "$job_id" --arg inline "$inline" --argjson log "$log_json" '{
     run_id:$run_id,sha:$sha,job_id:$job_id,attempt:$log.attempt,log_sha256:$log.log_sha256,size:$log.size,
-    url_or_inline:$log.content,truncated:false,cap_bytes:1048576
+    cap_bytes:1048576,truncated:false,url_or_inline:$inline
   }'
 }
 
@@ -238,6 +240,10 @@ rerun_command() {
   job_attempt=$(jq -r --arg job "$job_id" '.jobs[] | select(.name == $job) | .attempt' "$file")
   [[ -n "$job_state" ]] || error_json 1 job_not_found 'unknown job'
   [[ "$job_state" == success || "$job_state" == failure || "$job_state" == cancelled || "$job_state" == timed_out || "$job_state" == skipped ]] || error_json 1 job_not_terminal 'job is not terminal'
+  if [[ "$job_state" != failure ]]; then
+    jq -cn --arg error job_not_failed --arg run_id "$run_id" --arg job_id "$job_id" --argjson attempt "$job_attempt" --arg state "$job_state" '{error:$error,run_id:$run_id,job_id:$job_id,attempt:$attempt,state:$state}'
+    exit 1
+  fi
   ((job_attempt < 5)) || error_json 1 attempt_limit 'job attempt limit reached'
   local next_attempt=$((job_attempt + 1))
   local tmp="$file.tmp.$$"
@@ -269,13 +275,19 @@ verdict_command() {
     jq -cn --arg requested "$expected_sha" --arg resolved "$actual_sha" '{error:"sha_mismatch",requested:$requested,resolved:$resolved}'
     exit 1
   fi
-  local state terminal_count total_count required_failing
+  local state terminal_count total_count attempt reason required_failing
   state=$(jq -r '.state' "$file")
   terminal_count=$(jq '[.jobs[] | select(.state == "success" or .state == "failure" or .state == "cancelled" or .state == "timed_out" or .state == "skipped")] | length' "$file")
   total_count=$(jq '.jobs | length' "$file")
+  attempt=$(jq -r '.attempt' "$file")
+  if [[ "$state" == infrastructure_failure ]]; then
+    reason=$(jq -r '.reason // empty' "$file")
+    jq -cn --arg run_id "$run_id" --arg sha "$actual_sha" --argjson attempt "$attempt" --arg verdict infrastructure_failure --argjson jobs_terminal "$terminal_count" --argjson jobs_total "$total_count" --arg reason "$reason" '{run_id:$run_id,sha:$sha,attempt:$attempt,verdict:$verdict,jobs_terminal:$jobs_terminal,jobs_total:$jobs_total,required_failing:[],reason:$reason}'
+    exit 4
+  fi
   required_failing=$(jq -c '[.jobs[] | select(.required == true and (.state != "success" and .state != "skipped")) | .name]' "$file")
   local verdict=pending
-  if [[ "$state" == success || "$state" == failure || "$state" == cancelled || "$state" == infrastructure_failure ]]; then
+  if [[ "$state" == success || "$state" == failure || "$state" == cancelled ]]; then
     if [[ "$required_failing" == "[]" ]]; then verdict=green; else verdict=red; fi
   fi
   jq -cn --arg run_id "$run_id" --arg sha "$actual_sha" --arg verdict "$verdict" --arg jobs_terminal "$terminal_count/$total_count" --argjson required_failing "$required_failing" '{run_id:$run_id,sha:$sha,verdict:$verdict,jobs_terminal:$jobs_terminal,required_failing:$required_failing}'

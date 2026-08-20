@@ -71,4 +71,21 @@ if [[ -n "$watch_output" ]]; then
 fi
 record_assertion "terminal_reason_for_dropped_run" "$pass" "watch ends on infrastructure_failure/cancelled with a reason"
 
+verdict_output=
+verdict_rc=4
+if [[ -n "$run_id" ]]; then
+  capture_cli ci verdict --run "$run_id" --expect-sha "$BUZZ_CI_SHA"
+  verdict_output=$CAPTURE_STDOUT
+  verdict_rc=$CAPTURE_EXIT
+fi
+
+pass=false
+if assert_exit 4 "$verdict_rc" && assert_json "$verdict_output"; then
+  verdict_bound=$(jq -cn --arg expected_run_id "$run_id" --arg expected_sha "$BUZZ_CI_SHA" --argjson response "$verdict_output" '{expected_run_id:$expected_run_id,expected_sha:$expected_sha,response:$response}')
+  if assert_jq '.response.run_id == .expected_run_id and .response.sha == .expected_sha and .response.attempt == 1 and .response.verdict == "infrastructure_failure" and .response.verdict != "red" and (.response.required_failing == []) and (.response.reason | type == "string") and (.response.reason | length > 0) and (.response.jobs_terminal | type == "number") and (.response.jobs_total | type == "number")' "$verdict_bound"; then
+    pass=true
+  fi
+fi
+record_assertion "infrastructure_verdict_exit_four" "$pass" "infrastructure verdict exits 4 with a distinct verdict and reason"
+
 probe_finish

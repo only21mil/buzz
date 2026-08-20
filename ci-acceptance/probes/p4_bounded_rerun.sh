@@ -71,6 +71,17 @@ if [[ -n "$initial_terminal" ]] && assert_jq 'any(.jobs[]; .name == "flaky" and 
 fi
 record_assertion "initial_flaky_failure" "$pass" "initial terminal view has flaky failure at attempt 1"
 
+capture_cli ci rerun --run "$run_id" --job ok
+terminal_success_rerun_error=$(failure_json || true)
+pass=false
+if assert_exit 1 "$CAPTURE_EXIT" && assert_json "$terminal_success_rerun_error"; then
+  terminal_success_bound=$(jq -cn --arg expected_run_id "$run_id" --argjson response "$terminal_success_rerun_error" '{expected_run_id:$expected_run_id,response:$response}')
+  if assert_jq '.response.error == "job_not_failed" and .response.run_id == .expected_run_id and .response.job_id == "ok" and .response.attempt == 1 and .response.state == "success"' "$terminal_success_bound"; then
+    pass=true
+  fi
+fi
+record_assertion "rerun_terminal_success_refused" "$pass" "rerunning terminal success returns job_not_failed"
+
 capture_cli ci verdict --run "$run_id" --expect-sha "$BUZZ_CI_SHA"
 initial_verdict=$CAPTURE_STDOUT
 pass=false
