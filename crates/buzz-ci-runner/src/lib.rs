@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
+
 use buzz_ci_broker_protocol::{
     AdmitAttemptRequest, BrokerResponse, BrokerState, Conclusion, GitOid, TrustClass,
 };
@@ -118,6 +120,7 @@ pub fn build_teardown_attestation(
     request_event_id: &str,
     request: &CiRequestEnvelope,
     relay_signer: &str,
+    reducer_selected_job_attempts: &[(String, u32)],
     lease_receipts: Vec<TeardownLeaseReceipt>,
 ) -> Result<CiTeardownAttestationEnvelope, ControlError> {
     request
@@ -128,6 +131,24 @@ pub fn build_teardown_attestation(
     let tip_oid = parse_oid(&request.tip_oid)?;
     if lease_receipts.is_empty() {
         return Err(ControlError::TeardownNotProven);
+    }
+
+    let reducer_selected: HashSet<(&str, u32)> = reducer_selected_job_attempts
+        .iter()
+        .map(|(job_id, attempt)| (job_id.as_str(), *attempt))
+        .collect();
+    let reducer_selected_job_ids: HashSet<&str> = reducer_selected_job_attempts
+        .iter()
+        .map(|(job_id, _)| job_id.as_str())
+        .collect();
+    if reducer_selected_job_attempts.is_empty()
+        || reducer_selected.len() != reducer_selected_job_attempts.len()
+        || reducer_selected_job_ids.len() != reducer_selected_job_attempts.len()
+        || reducer_selected
+            .iter()
+            .any(|(job_id, attempt)| job_id.is_empty() || *attempt == 0)
+    {
+        return Err(ControlError::InvalidAttestation);
     }
 
     let mut leases = Vec::with_capacity(lease_receipts.len());
@@ -166,15 +187,21 @@ pub fn build_teardown_attestation(
             &right.lease_id,
         ))
     });
-    let selected_job_attempts = leases
+    let receipt_selected: HashSet<(&str, u32)> = leases
         .iter()
-        .map(|lease| (lease.job_id.clone(), lease.attempt))
-        .collect::<Vec<_>>();
-    let attempt = leases
+        .map(|lease| (lease.job_id.as_str(), lease.attempt))
+        .collect();
+    if receipt_selected.len() != leases.len()
+        || receipt_selected.len() != reducer_selected.len()
+        || receipt_selected != reducer_selected
+    {
+        return Err(ControlError::InvalidAttestation);
+    }
+    let attempt = reducer_selected_job_attempts
         .iter()
-        .map(|lease| lease.attempt)
+        .map(|(_, attempt)| *attempt)
         .max()
-        .ok_or(ControlError::TeardownNotProven)?;
+        .ok_or(ControlError::InvalidAttestation)?;
     let attestation = CiTeardownAttestationEnvelope {
         schema_version: CI_SCHEMA_VERSION,
         request_event_id: request_event_id.to_string(),
@@ -191,7 +218,7 @@ pub fn build_teardown_attestation(
         relay_signer: relay_signer.to_string(),
     };
     attestation
-        .validate_context(request_event_id, request, &selected_job_attempts)
+        .validate_context(request_event_id, request, reducer_selected_job_attempts)
         .map_err(|_| ControlError::InvalidAttestation)?;
     Ok(attestation)
 }
@@ -326,9 +353,16 @@ mod tests {
 
     fn build(
         request: &CiRequestEnvelope,
+        selected_job_attempts: &[(String, u32)],
         receipts: Vec<TeardownLeaseReceipt>,
     ) -> Result<CiTeardownAttestationEnvelope, ControlError> {
-        build_teardown_attestation(&"77".repeat(32), request, &"88".repeat(32), receipts)
+        build_teardown_attestation(
+            &"77".repeat(32),
+            request,
+            &"88".repeat(32),
+            selected_job_attempts,
+            receipts,
+        )
     }
 
     #[test]
@@ -344,14 +378,20 @@ mod tests {
     }
 
     #[test]
-    fn teardown_fact_canonically_covers_every_selected_job_lease() {
+    fn teardown_fact_matches_reducer_selected_rerun_graph() {
         let mut request = request();
-        request.job_ids = vec!["lint".to_string(), "test".to_string()];
+        request.request_type = CiRequestType::Rerun;
+        request.job_ids = vec!["lint".to_string()];
+        request.attempt = 2;
+        request.parent_attempt = Some(1);
+        request.parent_run_id = Some(request.run_id.clone());
+        let selected = vec![("lint".to_string(), 2), ("test".to_string(), 1)];
         let test = terminal_receipt("123e4567-e89b-12d3-a456-426614174010", 1, 2);
         let mut lint = terminal_receipt("123e4567-e89b-12d3-a456-426614174011", 2, 5);
         lint.updated_at = 21;
         let attestation = build(
             &request,
+            &selected,
             vec![lease_receipt("test", test), lease_receipt("lint", lint)],
         )
         .expect("valid teardown fact");
@@ -381,12 +421,14 @@ mod tests {
     fn teardown_fact_rejects_ambiguous_job_or_lease_identity() {
         let mut request = request();
         request.job_ids = vec!["lint".to_string(), "test".to_string()];
+        let selected = vec![("test".to_string(), 1)];
 
         let first = terminal_receipt("123e4567-e89b-12d3-a456-426614174010", 1, 2);
         let duplicate_job_attempt = terminal_receipt("123e4567-e89b-12d3-a456-426614174011", 1, 5);
         assert_eq!(
             build(
                 &request,
+                &selected,
                 vec![
                     lease_receipt("test", first),
                     lease_receipt("test", duplicate_job_attempt),
@@ -399,6 +441,7 @@ mod tests {
         assert_eq!(
             build(
                 &request,
+                &[("test".to_string(), 1), ("lint".to_string(), 2)],
                 vec![
                     lease_receipt("test", first),
                     lease_receipt("lint", duplicate_lease),
@@ -411,45 +454,54 @@ mod tests {
     #[test]
     fn teardown_fact_requires_terminal_nonempty_broker_proof() {
         let request = request();
+        let selected = vec![("test".to_string(), 1)];
         let valid = || terminal_receipt("123e4567-e89b-12d3-a456-426614174010", 1, 2);
 
         assert_eq!(
-            build(&request, Vec::new()),
+            build(&request, &selected, Vec::new()),
             Err(ControlError::TeardownNotProven)
         );
 
         let mut incomplete = valid();
         incomplete.teardown_digest = [0; 32];
         assert_eq!(
-            build(&request, vec![lease_receipt("test", incomplete)]),
+            build(&request, &selected, vec![lease_receipt("test", incomplete)]),
             Err(ControlError::TeardownNotProven)
         );
 
         let mut wrong_run = valid();
         wrong_run.run_id = [9; 16];
         assert_eq!(
-            build(&request, vec![lease_receipt("test", wrong_run)]),
+            build(&request, &selected, vec![lease_receipt("test", wrong_run)]),
             Err(ControlError::TeardownNotProven)
         );
 
         let mut wrong_tip = valid();
         wrong_tip.tip_oid = Some(GitOid::Sha1([0x34; 20]));
         assert_eq!(
-            build(&request, vec![lease_receipt("test", wrong_tip)]),
+            build(&request, &selected, vec![lease_receipt("test", wrong_tip)]),
             Err(ControlError::TeardownNotProven)
         );
 
         let mut zero_attempt = valid();
         zero_attempt.attempt = 0;
         assert_eq!(
-            build(&request, vec![lease_receipt("test", zero_attempt)]),
+            build(
+                &request,
+                &selected,
+                vec![lease_receipt("test", zero_attempt)]
+            ),
             Err(ControlError::TeardownNotProven)
         );
 
         let mut wrong_request = valid();
         wrong_request.accepted_request_digest = [0x78; 32];
         assert_eq!(
-            build(&request, vec![lease_receipt("test", wrong_request)]),
+            build(
+                &request,
+                &selected,
+                vec![lease_receipt("test", wrong_request)]
+            ),
             Err(ControlError::TeardownNotProven)
         );
 
@@ -458,6 +510,7 @@ mod tests {
         assert_eq!(
             build(
                 &request,
+                &selected,
                 vec![lease_receipt("test", missing_lease_generation)]
             ),
             Err(ControlError::TeardownNotProven)
@@ -466,7 +519,11 @@ mod tests {
         let mut time_reversed = valid();
         time_reversed.updated_at = time_reversed.accepted_at - 1;
         assert_eq!(
-            build(&request, vec![lease_receipt("test", time_reversed)]),
+            build(
+                &request,
+                &selected,
+                vec![lease_receipt("test", time_reversed)]
+            ),
             Err(ControlError::TeardownNotProven)
         );
 
@@ -474,8 +531,108 @@ mod tests {
         let mut wrong_manifest = lease_receipt("test", receipt);
         wrong_manifest.job_manifest_digest = [9; 32];
         assert_eq!(
-            build(&request, vec![wrong_manifest]),
+            build(&request, &selected, vec![wrong_manifest]),
             Err(ControlError::TeardownNotProven)
         );
+    }
+
+    #[test]
+    fn teardown_fact_rejects_receipts_that_do_not_exactly_match_reducer_graph() {
+        let mut request = request();
+        request.job_ids = vec!["lint".to_string(), "test".to_string()];
+        let lint = || {
+            lease_receipt(
+                "lint",
+                terminal_receipt("123e4567-e89b-12d3-a456-426614174011", 1, 5),
+            )
+        };
+        let test = || {
+            lease_receipt(
+                "test",
+                terminal_receipt("123e4567-e89b-12d3-a456-426614174010", 1, 2),
+            )
+        };
+        let selected = vec![("lint".to_string(), 1), ("test".to_string(), 1)];
+
+        assert_eq!(
+            build(&request, &selected, vec![test()]),
+            Err(ControlError::InvalidAttestation)
+        );
+        assert_eq!(
+            build(&request, &[("test".to_string(), 1)], vec![lint(), test()]),
+            Err(ControlError::InvalidAttestation)
+        );
+        assert_eq!(
+            build(
+                &request,
+                &[("lint".to_string(), 2), ("test".to_string(), 1)],
+                vec![lint(), test()],
+            ),
+            Err(ControlError::InvalidAttestation)
+        );
+        assert_eq!(
+            build(
+                &request,
+                &[("lint".to_string(), 1), ("lint".to_string(), 1)],
+                vec![lint()],
+            ),
+            Err(ControlError::InvalidAttestation)
+        );
+        assert_eq!(
+            build(
+                &request,
+                &[("lint".to_string(), 1), ("lint".to_string(), 2)],
+                vec![
+                    lint(),
+                    lease_receipt(
+                        "lint",
+                        terminal_receipt("123e4567-e89b-12d3-a456-426614174012", 2, 6),
+                    ),
+                ],
+            ),
+            Err(ControlError::InvalidAttestation)
+        );
+        assert_eq!(
+            build(
+                &request,
+                &[("lint".to_string(), 0), ("test".to_string(), 1)],
+                vec![lint(), test()],
+            ),
+            Err(ControlError::InvalidAttestation)
+        );
+        assert_eq!(
+            build(
+                &request,
+                &[(String::new(), 1)],
+                vec![lease_receipt(
+                    "",
+                    terminal_receipt("123e4567-e89b-12d3-a456-426614174012", 1, 6),
+                )],
+            ),
+            Err(ControlError::InvalidAttestation)
+        );
+        assert_eq!(
+            build(&request, &[], vec![test()]),
+            Err(ControlError::InvalidAttestation)
+        );
+    }
+
+    #[test]
+    fn teardown_fact_matches_reducer_selected_initial_run_graph() {
+        let mut request = request();
+        request.job_ids = vec!["lint".to_string(), "test".to_string()];
+        let selected = vec![("lint".to_string(), 1), ("test".to_string(), 1)];
+        let lint = terminal_receipt("123e4567-e89b-12d3-a456-426614174011", 1, 5);
+        let test = terminal_receipt("123e4567-e89b-12d3-a456-426614174010", 1, 2);
+
+        let attestation = build(
+            &request,
+            &selected,
+            vec![lease_receipt("test", test), lease_receipt("lint", lint)],
+        )
+        .expect("valid initial-run teardown fact");
+
+        assert_eq!(attestation.attempt, 1);
+        assert_eq!(attestation.leases.len(), 2);
     }
 }
