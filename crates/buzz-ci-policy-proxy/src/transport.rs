@@ -1498,6 +1498,10 @@ mod tests {
                 engine_kind: EngineKind::Podman,
                 engine_version: "5.8.4".into(),
                 arch: "x86_64".into(),
+                seccomp_profile_path: buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_PATH
+                    .into(),
+                seccomp_profile_digest: buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_DIGEST
+                    .into(),
                 limits: IsolationLimits {
                     cpu_quota_micros: 50_000,
                     memory_max_bytes: 1024 * 1024 * 1024,

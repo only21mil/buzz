@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+
+use buzz_ci_isolation_contract::{PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH};
 use std::{collections::BTreeSet, path::Component};
 
 use crate::ProxyError;
@@ -90,6 +92,10 @@ pub struct IsolationProfile {
     pub engine_version: String,
     /// Exact qualified architecture.
     pub arch: String,
+    /// Broker-provisioned content-addressed seccomp profile path.
+    pub seccomp_profile_path: String,
+    /// SHA-256 digest of the broker-provisioned seccomp profile bytes.
+    pub seccomp_profile_digest: String,
     /// Resource ceilings.
     pub limits: IsolationLimits,
     /// Root-owned execution network policy.
@@ -106,6 +112,13 @@ impl IsolationProfile {
         if self.engine_version.is_empty() || self.arch.is_empty() || self.netns.is_empty() {
             return Err(ProxyError::InvalidManifest(
                 "engine_version, arch, and netns are required".into(),
+            ));
+        }
+        if self.seccomp_profile_path != PHASE1_SECCOMP_PROFILE_PATH
+            || self.seccomp_profile_digest != PHASE1_SECCOMP_PROFILE_DIGEST
+        {
+            return Err(ProxyError::InvalidManifest(
+                "seccomp profile does not match the Phase-1 content-addressed profile".into(),
             ));
         }
         if self.network_policy != NetworkPolicy::None {

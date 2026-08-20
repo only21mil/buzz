@@ -442,6 +442,8 @@ mod tests {
                 engine_kind: EngineKind::Podman,
                 engine_version: "5.8.4".into(),
                 arch: "x86_64".into(),
+                seccomp_profile_path: crate::PHASE1_SECCOMP_PROFILE_PATH.into(),
+                seccomp_profile_digest: crate::PHASE1_SECCOMP_PROFILE_DIGEST.into(),
                 limits: limits(),
                 network_policy: NetworkPolicy::None,
                 service_requirements: Vec::new(),
@@ -561,6 +563,31 @@ mod tests {
         let mut wrong_arch = binding();
         wrong_arch.isolation_profile.arch = "amd64".into();
         assert!(wrong_arch.validate_phase1(&context()).is_err());
+
+        let mut wrong_seccomp_path = binding();
+        wrong_seccomp_path.isolation_profile.seccomp_profile_path =
+            "/var/lib/buzzci/seccomp/unconfined.json".into();
+        assert!(wrong_seccomp_path.validate_phase1(&context()).is_err());
+
+        let mut wrong_seccomp_digest = binding();
+        wrong_seccomp_digest
+            .isolation_profile
+            .seccomp_profile_digest = "0".repeat(64);
+        assert!(wrong_seccomp_digest.validate_phase1(&context()).is_err());
+    }
+
+    #[test]
+    fn lease_record_serializes_the_exact_seccomp_identity() {
+        let value = serde_json::to_value(binding()).unwrap();
+        let profile = &value["isolation_profile"];
+        assert_eq!(
+            profile["seccomp_profile_path"],
+            crate::PHASE1_SECCOMP_PROFILE_PATH
+        );
+        assert_eq!(
+            profile["seccomp_profile_digest"],
+            crate::PHASE1_SECCOMP_PROFILE_DIGEST
+        );
     }
 
     #[test]

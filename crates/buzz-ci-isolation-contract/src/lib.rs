@@ -29,4 +29,7 @@ pub use handle::{
     BrokerObjectHandle, CgroupHandle, NetnsHandle, QuotaBackend, QuotaHandle,
     RuntimeEndpointIdentity, WorkspaceHandle,
 };
-pub use profile::{EngineKind, IsolationProfile, NetworkPolicy, ResourceLimits};
+pub use profile::{
+    EngineKind, IsolationProfile, NetworkPolicy, ResourceLimits, PHASE1_SECCOMP_PROFILE_DIGEST,
+    PHASE1_SECCOMP_PROFILE_PATH,
+};

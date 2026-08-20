@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    contract::{is_environment_name, is_socket_path},
+    contract::{is_environment_name, is_socket_path, IsolationProfile},
     AttemptPhase, DockerMethod, DockerRoute, ObjectLedger, PolicyManifest, ProxyError,
 };
 
@@ -491,6 +491,11 @@ impl ProxyPolicy {
                 "container image is not the pinned digest".into(),
             ));
         }
+        if object.contains_key("SecurityOpt") {
+            return Err(ProxyError::PolicyRefused(
+                "caller may not set container SecurityOpt".into(),
+            ));
+        }
         reject_conflicting_host_config(object.get("HostConfig"))?;
         reject_socket_mounts(object)?;
         let environment = canonical_environment(object.get("Env"), &self.manifest)?;
@@ -534,7 +539,7 @@ impl ProxyPolicy {
                 "Privileged": false,
                 "CapAdd": [],
                 "CapDrop": ["ALL"],
-                "SecurityOpt": ["no-new-privileges", "label=type:container_t"],
+                "SecurityOpt": security_options(&self.manifest.isolation_profile),
                 "Binds": binds,
                 "Devices": [],
                 "PortBindings": {},
@@ -597,7 +602,7 @@ impl ProxyPolicy {
             cap_drop: vec!["ALL".into()],
             cap_add: Vec::new(),
             privileged: false,
-            security_opt: vec!["no-new-privileges".into(), "label=type:container_t".into()],
+            security_opt: security_options(&self.manifest.isolation_profile),
             pids_limit: limits.pids_max,
             memory: limits.memory_max_bytes,
             memory_swap: limits.memory_swap_max_bytes,
@@ -685,6 +690,8 @@ fn verify_lease_binding(
         || local.image_digest != shared.image_digest
         || local.engine_version != shared.engine_version
         || local.arch != shared.arch
+        || local.seccomp_profile_path != shared.seccomp_profile_path
+        || local.seccomp_profile_digest != shared.seccomp_profile_digest
         || local.netns != shared.netns
         || local.limits.memory_max_bytes != shared.limits.mem_max_bytes
         || local.limits.pids_max != u64::from(shared.limits.pids_max)
@@ -777,6 +784,11 @@ fn canonical_exec(body: &[u8], manifest: &PolicyManifest) -> Result<Vec<u8>, Pro
     if object.get("Privileged").and_then(Value::as_bool) == Some(true) {
         return Err(ProxyError::PolicyRefused(
             "privileged exec is forbidden".into(),
+        ));
+    }
+    if object.contains_key("SecurityOpt") {
+        return Err(ProxyError::PolicyRefused(
+            "caller may not set exec SecurityOpt".into(),
         ));
     }
     let mut output = Map::new();
@@ -875,6 +887,14 @@ fn canonical_binds(manifest: &PolicyManifest) -> Vec<String> {
     binds
 }
 
+fn security_options(profile: &IsolationProfile) -> Vec<String> {
+    vec![
+        "no-new-privileges".into(),
+        "label=type:container_t".into(),
+        format!("seccomp={}", profile.seccomp_profile_path),
+    ]
+}
+
 fn copy_bounded_string_array(
     input: &Map<String, Value>,
     output: &mut Map<String, Value>,
@@ -952,6 +972,10 @@ mod tests {
                 engine_kind: EngineKind::Podman,
                 engine_version: "5.8.4".into(),
                 arch: "x86_64".into(),
+                seccomp_profile_path: buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_PATH
+                    .into(),
+                seccomp_profile_digest: buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_DIGEST
+                    .into(),
                 limits: IsolationLimits {
                     cpu_quota_micros: 100_000,
                     memory_max_bytes: 1024 * 1024 * 1024,
@@ -1052,6 +1076,10 @@ mod tests {
                 engine_kind: SharedEngineKind::Podman,
                 engine_version: "5.8.4".into(),
                 arch: "x86_64".into(),
+                seccomp_profile_path: buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_PATH
+                    .into(),
+                seccomp_profile_digest: buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_DIGEST
+                    .into(),
                 limits,
                 network_policy: SharedNetworkPolicy::None,
                 service_requirements: Vec::new(),
@@ -1130,6 +1158,17 @@ mod tests {
         assert_eq!(value["HostConfig"]["ReadonlyRootfs"], true);
         assert_eq!(value["HostConfig"]["CapDrop"], serde_json::json!(["ALL"]));
         assert_eq!(value["HostConfig"]["Privileged"], false);
+        assert_eq!(
+            value["HostConfig"]["SecurityOpt"],
+            serde_json::json!([
+                "no-new-privileges",
+                "label=type:container_t",
+                format!(
+                    "seccomp={}",
+                    buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_PATH
+                )
+            ])
+        );
         assert_eq!(value["HostConfig"]["LogConfig"]["Type"], "none");
         assert_eq!(value["HostConfig"]["NanoCpus"], 1_000_000_000_u64);
         assert_eq!(
@@ -1148,6 +1187,11 @@ mod tests {
             ("NetworkMode", serde_json::json!("host")),
             ("Binds", serde_json::json!(["/var/run/docker.sock:/d.sock"])),
             ("CapAdd", serde_json::json!(["SYS_ADMIN"])),
+            ("SecurityOpt", serde_json::json!(["seccomp=unconfined"])),
+            (
+                "SecurityOpt",
+                serde_json::json!(["unknown-security-option"]),
+            ),
         ];
         for (field, value) in fields {
             let mut body = serde_json::json!({
@@ -1163,6 +1207,21 @@ mod tests {
                     &serde_json::to_vec(&body).unwrap()
                 )
                 .is_err());
+        }
+        for security_opt in ["seccomp=unconfined", "unknown-security-option"] {
+            let body = serde_json::json!({
+                "Image": format!("sha256:{}", "c".repeat(64)),
+                "SecurityOpt": [security_opt]
+            });
+            let mut policy = ProxyPolicy::install_for_test(manifest()).unwrap();
+            assert!(matches!(
+                policy.admit(
+                    DockerMethod::Post,
+                    "/containers/create",
+                    &serde_json::to_vec(&body).unwrap()
+                ),
+                Err(ProxyError::PolicyRefused(_))
+            ));
         }
     }
 
@@ -1262,9 +1321,32 @@ mod tests {
         let mut effective = policy.expected_effective_spec();
         effective.devices.push("/dev/kvm".into());
         assert!(policy.verify_pre_start("container-1", &effective).is_err());
+        let mut effective = policy.expected_effective_spec();
+        effective.security_opt.pop();
+        assert!(policy.verify_pre_start("container-1", &effective).is_err());
+        let mut effective = policy.expected_effective_spec();
+        effective.security_opt[2] = "seccomp=unconfined".into();
+        assert!(policy.verify_pre_start("container-1", &effective).is_err());
+        let mut effective = policy.expected_effective_spec();
+        effective
+            .security_opt
+            .push("unknown-security-option".into());
+        assert!(policy.verify_pre_start("container-1", &effective).is_err());
         let effective = policy.expected_effective_spec();
         let proof = policy.verify_pre_start("container-1", &effective).unwrap();
         policy.commit_started(&proof).unwrap();
+
+        for security_opt in ["seccomp=unconfined", "unknown-security-option"] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "Cmd": ["true"],
+                "SecurityOpt": [security_opt]
+            }))
+            .unwrap();
+            assert!(matches!(
+                policy.admit(DockerMethod::Post, "/containers/container-1/exec", &body),
+                Err(ProxyError::PolicyRefused(_))
+            ));
+        }
     }
 
     #[test]
