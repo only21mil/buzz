@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FIXTURE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ $# -ge 2 && $1 == ci && $2 == run ]]; then
+  output_file=$(mktemp "$FIXTURE_DIR/.broken-output.XXXXXX")
+  error_file=$(mktemp "$FIXTURE_DIR/.broken-error.XXXXXX")
+  set +e
+  "$FIXTURE_DIR/mock-buzz" "$@" >"$output_file" 2>"$error_file"
+  rc=$?
+  set -e
+  if ((rc == 0)); then
+    jq -c '.sha = (.sha | .[0:7])' "$output_file"
+  else
+    cat "$output_file"
+  fi
+  cat "$error_file" >&2
+  rm -f -- "$output_file" "$error_file"
+  exit "$rc"
+fi
+exec "$FIXTURE_DIR/mock-buzz" "$@"
+
