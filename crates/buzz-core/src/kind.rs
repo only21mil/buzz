@@ -554,6 +554,16 @@ pub const KIND_FORUM_VOTE: u32 = 45002;
 pub const KIND_FORUM_COMMENT: u32 = 45003;
 
 // Workflow engine (46000–46999)
+/// Request a Buzz-native CI run or failed-job rerun.
+pub const KIND_CI_REQUEST: u32 = 46100;
+/// Signed CI run status.
+pub const KIND_CI_RUN_STATUS: u32 = 46101;
+/// Signed CI job status.
+pub const KIND_CI_JOB_STATUS: u32 = 46102;
+/// Signed reference to scrubbed CI log bytes.
+pub const KIND_CI_LOG_REFERENCE: u32 = 46103;
+/// Signed reference to a quarantined CI artifact.
+pub const KIND_CI_ARTIFACT_REFERENCE: u32 = 46104;
 /// Trigger workflow execution.
 pub const KIND_WORKFLOW_TRIGGER: u32 = 46020;
 /// Grant pending approval.
