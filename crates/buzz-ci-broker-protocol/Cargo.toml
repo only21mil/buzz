@@ -1,0 +1,15 @@
+[package]
+name = "buzz-ci-broker-protocol"
+description = "Fixed-width, content-blind IPC protocol for the privileged Buzz CI broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "buzz_ci_broker_protocol"
+path = "src/lib.rs"
+
+[dev-dependencies]
+proptest = { workspace = true }

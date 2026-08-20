@@ -1,0 +1,19 @@
+[package]
+name = "buzz-ci-execd"
+description = "Keyless, networkless privileged resource broker for Buzz CI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "buzz_ci_execd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-ci-execd"
+path = "src/main.rs"
+
+[dependencies]
+buzz-ci-broker-protocol = { workspace = true }
