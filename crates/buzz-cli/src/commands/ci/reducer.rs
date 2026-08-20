@@ -912,7 +912,7 @@ fn infrastructure_reduction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::ci::{CI_SCHEMA_VERSION, CiFinalizedJobAttempt, CiRequestType, CiTeardownLease};
+    use buzz_core::ci::{CiFinalizedJobAttempt, CiRequestType, CiTeardownLease, CI_SCHEMA_VERSION};
 
     const REQUEST_ID: u64 = 1;
 

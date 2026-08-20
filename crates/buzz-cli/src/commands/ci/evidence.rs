@@ -5,7 +5,7 @@
 //! authorization before passing envelopes here. The functions below re-check
 //! envelope and cross-event bindings before producing output or write plans.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use buzz_core::ci::{
     CiJobState, CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType,
 };
@@ -715,7 +715,7 @@ fn validate_log_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::ci::{CI_SCHEMA_VERSION, CiSkipPolicy};
+    use buzz_core::ci::{CiSkipPolicy, CI_SCHEMA_VERSION};
 
     const REQUEST_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const LOG_EVENT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -897,18 +897,16 @@ mod tests {
         let mut statuses = terminal_status("unit", 1, CiJobState::Success);
         attach_log(&mut statuses);
         let valid = log_event("unit", 1, b"hello");
-        assert!(
-            select_log(
-                REQUEST_ID,
-                &request(),
-                &statuses,
-                std::slice::from_ref(&valid),
-                RELAY,
-                "unit",
-                None
-            )
-            .is_ok()
-        );
+        assert!(select_log(
+            REQUEST_ID,
+            &request(),
+            &statuses,
+            std::slice::from_ref(&valid),
+            RELAY,
+            "unit",
+            None
+        )
+        .is_ok());
 
         let mut cases = Vec::new();
         let mut noncanonical = valid.clone();
@@ -928,18 +926,16 @@ mod tests {
         cases.push(truncated);
 
         for event in cases {
-            assert!(
-                select_log(
-                    REQUEST_ID,
-                    &request(),
-                    &statuses,
-                    &[event],
-                    RELAY,
-                    "unit",
-                    None
-                )
-                .is_err()
-            );
+            assert!(select_log(
+                REQUEST_ID,
+                &request(),
+                &statuses,
+                &[event],
+                RELAY,
+                "unit",
+                None
+            )
+            .is_err());
         }
     }
 
@@ -966,18 +962,16 @@ mod tests {
         ] {
             let mut event = valid.clone();
             event.envelope.url = Some(bad);
-            assert!(
-                select_log(
-                    REQUEST_ID,
-                    &request(),
-                    &statuses,
-                    &[event],
-                    RELAY,
-                    "unit",
-                    None
-                )
-                .is_err()
-            );
+            assert!(select_log(
+                REQUEST_ID,
+                &request(),
+                &statuses,
+                &[event],
+                RELAY,
+                "unit",
+                None
+            )
+            .is_err());
         }
 
         let selected = select_log(

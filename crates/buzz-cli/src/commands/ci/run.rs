@@ -3,11 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use buzz_core::ci::{
-    CI_MAX_SAFE_INTEGER, CI_SCHEMA_VERSION, CiRequestEnvelope, CiRequestType, CiRunState,
-    CiSkipPolicy, ValidatedCiEnvelope, request_tags, validate_signed_ci_event,
+    request_tags, validate_signed_ci_event, CiRequestEnvelope, CiRequestType, CiRunState,
+    CiSkipPolicy, ValidatedCiEnvelope, CI_MAX_SAFE_INTEGER, CI_SCHEMA_VERSION,
 };
 use buzz_core::kind::{KIND_CI_REQUEST, KIND_CI_RUN_STATUS};
 use nostr::{Event, EventBuilder, Kind, Timestamp};
@@ -704,7 +704,7 @@ fn preflight_error(message: &str) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::ci::{CiRunStatusEnvelope, run_status_tags};
+    use buzz_core::ci::{run_status_tags, CiRunStatusEnvelope};
     use nostr::Keys;
 
     const CHANNEL: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -890,27 +890,21 @@ mod tests {
     #[test]
     fn trusted_context_requires_canonical_channel_and_nonempty_signers() {
         let signer = "a".repeat(64);
-        assert!(
-            validate_trusted_context(&RunTrustedContext {
-                channel_id: CHANNEL.into(),
-                status_signers: HashSet::from([signer.clone()]),
-            })
-            .is_ok()
-        );
-        assert!(
-            validate_trusted_context(&RunTrustedContext {
-                channel_id: CHANNEL.to_uppercase(),
-                status_signers: HashSet::from([signer]),
-            })
-            .is_err()
-        );
-        assert!(
-            validate_trusted_context(&RunTrustedContext {
-                channel_id: CHANNEL.into(),
-                status_signers: HashSet::new(),
-            })
-            .is_err()
-        );
+        assert!(validate_trusted_context(&RunTrustedContext {
+            channel_id: CHANNEL.into(),
+            status_signers: HashSet::from([signer.clone()]),
+        })
+        .is_ok());
+        assert!(validate_trusted_context(&RunTrustedContext {
+            channel_id: CHANNEL.to_uppercase(),
+            status_signers: HashSet::from([signer]),
+        })
+        .is_err());
+        assert!(validate_trusted_context(&RunTrustedContext {
+            channel_id: CHANNEL.into(),
+            status_signers: HashSet::new(),
+        })
+        .is_err());
     }
 
     #[test]
@@ -959,17 +953,15 @@ mod tests {
         assert_eq!(output.state, CiRunState::Queued);
         assert_eq!(output.jobs, jobs);
 
-        assert!(
-            evaluate_run_acknowledgements(
-                &values,
-                CHANNEL,
-                &request_event.id.to_hex(),
-                &request,
-                &jobs,
-                &HashSet::new(),
-            )
-            .is_err()
-        );
+        assert!(evaluate_run_acknowledgements(
+            &values,
+            CHANNEL,
+            &request_event.id.to_hex(),
+            &request,
+            &jobs,
+            &HashSet::new(),
+        )
+        .is_err());
 
         let mut wrong_sequence = status;
         wrong_sequence.sequence = 2;
@@ -980,17 +972,15 @@ mod tests {
         .tags(run_status_tags(CHANNEL, &wrong_sequence).unwrap())
         .sign_with_keys(&signer)
         .unwrap();
-        assert!(
-            evaluate_run_acknowledgements(
-                &[serde_json::to_value(event).unwrap()],
-                CHANNEL,
-                &request_event.id.to_hex(),
-                &request,
-                &jobs,
-                &authority,
-            )
-            .is_err()
-        );
+        assert!(evaluate_run_acknowledgements(
+            &[serde_json::to_value(event).unwrap()],
+            CHANNEL,
+            &request_event.id.to_hex(),
+            &request,
+            &jobs,
+            &authority,
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const CHANNEL_ID: &str = "018f4f4e-f60a-7b47-b8dc-68f59a4dc8f1";

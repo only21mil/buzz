@@ -2169,11 +2169,23 @@ mod tests {
         .is_ok());
         assert!(Cli::try_parse_from(["buzz", "ci", "status", "--run", "run-id"]).is_ok());
         assert!(Cli::try_parse_from([
-            "buzz", "ci", "logs", "--run", "run-id", "--job", "unit_linux",
+            "buzz",
+            "ci",
+            "logs",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
-            "buzz", "ci", "rerun", "--run", "run-id", "--job", "unit_linux",
+            "buzz",
+            "ci",
+            "rerun",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
