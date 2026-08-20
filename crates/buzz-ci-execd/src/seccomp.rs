@@ -142,13 +142,23 @@ pub struct SeccompFileReadback {
     pub digest: String,
 }
 
-/// Path and digest persisted into each validated lease record.
+/// Opaque path and digest proof produced only by [`SeccompSeedPlan::readiness`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SeccompLeaseEvidence {
-    /// Exact installed profile path.
-    pub path: &'static str,
-    /// Exact installed profile digest.
-    pub digest: &'static str,
+    path: &'static str,
+    digest: &'static str,
+}
+
+impl SeccompLeaseEvidence {
+    /// Exact installed profile path proven by the readiness readback.
+    pub const fn path(self) -> &'static str {
+        self.path
+    }
+
+    /// Exact installed profile digest proven by the readiness readback.
+    pub const fn digest(self) -> &'static str {
+        self.digest
+    }
 }
 
 /// Exact reason host readiness remained closed.
