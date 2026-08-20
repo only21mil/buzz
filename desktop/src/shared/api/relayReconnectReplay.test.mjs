@@ -84,6 +84,16 @@ function replayFilter(filter, since, until) {
   return buildReconnectReplayFilter(filter, since, until);
 }
 
+function historyPage(events) {
+  const cursorEvent = events.length >= 500 ? events[0] : null;
+  return {
+    events,
+    nextCursor: cursorEvent
+      ? { createdAt: cursorEvent.created_at, eventId: cursorEvent.id }
+      : null,
+  };
+}
+
 // ── buildReconnectReplayFilter ────────────────────────────────────────────────
 
 test("reconnect replay preserves small steady-state limits when adding since", () => {
@@ -208,7 +218,7 @@ test("replay sends all subs in one batch when count equals REPLAY_BATCH_SIZE", a
     sendRaw: async (payload) => {
       sentIds.push(payload[1]);
     },
-    requestHistory: async () => [],
+    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
     setTimeoutFn: (fn, _ms) => {
       delayCount++;
       fn();
@@ -244,7 +254,7 @@ test("replay splits subscriptions into batches of REPLAY_BATCH_SIZE", async () =
     sendRaw: async (payload) => {
       sentIds.push(payload[1]);
     },
-    requestHistory: async () => [],
+    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
     setTimeoutFn: (fn, _ms) => {
       delayCount++;
       batchBreakpoints.push(sentIds.length);
@@ -300,7 +310,7 @@ test("visible channel subscription is sent first", async () => {
     sendRaw: async (payload) => {
       sentOrder.push(payload[1]);
     },
-    requestHistory: async () => [],
+    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
     visibleChannelId: "ch-visible",
   });
 
@@ -331,7 +341,7 @@ test("replay waits for rate-limit gate before sending REQs", async () => {
     sendRaw: async (payload) => {
       sentIds.push(payload[1]);
     },
-    requestHistory: async () => [],
+    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
     setTimeoutFn: (fn, _ms) => {
       fn();
       return 0;
@@ -370,7 +380,7 @@ test("stale replay sends no REQs when generation advances while gate was active"
     sendRaw: async (payload) => {
       sentIds.push(payload[1]);
     },
-    requestHistory: async () => [],
+    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
     isActive: () => generationActive,
   });
 
@@ -416,9 +426,9 @@ test("channel reconnect replay pages the missed window until a short page", asyn
     sendRaw: async (payload) => {
       sentPayloads.push(payload);
     },
-    requestHistory: async (filter) => {
-      historyFilters.push(filter);
-      return pages.shift() ?? [];
+    requestHistoryPage: async (request) => {
+      historyFilters.push(request);
+      return historyPage(pages.shift() ?? []);
     },
   });
 
@@ -435,28 +445,93 @@ test("channel reconnect replay pages the missed window until a short page", asyn
   ]);
   assert.deepEqual(historyFilters, [
     {
+      channelId: "channel-1",
       kinds: filter.kinds,
-      "#h": ["channel-1"],
       limit: 500,
       since: 995,
       until: 2000,
+      beforeId: null,
     },
     {
+      channelId: "channel-1",
       kinds: filter.kinds,
-      "#h": ["channel-1"],
       limit: 500,
       since: 995,
       until: 1501,
+      beforeId: "newest-0",
     },
     {
+      channelId: "channel-1",
       kinds: filter.kinds,
-      "#h": ["channel-1"],
       limit: 500,
       since: 995,
       until: 1002,
+      beforeId: "middle-0",
     },
   ]);
   assert.equal(delivered.length, 1008);
+});
+
+test("channel reconnect replay crosses more than 500 events in one second without loss", async () => {
+  resetGate();
+  const createdAt = 1000;
+  const allEvents = Array.from({ length: 1201 }, (_, index) =>
+    event(index.toString(16).padStart(64, "0"), createdAt),
+  );
+  const delivered = [];
+  const requests = [];
+  const filter = buildChannelFilter("channel-1", 50);
+
+  await replayLiveSubscriptions({
+    subscriptions: new Map([
+      [
+        "live-1",
+        {
+          mode: "live",
+          filter,
+          onEvent: (value) => delivered.push(value),
+          lastSeenCreatedAt: 1005,
+        },
+      ],
+    ]),
+    now: 1010,
+    sendRaw: async () => {},
+    requestHistoryPage: async (request) => {
+      requests.push(request);
+      const candidates = allEvents.filter(
+        (value) =>
+          value.created_at >= request.since &&
+          (value.created_at < request.until ||
+            (value.created_at === request.until &&
+              (request.beforeId === null || value.id > request.beforeId))),
+      );
+      const events = candidates.slice(0, request.limit);
+      const last = events.at(-1);
+      return {
+        events,
+        nextCursor:
+          events.length >= request.limit && last
+            ? { createdAt: last.created_at, eventId: last.id }
+            : null,
+      };
+    },
+  });
+
+  assert.equal(requests.length, 3);
+  assert.deepEqual(
+    requests.map(({ until, beforeId }) => ({ until, beforeId })),
+    [
+      { until: 1010, beforeId: null },
+      { until: 1000, beforeId: allEvents[499].id },
+      { until: 1000, beforeId: allEvents[999].id },
+    ],
+  );
+  assert.equal(delivered.length, allEvents.length);
+  assert.deepEqual(
+    delivered.map(({ id }) => id),
+    allEvents.map(({ id }) => id),
+  );
+  assert.equal(new Set(delivered.map(({ id }) => id)).size, allEvents.length);
 });
 
 test("reconnect replay starts live REQs in parallel and preserves per-sub page order", async () => {
@@ -508,10 +583,10 @@ test("reconnect replay starts live REQs in parallel and preserves per-sub page o
         sendResolvers.push(resolve);
       });
     },
-    requestHistory: async (filter) => {
-      const channelId = filter["#h"]?.[0];
-      historyFiltersByChannel[channelId].push(filter.until);
-      return pagesByChannel[channelId].shift() ?? [];
+    requestHistoryPage: async (request) => {
+      const channelId = request.channelId;
+      historyFiltersByChannel[channelId].push(request.until);
+      return historyPage(pagesByChannel[channelId].shift() ?? []);
     },
   });
 
@@ -574,7 +649,7 @@ test("batch-1 arms gate mid-replay: batch-2 is withheld until gate expires", asy
         activateRateLimit(5);
       }
     },
-    requestHistory: async () => [],
+    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
     setTimeoutFn: (fn, _ms) => {
       fn();
       return 0;
@@ -625,7 +700,7 @@ test("history backfill rejection never escapes replayLiveSubscriptions", async (
     subscriptions,
     now: 2000,
     sendRaw: async () => {},
-    requestHistory: async () => {
+    requestHistoryPage: async () => {
       historyCalls++;
       throw new Error("rate-limited: quota exceeded; retry in 4s");
     },
@@ -663,7 +738,7 @@ test("backfill retry waits out the armed gate, then succeeds", async () => {
     subscriptions,
     now: 2000,
     sendRaw: async () => {},
-    requestHistory: async () => {
+    requestHistoryPage: async () => {
       attemptAtMs.push(fakeNow);
       if (attemptAtMs.length === 1) {
         // Mirror relayClosedRecovery: the CLOSED handler arms the gate
@@ -672,7 +747,7 @@ test("backfill retry waits out the armed gate, then succeeds", async () => {
         armGate();
         throw new Error("rate-limited: quota exceeded; retry in 4s");
       }
-      return [event("recovered", 1500)];
+      return historyPage([event("recovered", 1500)]);
     },
   });
 
@@ -710,7 +785,7 @@ test("backfill retry aborts when the subscription was replaced", async () => {
     subscriptions,
     now: 2000,
     sendRaw: async () => {},
-    requestHistory: async () => {
+    requestHistoryPage: async () => {
       historyCalls++;
       // Simulate the subscription being torn down while the REQ is in flight.
       subscriptions.delete("live-1");
@@ -745,7 +820,7 @@ test("exhausted backfill pins the floor: next replay still requests the original
     subscriptions,
     now: 2000,
     sendRaw: async () => {},
-    requestHistory: async () => {
+    requestHistoryPage: async () => {
       throw new Error("rate-limited: quota exceeded; retry in 4s");
     },
   });
@@ -765,9 +840,9 @@ test("exhausted backfill pins the floor: next replay still requests the original
     subscriptions,
     now: 2200,
     sendRaw: async () => {},
-    requestHistory: async (filter) => {
-      historyFilters.push(filter);
-      return [];
+    requestHistoryPage: async (request) => {
+      historyFilters.push(request);
+      return historyPage([]);
     },
   });
 
@@ -789,9 +864,9 @@ test("exhausted backfill pins the floor: next replay still requests the original
     subscriptions,
     now: 2300,
     sendRaw: async () => {},
-    requestHistory: async (filter) => {
-      laterFilters.push(filter);
-      return [];
+    requestHistoryPage: async (request) => {
+      laterFilters.push(request);
+      return historyPage([]);
     },
   });
   assert.equal(
@@ -825,7 +900,7 @@ test("in-flight stale abort keeps the pinned floor for the superseding connectio
     now: 2000,
     sendRaw: async () => {},
     isActive: () => generationActive,
-    requestHistory: async () => {
+    requestHistoryPage: async () => {
       historyCalls++;
       // Connection A is superseded while the REQ is in flight: the generation
       // advances, but the subscription keeps its key AND object identity —
@@ -833,7 +908,7 @@ test("in-flight stale abort keeps the pinned floor for the superseding connectio
       generationActive = false;
       // A full page would otherwise continue paging — the post-await
       // combined guard must abort instead.
-      return eventRange("full", 1001, 500);
+      return historyPage(eventRange("full", 1001, 500));
     },
   });
 

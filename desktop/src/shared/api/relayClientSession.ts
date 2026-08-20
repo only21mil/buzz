@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
   createAuthEvent,
+  getChannelHistoryPage,
   getRelayWsUrl,
   signRelayEvent,
 } from "@/shared/api/tauri";
@@ -937,7 +938,7 @@ export class RelayClient {
       await replayLiveSubscriptions({
         subscriptions: this.subscriptions,
         sendRaw: (payload) => this.sendRaw(payload),
-        requestHistory: (filter) => this.requestHistory(filter),
+        requestHistoryPage: (request) => getChannelHistoryPage(request),
         visibleChannelId: this.visibleChannelId,
         isActive: () => this.connectionGeneration === generation,
       });

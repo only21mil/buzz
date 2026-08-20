@@ -330,22 +330,27 @@ fn build_thread_replies_filter(
     filter
 }
 
-/// Build the relay `/query` filter for one keyset page of top-level channel
-/// history strictly older than `(before, before_id)`. Extracted so a unit test
-/// can pin the tiebreak field: it MUST be `before_id` (what the relay's
+/// Build the relay `/query` filter for one keyset page of channel history
+/// strictly older than `(before, before_id)`. Extracted so a unit test can pin
+/// the tiebreak field: it MUST be `before_id` (what the relay's
 /// `extract_before_id` reads), else the keyset degrades to a bare `until`.
 fn build_channel_messages_before_filter(
     channel_id: &str,
     before: i64,
     before_id: Option<&str>,
+    since: Option<i64>,
+    kinds: &[u32],
     cap: u32,
 ) -> serde_json::Map<String, serde_json::Value> {
-    // Timeline content kinds — mirror the WS history filter so the keyset page
-    // and the WS page select the same rows. Top-level filtering is enforced by
-    // the relay's thread_metadata join for this channel scope.
+    // Use the caller's exact kinds so reconnect replay covers the same rows as
+    // its live WS filter. Timeline callers omit kinds and retain the original
+    // TIMELINE_KINDS default.
     let mut filter = serde_json::Map::new();
     filter.insert("#h".to_string(), serde_json::json!([channel_id]));
-    filter.insert("kinds".to_string(), serde_json::json!(TIMELINE_KINDS));
+    filter.insert("kinds".to_string(), serde_json::json!(kinds));
+    if let Some(since) = since {
+        filter.insert("since".to_string(), serde_json::json!(since));
+    }
     filter.insert("until".to_string(), serde_json::json!(before));
     filter.insert("limit".to_string(), serde_json::json!(cap));
     // `before_id` is the bridge extension field for the composite tiebreak
@@ -356,8 +361,8 @@ fn build_channel_messages_before_filter(
     filter
 }
 
-/// Fetch one keyset page of top-level channel history strictly *older* than a
-/// cursor, server-side via the bridge composite cursor.
+/// Fetch one keyset page of channel history strictly *older* than a cursor,
+/// server-side via the bridge composite cursor.
 ///
 /// The desktop timeline normally pages history over WS `REQ` with a bare `until`
 /// (`created_at`) cursor. That cursor cannot advance past a single `created_at`
@@ -376,12 +381,30 @@ pub async fn get_channel_messages_before(
     channel_id: String,
     before: i64,
     before_id: Option<String>,
+    since: Option<i64>,
+    kinds: Option<Vec<u32>>,
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<crate::models::ChannelMessagesPageResponse, String> {
     let cap = limit.unwrap_or(200).min(500);
-    let filter =
-        build_channel_messages_before_filter(&channel_id, before, before_id.as_deref(), cap);
+    if kinds.as_ref().is_some_and(Vec::is_empty) {
+        return Err("kinds must not be empty".to_string());
+    }
+    if kinds
+        .as_ref()
+        .is_some_and(|values| values.iter().any(|kind| *kind > u16::MAX as u32))
+    {
+        return Err("kinds must contain valid Nostr kind values".to_string());
+    }
+    let kinds = kinds.as_deref().unwrap_or(&TIMELINE_KINDS);
+    let filter = build_channel_messages_before_filter(
+        &channel_id,
+        before,
+        before_id.as_deref(),
+        since,
+        kinds,
+        cap,
+    );
 
     let events = query_relay(&state, &[serde_json::Value::Object(filter)]).await?;
 

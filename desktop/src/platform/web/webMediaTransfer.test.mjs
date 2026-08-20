@@ -10,6 +10,7 @@ import {
   downloadBrowserImage,
   registerWebMediaTransferCommands,
 } from "./webMediaTransfer.ts";
+import { BrowserWorkspace } from "./workspace.ts";
 
 const previous = {
   ClipboardItem: globalThis.ClipboardItem,
@@ -184,11 +185,53 @@ test("clipboard copy decodes, bounds, and converts relay images to PNG", async (
 });
 
 test("native path upload is explicitly capability-off", async () => {
-  registerWebMediaTransferCommands();
+  registerWebMediaTransferCommands(new BrowserWorkspace());
   await assert.rejects(
     dispatch("upload_media", { filePath: "/tmp/image.png", isTemp: true }),
     /browsers cannot read a native temporary file path/,
   );
+});
+
+test("registered downloads follow the active browser workspace relay", async () => {
+  const workspace = new BrowserWorkspace();
+  workspace.apply({ relayUrl: "wss://relay-b.example", reposDir: null });
+  registerWebMediaTransferCommands(workspace);
+  installSigner();
+  let requestedUrl;
+  globalThis.fetch = async (url) => {
+    requestedUrl = String(url);
+    return new Response(Uint8Array.from([1]), {
+      headers: { "Content-Type": "image/png" },
+    });
+  };
+
+  await dispatch("download_image", {
+    url: `https://relay-b.example/media/${"f".repeat(64)}.png`,
+  });
+
+  assert.equal(
+    requestedUrl,
+    `https://relay-b.example/media/${"f".repeat(64)}.png`,
+  );
+});
+
+test("registered downloads reject the browser shell origin after a relay switch", async () => {
+  const workspace = new BrowserWorkspace();
+  workspace.apply({ relayUrl: "wss://relay-b.example", reposDir: null });
+  registerWebMediaTransferCommands(workspace);
+  let fetched = false;
+  globalThis.fetch = async () => {
+    fetched = true;
+    return new Response();
+  };
+
+  await assert.rejects(
+    dispatch("download_image", {
+      url: `https://relay.example/media/${"f".repeat(64)}.png`,
+    }),
+    /same-origin media URLs/,
+  );
+  assert.equal(fetched, false);
 });
 
 test.afterEach(() => {

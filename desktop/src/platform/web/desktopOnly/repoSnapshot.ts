@@ -4,6 +4,7 @@ import { dispatch, register, type InvokeBody } from "../registry";
 import { BrowserUnavailableError } from "./capabilityOff";
 
 const SNAPSHOT_TIMEOUT_MS = 15_000;
+const MAX_DATE_SECONDS = 8_640_000_000_000;
 const OWNER_RE = /^[0-9a-f]{64}$/;
 const REPO_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 const BROWSER_UNAVAILABLE_HINT =
@@ -143,6 +144,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isDateTimestamp(value: unknown): value is number {
+  return (
+    Number.isSafeInteger(value) && Math.abs(value as number) <= MAX_DATE_SECONDS
+  );
+}
+
+function isNullableDateTimestamp(value: unknown): value is number | null {
+  return value === null || isDateTimestamp(value);
+}
+
 function isCommit(value: unknown): value is RepoSnapshotCommit {
   return (
     isRecord(value) &&
@@ -151,7 +162,21 @@ function isCommit(value: unknown): value is RepoSnapshotCommit {
     typeof value.author_name === "string" &&
     typeof value.author_email === "string" &&
     typeof value.subject === "string" &&
-    typeof value.timestamp === "number"
+    isDateTimestamp(value.timestamp)
+  );
+}
+
+function isFile(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    typeof value.path === "string" &&
+    typeof value.kind === "string" &&
+    (value.size === null ||
+      (Number.isSafeInteger(value.size) && (value.size as number) >= 0)) &&
+    (value.preview_content === null ||
+      typeof value.preview_content === "string") &&
+    isNullableDateTimestamp(value.last_changed_at) &&
+    (value.latest_commit === null || isCommit(value.latest_commit))
   );
 }
 
@@ -163,12 +188,7 @@ function isSnapshot(value: unknown): value is Record<string, unknown> & {
     !isRecord(value) ||
     !(value.latest_commit === null || isCommit(value.latest_commit)) ||
     !Array.isArray(value.files) ||
-    !value.files.every(
-      (file) =>
-        isRecord(file) &&
-        typeof file.path === "string" &&
-        typeof file.kind === "string",
-    )
+    !value.files.every(isFile)
   ) {
     return false;
   }
@@ -186,8 +206,9 @@ function isSnapshot(value: unknown): value is Record<string, unknown> & {
           isRecord(contributor) &&
           typeof contributor.name === "string" &&
           typeof contributor.email === "string" &&
-          typeof contributor.commit_count === "number" &&
-          typeof contributor.last_commit_at === "number",
+          Number.isSafeInteger(contributor.commit_count) &&
+          (contributor.commit_count as number) >= 0 &&
+          isDateTimestamp(contributor.last_commit_at),
       ))
   );
 }

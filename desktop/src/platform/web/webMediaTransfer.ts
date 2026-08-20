@@ -5,6 +5,7 @@ import {
   type InvokeBody,
   register,
 } from "./registry";
+import type { BrowserWorkspace } from "./workspace";
 
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 const CLIPBOARD_PIXEL_BYTES = 4;
@@ -32,11 +33,15 @@ function parseMediaRequest(
   command: string,
   body: InvokeBody,
   needsFilename = false,
+  workspace?: BrowserWorkspace,
 ): MediaRequest {
   if (!isRecord(body) || typeof body.url !== "string") {
     throw new TypeError(`${command} requires a URL`);
   }
-  if (!mediaHashFromUrl(body.url)) {
+  const expectedOrigin = workspace
+    ? new URL(workspace.httpUrl()).origin
+    : window.location.origin;
+  if (!mediaHashFromUrl(body.url, expectedOrigin)) {
     throw new Error(`${command} only accepts same-origin media URLs`);
   }
   if (needsFilename && typeof body.filename !== "string") {
@@ -91,8 +96,12 @@ async function readBoundedBlob(response: Response): Promise<Blob> {
   return new Blob([bytes], { type: contentType });
 }
 
-async function fetchRelayMedia(url: URL, requireImage: boolean): Promise<Blob> {
-  const authorization = await mediaAuthorization(url.href);
+async function fetchRelayMedia(
+  url: URL,
+  requireImage: boolean,
+  workspace?: BrowserWorkspace,
+): Promise<Blob> {
+  const authorization = await mediaAuthorization(url.href, workspace);
   const controller = new AbortController();
   const timeout = window.setTimeout(
     () => controller.abort(),
@@ -145,16 +154,27 @@ function filenameFromUrl(url: URL): string {
   }
 }
 
-export async function downloadBrowserImage(body: InvokeBody): Promise<boolean> {
-  const { url } = parseMediaRequest("download_image", body);
-  const blob = await fetchRelayMedia(url, true);
+export async function downloadBrowserImage(
+  body: InvokeBody,
+  workspace?: BrowserWorkspace,
+): Promise<boolean> {
+  const { url } = parseMediaRequest("download_image", body, false, workspace);
+  const blob = await fetchRelayMedia(url, true, workspace);
   triggerDownload(blob, filenameFromUrl(url));
   return true;
 }
 
-export async function downloadBrowserFile(body: InvokeBody): Promise<boolean> {
-  const { url, filename } = parseMediaRequest("download_file", body, true);
-  const blob = await fetchRelayMedia(url, false);
+export async function downloadBrowserFile(
+  body: InvokeBody,
+  workspace?: BrowserWorkspace,
+): Promise<boolean> {
+  const { url, filename } = parseMediaRequest(
+    "download_file",
+    body,
+    true,
+    workspace,
+  );
+  const blob = await fetchRelayMedia(url, false, workspace);
   triggerDownload(blob, filename ?? "file");
   return true;
 }
@@ -170,9 +190,15 @@ function canvasToPng(canvas: HTMLCanvasElement): Promise<Blob> {
 
 export async function copyBrowserImageToClipboard(
   body: InvokeBody,
+  workspace?: BrowserWorkspace,
 ): Promise<void> {
-  const { url } = parseMediaRequest("copy_image_to_clipboard", body);
-  const source = await fetchRelayMedia(url, true);
+  const { url } = parseMediaRequest(
+    "copy_image_to_clipboard",
+    body,
+    false,
+    workspace,
+  );
+  const source = await fetchRelayMedia(url, true, workspace);
   const image = await createImageBitmap(source).catch((error: unknown) => {
     throw new Error(
       `failed to decode image: ${error instanceof Error ? error.message : String(error)}`,
@@ -205,9 +231,13 @@ function uploadMediaPathUnavailable(): never {
   );
 }
 
-export function registerWebMediaTransferCommands(): void {
+export function registerWebMediaTransferCommands(
+  workspace: BrowserWorkspace,
+): void {
   register("upload_media", uploadMediaPathUnavailable);
-  register("download_image", downloadBrowserImage);
-  register("download_file", downloadBrowserFile);
-  register("copy_image_to_clipboard", copyBrowserImageToClipboard);
+  register("download_image", (body) => downloadBrowserImage(body, workspace));
+  register("download_file", (body) => downloadBrowserFile(body, workspace));
+  register("copy_image_to_clipboard", (body) =>
+    copyBrowserImageToClipboard(body, workspace),
+  );
 }

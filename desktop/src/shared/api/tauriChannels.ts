@@ -177,6 +177,54 @@ type RawChannelMessagesPageResponse = {
   next_cursor: { created_at: number; event_id: string } | null;
 };
 
+export type ChannelHistoryPageRequest = {
+  channelId: string;
+  since?: number;
+  until: number;
+  beforeId?: string | null;
+  kinds?: readonly number[];
+  limit?: number;
+};
+
+/**
+ * Fetch one channel-history page through the relay bridge's raw-filter query.
+ *
+ * The bridge preserves its composite `until` + `before_id` extension, unlike a
+ * NIP-01 WebSocket REQ whose filter parser drops extension fields. `beforeId`
+ * is omitted only for the first inclusive page; every full page returns the
+ * composite cursor for the next request.
+ */
+export async function getChannelHistoryPage({
+  channelId,
+  since,
+  until,
+  beforeId,
+  kinds,
+  limit,
+}: ChannelHistoryPageRequest): Promise<ChannelMessagesPageResponse> {
+  const response = await invokeTauri<RawChannelMessagesPageResponse>(
+    "get_channel_messages_before",
+    {
+      channelId,
+      since: since ?? null,
+      before: until,
+      beforeId: beforeId ?? null,
+      kinds: kinds ? [...kinds] : null,
+      limit: limit ?? null,
+    },
+  );
+
+  return {
+    events: response.events,
+    nextCursor: response.next_cursor
+      ? {
+          createdAt: response.next_cursor.created_at,
+          eventId: response.next_cursor.event_id,
+        }
+      : null,
+  };
+}
+
 /**
  * Fetch one keyset page of top-level channel history strictly older than a
  * cursor, via the bridge composite `(createdAt, eventId)` cursor.
@@ -194,25 +242,12 @@ export async function getChannelMessagesBefore(
   cursor: ChannelPageCursor,
   limit?: number,
 ): Promise<ChannelMessagesPageResponse> {
-  const response = await invokeTauri<RawChannelMessagesPageResponse>(
-    "get_channel_messages_before",
-    {
-      channelId,
-      before: cursor.createdAt,
-      beforeId: cursor.eventId,
-      limit: limit ?? null,
-    },
-  );
-
-  return {
-    events: response.events,
-    nextCursor: response.next_cursor
-      ? {
-          createdAt: response.next_cursor.created_at,
-          eventId: response.next_cursor.event_id,
-        }
-      : null,
-  };
+  return getChannelHistoryPage({
+    channelId,
+    until: cursor.createdAt,
+    beforeId: cursor.eventId,
+    limit,
+  });
 }
 
 export async function getChannelMembers(

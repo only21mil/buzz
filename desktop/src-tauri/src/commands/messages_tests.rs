@@ -123,12 +123,21 @@ fn channel_messages_before_filter_sends_before_id_the_relay_reads() {
     // re-returning the same page forever. Pin the field name here so the
     // client/relay contract can't drift without a red test (the Playwright
     // mock reimplements the keyset in JS and cannot catch this).
-    let filter = build_channel_messages_before_filter("channel-1", 1_700_000_000, Some("ab"), 200);
+    let filter = build_channel_messages_before_filter(
+        "channel-1",
+        1_700_000_000,
+        Some("ab"),
+        Some(1_699_999_000),
+        &[9, 40002, 40003],
+        200,
+    );
 
     assert_eq!(filter["until"], serde_json::json!(1_700_000_000));
     assert_eq!(filter["before_id"], serde_json::json!("ab"));
     assert_eq!(filter["limit"], serde_json::json!(200));
     assert_eq!(filter["#h"], serde_json::json!(["channel-1"]));
+    assert_eq!(filter["since"], serde_json::json!(1_699_999_000));
+    assert_eq!(filter["kinds"], serde_json::json!([9, 40002, 40003]));
     assert!(
         !filter.contains_key("n"),
         "tiebreak must be `before_id`, not the `n` alias the relay ignores"
