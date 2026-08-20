@@ -12,8 +12,10 @@ checks=()
 statuses=()
 evidence_files=()
 preconditions=(
-  'broker lease hooks for exclusive socket, storage, and quota ownership'
-  'broker teardown hook that quarantines an incompletely cleaned lease'
+  'substrate wiring has published root-owned /etc/buzzci/harness.env'
+  'the published runner control supports admit, get, cancel, capacity readback, and --fault teardown_failure'
+  'the accepted fixture repository exposes ci-acceptance/probe-repo/workflow.yml jobs ok, flaky, and slowpoke'
+  'root readback of lease and reconciliation evidence requires SUITE_SUDO or passwordless sudo'
 )
 
 usage() {
@@ -207,7 +209,152 @@ evidence_files+=("$TEST_ID/delegated-scope.txt")
 
 slot_count=$(timeout "$TIMEOUT_SECONDS" getent passwd | timeout "$TIMEOUT_SECONDS" awk -F: '$1 ~ /^buzzci-(mat|exec|run)-[0-9][0-9]$/ {n++} END{print n+0}')
 if [[ $slot_count == 3 ]]; then record slot_concurrency pass 'Exactly three lease principals exist, proving one slot and concurrency at most one'; else record slot_concurrency fail "Found $slot_count lease principals; expected exactly three for one slot"; fi
-record exclusive_lease_pools not_runnable 'Exclusive socket, storage, and quota ownership requires broker lease hooks'
-record teardown_quarantine not_runnable 'Permanent quarantine after incomplete teardown requires the broker teardown hook'
+
+dynamic_names=(exclusive_lease_pools teardown_quarantine)
+if [[ ! -e /etc/buzzci/harness.env ]]; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'Substrate wiring has not published /etc/buzzci/harness.env'; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+fi
+if ((${#SUDO[@]} == 0)); then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'Root harness and lease evidence readback requires SUITE_SUDO or passwordless sudo'; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+fi
+harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || {
+  for name in "${dynamic_names[@]}"; do record "$name" fail 'Published harness.env is not root-readable'; done
+  emit
+  exit 1
+}
+env_get() {
+  local key=$1
+  printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'
+}
+runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
+lease_root=$(env_get BUZZ_CI_LEASE_STATE_ROOT)
+fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
+if [[ ! -x $runner_ctl || ! -d $lease_root || -z $fixture_repo ]]; then
+  for name in "${dynamic_names[@]}"; do record "$name" fail 'Published runner control, lease root, or fixture coordinate is missing'; done
+  emit
+  exit 1
+fi
+
+active_lease=''
+cleanup_lease() {
+  if [[ $active_lease =~ ^[A-Za-z0-9._-]+$ ]]; then
+    timeout 10 "$runner_ctl" cancel --lease "$active_lease" >/dev/null 2>&1 || true
+  fi
+}
+trap 'cleanup_lease; cleanup_unit' EXIT
+
+capacity_before=$out_dir/capacity-before.json
+if timeout "$TIMEOUT_SECONDS" "$runner_ctl" get --capacity >"$capacity_before" 2>"$out_dir/capacity-before.stderr"; then
+  concurrency_limit=$(timeout 10 jq -r '.concurrency_limit // 0' "$capacity_before")
+else
+  concurrency_limit=0
+fi
+evidence_files+=("$TEST_ID/capacity-before.json" "$TEST_ID/capacity-before.stderr")
+
+exclusive_ok=1
+: >"$out_dir/admit-exclusive.json"
+: >"$out_dir/admit-exclusive.stderr"
+: >"$out_dir/admit-while-leased.json"
+: >"$out_dir/admit-while-leased.stderr"
+: >"$out_dir/final-exclusive.json"
+: >"$out_dir/final-exclusive.stderr"
+if [[ $concurrency_limit != 1 ]]; then
+  exclusive_ok=0
+elif timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
+    --workflow ci-acceptance/probe-repo/workflow.yml --job slowpoke --attempt 1 >"$out_dir/admit-exclusive.json" 2>"$out_dir/admit-exclusive.stderr"; then
+  active_lease=$(timeout 10 jq -r '.lease_id // empty' "$out_dir/admit-exclusive.json")
+  [[ $active_lease =~ ^[A-Za-z0-9._-]+$ ]] || exclusive_ok=0
+else
+  exclusive_ok=0
+fi
+evidence_files+=("$TEST_ID/admit-exclusive.json" "$TEST_ID/admit-exclusive.stderr")
+second_rc=0
+if ((exclusive_ok)); then
+  timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
+    --workflow ci-acceptance/probe-repo/workflow.yml --job ok --attempt 1 >"$out_dir/admit-while-leased.json" 2>"$out_dir/admit-while-leased.stderr" || second_rc=$?
+  if ((second_rc == 0)) || ! {
+    timeout 10 jq -e '.error == "concurrency_limited"' "$out_dir/admit-while-leased.json" >/dev/null 2>&1 \
+      || timeout 10 jq -e '.error == "concurrency_limited"' "$out_dir/admit-while-leased.stderr" >/dev/null 2>&1
+  }; then
+    exclusive_ok=0
+  fi
+fi
+evidence_files+=("$TEST_ID/admit-while-leased.json" "$TEST_ID/admit-while-leased.stderr")
+cleanup_lease
+exclusive_terminal=0
+if [[ -s $out_dir/admit-exclusive.json ]]; then
+  exclusive_lease=$(timeout 10 jq -r '.lease_id // empty' "$out_dir/admit-exclusive.json")
+  for _ in {1..120}; do
+    if timeout 10 "$runner_ctl" get --lease "$exclusive_lease" >"$out_dir/final-exclusive.json" 2>"$out_dir/final-exclusive.stderr" \
+      && timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final-exclusive.json" >/dev/null 2>&1; then
+      exclusive_terminal=1
+      break
+    fi
+    timeout 2 sleep 0.25
+  done
+fi
+evidence_files+=("$TEST_ID/final-exclusive.json" "$TEST_ID/final-exclusive.stderr")
+active_lease=''
+((exclusive_terminal)) || exclusive_ok=0
+if ((exclusive_ok)); then
+  record exclusive_lease_pools pass 'Capacity is fixed at one, concurrent admission was refused with concurrency_limited, and cancellation reached terminal state'
+else
+  record exclusive_lease_pools fail 'Capacity was not one, the first lease failed, concurrent admission was not refused, or cancellation never reached terminal state'
+fi
+
+help_file=$out_dir/runner-help.txt
+timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --help >"$help_file" 2>&1 || true
+evidence_files+=("$TEST_ID/runner-help.txt")
+if ((exclusive_terminal == 0)); then
+  record teardown_quarantine not_runnable 'The prior live lease did not reach terminal state, so the teardown-failure probe was not started'
+elif ! timeout 10 grep -Fq -- '--fault' "$help_file"; then
+  record teardown_quarantine not_runnable 'The published runner control offers no forced teardown-failure operation'
+else
+  fault_ok=1
+  : >"$out_dir/final-teardown-failure.json"
+  : >"$out_dir/final-teardown-failure.stderr"
+  : >"$out_dir/reconcile-teardown-failure.json"
+  : >"$out_dir/capacity-after-quarantine.json"
+  : >"$out_dir/capacity-after-quarantine.stderr"
+  if timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
+      --workflow ci-acceptance/probe-repo/workflow.yml --job flaky --attempt 1 --fault teardown_failure \
+      >"$out_dir/admit-teardown-failure.json" 2>"$out_dir/admit-teardown-failure.stderr"; then
+    fault_lease=$(timeout 10 jq -r '.lease_id // empty' "$out_dir/admit-teardown-failure.json")
+    [[ $fault_lease =~ ^[A-Za-z0-9._-]+$ ]] || fault_ok=0
+  else
+    fault_ok=0
+    fault_lease=''
+  fi
+  evidence_files+=("$TEST_ID/admit-teardown-failure.json" "$TEST_ID/admit-teardown-failure.stderr")
+  if ((fault_ok)); then
+    for _ in {1..120}; do
+      if timeout 10 "$runner_ctl" get --lease "$fault_lease" >"$out_dir/final-teardown-failure.json" 2>"$out_dir/final-teardown-failure.stderr" \
+        && timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final-teardown-failure.json" >/dev/null 2>&1; then
+        break
+      fi
+      timeout 2 sleep 0.25
+    done
+    reconcile=$lease_root/$fault_lease/reconcile.json
+    for _ in {1..120}; do
+      if timeout 10 "${SUDO[@]}" test -r "$reconcile"; then break; fi
+      timeout 2 sleep 0.25
+    done
+    timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat "$reconcile" >"$out_dir/reconcile-teardown-failure.json" 2>/dev/null || fault_ok=0
+    timeout "$TIMEOUT_SECONDS" "$runner_ctl" get --capacity >"$out_dir/capacity-after-quarantine.json" 2>"$out_dir/capacity-after-quarantine.stderr" || fault_ok=0
+    timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final-teardown-failure.json" >/dev/null 2>&1 || fault_ok=0
+  fi
+  evidence_files+=("$TEST_ID/final-teardown-failure.json" "$TEST_ID/final-teardown-failure.stderr" "$TEST_ID/reconcile-teardown-failure.json" "$TEST_ID/capacity-after-quarantine.json" "$TEST_ID/capacity-after-quarantine.stderr")
+  if ((fault_ok)) \
+    && timeout 10 jq -e '.quarantined == true and .before_reuse == true and .reuse_allowed == false' "$out_dir/reconcile-teardown-failure.json" >/dev/null \
+    && timeout 10 jq -e '.concurrency_limit == 1' "$out_dir/capacity-after-quarantine.json" >/dev/null; then
+    record teardown_quarantine pass 'Forced incomplete teardown published a before-reuse quarantine with reuse disallowed, alongside live fixed-capacity readback'
+  else
+    record teardown_quarantine fail 'Forced incomplete teardown lacked terminal quarantine evidence, before-reuse proof, reuse refusal, or fixed-capacity readback'
+  fi
+fi
 emit
-exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || [[ " ${statuses[*]} " == *' not_runnable '* ]] && printf 3 || printf 0 )"
