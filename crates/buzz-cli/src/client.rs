@@ -4,6 +4,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
 use crate::error::CliError;
@@ -107,6 +108,15 @@ fn sign_nip98(
         .map_err(|e| CliError::Other(format!("NIP-98 signing failed: {e}")))?;
     let json = event.as_json();
     Ok(format!("Nostr {}", B64.encode(json.as_bytes())))
+}
+
+fn relay_relative_url(relay_url: &str, path: &str) -> Result<String, CliError> {
+    if !path.starts_with('/') || path.starts_with("//") || path.contains("://") {
+        return Err(CliError::Usage(
+            "authenticated POST path must be relay-relative".into(),
+        ));
+    }
+    Ok(format!("{relay_url}{path}"))
 }
 
 fn relay_server_tag(relay_url: &str) -> Option<String> {
@@ -849,6 +859,49 @@ impl BuzzClient {
                     .send()
                     .await?;
                 self.handle_response(resp).await
+            }
+        })
+        .await
+    }
+
+    /// POST a JSON value to a relay-relative NIP-98 authenticated endpoint and
+    /// deserialize its JSON response.
+    ///
+    /// The request body is serialized once before the retry loop. Every retry
+    /// therefore sends identical bytes while receiving a fresh NIP-98 nonce.
+    pub async fn post_authed_json<Request, Response>(
+        &self,
+        path: &str,
+        request: &Request,
+    ) -> Result<Response, CliError>
+    where
+        Request: serde::Serialize + ?Sized,
+        Response: DeserializeOwned,
+    {
+        let url = relay_relative_url(&self.relay_url, path)?;
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(request)
+                .map_err(|e| CliError::Other(format!("request serialization failed: {e}")))?,
+        );
+        self.with_retry_body(|| {
+            let body = body.clone();
+            let url = url.clone();
+            async move {
+                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let resp = self
+                    .with_auth_tag(
+                        self.http
+                            .post(&url)
+                            .header("Authorization", auth)
+                            .header("Content-Type", "application/json")
+                            .body(body),
+                    )
+                    .send()
+                    .await?;
+                let raw = self.handle_response(resp).await?;
+                serde_json::from_str(&raw).map_err(|e| {
+                    CliError::Other(format!("failed to parse authenticated POST response: {e}"))
+                })
             }
         })
         .await
@@ -1605,7 +1658,10 @@ mod retry_policy_tests {
     use tokio::net::TcpListener;
 
     use super::super::error::CliError;
-    use super::BuzzClient;
+    use super::{relay_relative_url, sign_nip98, BuzzClient, B64};
+    use base64::Engine as _;
+    use nostr::JsonUtil;
+    use sha2::{Digest, Sha256};
 
     /// Spawn a one-shot axum server on a random port.  The handler `f` receives the
     /// attempt counter (incremented before every call) and returns a `(StatusCode,
@@ -2302,6 +2358,32 @@ mod retry_policy_tests {
             3,
             "all 3 attempts must fire before surfacing DeliveryUnknown"
         );
+    }
+
+    #[test]
+    fn authenticated_json_post_binds_exact_body_and_relay_url() {
+        let keys = Keys::generate();
+        let request = serde_json::json!({"target_repo_a": "30617:owner:repo", "jobs": ["test"]});
+        let body = serde_json::to_vec(&request).unwrap();
+        let url = relay_relative_url("https://relay.example", "/ci/preflight").unwrap();
+        let header = sign_nip98(&keys, "POST", &url, Some(&body)).unwrap();
+        let encoded = header.strip_prefix("Nostr ").unwrap();
+        let event = nostr::Event::from_json(B64.decode(encoded).unwrap()).unwrap();
+        let tags: Vec<Vec<String>> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        assert!(tags.contains(&vec!["u".into(), url]));
+        assert!(tags.contains(&vec!["method".into(), "POST".into()]));
+        assert!(tags.contains(&vec!["payload".into(), hex::encode(Sha256::digest(&body)),]));
+    }
+
+    #[test]
+    fn authenticated_json_post_rejects_non_relative_path() {
+        let result =
+            relay_relative_url("https://relay.example", "https://evil.example/ci/preflight");
+        assert!(matches!(result, Err(CliError::Usage(_))));
     }
 }
 
