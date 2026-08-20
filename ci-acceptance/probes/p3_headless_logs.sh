@@ -65,13 +65,38 @@ fi
 record_assertion "headless_log_json" "$pass" "setsid log retrieval exits successfully with one JSON object"
 
 pass=false
+decoded_log_file=
+decoded_log_ok=false
 if assert_json "$log_output"; then
-  content=$(jq -r '.url_or_inline // empty' <<<"$log_output")
-  if grep -Fq 'flaky attempt 1 failure' <<<"$content"; then
+  inline=$(jq -r '.url_or_inline // empty' <<<"$log_output")
+  if [[ -n "$inline" ]]; then
+    decoded_log_file=$(mktemp "$PROBE_ROOT/.probe-log.XXXXXX")
+    if printf '%s' "$inline" | base64 --decode >"$decoded_log_file" 2>/dev/null; then
+      decoded_log_ok=true
+    fi
+  fi
+  if [[ "$decoded_log_ok" == true ]] && grep -Fq 'flaky attempt 1 failure' "$decoded_log_file"; then
     pass=true
   fi
 fi
-record_assertion "failure_line_grepable" "$pass" "failed-job log contains its deterministic failure line"
+record_assertion "failure_line_grepable" "$pass" "decoded failed-job log contains its deterministic failure line"
+
+pass=false
+if assert_json "$log_output" && assert_jq '(.cap_bytes | type == "number") and (.cap_bytes > 0) and .truncated == false' "$log_output"; then
+  pass=true
+fi
+record_assertion "normal_log_cap_and_truncation" "$pass" "normal log response carries a cap and is not truncated"
+
+pass=false
+if [[ "$decoded_log_ok" == true ]] && assert_json "$log_output"; then
+  decoded_sha=$(sha256sum "$decoded_log_file" | cut -d' ' -f1)
+  decoded_size=$(wc -c <"$decoded_log_file")
+  decoded_bound=$(jq -cn --arg expected_hash "$decoded_sha" --argjson expected_size "$decoded_size" --argjson response "$log_output" '{expected_hash:$expected_hash,expected_size:$expected_size,response:$response}')
+  if assert_jq '.response.log_sha256 == .expected_hash and .response.size == .expected_size' "$decoded_bound"; then
+    pass=true
+  fi
+fi
+record_assertion "decoded_inline_hash_and_size" "$pass" "log hash and size match the decoded inline bytes"
 
 pass=false
 if assert_json "$log_output" && assert_jq '.job_id == "flaky" and .attempt == 1 and (.log_sha256 | type == "string") and (.truncated | type == "boolean") and (.cap_bytes | type == "number")' "$log_output"; then
@@ -81,5 +106,9 @@ if assert_json "$log_output" && assert_jq '.job_id == "flaky" and .attempt == 1 
   fi
 fi
 record_assertion "attempt_scoped_scrubbed_log" "$pass" "response carries attempt, full log hash, truncation flag, and cap"
+
+if [[ -n "$decoded_log_file" ]]; then
+  rm -f -- "$decoded_log_file"
+fi
 
 probe_finish
