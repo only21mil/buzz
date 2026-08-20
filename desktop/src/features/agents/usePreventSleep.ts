@@ -7,6 +7,7 @@ import {
 import { createPreventSleepActivityTracker } from "@/features/agents/preventSleepActivity";
 import { setPreventSleepActive } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import { listen } from "@tauri-apps/api/event";
 
 // Intentionally not scoped per-pubkey — multi-user desktop is rare and the
@@ -14,11 +15,11 @@ import { listen } from "@tauri-apps/api/event";
 const STORAGE_KEY = "buzz-prevent-sleep";
 
 function readPreference(): boolean {
-  return window.localStorage.getItem(STORAGE_KEY) === "true";
+  return getStorageItem(STORAGE_KEY) === "true";
 }
 
 function writePreference(enabled: boolean) {
-  window.localStorage.setItem(STORAGE_KEY, String(enabled));
+  setStorageItem(STORAGE_KEY, String(enabled));
 }
 
 interface PreventSleepValue {
