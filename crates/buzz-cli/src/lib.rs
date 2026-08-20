@@ -201,6 +201,9 @@ enum Cmd {
     /// Create, trigger, and manage workflows
     #[command(subcommand)]
     Workflows(WorkflowsCmd),
+    /// Trigger and inspect CI runs
+    #[command(subcommand)]
+    Ci(commands::ci::CiCmd),
     /// Read the activity feed
     #[command(subcommand)]
     Feed(FeedCmd),
@@ -2075,6 +2078,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
+        Cmd::Ci(_) => Err(CliError::Other(
+            "CI command execution is not available in this parser-only build".into(),
+        )),
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
@@ -2145,6 +2151,144 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn ci_required_command_arguments_parse() {
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "run",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["buzz", "ci", "status", "--run", "run-id"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "logs",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "rerun",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "verdict",
+            "--run",
+            "run-id",
+            "--expect-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["buzz", "ci", "watch", "--run", "run-id"]).is_ok());
+    }
+
+    #[test]
+    fn ci_run_parses_optional_workflow_and_jobs() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "run",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--workflow",
+            "required-ci",
+            "--jobs",
+            "unit_linux,unit_macos",
+        ])
+        .expect("CI run options should parse");
+
+        let Cmd::Ci(commands::ci::CiCmd::Run { workflow, jobs, .. }) = cli.command else {
+            panic!("expected CI run");
+        };
+        assert_eq!(workflow.as_deref(), Some("required-ci"));
+        assert_eq!(jobs, ["unit_linux", "unit_macos"]);
+    }
+
+    #[test]
+    fn ci_logs_parses_optional_attempt_and_raw() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "logs",
+            "--run",
+            "run-id",
+            "--job",
+            "unit_linux",
+            "--attempt",
+            "2",
+            "--raw",
+        ])
+        .expect("CI log options should parse");
+
+        let Cmd::Ci(commands::ci::CiCmd::Logs { attempt, raw, .. }) = cli.command else {
+            panic!("expected CI logs");
+        };
+        assert_eq!(attempt, Some(2));
+        assert!(raw);
+    }
+
+    #[test]
+    fn ci_rejects_missing_required_arguments() {
+        for args in [
+            vec!["buzz", "ci", "run"],
+            vec![
+                "buzz",
+                "ci",
+                "run",
+                "--repo-owner",
+                "owner",
+                "--repo-id",
+                "repo",
+            ],
+            vec!["buzz", "ci", "status"],
+            vec!["buzz", "ci", "logs", "--run", "run-id"],
+            vec!["buzz", "ci", "rerun", "--job", "unit_linux"],
+            vec!["buzz", "ci", "verdict", "--run", "run-id"],
+            vec!["buzz", "ci", "watch"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "missing required CI arguments must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_rejects_unknown_commands_and_arguments() {
+        assert!(Cli::try_parse_from(["buzz", "ci", "unknown"]).is_err());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "status",
+            "--run",
+            "run-id",
+            "--unknown",
+            "value",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2335,6 +2479,7 @@ mod tests {
             "agents",
             "canvas",
             "channels",
+            "ci",
             "dms",
             "emoji",
             "feed",
@@ -2440,6 +2585,10 @@ mod tests {
             ]
         );
         assert_eq!(names(&cmd, "canvas"), vec!["get", "set"]);
+        assert_eq!(
+            names(&cmd, "ci"),
+            vec!["logs", "rerun", "run", "status", "verdict", "watch"]
+        );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
         assert_eq!(
             names(&cmd, "emoji"),
