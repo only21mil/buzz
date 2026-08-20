@@ -579,9 +579,11 @@ mod tests {
 
         let partial = state.consume(record(2, "two", WatchScope::Evidence));
         assert_eq!(emitted_cursors(&partial), [2]);
-        assert!(!partial
-            .iter()
-            .any(|action| matches!(action, WatchAction::RequestReplay(_))));
+        assert!(
+            !partial
+                .iter()
+                .any(|action| matches!(action, WatchAction::RequestReplay(_)))
+        );
 
         assert_eq!(
             state.replay_finished(),

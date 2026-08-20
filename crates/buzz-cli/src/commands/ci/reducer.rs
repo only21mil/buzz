@@ -759,15 +759,13 @@ fn required_job_good(status: &CiJobStatusEnvelope) -> bool {
 
 fn required_job_failed(status: &CiJobStatusEnvelope) -> bool {
     status.required
-        && matches!(
+        && (matches!(
             status.state,
             CiJobState::Failure | CiJobState::Cancelled | CiJobState::TimedOut
-        )
-        || status.required
-            && matches!(
-                (status.state, status.skip_policy),
-                (CiJobState::Skipped, CiSkipPolicy::Forbid)
-            )
+        ) || matches!(
+            (status.state, status.skip_policy),
+            (CiJobState::Skipped, CiSkipPolicy::Forbid)
+        ))
 }
 
 fn validate_run_coordinates(
@@ -914,7 +912,7 @@ fn infrastructure_reduction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::ci::{CiFinalizedJobAttempt, CiRequestType, CiTeardownLease, CI_SCHEMA_VERSION};
+    use buzz_core::ci::{CI_SCHEMA_VERSION, CiFinalizedJobAttempt, CiRequestType, CiTeardownLease};
 
     const REQUEST_ID: u64 = 1;
 

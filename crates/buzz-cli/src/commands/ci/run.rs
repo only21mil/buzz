@@ -284,11 +284,7 @@ fn validate_preflight(
     validate_nonempty_text(&response.base_ref, "base ref")?;
     validate_nonempty_text(&response.workflow_path, "workflow path")?;
     validate_workflow_path(&response.workflow_path)?;
-    let workflow_id = Uuid::parse_str(&response.workflow_id)
-        .map_err(|_| preflight_error("workflow_id is not a UUID"))?;
-    if workflow_id.to_string() != response.workflow_id {
-        return Err(preflight_error("workflow_id is not canonical"));
-    }
+    validate_nonempty_text(&response.workflow_id, "workflow_id")?;
     validate_lower_hex(&response.workflow_digest, 64, "workflow digest")?;
     if let Some(selector) = &request.workflow_selector {
         let matches = if is_lower_hex(selector, 64) {
@@ -389,6 +385,7 @@ fn validate_policy(policy: &PreflightPolicy) -> Result<(), CliError> {
     if values
         .iter()
         .any(|value| *value == 0 || *value > CI_MAX_SAFE_INTEGER)
+        || policy.max_attempts > u64::from(u32::MAX)
         || policy.min_timeout_seconds > policy.max_timeout_seconds
     {
         return Err(preflight_error("invalid preflight policy bounds"));
@@ -500,7 +497,6 @@ async fn wait_for_queued_acknowledgement(
                 "kinds": [KIND_CI_RUN_STATUS],
                 "#e": [request_event_id],
                 "#h": [channel_id],
-                "#run": [request.run_id],
             });
             let raw = client.query(&filter).await?;
             let values: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| {
@@ -742,7 +738,7 @@ mod tests {
             source_branch: "feature/ci".into(),
             base_ref: "refs/heads/main".into(),
             base_oid: "d".repeat(40),
-            workflow_id: "22222222-2222-4222-8222-222222222222".into(),
+            workflow_id: "ci".into(),
             workflow_path: ".github/workflows/ci.yml".into(),
             workflow_digest: hex::encode(Sha256::digest(workflow)),
             canonical_workflow_base64: BASE64_STANDARD.encode(workflow),

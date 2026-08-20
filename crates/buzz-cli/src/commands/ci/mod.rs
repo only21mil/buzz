@@ -1,5 +1,16 @@
 use clap::Subcommand;
 
+// Candidate A compiles and tests these pure helpers before relay/API v1.2
+// supplies the signer-authority and watch transport wiring used by dispatch.
+#[allow(dead_code)]
+pub mod evidence;
+#[allow(dead_code)]
+pub mod reducer;
+#[allow(dead_code)]
+pub mod run;
+#[allow(dead_code)]
+pub mod watch;
+
 /// Commands for triggering and inspecting Buzz CI runs.
 #[derive(Subcommand)]
 pub enum CiCmd {

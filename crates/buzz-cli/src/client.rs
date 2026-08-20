@@ -110,6 +110,7 @@ fn sign_nip98(
     Ok(format!("Nostr {}", B64.encode(json.as_bytes())))
 }
 
+#[allow(dead_code)]
 fn relay_relative_url(relay_url: &str, path: &str) -> Result<String, CliError> {
     if !path.starts_with('/') || path.starts_with("//") || path.contains("://") {
         return Err(CliError::Usage(
@@ -869,6 +870,7 @@ impl BuzzClient {
     ///
     /// The request body is serialized once before the retry loop. Every retry
     /// therefore sends identical bytes while receiving a fresh NIP-98 nonce.
+    #[allow(dead_code)]
     pub async fn post_authed_json<Request, Response>(
         &self,
         path: &str,

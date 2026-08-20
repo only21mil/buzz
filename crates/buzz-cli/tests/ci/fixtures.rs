@@ -1,5 +1,5 @@
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub const CHANNEL_ID: &str = "018f4f4e-f60a-7b47-b8dc-68f59a4dc8f1";
@@ -53,7 +53,7 @@ pub fn preflight_response() -> Value {
         "pr_update_event_id": PR_UPDATE_EVENT_ID,
         "trigger_event_id": PR_UPDATE_EVENT_ID,
         "source_clone_url": "https://git.example.invalid/buzz.git",
-        "immutable_source_ref": format!("refs/buzz/ci/{TIP_OID}"),
+        "immutable_source_ref": format!("refs/nostr/{PR_ROOT_EVENT_ID}"),
         "tip_oid": TIP_OID,
         "source_branch": "feature/ci",
         "base_ref": "refs/heads/main",
@@ -111,7 +111,7 @@ pub fn request_content() -> String {
             "\"pr_root_event_id\":\"{}\",",
             "\"pr_update_event_id\":\"{}\",",
             "\"source_clone_url\":\"https://git.example.invalid/buzz.git\",",
-            "\"immutable_source_ref\":\"refs/buzz/ci/{}\",",
+            "\"immutable_source_ref\":\"refs/nostr/{}\",",
             "\"tip_oid\":\"{}\",",
             "\"source_branch\":\"feature/ci\",",
             "\"base_ref\":\"refs/heads/main\",",
@@ -131,7 +131,7 @@ pub fn request_content() -> String {
         target_repo_a(),
         PR_ROOT_EVENT_ID,
         PR_UPDATE_EVENT_ID,
-        TIP_OID,
+        PR_ROOT_EVENT_ID,
         TIP_OID,
         BASE_OID,
         WORKFLOW_ID,

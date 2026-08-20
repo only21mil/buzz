@@ -2,10 +2,10 @@ mod ci;
 
 use axum::http::{Method, StatusCode};
 use ci::fixtures::{
+    BASE_OID, CANONICAL_WORKFLOW_BASE64, OTHER_TIP_OID, RUN_ID, TIP_OID, WORKFLOW_DIGEST,
     log_reference_event, mixed_attempt_status_events, preflight_response, preflight_tip_mismatch,
     preflight_workflow_digest_mismatch, queued_ack_event, request_content, request_event,
-    rerun_request_event, unauthorized_ack_event, watch_page, wrong_request_ack_event, BASE_OID,
-    CANONICAL_WORKFLOW_BASE64, OTHER_TIP_OID, RUN_ID, TIP_OID, WORKFLOW_DIGEST,
+    rerun_request_event, unauthorized_ack_event, watch_page, wrong_request_ack_event,
 };
 use ci::mock_relay::{ExpectedRequest, MockRelay};
 use serde_json::Value;
