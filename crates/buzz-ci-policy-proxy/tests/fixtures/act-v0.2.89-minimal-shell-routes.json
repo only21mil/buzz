@@ -1,0 +1,27 @@
+{
+  "act_version": "v0.2.89",
+  "scope": "minimal-linux-shell-job-without-services",
+  "source_audit_only": true,
+  "routes": [
+    {"method": "GET", "target": "/info", "required": true},
+    {"method": "GET", "target": "/images/sha256%3A{digest}/json", "required": true},
+    {"method": "GET", "target": "/containers/json?all=1", "required": true},
+    {"method": "GET", "target": "/version", "required": true},
+    {"method": "POST", "target": "/containers/create?name={name}", "required": true},
+    {"method": "POST", "target": "/containers/{container_id}/start", "required": true},
+    {"method": "POST", "target": "/containers/{container_id}/exec", "required": true},
+    {"method": "POST", "target": "/exec/{exec_id}/start", "required": true, "stream": "hijack"},
+    {"method": "PUT", "target": "/containers/{container_id}/archive?path={path}", "required": true, "stream": "archive"},
+    {"method": "GET", "target": "/exec/{exec_id}/json", "required": true},
+    {"method": "GET", "target": "/containers/{container_id}/archive?path={path}", "required": true, "stream": "archive"},
+    {"method": "DELETE", "target": "/containers/{container_id}?force=true&v=true", "required": true},
+    {"method": "GET", "target": "/volumes", "required": true}
+  ],
+  "optional_negotiation": [
+    {"method": "GET", "target": "/_ping"},
+    {"method": "HEAD", "target": "/_ping"}
+  ],
+  "must_refuse": [
+    {"method": "POST", "target": "/images/create", "condition": "pinned image absent"}
+  ]
+}

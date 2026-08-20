@@ -1,0 +1,24 @@
+[package]
+name = "buzz-ci-materializer"
+description = "Bounded, credential-free source materializer for Buzz CI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }
+hex = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"

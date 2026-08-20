@@ -1029,9 +1029,16 @@ jobs:
             touch "desktop/src-tauri/binaries/${bin}-${TARGET}.exe"
           done
       - name: Clippy (workspace)
-        run: cargo clippy --workspace --all-targets --target $env:TARGET -- -D warnings
+        run: >-
+          cargo clippy --workspace --all-targets --target $env:TARGET
+          --exclude buzz-ci-materializer
+          --exclude buzz-ci-policy-proxy
+          -- -D warnings
       - name: Check (workspace)
-        run: cargo check --workspace --all-targets --target $env:TARGET
+        run: >-
+          cargo check --workspace --all-targets --target $env:TARGET
+          --exclude buzz-ci-materializer
+          --exclude buzz-ci-policy-proxy
       - name: Test (buzz-dev-mcp)
         # The Windows-only bash resolver lives in buzz-dev-mcp; its unit tests
         # only gate if this crate is tested ON Windows.

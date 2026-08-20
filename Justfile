@@ -322,6 +322,10 @@ test-unit:
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
+        # Buzz-native CI isolation decision layers are infra-free and must stay
+        # in both the nextest and cargo-test fallback paths. Host/root
+        # qualification remains a separate gated smoke suite.
+        cargo nextest run -p buzz-ci-isolation-contract -p buzz-ci-materializer -p buzz-ci-policy-proxy
     else
         ./scripts/run-tests.sh unit
     fi
