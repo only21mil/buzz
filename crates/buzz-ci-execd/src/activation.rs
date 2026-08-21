@@ -168,6 +168,7 @@ pub struct LeaseToken {
     lease_id: [u8; 16],
     generation: u64,
     nonce: [u8; 32],
+    expires_at: u64,
 }
 
 impl LeaseToken {
@@ -179,6 +180,11 @@ impl LeaseToken {
     /// Return the controller-owned generation for this lease.
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+
+    /// Trusted admission expiry retained for runner-death reconciliation.
+    pub const fn expires_at(self) -> u64 {
+        self.expires_at
     }
 }
 
@@ -742,6 +748,7 @@ impl ActivationController {
             lease_id: request.lease_id,
             generation: self.next_lease_generation,
             nonce: request.nonce,
+            expires_at: request.expires_at,
         };
         self.seen_nonces.insert(request.nonce, request.expires_at)?;
         self.next_lease_generation += 1;
@@ -749,6 +756,23 @@ impl ActivationController {
         self.active_lease = Some(lease);
         self.state = ActivationState::Leased;
         Ok(lease)
+    }
+
+    /// Atomically quarantine one leased job when trusted wall time reaches its expiry.
+    /// The returned opaque token is the sole cleanup coordinate retained by the caller.
+    pub fn expire_active_lease(&mut self, now: u64) -> Result<Option<LeaseToken>, ActivationError> {
+        if self.state != ActivationState::Leased {
+            return Ok(None);
+        }
+        let Some(lease) = self.active_lease else {
+            self.quarantine();
+            return Err(ActivationError::MissingLease);
+        };
+        if now < lease.expires_at {
+            return Ok(None);
+        }
+        self.quarantine();
+        Ok(Some(lease))
     }
 
     /// Record an outcome and enter Draining. A lease token is mandatory even for success.
@@ -945,9 +969,14 @@ fn snapshot_shape_is_valid(snapshot: DurableStateSnapshot) -> bool {
             snapshot.qualification.is_some_and(|qualification| {
                 qualification.active_lease.is_none() && qualification.evidence_set_digest.is_some()
             }) && snapshot.activation.is_some()
-                && snapshot
-                    .active_lease
-                    .is_some_and(|lease| lease.generation < snapshot.next_lease_generation)
+                && snapshot.active_lease.is_some_and(|lease| {
+                    lease.generation < snapshot.next_lease_generation
+                        && lease.expires_at != 0
+                        && snapshot.nonce_ledger.contains(&lease.nonce)
+                        && snapshot
+                            .activation
+                            .is_some_and(|grant| lease.expires_at <= grant.expires_at)
+                })
         }
         ActivationState::Quarantined => true,
     }
@@ -1482,6 +1511,7 @@ mod tests {
             lease_id: [42; 16],
             generation: 1,
             nonce: [43; 32],
+            expires_at: 100,
         };
         assert_eq!(
             controller.finish_lease(fabricated, LeaseConclusion::Success),
@@ -1601,6 +1631,21 @@ mod tests {
             controller.admit_ordinary(ordinary_admission(23, 24, 101), 26),
             Err(AdmissionError::ExpiredNonce)
         );
+    }
+
+    #[test]
+    fn trusted_expiry_atomically_quarantines_a_live_lease() {
+        let mut controller = ready_controller();
+        let lease = controller
+            .admit_ordinary(ordinary_admission(21, 22, 50), 21)
+            .expect("ordinary lease");
+        assert_eq!(lease.expires_at(), 50);
+        assert_eq!(controller.expire_active_lease(49), Ok(None));
+        assert_eq!(controller.state(), ActivationState::Leased);
+        assert_eq!(controller.expire_active_lease(50), Ok(Some(lease)));
+        assert_eq!(controller.state(), ActivationState::Quarantined);
+        assert_eq!(controller.snapshot().active_lease, None);
+        assert_eq!(controller.ordinary_capacity(50), 0);
     }
 
     #[test]
@@ -1913,6 +1958,7 @@ mod tests {
             lease_id: [0xab; 16],
             generation: 42,
             nonce: [0xcd; 32],
+            expires_at: 100,
         };
         assert_eq!(token.lease_id(), [0xab; 16]);
         assert_eq!(token.generation(), 42);

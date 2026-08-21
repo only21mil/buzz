@@ -12,11 +12,11 @@ use crate::{
     activation::{LeaseToken, OrdinaryAdmission, QualificationLease},
     control::{ClosedDispatch, ControlDispatch},
     durable_dispatch::{
-        load_dispatch, BootstrapDispatch, ExecutionUnavailable, OrdinaryExecution,
-        OrdinaryExecutor, QualificationExecution, QualificationExecutor, ReadyHostProofs,
-        ReadyValidationProvider,
+        load_dispatch, BootstrapDispatch, ExecutionUnavailable, ExpiredLeaseReconciliation,
+        OrdinaryExecution, OrdinaryExecutor, QualificationExecution, QualificationExecutor,
+        ReadyHostProofs, ReadyValidationProvider,
     },
-    runtime::ReadyValidationTarget,
+    runtime::{ReadyValidationTarget, RuntimeLoadError},
 };
 
 /// Why production remains closed before authority/state loading.
@@ -81,6 +81,14 @@ impl OrdinaryExecutor for ProductionOrdinaryExecutor {
         now: u64,
     ) -> Result<OrdinaryExecution, ExecutionUnavailable> {
         self.backend.execute(header, request, admission, lease, now)
+    }
+
+    fn reconcile_expired(
+        &mut self,
+        lease: LeaseToken,
+        now: u64,
+    ) -> Result<ExpiredLeaseReconciliation, ExecutionUnavailable> {
+        self.backend.reconcile_expired(lease, now)
     }
 }
 
@@ -157,6 +165,19 @@ impl ControlDispatch for ProductionDispatch {
     }
 }
 
+impl ProductionDispatch {
+    /// Drive trusted-time lease expiry independently of protocol completion.
+    pub fn reconcile_expired(
+        &mut self,
+        now: u64,
+    ) -> Result<Option<ExpiredLeaseReconciliation>, RuntimeLoadError> {
+        match self {
+            Self::Closed(_) => Ok(None),
+            Self::Configured(dispatch) => dispatch.reconcile_expired(now),
+        }
+    }
+}
+
 /// Load the exact production composition. Missing backends expose zero capacity.
 pub fn load_production_dispatch(now: u64) -> ProductionDispatch {
     let Ok(adapters) = ProductionAdapters::canonical() else {
@@ -197,6 +218,14 @@ mod tests {
             _lease: LeaseToken,
             _now: u64,
         ) -> Result<OrdinaryExecution, ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn reconcile_expired(
+            &mut self,
+            _lease: LeaseToken,
+            _now: u64,
+        ) -> Result<ExpiredLeaseReconciliation, ExecutionUnavailable> {
             Err(ExecutionUnavailable)
         }
     }
