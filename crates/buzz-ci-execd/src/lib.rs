@@ -37,6 +37,8 @@ use buzz_ci_broker_protocol::{
 
 pub mod seccomp;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod seccomp_activation;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod seccomp_exec;
 pub mod seccomp_host;
 

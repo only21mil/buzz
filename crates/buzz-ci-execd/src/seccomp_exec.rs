@@ -5,8 +5,8 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_ci_broker_protocol::GitOid;
@@ -19,8 +19,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::activation::{LeaseToken, OrdinaryAdmission};
-use crate::seccomp::{FEDORA_SECCOMP_SOURCE_MODE, SECCOMP_PROFILE_MODE};
-use crate::seccomp_host::{SECCOMP_DIRECTORY_MODE, SECCOMP_OWNER_GID, SECCOMP_OWNER_UID};
+use crate::seccomp::{
+    SeccompFileReadback, SeccompFileType, FEDORA_SECCOMP_SOURCE_MODE, SECCOMP_PROFILE_MODE,
+};
+use crate::seccomp_host::{
+    SeccompDirectoryReadback, SeccompHostFileType, SeccompHostPlan, SECCOMP_DIRECTORY_MODE,
+    SECCOMP_OWNER_GID, SECCOMP_OWNER_UID,
+};
 use buzz_ci_isolation_contract::{PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH};
 
 const SOURCE_COMPONENTS: [&str; 4] = ["usr", "share", "containers", "seccomp.json"];
@@ -94,6 +99,10 @@ impl SeccompInstallReceipt {
     pub const fn installed_at_unix_ns(self) -> u64 {
         self.installed_at_unix_ns
     }
+
+    pub(crate) fn has_persisted_receipt(self) -> bool {
+        self.install_receipt_digest != [0; 32] && self.installed_at_unix_ns != 0
+    }
 }
 
 /// Closed filesystem failure. No error permits an unconfined fallback.
@@ -130,6 +139,7 @@ pub enum SeccompExecError {
     OpenReceipt,
     InvalidReceipt,
     ReceiptDrift,
+    ReadbackPath,
     OciCapabilityMismatch,
     OciPrestartDrift,
 }
@@ -143,6 +153,76 @@ pub fn install_phase1() -> Result<SeccompInstallReceipt, SeccompExecError> {
     let mut names = KernelTemporaryNames;
     let installed = install_from_root(&root, InstallContract::phase1(), &mut names)?;
     persist_install_receipt(&root, installed, &mut names, unix_time_ns()?)
+}
+
+/// Fresh descriptor-based observations made after the install path returns.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct FreshSeccompReadback {
+    source: SeccompFileReadback,
+    directories: [SeccompDirectoryReadback; 4],
+    installed: SeccompFileReadback,
+}
+
+impl FreshSeccompReadback {
+    pub(crate) const fn source(&self) -> &SeccompFileReadback {
+        &self.source
+    }
+
+    pub(crate) const fn directories(&self) -> &[SeccompDirectoryReadback; 4] {
+        &self.directories
+    }
+
+    pub(crate) const fn installed(&self) -> &SeccompFileReadback {
+        &self.installed
+    }
+}
+
+/// Reopen and verify every persisted Phase-1 seccomp artifact under `/`.
+pub(crate) fn fresh_phase1_readback(
+    install: SeccompInstallReceipt,
+) -> Result<FreshSeccompReadback, SeccompExecError> {
+    fresh_phase1_readback_from_root(Path::new("/"), install)
+}
+
+#[cfg(test)]
+pub(crate) fn install_phase1_mapped(
+    root: &Path,
+    expected_digest: [u8; 32],
+    owner_uid: u32,
+    owner_gid: u32,
+    installed_at_unix_ns: u64,
+) -> Result<SeccompInstallReceipt, SeccompExecError> {
+    let root = open_root(root)?;
+    let mut names = KernelTemporaryNames;
+    let install = install_from_root(
+        &root,
+        InstallContract {
+            expected_digest,
+            final_name: format!("{}.json", hex::encode(expected_digest)),
+            owner_uid,
+            owner_gid,
+        },
+        &mut names,
+    )?;
+    persist_install_receipt(&root, install, &mut names, installed_at_unix_ns)
+}
+
+#[cfg(test)]
+pub(crate) fn fresh_phase1_readback_mapped(
+    root: &Path,
+    install: SeccompInstallReceipt,
+) -> Result<FreshSeccompReadback, SeccompExecError> {
+    fresh_phase1_readback_from_root(root, install)
+}
+
+#[cfg(test)]
+pub(crate) fn fresh_phase1_readback_mapped_with_installed_owner(
+    root: &Path,
+    install: SeccompInstallReceipt,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<FreshSeccompReadback, SeccompExecError> {
+    fresh_phase1_readback_from_root_with_installed_owner(root, install, (owner_uid, owner_gid))
 }
 
 /// Opaque proof that an exact OCI prestart record was persisted and reopened.
@@ -590,13 +670,26 @@ fn read_receipt(
     name: &str,
     owner: (u32, u32),
 ) -> Result<Vec<u8>, SeccompExecError> {
-    let mut file = open_regular_at(
+    let mut file = open_receipt_file(directory, name, owner)?;
+    read_receipt_bytes(&mut file)
+}
+
+fn open_receipt_file(
+    directory: &OwnedFd,
+    name: &str,
+    owner: (u32, u32),
+) -> Result<File, SeccompExecError> {
+    let file = open_regular_at(
         directory,
         name,
         OFlag::O_RDONLY,
         SeccompExecError::OpenReceipt,
     )?;
     validate_receipt_regular(file.as_fd(), owner)?;
+    Ok(file)
+}
+
+fn read_receipt_bytes(file: &mut File) -> Result<Vec<u8>, SeccompExecError> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| SeccompExecError::InvalidReceipt)?;
@@ -626,10 +719,17 @@ fn verify_persisted_install_receipt(
     install: SeccompInstallReceipt,
 ) -> Result<(), SeccompExecError> {
     let bytes = read_receipt(receipts, INSTALL_RECEIPT_NAME, install_owner(install))?;
-    let record: InstallReceiptRecord = parse_canonical_json(&bytes)?;
+    verify_install_receipt_bytes(&bytes, install)
+}
+
+fn verify_install_receipt_bytes(
+    bytes: &[u8],
+    install: SeccompInstallReceipt,
+) -> Result<(), SeccompExecError> {
+    let record: InstallReceiptRecord = parse_canonical_json(bytes)?;
     if record.matches_install(install)
         && record.installed_at_unix_ns == install.installed_at_unix_ns
-        && Sha256::digest(&bytes).as_slice() == install.install_receipt_digest
+        && Sha256::digest(bytes).as_slice() == install.install_receipt_digest
     {
         Ok(())
     } else {
@@ -725,6 +825,15 @@ impl InstallContract {
             final_name: format!("{PHASE1_SECCOMP_PROFILE_DIGEST}.json"),
             owner_uid: SECCOMP_OWNER_UID,
             owner_gid: SECCOMP_OWNER_GID,
+        }
+    }
+
+    fn from_install(install: SeccompInstallReceipt) -> Self {
+        Self {
+            expected_digest: install.install_digest,
+            final_name: format!("{}.json", hex::encode(install.install_digest)),
+            owner_uid: install.owner_uid,
+            owner_gid: install.owner_gid,
         }
     }
 }
@@ -829,6 +938,242 @@ fn install_from_root(
         let _ = unlinkat(&destination, temp_name.as_str(), UnlinkatFlags::NoRemoveDir);
     }
     result
+}
+
+fn fresh_phase1_readback_from_root(
+    root_path: &Path,
+    install: SeccompInstallReceipt,
+) -> Result<FreshSeccompReadback, SeccompExecError> {
+    fresh_phase1_readback_from_root_with_installed_owner(root_path, install, install_owner(install))
+}
+
+fn fresh_phase1_readback_from_root_with_installed_owner(
+    root_path: &Path,
+    install: SeccompInstallReceipt,
+    installed_owner: (u32, u32),
+) -> Result<FreshSeccompReadback, SeccompExecError> {
+    let root = open_root(root_path)?;
+    verify_descriptor_path(&root, root_path, SeccompExecError::ReadbackPath)?;
+    let contract = InstallContract::from_install(install);
+    validate_parent_directory(&root, contract.owner_uid, contract.owner_gid)?;
+
+    let source_parent = open_existing_chain(
+        &root,
+        &SOURCE_COMPONENTS[..SOURCE_COMPONENTS.len() - 1],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let mut source = open_regular_at(
+        &source_parent,
+        SOURCE_COMPONENTS[SOURCE_COMPONENTS.len() - 1],
+        OFlag::O_RDONLY,
+        SeccompExecError::OpenSource,
+    )?;
+    validate_regular(
+        source.as_fd(),
+        contract.owner_uid,
+        contract.owner_gid,
+        FEDORA_SECCOMP_SOURCE_MODE,
+        SeccompExecError::InvalidSource,
+    )?;
+    verify_descriptor_path(
+        &source,
+        &rooted_path(root_path, crate::seccomp::FEDORA_SECCOMP_SOURCE_PATH),
+        SeccompExecError::ReadbackPath,
+    )?;
+    let source_digest = hash_file(&mut source).map_err(|_| SeccompExecError::SourceDigest)?;
+    if source_digest != contract.expected_digest {
+        return Err(SeccompExecError::SourceDigest);
+    }
+    let source = file_readback(
+        source.as_fd(),
+        crate::seccomp::FEDORA_SECCOMP_SOURCE_PATH,
+        source_digest,
+        SeccompExecError::InvalidSource,
+    )?;
+
+    let destination_parent = open_existing_chain(
+        &root,
+        &DESTINATION_PARENT_COMPONENTS,
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let specs = SeccompHostPlan::phase1().directories();
+    let buzzci = reopen_directory(
+        &destination_parent,
+        DESTINATION_COMPONENTS[0],
+        root_path,
+        specs[0],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let seccomp = reopen_directory(
+        &buzzci.0,
+        DESTINATION_COMPONENTS[1],
+        root_path,
+        specs[1],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let version = reopen_directory(
+        &seccomp.0,
+        DESTINATION_COMPONENTS[2],
+        root_path,
+        specs[2],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let destination = reopen_directory(
+        &version.0,
+        DESTINATION_COMPONENTS[3],
+        root_path,
+        specs[3],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let mut installed = open_installed(&destination.0, &contract.final_name)
+        .map_err(|_| SeccompExecError::OpenInstalled)?;
+    let installed_contract = InstallContract {
+        owner_uid: installed_owner.0,
+        owner_gid: installed_owner.1,
+        ..contract.clone()
+    };
+    let install_digest = verify_installed(&mut installed, &installed_contract)?;
+    let installed_logical_path =
+        format!("/var/lib/buzzci/seccomp/v1/sha256/{}", contract.final_name);
+    verify_descriptor_path(
+        &installed,
+        &rooted_path(root_path, &installed_logical_path),
+        SeccompExecError::ReadbackPath,
+    )?;
+    let installed = file_readback(
+        installed.as_fd(),
+        PHASE1_SECCOMP_PROFILE_PATH,
+        install_digest,
+        SeccompExecError::InvalidInstalled,
+    )?;
+    let directories = [buzzci.1, seccomp.1, version.1, destination.1];
+
+    let receipt_parent = open_existing_chain(
+        &root,
+        &DESTINATION_PARENT_COMPONENTS,
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let receipt_buzzci = reopen_exact_directory(
+        &receipt_parent,
+        RECEIPT_COMPONENTS[0],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let activation = reopen_exact_directory(
+        &receipt_buzzci,
+        RECEIPT_COMPONENTS[1],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    let receipts = reopen_exact_directory(
+        &activation,
+        RECEIPT_COMPONENTS[2],
+        contract.owner_uid,
+        contract.owner_gid,
+    )?;
+    verify_descriptor_path(
+        &receipts,
+        &rooted_path(root_path, "/var/lib/buzzci/activation/receipts"),
+        SeccompExecError::ReadbackPath,
+    )?;
+    let mut receipt = open_receipt_file(&receipts, INSTALL_RECEIPT_NAME, install_owner(install))?;
+    verify_descriptor_path(
+        &receipt,
+        &rooted_path(root_path, SECCOMP_INSTALL_RECEIPT_PATH),
+        SeccompExecError::ReadbackPath,
+    )?;
+    let receipt_bytes = read_receipt_bytes(&mut receipt)?;
+    verify_install_receipt_bytes(&receipt_bytes, install)?;
+
+    Ok(FreshSeccompReadback {
+        source,
+        directories,
+        installed,
+    })
+}
+
+fn reopen_directory(
+    parent: &OwnedFd,
+    name: &str,
+    root_path: &Path,
+    spec: crate::seccomp_host::SeccompDirectorySpec,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(OwnedFd, SeccompDirectoryReadback), SeccompExecError> {
+    let directory = reopen_exact_directory(parent, name, owner_uid, owner_gid)?;
+    verify_descriptor_path(
+        &directory,
+        &rooted_path(root_path, spec.path()),
+        SeccompExecError::ReadbackPath,
+    )?;
+    let stat = fstat(&directory).map_err(|_| SeccompExecError::InvalidDestinationDirectory)?;
+    Ok((
+        directory,
+        SeccompDirectoryReadback {
+            path: spec.path().into(),
+            canonical_path: spec.path().into(),
+            file_type: SeccompHostFileType::Directory,
+            owner_uid: stat.st_uid,
+            owner_gid: stat.st_gid,
+            mode: stat.st_mode & 0o7777,
+            opened_no_follow: true,
+        },
+    ))
+}
+
+fn reopen_exact_directory(
+    parent: &OwnedFd,
+    name: &str,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<OwnedFd, SeccompExecError> {
+    let directory = open_directory_at(parent, name)
+        .map_err(|_| SeccompExecError::InvalidDestinationDirectory)?;
+    validate_directory_exact(&directory, owner_uid, owner_gid, SECCOMP_DIRECTORY_MODE)?;
+    Ok(directory)
+}
+
+fn file_readback(
+    fd: impl AsFd,
+    path: &str,
+    digest: [u8; 32],
+    error: SeccompExecError,
+) -> Result<SeccompFileReadback, SeccompExecError> {
+    let stat = fstat(fd).map_err(|_| error)?;
+    Ok(SeccompFileReadback {
+        path: path.into(),
+        canonical_path: path.into(),
+        file_type: SeccompFileType::Regular,
+        link_count: stat.st_nlink,
+        owner_uid: stat.st_uid,
+        owner_gid: stat.st_gid,
+        mode: stat.st_mode & 0o7777,
+        digest: hex::encode(digest),
+    })
+}
+
+fn verify_descriptor_path(
+    fd: impl AsFd,
+    expected: &Path,
+    error: SeccompExecError,
+) -> Result<(), SeccompExecError> {
+    let descriptor = PathBuf::from(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd()));
+    let observed = std::fs::read_link(descriptor).map_err(|_| error)?;
+    if observed != expected {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn rooted_path(root: &Path, absolute: &str) -> PathBuf {
+    root.join(absolute.trim_start_matches('/'))
 }
 
 fn install_temporary(
