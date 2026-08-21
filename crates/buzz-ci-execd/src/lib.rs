@@ -12,6 +12,8 @@ pub mod activation;
 pub mod control;
 #[cfg(target_os = "linux")]
 pub mod dns_host;
+#[cfg(target_os = "linux")]
+pub mod durable_dispatch;
 pub mod dns_isolation;
 #[cfg(unix)]
 pub mod evidence;

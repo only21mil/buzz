@@ -3,12 +3,19 @@
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "linux")]
 use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
 #[cfg(target_os = "linux")]
 use buzz_ci_execd::control::{
-    control_account_uid, validate_systemd_environment, validate_systemd_listener, ClosedDispatch,
-    ControlError, ControlServer,
+    control_account_uid, validate_systemd_environment, validate_systemd_listener, ControlError,
+    ControlServer,
+};
+#[cfg(target_os = "linux")]
+use buzz_ci_execd::durable_dispatch::{
+    load_dispatch, UnavailableExecution, UnavailableReadyValidation,
 };
 
 #[cfg(target_os = "linux")]
@@ -71,7 +78,21 @@ fn main() -> ExitCode {
                         return ExitCode::from(4);
                     }
                 };
-                let mut server = ControlServer::new(listener, control_uid, ClosedDispatch::new());
+                let startup_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(duration) => duration.as_secs(),
+                    Err(_) => {
+                        eprintln!(r#"{{"error":"system_clock"}}"#);
+                        return ExitCode::from(4);
+                    }
+                };
+                let mut validation = UnavailableReadyValidation;
+                let dispatch = load_dispatch(
+                    startup_now,
+                    &mut validation,
+                    UnavailableExecution,
+                    UnavailableExecution,
+                );
+                let mut server = ControlServer::new(listener, control_uid, dispatch);
                 loop {
                     match server.serve_once() {
                         Ok(()) => {}

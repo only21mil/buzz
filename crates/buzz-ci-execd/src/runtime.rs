@@ -13,8 +13,7 @@ use std::{
 };
 
 use buzz_ci_broker_protocol::{
-    AdmitAttemptRequest, BrokerResponse, FrameHeader, GitOid, QualificationDirective,
-    QualificationRequest, TrustClass,
+    AdmitAttemptRequest, GitOid, QualificationDirective, QualificationRequest, TrustClass,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,15 +23,12 @@ use crate::{
     activation::{
         ActivationController, ActivationGrant, ActivationState, AdmissionTrustClass,
         DurableNonceEntry, DurableNonceLedger, DurableQualificationState, DurableStateSnapshot,
-        FixtureJobCoordinates, HostActivationCoordinates, LeaseToken, OrdinaryAdmission,
-        OrdinaryJobCoordinates, QualificationLease, QualificationPermit, ReadyRestoreValidation,
-        VerifiedSigner, NONCE_LEDGER_CAPACITY,
+        FixtureJobCoordinates, HostActivationCoordinates, OrdinaryAdmission,
+        OrdinaryJobCoordinates, QualificationPermit, ReadyRestoreValidation, VerifiedSigner,
+        NONCE_LEDGER_CAPACITY,
     },
-    control::{
-        ActivationDispatch, AdmissionBoundaryError, OrdinaryAdmissionBoundary,
-        QualificationAdmissionBoundary,
-    },
-    qualification_host::{QualificationHostExecution, QualificationHostPlan},
+    control::AdmissionBoundaryError,
+    durable_dispatch::{DurableDispatch, OrdinaryExecutor, QualificationExecutor},
 };
 
 /// Canonical immutable authority directory.
@@ -124,38 +120,29 @@ impl LoadedRuntime {
         &self.authority
     }
 
-    /// Compose restored state with execution/response handlers.
+    /// Compose restored state with durable lifecycle executors.
     ///
-    /// The returned dispatcher always authenticates through the loaded root
-    /// artifacts before either handler can receive an admitted lease.
+    /// The returned dispatcher retains the state writer and revision. It
+    /// authenticates through root-owned authority and commits each lifecycle
+    /// transition before exposing a successful response.
     pub fn compose<O, Q>(
         self,
         ordinary: O,
         qualification: Q,
-    ) -> ActivationDispatch<AuthorityOrdinary<O>, AuthorityQualification<Q>>
+    ) -> DurableDispatch<DurableStateStore, ServiceAuthority, O, Q>
     where
-        O: OrdinaryLeaseResponse,
-        Q: QualificationLeaseResponse,
+        O: OrdinaryExecutor,
+        Q: QualificationExecutor,
     {
-        let qualification_authority = self.authority.clone();
-        ActivationDispatch::new(
-            self.controller,
-            AuthorityOrdinary {
-                authority: self.authority,
-                response: ordinary,
-            },
-            AuthorityQualification {
-                authority: qualification_authority,
-                response: qualification,
-            },
-        )
+        let (controller, authority, store) = self.into_durable_parts();
+        DurableDispatch::new(controller, authority, store, ordinary, qualification)
     }
 
-    /// Persist an idle snapshot atomically beneath the canonical activation root.
+    /// Persist the current snapshot and advance this runtime's durable revision.
     ///
-    /// In-flight snapshots are refused because their opaque receipts cannot be
-    /// reconstructed safely after a process restart.
-    pub fn persist(&self) -> Result<(), RuntimeLoadError> {
+    /// In-flight records intentionally retain only an ambiguity marker: restart
+    /// quarantines them instead of reconstructing an opaque receipt.
+    pub fn persist(&mut self) -> Result<(), RuntimeLoadError> {
         let next_revision = self
             .state_revision
             .checked_add(1)
@@ -167,99 +154,53 @@ impl LoadedRuntime {
             next_revision,
             self.authority.revision,
             self.authority_sha256,
-        )
+        )?;
+        self.state_revision = next_revision;
+        Ok(())
+    }
+
+    /// Split a loaded runtime into the controller, authority, and revisioned store.
+    pub(crate) fn into_durable_parts(
+        self,
+    ) -> (ActivationController, ServiceAuthority, DurableStateStore) {
+        let store = DurableStateStore {
+            state_revision: self.state_revision,
+            authority_revision: self.authority.revision,
+            authority_sha256: self.authority_sha256,
+        };
+        (self.controller, self.authority, store)
     }
 }
 
-/// Encodes the result of an ordinary lease admitted under loaded authority.
-pub trait OrdinaryLeaseResponse {
-    /// Produce one bounded response after the controller allocates the lease.
-    fn admitted_response(
-        &mut self,
-        header: FrameHeader,
-        request: AdmitAttemptRequest,
-        admission: OrdinaryAdmission,
-        lease: LeaseToken,
-        now: u64,
-    ) -> BrokerResponse;
+/// Canonical revisioned state writer used by the production durable dispatcher.
+pub struct DurableStateStore {
+    state_revision: u64,
+    authority_revision: u64,
+    authority_sha256: [u8; 32],
 }
 
-/// Encodes or executes a qualification lease admitted under loaded authority.
-pub trait QualificationLeaseResponse {
-    /// Produce one bounded response after the controller allocates the fixture lease.
-    fn admitted_response(
-        &mut self,
-        header: FrameHeader,
-        request: QualificationRequest,
-        lease: QualificationLease,
-        now: u64,
-    ) -> BrokerResponse;
-
-    /// Execute the sole privileged teardown-failure plan.
-    fn execute_teardown_failure(
-        &mut self,
-        plan: QualificationHostPlan,
-    ) -> QualificationHostExecution;
-}
-
-/// Authority-enforcing ordinary boundary created only by [`LoadedRuntime::compose`].
-pub struct AuthorityOrdinary<R> {
-    authority: ServiceAuthority,
-    response: R,
-}
-
-impl<R: OrdinaryLeaseResponse> OrdinaryAdmissionBoundary for AuthorityOrdinary<R> {
-    fn authorize(
-        &mut self,
-        _header: FrameHeader,
-        request: AdmitAttemptRequest,
-    ) -> Result<OrdinaryAdmission, AdmissionBoundaryError> {
-        self.authority.authorize_ordinary(request)
+impl DurableStateStore {
+    /// Publish one exact controller snapshot, advancing revision only after fsync.
+    pub fn commit(&mut self, snapshot: DurableStateSnapshot) -> Result<(), RuntimeLoadError> {
+        let next_revision = self
+            .state_revision
+            .checked_add(1)
+            .ok_or(RuntimeLoadError::PersistFailed)?;
+        persist_to_path(
+            Path::new(ACTIVATION_ROOT),
+            Path::new(ACTIVATION_STATE_FILE),
+            snapshot,
+            next_revision,
+            self.authority_revision,
+            self.authority_sha256,
+        )?;
+        self.state_revision = next_revision;
+        Ok(())
     }
 
-    fn admitted_response(
-        &mut self,
-        header: FrameHeader,
-        request: AdmitAttemptRequest,
-        admission: OrdinaryAdmission,
-        lease: LeaseToken,
-        now: u64,
-    ) -> BrokerResponse {
-        self.response
-            .admitted_response(header, request, admission, lease, now)
-    }
-}
-
-/// Authority-enforcing qualification boundary created by [`LoadedRuntime::compose`].
-pub struct AuthorityQualification<R> {
-    authority: ServiceAuthority,
-    response: R,
-}
-
-impl<R: QualificationLeaseResponse> QualificationAdmissionBoundary for AuthorityQualification<R> {
-    fn authenticate(
-        &mut self,
-        _header: FrameHeader,
-        request: QualificationRequest,
-    ) -> Result<VerifiedSigner, AdmissionBoundaryError> {
-        self.authority.authenticate_qualification(request)
-    }
-
-    fn admitted_response(
-        &mut self,
-        header: FrameHeader,
-        request: QualificationRequest,
-        lease: QualificationLease,
-        now: u64,
-    ) -> BrokerResponse {
-        self.response.admitted_response(header, request, lease, now)
-    }
-
-    fn execute_teardown_failure(
-        &mut self,
-        plan: QualificationHostPlan,
-    ) -> QualificationHostExecution {
-        self.response.execute_teardown_failure(plan)
+    /// Current durable revision.
+    pub const fn revision(&self) -> u64 {
+        self.state_revision
     }
 }
 
@@ -545,16 +486,7 @@ fn persist_to_validated_path(
     authority_revision: u64,
     authority_sha256: [u8; 32],
 ) -> Result<(), RuntimeLoadError> {
-    if snapshot.active_lease.is_some()
-        || snapshot
-            .qualification
-            .is_some_and(|state| state.active_lease.is_some())
-        || matches!(
-            snapshot.state,
-            ActivationState::Leased | ActivationState::Draining
-        )
-        || revision == 0
-    {
+    if revision == 0 {
         return Err(RuntimeLoadError::PersistFailed);
     }
     let disk = StateFile::encode(snapshot, revision, authority_revision, authority_sha256)?;
@@ -787,7 +719,7 @@ impl StateFile {
                 .map(DurableQualificationFile::encode)
                 .transpose()?,
             activation: snapshot.activation.map(GrantFile::encode),
-            active_lease: false,
+            active_lease: snapshot.active_lease.is_some(),
             nonce_ledger: snapshot
                 .nonce_ledger
                 .entries
@@ -827,13 +759,10 @@ impl DurableQualificationFile {
     }
 
     fn encode(value: DurableQualificationState) -> Result<Self, RuntimeLoadError> {
-        if value.active_lease.is_some() {
-            return Err(RuntimeLoadError::PersistFailed);
-        }
         Ok(Self {
             permit: PermitFile::encode(value.permit),
             evidence_set_digest: value.evidence_set_digest.map(hex::encode),
-            active_lease: false,
+            active_lease: value.active_lease.is_some(),
         })
     }
 }
@@ -1412,7 +1341,7 @@ mod tests {
 
     #[test]
     fn exhausted_state_revision_refuses_before_host_io() {
-        let runtime = LoadedRuntime {
+        let mut runtime = LoadedRuntime {
             controller: ActivationController::new(ROOT),
             authority: ServiceAuthority {
                 revision: 7,
