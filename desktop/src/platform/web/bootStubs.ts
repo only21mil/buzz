@@ -85,7 +85,7 @@ export async function installBrowserPal(): Promise<void> {
   registerRelayDmCommands(identity);
   registerRelayCanvasCommands(identity);
   registerRelaySocialCommands(identity);
-  registerMediaCommands();
+  registerMediaCommands(workspace);
   registerTerminalGitMeshPairingCommands();
   registerRepoSnapshotCommands(identity);
   registerHuddleVoiceTtsCommands();
@@ -93,7 +93,7 @@ export async function installBrowserPal(): Promise<void> {
   registerRelaySocialConfigCommands(identity);
   registerRelayWorkflowsMembersCommands(identity);
   registerRelayCryptoSocialCommands(identity);
-  registerWebMediaTransferCommands();
+  registerWebMediaTransferCommands(workspace);
   registerLinkPreviewCommands();
-  await installMediaAuthServiceWorker();
+  await installMediaAuthServiceWorker(workspace);
 }

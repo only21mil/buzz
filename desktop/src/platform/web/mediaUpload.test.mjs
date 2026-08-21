@@ -10,6 +10,7 @@ import {
 } from "./mediaUpload.ts";
 import { dispatch, register, resetRegistryForTests } from "./registry.ts";
 import { listen } from "./shims/event.ts";
+import { BrowserWorkspace } from "./workspace.ts";
 
 const previousFetch = globalThis.fetch;
 const previousWindow = globalThis.window;
@@ -121,7 +122,7 @@ test("browser upload rejects a descriptor not bound to the signed bytes", async 
 });
 
 test("fetch_media_bytes rejects an oversized response before buffering", async () => {
-  registerMediaCommands();
+  registerMediaCommands(new BrowserWorkspace());
   globalThis.fetch = async () =>
     new Response(Uint8Array.from([1]), {
       headers: {
@@ -135,6 +136,49 @@ test("fetch_media_bytes rejects an oversized response before buffering", async (
     }),
     /50MB limit/,
   );
+});
+
+test("registered media commands follow the active browser workspace relay", async () => {
+  const workspace = new BrowserWorkspace();
+  workspace.apply({ relayUrl: "wss://relay-b.example", reposDir: null });
+  registerMediaCommands(workspace);
+  installSigner();
+  let requestedUrl;
+  globalThis.fetch = async (url, init) => {
+    requestedUrl = String(url);
+    const sha256 = init.headers.get("X-SHA-256");
+    return Response.json({
+      ...descriptor(sha256, init.body.byteLength),
+      url: `https://relay-b.example/media/${sha256}.png`,
+    });
+  };
+
+  const result = await dispatch(
+    "upload_media_bytes_raw",
+    Uint8Array.from([8, 9]),
+  );
+
+  assert.equal(requestedUrl, "https://relay-b.example/upload");
+  assert.equal(result.url.startsWith("https://relay-b.example/media/"), true);
+});
+
+test("registered media commands reject the browser shell origin after a relay switch", async () => {
+  const workspace = new BrowserWorkspace();
+  workspace.apply({ relayUrl: "wss://relay-b.example", reposDir: null });
+  registerMediaCommands(workspace);
+  let fetched = false;
+  globalThis.fetch = async () => {
+    fetched = true;
+    return new Response();
+  };
+
+  await assert.rejects(
+    dispatch("fetch_media_bytes", {
+      url: `https://relay.example/media/${"a".repeat(64)}.png`,
+    }),
+    /same-origin media URLs/,
+  );
+  assert.equal(fetched, false);
 });
 
 test("image sniffing rejects a malformed JPEG prefix", () => {

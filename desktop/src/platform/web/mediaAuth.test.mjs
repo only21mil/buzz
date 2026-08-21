@@ -39,6 +39,18 @@ test("media auth is same-origin, blob-scoped, and time-bounded", () => {
   );
 });
 
+test("media auth accepts the active workspace origin instead of the shell origin", () => {
+  const value = `https://relay-b.example/media/${HASH}.png`;
+  assert.equal(mediaHashFromUrl(value, "https://relay-b.example"), HASH);
+  assert.equal(mediaHashFromUrl(value, "https://relay.example"), null);
+  assert.deepEqual(
+    buildMediaGetAuthTemplate(value, 1_000, "https://relay-b.example").tags.at(
+      -1,
+    ),
+    ["server", "relay-b.example"],
+  );
+});
+
 test("authorization verifies the exact signed template and uses unpadded base64url", async () => {
   const secret = generateSecretKey();
   const template = buildMediaGetAuthTemplate(

@@ -75,16 +75,18 @@ export function loadCommunities(): Community[] {
     if (parsed.length > 0) {
       removeStorageItem(COMMUNITY_DISCOVERY_AFTER_LEAVE_KEY);
     }
-    // Migration: older builds stored the user's `nsec` in localStorage and
-    // re-applied it to the backend on every reload, which silently overwrote
-    // any `import_identity` result with the original generated key. The
-    // on-disk `identity.key` file is the only source of truth now. Strip
-    // any lingering `nsec` from existing entries on read and persist the
-    // cleaned list back so it cannot leak into future sessions.
+    // Migration: older builds stored the user's `nsec` and an unused API
+    // `token` in localStorage. The on-disk `identity.key` file is the only
+    // source of private identity data, and apply_workspace never consumed the
+    // token. Strip both legacy secrets and persist the cleaned list.
     let didStrip = false;
     const cleaned = (parsed as Array<Record<string, unknown>>).map((entry) => {
-      if (entry && typeof entry === "object" && "nsec" in entry) {
-        const { nsec: _nsec, ...rest } = entry;
+      if (
+        entry &&
+        typeof entry === "object" &&
+        ("nsec" in entry || "token" in entry)
+      ) {
+        const { nsec: _nsec, token: _token, ...rest } = entry;
         didStrip = true;
         return rest;
       }
@@ -100,9 +102,12 @@ export function loadCommunities(): Community[] {
 }
 
 export function saveCommunities(communities: Community[]): boolean {
+  const sanitized = communities.map(
+    ({ nsec: _nsec, token: _token, ...rest }) => rest,
+  );
   const didSave = setLocalStorageItemWithRecovery(
     COMMUNITIES_KEY,
-    JSON.stringify(communities),
+    JSON.stringify(sanitized),
   );
   if (didSave && communities.length > 0) {
     localStorage.removeItem(COMMUNITY_DISCOVERY_AFTER_LEAVE_KEY);

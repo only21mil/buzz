@@ -64,6 +64,18 @@ function snapshot(overrides = {}) {
   };
 }
 
+function file(overrides = {}) {
+  return {
+    path: "README.md",
+    kind: "blob",
+    size: 128,
+    preview_content: "# Snapshot",
+    last_changed_at: 123,
+    latest_commit: commit(),
+    ...overrides,
+  };
+}
+
 function successfulResponse(body = snapshot()) {
   return {
     ok: true,
@@ -172,7 +184,7 @@ test("repository snapshot returns a valid response object as-is", async () => {
   const body = snapshot({
     latest_commit: commit(),
     commits: [commit()],
-    files: [{ path: "README.md", kind: "blob" }],
+    files: [file()],
     contributors: [
       {
         name: "Sats",
@@ -372,7 +384,19 @@ test("repository snapshot validates mapper-dereferenced response fields", async 
     { files: [] },
     snapshot({ latest_commit: { hash: "f" } }),
     snapshot({ files: [{ path: "README.md" }] }),
+    snapshot({ files: [file({ size: undefined })] }),
+    snapshot({ files: [file({ preview_content: undefined })] }),
+    snapshot({ files: [file({ last_changed_at: undefined })] }),
+    snapshot({ files: [file({ latest_commit: undefined })] }),
+    snapshot({ files: [file({ last_changed_at: Number.NaN })] }),
+    snapshot({ files: [file({ last_changed_at: Number.POSITIVE_INFINITY })] }),
+    snapshot({ files: [file({ last_changed_at: 8_640_000_000_001 })] }),
     snapshot({ commits: [{ ...commit(), timestamp: "123" }] }),
+    snapshot({ commits: [{ ...commit(), timestamp: Number.NaN }] }),
+    snapshot({
+      commits: [{ ...commit(), timestamp: Number.NEGATIVE_INFINITY }],
+    }),
+    snapshot({ commits: [{ ...commit(), timestamp: -8_640_000_000_001 }] }),
     snapshot({
       contributors: [
         {
@@ -391,6 +415,44 @@ test("repository snapshot validates mapper-dereferenced response fields", async 
       await assert.rejects(
         dispatch("get_project_repo_snapshot", request),
         /snapshot response has an unexpected shape/,
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("repository snapshot accepts complete file previews and Date boundary timestamps", async () => {
+  const originalFetch = globalThis.fetch;
+  const body = snapshot({
+    latest_commit: commit(),
+    commits: [
+      commit("d".repeat(64)),
+      { ...commit("e".repeat(64)), timestamp: -8_640_000_000_000 },
+      { ...commit("f".repeat(64)), timestamp: 8_640_000_000_000 },
+    ],
+    files: [
+      file(),
+      file({
+        path: "empty.txt",
+        size: null,
+        preview_content: null,
+        last_changed_at: null,
+        latest_commit: null,
+      }),
+    ],
+  });
+  globalThis.fetch = async () => successfulResponse(body);
+  registerCommands();
+
+  try {
+    const result = await dispatch("get_project_repo_snapshot", {
+      cloneUrl: `${RELAY_HTTP}/git/${OWNER}/buzz`,
+    });
+    assert.strictEqual(result, body);
+    for (const entry of body.commits) {
+      assert.doesNotThrow(() =>
+        new Date(entry.timestamp * 1_000).toISOString(),
       );
     }
   } finally {
