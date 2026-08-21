@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.block.xyz/ci/qualification-template-v1.schema.json",
+  "title": "Buzz CI unsigned qualification case template",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "permit", "admission"],
+  "properties": {
+    "version": {"const": "qualification_v1"},
+    "permit": {"$ref": "#/$defs/permit"},
+    "admission": {"$ref": "#/$defs/admission"},
+    "directive": {"const": "teardown_failure"}
+  },
+  "$defs": {
+    "token": {"type": "string", "pattern": "^@[A-Z][A-Z0-9_]*@$"},
+    "oid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "properties": {
+        "algorithm": {"enum": ["sha1", "sha256"]},
+        "hex": {"$ref": "#/$defs/token"}
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["integrated_candidate_sha", "broker_build_identity", "host_profile_digest", "suite_identity"],
+      "properties": {
+        "integrated_candidate_sha": {"$ref": "#/$defs/oid"},
+        "broker_build_identity": {"$ref": "#/$defs/token"},
+        "host_profile_digest": {"$ref": "#/$defs/token"},
+        "suite_identity": {"$ref": "#/$defs/token"}
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_digest", "manifest_digest", "isolation_profile_digest", "source_oid", "base_oid", "test_identity"],
+      "properties": {
+        "request_digest": {"$ref": "#/$defs/token"},
+        "manifest_digest": {"$ref": "#/$defs/token"},
+        "isolation_profile_digest": {"$ref": "#/$defs/token"},
+        "source_oid": {"$ref": "#/$defs/oid"},
+        "base_oid": {"$ref": "#/$defs/oid"},
+        "test_identity": {"$ref": "#/$defs/token"}
+      }
+    },
+    "permit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authorized_by", "host", "fixture_job", "fixture_identity", "fixture_signer", "nonce", "not_before", "expires_at"],
+      "properties": {
+        "authorized_by": {"$ref": "#/$defs/token"},
+        "host": {"$ref": "#/$defs/host"},
+        "fixture_job": {"$ref": "#/$defs/job"},
+        "fixture_identity": {"$ref": "#/$defs/token"},
+        "fixture_signer": {"$ref": "#/$defs/token"},
+        "nonce": {"$ref": "#/$defs/token"},
+        "not_before": {"$ref": "#/$defs/token"},
+        "expires_at": {"$ref": "#/$defs/token"}
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "fixture_job", "fixture_identity", "signer", "nonce", "trust_class"],
+      "properties": {
+        "host": {"$ref": "#/$defs/host"},
+        "fixture_job": {"$ref": "#/$defs/job"},
+        "fixture_identity": {"$ref": "#/$defs/token"},
+        "signer": {"$ref": "#/$defs/token"},
+        "nonce": {"$ref": "#/$defs/token"},
+        "trust_class": {"enum": ["qualification_fixture", "unaccepted"]}
+      }
+    }
+  }
+}

@@ -154,9 +154,12 @@ run_job() {
   elif ((rc != 0)); then
     record "$safe" fail "The authenticated $job case was refused"
     return
+  elif ! timeout 10 jq -e '.type == "qualification_result" and .code == "ok"' "$admit_file" >/dev/null 2>&1; then
+    record "$safe" fail "Qualification control returned a malformed success response for $job"
+    return
   fi
   lease_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.attempt_id // .lease_id // empty' "$admit_file")
-  if [[ ! $lease_id =~ ^[A-Za-z0-9._-]+$ ]]; then record "$safe" not_runnable "Qualification response for $job exposes no safe attempt identifier"; return; fi
+  if [[ ! $lease_id =~ ^[0-9a-f]{32}$ || $lease_id == 00000000000000000000000000000000 ]]; then record "$safe" not_runnable "Qualification response for $job exposes no nonzero attempt identifier"; return; fi
   lease_dir=$lease_root/$lease_id
   lease_json=$lease_dir/lease.json
   for _ in {1..20}; do timeout 10 "${SUDO[@]}" test -r "$lease_json" && break; timeout 2 sleep 0.25; done
@@ -172,22 +175,23 @@ run_job() {
   done
   evidence_files+=("$TEST_ID/cgroup-$job.txt")
   for _ in {1..80}; do
-    if timeout 10 "${SUDO[@]}" test -r "$lease_dir/final.json"; then
-      timeout 10 "${SUDO[@]}" cp -- "$lease_dir/final.json" "$out_dir/final-$job.json" 2>"$out_dir/final-$job.stderr" || :
-      break
-    fi
+    if timeout 10 "${SUDO[@]}" test -r "$lease_dir/teardown.json" \
+      && timeout 10 "${SUDO[@]}" test -r "$lease_dir/ordering.jsonl"; then break; fi
     if [[ $job == memory-balloon && -r $cgroup_dir/memory.events ]]; then timeout 10 "${SUDO[@]}" cat "$cgroup_dir/memory.events" >"$out_dir/memory-events-$job.txt"; fi
     timeout 2 sleep 0.25
   done
-  evidence_files+=("$TEST_ID/final-$job.json" "$TEST_ID/final-$job.stderr")
   if [[ -r $cgroup_dir/cgroup.procs ]]; then timeout 10 "${SUDO[@]}" cat "$cgroup_dir/cgroup.procs" >"$out_dir/cgroup-procs-$job.txt"; else : >"$out_dir/cgroup-procs-$job.txt"; fi
   evidence_files+=("$TEST_ID/cgroup-procs-$job.txt")
   timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/ordering.jsonl" "$out_dir/ordering-$job.jsonl" 2>/dev/null || :
   timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/teardown.json" "$out_dir/teardown-$job.json" 2>/dev/null || :
   evidence_files+=("$TEST_ID/ordering-$job.jsonl" "$TEST_ID/teardown-$job.json")
+  if [[ ! -s $out_dir/ordering-$job.jsonl || ! -s $out_dir/teardown-$job.json ]]; then
+    record "$safe" not_runnable "$job was accepted but its ordering or teardown readback is absent"
+    return
+  fi
   local limits_ok=0 terminal_ok=0 ordering_ok=0 teardown_ok=0 oom_ok=1 reason_ok=0 expected_reason
-  if timeout 10 awk -F= '$1=="cpu.max" && $2!="max"{c=1} $1=="memory.max" && $2!="max"{m=1} $1=="memory.swap.max" && $2!="max"{s=1} $1=="pids.max" && $2!="max"{p=1} END{exit !(c&&m&&s&&p)}' "$limits_file"; then limits_ok=1; fi
-  if timeout 10 jq -e '(.state == "terminal" or .terminal == true) and ((.conclusion // .result // "failure") != "success")' "$out_dir/final-$job.json" >/dev/null 2>&1; then terminal_ok=1; fi
+  if timeout 10 jq -e '.resource_readback.cpu_quota_per_sec_usec > 0 and .resource_readback.memory_max_bytes > 0 and .resource_readback.tasks_max > 0 and .resource_readback.runtime_max_seconds > 0' "$out_dir/lease-$job.json" >/dev/null 2>&1; then limits_ok=1; fi
+  if timeout 10 jq -s -e 'any(.[]; .event == "stop") and any(.[]; .event == "teardown_proof")' "$out_dir/ordering-$job.jsonl" >/dev/null 2>&1; then terminal_ok=1; fi
   if timeout 10 jq -s --slurpfile lease "$out_dir/lease-$job.json" -e '
     map(select(.event as $e | ["stop","teardown_proof","publish"] | index($e))) as $x |
     ($x|length)==3 and $x[0].event=="stop" and $x[1].event=="teardown_proof" and $x[2].event=="publish" and
@@ -209,9 +213,11 @@ run_job() {
     wall-time-overrun) expected_reason='wall|timeout|deadline' ;;
     artifact-overrun) expected_reason='artifact|count|size|quota' ;;
   esac
-  if timeout 10 jq -er '(.terminal_reason // .reason // .error // "") | tostring | ascii_downcase' "$out_dir/final-$job.json" 2>/dev/null | timeout 10 grep -Eq "$expected_reason"; then reason_ok=1; fi
+  if timeout 10 jq -er '(.terminal_reason // .reason // .error // "") | tostring | ascii_downcase' "$admit_file" 2>/dev/null | timeout 10 grep -Eq "$expected_reason"; then reason_ok=1; fi
   if ((limits_ok && terminal_ok && ordering_ok && teardown_ok && oom_ok && reason_ok)); then
     record "$safe" pass "$job hit its bounded terminal path with finite cgroup limits and complete teardown"
+  elif ((limits_ok && terminal_ok && ordering_ok && teardown_ok && oom_ok && !reason_ok)); then
+    record "$safe" not_runnable "$job completed with bounded resource and teardown evidence, but the service protocol exposes no terminal-reason readback"
   else
     record "$safe" fail "$job lacked its expected exhaustion reason, finite limit, deadline order, required OOM kill, or empty teardown proof"
   fi

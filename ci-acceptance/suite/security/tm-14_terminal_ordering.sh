@@ -96,23 +96,32 @@ admit_and_wait() {
   local label=$1 case_name=$2 admit_file=$out_dir/admit-$1.json lease_id lease_dir rc=0
   acceptance_control_run "$case_name" "$admit_file" "$out_dir/admit-$label.stderr" || rc=$?
   ((rc == 0)) || return "$rc"
+  timeout 10 jq -e '.type == "qualification_result" and .code == "ok"' "$admit_file" >/dev/null 2>&1 || return 1
   lease_id=$(timeout 10 jq -r '.attempt_id // .lease_id // empty' "$admit_file")
-  [[ $lease_id =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ $lease_id =~ ^[0-9a-f]{32}$ && $lease_id != 00000000000000000000000000000000 ]] || return 1
   lease_dir=$lease_root/$lease_id
   for _ in {1..120}; do
-    if timeout 10 "${SUDO[@]}" test -r "$lease_dir/final.json"; then timeout 10 "${SUDO[@]}" cp -- "$lease_dir/final.json" "$out_dir/final-$label.json" 2>"$out_dir/final-$label.stderr" || :; break; fi
+    if [[ $case_name == normal ]] \
+      && timeout 10 "${SUDO[@]}" test -r "$lease_dir/ordering.jsonl" \
+      && timeout 10 "${SUDO[@]}" test -r "$lease_dir/teardown.json"; then break; fi
+    if [[ $case_name == teardown_failure ]] \
+      && timeout 10 "${SUDO[@]}" test -r "$lease_dir/ordering.jsonl" \
+      && timeout 10 "${SUDO[@]}" test -r "$lease_dir/reconcile.json"; then break; fi
     timeout 2 sleep 0.25
   done
   timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/ordering.jsonl" "$out_dir/ordering-$label.jsonl" 2>/dev/null || :
-  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/teardown.json" "$out_dir/teardown-$label.json" 2>/dev/null || :
+  if [[ $case_name == normal ]]; then timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/teardown.json" "$out_dir/teardown-$label.json" 2>/dev/null || :; fi
+  if [[ $case_name == teardown_failure ]]; then timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/reconcile.json" "$out_dir/reconcile-$label.json" 2>/dev/null || :; fi
   printf '%s' "$lease_id"
 }
 
 normal_rc=0
 normal_lease=$(admit_and_wait normal normal) || normal_rc=$?
 if ((normal_rc == 0)); then
-  evidence_files+=("$TEST_ID/admit-normal.json" "$TEST_ID/admit-normal.stderr" "$TEST_ID/final-normal.json" "$TEST_ID/final-normal.stderr" "$TEST_ID/ordering-normal.jsonl" "$TEST_ID/teardown-normal.json")
-  if timeout "$TIMEOUT_SECONDS" jq -s -e '
+  evidence_files+=("$TEST_ID/admit-normal.json" "$TEST_ID/admit-normal.stderr" "$TEST_ID/ordering-normal.jsonl" "$TEST_ID/teardown-normal.json")
+  if [[ ! -s $out_dir/ordering-normal.jsonl || ! -s $out_dir/teardown-normal.json ]]; then
+    record terminal_event_order not_runnable 'The service accepted the normal case but its required ordering or teardown readback is absent'
+  elif timeout "$TIMEOUT_SECONDS" jq -s -e '
     map(select(.event as $e | ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_proof","publish"] | index($e))) as $x |
     ($x|length)==9 and ([range(1;9)] | all(. as $i; $x[$i].timestamp_unix_ns > $x[$i-1].timestamp_unix_ns)) and
     ($x|map(.event)) == ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_proof","publish"] and
@@ -121,7 +130,7 @@ if ((normal_rc == 0)); then
     && timeout 10 jq -e '.cgroup_procs_empty == true and .mounts_removed == true and .dirs_removed == true' "$out_dir/teardown-normal.json" >/dev/null; then
     record terminal_event_order pass "Lease $normal_lease published only after a strictly monotonic teardown proof"
   else
-    record terminal_event_order fail 'The normal attempt lacks the required order, publication event IDs, or complete teardown proof'
+    record terminal_event_order fail 'The normal ordering or teardown readback violates the terminal publication contract'
   fi
 else
   if ((normal_rc == 3)); then record terminal_event_order not_runnable 'The fixed root-authored TM-14/normal.json case is unavailable or unsafe'; else record terminal_event_order fail 'Could not admit and observe the normal ordering attempt'; fi
@@ -130,10 +139,13 @@ fi
 fault_rc=0
 fault_lease=$(admit_and_wait teardown-failure teardown_failure) || fault_rc=$?
 if ((fault_rc == 0)); then
-  evidence_files+=("$TEST_ID/admit-teardown-failure.json" "$TEST_ID/admit-teardown-failure.stderr" "$TEST_ID/final-teardown-failure.json" "$TEST_ID/final-teardown-failure.stderr" "$TEST_ID/ordering-teardown-failure.jsonl" "$TEST_ID/teardown-teardown-failure.json")
-  if ! timeout 10 jq -e '.verdict == "green" or .conclusion == "success"' "$out_dir/final-teardown-failure.json" >/dev/null 2>&1 \
-    && ! timeout 10 jq -e 'select(.event == "publish")' "$out_dir/ordering-teardown-failure.jsonl" >/dev/null 2>&1; then
+  evidence_files+=("$TEST_ID/admit-teardown-failure.json" "$TEST_ID/admit-teardown-failure.stderr" "$TEST_ID/ordering-teardown-failure.jsonl" "$TEST_ID/reconcile-teardown-failure.json")
+  if timeout 10 jq -e '.code == "ok" and .broker_state == "quarantined" and .conclusion != "success"' "$out_dir/admit-teardown-failure.json" >/dev/null 2>&1 \
+    && timeout 10 jq -e '.quarantined == true and .before_reuse == true' "$out_dir/reconcile-teardown-failure.json" >/dev/null 2>&1 \
+    && ! timeout 10 jq -s -e 'any(.[]; .event == "publish")' "$out_dir/ordering-teardown-failure.jsonl" >/dev/null 2>&1; then
     record forced_teardown_failure_no_green pass "Forced teardown failure for lease $fault_lease produced neither green nor publication"
+  elif [[ ! -s $out_dir/ordering-teardown-failure.jsonl || ! -s $out_dir/reconcile-teardown-failure.json ]]; then
+    record forced_teardown_failure_no_green not_runnable 'The service response lacks the quarantine ordering/reconciliation readback required to prove no green or publication'
   else
     record forced_teardown_failure_no_green fail 'Forced teardown failure produced a green result or publication event'
   fi

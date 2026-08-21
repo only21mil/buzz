@@ -1,0 +1,63 @@
+{
+  "version": "qualification_v1",
+  "permit": {
+    "authorized_by": "@ROOT_AUTHORITY_HEX@",
+    "host": {
+      "integrated_candidate_sha": {
+        "algorithm": "sha1",
+        "hex": "@INTEGRATED_CANDIDATE_SHA1@"
+      },
+      "broker_build_identity": "@BROKER_BUILD_IDENTITY_HEX@",
+      "host_profile_digest": "@HOST_PROFILE_DIGEST_HEX@",
+      "suite_identity": "@SUITE_IDENTITY_HEX@"
+    },
+    "fixture_job": {
+      "request_digest": "@TM_13_HOSTILE_ARTIFACTS_REQUEST_DIGEST_HEX@",
+      "manifest_digest": "@TM_13_HOSTILE_ARTIFACTS_MANIFEST_DIGEST_HEX@",
+      "isolation_profile_digest": "@TM_13_HOSTILE_ARTIFACTS_ISOLATION_PROFILE_DIGEST_HEX@",
+      "source_oid": {
+        "algorithm": "sha1",
+        "hex": "@TM_13_HOSTILE_ARTIFACTS_SOURCE_OID_HEX@"
+      },
+      "base_oid": {
+        "algorithm": "sha1",
+        "hex": "@ACCEPTED_BASE_OID_HEX@"
+      },
+      "test_identity": "@TM_13_HOSTILE_ARTIFACTS_TEST_IDENTITY_HEX@"
+    },
+    "fixture_identity": "@TM_13_HOSTILE_ARTIFACTS_FIXTURE_IDENTITY_HEX@",
+    "fixture_signer": "@FIXTURE_SIGNER_HEX@",
+    "nonce": "@TM_13_HOSTILE_ARTIFACTS_NONCE_HEX@",
+    "not_before": "@TM_13_HOSTILE_ARTIFACTS_NOT_BEFORE_U64@",
+    "expires_at": "@TM_13_HOSTILE_ARTIFACTS_EXPIRES_AT_U64@"
+  },
+  "admission": {
+    "host": {
+      "integrated_candidate_sha": {
+        "algorithm": "sha1",
+        "hex": "@INTEGRATED_CANDIDATE_SHA1@"
+      },
+      "broker_build_identity": "@BROKER_BUILD_IDENTITY_HEX@",
+      "host_profile_digest": "@HOST_PROFILE_DIGEST_HEX@",
+      "suite_identity": "@SUITE_IDENTITY_HEX@"
+    },
+    "fixture_job": {
+      "request_digest": "@TM_13_HOSTILE_ARTIFACTS_REQUEST_DIGEST_HEX@",
+      "manifest_digest": "@TM_13_HOSTILE_ARTIFACTS_MANIFEST_DIGEST_HEX@",
+      "isolation_profile_digest": "@TM_13_HOSTILE_ARTIFACTS_ISOLATION_PROFILE_DIGEST_HEX@",
+      "source_oid": {
+        "algorithm": "sha1",
+        "hex": "@TM_13_HOSTILE_ARTIFACTS_SOURCE_OID_HEX@"
+      },
+      "base_oid": {
+        "algorithm": "sha1",
+        "hex": "@ACCEPTED_BASE_OID_HEX@"
+      },
+      "test_identity": "@TM_13_HOSTILE_ARTIFACTS_TEST_IDENTITY_HEX@"
+    },
+    "fixture_identity": "@TM_13_HOSTILE_ARTIFACTS_FIXTURE_IDENTITY_HEX@",
+    "signer": "@FIXTURE_SIGNER_HEX@",
+    "nonce": "@TM_13_HOSTILE_ARTIFACTS_NONCE_HEX@",
+    "trust_class": "qualification_fixture"
+  }
+}

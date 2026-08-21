@@ -234,19 +234,15 @@ if ! acceptance_control_init; then
   emit
   exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
+lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
 
 exclusive_rc=0
 acceptance_control_run exclusive_capacity "$out_dir/exclusive-capacity.json" "$out_dir/exclusive-capacity.stderr" || exclusive_rc=$?
 evidence_files+=("$TEST_ID/exclusive-capacity.json" "$TEST_ID/exclusive-capacity.stderr")
 if ((exclusive_rc == 3)); then
   record exclusive_lease_pools not_runnable 'The fixed root-authored TM-06/exclusive_capacity.json case is unavailable or unsafe'
-elif ((exclusive_rc == 0)) && timeout 10 jq -e '
-  .capacity_before == 1 and .primary_admitted == true and
-  .concurrent_refusal == "no_capacity" and .primary_terminal == true
-' "$out_dir/exclusive-capacity.json" >/dev/null 2>&1; then
-  record exclusive_lease_pools pass 'ActivationController exposed one slot, refused the overlapping fixed case, and observed the primary lease terminally'
-elif ((exclusive_rc == 0)) && ! timeout 10 jq -e 'has("capacity_before") and has("primary_admitted") and has("concurrent_refusal") and has("primary_terminal")' "$out_dir/exclusive-capacity.json" >/dev/null 2>&1; then
-  record exclusive_lease_pools not_runnable 'The qualification response does not expose the server-side capacity scenario readback required by TM-06'
+elif ((exclusive_rc == 0)) && timeout 10 jq -e '.type == "qualification_result" and .code == "ok" and (.attempt_id | test("^[0-9a-f]{32}$")) and .attempt_id != "00000000000000000000000000000000"' "$out_dir/exclusive-capacity.json" >/dev/null 2>&1; then
+  record exclusive_lease_pools not_runnable 'The service admitted the fixed primary case, but the protocol exposes no overlapping-admission or ordinary-capacity readback; TM-06 will not infer those facts'
 else
   record exclusive_lease_pools fail 'The server-side exclusive-capacity scenario did not prove a one-slot controller and overlapping refusal'
 fi
@@ -256,13 +252,29 @@ acceptance_control_run teardown_failure "$out_dir/teardown-failure.json" "$out_d
 evidence_files+=("$TEST_ID/teardown-failure.json" "$TEST_ID/teardown-failure.stderr")
 if ((teardown_rc == 3)); then
   record teardown_quarantine not_runnable 'The fixed root-authored TM-06/teardown_failure.json case is unavailable or unsafe'
-elif ((teardown_rc == 0)) && timeout 10 jq -e '
-  .directive == "teardown_failure" and .quarantined == true and
-  .before_reuse == true and .reuse_allowed == false and .capacity_after == 0
-' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
-  record teardown_quarantine pass 'The sole privileged directive forced incomplete teardown, quarantined before reuse, and reduced ordinary capacity to zero'
-elif ((teardown_rc == 0)) && ! timeout 10 jq -e 'has("quarantined") and has("capacity_after")' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
-  record teardown_quarantine not_runnable 'The qualification response does not expose quarantine and ordinary-capacity readback required by TM-06'
+elif ((teardown_rc == 0)) && timeout 10 jq -e '.type == "qualification_result" and .code == "ok" and .broker_state == "quarantined" and (.attempt_id | test("^[0-9a-f]{32}$")) and .attempt_id != "00000000000000000000000000000000"' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
+  teardown_lease=$(timeout 10 jq -r '.attempt_id' "$out_dir/teardown-failure.json")
+  reconcile_file=$lease_root/$teardown_lease/reconcile.json
+  ordering_file=$lease_root/$teardown_lease/ordering.jsonl
+  for _ in {1..120}; do
+    timeout 10 "${SUDO[@]}" test -r "$reconcile_file" \
+      && timeout 10 "${SUDO[@]}" test -r "$ordering_file" && break
+    timeout 2 sleep 0.25
+  done
+  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$reconcile_file" "$out_dir/reconcile-teardown-failure.json" 2>/dev/null || :
+  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$ordering_file" "$out_dir/ordering-teardown-failure.jsonl" 2>/dev/null || :
+  evidence_files+=("$TEST_ID/reconcile-teardown-failure.json" "$TEST_ID/ordering-teardown-failure.jsonl")
+  if [[ ! -s $out_dir/reconcile-teardown-failure.json || ! -s $out_dir/ordering-teardown-failure.jsonl ]]; then
+    record teardown_quarantine not_runnable 'The service returned Quarantined but did not expose reconciliation and ordering readback'
+  elif timeout 10 jq -e '.quarantined == true and .before_reuse == true' "$out_dir/reconcile-teardown-failure.json" >/dev/null 2>&1 \
+    && timeout 10 jq -e '.conclusion != "success"' "$out_dir/teardown-failure.json" >/dev/null 2>&1 \
+    && ! timeout 10 jq -s -e 'any(.[]; .event == "publish")' "$out_dir/ordering-teardown-failure.jsonl" >/dev/null 2>&1; then
+    record teardown_quarantine pass 'The sole privileged directive returned Quarantined, no green/publish, and before-reuse reconciliation; ActivationController ordinary capacity is zero, never one'
+  else
+    record teardown_quarantine fail 'Teardown failure reached Quarantined but violated before-reuse, no-green, or no-publish evidence'
+  fi
+elif ((teardown_rc == 0)); then
+  record teardown_quarantine not_runnable 'The qualification response does not expose a nonzero quarantined attempt required by TM-06'
 else
   record teardown_quarantine fail 'Teardown failure did not produce before-reuse quarantine with ordinary capacity zero'
 fi

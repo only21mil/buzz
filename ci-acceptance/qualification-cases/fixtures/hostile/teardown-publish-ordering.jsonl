@@ -1,0 +1,2 @@
+{"lease_id":"11111111111111111111111111111111","sequence":1,"event":"stop","timestamp_unix_ns":1}
+{"lease_id":"11111111111111111111111111111111","sequence":2,"event":"publish","timestamp_unix_ns":2,"status_event_id":"bad","verdict_event_id":"bad"}

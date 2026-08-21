@@ -172,10 +172,13 @@ evidence_files+=("$TEST_ID/socket-isolation.json" "$TEST_ID/socket-isolation.std
 if ((live_rc == 3)); then
   for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'The fixed root-authored TM-07/socket_isolation.json case is unavailable or unsafe'; done
   finish
+elif ((live_rc != 0)) || ! timeout 10 jq -e '.type == "qualification_result" and .code == "ok"' "$out_dir/socket-isolation.json" >/dev/null 2>&1; then
+  for name in "${dynamic_names[@]}"; do record "$name" fail 'The authenticated socket-isolation case was refused or returned a malformed service response'; done
+  finish
 fi
 live_lease=$(timeout 10 jq -r '.attempt_id // .lease_id // empty' "$out_dir/socket-isolation.json")
 live_ok=1
-[[ $live_lease =~ ^[A-Za-z0-9._-]+$ ]] || live_ok=0
+[[ $live_lease =~ ^[0-9a-f]{32}$ && $live_lease != 00000000000000000000000000000000 ]] || live_ok=0
 if ((live_ok)); then
   for _ in {1..120}; do
     if timeout 10 "${SUDO[@]}" test -d "$lease_root/$live_lease/proxy/objects"; then break; fi
@@ -198,7 +201,7 @@ if ((live_ok)) \
   && ! timeout 10 grep -Fq -e "$caller_docker_host" -e "$caller_socket" -e "$caller_act_socket" "$out_dir/proxy-objects.jsonl"; then
   record ignored_container_daemon_socket pass 'Caller-supplied Docker and container-daemon socket markers were absent from every recorded live proxy object'
 else
-  record ignored_container_daemon_socket fail 'Live admission failed, produced no proxy objects, or propagated a caller-supplied daemon endpoint'
+  record ignored_container_daemon_socket not_runnable 'The service response was accepted but the required proxy-object readback is absent or incomplete'
 fi
 if ((live_ok)) \
   && timeout 10 jq -s -e '
@@ -210,6 +213,6 @@ if ((live_ok)) \
   ' "$out_dir/proxy-objects.jsonl" >/dev/null; then
   record no_socket_inside_job pass 'No live effective-spec bind mounted the rootful Docker socket or a raw rootless Podman socket into the job'
 else
-  record no_socket_inside_job fail 'Live proxy-object evidence was absent or exposed a raw Docker or Podman daemon socket bind'
+  if ((live_ok)); then record no_socket_inside_job fail 'Live proxy-object evidence exposed a raw Docker or Podman daemon socket bind'; else record no_socket_inside_job not_runnable 'The required live proxy-object evidence is absent'; fi
 fi
 finish

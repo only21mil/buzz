@@ -126,17 +126,27 @@ elif ((admit_rc != 0)); then
   for name in "${dynamic_names[@]}"; do record "$name" fail 'The authenticated hostile-artifact case was refused'; done
   emit
   exit 1
+elif ! timeout 10 jq -e '.type == "qualification_result" and .code == "ok"' "$admit_file" >/dev/null 2>&1; then
+  evidence_files+=("$TEST_ID/admit.json" "$TEST_ID/admit.stderr")
+  for name in "${dynamic_names[@]}"; do record "$name" fail 'Qualification control returned a malformed success response'; done
+  emit
+  exit 1
 fi
 evidence_files+=("$TEST_ID/admit.json" "$TEST_ID/admit.stderr")
 lease_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.attempt_id // .lease_id // empty' "$admit_file")
-if [[ ! $lease_id =~ ^[A-Za-z0-9._-]+$ ]]; then for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'Qualification response exposes no safe attempt identifier'; done; emit; exit 3; fi
+if [[ ! $lease_id =~ ^[0-9a-f]{32}$ || $lease_id == 00000000000000000000000000000000 ]]; then for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'Qualification response exposes no nonzero attempt identifier'; done; emit; exit 3; fi
 lease_dir=$lease_root/$lease_id
 for _ in {1..120}; do
-  if timeout 10 "${SUDO[@]}" test -r "$lease_dir/final.json"; then timeout 10 "${SUDO[@]}" cp -- "$lease_dir/final.json" "$out_dir/final.json" 2>"$out_dir/final.stderr" || :; break; fi
+  if timeout 10 "${SUDO[@]}" test -r "$lease_dir/teardown.json" \
+    && timeout 10 "${SUDO[@]}" test -r "$lease_dir/ordering.jsonl"; then break; fi
   timeout 2 sleep 0.25
 done
-evidence_files+=("$TEST_ID/final.json" "$TEST_ID/final.stderr")
 for name in lease.json teardown.json ordering.jsonl; do timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/$name" "$out_dir/$name" 2>/dev/null || :; evidence_files+=("$TEST_ID/$name"); done
+if [[ ! -s $out_dir/lease.json || ! -s $out_dir/teardown.json || ! -s $out_dir/ordering.jsonl ]]; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'The accepted hostile-artifact case lacks lease, teardown, or ordering readback'; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+fi
 
 paths_file=$out_dir/publication-paths.txt
 timeout "$TIMEOUT_SECONDS" jq -r '.. | objects | to_entries[] | select(.key|test("((published|sanitized|content_addressed).*(artifact|log)|(artifact|log).*(published|sanitized|content_addressed|store_path))";"i")) | .value | select(type=="string")' \

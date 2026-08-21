@@ -1,0 +1,36 @@
+# test_id	case_name	directive	expected_code	readbacks	assertion
+TM-06	exclusive_capacity	none	ok	lease.json,reconcile.json	exclusive capacity and overlap refusal
+TM-06	teardown_failure	teardown_failure	ok	reconcile.json,ordering.jsonl	quarantine; capacity zero; no green; no publish
+TM-07	socket_isolation	none	ok	lease.json,proxy/objects	caller daemon endpoints absent
+TM-12	cpu-burn	none	ok	lease.json,ordering.jsonl,teardown.json	cpu-burn bounded terminal evidence
+TM-12	memory-balloon	none	ok	lease.json,ordering.jsonl,teardown.json	memory-balloon bounded terminal evidence
+TM-12	pid-fork-storm	none	ok	lease.json,ordering.jsonl,teardown.json	pid-fork-storm bounded terminal evidence
+TM-12	disk-fill	none	ok	lease.json,ordering.jsonl,teardown.json	disk-fill bounded terminal evidence
+TM-12	log-flood	none	ok	lease.json,ordering.jsonl,teardown.json	log-flood bounded terminal evidence
+TM-12	wall-time-overrun	none	ok	lease.json,ordering.jsonl,teardown.json	wall-time-overrun bounded terminal evidence
+TM-12	artifact-overrun	none	ok	lease.json,ordering.jsonl,teardown.json	artifact-overrun bounded terminal evidence
+TM-13	hostile_artifacts	none	ok	lease.json,ordering.jsonl,teardown.json	sanitized stores; no hostile publication
+TM-14	normal	none	ok	ordering.jsonl,teardown.json	strict teardown-before-publish
+TM-14	teardown_failure	teardown_failure	ok	ordering.jsonl,reconcile.json	quarantine; no green; no publish
+TM-15	act	none	ok	lease.json,reconcile.json	act crash reconciliation
+TM-15	reuse-act	none	ok	lease.json	act distinct replacement lease/workspace
+TM-15	podman	none	ok	lease.json,reconcile.json	podman crash reconciliation
+TM-15	reuse-podman	none	ok	lease.json	podman distinct replacement lease/workspace
+TM-15	proxy	none	ok	lease.json,reconcile.json	proxy crash reconciliation
+TM-15	reuse-proxy	none	ok	lease.json	proxy distinct replacement lease/workspace
+TM-15	materializer	none	ok	lease.json,reconcile.json	materializer crash reconciliation
+TM-15	reuse-materializer	none	ok	lease.json	materializer distinct replacement lease/workspace
+TM-15	broker	none	ok	lease.json,reconcile.json	broker crash reconciliation
+TM-15	reuse-broker	none	ok	lease.json	broker distinct replacement lease/workspace
+TM-15	simulated_host_crash	none	ok	lease.json,reconcile.json	simulated_host_crash crash reconciliation
+TM-15	reuse-simulated_host_crash	none	ok	lease.json	simulated_host_crash distinct replacement lease/workspace
+TM-16	attempt_1	none	ok	lease.json	retry attempt one
+TM-16	attempt_2	none	ok	lease.json	retry attempt two; distinct workspace
+TM-16	expired	none	policy_denied	none	service-side expiry refusal
+TM-16	replay	none	replay_conflict	none	ActivationController replay refusal
+TM-16	unauthorized_signer	none	binding_mismatch	none	local zero-transport signer refusal
+TM-16	rate_limit	none	no_capacity	none	ActivationController rate refusal
+TM-16	concurrency_primary	none	ok	lease.json	primary lease occupies capacity
+TM-16	concurrency_overflow	none	no_capacity	none	ActivationController overlap refusal
+TM-17	unaccepted	none	unaccepted_trust_class	none	local zero-transport trust refusal
+TM-17	external_fork	none	binding_mismatch	none	local zero-transport fork binding refusal
