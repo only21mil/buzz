@@ -249,7 +249,8 @@ pub struct GetAttemptRequest {
 pub struct CompleteAttemptRequest {
     pub signer_pubkey: [u8; 32],
     pub signed_request_digest: [u8; 32],
-    pub attempt_id: [u8; 16],
+    pub run_id: [u8; 16],
+    pub attempt: u32,
     pub lease_id: [u8; 16],
     pub lease_generation: u64,
     pub advisory_conclusion: Conclusion,
@@ -817,27 +818,30 @@ fn decode_cancel(body: &[u8]) -> Result<CancelAttemptRequest, DecodeError> {
 fn encode_complete(body: &mut [u8], value: CompleteAttemptRequest) {
     body[0..32].copy_from_slice(&value.signer_pubkey);
     body[32..64].copy_from_slice(&value.signed_request_digest);
-    body[64..80].copy_from_slice(&value.attempt_id);
-    body[80..96].copy_from_slice(&value.lease_id);
-    put_u64(body, 96, value.lease_generation);
-    body[104] = value.advisory_conclusion as u8;
-    body[105..137].copy_from_slice(&value.evidence_set_digest);
-    put_u64(body, 137, value.terminal_at);
+    body[64..80].copy_from_slice(&value.run_id);
+    put_u32(body, 80, value.attempt);
+    body[84..100].copy_from_slice(&value.lease_id);
+    put_u64(body, 100, value.lease_generation);
+    body[108] = value.advisory_conclusion as u8;
+    body[109..141].copy_from_slice(&value.evidence_set_digest);
+    put_u64(body, 141, value.terminal_at);
 }
 
 fn decode_complete(body: &[u8]) -> Result<CompleteAttemptRequest, DecodeError> {
-    require_zero(&body[145..])?;
+    require_zero(&body[149..])?;
     let value = CompleteAttemptRequest {
         signer_pubkey: nonzero_array(&body[0..32])?,
         signed_request_digest: nonzero_array(&body[32..64])?,
-        attempt_id: nonzero_array(&body[64..80])?,
-        lease_id: nonzero_array(&body[80..96])?,
-        lease_generation: get_u64(body, 96),
-        advisory_conclusion: Conclusion::try_from(body[104])?,
-        evidence_set_digest: nonzero_array(&body[105..137])?,
-        terminal_at: get_u64(body, 137),
+        run_id: nonzero_array(&body[64..80])?,
+        attempt: get_u32(body, 80),
+        lease_id: nonzero_array(&body[84..100])?,
+        lease_generation: get_u64(body, 100),
+        advisory_conclusion: Conclusion::try_from(body[108])?,
+        evidence_set_digest: nonzero_array(&body[109..141])?,
+        terminal_at: get_u64(body, 141),
     };
-    if value.lease_generation == 0
+    if value.attempt == 0
+        || value.lease_generation == 0
         || value.advisory_conclusion == Conclusion::None
         || value.terminal_at == 0
     {
@@ -965,11 +969,12 @@ mod tests {
         CompleteAttemptRequest {
             signer_pubkey: digest(25),
             signed_request_digest: digest(26),
-            attempt_id: [27; 16],
-            lease_id: [28; 16],
-            lease_generation: 29,
+            run_id: [27; 16],
+            attempt: 28,
+            lease_id: [29; 16],
+            lease_generation: 30,
             advisory_conclusion: Conclusion::Success,
-            evidence_set_digest: digest(30),
+            evidence_set_digest: digest(31),
             terminal_at: 300,
         }
     }
@@ -1298,7 +1303,7 @@ mod tests {
         assert_eq!(bytes.len(), HEADER_SIZE + COMPLETE_ATTEMPT_BODY_SIZE);
         assert_eq!(get_u16(bytes, 6), 6);
         assert_eq!(get_u32(bytes, 12), 160);
-        assert_eq!(&bytes[HEADER_SIZE + 145..], &[0; 15]);
+        assert_eq!(&bytes[HEADER_SIZE + 149..], &[0; 11]);
         assert_eq!(
             decode_request(bytes),
             Ok((
@@ -1316,34 +1321,38 @@ mod tests {
         let encoded = encode_request([1; 16], Request::CompleteAttempt(complete()));
         let original = encoded.as_bytes();
         let body = HEADER_SIZE;
-        for range in [0..32, 32..64, 64..80, 80..96, 105..137] {
+        for range in [0..32, 32..64, 64..80, 84..100, 109..141] {
             let mut zero = original.to_vec();
             zero[body + range.start..body + range.end].fill(0);
             assert_eq!(decode_request(&zero), Err(DecodeError::ZeroField));
         }
 
+        let mut zero_attempt = original.to_vec();
+        put_u32(&mut zero_attempt, body + 80, 0);
+        assert_eq!(decode_request(&zero_attempt), Err(DecodeError::ZeroField));
+
         let mut zero_generation = original.to_vec();
-        put_u64(&mut zero_generation, body + 96, 0);
+        put_u64(&mut zero_generation, body + 100, 0);
         assert_eq!(
             decode_request(&zero_generation),
             Err(DecodeError::ZeroField)
         );
 
         let mut no_conclusion = original.to_vec();
-        no_conclusion[body + 104] = Conclusion::None as u8;
+        no_conclusion[body + 108] = Conclusion::None as u8;
         assert_eq!(decode_request(&no_conclusion), Err(DecodeError::ZeroField));
         let mut unknown_conclusion = original.to_vec();
-        unknown_conclusion[body + 104] = 6;
+        unknown_conclusion[body + 108] = 6;
         assert_eq!(
             decode_request(&unknown_conclusion),
             Err(DecodeError::UnknownEnum)
         );
 
         let mut zero_terminal = original.to_vec();
-        put_u64(&mut zero_terminal, body + 137, 0);
+        put_u64(&mut zero_terminal, body + 141, 0);
         assert_eq!(decode_request(&zero_terminal), Err(DecodeError::ZeroField));
         let mut unsafe_terminal = original.to_vec();
-        put_u64(&mut unsafe_terminal, body + 137, MAX_SAFE_INTEGER + 1);
+        put_u64(&mut unsafe_terminal, body + 141, MAX_SAFE_INTEGER + 1);
         assert_eq!(
             decode_request(&unsafe_terminal),
             Err(DecodeError::UnsafeInteger)
