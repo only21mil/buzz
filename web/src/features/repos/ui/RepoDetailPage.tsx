@@ -206,26 +206,32 @@ export function RepoDetailPage() {
     data: fetchedTreeEntries,
     isLoading: isTreeLoading,
     error: treeError,
+    cloneError,
+    isCloneLoading,
   } = useGitTree(browseOwner, repoName, defaultRef);
   const {
     data: fetchedCommits,
     isLoading: areCommitsLoading,
     error: commitsError,
   } = useGitLog(browseOwner, repoName, defaultRef);
-  const { data: fetchedReadme, isLoading: isReadmeLoading } = useGitReadme(
-    browseOwner,
-    repoName,
-    defaultRef,
-  );
+  const {
+    data: fetchedReadme,
+    isLoading: isReadmeLoading,
+    error: readmeError,
+  } = useGitReadme(browseOwner, repoName, defaultRef);
   const treeEntries = showMockRepo ? mockRepoTree : fetchedTreeEntries;
   const commits = showMockRepo ? mockRepoCommits : fetchedCommits;
   const readme = showMockRepo ? mockRepoReadme : fetchedReadme;
-  const treeLoading = showMockRepo ? false : isTreeLoading;
-  const commitsLoading = showMockRepo ? false : areCommitsLoading;
-  const readmeLoading = showMockRepo ? false : isReadmeLoading;
+  const treeLoading = showMockRepo ? false : isCloneLoading || isTreeLoading;
+  const commitsLoading = showMockRepo
+    ? false
+    : isCloneLoading || areCommitsLoading;
+  const readmeLoading = showMockRepo
+    ? false
+    : isCloneLoading || isReadmeLoading;
 
   // Surface clone/browse errors — these are otherwise silent
-  const browseError = treeError || commitsError;
+  const browseError = cloneError || treeError || commitsError || readmeError;
   useEffect(() => {
     if (browseError) {
       console.error("[git-browse]", browseError);
@@ -304,25 +310,34 @@ export function RepoDetailPage() {
 
         {/* Clone/browse error banner */}
         {browseError && (
-          <div className="mt-6 rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-            Failed to load repository contents:{" "}
-            {browseError instanceof Error
-              ? browseError.message
-              : String(browseError)}
+          <div
+            role="alert"
+            className="mt-6 rounded-md border border-destructive/50 bg-destructive/10 px-4 py-4 text-black dark:text-white"
+          >
+            <h2 className="text-sm font-semibold">
+              Repository contents unavailable
+            </h2>
+            <p className="mt-1 text-sm leading-relaxed text-black/70 dark:text-white/70">
+              This repository could not be loaded. It may not exist, or it may
+              be restricted to members of its channel. If you have a Nostr
+              signer extension, connect it and reload.
+            </p>
           </div>
         )}
 
         {/* Tabs */}
-        <RepoTabs
-          repoId={repoId}
-          treeEntries={treeEntries}
-          treeLoading={treeLoading}
-          commits={commits}
-          commitsLoading={commitsLoading}
-          readme={readme}
-          readmeLoading={readmeLoading}
-          preview={showMockRepo}
-        />
+        {!browseError && (
+          <RepoTabs
+            repoId={repoId}
+            treeEntries={treeEntries}
+            treeLoading={treeLoading}
+            commits={commits}
+            commitsLoading={commitsLoading}
+            readme={readme}
+            readmeLoading={readmeLoading}
+            preview={showMockRepo}
+          />
+        )}
 
         {/* Clone URLs */}
         {repo.cloneUrls.length > 0 && (
