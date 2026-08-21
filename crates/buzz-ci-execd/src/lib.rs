@@ -17,6 +17,7 @@ pub mod evidence;
 pub mod harness;
 #[cfg(unix)]
 pub mod runtime;
+pub mod qualification_host;
 
 use buzz_ci_broker_protocol::{
     BrokerResponse, BrokerState, Conclusion, FrameHeader, Request, ResponseCode,

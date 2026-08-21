@@ -32,6 +32,9 @@ use crate::activation::{
     ActivationController, AdmissionError, LeaseToken, OrdinaryAdmission, QualificationLease,
     VerifiedSigner,
 };
+use crate::qualification_host::{
+    QualificationHostExecution, QualificationHostOutcome, QualificationHostPlan,
+};
 
 const CONTROL_ACCOUNT: &str = "buzzci-ctl";
 const CONTROL_ACCOUNT_UID: u32 = 961;
@@ -126,6 +129,15 @@ pub trait QualificationAdmissionBoundary {
         lease: QualificationLease,
         now: u64,
     ) -> BrokerResponse;
+
+    /// Execute only the closed teardown-failure plan inside root execd.
+    /// Missing support fails closed and never falls back to `admitted_response`.
+    fn execute_teardown_failure(
+        &mut self,
+        _plan: QualificationHostPlan,
+    ) -> QualificationHostExecution {
+        QualificationHostExecution::Missing
+    }
 }
 
 /// Dispatches one already authenticated and decoded control request.
@@ -196,9 +208,28 @@ impl<A: OrdinaryAdmissionBoundary, Q: QualificationAdmissionBoundary> ControlDis
                     .controller
                     .admit_qualification_request(request, signer, now)
                 {
-                    Ok(lease) => self
-                        .qualification_boundary
-                        .admitted_response(header, request, lease, now),
+                    Ok(lease) => match lease.directive() {
+                        None => self
+                            .qualification_boundary
+                            .admitted_response(header, request, lease, now),
+                        Some(buzz_ci_broker_protocol::QualificationDirective::TeardownFailure) => {
+                            let plan = QualificationHostPlan::from_admitted(request, lease).ok();
+                            let outcome = plan.map(|plan| {
+                                QualificationHostOutcome::evaluate(
+                                    plan,
+                                    self.qualification_boundary.execute_teardown_failure(plan),
+                                )
+                            });
+                            let cleanup_state =
+                                self.controller.finish_qualification_teardown_failure(lease);
+                            qualification_teardown_response(
+                                request,
+                                lease,
+                                outcome.filter(|_| cleanup_state.is_ok()),
+                                now,
+                            )
+                        }
+                    },
                     Err(error) => response(admission_error_code(error), now),
                 }
             }
@@ -517,6 +548,38 @@ fn response(code: ResponseCode, now: u64) -> BrokerResponse {
     }
 }
 
+fn qualification_teardown_response(
+    request: QualificationRequest,
+    lease: QualificationLease,
+    outcome: Option<QualificationHostOutcome>,
+    now: u64,
+) -> BrokerResponse {
+    let complete = outcome.is_some_and(QualificationHostOutcome::is_complete);
+    BrokerResponse {
+        code: if complete {
+            ResponseCode::Ok
+        } else {
+            ResponseCode::InternalFailure
+        },
+        retry_after_millis: 0,
+        attempt_id: lease.lease_id(),
+        run_id: [0; 16],
+        accepted_request_digest: request.request_digest,
+        job_manifest_digest: request.manifest_digest,
+        tip_oid: Some(request.integrated_candidate_sha),
+        broker_state: BrokerState::Quarantined,
+        conclusion: Conclusion::InfrastructureFailure,
+        terminal_reason: 1,
+        generation: lease.generation(),
+        accepted_at: now,
+        updated_at: now,
+        lease_generation: lease.generation(),
+        evidence_set_digest: outcome.map_or([0; 32], QualificationHostOutcome::no_publish_digest),
+        teardown_digest: outcome.map_or([0; 32], QualificationHostOutcome::teardown_digest),
+        attempt: 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -525,9 +588,11 @@ mod tests {
     use crate::activation::{
         FixtureJobCoordinates, HostActivationCoordinates, QualificationPermit,
     };
+    use crate::qualification_host::{QualificationHostReceipt, QUALIFICATION_TERMINAL_ORDER};
     use buzz_ci_broker_protocol::{
         decode_response, encode_request, AdmitAttemptRequest, GitOid, HelloRequest,
-        QualificationRequest, Request, ResponseCode, TrustClass, MAX_FRAME_SIZE,
+        QualificationDirective, QualificationRequest, Request, ResponseCode, TrustClass,
+        MAX_FRAME_SIZE,
     };
 
     struct RefusingOrdinaryBoundary;
@@ -581,7 +646,61 @@ mod tests {
         }
     }
 
-    fn qualification() -> (ActivationController, QualificationRequest) {
+    #[derive(Clone, Copy)]
+    enum TeardownEvidence {
+        Complete,
+        Missing,
+        Ambiguous,
+    }
+
+    struct TeardownQualificationBoundary {
+        signer: VerifiedSigner,
+        evidence: TeardownEvidence,
+    }
+
+    impl QualificationAdmissionBoundary for TeardownQualificationBoundary {
+        fn authenticate(
+            &mut self,
+            _header: FrameHeader,
+            _request: QualificationRequest,
+        ) -> Result<VerifiedSigner, AdmissionBoundaryError> {
+            Ok(self.signer)
+        }
+
+        fn admitted_response(
+            &mut self,
+            _header: FrameHeader,
+            _request: QualificationRequest,
+            _lease: QualificationLease,
+            _now: u64,
+        ) -> BrokerResponse {
+            panic!("teardown qualification reached ordinary response path")
+        }
+
+        fn execute_teardown_failure(
+            &mut self,
+            plan: QualificationHostPlan,
+        ) -> QualificationHostExecution {
+            match self.evidence {
+                TeardownEvidence::Complete => QualificationHostExecution::Complete(
+                    QualificationHostReceipt::new(
+                        plan,
+                        QUALIFICATION_TERMINAL_ORDER,
+                        [21; 32],
+                        [22; 32],
+                        [23; 32],
+                    )
+                    .unwrap(),
+                ),
+                TeardownEvidence::Missing => QualificationHostExecution::Missing,
+                TeardownEvidence::Ambiguous => QualificationHostExecution::Ambiguous,
+            }
+        }
+    }
+
+    fn qualification(
+        directive: Option<QualificationDirective>,
+    ) -> (ActivationController, QualificationRequest) {
         let root = VerifiedSigner([1; 32]);
         let signer = VerifiedSigner([2; 32]);
         let host = HostActivationCoordinates {
@@ -607,7 +726,7 @@ mod tests {
             nonce: [14; 32],
             not_before: 10,
             expires_at: 30,
-            directive: None,
+            directive,
         };
         let mut controller = ActivationController::new(root);
         controller.start_qualification(permit).unwrap();
@@ -629,7 +748,7 @@ mod tests {
                 nonce: permit.nonce,
                 not_before: permit.not_before,
                 expires_at: permit.expires_at,
-                directive: None,
+                directive,
             },
         )
     }
@@ -789,7 +908,7 @@ mod tests {
             operation: buzz_ci_broker_protocol::Operation::AdmitQualification,
             request_id: [15; 16],
         };
-        let (controller, request) = qualification();
+        let (controller, request) = qualification(None);
         let mut wrong = ActivationDispatch::new(
             controller,
             RefusingOrdinaryBoundary,
@@ -802,7 +921,7 @@ mod tests {
             ResponseCode::PolicyDenied
         );
 
-        let (controller, request) = qualification();
+        let (controller, request) = qualification(None);
         let mut exact = ActivationDispatch::new(
             controller,
             RefusingOrdinaryBoundary,
@@ -812,5 +931,48 @@ mod tests {
         assert_eq!(accepted.code, ResponseCode::Ok);
         assert_eq!(accepted.attempt_id, [13; 16]);
         assert_eq!(accepted.accepted_request_digest, [7; 32]);
+    }
+
+    #[test]
+    fn teardown_qualification_can_only_fail_quarantine_and_suppress_publication() {
+        let header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::AdmitQualification,
+            request_id: [15; 16],
+        };
+        for evidence in [
+            TeardownEvidence::Complete,
+            TeardownEvidence::Missing,
+            TeardownEvidence::Ambiguous,
+        ] {
+            let (controller, request) =
+                qualification(Some(QualificationDirective::TeardownFailure));
+            let mut dispatch = ActivationDispatch::new(
+                controller,
+                RefusingOrdinaryBoundary,
+                TeardownQualificationBoundary {
+                    signer: VerifiedSigner([2; 32]),
+                    evidence,
+                },
+            );
+            let result = dispatch.dispatch(header, Request::AdmitQualification(request), 10);
+            assert_eq!(result.broker_state, BrokerState::Quarantined);
+            assert_eq!(result.conclusion, Conclusion::InfrastructureFailure);
+            assert_eq!(result.attempt_id, [13; 16]);
+            assert_eq!(result.lease_generation, 1);
+            assert_eq!(result.accepted_request_digest, [7; 32]);
+            assert_eq!(result.job_manifest_digest, [8; 32]);
+            match evidence {
+                TeardownEvidence::Complete => {
+                    assert_eq!(result.code, ResponseCode::Ok);
+                    assert_eq!(result.evidence_set_digest, [22; 32]);
+                    assert_eq!(result.teardown_digest, [21; 32]);
+                }
+                TeardownEvidence::Missing | TeardownEvidence::Ambiguous => {
+                    assert_eq!(result.code, ResponseCode::InternalFailure);
+                    assert_eq!(result.evidence_set_digest, [0; 32]);
+                    assert_eq!(result.teardown_digest, [0; 32]);
+                }
+            }
+        }
     }
 }

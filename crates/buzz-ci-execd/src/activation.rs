@@ -92,11 +92,29 @@ pub struct QualificationAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QualificationLease {
     fixture_identity: [u8; 32],
+    lease_id: [u8; 16],
+    generation: u64,
     nonce: [u8; 32],
     directive: Option<QualificationDirective>,
 }
 
 impl QualificationLease {
+    pub const fn fixture_identity(self) -> [u8; 32] {
+        self.fixture_identity
+    }
+
+    pub const fn lease_id(self) -> [u8; 16] {
+        self.lease_id
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn nonce(self) -> [u8; 32] {
+        self.nonce
+    }
+
     /// Return the root-permitted behavior for this exact fixture lease.
     pub const fn directive(self) -> Option<QualificationDirective> {
         self.directive
@@ -541,14 +559,23 @@ impl ActivationController {
         if request.nonce != session.permit.nonce {
             return Err(AdmissionError::InvalidNonce);
         }
+        if self.next_lease_generation == u64::MAX {
+            self.quarantine();
+            return Err(AdmissionError::GenerationExhausted);
+        }
 
+        let mut lease_id = [0; 16];
+        lease_id.copy_from_slice(&request.fixture_identity[..16]);
         let lease = QualificationLease {
             fixture_identity: request.fixture_identity,
+            lease_id,
+            generation: self.next_lease_generation,
             nonce: request.nonce,
             directive: request.directive,
         };
         self.seen_nonces
             .insert(request.nonce, session.permit.expires_at)?;
+        self.next_lease_generation += 1;
         self.qualification = Some(DurableQualificationState {
             active_lease: Some(lease),
             ..session
@@ -592,6 +619,24 @@ impl ActivationController {
                 self.quarantine();
                 Err(ActivationError::ReconciliationAmbiguous)
             }
+        }
+    }
+
+    /// Quarantine after the forced teardown fixture, regardless of evidence quality.
+    pub fn finish_qualification_teardown_failure(
+        &mut self,
+        lease: QualificationLease,
+    ) -> Result<(), ActivationError> {
+        let accepted = self.state == ActivationState::Qualifying
+            && self
+                .qualification
+                .is_some_and(|session| session.active_lease == Some(lease))
+            && lease.directive == Some(QualificationDirective::TeardownFailure);
+        self.quarantine();
+        if accepted {
+            Ok(())
+        } else {
+            Err(ActivationError::MissingLease)
         }
     }
 
@@ -854,6 +899,8 @@ fn snapshot_shape_is_valid(snapshot: DurableStateSnapshot) -> bool {
         valid_qualification_permit(snapshot.root_authority, qualification.permit)
             && qualification.active_lease.is_none_or(|lease| {
                 lease.fixture_identity == qualification.permit.fixture_identity
+                    && lease.lease_id == qualification.permit.fixture_identity[..16]
+                    && lease.generation < snapshot.next_lease_generation
                     && lease.nonce == qualification.permit.nonce
                     && lease.directive == qualification.permit.directive
                     && snapshot.nonce_ledger.contains(&lease.nonce)
@@ -1663,7 +1710,7 @@ mod tests {
         let second = controller
             .admit_ordinary(ordinary_admission(23, 24, 100), 26)
             .expect("second admission");
-        assert_eq!(second.generation, 2);
+        assert_eq!(second.generation, 3);
     }
 
     #[test]
