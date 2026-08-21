@@ -3,7 +3,10 @@
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(target_os = "linux")]
 use std::os::{fd::FromRawFd, unix::net::UnixListener};
@@ -84,10 +87,23 @@ fn main() -> ExitCode {
                     }
                 };
                 let dispatch = load_production_dispatch(startup_now);
-                let mut server = ControlServer::new(listener, control_uid, dispatch);
+                let mut server = match ControlServer::new_polling(listener, control_uid, dispatch) {
+                    Ok(server) => server,
+                    Err(error) => {
+                        eprintln!(r#"{{"error":"control_listener","reason":"{error}"}}"#);
+                        return ExitCode::from(4);
+                    }
+                };
                 loop {
-                    match server.serve_once() {
-                        Ok(()) => {}
+                    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(duration) => duration.as_secs(),
+                        Err(_) => {
+                            eprintln!(r#"{{"error":"system_clock"}}"#);
+                            return ExitCode::from(4);
+                        }
+                    };
+                    match server.serve_tick(now) {
+                        Ok(()) => thread::sleep(Duration::from_millis(100)),
                         Err(error @ ControlError::Accept(_)) => {
                             eprintln!(r#"{{"error":"control_listener","reason":"{error}"}}"#);
                             return ExitCode::from(4);

@@ -22,13 +22,15 @@ use thiserror::Error;
 use crate::{
     activation::{
         ActivationController, ActivationGrant, ActivationState, AdmissionTrustClass,
-        DurableNonceEntry, DurableNonceLedger, DurableQualificationState, DurableStateSnapshot,
-        FixtureJobCoordinates, HostActivationCoordinates, OrdinaryAdmission,
-        OrdinaryJobCoordinates, QualificationPermit, ReadyRestoreValidation, VerifiedSigner,
-        NONCE_LEDGER_CAPACITY,
+        DurableLeaseFields, DurableNonceEntry, DurableNonceLedger, DurableQualificationState,
+        DurableStateSnapshot, FixtureJobCoordinates, HostActivationCoordinates, LeaseToken,
+        OrdinaryAdmission, OrdinaryJobCoordinates, QualificationPermit, ReadyRestoreValidation,
+        VerifiedSigner, NONCE_LEDGER_CAPACITY,
     },
     control::AdmissionBoundaryError,
-    durable_dispatch::{DurableDispatch, OrdinaryExecutor, QualificationExecutor},
+    durable_dispatch::{
+        DurableDispatch, OrdinaryAuthorityBinding, OrdinaryExecutor, QualificationExecutor,
+    },
 };
 
 /// Canonical immutable authority directory.
@@ -171,6 +173,21 @@ impl PreparedRuntime {
         let root = self.authority.root;
         let restored = ActivationController::restore(root, self.snapshot, ready_validation);
         if restored.quarantine_reason.is_some() {
+            if restored.controller.recovery_lease().is_some() {
+                let mut store = DurableStateStore {
+                    state_revision: self.state_revision,
+                    authority_revision: self.authority.revision,
+                    authority_sha256: self.authority_sha256,
+                };
+                if store.commit(restored.controller.snapshot()).is_ok() {
+                    return RuntimeBootstrap::Loaded(Box::new(LoadedRuntime {
+                        controller: restored.controller,
+                        authority: self.authority,
+                        state_revision: store.revision(),
+                        authority_sha256: self.authority_sha256,
+                    }));
+                }
+            }
             return persist_quarantine(
                 restored.controller,
                 self.state_revision,
@@ -351,6 +368,24 @@ impl ServiceAuthority {
             return Err(AdmissionBoundaryError::Unauthorized);
         }
         Ok(binding.admission)
+    }
+
+    /// Authenticate a later ordinary mutation against the root-owned signer.
+    pub fn authenticate_ordinary_signer(
+        &self,
+        signer_pubkey: [u8; 32],
+    ) -> Result<OrdinaryAuthorityBinding, AdmissionBoundaryError> {
+        let binding = self
+            .ordinary
+            .as_ref()
+            .ok_or(AdmissionBoundaryError::Unavailable)?;
+        if signer_pubkey != binding.admission.signer.0 {
+            return Err(AdmissionBoundaryError::Unauthorized);
+        }
+        Ok(OrdinaryAuthorityBinding {
+            request: binding.request,
+            admission: binding.admission,
+        })
     }
 
     /// Authenticate one qualification claim against the exact root permit.
@@ -750,9 +785,12 @@ impl OrdinaryAuthorityFile {
                 job_identity: hex_array(&self.job_identity)?,
             },
             lease_id: hex_array(&self.lease_id)?,
+            run_id: request.run_id,
+            attempt: request.attempt,
             signer: authenticated_signer,
             nonce: hex_array(&self.nonce)?,
             expires_at: request.expires_at,
+            wall_timeout_seconds: request.wall_timeout_seconds,
             trust_class: AdmissionTrustClass::AcceptedReviewed,
         };
         Ok(OrdinaryAuthority {
@@ -774,7 +812,7 @@ struct StateFile {
     state: String,
     qualification: Option<DurableQualificationFile>,
     activation: Option<GrantFile>,
-    active_lease: bool,
+    active_lease: ActiveLeaseFile,
     nonce_ledger: Vec<NonceFile>,
     last_admission_at: Option<u64>,
     next_lease_generation: u64,
@@ -792,7 +830,6 @@ impl StateFile {
             || self.authority_revision != authority.revision
             || !self.committed
             || hex_array::<32>(&self.authority_sha256)? != authority_sha256
-            || self.active_lease
             || self.nonce_ledger.len() > NONCE_LEDGER_CAPACITY
         {
             return Err(RuntimeLoadError::BindingMismatch);
@@ -808,6 +845,7 @@ impl StateFile {
             .as_ref()
             .map(GrantFile::decode)
             .transpose()?;
+        let active_lease = self.active_lease.decode(authority)?;
         let authority_bound = qualification.as_ref().map(|value| value.permit)
             == authority.qualification.as_ref().map(|value| value.permit)
             && activation == authority.ordinary.as_ref().map(|value| value.grant);
@@ -834,7 +872,7 @@ impl StateFile {
             state,
             qualification,
             activation,
-            active_lease: None,
+            active_lease,
             nonce_ledger: DurableNonceLedger { entries },
             last_admission_at: self.last_admission_at,
             next_lease_generation: self.next_lease_generation,
@@ -859,7 +897,7 @@ impl StateFile {
                 .map(DurableQualificationFile::encode)
                 .transpose()?,
             activation: snapshot.activation.map(GrantFile::encode),
-            active_lease: snapshot.active_lease.is_some(),
+            active_lease: ActiveLeaseFile::encode(snapshot.active_lease),
             nonce_ledger: snapshot
                 .nonce_ledger
                 .entries
@@ -871,6 +909,87 @@ impl StateFile {
             last_admission_at: snapshot.last_admission_at,
             next_lease_generation: snapshot.next_lease_generation,
         })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum ActiveLeaseFile {
+    Legacy(bool),
+    Lease(LeaseFile),
+}
+
+impl ActiveLeaseFile {
+    fn decode(&self, authority: &ServiceAuthority) -> Result<Option<LeaseToken>, RuntimeLoadError> {
+        match self {
+            Self::Legacy(false) => Ok(None),
+            Self::Legacy(true) => Err(RuntimeLoadError::Quarantined),
+            Self::Lease(lease) => lease.decode(authority).map(Some),
+        }
+    }
+
+    fn encode(lease: Option<LeaseToken>) -> Self {
+        match lease {
+            None => Self::Legacy(false),
+            Some(lease) => Self::Lease(LeaseFile {
+                lease_id: hex::encode(lease.lease_id()),
+                run_id: hex::encode(lease.run_id()),
+                attempt: lease.attempt(),
+                signed_request_digest: hex::encode(lease.signed_request_digest()),
+                signer_pubkey: hex::encode(lease.signer().0),
+                generation: lease.generation(),
+                nonce: hex::encode(lease.nonce()),
+                deadline_at: lease.deadline_at(),
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseFile {
+    lease_id: String,
+    run_id: String,
+    attempt: u32,
+    signed_request_digest: String,
+    signer_pubkey: String,
+    generation: u64,
+    nonce: String,
+    deadline_at: u64,
+}
+
+impl LeaseFile {
+    fn decode(&self, authority: &ServiceAuthority) -> Result<LeaseToken, RuntimeLoadError> {
+        let binding = authority
+            .ordinary
+            .as_ref()
+            .ok_or(RuntimeLoadError::BindingMismatch)?;
+        let lease_id = hex_array(&self.lease_id)?;
+        let run_id = hex_array(&self.run_id)?;
+        let nonce = hex_array(&self.nonce)?;
+        if self.generation == 0
+            || lease_id != binding.admission.lease_id
+            || run_id != binding.request.run_id
+            || self.attempt != binding.request.attempt
+            || hex_array::<32>(&self.signed_request_digest)?
+                != binding.request.signed_request_digest
+            || hex_array::<32>(&self.signer_pubkey)? != binding.admission.signer.0
+            || nonce != binding.admission.nonce
+            || self.deadline_at == 0
+            || self.deadline_at > binding.request.expires_at
+        {
+            return Err(RuntimeLoadError::BindingMismatch);
+        }
+        Ok(LeaseToken::from_durable(DurableLeaseFields {
+            lease_id,
+            run_id,
+            attempt: self.attempt,
+            signed_request_digest: binding.request.signed_request_digest,
+            signer: binding.admission.signer,
+            generation: self.generation,
+            nonce,
+            deadline_at: self.deadline_at,
+        }))
     }
 }
 
@@ -1318,9 +1437,12 @@ mod tests {
                     job_identity: [28; 32],
                 },
                 lease_id: [29; 16],
+                run_id: request.run_id,
+                attempt: request.attempt,
                 signer: ORDINARY,
                 nonce: [30; 32],
                 expires_at: request.expires_at,
+                wall_timeout_seconds: request.wall_timeout_seconds,
                 trust_class: AdmissionTrustClass::AcceptedReviewed,
             },
         }
@@ -1384,6 +1506,62 @@ mod tests {
     }
 
     #[test]
+    fn leased_snapshot_round_trips_with_exact_authority_binding() {
+        let authority = authority(true, 100);
+        let binding = ordinary_authority();
+        let lease = LeaseToken::from_durable(DurableLeaseFields {
+            lease_id: binding.admission.lease_id,
+            run_id: binding.request.run_id,
+            attempt: binding.request.attempt,
+            signed_request_digest: binding.request.signed_request_digest,
+            signer: binding.admission.signer,
+            generation: 2,
+            nonce: binding.admission.nonce,
+            deadline_at: 51,
+        });
+        let mut entries = [None; NONCE_LEDGER_CAPACITY];
+        entries[0] = Some(DurableNonceEntry {
+            nonce: binding.admission.nonce,
+            expires_at: binding.admission.expires_at,
+        });
+        let snapshot = DurableStateSnapshot {
+            version: FORMAT_VERSION,
+            root_authority: ROOT,
+            state: ActivationState::Leased,
+            qualification: Some(DurableQualificationState {
+                permit: permit(100),
+                active_lease: None,
+                evidence_set_digest: Some([16; 32]),
+            }),
+            activation: Some(grant(100)),
+            active_lease: Some(lease),
+            nonce_ledger: DurableNonceLedger { entries },
+            last_admission_at: Some(21),
+            next_lease_generation: 3,
+        };
+        let hash = [42; 32];
+        let mut disk = StateFile::encode(snapshot, 9, 7, hash).unwrap();
+
+        let decoded = disk.decode(&authority, hash, 22).unwrap();
+        let restored = ActivationController::restore(ROOT, decoded, None);
+        assert_eq!(
+            restored.quarantine_reason,
+            Some(ActivationError::RestartAmbiguous)
+        );
+        assert_eq!(restored.controller.state(), ActivationState::Quarantined);
+        assert_eq!(restored.controller.recovery_lease(), Some(lease));
+
+        let ActiveLeaseFile::Lease(active) = &mut disk.active_lease else {
+            panic!("leased state must encode an exact lease record");
+        };
+        active.run_id = hex::encode([99; 16]);
+        assert_eq!(
+            disk.decode(&authority, hash, 22),
+            Err(RuntimeLoadError::BindingMismatch)
+        );
+    }
+
+    #[test]
     fn stale_or_inflight_state_never_restores() {
         let authority = authority(false, 30);
         let mut controller = ActivationController::new(ROOT);
@@ -1394,10 +1572,10 @@ mod tests {
             disk.decode(&authority, hash, 30),
             Err(RuntimeLoadError::Stale)
         );
-        disk.active_lease = true;
+        disk.active_lease = ActiveLeaseFile::Legacy(true);
         assert_eq!(
             disk.decode(&authority, hash, 20),
-            Err(RuntimeLoadError::BindingMismatch)
+            Err(RuntimeLoadError::Quarantined)
         );
     }
 

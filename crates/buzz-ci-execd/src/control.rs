@@ -144,6 +144,9 @@ pub trait QualificationAdmissionBoundary {
 pub trait ControlDispatch {
     /// Return exactly one bounded protocol response.
     fn dispatch(&mut self, header: FrameHeader, request: Request, now: u64) -> BrokerResponse;
+
+    /// Run traffic-independent lease maintenance at one trusted clock reading.
+    fn maintenance(&mut self, _now: u64) {}
 }
 
 /// Ordinary admission dispatcher backed by the activation state machine.
@@ -287,9 +290,35 @@ impl<D: ControlDispatch> ControlServer<D> {
         }
     }
 
+    /// Construct the production polling server used for timer maintenance.
+    pub fn new_polling(
+        listener: UnixListener,
+        expected_peer_uid: u32,
+        dispatch: D,
+    ) -> Result<Self, ControlError> {
+        listener.set_nonblocking(true).map_err(ControlError::Io)?;
+        Ok(Self::new(listener, expected_peer_uid, dispatch))
+    }
+
     /// Accept and process one connection. The caller owns loop policy.
     pub fn serve_once(&mut self) -> Result<(), ControlError> {
         let (stream, _) = self.listener.accept().map_err(ControlError::Accept)?;
+        serve_stream(
+            stream,
+            self.expected_peer_uid,
+            self.io_timeout,
+            &mut self.dispatch,
+        )
+    }
+
+    /// Run maintenance and serve at most one ready connection without blocking.
+    pub fn serve_tick(&mut self, now: u64) -> Result<(), ControlError> {
+        self.dispatch.maintenance(now);
+        let (stream, _) = match self.listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(ControlError::Accept(error)),
+        };
         serve_stream(
             stream,
             self.expected_peer_uid,
@@ -580,7 +609,7 @@ fn qualification_teardown_response(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::{cell::Cell, io::Read, rc::Rc};
 
     use super::*;
     use crate::activation::{
@@ -594,6 +623,23 @@ mod tests {
     };
 
     struct RefusingOrdinaryBoundary;
+
+    struct MaintenanceCounter(Rc<Cell<u64>>);
+
+    impl ControlDispatch for MaintenanceCounter {
+        fn dispatch(
+            &mut self,
+            _header: FrameHeader,
+            _request: Request,
+            _now: u64,
+        ) -> BrokerResponse {
+            unreachable!("maintenance test has no control traffic")
+        }
+
+        fn maintenance(&mut self, now: u64) {
+            self.0.set(now);
+        }
+    }
 
     impl OrdinaryAdmissionBoundary for RefusingOrdinaryBoundary {
         fn authorize(
@@ -820,6 +866,24 @@ mod tests {
         let (header, _) = decode_request(encoded.as_bytes()).unwrap();
         let decoded = decode_response(header, &response).unwrap();
         assert_eq!(decoded.code, ResponseCode::NotProvisioned);
+    }
+
+    #[test]
+    fn polling_tick_runs_maintenance_without_control_traffic() {
+        let temporary = tempfile::tempdir().unwrap();
+        let listener = match UnixListener::bind(temporary.path().join("execd.sock")) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unexpected listener bind failure: {error}"),
+        };
+        let observed = Rc::new(Cell::new(0));
+        let mut server =
+            ControlServer::new_polling(listener, 961, MaintenanceCounter(Rc::clone(&observed)))
+                .unwrap();
+
+        server.serve_tick(42).unwrap();
+
+        assert_eq!(observed.get(), 42);
     }
 
     #[test]

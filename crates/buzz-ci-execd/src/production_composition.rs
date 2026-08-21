@@ -12,11 +12,11 @@ use crate::{
     activation::{LeaseToken, OrdinaryAdmission, QualificationLease},
     control::{ClosedDispatch, ControlDispatch},
     durable_dispatch::{
-        load_dispatch, BootstrapDispatch, ExecutionUnavailable, ExpiredLeaseReconciliation,
-        OrdinaryExecution, OrdinaryExecutor, QualificationExecution, QualificationExecutor,
+        load_dispatch, BootstrapDispatch, ExecutionUnavailable, OrdinaryCleanup, OrdinaryExecutor,
+        OrdinaryReceipts, OrdinaryStop, QualificationExecution, QualificationExecutor,
         ReadyHostProofs, ReadyValidationProvider,
     },
-    runtime::{ReadyValidationTarget, RuntimeLoadError},
+    runtime::ReadyValidationTarget,
 };
 
 /// Why production remains closed before authority/state loading.
@@ -72,23 +72,32 @@ impl OrdinaryExecutor for ProductionOrdinaryExecutor {
         self.backend.preflight(request, admission)
     }
 
-    fn execute(
+    fn provision(
         &mut self,
-        header: FrameHeader,
         request: AdmitAttemptRequest,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
-        now: u64,
-    ) -> Result<OrdinaryExecution, ExecutionUnavailable> {
-        self.backend.execute(header, request, admission, lease, now)
+    ) -> Result<(), ExecutionUnavailable> {
+        self.backend.provision(request, admission, lease)
     }
 
-    fn reconcile_expired(
+    fn read_receipts(
         &mut self,
+        request: AdmitAttemptRequest,
+        admission: OrdinaryAdmission,
         lease: LeaseToken,
-        now: u64,
-    ) -> Result<ExpiredLeaseReconciliation, ExecutionUnavailable> {
-        self.backend.reconcile_expired(lease, now)
+    ) -> Result<OrdinaryReceipts, ExecutionUnavailable> {
+        self.backend.read_receipts(request, admission, lease)
+    }
+
+    fn reconcile(
+        &mut self,
+        request: AdmitAttemptRequest,
+        admission: OrdinaryAdmission,
+        lease: LeaseToken,
+        stop: OrdinaryStop,
+    ) -> Result<OrdinaryCleanup, ExecutionUnavailable> {
+        self.backend.reconcile(request, admission, lease, stop)
     }
 }
 
@@ -163,17 +172,10 @@ impl ControlDispatch for ProductionDispatch {
             Self::Configured(dispatch) => dispatch.dispatch(header, request, now),
         }
     }
-}
 
-impl ProductionDispatch {
-    /// Drive trusted-time lease expiry independently of protocol completion.
-    pub fn reconcile_expired(
-        &mut self,
-        now: u64,
-    ) -> Result<Option<ExpiredLeaseReconciliation>, RuntimeLoadError> {
-        match self {
-            Self::Closed(_) => Ok(None),
-            Self::Configured(dispatch) => dispatch.reconcile_expired(now),
+    fn maintenance(&mut self, now: u64) {
+        if let Self::Configured(dispatch) = self {
+            dispatch.maintenance(now);
         }
     }
 }
@@ -210,22 +212,31 @@ mod tests {
             Err(ExecutionUnavailable)
         }
 
-        fn execute(
+        fn provision(
             &mut self,
-            _header: FrameHeader,
             _request: AdmitAttemptRequest,
             _admission: OrdinaryAdmission,
             _lease: LeaseToken,
-            _now: u64,
-        ) -> Result<OrdinaryExecution, ExecutionUnavailable> {
+        ) -> Result<(), ExecutionUnavailable> {
             Err(ExecutionUnavailable)
         }
 
-        fn reconcile_expired(
+        fn read_receipts(
             &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
             _lease: LeaseToken,
-            _now: u64,
-        ) -> Result<ExpiredLeaseReconciliation, ExecutionUnavailable> {
+        ) -> Result<OrdinaryReceipts, ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn reconcile(
+            &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
+            _lease: LeaseToken,
+            _stop: OrdinaryStop,
+        ) -> Result<OrdinaryCleanup, ExecutionUnavailable> {
             Err(ExecutionUnavailable)
         }
     }
