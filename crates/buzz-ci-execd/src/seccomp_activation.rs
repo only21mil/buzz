@@ -57,6 +57,10 @@ pub struct SeccompInstallCapability {
 }
 
 impl SeccompInstallCapability {
+    pub(crate) const fn receipt(self) -> SeccompInstallReceipt {
+        self.receipt
+    }
+
     /// Whether activation installed new bytes or reused an exact sealed file.
     pub const fn disposition(self) -> SeccompInstallDisposition {
         self.receipt.disposition()

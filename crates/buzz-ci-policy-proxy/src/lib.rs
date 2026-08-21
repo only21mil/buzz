@@ -26,7 +26,8 @@ pub use route::{CanonicalRoute, DockerMethod, DockerRoute};
 pub use state::{AttemptPhase, ObjectLedger};
 pub use transport::{
     ArchiveDirection, ArchiveGrant, HijackGrant, InheritedOneShotConnector, InheritedProxy,
-    OneShotUpstreamConnector, TransportLimits, UpstreamCapability,
+    NoopPreStartObserver, OneShotUpstreamConnector, PreStartObserver, TransportLimits,
+    UpstreamCapability,
 };
 
 use thiserror::Error;

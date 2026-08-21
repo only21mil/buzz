@@ -27,6 +27,8 @@ pub mod harness;
 pub mod materializer_evidence;
 #[cfg(target_os = "linux")]
 pub mod production_composition;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod proxy_lease;
 #[cfg(target_os = "linux")]
 pub mod qualification_cleanup;
 #[cfg(target_os = "linux")]
