@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +87,8 @@ pub struct PendingSeal {
     workspace: PathBuf,
     source_directory: File,
     workspace_directory: File,
+    workspace_device: u64,
+    workspace_inode: u64,
     source_device: u64,
     source_inode: u64,
 }
@@ -115,6 +117,14 @@ impl PendingSeal {
     /// Already-open attempt workspace retained for broker-owned cleanup.
     pub fn workspace_directory(&self) -> &File {
         &self.workspace_directory
+    }
+
+    /// Device/inode of the retained workspace cleanup capability.
+    ///
+    /// Cleanup must compare this identity through `workspace_directory()`
+    /// before removing the broker-owned workspace path.
+    pub fn workspace_identity(&self) -> (u64, u64) {
+        (self.workspace_device, self.workspace_inode)
     }
 
     /// Device/inode read back from the pinned source directory.
@@ -162,7 +172,7 @@ pub fn execute_materialization(
     let plan = MaterializationPlan::build(manifest, policy, &slot)?;
     let mut meter = Meter::default();
     // init, fetch, source commit, source tree, trusted-base commit, ls-tree,
-    // trusted-base workflow bytes.
+    // and trusted-base workflow object identity.
     if plan.commands.len() != 7 {
         return Err(MaterializeError::InvalidPolicy(
             "internal Git plan shape changed".into(),
@@ -179,7 +189,11 @@ pub fn execute_materialization(
         &trusted_base_readback.stdout,
     )?;
     let tree_listing = run_bounded(backend, &plan.commands[5], policy, &mut meter, &slot)?;
-    let trusted_workflow = run_bounded(backend, &plan.commands[6], policy, &mut meter, &slot)?;
+    let workflow_blob_readback =
+        run_bounded(backend, &plan.commands[6], policy, &mut meter, &slot)?;
+    let workflow_blob_oid = plan.verify_workflow_blob_readback(&workflow_blob_readback.stdout)?;
+    let workflow_command = plan.workflow_blob_command(&workflow_blob_oid)?;
+    let trusted_workflow = run_bounded(backend, &workflow_command, policy, &mut meter, &slot)?;
     verify_digest(
         "workflow_sha256",
         &manifest.workflow_sha256,
@@ -232,6 +246,7 @@ pub fn execute_materialization(
             maximum_path_bytes: policy.limits().max_path_bytes,
             maximum_depth: policy.limits().max_depth,
             trusted_workflow: &trusted_workflow.stdout,
+            workflow_blob_oid: &workflow_blob_oid,
             canonical_inputs,
             now_unix_seconds: &now,
             expires_at_unix_seconds: slot.lease_expires_at_unix_seconds(),
@@ -240,6 +255,7 @@ pub fn execute_materialization(
     )?;
 
     let workspace_directory = slot.take_workspace_directory()?;
+    let workspace_metadata = workspace_directory.metadata()?;
     let source_path = PathBuf::from(format!(
         "/proc/self/fd/{}",
         publication.directory.as_raw_fd()
@@ -250,6 +266,8 @@ pub fn execute_materialization(
         workspace: slot.workspace().to_path_buf(),
         source_directory: publication.directory,
         workspace_directory,
+        workspace_device: workspace_metadata.dev(),
+        workspace_inode: workspace_metadata.ino(),
         source_device: publication.device,
         source_inode: publication.inode,
     })
@@ -549,6 +567,7 @@ mod tests {
                 output(format!("{}\n", "b".repeat(40))),
                 output(format!("{}\n", "c".repeat(40))),
                 output(listing),
+                output(format!("{}\n", "e".repeat(40))),
                 output(b"name: CI\n".to_vec()),
                 output(b"abc".to_vec()),
             ]),
@@ -589,7 +608,13 @@ mod tests {
             fs::read(pending.source_path().join("file.txt")).unwrap(),
             b"abc"
         );
-        assert_eq!(backend.commands.len(), 8);
+        assert_eq!(pending.receipt().workflow_blob_oid(), "e".repeat(40));
+        let workspace_metadata = pending.workspace_directory().metadata().unwrap();
+        assert_eq!(
+            pending.workspace_identity(),
+            (workspace_metadata.dev(), workspace_metadata.ino())
+        );
+        assert_eq!(backend.commands.len(), 9);
         assert!(matches!(
             &backend.commands[1].network,
             NetworkScope::Origin { .. }

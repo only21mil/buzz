@@ -93,6 +93,7 @@ pub struct MaterializationSlot {
     lease_expires_at_unix_seconds: u64,
     cgroup_token: String,
     netns_token: String,
+    maximum_processes: u32,
 }
 
 impl MaterializationSlot {
@@ -139,6 +140,7 @@ impl MaterializationSlot {
             lease_expires_at_unix_seconds: binding.expires_at_unix_seconds,
             cgroup_token: binding.cgroup.object.token.clone(),
             netns_token: binding.netns.object.token.clone(),
+            maximum_processes: binding.cgroup.limits.pids_max,
         })
     }
 
@@ -254,6 +256,7 @@ impl MaterializationSlot {
             lease_expires_at_unix_seconds: u64::MAX,
             cgroup_token: "3".repeat(64),
             netns_token: "4".repeat(64),
+            maximum_processes: 32,
         }
     }
 
@@ -268,11 +271,30 @@ impl MaterializationSlot {
     }
 }
 
+/// One operation in the frozen raw-object Git protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitOperation {
+    /// Create one private bare object database.
+    Init,
+    /// Fetch only the exact candidate and trusted-base objects.
+    FetchExactObject,
+    /// Read and verify a commit identity.
+    ReadCommit,
+    /// Read tree identity or bounded tree metadata.
+    ReadTree,
+    /// Resolve or read the trusted workflow blob.
+    ReadWorkflow,
+    /// Read one source blob by exact object ID.
+    ReadBlob,
+}
+
 /// A command whose executable, arguments, environment, and cwd are completely
 /// broker-derived. The executor must honor `clear_environment` before applying
 /// `environment`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
+    /// Frozen operation class used by the backend and evidence translator.
+    pub operation: GitOperation,
     /// Root-owned absolute executable.
     pub program: PathBuf,
     /// Exact argument vector.
@@ -303,6 +325,8 @@ pub struct CommandSpec {
     pub network: NetworkScope,
     /// Maximum root-metered network bytes for this command.
     pub maximum_network_bytes: u64,
+    /// Maximum process count imposed by the lease cgroup.
+    pub maximum_processes: u32,
 }
 
 /// Network grant associated with one exact command.
@@ -374,13 +398,17 @@ impl MaterializationPlan {
             .ok_or_else(|| {
                 MaterializeError::InvalidPolicy("ls-tree output limit overflow".into())
             })?;
-        let git = |arguments: Vec<String>, maximum_stdout_bytes: u64, network: NetworkScope| {
+        let git = |operation: GitOperation,
+                   arguments: Vec<String>,
+                   maximum_stdout_bytes: u64,
+                   network: NetworkScope| {
             let maximum_network_bytes = if matches!(&network, NetworkScope::Origin { .. }) {
                 policy.limits.max_wire_bytes
             } else {
                 0
             };
             CommandSpec {
+                operation,
                 program: policy.git_program.clone(),
                 arguments,
                 current_dir: filesystem_root.clone(),
@@ -396,6 +424,7 @@ impl MaterializationPlan {
                 deadline_millis,
                 network,
                 maximum_network_bytes,
+                maximum_processes: slot.maximum_processes,
             }
         };
         // Keep Git's own paths relative to the descriptor-anchored cwd. The
@@ -406,11 +435,13 @@ impl MaterializationPlan {
         let trusted_base = "refs/buzz/materialize/trusted-base";
         let commands = vec![
             git(
+                GitOperation::Init,
                 vec![git_dir.clone(), "init".into(), "--bare".into()],
                 4 * 1024,
                 NetworkScope::None,
             ),
             git(
+                GitOperation::FetchExactObject,
                 vec![
                     git_dir.clone(),
                     "-c".into(),
@@ -456,6 +487,7 @@ impl MaterializationPlan {
                 },
             ),
             git(
+                GitOperation::ReadCommit,
                 vec![
                     git_dir.clone(),
                     "rev-parse".into(),
@@ -467,6 +499,7 @@ impl MaterializationPlan {
                 NetworkScope::None,
             ),
             git(
+                GitOperation::ReadTree,
                 vec![
                     git_dir.clone(),
                     "rev-parse".into(),
@@ -478,6 +511,7 @@ impl MaterializationPlan {
                 NetworkScope::None,
             ),
             git(
+                GitOperation::ReadCommit,
                 vec![
                     git_dir.clone(),
                     "rev-parse".into(),
@@ -489,6 +523,7 @@ impl MaterializationPlan {
                 NetworkScope::None,
             ),
             git(
+                GitOperation::ReadTree,
                 vec![
                     git_dir.clone(),
                     "ls-tree".into(),
@@ -502,12 +537,15 @@ impl MaterializationPlan {
                 NetworkScope::None,
             ),
             git(
+                GitOperation::ReadWorkflow,
                 vec![
                     git_dir.clone(),
-                    "show".into(),
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--end-of-options".into(),
                     format!("{trusted_base}:{}", manifest.workflow_path),
                 ],
-                policy.limits.max_blob_bytes,
+                129,
                 NetworkScope::None,
             ),
         ];
@@ -543,11 +581,34 @@ impl MaterializationPlan {
         )
     }
 
+    pub(crate) fn verify_workflow_blob_readback(
+        &self,
+        stdout: &[u8],
+    ) -> Result<String, MaterializeError> {
+        if stdout.len() > 129 {
+            return Err(MaterializeError::ResourceLimit(
+                "workflow_blob_oid readback bytes".into(),
+            ));
+        }
+        let value = std::str::from_utf8(stdout).map_err(|_| {
+            MaterializeError::InvalidManifest("workflow blob readback is not UTF-8".into())
+        })?;
+        let value = value.strip_suffix('\n').unwrap_or(value);
+        crate::manifest::validate_object_id("workflow_blob_oid", value)?;
+        if value.len() != self.expected_trusted_base_sha.len() {
+            return Err(MaterializeError::InvalidManifest(
+                "workflow blob object ID uses a different hash width".into(),
+            ));
+        }
+        Ok(value.to_owned())
+    }
+
     pub(crate) fn blob_command(&self, object_id: &str) -> Result<CommandSpec, MaterializeError> {
         let current_dir = self.bare_repository.parent().ok_or_else(|| {
             MaterializeError::InvalidPolicy("bare repository lacks a workspace parent".into())
         })?;
         Ok(CommandSpec {
+            operation: GitOperation::ReadBlob,
             program: self.git_program.clone(),
             arguments: vec![
                 self.git_dir_argument.clone(),
@@ -572,7 +633,17 @@ impl MaterializationPlan {
             deadline_millis: self.deadline_millis,
             network: NetworkScope::None,
             maximum_network_bytes: 0,
+            maximum_processes: self.commands[0].maximum_processes,
         })
+    }
+
+    pub(crate) fn workflow_blob_command(
+        &self,
+        object_id: &str,
+    ) -> Result<CommandSpec, MaterializeError> {
+        let mut command = self.blob_command(object_id)?;
+        command.operation = GitOperation::ReadWorkflow;
+        Ok(command)
     }
 }
 
@@ -643,8 +714,14 @@ fn hardened_environment(policy: &RootOwnedPolicy) -> BTreeMap<String, String> {
         // exec even when the workspace descriptor is CLOEXEC; a procfd HOME
         // would not.
         ("HOME".into(), "/proc/self/cwd/home".into()),
+        ("LC_ALL".into(), "C.UTF-8".into()),
         ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
         ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+        ("GIT_CONFIG_COUNT".into(), "2".into()),
+        ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+        ("GIT_CONFIG_VALUE_0".into(), String::new()),
+        ("GIT_CONFIG_KEY_1".into(), "core.hooksPath".into()),
+        ("GIT_CONFIG_VALUE_1".into(), "/dev/null".into()),
         ("GIT_TERMINAL_PROMPT".into(), "0".into()),
         ("GIT_ASKPASS".into(), "/bin/false".into()),
         ("SSH_ASKPASS".into(), "/bin/false".into()),
@@ -674,7 +751,7 @@ mod tests {
         NetnsHandle, NetworkPolicy, Phase1ValidationContext, PrincipalUids, QuotaBackend,
         QuotaHandle, ResourceLimits, RuntimeEndpointIdentity, WorkspaceHandle,
     };
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn manifest() -> MaterializationManifest {
         MaterializationManifest {
@@ -821,6 +898,23 @@ mod tests {
         let slot = MaterializationSlot::from_lease(lease.clone(), File::open(&workspace).unwrap())
             .unwrap();
         assert!(slot.verify_manifest(&manifest()).is_ok());
+        let workspace_link = temporary.path().join("workspace-link");
+        symlink(&workspace, &workspace_link).unwrap();
+        let mut symlinked = lease.clone().into_binding();
+        symlinked.workspace.path = workspace_link.display().to_string();
+        let symlinked = symlinked
+            .validate_phase1(&Phase1ValidationContext {
+                now_unix_seconds: 1_000,
+                max_expiry_horizon_seconds: 300,
+                forbidden_host_uids: &[],
+                expected_engine_version: "5.8.4",
+                expected_arch: "x86_64",
+            })
+            .unwrap();
+        assert!(
+            MaterializationSlot::from_lease(symlinked, File::open(&workspace_link).unwrap())
+                .is_err()
+        );
         let mut mismatches = Vec::new();
         let mut request = manifest();
         request.request_event_id = "1".repeat(64);
@@ -873,7 +967,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>()
             .join(" ");
-        for forbidden_command in ["clone", "checkout", "archive", "submodule", "lfs"] {
+        for forbidden_command in ["clone", "checkout", "show", "archive", "submodule", "lfs"] {
             assert!(
                 !plan.commands.iter().any(|command| command
                     .arguments
@@ -883,6 +977,11 @@ mod tests {
             );
         }
         assert!(joined.contains("--no-recurse-submodules"));
+        assert_eq!(plan.commands[6].operation, GitOperation::ReadWorkflow);
+        assert_eq!(plan.commands[6].arguments[1], "rev-parse");
+        let workflow_blob = plan.workflow_blob_command(&"d".repeat(40)).unwrap();
+        assert_eq!(workflow_blob.operation, GitOperation::ReadWorkflow);
+        assert_eq!(workflow_blob.arguments[1], "cat-file");
         assert_eq!(plan.commands[1].environment["GIT_CONFIG_NOSYSTEM"], "1");
         assert!(plan
             .verify_readbacks(
