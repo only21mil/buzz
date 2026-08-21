@@ -16,6 +16,7 @@ import { Button } from "@/shared/ui/button";
 import { relativeTime } from "@/shared/lib/relative-time";
 import { useRepoRefs } from "../use-repo-refs";
 import { useRepo } from "../use-repos";
+import { useRepoWorkItems } from "../use-repo-work-items";
 import {
   getMockRepo,
   mockRepoCommits,
@@ -30,6 +31,7 @@ import { RepoRefsSection } from "./RepoRefsSection";
 import { RepoTreeSection } from "./RepoTreeSection";
 import { RepoCommitsSection } from "./RepoCommitsSection";
 import { RepoReadmeSection } from "./RepoReadmeSection";
+import { RepoWorkItemsSection } from "./RepoWorkItemsSection";
 
 function CopyableUrl({ url }: { url: string }) {
   const [copied, setCopied] = useState(false);
@@ -108,7 +110,7 @@ function BackToRepositories({
   );
 }
 
-type Tab = "code" | "commits";
+type Tab = "code" | "commits" | "issues" | "pull-requests";
 
 function RepoTabs({
   repoId,
@@ -118,6 +120,10 @@ function RepoTabs({
   commitsLoading,
   readme,
   readmeLoading,
+  workItems,
+  workItemsLoading,
+  workItemsError,
+  onRetryWorkItems,
   preview,
 }: {
   repoId: string;
@@ -127,6 +133,10 @@ function RepoTabs({
   commitsLoading: boolean;
   readme: ReadmeResult | null | undefined;
   readmeLoading: boolean;
+  workItems: ReturnType<typeof useRepoWorkItems>["data"];
+  workItemsLoading: boolean;
+  workItemsError: Error | null;
+  onRetryWorkItems: () => void;
   preview: boolean;
 }) {
   const [tab, setTab] = useState<Tab>("code");
@@ -134,10 +144,16 @@ function RepoTabs({
   return (
     <div className="mt-6">
       {/* Tab bar */}
-      <div className="flex gap-1 border-b border-black/10 dark:border-white/10">
+      <div
+        className="flex gap-1 overflow-x-auto border-b border-black/10 dark:border-white/10"
+        role="tablist"
+        aria-label="Repository views"
+      >
         <button
           type="button"
           onClick={() => setTab("code")}
+          role="tab"
+          aria-selected={tab === "code"}
           className={`px-4 py-2 text-sm font-medium transition-colors ${
             tab === "code"
               ? "border-b-2 border-black text-black dark:border-white dark:text-white"
@@ -149,6 +165,8 @@ function RepoTabs({
         <button
           type="button"
           onClick={() => setTab("commits")}
+          role="tab"
+          aria-selected={tab === "commits"}
           className={`px-4 py-2 text-sm font-medium transition-colors ${
             tab === "commits"
               ? "border-b-2 border-black text-black dark:border-white dark:text-white"
@@ -156,6 +174,42 @@ function RepoTabs({
           }`}
         >
           Commits
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("issues")}
+          role="tab"
+          aria-selected={tab === "issues"}
+          className={`whitespace-nowrap px-4 py-2 text-sm font-medium transition-colors ${
+            tab === "issues"
+              ? "border-b-2 border-black text-black dark:border-white dark:text-white"
+              : "text-black/50 hover:text-black dark:text-white/50 dark:hover:text-white"
+          }`}
+        >
+          Issues
+          {workItems && (
+            <span className="ml-1.5 text-xs opacity-60">
+              {workItems.issues.length}
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("pull-requests")}
+          role="tab"
+          aria-selected={tab === "pull-requests"}
+          className={`whitespace-nowrap px-4 py-2 text-sm font-medium transition-colors ${
+            tab === "pull-requests"
+              ? "border-b-2 border-black text-black dark:border-white dark:text-white"
+              : "text-black/50 hover:text-black dark:text-white/50 dark:hover:text-white"
+          }`}
+        >
+          Pull Requests
+          {workItems && (
+            <span className="ml-1.5 text-xs opacity-60">
+              {workItems.pullRequests.length}
+            </span>
+          )}
         </button>
       </div>
 
@@ -173,6 +227,24 @@ function RepoTabs({
       )}
       {tab === "commits" && (
         <RepoCommitsSection commits={commits} isLoading={commitsLoading} />
+      )}
+      {tab === "issues" && (
+        <RepoWorkItemsSection
+          error={workItemsError}
+          isLoading={workItemsLoading}
+          items={workItems?.issues ?? []}
+          kind="issue"
+          onRetry={onRetryWorkItems}
+        />
+      )}
+      {tab === "pull-requests" && (
+        <RepoWorkItemsSection
+          error={workItemsError}
+          isLoading={workItemsLoading}
+          items={workItems?.pullRequests ?? []}
+          kind="pull-request"
+          onRetry={onRetryWorkItems}
+        />
       )}
     </div>
   );
@@ -195,6 +267,14 @@ export function RepoDetailPage() {
   });
   const { data: refs, isLoading: refsLoading } = useRepoRefs(repoId, {
     preview: showMockRepo,
+  });
+  const {
+    data: workItems,
+    isLoading: workItemsLoading,
+    error: workItemsError,
+    refetch: refetchWorkItems,
+  } = useRepoWorkItems(repo?.repoAddress ?? "", {
+    enabled: Boolean(repo) && !showMockRepo,
   });
 
   const defaultRef = refs?.head?.ref ?? "main";
@@ -335,6 +415,12 @@ export function RepoDetailPage() {
             commitsLoading={commitsLoading}
             readme={readme}
             readmeLoading={readmeLoading}
+            workItems={workItems}
+            workItemsLoading={workItemsLoading}
+            workItemsError={workItemsError}
+            onRetryWorkItems={() => {
+              void refetchWorkItems();
+            }}
             preview={showMockRepo}
           />
         )}

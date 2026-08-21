@@ -5,6 +5,7 @@ import { mockRepos } from "./mock-repos";
 
 export interface Repo {
   id: string;
+  repoAddress: string;
   name: string;
   description: string;
   cloneUrls: string[];
@@ -37,6 +38,7 @@ function eventToRepo(event: NostrEvent): Repo {
 
   return {
     id: d,
+    repoAddress: `${event.kind}:${event.pubkey}:${d}`,
     name,
     description,
     cloneUrls,
