@@ -22,6 +22,7 @@ import { useProfileQuery } from "@/features/profile/hooks";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { Channel } from "@/shared/api/types";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import {
   createChannel,
   deleteChannel,
@@ -205,10 +206,7 @@ function readOnboardingCompletion(pubkey: string | null) {
     return false;
   }
 
-  return (
-    window.localStorage.getItem(onboardingCompletionStorageKey(pubkey)) ===
-    "true"
-  );
+  return getStorageItem(onboardingCompletionStorageKey(pubkey)) === "true";
 }
 
 function createOnboardingGateState(pubkey: string | null): OnboardingGateState {
@@ -328,10 +326,7 @@ export function useFirstRunOnboardingGate({
       !hasCompletedCurrentPubkey
     ) {
       if (typeof window !== "undefined") {
-        window.localStorage.setItem(
-          onboardingCompletionStorageKey(currentPubkey),
-          "true",
-        );
+        setStorageItem(onboardingCompletionStorageKey(currentPubkey), "true");
       }
       setGateState((current) =>
         updateActiveGateState(current, currentPubkey, (activeGateState) => ({
@@ -396,10 +391,7 @@ export function useFirstRunOnboardingGate({
           hasCompletedAfterRecheck ||
           hasExistingProfile;
         if (alreadyOnboarded && typeof window !== "undefined") {
-          window.localStorage.setItem(
-            onboardingCompletionStorageKey(currentPubkey),
-            "true",
-          );
+          setStorageItem(onboardingCompletionStorageKey(currentPubkey), "true");
         }
         return {
           ...activeGateState,
@@ -432,10 +424,7 @@ export function useFirstRunOnboardingGate({
 
   const complete = React.useCallback(() => {
     if (typeof window !== "undefined" && currentPubkey) {
-      window.localStorage.setItem(
-        onboardingCompletionStorageKey(currentPubkey),
-        "true",
-      );
+      setStorageItem(onboardingCompletionStorageKey(currentPubkey), "true");
     }
 
     setGateState({
