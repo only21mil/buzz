@@ -1,0 +1,13 @@
+{
+  "version": "qualification_v1",
+  "permit": {
+    "authorized_by": "@ROOT_AUTHORITY_HEX@",
+    "host": {},
+    "fixture_identity": "@FIXTURE_IDENTITY_HEX@",
+    "fixture_signer": "@FIXTURE_SIGNER_HEX@",
+    "nonce": "@NONCE_HEX@",
+    "not_before": "@NOT_BEFORE_U64@",
+    "expires_at": "@EXPIRES_AT_U64@"
+  },
+  "admission": {}
+}

@@ -1,0 +1,22 @@
+# role	path	owner	group	mode	kind	publisher
+install	/usr/libexec/buzz-ci-execd	root	root	0755	compiled-binary	installer
+runtime	/run/buzzci	root	root	0711	directory	systemd-tmpfiles
+runtime	/run/buzzci/execd.sock	buzzci-ctl	buzzci-ctl	0600	unix-socket	systemd
+runtime	/run/netns	root	root	0755	directory	systemd-tmpfiles
+authority	/etc/buzzci/authority	root	root	0700	directory	installer
+authority	/etc/buzzci/authority/authority-v1.json	root	root	0400	immutable-file	installer-atomic
+authority	/etc/buzzci/authority/host-adapters-v1.json	root	root	0400	immutable-file	installer-atomic
+state	/var/lib/buzzci/activation	root	root	0700	directory	systemd-tmpfiles
+state	/var/lib/buzzci/activation/state-v1.json	root	root	0600	atomic-file	installer-then-execd
+receipt	/var/lib/buzzci/activation/receipts	root	root	0700	directory	systemd-tmpfiles
+receipt	/var/lib/buzzci/activation/receipts/authority.json	root	root	0600	atomic-file	execd
+receipt	/var/lib/buzzci/activation/receipts/cleanup	root	root	0700	directory	systemd-tmpfiles
+receipt	/var/lib/buzzci/activation/receipts/dns	root	root	0700	directory	systemd-tmpfiles
+receipt	/var/lib/buzzci/activation/receipts/seccomp.json	root	root	0600	atomic-file	execd
+state	/var/lib/buzzci/leases	root	root	0700	directory	systemd-tmpfiles
+artifact	/usr/share/containers/seccomp.json	root	root	0644	packaged-file	operating-system
+artifact	/var/lib/buzzci	root	root	0700	directory	systemd-tmpfiles
+artifact	/var/lib/buzzci/seccomp	root	root	0700	directory	systemd-tmpfiles
+artifact	/var/lib/buzzci/seccomp/v1	root	root	0700	directory	systemd-tmpfiles
+artifact	/var/lib/buzzci/seccomp/v1/sha256	root	root	0700	directory	systemd-tmpfiles
+artifact	/var/lib/buzzci/seccomp/v1/sha256/2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4.json	root	root	0444	immutable-file	execd-atomic

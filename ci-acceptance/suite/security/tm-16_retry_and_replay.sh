@@ -106,6 +106,7 @@ if ! acceptance_control_init; then
   emit
   exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
+lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
 
 run_case() {
   local case_name=$1 rc=0
@@ -120,13 +121,24 @@ run_case attempt_2 || retry_rc=$?
 if ((retry_rc == 3)); then
   record fresh_retry_environment not_runnable 'The fixed root-authored attempt_1 or attempt_2 case is unavailable or unsafe'
 elif ((retry_rc == 0)) && timeout 10 jq -s -e '
-  .[0] as $a | .[1] as $b |
-  ($a.attempt_id // $a.lease_id) != null and ($b.attempt_id // $b.lease_id) != null and
-  ($a.attempt_id // $a.lease_id) != ($b.attempt_id // $b.lease_id) and
-  $a.workspace_digest != null and $b.workspace_digest != null and $a.workspace_digest != $b.workspace_digest and
-  $a.run_id == $b.run_id and ($a.attempt|tonumber)==1 and ($b.attempt|tonumber)==2
+  all(.[]; .type == "qualification_result" and .code == "ok" and (.attempt_id | test("^[0-9a-f]{32}$")) and .attempt_id != "00000000000000000000000000000000") and
+  .[0].attempt_id != .[1].attempt_id
 ' "$out_dir/attempt_1.json" "$out_dir/attempt_2.json" >/dev/null 2>&1; then
-  record fresh_retry_environment pass 'The two fixed authenticated retry cases produced distinct ActivationController attempts/workspaces with one run identity and attempts 1 then 2'
+  lease_one=$(timeout 10 jq -r '.attempt_id' "$out_dir/attempt_1.json")
+  lease_two=$(timeout 10 jq -r '.attempt_id' "$out_dir/attempt_2.json")
+  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_root/$lease_one/lease.json" "$out_dir/lease-attempt-1.json" 2>/dev/null || :
+  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_root/$lease_two/lease.json" "$out_dir/lease-attempt-2.json" 2>/dev/null || :
+  evidence_files+=("$TEST_ID/lease-attempt-1.json" "$TEST_ID/lease-attempt-2.json")
+  if timeout 10 jq -s -e '
+    .[0].workspace_dir != null and .[1].workspace_dir != null and .[0].workspace_dir != .[1].workspace_dir and
+    .[0].run_id != null and .[0].run_id == .[1].run_id and .[0].attempt == 1 and .[1].attempt == 2
+  ' "$out_dir/lease-attempt-1.json" "$out_dir/lease-attempt-2.json" >/dev/null 2>&1; then
+    record fresh_retry_environment pass 'The two fixed authenticated retry cases produced distinct attempts/workspaces with one bound run identity and attempts 1 then 2'
+  elif timeout 10 jq -s -e '.[0].workspace_dir != null and .[1].workspace_dir != null and .[0].workspace_dir != .[1].workspace_dir' "$out_dir/lease-attempt-1.json" "$out_dir/lease-attempt-2.json" >/dev/null 2>&1; then
+    record fresh_retry_environment not_runnable 'Distinct retry workspaces are visible, but lease readback exposes no run_id/attempt binding; TM-16 will not infer it'
+  else
+    record fresh_retry_environment not_runnable 'The accepted retry attempts expose no complete lease/workspace readback'
+  fi
 else
   record fresh_retry_environment fail 'The fixed retry cases did not prove distinct attempts/workspaces and the bound 1-to-2 retry identity'
 fi
@@ -157,6 +169,8 @@ if ((primary_rc == 3)); then
   record concurrency_limit_refusal not_runnable 'The fixed root-authored concurrency_primary case is unavailable or unsafe'
 elif ((primary_rc != 0)); then
   record concurrency_limit_refusal fail 'ActivationController did not accept the fixed primary concurrency case'
+elif ! timeout 10 jq -e '.type == "qualification_result" and .code == "ok" and (.attempt_id | test("^[0-9a-f]{32}$")) and .attempt_id != "00000000000000000000000000000000"' "$out_dir/concurrency_primary.json" >/dev/null 2>&1; then
+  record concurrency_limit_refusal fail 'Primary concurrency case returned no valid accepted service response'
 else
   refusal_case concurrency_limit_refusal concurrency_overflow no_capacity false
 fi

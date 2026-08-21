@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.block.xyz/ci/qualification-v1.schema.json",
+  "title": "Buzz CI sealed qualification case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "permit", "admission"],
+  "properties": {
+    "version": {"const": "qualification_v1"},
+    "permit": {"$ref": "#/$defs/permit"},
+    "admission": {"$ref": "#/$defs/admission"},
+    "directive": {"const": "teardown_failure"}
+  },
+  "$defs": {
+    "hex32": {"type": "string", "pattern": "^[0-9a-f]{64}$", "not": {"const": "0000000000000000000000000000000000000000000000000000000000000000"}},
+    "oid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "oneOf": [
+        {
+          "properties": {
+            "algorithm": {"const": "sha1"},
+            "hex": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"const": "0000000000000000000000000000000000000000"}}
+          }
+        },
+        {
+          "properties": {
+            "algorithm": {"const": "sha256"},
+            "hex": {"$ref": "#/$defs/hex32"}
+          }
+        }
+      ]
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["integrated_candidate_sha", "broker_build_identity", "host_profile_digest", "suite_identity"],
+      "properties": {
+        "integrated_candidate_sha": {"$ref": "#/$defs/oid"},
+        "broker_build_identity": {"$ref": "#/$defs/hex32"},
+        "host_profile_digest": {"$ref": "#/$defs/hex32"},
+        "suite_identity": {"$ref": "#/$defs/hex32"}
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_digest", "manifest_digest", "isolation_profile_digest", "source_oid", "base_oid", "test_identity"],
+      "properties": {
+        "request_digest": {"$ref": "#/$defs/hex32"},
+        "manifest_digest": {"$ref": "#/$defs/hex32"},
+        "isolation_profile_digest": {"$ref": "#/$defs/hex32"},
+        "source_oid": {"$ref": "#/$defs/oid"},
+        "base_oid": {"$ref": "#/$defs/oid"},
+        "test_identity": {"$ref": "#/$defs/hex32"}
+      }
+    },
+    "permit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authorized_by", "host", "fixture_job", "fixture_identity", "fixture_signer", "nonce", "not_before", "expires_at"],
+      "properties": {
+        "authorized_by": {"$ref": "#/$defs/hex32"},
+        "host": {"$ref": "#/$defs/host"},
+        "fixture_job": {"$ref": "#/$defs/job"},
+        "fixture_identity": {"$ref": "#/$defs/hex32"},
+        "fixture_signer": {"$ref": "#/$defs/hex32"},
+        "nonce": {"$ref": "#/$defs/hex32"},
+        "not_before": {"type": "integer", "minimum": 1},
+        "expires_at": {"type": "integer", "minimum": 1}
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "fixture_job", "fixture_identity", "signer", "nonce", "trust_class"],
+      "properties": {
+        "host": {"$ref": "#/$defs/host"},
+        "fixture_job": {"$ref": "#/$defs/job"},
+        "fixture_identity": {"$ref": "#/$defs/hex32"},
+        "signer": {"$ref": "#/$defs/hex32"},
+        "nonce": {"$ref": "#/$defs/hex32"},
+        "trust_class": {"enum": ["qualification_fixture", "unaccepted"]}
+      }
+    }
+  }
+}

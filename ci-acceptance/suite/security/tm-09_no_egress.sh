@@ -4,11 +4,13 @@ set -euo pipefail
 TEST_ID=TM-09
 TITLE='Put outer `act`, Podman helpers, and jobs inside the root-owned no-egress attempt namespace'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''; candidate_dir=''; evidence_dir=''; plan=0
 checks=(); statuses=(); evidence_files=()
 preconditions=(
   'policy proxy + broker lease path live for outer act, Podman helper, and job placement'
-  'lease.json records the broker DNS and network proofs for the materializer, exec, and run principals'
+  'the exact root-authored TM-09/dns_readback case is sealed for the suite candidate'
+  'its root-owned DNS receipt binds the candidate, host, suite, signer, job, lease, and generation'
 )
 
 usage() { printf 'usage: %s --candidate SHA --candidate-dir DIR --evidence-dir DIR [--plan]\n' "${0##*/}" >&2; exit 4; }
@@ -125,34 +127,60 @@ fi
 record mediated_attempt_namespace not_runnable 'Placement of outer act, Podman helpers, and jobs requires the live policy proxy and broker lease path'
 record offline_missing_dependency not_runnable 'Missing-action/image offline proof requires a mediated job with DNS and connect observation'
 
+dns_binding=$out_dir/dns-binding.json
+dns_response=$out_dir/dns-response.json
+dns_error=$out_dir/dns-response.stderr
+dns_expected=$out_dir/dns-expected.json
 if [[ ! -e /etc/buzzci/harness.env ]]; then
-  record lease_dns_readback not_runnable 'substrate wiring has not published /etc/buzzci/harness.env (lease DNS seam)'
+  record lease_dns_readback not_runnable 'Substrate wiring has not published /etc/buzzci/harness.env'
+elif ((${#SUDO[@]} == 0)); then
+  record lease_dns_readback not_runnable 'Fresh DNS receipt readback requires SUITE_SUDO or passwordless sudo'
 else
-  harness_text=''
-  if ((${#SUDO[@]})); then
-    harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || harness_text=''
-  fi
-  if [[ -z $harness_text ]]; then
-    if ((${#SUDO[@]} == 0)); then record lease_dns_readback not_runnable 'harness.env unreadable without sudo'; else record lease_dns_readback fail 'Published harness.env is not root-readable.'; fi
+  harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || harness_text=''
+  export harness_text
+  dns_rc=0
+  if ! acceptance_control_init; then
+    record lease_dns_readback not_runnable "$ACCEPTANCE_UNAVAILABLE"
   else
-    state_root=$(printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= '$1=="BUZZ_CI_LEASE_STATE_ROOT"{print substr($0,index($0,"=")+1); exit}')
-    lease_dir=''
-    if [[ -n $state_root && -d $state_root ]]; then for entry in "$state_root"/*; do [[ -d $entry ]] && { lease_dir=$entry; break; }; done; fi
-    lease_json=$lease_dir/lease.json
-    dns_evidence=$out_dir/dns-readback.json
-    if [[ -z $lease_dir || ! -f $lease_json ]]; then
-      printf 'state_root=%s lease_dir=%s lease_json=%s\n' "$state_root" "$lease_dir" "$lease_json" >"$dns_evidence"
-      evidence_files+=("$TEST_ID/dns-readback.json")
-      record lease_dns_readback fail 'lease.json lacks dns_readback'
+    acceptance_control_run dns_readback "$dns_response" "$dns_error" "$dns_binding" || dns_rc=$?
+    evidence_files+=("$TEST_ID/dns-response.json" "$TEST_ID/dns-response.stderr" "$TEST_ID/dns-binding.json")
+    if ((dns_rc == 3)); then
+      record lease_dns_readback not_runnable 'The exact root-authored TM-09/dns_readback.json case is missing, stale, cross-candidate, or unsafe'
+    elif ((dns_rc != 0)); then
+      record lease_dns_readback fail 'The authenticated DNS qualification case was not admitted'
+    elif ! acceptance_bind_response "$dns_binding" "$dns_response" "$dns_expected"; then
+      record lease_dns_readback fail 'The authenticated DNS response does not bind the sealed fixture lease and generation'
     else
-      if ((${#SUDO[@]})); then timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat "$lease_json" >"$dns_evidence" 2>&1 || true
-      else timeout "$TIMEOUT_SECONDS" cat "$lease_json" >"$dns_evidence" 2>&1 || true
-      fi
-      evidence_files+=("$TEST_ID/dns-readback.json")
-      if timeout "$TIMEOUT_SECONDS" jq -e '.dns_readback | type == "object" and .files_lookup_ok == true and .arbitrary_getent_refused == true and .resolved_varlink_inaccessible == true and .direct_53_refused == true and .allowed_tuples_only == true' "$dns_evidence" >/dev/null 2>&1; then
-        record lease_dns_readback pass 'lease.json records all five broker DNS and approved-tuple proofs: pinned files lookup, arbitrary getent refusal, varlink isolation, direct 53 refusal, and approved tuples only'
+      dns_lease=$(timeout 10 jq -r '.lease_id' "$dns_expected")
+      dns_generation=$(timeout 10 jq -r '.lease_generation' "$dns_expected")
+      dns_source=$(acceptance_receipt_root)/dns/$dns_lease-g$dns_generation.json
+      dns_evidence=$out_dir/dns-readback.json
+      for _ in {1..120}; do
+        acceptance_copy_receipt "$dns_source" "$dns_evidence" && break
+        timeout 2 sleep 0.25
+      done
+      evidence_files+=("$TEST_ID/dns-expected.json" "$TEST_ID/dns-readback.json")
+      if [[ ! -s $dns_evidence ]]; then
+        if timeout 10 "${SUDO[@]}" test -e "$dns_source"; then
+          record lease_dns_readback fail 'The exact DNS receipt exists but has unsafe ownership, mode, type, or size'
+        else
+          record lease_dns_readback not_runnable 'The exact admitted lease has no durable DNS five-proof receipt'
+        fi
       else
-        record lease_dns_readback fail 'lease.json lacks dns_readback'
+        now_ns=$(timeout 10 date +%s%N)
+        if acceptance_receipt_binding_matches "$dns_expected" "$dns_evidence" \
+          && timeout "$TIMEOUT_SECONDS" jq -e \
+            --argjson now_ns "$now_ns" --argjson max_age_ns "$((TIMEOUT_SECONDS * 1000000000))" '
+              .version == 1 and .committed == true and .disposition == "ready" and
+              (.dns_readback | keys | sort) == ["allowed_tuples_only","arbitrary_getent_refused","direct_53_refused","files_lookup_ok","resolved_varlink_inaccessible"] and
+              (.dns_readback | all(.[]; . == true)) and
+              (.observed_at_unix_ns | type == "number" and . > 0 and floor == .) and
+              .observed_at_unix_ns <= $now_ns and ($now_ns - .observed_at_unix_ns) <= $max_age_ns
+            ' "$dns_evidence" >/dev/null 2>&1; then
+          record lease_dns_readback pass "Fresh DNS receipt binds admitted lease $dns_lease generation $dns_generation and all five proofs"
+        else
+          record lease_dns_readback fail 'The exact DNS receipt is stale, cross-bound, incomplete, or lacks one of the five proofs'
+        fi
       fi
     fi
   fi

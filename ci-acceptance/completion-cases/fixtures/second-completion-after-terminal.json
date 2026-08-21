@@ -1,0 +1,15 @@
+{
+  "version": "completion_acceptance_v1",
+  "wire_schema": "unbound",
+  "case_name": "second_completion_after_terminal",
+  "case_binding": {
+    "integrated_candidate_sha": "@INTEGRATED_CANDIDATE_SHA@", "broker_build_identity": "@BROKER_BUILD_IDENTITY_HEX@", "host_profile_digest": "@HOST_PROFILE_DIGEST_HEX@", "suite_identity": "@SUITE_IDENTITY_HEX@", "signer_pubkey": "@SIGNER_PUBKEY_HEX@", "request_digest": "@REQUEST_DIGEST_HEX@", "manifest_digest": "@MANIFEST_DIGEST_HEX@", "isolation_profile_digest": "@ISOLATION_PROFILE_DIGEST_HEX@", "source_oid": "@SOURCE_OID_HEX@", "base_oid": "@BASE_OID_HEX@", "job_identity": "@JOB_IDENTITY_HEX@", "run_id": "@RUN_ID_HEX@", "attempt": "@ATTEMPT_U32@", "nonce": "@NONCE_HEX@", "lease_id": "@LEASE_ID_HEX@", "lease_generation": "@LEASE_GENERATION_U64@"
+  },
+  "receipt_binding": {
+    "integrated_candidate_sha": "@INTEGRATED_CANDIDATE_SHA@", "broker_build_identity": "@BROKER_BUILD_IDENTITY_HEX@", "host_profile_digest": "@HOST_PROFILE_DIGEST_HEX@", "suite_identity": "@SUITE_IDENTITY_HEX@", "signer_pubkey": "@SIGNER_PUBKEY_HEX@", "request_digest": "@REQUEST_DIGEST_HEX@", "manifest_digest": "@MANIFEST_DIGEST_HEX@", "isolation_profile_digest": "@ISOLATION_PROFILE_DIGEST_HEX@", "source_oid": "@SOURCE_OID_HEX@", "base_oid": "@BASE_OID_HEX@", "job_identity": "@JOB_IDENTITY_HEX@", "run_id": "@RUN_ID_HEX@", "attempt": "@ATTEMPT_U32@", "nonce": "@NONCE_HEX@", "lease_id": "@LEASE_ID_HEX@", "lease_generation": "@LEASE_GENERATION_U64@"
+  },
+  "before": {"lifecycle": "terminal", "state_digest": "@TERMINAL_STATE_DIGEST_HEX@", "publish_count": 0},
+  "stimulus": {"phase": "prepare", "lease_relation": "current", "generation_relation": "current", "signer_authentication": "verified", "claimed_conclusion": "success"},
+  "root_receipts": {"evidence_verdict": "passed", "teardown_verdict": "passed", "receipt_set_digest": "@ROOT_RECEIPT_SET_DIGEST_HEX@"},
+  "expected": {"decision": "refuse", "after_lifecycle": "terminal", "after_state_digest": "@TERMINAL_STATE_DIGEST_HEX@", "publish": false}
+}

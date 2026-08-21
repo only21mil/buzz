@@ -10,17 +10,33 @@
 pub mod activation;
 #[cfg(target_os = "linux")]
 pub mod control;
+#[cfg(target_os = "linux")]
+pub mod dns_exec;
+#[cfg(target_os = "linux")]
+pub mod dns_host;
 pub mod dns_isolation;
+#[cfg(target_os = "linux")]
+pub mod durable_dispatch;
 #[cfg(unix)]
 pub mod evidence;
 #[cfg(unix)]
 pub mod harness;
+#[cfg(target_os = "linux")]
+pub mod production_composition;
+#[cfg(target_os = "linux")]
+pub mod qualification_exec;
+pub mod qualification_host;
+#[cfg(unix)]
+pub mod runtime;
 
 use buzz_ci_broker_protocol::{
     BrokerResponse, BrokerState, Conclusion, FrameHeader, Request, ResponseCode,
 };
 
 pub mod seccomp;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod seccomp_exec;
+pub mod seccomp_host;
 
 pub const FORBIDDEN_ENVIRONMENT_KEYS: &[&str] = &[
     "BUZZ_RELAY_PRIVATE_KEY",
@@ -88,7 +104,7 @@ impl Broker {
                 attempt: admit.attempt,
             },
             Request::AdmitQualification(_) => self.response(ResponseCode::NotProvisioned, now),
-            Request::CancelAttempt(_) | Request::GetAttempt(_) => {
+            Request::CancelAttempt(_) | Request::GetAttempt(_) | Request::CompleteAttempt(_) => {
                 self.response(ResponseCode::NotFound, now)
             }
         }

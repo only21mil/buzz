@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "revision": 1,
+  "authority_revision": 1,
+  "authority_sha256": "@LOWERCASE_64_HEX_RENDERED_AUTHORITY_SHA256@",
+  "committed": true,
+  "state": "unprovisioned",
+  "qualification": null,
+  "activation": null,
+  "active_lease": false,
+  "nonce_ledger": [],
+  "last_admission_at": null,
+  "next_lease_generation": 1
+}

@@ -92,11 +92,29 @@ pub struct QualificationAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QualificationLease {
     fixture_identity: [u8; 32],
+    lease_id: [u8; 16],
+    generation: u64,
     nonce: [u8; 32],
     directive: Option<QualificationDirective>,
 }
 
 impl QualificationLease {
+    pub const fn fixture_identity(self) -> [u8; 32] {
+        self.fixture_identity
+    }
+
+    pub const fn lease_id(self) -> [u8; 16] {
+        self.lease_id
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn nonce(self) -> [u8; 32] {
+        self.nonce
+    }
+
     /// Return the root-permitted behavior for this exact fixture lease.
     pub const fn directive(self) -> Option<QualificationDirective> {
         self.directive
@@ -138,9 +156,12 @@ pub struct OrdinaryAdmission {
     pub host: HostActivationCoordinates,
     pub job: OrdinaryJobCoordinates,
     pub lease_id: [u8; 16],
+    pub run_id: [u8; 16],
+    pub attempt: u32,
     pub signer: VerifiedSigner,
     pub nonce: [u8; 32],
     pub expires_at: u64,
+    pub wall_timeout_seconds: u32,
     pub trust_class: AdmissionTrustClass,
 }
 
@@ -148,8 +169,73 @@ pub struct OrdinaryAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LeaseToken {
     lease_id: [u8; 16],
+    run_id: [u8; 16],
+    attempt: u32,
+    signed_request_digest: [u8; 32],
+    signer: VerifiedSigner,
     generation: u64,
     nonce: [u8; 32],
+    deadline_at: u64,
+}
+
+pub(crate) struct DurableLeaseFields {
+    pub lease_id: [u8; 16],
+    pub run_id: [u8; 16],
+    pub attempt: u32,
+    pub signed_request_digest: [u8; 32],
+    pub signer: VerifiedSigner,
+    pub generation: u64,
+    pub nonce: [u8; 32],
+    pub deadline_at: u64,
+}
+
+impl LeaseToken {
+    pub(crate) const fn from_durable(fields: DurableLeaseFields) -> Self {
+        Self {
+            lease_id: fields.lease_id,
+            run_id: fields.run_id,
+            attempt: fields.attempt,
+            signed_request_digest: fields.signed_request_digest,
+            signer: fields.signer,
+            generation: fields.generation,
+            nonce: fields.nonce,
+            deadline_at: fields.deadline_at,
+        }
+    }
+
+    /// Return the lease identity allocated by the activation controller.
+    pub const fn lease_id(self) -> [u8; 16] {
+        self.lease_id
+    }
+
+    /// Return the controller-owned generation for this lease.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn run_id(self) -> [u8; 16] {
+        self.run_id
+    }
+
+    pub const fn attempt(self) -> u32 {
+        self.attempt
+    }
+
+    pub const fn signed_request_digest(self) -> [u8; 32] {
+        self.signed_request_digest
+    }
+
+    pub const fn signer(self) -> VerifiedSigner {
+        self.signer
+    }
+
+    pub const fn deadline_at(self) -> u64 {
+        self.deadline_at
+    }
+
+    pub(crate) const fn nonce(self) -> [u8; 32] {
+        self.nonce
+    }
 }
 
 /// Terminal job outcome. No outcome can be recorded without a lease token.
@@ -424,7 +510,11 @@ impl ActivationController {
         };
 
         if let Some(error) = structural_error {
-            controller.quarantine();
+            if error == ActivationError::RestartAmbiguous && controller.active_lease.is_some() {
+                controller.state = ActivationState::Quarantined;
+            } else {
+                controller.quarantine();
+            }
             RestoreOutcome {
                 controller,
                 quarantine_reason: Some(error),
@@ -541,14 +631,23 @@ impl ActivationController {
         if request.nonce != session.permit.nonce {
             return Err(AdmissionError::InvalidNonce);
         }
+        if self.next_lease_generation == u64::MAX {
+            self.quarantine();
+            return Err(AdmissionError::GenerationExhausted);
+        }
 
+        let mut lease_id = [0; 16];
+        lease_id.copy_from_slice(&request.fixture_identity[..16]);
         let lease = QualificationLease {
             fixture_identity: request.fixture_identity,
+            lease_id,
+            generation: self.next_lease_generation,
             nonce: request.nonce,
             directive: request.directive,
         };
         self.seen_nonces
             .insert(request.nonce, session.permit.expires_at)?;
+        self.next_lease_generation += 1;
         self.qualification = Some(DurableQualificationState {
             active_lease: Some(lease),
             ..session
@@ -595,6 +694,24 @@ impl ActivationController {
         }
     }
 
+    /// Quarantine after the forced teardown fixture, regardless of evidence quality.
+    pub fn finish_qualification_teardown_failure(
+        &mut self,
+        lease: QualificationLease,
+    ) -> Result<(), ActivationError> {
+        let accepted = self.state == ActivationState::Qualifying
+            && self
+                .qualification
+                .is_some_and(|session| session.active_lease == Some(lease))
+            && lease.directive == Some(QualificationDirective::TeardownFailure);
+        self.quarantine();
+        if accepted {
+            Ok(())
+        } else {
+            Err(ActivationError::MissingLease)
+        }
+    }
+
     /// Reconcile the root grant and exact TM-11 profile before becoming Ready.
     pub fn reconcile_activation(
         &mut self,
@@ -621,13 +738,18 @@ impl ActivationController {
     }
 
     /// Admit one ordinary reviewed job after activation.
-    pub fn admit_ordinary(
-        &mut self,
+    pub fn preflight_ordinary(
+        &self,
         request: OrdinaryAdmission,
         now: u64,
-    ) -> Result<LeaseToken, AdmissionError> {
-        self.seen_nonces.prune_expired(now);
-        if self.seen_nonces.contains(&request.nonce) {
+    ) -> Result<(), AdmissionError> {
+        if self
+            .seen_nonces
+            .entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.nonce == request.nonce && entry.expires_at > now)
+        {
             return Err(AdmissionError::Replay);
         }
         if matches!(
@@ -668,7 +790,12 @@ impl ActivationController {
         {
             return Err(AdmissionError::CoordinateMismatch);
         }
-        if request.nonce == [0; 32] || request.lease_id == [0; 16] {
+        if request.nonce == [0; 32]
+            || request.lease_id == [0; 16]
+            || request.run_id == [0; 16]
+            || request.attempt == 0
+            || request.wall_timeout_seconds == 0
+        {
             return Err(AdmissionError::InvalidNonce);
         }
         if let Some(last) = self.last_admission_at {
@@ -676,6 +803,28 @@ impl ActivationController {
                 return Err(AdmissionError::RateLimit);
             }
         }
+        if self
+            .seen_nonces
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.expires_at > now)
+            .count()
+            == NONCE_LEDGER_CAPACITY
+        {
+            return Err(AdmissionError::RateLimit);
+        }
+        Ok(())
+    }
+
+    /// Admit one ordinary reviewed job after activation.
+    pub fn admit_ordinary(
+        &mut self,
+        request: OrdinaryAdmission,
+        now: u64,
+    ) -> Result<LeaseToken, AdmissionError> {
+        self.preflight_ordinary(request, now)?;
+        self.seen_nonces.prune_expired(now);
         if self.next_lease_generation == u64::MAX {
             self.quarantine();
             return Err(AdmissionError::GenerationExhausted);
@@ -683,8 +832,15 @@ impl ActivationController {
 
         let lease = LeaseToken {
             lease_id: request.lease_id,
+            run_id: request.run_id,
+            attempt: request.attempt,
+            signed_request_digest: request.job.request_digest,
+            signer: request.signer,
             generation: self.next_lease_generation,
             nonce: request.nonce,
+            deadline_at: request
+                .expires_at
+                .min(now.saturating_add(u64::from(request.wall_timeout_seconds))),
         };
         self.seen_nonces.insert(request.nonce, request.expires_at)?;
         self.next_lease_generation += 1;
@@ -692,6 +848,49 @@ impl ActivationController {
         self.active_lease = Some(lease);
         self.state = ActivationState::Leased;
         Ok(lease)
+    }
+
+    /// Bind a mutating terminal request to the one currently active lease.
+    pub fn bind_active_lease(
+        &self,
+        run_id: [u8; 16],
+        attempt: u32,
+        lease_id: [u8; 16],
+        generation: u64,
+    ) -> Result<LeaseToken, ActivationError> {
+        let Some(lease) = self.active_lease else {
+            return Err(ActivationError::MissingLease);
+        };
+        if self.state != ActivationState::Leased
+            || run_id != lease.run_id
+            || attempt != lease.attempt
+            || lease_id != lease.lease_id
+            || generation != lease.generation
+        {
+            return Err(ActivationError::MissingLease);
+        }
+        Ok(lease)
+    }
+
+    /// Return an expired active lease for traffic-independent maintenance.
+    pub fn expired_active_lease(&self, now: u64) -> Option<LeaseToken> {
+        self.active_lease
+            .filter(|lease| self.state == ActivationState::Leased && now >= lease.deadline_at)
+    }
+
+    /// Return a restart recovery token without reopening ordinary capacity.
+    pub fn recovery_lease(&self) -> Option<LeaseToken> {
+        self.active_lease
+            .filter(|_| self.state == ActivationState::Quarantined)
+    }
+
+    /// Clear a restart recovery token after root cleanup has run.
+    pub fn finish_recovery(&mut self, lease: LeaseToken) -> Result<(), ActivationError> {
+        if self.state != ActivationState::Quarantined || self.active_lease != Some(lease) {
+            return Err(ActivationError::MissingLease);
+        }
+        self.active_lease = None;
+        Ok(())
     }
 
     /// Record an outcome and enter Draining. A lease token is mandatory even for success.
@@ -850,10 +1049,26 @@ fn valid_qualification_permit(root_authority: VerifiedSigner, permit: Qualificat
 }
 
 fn snapshot_shape_is_valid(snapshot: DurableStateSnapshot) -> bool {
+    let ordinary_lease_valid = snapshot.active_lease.is_none_or(|lease| {
+        lease.lease_id != [0; 16]
+            && lease.run_id != [0; 16]
+            && lease.attempt != 0
+            && lease.signed_request_digest != [0; 32]
+            && lease.signer.0 != [0; 32]
+            && lease.generation < snapshot.next_lease_generation
+            && lease.nonce != [0; 32]
+            && lease.deadline_at != 0
+            && snapshot.nonce_ledger.contains(&lease.nonce)
+    });
+    if !ordinary_lease_valid {
+        return false;
+    }
     let qualification_valid = snapshot.qualification.is_none_or(|qualification| {
         valid_qualification_permit(snapshot.root_authority, qualification.permit)
             && qualification.active_lease.is_none_or(|lease| {
                 lease.fixture_identity == qualification.permit.fixture_identity
+                    && lease.lease_id == qualification.permit.fixture_identity[..16]
+                    && lease.generation < snapshot.next_lease_generation
                     && lease.nonce == qualification.permit.nonce
                     && lease.directive == qualification.permit.directive
                     && snapshot.nonce_ledger.contains(&lease.nonce)
@@ -1119,9 +1334,12 @@ mod tests {
             host: host_coordinates(),
             job: ordinary_job(),
             lease_id: [lease_id; 16],
+            run_id: [44; 16],
+            attempt: 1,
             signer: ORDINARY_SIGNER,
             nonce: [nonce; 32],
             expires_at,
+            wall_timeout_seconds: 30,
             trust_class: AdmissionTrustClass::AcceptedReviewed,
         }
     }
@@ -1421,8 +1639,13 @@ mod tests {
         let mut controller = ready_controller();
         let fabricated = LeaseToken {
             lease_id: [42; 16],
+            run_id: [44; 16],
+            attempt: 1,
+            signed_request_digest: [4; 32],
+            signer: ORDINARY_SIGNER,
             generation: 1,
             nonce: [43; 32],
+            deadline_at: 50,
         };
         assert_eq!(
             controller.finish_lease(fabricated, LeaseConclusion::Success),
@@ -1663,11 +1886,11 @@ mod tests {
         let second = controller
             .admit_ordinary(ordinary_admission(23, 24, 100), 26)
             .expect("second admission");
-        assert_eq!(second.generation, 2);
+        assert_eq!(second.generation, 3);
     }
 
     #[test]
-    fn restart_quarantines_in_flight_and_unvalidated_ready_state() {
+    fn restart_retains_leased_but_quarantines_ambiguous_inflight_state() {
         let mut qualifying = qualifying_controller();
         qualifying
             .admit_qualification(qualification_admission(), 10)
@@ -1682,11 +1905,26 @@ mod tests {
             .finish_lease(lease, LeaseConclusion::Success)
             .expect("lease finish");
 
+        let restored = ActivationController::restore(ROOT, leased_snapshot, None);
+        assert_eq!(restored.controller.state(), ActivationState::Quarantined);
+        assert_eq!(restored.controller.recovery_lease(), Some(lease));
+        assert_eq!(
+            restored.quarantine_reason,
+            Some(ActivationError::RestartAmbiguous)
+        );
+        assert_eq!(restored.controller.ordinary_capacity(21), 0);
+
+        let restored = ActivationController::restore(ROOT, leased.snapshot(), None);
+        assert_eq!(restored.controller.state(), ActivationState::Quarantined);
+        assert_eq!(restored.controller.recovery_lease(), Some(lease));
+        assert_eq!(
+            restored.quarantine_reason,
+            Some(ActivationError::RestartAmbiguous)
+        );
+
         for snapshot in [
             qualifying.snapshot(),
             controller_at_reconciliation().snapshot(),
-            leased_snapshot,
-            leased.snapshot(),
         ] {
             let restored = ActivationController::restore(ROOT, snapshot, None);
             assert_eq!(restored.controller.state(), ActivationState::Quarantined);
@@ -1845,6 +2083,27 @@ mod tests {
         );
         assert_eq!(controller.state(), ActivationState::Quarantined);
         assert_eq!(controller.ordinary_capacity(10), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn oci_receipt_name_comes_from_the_opaque_lease_token() {
+        let token = LeaseToken {
+            lease_id: [0xab; 16],
+            run_id: [0xbc; 16],
+            attempt: 1,
+            signed_request_digest: [0xbd; 32],
+            signer: ORDINARY_SIGNER,
+            generation: 42,
+            nonce: [0xcd; 32],
+            deadline_at: 100,
+        };
+        assert_eq!(token.lease_id(), [0xab; 16]);
+        assert_eq!(token.generation(), 42);
+        assert_eq!(
+            crate::seccomp_exec::oci_receipt_filename(token),
+            "abababababababababababababababab-g42.json"
+        );
     }
 
     fn controller_at_reconciliation() -> ActivationController {

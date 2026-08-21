@@ -1,4 +1,4 @@
-//! Production admission path and fixed-frame broker transport.
+//! Production admission, unprivileged execution, completion, and broker transport.
 //!
 //! The service layer supplies authenticated request data, reviewed workflow
 //! policy, and manifest bindings. This module does not derive any of those
@@ -8,8 +8,9 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use buzz_ci_broker_protocol::{
-    decode_response, encode_request, AdmitAttemptRequest, BrokerResponse, FrameHeader, Request,
-    TrustClass, HEADER_SIZE, RESPONSE_BODY_SIZE,
+    decode_response, encode_request, AdmitAttemptRequest, BrokerResponse, BrokerState,
+    CompleteAttemptRequest, Conclusion, FrameHeader, GitOid, Request, ResponseCode, TrustClass,
+    HEADER_SIZE, MAX_SAFE_INTEGER, RESPONSE_BODY_SIZE,
 };
 use buzz_core::ci::CiRequestEnvelope;
 use sha2::{Digest, Sha256};
@@ -24,7 +25,8 @@ pub const BROKER_SOCKET_PATH: &str = "/run/buzzci/execd.sock";
 
 const RESPONSE_FRAME_SIZE: usize = HEADER_SIZE + RESPONSE_BODY_SIZE;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_ID_DOMAIN: &[u8] = b"buzz-ci-runner:admit-request-id:v1\0";
+const ADMIT_REQUEST_ID_DOMAIN: &[u8] = b"buzz-ci-runner:admit-request-id:v1\0";
+const COMPLETE_REQUEST_ID_DOMAIN: &[u8] = b"buzz-ci-runner:complete-request-id:v1\0";
 
 /// Reviewed workflow facts supplied by the trusted integration layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,9 +90,140 @@ pub struct AdmitRequestInput<'a> {
     pub now: u64,
 }
 
-/// A broker transport accepts only a canonical, fixed-width request.
+/// Raw workflow inputs already approved by the trusted integration layer.
+///
+/// The runner passes this value only to the unprivileged execution backend. It
+/// is never reduced into, or exposed to, the broker protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedWorkflowInputs<T> {
+    raw: T,
+}
+
+impl<T> AuthorizedWorkflowInputs<T> {
+    /// Wrap workflow inputs after the trusted integration layer authorizes them.
+    pub const fn new(raw: T) -> Self {
+        Self { raw }
+    }
+
+    /// Borrow the authorized workflow inputs.
+    pub const fn raw(&self) -> &T {
+        &self.raw
+    }
+
+    /// Consume the wrapper and return the authorized workflow inputs.
+    pub fn into_raw(self) -> T {
+        self.raw
+    }
+}
+
+/// Opaque proof of one broker-admitted ordinary execution lease.
+///
+/// Private fields prevent an execution backend from constructing or changing
+/// the binding. Accessors expose only the identity needed to bind its evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmittedLease {
+    signer_pubkey: [u8; 32],
+    signed_request_digest: [u8; 32],
+    run_id: [u8; 16],
+    attempt: u32,
+    job_manifest_digest: [u8; 32],
+    tip_oid: GitOid,
+    lease_id: [u8; 16],
+    lease_generation: u64,
+    accepted_at: u64,
+}
+
+impl AdmittedLease {
+    /// Return the request run identifier bound at admission.
+    pub const fn run_id(self) -> [u8; 16] {
+        self.run_id
+    }
+
+    /// Return the request attempt number bound at admission.
+    pub const fn attempt(self) -> u32 {
+        self.attempt
+    }
+
+    /// Return the exact broker lease identifier.
+    pub const fn lease_id(self) -> [u8; 16] {
+        self.lease_id
+    }
+
+    /// Return the exact broker lease generation.
+    pub const fn lease_generation(self) -> u64 {
+        self.lease_generation
+    }
+}
+
+/// Bounded terminal evidence produced by the unprivileged execution backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundedExecutionEvidence {
+    advisory_conclusion: Conclusion,
+    evidence_set_digest: [u8; 32],
+    terminal_at: u64,
+}
+
+impl BoundedExecutionEvidence {
+    /// Validate a backend's terminal evidence before it can reach the broker.
+    pub fn new(
+        advisory_conclusion: Conclusion,
+        evidence_set_digest: [u8; 32],
+        terminal_at: u64,
+    ) -> Result<Self, ControlError> {
+        if advisory_conclusion == Conclusion::None
+            || evidence_set_digest == [0; 32]
+            || terminal_at == 0
+            || terminal_at > MAX_SAFE_INTEGER
+        {
+            return Err(ControlError::InvalidExecutionEvidence);
+        }
+        Ok(Self {
+            advisory_conclusion,
+            evidence_set_digest,
+            terminal_at,
+        })
+    }
+}
+
+/// Closed execution failures. Backend-specific details stay outside this API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionBackendError {
+    /// No concrete artifact and job backend is configured.
+    Unavailable,
+    /// Execution failed before it produced terminal bounded evidence.
+    Failed,
+    /// Execution returned without a complete bounded evidence set.
+    MissingEvidence,
+}
+
+impl From<ExecutionBackendError> for ControlError {
+    fn from(error: ExecutionBackendError) -> Self {
+        match error {
+            ExecutionBackendError::Unavailable => Self::ExecutionBackendUnavailable,
+            ExecutionBackendError::Failed => Self::ExecutionFailed,
+            ExecutionBackendError::MissingEvidence => Self::InvalidExecutionEvidence,
+        }
+    }
+}
+
+/// Unprivileged workflow execution seam.
+pub trait ExecutionBackend<T> {
+    /// Execute already-authorized raw inputs under one admitted lease.
+    fn execute(
+        &mut self,
+        inputs: AuthorizedWorkflowInputs<T>,
+        lease: &AdmittedLease,
+    ) -> Result<BoundedExecutionEvidence, ExecutionBackendError>;
+}
+
+/// A broker transport accepts only canonical, fixed-width protocol values.
 pub trait BrokerTransport {
-    fn exchange(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError>;
+    /// Send one normalized admission request.
+    fn admit(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError>;
+
+    /// Send one completion bound to the admitted lease.
+    fn complete(&mut self, request: CompleteAttemptRequest)
+        -> Result<BrokerResponse, ControlError>;
 }
 
 /// Authorize, reject expired input, normalize, and only then contact the broker.
@@ -98,11 +231,123 @@ pub fn admit_request(
     input: AdmitRequestInput<'_>,
     authorizer: &impl RequestAuthorizer,
     transport: &mut impl BrokerTransport,
-) -> Result<BrokerResponse, ControlError> {
+) -> Result<AdmittedLease, ControlError> {
     let authorized = authorize_request(input.request, input.workflow_policy, authorizer)?;
     let authorized = authorized.check_expiry(input.now)?;
     let normalized = normalize_admit_request(authorized, input.binding)?;
-    transport.exchange(normalized)
+    let response = transport.admit(normalized)?;
+    validate_admitted_response(normalized, response)
+}
+
+/// Validate an admission response against the exact normalized request.
+pub fn validate_admitted_response(
+    request: AdmitAttemptRequest,
+    response: BrokerResponse,
+) -> Result<AdmittedLease, ControlError> {
+    if !matches!(response.code, ResponseCode::Ok | ResponseCode::Existing) {
+        return Err(ControlError::BrokerRejected);
+    }
+    if response.retry_after_millis != 0
+        || response.attempt_id == [0; 16]
+        || response.run_id != request.run_id
+        || response.accepted_request_digest != request.signed_request_digest
+        || response.job_manifest_digest != request.job_manifest_digest
+        || response.tip_oid != Some(request.tip_oid)
+        || response.broker_state != BrokerState::Leased
+        || response.conclusion != Conclusion::None
+        || response.terminal_reason != 0
+        || response.generation == 0
+        || response.accepted_at == 0
+        || response.accepted_at > MAX_SAFE_INTEGER
+        || response.updated_at < response.accepted_at
+        || response.updated_at > MAX_SAFE_INTEGER
+        || response.lease_generation == 0
+        || response.lease_generation != response.generation
+        || response.evidence_set_digest != [0; 32]
+        || response.teardown_digest != [0; 32]
+        || response.attempt != request.attempt
+    {
+        return Err(ControlError::InvalidBrokerResponse);
+    }
+    Ok(AdmittedLease {
+        signer_pubkey: request.actor_pubkey,
+        signed_request_digest: request.signed_request_digest,
+        run_id: request.run_id,
+        attempt: request.attempt,
+        job_manifest_digest: request.job_manifest_digest,
+        tip_oid: request.tip_oid,
+        lease_id: response.attempt_id,
+        lease_generation: response.lease_generation,
+        accepted_at: response.accepted_at,
+    })
+}
+
+/// Execute authorized inputs in the runner and complete the exact admitted lease.
+pub fn execute_request<T>(
+    input: AdmitRequestInput<'_>,
+    workflow_inputs: AuthorizedWorkflowInputs<T>,
+    authorizer: &impl RequestAuthorizer,
+    transport: &mut impl BrokerTransport,
+    backend: &mut impl ExecutionBackend<T>,
+) -> Result<BrokerResponse, ControlError> {
+    let lease = admit_request(input, authorizer, transport)?;
+    let evidence = backend.execute(workflow_inputs, &lease)?;
+    complete_attempt(lease, evidence, transport)
+}
+
+/// Build and send one completion for the exact admitted lease.
+pub fn complete_attempt(
+    lease: AdmittedLease,
+    evidence: BoundedExecutionEvidence,
+    transport: &mut impl BrokerTransport,
+) -> Result<BrokerResponse, ControlError> {
+    if evidence.terminal_at < lease.accepted_at {
+        return Err(ControlError::InvalidExecutionEvidence);
+    }
+    let request = CompleteAttemptRequest {
+        signer_pubkey: lease.signer_pubkey,
+        signed_request_digest: lease.signed_request_digest,
+        run_id: lease.run_id,
+        attempt: lease.attempt,
+        lease_id: lease.lease_id,
+        lease_generation: lease.lease_generation,
+        advisory_conclusion: evidence.advisory_conclusion,
+        evidence_set_digest: evidence.evidence_set_digest,
+        terminal_at: evidence.terminal_at,
+    };
+    let response = transport.complete(request)?;
+    validate_completed_response(lease, request, response)
+}
+
+/// Reject a terminal broker response that is not bound to the completed lease.
+pub fn validate_completed_response(
+    lease: AdmittedLease,
+    request: CompleteAttemptRequest,
+    response: BrokerResponse,
+) -> Result<BrokerResponse, ControlError> {
+    if !matches!(response.code, ResponseCode::Ok | ResponseCode::Existing)
+        || response.retry_after_millis != 0
+        || response.attempt_id != request.lease_id
+        || response.run_id != request.run_id
+        || response.accepted_request_digest != request.signed_request_digest
+        || response.job_manifest_digest != lease.job_manifest_digest
+        || response.tip_oid != Some(lease.tip_oid)
+        || !matches!(
+            response.broker_state,
+            BrokerState::Ready | BrokerState::Quarantined | BrokerState::Terminal
+        )
+        || response.conclusion == Conclusion::None
+        || response.generation == 0
+        || response.updated_at < response.accepted_at
+        || response.updated_at < request.terminal_at
+        || response.updated_at > MAX_SAFE_INTEGER
+        || response.lease_generation != request.lease_generation
+        || response.accepted_at != lease.accepted_at
+        || response.attempt != request.attempt
+    {
+        return Err(ControlError::InvalidBrokerResponse);
+    }
+    Ok(response)
 }
 
 /// Production fixed-socket Unix transport.
@@ -110,13 +355,20 @@ pub fn admit_request(
 pub struct UnixBrokerTransport;
 
 impl BrokerTransport for UnixBrokerTransport {
-    fn exchange(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError> {
-        exchange_unix(request)
+    fn admit(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError> {
+        exchange_unix(Request::AdmitAttempt(request))
+    }
+
+    fn complete(
+        &mut self,
+        request: CompleteAttemptRequest,
+    ) -> Result<BrokerResponse, ControlError> {
+        exchange_unix(Request::CompleteAttempt(request))
     }
 }
 
 #[cfg(unix)]
-fn exchange_unix(request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError> {
+fn exchange_unix(request: Request) -> Result<BrokerResponse, ControlError> {
     use std::os::unix::net::UnixStream;
 
     let mut stream =
@@ -129,7 +381,7 @@ fn exchange_unix(request: AdmitAttemptRequest) -> Result<BrokerResponse, Control
 }
 
 #[cfg(not(unix))]
-fn exchange_unix(_request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError> {
+fn exchange_unix(_request: Request) -> Result<BrokerResponse, ControlError> {
     Err(ControlError::BrokerUnavailable)
 }
 
@@ -146,10 +398,9 @@ impl ControlStream for std::os::unix::net::UnixStream {
 
 fn exchange_stream(
     stream: &mut impl ControlStream,
-    request: AdmitAttemptRequest,
+    request: Request,
 ) -> Result<BrokerResponse, ControlError> {
-    let request_id = request_id_for_admit(request.signed_request_digest);
-    let request = Request::AdmitAttempt(request);
+    let request_id = request_id_for(request);
     let encoded = encode_request(request_id, request);
     stream
         .write_all(encoded.as_bytes())
@@ -177,11 +428,31 @@ fn exchange_stream(
     .map_err(|_| ControlError::InvalidBrokerResponse)
 }
 
-fn request_id_for_admit(signed_request_digest: [u8; 32]) -> [u8; 16] {
-    let digest = Sha256::new()
-        .chain_update(REQUEST_ID_DOMAIN)
-        .chain_update(signed_request_digest)
-        .finalize();
+fn request_id_for(request: Request) -> [u8; 16] {
+    let digest = match request {
+        Request::AdmitAttempt(request) => Sha256::new()
+            .chain_update(ADMIT_REQUEST_ID_DOMAIN)
+            .chain_update(request.signed_request_digest)
+            .finalize(),
+        Request::CompleteAttempt(request) => Sha256::new()
+            .chain_update(COMPLETE_REQUEST_ID_DOMAIN)
+            .chain_update(request.signer_pubkey)
+            .chain_update(request.signed_request_digest)
+            .chain_update(request.run_id)
+            .chain_update(request.attempt.to_be_bytes())
+            .chain_update(request.lease_id)
+            .chain_update(request.lease_generation.to_be_bytes())
+            .chain_update([request.advisory_conclusion as u8])
+            .chain_update(request.evidence_set_digest)
+            .chain_update(request.terminal_at.to_be_bytes())
+            .finalize(),
+        Request::Hello(_)
+        | Request::CancelAttempt(_)
+        | Request::GetAttempt(_)
+        | Request::AdmitQualification(_) => {
+            unreachable!("runner transport exposes only admit and complete")
+        }
+    };
     let mut request_id = [0; 16];
     request_id.copy_from_slice(&digest[..16]);
     request_id
@@ -209,21 +480,69 @@ mod tests {
 
     #[derive(Default)]
     struct SpyTransport {
-        requests: Vec<AdmitAttemptRequest>,
-        written: Vec<u8>,
+        admissions: Vec<AdmitAttemptRequest>,
+        completions: Vec<CompleteAttemptRequest>,
+        frames: Vec<Vec<u8>>,
+        admit_response: Option<BrokerResponse>,
+        fail_admit: bool,
+        fail_complete: bool,
     }
 
     impl BrokerTransport for SpyTransport {
-        fn exchange(
-            &mut self,
-            request: AdmitAttemptRequest,
-        ) -> Result<BrokerResponse, ControlError> {
-            self.requests.push(request);
-            let request_id = request_id_for_admit(request.signed_request_digest);
-            self.written.extend_from_slice(
-                encode_request(request_id, Request::AdmitAttempt(request)).as_bytes(),
+        fn admit(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError> {
+            self.admissions.push(request);
+            let request = Request::AdmitAttempt(request);
+            self.frames.push(
+                encode_request(request_id_for(request), request)
+                    .as_bytes()
+                    .to_vec(),
             );
-            Ok(response_for(request))
+            if self.fail_admit {
+                return Err(ControlError::TransportFailure);
+            }
+            Ok(self
+                .admit_response
+                .unwrap_or_else(|| response_for(self.admissions[0])))
+        }
+
+        fn complete(
+            &mut self,
+            request: CompleteAttemptRequest,
+        ) -> Result<BrokerResponse, ControlError> {
+            self.completions.push(request);
+            let request = Request::CompleteAttempt(request);
+            self.frames.push(
+                encode_request(request_id_for(request), request)
+                    .as_bytes()
+                    .to_vec(),
+            );
+            if self.fail_complete {
+                return Err(ControlError::TransportFailure);
+            }
+            Ok(completion_response(self.completions[0]))
+        }
+    }
+
+    #[derive(Default)]
+    struct SpyBackend {
+        calls: Vec<Vec<String>>,
+        leases: Vec<AdmittedLease>,
+        failure: Option<ExecutionBackendError>,
+    }
+
+    impl ExecutionBackend<Vec<String>> for SpyBackend {
+        fn execute(
+            &mut self,
+            inputs: AuthorizedWorkflowInputs<Vec<String>>,
+            lease: &AdmittedLease,
+        ) -> Result<BoundedExecutionEvidence, ExecutionBackendError> {
+            self.calls.push(inputs.into_raw());
+            self.leases.push(*lease);
+            if let Some(error) = self.failure {
+                return Err(error);
+            }
+            BoundedExecutionEvidence::new(Conclusion::Success, [7; 32], 21)
+                .map_err(|_| ExecutionBackendError::MissingEvidence)
         }
     }
 
@@ -287,7 +606,7 @@ mod tests {
             accepted_request_digest: request.signed_request_digest,
             job_manifest_digest: request.job_manifest_digest,
             tip_oid: Some(request.tip_oid),
-            broker_state: BrokerState::Ready,
+            broker_state: BrokerState::Leased,
             conclusion: Conclusion::None,
             terminal_reason: 0,
             generation: 1,
@@ -296,6 +615,28 @@ mod tests {
             lease_generation: 1,
             evidence_set_digest: [0; 32],
             teardown_digest: [0; 32],
+            attempt: request.attempt,
+        }
+    }
+
+    fn completion_response(request: CompleteAttemptRequest) -> BrokerResponse {
+        BrokerResponse {
+            code: ResponseCode::Ok,
+            retry_after_millis: 0,
+            attempt_id: request.lease_id,
+            run_id: request.run_id,
+            accepted_request_digest: request.signed_request_digest,
+            job_manifest_digest: [3; 32],
+            tip_oid: Some(GitOid::Sha1([0x33; 20])),
+            broker_state: BrokerState::Terminal,
+            conclusion: request.advisory_conclusion,
+            terminal_reason: 0,
+            generation: request.lease_generation,
+            accepted_at: 10,
+            updated_at: request.terminal_at,
+            lease_generation: request.lease_generation,
+            evidence_set_digest: request.evidence_set_digest,
+            teardown_digest: [8; 32],
             attempt: request.attempt,
         }
     }
@@ -309,7 +650,7 @@ mod tests {
             admit_request(input(&request), &Policy(false), &mut unauthorized),
             Err(ControlError::Unauthorized)
         );
-        assert!(unauthorized.written.is_empty());
+        assert!(unauthorized.frames.is_empty());
 
         let mut unaccepted = SpyTransport::default();
         let mut unaccepted_input = input(&request);
@@ -318,7 +659,7 @@ mod tests {
             admit_request(unaccepted_input, &Policy(true), &mut unaccepted),
             Err(ControlError::UnacceptedTrust)
         );
-        assert!(unaccepted.written.is_empty());
+        assert!(unaccepted.frames.is_empty());
 
         let mut fork = SpyTransport::default();
         let mut fork_input = input(&request);
@@ -328,7 +669,7 @@ mod tests {
             admit_request(fork_input, &Policy(true), &mut fork),
             Err(ControlError::ExternalFork)
         );
-        assert!(fork.written.is_empty());
+        assert!(fork.frames.is_empty());
 
         let mut expired = SpyTransport::default();
         let mut expired_input = input(&request);
@@ -337,7 +678,7 @@ mod tests {
             admit_request(expired_input, &Policy(true), &mut expired),
             Err(ControlError::ExpiredRequest)
         );
-        assert!(expired.written.is_empty());
+        assert!(expired.frames.is_empty());
 
         let mut invalid_binding = SpyTransport::default();
         let mut invalid_input = input(&request);
@@ -346,15 +687,15 @@ mod tests {
             admit_request(invalid_input, &Policy(true), &mut invalid_binding),
             Err(ControlError::InvalidBinding)
         );
-        assert!(invalid_binding.written.is_empty());
+        assert!(invalid_binding.frames.is_empty());
     }
 
     #[test]
-    fn transport_receives_canonical_normalization_byte_for_byte() {
+    fn transport_receives_canonical_admit_frame_byte_for_byte() {
         let request = request();
         let mut transport = SpyTransport::default();
         admit_request(input(&request), &Policy(true), &mut transport).expect("admitted");
-        let [sent] = transport.requests.as_slice() else {
+        let [sent] = transport.admissions.as_slice() else {
             panic!("expected one request")
         };
 
@@ -386,11 +727,243 @@ mod tests {
         };
         assert_eq!(*sent, expected);
 
-        let request_id = request_id_for_admit(expected.signed_request_digest);
+        let expected_request = Request::AdmitAttempt(expected);
+        let request_id = request_id_for(expected_request);
         let sent_frame = encode_request(request_id, Request::AdmitAttempt(*sent));
-        let golden_frame = encode_request(request_id, Request::AdmitAttempt(expected));
-        assert_eq!(transport.written, sent_frame.as_bytes());
+        let golden_frame = encode_request(request_id, expected_request);
+        assert_eq!(transport.frames[0], sent_frame.as_bytes());
         assert_eq!(sent_frame.as_bytes(), golden_frame.as_bytes());
+        assert_eq!(
+            hex::encode(Sha256::digest(&transport.frames[0])),
+            "d3dd76de6ad85d1d3e860af6e4339eb4450bf94b65fcbf340d1d2ec03a1c2e1c"
+        );
+    }
+
+    #[test]
+    fn admitted_response_returns_exact_bound_opaque_lease() {
+        let normalized = transport_request();
+        let response = response_for(normalized);
+        let lease = validate_admitted_response(normalized, response).expect("bound lease");
+        assert_eq!(lease.run_id(), normalized.run_id);
+        assert_eq!(lease.attempt(), normalized.attempt);
+        assert_eq!(lease.lease_id(), [9; 16]);
+        assert_eq!(lease.lease_generation(), 1);
+
+        let mut mismatch = response;
+        mismatch.accepted_request_digest = [8; 32];
+        assert_eq!(
+            validate_admitted_response(normalized, mismatch),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        let mut wrong_attempt = response;
+        wrong_attempt.attempt = 2;
+        assert_eq!(
+            validate_admitted_response(normalized, wrong_attempt),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        let mut missing_lease = response;
+        missing_lease.attempt_id = [0; 16];
+        assert_eq!(
+            validate_admitted_response(normalized, missing_lease),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        let mut generation_mismatch = response;
+        generation_mismatch.lease_generation = 2;
+        assert_eq!(
+            validate_admitted_response(normalized, generation_mismatch),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+    }
+
+    #[test]
+    fn runner_executes_raw_inputs_then_sends_exact_completion_frame() {
+        let request = request();
+        let raw_inputs = vec![
+            "/unprivileged/work/repo".to_string(),
+            "cargo test --workspace".to_string(),
+        ];
+        let mut transport = SpyTransport::default();
+        let mut backend = SpyBackend::default();
+
+        let response = execute_request(
+            input(&request),
+            AuthorizedWorkflowInputs::new(raw_inputs.clone()),
+            &Policy(true),
+            &mut transport,
+            &mut backend,
+        )
+        .expect("completed");
+
+        assert_eq!(backend.calls.as_slice(), std::slice::from_ref(&raw_inputs));
+        assert_eq!(backend.leases.len(), 1);
+        assert_eq!(transport.admissions.len(), 1);
+        let [complete] = transport.completions.as_slice() else {
+            panic!("expected one completion")
+        };
+        assert_eq!(complete.signer_pubkey, [0x66; 32]);
+        assert_eq!(complete.signed_request_digest, [1; 32]);
+        assert_eq!(complete.run_id, transport_request().run_id);
+        assert_eq!(complete.attempt, 1);
+        assert_eq!(complete.lease_id, [9; 16]);
+        assert_eq!(complete.lease_generation, 1);
+        assert_eq!(complete.advisory_conclusion, Conclusion::Success);
+        assert_eq!(complete.evidence_set_digest, [7; 32]);
+        assert_eq!(complete.terminal_at, 21);
+        assert_eq!(response, completion_response(*complete));
+
+        let admitted = backend.leases[0];
+        let mut switched_manifest = response;
+        switched_manifest.job_manifest_digest = [99; 32];
+        assert_eq!(
+            validate_completed_response(admitted, *complete, switched_manifest),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        let mut switched_tip = response;
+        switched_tip.tip_oid = Some(GitOid::Sha1([0x44; 20]));
+        assert_eq!(
+            validate_completed_response(admitted, *complete, switched_tip),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        let mut switched_acceptance = response;
+        switched_acceptance.accepted_at += 1;
+        assert_eq!(
+            validate_completed_response(admitted, *complete, switched_acceptance),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+
+        let request = Request::CompleteAttempt(*complete);
+        let golden = encode_request(request_id_for(request), request);
+        assert_eq!(transport.frames[1], golden.as_bytes());
+        assert_eq!(
+            hex::encode(Sha256::digest(&transport.frames[1])),
+            "d929daa3a6b651a6efe88237754f360e02e8d68631407e9de8cbdfefc3ce928a"
+        );
+        for frame in &transport.frames {
+            for raw in &raw_inputs {
+                assert!(!frame
+                    .windows(raw.len())
+                    .any(|window| window == raw.as_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn binding_mismatch_stops_before_execution_and_completion() {
+        let request = request();
+        let normalized = transport_request();
+        let mut mismatch = response_for(normalized);
+        mismatch.job_manifest_digest = [99; 32];
+        let mut transport = SpyTransport {
+            admit_response: Some(mismatch),
+            ..SpyTransport::default()
+        };
+        let mut backend = SpyBackend::default();
+
+        assert_eq!(
+            execute_request(
+                input(&request),
+                AuthorizedWorkflowInputs::new(vec!["raw".to_string()]),
+                &Policy(true),
+                &mut transport,
+                &mut backend,
+            ),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        assert!(backend.calls.is_empty());
+        assert!(transport.completions.is_empty());
+        assert_eq!(transport.frames.len(), 1);
+    }
+
+    #[test]
+    fn missing_evidence_and_transport_failures_never_forge_later_phases() {
+        let request = request();
+
+        let mut admission_failure = SpyTransport {
+            fail_admit: true,
+            ..SpyTransport::default()
+        };
+        let mut backend = SpyBackend::default();
+        assert_eq!(
+            execute_request(
+                input(&request),
+                AuthorizedWorkflowInputs::new(vec!["raw".to_string()]),
+                &Policy(true),
+                &mut admission_failure,
+                &mut backend,
+            ),
+            Err(ControlError::TransportFailure)
+        );
+        assert!(backend.calls.is_empty());
+        assert!(admission_failure.completions.is_empty());
+
+        let mut missing = SpyBackend {
+            failure: Some(ExecutionBackendError::MissingEvidence),
+            ..SpyBackend::default()
+        };
+        let mut transport = SpyTransport::default();
+        assert_eq!(
+            execute_request(
+                input(&request),
+                AuthorizedWorkflowInputs::new(vec!["raw".to_string()]),
+                &Policy(true),
+                &mut transport,
+                &mut missing,
+            ),
+            Err(ControlError::InvalidExecutionEvidence)
+        );
+        assert!(transport.completions.is_empty());
+        assert_eq!(transport.frames.len(), 1);
+
+        let mut completion_failure = SpyTransport {
+            fail_complete: true,
+            ..SpyTransport::default()
+        };
+        let mut backend = SpyBackend::default();
+        assert_eq!(
+            execute_request(
+                input(&request),
+                AuthorizedWorkflowInputs::new(vec!["raw".to_string()]),
+                &Policy(true),
+                &mut completion_failure,
+                &mut backend,
+            ),
+            Err(ControlError::TransportFailure)
+        );
+        assert_eq!(backend.calls.len(), 1);
+        assert_eq!(completion_failure.completions.len(), 1);
+        assert_eq!(completion_failure.frames.len(), 2);
+    }
+
+    #[test]
+    fn bounded_evidence_rejects_missing_or_unsafe_fields() {
+        assert_eq!(
+            BoundedExecutionEvidence::new(Conclusion::None, [7; 32], 21),
+            Err(ControlError::InvalidExecutionEvidence)
+        );
+        assert_eq!(
+            BoundedExecutionEvidence::new(Conclusion::Success, [0; 32], 21),
+            Err(ControlError::InvalidExecutionEvidence)
+        );
+        assert_eq!(
+            BoundedExecutionEvidence::new(Conclusion::Success, [7; 32], 0),
+            Err(ControlError::InvalidExecutionEvidence)
+        );
+        assert_eq!(
+            BoundedExecutionEvidence::new(Conclusion::Success, [7; 32], MAX_SAFE_INTEGER + 1),
+            Err(ControlError::InvalidExecutionEvidence)
+        );
+
+        let normalized = transport_request();
+        let lease = validate_admitted_response(normalized, response_for(normalized))
+            .expect("admitted lease");
+        let before_admission =
+            BoundedExecutionEvidence::new(Conclusion::Success, [7; 32], 9).expect("bounded");
+        let mut transport = SpyTransport::default();
+        assert_eq!(
+            complete_attempt(lease, before_admission, &mut transport),
+            Err(ControlError::InvalidExecutionEvidence)
+        );
+        assert!(transport.frames.is_empty());
     }
 
     struct ScriptedStream {
@@ -428,12 +1001,13 @@ mod tests {
 
     #[test]
     fn unix_exchange_writes_one_fixed_request_and_requires_exact_response() {
-        let request = transport_request();
-        let request_id = request_id_for_admit(request.signed_request_digest);
-        let response = response_for(request);
+        let admit = transport_request();
+        let request = Request::AdmitAttempt(admit);
+        let request_id = request_id_for(request);
+        let response = response_for(admit);
         let encoded = encode_response(
             FrameHeader {
-                operation: Request::AdmitAttempt(request).operation(),
+                operation: request.operation(),
                 request_id,
             },
             response,
@@ -448,18 +1022,19 @@ mod tests {
         assert!(stream.shutdown);
         assert_eq!(
             decode_request(&stream.written).expect("fixed request").1,
-            Request::AdmitAttempt(request)
+            request
         );
     }
 
     #[test]
     fn unix_exchange_rejects_trailing_response_bytes() {
-        let request = transport_request();
-        let request_id = request_id_for_admit(request.signed_request_digest);
-        let response = response_for(request);
+        let admit = transport_request();
+        let request = Request::AdmitAttempt(admit);
+        let request_id = request_id_for(request);
+        let response = response_for(admit);
         let encoded = encode_response(
             FrameHeader {
-                operation: Request::AdmitAttempt(request).operation(),
+                operation: request.operation(),
                 request_id,
             },
             response,

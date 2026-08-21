@@ -96,6 +96,7 @@ const fn broker_state_name(state: BrokerState) -> &'static str {
         BrokerState::Draining => "draining",
         BrokerState::Quarantined => "quarantined",
         BrokerState::Terminal => "terminal",
+        BrokerState::Leased => "leased",
     }
 }
 
@@ -129,5 +130,15 @@ fn emit_error(code: &'static str, field: Option<&'static str>, message: &str) {
     };
     if serde_json::to_writer(io::stderr().lock(), &line).is_ok() {
         eprintln!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leased_state_has_a_stable_json_name() {
+        assert_eq!(broker_state_name(BrokerState::Leased), "leased");
     }
 }

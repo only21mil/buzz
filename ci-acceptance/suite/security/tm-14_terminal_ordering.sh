@@ -93,26 +93,34 @@ if ! acceptance_control_init; then for name in "${dynamic_names[@]}"; do record 
 if [[ ! -d $lease_root ]]; then for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'harness.env lacks a readable BUZZ_CI_LEASE_STATE_ROOT'; done; emit; exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"; fi
 
 admit_and_wait() {
-  local label=$1 case_name=$2 admit_file=$out_dir/admit-$1.json lease_id lease_dir rc=0
-  acceptance_control_run "$case_name" "$admit_file" "$out_dir/admit-$label.stderr" || rc=$?
+  local label=$1 case_name=$2 admit_file=$out_dir/admit-$1.json
+  local binding_file=$out_dir/binding-$1.json expected_file=$out_dir/expected-$1.json
+  local lease_id lease_dir rc=0
+  acceptance_control_run "$case_name" "$admit_file" "$out_dir/admit-$label.stderr" "$binding_file" || rc=$?
   ((rc == 0)) || return "$rc"
-  lease_id=$(timeout 10 jq -r '.attempt_id // .lease_id // empty' "$admit_file")
-  [[ $lease_id =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  timeout 10 jq -e '.type == "qualification_result" and .code == "ok"' "$admit_file" >/dev/null 2>&1 || return 1
+  acceptance_bind_response "$binding_file" "$admit_file" "$expected_file" || return 1
+  lease_id=$(timeout 10 jq -r '.lease_id' "$expected_file")
   lease_dir=$lease_root/$lease_id
-  for _ in {1..120}; do
-    if timeout 10 "${SUDO[@]}" test -r "$lease_dir/final.json"; then timeout 10 "${SUDO[@]}" cp -- "$lease_dir/final.json" "$out_dir/final-$label.json" 2>"$out_dir/final-$label.stderr" || :; break; fi
-    timeout 2 sleep 0.25
-  done
-  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/ordering.jsonl" "$out_dir/ordering-$label.jsonl" 2>/dev/null || :
-  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/teardown.json" "$out_dir/teardown-$label.json" 2>/dev/null || :
+  if [[ $case_name == normal ]]; then
+    for _ in {1..120}; do
+      timeout 10 "${SUDO[@]}" test -r "$lease_dir/ordering.jsonl" \
+        && timeout 10 "${SUDO[@]}" test -r "$lease_dir/teardown.json" && break
+      timeout 2 sleep 0.25
+    done
+    timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/ordering.jsonl" "$out_dir/ordering-$label.jsonl" 2>/dev/null || :
+    timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/teardown.json" "$out_dir/teardown-$label.json" 2>/dev/null || :
+  fi
   printf '%s' "$lease_id"
 }
 
 normal_rc=0
 normal_lease=$(admit_and_wait normal normal) || normal_rc=$?
 if ((normal_rc == 0)); then
-  evidence_files+=("$TEST_ID/admit-normal.json" "$TEST_ID/admit-normal.stderr" "$TEST_ID/final-normal.json" "$TEST_ID/final-normal.stderr" "$TEST_ID/ordering-normal.jsonl" "$TEST_ID/teardown-normal.json")
-  if timeout "$TIMEOUT_SECONDS" jq -s -e '
+  evidence_files+=("$TEST_ID/admit-normal.json" "$TEST_ID/admit-normal.stderr" "$TEST_ID/binding-normal.json" "$TEST_ID/expected-normal.json" "$TEST_ID/ordering-normal.jsonl" "$TEST_ID/teardown-normal.json")
+  if [[ ! -s $out_dir/ordering-normal.jsonl || ! -s $out_dir/teardown-normal.json ]]; then
+    record terminal_event_order not_runnable 'The service accepted the normal case but its required ordering or teardown readback is absent'
+  elif timeout "$TIMEOUT_SECONDS" jq -s -e '
     map(select(.event as $e | ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_proof","publish"] | index($e))) as $x |
     ($x|length)==9 and ([range(1;9)] | all(. as $i; $x[$i].timestamp_unix_ns > $x[$i-1].timestamp_unix_ns)) and
     ($x|map(.event)) == ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_proof","publish"] and
@@ -121,7 +129,7 @@ if ((normal_rc == 0)); then
     && timeout 10 jq -e '.cgroup_procs_empty == true and .mounts_removed == true and .dirs_removed == true' "$out_dir/teardown-normal.json" >/dev/null; then
     record terminal_event_order pass "Lease $normal_lease published only after a strictly monotonic teardown proof"
   else
-    record terminal_event_order fail 'The normal attempt lacks the required order, publication event IDs, or complete teardown proof'
+    record terminal_event_order fail 'The normal ordering or teardown readback violates the terminal publication contract'
   fi
 else
   if ((normal_rc == 3)); then record terminal_event_order not_runnable 'The fixed root-authored TM-14/normal.json case is unavailable or unsafe'; else record terminal_event_order fail 'Could not admit and observe the normal ordering attempt'; fi
@@ -130,12 +138,30 @@ fi
 fault_rc=0
 fault_lease=$(admit_and_wait teardown-failure teardown_failure) || fault_rc=$?
 if ((fault_rc == 0)); then
-  evidence_files+=("$TEST_ID/admit-teardown-failure.json" "$TEST_ID/admit-teardown-failure.stderr" "$TEST_ID/final-teardown-failure.json" "$TEST_ID/final-teardown-failure.stderr" "$TEST_ID/ordering-teardown-failure.jsonl" "$TEST_ID/teardown-teardown-failure.json")
-  if ! timeout 10 jq -e '.verdict == "green" or .conclusion == "success"' "$out_dir/final-teardown-failure.json" >/dev/null 2>&1 \
-    && ! timeout 10 jq -e 'select(.event == "publish")' "$out_dir/ordering-teardown-failure.jsonl" >/dev/null 2>&1; then
-    record forced_teardown_failure_no_green pass "Forced teardown failure for lease $fault_lease produced neither green nor publication"
+  fault_expected=$out_dir/expected-teardown-failure.json
+  fault_generation=$(timeout 10 jq -r '.lease_generation' "$fault_expected")
+  cleanup_source=$(acceptance_receipt_root)/cleanup/$fault_lease-g$fault_generation.json
+  cleanup_evidence=$out_dir/cleanup-teardown-failure.json
+  for _ in {1..120}; do
+    acceptance_copy_receipt "$cleanup_source" "$cleanup_evidence" && break
+    timeout 2 sleep 0.25
+  done
+  evidence_files+=("$TEST_ID/admit-teardown-failure.json" "$TEST_ID/admit-teardown-failure.stderr" "$TEST_ID/binding-teardown-failure.json" "$TEST_ID/expected-teardown-failure.json" "$TEST_ID/cleanup-teardown-failure.json")
+  if [[ ! -s $cleanup_evidence ]]; then
+    record forced_teardown_failure_no_green not_runnable 'The exact durable teardown cleanup receipt is missing or unsafe'
+  elif acceptance_receipt_binding_matches "$fault_expected" "$cleanup_evidence" \
+    && timeout 10 jq -e '
+      .version == 1 and .committed == true and .evidence_state == "complete" and
+      .conclusion == "infrastructure_failure" and .state == "quarantined" and .publication == "suppressed" and
+      .observation.lease_files_absent == true and .observation.teardown_failure_observed == true and
+      .observation.slice_quarantined == true and .observation.publish_observed == false and
+      [.terminal_order[].event] == ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_failure_observed","publication_suppressed","quarantined"] and
+      ([.terminal_order[].sequence] == [1,2,3,4,5,6,7,8,9,10])
+    ' "$cleanup_evidence" >/dev/null 2>&1 \
+    && timeout 10 jq -e '.code == "ok" and .broker_state == "quarantined" and .conclusion == "infrastructure_failure"' "$out_dir/admit-teardown-failure.json" >/dev/null 2>&1; then
+    record forced_teardown_failure_no_green pass "Forced teardown failure for lease $fault_lease has one exact bound durable no-publish receipt"
   else
-    record forced_teardown_failure_no_green fail 'Forced teardown failure produced a green result or publication event'
+    record forced_teardown_failure_no_green fail 'The durable teardown receipt is stale, cross-bound, incomplete, green, or publish-capable'
   fi
 else
   if ((fault_rc == 3)); then record forced_teardown_failure_no_green not_runnable 'The fixed root-authored TM-14/teardown_failure.json case is unavailable or unsafe'; else record forced_teardown_failure_no_green fail 'The authenticated teardown_failure directive could not be admitted and observed'; fi

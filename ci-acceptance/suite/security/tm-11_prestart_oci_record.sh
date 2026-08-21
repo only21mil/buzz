@@ -4,11 +4,13 @@ set -euo pipefail
 TEST_ID=TM-11
 TITLE='Before every start, record the proxy-approved canonical OCI request'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''; candidate_dir=''; evidence_dir=''; plan=0
 checks=(); evidence=(); preconditions=(
   'buzz-ci-policy-proxy source and Cargo workspace exist in BUZZ_CI_PROXY_DIR or candidate-dir'
   'bash, coreutils, jq, and cargo are installed; evidence-dir is writable'
-  'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
+  'the exact root-authored TM-11/prestart_oci case is sealed for the suite candidate'
+  'the response exposes a nonzero attempt_id and equal positive generation fields'
 )
 failed=0; unrunnable=0
 usage(){ printf 'usage: %s --candidate <full-sha> --candidate-dir <path> --evidence-dir <path> [--plan]\n' "$0" >&2; exit 4; }
@@ -24,12 +26,7 @@ if ((plan)); then
 fi
 [[ $candidate =~ ^[0-9a-f]{40}$ && -n $candidate_dir && -n $evidence_dir ]]||usage
 if [[ -z ${SUITE_SUDO+x} ]]; then if timeout 5 sudo -n true >/dev/null 2>&1; then SUITE_SUDO='sudo -n'; else SUITE_SUDO=''; fi; fi
-read -r -a sudo_cmd <<<"$SUITE_SUDO"
-read_harness() {
-  if ((${#sudo_cmd[@]})); then timeout "$TIMEOUT_SECONDS" "${sudo_cmd[@]}" cat /etc/buzzci/harness.env
-  else return 3; fi
-}
-read_harness_key(){ local key=$1; printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'; }
+read -r -a SUDO <<<"$SUITE_SUDO"
 proxy_dir=${BUZZ_CI_PROXY_DIR:-$candidate_dir}; out_dir=$evidence_dir/$TEST_ID
 timeout "$TIMEOUT_SECONDS" mkdir -p -- "$out_dir"||exit 4
 cargo_log=$out_dir/cargo-test.log
@@ -50,45 +47,79 @@ else
   printf 'missing policy.rs or transport.rs\n' >"$proof"; evidence+=("$TEST_ID/static-prestart-proof.txt"); add_check prestart_proof_gate fail 'Proxy checkout is missing policy or transport source.'; add_check effective_oci_constraints fail 'Proxy checkout is missing effective OCI constraint source.'
 fi
 
+seccomp_source=$(acceptance_receipt_root)/seccomp.json
+seccomp_evidence=$out_dir/seccomp-install-receipt.json
+oci_receipt_dir=$(acceptance_receipt_root)/oci
+fixed_profile=/var/lib/buzzci/seccomp/v1/sha256/2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4.json
+fixed_digest=2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4
+oci_binding=$out_dir/oci-binding.json
+oci_response=$out_dir/oci-response.json
+oci_error=$out_dir/oci-response.stderr
+oci_expected=$out_dir/oci-expected.json
 if [[ ! -e /etc/buzzci/harness.env ]]; then
-  add_check live_request_before_start not_runnable 'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
+  add_check live_request_before_start not_runnable 'Substrate wiring has not published /etc/buzzci/harness.env'
+elif ((${#SUDO[@]} == 0)); then
+  add_check live_request_before_start not_runnable 'Seccomp and OCI receipt readback requires SUITE_SUDO or passwordless sudo'
 else
-  harness_text=''
-  if ! harness_text=$(read_harness 2>/dev/null); then
-    if ((${#sudo_cmd[@]} == 0)); then add_check live_request_before_start not_runnable 'harness.env unreadable without sudo'; else add_check live_request_before_start fail 'Published harness.env is not root-readable.'; fi
+  harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || harness_text=''
+  export harness_text
+  oci_rc=0
+  if ! acceptance_control_init; then
+    add_check live_request_before_start not_runnable "$ACCEPTANCE_UNAVAILABLE"
   else
-  state_root=$(read_harness_key BUZZ_CI_LEASE_STATE_ROOT 2>/dev/null||true)
-  lease_dir=''; [[ -n $state_root && -d $state_root ]]&&for e in "$state_root"/*; do [[ -d $e ]]&&{ lease_dir=$e; break; }; done
-  ordering=$lease_dir/ordering.jsonl; object_dir=$lease_dir/proxy/objects; live=$out_dir/live-prestart-proof.txt
-  object_files=(); [[ -d $object_dir ]]&&for f in "$object_dir"/*.json; do [[ -f $f ]]&&object_files+=("$f"); done
-  if [[ -z $state_root || ! -d $state_root || -z $lease_dir || ! -f $ordering || ${#object_files[@]} -eq 0 ]]; then
-    printf 'state_root=%s lease_dir=%s ordering=%s objects=%s\n' "$state_root" "$lease_dir" "$ordering" "${#object_files[@]}" >"$live"; evidence+=("$TEST_ID/live-prestart-proof.txt"); add_check live_request_before_start fail 'harness.env exists but ordering.jsonl or canonical proxy object records are missing.'
-  else
-    : >"$live"; live_ok=1
-    for f in "${object_files[@]}"; do
-      timeout "$TIMEOUT_SECONDS" jq -c '{object_id:(.object_id//.container_id//.id),recorded_ns:(.recorded_ns//.recorded_at_ns//.timestamp_ns),start_ns:(.start_ns//.started_at_ns),effective_spec:(.effective_spec//.effective//.approved_spec)}' "$f" >>"$live" 2>&1||live_ok=0
-      object_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.object_id//.container_id//.id//empty' "$f" 2>/dev/null||true)
-      recorded_ns=$(timeout "$TIMEOUT_SECONDS" jq -r '.recorded_ns//.recorded_at_ns//.timestamp_ns//empty' "$f" 2>/dev/null||true)
-      start_ns=$(timeout "$TIMEOUT_SECONDS" jq -r --arg id "$object_id" '[select((.event//.name//"")|test("start")) | select(($id=="") or ((.object_id//.container_id//"")==$id)) | (.timestamp_unix_ns//.timestamp_ns//.monotonic_ns//.unix_ns)] | min // empty' "$ordering" 2>/dev/null||true)
-      [[ $recorded_ns =~ ^[0-9]+$ && $start_ns =~ ^[0-9]+$ && $recorded_ns -lt $start_ns ]]||live_ok=0
-      timeout "$TIMEOUT_SECONDS" jq -e '
-        (.effective_spec//.effective//.approved_spec) as $s |
-        (($s.user//$s.container_user//"")|test("^[1-9][0-9]*:[1-9][0-9]*$")) and
-        (($s.userns_mode//$s.userns//"")|length>0) and
-        (($s.cap_drop//$s.capabilities.drop//[])|index("ALL")!=null) and
-        (($s.security_opt//$s.security_options//[])|map(ascii_downcase)|any(test("seccomp"))) and
-        (($s.security_opt//$s.security_options//[])|map(ascii_downcase)|any(test("label|selinux"))) and
-        (($s.network_mode//$s.network//"")=="none") and
-        (($s.image//$s.image_digest//"")|test("^sha256:[0-9a-f]{64}$")) and
-        (($s.binds//$s.mounts//[])|map(tostring)|all(test("docker\\.sock|podman\\.sock|proxy\\.sock")|not)) and
-        (($s.log_driver//$s.log_config.type//"")=="none") and
-        (($s.artifact_server_enabled//false)==false) and (($s.persistent_logs//false)==false) and
-        (($s.nano_cpus//$s.cpu_quota//0)>0) and (($s.memory//$s.memory_max_bytes//0)>0) and (($s.pids_limit//$s.pids_max//0)>0)
-      ' "$f" >/dev/null 2>&1||live_ok=0
-    done
-    evidence+=("$TEST_ID/live-prestart-proof.txt")
-    if ((live_ok)); then add_check live_request_before_start pass 'Every canonical request record predates start and proves the required effective OCI constraints.'; else add_check live_request_before_start fail 'A canonical request is late, unbound to a start, or lacks one or more required effective OCI constraints.'; fi
-  fi
+    acceptance_control_run prestart_oci "$oci_response" "$oci_error" "$oci_binding" || oci_rc=$?
+    evidence+=("$TEST_ID/oci-response.json" "$TEST_ID/oci-response.stderr" "$TEST_ID/oci-binding.json")
+    if ((oci_rc == 3)); then
+      add_check live_request_before_start not_runnable 'The exact root-authored TM-11/prestart_oci.json case is missing, stale, cross-candidate, or unsafe'
+    elif ((oci_rc != 0)); then
+      add_check live_request_before_start fail 'The authenticated OCI qualification case was not admitted'
+    elif ! acceptance_bind_response "$oci_binding" "$oci_response" "$oci_expected"; then
+      add_check live_request_before_start not_runnable 'The response must expose type=qualification_result, code=ok, nonzero 32-hex attempt_id, equal positive integer generation and lease_generation, and positive updated_at'
+    elif ! acceptance_copy_receipt "$seccomp_source" "$seccomp_evidence"; then
+      add_check live_request_before_start not_runnable 'The fixed sealed seccomp install receipt is missing or unsafe'
+    else
+      evidence+=("$TEST_ID/oci-expected.json" "$TEST_ID/seccomp-install-receipt.json")
+      install_receipt_sha256=$(timeout 10 sha256sum -- "$seccomp_evidence" | timeout 10 awk '{print $1}')
+      oci_lease=$(timeout 10 jq -r '.lease_id' "$oci_expected")
+      oci_generation=$(timeout 10 jq -r '.lease_generation' "$oci_expected")
+      oci_source=$oci_receipt_dir/$oci_lease-g$oci_generation.json
+      oci_evidence=$out_dir/oci-prestart-receipt.json
+      for _ in {1..120}; do
+        acceptance_copy_receipt "$oci_source" "$oci_evidence" && break
+        timeout 2 sleep 0.25
+      done
+      evidence+=("$TEST_ID/oci-prestart-receipt.json")
+      if [[ ! -s $oci_evidence ]]; then
+        add_check live_request_before_start not_runnable 'The exact response-derived OCI receipt is missing or unsafe'
+      else
+        now_ns=$(timeout 10 date +%s%N)
+        if acceptance_receipt_binding_matches "$oci_expected" "$oci_evidence" \
+          && timeout "$TIMEOUT_SECONDS" jq -e \
+            --arg path "$fixed_profile" --arg digest "$fixed_digest" --arg install_digest "$install_receipt_sha256" \
+            --argjson now_ns "$now_ns" --argjson max_age_ns "$((TIMEOUT_SECONDS * 1000000000))" '
+              .version == 1 and .committed == true and
+              .install_receipt_sha256 == $install_digest and
+              .profile_path == $path and .profile_sha256 == $digest and .phase == "prestart" and
+              .no_new_privileges == true and .recorded_before_unit_start == true and
+              ([.security_options[] | select(ascii_downcase | startswith("seccomp="))] == ["seccomp=" + $path]) and
+              (.recorded_at_unix_ns | type == "number" and . > 0 and floor == .) and
+              (.unit_start_requested_at_unix_ns | type == "number" and . > 0 and floor == .) and
+              .unit_start_requested_at_unix_ns > .recorded_at_unix_ns and
+              .recorded_at_unix_ns <= $now_ns and ($now_ns - .recorded_at_unix_ns) <= $max_age_ns
+            ' "$oci_evidence" >/dev/null 2>&1 \
+          && timeout "$TIMEOUT_SECONDS" jq -e --arg path "$fixed_profile" --arg digest "$fixed_digest" '
+            .version == 1 and .committed == true and
+            (.disposition == "installed" or .disposition == "existing") and
+            .profile_path == $path and .profile_sha256 == $digest and
+            .source_sha256 == $digest and .build_sha256 == $digest and .install_sha256 == $digest and
+            (.recorded_at_unix_ns | type == "number" and . > 0 and floor == .)
+          ' "$seccomp_evidence" >/dev/null 2>&1; then
+          add_check live_request_before_start pass "Lease $oci_lease generation $oci_generation binds the sealed seccomp receipt to an actual prestart record before unit start"
+        else
+          add_check live_request_before_start fail 'The exact OCI receipt is stale, cross-bound, or lacks the sealed seccomp prestart proof'
+        fi
+      fi
+    fi
   fi
 fi
 if ((failed)); then emit fail 'One or more pre-start OCI record checks failed.'; exit 1; fi

@@ -41,6 +41,24 @@ else
   printf 'shellcheck: absent (not a failure)\n'
 fi
 
+case_catalog_log="$temp_dir/qualification-cases.log"
+if "$ROOT/qualification-cases/selftest.sh" >"$case_catalog_log" 2>&1; then
+  printf 'qualification cases: pass\n'
+else
+  printf 'qualification cases: FAIL\n'
+  tail -n 30 "$case_catalog_log"
+  failed=1
+fi
+
+completion_cases_log="$temp_dir/completion-cases.log"
+if "$ROOT/completion-cases/selftest.sh" >"$completion_cases_log" 2>&1; then
+  printf 'completion cases: pass\n'
+else
+  printf 'completion cases: FAIL\n'
+  tail -n 30 "$completion_cases_log"
+  failed=1
+fi
+
 run_suite_case() {
   local name=$1
   shift

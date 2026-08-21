@@ -234,35 +234,63 @@ if ! acceptance_control_init; then
   emit
   exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
-
 exclusive_rc=0
 acceptance_control_run exclusive_capacity "$out_dir/exclusive-capacity.json" "$out_dir/exclusive-capacity.stderr" || exclusive_rc=$?
 evidence_files+=("$TEST_ID/exclusive-capacity.json" "$TEST_ID/exclusive-capacity.stderr")
 if ((exclusive_rc == 3)); then
   record exclusive_lease_pools not_runnable 'The fixed root-authored TM-06/exclusive_capacity.json case is unavailable or unsafe'
-elif ((exclusive_rc == 0)) && timeout 10 jq -e '
-  .capacity_before == 1 and .primary_admitted == true and
-  .concurrent_refusal == "no_capacity" and .primary_terminal == true
-' "$out_dir/exclusive-capacity.json" >/dev/null 2>&1; then
-  record exclusive_lease_pools pass 'ActivationController exposed one slot, refused the overlapping fixed case, and observed the primary lease terminally'
-elif ((exclusive_rc == 0)) && ! timeout 10 jq -e 'has("capacity_before") and has("primary_admitted") and has("concurrent_refusal") and has("primary_terminal")' "$out_dir/exclusive-capacity.json" >/dev/null 2>&1; then
-  record exclusive_lease_pools not_runnable 'The qualification response does not expose the server-side capacity scenario readback required by TM-06'
+elif ((exclusive_rc == 0)) && timeout 10 jq -e '.type == "qualification_result" and .code == "ok" and (.attempt_id | test("^[0-9a-f]{32}$")) and .attempt_id != "00000000000000000000000000000000"' "$out_dir/exclusive-capacity.json" >/dev/null 2>&1; then
+  record exclusive_lease_pools not_runnable 'The service admitted the fixed primary case, but the protocol exposes no overlapping-admission or ordinary-capacity readback; TM-06 will not infer those facts'
 else
   record exclusive_lease_pools fail 'The server-side exclusive-capacity scenario did not prove a one-slot controller and overlapping refusal'
 fi
 
 teardown_rc=0
-acceptance_control_run teardown_failure "$out_dir/teardown-failure.json" "$out_dir/teardown-failure.stderr" || teardown_rc=$?
-evidence_files+=("$TEST_ID/teardown-failure.json" "$TEST_ID/teardown-failure.stderr")
+teardown_binding=$out_dir/teardown-failure-binding.json
+teardown_expected=$out_dir/teardown-failure-expected.json
+acceptance_control_run teardown_failure "$out_dir/teardown-failure.json" "$out_dir/teardown-failure.stderr" "$teardown_binding" || teardown_rc=$?
+evidence_files+=("$TEST_ID/teardown-failure.json" "$TEST_ID/teardown-failure.stderr" "$TEST_ID/teardown-failure-binding.json")
 if ((teardown_rc == 3)); then
   record teardown_quarantine not_runnable 'The fixed root-authored TM-06/teardown_failure.json case is unavailable or unsafe'
-elif ((teardown_rc == 0)) && timeout 10 jq -e '
-  .directive == "teardown_failure" and .quarantined == true and
-  .before_reuse == true and .reuse_allowed == false and .capacity_after == 0
-' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
-  record teardown_quarantine pass 'The sole privileged directive forced incomplete teardown, quarantined before reuse, and reduced ordinary capacity to zero'
-elif ((teardown_rc == 0)) && ! timeout 10 jq -e 'has("quarantined") and has("capacity_after")' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
-  record teardown_quarantine not_runnable 'The qualification response does not expose quarantine and ordinary-capacity readback required by TM-06'
+elif ((teardown_rc == 0)) && timeout 10 jq -e '.type == "qualification_result" and .code == "ok" and .broker_state == "quarantined" and (.attempt_id | test("^[0-9a-f]{32}$")) and .attempt_id != "00000000000000000000000000000000"' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
+  if ! acceptance_bind_response "$teardown_binding" "$out_dir/teardown-failure.json" "$teardown_expected"; then
+    record teardown_quarantine fail 'The authenticated response does not match the sealed teardown case lease identity or generation'
+  else
+    teardown_lease=$(timeout 10 jq -r '.lease_id' "$teardown_expected")
+    teardown_generation=$(timeout 10 jq -r '.lease_generation' "$teardown_expected")
+    cleanup_source=$(acceptance_receipt_root)/cleanup/$teardown_lease-g$teardown_generation.json
+    cleanup_evidence=$out_dir/cleanup-teardown-failure.json
+    for _ in {1..120}; do
+      acceptance_copy_receipt "$cleanup_source" "$cleanup_evidence" && break
+      timeout 2 sleep 0.25
+    done
+    evidence_files+=("$TEST_ID/teardown-failure-expected.json" "$TEST_ID/cleanup-teardown-failure.json")
+    if [[ ! -s $cleanup_evidence ]]; then
+      record teardown_quarantine not_runnable 'The service returned Quarantined but its exact durable cleanup receipt is missing or unsafe'
+    elif acceptance_receipt_binding_matches "$teardown_expected" "$cleanup_evidence" \
+      && timeout 10 jq -e '
+        .version == 1 and .committed == true and
+        .conclusion == "infrastructure_failure" and .state == "quarantined" and
+        .publication == "suppressed" and .evidence_state == "complete" and
+        (.operations | length == 5 and all(.[]; .completed == true)) and
+        .observation.lease_slice_inactive == true and .observation.lease_cgroup_empty == true and
+        .observation.nft_table_absent == true and .observation.namespace_absent == true and
+        .observation.lease_files_absent == true and .observation.teardown_failure_observed == true and
+        .observation.slice_quarantined == true and .observation.publish_observed == false and
+        [.terminal_order[].event] == ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_failure_observed","publication_suppressed","quarantined"] and
+        ([.terminal_order[].sequence] == [1,2,3,4,5,6,7,8,9,10]) and
+        (.teardown_digest | test("^[0-9a-f]{64}$")) and
+        (.no_publish_digest | test("^[0-9a-f]{64}$")) and
+        (.quarantine_digest | test("^[0-9a-f]{64}$"))
+      ' "$cleanup_evidence" >/dev/null 2>&1 \
+      && timeout 10 jq -e '.conclusion == "infrastructure_failure" and .broker_state == "quarantined"' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
+      record teardown_quarantine pass 'The exact durable cleanup receipt binds the sealed case and proves infrastructure failure, quarantine, and suppressed publication'
+    else
+      record teardown_quarantine fail 'The durable cleanup receipt is stale, cross-bound, incomplete, green, or publish-capable'
+    fi
+  fi
+elif ((teardown_rc == 0)); then
+  record teardown_quarantine not_runnable 'The qualification response does not expose a nonzero quarantined attempt required by TM-06'
 else
   record teardown_quarantine fail 'Teardown failure did not produce before-reuse quarantine with ordinary capacity zero'
 fi

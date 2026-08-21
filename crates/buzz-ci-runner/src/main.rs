@@ -13,7 +13,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!(r#"{{"error":"service_wiring_unavailable"}}"#);
+            eprintln!(r#"{{"error":"execution_backend_unavailable"}}"#);
             ExitCode::from(4)
         }
     }

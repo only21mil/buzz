@@ -110,6 +110,11 @@ TM-06, TM-07, and TM-12 through TM-17 never send synthetic control flags.
 They stream exact root-authored, root:root mode `0444` case files from the
 qualification case root to the no-argv acceptance controller. Missing,
 mutable, symlinked, or otherwise unsafe case artifacts are `not_runnable`.
+The reviewable unsigned sources, sealed schema, exact expectation catalog,
+hostile fixtures, and live-canary plan live under
+`ci-acceptance/qualification-cases/`. Any unresolved `@...@` token or stale
+positive validity window is also `not_runnable`; the deliberately expired
+TM-16 case is the sole stale input allowed to reach the service refusal path.
 
 For a lease id, the published state is laid out as follows:
 
@@ -155,4 +160,4 @@ DNS and egress remain blocked while approved address/port tuples work.
 | TM-14 | Runner teardown-attestation guard | Live terminal ordering and fault refusal |
 | TM-15 | Crash fixture syntax and static controls | `lease_unit`, cgroup, `reconcile.json`, and no-reuse proof |
 | TM-16 | Broker protocol refusal source checks | Fresh retry, replay refusal, and capacity enforcement |
-| TM-17 | Broker-protocol and runner static refusal checks | Live refusal through the runner control path |
+| TM-17 | Broker-protocol and acceptance-control static refusal checks | Pre-transport refusal through the qualification control path |

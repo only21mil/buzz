@@ -99,8 +99,9 @@ admit_slowpoke() {
   local label=$1 admit_file=$out_dir/admit-$1.json lease_id lease_json rc=0
   acceptance_control_run "$label" "$admit_file" "$out_dir/admit-$label.stderr" || rc=$?
   ((rc == 0)) || return "$rc"
+  timeout 10 jq -e '.type == "qualification_result" and .code == "ok"' "$admit_file" >/dev/null 2>&1 || return 1
   lease_id=$(timeout 10 jq -r '.attempt_id // .lease_id // empty' "$admit_file")
-  [[ $lease_id =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ $lease_id =~ ^[0-9a-f]{32}$ && $lease_id != 00000000000000000000000000000000 ]] || return 1
   lease_json=$lease_root/$lease_id/lease.json
   for _ in {1..40}; do timeout 10 "${SUDO[@]}" test -r "$lease_json" && break; timeout 2 sleep 0.25; done
   timeout 10 "${SUDO[@]}" test -r "$lease_json" || return 1
@@ -176,9 +177,9 @@ else
 fi
 
 host_rc=0
-host_lease=$(admit_slowpoke simulated-host-crash) || host_rc=$?
+host_lease=$(admit_slowpoke simulated_host_crash) || host_rc=$?
 if ((host_rc == 0)); then
-  evidence_files+=("$TEST_ID/admit-simulated-host-crash.json" "$TEST_ID/admit-simulated-host-crash.stderr")
+  evidence_files+=("$TEST_ID/admit-simulated_host_crash.json" "$TEST_ID/admit-simulated_host_crash.stderr")
   host_unit=$(timeout 10 "${SUDO[@]}" jq -r '.lease_unit // empty' "$lease_root/$host_lease/lease.json")
   if [[ -n $host_unit ]]; then
     timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" systemctl kill --kill-whom=all --signal=KILL "$host_unit"

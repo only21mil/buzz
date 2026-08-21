@@ -3,13 +3,21 @@
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
+use std::{
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(target_os = "linux")]
 use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
 #[cfg(target_os = "linux")]
 use buzz_ci_execd::control::{
-    control_account_uid, validate_systemd_environment, validate_systemd_listener, ClosedDispatch,
-    ControlError, ControlServer,
+    control_account_uid, validate_systemd_environment, validate_systemd_listener, ControlError,
+    ControlServer,
 };
+#[cfg(target_os = "linux")]
+use buzz_ci_execd::production_composition::load_production_dispatch;
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_LISTEN_FD: i32 = 3;
@@ -71,10 +79,31 @@ fn main() -> ExitCode {
                         return ExitCode::from(4);
                     }
                 };
-                let mut server = ControlServer::new(listener, control_uid, ClosedDispatch::new());
+                let startup_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(duration) => duration.as_secs(),
+                    Err(_) => {
+                        eprintln!(r#"{{"error":"system_clock"}}"#);
+                        return ExitCode::from(4);
+                    }
+                };
+                let dispatch = load_production_dispatch(startup_now);
+                let mut server = match ControlServer::new_polling(listener, control_uid, dispatch) {
+                    Ok(server) => server,
+                    Err(error) => {
+                        eprintln!(r#"{{"error":"control_listener","reason":"{error}"}}"#);
+                        return ExitCode::from(4);
+                    }
+                };
                 loop {
-                    match server.serve_once() {
-                        Ok(()) => {}
+                    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(duration) => duration.as_secs(),
+                        Err(_) => {
+                            eprintln!(r#"{{"error":"system_clock"}}"#);
+                            return ExitCode::from(4);
+                        }
+                    };
+                    match server.serve_tick(now) {
+                        Ok(()) => thread::sleep(Duration::from_millis(100)),
                         Err(error @ ControlError::Accept(_)) => {
                             eprintln!(r#"{{"error":"control_listener","reason":"{error}"}}"#);
                             return ExitCode::from(4);

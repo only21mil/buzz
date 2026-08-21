@@ -1,9 +1,9 @@
-//! Unprivileged control-plane boundary for Buzz CI.
+//! Unprivileged runner boundary for Buzz CI.
 //!
 //! This crate validates owner-authorized public CI requests, reduces them to
-//! the content-blind broker protocol, and constructs teardown attestations only
-//! from terminal broker receipts. It does not execute jobs or own privileged
-//! resources.
+//! the content-blind broker protocol, drives a separately supplied unprivileged
+//! execution backend, and constructs teardown attestations only from terminal
+//! broker receipts. It does not own privileged resources.
 
 #![forbid(unsafe_code)]
 
@@ -98,6 +98,14 @@ pub enum ControlError {
     TransportFailure,
     #[error("broker returned an invalid response")]
     InvalidBrokerResponse,
+    #[error("broker rejected the request")]
+    BrokerRejected,
+    #[error("workflow execution backend is unavailable")]
+    ExecutionBackendUnavailable,
+    #[error("workflow execution failed")]
+    ExecutionFailed,
+    #[error("workflow execution did not produce valid bounded evidence")]
+    InvalidExecutionEvidence,
 }
 
 pub fn authorize_request<'a>(

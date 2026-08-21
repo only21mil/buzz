@@ -1,0 +1,10 @@
+{
+  "type": "qualification_result",
+  "code": "ok",
+  "attempt_id": "11111111111111111111111111111111",
+  "broker_state": "terminal",
+  "conclusion": "success",
+  "generation": 1,
+  "lease_generation": 1,
+  "updated_at": 1
+}
