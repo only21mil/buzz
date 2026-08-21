@@ -26,6 +26,7 @@ use buzz_ci_broker_protocol::{
 };
 
 pub mod seccomp;
+pub mod seccomp_host;
 
 pub const FORBIDDEN_ENVIRONMENT_KEYS: &[&str] = &[
     "BUZZ_RELAY_PRIVATE_KEY",
