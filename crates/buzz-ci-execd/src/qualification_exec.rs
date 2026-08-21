@@ -20,12 +20,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     activation::QualificationLease,
+    durable_dispatch::{
+        ExecutionUnavailable, QualificationExecution, QualificationExecutor, QualificationTerminal,
+    },
     qualification_host::{
         QualificationHostBinding, QualificationHostExecution, QualificationHostOutcome,
         QualificationHostPlan, QualificationHostReceipt, QualificationTerminalEvent,
         QUALIFICATION_TERMINAL_ORDER,
     },
-    runtime::QualificationLeaseResponse,
 };
 
 pub const QUALIFICATION_CLEANUP_RECEIPT_ROOT: &str = "/var/lib/buzzci/activation/receipts/cleanup";
@@ -235,40 +237,68 @@ impl<R: QualificationCleanupRunner> QualificationCleanupExecutor<R> {
     }
 }
 
-impl<R: QualificationCleanupRunner> QualificationLeaseResponse for QualificationCleanupExecutor<R> {
-    fn admitted_response(
+impl<R: QualificationCleanupRunner> QualificationExecutor for QualificationCleanupExecutor<R> {
+    fn preflight(&mut self, request: QualificationRequest) -> Result<(), ExecutionUnavailable> {
+        if request.directive
+            == Some(buzz_ci_broker_protocol::QualificationDirective::TeardownFailure)
+        {
+            Ok(())
+        } else {
+            Err(ExecutionUnavailable)
+        }
+    }
+
+    fn execute(
         &mut self,
         _header: FrameHeader,
         request: QualificationRequest,
         lease: QualificationLease,
         now: u64,
-    ) -> BrokerResponse {
-        BrokerResponse {
-            code: ResponseCode::Ok,
-            retry_after_millis: 0,
-            attempt_id: lease.lease_id(),
-            run_id: [0; 16],
-            accepted_request_digest: request.request_digest,
-            job_manifest_digest: request.manifest_digest,
-            tip_oid: Some(request.integrated_candidate_sha),
-            broker_state: BrokerState::Reconciling,
-            conclusion: Conclusion::None,
-            terminal_reason: 0,
-            generation: lease.generation(),
-            accepted_at: now,
-            updated_at: now,
-            lease_generation: lease.generation(),
-            evidence_set_digest: [0; 32],
-            teardown_digest: [0; 32],
-            attempt: 1,
-        }
+    ) -> Result<QualificationExecution, ExecutionUnavailable> {
+        let outcome = QualificationHostPlan::from_admitted(request, lease)
+            .ok()
+            .map(|plan| {
+                QualificationHostOutcome::evaluate(
+                    plan,
+                    QualificationCleanupExecutor::execute(self, plan),
+                )
+            });
+        Ok(QualificationExecution {
+            terminal: QualificationTerminal::TeardownFailure,
+            response: qualification_teardown_response(request, lease, outcome, now),
+        })
     }
+}
 
-    fn execute_teardown_failure(
-        &mut self,
-        plan: QualificationHostPlan,
-    ) -> QualificationHostExecution {
-        self.execute(plan)
+fn qualification_teardown_response(
+    request: QualificationRequest,
+    lease: QualificationLease,
+    outcome: Option<QualificationHostOutcome>,
+    now: u64,
+) -> BrokerResponse {
+    let complete = outcome.is_some_and(QualificationHostOutcome::is_complete);
+    BrokerResponse {
+        code: if complete {
+            ResponseCode::Ok
+        } else {
+            ResponseCode::InternalFailure
+        },
+        retry_after_millis: 0,
+        attempt_id: lease.lease_id(),
+        run_id: [0; 16],
+        accepted_request_digest: request.request_digest,
+        job_manifest_digest: request.manifest_digest,
+        tip_oid: Some(request.integrated_candidate_sha),
+        broker_state: BrokerState::Quarantined,
+        conclusion: Conclusion::InfrastructureFailure,
+        terminal_reason: 1,
+        generation: lease.generation(),
+        accepted_at: now,
+        updated_at: now,
+        lease_generation: lease.generation(),
+        evidence_set_digest: outcome.map_or([0; 32], QualificationHostOutcome::no_publish_digest),
+        teardown_digest: outcome.map_or([0; 32], QualificationHostOutcome::teardown_digest),
+        attempt: 1,
     }
 }
 
@@ -676,7 +706,7 @@ mod tests {
         ActivationController, FixtureJobCoordinates, HostActivationCoordinates,
         QualificationPermit, VerifiedSigner,
     };
-    use buzz_ci_broker_protocol::QualificationDirective;
+    use buzz_ci_broker_protocol::{Operation, QualificationDirective};
 
     #[derive(Clone, Copy)]
     enum FakeObservation {
@@ -742,7 +772,7 @@ mod tests {
         }
     }
 
-    fn admitted_plan() -> QualificationHostPlan {
+    fn admitted_fixture() -> (QualificationRequest, QualificationLease) {
         let root = VerifiedSigner([1; 32]);
         let signer = VerifiedSigner([2; 32]);
         let host = HostActivationCoordinates {
@@ -793,6 +823,11 @@ mod tests {
         let lease = controller
             .admit_qualification_request(request, signer, 10)
             .unwrap();
+        (request, lease)
+    }
+
+    fn admitted_plan() -> QualificationHostPlan {
+        let (request, lease) = admitted_fixture();
         QualificationHostPlan::from_admitted(request, lease).unwrap()
     }
 
@@ -901,6 +936,71 @@ mod tests {
             "publication_suppressed"
         );
         assert!(!value["no_publish_digest"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn durable_dispatch_receives_only_the_teardown_failure_terminal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("activation");
+        let mut cleanup_executor = executor(&root, FakeObservation::Complete, None);
+        let (request, lease) = admitted_fixture();
+        assert_eq!(
+            QualificationExecutor::preflight(&mut cleanup_executor, request),
+            Ok(())
+        );
+
+        let mut ordinary = request;
+        ordinary.directive = None;
+        assert_eq!(
+            QualificationExecutor::preflight(&mut cleanup_executor, ordinary),
+            Err(ExecutionUnavailable)
+        );
+
+        let execution = QualificationExecutor::execute(
+            &mut cleanup_executor,
+            FrameHeader {
+                operation: Operation::AdmitQualification,
+                request_id: [21; 16],
+            },
+            request,
+            lease,
+            10,
+        )
+        .unwrap();
+        assert_eq!(execution.terminal, QualificationTerminal::TeardownFailure);
+        assert_eq!(execution.response.code, ResponseCode::Ok);
+        assert_eq!(execution.response.broker_state, BrokerState::Quarantined);
+        assert_eq!(
+            execution.response.conclusion,
+            Conclusion::InfrastructureFailure
+        );
+        assert_ne!(execution.response.evidence_set_digest, [0; 32]);
+        assert_ne!(execution.response.teardown_digest, [0; 32]);
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("activation");
+        let mut missing = executor(&root, FakeObservation::Missing, None);
+        let (request, lease) = admitted_fixture();
+        let execution = QualificationExecutor::execute(
+            &mut missing,
+            FrameHeader {
+                operation: Operation::AdmitQualification,
+                request_id: [22; 16],
+            },
+            request,
+            lease,
+            10,
+        )
+        .unwrap();
+        assert_eq!(execution.terminal, QualificationTerminal::TeardownFailure);
+        assert_eq!(execution.response.code, ResponseCode::InternalFailure);
+        assert_eq!(execution.response.broker_state, BrokerState::Quarantined);
+        assert_eq!(
+            execution.response.conclusion,
+            Conclusion::InfrastructureFailure
+        );
+        assert_eq!(execution.response.evidence_set_digest, [0; 32]);
+        assert_eq!(execution.response.teardown_digest, [0; 32]);
     }
 
     #[test]
