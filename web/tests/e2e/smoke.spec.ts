@@ -13,6 +13,86 @@ test("home page shows repositories section", async ({ page }) => {
   await expect(page.getByText("Repositories")).toBeVisible();
 });
 
+test("repository clone failure shows an access-safe error state", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    class MockRelayWebSocket extends EventTarget {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+
+      readonly url: string;
+      readyState = MockRelayWebSocket.CONNECTING;
+
+      constructor(url: string | URL) {
+        super();
+        this.url = String(url);
+        queueMicrotask(() => {
+          this.readyState = MockRelayWebSocket.OPEN;
+          this.dispatchEvent(new Event("open"));
+        });
+      }
+
+      send(data: string) {
+        const message = JSON.parse(data) as [
+          string,
+          string,
+          { kinds?: number[] },
+        ];
+        if (message[0] !== "REQ") return;
+
+        const [, subscriptionId, filter] = message;
+        if (filter.kinds?.includes(30617)) {
+          this.dispatchEvent(
+            new MessageEvent("message", {
+              data: JSON.stringify([
+                "EVENT",
+                subscriptionId,
+                {
+                  id: "11".repeat(32),
+                  pubkey: "22".repeat(32),
+                  created_at: 1_700_000_000,
+                  kind: 30617,
+                  tags: [
+                    ["d", "restricted-repo"],
+                    ["name", "Restricted repository"],
+                    ["description", "A repository used by this test."],
+                  ],
+                  content: "",
+                  sig: "33".repeat(64),
+                },
+              ]),
+            }),
+          );
+        }
+
+        this.dispatchEvent(
+          new MessageEvent("message", {
+            data: JSON.stringify(["EOSE", subscriptionId]),
+          }),
+        );
+      }
+
+      close() {
+        this.readyState = MockRelayWebSocket.CLOSED;
+      }
+    }
+
+    window.WebSocket = MockRelayWebSocket as unknown as typeof WebSocket;
+  });
+  await page.route("**/git/**", async (route) => {
+    await route.fulfill({ status: 404, body: "Not Found" });
+  });
+
+  await page.goto("/repos/restricted-repo");
+
+  await expect(page.getByRole("alert")).toContainText(
+    "This repository could not be loaded. It may not exist, or it may be restricted to members of its channel. If you have a Nostr signer extension, connect it and reload.",
+  );
+});
+
 test("invite requires age and legal consent before opening Buzz", async ({
   page,
 }) => {

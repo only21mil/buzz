@@ -39,7 +39,7 @@ export function useGitTree(
 ) {
   const cloneQuery = useGitClone(owner, repoName, ref);
 
-  return useQuery({
+  const treeQuery = useQuery({
     queryKey: ["git-tree", owner, repoName, ref, path ?? ""],
     queryFn: async () => {
       if (!cloneQuery.data) throw new Error("unreachable: enabled guards data");
@@ -57,13 +57,19 @@ export function useGitTree(
     enabled: !!cloneQuery.data,
     staleTime: 5 * 60_000,
   });
+
+  return {
+    ...treeQuery,
+    cloneError: cloneQuery.error,
+    isCloneLoading: cloneQuery.isLoading,
+  };
 }
 
 /** Get recent commits for the given ref. */
 export function useGitLog(owner: string, repoName: string, ref: string) {
   const cloneQuery = useGitClone(owner, repoName, ref);
 
-  return useQuery({
+  const logQuery = useQuery({
     queryKey: ["git-log", owner, repoName, ref],
     queryFn: async () => {
       if (!cloneQuery.data) throw new Error("unreachable: enabled guards data");
@@ -73,13 +79,19 @@ export function useGitLog(owner: string, repoName: string, ref: string) {
     enabled: !!cloneQuery.data,
     staleTime: 5 * 60_000,
   });
+
+  return {
+    ...logQuery,
+    cloneError: cloneQuery.error,
+    isCloneLoading: cloneQuery.isLoading,
+  };
 }
 
 /** Find and read the README from the repo root. */
 export function useGitReadme(owner: string, repoName: string, ref: string) {
   const cloneQuery = useGitClone(owner, repoName, ref);
 
-  return useQuery({
+  const readmeQuery = useQuery({
     queryKey: ["git-readme", owner, repoName, ref],
     queryFn: async () => {
       if (!cloneQuery.data) throw new Error("unreachable: enabled guards data");
@@ -89,6 +101,12 @@ export function useGitReadme(owner: string, repoName: string, ref: string) {
     enabled: !!cloneQuery.data,
     staleTime: 5 * 60_000,
   });
+
+  return {
+    ...readmeQuery,
+    cloneError: cloneQuery.error,
+    isCloneLoading: cloneQuery.isLoading,
+  };
 }
 
 /** Read a single file's content as a classified `BlobView`. */
