@@ -588,6 +588,43 @@ test("get_channel_messages_before forwards the composite keyset and returns the 
   );
 });
 
+test("get_channel_messages_before preserves reconnect kinds and since on its web route", async () => {
+  const page = [event({ id: "3".repeat(64), kind: 40003, createdAt: 50 })];
+  const client = {
+    async fetchFirstEvent() {
+      return null;
+    },
+    async fetchEvents() {
+      return [];
+    },
+    async queryEvents(filters) {
+      assert.deepEqual(filters, [
+        {
+          "#h": ["channel-id"],
+          kinds: [5, 7, 40003],
+          since: 45,
+          until: 51,
+          limit: 500,
+        },
+      ]);
+      return page;
+    },
+  };
+  registerRelayQueryCommands(identity, client);
+
+  assert.deepEqual(
+    await dispatch("get_channel_messages_before", {
+      channelId: "channel-id",
+      since: 45,
+      before: 51,
+      beforeId: null,
+      kinds: [5, 7, 40003],
+      limit: 500,
+    }),
+    { events: page, next_cursor: null },
+  );
+});
+
 test("get_channel_window mirrors the relay bridge read-model filter", async () => {
   const response = [event({ id: "window", kind: 39006, createdAt: 60 })];
   const client = {

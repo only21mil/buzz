@@ -2,6 +2,7 @@ import { blossomAuthorization } from "./mediaAuth";
 import { serverAuthority } from "./mediaAuthProtocol";
 import { type InvokeBody, type InvokeOptions, register } from "./registry";
 import { emit } from "./shims/event";
+import type { BrowserWorkspace } from "./workspace";
 
 const MAX_BROWSER_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_BROWSER_FETCH_BYTES = 50 * 1024 * 1024;
@@ -94,6 +95,7 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 function uploadTemplate(
   sha256: string,
   mimeType: string,
+  mediaOrigin: string,
   nowSeconds = Math.floor(Date.now() / 1000),
 ) {
   const lifetime = mimeType.startsWith("video/")
@@ -107,7 +109,7 @@ function uploadTemplate(
       ["t", "upload"],
       ["x", sha256],
       ["expiration", String(nowSeconds + lifetime)],
-      ["server", serverAuthority(window.location.href)],
+      ["server", serverAuthority(mediaOrigin)],
     ],
   };
 }
@@ -119,11 +121,15 @@ async function responseError(response: Response): Promise<Error> {
   );
 }
 
-function sameOriginMediaUrl(value: string, sha256: string): boolean {
+function sameOriginMediaUrl(
+  value: string,
+  sha256: string,
+  mediaOrigin: string,
+): boolean {
   try {
     const url = new URL(value);
     return (
-      url.origin === window.location.origin &&
+      url.origin === mediaOrigin &&
       new RegExp(`^/media/${sha256}(?:\\.[^/]+)?$`).test(url.pathname)
     );
   } catch {
@@ -135,6 +141,7 @@ function parseDescriptor(
   value: unknown,
   expectedSha256: string,
   expectedSize: number,
+  mediaOrigin: string,
 ): BlobDescriptor {
   if (
     !isRecord(value) ||
@@ -144,7 +151,7 @@ function parseDescriptor(
     typeof value.type !== "string" ||
     typeof value.uploaded !== "number" ||
     !Number.isFinite(value.uploaded) ||
-    !sameOriginMediaUrl(value.url, expectedSha256)
+    !sameOriginMediaUrl(value.url, expectedSha256, mediaOrigin)
   ) {
     throw new Error("media upload returned a descriptor for different bytes");
   }
@@ -173,8 +180,9 @@ async function sendUpload(
   bytes: Uint8Array,
   headers: Headers,
   signal: AbortSignal,
+  mediaOrigin: string,
 ): Promise<Response> {
-  return fetch(new URL(path, window.location.origin), {
+  return fetch(new URL(path, mediaOrigin), {
     method: "PUT",
     body: Uint8Array.from(bytes),
     cache: "no-store",
@@ -188,6 +196,7 @@ async function sendUpload(
 export async function uploadBrowserMedia(
   body: InvokeBody,
   options?: InvokeOptions,
+  workspace?: BrowserWorkspace,
 ): Promise<BlobDescriptor> {
   const { bytes, filename, mimeType, progressId } = uploadInput(body, options);
   if (bytes.byteLength > MAX_BROWSER_UPLOAD_BYTES) {
@@ -195,9 +204,12 @@ export async function uploadBrowserMedia(
   }
 
   await emitUploadPhase(progressId, "preparing");
+  const mediaOrigin = workspace
+    ? new URL(workspace.httpUrl()).origin
+    : window.location.origin;
   const sha256 = await sha256Hex(bytes);
   const authorization = await blossomAuthorization(
-    uploadTemplate(sha256, mimeType),
+    uploadTemplate(sha256, mimeType, mediaOrigin),
   );
   const headers = new Headers({
     Authorization: authorization,
@@ -215,6 +227,7 @@ export async function uploadBrowserMedia(
       bytes,
       headers,
       controller.signal,
+      mediaOrigin,
     );
     if (response.status === 404 || response.status === 405) {
       response = await sendUpload(
@@ -222,6 +235,7 @@ export async function uploadBrowserMedia(
         bytes,
         headers,
         controller.signal,
+        mediaOrigin,
       );
     }
     if (!response.ok) throw await responseError(response);
@@ -229,6 +243,7 @@ export async function uploadBrowserMedia(
       await response.json(),
       sha256,
       bytes.byteLength,
+      mediaOrigin,
     );
     await emitUploadProgress(progressId, bytes.byteLength, bytes.byteLength);
     await emitUploadPhase(progressId, "finishing");
@@ -295,6 +310,7 @@ async function uploadFile(
   file: File,
   progressId?: string,
   requireImage = false,
+  workspace?: BrowserWorkspace,
 ): Promise<BlobDescriptor> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const detectedImageMime = sniffImageMime(bytes);
@@ -315,7 +331,7 @@ async function uploadFile(
       "x-buzz-progress-id": encodeRawHeader(progressId),
     };
   }
-  return uploadBrowserMedia(bytes, options);
+  return uploadBrowserMedia(bytes, options, workspace);
 }
 
 function encodeRawHeader(value: string): string {
@@ -328,15 +344,18 @@ function encodeRawHeader(value: string): string {
     .replace(/=+$/, "");
 }
 
-async function fetchMediaBytes(body: InvokeBody): Promise<ArrayBuffer> {
+async function fetchMediaBytes(
+  body: InvokeBody,
+  workspace?: BrowserWorkspace,
+): Promise<ArrayBuffer> {
   if (!isRecord(body) || typeof body.url !== "string") {
     throw new TypeError("fetch_media_bytes requires a URL");
   }
   const url = new URL(body.url);
-  if (
-    url.origin !== window.location.origin ||
-    !url.pathname.startsWith("/media/")
-  ) {
+  const mediaOrigin = workspace
+    ? new URL(workspace.httpUrl()).origin
+    : window.location.origin;
+  if (url.origin !== mediaOrigin || !url.pathname.startsWith("/media/")) {
     throw new Error("fetch_media_bytes only accepts same-origin media URLs");
   }
   const response = await fetch(url, {
@@ -380,9 +399,13 @@ async function fetchMediaBytes(body: InvokeBody): Promise<ArrayBuffer> {
   return bytes.buffer;
 }
 
-export function registerMediaCommands(): void {
-  register("upload_media_bytes_raw", uploadBrowserMedia);
-  register("upload_media_bytes", uploadBrowserMedia);
+export function registerMediaCommands(workspace: BrowserWorkspace): void {
+  register("upload_media_bytes_raw", (body, options) =>
+    uploadBrowserMedia(body, options, workspace),
+  );
+  register("upload_media_bytes", (body, options) =>
+    uploadBrowserMedia(body, options, workspace),
+  );
   register("cancel_media_upload", (body) => {
     if (!isRecord(body) || typeof body.progressId !== "string") return;
     activeUploads.get(body.progressId)?.abort();
@@ -395,13 +418,13 @@ export function registerMediaCommands(): void {
         : undefined;
     const descriptors: BlobDescriptor[] = [];
     for (const file of files) {
-      descriptors.push(await uploadFile(file, progressId));
+      descriptors.push(await uploadFile(file, progressId, false, workspace));
     }
     return descriptors;
   });
   register("pick_and_upload_image", async () => {
     const [file] = await selectFiles("image/*");
-    return file ? uploadFile(file, undefined, true) : null;
+    return file ? uploadFile(file, undefined, true, workspace) : null;
   });
-  register("fetch_media_bytes", fetchMediaBytes);
+  register("fetch_media_bytes", (body) => fetchMediaBytes(body, workspace));
 }

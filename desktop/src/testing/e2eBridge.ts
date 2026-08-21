@@ -4784,9 +4784,10 @@ type RawChannelMessagesPageResponse = {
 
 /**
  * Mirror of the desktop `get_channel_messages_before` command: return one
- * keyset page of *top-level* channel history strictly older than a composite
- * `(before, before_id)` cursor, newest first (relay order `created_at DESC,
- * id ASC`).
+ * keyset page of channel history strictly older than a composite `(before,
+ * before_id)` cursor, newest first (relay order `created_at DESC, id ASC`).
+ * Callers that omit `kinds` retain the original top-level timeline behavior;
+ * reconnect callers pass the exact kinds from their live subscription.
  *
  * This is the dense-second escape hatch — the id tiebreak is load-bearing so a
  * single `created_at` second denser than one WS page can still be paged
@@ -4799,6 +4800,8 @@ async function handleGetChannelMessagesBefore(
     channelId: string;
     before: number;
     beforeId?: string | null;
+    since?: number | null;
+    kinds?: number[] | null;
     limit?: number | null;
   },
   config: E2eConfig | undefined,
@@ -4806,23 +4809,27 @@ async function handleGetChannelMessagesBefore(
   const cap = Math.min(args.limit ?? 200, 500);
   const identity = getIdentity(config);
 
+  const kinds = new Set(args.kinds ?? TIMELINE_KINDS);
   let events: RelayEvent[];
   if (!identity) {
     // Mock store: top-level timeline events for this channel.
     events = getMockMessageStore(args.channelId).filter((event) => {
-      if (!TIMELINE_KINDS.has(event.kind)) {
+      if (!kinds.has(event.kind)) {
         return false;
       }
-      return isMockTopLevelRow(event);
+      return args.kinds ? true : isMockTopLevelRow(event);
     });
   } else {
     // Config mode: exercise the real bridge keyset over /query.
     const filter: Record<string, unknown> = {
       "#h": [args.channelId],
-      kinds: [...TIMELINE_KINDS],
+      kinds: [...kinds],
       until: args.before,
       limit: cap,
     };
+    if (args.since !== undefined && args.since !== null) {
+      filter.since = args.since;
+    }
     if (args.beforeId) {
       filter.before_id = args.beforeId;
     }
@@ -4848,11 +4855,18 @@ async function handleGetChannelMessagesBefore(
   const before = args.before;
   const beforeId = args.beforeId ?? null;
   const older = events.filter((event) => {
+    if (
+      args.since !== undefined &&
+      args.since !== null &&
+      event.created_at < args.since
+    ) {
+      return false;
+    }
     if (event.created_at < before) {
       return true;
     }
-    if (event.created_at === before && beforeId !== null) {
-      return event.id.localeCompare(beforeId) > 0;
+    if (event.created_at === before) {
+      return beforeId === null || event.id.localeCompare(beforeId) > 0;
     }
     return false;
   });

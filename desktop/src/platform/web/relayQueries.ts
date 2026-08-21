@@ -97,6 +97,22 @@ function optionalStrings(body: ObjectBody, field: string): string[] {
   return value as string[];
 }
 
+function optionalKinds(body: ObjectBody, field: string): number[] | undefined {
+  const value = body[field];
+  if (value === undefined || value === null) return undefined;
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.some(
+      (kind) =>
+        !Number.isInteger(kind) || (kind as number) < 0 || kind > 65_535,
+    )
+  ) {
+    throw new TypeError(`${field} must be non-empty valid Nostr kinds`);
+  }
+  return value as number[];
+}
+
 function optionalNullableNumber(
   body: ObjectBody,
   field: string,
@@ -651,15 +667,18 @@ async function getChannelMessagesBefore(
   const before = optionalNumber(input, "before");
   if (before === undefined) throw new TypeError("before must be an integer");
   const beforeId = optionalString(input, "beforeId");
+  const since = optionalNumber(input, "since");
+  const kinds = optionalKinds(input, "kinds") ?? [...TIMELINE_KINDS];
   const requestedLimit = optionalNumber(input, "limit") ?? 200;
   if (requestedLimit < 0) throw new TypeError("limit must be non-negative");
   const cap = Math.min(requestedLimit, 500);
   const filter: Record<string, unknown> = {
     "#h": [channelId],
-    kinds: [...TIMELINE_KINDS],
+    kinds,
     until: before,
     limit: cap,
   };
+  if (since !== undefined) filter.since = since;
   if (beforeId) filter.before_id = beforeId;
   const events = await queryBridge(client, [filter]);
   const oldest = events.at(-1);

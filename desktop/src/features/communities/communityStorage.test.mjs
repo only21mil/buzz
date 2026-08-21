@@ -105,6 +105,55 @@ test("loading an existing community clears stale final-leave discovery", () => {
   assert.equal(loadCommunityDiscoveryAfterLeave(storage), false);
 });
 
+test("legacy community secrets are stripped and rewritten on load", () => {
+  const storage = createMemoryStorage({
+    "buzz-communities": JSON.stringify([
+      {
+        id: "joined",
+        name: "Joined",
+        relayUrl: "wss://relay.example",
+        token: "plaintext-api-token",
+        nsec: "plaintext-private-key",
+      },
+    ]),
+  });
+  globalThis.localStorage = storage;
+  globalThis.window = { localStorage: storage };
+
+  assert.deepEqual(loadCommunities(), [
+    {
+      id: "joined",
+      name: "Joined",
+      relayUrl: "wss://relay.example",
+    },
+  ]);
+  const rewritten = storage.getItem("buzz-communities");
+  assert.equal(rewritten.includes("plaintext-api-token"), false);
+  assert.equal(rewritten.includes("plaintext-private-key"), false);
+});
+
+test("saving communities refuses legacy secret fields", () => {
+  const storage = createMemoryStorage();
+  globalThis.localStorage = storage;
+  globalThis.window = { localStorage: storage };
+
+  assert.equal(
+    saveCommunities([
+      {
+        id: "joined",
+        name: "Joined",
+        relayUrl: "wss://relay.example",
+        token: "plaintext-api-token",
+        nsec: "plaintext-private-key",
+      },
+    ]),
+    true,
+  );
+  const saved = storage.getItem("buzz-communities");
+  assert.equal(saved.includes("plaintext-api-token"), false);
+  assert.equal(saved.includes("plaintext-private-key"), false);
+});
+
 test("completed final leave persists discovery until a community is saved", () => {
   const storage = createMemoryStorage();
   globalThis.localStorage = storage;

@@ -33,6 +33,7 @@ import {
 } from "@/features/messages/lib/headWindowTransaction";
 import { reconcileChannelWindowMessages } from "@/features/messages/lib/channelWindowReconciliation";
 import { appendChannelSubscriptionEvent } from "@/features/messages/lib/channelSubscriptionEvent";
+import { removeChannelWindowMessage } from "@/features/messages/lib/messageMutationProjection";
 import {
   mergeMessages,
   mergeTimelineCacheMessages,
@@ -82,10 +83,7 @@ import { KIND_STREAM_MESSAGE } from "@/shared/constants/kinds";
 
 type MessageQueryContext = {
   optimisticId: string;
-  previousMessages: RelayEvent[];
-  previousWindow: ChannelWindowStore | undefined;
   channelId: string;
-  queryKey: ReturnType<typeof channelMessagesKey>;
 };
 
 export type { ChannelSubscriptionGeneration };
@@ -774,23 +772,23 @@ export function useSendMessageMutation(
       const queryKey = channelMessagesKey(effectiveChannel.id);
       await queryClient.cancelQueries({ queryKey });
 
-      const previousMessages =
+      const currentMessages =
         queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [];
       const windowKey = channelWindowKey(effectiveChannel.id);
-      const previousWindow =
+      const currentWindow =
         queryClient.getQueryData<ChannelWindowStore>(windowKey);
       const optimisticMessage = createOptimisticMessage(
         effectiveChannel.id,
         content.trim(),
         identity,
-        previousMessages,
+        currentMessages,
         mentionPubkeys ?? [],
         parentEventId ?? null,
         mediaTags ?? [],
       );
 
       const nextWindow = mergeLiveChannelWindowEvent(
-        previousWindow ?? emptyChannelWindowStore(),
+        currentWindow ?? emptyChannelWindowStore(),
         optimisticMessage,
       );
       queryClient.setQueryData(windowKey, nextWindow);
@@ -798,10 +796,7 @@ export function useSendMessageMutation(
 
       return {
         optimisticId: optimisticMessage.id,
-        previousMessages,
-        previousWindow,
         channelId: effectiveChannel.id,
-        queryKey,
       };
     },
     onError: (error, _variables, context) => {
@@ -813,10 +808,10 @@ export function useSendMessageMutation(
         return;
       }
 
-      queryClient.setQueryData(context.queryKey, context.previousMessages);
-      queryClient.setQueryData(
-        channelWindowKey(context.channelId),
-        context.previousWindow,
+      removeChannelWindowMessage(
+        queryClient,
+        context.channelId,
+        context.optimisticId,
       );
     },
     onSuccess: (message, _variables, context) => {
@@ -888,10 +883,7 @@ export function useDeleteMessageMutation(channel: Channel | null) {
     },
     onSuccess: (_data, { eventId }) => {
       if (!channel) return;
-      queryClient.setQueryData<RelayEvent[]>(
-        channelMessagesKey(channel.id),
-        (current = []) => current.filter((message) => message.id !== eventId),
-      );
+      removeChannelWindowMessage(queryClient, channel.id, eventId);
     },
     onError: (error) => {
       toast.error(`Failed to delete message: ${error.message}`);

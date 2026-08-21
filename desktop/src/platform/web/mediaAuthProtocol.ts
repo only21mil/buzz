@@ -31,10 +31,13 @@ function base64UrlEncode(value: string): string {
     .replace(/=+$/, "");
 }
 
-export function mediaHashFromUrl(value: string): string | null {
+export function mediaHashFromUrl(
+  value: string,
+  expectedOrigin = window.location.origin,
+): string | null {
   try {
     const url = new URL(value);
-    if (url.origin !== window.location.origin) return null;
+    if (url.origin !== expectedOrigin) return null;
     return MEDIA_PATH_RE.exec(url.pathname)?.[1] ?? null;
   } catch {
     return null;
@@ -48,8 +51,9 @@ export function serverAuthority(value: string): string {
 export function buildMediaGetAuthTemplate(
   value: string,
   nowSeconds = Math.floor(Date.now() / 1000),
+  expectedOrigin = window.location.origin,
 ): Required<SignEventTemplate> {
-  const sha256 = mediaHashFromUrl(value);
+  const sha256 = mediaHashFromUrl(value, expectedOrigin);
   if (!sha256) throw new Error("media auth requires a same-origin media URL");
   return {
     kind: BLOSSOM_AUTH_KIND,

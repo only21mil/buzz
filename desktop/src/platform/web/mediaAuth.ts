@@ -5,6 +5,7 @@ import {
   type SignEventTemplate,
 } from "./mediaAuthProtocol";
 import { dispatch } from "./registry";
+import type { BrowserWorkspace } from "./workspace";
 
 const MEDIA_AUTH_REQUEST = "buzz:media-auth-request";
 const MEDIA_AUTH_RESPONSE = "buzz:media-auth-response";
@@ -36,21 +37,36 @@ export async function blossomAuthorization(
   );
 }
 
-export function mediaAuthorization(value: string): Promise<string> {
-  const sha256 = mediaHashFromUrl(value);
+function mediaOrigin(workspace?: BrowserWorkspace): string {
+  return workspace
+    ? new URL(workspace.httpUrl()).origin
+    : window.location.origin;
+}
+
+export function mediaAuthorization(
+  value: string,
+  workspace?: BrowserWorkspace,
+): Promise<string> {
+  const expectedOrigin = mediaOrigin(workspace);
+  const sha256 = mediaHashFromUrl(value, expectedOrigin);
   if (!sha256) {
     return Promise.reject(
       new Error("media auth requires a same-origin media URL"),
     );
   }
 
-  const active = pendingHeaders.get(sha256);
+  const cacheKey = `${expectedOrigin}:${sha256}`;
+  const active = pendingHeaders.get(cacheKey);
   if (active) return active;
 
-  const request = blossomAuthorization(buildMediaGetAuthTemplate(value));
-  pendingHeaders.set(sha256, request);
+  const request = blossomAuthorization(
+    buildMediaGetAuthTemplate(value, undefined, expectedOrigin),
+  );
+  pendingHeaders.set(cacheKey, request);
   void request.finally(() => {
-    if (pendingHeaders.get(sha256) === request) pendingHeaders.delete(sha256);
+    if (pendingHeaders.get(cacheKey) === request) {
+      pendingHeaders.delete(cacheKey);
+    }
   });
   return request;
 }
@@ -64,7 +80,10 @@ function isMediaAuthRequest(value: unknown): value is MediaAuthRequest {
   );
 }
 
-async function handleMediaAuthMessage(event: MessageEvent): Promise<void> {
+async function handleMediaAuthMessage(
+  event: MessageEvent,
+  workspace: BrowserWorkspace,
+): Promise<void> {
   if (!isMediaAuthRequest(event.data)) return;
   const port = event.ports[0];
   if (!port) return;
@@ -74,7 +93,10 @@ async function handleMediaAuthMessage(event: MessageEvent): Promise<void> {
     requestId: event.data.requestId,
   };
   try {
-    response.authorization = await mediaAuthorization(event.data.url);
+    response.authorization = await mediaAuthorization(
+      event.data.url,
+      workspace,
+    );
   } catch {
     // Refused/unavailable signing fails closed in the worker. Never return the
     // signer error because provider messages can contain identity details.
@@ -82,10 +104,10 @@ async function handleMediaAuthMessage(event: MessageEvent): Promise<void> {
   port.postMessage(response);
 }
 
-function installMessageHandler(): void {
+function installMessageHandler(workspace: BrowserWorkspace): void {
   if (messageHandlerInstalled) return;
   navigator.serviceWorker.addEventListener("message", (event) => {
-    void handleMediaAuthMessage(event);
+    void handleMediaAuthMessage(event, workspace);
   });
   messageHandlerInstalled = true;
 }
@@ -105,9 +127,11 @@ async function waitForController(timeoutMs: number): Promise<void> {
   });
 }
 
-export async function installMediaAuthServiceWorker(): Promise<void> {
+export async function installMediaAuthServiceWorker(
+  workspace: BrowserWorkspace,
+): Promise<void> {
   if (!("serviceWorker" in navigator)) return;
-  installMessageHandler();
+  installMessageHandler(workspace);
 
   const configuredBase = import.meta.env?.BASE_URL ?? "/app/";
   const base = new URL(configuredBase, window.location.origin);

@@ -3,7 +3,7 @@ import type {
   RelaySubscription,
   RelaySubscriptionFilter,
 } from "@/shared/api/relayClientShared";
-import type { RelayEvent } from "@/shared/api/types";
+import type { ChannelMessagesPageResponse } from "@/shared/api/types";
 import {
   isRateLimited,
   waitForRateLimit,
@@ -44,6 +44,15 @@ export const REPLAY_BATCH_SIZE = 8;
  * can absorb each batch without triggering rate-limiting on the next.
  */
 export const REPLAY_INTER_BATCH_DELAY_MS = 50;
+
+export type ReconnectHistoryPageRequest = {
+  channelId: string;
+  since: number;
+  until: number;
+  beforeId: string | null;
+  kinds: readonly number[];
+  limit: number;
+};
 
 async function runWithConcurrency<T>(
   items: T[],
@@ -109,38 +118,55 @@ export async function replayReconnectHistoryPages({
   since,
   until,
   isActive,
-  requestHistory,
+  requestHistoryPage,
 }: {
   subscription: Extract<RelaySubscription, { mode: "live" }>;
   since: number;
   until: number;
   isActive: () => boolean;
-  requestHistory: (filter: RelaySubscriptionFilter) => Promise<RelayEvent[]>;
+  requestHistoryPage: (
+    request: ReconnectHistoryPageRequest,
+  ) => Promise<ChannelMessagesPageResponse>;
 }): Promise<boolean> {
+  const channelId = subscription.filter["#h"]?.[0];
+  if (!channelId) {
+    throw new Error("paged reconnect replay requires one channel id");
+  }
   let pageUntil = until;
+  let beforeId: string | null = null;
 
   while (pageUntil >= since) {
     if (!isActive()) return false;
 
-    const events = await requestHistory(
-      buildReconnectReplayFilter(
-        subscription.filter,
-        since,
-        pageUntil,
-        RECONNECT_REPLAY_PAGE_LIMIT,
-      ),
-    );
+    const page = await requestHistoryPage({
+      channelId,
+      since,
+      until: pageUntil,
+      beforeId,
+      kinds: subscription.filter.kinds,
+      limit: RECONNECT_REPLAY_PAGE_LIMIT,
+    });
 
     if (!isActive()) return false;
 
-    for (const event of events) subscription.onEvent(event);
-    if (events.length < RECONNECT_REPLAY_PAGE_LIMIT) return true;
+    for (const event of page.events) subscription.onEvent(event);
+    if (page.events.length < RECONNECT_REPLAY_PAGE_LIMIT) return true;
 
-    const oldestCreatedAt = events[0]?.created_at;
-    if (oldestCreatedAt === undefined || oldestCreatedAt <= since) return true;
+    const nextCursor = page.nextCursor;
+    if (!nextCursor) {
+      throw new Error("full reconnect replay page did not return a cursor");
+    }
+    if (
+      nextCursor.createdAt > pageUntil ||
+      (nextCursor.createdAt === pageUntil &&
+        beforeId !== null &&
+        nextCursor.eventId <= beforeId)
+    ) {
+      throw new Error("reconnect replay cursor did not advance");
+    }
 
-    pageUntil =
-      oldestCreatedAt < pageUntil ? oldestCreatedAt : oldestCreatedAt - 1;
+    pageUntil = nextCursor.createdAt;
+    beforeId = nextCursor.eventId;
   }
   return true;
 }
@@ -148,7 +174,7 @@ export async function replayReconnectHistoryPages({
 export async function replayLiveSubscriptions({
   subscriptions,
   sendRaw,
-  requestHistory,
+  requestHistoryPage,
   now = Math.floor(Date.now() / 1_000),
   pageReplayConcurrency = RECONNECT_REPLAY_PAGE_CONCURRENCY,
   visibleChannelId = null,
@@ -160,7 +186,9 @@ export async function replayLiveSubscriptions({
 }: {
   subscriptions: Map<string, RelaySubscription>;
   sendRaw: (payload: unknown[]) => Promise<void>;
-  requestHistory: (filter: RelaySubscriptionFilter) => Promise<RelayEvent[]>;
+  requestHistoryPage: (
+    request: ReconnectHistoryPageRequest,
+  ) => Promise<ChannelMessagesPageResponse>;
   now?: number;
   pageReplayConcurrency?: number;
   /** Channel currently visible in the UI — its subscriptions go in the first batch. */
@@ -298,7 +326,7 @@ export async function replayLiveSubscriptions({
             // floor the superseding connection needs.
             isActive: () =>
               isActive() && subscriptions.get(subId) === subscription,
-            requestHistory,
+            requestHistoryPage,
           });
           // A stale-connection abort is NOT completion: the superseding
           // connection shares this subscription object and still needs the
