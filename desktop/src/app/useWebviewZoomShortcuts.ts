@@ -2,6 +2,11 @@ import * as React from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 import { hasPrimaryShortcutModifier } from "@/shared/lib/platform";
+import {
+  getStorageItem,
+  removeStorageItem,
+  setStorageItem,
+} from "@/shared/lib/safeStorage";
 
 const DEFAULT_ZOOM_FACTOR = 1;
 const MIN_ZOOM_FACTOR = 0.75;
@@ -62,7 +67,7 @@ function getNextZoomFactor(action: ZoomAction, zoomFactor: number) {
 }
 
 function readStoredZoomFactor() {
-  const raw = window.localStorage.getItem(TEXT_SCALE_STORAGE_KEY);
+  const raw = getStorageItem(TEXT_SCALE_STORAGE_KEY);
   if (!raw) {
     return DEFAULT_ZOOM_FACTOR;
   }
@@ -78,12 +83,12 @@ function readStoredZoomFactor() {
 function applyTextScale(zoomFactor: number) {
   if (zoomFactor === DEFAULT_ZOOM_FACTOR) {
     document.documentElement.style.fontSize = "";
-    window.localStorage.removeItem(TEXT_SCALE_STORAGE_KEY);
+    removeStorageItem(TEXT_SCALE_STORAGE_KEY);
     return;
   }
 
   document.documentElement.style.fontSize = `${BASE_FONT_SIZE_PX * zoomFactor}px`;
-  window.localStorage.setItem(TEXT_SCALE_STORAGE_KEY, String(zoomFactor));
+  setStorageItem(TEXT_SCALE_STORAGE_KEY, String(zoomFactor));
 }
 
 export function useWebviewZoomShortcuts() {

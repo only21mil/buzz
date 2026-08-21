@@ -14,6 +14,7 @@ import { clearTrayAgentActivity } from "@/shared/api/trayMenu";
 import { getOverrides } from "@/shared/features";
 import { resetMediaCaches } from "@/shared/lib/mediaUrl";
 import { resetLinkPreviewMetadataCache } from "@/shared/lib/useResolvedLinkPreviews";
+import { clearTimeoutState } from "@/features/moderation/lib/timeoutStore";
 import { clearSearchHitEventCache } from "@/app/navigation/searchHitEventCache";
 import {
   clearAllDrafts,
@@ -39,6 +40,7 @@ import {
   shouldAutoConnectDefaultRelay,
 } from "./communityStorage";
 import type { Community } from "./types";
+import { communityApplyQueue } from "./communityApplyQueue";
 
 /**
  * Tear down all community-scoped module singletons so the new
@@ -54,6 +56,7 @@ function resetCommunityState({
 }): void {
   relayClient.disconnect();
   resetRateLimitGate();
+  clearTimeoutState();
   clearAllDrafts();
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
@@ -225,13 +228,18 @@ export function useCommunityInit(
       // imported key. `loadCommunities()` strips lingering `nsec` fields from
       // legacy entries; this site refuses to apply one even if present.
       try {
-        await applyCommunity(
-          activeCommunity.relayUrl,
-          undefined,
-          activeCommunity.token,
-          activeCommunity.reposDir,
-          getOverrides().agentManagedProfiles === true,
-        );
+        await communityApplyQueue.run(async () => {
+          // Effect cleanup cannot cancel a native apply already in flight, but
+          // it can prevent a queued stale community from crossing IPC.
+          if (cancelled) return;
+          await applyCommunity(
+            activeCommunity.relayUrl,
+            undefined,
+            activeCommunity.token,
+            activeCommunity.reposDir,
+            getOverrides().agentManagedProfiles === true,
+          );
+        });
       } catch (error) {
         // A bad `repos_dir` no longer reaches here — `apply_workspace` treats
         // it as non-fatal (relay/keys apply, bad value not persisted, REPOS
