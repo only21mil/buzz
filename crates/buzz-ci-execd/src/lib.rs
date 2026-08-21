@@ -17,9 +17,9 @@ pub mod dns_isolation;
 pub mod evidence;
 #[cfg(unix)]
 pub mod harness;
+pub mod qualification_host;
 #[cfg(unix)]
 pub mod runtime;
-pub mod qualification_host;
 
 use buzz_ci_broker_protocol::{
     BrokerResponse, BrokerState, Conclusion, FrameHeader, Request, ResponseCode,
