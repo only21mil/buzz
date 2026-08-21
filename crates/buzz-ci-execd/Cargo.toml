@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 buzz-ci-broker-protocol = { workspace = true }
 buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }
+buzz-ci-policy-proxy = { path = "../buzz-ci-policy-proxy" }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

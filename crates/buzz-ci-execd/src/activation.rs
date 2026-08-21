@@ -170,6 +170,18 @@ pub struct LeaseToken {
     nonce: [u8; 32],
 }
 
+impl LeaseToken {
+    /// Return the lease identity allocated by the activation controller.
+    pub const fn lease_id(self) -> [u8; 16] {
+        self.lease_id
+    }
+
+    /// Return the controller-owned generation for this lease.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 /// Terminal job outcome. No outcome can be recorded without a lease token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeaseConclusion {
@@ -1892,6 +1904,22 @@ mod tests {
         );
         assert_eq!(controller.state(), ActivationState::Quarantined);
         assert_eq!(controller.ordinary_capacity(10), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn oci_receipt_name_comes_from_the_opaque_lease_token() {
+        let token = LeaseToken {
+            lease_id: [0xab; 16],
+            generation: 42,
+            nonce: [0xcd; 32],
+        };
+        assert_eq!(token.lease_id(), [0xab; 16]);
+        assert_eq!(token.generation(), 42);
+        assert_eq!(
+            crate::seccomp_exec::oci_receipt_filename(token),
+            "abababababababababababababababab-g42.json"
+        );
     }
 
     fn controller_at_reconciliation() -> ActivationController {

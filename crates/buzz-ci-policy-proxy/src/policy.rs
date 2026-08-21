@@ -111,6 +111,14 @@ pub struct VerifiedStart {
     create_fingerprint: String,
 }
 
+impl VerifiedStart {
+    /// Return whether this opaque pre-start proof belongs to the supplied
+    /// canonical create capability.
+    pub fn matches_create(&self, create: &CanonicalCreate) -> bool {
+        self.create_fingerprint == create.fingerprint
+    }
+}
+
 /// Admission result. Denied requests return [`ProxyError`] and therefore never
 /// reach the upstream runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1347,6 +1355,35 @@ mod tests {
                 Err(ProxyError::PolicyRefused(_))
             ));
         }
+    }
+
+    #[test]
+    fn verified_start_is_bound_to_its_canonical_create() {
+        let mut first = ProxyPolicy::install_for_test(manifest()).unwrap();
+        let Admission::Create(first_create) = first
+            .admit(DockerMethod::Post, "/containers/create", &create_body())
+            .unwrap()
+        else {
+            panic!("expected create");
+        };
+        first
+            .record_created("container-1".into(), &first_create)
+            .unwrap();
+        let proof = first
+            .verify_pre_start("container-1", &first.expected_effective_spec())
+            .unwrap();
+        assert!(proof.matches_create(&first_create));
+
+        let mut changed = manifest();
+        changed.job_id = "different-job".into();
+        let mut second = ProxyPolicy::install_for_test(changed).unwrap();
+        let Admission::Create(other_create) = second
+            .admit(DockerMethod::Post, "/containers/create", &create_body())
+            .unwrap()
+        else {
+            panic!("expected create");
+        };
+        assert!(!proof.matches_create(&other_create));
     }
 
     #[test]

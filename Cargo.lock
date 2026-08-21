@@ -959,6 +959,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-ci-broker-protocol",
  "buzz-ci-isolation-contract",
+ "buzz-ci-policy-proxy",
  "hex",
  "nix 0.31.3",
  "serde",
