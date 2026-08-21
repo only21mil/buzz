@@ -574,7 +574,6 @@ impl BuzzClient {
     }
 
     /// Get the relay base URL.
-    #[allow(dead_code)]
     pub fn relay_url(&self) -> &str {
         &self.relay_url
     }
@@ -869,7 +868,6 @@ impl BuzzClient {
     ///
     /// The request body is serialized once before the retry loop. Every retry
     /// therefore sends identical bytes while receiving a fresh NIP-98 nonce.
-    #[allow(dead_code)]
     pub async fn post_authed_json<Request, Response>(
         &self,
         path: &str,
