@@ -101,7 +101,7 @@ pub struct ExactCommand {
 }
 
 impl ExactCommand {
-    fn new(binary: AllowedBinary, argv: Vec<OsString>, timeout: Duration) -> Self {
+    pub(crate) fn new(binary: AllowedBinary, argv: Vec<OsString>, timeout: Duration) -> Self {
         Self {
             binary,
             argv,
