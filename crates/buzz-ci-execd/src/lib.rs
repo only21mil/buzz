@@ -17,6 +17,8 @@ pub mod dns_isolation;
 pub mod evidence;
 #[cfg(unix)]
 pub mod harness;
+#[cfg(target_os = "linux")]
+pub mod qualification_exec;
 pub mod qualification_host;
 #[cfg(unix)]
 pub mod runtime;

@@ -32,6 +32,7 @@ use crate::{
         ActivationDispatch, AdmissionBoundaryError, OrdinaryAdmissionBoundary,
         QualificationAdmissionBoundary,
     },
+    qualification_host::{QualificationHostExecution, QualificationHostPlan},
 };
 
 /// Canonical immutable authority directory.
@@ -193,6 +194,12 @@ pub trait QualificationLeaseResponse {
         lease: QualificationLease,
         now: u64,
     ) -> BrokerResponse;
+
+    /// Execute the sole privileged teardown-failure plan.
+    fn execute_teardown_failure(
+        &mut self,
+        plan: QualificationHostPlan,
+    ) -> QualificationHostExecution;
 }
 
 /// Authority-enforcing ordinary boundary created only by [`LoadedRuntime::compose`].
@@ -246,6 +253,13 @@ impl<R: QualificationLeaseResponse> QualificationAdmissionBoundary for Authority
         now: u64,
     ) -> BrokerResponse {
         self.response.admitted_response(header, request, lease, now)
+    }
+
+    fn execute_teardown_failure(
+        &mut self,
+        plan: QualificationHostPlan,
+    ) -> QualificationHostExecution {
+        self.response.execute_teardown_failure(plan)
     }
 }
 

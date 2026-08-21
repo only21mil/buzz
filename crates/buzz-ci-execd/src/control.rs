@@ -131,13 +131,11 @@ pub trait QualificationAdmissionBoundary {
     ) -> BrokerResponse;
 
     /// Execute only the closed teardown-failure plan inside root execd.
-    /// Missing support fails closed and never falls back to `admitted_response`.
+    /// Every production boundary must provide this path explicitly.
     fn execute_teardown_failure(
         &mut self,
-        _plan: QualificationHostPlan,
-    ) -> QualificationHostExecution {
-        QualificationHostExecution::Missing
-    }
+        plan: QualificationHostPlan,
+    ) -> QualificationHostExecution;
 }
 
 /// Dispatches one already authenticated and decoded control request.
@@ -643,6 +641,13 @@ mod tests {
             accepted.accepted_request_digest = request.request_digest;
             accepted.job_manifest_digest = request.manifest_digest;
             accepted
+        }
+
+        fn execute_teardown_failure(
+            &mut self,
+            _plan: QualificationHostPlan,
+        ) -> QualificationHostExecution {
+            QualificationHostExecution::Missing
         }
     }
 
