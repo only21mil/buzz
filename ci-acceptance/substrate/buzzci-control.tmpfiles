@@ -1,5 +1,13 @@
 d /run/buzzci 0711 root root -
+d /run/netns 0755 root root -
 d /var/lib/buzzci 0700 root root -
+d /var/lib/buzzci/activation 0700 root root -
+d /var/lib/buzzci/activation/receipts 0700 root root -
+d /var/lib/buzzci/activation/receipts/cleanup 0700 root root -
+d /var/lib/buzzci/activation/receipts/dns 0700 root root -
 d /var/lib/buzzci/leases 0700 root root -
 d /var/lib/buzzci/principals 0711 root root -
 d /var/lib/buzzci/principals/ctl 0700 buzzci-ctl buzzci-ctl -
+d /var/lib/buzzci/seccomp 0700 root root -
+d /var/lib/buzzci/seccomp/v1 0700 root root -
+d /var/lib/buzzci/seccomp/v1/sha256 0700 root root -

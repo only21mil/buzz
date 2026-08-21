@@ -1,0 +1,22 @@
+{
+  "schema": "buzz-ci-host-adapters-v1",
+  "default_capacity": 0,
+  "authority_file": "/etc/buzzci/authority/authority-v1.json",
+  "activation_state_file": "/var/lib/buzzci/activation/state-v1.json",
+  "adapter_receipt_root": "/var/lib/buzzci/activation/receipts",
+  "lease_state_root": "/var/lib/buzzci/leases",
+  "qualification_case_root": "/etc/buzzci/qualification-cases",
+  "network_namespace_root": "/run/netns",
+  "systemd_resolve_runtime": "/run/systemd/resolve",
+  "seccomp_source": "/usr/share/containers/seccomp.json",
+  "seccomp_profile": "/var/lib/buzzci/seccomp/v1/sha256/2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4.json",
+  "seccomp_sha256": "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4",
+  "composition_order": [
+    "authority",
+    "durable_state",
+    "cleanup_reconcile",
+    "seccomp_readback",
+    "dns_readback",
+    "activation_dispatch"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "revision": 1,
+  "root_authority": "@LOWERCASE_64_HEX_PUBLIC_KEY@",
+  "qualification": null,
+  "ordinary": null
+}
