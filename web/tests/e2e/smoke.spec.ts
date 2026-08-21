@@ -93,6 +93,186 @@ test("repository clone failure shows an access-safe error state", async ({
   );
 });
 
+test("repository issues and pull requests render relay items", async ({
+  page,
+}) => {
+  const owner = "ab".repeat(32);
+  const issueAuthor = "cd".repeat(32);
+  const pullRequestAuthor = "de".repeat(32);
+  const repoAddress = `30617:${owner}:browser-repo`;
+  const issueId = "11".repeat(32);
+  const pullRequestId = "22".repeat(32);
+  const now = Math.floor(Date.now() / 1000);
+
+  const events = [
+    {
+      id: "01".repeat(32),
+      kind: 30617,
+      pubkey: owner,
+      created_at: now - 600,
+      content: "Repository used by the browser work-item test.",
+      tags: [
+        ["d", "browser-repo"],
+        ["name", "browser-repo"],
+      ],
+      sig: "00".repeat(64),
+    },
+    {
+      id: "02".repeat(32),
+      kind: 30618,
+      pubkey: owner,
+      created_at: now - 500,
+      content: "",
+      tags: [
+        ["d", "browser-repo"],
+        ["HEAD", "ref: refs/heads/main"],
+        ["refs/heads/main", "aa".repeat(20)],
+      ],
+      sig: "00".repeat(64),
+    },
+    {
+      id: issueId,
+      kind: 1621,
+      pubkey: issueAuthor,
+      created_at: now - 400,
+      content: "Issue details are visible without editing controls.",
+      tags: [
+        ["a", repoAddress],
+        ["subject", "Fix browser issue"],
+        ["t", "web"],
+      ],
+      sig: "00".repeat(64),
+    },
+    {
+      id: pullRequestId,
+      kind: 1618,
+      pubkey: pullRequestAuthor,
+      created_at: now - 350,
+      content: "Pull request details are visible without merge controls.",
+      tags: [
+        ["a", repoAddress],
+        ["subject", "Ship browser fix"],
+        ["branch-name", "fix/browser"],
+        ["target-branch", "main"],
+        ["c", "bb".repeat(20)],
+      ],
+      sig: "00".repeat(64),
+    },
+    {
+      id: "03".repeat(32),
+      kind: 1619,
+      pubkey: owner,
+      created_at: now - 300,
+      content: "Updated tip",
+      tags: [
+        ["a", repoAddress],
+        ["E", pullRequestId],
+        ["c", "cc".repeat(20)],
+      ],
+      sig: "00".repeat(64),
+    },
+    {
+      id: "04".repeat(32),
+      kind: 1,
+      pubkey: owner,
+      created_at: now - 250,
+      content: "Read-only issue comment",
+      tags: [
+        ["a", repoAddress],
+        ["e", issueId],
+      ],
+      sig: "00".repeat(64),
+    },
+    {
+      id: "05".repeat(32),
+      kind: 1631,
+      pubkey: owner,
+      created_at: now - 200,
+      content: "",
+      tags: [
+        ["a", repoAddress],
+        ["e", issueId],
+      ],
+      sig: "00".repeat(64),
+    },
+    {
+      id: "06".repeat(32),
+      kind: 1633,
+      pubkey: pullRequestAuthor,
+      created_at: now - 150,
+      content: "",
+      tags: [
+        ["a", repoAddress],
+        ["e", pullRequestId],
+      ],
+      sig: "00".repeat(64),
+    },
+  ];
+
+  await page.routeWebSocket(/.*/, (socket) => {
+    socket.onMessage((message) => {
+      const request = JSON.parse(String(message)) as [
+        string,
+        string,
+        { kinds?: number[]; "#a"?: string[]; "#d"?: string[] },
+      ];
+      if (request[0] !== "REQ") return;
+      const [, subscriptionId, filter] = request;
+      const matchingEvents = events.filter((event) => {
+        if (filter.kinds && !filter.kinds.includes(event.kind)) return false;
+        if (
+          filter["#a"] &&
+          !event.tags.some(
+            (tag) => tag[0] === "a" && filter["#a"]?.includes(tag[1]),
+          )
+        ) {
+          return false;
+        }
+        if (
+          filter["#d"] &&
+          !event.tags.some(
+            (tag) => tag[0] === "d" && filter["#d"]?.includes(tag[1]),
+          )
+        ) {
+          return false;
+        }
+        return true;
+      });
+      for (const event of matchingEvents) {
+        socket.send(JSON.stringify(["EVENT", subscriptionId, event]));
+      }
+      socket.send(JSON.stringify(["EOSE", subscriptionId]));
+    });
+  });
+  await page.route("**/git/**", async (route) => {
+    await route.fulfill({ status: 404, body: "not needed for this test" });
+  });
+
+  await page.goto("/repos/browser-repo");
+  await expect(
+    page.getByRole("heading", { name: "browser-repo" }),
+  ).toBeVisible();
+
+  await page.getByRole("tab", { name: /Issues/ }).click();
+  const issueRow = page.getByTestId(`issue-row-${issueId}`);
+  await expect(issueRow.getByText("Fix browser issue")).toBeVisible();
+  await expect(issueRow.getByText("Done", { exact: true })).toBeVisible();
+  await issueRow.locator("summary").click();
+  await expect(
+    issueRow.getByText("Issue details are visible without editing controls."),
+  ).toBeVisible();
+  await expect(issueRow.getByText("Read-only issue comment")).toBeVisible();
+
+  await page.getByRole("tab", { name: /Pull Requests/ }).click();
+  const pullRequestRow = page.getByTestId(`pull-request-row-${pullRequestId}`);
+  await expect(pullRequestRow.getByText("Ship browser fix")).toBeVisible();
+  await expect(
+    pullRequestRow.getByText("Draft", { exact: true }),
+  ).toBeVisible();
+  await pullRequestRow.locator("summary").click();
+  await expect(pullRequestRow.getByText("fix/browser → main")).toBeVisible();
+});
+
 test("invite requires age and legal consent before opening Buzz", async ({
   page,
 }) => {

@@ -18,6 +18,7 @@ const people = {
 export const mockRepos: Repo[] = [
   {
     id: "buzz-desktop",
+    repoAddress: `30617:${people.ada}:buzz-desktop`,
     name: "buzz-desktop",
     description:
       "The desktop client for collaborating with people and agents across Buzz communities.",
@@ -30,6 +31,7 @@ export const mockRepos: Repo[] = [
   },
   {
     id: "agent-harness",
+    repoAddress: `30617:${people.grace}:agent-harness`,
     name: "agent-harness",
     description:
       "Tools and shared workflows for launching and coordinating coding agents.",
@@ -42,6 +44,7 @@ export const mockRepos: Repo[] = [
   },
   {
     id: "relay-infrastructure",
+    repoAddress: `30617:${people.linus}:relay-infrastructure`,
     name: "relay-infrastructure",
     description:
       "Infrastructure and deployment configuration for community relays.",
@@ -54,6 +57,7 @@ export const mockRepos: Repo[] = [
   },
   {
     id: "design-system",
+    repoAddress: `30617:${people.margaret}:design-system`,
     name: "design-system",
     description: "Shared foundations, components, and interaction patterns.",
     cloneUrls: ["https://example.com/design-system.git"],
