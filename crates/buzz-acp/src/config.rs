@@ -373,6 +373,16 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
 
+    /// Seconds before an inactive channel session is closed and made resumable.
+    #[arg(long, env = "BUZZ_ACP_SESSION_IDLE_TTL", default_value_t = 2700,
+          value_parser = clap::value_parser!(u64).range(60..))]
+    pub session_idle_ttl: u64,
+
+    /// Maximum number of live channel sessions retained by each agent process.
+    #[arg(long, env = "BUZZ_ACP_MAX_LIVE_SESSIONS", default_value_t = 8,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_live_sessions: u32,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -524,6 +534,10 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Seconds before an inactive channel session is closed and made resumable.
+    pub session_idle_ttl_secs: u64,
+    /// Maximum live channel sessions retained per agent process.
+    pub max_live_sessions: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1090,6 +1104,8 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            session_idle_ttl_secs: args.session_idle_ttl,
+            max_live_sessions: args.max_live_sessions,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1131,7 +1147,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} session_idle_ttl={}s max_live_sessions={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1147,6 +1163,8 @@ impl Config {
             self.ignore_self,
             self.context_message_limit,
             self.max_turns_per_session,
+            self.session_idle_ttl_secs,
+            self.max_live_sessions,
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
@@ -1464,6 +1482,8 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: 2700,
+            max_live_sessions: 8,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,
@@ -2610,6 +2630,13 @@ channels = "ALL"
     fn default_idle_timeout_is_900_seconds() {
         // Lock the constant value so accidental changes are caught.
         assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 900);
+    }
+
+    #[test]
+    fn session_reaper_defaults_are_bounded_and_enabled() {
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
+        assert_eq!(args.session_idle_ttl, 2700);
+        assert_eq!(args.max_live_sessions, 8);
     }
 
     #[test]

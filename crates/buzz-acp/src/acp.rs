@@ -689,6 +689,57 @@ impl AcpClient {
             .session_id)
     }
 
+    /// Resume a previously closed ACP session on this adapter process.
+    pub async fn session_resume(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<(), AcpError> {
+        self.send_request(
+            "session/resume",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd,
+                "mcpServers": mcp_servers,
+            }),
+        )
+        .await?;
+        tracing::info!(target: "acp::session", "session resumed: {session_id}");
+        Ok(())
+    }
+
+    /// Close an ACP session without allowing a wedged adapter to block the pool.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
+        const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        self.send_request_with_timeout(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+            CLOSE_TIMEOUT,
+        )
+        .await?;
+        tracing::info!(target: "acp::session", "session closed: {session_id}");
+        Ok(())
+    }
+
+    /// Delete a rotated or evicted ACP session after closing it.
+    pub async fn session_delete(&mut self, session_id: &str) -> Result<(), AcpError> {
+        const DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        let result = self
+            .send_request_with_timeout(
+                "session/delete",
+                serde_json::json!({ "sessionId": session_id }),
+                DELETE_TIMEOUT,
+            )
+            .await;
+        // Explicit invalidation has already discarded the local session even
+        // when an adapter rejects or times out this best-effort fallback.
+        self.goose_usage.close_session(session_id);
+        result?;
+        tracing::info!(target: "acp::session", "session deleted: {session_id}");
+        Ok(())
+    }
+
     /// Send Goose's custom system-prompt request after `session/new`.
     pub async fn session_set_goose_system_prompt(
         &mut self,
@@ -1069,14 +1120,25 @@ impl AcpClient {
     /// Assigns the next available id, writes the NDJSON line to stdin,
     /// then calls [`read_until_response`](Self::read_until_response).
     ///
-    /// The write phase is bounded by `WRITE_TIMEOUT` (30s) and the read phase
-    /// by `REQUEST_TIMEOUT` (60s), so worst-case wall clock is ~90s. Non-prompt
-    /// RPCs like `initialize` and `session/new` should complete in seconds;
-    /// if they don't, the agent is likely stuck and we must not block forever.
+    /// One `REQUEST_TIMEOUT` (60s) deadline covers both the write and matching
+    /// response. Non-prompt RPCs like `initialize` and `session/new` should
+    /// complete in seconds; if they don't, the agent is likely stuck and we
+    /// must not block forever.
     async fn send_request(
         &mut self,
         method: &str,
         params: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.send_request_with_timeout(method, params, Self::REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Send a JSON-RPC request with one caller-supplied end-to-end deadline.
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
     ) -> Result<serde_json::Value, AcpError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -1090,16 +1152,14 @@ impl AcpClient {
 
         tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
 
-        // Wrap write + read in a single timeout so a hung agent can't block forever.
-        // We cannot use an async block that borrows `self` mutably across two awaits
-        // inside timeout(), so we sequence them with early-return on timeout.
-        let timeout = Self::REQUEST_TIMEOUT;
-        match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
-            Ok(result) => result?,
-            Err(_) => return Err(AcpError::Timeout(timeout)),
-        }
-
-        match tokio::time::timeout(timeout, self.read_until_response(id)).await {
+        // One deadline covers both write and response. Applying `timeout`
+        // separately would double the advertised bound for a wedged adapter.
+        match tokio::time::timeout(timeout, async {
+            self.write_ndjson(&msg).await?;
+            self.read_until_response(id).await
+        })
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(AcpError::Timeout(timeout)),
         }
@@ -3320,6 +3380,109 @@ mod tests {
             Some("Custom system prompt"),
             "systemPrompt should be included in params when Some"
         );
+    }
+
+    #[tokio::test]
+    async fn session_close_sends_bounded_request_with_exact_session_id() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-session-close-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"
+                read -t 2 REQ
+                printf '%s' "$REQ" > '{}'
+                echo '{{"jsonrpc":"2.0","id":0,"result":{{}}}}'
+                sleep 1
+            "#,
+            capture.display()
+        );
+        let mut client = spawn_script(&script).await;
+
+        client
+            .session_close("ses_close_me")
+            .await
+            .expect("session/close should succeed");
+
+        let raw = std::fs::read_to_string(&capture).expect("captured close request");
+        let request: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON-RPC");
+        assert_eq!(request["method"], "session/close");
+        assert_eq!(request["params"]["sessionId"], "ses_close_me");
+        assert_eq!(request["id"], 0);
+        let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn session_close_then_resume_preserves_cumulative_usage_baseline() {
+        let script = r#"
+            read _close || exit 1
+            echo '{"jsonrpc":"2.0","id":0,"result":{}}'
+            read _resume || exit 1
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client.goose_usage.begin_turn("ses-resume");
+        client.handle_goose_usage_update(&goose_usage_update_msg("ses-resume", 100, 10, None));
+        let first = client.take_turn_usage().expect("first usage record");
+        assert_eq!(first.turn_seq, 1);
+
+        client
+            .session_close("ses-resume")
+            .await
+            .expect("session close");
+        client
+            .session_resume("ses-resume", "/tmp", vec![])
+            .await
+            .expect("session resume");
+
+        client.goose_usage.begin_turn("ses-resume");
+        client.handle_goose_usage_update(&goose_usage_update_msg("ses-resume", 150, 15, None));
+        let resumed = client.take_turn_usage().expect("resumed usage record");
+        assert_eq!(resumed.turn_seq, 2);
+        assert!(resumed.delta_reliable);
+        assert_eq!(resumed.turn_input_tokens, Some(50));
+        assert_eq!(resumed.turn_output_tokens, Some(5));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_session_close_releases_fake_child_processes() {
+        const CYCLES: usize = 4;
+        let script = r#"
+            for i in 1 2 3 4; do
+                read _new || exit 1
+                sleep 30 & child=$!
+                echo "{\"jsonrpc\":\"2.0\",\"id\":$((2 * i - 2)),\"result\":{\"sessionId\":\"ses_$i\"}}"
+                read _close || exit 1
+                kill "$child"
+                wait "$child" 2>/dev/null || true
+                echo "{\"jsonrpc\":\"2.0\",\"id\":$((2 * i - 1)),\"result\":{}}"
+            done
+            read _count || exit 1
+            count=$(jobs -pr | wc -l)
+            echo "{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{\"liveChildren\":$count}}"
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+
+        for cycle in 1..=CYCLES {
+            let session_id = client
+                .session_new("/tmp", vec![], None, None)
+                .await
+                .expect("session/new should succeed");
+            assert_eq!(session_id, format!("ses_{cycle}"));
+            client
+                .session_close(&session_id)
+                .await
+                .expect("session/close should release child");
+        }
+
+        let result = client
+            .send_request("test/live_children", serde_json::json!({}))
+            .await
+            .expect("child count request should succeed");
+        assert_eq!(result["liveChildren"], 0);
     }
 
     #[tokio::test]
