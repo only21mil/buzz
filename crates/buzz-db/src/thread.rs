@@ -247,7 +247,6 @@ pub async fn insert_thread_metadata(
 /// NOTE: The primary increment path is inlined inside [`insert_thread_metadata`]'s
 /// transaction. This standalone version exists for future use cases where
 /// incrementing outside of insert is needed (e.g., event re-parenting).
-#[allow(dead_code)]
 pub async fn increment_reply_count(
     pool: &PgPool,
     community_id: CommunityId,
