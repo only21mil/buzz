@@ -14,9 +14,7 @@ use buzz_ci_execd::control::{
     ControlServer,
 };
 #[cfg(target_os = "linux")]
-use buzz_ci_execd::durable_dispatch::{
-    load_dispatch, UnavailableExecution, UnavailableReadyValidation,
-};
+use buzz_ci_execd::production_composition::load_production_dispatch;
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_LISTEN_FD: i32 = 3;
@@ -85,13 +83,7 @@ fn main() -> ExitCode {
                         return ExitCode::from(4);
                     }
                 };
-                let mut validation = UnavailableReadyValidation;
-                let dispatch = load_dispatch(
-                    startup_now,
-                    &mut validation,
-                    UnavailableExecution,
-                    UnavailableExecution,
-                );
+                let dispatch = load_production_dispatch(startup_now);
                 let mut server = ControlServer::new(listener, control_uid, dispatch);
                 loop {
                     match server.serve_once() {

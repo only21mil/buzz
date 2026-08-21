@@ -17,7 +17,8 @@ use crate::{
     },
     control::{AdmissionBoundaryError, ClosedDispatch, ControlDispatch},
     runtime::{
-        load_runtime, DurableStateStore, RuntimeBootstrap, RuntimeLoadError, ServiceAuthority,
+        prepare_runtime, DurableStateStore, ReadyValidationTarget, RuntimeBootstrap,
+        RuntimeLoadError, RuntimePreparation, ServiceAuthority,
     },
 };
 
@@ -74,7 +75,10 @@ pub struct OrdinaryExecution {
     pub conclusion: LeaseConclusion,
     /// Cleanup proof controlling Ready versus Quarantined.
     pub cleanup: CleanupDisposition,
-    /// Bounded protocol response released only after the final durable commit.
+    /// Legacy executor response. The dispatcher never publishes it.
+    ///
+    /// This field remains temporarily source-compatible with the host executor
+    /// lanes while response construction moves behind the durable boundary.
     pub response: BrokerResponse,
 }
 
@@ -111,7 +115,8 @@ pub enum QualificationTerminal {
 pub struct QualificationExecution {
     /// Transition the dispatcher must apply.
     pub terminal: QualificationTerminal,
-    /// Bounded response released only after the terminal durable commit.
+    /// Legacy executor response. Only teardown evidence digests are consumed;
+    /// all protocol coordinates and status fields are rebuilt by the dispatcher.
     pub response: BrokerResponse,
 }
 
@@ -171,10 +176,40 @@ impl QualificationExecutor for UnavailableExecution {
     }
 }
 
+/// Fresh cleanup, seccomp, and DNS evidence bound to one loaded runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadyHostProofs {
+    pub target: ReadyValidationTarget,
+    pub validation: ReadyRestoreValidation,
+    pub cleanup_proof_digest: [u8; 32],
+    pub dns_proof_digest: [u8; 32],
+    pub observed_at: u64,
+}
+
+impl ReadyHostProofs {
+    fn restore_validation(
+        self,
+        target: ReadyValidationTarget,
+        now: u64,
+    ) -> Option<ReadyRestoreValidation> {
+        (self.target == target
+            && self.validation.grant == target.grant()
+            && self.validation.now == now
+            && self.observed_at == now
+            && self.cleanup_proof_digest != [0; 32]
+            && self.dns_proof_digest != [0; 32])
+            .then_some(self.validation)
+    }
+}
+
 /// Fresh trusted host validation provider used only during bootstrap.
 pub trait ReadyValidationProvider {
     /// Return current validation for the exact loaded grant, or fail closed.
-    fn ready_validation(&mut self, now: u64) -> Option<ReadyRestoreValidation>;
+    fn ready_validation(
+        &mut self,
+        target: &ReadyValidationTarget,
+        now: u64,
+    ) -> Option<ReadyHostProofs>;
 }
 
 /// Default bootstrap provider: no host proof, therefore no Ready restore.
@@ -182,7 +217,11 @@ pub trait ReadyValidationProvider {
 pub struct UnavailableReadyValidation;
 
 impl ReadyValidationProvider for UnavailableReadyValidation {
-    fn ready_validation(&mut self, _now: u64) -> Option<ReadyRestoreValidation> {
+    fn ready_validation(
+        &mut self,
+        _target: &ReadyValidationTarget,
+        _now: u64,
+    ) -> Option<ReadyHostProofs> {
         None
     }
 }
@@ -263,6 +302,7 @@ where
         if !self.commit() {
             return response(ResponseCode::InternalFailure, now);
         }
+        let lease_generation = self.controller.snapshot().next_lease_generation - 1;
 
         let execution = match self
             .ordinary
@@ -288,7 +328,13 @@ where
         if !self.commit() || !cleanup_complete {
             return response(ResponseCode::InternalFailure, now);
         }
-        execution.response
+        ordinary_response(
+            request,
+            admission,
+            lease_generation,
+            execution.conclusion,
+            now,
+        )
     }
 
     fn fail_ordinary_ambiguously(&mut self, lease: LeaseToken, now: u64) -> BrokerResponse {
@@ -364,10 +410,10 @@ where
                 false
             }
         };
-        if !self.commit() || !terminal_ok {
+        if !self.commit() {
             return response(ResponseCode::InternalFailure, now);
         }
-        execution.response
+        qualification_response(request, lease, execution, terminal_ok, now)
     }
 }
 
@@ -442,11 +488,151 @@ where
     O: OrdinaryExecutor,
     Q: QualificationExecutor,
 {
-    compose_bootstrap(
-        load_runtime(now, validation.ready_validation(now)),
-        ordinary,
-        qualification,
-    )
+    let preparation = prepare_runtime(now);
+    let bootstrap = match preparation {
+        RuntimePreparation::Prepared(runtime) => {
+            let ready_validation = runtime.ready_validation_target().and_then(|target| {
+                validation
+                    .ready_validation(&target, now)
+                    .and_then(|proofs| proofs.restore_validation(target, now))
+            });
+            runtime.restore(ready_validation)
+        }
+        other => other.complete_closed(),
+    };
+    compose_bootstrap(bootstrap, ordinary, qualification)
+}
+
+fn ordinary_response(
+    request: AdmitAttemptRequest,
+    admission: OrdinaryAdmission,
+    lease_generation: u64,
+    conclusion: LeaseConclusion,
+    now: u64,
+) -> BrokerResponse {
+    BrokerResponse {
+        code: ResponseCode::Ok,
+        retry_after_millis: 0,
+        attempt_id: admission.lease_id,
+        run_id: request.run_id,
+        accepted_request_digest: request.signed_request_digest,
+        job_manifest_digest: request.job_manifest_digest,
+        tip_oid: Some(request.tip_oid),
+        broker_state: BrokerState::Ready,
+        conclusion: protocol_conclusion(conclusion),
+        terminal_reason: u16::from(conclusion == LeaseConclusion::InfrastructureFailure),
+        generation: lease_generation,
+        accepted_at: now,
+        updated_at: now,
+        lease_generation,
+        evidence_set_digest: [0; 32],
+        teardown_digest: [0; 32],
+        attempt: request.attempt,
+    }
+}
+
+fn qualification_response(
+    request: QualificationRequest,
+    lease: QualificationLease,
+    execution: QualificationExecution,
+    terminal_ok: bool,
+    now: u64,
+) -> BrokerResponse {
+    let teardown_evidence = validated_teardown_evidence(request, lease, execution.response, now);
+    let (code, state, conclusion, evidence_set_digest, teardown_digest) =
+        match (execution.terminal, teardown_evidence) {
+            (
+                QualificationTerminal::Completed(QualificationOutcome::Accepted {
+                    evidence_set_digest,
+                }),
+                _,
+            ) if terminal_ok => (
+                ResponseCode::Ok,
+                BrokerState::Reconciling,
+                Conclusion::Success,
+                evidence_set_digest,
+                [0; 32],
+            ),
+            (
+                QualificationTerminal::TeardownFailure,
+                Some((evidence_set_digest, teardown_digest)),
+            ) if terminal_ok => (
+                ResponseCode::Ok,
+                BrokerState::Quarantined,
+                Conclusion::InfrastructureFailure,
+                evidence_set_digest,
+                teardown_digest,
+            ),
+            (QualificationTerminal::Completed(QualificationOutcome::Failed), _) => (
+                ResponseCode::InternalFailure,
+                BrokerState::Quarantined,
+                Conclusion::Failure,
+                [0; 32],
+                [0; 32],
+            ),
+            _ => (
+                ResponseCode::InternalFailure,
+                BrokerState::Quarantined,
+                Conclusion::InfrastructureFailure,
+                [0; 32],
+                [0; 32],
+            ),
+        };
+    BrokerResponse {
+        code,
+        retry_after_millis: 0,
+        attempt_id: lease.lease_id(),
+        run_id: [0; 16],
+        accepted_request_digest: request.request_digest,
+        job_manifest_digest: request.manifest_digest,
+        tip_oid: Some(request.integrated_candidate_sha),
+        broker_state: state,
+        conclusion,
+        terminal_reason: u16::from(code != ResponseCode::Ok),
+        generation: lease.generation(),
+        accepted_at: now,
+        updated_at: now,
+        lease_generation: lease.generation(),
+        evidence_set_digest,
+        teardown_digest,
+        attempt: 1,
+    }
+}
+
+fn validated_teardown_evidence(
+    request: QualificationRequest,
+    lease: QualificationLease,
+    candidate: BrokerResponse,
+    now: u64,
+) -> Option<([u8; 32], [u8; 32])> {
+    (candidate.code == ResponseCode::Ok
+        && candidate.retry_after_millis == 0
+        && candidate.attempt_id == lease.lease_id()
+        && candidate.run_id == [0; 16]
+        && candidate.accepted_request_digest == request.request_digest
+        && candidate.job_manifest_digest == request.manifest_digest
+        && candidate.tip_oid == Some(request.integrated_candidate_sha)
+        && candidate.broker_state == BrokerState::Quarantined
+        && candidate.conclusion == Conclusion::InfrastructureFailure
+        && candidate.terminal_reason == 1
+        && candidate.generation == lease.generation()
+        && candidate.accepted_at == now
+        && candidate.updated_at == now
+        && candidate.lease_generation == lease.generation()
+        && candidate.evidence_set_digest != [0; 32]
+        && candidate.teardown_digest != [0; 32]
+        && candidate.attempt == 1)
+        .then_some((candidate.evidence_set_digest, candidate.teardown_digest))
+}
+
+const fn protocol_conclusion(conclusion: LeaseConclusion) -> Conclusion {
+    match conclusion {
+        LeaseConclusion::Success => Conclusion::Success,
+        LeaseConclusion::Failure => Conclusion::Failure,
+        LeaseConclusion::Cancelled => Conclusion::Cancelled,
+        LeaseConclusion::TimedOut => Conclusion::TimedOut,
+        LeaseConclusion::InfrastructureFailure => Conclusion::InfrastructureFailure,
+    }
 }
 
 fn boundary_error_response(error: AdmissionBoundaryError, now: u64) -> BrokerResponse {
@@ -827,6 +1013,22 @@ mod tests {
         );
 
         assert_eq!(result.code, ResponseCode::Ok);
+        assert_eq!(result.attempt_id, ordinary_admission().lease_id);
+        assert_eq!(result.run_id, ordinary_request().run_id);
+        assert_eq!(
+            result.accepted_request_digest,
+            ordinary_request().signed_request_digest
+        );
+        assert_eq!(
+            result.job_manifest_digest,
+            ordinary_request().job_manifest_digest
+        );
+        assert_eq!(result.tip_oid, Some(ordinary_request().tip_oid));
+        assert_eq!(result.broker_state, BrokerState::Ready);
+        assert_eq!(result.conclusion, Conclusion::Success);
+        assert_eq!(result.generation, 2);
+        assert_eq!(result.lease_generation, 2);
+        assert_eq!(result.attempt, ordinary_request().attempt);
         assert_eq!(calls.get(), 1);
         assert_eq!(dispatch.state(), ActivationState::Ready);
         let states: Vec<_> = commits.borrow().iter().map(|entry| entry.state).collect();
@@ -981,6 +1183,13 @@ mod tests {
         );
 
         assert_eq!(result.code, ResponseCode::Ok);
+        assert_eq!(result.attempt_id, [14; 16]);
+        assert_eq!(result.accepted_request_digest, fixture().request_digest);
+        assert_eq!(result.job_manifest_digest, fixture().manifest_digest);
+        assert_eq!(result.tip_oid, Some(host().integrated_candidate_sha));
+        assert_eq!(result.broker_state, BrokerState::Reconciling);
+        assert_eq!(result.conclusion, Conclusion::Success);
+        assert_eq!(result.evidence_set_digest, [16; 32]);
         assert_eq!(dispatch.state(), ActivationState::Reconciling);
         let states: Vec<_> = commits.borrow().iter().map(|entry| entry.state).collect();
         assert_eq!(
@@ -990,5 +1199,91 @@ mod tests {
         assert!(commits.borrow()[0]
             .qualification
             .is_some_and(|state| state.active_lease.is_some()));
+    }
+
+    #[test]
+    fn ready_proofs_must_be_fresh_and_bound_to_the_loaded_target() {
+        let target = ReadyValidationTarget::new(grant(), ordinary_request(), 7, [40; 32], 9);
+        let validation = ReadyRestoreValidation {
+            grant: grant(),
+            seccomp_evidence: seccomp(),
+            host_profile_digest: host().host_profile_digest,
+            now: 20,
+        };
+        let proofs = ReadyHostProofs {
+            target,
+            validation,
+            cleanup_proof_digest: [41; 32],
+            dns_proof_digest: [42; 32],
+            observed_at: 20,
+        };
+        assert_eq!(proofs.restore_validation(target, 20), Some(validation));
+
+        assert_eq!(
+            ReadyHostProofs {
+                observed_at: 19,
+                ..proofs
+            }
+            .restore_validation(target, 20),
+            None
+        );
+        assert_eq!(
+            ReadyHostProofs {
+                dns_proof_digest: [0; 32],
+                ..proofs
+            }
+            .restore_validation(target, 20),
+            None
+        );
+        let other = ReadyValidationTarget::new(grant(), ordinary_request(), 8, [40; 32], 9);
+        assert_eq!(proofs.restore_validation(other, 20), None);
+    }
+
+    #[test]
+    fn teardown_evidence_cannot_override_response_bindings() {
+        let mut teardown_permit = permit();
+        teardown_permit.directive = Some(QualificationDirective::TeardownFailure);
+        let mut teardown_request = qualification_request();
+        teardown_request.directive = Some(QualificationDirective::TeardownFailure);
+        let mut controller = ActivationController::new(ROOT);
+        controller.start_qualification(teardown_permit).unwrap();
+        let lease = controller
+            .admit_qualification_request(teardown_request, FIXTURE, 10)
+            .unwrap();
+        let candidate = BrokerResponse {
+            code: ResponseCode::Ok,
+            retry_after_millis: 0,
+            attempt_id: lease.lease_id(),
+            run_id: [0; 16],
+            accepted_request_digest: teardown_request.request_digest,
+            job_manifest_digest: teardown_request.manifest_digest,
+            tip_oid: Some(teardown_request.integrated_candidate_sha),
+            broker_state: BrokerState::Quarantined,
+            conclusion: Conclusion::InfrastructureFailure,
+            terminal_reason: 1,
+            generation: lease.generation(),
+            accepted_at: 10,
+            updated_at: 10,
+            lease_generation: lease.generation(),
+            evidence_set_digest: [43; 32],
+            teardown_digest: [44; 32],
+            attempt: 1,
+        };
+        assert_eq!(
+            validated_teardown_evidence(teardown_request, lease, candidate, 10),
+            Some(([43; 32], [44; 32]))
+        );
+        assert_eq!(
+            validated_teardown_evidence(
+                teardown_request,
+                lease,
+                BrokerResponse {
+                    accepted_request_digest: [99; 32],
+                    ..candidate
+                },
+                10,
+            ),
+            None
+        );
     }
 }

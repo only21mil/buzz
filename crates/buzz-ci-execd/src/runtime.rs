@@ -91,6 +91,125 @@ pub enum RuntimeBootstrap {
     Loaded(Box<LoadedRuntime>),
 }
 
+/// Immutable authority/state binding presented to fresh host validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadyValidationTarget {
+    grant: ActivationGrant,
+    request: AdmitAttemptRequest,
+    authority_revision: u64,
+    authority_sha256: [u8; 32],
+    state_revision: u64,
+}
+
+impl ReadyValidationTarget {
+    pub(crate) const fn new(
+        grant: ActivationGrant,
+        request: AdmitAttemptRequest,
+        authority_revision: u64,
+        authority_sha256: [u8; 32],
+        state_revision: u64,
+    ) -> Self {
+        Self {
+            grant,
+            request,
+            authority_revision,
+            authority_sha256,
+            state_revision,
+        }
+    }
+
+    pub const fn grant(self) -> ActivationGrant {
+        self.grant
+    }
+
+    pub const fn request(self) -> AdmitAttemptRequest {
+        self.request
+    }
+
+    pub const fn authority_revision(self) -> u64 {
+        self.authority_revision
+    }
+
+    pub const fn authority_sha256(self) -> [u8; 32] {
+        self.authority_sha256
+    }
+
+    pub const fn state_revision(self) -> u64 {
+        self.state_revision
+    }
+}
+
+/// Securely loaded authority and state awaiting fresh Ready validation.
+pub struct PreparedRuntime {
+    snapshot: DurableStateSnapshot,
+    authority: ServiceAuthority,
+    state_revision: u64,
+    authority_sha256: [u8; 32],
+}
+
+impl PreparedRuntime {
+    /// Return the exact immutable grant/request pair that fresh proofs must bind.
+    pub fn ready_validation_target(&self) -> Option<ReadyValidationTarget> {
+        if self.snapshot.state != ActivationState::Ready {
+            return None;
+        }
+        let ordinary = self.authority.ordinary.as_ref()?;
+        Some(ReadyValidationTarget::new(
+            ordinary.grant,
+            ordinary.request,
+            self.authority.revision,
+            self.authority_sha256,
+            self.state_revision,
+        ))
+    }
+
+    /// Restore only after validation has observed the exact loaded target.
+    pub(crate) fn restore(
+        self,
+        ready_validation: Option<ReadyRestoreValidation>,
+    ) -> RuntimeBootstrap {
+        let root = self.authority.root;
+        let restored = ActivationController::restore(root, self.snapshot, ready_validation);
+        if restored.quarantine_reason.is_some() {
+            return persist_quarantine(
+                restored.controller,
+                self.state_revision,
+                self.authority.revision,
+                self.authority_sha256,
+                RuntimeLoadError::Quarantined,
+            );
+        }
+        RuntimeBootstrap::Loaded(Box::new(LoadedRuntime {
+            controller: restored.controller,
+            authority: self.authority,
+            state_revision: self.state_revision,
+            authority_sha256: self.authority_sha256,
+        }))
+    }
+}
+
+/// First bootstrap phase: no Ready state is restored before fresh validation.
+pub enum RuntimePreparation {
+    NotProvisioned(RuntimeLoadError),
+    Quarantined {
+        controller: Box<ActivationController>,
+        reason: RuntimeLoadError,
+    },
+    Prepared(Box<PreparedRuntime>),
+}
+
+impl RuntimePreparation {
+    pub(crate) fn complete_closed(self) -> RuntimeBootstrap {
+        match self {
+            Self::NotProvisioned(reason) => RuntimeBootstrap::NotProvisioned(reason),
+            Self::Quarantined { controller, reason } => {
+                RuntimeBootstrap::Quarantined { controller, reason }
+            }
+            Self::Prepared(runtime) => runtime.restore(None),
+        }
+    }
+}
+
 impl RuntimeBootstrap {
     /// Report ordinary capacity without exposing a fallback-to-ready path.
     pub fn ordinary_capacity(&self, now: u64) -> u8 {
@@ -283,19 +402,12 @@ impl RuntimePaths {
     }
 }
 
-/// Load only the canonical authority and activation artifacts.
-pub fn load_runtime(
-    now: u64,
-    ready_validation: Option<ReadyRestoreValidation>,
-) -> RuntimeBootstrap {
-    load_from_paths(&RuntimePaths::canonical(), now, ready_validation)
+/// Securely load and bind canonical authority/state without restoring Ready.
+pub fn prepare_runtime(now: u64) -> RuntimePreparation {
+    prepare_from_paths(&RuntimePaths::canonical(), now)
 }
 
-fn load_from_paths(
-    paths: &RuntimePaths,
-    now: u64,
-    ready_validation: Option<ReadyRestoreValidation>,
-) -> RuntimeBootstrap {
+fn prepare_from_paths(paths: &RuntimePaths, now: u64) -> RuntimePreparation {
     let authority_bytes = match read_artifact(
         &paths.authority_root,
         &paths.authority_file,
@@ -303,15 +415,15 @@ fn load_from_paths(
         MAX_AUTHORITY_BYTES,
     ) {
         Ok(bytes) => bytes,
-        Err(error) => return RuntimeBootstrap::NotProvisioned(error),
+        Err(error) => return RuntimePreparation::NotProvisioned(error),
     };
     let authority_disk: AuthorityFile = match serde_json::from_slice(&authority_bytes) {
         Ok(value) => value,
-        Err(_) => return RuntimeBootstrap::NotProvisioned(RuntimeLoadError::Malformed),
+        Err(_) => return RuntimePreparation::NotProvisioned(RuntimeLoadError::Malformed),
     };
     let authority = match authority_disk.decode() {
         Ok(value) => value,
-        Err(error) => return RuntimeBootstrap::NotProvisioned(error),
+        Err(error) => return RuntimePreparation::NotProvisioned(error),
     };
     let root = authority.root;
     let authority_sha256: [u8; 32] = Sha256::digest(&authority_bytes).into();
@@ -324,7 +436,7 @@ fn load_from_paths(
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return RuntimeBootstrap::Quarantined {
+            return RuntimePreparation::Quarantined {
                 controller: Box::new(quarantine(root)),
                 reason: error,
             }
@@ -333,7 +445,7 @@ fn load_from_paths(
     let state_disk: StateFile = match serde_json::from_slice(&state_bytes) {
         Ok(value) => value,
         Err(_) => {
-            return RuntimeBootstrap::Quarantined {
+            return RuntimePreparation::Quarantined {
                 controller: Box::new(quarantine(root)),
                 reason: RuntimeLoadError::Malformed,
             }
@@ -342,26 +454,51 @@ fn load_from_paths(
     let snapshot = match state_disk.decode(&authority, authority_sha256, now) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return RuntimeBootstrap::Quarantined {
-                controller: Box::new(quarantine(root)),
-                reason: error,
-            }
+            return match persist_quarantine(
+                quarantine(root),
+                state_disk.revision,
+                authority.revision,
+                authority_sha256,
+                error,
+            ) {
+                RuntimeBootstrap::Quarantined { controller, reason } => {
+                    RuntimePreparation::Quarantined { controller, reason }
+                }
+                RuntimeBootstrap::NotProvisioned(reason) => {
+                    RuntimePreparation::NotProvisioned(reason)
+                }
+                RuntimeBootstrap::Loaded(_) => unreachable!("quarantine persistence cannot load"),
+            };
         }
     };
     let state_revision = state_disk.revision;
-    let restored = ActivationController::restore(root, snapshot, ready_validation);
-    if restored.quarantine_reason.is_some() {
-        RuntimeBootstrap::Quarantined {
-            controller: Box::new(restored.controller),
-            reason: RuntimeLoadError::Quarantined,
-        }
-    } else {
-        RuntimeBootstrap::Loaded(Box::new(LoadedRuntime {
-            controller: restored.controller,
-            authority,
-            state_revision,
-            authority_sha256,
-        }))
+    RuntimePreparation::Prepared(Box::new(PreparedRuntime {
+        snapshot,
+        authority,
+        state_revision,
+        authority_sha256,
+    }))
+}
+
+fn persist_quarantine(
+    controller: ActivationController,
+    state_revision: u64,
+    authority_revision: u64,
+    authority_sha256: [u8; 32],
+    reason: RuntimeLoadError,
+) -> RuntimeBootstrap {
+    let mut store = DurableStateStore {
+        state_revision,
+        authority_revision,
+        authority_sha256,
+    };
+    let persisted_reason = match store.commit(controller.snapshot()) {
+        Ok(()) => reason,
+        Err(error) => error,
+    };
+    RuntimeBootstrap::Quarantined {
+        controller: Box::new(controller),
+        reason: persisted_reason,
     }
 }
 
@@ -671,10 +808,13 @@ impl StateFile {
             .as_ref()
             .map(GrantFile::decode)
             .transpose()?;
-        if qualification.as_ref().map(|value| value.permit)
-            != authority.qualification.as_ref().map(|value| value.permit)
-            || activation != authority.ordinary.as_ref().map(|value| value.grant)
-        {
+        let authority_bound = qualification.as_ref().map(|value| value.permit)
+            == authority.qualification.as_ref().map(|value| value.permit)
+            && activation == authority.ordinary.as_ref().map(|value| value.grant);
+        let durable_closed_quarantine = state == ActivationState::Quarantined
+            && qualification.is_none()
+            && activation.is_none();
+        if !authority_bound && !durable_closed_quarantine {
             return Err(RuntimeLoadError::BindingMismatch);
         }
         if (state == ActivationState::Qualifying
@@ -1259,6 +1399,44 @@ mod tests {
             disk.decode(&authority, hash, 20),
             Err(RuntimeLoadError::BindingMismatch)
         );
+    }
+
+    #[test]
+    fn persisted_restart_quarantine_remains_closed_on_second_decode() {
+        let authority = authority(false, 100);
+        let mut controller = ActivationController::new(ROOT);
+        controller.start_qualification(permit(100)).unwrap();
+        controller
+            .admit_qualification_request(qualification_request(permit(100)), FIXTURE, 20)
+            .unwrap();
+        let hash = [43; 32];
+        let inflight = StateFile::encode(controller.snapshot(), 4, 7, hash).unwrap();
+        assert_eq!(
+            inflight.decode(&authority, hash, 20),
+            Err(RuntimeLoadError::Quarantined)
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("activation");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+        let destination = directory.join("state-v1.json");
+        persist_to_validated_path(
+            &directory,
+            &destination,
+            quarantine(ROOT).snapshot(),
+            5,
+            7,
+            hash,
+        )
+        .unwrap();
+
+        let persisted: StateFile = serde_json::from_slice(&fs::read(destination).unwrap()).unwrap();
+        let snapshot = persisted.decode(&authority, hash, 21).unwrap();
+        let second = ActivationController::restore(ROOT, snapshot, None);
+        assert_eq!(second.quarantine_reason, None);
+        assert_eq!(second.controller.state(), ActivationState::Quarantined);
+        assert_eq!(second.controller.ordinary_capacity(21), 0);
     }
 
     #[test]
