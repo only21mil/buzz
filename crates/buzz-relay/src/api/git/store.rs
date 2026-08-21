@@ -22,8 +22,6 @@
 //! *detectable*, not silent — that is what A1's "create-only + content-address"
 //! discipline buys us, independent of bucket immutability features.
 
-#![allow(dead_code)] // wired in by the push path in a follow-up commit
-
 use std::sync::Arc;
 
 use bytes::Bytes;
