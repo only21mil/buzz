@@ -10,6 +10,7 @@ import {
   THREAD_PREFIX,
 } from "@/features/channels/readState/readStateFormat";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
+import { getStorageItem } from "@/shared/lib/safeStorage";
 
 export type StoredReadState = {
   contexts: Map<string, number>;
@@ -21,7 +22,7 @@ function mergeLocalStorageKey(
   contexts: Map<string, number>,
   key: string,
 ): void {
-  const raw = localStorage.getItem(key);
+  const raw = getStorageItem(key);
   if (!raw) return;
 
   try {
@@ -44,7 +45,7 @@ function mergeLocalStorageKey(
 
 function readPublishableContextIds(pubkey: string): Set<string> {
   const result = new Set<string>();
-  const raw = localStorage.getItem(localPublishableContextKey(pubkey));
+  const raw = getStorageItem(localPublishableContextKey(pubkey));
   if (!raw) return result;
 
   try {
@@ -69,7 +70,7 @@ function readPublishableContextIds(pubkey: string): Set<string> {
 
 function readContextSourceCreatedAt(pubkey: string): Map<string, number> {
   const result = new Map<string, number>();
-  const raw = localStorage.getItem(localSourceCreatedAtKey(pubkey));
+  const raw = getStorageItem(localSourceCreatedAtKey(pubkey));
   if (!raw) return result;
 
   try {

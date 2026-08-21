@@ -8,6 +8,11 @@ import { getOsIdleSeconds } from "@/shared/api/osIdle";
 import { getPresence } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
+  getStorageItem,
+  removeStorageItem,
+  setStorageItem,
+} from "@/shared/lib/safeStorage";
+import {
   mergePresenceUpdate,
   parseLivePresenceEvent,
   presenceQueryWantsPubkey,
@@ -42,9 +47,7 @@ function readStoredPresencePreference(pubkey: string): PresencePreference {
     return null;
   }
 
-  const value = window.localStorage.getItem(
-    presencePreferenceStorageKey(pubkey),
-  );
+  const value = getStorageItem(presencePreferenceStorageKey(pubkey));
   return value === "auto" || value === "away" || value === "offline"
     ? value
     : null;
@@ -59,11 +62,11 @@ function writeStoredPresencePreference(
   }
 
   if (preference === null) {
-    window.localStorage.removeItem(presencePreferenceStorageKey(pubkey));
+    removeStorageItem(presencePreferenceStorageKey(pubkey));
     return;
   }
 
-  window.localStorage.setItem(presencePreferenceStorageKey(pubkey), preference);
+  setStorageItem(presencePreferenceStorageKey(pubkey), preference);
 }
 
 function resolveAutomaticPresenceStatusSync(

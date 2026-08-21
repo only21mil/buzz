@@ -21,9 +21,11 @@ import {
   playNotificationSound,
   resolveSlotSound,
 } from "@/features/notifications/lib/sound";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 
 const WATERMARK_STORAGE_PREFIX = "buzz:lastReminderCheck:";
 const POLL_INTERVAL_MS = 30_000;
+const sessionWatermarks = new Map<string, number>();
 
 function watermarkStorageKey(pubkey: string): string {
   return `${WATERMARK_STORAGE_PREFIX}${pubkey.trim().toLowerCase()}`;
@@ -38,14 +40,26 @@ function watermarkStorageKey(pubkey: string): string {
  */
 function readWatermark(pubkey: string): number {
   const key = watermarkStorageKey(pubkey);
-  const stored = window.localStorage.getItem(key);
+  const stored = getStorageItem(key);
   if (stored !== null) {
     const parsed = Number(stored);
-    if (Number.isFinite(parsed)) return parsed;
+    if (Number.isFinite(parsed)) {
+      sessionWatermarks.set(key, parsed);
+      return parsed;
+    }
   }
+  const sessionWatermark = sessionWatermarks.get(key);
+  if (sessionWatermark !== undefined) return sessionWatermark;
   const now = Math.floor(Date.now() / 1_000);
-  window.localStorage.setItem(key, String(now));
+  sessionWatermarks.set(key, now);
+  setStorageItem(key, String(now));
   return now;
+}
+
+function writeWatermark(pubkey: string, watermark: number): void {
+  const key = watermarkStorageKey(pubkey);
+  sessionWatermarks.set(key, watermark);
+  setStorageItem(key, String(watermark));
 }
 
 /**
@@ -133,7 +147,7 @@ export function useReminderNotifications(
       // (notifications off or needs_action slot muted). Re-enabling later must
       // not backlog-replay reminders that came due while muted — same no-replay
       // rationale as seed-to-now. Suppressed reminders still show in panel/badge.
-      window.localStorage.setItem(watermarkStorageKey(pubkey), String(now));
+      writeWatermark(pubkey, now);
       // Liveness tick: re-render every countDue consumer (inbox nav badge,
       // HomeView filter, panel) so a reminder that crossed notBefore while the
       // app sat idle surfaces within the poll interval. Safe to run after the

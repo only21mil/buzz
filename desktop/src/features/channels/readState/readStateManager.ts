@@ -20,10 +20,12 @@ import {
 } from "@/features/channels/readState/readStateStorage";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import { truncatePubkey } from "@/shared/lib/pubkey";
+import { getStorageItem } from "@/shared/lib/safeStorage";
 
 const CLIENT_ID_KEY_PREFIX = "buzz.nip-rs.client-id";
 const SLOT_ID_KEY_PREFIX = "buzz.nip-rs.slot-id";
 const DEBOUNCE_MS = 5_000;
+const sessionPersistedValues = new Map<string, string>();
 
 function generateHex(bytes: number): string {
   const arr = new Uint8Array(bytes);
@@ -32,11 +34,15 @@ function generateHex(bytes: number): string {
 }
 
 function getOrCreatePersisted(key: string, generator: () => string): string {
-  let value = localStorage.getItem(key);
-  if (!value) {
-    value = generator();
-    setLocalStorageItemWithRecovery(key, value);
+  let value = getStorageItem(key) ?? sessionPersistedValues.get(key) ?? null;
+  if (value) {
+    sessionPersistedValues.set(key, value);
+    return value;
   }
+
+  value = generator();
+  sessionPersistedValues.set(key, value);
+  setLocalStorageItemWithRecovery(key, value);
   return value;
 }
 
@@ -50,7 +56,7 @@ function slotIdKey(pubkey: string): string {
 
 function loadExtraSlotIds(pubkey: string): string[] {
   try {
-    const raw = localStorage.getItem(localExtraSlotIdsKey(pubkey));
+    const raw = getStorageItem(localExtraSlotIdsKey(pubkey));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
