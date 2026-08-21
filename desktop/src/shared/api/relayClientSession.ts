@@ -236,10 +236,6 @@ export class RelayClient {
 
   private async fetchHistory(filters: RelayHistoryFilters) {
     await this.ensureConnected();
-    return this.requestHistory(filters);
-  }
-
-  private requestHistory(filters: RelayHistoryFilters): Promise<RelayEvent[]> {
     return requestHistoryGated(
       this.subscriptions,
       (payload) => this.sendRaw(payload),
