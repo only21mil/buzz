@@ -176,6 +176,8 @@ pub struct MaterializationReceipt {
     pub(crate) workflow_id: String,
     /// Exact observed tree object ID.
     pub(crate) tree_oid: String,
+    /// Exact trusted-base workflow blob object ID.
+    pub(crate) workflow_blob_oid: String,
     /// Job identity.
     pub(crate) job_id: String,
     /// Attempt number.
@@ -215,6 +217,10 @@ impl MaterializationReceipt {
 
     pub fn tree_oid(&self) -> &str {
         &self.tree_oid
+    }
+
+    pub fn workflow_blob_oid(&self) -> &str {
+        &self.workflow_blob_oid
     }
 
     pub fn trusted_base_sha(&self) -> &str {

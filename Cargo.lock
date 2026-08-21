@@ -960,6 +960,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-ci-broker-protocol",
  "buzz-ci-isolation-contract",
+ "buzz-ci-materializer",
  "buzz-ci-policy-proxy",
  "hex",
  "nix 0.31.3",
@@ -987,6 +988,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-ci-isolation-contract",
  "hex",
+ "nix 0.31.3",
  "rustix 1.1.4",
  "serde",
  "serde_json",

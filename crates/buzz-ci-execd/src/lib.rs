@@ -23,6 +23,8 @@ pub mod durable_dispatch;
 pub mod evidence;
 #[cfg(unix)]
 pub mod harness;
+#[cfg(unix)]
+pub mod materializer_evidence;
 #[cfg(target_os = "linux")]
 pub mod production_composition;
 #[cfg(target_os = "linux")]

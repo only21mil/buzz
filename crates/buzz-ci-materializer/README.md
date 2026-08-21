@@ -22,12 +22,21 @@ directory, rejects extra files/directories, and returns that File and identity
 inside `PendingSeal`. No receipt is returned after expiry, and post-rename
 failures remove the published tree.
 
+`PendingSeal` also retains the already-open workspace directory and its
+device/inode identity. The later broker cleanup stage must compare that
+descriptor identity before removing the workspace pathname. It must not reopen
+and trust the pathname by itself.
+
 It is not a sandbox and does not authorize a run. The root-owned broker remains
 responsible for the materializer UID, process-group/cgroup deadline, narrow
 egress namespace, quota-backed slot, signature/role/expiry checks, and sealing
 the verified output under an identity the materializer cannot modify.
-The production materializer process/watchdog and real Git backend remain
-required before this library can satisfy the frozen hard wall-clock gate.
+`ProcessGitBackend` runs the frozen raw-object Git protocol with no shell, an
+empty inherited environment, descriptor-anchored cwd, bounded pipes, and a
+deadline on every command. It accepts a required `GitHostObserver` because the
+root-owned lease machine, not this unprivileged crate, owns the exact cgroup
+descriptor and nft byte counters. Publication fails unless that observer proves
+the process group and lease cgroup empty and returns the counter delta.
 
 Phase 1 is an accepted-commit verifier only. This crate does not make current
 hosts safe for unaccepted PR code.

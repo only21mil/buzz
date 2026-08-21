@@ -6,6 +6,7 @@
 //! and grants a private [`MaterializationSlot`]. The materializer fetches raw
 //! Git objects into that slot and publishes only a digest-verified tree.
 
+mod backend;
 mod execute;
 mod manifest;
 mod plan;
@@ -17,7 +18,7 @@ pub use execute::{
 pub use manifest::{
     MaterializationLimits, MaterializationManifest, MaterializationReceipt, Sha256Digest,
 };
-pub use plan::{CommandSpec, MaterializationSlot, NetworkScope, RootOwnedPolicy};
+pub use plan::{CommandSpec, GitOperation, MaterializationSlot, NetworkScope, RootOwnedPolicy};
 
 use thiserror::Error;
 
@@ -56,3 +57,6 @@ pub enum MaterializeError {
     #[error("filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
+pub use backend::{
+    GitCommandLog, GitCommandResultLog, GitHostObservation, GitHostObserver, ProcessGitBackend,
+};

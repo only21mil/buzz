@@ -129,6 +129,8 @@ pub(crate) struct TreeMaterialization<'a> {
     pub maximum_depth: u16,
     /// Trusted-base workflow bytes.
     pub trusted_workflow: &'a [u8],
+    /// Exact trusted-base workflow blob object ID.
+    pub workflow_blob_oid: &'a str,
     /// Canonical broker-supplied input bytes.
     pub canonical_inputs: &'a [u8],
     /// Trusted wall clock used to stop publication at lease expiry.
@@ -234,6 +236,7 @@ pub(crate) fn materialize_tree(
             repo_coordinate: request.manifest.repo_coordinate.clone(),
             source_sha: request.manifest.source_sha.clone(),
             tree_oid: request.manifest.tree_oid.clone(),
+            workflow_blob_oid: request.workflow_blob_oid.to_owned(),
             trusted_base_sha: request.manifest.trusted_base_sha.clone(),
             workflow_id: request.manifest.workflow_id.clone(),
             job_id: request.manifest.job_id.clone(),
@@ -694,6 +697,7 @@ mod tests {
             maximum_path_bytes: 100,
             maximum_depth: 5,
             trusted_workflow: b"name: CI\n",
+            workflow_blob_oid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             canonical_inputs: b"{}",
             now_unix_seconds: &test_now,
             expires_at_unix_seconds: 2_000,
@@ -792,6 +796,7 @@ mod tests {
                 maximum_path_bytes: 100,
                 maximum_depth: 5,
                 trusted_workflow: b"name: CI\n",
+                workflow_blob_oid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                 canonical_inputs: b"{}",
                 now_unix_seconds: &clock,
                 expires_at_unix_seconds: 2_000,
@@ -843,6 +848,7 @@ mod tests {
                 maximum_path_bytes: 100,
                 maximum_depth: 5,
                 trusted_workflow: b"name: CI\n",
+                workflow_blob_oid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                 canonical_inputs: b"{}",
                 now_unix_seconds: &test_now,
                 expires_at_unix_seconds: 2_000,
