@@ -382,6 +382,16 @@ impl DnsExecPlan {
         &self.host
     }
 
+    /// Return the pure lease plan retained by the lifecycle adapter.
+    pub fn isolation_plan(&self) -> &LeaseIsolationPlan {
+        &self.isolation
+    }
+
+    /// Return the authenticated activation binding retained with the receipt.
+    pub fn activation_binding(&self) -> &DnsActivationBinding {
+        &self.activation
+    }
+
     pub fn receipt_name(&self) -> &str {
         &self.receipt_name
     }
@@ -544,6 +554,16 @@ impl DnsExecReceipt {
             readback,
         }
     }
+
+    /// Return the activation coordinates sealed into this executor receipt.
+    pub fn activation_binding(&self) -> &DnsActivationBinding {
+        &self.activation
+    }
+
+    /// Return the five released DNS proofs sealed into this receipt.
+    pub const fn readback(&self) -> DnsReadback {
+        self.readback
+    }
 }
 
 /// Concrete executor which applies [`DnsHostPlan`] through exact commands.
@@ -563,7 +583,7 @@ impl DnsExecutor<ProcessCommandRunner> {
 
 impl<R: ExactCommandRunner> DnsExecutor<R> {
     #[cfg(test)]
-    fn mapped(runner: R, base: &Path) -> Self {
+    pub(crate) fn mapped(runner: R, base: &Path) -> Self {
         Self {
             runner,
             roots: ExecutorRoots::mapped(base),
