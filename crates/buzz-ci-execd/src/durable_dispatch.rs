@@ -12,8 +12,8 @@ use buzz_ci_broker_protocol::{
 use crate::{
     activation::{
         ActivationController, ActivationState, AdmissionError, CleanupDisposition,
-        DurableStateSnapshot, LeaseConclusion, LeaseToken, OrdinaryAdmission,
-        QualificationLease, QualificationOutcome, ReadyRestoreValidation, VerifiedSigner,
+        DurableStateSnapshot, LeaseConclusion, LeaseToken, OrdinaryAdmission, QualificationLease,
+        QualificationOutcome, ReadyRestoreValidation, VerifiedSigner,
     },
     control::{AdmissionBoundaryError, ClosedDispatch, ControlDispatch},
     runtime::{
@@ -360,9 +360,7 @@ where
                 Some(QualificationDirective::TeardownFailure),
                 QualificationTerminal::Completed(_),
             ) => {
-                let _ = self
-                    .controller
-                    .finish_qualification_teardown_failure(lease);
+                let _ = self.controller.finish_qualification_teardown_failure(lease);
                 false
             }
         };
@@ -400,7 +398,7 @@ pub enum BootstrapDispatch<O, Q> {
     /// Missing or quarantined authority/state exposes zero capacity.
     Closed(ClosedDispatch),
     /// Loaded authority/state retains its durable store and revision.
-    Loaded(DurableDispatch<DurableStateStore, ServiceAuthority, O, Q>),
+    Loaded(Box<DurableDispatch<DurableStateStore, ServiceAuthority, O, Q>>),
 }
 
 impl<O: OrdinaryExecutor, Q: QualificationExecutor> ControlDispatch for BootstrapDispatch<O, Q> {
@@ -424,7 +422,7 @@ where
 {
     match bootstrap {
         RuntimeBootstrap::Loaded(runtime) => {
-            BootstrapDispatch::Loaded(runtime.compose(ordinary, qualification))
+            BootstrapDispatch::Loaded(Box::new(runtime.compose(ordinary, qualification)))
         }
         RuntimeBootstrap::NotProvisioned(_) | RuntimeBootstrap::Quarantined { .. } => {
             BootstrapDispatch::Closed(ClosedDispatch::new())
@@ -507,19 +505,15 @@ mod tests {
     };
 
     use buzz_ci_broker_protocol::{GitOid, Operation, TrustClass};
-    use buzz_ci_isolation_contract::{
-        PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH,
-    };
+    use buzz_ci_isolation_contract::{PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH};
 
     use super::*;
     use crate::{
         activation::{
-            ActivationGrant, AdmissionTrustClass, FixtureJobCoordinates,
-            HostActivationCoordinates, OrdinaryJobCoordinates, QualificationPermit,
+            ActivationGrant, AdmissionTrustClass, FixtureJobCoordinates, HostActivationCoordinates,
+            OrdinaryJobCoordinates, QualificationPermit,
         },
-        seccomp::{
-            SeccompFileReadback, SeccompFileType, SeccompSeedPlan, SECCOMP_PROFILE_MODE,
-        },
+        seccomp::{SeccompFileReadback, SeccompFileType, SeccompSeedPlan, SECCOMP_PROFILE_MODE},
     };
 
     const ROOT: VerifiedSigner = VerifiedSigner([1; 32]);

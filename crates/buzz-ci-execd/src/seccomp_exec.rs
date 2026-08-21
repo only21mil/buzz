@@ -14,12 +14,8 @@ use nix::sys::stat::{fchmod, fstat, mkdirat, Mode, SFlag};
 use nix::unistd::{fchown, fsync, unlinkat, Gid, Uid, UnlinkatFlags};
 use sha2::{Digest, Sha256};
 
-use crate::seccomp::{
-    FEDORA_SECCOMP_SOURCE_MODE, SECCOMP_PROFILE_MODE,
-};
-use crate::seccomp_host::{
-    SECCOMP_DIRECTORY_MODE, SECCOMP_OWNER_GID, SECCOMP_OWNER_UID,
-};
+use crate::seccomp::{FEDORA_SECCOMP_SOURCE_MODE, SECCOMP_PROFILE_MODE};
+use crate::seccomp_host::{SECCOMP_DIRECTORY_MODE, SECCOMP_OWNER_GID, SECCOMP_OWNER_UID};
 use buzz_ci_isolation_contract::{PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH};
 
 const SOURCE_COMPONENTS: [&str; 4] = ["usr", "share", "containers", "seccomp.json"];
@@ -104,11 +100,7 @@ pub enum SeccompExecError {
 pub fn install_phase1() -> Result<SeccompInstallReceipt, SeccompExecError> {
     let root = open_root(Path::new("/"))?;
     let mut names = KernelTemporaryNames;
-    install_from_root(
-        &root,
-        InstallContract::phase1(),
-        &mut names,
-    )
+    install_from_root(&root, InstallContract::phase1(), &mut names)
 }
 
 /// OCI lifecycle position observed from the concrete create request.
@@ -396,12 +388,7 @@ fn ensure_destination_directory(
     }
     let directory = open_directory_at(parent, name)
         .map_err(|_| SeccompExecError::InvalidDestinationDirectory)?;
-    validate_directory_exact(
-        &directory,
-        owner_uid,
-        owner_gid,
-        SECCOMP_DIRECTORY_MODE,
-    )?;
+    validate_directory_exact(&directory, owner_uid, owner_gid, SECCOMP_DIRECTORY_MODE)?;
     Ok(directory)
 }
 
@@ -453,11 +440,7 @@ fn create_temporary(
         match openat(
             destination,
             name.as_str(),
-            OFlag::O_WRONLY
-                | OFlag::O_CREAT
-                | OFlag::O_EXCL
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0o600),
         ) {
             Ok(fd) => return Ok((name, File::from(fd))),
@@ -679,9 +662,18 @@ mod tests {
         );
         let receipt = execute(root.path(), contract.clone()).unwrap();
         assert_eq!(receipt.disposition(), SeccompInstallDisposition::Installed);
-        assert_eq!(receipt.source_digest(), hex::encode(contract.expected_digest));
-        assert_eq!(receipt.build_digest(), hex::encode(contract.expected_digest));
-        assert_eq!(receipt.install_digest(), hex::encode(contract.expected_digest));
+        assert_eq!(
+            receipt.source_digest(),
+            hex::encode(contract.expected_digest)
+        );
+        assert_eq!(
+            receipt.build_digest(),
+            hex::encode(contract.expected_digest)
+        );
+        assert_eq!(
+            receipt.install_digest(),
+            hex::encode(contract.expected_digest)
+        );
 
         let installed = installed_path(root.path(), &contract);
         let metadata = fs::metadata(&installed).unwrap();
@@ -698,9 +690,15 @@ mod tests {
                 & 0o7777,
             SECCOMP_DIRECTORY_MODE
         );
-        assert!(fs::read_dir(root.path().join("var/lib/buzzci/seccomp/v1/sha256"))
-            .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(
+            fs::read_dir(root.path().join("var/lib/buzzci/seccomp/v1/sha256"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
     }
 
     #[test]
@@ -738,7 +736,10 @@ mod tests {
         let source = root.path().join("usr/share/containers/seccomp.json");
         fs::remove_file(&source).unwrap();
         symlink("/etc/passwd", &source).unwrap();
-        assert_eq!(execute(root.path(), contract), Err(SeccompExecError::OpenSource));
+        assert_eq!(
+            execute(root.path(), contract),
+            Err(SeccompExecError::OpenSource)
+        );
 
         let (root, contract) = fixture();
         symlink("/tmp", root.path().join("var/lib/buzzci")).unwrap();
@@ -771,11 +772,21 @@ mod tests {
         let (root, contract) = fixture();
         let source = root.path().join("usr/share/containers/seccomp.json");
         fs::set_permissions(&source, fs::Permissions::from_mode(0o666)).unwrap();
-        assert_eq!(execute(root.path(), contract), Err(SeccompExecError::InvalidSource));
+        assert_eq!(
+            execute(root.path(), contract),
+            Err(SeccompExecError::InvalidSource)
+        );
 
         let (root, contract) = fixture();
-        fs::write(root.path().join("usr/share/containers/seccomp.json"), b"wrong").unwrap();
-        assert_eq!(execute(root.path(), contract), Err(SeccompExecError::SourceDigest));
+        fs::write(
+            root.path().join("usr/share/containers/seccomp.json"),
+            b"wrong",
+        )
+        .unwrap();
+        assert_eq!(
+            execute(root.path(), contract),
+            Err(SeccompExecError::SourceDigest)
+        );
 
         let (root, contract) = fixture();
         fs::hard_link(
@@ -783,7 +794,10 @@ mod tests {
             root.path().join("usr/share/containers/second-link.json"),
         )
         .unwrap();
-        assert_eq!(execute(root.path(), contract), Err(SeccompExecError::InvalidSource));
+        assert_eq!(
+            execute(root.path(), contract),
+            Err(SeccompExecError::InvalidSource)
+        );
     }
 
     #[test]
