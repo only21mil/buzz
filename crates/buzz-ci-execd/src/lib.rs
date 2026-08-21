@@ -9,6 +9,8 @@
 
 pub mod activation;
 #[cfg(target_os = "linux")]
+pub mod activation_coordinator;
+#[cfg(target_os = "linux")]
 pub mod control;
 #[cfg(target_os = "linux")]
 pub mod dns_activation;

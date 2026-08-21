@@ -527,6 +527,45 @@ impl ActivationController {
         }
     }
 
+    /// Resume the completed qualification handoff under an explicit root
+    /// coordinator action. Ordinary daemon restart restoration deliberately
+    /// rejects this state as ambiguous; only the root-owned authority/state
+    /// coordinator may use this narrower seam while holding its publication
+    /// lock.
+    pub(crate) fn resume_reconciliation(
+        root_authority: VerifiedSigner,
+        snapshot: DurableStateSnapshot,
+    ) -> Result<Self, ActivationError> {
+        if snapshot.version != 1
+            || snapshot.root_authority != root_authority
+            || root_authority.0 == [0; 32]
+            || snapshot.state != ActivationState::Reconciling
+            || snapshot.active_lease.is_some()
+            || snapshot.activation.is_some()
+            || !snapshot.nonce_ledger.is_valid()
+            || snapshot.next_lease_generation == 0
+            || !snapshot_shape_is_valid(snapshot)
+            || !snapshot.qualification.is_some_and(|qualification| {
+                qualification.active_lease.is_none()
+                    && qualification
+                        .evidence_set_digest
+                        .is_some_and(|digest| digest != [0; 32])
+            })
+        {
+            return Err(ActivationError::RestartAmbiguous);
+        }
+        Ok(Self {
+            root_authority,
+            state: snapshot.state,
+            qualification: snapshot.qualification,
+            activation: snapshot.activation,
+            active_lease: snapshot.active_lease,
+            seen_nonces: snapshot.nonce_ledger,
+            last_admission_at: snapshot.last_admission_at,
+            next_lease_generation: snapshot.next_lease_generation,
+        })
+    }
+
     /// Enter the qualification-only state under an exact root permit.
     pub fn start_qualification(
         &mut self,

@@ -15,6 +15,7 @@ use std::{
 use buzz_ci_broker_protocol::{
     AdmitAttemptRequest, GitOid, QualificationDirective, QualificationRequest, TrustClass,
 };
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -42,12 +43,14 @@ pub const AUTHORITY_FILE: &str = "/etc/buzzci/authority/authority-v1.json";
 /// Canonical atomic controller-state record.
 pub const ACTIVATION_STATE_FILE: &str = "/var/lib/buzzci/activation/state-v1.json";
 
-const DIRECTORY_MODE: u32 = 0o700;
-const AUTHORITY_MODE: u32 = 0o400;
-const STATE_MODE: u32 = 0o600;
-const MAX_AUTHORITY_BYTES: u64 = 64 * 1024;
-const MAX_STATE_BYTES: u64 = 128 * 1024;
-const FORMAT_VERSION: u8 = 1;
+pub(crate) const DIRECTORY_MODE: u32 = 0o700;
+pub(crate) const AUTHORITY_MODE: u32 = 0o400;
+pub(crate) const STATE_MODE: u32 = 0o600;
+pub(crate) const MAX_AUTHORITY_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_STATE_BYTES: u64 = 128 * 1024;
+pub(crate) const FORMAT_VERSION: u8 = 1;
+pub(crate) const COORDINATOR_LOCK_FILE: &str = "authority-state-v1.lock";
+pub(crate) const COORDINATOR_MARKER_FILE: &str = ".authority-state-v1.pending";
 
 /// Why authority or controller state did not open capacity.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -350,6 +353,10 @@ pub struct ServiceAuthority {
 }
 
 impl ServiceAuthority {
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Root identity used by the pure activation controller.
     pub const fn root(&self) -> VerifiedSigner {
         self.root
@@ -418,16 +425,27 @@ struct OrdinaryAuthority {
     admission: OrdinaryAdmission,
 }
 
+/// Exact root-authored ordinary request bound to an activation grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RootOrdinaryAuthority {
+    pub grant: ActivationGrant,
+    pub request: AdmitAttemptRequest,
+    pub job_identity: [u8; 32],
+    pub lease_id: [u8; 16],
+    pub nonce: [u8; 32],
+    pub authenticated_signer: VerifiedSigner,
+}
+
 #[derive(Clone)]
-struct RuntimePaths {
-    authority_root: PathBuf,
-    authority_file: PathBuf,
-    activation_root: PathBuf,
-    state_file: PathBuf,
+pub(crate) struct RuntimePaths {
+    pub(crate) authority_root: PathBuf,
+    pub(crate) authority_file: PathBuf,
+    pub(crate) activation_root: PathBuf,
+    pub(crate) state_file: PathBuf,
 }
 
 impl RuntimePaths {
-    fn canonical() -> Self {
+    pub(crate) fn canonical() -> Self {
         Self {
             authority_root: AUTHORITY_ROOT.into(),
             authority_file: AUTHORITY_FILE.into(),
@@ -443,6 +461,18 @@ pub fn prepare_runtime(now: u64) -> RuntimePreparation {
 }
 
 fn prepare_from_paths(paths: &RuntimePaths, now: u64) -> RuntimePreparation {
+    let _lock = match acquire_runtime_lock(paths, FlockArg::LockShared, 0) {
+        Ok(lock) => lock,
+        Err(error) => return RuntimePreparation::NotProvisioned(error),
+    };
+    if paths
+        .activation_root
+        .join(COORDINATOR_MARKER_FILE)
+        .try_exists()
+        .unwrap_or(true)
+    {
+        return RuntimePreparation::NotProvisioned(RuntimeLoadError::Quarantined);
+    }
     let authority_bytes = match read_artifact(
         &paths.authority_root,
         &paths.authority_file,
@@ -554,7 +584,7 @@ fn quarantine(root: VerifiedSigner) -> ActivationController {
     ActivationController::restore(root, snapshot, None).controller
 }
 
-fn read_artifact(
+pub(crate) fn read_artifact(
     directory: &Path,
     path: &Path,
     expected_mode: u32,
@@ -586,14 +616,54 @@ fn read_artifact(
     Ok(bytes)
 }
 
+pub(crate) fn read_artifact_for_owner(
+    directory: &Path,
+    path: &Path,
+    expected_mode: u32,
+    max_bytes: u64,
+    expected_uid: u32,
+) -> Result<Vec<u8>, RuntimeLoadError> {
+    validate_directory_for_owner(directory, expected_uid)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => RuntimeLoadError::NotProvisioned,
+        _ => RuntimeLoadError::ReadFailed,
+    })?;
+    let before = file.metadata().map_err(|_| RuntimeLoadError::ReadFailed)?;
+    validate_file_for_owner(&before, expected_mode, max_bytes, expected_uid)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| RuntimeLoadError::ReadFailed)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(RuntimeLoadError::ReadFailed);
+    }
+    let after = file.metadata().map_err(|_| RuntimeLoadError::ReadFailed)?;
+    if file_identity(&before) != file_identity(&after) || after.len() != bytes.len() as u64 {
+        return Err(RuntimeLoadError::ReadFailed);
+    }
+    Ok(bytes)
+}
+
 fn validate_directory(path: &Path) -> Result<(), RuntimeLoadError> {
+    validate_directory_for_owner(path, 0)
+}
+
+pub(crate) fn validate_directory_for_owner(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(), RuntimeLoadError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => RuntimeLoadError::NotProvisioned,
         _ => RuntimeLoadError::UnsafeMetadata,
     })?;
     if !metadata.file_type().is_dir()
-        || metadata.uid() != 0
-        || metadata.gid() != 0
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_uid
         || metadata.permissions().mode() & 0o7777 != DIRECTORY_MODE
     {
         return Err(RuntimeLoadError::UnsafeMetadata);
@@ -606,9 +676,18 @@ fn validate_file(
     expected_mode: u32,
     max_bytes: u64,
 ) -> Result<(), RuntimeLoadError> {
+    validate_file_for_owner(metadata, expected_mode, max_bytes, 0)
+}
+
+pub(crate) fn validate_file_for_owner(
+    metadata: &Metadata,
+    expected_mode: u32,
+    max_bytes: u64,
+    expected_uid: u32,
+) -> Result<(), RuntimeLoadError> {
     if !metadata.file_type().is_file()
-        || metadata.uid() != 0
-        || metadata.gid() != 0
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_uid
         || metadata.nlink() != 1
         || metadata.permissions().mode() & 0o7777 != expected_mode
         || metadata.len() == 0
@@ -617,6 +696,31 @@ fn validate_file(
         return Err(RuntimeLoadError::UnsafeMetadata);
     }
     Ok(())
+}
+
+pub(crate) fn acquire_runtime_lock(
+    paths: &RuntimePaths,
+    operation: FlockArg,
+    expected_uid: u32,
+) -> Result<Flock<File>, RuntimeLoadError> {
+    validate_directory_for_owner(&paths.activation_root, expected_uid)?;
+    let path = paths.activation_root.join(COORDINATOR_LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => RuntimeLoadError::NotProvisioned,
+        _ => RuntimeLoadError::ReadFailed,
+    })?;
+    validate_file_for_owner(
+        &file.metadata().map_err(|_| RuntimeLoadError::ReadFailed)?,
+        STATE_MODE,
+        1,
+        expected_uid,
+    )?;
+    Flock::lock(file, operation).map_err(|_| RuntimeLoadError::ReadFailed)
 }
 
 fn file_identity(metadata: &Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
@@ -650,7 +754,7 @@ fn persist_to_path(
     )
 }
 
-fn persist_to_validated_path(
+pub(crate) fn persist_to_validated_path(
     directory: &Path,
     destination: &Path,
     snapshot: DurableStateSnapshot,
@@ -686,9 +790,9 @@ fn persist_to_validated_path(
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AuthorityFile {
+pub(crate) struct AuthorityFile {
     version: u8,
     revision: u64,
     root_authority: String,
@@ -697,7 +801,7 @@ struct AuthorityFile {
 }
 
 impl AuthorityFile {
-    fn decode(self) -> Result<ServiceAuthority, RuntimeLoadError> {
+    pub(crate) fn decode(self) -> Result<ServiceAuthority, RuntimeLoadError> {
         if self.version != FORMAT_VERSION || self.revision == 0 {
             return Err(RuntimeLoadError::Malformed);
         }
@@ -717,9 +821,26 @@ impl AuthorityFile {
             ordinary,
         })
     }
+
+    pub(crate) fn encode(
+        revision: u64,
+        root: VerifiedSigner,
+        qualification: Option<QualificationPermit>,
+        ordinary: Option<RootOrdinaryAuthority>,
+    ) -> Result<Self, RuntimeLoadError> {
+        let value = Self {
+            version: FORMAT_VERSION,
+            revision,
+            root_authority: hex::encode(root.0),
+            qualification: qualification.map(QualificationAuthorityFile::encode),
+            ordinary: ordinary.map(OrdinaryAuthorityFile::encode),
+        };
+        value.clone().decode()?;
+        Ok(value)
+    }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct QualificationAuthorityFile {
     permit: PermitFile,
@@ -747,9 +868,16 @@ impl QualificationAuthorityFile {
             authenticated_signer,
         })
     }
+
+    fn encode(permit: QualificationPermit) -> Self {
+        Self {
+            permit: PermitFile::encode(permit),
+            authenticated_signer: hex::encode(permit.fixture_signer.0),
+        }
+    }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OrdinaryAuthorityFile {
     grant: GrantFile,
@@ -799,11 +927,23 @@ impl OrdinaryAuthorityFile {
             admission,
         })
     }
+
+    fn encode(value: RootOrdinaryAuthority) -> Self {
+        Self {
+            grant: GrantFile::encode(value.grant),
+            request: AdmitFile::encode(value.request),
+            host: HostFile::encode(value.grant.host),
+            job_identity: hex::encode(value.job_identity),
+            lease_id: hex::encode(value.lease_id),
+            nonce: hex::encode(value.nonce),
+            authenticated_signer: hex::encode(value.authenticated_signer.0),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StateFile {
+pub(crate) struct StateFile {
     version: u8,
     revision: u64,
     authority_revision: u64,
@@ -819,7 +959,11 @@ struct StateFile {
 }
 
 impl StateFile {
-    fn decode(
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn decode(
         &self,
         authority: &ServiceAuthority,
         authority_sha256: [u8; 32],
@@ -879,7 +1023,7 @@ impl StateFile {
         })
     }
 
-    fn encode(
+    pub(crate) fn encode(
         snapshot: DurableStateSnapshot,
         revision: u64,
         authority_revision: u64,
@@ -1195,7 +1339,7 @@ impl GrantFile {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AdmitFile {
     signed_request_digest: String,
@@ -1242,6 +1386,28 @@ impl AdmitFile {
             trust_class: TrustClass::AcceptedReviewed,
         })
     }
+
+    fn encode(value: AdmitAttemptRequest) -> Self {
+        Self {
+            signed_request_digest: hex::encode(value.signed_request_digest),
+            actor_pubkey: hex::encode(value.actor_pubkey),
+            audience_digest: hex::encode(value.audience_digest),
+            idempotency_digest: hex::encode(value.idempotency_digest),
+            source_pin_event_id: hex::encode(value.source_pin_event_id),
+            workflow_digest: hex::encode(value.workflow_digest),
+            job_manifest_digest: hex::encode(value.job_manifest_digest),
+            isolation_profile_digest: hex::encode(value.isolation_profile_digest),
+            run_id: hex::encode(value.run_id),
+            tip_oid: OidFile::encode(value.tip_oid),
+            base_oid: OidFile::encode(value.base_oid),
+            issued_at: value.issued_at,
+            expires_at: value.expires_at,
+            wall_timeout_seconds: value.wall_timeout_seconds,
+            attempt: value.attempt,
+            parent_attempt: value.parent_attempt,
+            trust_class: "accepted_reviewed".into(),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1274,7 +1440,7 @@ impl OidFile {
     }
 }
 
-fn qualification_request(permit: QualificationPermit) -> QualificationRequest {
+pub(crate) fn qualification_request(permit: QualificationPermit) -> QualificationRequest {
     QualificationRequest {
         integrated_candidate_sha: permit.host.integrated_candidate_sha,
         broker_build_identity: permit.host.broker_build_identity,
