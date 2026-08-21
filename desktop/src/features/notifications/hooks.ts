@@ -4,6 +4,7 @@ import { useHomeFeedQuery } from "@/features/home/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { Channel, FeedItem, HomeFeedResponse } from "@/shared/api/types";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import {
   getDesktopNotificationPermissionState,
   requestDesktopNotificationAccess,
@@ -127,9 +128,7 @@ function readStoredNotificationSettings(pubkey: string): NotificationSettings {
     return DEFAULT_NOTIFICATION_SETTINGS;
   }
 
-  const rawValue = window.localStorage.getItem(
-    notificationSettingsStorageKey(pubkey),
-  );
+  const rawValue = getStorageItem(notificationSettingsStorageKey(pubkey));
   if (!rawValue) {
     return DEFAULT_NOTIFICATION_SETTINGS;
   }
@@ -149,7 +148,7 @@ function writeStoredNotificationSettings(
     return;
   }
 
-  window.localStorage.setItem(
+  setStorageItem(
     notificationSettingsStorageKey(pubkey),
     JSON.stringify(settings),
   );

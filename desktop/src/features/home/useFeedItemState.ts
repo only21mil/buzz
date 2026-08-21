@@ -1,5 +1,7 @@
 import * as React from "react";
 
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
+
 const DONE_STORAGE_KEY = "buzz-home-feed-done.v1";
 const UNREAD_STORAGE_KEY = "buzz-home-feed-unread.v1";
 const MAX_ITEMS = 500;
@@ -14,7 +16,7 @@ function unreadStorageKey(pubkey: string) {
 
 function readStoredIds(key: string): string[] {
   if (typeof window === "undefined") return [];
-  const raw = window.localStorage.getItem(key);
+  const raw = getStorageItem(key);
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -30,7 +32,7 @@ function readStoredIds(key: string): string[] {
 
 function writeStoredIds(key: string, ids: string[]) {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(key, JSON.stringify(ids.slice(-MAX_ITEMS)));
+  setStorageItem(key, JSON.stringify(ids.slice(-MAX_ITEMS)));
 }
 
 export function useFeedItemState(pubkey: string | undefined) {

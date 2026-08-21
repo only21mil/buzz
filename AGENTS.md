@@ -496,6 +496,7 @@ Current singletons that are reset on relay boundary changes (same-relay
 reconnects preserve pending avatar verification work):
 - `relayClient.disconnect()` — WebSocket teardown + promise rejection
 - `resetRateLimitGate()` — clears any active rate-limit window from the old relay
+- `clearTimeoutState()` — clears the old community's process-wide moderation timeout
 - `clearAllDrafts()` — message draft cache
 - `resetAgentObserverStore()` — agent observer relay store
 - `resetActiveAgentTurnsStore()` — active agent turn timers

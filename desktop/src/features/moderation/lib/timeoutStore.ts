@@ -60,7 +60,7 @@ export function recordTimeoutFromRejection(
   return true;
 }
 
-/** Clear the timeout — called when a send is accepted (the block is lifted). */
+/** Clear the timeout after an accepted send or a community boundary reset. */
 export function clearTimeoutState(): void {
   if (!active && expiresAtMs === null) {
     return;
