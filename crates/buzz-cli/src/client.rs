@@ -110,7 +110,6 @@ fn sign_nip98(
     Ok(format!("Nostr {}", B64.encode(json.as_bytes())))
 }
 
-#[allow(dead_code)]
 fn relay_relative_url(relay_url: &str, path: &str) -> Result<String, CliError> {
     if !path.starts_with('/') || path.starts_with("//") || path.contains("://") {
         return Err(CliError::Usage(
