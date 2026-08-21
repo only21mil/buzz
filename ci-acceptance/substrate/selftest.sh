@@ -198,11 +198,11 @@ done
 
 awk -F '\t' '
   /^#/ || NF == 0 { next }
-  NF != 3 || $1 !~ /^TM-(06|07|1[2-7])$/ || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ \
+  NF != 3 || $1 !~ /^TM-(06|07|09|11|1[2-7])$/ || $2 !~ /^[a-z0-9][a-z0-9_-]*$/ \
     || $3 !~ /^(none|teardown_failure)$/ { bad = 1 }
   seen[$1 SUBSEP $2]++ { bad = 1 }
   $3 == "teardown_failure" { teardown++ }
-  END { if (bad || teardown != 2 || length(seen) != 35) exit 1 }
+  END { if (bad || teardown != 2 || length(seen) != 37) exit 1 }
 ' "$case_plan" || fail 'invalid qualification case plan'
 
 grep -Fxq 'ListenStream=/run/buzzci/execd.sock' "$socket"
