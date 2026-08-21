@@ -31,7 +31,7 @@ fi
 
 if timeout 10 jq -s -e '
   def exact_token: type == "string" and test("^@[A-Z][A-Z0-9_]*@$");
-  def binding_keys: ["attempt_id","base_oid","broker_build_identity","host_profile_digest","integrated_candidate_sha","isolation_profile_digest","job_identity","lease_generation","lease_id","manifest_digest","nonce","request_digest","signer_pubkey","source_oid","suite_identity"];
+  def binding_keys: ["attempt","base_oid","broker_build_identity","host_profile_digest","integrated_candidate_sha","isolation_profile_digest","job_identity","lease_generation","lease_id","manifest_digest","nonce","request_digest","run_id","signer_pubkey","source_oid","suite_identity"];
   all(.[];
     .version == "completion_acceptance_v1" and .wire_schema == "unbound" and
     (.case_binding | keys | sort) == binding_keys and

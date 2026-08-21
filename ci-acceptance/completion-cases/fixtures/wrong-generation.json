@@ -14,7 +14,8 @@
     "source_oid": "@SOURCE_OID_HEX@",
     "base_oid": "@BASE_OID_HEX@",
     "job_identity": "@JOB_IDENTITY_HEX@",
-    "attempt_id": "@ATTEMPT_ID_HEX@",
+    "run_id": "@RUN_ID_HEX@",
+    "attempt": "@ATTEMPT_U32@",
     "nonce": "@NONCE_HEX@",
     "lease_id": "@LEASE_ID_HEX@",
     "lease_generation": "@LEASE_GENERATION_U64@"
@@ -31,7 +32,8 @@
     "source_oid": "@SOURCE_OID_HEX@",
     "base_oid": "@BASE_OID_HEX@",
     "job_identity": "@JOB_IDENTITY_HEX@",
-    "attempt_id": "@ATTEMPT_ID_HEX@",
+    "run_id": "@RUN_ID_HEX@",
+    "attempt": "@ATTEMPT_U32@",
     "nonce": "@NONCE_HEX@",
     "lease_id": "@LEASE_ID_HEX@",
     "lease_generation": "@LEASE_GENERATION_U64@"
