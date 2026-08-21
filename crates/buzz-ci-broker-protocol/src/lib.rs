@@ -364,6 +364,7 @@ pub enum BrokerState {
     Draining = 4,
     Quarantined = 5,
     Terminal = 6,
+    Leased = 7,
 }
 
 impl TryFrom<u8> for BrokerState {
@@ -377,6 +378,7 @@ impl TryFrom<u8> for BrokerState {
             4 => Ok(Self::Draining),
             5 => Ok(Self::Quarantined),
             6 => Ok(Self::Terminal),
+            7 => Ok(Self::Leased),
             _ => Err(DecodeError::UnknownEnum),
         }
     }
@@ -1293,6 +1295,7 @@ mod tests {
         assert_eq!(Operation::GetAttempt as u16, 4);
         assert_eq!(Operation::AdmitQualification as u16, 5);
         assert_eq!(Operation::CompleteAttempt as u16, 6);
+        assert_eq!(BrokerState::Leased as u8, 7);
     }
 
     #[test]
