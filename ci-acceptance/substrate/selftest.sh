@@ -274,12 +274,19 @@ for job_principal in buzzci-mat-01 buzzci-exec-01 buzzci-run-01; do
     || fail "ordinary job principal received acceptance sudo: $job_principal"
 done
 
+repo_root=$(git -C "$script_dir" rev-parse --show-toplevel) \
+  || fail 'cannot resolve repository root for index-mode checks'
+index_mode() {
+  local relative=${1#"$repo_root/"}
+  git -C "$repo_root" ls-files -s -- "$relative" \
+    | awk 'NR == 1 { mode = $1 } END { if (NR != 1) exit 1; print mode }'
+}
 while IFS= read -r repository_asset; do
-  [[ $(stat -c '%a' "$repository_asset") == 644 ]] \
-    || fail "unexpected repository mode: ${repository_asset#"$script_dir/"}"
+  [[ $(index_mode "$repository_asset") == 100644 ]] \
+    || fail "unexpected repository index mode: ${repository_asset#"$script_dir/"}"
 done < <(find "$script_dir" -type f ! -name selftest.sh -print | sort)
-[[ $(stat -c '%a' "$script_dir/selftest.sh") == 755 ]] \
-  || fail 'selftest is not executable'
+[[ $(index_mode "$script_dir/selftest.sh") == 100755 ]] \
+  || fail 'selftest is not executable in the repository index'
 
 if rg -n '(^|[;&|[:space:]])(sudo|systemctl|systemd-run|useradd|groupadd|usermod|install|cp|mv|mount)([;&|[:space:]]|$)' \
   "$script_dir" --glob '*.sh' --glob '!selftest.sh'; then
