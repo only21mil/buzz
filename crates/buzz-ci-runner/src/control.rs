@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use buzz_ci_broker_protocol::{
     decode_response, encode_request, AdmitAttemptRequest, BrokerResponse, BrokerState,
-    CompleteAttemptRequest, Conclusion, FrameHeader, Request, ResponseCode, TrustClass,
+    CompleteAttemptRequest, Conclusion, FrameHeader, GitOid, Request, ResponseCode, TrustClass,
     HEADER_SIZE, MAX_SAFE_INTEGER, RESPONSE_BODY_SIZE,
 };
 use buzz_core::ci::CiRequestEnvelope;
@@ -126,6 +126,8 @@ pub struct AdmittedLease {
     signed_request_digest: [u8; 32],
     run_id: [u8; 16],
     attempt: u32,
+    job_manifest_digest: [u8; 32],
+    tip_oid: GitOid,
     lease_id: [u8; 16],
     lease_generation: u64,
     accepted_at: u64,
@@ -272,6 +274,8 @@ pub fn validate_admitted_response(
         signed_request_digest: request.signed_request_digest,
         run_id: request.run_id,
         attempt: request.attempt,
+        job_manifest_digest: request.job_manifest_digest,
+        tip_oid: request.tip_oid,
         lease_id: response.attempt_id,
         lease_generation: response.lease_generation,
         accepted_at: response.accepted_at,
@@ -312,11 +316,12 @@ pub fn complete_attempt(
         terminal_at: evidence.terminal_at,
     };
     let response = transport.complete(request)?;
-    validate_completed_response(request, response)
+    validate_completed_response(lease, request, response)
 }
 
 /// Reject a terminal broker response that is not bound to the completed lease.
 pub fn validate_completed_response(
+    lease: AdmittedLease,
     request: CompleteAttemptRequest,
     response: BrokerResponse,
 ) -> Result<BrokerResponse, ControlError> {
@@ -325,6 +330,8 @@ pub fn validate_completed_response(
         || response.attempt_id != request.lease_id
         || response.run_id != request.run_id
         || response.accepted_request_digest != request.signed_request_digest
+        || response.job_manifest_digest != lease.job_manifest_digest
+        || response.tip_oid != Some(lease.tip_oid)
         || !matches!(
             response.broker_state,
             BrokerState::Ready | BrokerState::Quarantined | BrokerState::Terminal
@@ -335,6 +342,7 @@ pub fn validate_completed_response(
         || response.updated_at < request.terminal_at
         || response.updated_at > MAX_SAFE_INTEGER
         || response.lease_generation != request.lease_generation
+        || response.accepted_at != lease.accepted_at
         || response.attempt != request.attempt
     {
         return Err(ControlError::InvalidBrokerResponse);
@@ -618,8 +626,8 @@ mod tests {
             attempt_id: request.lease_id,
             run_id: request.run_id,
             accepted_request_digest: request.signed_request_digest,
-            job_manifest_digest: [0; 32],
-            tip_oid: None,
+            job_manifest_digest: [3; 32],
+            tip_oid: Some(GitOid::Sha1([0x33; 20])),
             broker_state: BrokerState::Terminal,
             conclusion: request.advisory_conclusion,
             terminal_reason: 0,
@@ -802,6 +810,26 @@ mod tests {
         assert_eq!(complete.evidence_set_digest, [7; 32]);
         assert_eq!(complete.terminal_at, 21);
         assert_eq!(response, completion_response(*complete));
+
+        let admitted = backend.leases[0];
+        let mut switched_manifest = response;
+        switched_manifest.job_manifest_digest = [99; 32];
+        assert_eq!(
+            validate_completed_response(admitted, *complete, switched_manifest),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        let mut switched_tip = response;
+        switched_tip.tip_oid = Some(GitOid::Sha1([0x44; 20]));
+        assert_eq!(
+            validate_completed_response(admitted, *complete, switched_tip),
+            Err(ControlError::InvalidBrokerResponse)
+        );
+        let mut switched_acceptance = response;
+        switched_acceptance.accepted_at += 1;
+        assert_eq!(
+            validate_completed_response(admitted, *complete, switched_acceptance),
+            Err(ControlError::InvalidBrokerResponse)
+        );
 
         let request = Request::CompleteAttempt(*complete);
         let golden = encode_request(request_id_for(request), request);
