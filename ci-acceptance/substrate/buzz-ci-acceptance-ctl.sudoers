@@ -1,0 +1,2 @@
+Defaults!/usr/libexec/buzz-ci-acceptance-ctl env_reset,!setenv
+root ALL=(buzzci-ctl) NOPASSWD: /usr/libexec/buzz-ci-acceptance-ctl ""

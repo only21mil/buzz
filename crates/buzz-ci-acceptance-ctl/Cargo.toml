@@ -1,6 +1,6 @@
 [package]
-name = "buzz-ci-execd"
-description = "Keyless, networkless privileged resource broker for Buzz CI"
+name = "buzz-ci-acceptance-ctl"
+description = "Qualification-only control input for Buzz CI acceptance"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,19 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "buzz_ci_execd"
+name = "buzz_ci_acceptance_ctl"
 path = "src/lib.rs"
 
 [[bin]]
-name = "buzz-ci-execd"
+name = "buzz-ci-acceptance-ctl"
 path = "src/main.rs"
 
 [dependencies]
 buzz-ci-broker-protocol = { workspace = true }
-buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["socket"] }

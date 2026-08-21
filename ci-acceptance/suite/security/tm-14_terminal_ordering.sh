@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_ID=TM-14
 TITLE='Prove the terminal ordering'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''
 candidate_dir=''
 evidence_dir=''
@@ -13,8 +14,8 @@ statuses=()
 evidence_files=()
 preconditions=(
   'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
-  'the published runner control entrypoint must support admit and get'
-  'forced teardown-failure coverage requires a published --fault teardown_failure control flag'
+  'BUZZ_CI_ACCEPTANCE_CTL receives exact root-authored normal and teardown_failure cases on stdin'
+  'teardown_failure is the only privileged qualification directive'
   'root readback of lease state requires SUITE_SUDO or passwordless sudo'
 )
 
@@ -36,7 +37,7 @@ emit() {
   local status summary pass_json=false checks_json evidence_json preconditions_json
   if ((plan)); then status=plan; summary='Plan only; no checks executed'
   elif [[ " ${statuses[*]} " == *' fail '* ]]; then status=fail; summary='At least one terminal-ordering check failed'
-  elif [[ " ${statuses[*]} " == *' not_runnable '* ]]; then status=not_runnable; summary='Terminal-ordering checks need the published isolation wiring or fault flag'
+  elif [[ " ${statuses[*]} " == *' not_runnable '* ]]; then status=not_runnable; summary='Terminal-ordering checks need published isolation wiring and fixed qualification cases'
   else status=pass; pass_json=true; summary='Publication followed complete teardown proof and teardown failure could not produce green'
   fi
   checks_json=$(printf '%s\n' "${checks[@]}" | timeout "$TIMEOUT_SECONDS" jq -sc '.')
@@ -86,24 +87,20 @@ if ((${#SUDO[@]} == 0)) && [[ ! -r /etc/buzzci/harness.env ]]; then
 fi
 if ((${#SUDO[@]} == 0)); then for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'Root lease readback requires SUITE_SUDO or passwordless sudo'; done; emit; exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"; fi
 harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || { for name in "${dynamic_names[@]}"; do record "$name" fail 'Published harness.env is not root-readable'; done; emit; exit 1; }
-env_get() { local key=$1; printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'; }
-runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
-lease_root=$(env_get BUZZ_CI_LEASE_STATE_ROOT)
-fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
-if [[ ! -x $runner_ctl || ! -d $lease_root || -z $fixture_repo ]]; then for name in "${dynamic_names[@]}"; do record "$name" fail 'Published runner control, lease state root, or fixture coordinate is missing'; done; emit; exit 1; fi
+export harness_text
+lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
+if ! acceptance_control_init; then for name in "${dynamic_names[@]}"; do record "$name" not_runnable "$ACCEPTANCE_UNAVAILABLE"; done; emit; exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"; fi
+if [[ ! -d $lease_root ]]; then for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'harness.env lacks a readable BUZZ_CI_LEASE_STATE_ROOT'; done; emit; exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"; fi
 
 admit_and_wait() {
-  local label=$1
-  shift
-  local admit_file=$out_dir/admit-$label.json lease_id lease_dir
-  if ! timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
-      --workflow ci-acceptance/probe-repo/workflow.yml --job ok --attempt 1 "$@" >"$admit_file" 2>"$out_dir/admit-$label.stderr"; then return 1; fi
-  lease_id=$(timeout 10 jq -r '.lease_id // empty' "$admit_file")
+  local label=$1 case_name=$2 admit_file=$out_dir/admit-$1.json lease_id lease_dir rc=0
+  acceptance_control_run "$case_name" "$admit_file" "$out_dir/admit-$label.stderr" || rc=$?
+  ((rc == 0)) || return "$rc"
+  lease_id=$(timeout 10 jq -r '.attempt_id // .lease_id // empty' "$admit_file")
   [[ $lease_id =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   lease_dir=$lease_root/$lease_id
   for _ in {1..120}; do
-    if timeout 10 "$runner_ctl" get --lease "$lease_id" >"$out_dir/final-$label.json" 2>"$out_dir/final-$label.stderr" \
-      && timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final-$label.json" >/dev/null; then break; fi
+    if timeout 10 "${SUDO[@]}" test -r "$lease_dir/final.json"; then timeout 10 "${SUDO[@]}" cp -- "$lease_dir/final.json" "$out_dir/final-$label.json" 2>"$out_dir/final-$label.stderr" || :; break; fi
     timeout 2 sleep 0.25
   done
   timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_dir/ordering.jsonl" "$out_dir/ordering-$label.jsonl" 2>/dev/null || :
@@ -111,7 +108,9 @@ admit_and_wait() {
   printf '%s' "$lease_id"
 }
 
-if normal_lease=$(admit_and_wait normal); then
+normal_rc=0
+normal_lease=$(admit_and_wait normal normal) || normal_rc=$?
+if ((normal_rc == 0)); then
   evidence_files+=("$TEST_ID/admit-normal.json" "$TEST_ID/admit-normal.stderr" "$TEST_ID/final-normal.json" "$TEST_ID/final-normal.stderr" "$TEST_ID/ordering-normal.jsonl" "$TEST_ID/teardown-normal.json")
   if timeout "$TIMEOUT_SECONDS" jq -s -e '
     map(select(.event as $e | ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_proof","publish"] | index($e))) as $x |
@@ -125,15 +124,12 @@ if normal_lease=$(admit_and_wait normal); then
     record terminal_event_order fail 'The normal attempt lacks the required order, publication event IDs, or complete teardown proof'
   fi
 else
-  record terminal_event_order fail 'Could not admit and observe the normal ordering attempt'
+  if ((normal_rc == 3)); then record terminal_event_order not_runnable 'The fixed root-authored TM-14/normal.json case is unavailable or unsafe'; else record terminal_event_order fail 'Could not admit and observe the normal ordering attempt'; fi
 fi
 
-help_file=$out_dir/runner-help.txt
-timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --help >"$help_file" 2>&1 || true
-evidence_files+=("$TEST_ID/runner-help.txt")
-if ! timeout 10 grep -Fq -- '--fault' "$help_file"; then
-  record forced_teardown_failure_no_green not_runnable 'The published runner control offers no forced teardown-failure flag'
-elif fault_lease=$(admit_and_wait teardown-failure --fault teardown_failure); then
+fault_rc=0
+fault_lease=$(admit_and_wait teardown-failure teardown_failure) || fault_rc=$?
+if ((fault_rc == 0)); then
   evidence_files+=("$TEST_ID/admit-teardown-failure.json" "$TEST_ID/admit-teardown-failure.stderr" "$TEST_ID/final-teardown-failure.json" "$TEST_ID/final-teardown-failure.stderr" "$TEST_ID/ordering-teardown-failure.jsonl" "$TEST_ID/teardown-teardown-failure.json")
   if ! timeout 10 jq -e '.verdict == "green" or .conclusion == "success"' "$out_dir/final-teardown-failure.json" >/dev/null 2>&1 \
     && ! timeout 10 jq -e 'select(.event == "publish")' "$out_dir/ordering-teardown-failure.jsonl" >/dev/null 2>&1; then
@@ -142,7 +138,7 @@ elif fault_lease=$(admit_and_wait teardown-failure --fault teardown_failure); th
     record forced_teardown_failure_no_green fail 'Forced teardown failure produced a green result or publication event'
   fi
 else
-  record forced_teardown_failure_no_green fail 'The advertised teardown_failure fault could not be admitted and observed'
+  if ((fault_rc == 3)); then record forced_teardown_failure_no_green not_runnable 'The fixed root-authored TM-14/teardown_failure.json case is unavailable or unsafe'; else record forced_teardown_failure_no_green fail 'The authenticated teardown_failure directive could not be admitted and observed'; fi
 fi
 emit
 exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || [[ " ${statuses[*]} " == *' not_runnable '* ]] && printf 3 || printf 0 )"

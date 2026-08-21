@@ -1,0 +1,7 @@
+# role	name	uid	gid	home	shell
+group	buzzci-ctl	-	961	-	-
+group	buzzci	-	962	-	-
+controller	buzzci-ctl	961	961	/var/lib/buzzci/principals/ctl	/usr/sbin/nologin
+materializer	buzzci-mat-01	966	962	/var/lib/buzzci/principals/mat-01	/usr/sbin/nologin
+executor	buzzci-exec-01	965	962	/var/lib/buzzci/principals/exec-01	/usr/sbin/nologin
+runtime	buzzci-run-01	964	962	/var/lib/buzzci/principals/run-01	/usr/sbin/nologin

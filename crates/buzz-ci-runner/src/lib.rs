@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod control;
+
 use std::collections::HashSet;
 
 use buzz_ci_broker_protocol::{
@@ -30,12 +32,25 @@ pub trait RequestAuthorizer {
 
 pub struct AuthorizedRequest<'a> {
     request: &'a CiRequestEnvelope,
+    signed_request_digest: [u8; 32],
+    trust_class: TrustClass,
 }
 
 impl<'a> AuthorizedRequest<'a> {
     pub fn request(&self) -> &'a CiRequestEnvelope {
         self.request
     }
+
+    pub fn check_expiry(self, now: u64) -> Result<UnexpiredAuthorizedRequest<'a>, ControlError> {
+        if now >= self.request.expires_at {
+            return Err(ControlError::ExpiredRequest);
+        }
+        Ok(UnexpiredAuthorizedRequest { authorized: self })
+    }
+}
+
+pub struct UnexpiredAuthorizedRequest<'a> {
+    authorized: AuthorizedRequest<'a>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +74,14 @@ pub enum ControlError {
     InvalidRequest,
     #[error("request is not authorized by owner-configured policy")]
     Unauthorized,
+    #[error("request does not carry accepted reviewed trust")]
+    UnacceptedTrust,
+    #[error("external fork requests are not accepted")]
+    ExternalFork,
+    #[error("request has expired")]
+    ExpiredRequest,
+    #[error("manifest binding does not match the authenticated request")]
+    InvalidBinding,
     #[error("invalid hex field")]
     InvalidHex,
     #[error("invalid UUID field")]
@@ -69,26 +92,43 @@ pub enum ControlError {
     TeardownNotProven,
     #[error("invalid teardown attestation")]
     InvalidAttestation,
+    #[error("broker socket is unavailable")]
+    BrokerUnavailable,
+    #[error("broker transport failed")]
+    TransportFailure,
+    #[error("broker returned an invalid response")]
+    InvalidBrokerResponse,
 }
 
 pub fn authorize_request<'a>(
-    request: &'a CiRequestEnvelope,
+    authenticated: control::AuthenticatedCiRequest<'a>,
+    workflow_policy: control::CiWorkflowPolicy,
     policy: &impl RequestAuthorizer,
 ) -> Result<AuthorizedRequest<'a>, ControlError> {
+    let request = authenticated.envelope();
     request
         .validate()
         .map_err(|_| ControlError::InvalidRequest)?;
+    let trust_class = workflow_policy.accepted_trust_class()?;
     if !policy.authorize(request) {
         return Err(ControlError::Unauthorized);
     }
-    Ok(AuthorizedRequest { request })
+    Ok(AuthorizedRequest {
+        request,
+        signed_request_digest: authenticated.signed_request_digest(),
+        trust_class,
+    })
 }
 
 pub fn normalize_admit_request(
-    authorized: AuthorizedRequest<'_>,
+    authorized: UnexpiredAuthorizedRequest<'_>,
     binding: BrokerManifestBinding,
 ) -> Result<AdmitAttemptRequest, ControlError> {
-    let request = authorized.request;
+    let request = authorized.authorized.request;
+    if authorized.authorized.signed_request_digest != binding.signed_request_digest {
+        return Err(ControlError::InvalidBinding);
+    }
+    let trust_class = authorized.authorized.trust_class;
     let timeout =
         u32::try_from(request.timeout_seconds).map_err(|_| ControlError::InvalidTimeout)?;
     let run_id = Uuid::parse_str(&request.run_id).map_err(|_| ControlError::InvalidUuid)?;
@@ -112,7 +152,7 @@ pub fn normalize_admit_request(
         wall_timeout_seconds: timeout,
         attempt: request.attempt,
         parent_attempt: request.parent_attempt.unwrap_or(0),
-        trust_class: TrustClass::AcceptedReviewed,
+        trust_class,
     })
 }
 
@@ -293,7 +333,11 @@ mod tests {
     #[test]
     fn authorization_is_mandatory_before_normalization() {
         assert!(matches!(
-            authorize_request(&request(), &Policy(false)),
+            authorize_request(
+                control::AuthenticatedCiRequest::new(&request(), [1; 32]),
+                control::CiWorkflowPolicy::new(Some(TrustClass::AcceptedReviewed), false),
+                &Policy(false)
+            ),
             Err(ControlError::Unauthorized)
         ));
     }
@@ -301,7 +345,14 @@ mod tests {
     #[test]
     fn authorized_request_reduces_to_content_blind_fields() {
         let request = request();
-        let authorized = authorize_request(&request, &Policy(true)).expect("authorized request");
+        let authorized = authorize_request(
+            control::AuthenticatedCiRequest::new(&request, [1; 32]),
+            control::CiWorkflowPolicy::new(Some(TrustClass::AcceptedReviewed), false),
+            &Policy(true),
+        )
+        .expect("authorized request")
+        .check_expiry(19)
+        .expect("unexpired request");
         let normalized = normalize_admit_request(
             authorized,
             BrokerManifestBinding {

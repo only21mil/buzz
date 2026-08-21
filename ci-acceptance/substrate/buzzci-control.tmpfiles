@@ -1,0 +1,5 @@
+d /run/buzzci 0711 root root -
+d /var/lib/buzzci 0700 root root -
+d /var/lib/buzzci/leases 0700 root root -
+d /var/lib/buzzci/principals 0711 root root -
+d /var/lib/buzzci/principals/ctl 0700 buzzci-ctl buzzci-ctl -

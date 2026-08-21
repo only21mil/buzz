@@ -1,0 +1,17 @@
+[Unit]
+Description=Buzz CI qualification broker
+Requires=buzz-ci-execd.socket
+After=buzz-ci-execd.socket
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/buzz-ci-execd --socket-activation
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/buzzci /var/lib/buzzci
+Restart=no

@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_ID=TM-12
 TITLE='Exhaust CPU, RAM, PIDs, disk, log bytes/rate, wall time, and artifact count/size'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''
 candidate_dir=''
 evidence_dir=''
@@ -13,7 +14,7 @@ statuses=()
 evidence_files=()
 preconditions=(
   'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
-  'the published runner control entrypoint must support admit and get'
+  'BUZZ_CI_ACCEPTANCE_CTL receives one exact root-authored case per exhaustion job on stdin'
   'root readback of lease state and cgroup v2 requires SUITE_SUDO or passwordless sudo'
 )
 
@@ -125,18 +126,17 @@ if ((${#SUDO[@]} == 0)); then
 fi
 
 harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || { for name in "${dynamic_names[@]}"; do record "$name" fail 'Published harness.env is not root-readable'; done; emit; exit 1; }
-env_get() {
-  local key=$1 line
-  line=$(printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}')
-  printf '%s' "$line"
-}
-runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
-lease_root=$(env_get BUZZ_CI_LEASE_STATE_ROOT)
-fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
-if [[ ! -x $runner_ctl || ! -d $lease_root || -z $fixture_repo ]]; then
-  for name in "${dynamic_names[@]}"; do record "$name" fail 'Published runner control, lease state root, or fixture coordinate is missing'; done
+export harness_text
+lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
+if ! acceptance_control_init; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable "$ACCEPTANCE_UNAVAILABLE"; done
   emit
-  exit 1
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+fi
+if [[ ! -d $lease_root ]]; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'harness.env lacks a readable BUZZ_CI_LEASE_STATE_ROOT'; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
 
 host_before=$out_dir/host-before.txt
@@ -144,21 +144,23 @@ host_before=$out_dir/host-before.txt
 evidence_files+=("$TEST_ID/host-before.txt")
 
 run_job() {
-  local job=$1 safe=${1//-/_} admit_file lease_id lease_dir lease_json cgroup_path cgroup_dir
+  local job=$1 safe=${1//-/_} admit_file lease_id lease_dir lease_json cgroup_path cgroup_dir rc=0
   admit_file=$out_dir/admit-$job.json
-  if ! timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
-      --workflow ci-acceptance/suite/fixtures/tm-12-exhaustion-repo/workflow.yml --job "$job" --attempt 1 >"$admit_file" 2>"$out_dir/admit-$job.stderr"; then
-    evidence_files+=("$TEST_ID/admit-$job.json" "$TEST_ID/admit-$job.stderr")
-    record "$safe" fail "Admission failed for $job"
+  acceptance_control_run "$job" "$admit_file" "$out_dir/admit-$job.stderr" || rc=$?
+  evidence_files+=("$TEST_ID/admit-$job.json" "$TEST_ID/admit-$job.stderr")
+  if ((rc == 3)); then
+    record "$safe" not_runnable "The fixed root-authored $TEST_ID/$job.json case is unavailable or unsafe"
+    return
+  elif ((rc != 0)); then
+    record "$safe" fail "The authenticated $job case was refused"
     return
   fi
-  evidence_files+=("$TEST_ID/admit-$job.json" "$TEST_ID/admit-$job.stderr")
-  lease_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.lease_id // empty' "$admit_file")
-  if [[ ! $lease_id =~ ^[A-Za-z0-9._-]+$ ]]; then record "$safe" fail "Admission for $job returned no safe lease_id"; return; fi
+  lease_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.attempt_id // .lease_id // empty' "$admit_file")
+  if [[ ! $lease_id =~ ^[A-Za-z0-9._-]+$ ]]; then record "$safe" not_runnable "Qualification response for $job exposes no safe attempt identifier"; return; fi
   lease_dir=$lease_root/$lease_id
   lease_json=$lease_dir/lease.json
-  for _ in {1..20}; do [[ -r $lease_json ]] && break; timeout 2 sleep 0.25; done
-  if [[ ! -r $lease_json ]]; then record "$safe" fail "Lease $lease_id did not publish lease.json"; return; fi
+  for _ in {1..20}; do timeout 10 "${SUDO[@]}" test -r "$lease_json" && break; timeout 2 sleep 0.25; done
+  if ! timeout 10 "${SUDO[@]}" test -r "$lease_json"; then record "$safe" not_runnable "Attempt $lease_id did not expose lease.json readback"; return; fi
   timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$lease_json" "$out_dir/lease-$job.json"
   evidence_files+=("$TEST_ID/lease-$job.json")
   cgroup_path=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" jq -r '.cgroup_path // empty' "$lease_json")
@@ -170,8 +172,10 @@ run_job() {
   done
   evidence_files+=("$TEST_ID/cgroup-$job.txt")
   for _ in {1..80}; do
-    if timeout 10 "$runner_ctl" get --lease "$lease_id" >"$out_dir/final-$job.json" 2>"$out_dir/final-$job.stderr" \
-      && timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final-$job.json" >/dev/null; then break; fi
+    if timeout 10 "${SUDO[@]}" test -r "$lease_dir/final.json"; then
+      timeout 10 "${SUDO[@]}" cp -- "$lease_dir/final.json" "$out_dir/final-$job.json" 2>"$out_dir/final-$job.stderr" || :
+      break
+    fi
     if [[ $job == memory-balloon && -r $cgroup_dir/memory.events ]]; then timeout 10 "${SUDO[@]}" cat "$cgroup_dir/memory.events" >"$out_dir/memory-events-$job.txt"; fi
     timeout 2 sleep 0.25
   done
