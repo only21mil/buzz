@@ -215,11 +215,25 @@ already running.
 
 End-to-end tests live in `crates/buzz-test-client/tests/`:
 
-- `e2e_relay.rs` — WebSocket relay tests
-- `e2e_mcp.rs` — MCP tool tests
-- `e2e_nostr_interop.rs` — Nostr protocol interoperability tests
-- `e2e_media.rs` — media upload/download tests
-- `e2e_media_extended.rs` — extended media tests (GIF, image processing)
+- `conformance_multitenant.rs`
+- `e2e_event_reminder.rs`
+- `e2e_git.rs`
+- `e2e_human_edit_agent_content.rs`
+- `e2e_long_form.rs`
+- `e2e_managed_agent.rs`
+- `e2e_media.rs`
+- `e2e_media_extended.rs`
+- `e2e_media_video.rs`
+- `e2e_mesh_llm.rs`
+- `e2e_nostr_interop.rs`
+- `e2e_persona.rs`
+- `e2e_project.rs`
+- `e2e_relay.rs`
+- `e2e_team.rs`
+- `e2e_team_catalog.rs`
+- `e2e_user_status.rs`
+- `nip42_host_binding_live.rs`
+- `regression_relay_admin_ban_gate.rs`
 
 Run them with (requires running infrastructure):
 
