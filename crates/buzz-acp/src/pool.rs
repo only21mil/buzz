@@ -22,7 +22,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -88,6 +88,10 @@ pub struct AgentModelCapabilities {
 pub struct SessionState {
     /// channel_id → session_id
     pub sessions: HashMap<Uuid, String>,
+    /// Closed sessions retained for history-preserving `session/resume`.
+    pub cold_sessions: HashMap<Uuid, String>,
+    /// Last successful checkout/use time for each live channel session.
+    pub last_used: HashMap<Uuid, Instant>,
     pub heartbeat_session: Option<String>,
     /// Per-channel turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
@@ -108,6 +112,7 @@ pub struct SessionState {
 
 impl SessionState {
     /// Invalidate the session (and turn counter) for a specific prompt source.
+    #[cfg(test)]
     pub fn invalidate(&mut self, source: &PromptSource) {
         match source {
             PromptSource::Channel(cid) => {
@@ -121,17 +126,107 @@ impl SessionState {
     }
 
     /// Invalidate a single channel's session and turn counter.
-    /// Returns `true` if the channel had an active session.
+    /// Returns `true` if the channel had a live or resumable session.
+    #[cfg(test)]
     pub fn invalidate_channel(&mut self, channel_id: &Uuid) -> bool {
+        self.take_channel_session(channel_id).is_some()
+    }
+
+    fn take_channel_session(&mut self, channel_id: &Uuid) -> Option<String> {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
-        self.sessions.remove(channel_id).is_some()
+        self.last_used.remove(channel_id);
+        let live = self.sessions.remove(channel_id);
+        let cold = self.cold_sessions.remove(channel_id);
+        live.or(cold)
+    }
+
+    fn take_source_session(&mut self, source: &PromptSource) -> Option<String> {
+        match source {
+            PromptSource::Channel(channel_id) => self.take_channel_session(channel_id),
+            PromptSource::Heartbeat => {
+                self.heartbeat_turn_count = 0;
+                self.heartbeat_session.take()
+            }
+        }
+    }
+
+    fn has_reusable_channel_session(&self, channel_id: &Uuid) -> bool {
+        self.sessions.contains_key(channel_id) || self.cold_sessions.contains_key(channel_id)
+    }
+
+    pub(crate) fn touch_channel(&mut self, channel_id: Uuid) {
+        self.last_used.insert(channel_id, Instant::now());
+    }
+
+    fn idle_reap_candidates(
+        &self,
+        now: Instant,
+        idle_ttl: Duration,
+        max_live_sessions: usize,
+    ) -> Vec<Uuid> {
+        let mut oldest: Vec<(Uuid, Instant)> = self
+            .sessions
+            .keys()
+            .map(|channel_id| {
+                (
+                    *channel_id,
+                    self.last_used.get(channel_id).copied().unwrap_or(now),
+                )
+            })
+            .collect();
+        oldest.sort_by_key(|(_, last_used)| *last_used);
+
+        let expired: HashSet<Uuid> = oldest
+            .iter()
+            .filter_map(|(channel_id, last_used)| {
+                (now.saturating_duration_since(*last_used) >= idle_ttl).then_some(*channel_id)
+            })
+            .collect();
+        let excess = oldest
+            .len()
+            .saturating_sub(expired.len())
+            .saturating_sub(max_live_sessions);
+        let lru_excess: HashSet<Uuid> = oldest
+            .iter()
+            .filter(|(channel_id, _)| !expired.contains(channel_id))
+            .take(excess)
+            .map(|(channel_id, _)| *channel_id)
+            .collect();
+
+        oldest
+            .into_iter()
+            .map(|(channel_id, _)| channel_id)
+            .filter(|channel_id| expired.contains(channel_id) || lru_excess.contains(channel_id))
+            .collect()
+    }
+
+    fn suspend_channel(&mut self, channel_id: &Uuid) -> Option<String> {
+        self.last_used.remove(channel_id);
+        let session_id = self.sessions.remove(channel_id)?;
+        self.cold_sessions.insert(*channel_id, session_id.clone());
+        Some(session_id)
+    }
+
+    fn take_all_live_sessions(&mut self) -> Vec<String> {
+        let mut sessions: Vec<String> = self.sessions.drain().map(|(_, sid)| sid).collect();
+        if let Some(heartbeat) = self.heartbeat_session.take() {
+            sessions.push(heartbeat);
+        }
+        self.last_used.clear();
+        self.turn_counts.clear();
+        self.heartbeat_turn_count = 0;
+        self.core_sections.clear();
+        self.canvas_sections.clear();
+        sessions
     }
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
+        self.cold_sessions.clear();
+        self.last_used.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
@@ -142,6 +237,8 @@ impl SessionState {
     #[cfg(test)]
     fn has_channel_state(&self, channel_id: &Uuid) -> bool {
         self.sessions.contains_key(channel_id)
+            || self.cold_sessions.contains_key(channel_id)
+            || self.last_used.contains_key(channel_id)
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
@@ -216,6 +313,86 @@ impl OwnedAgent {
             self.goose_system_prompt_supported,
         )
     }
+
+    async fn release_session_best_effort(
+        &mut self,
+        session_id: &str,
+        reason: &'static str,
+        delete_after_close: bool,
+    ) -> bool {
+        let closed = match self.acp.session_close(session_id).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "pool::session",
+                    session_id,
+                    reason,
+                    %error,
+                    "best-effort session close failed"
+                );
+                false
+            }
+        };
+        if delete_after_close {
+            if let Err(error) = self.acp.session_delete(session_id).await {
+                tracing::warn!(
+                    target: "pool::session",
+                    session_id,
+                    reason,
+                    %error,
+                    "best-effort session delete fallback failed"
+                );
+            }
+        }
+        closed
+    }
+
+    pub async fn invalidate_source(&mut self, source: &PromptSource, reason: &'static str) {
+        if let Some(session_id) = self.state.take_source_session(source) {
+            self.release_session_best_effort(&session_id, reason, true)
+                .await;
+        }
+    }
+
+    pub async fn invalidate_channel(&mut self, channel_id: &Uuid, reason: &'static str) -> bool {
+        let Some(session_id) = self.state.take_channel_session(channel_id) else {
+            return false;
+        };
+        self.release_session_best_effort(&session_id, reason, true)
+            .await;
+        true
+    }
+
+    pub async fn close_all_live_sessions(&mut self, reason: &'static str) {
+        for session_id in self.state.take_all_live_sessions() {
+            self.release_session_best_effort(&session_id, reason, false)
+                .await;
+        }
+    }
+
+    async fn reap_one_idle_session(
+        &mut self,
+        idle_ttl: Duration,
+        max_live_sessions: usize,
+    ) -> Option<bool> {
+        let channel_id = self
+            .state
+            .idle_reap_candidates(Instant::now(), idle_ttl, max_live_sessions)
+            .into_iter()
+            .next()?;
+        let session_id = self.state.sessions.get(&channel_id).cloned()?;
+        let closed = self
+            .release_session_best_effort(&session_id, "idle_or_lru_reap", false)
+            .await;
+        if closed {
+            self.state.suspend_channel(&channel_id);
+        } else {
+            // Back off this candidate so one adapter that rejects close does
+            // not monopolize every maintenance tick.
+            self.state.touch_channel(channel_id);
+        }
+        Some(closed)
+    }
 }
 
 /// Pool of agents with take-and-return ownership semantics.
@@ -229,6 +406,8 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    /// Round-robin start slot for the one-session-per-tick idle reaper.
+    reap_cursor: usize,
 }
 
 /// Result returned by a completed prompt task.
@@ -257,7 +436,7 @@ fn apply_completed_before_control_signal(
     state: &mut SessionState,
     source: &PromptSource,
     control_signal: &ControlSignal,
-) {
+) -> Option<String> {
     // Rotate and SwitchModel both invalidate so the next turn creates a fresh
     // session. For SwitchModel the caller has already set `desired_model`, so
     // the fresh session applies the new model on its next creation.
@@ -265,7 +444,9 @@ fn apply_completed_before_control_signal(
         control_signal,
         ControlSignal::Rotate | ControlSignal::SwitchModel(_)
     ) {
-        state.invalidate(source);
+        state.take_source_session(source)
+    } else {
+        None
     }
 }
 
@@ -581,6 +762,7 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            reap_cursor: 0,
         }
     }
 
@@ -595,7 +777,7 @@ impl AgentPool {
         if let Some(cid) = channel_id {
             let idx = self.agents.iter().position(|slot| {
                 slot.as_ref()
-                    .map(|a| a.state.sessions.contains_key(&cid))
+                    .map(|a| a.state.has_reusable_channel_session(&cid))
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
@@ -634,7 +816,7 @@ impl AgentPool {
     pub fn has_session_for(&self, channel_id: Uuid) -> bool {
         self.agents.iter().any(|slot| {
             slot.as_ref()
-                .map(|a| a.state.sessions.contains_key(&channel_id))
+                .map(|a| a.state.has_reusable_channel_session(&channel_id))
                 .unwrap_or(false)
         })
     }
@@ -735,20 +917,49 @@ impl AgentPool {
     ///
     /// Called when the agent is removed from a channel — stale sessions
     /// should not be reused. Checked-out agents (in-flight) are not
-    /// modified; their sessions will fail naturally on the next prompt
-    /// if the relay rejects the request.
+    /// modified here; `handle_prompt_result` closes them when they return.
     ///
     /// Returns the number of sessions invalidated.
-    pub fn invalidate_channel_sessions(&mut self, channel_id: Uuid) -> usize {
+    pub async fn invalidate_channel_sessions(&mut self, channel_id: Uuid) -> usize {
         let mut count = 0;
         for slot in &mut self.agents {
             if let Some(agent) = slot.as_mut() {
-                if agent.state.invalidate_channel(&channel_id) {
+                if agent
+                    .invalidate_channel(&channel_id, "channel_invalidation")
+                    .await
+                {
                     count += 1;
                 }
             }
         }
         count
+    }
+
+    /// Close at most one idle or least-recently-used session per maintenance tick.
+    pub async fn reap_idle_sessions(
+        &mut self,
+        idle_ttl: Duration,
+        max_live_sessions: usize,
+    ) -> usize {
+        let len = self.agents.len();
+        if len == 0 {
+            return 0;
+        }
+        for offset in 0..len {
+            let index = (self.reap_cursor + offset) % len;
+            let Some(agent) = self.agents[index].as_mut() else {
+                continue;
+            };
+            if let Some(reaped) = agent
+                .reap_one_idle_session(idle_ttl, max_live_sessions)
+                .await
+            {
+                self.reap_cursor = (index + 1) % len;
+                return usize::from(reaped);
+            }
+        }
+        self.reap_cursor = (self.reap_cursor + 1) % len;
+        0
     }
 
     /// Idle-path model switch: set `desired_model` on the idle agent for
@@ -764,7 +975,7 @@ impl AgentPool {
     /// runs a turn (no live session exists to re-emit `session_config_captured`
     /// from an idle agent). This lag is intentional: faking the emit would
     /// surface an override the session has not actually applied.
-    pub fn switch_idle_agent_model(
+    pub async fn switch_idle_agent_model(
         &mut self,
         channel_id: Uuid,
         model_id: &str,
@@ -773,7 +984,7 @@ impl AgentPool {
             .agents
             .iter_mut()
             .flatten()
-            .find(|a| a.state.sessions.contains_key(&channel_id))
+            .find(|a| a.state.has_reusable_channel_session(&channel_id))
         else {
             return IdleSwitchResult::NoIdleAgent;
         };
@@ -792,7 +1003,9 @@ impl AgentPool {
 
         agent.desired_model = Some(model_id.to_string());
         agent.model_overridden = true;
-        agent.state.invalidate_channel(&channel_id);
+        agent
+            .invalidate_channel(&channel_id, "idle_model_switch")
+            .await;
         IdleSwitchResult::Switched
     }
 }
@@ -1504,7 +1717,7 @@ pub async fn run_prompt_task(
         if let (PromptSource::Channel(cid), Some(owner_pk)) =
             (&source, ctx.agent_owner_pubkey.as_ref())
         {
-            let is_new_channel_session = !agent.state.sessions.contains_key(cid);
+            let is_new_channel_session = !agent.state.has_reusable_channel_session(cid);
             if is_new_channel_session && !agent.state.core_sections.contains_key(cid) {
                 // Bounded — we'd rather start the session with no core hint
                 // than block session creation on a stalled relay.
@@ -1557,9 +1770,10 @@ pub async fn run_prompt_task(
     let mut title_channel: Option<String> = None;
     let mut origin_channel_type: Option<String> = None;
     if let PromptSource::Channel(cid) = &source {
-        let is_new_channel_session = !agent.state.sessions.contains_key(cid);
+        let needs_session_resolution = !agent.state.sessions.contains_key(cid);
+        let is_new_channel_session = !agent.state.has_reusable_channel_session(cid);
         let needs_canvas = is_new_channel_session && !agent.state.canvas_sections.contains_key(cid);
-        if is_new_channel_session {
+        if needs_session_resolution {
             let (is_dm, resolved_channel, resolved_channel_type) =
                 resolve_new_session_channel_context(&ctx.channel_info, *cid).await;
             title_channel = resolved_channel;
@@ -1592,6 +1806,84 @@ pub async fn run_prompt_task(
             .or_else(|| pending_canvas.as_ref().map(|(_, s)| s.clone())),
         PromptSource::Heartbeat => None,
     };
+
+    // Idle/LRU eviction closes the live adapter resources but retains the
+    // channel's session ID. Resume that cold session before creating a new one
+    // so Codex and other resumable adapters preserve conversation history.
+    if let PromptSource::Channel(cid) = &source {
+        if !agent.state.sessions.contains_key(cid) {
+            if let Some(session_id) = agent.state.cold_sessions.get(cid).cloned() {
+                let mcp_servers = mcp_servers_with_git_origin(
+                    &ctx.mcp_servers,
+                    Some(*cid),
+                    origin_channel_type.as_deref(),
+                    ctx.session_title.as_deref(),
+                );
+                match agent
+                    .acp
+                    .session_resume(&session_id, &ctx.cwd, mcp_servers)
+                    .await
+                {
+                    Ok(()) => {
+                        agent.state.cold_sessions.remove(cid);
+                        agent.state.sessions.insert(*cid, session_id.clone());
+                        tracing::info!(
+                            target: "pool::session",
+                            "resumed session {session_id} for channel {cid}"
+                        );
+                    }
+                    Err(AcpError::AgentExited) => {
+                        agent.state.invalidate_all();
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::AgentExited,
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        let transport_error = matches!(
+                            &error,
+                            AcpError::Io(_)
+                                | AcpError::WriteTimeout(_)
+                                | AcpError::Timeout(_)
+                                | AcpError::Protocol(_)
+                        );
+                        if transport_error {
+                            agent.state.invalidate_all();
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(error),
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
+
+                        agent.state.cold_sessions.remove(cid);
+                        agent.state.turn_counts.remove(cid);
+                        tracing::warn!(
+                            target: "pool::session",
+                            %error,
+                            "failed to resume session {session_id} for channel {cid}; creating a new session"
+                        );
+                        if let Err(delete_error) = agent.acp.session_delete(&session_id).await {
+                            tracing::warn!(
+                                target: "pool::session",
+                                %delete_error,
+                                "best-effort delete failed after session resume rejection for {session_id}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
@@ -1785,7 +2077,9 @@ pub async fn run_prompt_task(
                         .await
                     {
                         Ok(_) => {
-                            agent.state.invalidate(&source);
+                            agent
+                                .invalidate_source(&source, "initial_message_idle_timeout")
+                                .await;
                         }
                         Err(AcpError::AgentExited) => {
                             agent.state.invalidate_all();
@@ -1804,7 +2098,7 @@ pub async fn run_prompt_task(
                                 target: "pool::session",
                                 "cancel_with_cleanup failed during initial_message timeout: {e}"
                             );
-                            agent.state.invalidate(&source);
+                            agent.state.invalidate_all();
                         }
                     }
                     send_prompt_result(
@@ -1840,7 +2134,9 @@ pub async fn run_prompt_task(
                         target: "pool::session",
                         "initial_message failed for channel {cid}: {e} — invalidating session"
                     );
-                    agent.state.invalidate(&source);
+                    agent
+                        .invalidate_source(&source, "initial_message_error")
+                        .await;
                     send_prompt_result(
                         &result_tx,
                         &turn_id,
@@ -2015,7 +2311,9 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
-                                agent.state.invalidate(&source);
+                                agent
+                                    .invalidate_source(&source, "control_cancel")
+                                    .await;
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
@@ -2052,7 +2350,9 @@ pub async fn run_prompt_task(
                                 if failure.invalidate_all {
                                     agent.state.invalidate_all();
                                 } else {
-                                    agent.state.invalidate(&source);
+                                    agent
+                                        .invalidate_source(&source, "control_cancel_error")
+                                        .await;
                                 }
 
                                 let usage = agent.acp.take_turn_usage();
@@ -2105,11 +2405,19 @@ pub async fn run_prompt_task(
                                 "control signal arrived but turn already completed — treating as success"
                             );
                         }
-                        apply_completed_before_control_signal(
+                        if let Some(session_id) = apply_completed_before_control_signal(
                             &mut agent.state,
                             &source,
                             &control_signal,
-                        );
+                        ) {
+                            agent
+                                .release_session_best_effort(
+                                    &session_id,
+                                    "completed_before_rotate_or_switch",
+                                    true,
+                                )
+                                .await;
+                        }
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -2168,7 +2476,9 @@ pub async fn run_prompt_task(
                     target: "pool::session",
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
-                agent.state.invalidate(&source);
+                agent
+                    .invalidate_source(&source, "turn_limit_rotation")
+                    .await;
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -2279,7 +2589,7 @@ pub async fn run_prompt_task(
                         target: "pool::prompt",
                         "cancel_with_cleanup error: {e} — invalidating session"
                     );
-                    agent.state.invalidate(&source);
+                    agent.state.invalidate_all();
                     let usage = agent.acp.take_turn_usage();
                     publish_agent_turn_metric(
                         &ctx,
@@ -2334,7 +2644,9 @@ pub async fn run_prompt_task(
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
             if !matches!(e, AcpError::AgentError { .. }) {
-                agent.state.invalidate(&source);
+                agent
+                    .invalidate_source(&source, "session_prompt_error")
+                    .await;
             }
             let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
@@ -5283,7 +5595,7 @@ mod tests {
     fn test_rotate_after_natural_completion_invalidates_channel_state() {
         let (mut s, ch_a, ch_b) = make_state();
 
-        apply_completed_before_control_signal(
+        let _ = apply_completed_before_control_signal(
             &mut s,
             &PromptSource::Channel(ch_a),
             &ControlSignal::Rotate,
@@ -5304,7 +5616,7 @@ mod tests {
     fn test_cancel_after_natural_completion_preserves_channel_state() {
         let (mut s, ch_a, ch_b) = make_state();
 
-        apply_completed_before_control_signal(
+        let _ = apply_completed_before_control_signal(
             &mut s,
             &PromptSource::Channel(ch_a),
             &ControlSignal::Cancel,
@@ -5413,6 +5725,68 @@ mod tests {
     }
 
     #[test]
+    fn test_idle_reaper_selects_expired_then_oldest_excess_sessions() {
+        let now = Instant::now();
+        let mut state = SessionState::default();
+        let expired = Uuid::new_v4();
+        let oldest_live = Uuid::new_v4();
+        let newest_live = Uuid::new_v4();
+        for (channel_id, session_id) in [
+            (expired, "expired"),
+            (oldest_live, "oldest"),
+            (newest_live, "newest"),
+        ] {
+            state.sessions.insert(channel_id, session_id.into());
+        }
+        state
+            .last_used
+            .insert(expired, now - Duration::from_secs(120));
+        state
+            .last_used
+            .insert(oldest_live, now - Duration::from_secs(20));
+        state
+            .last_used
+            .insert(newest_live, now - Duration::from_secs(10));
+
+        let candidates = state.idle_reap_candidates(now, Duration::from_secs(60), 1);
+
+        assert_eq!(candidates, vec![expired, oldest_live]);
+    }
+
+    #[test]
+    fn test_suspend_preserves_prompt_state_for_resume() {
+        let (mut state, channel_id, _) = make_state();
+        state.touch_channel(channel_id);
+
+        assert_eq!(
+            state.suspend_channel(&channel_id).as_deref(),
+            Some("sess-a")
+        );
+
+        assert!(!state.sessions.contains_key(&channel_id));
+        assert_eq!(
+            state.cold_sessions.get(&channel_id).map(String::as_str),
+            Some("sess-a")
+        );
+        assert_eq!(state.turn_counts.get(&channel_id), Some(&5));
+        assert_eq!(
+            state.core_sections.get(&channel_id).map(String::as_str),
+            Some("core-a")
+        );
+        assert!(!state.last_used.contains_key(&channel_id));
+    }
+
+    #[test]
+    fn test_invalidate_channel_clears_cold_session_and_resume_state() {
+        let (mut state, channel_id, _) = make_state();
+        state.suspend_channel(&channel_id);
+
+        assert!(state.invalidate_channel(&channel_id));
+
+        assert!(!state.has_channel_state(&channel_id));
+    }
+
+    #[test]
     fn test_removed_channels_cleaned_via_invalidate_channel() {
         // Simulates handle_prompt_result: channels removed while agent
         // was checked out should have both sessions and turn_counts stripped.
@@ -5438,7 +5812,7 @@ mod tests {
 
         // SwitchModel must invalidate just like Rotate so the requeued turn
         // re-creates a fresh session that re-applies the new desired_model.
-        apply_completed_before_control_signal(
+        let _ = apply_completed_before_control_signal(
             &mut s,
             &PromptSource::Channel(ch_a),
             &ControlSignal::SwitchModel("gpt-5".into()),
@@ -6108,6 +6482,140 @@ mod tests {
         let (_steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
         result.agent.acp.install_steer_rx(steer_rx);
         // Reaching here without a panic is the test.
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_source_emits_close_and_delete_requests() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-invalidate-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"
+                read CLOSE || exit 1
+                printf '%s\n' "$CLOSE" >> '{}'
+                echo '{{"jsonrpc":"2.0","id":0,"result":{{}}}}'
+                read DELETE || exit 1
+                printf '%s\n' "$DELETE" >> '{}'
+                echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+                sleep 1
+            "#,
+            capture.display(),
+            capture.display()
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let channel_id = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(channel_id, "session-to-drop".into());
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+
+        agent
+            .invalidate_source(&PromptSource::Channel(channel_id), "test_invalidation")
+            .await;
+
+        let requests = std::fs::read_to_string(&capture).expect("captured invalidation requests");
+        let requests: Vec<serde_json::Value> = requests
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON-RPC"))
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["method"], "session/close");
+        assert_eq!(requests[1]["method"], "session/delete");
+        assert!(requests
+            .iter()
+            .all(|request| request["params"]["sessionId"] == "session-to-drop"));
+        assert!(!agent.state.has_channel_state(&channel_id));
+        let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn test_idle_reaper_closes_at_most_one_session_per_tick() {
+        let script = r#"
+            read _close || exit 1
+            echo '{"jsonrpc":"2.0","id":0,"result":{}}'
+            sleep 1
+        "#;
+        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(first, "first-session".into());
+        state.sessions.insert(second, "second-session".into());
+        state
+            .last_used
+            .insert(first, Instant::now() - Duration::from_secs(120));
+        state
+            .last_used
+            .insert(second, Instant::now() - Duration::from_secs(60));
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let reaped = pool.reap_idle_sessions(Duration::from_secs(30), 1).await;
+
+        assert_eq!(reaped, 1);
+        let state = &pool.agents[0].as_ref().expect("agent remains idle").state;
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.cold_sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_closes_every_live_session_but_keeps_cold_history() {
+        let script = r#"
+            read _first || exit 1
+            echo '{"jsonrpc":"2.0","id":0,"result":{}}'
+            read _second || exit 1
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            sleep 1
+        "#;
+        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let mut state = SessionState::default();
+        state.sessions.insert(Uuid::new_v4(), "live-one".into());
+        state.sessions.insert(Uuid::new_v4(), "live-two".into());
+        state
+            .cold_sessions
+            .insert(Uuid::new_v4(), "already-closed".into());
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+
+        agent.close_all_live_sessions("test_shutdown").await;
+
+        assert!(agent.state.sessions.is_empty());
+        assert_eq!(agent.state.cold_sessions.len(), 1);
     }
 
     // ── NIP-AM emit-hook unit tests ────────────────────────────────────────

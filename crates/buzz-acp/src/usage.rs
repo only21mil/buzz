@@ -31,7 +31,7 @@
 //! The `TurnUsage` produced after each turn is consumed by the
 //! `TurnCompletionGuard` in `pool.rs` to publish a kind 44200 relay event.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Wire-format deserialization for `_goose/unstable/session/update` params.
 ///
@@ -217,6 +217,9 @@ pub(crate) struct UsageTracker {
     in_flight_session: Option<String>,
     /// The most recently computed turn usage, ready for `take()`.
     pending: Option<TurnUsage>,
+    /// Permanently closed sessions whose final pending metric must be drained
+    /// before their cumulative baseline is forgotten.
+    close_after_take: HashSet<String>,
 }
 
 impl UsageTracker {
@@ -227,8 +230,25 @@ impl UsageTracker {
     /// request is sent so that setup notifications received before this call
     /// do not become publishable for this turn.
     pub(crate) fn begin_turn(&mut self, session_id: &str) {
+        if let Some(abandoned) = self.pending.take() {
+            if self.close_after_take.remove(&abandoned.session_id) {
+                self.sessions.remove(&abandoned.session_id);
+            }
+        }
         self.in_flight_session = Some(session_id.to_string());
-        self.pending = None;
+    }
+
+    /// Forget all cumulative state for a session that has been closed.
+    pub(crate) fn close_session(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            self.in_flight_session = None;
+        }
+        if self.pending.as_ref().map(|usage| usage.session_id.as_str()) == Some(session_id) {
+            self.close_after_take.insert(session_id.to_string());
+        } else {
+            self.sessions.remove(session_id);
+            self.close_after_take.remove(session_id);
+        }
     }
 
     /// Process a `usage_update` notification payload.
@@ -385,6 +405,10 @@ impl UsageTracker {
     pub(crate) fn take(&mut self) -> Option<TurnUsage> {
         self.in_flight_session = None;
         let record = self.pending.take()?;
+        if self.close_after_take.remove(&record.session_id) {
+            self.sessions.remove(&record.session_id);
+            return Some(record);
+        }
         // Advance the committed baseline to this published record so the
         // *next* turn measures its delta from here.
         self.sessions.insert(
@@ -931,6 +955,74 @@ mod tests {
         assert!(t2.delta_reliable, "second turn: reliable");
         assert_eq!(t2.turn_input_tokens, Some(400)); // 700 - 300
         assert_eq!(t2.turn_output_tokens, Some(70)); // 150 - 80
+    }
+
+    #[test]
+    fn close_session_removes_only_the_target_baseline() {
+        let mut tracker = UsageTracker::default();
+        tracker.sessions.insert(
+            "closed".into(),
+            SessionState {
+                published_seq: 1,
+                last_input: 10,
+                last_output: 2,
+                last_cost: None,
+                last_total: None,
+                last_cached_input: None,
+            },
+        );
+        tracker.sessions.insert(
+            "kept".into(),
+            SessionState {
+                published_seq: 2,
+                last_input: 20,
+                last_output: 4,
+                last_cost: None,
+                last_total: None,
+                last_cached_input: None,
+            },
+        );
+        tracker.in_flight_session = Some("closed".into());
+
+        tracker.close_session("closed");
+
+        assert!(!tracker.sessions.contains_key("closed"));
+        assert!(tracker.sessions.contains_key("kept"));
+        assert!(tracker.in_flight_session.is_none());
+    }
+
+    #[test]
+    fn close_session_preserves_final_pending_metric_then_forgets_baseline() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("rotating");
+        tracker.record("rotating", &payload(100, 10, None));
+        let _ = tracker.take().expect("first turn");
+
+        tracker.begin_turn("rotating");
+        tracker.record("rotating", &payload(150, 15, None));
+        tracker.close_session("rotating");
+
+        let final_turn = tracker.take().expect("rotation preserves final metric");
+        assert_eq!(final_turn.turn_seq, 2);
+        assert_eq!(final_turn.turn_input_tokens, Some(50));
+        assert_eq!(final_turn.turn_output_tokens, Some(5));
+        assert!(!tracker.sessions.contains_key("rotating"));
+        assert!(!tracker.close_after_take.contains("rotating"));
+    }
+
+    #[test]
+    fn next_turn_finalizes_deferred_close_when_final_metric_is_dropped() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("initial-message");
+        tracker.record("initial-message", &payload(100, 10, None));
+        tracker.close_session("initial-message");
+
+        tracker.begin_turn("next-session");
+
+        assert!(!tracker.sessions.contains_key("initial-message"));
+        assert!(!tracker.close_after_take.contains("initial-message"));
+        assert!(tracker.pending.is_none());
+        assert_eq!(tracker.in_flight_session.as_deref(), Some("next-session"));
     }
 
     #[test]

@@ -1133,7 +1133,7 @@ async fn publish_relay_observer_event(
 /// Maximum age (seconds) for an observer control frame to be considered fresh.
 const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
 
-fn handle_relay_observer_control_event(
+async fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
     pool: &mut AgentPool,
@@ -1182,7 +1182,7 @@ fn handle_relay_observer_control_event(
             handle_cancel_turn_control(&payload, pool, observer);
         }
         Some("switch_model") => {
-            handle_switch_model_control(&payload, pool, observer);
+            handle_switch_model_control(&payload, pool, observer).await;
         }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
@@ -1236,7 +1236,7 @@ fn handle_cancel_turn_control(
 /// Idle path: validate against the cached catalog *before* invalidating
 /// (pre-cancel guard), then set `desired_model` + invalidate. The override
 /// takes visible effect on the agent's next turn.
-fn handle_switch_model_control(
+async fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
@@ -1277,7 +1277,7 @@ fn handle_switch_model_control(
         }
     } else {
         // Idle path: validate against the cached catalog before invalidating.
-        match pool.switch_idle_agent_model(channel_id, model_id) {
+        match pool.switch_idle_agent_model(channel_id, model_id).await {
             IdleSwitchResult::Switched => "switched",
             IdleSwitchResult::UnsupportedModel => "unsupported_model",
             IdleSwitchResult::NoIdleAgent => "no_active_turn",
@@ -2111,6 +2111,19 @@ async fn tokio_main() -> Result<()> {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
+            // Reap at most one session per maintenance tick. The close RPC has
+            // its own 3s end-to-end deadline, so maintenance never cancels a
+            // request after the adapter may already have applied it.
+            let reaped = pool
+                .reap_idle_sessions(
+                    Duration::from_secs(config.session_idle_ttl_secs),
+                    config.max_live_sessions as usize,
+                )
+                .await;
+            if reaped > 0 {
+                tracing::info!(reaped, "closed idle or excess ACP sessions");
+            }
+
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
             // loop so it never blocks event processing.
@@ -2259,7 +2272,7 @@ async fn tokio_main() -> Result<()> {
                     match control_event {
                         Some(event) => {
                             if let Some(owner_hex) = owner_cache.get() {
-                                handle_relay_observer_control_event(&config.keys, event, &mut pool, observer.as_ref(), owner_hex);
+                                handle_relay_observer_control_event(&config.keys, event, &mut pool, observer.as_ref(), owner_hex).await;
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
                             }
@@ -2359,7 +2372,7 @@ async fn tokio_main() -> Result<()> {
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
                                     let invalidated = if pool_ready {
-                                        pool.invalidate_channel_sessions(ch)
+                                        pool.invalidate_channel_sessions(ch).await
                                     } else {
                                         0
                                     };
@@ -2489,7 +2502,7 @@ async fn tokio_main() -> Result<()> {
                                                 "!rotate received — cancelling in-flight turn and rotating session"
                                             );
                                         } else {
-                                            let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
+                                            let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id).await;
                                             tracing::info!(
                                                 channel_id = %buzz_event.channel_id,
                                                 invalidated,
@@ -2757,7 +2770,9 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
-                ) == LoopAction::Exit
+                )
+                .await
+                    == LoopAction::Exit
                 {
                     break;
                 }
@@ -3043,6 +3058,9 @@ async fn tokio_main() -> Result<()> {
                 maybe_result = rx_ref.recv() => {
                     if let Some(mut pr) = maybe_result {
                         let idx = pr.agent.index;
+                        pr.agent
+                            .close_all_live_sessions("harness_shutdown")
+                            .await;
                         pr.agent.acp.shutdown().await;
                         tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
                     }
@@ -3060,15 +3078,16 @@ async fn tokio_main() -> Result<()> {
     // before tasks were aborted.
     while let Ok(mut pr) = pool.result_rx_try_recv() {
         let idx = pr.agent.index;
+        pr.agent.close_all_live_sessions("harness_shutdown").await;
         pr.agent.acp.shutdown().await;
         tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
     }
     // Explicitly shut down idle agents still sitting in their slots.
     for slot in pool.agents_mut().iter_mut() {
-        if let Some(agent) = slot.take() {
+        if let Some(mut agent) = slot.take() {
             let idx = agent.index;
-            let mut acp = agent.acp;
-            acp.shutdown().await;
+            agent.close_all_live_sessions("harness_shutdown").await;
+            agent.acp.shutdown().await;
             tracing::debug!(agent = idx, "reaped idle agent on shutdown");
         }
     }
@@ -3451,7 +3470,7 @@ fn spawn_failure_notice(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_prompt_result(
+async fn handle_prompt_result(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     config: &Config,
@@ -3596,7 +3615,19 @@ fn handle_prompt_result(
     // agent was checked out. This covers the gap where invalidate_channel_sessions
     // only touches idle agents.
     for ch in removed_channels {
-        result.agent.state.invalidate_channel(ch);
+        result
+            .agent
+            .invalidate_channel(ch, "removed_while_checked_out")
+            .await;
+    }
+
+    // Measure idleness from turn completion, not checkout. A long-running
+    // prompt that just returned is active now and must not be reaped on the
+    // next maintenance tick.
+    if let PromptSource::Channel(ch) = &result.source {
+        if result.agent.state.sessions.contains_key(ch) {
+            result.agent.state.touch_channel(*ch);
+        }
     }
 
     let outcome_label = match &result.outcome {
@@ -4133,6 +4164,7 @@ fn normalized_agent_name(init_result: &serde_json::Value) -> String {
 async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
     for slot in slots {
         if let Some(mut agent) = slot.take() {
+            agent.close_all_live_sessions("harness_shutdown").await;
             agent.acp.shutdown().await;
         }
     }
@@ -4141,10 +4173,15 @@ async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
 async fn shutdown_agent_pool(pool: &mut AgentPool) {
     pool.join_set.shutdown().await;
     while let Ok(mut result) = pool.result_rx_try_recv() {
+        result
+            .agent
+            .close_all_live_sessions("harness_shutdown")
+            .await;
         result.agent.acp.shutdown().await;
     }
     for slot in pool.agents_mut() {
         if let Some(mut agent) = slot.take() {
+            agent.close_all_live_sessions("harness_shutdown").await;
             agent.acp.shutdown().await;
         }
     }
@@ -6338,6 +6375,8 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: 2700,
+            max_live_sessions: 8,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -6560,6 +6599,8 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: 2700,
+            max_live_sessions: 8,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -6673,7 +6714,8 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
-        );
+        )
+        .await;
 
         let turn_errors: Vec<_> = observer
             .snapshot()
@@ -6838,7 +6880,8 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 Some(observer.clone()),
                 None,
-            );
+            )
+            .await;
             let events = observer.snapshot();
             let turn_error = events.iter().find(|e| e.kind == "turn_error").unwrap();
             assert_eq!(
@@ -6928,7 +6971,8 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
-            );
+            )
+            .await;
             (
                 queue.pending_channels(),
                 queue.queued_event_count(&channel_id),
@@ -7033,7 +7077,8 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
-            );
+            )
+            .await;
             (
                 queue.pending_channels(),
                 queue.queued_event_count(&channel_id),
@@ -7124,7 +7169,8 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
-        );
+        )
+        .await;
 
         let events = observer.snapshot();
         let turn_error = events
@@ -7217,7 +7263,8 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
-        );
+        )
+        .await;
 
         let events = observer.snapshot();
         let turn_error = events
@@ -7332,7 +7379,8 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
-        );
+        )
+        .await;
 
         // Batch preserved as a cancelled merge, not dead-lettered — same
         // treatment as a normal `Cancelled` outcome. `handle_prompt_result`
@@ -7464,7 +7512,8 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
-        );
+        )
+        .await;
 
         // No batch to merge — the queue has nothing pending for any channel.
         assert_eq!(
@@ -7646,7 +7695,8 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
-        );
+        )
+        .await;
 
         // The batch must not be requeued: pending_channels returns 0.
         assert_eq!(
@@ -7731,7 +7781,8 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
-        );
+        )
+        .await;
 
         // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
         assert_eq!(
