@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::{
     Admission, CanonicalCreate, CanonicalExec, DockerMethod, DockerRoute, EffectiveContainerSpec,
-    ProxyError, ProxyPolicy,
+    ProxyError, ProxyPolicy, VerifiedStart,
 };
 
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
@@ -192,22 +192,58 @@ impl TransportLimits {
     }
 }
 
+/// Fail-closed callback between effective-spec verification and Podman start.
+pub trait PreStartObserver {
+    /// Persist the verified effective specification before the start request.
+    fn observe_pre_start(
+        &mut self,
+        create: &CanonicalCreate,
+        container_id: &str,
+        effective: &EffectiveContainerSpec,
+        proof: &VerifiedStart,
+    ) -> Result<(), ProxyError>;
+
+    /// Record a successful start after policy state commits it.
+    fn observe_started(&mut self, container_id: &str) -> Result<(), ProxyError>;
+}
+
+/// Observer used when a caller needs policy transport without C5 persistence.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopPreStartObserver;
+
+impl PreStartObserver for NoopPreStartObserver {
+    fn observe_pre_start(
+        &mut self,
+        _create: &CanonicalCreate,
+        _container_id: &str,
+        _effective: &EffectiveContainerSpec,
+        _proof: &VerifiedStart,
+    ) -> Result<(), ProxyError> {
+        Ok(())
+    }
+
+    fn observe_started(&mut self, _container_id: &str) -> Result<(), ProxyError> {
+        Ok(())
+    }
+}
+
 /// A fail-closed proxy whose listener and raw upstream are broker-inherited.
 ///
 /// The upstream descriptor is never returned or duplicated into an executor
 /// process. `serve_once` verifies `SO_PEERCRED`, processes one non-pipelined
 /// request, writes one filtered response, and closes that executor connection.
-pub struct InheritedProxy<C: OneShotUpstreamConnector> {
+pub struct InheritedProxy<C: OneShotUpstreamConnector, O: PreStartObserver = NoopPreStartObserver> {
     listener: UnixListener,
     upstream_connector: C,
     upstream_capability: UpstreamCapability,
     expected_executor_uid: u32,
     limits: TransportLimits,
     policy: ProxyPolicy,
+    observer: O,
     poisoned: bool,
 }
 
-impl<C: OneShotUpstreamConnector> InheritedProxy<C> {
+impl<C: OneShotUpstreamConnector> InheritedProxy<C, NoopPreStartObserver> {
     /// Install a proxy over broker-opened Unix descriptors.
     pub fn new(
         listener: UnixListener,
@@ -215,6 +251,27 @@ impl<C: OneShotUpstreamConnector> InheritedProxy<C> {
         upstream_capability: UpstreamCapability,
         limits: TransportLimits,
         policy: ProxyPolicy,
+    ) -> Result<Self, ProxyError> {
+        Self::new_with_observer(
+            listener,
+            upstream_connector,
+            upstream_capability,
+            limits,
+            policy,
+            NoopPreStartObserver,
+        )
+    }
+}
+
+impl<C: OneShotUpstreamConnector, O: PreStartObserver> InheritedProxy<C, O> {
+    /// Install a proxy with a fail-closed pre-start persistence observer.
+    pub fn new_with_observer(
+        listener: UnixListener,
+        upstream_connector: C,
+        upstream_capability: UpstreamCapability,
+        limits: TransportLimits,
+        policy: ProxyPolicy,
+        observer: O,
     ) -> Result<Self, ProxyError> {
         let expected_executor_uid = policy.executor_uid();
         if expected_executor_uid == 0 {
@@ -235,6 +292,7 @@ impl<C: OneShotUpstreamConnector> InheritedProxy<C> {
             expected_executor_uid,
             limits,
             policy,
+            observer,
             poisoned: false,
         })
     }
@@ -278,7 +336,13 @@ impl<C: OneShotUpstreamConnector> InheritedProxy<C> {
                 "upstream peer UID does not match the broker capability".into(),
             ));
         }
-        match serve_connection(&mut executor, &mut upstream, &mut self.policy, self.limits) {
+        match serve_connection(
+            &mut executor,
+            &mut upstream,
+            &mut self.policy,
+            &mut self.observer,
+            self.limits,
+        ) {
             Ok(upstream_closed) => {
                 self.poisoned |= upstream_closed;
                 Ok(())
@@ -296,6 +360,21 @@ impl<C: OneShotUpstreamConnector> InheritedProxy<C> {
     /// Report whether the broker must terminate and reconcile this proxy.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+}
+
+impl<O: PreStartObserver> InheritedProxy<InheritedOneShotConnector, O> {
+    /// Authenticate and install the next one-shot runtime descriptor while
+    /// retaining this lease's policy ledger and observer state.
+    pub fn replace_inherited_upstream(&mut self, stream: UnixStream) -> Result<(), ProxyError> {
+        if self.poisoned {
+            return Err(ProxyError::Transport(
+                "poisoned proxy cannot accept another runtime descriptor".into(),
+            ));
+        }
+        self.upstream_connector =
+            InheritedOneShotConnector::new(stream, self.upstream_capability.clone())?;
+        Ok(())
     }
 }
 
@@ -343,6 +422,7 @@ fn serve_connection(
     executor: &mut UnixStream,
     upstream: &mut UnixStream,
     policy: &mut ProxyPolicy,
+    observer: &mut impl PreStartObserver,
     limits: TransportLimits,
 ) -> Result<bool, ConnectionFailure> {
     let request = read_request(executor, limits.request_body_bytes)
@@ -394,6 +474,7 @@ fn serve_connection(
             handle_start(
                 upstream,
                 policy,
+                observer,
                 &container_id,
                 &target,
                 limits.response_body_bytes,
@@ -551,6 +632,7 @@ fn handle_exec_create(
 fn handle_start(
     upstream: &mut UnixStream,
     policy: &mut ProxyPolicy,
+    observer: &mut impl PreStartObserver,
     container_id: &str,
     start_target: &str,
     max_response: usize,
@@ -574,6 +656,13 @@ fn handle_start(
     let proof = policy
         .verify_pre_start(container_id, &effective)
         .map_err(ConnectionFailure::after_upstream)?;
+    let create = policy
+        .created_request(container_id)
+        .cloned()
+        .map_err(ConnectionFailure::after_upstream)?;
+    observer
+        .observe_pre_start(&create, container_id, &effective, &proof)
+        .map_err(ConnectionFailure::after_upstream)?;
     let response = exchange(
         upstream,
         DockerMethod::Post,
@@ -586,6 +675,9 @@ fn handle_start(
         validate_empty_ack(&response.body).map_err(ConnectionFailure::after_upstream)?;
         policy
             .commit_started(&proof)
+            .map_err(ConnectionFailure::after_upstream)?;
+        observer
+            .observe_started(container_id)
             .map_err(ConnectionFailure::after_upstream)?;
     }
     Ok(response)
@@ -1472,15 +1564,19 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::net::UnixStream, thread};
+    use std::{
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex},
+        thread,
+    };
 
     use super::*;
     use crate::{
         AllowedMount, EngineKind, IsolationLimits, IsolationProfile, NetworkPolicy, PolicyManifest,
     };
 
-    fn policy() -> ProxyPolicy {
-        ProxyPolicy::install_for_test(PolicyManifest {
+    fn manifest() -> PolicyManifest {
+        PolicyManifest {
             schema_version: 1,
             request_event_id: "f".repeat(64),
             run_id: "run-transport".into(),
@@ -1522,8 +1618,190 @@ mod tests {
                 read_only: true,
             }],
             allowed_environment: Vec::new(),
-        })
+        }
+    }
+
+    fn policy() -> ProxyPolicy {
+        ProxyPolicy::install_for_test(manifest()).unwrap()
+    }
+
+    fn inspect_body() -> Vec<u8> {
+        let manifest = manifest();
+        serde_json::to_vec(&serde_json::json!({
+            "Config": {
+                "Image": manifest.isolation_profile.image_digest,
+                "User": manifest.container_user,
+                "Labels": {
+                    "buzz.ci.run": manifest.run_id,
+                    "buzz.ci.sha": manifest.sha,
+                    "buzz.ci.job": manifest.job_id,
+                    "buzz.ci.attempt": manifest.attempt.to_string(),
+                    "buzz.ci.manifest": manifest.manifest_digest,
+                }
+            },
+            "HostConfig": {
+                "Binds": ["/var/lib/buzz-ci/attempt/source:/workspace:ro,Z"],
+                "NetworkMode": "none",
+                "ReadonlyRootfs": true,
+                "CapDrop": ["ALL"],
+                "CapAdd": [],
+                "Privileged": false,
+                "SecurityOpt": [
+                    "no-new-privileges",
+                    "label=type:container_t",
+                    format!("seccomp={}", buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_PATH)
+                ],
+                "PidsLimit": 128,
+                "Memory": 1024 * 1024 * 1024_u64,
+                "MemorySwap": 0,
+                "ShmSize": 64 * 1024 * 1024_u64,
+                "NanoCpus": 500_000_000_u64,
+                "Devices": [],
+                "PortBindings": {},
+                "PublishAllPorts": false,
+                "PidMode": "private",
+                "IpcMode": "private",
+                "UTSMode": "private",
+                "CgroupnsMode": "private",
+                "UsernsMode": "private",
+                "RestartPolicy": {"Name": "no"},
+                "LogConfig": {"Type": "none"}
+            },
+            "NetworkSettings": {"Networks": {}}
+        }))
         .unwrap()
+    }
+
+    struct RecordingObserver {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    impl PreStartObserver for RecordingObserver {
+        fn observe_pre_start(
+            &mut self,
+            _create: &CanonicalCreate,
+            _container_id: &str,
+            _effective: &EffectiveContainerSpec,
+            _proof: &VerifiedStart,
+        ) -> Result<(), ProxyError> {
+            self.events.lock().unwrap().push("persist");
+            if self.fail {
+                Err(ProxyError::Transport("injected persistence failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn observe_started(&mut self, _container_id: &str) -> Result<(), ProxyError> {
+            self.events.lock().unwrap().push("committed");
+            Ok(())
+        }
+    }
+
+    fn policy_with_created_container() -> ProxyPolicy {
+        let mut policy = policy();
+        let Admission::Create(create) = policy
+            .admit(
+                DockerMethod::Post,
+                "/containers/create",
+                &serde_json::to_vec(&serde_json::json!({
+                    "Image": format!("sha256:{}", "c".repeat(64))
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("create admission");
+        };
+        policy.record_created("owned".into(), &create).unwrap();
+        policy
+    }
+
+    #[test]
+    fn prestart_observer_runs_before_start_and_commit() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+        let runtime_events = Arc::clone(&events);
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned/json");
+            runtime_events.lock().unwrap().push("inspect");
+            let body = inspect_body();
+            write!(
+                runtime,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            runtime.write_all(&body).unwrap();
+            let request = read_request(&mut runtime, 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned/start");
+            runtime_events.lock().unwrap().push("start");
+            runtime
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let mut policy = policy_with_created_container();
+        let mut observer = RecordingObserver {
+            events: Arc::clone(&events),
+            fail: false,
+        };
+        assert!(handle_start(
+            &mut proxy,
+            &mut policy,
+            &mut observer,
+            "owned",
+            "/containers/owned/start",
+            1024 * 1024,
+        )
+        .is_ok());
+        runtime_handle.join().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["inspect", "persist", "start", "committed"]
+        );
+    }
+
+    #[test]
+    fn prestart_observer_failure_never_forwards_start() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+        let runtime_events = Arc::clone(&events);
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned/json");
+            runtime_events.lock().unwrap().push("inspect");
+            let body = inspect_body();
+            write!(
+                runtime,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            runtime.write_all(&body).unwrap();
+            runtime
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            assert!(read_request(&mut runtime, 1024).is_err());
+        });
+        let mut policy = policy_with_created_container();
+        let mut observer = RecordingObserver {
+            events: Arc::clone(&events),
+            fail: true,
+        };
+        assert!(handle_start(
+            &mut proxy,
+            &mut policy,
+            &mut observer,
+            "owned",
+            "/containers/owned/start",
+            1024 * 1024,
+        )
+        .is_err());
+        drop(proxy);
+        runtime_handle.join().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["inspect", "persist"]);
     }
 
     fn serve_pair(
@@ -1534,10 +1812,12 @@ mod tests {
         thread::spawn(move || {
             let mut executor_server = executor_server;
             let mut upstream_client = upstream_client;
+            let mut observer = NoopPreStartObserver;
             serve_connection(
                 &mut executor_server,
                 &mut upstream_client,
                 &mut policy(),
+                &mut observer,
                 limits,
             )
             .map(|_| ())
@@ -1882,10 +2162,12 @@ mod tests {
         let mut executor_server = executor_server;
         let mut upstream_client = upstream_client;
         let handle = thread::spawn(move || {
+            let mut observer = NoopPreStartObserver;
             serve_connection(
                 &mut executor_server,
                 &mut upstream_client,
                 &mut policy(),
+                &mut observer,
                 TransportLimits::default(),
             )
         });

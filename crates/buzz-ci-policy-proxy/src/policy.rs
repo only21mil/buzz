@@ -167,6 +167,7 @@ pub struct ProxyPolicy {
     ledger: ObjectLedger,
     next_operation: u64,
     pending_creates: BTreeMap<u64, String>,
+    created_requests: BTreeMap<String, CanonicalCreate>,
     pending_execs: BTreeMap<u64, String>,
     executor_uid: u32,
     runtime_uid: u32,
@@ -207,6 +208,7 @@ impl ProxyPolicy {
             ledger: ObjectLedger::default(),
             next_operation: 1,
             pending_creates: BTreeMap::new(),
+            created_requests: BTreeMap::new(),
             pending_execs: BTreeMap::new(),
             executor_uid,
             runtime_uid,
@@ -371,7 +373,9 @@ impl ProxyPolicy {
         }
         self.pending_creates.remove(&approved.operation_id);
         self.ledger
-            .record_container(container_id, approved.fingerprint.clone())
+            .record_container(container_id.clone(), approved.fingerprint.clone())?;
+        self.created_requests.insert(container_id, approved.clone());
+        Ok(())
     }
 
     /// Abandon a pending create after a failed upstream response.
@@ -404,6 +408,14 @@ impl ProxyPolicy {
         })
     }
 
+    /// Return the canonical create capability retained for an owned container.
+    pub fn created_request(&self, container_id: &str) -> Result<&CanonicalCreate, ProxyError> {
+        self.ledger.container_fingerprint(container_id)?;
+        self.created_requests.get(container_id).ok_or_else(|| {
+            ProxyError::StateRefused("owned container lacks its canonical create record".into())
+        })
+    }
+
     /// Commit start state only after the upstream runtime reports success.
     pub fn commit_started(&mut self, proof: &VerifiedStart) -> Result<(), ProxyError> {
         if self.ledger.container_fingerprint(&proof.container_id)?
@@ -418,7 +430,14 @@ impl ProxyPolicy {
 
     /// Commit deletion only after the upstream runtime reports success.
     pub fn commit_deleted(&mut self, container_id: &str) -> Result<(), ProxyError> {
-        self.ledger.remove_container(container_id)
+        if !self.created_requests.contains_key(container_id) {
+            return Err(ProxyError::StateRefused(
+                "deleted container lacked its canonical create record".into(),
+            ));
+        }
+        self.ledger.remove_container(container_id)?;
+        self.created_requests.remove(container_id);
+        Ok(())
     }
 
     /// Commit stopped state only after a successful upstream wait/readback.
