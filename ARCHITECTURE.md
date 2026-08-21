@@ -72,27 +72,16 @@ Buzz is a Rust monorepo, licensed Apache 2.0 under Block, Inc.
 
 ---
 
-### Crate Dependency Hierarchy
+### Crate map
 
-```
-buzz-core    (zero I/O — types, verification, filter matching, kind registry)
-    │
-    ├── buzz-db          (Postgres: events, channels, tokens, workflows, audit)
-    ├── buzz-auth        (NIP-42, NIP-98, API tokens, scopes, rate limiting)
-    ├── buzz-pubsub      (Redis pub/sub, presence, typing indicators)
-    ├── buzz-search      (Postgres FTS: query, delete)
-    ├── buzz-audit       (hash-chain tamper-evident log)
-    └── buzz-workflow    (YAML-as-code automation engine)
-         │
-         └── buzz-relay       (ties everything together — the server)
+The workspace has 35 crates under `crates/`:
 
-buzz-acp            (agent harness — bridges relay @mentions → AI agents via ACP/JSON-RPC)
-buzz-sdk            (typed Nostr event builders — used by buzz-acp and buzz-cli)
-buzz-media          (Blossom/S3 media storage)
-buzz-cli            (agent-first CLI)
-buzz-admin          (operator CLI: relay membership + key generation)
-buzz-test-client    (integration test harness + manual CLI)
-```
+- **Core and services:** `buzz-core`, `buzz-relay`, `buzz-db`, `buzz-auth`, `buzz-pubsub`, `buzz-search`, `buzz-audit`, `buzz-workflow`, `buzz-media`, `buzz-push-gateway`
+- **Agents and remote execution:** `buzz-acp`, `buzz-agent`, `buzz-dev-mcp`, `buzz-persona`, `sprig`, `buzz-voice`, `buzz-backend-kubernetes`
+- **Clients, Git, and relay interop:** `buzz-cli`, `buzz-admin`, `buzz-sdk`, `buzz-ws-client`, `buzz-test-client`, `buzz-pair-relay`, `buzz-pairing-cli`, `git-sign-nostr`, `git-credential-nostr`, `buzz-relay-mesh`
+- **CI and conformance:** `buzz-conformance`, `buzz-ci-acceptance-ctl`, `buzz-ci-broker-protocol`, `buzz-ci-execd`, `buzz-ci-isolation-contract`, `buzz-ci-materializer`, `buzz-ci-policy-proxy`, `buzz-ci-runner`
+
+The Cargo workspace also includes the `examples/countdown-bot` example package.
 
 **Key architectural principle:** The relay is the single source of truth. `buzz-relay` orchestrates all subsystems by calling them directly — it imports `buzz-db`, `buzz-auth`, `buzz-pubsub`, `buzz-search`, `buzz-audit`, and `buzz-workflow`. However, those subsystems are isolated from each other: `buzz-workflow` never calls `buzz-pubsub`, `buzz-search` never calls `buzz-db`, etc. Cross-subsystem coordination happens only through the relay. In multi-community mode, the relay also owns propagation of `TenantContext`; service crates should receive community-scoped inputs rather than independently deriving tenancy from client-controlled event tags.
 
@@ -139,7 +128,7 @@ The `kind` integer is the only dispatch switch. The relay routes, stores, and fa
 | 46001–46012 | KIND_WORKFLOW_* | Workflow execution events |
 | 20001 | KIND_PRESENCE_UPDATE | Ephemeral presence heartbeat |
 
-`buzz-core` defines each event kind as a `pub const u32` and exports the full registry as `ALL_KINDS: &[u32]` (127 kinds at the time of writing); `crates/buzz-core/src/kind.rs` is the source of truth for the current list. Kinds are `u32` (NIP-01 specifies unsigned integer; `u32` covers the full range). Buzz uses both standard Nostr kinds (e.g., kind 7 for reactions) and custom ranges (40000+).
+`buzz-core` defines each event kind as a `pub const u32` and exports the full registry as `ALL_KINDS: &[u32]`. The registry has 137 entries: 133 `KIND_*` constants and four relay-admin constants. `crates/buzz-core/src/kind.rs` is the source of truth for the current list. Kinds are `u32` (NIP-01 specifies unsigned integer; `u32` covers the full range). Buzz uses both standard Nostr kinds (e.g., kind 7 for reactions) and custom ranges (40000+).
 
 Note: `KIND_AUTH` (22242) is `pub const KIND_AUTH: u32` in `buzz-core/src/kind.rs` and imported by `buzz-relay/src/handlers/event.rs`. `KIND_CANVAS` (40100) is likewise `pub const KIND_CANVAS: u32` in `buzz-core/src/kind.rs`.
 
@@ -343,7 +332,7 @@ pub struct StoredEvent {
     verified: bool,          // private — use is_verified()
 }
 
-pub const ALL_KINDS: &[u32]  // 80 entries (KIND_AUTH excluded — never stored)
+pub const ALL_KINDS: &[u32]  // 137 registry entries
 ```
 
 **Key functions:**
@@ -699,12 +688,27 @@ The `buzz-admin` binary is shipped in the relay Docker image (`/usr/local/bin/bu
 
 | File | Tests | Scope |
 |------|-------|-------|
-| `tests/e2e_relay.rs` | 27 | WebSocket protocol (auth, subscriptions, filters, limits, NIP-11) |
-| `tests/e2e_media.rs` | 7 | Media upload/download (Blossom) |
-| `tests/e2e_media_extended.rs` | 18 | Extended media scenarios |
-| `tests/e2e_nostr_interop.rs` | 15 | Nostr interoperability: NIP-50 search, NIP-10 threads, NIP-17 gift wraps, DM discovery |
+| `tests/conformance_multitenant.rs` | 19 | Multi-community isolation and fail-closed host binding |
+| `tests/e2e_event_reminder.rs` | 29 | Reminder validation, access control, and delivery claims |
+| `tests/e2e_git.rs` | 3 | Git S3 addressing and clone/push/fetch behavior |
+| `tests/e2e_human_edit_agent_content.rs` | 19 | Agent-content edit and delete authorization |
+| `tests/e2e_long_form.rs` | 8 | Long-form publish, replacement, and deletion |
+| `tests/e2e_managed_agent.rs` | 5 | Managed-agent projection, replacement, and deletion |
+| `tests/e2e_media.rs` | 8 | Blossom upload, download, authentication, and validation |
+| `tests/e2e_media_extended.rs` | 21 | Media formats, authorization edge cases, and metadata |
+| `tests/e2e_media_video.rs` | 7 | Video upload, ranges, and poster metadata |
+| `tests/e2e_mesh_llm.rs` | 4 | Relay-mesh access and live model completion |
+| `tests/e2e_nostr_interop.rs` | 25 | NIP-50 search, NIP-10 threads, NIP-17 gift wraps, and DM discovery |
+| `tests/e2e_persona.rs` | 24 | Persona validation, visibility, replacement, and deletion |
+| `tests/e2e_project.rs` | 6 | Project visibility, replacement, and deletion |
+| `tests/e2e_relay.rs` | 44 | WebSocket protocol, authentication, subscriptions, filters, and limits |
+| `tests/e2e_team.rs` | 3 | Team publish, replacement, and deletion |
+| `tests/e2e_team_catalog.rs` | 9 | Team catalog validation and sharing visibility |
+| `tests/e2e_user_status.rs` | 5 | User-status publish, retrieval, and replacement |
+| `tests/nip42_host_binding_live.rs` | 4 | Live NIP-42 host binding and cross-host refusal |
+| `tests/regression_relay_admin_ban_gate.rs` | 1 | Relay-admin ban and timeout regression |
 
-All e2e tests are `#[ignore]` — require a running relay. Total: **134 e2e tests**.
+The directory contains 244 `#[test]` and `#[tokio::test]` attributes. Of these, 242 have an `#[ignore]` attribute because they require live infrastructure; two run without one.
 
 `src/main.rs` is a manual testing CLI (`buzz-test-cli`) with `--send`, `--subscribe`, `--channel`, `--url`, `--kind` flags.
 

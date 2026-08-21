@@ -100,8 +100,10 @@ Agents are part of the room, not haunted cron jobs.
 | ✅ Works today | 🚧 Being wired up | 💭 Strong opinions, pending code |
 |---|---|---|
 | Relay, channels, threads, DMs, canvases, media, search, audit log | Mobile clients (iOS + Android, Flutter) | Web-of-trust reputation across relays |
-| Desktop app (Tauri + React) | Workflow approval gates (infra exists, glue still drying) | Push notifications |
-| `buzz-cli` (agent-first, JSON in / JSON out) + ACP harness (Goose, Codex, Claude Code) | Huddle lifecycle events | Culture features |
+| Desktop app (Tauri + React) | Workflow approval gates (infra exists, glue still drying) | Culture features |
+| `buzz-cli` (agent-first, JSON in / JSON out) + ACP harness (Goose, Codex, Claude Code) | | |
+| Public APNs push gateway and relay delivery worker ([deployment guide](docs/push-gateway-deployment.md)) | | |
+| Huddle room lifecycle events: started, joined, left, ended | | |
 | YAML workflows: message / reaction / schedule / webhook triggers | | |
 | Git events (NIP-34: patches, repo announcements, status) | | |
 | Git hosting backend | | |
@@ -223,17 +225,17 @@ A Rust workspace of focused crates. Single source of truth: the relay. See [ARCH
 <details>
 <summary><strong>Crate map</strong></summary>
 
-**Core protocol** — `buzz-core` (zero-I/O types, NIP-01 filters, Schnorr verify) · `buzz-relay` (Axum WS + REST)
+The workspace has 35 crates under `crates/`.
 
-**Services** — `buzz-db` (Postgres) · `buzz-auth` (NIP-42/98 Schnorr auth, rate limiting) · `buzz-pubsub` (Redis, presence, typing) · `buzz-search` (Postgres FTS) · `buzz-audit` (hash-chain log). Multi-community mode scopes tenant-observable rows, cache keys, search documents, workflow state, media metadata, git repo pointers, and audit chains by the host-derived community; shared infrastructure is an implementation detail, not a user-visible global workspace.
+**Core and services.** `buzz-core` · `buzz-relay` · `buzz-db` · `buzz-auth` · `buzz-pubsub` · `buzz-search` · `buzz-audit` · `buzz-workflow` · `buzz-media` · `buzz-push-gateway`. Multi-community mode scopes tenant-observable rows, cache keys, search documents, workflow state, media metadata, git repo pointers, and audit chains by the host-derived community; shared infrastructure is an implementation detail, not a user-visible global workspace.
 
-**Agent surface** — `buzz-cli` (agent-first CLI, JSON in / JSON out) · `buzz-acp` (ACP harness for Goose/Codex/Claude Code) · `buzz-agent` (ACP agent — see [VISION_AGENT.md](VISION_AGENT.md)) · `buzz-dev-mcp` (shell + file-edit tools) · `buzz-workflow` (YAML automation) · `buzz-persona` (agent persona packs)
+**Agents and remote execution.** `buzz-acp` · `buzz-agent` · `buzz-dev-mcp` · `buzz-persona` · `sprig` · `buzz-voice` · `buzz-backend-kubernetes`
 
-**Git & pairing** — `git-sign-nostr` / `git-credential-nostr` (nostr-signed git) · `buzz-pair-relay` / `buzz-pairing-cli` (relay pairing)
+**Clients, Git, and relay interop.** `buzz-cli` · `buzz-admin` · `buzz-sdk` · `buzz-ws-client` · `buzz-test-client` · `buzz-pair-relay` · `buzz-pairing-cli` · `git-sign-nostr` · `git-credential-nostr` · `buzz-relay-mesh`
 
-**Shared** — `buzz-sdk` (typed event builders) · `buzz-media` (Blossom/S3)
+**CI and conformance.** `buzz-conformance` · `buzz-ci-acceptance-ctl` · `buzz-ci-broker-protocol` · `buzz-ci-execd` · `buzz-ci-isolation-contract` · `buzz-ci-materializer` · `buzz-ci-policy-proxy` · `buzz-ci-runner`
 
-**Tooling** — `buzz-admin` (admin CLI) · `buzz-test-client` (E2E)
+The Cargo workspace also includes the `examples/countdown-bot` example package.
 
 </details>
 

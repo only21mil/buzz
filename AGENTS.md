@@ -34,39 +34,54 @@ access information.
 
 ## Repo Structure
 
+The Cargo workspace has 35 crates under `crates/` plus the `countdown-bot` example package.
+
 ```
 crates/
-  # Relay + core
-  buzz-relay          # WebSocket relay server — main entry point; also hosts git + huddle audio
-  buzz-core           # Core types, event verification, filter matching, kind registry
-  buzz-db             # Postgres event store and data access layer
-  buzz-auth           # Authentication and authorization
-  buzz-pubsub         # Redis pub/sub fan-out, presence, typing indicators
-  buzz-search         # Postgres FTS full-text search
-  buzz-audit          # Hash-chain audit log
-  buzz-media          # Blossom/S3 media storage
-  # Agent surface
-  buzz-acp            # ACP harness bridging Buzz events to AI agents
-  buzz-agent          # Minimal ACP-compliant agent (non-streaming, tool-calls-as-output)
-  buzz-dev-mcp        # Developer MCP server — shell + file-edit tools
-  buzz-persona        # Agent persona packs
-  buzz-workflow       # YAML-as-code workflow engine (evalexpr conditions)
-  # Clients + interop
-  buzz-pair-relay     # Ephemeral sidecar relay for NIP-AB device pairing
-  buzz-pairing-cli    # CLI for NIP-AB device pairing interop testing
-  git-sign-nostr      # Sign git objects with a Nostr key
-  git-credential-nostr # Git credential helper for Nostr-authed push/fetch
-  # Tooling + shared
-  buzz-cli            # Agent-first CLI
-  buzz-sdk            # Typed Nostr event builders
-  buzz-admin          # Operator CLI for relay administration
-  buzz-ws-client      # Shared NIP-42 WebSocket client (connect, auth, publish)
-  buzz-test-client    # Integration test client and E2E test suite
-  sprig               # All-in-one harness bundling ACP, agent, and dev MCP
+  # Relay, protocol, and services
+  buzz-relay                 # WebSocket relay server; also hosts git and huddle audio
+  buzz-core                  # Core types, event verification, filters, kind registry
+  buzz-db                    # Postgres event store and data access layer
+  buzz-auth                  # Authentication and authorization
+  buzz-pubsub                # Redis fan-out, presence, and typing indicators
+  buzz-search                # Community-scoped Postgres full-text search
+  buzz-audit                 # Hash-chain audit log
+  buzz-workflow              # YAML-as-code workflow engine
+  buzz-media                 # Blossom/S3 media storage
+  buzz-push-gateway          # Capability-gated APNs push gateway
+  # Agents and remote execution
+  buzz-acp                   # ACP harness bridging Buzz events to AI agents
+  buzz-agent                 # Minimal ACP-compliant agent
+  buzz-dev-mcp               # Developer MCP server with shell and file tools
+  buzz-persona               # Agent persona pack parser and loader
+  sprig                      # Combined ACP harness, agent, and developer MCP
+  buzz-voice                 # Reusable local voice primitives
+  buzz-backend-kubernetes    # Kubernetes backend for remote agents
+  # Clients, Git, and relay interop
+  buzz-cli                   # Agent-first CLI
+  buzz-admin                 # Relay administration CLI
+  buzz-sdk                   # Typed Nostr event builders
+  buzz-ws-client             # Shared NIP-42 WebSocket client
+  buzz-test-client           # Integration test client and E2E suite
+  buzz-pair-relay            # Sidecar relay for NIP-AB device pairing
+  buzz-pairing-cli           # NIP-AB pairing interop CLI
+  git-sign-nostr             # Sign Git objects with a Nostr key
+  git-credential-nostr       # NIP-98 Git credential helper
+  buzz-relay-mesh            # Inter-relay QUIC mesh
+  # CI and conformance
+  buzz-conformance           # Multi-tenant runtime trace checker
+  buzz-ci-acceptance-ctl     # Qualification-only acceptance input
+  buzz-ci-broker-protocol    # Fixed-width privileged broker protocol
+  buzz-ci-execd              # Privileged CI resource broker
+  buzz-ci-isolation-contract # Shared attempt and lease validation
+  buzz-ci-materializer       # Credential-free source materializer
+  buzz-ci-policy-proxy       # Docker API admission proxy
+  buzz-ci-runner             # Unprivileged CI control process
 
 desktop/              # Tauri 2 + React 19 desktop app
 web/                  # Browser web client (repo browser, served by the relay)
 mobile/               # Flutter mobile app
+examples/countdown-bot  # Example package; also a Cargo workspace member
 migrations/           # SQL migrations (auto-applied on relay startup)
 scripts/              # Dev tooling
 .env.example          # Config template — copy to .env before running
@@ -211,10 +226,25 @@ just test         # full integration suite (requires Postgres + Redis)
 ```
 
 E2E tests live in `crates/buzz-test-client/tests/`:
-- `e2e_relay.rs` — WebSocket relay protocol
-- `e2e_media.rs` — media upload/download (Blossom)
-- `e2e_media_extended.rs` — extended media scenarios
-- `e2e_nostr_interop.rs` — Nostr interop (NIP-50 search, NIP-10 threads, NIP-17 gift wraps)
+- `conformance_multitenant.rs`
+- `e2e_event_reminder.rs`
+- `e2e_git.rs`
+- `e2e_human_edit_agent_content.rs`
+- `e2e_long_form.rs`
+- `e2e_managed_agent.rs`
+- `e2e_media.rs`
+- `e2e_media_extended.rs`
+- `e2e_media_video.rs`
+- `e2e_mesh_llm.rs`
+- `e2e_nostr_interop.rs`
+- `e2e_persona.rs`
+- `e2e_project.rs`
+- `e2e_relay.rs`
+- `e2e_team.rs`
+- `e2e_team_catalog.rs`
+- `e2e_user_status.rs`
+- `nip42_host_binding_live.rs`
+- `regression_relay_admin_ban_gate.rs`
 
 Desktop E2E: `cd desktop && pnpm exec playwright test`
 
