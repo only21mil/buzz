@@ -2,6 +2,8 @@
 TM-06	exclusive_capacity	none	ok	lease.json,reconcile.json	exclusive capacity and overlap refusal
 TM-06	teardown_failure	teardown_failure	ok	reconcile.json,ordering.jsonl	quarantine; capacity zero; no green; no publish
 TM-07	socket_isolation	none	ok	lease.json,proxy/objects	caller daemon endpoints absent
+TM-09	dns_readback	none	ok	receipts/dns/<lease>-g<generation>.json	exact fresh five-proof DNS receipt
+TM-11	prestart_oci	none	ok	receipts/seccomp.json,receipts/oci/<lease>-g<generation>.json	fixed seccomp install receipt and exact prestart OCI record
 TM-12	cpu-burn	none	ok	lease.json,ordering.jsonl,teardown.json	cpu-burn bounded terminal evidence
 TM-12	memory-balloon	none	ok	lease.json,ordering.jsonl,teardown.json	memory-balloon bounded terminal evidence
 TM-12	pid-fork-storm	none	ok	lease.json,ordering.jsonl,teardown.json	pid-fork-storm bounded terminal evidence

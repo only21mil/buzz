@@ -23,6 +23,10 @@ readback. Negative cases are explicit: unaccepted trust, external-fork binding,
 and unauthorized signer must fail in the local validator; expiry, replay, rate,
 and concurrency reach the service-owned `ActivationController`.
 
+Every live runner also compares the sealed `integrated_candidate_sha` with its
+exact `--candidate`. A valid case sealed for another candidate is unavailable;
+the suite never sends it or falls back to a different case or receipt.
+
 Run the deterministic catalog and hostile-fixture checks with:
 
 ```bash

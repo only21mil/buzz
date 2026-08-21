@@ -234,8 +234,6 @@ if ! acceptance_control_init; then
   emit
   exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
-lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
-
 exclusive_rc=0
 acceptance_control_run exclusive_capacity "$out_dir/exclusive-capacity.json" "$out_dir/exclusive-capacity.stderr" || exclusive_rc=$?
 evidence_files+=("$TEST_ID/exclusive-capacity.json" "$TEST_ID/exclusive-capacity.stderr")
@@ -248,30 +246,48 @@ else
 fi
 
 teardown_rc=0
-acceptance_control_run teardown_failure "$out_dir/teardown-failure.json" "$out_dir/teardown-failure.stderr" || teardown_rc=$?
-evidence_files+=("$TEST_ID/teardown-failure.json" "$TEST_ID/teardown-failure.stderr")
+teardown_binding=$out_dir/teardown-failure-binding.json
+teardown_expected=$out_dir/teardown-failure-expected.json
+acceptance_control_run teardown_failure "$out_dir/teardown-failure.json" "$out_dir/teardown-failure.stderr" "$teardown_binding" || teardown_rc=$?
+evidence_files+=("$TEST_ID/teardown-failure.json" "$TEST_ID/teardown-failure.stderr" "$TEST_ID/teardown-failure-binding.json")
 if ((teardown_rc == 3)); then
   record teardown_quarantine not_runnable 'The fixed root-authored TM-06/teardown_failure.json case is unavailable or unsafe'
 elif ((teardown_rc == 0)) && timeout 10 jq -e '.type == "qualification_result" and .code == "ok" and .broker_state == "quarantined" and (.attempt_id | test("^[0-9a-f]{32}$")) and .attempt_id != "00000000000000000000000000000000"' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
-  teardown_lease=$(timeout 10 jq -r '.attempt_id' "$out_dir/teardown-failure.json")
-  reconcile_file=$lease_root/$teardown_lease/reconcile.json
-  ordering_file=$lease_root/$teardown_lease/ordering.jsonl
-  for _ in {1..120}; do
-    timeout 10 "${SUDO[@]}" test -r "$reconcile_file" \
-      && timeout 10 "${SUDO[@]}" test -r "$ordering_file" && break
-    timeout 2 sleep 0.25
-  done
-  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$reconcile_file" "$out_dir/reconcile-teardown-failure.json" 2>/dev/null || :
-  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$ordering_file" "$out_dir/ordering-teardown-failure.jsonl" 2>/dev/null || :
-  evidence_files+=("$TEST_ID/reconcile-teardown-failure.json" "$TEST_ID/ordering-teardown-failure.jsonl")
-  if [[ ! -s $out_dir/reconcile-teardown-failure.json || ! -s $out_dir/ordering-teardown-failure.jsonl ]]; then
-    record teardown_quarantine not_runnable 'The service returned Quarantined but did not expose reconciliation and ordering readback'
-  elif timeout 10 jq -e '.quarantined == true and .before_reuse == true' "$out_dir/reconcile-teardown-failure.json" >/dev/null 2>&1 \
-    && timeout 10 jq -e '.conclusion != "success"' "$out_dir/teardown-failure.json" >/dev/null 2>&1 \
-    && ! timeout 10 jq -s -e 'any(.[]; .event == "publish")' "$out_dir/ordering-teardown-failure.jsonl" >/dev/null 2>&1; then
-    record teardown_quarantine pass 'The sole privileged directive returned Quarantined, no green/publish, and before-reuse reconciliation; ActivationController ordinary capacity is zero, never one'
+  if ! acceptance_bind_response "$teardown_binding" "$out_dir/teardown-failure.json" "$teardown_expected"; then
+    record teardown_quarantine fail 'The authenticated response does not match the sealed teardown case lease identity or generation'
   else
-    record teardown_quarantine fail 'Teardown failure reached Quarantined but violated before-reuse, no-green, or no-publish evidence'
+    teardown_lease=$(timeout 10 jq -r '.lease_id' "$teardown_expected")
+    teardown_generation=$(timeout 10 jq -r '.lease_generation' "$teardown_expected")
+    cleanup_source=$(acceptance_receipt_root)/cleanup/$teardown_lease-g$teardown_generation.json
+    cleanup_evidence=$out_dir/cleanup-teardown-failure.json
+    for _ in {1..120}; do
+      acceptance_copy_receipt "$cleanup_source" "$cleanup_evidence" && break
+      timeout 2 sleep 0.25
+    done
+    evidence_files+=("$TEST_ID/teardown-failure-expected.json" "$TEST_ID/cleanup-teardown-failure.json")
+    if [[ ! -s $cleanup_evidence ]]; then
+      record teardown_quarantine not_runnable 'The service returned Quarantined but its exact durable cleanup receipt is missing or unsafe'
+    elif acceptance_receipt_binding_matches "$teardown_expected" "$cleanup_evidence" \
+      && timeout 10 jq -e '
+        .version == 1 and .committed == true and
+        .conclusion == "infrastructure_failure" and .state == "quarantined" and
+        .publication == "suppressed" and .evidence_state == "complete" and
+        (.operations | length == 5 and all(.[]; .completed == true)) and
+        .observation.lease_slice_inactive == true and .observation.lease_cgroup_empty == true and
+        .observation.nft_table_absent == true and .observation.namespace_absent == true and
+        .observation.lease_files_absent == true and .observation.teardown_failure_observed == true and
+        .observation.slice_quarantined == true and .observation.publish_observed == false and
+        [.terminal_order[].event] == ["stop","finalize_raw_stream","extract","scrub","scan","hash","upload","teardown_failure_observed","publication_suppressed","quarantined"] and
+        ([.terminal_order[].sequence] == [1,2,3,4,5,6,7,8,9,10]) and
+        (.teardown_digest | test("^[0-9a-f]{64}$")) and
+        (.no_publish_digest | test("^[0-9a-f]{64}$")) and
+        (.quarantine_digest | test("^[0-9a-f]{64}$"))
+      ' "$cleanup_evidence" >/dev/null 2>&1 \
+      && timeout 10 jq -e '.conclusion == "infrastructure_failure" and .broker_state == "quarantined"' "$out_dir/teardown-failure.json" >/dev/null 2>&1; then
+      record teardown_quarantine pass 'The exact durable cleanup receipt binds the sealed case and proves infrastructure failure, quarantine, and suppressed publication'
+    else
+      record teardown_quarantine fail 'The durable cleanup receipt is stale, cross-bound, incomplete, green, or publish-capable'
+    fi
   fi
 elif ((teardown_rc == 0)); then
   record teardown_quarantine not_runnable 'The qualification response does not expose a nonzero quarantined attempt required by TM-06'

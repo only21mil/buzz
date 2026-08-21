@@ -2,6 +2,8 @@
 TM-06	exclusive_capacity	none
 TM-06	teardown_failure	teardown_failure
 TM-07	socket_isolation	none
+TM-09	dns_readback	none
+TM-11	prestart_oci	none
 TM-12	cpu-burn	none
 TM-12	memory-balloon	none
 TM-12	pid-fork-storm	none

@@ -55,7 +55,7 @@ awk -F '\t' 'NF && $1 !~ /^#/ {print $1 "/" $2}' "$PLAN" | sort >"$temp_dir/plan
 find "$TEMPLATES" -type f -name '*.json' -printf '%P\n' | sed 's/\.json$//' | sort >"$temp_dir/templates"
 if cmp -s "$temp_dir/planned" "$temp_dir/templates"; then pass coverage; else fail coverage; diff -u "$temp_dir/planned" "$temp_dir/templates" || true; fi
 
-if [[ $(wc -l <"$temp_dir/templates") -eq 35 ]] \
+if [[ $(wc -l <"$temp_dir/templates") -eq 37 ]] \
   && [[ -z $(find "$TEMPLATES" -type l -print -quit) ]] \
   && [[ -z $(find "$TEMPLATES" -type f -size +64k -print -quit) ]]; then
   pass artifact_posture
@@ -94,6 +94,18 @@ else
   fail controller_relationships
 fi
 
+if timeout 10 jq -s -e '
+  all(.[];
+    .permit.host.integrated_candidate_sha == {"algorithm":"sha1","hex":"@INTEGRATED_CANDIDATE_SHA1@"} and
+    .permit.host == .admission.host and .permit.fixture_job == .admission.fixture_job and
+    .permit.fixture_identity == .admission.fixture_identity and
+    .permit.fixture_signer == .admission.signer and .permit.nonce == .admission.nonce)
+' "$TEMPLATES/TM-09/dns_readback.json" "$TEMPLATES/TM-11/prestart_oci.json" >/dev/null; then
+  pass receipt_case_bindings
+else
+  fail receipt_case_bindings
+fi
+
 if timeout 10 jq -e . "$CASE_DIR"/schema/*.json "$CASE_DIR"/fixtures/hostile/*.json >/dev/null \
   && while IFS= read -r file; do timeout 10 jq -e . "$file" >/dev/null || exit 1; done < <(find "$TEMPLATES" -type f -name '*.json' -print | sort); then
   pass json_parse
@@ -117,6 +129,24 @@ if timeout 10 jq -e --argjson now 100 '
   fail stale_case
 else
   pass stale_case
+fi
+
+if timeout 10 jq -e --arg candidate 2222222222222222222222222222222222222222 --argjson now 100 '
+  .version == "qualification_v1" and
+  .permit.host == .admission.host and .permit.fixture_job == .admission.fixture_job and
+  .permit.fixture_identity == .admission.fixture_identity and
+  .permit.fixture_signer == .admission.signer and .permit.nonce == .admission.nonce and
+  .permit.host.integrated_candidate_sha == {"algorithm":"sha1","hex":$candidate} and
+  .permit.not_before <= $now and $now < .permit.expires_at
+' "$CASE_DIR/fixtures/hostile/cross-candidate-sealed.json" >/dev/null 2>&1; then
+  fail cross_candidate_case
+elif ! timeout 10 jq -e --arg candidate 1111111111111111111111111111111111111111 --argjson now 100 '
+  .permit.host.integrated_candidate_sha == {"algorithm":"sha1","hex":$candidate} and
+  .permit.host == .admission.host and .permit.not_before <= $now and $now < .permit.expires_at
+' "$CASE_DIR/fixtures/hostile/cross-candidate-sealed.json" >/dev/null 2>&1; then
+  fail cross_candidate_fixture_control
+else
+  pass cross_candidate_case
 fi
 
 if timeout 10 jq -e '.code == "ok" and .conclusion != "success" and .broker_state == "quarantined"' \
