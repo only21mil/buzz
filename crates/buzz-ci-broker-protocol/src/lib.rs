@@ -16,6 +16,7 @@ pub const ADMIT_ATTEMPT_BODY_SIZE: usize = 376;
 pub const ADMIT_QUALIFICATION_BODY_SIZE: usize = 440;
 pub const CANCEL_ATTEMPT_BODY_SIZE: usize = 128;
 pub const GET_ATTEMPT_BODY_SIZE: usize = 32;
+pub const COMPLETE_ATTEMPT_BODY_SIZE: usize = 160;
 pub const RESPONSE_BODY_SIZE: usize = 256;
 pub const MAX_BODY_SIZE: usize = ADMIT_QUALIFICATION_BODY_SIZE;
 pub const MAX_FRAME_SIZE: usize = HEADER_SIZE + MAX_BODY_SIZE;
@@ -31,6 +32,7 @@ pub enum Operation {
     CancelAttempt = 3,
     GetAttempt = 4,
     AdmitQualification = 5,
+    CompleteAttempt = 6,
 }
 
 impl Operation {
@@ -41,6 +43,7 @@ impl Operation {
             3 => Ok(Self::CancelAttempt),
             4 => Ok(Self::GetAttempt),
             5 => Ok(Self::AdmitQualification),
+            6 => Ok(Self::CompleteAttempt),
             _ => Err(DecodeError::UnknownOperation),
         }
     }
@@ -52,6 +55,7 @@ impl Operation {
             Self::CancelAttempt => CANCEL_ATTEMPT_BODY_SIZE,
             Self::GetAttempt => GET_ATTEMPT_BODY_SIZE,
             Self::AdmitQualification => ADMIT_QUALIFICATION_BODY_SIZE,
+            Self::CompleteAttempt => COMPLETE_ATTEMPT_BODY_SIZE,
         }
     }
 }
@@ -235,6 +239,24 @@ pub struct GetAttemptRequest {
     pub attempt_id: [u8; 16],
 }
 
+/// Authenticated completion claim for one exact admitted lease.
+///
+/// `signer_pubkey` remains a claim on the wire. The service-owned boundary must
+/// authenticate it and compare it to the admitted actor before using this
+/// request to mutate lifecycle state. The conclusion is advisory; durable
+/// evidence and teardown decide final state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteAttemptRequest {
+    pub signer_pubkey: [u8; 32],
+    pub signed_request_digest: [u8; 32],
+    pub attempt_id: [u8; 16],
+    pub lease_id: [u8; 16],
+    pub lease_generation: u64,
+    pub advisory_conclusion: Conclusion,
+    pub evidence_set_digest: [u8; 32],
+    pub terminal_at: u64,
+}
+
 /// One root-permitted qualification fixture request.
 ///
 /// `fixture_signer` is a claimed identity. The service-owned authentication
@@ -269,6 +291,7 @@ pub enum Request {
     CancelAttempt(CancelAttemptRequest),
     GetAttempt(GetAttemptRequest),
     AdmitQualification(QualificationRequest),
+    CompleteAttempt(CompleteAttemptRequest),
 }
 
 impl Request {
@@ -279,6 +302,7 @@ impl Request {
             Self::CancelAttempt(_) => Operation::CancelAttempt,
             Self::GetAttempt(_) => Operation::GetAttempt,
             Self::AdmitQualification(_) => Operation::AdmitQualification,
+            Self::CompleteAttempt(_) => Operation::CompleteAttempt,
         }
     }
 }
@@ -490,6 +514,7 @@ pub fn encode_request(request_id: [u8; 16], request: Request) -> EncodedFrame {
         Request::CancelAttempt(value) => encode_cancel(body, value),
         Request::GetAttempt(value) => body[..16].copy_from_slice(&value.attempt_id),
         Request::AdmitQualification(value) => encode_qualification(body, value),
+        Request::CompleteAttempt(value) => encode_complete(body, value),
     }
     encoded
 }
@@ -522,6 +547,7 @@ pub fn decode_request(frame: &[u8]) -> Result<(FrameHeader, Request), DecodeErro
             })
         }
         Operation::AdmitQualification => Request::AdmitQualification(decode_qualification(body)?),
+        Operation::CompleteAttempt => Request::CompleteAttempt(decode_complete(body)?),
     };
     Ok((header, request))
 }
@@ -788,6 +814,39 @@ fn decode_cancel(body: &[u8]) -> Result<CancelAttemptRequest, DecodeError> {
     Ok(value)
 }
 
+fn encode_complete(body: &mut [u8], value: CompleteAttemptRequest) {
+    body[0..32].copy_from_slice(&value.signer_pubkey);
+    body[32..64].copy_from_slice(&value.signed_request_digest);
+    body[64..80].copy_from_slice(&value.attempt_id);
+    body[80..96].copy_from_slice(&value.lease_id);
+    put_u64(body, 96, value.lease_generation);
+    body[104] = value.advisory_conclusion as u8;
+    body[105..137].copy_from_slice(&value.evidence_set_digest);
+    put_u64(body, 137, value.terminal_at);
+}
+
+fn decode_complete(body: &[u8]) -> Result<CompleteAttemptRequest, DecodeError> {
+    require_zero(&body[145..])?;
+    let value = CompleteAttemptRequest {
+        signer_pubkey: nonzero_array(&body[0..32])?,
+        signed_request_digest: nonzero_array(&body[32..64])?,
+        attempt_id: nonzero_array(&body[64..80])?,
+        lease_id: nonzero_array(&body[80..96])?,
+        lease_generation: get_u64(body, 96),
+        advisory_conclusion: Conclusion::try_from(body[104])?,
+        evidence_set_digest: nonzero_array(&body[105..137])?,
+        terminal_at: get_u64(body, 137),
+    };
+    if value.lease_generation == 0
+        || value.advisory_conclusion == Conclusion::None
+        || value.terminal_at == 0
+    {
+        return Err(DecodeError::ZeroField);
+    }
+    validate_safe(value.terminal_at)?;
+    Ok(value)
+}
+
 fn require_zero(input: &[u8]) -> Result<(), DecodeError> {
     if input.iter().any(|byte| *byte != 0) {
         return Err(DecodeError::NonZeroReserved);
@@ -848,6 +907,8 @@ fn get_u64(input: &[u8], offset: usize) -> u64 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     fn digest(byte: u8) -> [u8; 32] {
         [byte; 32]
@@ -900,6 +961,115 @@ mod tests {
         }
     }
 
+    fn complete() -> CompleteAttemptRequest {
+        CompleteAttemptRequest {
+            signer_pubkey: digest(25),
+            signed_request_digest: digest(26),
+            attempt_id: [27; 16],
+            lease_id: [28; 16],
+            lease_generation: 29,
+            advisory_conclusion: Conclusion::Success,
+            evidence_set_digest: digest(30),
+            terminal_at: 300,
+        }
+    }
+
+    fn legacy_fingerprint(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(64);
+        for byte in Sha256::digest(bytes) {
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        encoded
+    }
+
+    #[test]
+    fn legacy_frame_fingerprints_are_frozen() {
+        let requests = [
+            Request::Hello(HelloRequest {
+                controller_instance: digest(1),
+                nonce: digest(2),
+            }),
+            Request::AdmitAttempt(admit()),
+            Request::CancelAttempt(CancelAttemptRequest {
+                attempt_id: [3; 16],
+                actor_pubkey: digest(4),
+                cancel_digest: digest(5),
+                issued_at: 100,
+                expires_at: 200,
+                expected_generation: 7,
+                reason: CancelReason::SignedPolicy,
+            }),
+            Request::GetAttempt(GetAttemptRequest {
+                attempt_id: [6; 16],
+            }),
+            Request::AdmitQualification(qualification(None)),
+            Request::AdmitQualification(qualification(Some(
+                QualificationDirective::TeardownFailure,
+            ))),
+        ];
+        let fingerprints = requests
+            .map(|request| legacy_fingerprint(encode_request([42; 16], request).as_bytes()));
+        assert_eq!(
+            fingerprints,
+            [
+                "fdcc4db112dd807e89376b0393ea51aa3647802d5e82adf1ee64ae3e74d6b332",
+                "ace88f9c024a0fd5d05b195e654070b1cc70f0a1b908f7eb5bdb97e2af8a6378",
+                "5c30309d9c54caaf8326455f5dd50ea6932da6ede7ce4154449f8ce9274f2c4a",
+                "baaf58b3790f65d84c7a23371d78f41b4d1bd0f6720083fdfef1dc15110adc06",
+                "c37dbe68b9268287a47f4409ba711f4a565a4433156df6eebfbf23d3a1220476",
+                "40999559bb1b66b47ba55a7367d16a9ae605f1d16284b6ceb1dbc307ae753470",
+            ]
+        );
+        let response = BrokerResponse {
+            code: ResponseCode::NotProvisioned,
+            retry_after_millis: 0,
+            attempt_id: [8; 16],
+            run_id: [9; 16],
+            accepted_request_digest: digest(10),
+            job_manifest_digest: digest(11),
+            tip_oid: Some(oid()),
+            broker_state: BrokerState::Reconciling,
+            conclusion: Conclusion::InfrastructureFailure,
+            terminal_reason: 2,
+            generation: 3,
+            accepted_at: 100,
+            updated_at: 101,
+            lease_generation: 4,
+            evidence_set_digest: [0; 32],
+            teardown_digest: [0; 32],
+            attempt: 1,
+        };
+        let response_fingerprints = [
+            Operation::Hello,
+            Operation::AdmitAttempt,
+            Operation::CancelAttempt,
+            Operation::GetAttempt,
+            Operation::AdmitQualification,
+        ]
+        .map(|operation| {
+            legacy_fingerprint(
+                encode_response(
+                    FrameHeader {
+                        operation,
+                        request_id: [42; 16],
+                    },
+                    response,
+                )
+                .as_bytes(),
+            )
+        });
+        assert_eq!(
+            response_fingerprints,
+            [
+                "cc96c5915cf176ddcdabdf3896286422b6a96696c9ca93ab9b7a009dcfa1e810",
+                "a25a9177e94470942ad719b9512fcbd99dec17a7384ca2a1c4ba8ec42cf859d7",
+                "98f75c52d40d8f8c5e9e9bb75543c73ccda6bac823bfe52cc55d57964a34d6f0",
+                "e61aefcf81faccc4d32eda5679e26403a9f737edac4e51d26cfb13308c693956",
+                "98108352cd166e83977ec25aca9fb3c8321710e3254317b6a4a75d5017a0ec51",
+            ]
+        );
+    }
+
     #[test]
     fn every_request_round_trips() {
         let requests = [
@@ -924,6 +1094,7 @@ mod tests {
             Request::AdmitQualification(qualification(Some(
                 QualificationDirective::TeardownFailure,
             ))),
+            Request::CompleteAttempt(complete()),
         ];
         for request in requests {
             let encoded = encode_request([42; 16], request);
@@ -1064,7 +1235,7 @@ mod tests {
         );
 
         let mut unknown_operation = original.to_vec();
-        put_u16(&mut unknown_operation, 6, 6);
+        put_u16(&mut unknown_operation, 6, 7);
         assert_eq!(
             decode_request(&unknown_operation),
             Err(DecodeError::UnknownOperation)
@@ -1101,6 +1272,7 @@ mod tests {
     fn frame_shape_has_no_content_bearing_fields() {
         assert_eq!(ADMIT_ATTEMPT_BODY_SIZE, 376);
         assert_eq!(ADMIT_QUALIFICATION_BODY_SIZE, 440);
+        assert_eq!(COMPLETE_ATTEMPT_BODY_SIZE, 160);
         assert_eq!(MAX_FRAME_SIZE, 472);
         assert!(!std::mem::needs_drop::<AdmitAttemptRequest>());
         let encoded = encode_request([1; 16], Request::AdmitAttempt(admit()));
@@ -1110,6 +1282,83 @@ mod tests {
         );
         assert_eq!(get_u16(encoded.as_bytes(), 6), 2);
         assert_eq!(get_u32(encoded.as_bytes(), 12), 376);
+        assert_eq!(Operation::Hello as u16, 1);
+        assert_eq!(Operation::AdmitAttempt as u16, 2);
+        assert_eq!(Operation::CancelAttempt as u16, 3);
+        assert_eq!(Operation::GetAttempt as u16, 4);
+        assert_eq!(Operation::AdmitQualification as u16, 5);
+        assert_eq!(Operation::CompleteAttempt as u16, 6);
+    }
+
+    #[test]
+    fn complete_attempt_has_canonical_fixed_width_encoding() {
+        let request = complete();
+        let encoded = encode_request([42; 16], Request::CompleteAttempt(request));
+        let bytes = encoded.as_bytes();
+        assert_eq!(bytes.len(), HEADER_SIZE + COMPLETE_ATTEMPT_BODY_SIZE);
+        assert_eq!(get_u16(bytes, 6), 6);
+        assert_eq!(get_u32(bytes, 12), 160);
+        assert_eq!(&bytes[HEADER_SIZE + 145..], &[0; 15]);
+        assert_eq!(
+            decode_request(bytes),
+            Ok((
+                FrameHeader {
+                    operation: Operation::CompleteAttempt,
+                    request_id: [42; 16],
+                },
+                Request::CompleteAttempt(request),
+            ))
+        );
+    }
+
+    #[test]
+    fn complete_attempt_rejects_hostile_fields_and_shape() {
+        let encoded = encode_request([1; 16], Request::CompleteAttempt(complete()));
+        let original = encoded.as_bytes();
+        let body = HEADER_SIZE;
+        for range in [0..32, 32..64, 64..80, 80..96, 105..137] {
+            let mut zero = original.to_vec();
+            zero[body + range.start..body + range.end].fill(0);
+            assert_eq!(decode_request(&zero), Err(DecodeError::ZeroField));
+        }
+
+        let mut zero_generation = original.to_vec();
+        put_u64(&mut zero_generation, body + 96, 0);
+        assert_eq!(
+            decode_request(&zero_generation),
+            Err(DecodeError::ZeroField)
+        );
+
+        let mut no_conclusion = original.to_vec();
+        no_conclusion[body + 104] = Conclusion::None as u8;
+        assert_eq!(decode_request(&no_conclusion), Err(DecodeError::ZeroField));
+        let mut unknown_conclusion = original.to_vec();
+        unknown_conclusion[body + 104] = 6;
+        assert_eq!(
+            decode_request(&unknown_conclusion),
+            Err(DecodeError::UnknownEnum)
+        );
+
+        let mut zero_terminal = original.to_vec();
+        put_u64(&mut zero_terminal, body + 137, 0);
+        assert_eq!(decode_request(&zero_terminal), Err(DecodeError::ZeroField));
+        let mut unsafe_terminal = original.to_vec();
+        put_u64(&mut unsafe_terminal, body + 137, MAX_SAFE_INTEGER + 1);
+        assert_eq!(
+            decode_request(&unsafe_terminal),
+            Err(DecodeError::UnsafeInteger)
+        );
+
+        let mut reserved = original.to_vec();
+        reserved[body + 159] = 1;
+        assert_eq!(decode_request(&reserved), Err(DecodeError::NonZeroReserved));
+        assert_eq!(
+            decode_request(&original[..original.len() - 1]),
+            Err(DecodeError::WrongBodyLength)
+        );
+        let mut trailing = original.to_vec();
+        trailing.push(0);
+        assert_eq!(decode_request(&trailing), Err(DecodeError::TrailingBytes));
     }
 
     proptest! {

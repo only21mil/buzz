@@ -232,7 +232,7 @@ impl<A: OrdinaryAdmissionBoundary, Q: QualificationAdmissionBoundary> ControlDis
                 }
             }
             Request::Hello(_) => response(ResponseCode::NotProvisioned, now),
-            Request::CancelAttempt(_) | Request::GetAttempt(_) => {
+            Request::CancelAttempt(_) | Request::GetAttempt(_) | Request::CompleteAttempt(_) => {
                 response(ResponseCode::NotFound, now)
             }
         }
@@ -258,7 +258,7 @@ impl Default for ClosedDispatch {
 impl ControlDispatch for ClosedDispatch {
     fn dispatch(&mut self, _header: FrameHeader, request: Request, now: u64) -> BrokerResponse {
         match request {
-            Request::CancelAttempt(_) | Request::GetAttempt(_) => {
+            Request::CancelAttempt(_) | Request::GetAttempt(_) | Request::CompleteAttempt(_) => {
                 response(ResponseCode::NotFound, now)
             }
             Request::Hello(_) | Request::AdmitAttempt(_) | Request::AdmitQualification(_) => {

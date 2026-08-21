@@ -432,7 +432,7 @@ where
             Request::AdmitAttempt(request) => self.ordinary(header, request, now),
             Request::AdmitQualification(request) => self.qualification(header, request, now),
             Request::Hello(_) => response(ResponseCode::NotProvisioned, now),
-            Request::CancelAttempt(_) | Request::GetAttempt(_) => {
+            Request::CancelAttempt(_) | Request::GetAttempt(_) | Request::CompleteAttempt(_) => {
                 response(ResponseCode::NotFound, now)
             }
         }

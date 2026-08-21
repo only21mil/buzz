@@ -104,7 +104,7 @@ impl Broker {
                 attempt: admit.attempt,
             },
             Request::AdmitQualification(_) => self.response(ResponseCode::NotProvisioned, now),
-            Request::CancelAttempt(_) | Request::GetAttempt(_) => {
+            Request::CancelAttempt(_) | Request::GetAttempt(_) | Request::CompleteAttempt(_) => {
                 self.response(ResponseCode::NotFound, now)
             }
         }
