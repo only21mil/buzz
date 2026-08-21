@@ -65,7 +65,7 @@ pub struct QualificationCleanupTargets {
 }
 
 impl QualificationCleanupTargets {
-    fn from_binding(binding: QualificationHostBinding) -> Self {
+    pub(crate) fn from_binding(binding: QualificationHostBinding) -> Self {
         let lease_id = hex::encode(binding.lease_id);
         let lease_slice = format!("buzzci-{lease_id}.slice");
         let namespace_name = format!("buzzci-{lease_id}");
@@ -160,7 +160,7 @@ pub struct QualificationCleanupDeadline {
 }
 
 impl QualificationCleanupDeadline {
-    fn after(timeout: Duration) -> Self {
+    pub(crate) fn after(timeout: Duration) -> Self {
         Self {
             expires_at: Instant::now()
                 .checked_add(timeout)
