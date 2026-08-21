@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 pub mod activation;
+#[cfg(target_os = "linux")]
+pub mod control;
 pub mod dns_isolation;
 #[cfg(unix)]
 pub mod evidence;
@@ -85,6 +87,7 @@ impl Broker {
                 teardown_digest: [0; 32],
                 attempt: admit.attempt,
             },
+            Request::AdmitQualification(_) => self.response(ResponseCode::NotProvisioned, now),
             Request::CancelAttempt(_) | Request::GetAttempt(_) => {
                 self.response(ResponseCode::NotFound, now)
             }

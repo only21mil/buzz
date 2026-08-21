@@ -518,6 +518,20 @@ fn random_state() -> Result<String, AgentError> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn oauth_callback_response(result: &Result<String, String>) -> axum::response::Response {
+    use axum::response::{Html, IntoResponse};
+
+    match result {
+        Ok(_) => Html("<h2>Buzz: signed in</h2><p>You can close this window.</p>".to_string())
+            .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Buzz authentication failed. You can close this window.",
+        )
+            .into_response(),
+    }
+}
+
 /// Spin up a localhost callback server, open the authorize URL in a
 /// browser, wait up to [`BROWSER_AUTH_TIMEOUT`] for the redirect, then
 /// exchange the code for a token.
@@ -526,7 +540,7 @@ async fn browser_pkce_flow(
     cfg: &PkceOAuthConfig,
     endpoints: &OidcEndpoints,
 ) -> Result<CachedToken, AgentError> {
-    use axum::{extract::Query, response::Html, routing::get, Router};
+    use axum::{extract::Query, routing::get, Router};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use tokio::sync::oneshot;
@@ -555,12 +569,7 @@ async fn browser_pkce_flow(
                 if let Some(sender) = tx.lock().await.take() {
                     let _ = sender.send(result.clone());
                 }
-                match result {
-                    Ok(_) => Html(
-                        "<h2>Buzz: signed in</h2><p>You can close this window.</p>".to_string(),
-                    ),
-                    Err(e) => Html(format!("<h2>Buzz auth failed</h2><pre>{e}</pre>")),
-                }
+                oauth_callback_response(&result)
             }
         }),
     );
@@ -629,6 +638,28 @@ async fn browser_pkce_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_callback_provider_error_is_returned_as_fixed_plain_text() {
+        let hostile = "<img src=x onerror=alert(document.domain)>";
+        let response = oauth_callback_response(&Err(hostile.to_string()));
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            body,
+            "Buzz authentication failed. You can close this window."
+        );
+        assert!(!body.contains(hostile));
+    }
 
     #[test]
     fn pkce_pair_produces_valid_challenge() {

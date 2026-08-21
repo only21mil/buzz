@@ -5,7 +5,7 @@
 //! readiness evidence into this state machine.
 
 use crate::seccomp::SeccompLeaseEvidence;
-use buzz_ci_broker_protocol::GitOid;
+use buzz_ci_broker_protocol::{GitOid, QualificationDirective, QualificationRequest};
 
 /// Exact acceptance record count required before activation.
 pub const REQUIRED_SECURITY_RECORDS: u8 = 17;
@@ -60,6 +60,7 @@ pub struct QualificationPermit {
     pub nonce: [u8; 32],
     pub not_before: u64,
     pub expires_at: u64,
+    pub directive: Option<QualificationDirective>,
 }
 
 /// Trust class presented at the pure admission seam.
@@ -81,6 +82,9 @@ pub struct QualificationAdmission {
     pub fixture_identity: [u8; 32],
     pub signer: VerifiedSigner,
     pub nonce: [u8; 32],
+    pub not_before: u64,
+    pub expires_at: u64,
+    pub directive: Option<QualificationDirective>,
     pub trust_class: AdmissionTrustClass,
 }
 
@@ -89,6 +93,14 @@ pub struct QualificationAdmission {
 pub struct QualificationLease {
     fixture_identity: [u8; 32],
     nonce: [u8; 32],
+    directive: Option<QualificationDirective>,
+}
+
+impl QualificationLease {
+    /// Return the root-permitted behavior for this exact fixture lease.
+    pub const fn directive(self) -> Option<QualificationDirective> {
+        self.directive
+    }
 }
 
 /// Qualification completion reported by the acceptance harness.
@@ -448,6 +460,44 @@ impl ActivationController {
         Ok(())
     }
 
+    /// Authenticate and bind one decoded qualification protocol request.
+    pub fn admit_qualification_request(
+        &mut self,
+        request: QualificationRequest,
+        authenticated_signer: VerifiedSigner,
+        now: u64,
+    ) -> Result<QualificationLease, AdmissionError> {
+        if request.fixture_signer != authenticated_signer.0 {
+            return Err(AdmissionError::UnauthorizedSigner);
+        }
+        self.admit_qualification(
+            QualificationAdmission {
+                host: HostActivationCoordinates {
+                    integrated_candidate_sha: request.integrated_candidate_sha,
+                    broker_build_identity: request.broker_build_identity,
+                    host_profile_digest: request.host_profile_digest,
+                    suite_identity: request.suite_identity,
+                },
+                fixture_job: FixtureJobCoordinates {
+                    request_digest: request.request_digest,
+                    manifest_digest: request.manifest_digest,
+                    isolation_profile_digest: request.isolation_profile_digest,
+                    source_oid: request.source_oid,
+                    base_oid: request.base_oid,
+                    test_identity: request.job_identity,
+                },
+                fixture_identity: request.fixture_identity,
+                signer: authenticated_signer,
+                nonce: request.nonce,
+                not_before: request.not_before,
+                expires_at: request.expires_at,
+                directive: request.directive,
+                trust_class: AdmissionTrustClass::QualificationFixture,
+            },
+            now,
+        )
+    }
+
     /// Admit the one exact qualification fixture without enabling ordinary jobs.
     pub fn admit_qualification(
         &mut self,
@@ -482,6 +532,9 @@ impl ActivationController {
         if request.host != session.permit.host
             || request.fixture_job != session.permit.fixture_job
             || request.fixture_identity != session.permit.fixture_identity
+            || request.not_before != session.permit.not_before
+            || request.expires_at != session.permit.expires_at
+            || request.directive != session.permit.directive
         {
             return Err(AdmissionError::CoordinateMismatch);
         }
@@ -492,6 +545,7 @@ impl ActivationController {
         let lease = QualificationLease {
             fixture_identity: request.fixture_identity,
             nonce: request.nonce,
+            directive: request.directive,
         };
         self.seen_nonces
             .insert(request.nonce, session.permit.expires_at)?;
@@ -801,6 +855,7 @@ fn snapshot_shape_is_valid(snapshot: DurableStateSnapshot) -> bool {
             && qualification.active_lease.is_none_or(|lease| {
                 lease.fixture_identity == qualification.permit.fixture_identity
                     && lease.nonce == qualification.permit.nonce
+                    && lease.directive == qualification.permit.directive
                     && snapshot.nonce_ledger.contains(&lease.nonce)
             })
     });
@@ -948,6 +1003,7 @@ mod tests {
             nonce: [15; 32],
             not_before: 10,
             expires_at: 30,
+            directive: None,
         }
     }
 
@@ -958,7 +1014,32 @@ mod tests {
             fixture_identity: [14; 32],
             signer: FIXTURE_SIGNER,
             nonce: [15; 32],
+            not_before: 10,
+            expires_at: 30,
+            directive: None,
             trust_class: AdmissionTrustClass::QualificationFixture,
+        }
+    }
+
+    fn qualification_request(directive: Option<QualificationDirective>) -> QualificationRequest {
+        let permit = permit();
+        QualificationRequest {
+            integrated_candidate_sha: permit.host.integrated_candidate_sha,
+            broker_build_identity: permit.host.broker_build_identity,
+            host_profile_digest: permit.host.host_profile_digest,
+            suite_identity: permit.host.suite_identity,
+            fixture_signer: permit.fixture_signer.0,
+            request_digest: permit.fixture_job.request_digest,
+            manifest_digest: permit.fixture_job.manifest_digest,
+            isolation_profile_digest: permit.fixture_job.isolation_profile_digest,
+            source_oid: permit.fixture_job.source_oid,
+            base_oid: permit.fixture_job.base_oid,
+            job_identity: permit.fixture_job.test_identity,
+            fixture_identity: permit.fixture_identity,
+            nonce: permit.nonce,
+            not_before: permit.not_before,
+            expires_at: permit.expires_at,
+            directive,
         }
     }
 
@@ -1165,6 +1246,56 @@ mod tests {
         assert_eq!(
             controller.admit_qualification(second, 10),
             Err(AdmissionError::ConcurrencyLimit)
+        );
+    }
+
+    #[test]
+    fn protocol_qualification_binds_authenticated_signer_expiry_and_directive() {
+        let mut controller = qualifying_controller();
+        assert_eq!(
+            controller.admit_qualification_request(
+                qualification_request(None),
+                VerifiedSigner([99; 32]),
+                10,
+            ),
+            Err(AdmissionError::UnauthorizedSigner)
+        );
+
+        let mut wrong_expiry = qualification_request(None);
+        wrong_expiry.expires_at += 1;
+        assert_eq!(
+            controller.admit_qualification_request(wrong_expiry, FIXTURE_SIGNER, 10),
+            Err(AdmissionError::CoordinateMismatch)
+        );
+
+        let mut unauthorized_directive = qualification_request(None);
+        unauthorized_directive.directive = Some(QualificationDirective::TeardownFailure);
+        assert_eq!(
+            controller.admit_qualification_request(unauthorized_directive, FIXTURE_SIGNER, 10,),
+            Err(AdmissionError::CoordinateMismatch)
+        );
+
+        let lease = controller
+            .admit_qualification_request(qualification_request(None), FIXTURE_SIGNER, 10)
+            .expect("ordinary qualification fixture");
+        assert_eq!(lease.directive(), None);
+
+        let mut teardown_permit = permit();
+        teardown_permit.directive = Some(QualificationDirective::TeardownFailure);
+        let mut teardown_controller = ActivationController::new(ROOT);
+        teardown_controller
+            .start_qualification(teardown_permit)
+            .expect("teardown qualification permit");
+        let teardown_lease = teardown_controller
+            .admit_qualification_request(
+                qualification_request(Some(QualificationDirective::TeardownFailure)),
+                FIXTURE_SIGNER,
+                10,
+            )
+            .expect("teardown qualification fixture");
+        assert_eq!(
+            teardown_lease.directive(),
+            Some(QualificationDirective::TeardownFailure)
         );
     }
 

@@ -13,10 +13,11 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const HEADER_SIZE: usize = 32;
 pub const HELLO_BODY_SIZE: usize = 64;
 pub const ADMIT_ATTEMPT_BODY_SIZE: usize = 376;
+pub const ADMIT_QUALIFICATION_BODY_SIZE: usize = 440;
 pub const CANCEL_ATTEMPT_BODY_SIZE: usize = 128;
 pub const GET_ATTEMPT_BODY_SIZE: usize = 32;
 pub const RESPONSE_BODY_SIZE: usize = 256;
-pub const MAX_BODY_SIZE: usize = ADMIT_ATTEMPT_BODY_SIZE;
+pub const MAX_BODY_SIZE: usize = ADMIT_QUALIFICATION_BODY_SIZE;
 pub const MAX_FRAME_SIZE: usize = HEADER_SIZE + MAX_BODY_SIZE;
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -29,6 +30,7 @@ pub enum Operation {
     AdmitAttempt = 2,
     CancelAttempt = 3,
     GetAttempt = 4,
+    AdmitQualification = 5,
 }
 
 impl Operation {
@@ -38,6 +40,7 @@ impl Operation {
             2 => Ok(Self::AdmitAttempt),
             3 => Ok(Self::CancelAttempt),
             4 => Ok(Self::GetAttempt),
+            5 => Ok(Self::AdmitQualification),
             _ => Err(DecodeError::UnknownOperation),
         }
     }
@@ -48,6 +51,7 @@ impl Operation {
             Self::AdmitAttempt => ADMIT_ATTEMPT_BODY_SIZE,
             Self::CancelAttempt => CANCEL_ATTEMPT_BODY_SIZE,
             Self::GetAttempt => GET_ATTEMPT_BODY_SIZE,
+            Self::AdmitQualification => ADMIT_QUALIFICATION_BODY_SIZE,
         }
     }
 }
@@ -161,6 +165,33 @@ impl TryFrom<u16> for CancelReason {
     }
 }
 
+/// The only privileged fault behavior available to a qualification fixture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum QualificationDirective {
+    TeardownFailure = 1,
+}
+
+impl QualificationDirective {
+    fn decode_optional(value: u8) -> Result<Option<Self>, DecodeError> {
+        match value {
+            0 => Ok(None),
+            _ => Self::try_from(value).map(Some),
+        }
+    }
+}
+
+impl TryFrom<u8> for QualificationDirective {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::TeardownFailure),
+            _ => Err(DecodeError::UnknownEnum),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HelloRequest {
     pub controller_instance: [u8; 32],
@@ -204,6 +235,30 @@ pub struct GetAttemptRequest {
     pub attempt_id: [u8; 16],
 }
 
+/// One root-permitted qualification fixture request.
+///
+/// `fixture_signer` is a claimed identity. The service-owned authentication
+/// adapter must verify it before constructing its trusted signer identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QualificationRequest {
+    pub integrated_candidate_sha: GitOid,
+    pub broker_build_identity: [u8; 32],
+    pub host_profile_digest: [u8; 32],
+    pub suite_identity: [u8; 32],
+    pub fixture_signer: [u8; 32],
+    pub request_digest: [u8; 32],
+    pub manifest_digest: [u8; 32],
+    pub isolation_profile_digest: [u8; 32],
+    pub source_oid: GitOid,
+    pub base_oid: GitOid,
+    pub job_identity: [u8; 32],
+    pub fixture_identity: [u8; 32],
+    pub nonce: [u8; 32],
+    pub not_before: u64,
+    pub expires_at: u64,
+    pub directive: Option<QualificationDirective>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 // Keeping every request inline is deliberate: the root broker accepts only
 // bounded fixed-width frames and never allocates from attacker-selected data.
@@ -213,6 +268,7 @@ pub enum Request {
     AdmitAttempt(AdmitAttemptRequest),
     CancelAttempt(CancelAttemptRequest),
     GetAttempt(GetAttemptRequest),
+    AdmitQualification(QualificationRequest),
 }
 
 impl Request {
@@ -222,6 +278,7 @@ impl Request {
             Self::AdmitAttempt(_) => Operation::AdmitAttempt,
             Self::CancelAttempt(_) => Operation::CancelAttempt,
             Self::GetAttempt(_) => Operation::GetAttempt,
+            Self::AdmitQualification(_) => Operation::AdmitQualification,
         }
     }
 }
@@ -432,6 +489,7 @@ pub fn encode_request(request_id: [u8; 16], request: Request) -> EncodedFrame {
         Request::AdmitAttempt(value) => encode_admit(body, value),
         Request::CancelAttempt(value) => encode_cancel(body, value),
         Request::GetAttempt(value) => body[..16].copy_from_slice(&value.attempt_id),
+        Request::AdmitQualification(value) => encode_qualification(body, value),
     }
     encoded
 }
@@ -463,6 +521,7 @@ pub fn decode_request(frame: &[u8]) -> Result<(FrameHeader, Request), DecodeErro
                 attempt_id: nonzero_array(&body[..16])?,
             })
         }
+        Operation::AdmitQualification => Request::AdmitQualification(decode_qualification(body)?),
     };
     Ok((header, request))
 }
@@ -653,6 +712,53 @@ fn decode_admit(body: &[u8]) -> Result<AdmitAttemptRequest, DecodeError> {
     Ok(value)
 }
 
+fn encode_qualification(body: &mut [u8], value: QualificationRequest) {
+    value.integrated_candidate_sha.encode_into(&mut body[0..33]);
+    body[33..65].copy_from_slice(&value.broker_build_identity);
+    body[65..97].copy_from_slice(&value.host_profile_digest);
+    body[97..129].copy_from_slice(&value.suite_identity);
+    body[129..161].copy_from_slice(&value.fixture_signer);
+    body[161..193].copy_from_slice(&value.request_digest);
+    body[193..225].copy_from_slice(&value.manifest_digest);
+    body[225..257].copy_from_slice(&value.isolation_profile_digest);
+    value.source_oid.encode_into(&mut body[257..290]);
+    value.base_oid.encode_into(&mut body[290..323]);
+    body[323..355].copy_from_slice(&value.job_identity);
+    body[355..387].copy_from_slice(&value.fixture_identity);
+    body[387..419].copy_from_slice(&value.nonce);
+    put_u64(body, 419, value.not_before);
+    put_u64(body, 427, value.expires_at);
+    body[435] = value.directive.map_or(0, |directive| directive as u8);
+}
+
+fn decode_qualification(body: &[u8]) -> Result<QualificationRequest, DecodeError> {
+    require_zero(&body[436..])?;
+    let value = QualificationRequest {
+        integrated_candidate_sha: GitOid::decode(&body[0..33])?,
+        broker_build_identity: nonzero_array(&body[33..65])?,
+        host_profile_digest: nonzero_array(&body[65..97])?,
+        suite_identity: nonzero_array(&body[97..129])?,
+        fixture_signer: nonzero_array(&body[129..161])?,
+        request_digest: nonzero_array(&body[161..193])?,
+        manifest_digest: nonzero_array(&body[193..225])?,
+        isolation_profile_digest: nonzero_array(&body[225..257])?,
+        source_oid: GitOid::decode(&body[257..290])?,
+        base_oid: GitOid::decode(&body[290..323])?,
+        job_identity: nonzero_array(&body[323..355])?,
+        fixture_identity: nonzero_array(&body[355..387])?,
+        nonce: nonzero_array(&body[387..419])?,
+        not_before: get_u64(body, 419),
+        expires_at: get_u64(body, 427),
+        directive: QualificationDirective::decode_optional(body[435])?,
+    };
+    validate_safe(value.not_before)?;
+    validate_safe(value.expires_at)?;
+    if value.not_before >= value.expires_at {
+        return Err(DecodeError::InvalidDeadline);
+    }
+    Ok(value)
+}
+
 fn encode_cancel(body: &mut [u8], value: CancelAttemptRequest) {
     body[..16].copy_from_slice(&value.attempt_id);
     body[16..48].copy_from_slice(&value.actor_pubkey);
@@ -773,6 +879,27 @@ mod tests {
         }
     }
 
+    fn qualification(directive: Option<QualificationDirective>) -> QualificationRequest {
+        QualificationRequest {
+            integrated_candidate_sha: GitOid::Sha256(digest(12)),
+            broker_build_identity: digest(13),
+            host_profile_digest: digest(14),
+            suite_identity: digest(15),
+            fixture_signer: digest(16),
+            request_digest: digest(17),
+            manifest_digest: digest(18),
+            isolation_profile_digest: digest(19),
+            source_oid: GitOid::Sha256(digest(20)),
+            base_oid: GitOid::Sha1([21; 20]),
+            job_identity: digest(22),
+            fixture_identity: digest(23),
+            nonce: digest(24),
+            not_before: 100,
+            expires_at: 200,
+            directive,
+        }
+    }
+
     #[test]
     fn every_request_round_trips() {
         let requests = [
@@ -793,6 +920,10 @@ mod tests {
             Request::GetAttempt(GetAttemptRequest {
                 attempt_id: [6; 16],
             }),
+            Request::AdmitQualification(qualification(None)),
+            Request::AdmitQualification(qualification(Some(
+                QualificationDirective::TeardownFailure,
+            ))),
         ];
         for request in requests {
             let encoded = encode_request([42; 16], request);
@@ -915,12 +1046,70 @@ mod tests {
     }
 
     #[test]
+    fn qualification_decode_rejects_unknown_directives_invalid_fields_and_shape() {
+        let encoded = encode_request(
+            [1; 16],
+            Request::AdmitQualification(qualification(Some(
+                QualificationDirective::TeardownFailure,
+            ))),
+        );
+        let original = encoded.as_bytes();
+        let body = HEADER_SIZE;
+
+        let mut unknown_directive = original.to_vec();
+        unknown_directive[body + 435] = 2;
+        assert_eq!(
+            decode_request(&unknown_directive),
+            Err(DecodeError::UnknownEnum)
+        );
+
+        let mut unknown_operation = original.to_vec();
+        put_u16(&mut unknown_operation, 6, 6);
+        assert_eq!(
+            decode_request(&unknown_operation),
+            Err(DecodeError::UnknownOperation)
+        );
+
+        let mut zero_signer = original.to_vec();
+        zero_signer[body + 129..body + 161].fill(0);
+        assert_eq!(decode_request(&zero_signer), Err(DecodeError::ZeroField));
+
+        let mut invalid_expiry = original.to_vec();
+        put_u64(&mut invalid_expiry, body + 427, 100);
+        assert_eq!(
+            decode_request(&invalid_expiry),
+            Err(DecodeError::InvalidDeadline)
+        );
+
+        let mut nonzero_reserved = original.to_vec();
+        nonzero_reserved[body + 439] = 1;
+        assert_eq!(
+            decode_request(&nonzero_reserved),
+            Err(DecodeError::NonZeroReserved)
+        );
+
+        assert_eq!(
+            decode_request(&original[..original.len() - 1]),
+            Err(DecodeError::WrongBodyLength)
+        );
+        let mut trailing = original.to_vec();
+        trailing.push(0);
+        assert_eq!(decode_request(&trailing), Err(DecodeError::TrailingBytes));
+    }
+
+    #[test]
     fn frame_shape_has_no_content_bearing_fields() {
         assert_eq!(ADMIT_ATTEMPT_BODY_SIZE, 376);
-        assert_eq!(MAX_FRAME_SIZE, 408);
+        assert_eq!(ADMIT_QUALIFICATION_BODY_SIZE, 440);
+        assert_eq!(MAX_FRAME_SIZE, 472);
         assert!(!std::mem::needs_drop::<AdmitAttemptRequest>());
         let encoded = encode_request([1; 16], Request::AdmitAttempt(admit()));
-        assert_eq!(encoded.as_bytes().len(), MAX_FRAME_SIZE);
+        assert_eq!(
+            encoded.as_bytes().len(),
+            HEADER_SIZE + ADMIT_ATTEMPT_BODY_SIZE
+        );
+        assert_eq!(get_u16(encoded.as_bytes(), 6), 2);
+        assert_eq!(get_u32(encoded.as_bytes(), 12), 376);
     }
 
     proptest! {

@@ -1,0 +1,16 @@
+[Unit]
+Description=Buzz CI qualification broker socket
+
+[Socket]
+ListenStream=/run/buzzci/execd.sock
+FileDescriptorName=buzz-ci-execd
+Accept=no
+SocketUser=buzzci-ctl
+SocketGroup=buzzci-ctl
+SocketMode=0600
+DirectoryMode=0711
+RemoveOnStop=yes
+Service=buzz-ci-execd.service
+
+[Install]
+WantedBy=sockets.target

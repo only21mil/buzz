@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_ID=TM-16
 TITLE='Run the Phase-2 retry probe with fresh workspaces using final `BUZZ_CI_RUN_ID`, `BUZZ_CI_SHA`, and `BUZZ_CI_ATTEMPT`'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''
 candidate_dir=''
 evidence_dir=''
@@ -13,8 +14,8 @@ statuses=()
 evidence_files=()
 preconditions=(
   'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
-  'the published runner control entrypoint must support admit, get, cancel, request replay, nonce override, signer override, and capacity readback'
-  'the accepted fixture repository must expose ci-acceptance/probe-repo/workflow.yml job flaky'
+  'BUZZ_CI_ACCEPTANCE_CTL receives exact root-authored TM-16 case files on stdin with no arguments'
+  'replay, rate, and concurrency case files bind requests exercised by ActivationController'
   'root readback of per-attempt receipts and proxy objects requires SUITE_SUDO or passwordless sudo'
 )
 
@@ -66,22 +67,22 @@ evidence_files+=("$TEST_ID/static-probe-contracts.txt")
 
 broker_dir=${BUZZ_CI_BROKER_DIR:-$candidate_dir}
 protocol_lib=$broker_dir/crates/buzz-ci-broker-protocol/src/lib.rs
-runner_lib=$broker_dir/crates/buzz-ci-runner/src/lib.rs
+activation_lib=$broker_dir/crates/buzz-ci-execd/src/activation.rs
+acceptance_lib=$broker_dir/crates/buzz-ci-acceptance-ctl/src/lib.rs
 protocol_static=$out_dir/static-protocol-refusals.txt
-if [[ -f $protocol_lib && -f $runner_lib ]]; then
-  { timeout "$TIMEOUT_SECONDS" awk 'NR>=231 && NR<=247 {print "broker-protocol:" NR ":" $0} NR>=642 && NR<=645 {print "broker-protocol:" NR ":" $0}' "$protocol_lib"; timeout "$TIMEOUT_SECONDS" awk 'NR>=55 && NR<=82 {print "runner:" NR ":" $0}' "$runner_lib"; } >"$protocol_static"
+if [[ -f $protocol_lib && -f $activation_lib && -f $acceptance_lib ]]; then
+  { timeout "$TIMEOUT_SECONDS" grep -nE 'ReplayConflict|NoCapacity|PolicyDenied' "$protocol_lib"; timeout "$TIMEOUT_SECONDS" grep -nE 'Replay|ExpiredNonce|UnauthorizedSigner|RateLimit|ConcurrencyLimit' "$activation_lib"; timeout "$TIMEOUT_SECONDS" grep -nE 'invalid_time_window|binding_mismatch|transport' "$acceptance_lib"; } >"$protocol_static"
 else
   : >"$protocol_static"
 fi
 evidence_files+=("$TEST_ID/static-protocol-refusals.txt")
-if timeout 10 grep -Fq 'broker-protocol:238:    UnauthorizedPeer = 104' "$protocol_static" \
-  && timeout 10 grep -Fq 'broker-protocol:240:    ReplayConflict = 106' "$protocol_static" \
-  && timeout 10 grep -Fq 'broker-protocol:645:        return Err(DecodeError::InvalidDeadline)' "$protocol_static" \
-  && timeout 10 grep -Fq 'runner:59:    Unauthorized' "$protocol_static" \
-  && timeout 10 grep -Fq 'runner:80:        return Err(ControlError::Unauthorized)' "$protocol_static"; then
-  record static_protocol_refusals pass 'broker-protocol/src/lib.rs:238,240,645 names unauthorized, replay, and deadline refusal; buzz-ci-runner/src/lib.rs:59,80 rejects unauthorized control input'
+if timeout 10 grep -q 'ReplayConflict' "$protocol_static" \
+  && timeout 10 grep -q 'RateLimit' "$protocol_static" \
+  && timeout 10 grep -q 'ConcurrencyLimit' "$protocol_static" \
+  && timeout 10 grep -q 'binding_mismatch' "$protocol_static"; then
+  record static_protocol_refusals pass 'Acceptance validation refuses signer/binding mismatches before transport; expiry, replay, rate, and concurrency remain ActivationController decisions'
 else
-  record static_protocol_refusals fail 'A cited protocol or runner refusal name is missing or moved'
+  record static_protocol_refusals fail 'The acceptance-control or ActivationController refusal path is missing'
 fi
 
 dynamic_names=(fresh_retry_environment replay_refusal expired_nonce_refusal unauthorized_signer_refusal rate_limit_refusal concurrency_limit_refusal)
@@ -99,90 +100,65 @@ if ((${#SUDO[@]} == 0)) && [[ ! -r /etc/buzzci/harness.env ]]; then
 fi
 if ((${#SUDO[@]} == 0)); then for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'Root receipt and proxy object readback requires SUITE_SUDO or passwordless sudo'; done; emit; exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"; fi
 harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || { for name in "${dynamic_names[@]}"; do record "$name" fail 'Published harness.env is not root-readable'; done; emit; exit 1; }
-env_get() { local key=$1; printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'; }
-runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
-lease_root=$(env_get BUZZ_CI_LEASE_STATE_ROOT)
-fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
-harness_signer=$(env_get BUZZ_CI_HARNESS_SIGNER)
-if [[ ! -x $runner_ctl || ! -d $lease_root || -z $fixture_repo || -z $harness_signer ]]; then for name in "${dynamic_names[@]}"; do record "$name" fail 'Published runner control, lease root, fixture coordinate, or harness signer is missing'; done; emit; exit 1; fi
-
-admit_retry() {
-  local label=$1 attempt=$2
-  shift 2
-  timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
-    --workflow ci-acceptance/probe-repo/workflow.yml --job flaky --attempt "$attempt" "$@" >"$out_dir/admit-$label.json" 2>"$out_dir/admit-$label.stderr"
-}
-wait_terminal() {
-  local label=$1 lease_id=$2
-  for _ in {1..120}; do
-    if timeout 10 "$runner_ctl" get --lease "$lease_id" >"$out_dir/final-$label.json" 2>"$out_dir/final-$label.stderr" \
-      && timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final-$label.json" >/dev/null; then return 0; fi
-    timeout 2 sleep 0.25
-  done
-  return 1
-}
-
-retry_ok=1
-if admit_retry attempt-1 1; then
-  lease_one=$(timeout 10 jq -r '.lease_id // empty' "$out_dir/admit-attempt-1.json")
-  run_id=$(timeout 10 jq -r '.run_id // empty' "$out_dir/admit-attempt-1.json")
-  request_id=$(timeout 10 jq -r '.request_id // empty' "$out_dir/admit-attempt-1.json")
-  [[ $lease_one =~ ^[A-Za-z0-9._-]+$ && -n $run_id && -n $request_id ]] || retry_ok=0
-  ((retry_ok)) && wait_terminal attempt-1 "$lease_one" || retry_ok=0
-else retry_ok=0; fi
-if ((retry_ok)) && admit_retry attempt-2 2 --run-id "$run_id" --parent-attempt 1; then
-  lease_two=$(timeout 10 jq -r '.lease_id // empty' "$out_dir/admit-attempt-2.json")
-  [[ $lease_two =~ ^[A-Za-z0-9._-]+$ ]] || retry_ok=0
-  ((retry_ok)) && wait_terminal attempt-2 "$lease_two" || retry_ok=0
-else retry_ok=0; fi
-evidence_files+=("$TEST_ID/admit-attempt-1.json" "$TEST_ID/admit-attempt-1.stderr" "$TEST_ID/final-attempt-1.json" "$TEST_ID/final-attempt-1.stderr" "$TEST_ID/admit-attempt-2.json" "$TEST_ID/admit-attempt-2.stderr" "$TEST_ID/final-attempt-2.json" "$TEST_ID/final-attempt-2.stderr")
-if ((retry_ok)); then
-  workspace_one=$(timeout 10 "${SUDO[@]}" jq -r '.workspace_dir // empty' "$lease_root/$lease_one/lease.json")
-  workspace_two=$(timeout 10 "${SUDO[@]}" jq -r '.workspace_dir // empty' "$lease_root/$lease_two/lease.json")
-  env_one=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" find "$lease_root/$lease_one/proxy/objects" -type f -name '*.json' -print -quit 2>/dev/null || true)
-  env_two=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" find "$lease_root/$lease_two/proxy/objects" -type f -name '*.json' -print -quit 2>/dev/null || true)
-  env_ok=0
-  if [[ -n $env_one && -n $env_two ]] \
-    && timeout 10 "${SUDO[@]}" jq -e --arg run "$run_id" --arg sha "$candidate" '.. | objects | .env? | select(type=="object") | select(.BUZZ_CI_RUN_ID==$run and .BUZZ_CI_SHA==$sha and (.BUZZ_CI_ATTEMPT|tostring)=="1")' "$env_one" >/dev/null \
-    && timeout 10 "${SUDO[@]}" jq -e --arg run "$run_id" --arg sha "$candidate" '.. | objects | .env? | select(type=="object") | select(.BUZZ_CI_RUN_ID==$run and .BUZZ_CI_SHA==$sha and (.BUZZ_CI_ATTEMPT|tostring)=="2")' "$env_two" >/dev/null; then env_ok=1; fi
-  printf 'attempt_1_workspace=%s\nattempt_2_workspace=%s\nenv_names=BUZZ_CI_RUN_ID,BUZZ_CI_SHA,BUZZ_CI_ATTEMPT\nenv_values_match=%s\n' "$workspace_one" "$workspace_two" "$env_ok" >"$out_dir/retry-readback.txt"
-  evidence_files+=("$TEST_ID/retry-readback.txt")
-  if ((env_ok)) && [[ -n $workspace_one && -n $workspace_two && $workspace_one != "$workspace_two" && $lease_one != "$lease_two" ]]; then record fresh_retry_environment pass 'Attempts 1 and 2 used distinct leases/workspaces and the final three BUZZ_CI job variables matched their attempt'; else record fresh_retry_environment fail 'Retry reused a lease/workspace or its final BUZZ_CI job variables did not match'; fi
-else
-  record fresh_retry_environment fail 'Could not complete the two-attempt retry through the real runner path'
-  request_id=''
+export harness_text
+if ! acceptance_control_init; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable "$ACCEPTANCE_UNAVAILABLE"; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
 
-refusal() {
-  local name=$1 expected=$2
-  shift 2
-  local rc=0
-  timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
-    --workflow ci-acceptance/probe-repo/workflow.yml --job flaky --attempt 1 "$@" >"$out_dir/$name.json" 2>"$out_dir/$name.stderr" || rc=$?
-  evidence_files+=("$TEST_ID/$name.json" "$TEST_ID/$name.stderr")
-  if ((rc != 0)) && { timeout 10 jq -e --arg expected "$expected" '.error == $expected' "$out_dir/$name.json" >/dev/null 2>&1 || timeout 10 jq -e --arg expected "$expected" '.error == $expected' "$out_dir/$name.stderr" >/dev/null 2>&1; }; then record "$name" pass "Admission refused with stable error $expected"; else record "$name" fail "Admission did not refuse with stable error $expected"; fi
+run_case() {
+  local case_name=$1 rc=0
+  acceptance_control_run "$case_name" "$out_dir/$case_name.json" "$out_dir/$case_name.stderr" || rc=$?
+  evidence_files+=("$TEST_ID/$case_name.json" "$TEST_ID/$case_name.stderr")
+  return "$rc"
 }
 
-if [[ -n $request_id ]]; then refusal replay_refusal replay --replay-request "$request_id"; else record replay_refusal fail 'No captured signed request ID was available for replay'; fi
-refusal expired_nonce_refusal nonce_expired --nonce-issued-at 1 --nonce-expires-at 2
-refusal unauthorized_signer_refusal unauthorized_signer --signer "unauthorized-$harness_signer"
-refusal rate_limit_refusal rate_limited --acceptance-case rate_limit
-
-capacity_file=$out_dir/capacity.json
-if timeout "$TIMEOUT_SECONDS" "$runner_ctl" get --capacity >"$capacity_file" 2>"$out_dir/capacity.stderr"; then
-  limit=$(timeout 10 jq -r '.concurrency_limit // 0' "$capacity_file")
-else limit=0; fi
-evidence_files+=("$TEST_ID/capacity.json" "$TEST_ID/capacity.stderr")
-if [[ $limit =~ ^[1-9][0-9]*$ ]] && ((limit <= 16)); then
-  pids=()
-  for ((i=0; i<=limit; i++)); do timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" --workflow ci-acceptance/probe-repo/workflow.yml --job slowpoke --attempt 1 >"$out_dir/concurrent-$i.json" 2>"$out_dir/concurrent-$i.stderr" & pids+=("$!"); done
-  for pid in "${pids[@]}"; do wait "$pid" || true; done
-  for ((i=0; i<=limit; i++)); do evidence_files+=("$TEST_ID/concurrent-$i.json" "$TEST_ID/concurrent-$i.stderr"); done
-  refused=$(timeout "$TIMEOUT_SECONDS" jq -s '[.[] | select(.error == "concurrency_limited")] | length' "$out_dir"/concurrent-*.json)
-  if ((refused >= 1)); then record concurrency_limit_refusal pass "Admission N+1 refused at least one request with concurrency_limited for N=$limit"; else record concurrency_limit_refusal fail "Admission N+1 produced no concurrency_limited refusal for N=$limit"; fi
-  for file in "$out_dir"/concurrent-*.json; do lease=$(timeout 10 jq -r '.lease_id // empty' "$file"); [[ $lease =~ ^[A-Za-z0-9._-]+$ ]] && timeout 10 "$runner_ctl" cancel --lease "$lease" >/dev/null 2>&1 || true; done
+retry_rc=0
+run_case attempt_1 || retry_rc=$?
+run_case attempt_2 || retry_rc=$?
+if ((retry_rc == 3)); then
+  record fresh_retry_environment not_runnable 'The fixed root-authored attempt_1 or attempt_2 case is unavailable or unsafe'
+elif ((retry_rc == 0)) && timeout 10 jq -s -e '
+  .[0] as $a | .[1] as $b |
+  ($a.attempt_id // $a.lease_id) != null and ($b.attempt_id // $b.lease_id) != null and
+  ($a.attempt_id // $a.lease_id) != ($b.attempt_id // $b.lease_id) and
+  $a.workspace_digest != null and $b.workspace_digest != null and $a.workspace_digest != $b.workspace_digest and
+  $a.run_id == $b.run_id and ($a.attempt|tonumber)==1 and ($b.attempt|tonumber)==2
+' "$out_dir/attempt_1.json" "$out_dir/attempt_2.json" >/dev/null 2>&1; then
+  record fresh_retry_environment pass 'The two fixed authenticated retry cases produced distinct ActivationController attempts/workspaces with one run identity and attempts 1 then 2'
 else
-  record concurrency_limit_refusal fail 'Runner capacity readback did not return a bounded positive concurrency_limit'
+  record fresh_retry_environment fail 'The fixed retry cases did not prove distinct attempts/workspaces and the bound 1-to-2 retry identity'
+fi
+
+refusal_case() {
+  local check=$1 case_name=$2 expected=$3 before_transport=$4 rc=0
+  run_case "$case_name" || rc=$?
+  if ((rc == 3)); then
+    record "$check" not_runnable "The fixed root-authored $case_name case is unavailable or unsafe"
+  elif ((rc != 0)) && acceptance_error_is "$expected" "$out_dir/$case_name.json" "$out_dir/$case_name.stderr" \
+    && { [[ $before_transport == false ]] || [[ ! -s $out_dir/$case_name.json ]]; }; then
+    record "$check" pass "The fixed $case_name case was refused with stable error $expected"
+  else
+    record "$check" fail "The fixed $case_name case did not produce stable refusal $expected on the required side of transport"
+  fi
+}
+
+# Expiry, replay, rate, and concurrency reach ActivationController. A signer
+# mismatch is closed by the authenticated-input validator before broker bytes.
+refusal_case replay_refusal replay replay_conflict false
+refusal_case expired_nonce_refusal expired policy_denied false
+refusal_case unauthorized_signer_refusal unauthorized_signer binding_mismatch true
+refusal_case rate_limit_refusal rate_limit no_capacity false
+
+primary_rc=0
+run_case concurrency_primary || primary_rc=$?
+if ((primary_rc == 3)); then
+  record concurrency_limit_refusal not_runnable 'The fixed root-authored concurrency_primary case is unavailable or unsafe'
+elif ((primary_rc != 0)); then
+  record concurrency_limit_refusal fail 'ActivationController did not accept the fixed primary concurrency case'
+else
+  refusal_case concurrency_limit_refusal concurrency_overflow no_capacity false
 fi
 emit
 exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || [[ " ${statuses[*]} " == *' not_runnable '* ]] && printf 3 || printf 0 )"

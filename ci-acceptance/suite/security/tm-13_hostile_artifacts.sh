@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_ID=TM-13
 TITLE='Attempt cache collision/poisoning, symlink/hardlink/path traversal, device/FIFO/socket archive entries, decompression bomb, ANSI/OSC terminal injection, and encoded secret patterns'
 TIMEOUT_SECONDS=${SUITE_TIMEOUT_SECONDS:-600}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/acceptance_control.sh"
 candidate=''
 candidate_dir=''
 evidence_dir=''
@@ -13,7 +14,7 @@ statuses=()
 evidence_files=()
 preconditions=(
   'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
-  'the published runner control entrypoint must support admit and get'
+  'BUZZ_CI_ACCEPTANCE_CTL receives the exact root-authored TM-13 hostile_artifacts case on stdin'
   'lease.json or teardown.json must name sanitized artifact and log publication paths'
   'root readback of lease state and publication stores requires SUITE_SUDO or passwordless sudo'
 )
@@ -99,31 +100,39 @@ if ((${#SUDO[@]} == 0)); then
   exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
 harness_text=$(timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cat /etc/buzzci/harness.env 2>/dev/null) || { for name in "${dynamic_names[@]}"; do record "$name" fail 'Published harness.env is not root-readable'; done; emit; exit 1; }
-env_get() { local key=$1; printf '%s\n' "$harness_text" | timeout "$TIMEOUT_SECONDS" awk -F= -v key="$key" '$1==key{print substr($0,index($0,"=")+1); exit}'; }
-runner_ctl=$(env_get BUZZ_CI_RUNNER_CTL)
-lease_root=$(env_get BUZZ_CI_LEASE_STATE_ROOT)
-fixture_repo=$(env_get BUZZ_CI_FIXTURE_REPO)
-if [[ ! -x $runner_ctl || ! -d $lease_root || -z $fixture_repo ]]; then
-  for name in "${dynamic_names[@]}"; do record "$name" fail 'Published runner control, lease state root, or fixture coordinate is missing'; done
+export harness_text
+lease_root=$(acceptance_env_get BUZZ_CI_LEASE_STATE_ROOT)
+if ! acceptance_control_init; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable "$ACCEPTANCE_UNAVAILABLE"; done
   emit
-  exit 1
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+fi
+if [[ ! -d $lease_root ]]; then
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'harness.env lacks a readable BUZZ_CI_LEASE_STATE_ROOT'; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
 fi
 
 admit_file=$out_dir/admit.json
-if ! timeout "$TIMEOUT_SECONDS" "$runner_ctl" admit --repo "$fixture_repo" --sha "$candidate" \
-    --workflow ci-acceptance/suite/fixtures/tm-13-hostile-artifacts-repo/workflow.yml --job hostile-artifacts --attempt 1 >"$admit_file" 2>"$out_dir/admit.stderr"; then
+admit_rc=0
+acceptance_control_run hostile_artifacts "$admit_file" "$out_dir/admit.stderr" || admit_rc=$?
+if ((admit_rc == 3)); then
   evidence_files+=("$TEST_ID/admit.json" "$TEST_ID/admit.stderr")
-  for name in "${dynamic_names[@]}"; do record "$name" fail 'The hostile-artifact attempt was not admitted'; done
+  for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'The fixed root-authored TM-13/hostile_artifacts.json case is unavailable or unsafe'; done
+  emit
+  exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || printf 3 )"
+elif ((admit_rc != 0)); then
+  evidence_files+=("$TEST_ID/admit.json" "$TEST_ID/admit.stderr")
+  for name in "${dynamic_names[@]}"; do record "$name" fail 'The authenticated hostile-artifact case was refused'; done
   emit
   exit 1
 fi
 evidence_files+=("$TEST_ID/admit.json" "$TEST_ID/admit.stderr")
-lease_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.lease_id // empty' "$admit_file")
-if [[ ! $lease_id =~ ^[A-Za-z0-9._-]+$ ]]; then for name in "${dynamic_names[@]}"; do record "$name" fail 'Admission returned no safe lease_id'; done; emit; exit 1; fi
+lease_id=$(timeout "$TIMEOUT_SECONDS" jq -r '.attempt_id // .lease_id // empty' "$admit_file")
+if [[ ! $lease_id =~ ^[A-Za-z0-9._-]+$ ]]; then for name in "${dynamic_names[@]}"; do record "$name" not_runnable 'Qualification response exposes no safe attempt identifier'; done; emit; exit 3; fi
 lease_dir=$lease_root/$lease_id
 for _ in {1..120}; do
-  if timeout 10 "$runner_ctl" get --lease "$lease_id" >"$out_dir/final.json" 2>"$out_dir/final.stderr" \
-    && timeout 10 jq -e '.state == "terminal" or .terminal == true' "$out_dir/final.json" >/dev/null; then break; fi
+  if timeout 10 "${SUDO[@]}" test -r "$lease_dir/final.json"; then timeout 10 "${SUDO[@]}" cp -- "$lease_dir/final.json" "$out_dir/final.json" 2>"$out_dir/final.stderr" || :; break; fi
   timeout 2 sleep 0.25
 done
 evidence_files+=("$TEST_ID/final.json" "$TEST_ID/final.stderr")

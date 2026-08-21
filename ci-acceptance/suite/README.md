@@ -101,8 +101,15 @@ entries. Runners read it with the configured `SUITE_SUDO` command and parse
 the values as data. They never source it:
 
 `BUZZ_CI_EXECD_SOCKET`, `BUZZ_CI_BROKER_UNIT`, `BUZZ_CI_LEASE_STATE_ROOT`,
-`BUZZ_CI_RUNNER_CTL`, `BUZZ_CI_FIXTURE_REPO`, `BUZZ_CI_HARNESS_SIGNER`,
-`BUZZ_CI_GRAPH_REDUCER`, and `BUZZ_CI_GRAPH_FIXTURE_DIR`.
+`BUZZ_CI_RUNNER_CTL`, `BUZZ_CI_ACCEPTANCE_CTL`,
+`BUZZ_CI_QUALIFICATION_CASE_ROOT`, `BUZZ_CI_FIXTURE_REPO`,
+`BUZZ_CI_HARNESS_SIGNER`, `BUZZ_CI_GRAPH_REDUCER`, and
+`BUZZ_CI_GRAPH_FIXTURE_DIR`.
+
+TM-06, TM-07, and TM-12 through TM-17 never send synthetic control flags.
+They stream exact root-authored, root:root mode `0444` case files from the
+qualification case root to the no-argv acceptance controller. Missing,
+mutable, symlinked, or otherwise unsafe case artifacts are `not_runnable`.
 
 For a lease id, the published state is laid out as follows:
 
