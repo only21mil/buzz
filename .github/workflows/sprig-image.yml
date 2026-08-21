@@ -26,6 +26,7 @@ on:
     tags: ["sprig-v[0-9]*"]
     paths:
       - "Dockerfile.sprig"
+      - ".dockerignore"
       - "scripts/sprig-entrypoint.sh"
       - ".github/workflows/sprig-image.yml"
       - "Cargo.toml"
@@ -35,8 +36,13 @@ on:
   pull_request:
     paths:
       - "Dockerfile.sprig"
+      - ".dockerignore"
       - "scripts/sprig-entrypoint.sh"
       - ".github/workflows/sprig-image.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
   workflow_dispatch: {}
 
 concurrency:
@@ -51,8 +57,46 @@ env:
   IMAGE_NAME: ${{ vars.GHCR_SPRIG_IMAGE != '' && vars.GHCR_SPRIG_IMAGE || 'ghcr.io/block/buzz-sprig' }}
 
 jobs:
-  build:
-    name: Build (${{ matrix.platform }})
+  validate:
+    name: Validate (${{ matrix.platform }})
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Validate image build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile.sprig
+          platforms: ${{ matrix.platform }}
+          push: false
+
+  publish:
+    name: Publish (${{ matrix.platform }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -87,7 +131,6 @@ jobs:
               max-parallelism = 2
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
         with:
           registry: ghcr.io
@@ -120,11 +163,11 @@ jobs:
           file: ./Dockerfile.sprig
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
           cache-to: |
-            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
+            type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }},mode=max,compression=zstd
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -147,7 +190,7 @@ jobs:
     name: Merge multi-arch manifest
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    needs: build
+    needs: publish
     timeout-minutes: 15
     permissions:
       contents: read
