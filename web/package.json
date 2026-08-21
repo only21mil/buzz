@@ -12,6 +12,7 @@
     "lint": "biome lint .",
     "check": "biome check . && pnpm check:file-sizes && pnpm check:pubkey-truncation",
     "format": "biome format --write .",
+    "test": "node --experimental-strip-types --test \"src/**/*.test.mjs\"",
     "preview": "vite preview",
     "test:e2e": "pnpm build && playwright test",
     "test:e2e:smoke": "pnpm build && playwright test --project=smoke"

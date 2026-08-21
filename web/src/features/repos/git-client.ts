@@ -25,6 +25,7 @@ import {
 import http from "isomorphic-git/http/web";
 import { makeNip98AuthHeader } from "@/shared/lib/nip98";
 import { relayHttpBaseUrl } from "@/shared/lib/relay-url";
+import { gitReadAuthOptions } from "./git-read-auth-policy";
 
 /** Get a repo-specific LightningFS instance backed by IndexedDB. */
 export function getFs(owner: string, repoName: string): LightningFS {
@@ -57,6 +58,7 @@ async function authHeaders(
     Authorization: await makeNip98AuthHeader(
       repoAuthUrl(owner, repoName),
       "GET",
+      gitReadAuthOptions,
     ),
   };
 }
