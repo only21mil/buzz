@@ -911,6 +911,14 @@ impl ActivationController {
         Ok(lease)
     }
 
+    /// Return the controller-observed admission time for one exact active lease.
+    pub(crate) fn lease_admitted_at(&self, lease: LeaseToken) -> Result<u64, ActivationError> {
+        if self.active_lease != Some(lease) {
+            return Err(ActivationError::MissingLease);
+        }
+        self.last_admission_at.ok_or(ActivationError::MissingLease)
+    }
+
     /// Return an expired active lease for traffic-independent maintenance.
     pub fn expired_active_lease(&self, now: u64) -> Option<LeaseToken> {
         self.active_lease
@@ -930,6 +938,15 @@ impl ActivationController {
         }
         self.active_lease = None;
         Ok(())
+    }
+
+    /// Invalidate admission after a failed durable commit while retaining any
+    /// exact ordinary lease needed for root reconciliation.
+    pub(crate) fn quarantine_after_commit_failure(&mut self, recovery_lease: Option<LeaseToken>) {
+        if let Some(lease) = recovery_lease {
+            self.active_lease = Some(lease);
+        }
+        self.state = ActivationState::Quarantined;
     }
 
     /// Record an outcome and enter Draining. A lease token is mandatory even for success.

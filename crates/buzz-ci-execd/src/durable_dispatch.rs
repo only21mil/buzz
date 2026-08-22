@@ -344,20 +344,14 @@ where
     O: OrdinaryExecutor,
     Q: QualificationExecutor,
 {
-    fn commit(&mut self) -> bool {
+    fn commit(&mut self, recovery_lease: Option<LeaseToken>) -> bool {
         if self.store.commit(self.controller.snapshot()).is_ok() {
             true
         } else {
-            self.quarantine_in_memory();
+            self.controller
+                .quarantine_after_commit_failure(recovery_lease);
             false
         }
-    }
-
-    fn quarantine_in_memory(&mut self) {
-        let root = self.controller.snapshot().root_authority;
-        let mut invalid = self.controller.snapshot();
-        invalid.root_authority = VerifiedSigner([0; 32]);
-        self.controller = ActivationController::restore(root, invalid, None).controller;
     }
 
     fn admit_ordinary(&mut self, request: AdmitAttemptRequest, now: u64) -> BrokerResponse {
@@ -375,7 +369,7 @@ where
             Ok(lease) => lease,
             Err(error) => return response(admission_error_code(error), now),
         };
-        if !self.commit() {
+        if !self.commit(Some(lease)) {
             return response(ResponseCode::InternalFailure, now);
         }
         if self.ordinary.provision(request, admission, lease).is_err() {
@@ -417,6 +411,13 @@ where
             Ok(lease) => lease,
             Err(_) => return response(ResponseCode::NotFound, now),
         };
+        let accepted_at = match self.controller.lease_admitted_at(lease) {
+            Ok(accepted_at) => accepted_at,
+            Err(_) => return response(ResponseCode::NotFound, now),
+        };
+        if request.terminal_at < accepted_at {
+            return response(ResponseCode::PolicyDenied, now);
+        }
         if now >= lease.deadline_at() || request.terminal_at > lease.deadline_at() {
             return response(ResponseCode::NotFound, now);
         }
@@ -500,8 +501,17 @@ where
         stop: OrdinaryStop,
         now: u64,
     ) -> BrokerResponse {
-        let accepted_at = self.controller.snapshot().last_admission_at.unwrap_or(now);
-        if self.controller.finish_lease(lease, conclusion).is_err() || !self.commit() {
+        let accepted_at = match self.controller.lease_admitted_at(lease) {
+            Ok(accepted_at) => accepted_at,
+            Err(_) => return response(ResponseCode::InternalFailure, now),
+        };
+        if self.controller.finish_lease(lease, conclusion).is_err() {
+            return response(ResponseCode::InternalFailure, now);
+        }
+        if !self.commit(Some(lease)) {
+            let _ = self
+                .ordinary
+                .reconcile(binding.request, binding.admission, lease, stop);
             return response(ResponseCode::InternalFailure, now);
         }
         let cleanup = self
@@ -531,7 +541,7 @@ where
             .controller
             .finish_cleanup(lease, disposition, now)
             .is_ok();
-        if !self.commit() {
+        if !self.commit(Some(lease)) {
             return response(ResponseCode::InternalFailure, now);
         }
         completed_ordinary_response(
@@ -573,7 +583,7 @@ where
                     && cleanup.teardown_digest != [0; 32]
             }) && self.controller.finish_recovery(lease).is_ok()
             {
-                let _ = self.commit();
+                let _ = self.commit(Some(lease));
             }
             return;
         }
@@ -616,7 +626,7 @@ where
             Ok(lease) => lease,
             Err(error) => return response(admission_error_code(error), now),
         };
-        if !self.commit() {
+        if !self.commit(None) {
             return response(ResponseCode::InternalFailure, now);
         }
 
@@ -626,7 +636,7 @@ where
                 let _ = self
                     .controller
                     .finish_qualification(lease, QualificationOutcome::Ambiguous);
-                let _ = self.commit();
+                let _ = self.commit(None);
                 return response(ResponseCode::InternalFailure, now);
             }
         };
@@ -653,7 +663,7 @@ where
                 false
             }
         };
-        if !self.commit() {
+        if !self.commit(None) {
             return response(ResponseCode::InternalFailure, now);
         }
         qualification_response(request, lease, execution, terminal_ok, now)
@@ -1495,6 +1505,7 @@ mod tests {
         );
         let snapshot = dispatch.controller.snapshot();
         let commit_count = commits.borrow().len();
+        let commit_attempts = dispatch.store.attempts.get();
 
         let wrong_generation = dispatch.dispatch(
             complete_header(),
@@ -1518,6 +1529,15 @@ mod tests {
         );
         assert_eq!(wrong_signer.code, ResponseCode::PolicyDenied);
 
+        let mut before_admission = complete_request(admitted.lease_generation);
+        before_admission.terminal_at = 20;
+        let before_admission = dispatch.dispatch(
+            complete_header(),
+            Request::CompleteAttempt(before_admission),
+            22,
+        );
+        assert_eq!(before_admission.code, ResponseCode::PolicyDenied);
+
         let at_lease_deadline = dispatch.dispatch(
             complete_header(),
             Request::CompleteAttempt(complete_request(admitted.lease_generation)),
@@ -1527,6 +1547,7 @@ mod tests {
 
         assert_eq!(dispatch.controller.snapshot(), snapshot);
         assert_eq!(commits.borrow().len(), commit_count);
+        assert_eq!(dispatch.store.attempts.get(), commit_attempts);
         assert_eq!(calls.receipts.get(), 0);
         assert_eq!(calls.reconciles.get(), 0);
     }
@@ -1685,8 +1706,9 @@ mod tests {
     }
 
     #[test]
-    fn admission_commit_failure_prevents_receipt_read_and_success() {
+    fn leased_commit_failure_retains_recovery_lease_until_cleanup() {
         let store = FakeStore::new(Some(1));
+        let commits = Rc::clone(&store.commits);
         let calls = OrdinaryCalls::new();
         let mut dispatch = DurableDispatch::new(
             ready_controller(),
@@ -1707,6 +1729,139 @@ mod tests {
         assert_eq!(calls.receipts.get(), 0);
         assert_eq!(calls.reconciles.get(), 0);
         assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        let recovery_lease = dispatch
+            .controller
+            .recovery_lease()
+            .expect("failed Leased commit retains exact recovery lease");
+        assert_eq!(recovery_lease.lease_id(), ordinary_admission().lease_id);
+        assert!(commits.borrow().is_empty());
+
+        dispatch.maintenance(21);
+
+        assert_eq!(calls.reconciles.get(), 1);
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(dispatch.controller.recovery_lease(), None);
+        assert_eq!(commits.borrow().len(), 1);
+        assert_eq!(commits.borrow()[0].state, ActivationState::Quarantined);
+        assert_eq!(commits.borrow()[0].active_lease, None);
+    }
+
+    #[test]
+    fn draining_commit_failure_still_reconciles_and_retains_recovery_lease() {
+        let store = FakeStore::new(Some(2));
+        let commits = Rc::clone(&store.commits);
+        let calls = OrdinaryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            ready_controller(),
+            authority(),
+            store,
+            ordinary_fake(calls.clone()),
+            QualificationFake,
+        );
+        let admitted = dispatch.dispatch(
+            ordinary_header(),
+            Request::AdmitAttempt(ordinary_request()),
+            21,
+        );
+
+        let result = dispatch.dispatch(
+            complete_header(),
+            Request::CompleteAttempt(complete_request(admitted.lease_generation)),
+            22,
+        );
+
+        assert_eq!(result.code, ResponseCode::InternalFailure);
+        assert_ne!(result.broker_state, BrokerState::Ready);
+        assert_eq!(calls.receipts.get(), 1);
+        assert_eq!(calls.reconciles.get(), 1);
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(
+            dispatch
+                .controller
+                .recovery_lease()
+                .map(LeaseToken::lease_id),
+            Some(ordinary_admission().lease_id)
+        );
+        assert_eq!(commits.borrow().len(), 1);
+        assert_eq!(commits.borrow()[0].state, ActivationState::Leased);
+        assert_eq!(
+            commits.borrow()[0].active_lease.map(LeaseToken::lease_id),
+            Some(ordinary_admission().lease_id)
+        );
+    }
+
+    #[test]
+    fn cancellation_draining_commit_failure_still_reconciles_fail_closed() {
+        let store = FakeStore::new(Some(2));
+        let commits = Rc::clone(&store.commits);
+        let calls = OrdinaryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            ready_controller(),
+            authority(),
+            store,
+            ordinary_fake(calls.clone()),
+            QualificationFake,
+        );
+        let admitted = dispatch.dispatch(
+            ordinary_header(),
+            Request::AdmitAttempt(ordinary_request()),
+            21,
+        );
+
+        let result = dispatch.dispatch(
+            cancel_header(),
+            Request::CancelAttempt(cancel_request(admitted.lease_generation)),
+            22,
+        );
+
+        assert_eq!(result.code, ResponseCode::InternalFailure);
+        assert_ne!(result.broker_state, BrokerState::Ready);
+        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.reconciles.get(), 1);
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(
+            dispatch
+                .controller
+                .recovery_lease()
+                .map(LeaseToken::lease_id),
+            Some(ordinary_admission().lease_id)
+        );
+        assert_eq!(commits.borrow().len(), 1);
+        assert_eq!(commits.borrow()[0].state, ActivationState::Leased);
+    }
+
+    #[test]
+    fn expiry_draining_commit_failure_still_reconciles_fail_closed() {
+        let store = FakeStore::new(Some(2));
+        let commits = Rc::clone(&store.commits);
+        let calls = OrdinaryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            ready_controller(),
+            authority(),
+            store,
+            ordinary_fake(calls.clone()),
+            QualificationFake,
+        );
+        dispatch.dispatch(
+            ordinary_header(),
+            Request::AdmitAttempt(ordinary_request()),
+            21,
+        );
+
+        dispatch.maintenance(51);
+
+        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.reconciles.get(), 1);
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(
+            dispatch
+                .controller
+                .recovery_lease()
+                .map(LeaseToken::lease_id),
+            Some(ordinary_admission().lease_id)
+        );
+        assert_eq!(commits.borrow().len(), 1);
+        assert_eq!(commits.borrow()[0].state, ActivationState::Leased);
     }
 
     #[test]
@@ -1749,6 +1904,7 @@ mod tests {
     #[test]
     fn final_commit_failure_suppresses_success_and_closes_capacity() {
         let store = FakeStore::new(Some(3));
+        let commits = Rc::clone(&store.commits);
         let calls = OrdinaryCalls::new();
         let mut dispatch = DurableDispatch::new(
             ready_controller(),
@@ -1770,8 +1926,23 @@ mod tests {
         );
 
         assert_eq!(result.code, ResponseCode::InternalFailure);
+        assert_ne!(result.broker_state, BrokerState::Ready);
         assert_eq!(calls.receipts.get(), 1);
+        assert_eq!(calls.reconciles.get(), 1);
         assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(
+            dispatch
+                .controller
+                .recovery_lease()
+                .map(LeaseToken::lease_id),
+            Some(ordinary_admission().lease_id)
+        );
+        let states: Vec<_> = commits.borrow().iter().map(|entry| entry.state).collect();
+        assert_eq!(states, [ActivationState::Leased, ActivationState::Draining]);
+        assert_eq!(
+            commits.borrow()[1].active_lease.map(LeaseToken::lease_id),
+            Some(ordinary_admission().lease_id)
+        );
     }
 
     #[test]
