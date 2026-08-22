@@ -12,6 +12,7 @@ import '../../shared/widgets/directional_transition_scope.dart';
 import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
 import '../activity/activity_page.dart';
 import '../channels/channels_page.dart';
+import '../repositories/repositories_page.dart';
 import '../search/search_page.dart';
 
 class HomePage extends HookConsumerWidget {
@@ -59,6 +60,11 @@ class HomePage extends HookConsumerWidget {
       selectedIcon: LucideIcons.search500,
       label: 'Search',
     ),
+    _HomeDestination(
+      icon: LucideIcons.folderGit2300,
+      selectedIcon: LucideIcons.folderGit2500,
+      label: 'Repositories',
+    ),
   ];
 
   @override
@@ -75,6 +81,7 @@ class HomePage extends HookConsumerWidget {
     final homeReselection = useValueNotifier(0);
     final activityReselection = useValueNotifier(0);
     final searchReselection = useValueNotifier(0);
+    final repositoriesReselection = useValueNotifier(0);
     final settingsTransitionProgress = useValueNotifier(0.0);
     final reducedMotion = MediaQuery.of(context).disableAnimations;
     final tabContentTransitionProgress = reducedMotion
@@ -98,6 +105,7 @@ class HomePage extends HookConsumerWidget {
       ),
       ActivityPage(tabReselection: activityReselection),
       SearchPage(tabReselection: searchReselection),
+      RepositoriesPage(tabReselection: repositoriesReselection),
     ];
 
     final settingsTransitionGradient = tabIndex.value == 0
@@ -188,6 +196,8 @@ class HomePage extends HookConsumerWidget {
                       activityReselection.value++;
                     case 2:
                       searchReselection.value++;
+                    case 3:
+                      repositoriesReselection.value++;
                   }
                   return;
                 }
