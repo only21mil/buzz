@@ -219,8 +219,31 @@ if grep -Fq 'environment: android-release' <<<"$build_job"; then
 fi
 grep -Fq 'BUZZ_ANDROID_RELEASE_SIGNING: external' <<<"$build_job" || \
   fail "networked build does not select the unsigned external seam"
-grep -Fq 'trusted-release/scripts/verify-android-fork-release-unsigned-apk.sh' <<<"$build_job" || \
-  fail "networked build does not reject a signed handoff"
+# shellcheck disable=SC2016
+{
+  grep -Fq 'trusted_release="$RUNNER_TEMP/trusted-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' <<<"$build_job" || \
+    fail "trusted handoff policy lacks a unique runner-temp destination"
+  grep -Fq 'test -d "$source"' <<<"$build_job" || \
+    fail "trusted handoff policy move accepts a missing source"
+  grep -Fq 'test ! -L "$source"' <<<"$build_job" || \
+    fail "trusted handoff policy move accepts a symlink source"
+  grep -Fq 'test ! -e "$trusted_release"' <<<"$build_job" || \
+    fail "trusted handoff policy move accepts an existing destination"
+  grep -Fq 'test ! -L "$trusted_release"' <<<"$build_job" || \
+    fail "trusted handoff policy move accepts a symlink destination"
+  grep -Fq 'mv -- "$source" "$trusted_release"' <<<"$build_job" || \
+    fail "trusted handoff policy checkout is not moved out of the source workspace"
+  move_line="$(grep -nF 'mv -- "$source" "$trusted_release"' <<<"$build_job" | cut -d: -f1)"
+  hermit_line="$(grep -nF 'cashapp/activate-hermit@' <<<"$build_job" | cut -d: -f1)"
+  (( move_line < hermit_line )) || fail "trusted handoff policy is not moved before Hermit activation"
+  [[ "$(grep -Fc 'verify-android-fork-release-unsigned-apk.sh' <<<"$build_job")" -eq 1 ]] || \
+    fail "networked build must invoke the unsigned handoff verifier exactly once"
+  grep -Fq '"$RUNNER_TEMP/trusted-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/scripts/verify-android-fork-release-unsigned-apk.sh"' <<<"$build_job" || \
+    fail "networked build does not invoke the unsigned verifier from runner temp"
+  if grep -Fq 'trusted-release/scripts/verify-android-fork-release-unsigned-apk.sh' <<<"$build_job"; then
+    fail "networked build still invokes a workspace-relative unsigned verifier"
+  fi
+}
 grep -Fq 'actions/upload-artifact@' <<<"$build_job" || \
   fail "unsigned build lacks a job-boundary artifact handoff"
 

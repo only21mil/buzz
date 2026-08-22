@@ -88,6 +88,17 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Move trusted handoff policy outside source workspace
+        run: |
+          set -euo pipefail
+          source=trusted-release
+          trusted_release="$RUNNER_TEMP/trusted-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test -d "$source"
+          test ! -L "$source"
+          test ! -e "$trusted_release"
+          test ! -L "$trusted_release"
+          mv -- "$source" "$trusted_release"
+
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616  # v1
 
       - name: Prime pinned Flutter SDK
@@ -154,7 +165,7 @@ jobs:
           set -euo pipefail
           unsigned_apk=mobile/build/app/outputs/flutter-apk/app-release.apk
           dependencies=mobile/build/app/reports/buzz-runtime-dependencies.tsv
-          trusted-release/scripts/verify-android-fork-release-unsigned-apk.sh \
+          "$RUNNER_TEMP/trusted-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/scripts/verify-android-fork-release-unsigned-apk.sh" \
             "$unsigned_apk" "$dependencies" "$VERSION_NAME" "$VERSION_CODE"
           stage="$RUNNER_TEMP/buzz-android-unsigned-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           test ! -e "$stage"
