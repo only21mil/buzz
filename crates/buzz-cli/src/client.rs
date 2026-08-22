@@ -528,6 +528,26 @@ fn advance_query_cursor(
     Ok(())
 }
 
+/// Return `true` if the raw event JSON has an `#a` tag whose second element
+/// equals `a_value`. Defense in depth: the relay post-filters by `#a` too,
+/// but `query_repo_events` does not trust that.
+fn event_matches_a_tag(event: &serde_json::Value, a_value: &str) -> bool {
+    event
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|tags| {
+            tags.iter().any(|tag| {
+                let arr = match tag.as_array() {
+                    Some(a) => a,
+                    None => return false,
+                };
+                arr.first().and_then(|v| v.as_str()) == Some("a")
+                    && arr.get(1).and_then(|v| v.as_str()) == Some(a_value)
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub struct BuzzClient {
     http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
@@ -740,6 +760,114 @@ impl BuzzClient {
         filter: serde_json::Value,
     ) -> Result<Vec<serde_json::Value>, CliError> {
         self.query_pages(filter, None).await
+    }
+
+    /// Query up to `limit` events matching a repo coordinate (`#a` tag), using
+    /// deterministic windowed pagination that is robust to the relay NOT pushing
+    /// `#a` into its SQL `WHERE` clause.
+    ///
+    /// The relay fetches the most recent `limit` events of the kind across ALL
+    /// repos, then post-filters by `#a` (see crates/buzz-relay/src/handlers/req.rs
+    /// — "Any other generic tag (#t, #a, etc.) is not pushed"). A single
+    /// bounded fetch therefore returns a fraction of the requested `limit` (or
+    /// empty for a quiet repo) when other repos' events are more recent than
+    /// the target repo's. `query_pages` cannot detect this: it treats a
+    /// post-filtered short page (`page.len() < page_limit`) as end-of-data and
+    /// stops, missing older matching events.
+    ///
+    /// This helper pages through the relay by the composite `(until,
+    /// before_id)` cursor — each page returns the most recent `page_size`
+    /// events of the kind strictly older than the cursor — and keeps only
+    /// events whose `#a` tag matches `a_value` (defense in depth: the relay
+    /// post-filters too, but we do not trust that). Pagination stops when:
+    ///
+    ///   1. `limit` matching events have been collected (success), OR
+    ///   2. the relay returns an empty page — no more events of the kind
+    ///      remain older than the cursor (exhausted), OR
+    ///   3. `max_pages` pages have been scanned (hard ceiling — the search is
+    ///      bounded so a runaway loop cannot exhaust the relay).
+    ///
+    /// On the ceiling path a warning is written to stderr naming how much was
+    /// scanned. The returned vec is sorted by `created_at` descending and
+    /// truncated to `limit`.
+    pub async fn query_repo_events(
+        &self,
+        mut filter: serde_json::Value,
+        a_value: &str,
+        limit: u32,
+        page_size: u32,
+        max_pages: u32,
+    ) -> Result<Vec<serde_json::Value>, CliError> {
+        let mut matches: Vec<serde_json::Value> = Vec::new();
+        let mut pages_scanned: u32 = 0;
+
+        while pages_scanned < max_pages {
+            pages_scanned += 1;
+            filter["limit"] = serde_json::json!(page_size);
+
+            let raw = self.query(&filter).await?;
+            let page: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
+
+            if page.is_empty() {
+                // Relay exhausted: no more events of the kind older than the
+                // cursor. This is the only reliable end-of-data signal — a
+                // non-empty short page may simply be a post-filtered fraction.
+                break;
+            }
+
+            for event in &page {
+                if event_matches_a_tag(event, a_value) {
+                    matches.push(event.clone());
+                }
+            }
+
+            if matches.len() >= limit as usize {
+                break;
+            }
+
+            // Advance the composite cursor to the oldest event on this page so
+            // the next page returns strictly older events. `advance_query_cursor`
+            // requires a non-empty page, which the guard above guarantees.
+            advance_query_cursor(&mut filter, &page)?;
+        }
+
+        if matches.len() < limit as usize && pages_scanned == max_pages {
+            eprintln!(
+                "warning: buzz-cli scanned {max_pages} pages ({}) for kind {:?} \
+                 and found {} matching events, fewer than the requested {limit}; \
+                 older matching events may exist beyond the scan ceiling",
+                max_pages as u64 * page_size as u64,
+                filter.get("kinds"),
+                matches.len(),
+            );
+        }
+
+        // Sort by created_at descending (stable on (created_at, id) so ties break
+        // deterministically) and truncate to the user's limit.
+        matches.sort_by(|a, b| {
+            let ca = a
+                .get("created_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let cb = b
+                .get("created_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            cb.cmp(&ca).then_with(|| {
+                let ida = a
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let idb = b
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                ida.cmp(idb)
+            })
+        });
+        matches.truncate(limit as usize);
+        Ok(matches)
     }
 
     /// Sign an event builder verbatim: no NIP-OA auth-tag injection, and none
