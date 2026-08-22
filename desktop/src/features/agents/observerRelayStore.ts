@@ -169,6 +169,14 @@ let startPromise: Promise<void> | null = null;
 let eventProcessingQueue: Promise<void> = Promise.resolve();
 let generation = 0;
 
+// The owner's pubkey, resolved when ensureRelayObserverSubscription starts.
+// Used to authenticate owner-signed management-request (draft) frames: a
+// draft-create is signed by the owner's CLI key, which is not a registered
+// managed agent, so the knownAgentPubkeys gate would drop it before
+// parseAgentManagementRequest ever runs. Owner-signed frames bypass that gate
+// for management requests; the owner's signature is the authentication.
+let ownerPubkey: string | null = null;
+
 function notifyListeners() {
   for (const listener of listeners) {
     listener();
@@ -403,9 +411,10 @@ function processLiveObserverEvent(agentPubkey: string, parsed: ObserverEvent) {
   }
 }
 
-async function handleRelayObserverEvent(
+export async function handleRelayObserverEvent(
   event: RelayEvent,
   activeGeneration: number,
+  decryptFn: (event: RelayEvent) => Promise<unknown> = decryptObserverEvent,
 ) {
   const agentPubkey = observerTag(event, "agent");
   const frame = observerTag(event, "frame");
@@ -413,9 +422,80 @@ async function handleRelayObserverEvent(
     return;
   }
 
-  // Ownership data arrives asynchronously during startup. Buffer raw signed
-  // frames until the first trusted-agent set is registered, then re-run this
-  // same gate. Once initialized, unknown agents are rejected immediately.
+  // Owner-signed frames: the owner's signature authenticates the frame. A
+  // draft-create (`buzz agents draft-create`) is signed by the owner's CLI
+  // key and tags agent = <CLI signer pubkey> (= owner's key). That key is NOT
+  // a registered managed agent, so the knownAgentPubkeys gate below would drop
+  // the frame before parseAgentManagementRequest ever runs — the draft never
+  // reaches the review surface (defect 7eabb71a).
+  //
+  // Decrypt owner-signed frames and route any management request to
+  // agentManagementListeners regardless of the agent tag. Non-management
+  // telemetry still applies the knownAgentPubkeys gate for the per-agent
+  // event store. Management requests from non-owner signers are NOT routed —
+  // they fall through to the gate below, which drops them before decrypt.
+  // Decryption proves the sender knew the owner's pubkey (public), not that
+  // the sender IS the owner; the signer-equals-owner check is the auth gate.
+  if (
+    ownerPubkey &&
+    normalizePubkey(event.pubkey) === normalizePubkey(ownerPubkey)
+  ) {
+    try {
+      const parsed = (await decryptFn(event)) as ObserverEvent;
+      if (activeGeneration !== generation) {
+        return;
+      }
+      const innerEvents = unwrapObserverBatch(parsed);
+      const telemetryEvents: ObserverEvent[] = [];
+      for (const inner of innerEvents) {
+        const managementRequest = parseAgentManagementRequest(inner.payload);
+        if (managementRequest) {
+          for (const listener of agentManagementListeners) {
+            listener(agentPubkey, managementRequest);
+          }
+        } else {
+          telemetryEvents.push(inner);
+        }
+      }
+      // Owner-signed telemetry still applies the knownAgentPubkeys gate for
+      // the per-agent event store (defense-in-depth for telemetry storage).
+      if (telemetryEvents.length > 0) {
+        if (!knownAgentPubkeys.has(normalizePubkey(agentPubkey))) {
+          if (
+            knownAgentsBySubscription.size === 0 ||
+            knownAgentPubkeys.size === 0
+          ) {
+            pendingUnknownAgentFrames.push(event);
+            if (
+              pendingUnknownAgentFrames.length >
+              MAX_PENDING_UNKNOWN_AGENT_FRAMES
+            ) {
+              pendingUnknownAgentFrames.shift();
+            }
+          }
+          return;
+        }
+        for (const inner of telemetryEvents) {
+          processLiveObserverEvent(agentPubkey, inner);
+        }
+      }
+    } catch (error) {
+      if (activeGeneration !== generation) {
+        return;
+      }
+      setConnectionState(
+        "error",
+        error instanceof Error
+          ? `Observer event decrypt failed: ${error.message}`
+          : "Observer event decrypt failed.",
+      );
+    }
+    return;
+  }
+
+  // Non-owner-signed frames: apply the knownAgentPubkeys gate for telemetry.
+  // Management requests from non-owner signers must NOT reach the review
+  // surface — the gate drops them before decrypt.
   if (!knownAgentPubkeys.has(normalizePubkey(agentPubkey))) {
     if (knownAgentsBySubscription.size === 0 || knownAgentPubkeys.size === 0) {
       pendingUnknownAgentFrames.push(event);
@@ -433,7 +513,7 @@ async function handleRelayObserverEvent(
   }
 
   try {
-    const parsed = (await decryptObserverEvent(event)) as ObserverEvent;
+    const parsed = (await decryptFn(event)) as ObserverEvent;
     if (activeGeneration !== generation) {
       return;
     }
@@ -465,6 +545,7 @@ export function ensureRelayObserverSubscription() {
   setConnectionState("connecting", null);
   startPromise = (async () => {
     const identity = await getIdentity();
+    ownerPubkey = identity.pubkey;
     const unsubscribe = await subscribeToAgentObserverFrames(
       identity.pubkey,
       (event) => {
@@ -630,7 +711,6 @@ export function useManagedAgentObserverBridge(
   agents: readonly Pick<ManagedAgent, "pubkey" | "status">[],
 ) {
   const subscriptionId = React.useId();
-  const hasManagedAgent = shouldObserveManagedAgents(agents);
 
   const agentPubkeys = React.useMemo(
     () => agents.map((agent) => agent.pubkey),
@@ -648,11 +728,16 @@ export function useManagedAgentObserverBridge(
   }, [subscriptionId, agentPubkeys]);
 
   React.useEffect(() => {
-    if (!hasManagedAgent) {
-      return;
-    }
+    // Start the observer subscription even when there are no managed agents.
+    // A fresh Desktop with zero managed agents still needs to receive
+    // owner-signed management-request (draft) frames from `buzz agents
+    // draft-create`; kind 24200 is ephemeral (never stored on the relay), so
+    // if the subscription is not live when the CLI publishes, the draft is
+    // gone forever. The owner-signed gate in handleRelayObserverEvent
+    // authenticates draft frames; the knownAgentPubkeys gate still drops
+    // telemetry from unregistered agents.
     void ensureRelayObserverSubscription();
-  }, [hasManagedAgent]);
+  }, []);
 
   // Wire up config-surface query invalidation when session_config_captured fires.
   const queryClient = useQueryClient();
@@ -783,6 +868,7 @@ export function resetAgentObserverStore() {
   latestLiveSessionByAgentChannel.clear();
   agentManagementListeners.clear();
   onSessionConfigCaptured = null;
+  ownerPubkey = null;
   connectionState = "idle";
   errorMessage = null;
   notifyListeners();
@@ -813,4 +899,23 @@ export function _testGetArchivedChannelEvents(
   return (
     archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ?? []
   );
+}
+
+/**
+ * Test-only: set the owner pubkey so handleRelayObserverEvent can authenticate
+ * owner-signed management-request (draft) frames. Mirrors the effect of
+ * ensureRelayObserverSubscription resolving the identity. Only call from tests.
+ */
+export function _testSetOwnerPubkey(pubkey: string | null): void {
+  ownerPubkey = pubkey;
+}
+
+/**
+ * Test-only: read the current store generation. Tests that call
+ * handleRelayObserverEvent directly need to pass the active generation so the
+ * stale-generation guard does not silently discard the event. Only call from
+ * tests.
+ */
+export function _testGetGeneration(): number {
+  return generation;
 }
