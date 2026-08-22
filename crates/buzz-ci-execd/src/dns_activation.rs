@@ -6,14 +6,19 @@
 //! never enters this boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
-use std::fs;
-use std::io::ErrorKind;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read};
 use std::net::IpAddr;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use buzz_ci_broker_protocol::{GitOid, TrustClass};
 use buzz_ci_isolation_contract::PrincipalUids;
+use nix::dir::Dir;
+use nix::errno::Errno;
+use nix::fcntl::{openat, OFlag};
+use nix::sys::stat::Mode;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -21,18 +26,23 @@ use thiserror::Error;
 use crate::activation::{AdmissionTrustClass, LeaseToken, OrdinaryAdmission};
 use crate::dns_exec::{
     AllowedBinary, DnsExecError, DnsExecPlan, DnsExecPlanError, DnsExecReceipt, DnsExecutor,
-    ExactCommand, ExactCommandOutput, ExactCommandRunner, ProcessCommandRunner, COMMAND_TIMEOUT,
-    LEASE_ROOT,
+    ExactCommand, ExactCommandOutput, ExactCommandRunner, ProcessCommandRunner, ACTIVATION_ROOT,
+    COMMAND_TIMEOUT, LEASE_ROOT,
 };
 use crate::dns_isolation::{
     build_lease_isolation_plan, BrokerApprovedMaterializerNetwork, BrokerPinnedFile,
-    DelegationCanaryReadback, DnsFiles, IsolationPlanError, LeaseIsolationPlan,
+    DelegationCanaryReadback, DnsFiles, DnsReadback, IsolationPlanError, LeaseIsolationPlan,
     LeaseIsolationRequest, LeaseSliceIdentity, NetworkNamespaceProperty, PinnedServiceKind,
     PrincipalRole, PrincipalUnitIdentity, SniHostPin, TcpServiceTuple, UnitResources,
     BUZZCI_ROOT_CGROUP_PATH, EMPTY_FILE_SHA256,
 };
 use crate::evidence;
 use crate::runtime::ReadyValidationTarget;
+
+const DNS_RECEIPT_DIRECTORY_MODE: u32 = 0o700;
+const DNS_RECEIPT_FILE_MODE: u32 = 0o400;
+const DNS_RECEIPT_VERSION: u8 = 2;
+const MAX_DNS_RECEIPT_BYTES: u64 = 64 * 1024;
 
 /// Root-owned proof that all three principal UIDs may join the broker namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,6 +250,239 @@ pub enum DnsLeaseBuildError {
     ExecPlan(#[from] DnsExecPlanError),
 }
 
+#[derive(Clone, Debug)]
+struct DnsReceiptRoots {
+    base_root: PathBuf,
+    owner_uid: u32,
+    owner_gid: u32,
+}
+
+impl DnsReceiptRoots {
+    fn production() -> Self {
+        Self {
+            base_root: PathBuf::from("/"),
+            owner_uid: 0,
+            owner_gid: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn mapped(base_root: &Path) -> Self {
+        let owner = fs::metadata(base_root).expect("test root must exist");
+        Self {
+            base_root: base_root.to_path_buf(),
+            owner_uid: owner.uid(),
+            owner_gid: owner.gid(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DnsReceiptStore {
+    roots: DnsReceiptRoots,
+}
+
+impl DnsReceiptStore {
+    fn production() -> Self {
+        Self {
+            roots: DnsReceiptRoots::production(),
+        }
+    }
+
+    #[cfg(test)]
+    fn mapped(base_root: &Path) -> Self {
+        Self {
+            roots: DnsReceiptRoots::mapped(base_root),
+        }
+    }
+
+    fn read(
+        &self,
+        lease_id: &str,
+        generation: u64,
+    ) -> Result<(String, Vec<u8>), DnsLeaseRecoveryError> {
+        if generation == 0 || !is_lower_hex(lease_id, 32) {
+            return Err(DnsLeaseRecoveryError::Stale);
+        }
+        let receipt_name = format!("{lease_id}-g{generation}.json");
+        let receipt_directory = self.open_receipt_directory()?;
+        let descriptor = match openat(
+            &receipt_directory,
+            receipt_name.as_str(),
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::ENOENT) => return Err(DnsLeaseRecoveryError::Missing),
+            Err(_) => return Err(DnsLeaseRecoveryError::UnsafeAuthority),
+        };
+        let mut receipt = File::from(descriptor);
+        let before = receipt
+            .metadata()
+            .map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+        if !safe_receipt_file(&before, &self.roots) {
+            return Err(DnsLeaseRecoveryError::UnsafeAuthority);
+        }
+        self.require_unambiguous_receipt(&receipt_directory, lease_id, &receipt_name)?;
+
+        let mut bytes = Vec::new();
+        receipt
+            .by_ref()
+            .take(MAX_DNS_RECEIPT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+        let after = receipt
+            .metadata()
+            .map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+        if bytes.is_empty()
+            || bytes.len() as u64 > MAX_DNS_RECEIPT_BYTES
+            || !safe_receipt_file(&after, &self.roots)
+            || before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+        {
+            return Err(DnsLeaseRecoveryError::UnsafeAuthority);
+        }
+        Ok((receipt_name, bytes))
+    }
+
+    fn open_receipt_directory(&self) -> Result<File, DnsLeaseRecoveryError> {
+        let mut current = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&self.roots.base_root)
+            .map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+        validate_receipt_directory(&current, &self.roots, false)?;
+        let canonical = Path::new(ACTIVATION_ROOT).join("receipts/dns");
+        let components = canonical
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::RootDir => None,
+                std::path::Component::Normal(value) => Some(Ok(value)),
+                _ => Some(Err(DnsLeaseRecoveryError::UnsafeAuthority)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, component) in components.iter().enumerate() {
+            let descriptor = match openat(
+                &current,
+                *component,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(Errno::ENOENT) => return Err(DnsLeaseRecoveryError::Missing),
+                Err(_) => return Err(DnsLeaseRecoveryError::UnsafeAuthority),
+            };
+            current = File::from(descriptor);
+            validate_receipt_directory(&current, &self.roots, index + 1 == components.len())?;
+        }
+        Ok(current)
+    }
+
+    fn require_unambiguous_receipt(
+        &self,
+        directory: &File,
+        lease_id: &str,
+        receipt_name: &str,
+    ) -> Result<(), DnsLeaseRecoveryError> {
+        let descriptor = openat(
+            directory,
+            OsStr::new("."),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+        let mut entries =
+            Dir::from_fd(descriptor).map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+        let prefix = format!("{lease_id}-g");
+        let mut matching = 0_usize;
+        for entry in entries.iter() {
+            let entry = entry.map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if name.starts_with(prefix.as_bytes()) {
+                if name != receipt_name.as_bytes() {
+                    return Err(DnsLeaseRecoveryError::Ambiguous);
+                }
+                matching += 1;
+            }
+        }
+        match matching {
+            1 => Ok(()),
+            0 => Err(DnsLeaseRecoveryError::Missing),
+            _ => Err(DnsLeaseRecoveryError::Ambiguous),
+        }
+    }
+}
+
+fn validate_receipt_directory(
+    directory: &File,
+    roots: &DnsReceiptRoots,
+    require_private: bool,
+) -> Result<(), DnsLeaseRecoveryError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| DnsLeaseRecoveryError::UnsafeAuthority)?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != roots.owner_uid
+        || metadata.gid() != roots.owner_gid
+        || if require_private {
+            mode != DNS_RECEIPT_DIRECTORY_MODE
+        } else {
+            mode & 0o022 != 0
+        }
+    {
+        return Err(DnsLeaseRecoveryError::UnsafeAuthority);
+    }
+    Ok(())
+}
+
+fn safe_receipt_file(metadata: &fs::Metadata, roots: &DnsReceiptRoots) -> bool {
+    metadata.file_type().is_file()
+        && metadata.uid() == roots.owner_uid
+        && metadata.gid() == roots.owner_gid
+        && metadata.nlink() == 1
+        && metadata.permissions().mode() & 0o7777 == DNS_RECEIPT_FILE_MODE
+        && metadata.len() > 0
+        && metadata.len() <= MAX_DNS_RECEIPT_BYTES
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Why root-owned retained DNS state could not be recovered safely.
+#[derive(Debug, Error)]
+pub enum DnsLeaseRecoveryError {
+    /// The exact generation-bound receipt does not exist.
+    #[error("the exact DNS receipt is missing")]
+    Missing,
+    /// A receipt path or descriptor failed root ownership, mode, type, or no-follow checks.
+    #[error("DNS receipt authority is unsafe")]
+    UnsafeAuthority,
+    /// More than one receipt can claim the durable lease identity.
+    #[error("DNS receipt state is ambiguous")]
+    Ambiguous,
+    /// Receipt bytes are not the canonical closed receipt schema.
+    #[error("DNS receipt is malformed")]
+    Malformed,
+    /// Receipt lease or generation identity is stale.
+    #[error("DNS receipt is stale")]
+    Stale,
+    /// Persisted state differs from the freshly rebuilt plan.
+    #[error("DNS receipt does not match the rebuilt plan")]
+    Mismatch,
+    /// Fresh construction from durable admission and root authority failed.
+    #[error("DNS recovery plan construction failed")]
+    Build(#[source] DnsLeaseBuildError),
+}
+
 /// Receipt retained until the ordinary cleanup machine reconciles this lease.
 #[derive(Clone, Debug)]
 pub struct RetainedDnsLease {
@@ -280,6 +523,7 @@ impl RetainedDnsLease {
 pub struct DnsLeaseLifecycle<R> {
     builder: DnsLeaseBuilder,
     executor: DnsExecutor<R>,
+    receipts: DnsReceiptStore,
     active: Option<RetainedDnsLease>,
 }
 
@@ -296,6 +540,21 @@ impl<R: ExactCommandRunner> DnsLeaseLifecycle<R> {
         Self {
             builder,
             executor,
+            receipts: DnsReceiptStore::production(),
+            active: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_mapped_executor(
+        builder: DnsLeaseBuilder,
+        executor: DnsExecutor<R>,
+        base_root: &Path,
+    ) -> Self {
+        Self {
+            builder,
+            executor,
+            receipts: DnsReceiptStore::mapped(base_root),
             active: None,
         }
     }
@@ -323,6 +582,60 @@ impl<R: ExactCommandRunner> DnsLeaseLifecycle<R> {
             lease,
             plan,
             exec_receipt: outcome.receipt,
+            evidence,
+        }))
+    }
+
+    /// Reopen the exact generation receipt and retain it for bounded cleanup.
+    pub fn recover(
+        &mut self,
+        admission: OrdinaryAdmission,
+        lease: LeaseToken,
+    ) -> Result<&RetainedDnsLease, DnsLeaseLifecycleError<R::Error>> {
+        if self.active.is_some() {
+            return Err(DnsLeaseLifecycleError::ActiveLease);
+        }
+        let lease_id = hex::encode(lease.lease_id());
+        let (receipt_name, bytes) = self
+            .receipts
+            .read(&lease_id, lease.generation())
+            .map_err(DnsLeaseLifecycleError::Recovery)?;
+        let receipt: DnsExecReceipt = serde_json::from_slice(&bytes)
+            .map_err(|_| DnsLeaseLifecycleError::Recovery(DnsLeaseRecoveryError::Malformed))?;
+        let canonical = serde_json::to_vec(&receipt)
+            .map_err(|_| DnsLeaseLifecycleError::Recovery(DnsLeaseRecoveryError::Malformed))?;
+        if canonical != bytes {
+            return Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Malformed,
+            ));
+        }
+        if receipt.activation_binding().lease_id != lease_id
+            || receipt.activation_binding().lease_generation != lease.generation()
+        {
+            return Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Stale,
+            ));
+        }
+        let plan = self
+            .builder
+            .build(
+                admission,
+                lease,
+                receipt.activation_binding().observed_at_unix_ns,
+            )
+            .map_err(|error| {
+                DnsLeaseLifecycleError::Recovery(DnsLeaseRecoveryError::Build(error))
+            })?;
+        if receipt_name != plan.receipt_name() || !receipt_matches_plan(&bytes, &receipt, &plan) {
+            return Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Mismatch,
+            ));
+        }
+        let evidence = evidence_dns_readback(receipt.readback());
+        Ok(self.active.insert(RetainedDnsLease {
+            lease,
+            plan,
+            exec_receipt: receipt,
             evidence,
         }))
     }
@@ -367,6 +680,9 @@ pub enum DnsLeaseLifecycleError<E: std::error::Error + 'static> {
     /// Trusted plan construction failed before host mutation.
     #[error("DNS lease construction failed")]
     Build(#[source] DnsLeaseBuildError),
+    /// Root-owned retained state could not be reopened exactly.
+    #[error("DNS lease recovery failed closed")]
+    Recovery(#[source] DnsLeaseRecoveryError),
     /// Host apply, readback, quarantine, or cleanup failed.
     #[error("DNS executor failed or quarantined the lease")]
     Exec(#[source] DnsExecError<E>),
@@ -650,6 +966,57 @@ fn evidence_dns_readback(readback: crate::dns_isolation::DnsReadback) -> evidenc
     }
 }
 
+fn receipt_matches_plan(bytes: &[u8], receipt: &DnsExecReceipt, plan: &DnsExecPlan) -> bool {
+    if receipt.readback() != released_dns_readback() {
+        return false;
+    }
+    let Ok(Value::Object(mut expected)) = serde_json::to_value(plan.activation_binding()) else {
+        return false;
+    };
+    let identifiers = plan.host_plan().identifiers();
+    let isolation = plan.isolation_plan();
+    expected.insert("version".into(), Value::from(DNS_RECEIPT_VERSION));
+    expected.insert("committed".into(), Value::Bool(true));
+    expected.insert(
+        "lease_slice".into(),
+        Value::String(identifiers.lease_slice().to_owned()),
+    );
+    expected.insert(
+        "namespace_name".into(),
+        Value::String(identifiers.namespace_name().to_owned()),
+    );
+    expected.insert(
+        "nft_table".into(),
+        Value::String(identifiers.nft_table().to_owned()),
+    );
+    expected.insert(
+        "resolv_conf_sha256".into(),
+        Value::String(isolation.dns_files.resolv_conf.sha256().to_owned()),
+    );
+    expected.insert(
+        "hosts_sha256".into(),
+        Value::String(isolation.dns_files.hosts.sha256().to_owned()),
+    );
+    let Ok(readback) = serde_json::to_value(released_dns_readback()) else {
+        return false;
+    };
+    expected.insert("readback".into(), readback);
+    matches!(
+        serde_json::from_slice::<Value>(bytes),
+        Ok(observed) if observed == Value::Object(expected)
+    )
+}
+
+const fn released_dns_readback() -> DnsReadback {
+    DnsReadback {
+        files_lookup_ok: true,
+        arbitrary_getent_refused: true,
+        resolved_varlink_inaccessible: true,
+        direct_53_refused: true,
+        allowed_tuples_only: true,
+    }
+}
+
 fn admission_matches_target(admission: OrdinaryAdmission, target: ReadyValidationTarget) -> bool {
     let request = target.request();
     let grant = target.grant();
@@ -736,6 +1103,7 @@ fn os(value: impl Into<OsString>) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
 
     use buzz_ci_broker_protocol::AdmitAttemptRequest;
@@ -1153,7 +1521,34 @@ mod tests {
         let mut runner = FakeApplyRunner::new(plan.isolation_plan().clone(), root);
         runner.fault = fault;
         runner.leftover = leftover;
-        DnsLeaseLifecycle::with_executor(builder, DnsExecutor::mapped(runner, root))
+        DnsLeaseLifecycle::with_mapped_executor(builder, DnsExecutor::mapped(runner, root), root)
+    }
+
+    fn recovery_lifecycle(root: &Path) -> DnsLeaseLifecycle<FakeApplyRunner> {
+        let builder = DnsLeaseBuilder::new(authority());
+        let plan = builder.build(admission(), lease(), 123).unwrap();
+        let mut runner = FakeApplyRunner::new(plan.isolation_plan().clone(), root);
+        runner.slice_exists = true;
+        runner.namespace_exists = true;
+        runner.table_exists = true;
+        DnsLeaseLifecycle::with_mapped_executor(builder, DnsExecutor::mapped(runner, root), root)
+    }
+
+    fn persisted_receipt(root: &Path) -> PathBuf {
+        let mut lifecycle = lifecycle(root, ApplyFault::None, CleanupLeftover::None);
+        lifecycle.apply(admission(), lease(), 123).unwrap();
+        root.join("var/lib/buzzci/activation/receipts/dns")
+            .join(format!(
+                "{}-g{}.json",
+                hex::encode(lease().lease_id()),
+                lease().generation()
+            ))
+    }
+
+    fn replace_receipt(path: &Path, bytes: &[u8]) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(DNS_RECEIPT_FILE_MODE)).unwrap();
     }
 
     #[test]
@@ -1241,6 +1636,153 @@ mod tests {
             .join("var/lib/buzzci/leases")
             .join(hex::encode(admission().lease_id))
             .exists());
+    }
+
+    #[test]
+    fn lifecycle_recovers_exact_receipt_then_uses_bounded_reconcile() {
+        let temporary = tempdir().unwrap();
+        let receipt_path = persisted_receipt(temporary.path());
+        let persisted = fs::read(&receipt_path).unwrap();
+
+        let mut lifecycle = recovery_lifecycle(temporary.path());
+        let retained = lifecycle.recover(admission(), lease()).unwrap();
+        assert_eq!(retained.lease_id(), lease().lease_id());
+        assert_eq!(
+            retained.plan().receipt_name(),
+            receipt_path.file_name().unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(retained.exec_receipt()).unwrap(),
+            persisted
+        );
+        assert_eq!(
+            retained.evidence(),
+            evidence_dns_readback(released_dns_readback())
+        );
+
+        lifecycle.reconcile(lease()).unwrap();
+        assert!(lifecycle.active().is_none());
+        assert!(!temporary
+            .path()
+            .join("var/lib/buzzci/leases")
+            .join(hex::encode(lease().lease_id()))
+            .exists());
+        assert!(receipt_path.exists());
+    }
+
+    #[test]
+    fn recovery_rejects_missing_symlinked_wrong_owner_mode_and_ambiguous_receipts() {
+        let temporary = tempdir().unwrap();
+        let receipt = persisted_receipt(temporary.path());
+        fs::remove_file(&receipt).unwrap();
+        assert!(matches!(
+            recovery_lifecycle(temporary.path()).recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Missing
+            ))
+        ));
+
+        let temporary = tempdir().unwrap();
+        let receipt = persisted_receipt(temporary.path());
+        let outside = temporary.path().join("outside-receipt");
+        fs::copy(&receipt, &outside).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        symlink(&outside, &receipt).unwrap();
+        assert!(matches!(
+            recovery_lifecycle(temporary.path()).recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::UnsafeAuthority
+            ))
+        ));
+
+        let temporary = tempdir().unwrap();
+        persisted_receipt(temporary.path());
+        let mut wrong_owner = recovery_lifecycle(temporary.path());
+        wrong_owner.receipts.roots.owner_uid = wrong_owner.receipts.roots.owner_uid.wrapping_add(1);
+        assert!(matches!(
+            wrong_owner.recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::UnsafeAuthority
+            ))
+        ));
+
+        let temporary = tempdir().unwrap();
+        let receipt = persisted_receipt(temporary.path());
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            recovery_lifecycle(temporary.path()).recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::UnsafeAuthority
+            ))
+        ));
+
+        let temporary = tempdir().unwrap();
+        let receipt = persisted_receipt(temporary.path());
+        let alternate = receipt.with_file_name(format!(
+            "{}-g{}.json",
+            hex::encode(lease().lease_id()),
+            lease().generation() + 1
+        ));
+        fs::copy(&receipt, &alternate).unwrap();
+        fs::set_permissions(
+            &alternate,
+            fs::Permissions::from_mode(DNS_RECEIPT_FILE_MODE),
+        )
+        .unwrap();
+        assert!(matches!(
+            recovery_lifecycle(temporary.path()).recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Ambiguous
+            ))
+        ));
+    }
+
+    #[test]
+    fn recovery_rejects_malformed_stale_and_plan_mismatched_receipts() {
+        let temporary = tempdir().unwrap();
+        let receipt = persisted_receipt(temporary.path());
+        replace_receipt(&receipt, b"{}");
+        assert!(matches!(
+            recovery_lifecycle(temporary.path()).recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Malformed
+            ))
+        ));
+
+        let temporary = tempdir().unwrap();
+        let receipt = persisted_receipt(temporary.path());
+        let original = String::from_utf8(fs::read(&receipt).unwrap()).unwrap();
+        let stale = original.replacen(
+            &format!("\"lease_generation\":{}", lease().generation()),
+            &format!("\"lease_generation\":{}", lease().generation() + 1),
+            1,
+        );
+        replace_receipt(&receipt, stale.as_bytes());
+        assert!(matches!(
+            recovery_lifecycle(temporary.path()).recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Stale
+            ))
+        ));
+
+        let temporary = tempdir().unwrap();
+        let receipt = persisted_receipt(temporary.path());
+        let plan = DnsLeaseBuilder::new(authority())
+            .build(admission(), lease(), 123)
+            .unwrap();
+        let original = String::from_utf8(fs::read(&receipt).unwrap()).unwrap();
+        let mismatched = original.replacen(
+            plan.isolation_plan().dns_files.hosts.sha256(),
+            &"0".repeat(64),
+            1,
+        );
+        replace_receipt(&receipt, mismatched.as_bytes());
+        assert!(matches!(
+            recovery_lifecycle(temporary.path()).recover(admission(), lease()),
+            Err(DnsLeaseLifecycleError::Recovery(
+                DnsLeaseRecoveryError::Mismatch
+            ))
+        ));
     }
 
     #[test]
