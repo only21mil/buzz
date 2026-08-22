@@ -26,6 +26,10 @@ TM-15	broker	none	ok	lease.json,reconcile.json	broker crash reconciliation
 TM-15	reuse-broker	none	ok	lease.json	broker distinct replacement lease/workspace
 TM-15	simulated_host_crash	none	ok	lease.json,reconcile.json	simulated_host_crash crash reconciliation
 TM-15	reuse-simulated_host_crash	none	ok	lease.json	simulated_host_crash distinct replacement lease/workspace
+TM-15	cleanup_adapter_recovery	none	ok	lease.json,reconcile.json	clean recovery of declared non-DNS cleanup resources
+TM-15	reuse-cleanup_adapter_recovery	none	ok	lease.json	cleanup adapter recovery distinct replacement lease/workspace
+TM-15	dns_adapter_recovery	none	ok	lease.json,reconcile.json	clean network namespace recovery
+TM-15	reuse-dns_adapter_recovery	none	ok	lease.json	DNS adapter recovery distinct replacement lease/workspace
 TM-16	attempt_1	none	ok	lease.json	retry attempt one
 TM-16	attempt_2	none	ok	lease.json	retry attempt two; distinct workspace
 TM-16	expired	none	policy_denied	none	service-side expiry refusal

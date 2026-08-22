@@ -15,6 +15,7 @@ evidence_files=()
 preconditions=(
   'substrate wiring has not published /etc/buzzci/harness.env (seam contract item 1)'
   'BUZZ_CI_ACCEPTANCE_CTL receives exact root-authored TM-15 target and reuse cases on stdin'
+  'cleanup_adapter_recovery and dns_adapter_recovery must publish clean before-reuse reconciliation and permit a distinct replacement lease/workspace'
   'the accepted fixture repository must expose ci-acceptance/probe-repo/workflow.yml job slowpoke'
   'root kill, systemctl, cgroup, and lease-state access requires SUITE_SUDO or passwordless sudo'
 )
@@ -38,7 +39,7 @@ emit() {
   if ((plan)); then status=plan; summary='Plan only; no checks executed'
   elif [[ " ${statuses[*]} " == *' fail '* ]]; then status=fail; summary='At least one crash-reconciliation check failed'
   elif [[ " ${statuses[*]} " == *' not_runnable '* ]]; then status=not_runnable; summary='Crash-reconciliation checks need the published isolation wiring and root access'
-  else status=pass; pass_json=true; summary='Every crash target reconciled to empty or quarantine before any lease reuse'
+  else status=pass; pass_json=true; summary='Generic crash targets reconciled to empty or quarantine; adapter recovery targets reconciled clean before distinct reuse'
   fi
   checks_json=$(printf '%s\n' "${checks[@]}" | timeout "$TIMEOUT_SECONDS" jq -sc '.')
   evidence_json=$(string_array "${evidence_files[@]}")
@@ -49,14 +50,20 @@ emit() {
     '{test_id:$test_id,title:$title,status:$status,pass:$pass,summary:$summary,checks:$checks,evidence_files:$evidence_files,preconditions:$preconditions}'
 }
 
-targets=(act podman proxy materializer broker simulated_host_crash)
+generic_targets=(act podman proxy materializer broker simulated_host_crash)
+recovery_targets=(cleanup_adapter_recovery dns_adapter_recovery)
+targets=("${generic_targets[@]}" "${recovery_targets[@]}")
+recovery_contract=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/tm-15_recovery_contract.jq
 if ((plan)); then
   record probe_fixture_scripts_parse plan 'Would run bash -n on the probe job scripts used for crash attempts'
-  for target in "${targets[@]}"; do record "$target" plan "Would kill $target mid-attempt and verify reconciliation before reuse"; done
+  for target in "${generic_targets[@]}"; do record "$target" plan "Would kill $target mid-attempt and verify reconciliation before reuse"; done
+  record cleanup_adapter_recovery plan 'Would require clean recovery of the declared non-DNS cleanup resources before a distinct replacement lease/workspace'
+  record dns_adapter_recovery plan 'Would require clean network-namespace recovery before a distinct replacement lease/workspace'
   emit
   exit 0
 fi
 [[ -d $candidate_dir ]] || { printf 'candidate directory is not a directory\n' >&2; exit 4; }
+[[ -f $recovery_contract && ! -L $recovery_contract ]] || { printf 'TM-15 recovery contract is missing or linked\n' >&2; exit 4; }
 out_dir=$evidence_dir/$TEST_ID
 timeout "$TIMEOUT_SECONDS" mkdir -p -- "$out_dir"
 syntax_file=$out_dir/probe-fixture-syntax.txt
@@ -131,6 +138,48 @@ check_reconcile_and_no_reuse() {
   fi
 }
 
+check_adapter_recovery() {
+  local target=$1 old_lease old_dir old_workspace reconcile new_lease new_workspace
+  local admit_rc=0 reuse_rc=0
+  old_lease=$(admit_slowpoke "$target") || admit_rc=$?
+  if ((admit_rc != 0)); then
+    record "$target" fail "The fixed root-authored $target recovery case is unavailable or did not publish its lease"
+    return
+  fi
+  evidence_files+=("$TEST_ID/admit-$target.json" "$TEST_ID/admit-$target.stderr")
+
+  old_dir=$lease_root/$old_lease
+  reconcile=$old_dir/reconcile.json
+  for _ in {1..120}; do
+    timeout 10 "${SUDO[@]}" test -r "$reconcile" && break
+    timeout 2 sleep 0.25
+  done
+  timeout "$TIMEOUT_SECONDS" "${SUDO[@]}" cp -- "$reconcile" "$out_dir/reconcile-$target.json" 2>/dev/null || :
+  evidence_files+=("$TEST_ID/reconcile-$target.json")
+  if [[ ! -s $out_dir/reconcile-$target.json ]]; then
+    record "$target" fail "$target did not publish recovery reconciliation evidence"
+    return
+  fi
+
+  old_workspace=$(timeout 10 "${SUDO[@]}" jq -r '.workspace_dir // empty' "$old_dir/lease.json" 2>/dev/null || true)
+  new_lease=$(admit_slowpoke "reuse-$target") || reuse_rc=$?
+  if ((reuse_rc != 0)); then
+    record "$target" fail "The fixed root-authored reuse-$target case is unavailable after recovery"
+    return
+  fi
+  evidence_files+=("$TEST_ID/admit-reuse-$target.json" "$TEST_ID/admit-reuse-$target.stderr")
+  new_workspace=$(timeout 10 "${SUDO[@]}" jq -r '.workspace_dir // empty' "$lease_root/$new_lease/lease.json" 2>/dev/null || true)
+
+  if timeout 10 jq -e --arg target "$target" \
+    --arg old_lease "$old_lease" --arg new_lease "$new_lease" \
+    --arg old_workspace "$old_workspace" --arg new_workspace "$new_workspace" \
+    -f "$recovery_contract" "$out_dir/reconcile-$target.json" >/dev/null 2>&1; then
+    record "$target" pass "$target published clean before-reuse recovery and a distinct replacement lease/workspace"
+  else
+    record "$target" fail "$target lacked its required clean resource recovery or reused the prior lease/workspace"
+  fi
+}
+
 kill_scoped_process() {
   local target=$1 pattern=$2 lease_id lease_json cgroup_path cgroup_dir lease_unit pid='' comm
   local admit_rc=0
@@ -191,5 +240,9 @@ if ((host_rc == 0)); then
 else
   if ((host_rc == 3)); then record simulated_host_crash not_runnable 'The fixed root-authored simulated-host-crash case is unavailable or unsafe'; else record simulated_host_crash fail 'Could not admit the simulated host-crash attempt'; fi
 fi
+
+for target in "${recovery_targets[@]}"; do
+  check_adapter_recovery "$target"
+done
 emit
 exit "$( [[ " ${statuses[*]} " == *' fail '* ]] && printf 1 || [[ " ${statuses[*]} " == *' not_runnable '* ]] && printf 3 || printf 0 )"

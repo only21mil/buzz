@@ -26,6 +26,10 @@ TM-15	broker	none
 TM-15	reuse-broker	none
 TM-15	simulated_host_crash	none
 TM-15	reuse-simulated_host_crash	none
+TM-15	cleanup_adapter_recovery	none
+TM-15	reuse-cleanup_adapter_recovery	none
+TM-15	dns_adapter_recovery	none
+TM-15	reuse-dns_adapter_recovery	none
 TM-16	attempt_1	none
 TM-16	attempt_2	none
 TM-16	expired	none

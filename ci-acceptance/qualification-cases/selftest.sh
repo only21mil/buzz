@@ -55,7 +55,7 @@ awk -F '\t' 'NF && $1 !~ /^#/ {print $1 "/" $2}' "$PLAN" | sort >"$temp_dir/plan
 find "$TEMPLATES" -type f -name '*.json' -printf '%P\n' | sed 's/\.json$//' | sort >"$temp_dir/templates"
 if cmp -s "$temp_dir/planned" "$temp_dir/templates"; then pass coverage; else fail coverage; diff -u "$temp_dir/planned" "$temp_dir/templates" || true; fi
 
-if [[ $(wc -l <"$temp_dir/templates") -eq 37 ]] \
+if [[ $(wc -l <"$temp_dir/templates") -eq 41 ]] \
   && [[ -z $(find "$TEMPLATES" -type l -print -quit) ]] \
   && [[ -z $(find "$TEMPLATES" -type f -size +64k -print -quit) ]]; then
   pass artifact_posture
