@@ -191,9 +191,23 @@ print("\n".join(lines[start:end]))
 PY
 }
 
+# shellcheck disable=SC2016
+readonly runner_temp_verifier_command='"$RUNNER_TEMP/trusted-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/scripts/verify-android-fork-release-unsigned-apk.sh" '"\\"
+
+count_active_runner_temp_verifiers() {
+  awk -v expected="$runner_temp_verifier_command" '
+    { sub(/^[[:space:]]*/, ""); if ($0 == expected) count += 1 }
+    END { print count + 0 }
+  ' <<<"$1"
+}
+
 verify_job="$(extract_job verify-source)"
 build_job="$(extract_job build-unsigned)"
 sign_job="$(extract_job sign)"
+trusted_checkout_step="$(
+  sed -n '/^      - name: Check out trusted handoff policy from main$/,/^      - name: Move trusted handoff policy outside source workspace$/p' \
+    <<<"$build_job"
+)"
 
 # These are literal GitHub Actions expressions inspected as text.
 # shellcheck disable=SC2016
@@ -205,6 +219,15 @@ grep -Fq 'trusted-release/scripts/verify-android-fork-release-ref.sh' <<<"$verif
   fail "source tag is not verified by trusted-main code"
 grep -Fq 'needs: verify-source' <<<"$build_job" || \
   fail "source checkout can start before trusted verification"
+grep -Eq '^        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10([[:space:]]+#.*)?$' \
+  <<<"$trusted_checkout_step" || fail "trusted handoff policy is not checked out with the pinned checkout action"
+# shellcheck disable=SC2016
+grep -Fxq '          ref: ${{ github.sha }}' <<<"$trusted_checkout_step" || \
+  fail "trusted handoff policy checkout is not pinned to the reviewed main dispatch SHA"
+grep -Fxq '          path: trusted-release' <<<"$trusted_checkout_step" || \
+  fail "trusted handoff policy checkout does not use the trusted-release path"
+grep -Fxq '          persist-credentials: false' <<<"$trusted_checkout_step" || \
+  fail "trusted handoff policy checkout persists credentials"
 # shellcheck disable=SC2016
 grep -Fq 'ref: ${{ needs.verify-source.outputs.source_sha }}' <<<"$build_job" || \
   fail "source checkout is not pinned to the verified peeled commit"
@@ -233,14 +256,24 @@ grep -Fq 'BUZZ_ANDROID_RELEASE_SIGNING: external' <<<"$build_job" || \
     fail "trusted handoff policy move accepts a symlink destination"
   grep -Fq 'mv -- "$source" "$trusted_release"' <<<"$build_job" || \
     fail "trusted handoff policy checkout is not moved out of the source workspace"
+  checkout_line="$(grep -nF '      - name: Check out trusted handoff policy from main' <<<"$build_job" | cut -d: -f1)"
   move_line="$(grep -nF 'mv -- "$source" "$trusted_release"' <<<"$build_job" | cut -d: -f1)"
   hermit_line="$(grep -nF 'cashapp/activate-hermit@' <<<"$build_job" | cut -d: -f1)"
+  (( checkout_line < move_line )) || fail "trusted handoff policy checkout does not precede its runner-temp move"
   (( move_line < hermit_line )) || fail "trusted handoff policy is not moved before Hermit activation"
-  [[ "$(grep -Fc 'verify-android-fork-release-unsigned-apk.sh' <<<"$build_job")" -eq 1 ]] || \
-    fail "networked build must invoke the unsigned handoff verifier exactly once"
-  grep -Fq '"$RUNNER_TEMP/trusted-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/scripts/verify-android-fork-release-unsigned-apk.sh"' <<<"$build_job" || \
-    fail "networked build does not invoke the unsigned verifier from runner temp"
-  if grep -Fq 'trusted-release/scripts/verify-android-fork-release-unsigned-apk.sh' <<<"$build_job"; then
+  [[ "$(count_active_runner_temp_verifiers "$build_job")" -eq 1 ]] || \
+    fail "networked build must actively invoke the runner-temp unsigned handoff verifier exactly once"
+  commented_verifier_job="${build_job/"$runner_temp_verifier_command"/"# $runner_temp_verifier_command"}"
+  [[ "$commented_verifier_job" != "$build_job" ]] || fail "commented verifier fixture did not mutate the job"
+  [[ "$(count_active_runner_temp_verifiers "$commented_verifier_job")" -eq 0 ]] || \
+    fail "a commented verifier counts as an active runner-temp invocation"
+  dead_verifier_text="verifier_text=\"\$RUNNER_TEMP/trusted-release-\${GITHUB_RUN_ID}-\${GITHUB_RUN_ATTEMPT}/scripts/verify-android-fork-release-unsigned-apk.sh\""
+  dead_text_verifier_job="${build_job/"$runner_temp_verifier_command"/"$dead_verifier_text"}"
+  [[ "$dead_text_verifier_job" != "$build_job" ]] || fail "dead verifier text fixture did not mutate the job"
+  [[ "$(count_active_runner_temp_verifiers "$dead_text_verifier_job")" -eq 0 ]] || \
+    fail "dead verifier text counts as an active runner-temp invocation"
+  if grep -Eq '^[[:space:]]*"?(\./)?trusted-release/scripts/verify-android-fork-release-unsigned-apk\.sh"?([[:space:]]|$)' \
+    <<<"$build_job"; then
     fail "networked build still invokes a workspace-relative unsigned verifier"
   fi
 }
