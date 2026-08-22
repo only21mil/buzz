@@ -1127,6 +1127,20 @@ impl<N: QualificationExecutor, T: QualificationExecutor> QualificationExecutor
             _ => Err(ExecutionUnavailable),
         }
     }
+
+    fn reconcile(
+        &mut self,
+        request: QualificationRequest,
+        lease: QualificationLease,
+        stop: crate::durable_dispatch::QualificationStop,
+    ) -> Result<crate::durable_dispatch::QualificationCleanup, ExecutionUnavailable> {
+        match request.directive {
+            None => self.normal.reconcile(request, lease, stop),
+            Some(QualificationDirective::TeardownFailure) => {
+                self.teardown.reconcile(request, lease, stop)
+            }
+        }
+    }
 }
 
 fn normal_qualification_response(
@@ -2439,6 +2453,19 @@ mod tests {
                 response: empty_response(now),
             })
         }
+
+        fn reconcile(
+            &mut self,
+            _request: QualificationRequest,
+            _lease: QualificationLease,
+            _stop: crate::durable_dispatch::QualificationStop,
+        ) -> Result<crate::durable_dispatch::QualificationCleanup, ExecutionUnavailable> {
+            self.calls.borrow_mut().push("teardown-reconcile");
+            Ok(crate::durable_dispatch::QualificationCleanup {
+                disposition: CleanupDisposition::Clean,
+                teardown_digest: [72; 32],
+            })
+        }
     }
 
     fn qualification_request(directive: Option<QualificationDirective>) -> QualificationRequest {
@@ -2561,12 +2588,30 @@ mod tests {
             QualificationTerminal::TeardownFailure
         );
         assert_eq!(
+            mux.reconcile(
+                normal_request,
+                qualification_lease(None),
+                crate::durable_dispatch::QualificationStop::Recovery,
+            ),
+            Err(ExecutionUnavailable)
+        );
+        let teardown_cleanup = mux
+            .reconcile(
+                teardown_request,
+                qualification_lease(directive),
+                crate::durable_dispatch::QualificationStop::Expired,
+            )
+            .unwrap();
+        assert_eq!(teardown_cleanup.disposition, CleanupDisposition::Clean);
+        assert_eq!(teardown_cleanup.teardown_digest, [72; 32]);
+        assert_eq!(
             calls.borrow().as_slice(),
             [
                 "normal-preflight",
                 "normal-execute",
                 "teardown-preflight",
-                "teardown-execute"
+                "teardown-execute",
+                "teardown-reconcile"
             ]
         );
     }

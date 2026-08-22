@@ -13,8 +13,8 @@ use crate::{
     control::{ClosedDispatch, ControlDispatch},
     durable_dispatch::{
         load_dispatch, BootstrapDispatch, ExecutionUnavailable, OrdinaryCleanup, OrdinaryExecutor,
-        OrdinaryReceipts, OrdinaryStop, QualificationExecution, QualificationExecutor,
-        ReadyHostProofs, ReadyValidationProvider,
+        OrdinaryReceipts, OrdinaryStop, QualificationCleanup, QualificationExecution,
+        QualificationExecutor, QualificationStop, ReadyHostProofs, ReadyValidationProvider,
     },
     runtime::ReadyValidationTarget,
 };
@@ -126,6 +126,15 @@ impl QualificationExecutor for ProductionQualificationExecutor {
     ) -> Result<QualificationExecution, ExecutionUnavailable> {
         self.backend.execute(header, request, lease, now)
     }
+
+    fn reconcile(
+        &mut self,
+        request: QualificationRequest,
+        lease: QualificationLease,
+        stop: QualificationStop,
+    ) -> Result<QualificationCleanup, ExecutionUnavailable> {
+        self.backend.reconcile(request, lease, stop)
+    }
 }
 
 /// Complete production adapter set. It cannot represent a partial composition.
@@ -199,6 +208,8 @@ fn compose_production_dispatch(now: u64, mut adapters: ProductionAdapters) -> Pr
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
 
     struct TestClosedExecutor;
@@ -260,6 +271,73 @@ mod tests {
         }
     }
 
+    struct TestQualificationForwarder {
+        reconciles: Rc<Cell<usize>>,
+    }
+
+    impl QualificationExecutor for TestQualificationForwarder {
+        fn preflight(
+            &mut self,
+            _request: QualificationRequest,
+        ) -> Result<(), ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn execute(
+            &mut self,
+            _header: FrameHeader,
+            _request: QualificationRequest,
+            _lease: QualificationLease,
+            _now: u64,
+        ) -> Result<QualificationExecution, ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn reconcile(
+            &mut self,
+            _request: QualificationRequest,
+            _lease: QualificationLease,
+            _stop: QualificationStop,
+        ) -> Result<QualificationCleanup, ExecutionUnavailable> {
+            self.reconciles.set(self.reconciles.get() + 1);
+            Ok(QualificationCleanup {
+                disposition: crate::activation::CleanupDisposition::Clean,
+                teardown_digest: [91; 32],
+            })
+        }
+    }
+
+    fn qualification_request() -> QualificationRequest {
+        QualificationRequest {
+            integrated_candidate_sha: buzz_ci_broker_protocol::GitOid::Sha256([1; 32]),
+            broker_build_identity: [2; 32],
+            host_profile_digest: [3; 32],
+            suite_identity: [4; 32],
+            fixture_signer: [5; 32],
+            request_digest: [6; 32],
+            manifest_digest: [7; 32],
+            isolation_profile_digest: [8; 32],
+            source_oid: buzz_ci_broker_protocol::GitOid::Sha256([9; 32]),
+            base_oid: buzz_ci_broker_protocol::GitOid::Sha256([10; 32]),
+            job_identity: [11; 32],
+            fixture_identity: [12; 32],
+            nonce: [13; 32],
+            not_before: 1,
+            expires_at: 2,
+            directive: Some(buzz_ci_broker_protocol::QualificationDirective::TeardownFailure),
+        }
+    }
+
+    fn qualification_lease() -> QualificationLease {
+        QualificationLease::from_durable(crate::activation::DurableQualificationLeaseFields {
+            fixture_identity: [12; 32],
+            lease_id: [12; 16],
+            generation: 1,
+            nonce: [13; 32],
+            directive: Some(buzz_ci_broker_protocol::QualificationDirective::TeardownFailure),
+        })
+    }
+
     #[test]
     fn canonical_composition_is_closed_until_every_backend_is_linked() {
         assert_eq!(
@@ -291,5 +369,29 @@ mod tests {
             Box::new(TestClosedExecutor),
         );
         let _ = compose_production_dispatch(1, adapters);
+    }
+
+    #[test]
+    fn production_qualification_adapter_forwards_cleanup_reconciliation() {
+        let reconciles = Rc::new(Cell::new(0));
+        let mut executor =
+            ProductionQualificationExecutor::new(Box::new(TestQualificationForwarder {
+                reconciles: Rc::clone(&reconciles),
+            }));
+
+        let cleanup = executor
+            .reconcile(
+                qualification_request(),
+                qualification_lease(),
+                QualificationStop::Recovery,
+            )
+            .unwrap();
+
+        assert_eq!(reconciles.get(), 1);
+        assert_eq!(
+            cleanup.disposition,
+            crate::activation::CleanupDisposition::Clean
+        );
+        assert_eq!(cleanup.teardown_digest, [91; 32]);
     }
 }

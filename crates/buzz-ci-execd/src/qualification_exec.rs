@@ -29,7 +29,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     activation::QualificationLease,
     durable_dispatch::{
-        ExecutionUnavailable, QualificationExecution, QualificationExecutor, QualificationTerminal,
+        ExecutionUnavailable, QualificationCleanup, QualificationExecution, QualificationExecutor,
+        QualificationStop, QualificationTerminal,
     },
     qualification_host::{
         QualificationHostBinding, QualificationHostExecution, QualificationHostOutcome,
@@ -149,6 +150,15 @@ impl QualificationCleanupObservation {
             && self.lease_files_absent
             && self.teardown_failure_observed
             && self.slice_quarantined
+            && !self.publish_observed
+    }
+
+    fn clean_for_recovery(self) -> bool {
+        self.lease_slice_inactive
+            && self.lease_cgroup_empty
+            && self.nft_table_absent
+            && self.namespace_absent
+            && self.lease_files_absent
             && !self.publish_observed
     }
 }
@@ -310,6 +320,45 @@ impl<R: QualificationCleanupRunner> QualificationCleanupExecutor<R> {
         }
         execution
     }
+
+    fn reconcile_bounded(
+        &mut self,
+        plan: QualificationHostPlan,
+    ) -> Result<QualificationCleanup, ExecutionUnavailable> {
+        let targets = QualificationCleanupTargets::from_binding(plan.binding());
+        let deadline = QualificationCleanupDeadline::after(QUALIFICATION_CLEANUP_TIMEOUT);
+
+        // A prior process may have completed any prefix before it crashed. Run
+        // every closed cleanup operation, then let fresh terminal readback decide
+        // whether cleanup is complete. Operation errors alone never prove clean.
+        for operation in &CLEANUP_OPERATIONS {
+            if deadline.expired() {
+                break;
+            }
+            let _ = self.runner.execute(operation, &targets, deadline);
+        }
+
+        let observation = if deadline.expired() {
+            None
+        } else {
+            self.runner.observe(&targets, deadline).ok().flatten()
+        };
+        if deadline.expired()
+            || !observation.is_some_and(QualificationCleanupObservation::clean_for_recovery)
+        {
+            let _ = self.runner.cancel_and_reap(&targets, deadline);
+            return Err(ExecutionUnavailable);
+        }
+
+        let teardown_digest = evidence_digest(b"cleanup-recovery-v1", plan.binding());
+        if teardown_digest == [0; 32] {
+            return Err(ExecutionUnavailable);
+        }
+        Ok(QualificationCleanup {
+            disposition: crate::activation::CleanupDisposition::Clean,
+            teardown_digest,
+        })
+    }
 }
 
 impl<R: QualificationCleanupRunner> QualificationExecutor for QualificationCleanupExecutor<R> {
@@ -344,6 +393,17 @@ impl<R: QualificationCleanupRunner> QualificationExecutor for QualificationClean
             terminal: QualificationTerminal::TeardownFailure,
             response: qualification_teardown_response(request, lease, outcome, now),
         })
+    }
+
+    fn reconcile(
+        &mut self,
+        request: QualificationRequest,
+        lease: QualificationLease,
+        _stop: QualificationStop,
+    ) -> Result<QualificationCleanup, ExecutionUnavailable> {
+        let plan = QualificationHostPlan::from_admitted(request, lease)
+            .map_err(|_| ExecutionUnavailable)?;
+        self.reconcile_bounded(plan)
     }
 }
 
@@ -924,6 +984,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FakeObservation {
         Complete,
+        Stale,
         Missing,
         PublishSeen,
         Error,
@@ -975,6 +1036,16 @@ mod tests {
                     lease_files_absent: true,
                     teardown_failure_observed: true,
                     slice_quarantined: true,
+                    publish_observed: false,
+                })),
+                FakeObservation::Stale => Ok(Some(QualificationCleanupObservation {
+                    lease_slice_inactive: true,
+                    lease_cgroup_empty: true,
+                    nft_table_absent: true,
+                    namespace_absent: false,
+                    lease_files_absent: true,
+                    teardown_failure_observed: false,
+                    slice_quarantined: false,
                     publish_observed: false,
                 })),
                 FakeObservation::Missing => Ok(None),
@@ -1245,6 +1316,80 @@ mod tests {
         );
         assert_eq!(execution.response.evidence_set_digest, [0; 32]);
         assert_eq!(execution.response.teardown_digest, [0; 32]);
+    }
+
+    #[test]
+    fn reconcile_runs_cleanup_only_and_accepts_only_fresh_clean_readback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("activation");
+        let mut cleanup_executor = executor(&root, FakeObservation::Complete, Some(2));
+        let (request, lease) = admitted_fixture();
+
+        let cleanup = QualificationExecutor::reconcile(
+            &mut cleanup_executor,
+            request,
+            lease,
+            QualificationStop::Recovery,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cleanup.disposition,
+            crate::activation::CleanupDisposition::Clean
+        );
+        assert_ne!(cleanup.teardown_digest, [0; 32]);
+        assert_eq!(cleanup_executor.runner().operations, CLEANUP_OPERATIONS);
+        assert_eq!(cleanup_executor.runner().cancellations, 0);
+        assert!(!receipt_path(&root).exists());
+
+        for observation in [
+            FakeObservation::Stale,
+            FakeObservation::Missing,
+            FakeObservation::PublishSeen,
+            FakeObservation::Error,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("activation");
+            let mut cleanup_executor = executor(&root, observation, None);
+            let (request, lease) = admitted_fixture();
+            assert_eq!(
+                QualificationExecutor::reconcile(
+                    &mut cleanup_executor,
+                    request,
+                    lease,
+                    QualificationStop::Expired,
+                ),
+                Err(ExecutionUnavailable)
+            );
+            assert_eq!(cleanup_executor.runner().cancellations, 1);
+            assert!(!receipt_path(&root).exists());
+        }
+    }
+
+    #[test]
+    fn reconcile_rejects_malformed_or_mismatched_binding_before_host_cleanup() {
+        for mutate in [
+            |request: &mut QualificationRequest| request.directive = None,
+            |request: &mut QualificationRequest| request.nonce = [99; 32],
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("activation");
+            let mut cleanup_executor = executor(&root, FakeObservation::Complete, None);
+            let (mut request, lease) = admitted_fixture();
+            mutate(&mut request);
+
+            assert_eq!(
+                QualificationExecutor::reconcile(
+                    &mut cleanup_executor,
+                    request,
+                    lease,
+                    QualificationStop::Recovery,
+                ),
+                Err(ExecutionUnavailable)
+            );
+            assert!(cleanup_executor.runner().operations.is_empty());
+            assert_eq!(cleanup_executor.runner().cancellations, 0);
+        }
     }
 
     #[test]
