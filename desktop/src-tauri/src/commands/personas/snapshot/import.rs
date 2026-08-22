@@ -590,7 +590,9 @@ pub async fn confirm_agent_snapshot_import(
         save_personas(&app, &personas)?;
 
         // Enqueue the kind:30175 persona event via the retention path.
-        super::super::pending::retain_persona_pending(&app, &state, &persona);
+        if let Err(e) = super::super::pending::retain_persona_pending(&app, &state, &persona) {
+            eprintln!("buzz-desktop: persona-retain (import): {e}");
+        }
 
         // Build the managed agent record — no machine-local commands, no
         // secrets, no lineage from the snapshot.

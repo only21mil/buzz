@@ -673,3 +673,297 @@ fn inbound_gate_accepts_validly_signed_event() {
     let parsed = parse_verified_inbound_event(&event.as_json()).unwrap();
     assert_eq!(parsed.pubkey, keys.public_key());
 }
+
+// ── Prompt-save round-trip (issue f8fce672) ────────────────────────────────
+//
+// After a successful local save of a new system_prompt (the retention row
+// lands with created_at = T), an inbound kind:30175 carrying the OLD
+// system_prompt at created_at < T must NOT revert the local prompt. The
+// retention row exists and is newer, so `retain_inbound_event` returns
+// `Skipped` and `apply_inbound_persona` is never called.
+
+/// Build a kind:30175 `nostr::Event` from `persona`, signed with `keys`, at a
+/// fixed `created_at` so the test can stage an OLDER inbound against a NEWER
+/// retained row. Mirrors the wire path `build_persona_event` + sign.
+fn persona_event_at(
+    persona: &AgentDefinition,
+    keys: &nostr::Keys,
+    created_at: u64,
+) -> nostr::Event {
+    use crate::managed_agents::persona_events::build_persona_event;
+    use nostr::JsonUtil;
+    let event = build_persona_event(persona)
+        .unwrap()
+        .custom_created_at(nostr::Timestamp::from_secs(created_at))
+        .sign_with_keys(keys)
+        .unwrap();
+    // Round-trip through JSON to mirror the wire path the reconcile command
+    // parses from.
+    nostr::Event::from_json(event.as_json()).unwrap()
+}
+
+/// The save-then-older-inbound invariant: after a successful local save
+/// (retention row written at created_at = T, where T is `now`), an inbound
+/// kind:30175 with the OLD system_prompt at created_at < T does NOT revert
+/// the local prompt.
+///
+/// `retain_inbound_event` returns `Skipped` (the retained row is newer), so
+/// `apply_inbound_persona` is never called and the local prompt is untouched.
+/// This test passes both before and after the fix — the retention row protects
+/// the local edit. The fix's invariant is that the retain MUST succeed for
+/// this protection to hold; when it fails, the save path surfaces the error
+/// instead (see `retain_failure_surfaces_error_not_swallowed`).
+#[test]
+fn successful_save_protects_new_prompt_against_older_inbound() {
+    use crate::managed_agents::retention::{
+        open_retention_db, retain_inbound_event, InboundOutcome, RetainedEvent,
+    };
+    use nostr::JsonUtil;
+
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = crate::managed_agents::retention::scoped_retention_db_path(
+        dir.path(),
+        "wss://a.example",
+        &owner,
+    );
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // Local save: a persona with the NEW prompt retained at created_at = now.
+    let mut saved = local_in_app();
+    saved.system_prompt = "new prompt".to_string();
+    let (_, retained, _) =
+        super::super::pending::prepare_persona_publication_at(&db_path, &keys, &saved, None)
+            .unwrap();
+    let retained_created_at = retained.created_at;
+    assert!(
+        retained_created_at > 1000,
+        "monotonic_created_at returns now, which is > 1000"
+    );
+
+    // Inbound: the OLD prompt at an OLDER created_at (1000 < retained).
+    let mut old_persona = local_in_app();
+    old_persona.system_prompt = "old prompt".to_string();
+    let old_event = persona_event_at(&old_persona, &keys, 1000);
+
+    let conn = open_retention_db(&db_path).unwrap();
+    let outcome = retain_inbound_event(
+        &conn,
+        &RetainedEvent {
+            kind: buzz_core_pkg::kind::KIND_PERSONA,
+            pubkey: old_event.pubkey.to_hex(),
+            d_tag: crate::managed_agents::persona_events::persona_d_tag(&old_persona),
+            content: old_event.content.to_string(),
+            created_at: 1000,
+            raw_event: old_event.as_json(),
+            pending_sync: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        InboundOutcome::Skipped,
+        "an older inbound must not overwrite a newer retained local edit"
+    );
+
+    // The local prompt is untouched — `apply_inbound_persona` was never called
+    // because the outcome was Skipped. Simulate the Applied branch to prove the
+    // guard: had the inbound been Applied, it would have overwritten the prompt.
+    let mut personas = vec![saved];
+    if outcome == InboundOutcome::Applied {
+        apply_inbound_persona(&mut personas, inbound_for(UUID, "Local"));
+    }
+    assert_eq!(
+        personas[0].system_prompt, "new prompt",
+        "the local new prompt must survive — the older inbound was skipped"
+    );
+}
+
+/// The revert hole the fix closes: when the retention write FAILS, the save
+/// path must surface the error to the caller rather than silently reporting
+/// success. This test calls `retain_persona_pending` itself — the wrapper
+/// whose body is the propagate-vs-swallow site — with an `AppState` in
+/// recovery mode (`identity_lost`), so `active_retention_scope` returns
+/// `Err("...recovery mode...")` from `signing_keys()` before the AppHandle's
+/// data dir is ever touched. The wrapper must return that `Err`, not swallow
+/// it into `eprintln!` and report `Ok(())`. Restore the pre-fix swallow
+/// inside `retain_persona_pending` and this test fails (the wrapper returns
+/// `Ok(())` instead of `Err`).
+#[test]
+fn retain_persona_pending_surfaces_recovery_mode_error() {
+    use tauri::test::mock_app;
+
+    let app = mock_app();
+    let state = crate::build_app_state();
+    state
+        .identity_lost
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let mut persona = local_in_app();
+    persona.system_prompt = "new prompt".to_string();
+
+    let error =
+        crate::commands::personas::pending::retain_persona_pending(app.handle(), &state, &persona)
+            .expect_err("recovery mode must surface as Err, not be swallowed into Ok");
+    assert!(
+        error.contains("recovery mode"),
+        "the recovery-mode failure must propagate: {error}"
+    );
+}
+
+/// The inner `_at` seam still surfaces an unopenable retention db. Kept
+/// because it covers the on-disk failure path (`create_dir_all` / `open_retention_db`)
+/// that the recovery-mode test does not reach, and asserts the failure string
+/// is actionable rather than a bare panic.
+#[test]
+fn retain_persona_publication_at_surfaces_unopenable_db() {
+    use crate::managed_agents::persona_events::persona_d_tag;
+
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+
+    let mut persona = local_in_app();
+    persona.system_prompt = "new prompt".to_string();
+
+    let error =
+        super::super::pending::prepare_persona_publication_at(dir.path(), &keys, &persona, None)
+            .expect_err("an unopenable retention db must surface its failure");
+    assert!(
+        error.contains("failed to open retention db"),
+        "the retention failure must be surfaced, not swallowed: {error}"
+    );
+
+    let _ = persona_d_tag(&persona);
+}
+
+/// The managed-agent (kind:30177) twin: `retain_managed_agent_pending` must
+/// surface the recovery-mode error instead of swallowing it into `eprintln!`.
+/// Restore the pre-fix swallow inside `retain_managed_agent_pending` and this
+/// test fails.
+#[test]
+fn retain_managed_agent_pending_surfaces_recovery_mode_error() {
+    use tauri::test::mock_app;
+
+    let app = mock_app();
+    let state = crate::build_app_state();
+    state
+        .identity_lost
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let record = ManagedAgentRecord {
+        pubkey: "a".repeat(64),
+        name: "Test".to_string(),
+        persona_id: None,
+        private_key_nsec: String::new(),
+        auth_tag: None,
+        relay_url: String::new(),
+        avatar_url: None,
+        acp_command: String::new(),
+        agent_command: String::new(),
+        agent_command_override: None,
+        agent_args: vec![],
+        mcp_command: String::new(),
+        turn_timeout_seconds: 0,
+        idle_timeout_seconds: None,
+        max_turn_duration_seconds: None,
+        parallelism: 1,
+        system_prompt: None,
+        model: None,
+        provider: None,
+        persona_source_version: None,
+        env_vars: std::collections::BTreeMap::new(),
+        start_on_app_launch: false,
+        auto_restart_on_config_change: true,
+        runtime_pid: None,
+        backend: Default::default(),
+        backend_agent_id: None,
+        provider_binary_path: None,
+        team_id: None,
+        persona_team_dir: None,
+        persona_name_in_team: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+        last_started_at: None,
+        last_stopped_at: None,
+        last_exit_code: None,
+        last_error: None,
+        last_error_code: None,
+        respond_to: Default::default(),
+        respond_to_allowlist: vec![],
+        display_name: None,
+        slug: None,
+        runtime: None,
+        name_pool: vec![],
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        definition_respond_to: None,
+        definition_respond_to_allowlist: vec![],
+        definition_parallelism: None,
+        relay_mesh: None,
+    };
+
+    let error =
+        crate::commands::agents::retain_managed_agent_pending(app.handle(), &state, &record)
+            .expect_err("recovery mode must surface as Err, not be swallowed into Ok");
+    assert!(
+        error.contains("recovery mode"),
+        "the recovery-mode failure must propagate: {error}"
+    );
+}
+
+/// The managed-agent (kind:30177) analog: a successful local save protects
+/// the new prompt against an older inbound. `retain_inbound_event` returns
+/// `Skipped` because the retained row is newer, so `apply_inbound_managed_agent`
+/// is never called and the local prompt is untouched.
+#[test]
+fn successful_managed_agent_save_protects_new_prompt_against_older_inbound() {
+    use crate::managed_agents::retention::{
+        open_retention_db, retain_event, retain_inbound_event, InboundOutcome, RetainedEvent,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("retention.db");
+    let owner = "ownerpubkeyhex0000000000000000000000000000000000000000000000000000";
+
+    // Local save: a kind:30177 row retained at created_at = 2000 with the NEW
+    // prompt in its content.
+    let conn = open_retention_db(&db_path).unwrap();
+    retain_event(
+        &conn,
+        &RetainedEvent {
+            kind: buzz_core_pkg::kind::KIND_MANAGED_AGENT,
+            pubkey: owner.to_string(),
+            d_tag: AGENT_PUBKEY.to_string(),
+            content: r#"{"name":"Local","system_prompt":"new prompt"}"#.to_string(),
+            created_at: 2000,
+            raw_event: r#"{"id":"local"}"#.to_string(),
+            pending_sync: true,
+        },
+    )
+    .unwrap();
+
+    // Inbound: the OLD prompt at created_at = 1000 (< 2000).
+    let outcome = retain_inbound_event(
+        &conn,
+        &RetainedEvent {
+            kind: buzz_core_pkg::kind::KIND_MANAGED_AGENT,
+            pubkey: owner.to_string(),
+            d_tag: AGENT_PUBKEY.to_string(),
+            content: r#"{"name":"Local","system_prompt":"old prompt"}"#.to_string(),
+            created_at: 1000,
+            raw_event: r#"{"id":"old"}"#.to_string(),
+            pending_sync: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        InboundOutcome::Skipped,
+        "an older inbound must not overwrite a newer retained managed-agent edit"
+    );
+}

@@ -63,8 +63,7 @@ pub async fn update_persona(
     app: AppHandle,
 ) -> Result<UpdatePersonaResult, String> {
     let (persona, ()) = update_persona_with(input, app, |app, state, persona| {
-        retain_persona_pending(app, state, persona);
-        Ok(())
+        retain_persona_pending(app, state, persona)
     })
     .await?;
     Ok(UpdatePersonaResult { persona })
@@ -77,6 +76,13 @@ pub async fn update_persona(
 /// [`update_persona`] enqueues best-effort, while
 /// [`sharing::update_persona_and_publish`] prepares a strict publication and
 /// returns the event so the caller can await relay acceptance.
+///
+/// When `retain` returns `Err`, the local `personas.json` has already been
+/// written (the edit is on disk), but the retention store has no pending row.
+/// The error propagates to the caller so the user learns the edit is local-only
+/// and not yet synced — without it, the next inbound `kind:30175` with an older
+/// `created_at` would revert the local edit because `retain_inbound_event`
+/// returns `Applied` when no local row exists. See issue f8fce672.
 pub(super) async fn update_persona_with<R: Send + 'static>(
     input: UpdatePersonaRequest,
     app: AppHandle,
@@ -211,7 +217,11 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                     // Avatar-only edits are excluded — the avatar is not in the
                     // projection, so retaining would be a guaranteed no-op.
                     for record in records.iter().filter(|r| renamed.contains(&r.pubkey)) {
-                        crate::commands::agents::retain_managed_agent_pending(&app, &state, record);
+                        if let Err(e) = crate::commands::agents::retain_managed_agent_pending(
+                            &app, &state, record,
+                        ) {
+                            eprintln!("buzz-desktop: agent-retain (rename): {e}");
+                        }
                     }
                 }
 

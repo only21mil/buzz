@@ -70,7 +70,10 @@ pub fn scoped_retention_db_path(base_dir: &Path, relay_url: &str, owner_pubkey: 
 ///
 /// Callers keep the returned relay and keys alongside the path whenever work
 /// crosses an `.await`; a later workspace switch cannot retarget that work.
-pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<RetentionScope, String> {
+pub fn active_retention_scope<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+) -> Result<RetentionScope, String> {
     let relay_url = crate::relay::relay_ws_url_with_override(state);
     let owner_keys = state.signing_keys()?;
     let base_dir = super::managed_agents_base_dir(app)?;
@@ -95,8 +98,8 @@ pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<Reten
 /// returned scope is both the one that will be written to and the one the event
 /// arrived on. `Ok(None)` means the arrival community is no longer active and
 /// the caller must drop the event — see [`scope_for_arrival`].
-pub fn arrival_retention_scope(
-    app: &AppHandle,
+pub fn arrival_retention_scope<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     arrival_relay_url: &str,
 ) -> Result<Option<RetentionScope>, String> {

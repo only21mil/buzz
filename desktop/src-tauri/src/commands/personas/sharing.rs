@@ -375,9 +375,9 @@ mod tests {
         );
     }
 
-    /// The save path swallows enqueue failures (`retain_persona_pending` logs
-    /// them). This command promises a publication outcome, so the strict
-    /// preparation it uses must surface the failure instead.
+    /// The save path propagates enqueue failures (`retain_persona_pending`
+    /// returns them). This command promises a publication outcome, so the
+    /// strict preparation it uses must surface the failure instead.
     #[tokio::test]
     async fn test_update_and_publish_enqueue_failure_is_returned() {
         let dir = tempfile::tempdir().unwrap();

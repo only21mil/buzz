@@ -76,7 +76,9 @@ pub async fn create_persona(
         apply_persona_behavior(&mut persona, input.behavior)?;
         personas.push(persona.clone());
         save_personas(&app, &personas)?;
-        retain_persona_pending(&app, &state, &persona);
+        if let Err(e) = retain_persona_pending(&app, &state, &persona) {
+            eprintln!("buzz-desktop: persona-retain (create): {e}");
+        }
         try_regenerate_nest(&app);
         Ok(persona)
     })

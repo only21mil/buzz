@@ -37,26 +37,20 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
 /// [`agent_event_content`] projection — the retention upsert's content-equality
 /// guard compares this projection, so an operational start/stop that mutates
 /// only runtime fields produces an identical row and never re-enqueues a
-/// publish. Best-effort: a failure here is logged and swallowed so a retention
-/// hiccup never blocks the disk-authoritative write.
-pub(super) fn retain_managed_agent_pending(
-    app: &AppHandle,
+/// publish.
+///
+/// Returns `Err` on retention failure; caller must surface it. See f8fce672.
+pub(super) fn retain_managed_agent_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     record: &ManagedAgentRecord,
-) {
+) -> Result<(), String> {
     use crate::managed_agents::{reconcile::retain_agent_record, retention::open_retention_db};
 
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let conn = open_retention_db(&scope.db_path)?;
-        // Shared engine with the boot-time reconcile: projection content diff
-        // (no republish for runtime-only churn) + monotonic created_at bump
-        // past the retained head (NIP-AP step 3).
-        retain_agent_record(&conn, &scope.owner_keys, record).map(|_| ())
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: agent-retain: {e}");
-    }
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    let conn = open_retention_db(&scope.db_path)?;
+    // Content-diff + monotonic created_at bump past the retained head (NIP-AP 3).
+    retain_agent_record(&conn, &scope.owner_keys, record).map(|_| ())
 }
 
 /// Purge a deleted agent's pending row and enqueue a NIP-09 tombstone, both
@@ -310,7 +304,9 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
         }
         save_managed_agents(app, &records)?;
         if let Some(saved_record) = records.iter().find(|record| record.pubkey == pubkey) {
-            retain_managed_agent_pending(app, state, saved_record);
+            if let Err(e) = retain_managed_agent_pending(app, state, saved_record) {
+                eprintln!("buzz-desktop: agent-retain (restart): {e}");
+            }
         }
     }
 
@@ -432,7 +428,9 @@ pub(super) async fn start_local_agent_with_preflight(
     start_managed_agent_process(app, record, &mut runtimes, Some(owner_hex))?;
     save_managed_agents(app, &records)?;
     if let Some(saved_record) = records.iter().find(|r| r.pubkey == pubkey) {
-        retain_managed_agent_pending(app, state, saved_record);
+        if let Err(e) = retain_managed_agent_pending(app, state, saved_record) {
+            eprintln!("buzz-desktop: agent-retain (start): {e}");
+        }
     }
     let record = records
         .iter()
@@ -926,7 +924,9 @@ pub async fn create_managed_agent(
         // Publish the agent to the relay. Inside the Phase-3 lock, after save,
         // before any .await — owner-authored, every agent (Will's ruling: no
         // is_builtin/persona-membership gate).
-        retain_managed_agent_pending(&app, &state, record);
+        if let Err(e) = retain_managed_agent_pending(&app, &state, record) {
+            eprintln!("buzz-desktop: agent-retain (create): {e}");
+        }
         let personas = load_personas(&app).unwrap_or_default();
         (
             build_managed_agent_summary(

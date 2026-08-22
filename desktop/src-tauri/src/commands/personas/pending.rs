@@ -24,10 +24,9 @@ pub(super) struct PreparedPersonaPublication {
 /// The event is signed with the owner keys at call time, so its `created_at`
 /// is `now` — newer than any prior retained row, clearing the upsert's
 /// newer-or-equal guard. `pending_sync = 1` enqueues it for the flush loop,
-/// which is the sole publisher. Best-effort: a failure here is logged and
-/// swallowed so a retention hiccup never blocks the disk-authoritative write.
-/// The explicit catalog toggle uses [`prepare_persona_publication`] directly
-/// so its durable enqueue failure reaches the UI.
+/// which is the sole publisher. The explicit catalog toggle uses
+/// [`prepare_persona_publication`] directly so its durable enqueue failure
+/// reaches the UI.
 ///
 /// Unlike `retain_managed_agent_pending`, this has no projection-equality
 /// short-circuit: personas have no start/stop runtime churn, so a republish
@@ -36,14 +35,20 @@ pub(super) struct PreparedPersonaPublication {
 /// never republishes, while `set_persona_shared` must retain because the tag is
 /// relay-authoritative). A byte-identical user-save republish is harmlessly
 /// NIP-33-replaced. The guard is intentionally omitted.
-pub(in crate::commands) fn retain_persona_pending(
-    app: &AppHandle,
+///
+/// Returns `Err` when the retention write fails (recovery mode / identity lost
+/// / keyring locked / disk unopenable). The caller MUST surface this to the
+/// user so they know the edit is local-only and not yet synced — a silent
+/// swallow here leaves `personas.json` holding the new prompt while the
+/// retention store has no row, so the next inbound `kind:30175` with an older
+/// `created_at` reverts the local edit (`retain_inbound_event` returns
+/// `Applied` when no local row exists). See issue f8fce672.
+pub(in crate::commands) fn retain_persona_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     persona: &AgentDefinition,
-) {
-    if let Err(e) = prepare_persona_publication(app, state, persona, None) {
-        eprintln!("buzz-desktop: persona-retain: {e}");
-    }
+) -> Result<(), String> {
+    prepare_persona_publication(app, state, persona, None).map(|_| ())
 }
 
 /// Build, sign, and durably retain a persona event in the active relay+owner
@@ -53,8 +58,8 @@ pub(in crate::commands) fn retain_persona_pending(
 /// exact share tag. The explicit share toggle passes `Some(shared)`. Returning
 /// the retained event lets that command immediately await relay acceptance
 /// without rebuilding or re-signing a different NIP-33 head.
-pub(super) fn prepare_persona_publication(
-    app: &AppHandle,
+pub(super) fn prepare_persona_publication<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     persona: &AgentDefinition,
     shared_override: Option<bool>,

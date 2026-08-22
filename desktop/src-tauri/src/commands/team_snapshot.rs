@@ -741,7 +741,11 @@ pub async fn confirm_team_snapshot_import(
 
         // All writes committed — safe to update in-memory state.
         for m in &minted {
-            crate::commands::personas::retain_persona_pending(&app, &state, &m.definition);
+            if let Err(e) =
+                crate::commands::personas::retain_persona_pending(&app, &state, &m.definition)
+            {
+                eprintln!("buzz-desktop: persona-retain (snapshot): {e}");
+            }
         }
         for m in &minted {
             retain_agent_pending(&app, &state, &m.record);
