@@ -23,10 +23,11 @@ use thiserror::Error;
 use crate::{
     activation::{
         ActivationController, ActivationGrant, ActivationState, AdmissionTrustClass,
-        DurableLeaseFields, DurableNonceEntry, DurableNonceLedger, DurableQualificationState,
-        DurableStateSnapshot, FixtureJobCoordinates, HostActivationCoordinates, LeaseToken,
-        OrdinaryAdmission, OrdinaryJobCoordinates, QualificationPermit, ReadyRestoreValidation,
-        VerifiedSigner, NONCE_LEDGER_CAPACITY,
+        DurableLeaseFields, DurableNonceEntry, DurableNonceLedger, DurableQualificationLeaseFields,
+        DurableQualificationState, DurableStateSnapshot, FixtureJobCoordinates,
+        HostActivationCoordinates, LeaseToken, OrdinaryAdmission, OrdinaryJobCoordinates,
+        QualificationLease, QualificationPermit, ReadyRestoreValidation, VerifiedSigner,
+        NONCE_LEDGER_CAPACITY,
     },
     control::AdmissionBoundaryError,
     durable_dispatch::{
@@ -197,6 +198,16 @@ impl PreparedRuntime {
                     }));
                 }
             }
+            if restored.controller.qualification_recovery_lease().is_some() {
+                return RuntimeBootstrap::Loaded(Box::new(LoadedRuntime {
+                    controller: restored.controller,
+                    authority: self.authority,
+                    state_revision: self.state_revision,
+                    authority_sha256: self.authority_sha256,
+                    paths: self.paths,
+                    expected_uid: self.expected_uid,
+                }));
+            }
             return persist_quarantine(
                 restored.controller,
                 self.state_revision,
@@ -291,8 +302,8 @@ impl LoadedRuntime {
 
     /// Persist the current snapshot and advance this runtime's durable revision.
     ///
-    /// In-flight records intentionally retain only an ambiguity marker: restart
-    /// quarantines them instead of reconstructing an opaque receipt.
+    /// In-flight records restore with zero capacity; exact retained receipts
+    /// authorize cleanup only.
     pub fn persist(&mut self) -> Result<(), RuntimeLoadError> {
         let mut store = DurableStateStore {
             state_revision: self.state_revision,
@@ -465,6 +476,28 @@ impl ServiceAuthority {
             return Err(AdmissionBoundaryError::Unauthorized);
         }
         Ok(binding.authenticated_signer)
+    }
+
+    /// Recover the exact root-authored qualification request for cleanup only.
+    pub fn recover_qualification(
+        &self,
+        lease: QualificationLease,
+    ) -> Result<QualificationRequest, AdmissionBoundaryError> {
+        let binding = self
+            .qualification
+            .as_ref()
+            .ok_or(AdmissionBoundaryError::Unavailable)?;
+        let mut expected_lease_id = [0; 16];
+        expected_lease_id.copy_from_slice(&binding.permit.fixture_identity[..16]);
+        if lease.fixture_identity() != binding.permit.fixture_identity
+            || lease.lease_id() != expected_lease_id
+            || lease.generation() == 0
+            || lease.nonce() != binding.permit.nonce
+            || lease.directive() != binding.permit.directive
+        {
+            return Err(AdmissionBoundaryError::Unauthorized);
+        }
+        Ok(binding.request)
     }
 }
 
@@ -1011,7 +1044,7 @@ impl OrdinaryAuthorityFile {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateFile {
     version: u8,
@@ -1049,10 +1082,22 @@ impl StateFile {
             return Err(RuntimeLoadError::BindingMismatch);
         }
         let state = parse_state(&self.state)?;
+        let mut entries = [None; NONCE_LEDGER_CAPACITY];
+        for (index, value) in self.nonce_ledger.iter().enumerate() {
+            entries[index] = Some(value.decode()?);
+        }
+        let nonce_ledger = DurableNonceLedger { entries };
         let qualification = self
             .qualification
             .as_ref()
-            .map(DurableQualificationFile::decode)
+            .map(|value| {
+                value.decode(
+                    authority.qualification.as_ref().map(|value| value.permit),
+                    state,
+                    nonce_ledger,
+                    self.next_lease_generation,
+                )
+            })
             .transpose()?;
         let activation = self
             .activation
@@ -1070,15 +1115,13 @@ impl StateFile {
             return Err(RuntimeLoadError::BindingMismatch);
         }
         if (state == ActivationState::Qualifying
-            && qualification.is_some_and(|value| now >= value.permit.expires_at))
+            && qualification.is_some_and(|value| {
+                value.active_lease.is_none() && now >= value.permit.expires_at
+            }))
             || (state == ActivationState::Ready
                 && activation.is_some_and(|value| now >= value.expires_at))
         {
             return Err(RuntimeLoadError::Stale);
-        }
-        let mut entries = [None; NONCE_LEDGER_CAPACITY];
-        for (index, value) in self.nonce_ledger.iter().enumerate() {
-            entries[index] = Some(value.decode()?);
         }
         Ok(DurableStateSnapshot {
             version: FORMAT_VERSION,
@@ -1087,7 +1130,7 @@ impl StateFile {
             qualification,
             activation,
             active_lease,
-            nonce_ledger: DurableNonceLedger { entries },
+            nonce_ledger,
             last_admission_at: self.last_admission_at,
             next_lease_generation: self.next_lease_generation,
         })
@@ -1126,7 +1169,7 @@ impl StateFile {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum ActiveLeaseFile {
     Legacy(bool),
@@ -1159,7 +1202,7 @@ impl ActiveLeaseFile {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LeaseFile {
     lease_id: String,
@@ -1207,27 +1250,42 @@ impl LeaseFile {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DurableQualificationFile {
     permit: PermitFile,
     evidence_set_digest: Option<String>,
-    active_lease: bool,
+    active_lease: QualificationLeaseFile,
 }
 
 impl DurableQualificationFile {
-    fn decode(&self) -> Result<DurableQualificationState, RuntimeLoadError> {
-        if self.active_lease {
-            return Err(RuntimeLoadError::Quarantined);
+    fn decode(
+        &self,
+        authority_permit: Option<QualificationPermit>,
+        state: ActivationState,
+        nonce_ledger: DurableNonceLedger,
+        next_lease_generation: u64,
+    ) -> Result<DurableQualificationState, RuntimeLoadError> {
+        let permit = self.permit.decode()?;
+        if authority_permit != Some(permit) {
+            return Err(RuntimeLoadError::BindingMismatch);
         }
+        let evidence_set_digest = self
+            .evidence_set_digest
+            .as_ref()
+            .map(|value| hex_array(value))
+            .transpose()?;
+        let active_lease = self.active_lease.decode(
+            permit,
+            state,
+            evidence_set_digest,
+            nonce_ledger,
+            next_lease_generation,
+        )?;
         Ok(DurableQualificationState {
-            permit: self.permit.decode()?,
-            active_lease: None,
-            evidence_set_digest: self
-                .evidence_set_digest
-                .as_ref()
-                .map(|value| hex_array(value))
-                .transpose()?,
+            permit,
+            active_lease,
+            evidence_set_digest,
         })
     }
 
@@ -1235,12 +1293,108 @@ impl DurableQualificationFile {
         Ok(Self {
             permit: PermitFile::encode(value.permit),
             evidence_set_digest: value.evidence_set_digest.map(hex::encode),
-            active_lease: value.active_lease.is_some(),
+            active_lease: QualificationLeaseFile::encode(value.active_lease),
         })
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum QualificationLeaseFile {
+    Legacy(bool),
+    Lease(ExactQualificationLeaseFile),
+}
+
+impl QualificationLeaseFile {
+    fn decode(
+        &self,
+        permit: QualificationPermit,
+        state: ActivationState,
+        evidence_set_digest: Option<[u8; 32]>,
+        nonce_ledger: DurableNonceLedger,
+        next_lease_generation: u64,
+    ) -> Result<Option<QualificationLease>, RuntimeLoadError> {
+        match self {
+            Self::Legacy(false) => Ok(None),
+            Self::Legacy(true) => Err(RuntimeLoadError::Quarantined),
+            Self::Lease(lease) => lease
+                .decode(
+                    permit,
+                    state,
+                    evidence_set_digest,
+                    nonce_ledger,
+                    next_lease_generation,
+                )
+                .map(Some),
+        }
+    }
+
+    fn encode(lease: Option<QualificationLease>) -> Self {
+        match lease {
+            None => Self::Legacy(false),
+            Some(lease) => Self::Lease(ExactQualificationLeaseFile {
+                fixture_identity: hex::encode(lease.fixture_identity()),
+                lease_id: hex::encode(lease.lease_id()),
+                generation: lease.generation(),
+                nonce: hex::encode(lease.nonce()),
+                directive: lease.directive().map(|_| "teardown_failure".into()),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExactQualificationLeaseFile {
+    fixture_identity: String,
+    lease_id: String,
+    generation: u64,
+    nonce: String,
+    directive: Option<String>,
+}
+
+impl ExactQualificationLeaseFile {
+    fn decode(
+        &self,
+        permit: QualificationPermit,
+        state: ActivationState,
+        evidence_set_digest: Option<[u8; 32]>,
+        nonce_ledger: DurableNonceLedger,
+        next_lease_generation: u64,
+    ) -> Result<QualificationLease, RuntimeLoadError> {
+        let fixture_identity = hex_array(&self.fixture_identity)?;
+        let lease_id = hex_array(&self.lease_id)?;
+        let nonce = hex_array(&self.nonce)?;
+        let directive = parse_directive(self.directive.as_deref())?;
+        if state != ActivationState::Qualifying
+            || evidence_set_digest.is_some()
+            || fixture_identity != permit.fixture_identity
+            || lease_id != permit.fixture_identity[..16]
+            || self.generation == 0
+            || self.generation.checked_add(1) != Some(next_lease_generation)
+            || nonce != permit.nonce
+            || directive != permit.directive
+            || !nonce_ledger
+                .entries
+                .iter()
+                .flatten()
+                .any(|entry| entry.nonce == nonce && entry.expires_at == permit.expires_at)
+        {
+            return Err(RuntimeLoadError::BindingMismatch);
+        }
+        Ok(QualificationLease::from_durable(
+            DurableQualificationLeaseFields {
+                fixture_identity,
+                lease_id,
+                generation: self.generation,
+                nonce,
+                directive,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct NonceFile {
     nonce: String,
@@ -1901,11 +2055,23 @@ mod tests {
         controller.start_qualification(permit(30)).unwrap();
         let hash = [32; 32];
         let mut disk = StateFile::encode(controller.snapshot(), 1, 7, hash).unwrap();
+        let QualificationLeaseFile::Legacy(active) = &disk
+            .qualification
+            .as_ref()
+            .expect("qualification")
+            .active_lease
+        else {
+            panic!("inactive qualification must use the legacy boolean encoding");
+        };
+        assert!(!*active);
         assert_eq!(
             disk.decode(&authority, hash, 30),
             Err(RuntimeLoadError::Stale)
         );
-        disk.active_lease = ActiveLeaseFile::Legacy(true);
+        disk.qualification
+            .as_mut()
+            .expect("qualification")
+            .active_lease = QualificationLeaseFile::Legacy(true);
         assert_eq!(
             disk.decode(&authority, hash, 20),
             Err(RuntimeLoadError::Quarantined)
@@ -1913,41 +2079,73 @@ mod tests {
     }
 
     #[test]
-    fn persisted_restart_quarantine_remains_closed_on_second_decode() {
+    fn exact_qualification_lease_round_trips_and_rejects_every_mutation() {
         let authority = authority(false, 100);
         let mut controller = ActivationController::new(ROOT);
         controller.start_qualification(permit(100)).unwrap();
-        controller
+        let lease = controller
             .admit_qualification_request(qualification_request(permit(100)), FIXTURE, 20)
             .unwrap();
         let hash = [43; 32];
-        let inflight = StateFile::encode(controller.snapshot(), 4, 7, hash).unwrap();
+        let disk = StateFile::encode(controller.snapshot(), 4, 7, hash).unwrap();
+        let decoded = disk.decode(&authority, hash, 20).unwrap();
         assert_eq!(
-            inflight.decode(&authority, hash, 20),
-            Err(RuntimeLoadError::Quarantined)
+            decoded
+                .qualification
+                .and_then(|qualification| qualification.active_lease),
+            Some(lease)
+        );
+        let expired = disk.decode(&authority, hash, 100).unwrap();
+        assert_eq!(
+            expired
+                .qualification
+                .and_then(|qualification| qualification.active_lease),
+            Some(lease)
         );
 
-        let temporary = tempfile::tempdir().unwrap();
-        let directory = temporary.path().join("activation");
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
-        let destination = directory.join("state-v1.json");
-        persist_to_validated_path(
-            &directory,
-            &destination,
-            quarantine(ROOT).snapshot(),
-            5,
-            7,
-            hash,
-        )
-        .unwrap();
+        let mutate = |change: fn(&mut ExactQualificationLeaseFile)| {
+            let mut candidate = disk.clone();
+            let QualificationLeaseFile::Lease(active) = &mut candidate
+                .qualification
+                .as_mut()
+                .expect("qualification")
+                .active_lease
+            else {
+                panic!("active qualification must encode an exact lease");
+            };
+            change(active);
+            assert_eq!(
+                candidate.decode(&authority, hash, 20),
+                Err(RuntimeLoadError::BindingMismatch)
+            );
+        };
+        mutate(|active| active.fixture_identity = hex::encode([99; 32]));
+        mutate(|active| active.lease_id = hex::encode([99; 16]));
+        mutate(|active| active.generation += 1);
+        mutate(|active| active.nonce = hex::encode([99; 32]));
+        mutate(|active| active.directive = Some("teardown_failure".into()));
 
-        let persisted: StateFile = serde_json::from_slice(&fs::read(destination).unwrap()).unwrap();
-        let snapshot = persisted.decode(&authority, hash, 21).unwrap();
-        let second = ActivationController::restore(ROOT, snapshot, None);
-        assert_eq!(second.quarantine_reason, None);
-        assert_eq!(second.controller.state(), ActivationState::Quarantined);
-        assert_eq!(second.controller.ordinary_capacity(21), 0);
+        let mut wrong_expiry = disk.clone();
+        wrong_expiry.nonce_ledger[0].expires_at -= 1;
+        assert_eq!(
+            wrong_expiry.decode(&authority, hash, 20),
+            Err(RuntimeLoadError::BindingMismatch)
+        );
+
+        let mut with_evidence = disk.clone();
+        with_evidence
+            .qualification
+            .as_mut()
+            .expect("qualification")
+            .evidence_set_digest = Some(hex::encode([44; 32]));
+        assert_eq!(
+            with_evidence.decode(&authority, hash, 20),
+            Err(RuntimeLoadError::BindingMismatch)
+        );
+
+        let mut value = serde_json::to_value(&disk).unwrap();
+        value["qualification"]["active_lease"]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StateFile>(value).is_err());
     }
 
     #[test]

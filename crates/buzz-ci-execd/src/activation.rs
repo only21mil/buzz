@@ -98,7 +98,25 @@ pub struct QualificationLease {
     directive: Option<QualificationDirective>,
 }
 
+pub(crate) struct DurableQualificationLeaseFields {
+    pub fixture_identity: [u8; 32],
+    pub lease_id: [u8; 16],
+    pub generation: u64,
+    pub nonce: [u8; 32],
+    pub directive: Option<QualificationDirective>,
+}
+
 impl QualificationLease {
+    pub(crate) const fn from_durable(fields: DurableQualificationLeaseFields) -> Self {
+        Self {
+            fixture_identity: fields.fixture_identity,
+            lease_id: fields.lease_id,
+            generation: fields.generation,
+            nonce: fields.nonce,
+            directive: fields.directive,
+        }
+    }
+
     pub const fn fixture_identity(self) -> [u8; 32] {
         self.fixture_identity
     }
@@ -931,6 +949,58 @@ impl ActivationController {
             .filter(|_| self.state == ActivationState::Quarantined)
     }
 
+    /// Return an exact qualification token retained only for quarantined cleanup.
+    pub fn qualification_recovery_lease(&self) -> Option<QualificationLease> {
+        self.qualification
+            .and_then(|qualification| qualification.active_lease)
+            .filter(|_| self.state == ActivationState::Quarantined)
+    }
+
+    /// Return an expired qualification token for traffic-independent cleanup.
+    pub fn expired_qualification_lease(&self, now: u64) -> Option<QualificationLease> {
+        self.qualification
+            .filter(|qualification| {
+                self.state == ActivationState::Qualifying && now >= qualification.permit.expires_at
+            })
+            .and_then(|qualification| qualification.active_lease)
+    }
+
+    /// Close capacity while retaining one exact qualification cleanup token.
+    pub fn quarantine_qualification_recovery(
+        &mut self,
+        lease: QualificationLease,
+    ) -> Result<(), ActivationError> {
+        if !matches!(
+            self.state,
+            ActivationState::Qualifying | ActivationState::Quarantined
+        ) || !self
+            .qualification
+            .is_some_and(|qualification| qualification.active_lease == Some(lease))
+        {
+            return Err(ActivationError::MissingLease);
+        }
+        self.state = ActivationState::Quarantined;
+        Ok(())
+    }
+
+    /// Clear only the exact qualification token after cleanup proves clean.
+    pub fn finish_qualification_recovery(
+        &mut self,
+        lease: QualificationLease,
+    ) -> Result<(), ActivationError> {
+        if self.state != ActivationState::Quarantined {
+            return Err(ActivationError::MissingLease);
+        }
+        let Some(qualification) = self.qualification.as_mut() else {
+            return Err(ActivationError::MissingLease);
+        };
+        if qualification.active_lease != Some(lease) {
+            return Err(ActivationError::MissingLease);
+        }
+        qualification.active_lease = None;
+        Ok(())
+    }
+
     /// Clear a restart recovery token after root cleanup has run.
     pub fn finish_recovery(&mut self, lease: LeaseToken) -> Result<(), ActivationError> {
         if self.state != ActivationState::Quarantined || self.active_lease != Some(lease) {
@@ -945,6 +1015,17 @@ impl ActivationController {
     pub(crate) fn quarantine_after_commit_failure(&mut self, recovery_lease: Option<LeaseToken>) {
         if let Some(lease) = recovery_lease {
             self.active_lease = Some(lease);
+        }
+        self.state = ActivationState::Quarantined;
+    }
+
+    /// Retain an exact qualification cleanup token after publication fails.
+    pub(crate) fn quarantine_qualification_after_commit_failure(
+        &mut self,
+        recovery_lease: QualificationLease,
+    ) {
+        if let Some(qualification) = self.qualification.as_mut() {
+            qualification.active_lease = Some(recovery_lease);
         }
         self.state = ActivationState::Quarantined;
     }
@@ -1124,10 +1205,14 @@ fn snapshot_shape_is_valid(snapshot: DurableStateSnapshot) -> bool {
             && qualification.active_lease.is_none_or(|lease| {
                 lease.fixture_identity == qualification.permit.fixture_identity
                     && lease.lease_id == qualification.permit.fixture_identity[..16]
-                    && lease.generation < snapshot.next_lease_generation
+                    && lease.generation != 0
+                    && lease.generation.checked_add(1) == Some(snapshot.next_lease_generation)
                     && lease.nonce == qualification.permit.nonce
                     && lease.directive == qualification.permit.directive
-                    && snapshot.nonce_ledger.contains(&lease.nonce)
+                    && snapshot.nonce_ledger.entries.iter().flatten().any(|entry| {
+                        entry.nonce == lease.nonce
+                            && entry.expires_at == qualification.permit.expires_at
+                    })
             })
     });
     if !qualification_valid {
@@ -1948,7 +2033,7 @@ mod tests {
     #[test]
     fn restart_retains_leased_but_quarantines_ambiguous_inflight_state() {
         let mut qualifying = qualifying_controller();
-        qualifying
+        let qualification_lease = qualifying
             .admit_qualification(qualification_admission(), 10)
             .expect("qualification admission");
 
@@ -1990,6 +2075,29 @@ mod tests {
             );
             assert_eq!(restored.controller.ordinary_capacity(21), 0);
         }
+
+        let restored = ActivationController::restore(ROOT, qualifying.snapshot(), None);
+        let mut controller = restored.controller;
+        assert_eq!(
+            controller.qualification_recovery_lease(),
+            Some(qualification_lease)
+        );
+        let mut wrong = qualification_lease;
+        wrong.generation += 1;
+        assert_eq!(
+            controller.finish_qualification_recovery(wrong),
+            Err(ActivationError::MissingLease)
+        );
+        assert_eq!(
+            controller.qualification_recovery_lease(),
+            Some(qualification_lease)
+        );
+        assert_eq!(
+            controller.finish_qualification_recovery(qualification_lease),
+            Ok(())
+        );
+        assert_eq!(controller.state(), ActivationState::Quarantined);
+        assert_eq!(controller.qualification_recovery_lease(), None);
 
         let ready = ready_controller();
         let restored = ActivationController::restore(ROOT, ready.snapshot(), None);

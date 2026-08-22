@@ -42,6 +42,14 @@ pub trait AdmissionAuthority {
         &mut self,
         request: QualificationRequest,
     ) -> Result<VerifiedSigner, AdmissionBoundaryError>;
+
+    /// Recover root-owned qualification authority for cleanup only.
+    fn recover_qualification(
+        &mut self,
+        _lease: QualificationLease,
+    ) -> Result<QualificationRequest, AdmissionBoundaryError> {
+        Err(AdmissionBoundaryError::Unavailable)
+    }
 }
 
 impl AdmissionAuthority for ServiceAuthority {
@@ -64,6 +72,13 @@ impl AdmissionAuthority for ServiceAuthority {
         request: QualificationRequest,
     ) -> Result<VerifiedSigner, AdmissionBoundaryError> {
         ServiceAuthority::authenticate_qualification(self, request)
+    }
+
+    fn recover_qualification(
+        &mut self,
+        lease: QualificationLease,
+    ) -> Result<QualificationRequest, AdmissionBoundaryError> {
+        ServiceAuthority::recover_qualification(self, lease)
     }
 }
 
@@ -181,6 +196,24 @@ pub struct QualificationExecution {
     pub response: BrokerResponse,
 }
 
+/// Why qualification cleanup-only reconciliation started.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QualificationStop {
+    /// Startup retained an active qualification token only for cleanup.
+    Recovery,
+    /// The root permit expired while its exact fixture token remained active.
+    Expired,
+}
+
+/// Root cleanup result for one retained qualification token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QualificationCleanup {
+    /// Only `Clean` with a nonzero teardown digest clears the token.
+    pub disposition: CleanupDisposition,
+    /// Root-owned teardown proof. A zero digest cannot prove clean cleanup.
+    pub teardown_digest: [u8; 32],
+}
+
 /// Concrete qualification execution seam. It cannot mutate activation state.
 pub trait QualificationExecutor {
     /// Confirm required concrete fixture providers exist before admission.
@@ -194,6 +227,16 @@ pub trait QualificationExecutor {
         lease: QualificationLease,
         now: u64,
     ) -> Result<QualificationExecution, ExecutionUnavailable>;
+
+    /// Clean root resources without re-running qualification execution.
+    fn reconcile(
+        &mut self,
+        _request: QualificationRequest,
+        _lease: QualificationLease,
+        _stop: QualificationStop,
+    ) -> Result<QualificationCleanup, ExecutionUnavailable> {
+        Err(ExecutionUnavailable)
+    }
 }
 
 /// Explicit fail-closed placeholder until concrete host adapters are injected.
@@ -350,6 +393,16 @@ where
         } else {
             self.controller
                 .quarantine_after_commit_failure(recovery_lease);
+            false
+        }
+    }
+
+    fn commit_qualification(&mut self, recovery_lease: QualificationLease) -> bool {
+        if self.store.commit(self.controller.snapshot()).is_ok() {
+            true
+        } else {
+            self.controller
+                .quarantine_qualification_after_commit_failure(recovery_lease);
             false
         }
     }
@@ -606,6 +659,38 @@ where
         );
     }
 
+    fn maintain_qualification(&mut self, now: u64) {
+        let (lease, stop) = if let Some(lease) = self.controller.qualification_recovery_lease() {
+            (lease, QualificationStop::Recovery)
+        } else if let Some(lease) = self.controller.expired_qualification_lease(now) {
+            (lease, QualificationStop::Expired)
+        } else {
+            return;
+        };
+        let Ok(request) = self.authority.recover_qualification(lease) else {
+            return;
+        };
+        if self
+            .controller
+            .quarantine_qualification_recovery(lease)
+            .is_err()
+        {
+            return;
+        }
+        if !self.commit_qualification(lease) {
+            return;
+        }
+        let cleanup = self.qualification.reconcile(request, lease, stop);
+        // Failed or ambiguous cleanup leaves the committed Quarantined record and
+        // its exact token available for a later cleanup-only retry.
+        if cleanup.is_ok_and(|cleanup| {
+            cleanup.disposition == CleanupDisposition::Clean && cleanup.teardown_digest != [0; 32]
+        }) && self.controller.finish_qualification_recovery(lease).is_ok()
+        {
+            let _ = self.commit_qualification(lease);
+        }
+    }
+
     fn qualification(
         &mut self,
         header: FrameHeader,
@@ -693,6 +778,7 @@ where
 
     fn maintenance(&mut self, now: u64) {
         self.maintain_ordinary(now);
+        self.maintain_qualification(now);
     }
 }
 
@@ -1046,6 +1132,20 @@ mod tests {
                 .then_some(FIXTURE)
                 .ok_or(AdmissionBoundaryError::Unauthorized)
         }
+
+        fn recover_qualification(
+            &mut self,
+            lease: QualificationLease,
+        ) -> Result<QualificationRequest, AdmissionBoundaryError> {
+            let request = self.qualification_request;
+            (lease.fixture_identity() == request.fixture_identity
+                && lease.lease_id() == request.fixture_identity[..16]
+                && lease.generation() != 0
+                && lease.nonce() == request.nonce
+                && lease.directive() == request.directive)
+                .then_some(request)
+                .ok_or(AdmissionBoundaryError::Unauthorized)
+        }
     }
 
     #[derive(Clone)]
@@ -1187,6 +1287,75 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct QualificationRecoveryCalls {
+        executes: Rc<Cell<usize>>,
+        reconciles: Rc<Cell<usize>>,
+        stop: Rc<RefCell<Option<QualificationStop>>>,
+    }
+
+    impl QualificationRecoveryCalls {
+        fn new() -> Self {
+            Self {
+                executes: Rc::new(Cell::new(0)),
+                reconciles: Rc::new(Cell::new(0)),
+                stop: Rc::new(RefCell::new(None)),
+            }
+        }
+    }
+
+    struct QualificationRecoveryFake {
+        calls: QualificationRecoveryCalls,
+        available: bool,
+        cleanup: QualificationCleanup,
+    }
+
+    impl QualificationExecutor for QualificationRecoveryFake {
+        fn preflight(
+            &mut self,
+            _request: QualificationRequest,
+        ) -> Result<(), ExecutionUnavailable> {
+            Ok(())
+        }
+
+        fn execute(
+            &mut self,
+            _header: FrameHeader,
+            _request: QualificationRequest,
+            _lease: QualificationLease,
+            _now: u64,
+        ) -> Result<QualificationExecution, ExecutionUnavailable> {
+            self.calls.executes.set(self.calls.executes.get() + 1);
+            Err(ExecutionUnavailable)
+        }
+
+        fn reconcile(
+            &mut self,
+            _request: QualificationRequest,
+            _lease: QualificationLease,
+            stop: QualificationStop,
+        ) -> Result<QualificationCleanup, ExecutionUnavailable> {
+            self.calls.reconciles.set(self.calls.reconciles.get() + 1);
+            self.calls.stop.replace(Some(stop));
+            if self.available {
+                Ok(self.cleanup)
+            } else {
+                Err(ExecutionUnavailable)
+            }
+        }
+    }
+
+    fn qualification_recovery_fake(calls: QualificationRecoveryCalls) -> QualificationRecoveryFake {
+        QualificationRecoveryFake {
+            calls,
+            available: true,
+            cleanup: QualificationCleanup {
+                disposition: CleanupDisposition::Clean,
+                teardown_digest: [46; 32],
+            },
+        }
+    }
+
     fn host() -> HostActivationCoordinates {
         HostActivationCoordinates {
             integrated_candidate_sha: GitOid::Sha256([4; 32]),
@@ -1318,6 +1487,14 @@ mod tests {
         let mut controller = ActivationController::new(ROOT);
         controller.start_qualification(permit()).unwrap();
         controller
+    }
+
+    fn active_qualification_controller() -> (ActivationController, QualificationLease) {
+        let mut controller = qualifying_controller();
+        let lease = controller
+            .admit_qualification_request(qualification_request(), FIXTURE, 10)
+            .expect("qualification admission");
+        (controller, lease)
     }
 
     fn seccomp() -> crate::seccomp::SeccompLeaseEvidence {
@@ -2120,6 +2297,210 @@ mod tests {
         assert_eq!(commits.borrow().len(), 1);
         assert_eq!(commits.borrow()[0].state, ActivationState::Quarantined);
         assert_eq!(commits.borrow()[0].active_lease, None);
+    }
+
+    #[test]
+    fn qualification_restart_recovery_commits_quarantine_before_cleanup_then_commits_clear() {
+        let (controller, lease) = active_qualification_controller();
+        let restored = ActivationController::restore(ROOT, controller.snapshot(), None);
+        assert_eq!(
+            restored.controller.qualification_recovery_lease(),
+            Some(lease)
+        );
+        let store = FakeStore::new(None);
+        let commits = Rc::clone(&store.commits);
+        let calls = QualificationRecoveryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            restored.controller,
+            authority(),
+            store,
+            ordinary_fake(OrdinaryCalls::new()),
+            qualification_recovery_fake(calls.clone()),
+        );
+
+        dispatch.maintenance(20);
+
+        assert_eq!(calls.executes.get(), 0);
+        assert_eq!(calls.reconciles.get(), 1);
+        assert_eq!(*calls.stop.borrow(), Some(QualificationStop::Recovery));
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(dispatch.controller.qualification_recovery_lease(), None);
+        assert_eq!(commits.borrow().len(), 2);
+        assert_eq!(commits.borrow()[0].state, ActivationState::Quarantined);
+        assert!(commits.borrow()[0]
+            .qualification
+            .is_some_and(|qualification| qualification.active_lease == Some(lease)));
+        assert_eq!(commits.borrow()[1].state, ActivationState::Quarantined);
+        assert!(commits.borrow()[1]
+            .qualification
+            .is_some_and(|qualification| qualification.active_lease.is_none()));
+    }
+
+    #[test]
+    fn qualification_expiry_commits_quarantine_before_cleanup_then_commits_clear() {
+        let (controller, lease) = active_qualification_controller();
+        let store = FakeStore::new(None);
+        let commits = Rc::clone(&store.commits);
+        let calls = QualificationRecoveryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            controller,
+            authority(),
+            store,
+            ordinary_fake(OrdinaryCalls::new()),
+            qualification_recovery_fake(calls.clone()),
+        );
+
+        dispatch.maintenance(permit().expires_at);
+
+        assert_eq!(calls.executes.get(), 0);
+        assert_eq!(calls.reconciles.get(), 1);
+        assert_eq!(*calls.stop.borrow(), Some(QualificationStop::Expired));
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(dispatch.controller.qualification_recovery_lease(), None);
+        assert_eq!(commits.borrow().len(), 2);
+        assert_eq!(commits.borrow()[0].state, ActivationState::Quarantined);
+        assert!(commits.borrow()[0]
+            .qualification
+            .is_some_and(|qualification| qualification.active_lease == Some(lease)));
+        assert_eq!(commits.borrow()[1].state, ActivationState::Quarantined);
+        assert!(commits.borrow()[1]
+            .qualification
+            .is_some_and(|qualification| qualification.active_lease.is_none()));
+    }
+
+    #[test]
+    fn qualification_ambiguous_or_unavailable_cleanup_retains_exact_token() {
+        for (available, disposition, teardown_digest) in [
+            (true, CleanupDisposition::Ambiguous, [46; 32]),
+            (true, CleanupDisposition::Clean, [0; 32]),
+            (false, CleanupDisposition::Clean, [46; 32]),
+        ] {
+            let (controller, lease) = active_qualification_controller();
+            let restored = ActivationController::restore(ROOT, controller.snapshot(), None);
+            let store = FakeStore::new(None);
+            let commits = Rc::clone(&store.commits);
+            let calls = QualificationRecoveryCalls::new();
+            let mut executor = qualification_recovery_fake(calls.clone());
+            executor.available = available;
+            executor.cleanup = QualificationCleanup {
+                disposition,
+                teardown_digest,
+            };
+            let mut dispatch = DurableDispatch::new(
+                restored.controller,
+                authority(),
+                store,
+                ordinary_fake(OrdinaryCalls::new()),
+                executor,
+            );
+
+            dispatch.maintenance(20);
+
+            assert_eq!(calls.executes.get(), 0);
+            assert_eq!(calls.reconciles.get(), 1);
+            assert_eq!(dispatch.state(), ActivationState::Quarantined);
+            assert_eq!(
+                dispatch.controller.qualification_recovery_lease(),
+                Some(lease)
+            );
+            assert_eq!(commits.borrow().len(), 1);
+            assert_eq!(commits.borrow()[0].state, ActivationState::Quarantined);
+            assert!(commits.borrow()[0]
+                .qualification
+                .is_some_and(|qualification| qualification.active_lease == Some(lease)));
+        }
+    }
+
+    #[test]
+    fn qualification_quarantine_commit_failure_skips_cleanup_and_retains_exact_token() {
+        let (controller, lease) = active_qualification_controller();
+        let restored = ActivationController::restore(ROOT, controller.snapshot(), None);
+        let store = FakeStore::new(Some(1));
+        let commits = Rc::clone(&store.commits);
+        let calls = QualificationRecoveryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            restored.controller,
+            authority(),
+            store,
+            ordinary_fake(OrdinaryCalls::new()),
+            qualification_recovery_fake(calls.clone()),
+        );
+
+        dispatch.maintenance(20);
+
+        assert_eq!(calls.executes.get(), 0);
+        assert_eq!(calls.reconciles.get(), 0);
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(
+            dispatch.controller.qualification_recovery_lease(),
+            Some(lease)
+        );
+        assert!(commits.borrow().is_empty());
+        assert_eq!(dispatch.store.attempts.get(), 1);
+    }
+
+    #[test]
+    fn qualification_clear_commit_failure_restores_exact_token_after_safe_quarantine_commit() {
+        let (controller, lease) = active_qualification_controller();
+        let restored = ActivationController::restore(ROOT, controller.snapshot(), None);
+        let store = FakeStore::new(Some(2));
+        let commits = Rc::clone(&store.commits);
+        let calls = QualificationRecoveryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            restored.controller,
+            authority(),
+            store,
+            ordinary_fake(OrdinaryCalls::new()),
+            qualification_recovery_fake(calls.clone()),
+        );
+
+        dispatch.maintenance(20);
+
+        assert_eq!(calls.executes.get(), 0);
+        assert_eq!(calls.reconciles.get(), 1);
+        assert_eq!(dispatch.state(), ActivationState::Quarantined);
+        assert_eq!(
+            dispatch.controller.qualification_recovery_lease(),
+            Some(lease)
+        );
+        assert_eq!(commits.borrow().len(), 1);
+        assert_eq!(commits.borrow()[0].state, ActivationState::Quarantined);
+        assert!(commits.borrow()[0]
+            .qualification
+            .is_some_and(|qualification| qualification.active_lease == Some(lease)));
+        assert_eq!(dispatch.store.attempts.get(), 2);
+    }
+
+    #[test]
+    fn qualification_recovery_authority_mismatch_causes_no_cleanup_or_mutation() {
+        let (controller, lease) = active_qualification_controller();
+        let before = controller.snapshot();
+        let store = FakeStore::new(None);
+        let commits = Rc::clone(&store.commits);
+        let calls = QualificationRecoveryCalls::new();
+        let mut mismatched = authority();
+        mismatched.qualification_request.fixture_identity = [99; 32];
+        let mut dispatch = DurableDispatch::new(
+            controller,
+            mismatched,
+            store,
+            ordinary_fake(OrdinaryCalls::new()),
+            qualification_recovery_fake(calls.clone()),
+        );
+
+        dispatch.maintenance(permit().expires_at);
+
+        assert_eq!(calls.executes.get(), 0);
+        assert_eq!(calls.reconciles.get(), 0);
+        assert_eq!(dispatch.state(), ActivationState::Qualifying);
+        assert_eq!(dispatch.controller.snapshot(), before);
+        assert_eq!(
+            dispatch
+                .controller
+                .expired_qualification_lease(permit().expires_at),
+            Some(lease)
+        );
+        assert!(commits.borrow().is_empty());
     }
 
     #[test]
