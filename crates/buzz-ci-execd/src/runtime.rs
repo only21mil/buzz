@@ -150,6 +150,8 @@ pub struct PreparedRuntime {
     authority: ServiceAuthority,
     state_revision: u64,
     authority_sha256: [u8; 32],
+    paths: RuntimePaths,
+    expected_uid: u32,
 }
 
 impl PreparedRuntime {
@@ -181,6 +183,8 @@ impl PreparedRuntime {
                     state_revision: self.state_revision,
                     authority_revision: self.authority.revision,
                     authority_sha256: self.authority_sha256,
+                    paths: self.paths.clone(),
+                    expected_uid: self.expected_uid,
                 };
                 if store.commit(restored.controller.snapshot()).is_ok() {
                     return RuntimeBootstrap::Loaded(Box::new(LoadedRuntime {
@@ -188,6 +192,8 @@ impl PreparedRuntime {
                         authority: self.authority,
                         state_revision: store.revision(),
                         authority_sha256: self.authority_sha256,
+                        paths: self.paths,
+                        expected_uid: self.expected_uid,
                     }));
                 }
             }
@@ -196,6 +202,8 @@ impl PreparedRuntime {
                 self.state_revision,
                 self.authority.revision,
                 self.authority_sha256,
+                self.paths,
+                self.expected_uid,
                 RuntimeLoadError::Quarantined,
             );
         }
@@ -204,6 +212,8 @@ impl PreparedRuntime {
             authority: self.authority,
             state_revision: self.state_revision,
             authority_sha256: self.authority_sha256,
+            paths: self.paths,
+            expected_uid: self.expected_uid,
         }))
     }
 }
@@ -246,6 +256,8 @@ pub struct LoadedRuntime {
     authority: ServiceAuthority,
     state_revision: u64,
     authority_sha256: [u8; 32],
+    paths: RuntimePaths,
+    expected_uid: u32,
 }
 
 impl LoadedRuntime {
@@ -282,19 +294,15 @@ impl LoadedRuntime {
     /// In-flight records intentionally retain only an ambiguity marker: restart
     /// quarantines them instead of reconstructing an opaque receipt.
     pub fn persist(&mut self) -> Result<(), RuntimeLoadError> {
-        let next_revision = self
-            .state_revision
-            .checked_add(1)
-            .ok_or(RuntimeLoadError::PersistFailed)?;
-        persist_to_path(
-            Path::new(ACTIVATION_ROOT),
-            Path::new(ACTIVATION_STATE_FILE),
-            self.controller.snapshot(),
-            next_revision,
-            self.authority.revision,
-            self.authority_sha256,
-        )?;
-        self.state_revision = next_revision;
+        let mut store = DurableStateStore {
+            state_revision: self.state_revision,
+            authority_revision: self.authority.revision,
+            authority_sha256: self.authority_sha256,
+            paths: self.paths.clone(),
+            expected_uid: self.expected_uid,
+        };
+        store.commit(self.controller.snapshot())?;
+        self.state_revision = store.revision();
         Ok(())
     }
 
@@ -306,6 +314,8 @@ impl LoadedRuntime {
             state_revision: self.state_revision,
             authority_revision: self.authority.revision,
             authority_sha256: self.authority_sha256,
+            paths: self.paths,
+            expected_uid: self.expected_uid,
         };
         (self.controller, self.authority, store)
     }
@@ -316,6 +326,8 @@ pub struct DurableStateStore {
     state_revision: u64,
     authority_revision: u64,
     authority_sha256: [u8; 32],
+    paths: RuntimePaths,
+    expected_uid: u32,
 }
 
 impl DurableStateStore {
@@ -325,9 +337,11 @@ impl DurableStateStore {
             .state_revision
             .checked_add(1)
             .ok_or(RuntimeLoadError::PersistFailed)?;
-        persist_to_path(
-            Path::new(ACTIVATION_ROOT),
-            Path::new(ACTIVATION_STATE_FILE),
+        let _lock = acquire_runtime_lock(&self.paths, FlockArg::LockShared, self.expected_uid)?;
+        self.validate_commit_base()?;
+        persist_to_validated_path(
+            &self.paths.activation_root,
+            &self.paths.state_file,
             snapshot,
             next_revision,
             self.authority_revision,
@@ -340,6 +354,49 @@ impl DurableStateStore {
     /// Current durable revision.
     pub const fn revision(&self) -> u64 {
         self.state_revision
+    }
+
+    fn validate_commit_base(&self) -> Result<(), RuntimeLoadError> {
+        if self
+            .paths
+            .activation_root
+            .join(COORDINATOR_MARKER_FILE)
+            .try_exists()
+            .unwrap_or(true)
+        {
+            return Err(RuntimeLoadError::Quarantined);
+        }
+        let authority_bytes = read_artifact_for_owner(
+            &self.paths.authority_root,
+            &self.paths.authority_file,
+            AUTHORITY_MODE,
+            MAX_AUTHORITY_BYTES,
+            self.expected_uid,
+        )?;
+        let authority_disk: AuthorityFile =
+            serde_json::from_slice(&authority_bytes).map_err(|_| RuntimeLoadError::Malformed)?;
+        let authority = authority_disk.decode()?;
+        let authority_sha256: [u8; 32] = Sha256::digest(&authority_bytes).into();
+        let state_bytes = read_artifact_for_owner(
+            &self.paths.activation_root,
+            &self.paths.state_file,
+            STATE_MODE,
+            MAX_STATE_BYTES,
+            self.expected_uid,
+        )?;
+        let state: StateFile =
+            serde_json::from_slice(&state_bytes).map_err(|_| RuntimeLoadError::Malformed)?;
+        if authority.revision != self.authority_revision
+            || authority_sha256 != self.authority_sha256
+            || state.version != FORMAT_VERSION
+            || state.revision != self.state_revision
+            || state.authority_revision != self.authority_revision
+            || !state.committed
+            || hex_array::<32>(&state.authority_sha256)? != self.authority_sha256
+        {
+            return Err(RuntimeLoadError::BindingMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -461,7 +518,15 @@ pub fn prepare_runtime(now: u64) -> RuntimePreparation {
 }
 
 fn prepare_from_paths(paths: &RuntimePaths, now: u64) -> RuntimePreparation {
-    let _lock = match acquire_runtime_lock(paths, FlockArg::LockShared, 0) {
+    prepare_from_paths_for_owner(paths, now, 0)
+}
+
+fn prepare_from_paths_for_owner(
+    paths: &RuntimePaths,
+    now: u64,
+    expected_uid: u32,
+) -> RuntimePreparation {
+    let _lock = match acquire_runtime_lock(paths, FlockArg::LockShared, expected_uid) {
         Ok(lock) => lock,
         Err(error) => return RuntimePreparation::NotProvisioned(error),
     };
@@ -473,11 +538,12 @@ fn prepare_from_paths(paths: &RuntimePaths, now: u64) -> RuntimePreparation {
     {
         return RuntimePreparation::NotProvisioned(RuntimeLoadError::Quarantined);
     }
-    let authority_bytes = match read_artifact(
+    let authority_bytes = match read_artifact_for_runtime_owner(
         &paths.authority_root,
         &paths.authority_file,
         AUTHORITY_MODE,
         MAX_AUTHORITY_BYTES,
+        expected_uid,
     ) {
         Ok(bytes) => bytes,
         Err(error) => return RuntimePreparation::NotProvisioned(error),
@@ -493,11 +559,12 @@ fn prepare_from_paths(paths: &RuntimePaths, now: u64) -> RuntimePreparation {
     let root = authority.root;
     let authority_sha256: [u8; 32] = Sha256::digest(&authority_bytes).into();
 
-    let state_bytes = match read_artifact(
+    let state_bytes = match read_artifact_for_runtime_owner(
         &paths.activation_root,
         &paths.state_file,
         STATE_MODE,
         MAX_STATE_BYTES,
+        expected_uid,
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -524,6 +591,8 @@ fn prepare_from_paths(paths: &RuntimePaths, now: u64) -> RuntimePreparation {
                 state_disk.revision,
                 authority.revision,
                 authority_sha256,
+                paths.clone(),
+                expected_uid,
                 error,
             ) {
                 RuntimeBootstrap::Quarantined { controller, reason } => {
@@ -542,6 +611,8 @@ fn prepare_from_paths(paths: &RuntimePaths, now: u64) -> RuntimePreparation {
         authority,
         state_revision,
         authority_sha256,
+        paths: paths.clone(),
+        expected_uid,
     }))
 }
 
@@ -550,12 +621,16 @@ fn persist_quarantine(
     state_revision: u64,
     authority_revision: u64,
     authority_sha256: [u8; 32],
+    paths: RuntimePaths,
+    expected_uid: u32,
     reason: RuntimeLoadError,
 ) -> RuntimeBootstrap {
     let mut store = DurableStateStore {
         state_revision,
         authority_revision,
         authority_sha256,
+        paths,
+        expected_uid,
     };
     let persisted_reason = match store.commit(controller.snapshot()) {
         Ok(()) => reason,
@@ -614,6 +689,20 @@ pub(crate) fn read_artifact(
         return Err(RuntimeLoadError::ReadFailed);
     }
     Ok(bytes)
+}
+
+fn read_artifact_for_runtime_owner(
+    directory: &Path,
+    path: &Path,
+    expected_mode: u32,
+    max_bytes: u64,
+    expected_uid: u32,
+) -> Result<Vec<u8>, RuntimeLoadError> {
+    if expected_uid == 0 {
+        read_artifact(directory, path, expected_mode, max_bytes)
+    } else {
+        read_artifact_for_owner(directory, path, expected_mode, max_bytes, expected_uid)
+    }
 }
 
 pub(crate) fn read_artifact_for_owner(
@@ -732,25 +821,6 @@ fn file_identity(metadata: &Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
         metadata.mtime_nsec(),
         metadata.ctime(),
         metadata.ctime_nsec(),
-    )
-}
-
-fn persist_to_path(
-    directory: &Path,
-    destination: &Path,
-    snapshot: DurableStateSnapshot,
-    revision: u64,
-    authority_revision: u64,
-    authority_sha256: [u8; 32],
-) -> Result<(), RuntimeLoadError> {
-    validate_directory(directory)?;
-    persist_to_validated_path(
-        directory,
-        destination,
-        snapshot,
-        revision,
-        authority_revision,
-        authority_sha256,
     )
 }
 
@@ -1512,6 +1582,7 @@ fn hex_array<const N: usize>(value: &str) -> Result<[u8; N], RuntimeLoadError> {
 mod tests {
     use super::*;
     use crate::activation::ActivationError;
+    use std::sync::mpsc;
 
     const ROOT: VerifiedSigner = VerifiedSigner([1; 32]);
     const FIXTURE: VerifiedSigner = VerifiedSigner([2; 32]);
@@ -1625,6 +1696,102 @@ mod tests {
                 authenticated_signer: FIXTURE,
             }),
             ordinary: with_ordinary.then(ordinary_authority),
+        }
+    }
+
+    struct RuntimeFixture {
+        _temporary: tempfile::TempDir,
+        paths: RuntimePaths,
+        expected_uid: u32,
+    }
+
+    impl RuntimeFixture {
+        fn new() -> Self {
+            let temporary = tempfile::tempdir().unwrap();
+            let authority_root = temporary.path().join("authority");
+            let activation_root = temporary.path().join("activation");
+            fs::create_dir(&authority_root).unwrap();
+            fs::create_dir(&activation_root).unwrap();
+            fs::set_permissions(&authority_root, fs::Permissions::from_mode(DIRECTORY_MODE))
+                .unwrap();
+            fs::set_permissions(&activation_root, fs::Permissions::from_mode(DIRECTORY_MODE))
+                .unwrap();
+            let paths = RuntimePaths {
+                authority_file: authority_root.join("authority-v1.json"),
+                state_file: activation_root.join("state-v1.json"),
+                authority_root,
+                activation_root,
+            };
+            let authority = AuthorityFile::encode(7, ROOT, None, None).unwrap();
+            let authority_bytes = serde_json::to_vec(&authority).unwrap();
+            fs::write(&paths.authority_file, &authority_bytes).unwrap();
+            fs::set_permissions(
+                &paths.authority_file,
+                fs::Permissions::from_mode(AUTHORITY_MODE),
+            )
+            .unwrap();
+            persist_to_validated_path(
+                &paths.activation_root,
+                &paths.state_file,
+                ActivationController::new(ROOT).snapshot(),
+                1,
+                7,
+                Sha256::digest(&authority_bytes).into(),
+            )
+            .unwrap();
+            fs::write(paths.activation_root.join(COORDINATOR_LOCK_FILE), b"1").unwrap();
+            fs::set_permissions(
+                paths.activation_root.join(COORDINATOR_LOCK_FILE),
+                fs::Permissions::from_mode(STATE_MODE),
+            )
+            .unwrap();
+            Self {
+                expected_uid: nix::unistd::geteuid().as_raw(),
+                _temporary: temporary,
+                paths,
+            }
+        }
+
+        fn store(&self) -> DurableStateStore {
+            let prepared = match prepare_from_paths_for_owner(&self.paths, 20, self.expected_uid) {
+                RuntimePreparation::Prepared(prepared) => prepared,
+                RuntimePreparation::NotProvisioned(error) => {
+                    panic!("fixture was not provisioned: {error}")
+                }
+                RuntimePreparation::Quarantined { reason, .. } => {
+                    panic!("fixture was quarantined: {reason}")
+                }
+            };
+            let loaded = match prepared.restore(None) {
+                RuntimeBootstrap::Loaded(loaded) => loaded,
+                RuntimeBootstrap::NotProvisioned(error) => {
+                    panic!("fixture failed to load: {error}")
+                }
+                RuntimeBootstrap::Quarantined { reason, .. } => {
+                    panic!("fixture load quarantined: {reason}")
+                }
+            };
+            loaded.into_durable_parts().2
+        }
+
+        fn replace_authority(&self, authority: AuthorityFile) -> Vec<u8> {
+            let bytes = serde_json::to_vec(&authority).unwrap();
+            fs::set_permissions(
+                &self.paths.authority_file,
+                fs::Permissions::from_mode(STATE_MODE),
+            )
+            .unwrap();
+            fs::write(&self.paths.authority_file, &bytes).unwrap();
+            fs::set_permissions(
+                &self.paths.authority_file,
+                fs::Permissions::from_mode(AUTHORITY_MODE),
+            )
+            .unwrap();
+            bytes
+        }
+
+        fn state_bytes(&self) -> Vec<u8> {
+            fs::read(&self.paths.state_file).unwrap()
         }
     }
 
@@ -1873,8 +2040,149 @@ mod tests {
             },
             state_revision: u64::MAX,
             authority_sha256: [35; 32],
+            paths: RuntimePaths::canonical(),
+            expected_uid: 0,
         };
         assert_eq!(runtime.persist(), Err(RuntimeLoadError::PersistFailed));
+    }
+
+    #[test]
+    fn durable_store_commits_only_to_its_loaded_runtime_paths() {
+        let fixture = RuntimeFixture::new();
+        let mut store = fixture.store();
+
+        store
+            .commit(ActivationController::new(ROOT).snapshot())
+            .unwrap();
+
+        assert_eq!(store.revision(), 2);
+        let persisted: StateFile = serde_json::from_slice(&fixture.state_bytes()).unwrap();
+        assert_eq!(persisted.revision(), 2);
+    }
+
+    #[test]
+    fn durable_store_refuses_a_stale_state_revision_without_replacing_it() {
+        let fixture = RuntimeFixture::new();
+        let mut store = fixture.store();
+        let authority_bytes = fs::read(&fixture.paths.authority_file).unwrap();
+        persist_to_validated_path(
+            &fixture.paths.activation_root,
+            &fixture.paths.state_file,
+            ActivationController::new(ROOT).snapshot(),
+            2,
+            7,
+            Sha256::digest(authority_bytes).into(),
+        )
+        .unwrap();
+        let newer_state = fixture.state_bytes();
+
+        assert_eq!(
+            store.commit(ActivationController::new(ROOT).snapshot()),
+            Err(RuntimeLoadError::BindingMismatch)
+        );
+        assert_eq!(store.revision(), 1);
+        assert_eq!(fixture.state_bytes(), newer_state);
+    }
+
+    #[test]
+    fn durable_store_refuses_changed_authority_bytes_and_revision() {
+        for replacement in [
+            AuthorityFile::encode(7, VerifiedSigner([9; 32]), None, None).unwrap(),
+            AuthorityFile::encode(8, ROOT, None, None).unwrap(),
+        ] {
+            let fixture = RuntimeFixture::new();
+            let mut store = fixture.store();
+            fixture.replace_authority(replacement);
+            let state_before = fixture.state_bytes();
+
+            assert_eq!(
+                store.commit(ActivationController::new(ROOT).snapshot()),
+                Err(RuntimeLoadError::BindingMismatch)
+            );
+            assert_eq!(store.revision(), 1);
+            assert_eq!(fixture.state_bytes(), state_before);
+        }
+    }
+
+    #[test]
+    fn durable_store_refuses_a_pending_pair_publication_marker() {
+        let fixture = RuntimeFixture::new();
+        let mut store = fixture.store();
+        let marker = fixture.paths.activation_root.join(COORDINATOR_MARKER_FILE);
+        fs::write(&marker, b"pending-v1").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(STATE_MODE)).unwrap();
+        let state_before = fixture.state_bytes();
+
+        assert_eq!(
+            store.commit(ActivationController::new(ROOT).snapshot()),
+            Err(RuntimeLoadError::Quarantined)
+        );
+        assert_eq!(store.revision(), 1);
+        assert_eq!(fixture.state_bytes(), state_before);
+    }
+
+    #[test]
+    fn coordinator_rotation_wins_the_lock_race_against_a_stale_daemon_commit() {
+        let fixture = RuntimeFixture::new();
+        let mut store = fixture.store();
+        let lock = acquire_runtime_lock(
+            &fixture.paths,
+            FlockArg::LockExclusive,
+            fixture.expected_uid,
+        )
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let daemon = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = store.commit(ActivationController::new(ROOT).snapshot());
+            (result, store.revision())
+        });
+        started_rx.recv().unwrap();
+
+        let marker = fixture.paths.activation_root.join(COORDINATOR_MARKER_FILE);
+        fs::write(&marker, b"pending-v1").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(STATE_MODE)).unwrap();
+        let authority_bytes =
+            fixture.replace_authority(AuthorityFile::encode(8, ROOT, None, None).unwrap());
+        persist_to_validated_path(
+            &fixture.paths.activation_root,
+            &fixture.paths.state_file,
+            ActivationController::new(ROOT).snapshot(),
+            2,
+            8,
+            Sha256::digest(authority_bytes).into(),
+        )
+        .unwrap();
+        fs::remove_file(marker).unwrap();
+        let rotated_authority = fs::read(&fixture.paths.authority_file).unwrap();
+        let rotated_state = fixture.state_bytes();
+        drop(lock);
+
+        let (result, revision) = daemon.join().unwrap();
+        assert_eq!(result, Err(RuntimeLoadError::BindingMismatch));
+        assert_eq!(revision, 1);
+        assert_eq!(
+            fs::read(&fixture.paths.authority_file).unwrap(),
+            rotated_authority
+        );
+        assert_eq!(fixture.state_bytes(), rotated_state);
+    }
+
+    #[test]
+    fn stale_state_temporary_refuses_without_unlinking_or_replacing() {
+        let fixture = RuntimeFixture::new();
+        let mut store = fixture.store();
+        let temporary = fixture.paths.activation_root.join(".state-v1.json.tmp");
+        fs::write(&temporary, b"untrusted-stale-temporary").unwrap();
+        let state_before = fixture.state_bytes();
+
+        assert_eq!(
+            store.commit(ActivationController::new(ROOT).snapshot()),
+            Err(RuntimeLoadError::PersistFailed)
+        );
+        assert_eq!(store.revision(), 1);
+        assert_eq!(fixture.state_bytes(), state_before);
+        assert_eq!(fs::read(temporary).unwrap(), b"untrusted-stale-temporary");
     }
 
     #[test]
