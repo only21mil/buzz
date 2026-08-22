@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 pub const ROOT_ONLY_DIRECTORY_MODE: u32 = 0o700;
@@ -16,6 +16,8 @@ pub const SECCOMP_PROFILE_PATH: &str = "/var/lib/buzzci/seccomp/v1/sha256/2598b3
 pub const SECCOMP_PROFILE_SHA256: &str =
     "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4";
 const MAX_JSONL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RECOVERY_JSON_BYTES: u64 = 64 * 1024;
+const MAX_RECOVERY_ORDERING_BYTES: u64 = 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
@@ -45,6 +47,8 @@ pub struct LeasePaths {
     pub proxy_decisions: PathBuf,
     pub proxy_objects: PathBuf,
     pub ordering: PathBuf,
+    pub recovery_authority: PathBuf,
+    pub terminal: PathBuf,
     pub teardown: PathBuf,
     pub reconcile: PathBuf,
 }
@@ -60,6 +64,8 @@ impl LeasePaths {
             proxy_decisions: root.join("proxy/decisions.jsonl"),
             proxy_objects: root.join("proxy/objects"),
             ordering: root.join("ordering.jsonl"),
+            recovery_authority: root.join("recovery-authority.json"),
+            terminal: root.join("terminal.json"),
             teardown: root.join("teardown.json"),
             reconcile: root.join("reconcile.json"),
             root,
@@ -379,6 +385,48 @@ pub struct OrderingRecord {
     pub verdict_event_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalConclusion {
+    Success,
+    Failure,
+    Cancelled,
+    TimedOut,
+    InfrastructureFailure,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryAuthorityRecord {
+    pub schema_version: u16,
+    pub lease_id: String,
+    pub controller_lease_id: [u8; 16],
+    pub run_id: [u8; 16],
+    pub attempt: u32,
+    pub signed_request_digest: Digest32,
+    pub signer: Digest32,
+    pub generation: u64,
+    pub deadline_at: u64,
+    pub request_context_sha256: Digest32,
+    pub admission_context_sha256: Digest32,
+    pub lease_context_sha256: Digest32,
+    pub plan_identity_sha256: Digest32,
+    pub validation_authority_sha256: Digest32,
+    pub event_binding: CiEventBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalRecord {
+    pub schema_version: u16,
+    pub lease_id: String,
+    pub event_binding: CiEventBinding,
+    pub recovery_authority_sha256: Digest32,
+    pub conclusion: TerminalConclusion,
+    pub evidence_set_digest: Digest32,
+    pub completed_at_unix_ns: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TeardownRecord {
     pub lease_id: String,
@@ -431,6 +479,21 @@ pub struct ReconcileRecord {
     pub quarantined_resources: Vec<ReconciledResource>,
     pub reuse_allowed: bool,
     pub observed_at_unix_ns: u64,
+}
+
+/// Root-owned evidence recovered for one exact durable lease.
+pub enum RecoveryEvidence {
+    AuthorityOnly {
+        authority: RecoveryAuthorityRecord,
+    },
+    Provisioned {
+        lease: Box<LeaseRecord>,
+        authority: Box<RecoveryAuthorityRecord>,
+        terminal: Option<TerminalRecord>,
+        ordering: Vec<OrderingRecord>,
+        teardown: Option<TeardownRecord>,
+        reconcile: Option<ReconcileRecord>,
+    },
 }
 
 pub struct EvidenceStore {
@@ -521,34 +584,32 @@ impl EvidenceStore {
 
     pub fn append_ordering(&self, value: &OrderingRecord) -> Result<(), PublicationError> {
         self.require_record_lease(&value.lease_id)?;
-        validate_event_binding(value.event_binding)?;
-        if value.sequence == 0
-            || value.timestamp_unix_ns == 0
-            || value
-                .object_id
-                .as_deref()
-                .is_some_and(|object_id| !safe_identifier(object_id))
-            || (value.event == OrderingEvent::Start && value.object_id.is_none())
-        {
-            return Err(PublicationError::RecordMismatch);
-        }
+        validate_ordering_record(value)?;
         let path = self.paths(&value.lease_id)?.ordering;
         validate_ordering_transition(&path, value)?;
         append_ordered_jsonl(&path, value.sequence, value)
     }
 
+    pub fn publish_recovery_authority(
+        &self,
+        value: &RecoveryAuthorityRecord,
+    ) -> Result<(), PublicationError> {
+        validate_recovery_authority(value)?;
+        let paths = self.paths(&value.lease_id)?;
+        create_owned_dir(&self.state_root)?;
+        create_owned_dir(&paths.root)?;
+        publish_json_once(&paths.recovery_authority, value)
+    }
+
+    pub fn publish_terminal(&self, value: &TerminalRecord) -> Result<(), PublicationError> {
+        self.require_record_lease(&value.lease_id)?;
+        validate_terminal(value)?;
+        publish_json_once(&self.paths(&value.lease_id)?.terminal, value)
+    }
+
     pub fn publish_teardown(&self, value: &TeardownRecord) -> Result<(), PublicationError> {
         self.require_record_lease(&value.lease_id)?;
-        validate_event_binding(value.event_binding)?;
-        if !safe_cgroup_path(&value.cgroup_path)
-            || is_zero_digest(value.teardown_sha256)
-            || !value.unit_inactive
-            || !value.cgroup_procs_empty
-            || !value.mounts_removed
-            || !value.dirs_removed
-        {
-            return Err(PublicationError::RecordMismatch);
-        }
+        validate_teardown(value)?;
         publish_json(&self.paths(&value.lease_id)?.teardown, value)
     }
 
@@ -558,6 +619,85 @@ impl EvidenceStore {
         publish_json(&self.paths(&value.lease_id)?.reconcile, value)
     }
 
+    /// Read the bounded broker-owned recovery set without following evidence
+    /// symlinks. A directory containing only exact authority is a partial provision.
+    pub fn read_recovery(
+        &self,
+        lease_id: &str,
+    ) -> Result<Option<RecoveryEvidence>, PublicationError> {
+        let paths = self.paths(lease_id)?;
+        let owner_uid = nix::unistd::geteuid().as_raw();
+        let owner_gid = nix::unistd::getegid().as_raw();
+        if !secure_directory_if_present(&self.state_root, owner_uid, owner_gid)?
+            || !secure_directory_if_present(&paths.root, owner_uid, owner_gid)?
+        {
+            return Ok(None);
+        }
+
+        let authority = read_required_json::<RecoveryAuthorityRecord>(
+            &paths.recovery_authority,
+            owner_uid,
+            owner_gid,
+            MAX_RECOVERY_JSON_BYTES,
+        )?;
+        validate_recovery_authority(&authority)?;
+        let Some(lease) = read_optional_json::<LeaseRecord>(
+            &paths.lease,
+            owner_uid,
+            owner_gid,
+            MAX_RECOVERY_JSON_BYTES,
+        )?
+        else {
+            require_authority_only_directory(&paths.root)?;
+            return Ok(Some(RecoveryEvidence::AuthorityOnly { authority }));
+        };
+        validate_lease_record(&lease)?;
+        if lease.lease_id != lease_id {
+            return Err(PublicationError::RecordMismatch);
+        }
+        let terminal = read_optional_json::<TerminalRecord>(
+            &paths.terminal,
+            owner_uid,
+            owner_gid,
+            MAX_RECOVERY_JSON_BYTES,
+        )?;
+        if let Some(value) = &terminal {
+            validate_terminal(value)?;
+        }
+        let teardown = read_optional_json::<TeardownRecord>(
+            &paths.teardown,
+            owner_uid,
+            owner_gid,
+            MAX_RECOVERY_JSON_BYTES,
+        )?;
+        if let Some(value) = &teardown {
+            validate_teardown(value)?;
+        }
+        let reconcile = read_optional_json::<ReconcileRecord>(
+            &paths.reconcile,
+            owner_uid,
+            owner_gid,
+            MAX_RECOVERY_JSON_BYTES,
+        )?;
+        if let Some(value) = &reconcile {
+            validate_reconcile(value)?;
+        }
+        let ordering = read_ordering(
+            &paths.ordering,
+            owner_uid,
+            owner_gid,
+            MAX_RECOVERY_ORDERING_BYTES,
+        )?;
+        Ok(Some(RecoveryEvidence::Provisioned {
+            lease: Box::new(lease),
+            authority: Box::new(authority),
+            terminal,
+            ordering,
+            teardown,
+            reconcile,
+        }))
+    }
+
     fn require_record_lease(&self, lease_id: &str) -> Result<(), PublicationError> {
         let paths = self.paths(lease_id)?;
         if !paths.lease.is_file() {
@@ -565,6 +705,93 @@ impl EvidenceStore {
         }
         Ok(())
     }
+}
+
+fn require_authority_only_directory(path: &Path) -> Result<(), PublicationError> {
+    let entries = fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if entries.as_slice() != [std::ffi::OsStr::new("recovery-authority.json")] {
+        return Err(PublicationError::RecordMismatch);
+    }
+    Ok(())
+}
+
+fn validate_ordering_record(value: &OrderingRecord) -> Result<(), PublicationError> {
+    validate_event_binding(value.event_binding)?;
+    let status_valid = value
+        .status_event_id
+        .as_deref()
+        .is_some_and(valid_external_event_id);
+    let verdict_valid = value
+        .verdict_event_id
+        .as_deref()
+        .is_some_and(valid_external_event_id);
+    if value.sequence == 0
+        || value.timestamp_unix_ns == 0
+        || value
+            .object_id
+            .as_deref()
+            .is_some_and(|object_id| !safe_identifier(object_id))
+        || (value.event == OrderingEvent::Start && value.object_id.is_none())
+        || (value.event == OrderingEvent::Publish && (!status_valid || !verdict_valid))
+        || (value.event != OrderingEvent::Publish
+            && (value.status_event_id.is_some() && !status_valid
+                || value.verdict_event_id.is_some() && !verdict_valid))
+    {
+        return Err(PublicationError::RecordMismatch);
+    }
+    Ok(())
+}
+
+fn validate_terminal(value: &TerminalRecord) -> Result<(), PublicationError> {
+    validate_lease_id(&value.lease_id)?;
+    validate_event_binding(value.event_binding)?;
+    if value.schema_version != 1
+        || is_zero_digest(value.recovery_authority_sha256)
+        || is_zero_digest(value.evidence_set_digest)
+        || value.completed_at_unix_ns == 0
+    {
+        return Err(PublicationError::RecordMismatch);
+    }
+    Ok(())
+}
+
+fn validate_recovery_authority(value: &RecoveryAuthorityRecord) -> Result<(), PublicationError> {
+    validate_lease_id(&value.lease_id)?;
+    validate_event_binding(value.event_binding)?;
+    if value.schema_version != 1
+        || value.controller_lease_id == [0; 16]
+        || value.run_id == [0; 16]
+        || value.attempt == 0
+        || is_zero_digest(value.signed_request_digest)
+        || is_zero_digest(value.signer)
+        || value.generation == 0
+        || value.deadline_at == 0
+        || is_zero_digest(value.request_context_sha256)
+        || is_zero_digest(value.admission_context_sha256)
+        || is_zero_digest(value.lease_context_sha256)
+        || is_zero_digest(value.plan_identity_sha256)
+        || is_zero_digest(value.validation_authority_sha256)
+    {
+        return Err(PublicationError::RecordMismatch);
+    }
+    Ok(())
+}
+
+fn validate_teardown(value: &TeardownRecord) -> Result<(), PublicationError> {
+    validate_lease_id(&value.lease_id)?;
+    validate_event_binding(value.event_binding)?;
+    if !safe_cgroup_path(&value.cgroup_path)
+        || is_zero_digest(value.teardown_sha256)
+        || !value.unit_inactive
+        || !value.cgroup_procs_empty
+        || !value.mounts_removed
+        || !value.dirs_removed
+    {
+        return Err(PublicationError::RecordMismatch);
+    }
+    Ok(())
 }
 
 fn validate_ordering_transition(
@@ -617,6 +844,133 @@ fn validate_ordering_transition(
         None if value.event == OrderingEvent::Reconcile && last_terminal == Some(8) => Ok(()),
         None => Err(PublicationError::SequenceViolation),
     }
+}
+
+fn secure_directory_if_present(
+    path: &Path,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<bool, PublicationError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != owner_uid
+        || metadata.gid() != owner_gid
+        || metadata.permissions().mode() & 0o7777 != ROOT_ONLY_DIRECTORY_MODE
+    {
+        return Err(PublicationError::RecordMismatch);
+    }
+    Ok(true)
+}
+
+fn read_required_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    owner_uid: u32,
+    owner_gid: u32,
+    max_bytes: u64,
+) -> Result<T, PublicationError> {
+    let bytes = read_owned_file(path, owner_uid, owner_gid, max_bytes, false)?
+        .ok_or(PublicationError::RecordMismatch)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_optional_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    owner_uid: u32,
+    owner_gid: u32,
+    max_bytes: u64,
+) -> Result<Option<T>, PublicationError> {
+    read_owned_file(path, owner_uid, owner_gid, max_bytes, false)?
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(PublicationError::from))
+        .transpose()
+}
+
+fn read_ordering(
+    path: &Path,
+    owner_uid: u32,
+    owner_gid: u32,
+    max_bytes: u64,
+) -> Result<Vec<OrderingRecord>, PublicationError> {
+    let bytes = read_owned_file(path, owner_uid, owner_gid, max_bytes, true)?
+        .ok_or(PublicationError::RecordMismatch)?;
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(PublicationError::RecordMismatch);
+    }
+    let mut records = Vec::new();
+    let mut previous_timestamp = 0;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let record: OrderingRecord = serde_json::from_slice(line)?;
+        validate_ordering_record(&record)?;
+        if record.sequence != records.len() as u64 + 1
+            || record.timestamp_unix_ns <= previous_timestamp
+        {
+            return Err(PublicationError::SequenceViolation);
+        }
+        previous_timestamp = record.timestamp_unix_ns;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn read_owned_file(
+    path: &Path,
+    owner_uid: u32,
+    owner_gid: u32,
+    max_bytes: u64,
+    allow_empty: bool,
+) -> Result<Option<Vec<u8>>, PublicationError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let before = file.metadata()?;
+    if !before.file_type().is_file()
+        || before.uid() != owner_uid
+        || before.gid() != owner_gid
+        || before.nlink() != 1
+        || before.permissions().mode() & 0o7777 != ROOT_READ_ONLY_FILE_MODE
+        || (!allow_empty && before.len() == 0)
+        || before.len() > max_bytes
+    {
+        return Err(PublicationError::RecordMismatch);
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(PublicationError::LogTooLarge);
+    }
+    let after = file.metadata()?;
+    if evidence_file_identity(&before) != evidence_file_identity(&after)
+        || after.len() != bytes.len() as u64
+    {
+        return Err(PublicationError::RecordMismatch);
+    }
+    Ok(Some(bytes))
+}
+
+fn evidence_file_identity(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
 }
 
 fn terminal_order(event: OrderingEvent) -> Option<u8> {
@@ -1003,6 +1357,29 @@ fn publish_json<T: Serialize>(destination: &Path, value: &T) -> Result<(), Publi
     atomic_publish(destination, &bytes, ROOT_READ_ONLY_FILE_MODE)
 }
 
+fn publish_json_once<T>(destination: &Path, value: &T) -> Result<(), PublicationError>
+where
+    T: DeserializeOwned + Eq + Serialize,
+{
+    let owner_uid = nix::unistd::geteuid().as_raw();
+    let owner_gid = nix::unistd::getegid().as_raw();
+    if let Some(bytes) = read_owned_file(
+        destination,
+        owner_uid,
+        owner_gid,
+        MAX_RECOVERY_JSON_BYTES,
+        false,
+    )? {
+        let existing: T = serde_json::from_slice(&bytes)?;
+        return if existing == *value {
+            Ok(())
+        } else {
+            Err(PublicationError::RecordMismatch)
+        };
+    }
+    publish_json(destination, value)
+}
+
 fn append_ordered_jsonl<T: Serialize>(
     destination: &Path,
     sequence: u64,
@@ -1256,6 +1633,11 @@ pub(crate) mod tests {
             paths.root.join("proxy/objects/7.json")
         );
         assert_eq!(paths.ordering, paths.root.join("ordering.jsonl"));
+        assert_eq!(
+            paths.recovery_authority,
+            paths.root.join("recovery-authority.json")
+        );
+        assert_eq!(paths.terminal, paths.root.join("terminal.json"));
         assert_eq!(paths.teardown, paths.root.join("teardown.json"));
         assert_eq!(paths.reconcile, paths.root.join("reconcile.json"));
         assert_eq!(paths.lease, paths.root.join("lease.json"));

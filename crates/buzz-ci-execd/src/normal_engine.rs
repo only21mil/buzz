@@ -13,6 +13,7 @@ use buzz_ci_broker_protocol::{
 use buzz_ci_isolation_contract::{
     AttemptLeaseBinding, Phase1ValidationContext, ValidatedAttemptLeaseBinding,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     activation::{
@@ -25,10 +26,13 @@ use crate::{
     },
     evidence::{
         CiEventBinding, Digest32, DnsReadback, EvidenceStore, LeaseRecord, OrderingEvent,
-        OrderingRecord, ReconcileRecord, ReconcileState, TeardownRecord,
+        OrderingRecord, ReconcileRecord, ReconcileState, RecoveryAuthorityRecord, RecoveryEvidence,
+        TeardownRecord, TerminalConclusion, TerminalRecord,
     },
 };
 
+const PROVISIONED_SEQUENCE: [OrderingEvent; 2] =
+    [OrderingEvent::ProxyObjectRecorded, OrderingEvent::Start];
 const FIRST_TERMINAL_SEQUENCE: u64 = 3;
 /// Reviewed `nektos/act` v0.2.89 Linux x86_64 binary digest.
 pub const PINNED_ACT_SHA256: &str =
@@ -222,6 +226,16 @@ pub trait NormalJobSource {
         request: AdmitAttemptRequest,
         admission: OrdinaryAdmission,
     ) -> Result<NormalJobPlan, ExecutionUnavailable>;
+
+    /// Reconstruct the plan for the exact durable lease. The source must
+    /// reject every lease coordinate, including generation and deadline, that
+    /// differs from its root-owned recovery authority.
+    fn recover(
+        &mut self,
+        request: AdmitAttemptRequest,
+        admission: OrdinaryAdmission,
+        lease: LeaseToken,
+    ) -> Result<NormalJobPlan, ExecutionUnavailable>;
 }
 
 /// Host lifecycle operations behind the closed normal engine.
@@ -302,6 +316,7 @@ struct ActiveJob {
     lease: LeaseToken,
     plan: NormalJobPlan,
     binding: ValidatedAttemptLeaseBinding,
+    recovery_authority_sha256: Digest32,
     terminal_published: bool,
     provision_complete: bool,
 }
@@ -375,15 +390,22 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
             lease,
             plan: prepared.plan,
             binding: prepared.binding,
+            recovery_authority_sha256: Digest32([0; 32]),
             terminal_published: false,
             provision_complete: false,
         });
 
         let active = self.active.as_mut().ok_or(ExecutionUnavailable)?;
-        let dns = self.backend.apply_dns(admission, lease, &active.binding)?;
-        active.plan.lease_record.dns_readback = dns;
+        let recovery_authority = recovery_authority(request, admission, lease, &active.plan)?;
+        let recovery_authority_sha256 = recovery_authority_digest(&recovery_authority);
         let store = EvidenceStore::new(active.plan.evidence_root.clone())
             .map_err(|_| ExecutionUnavailable)?;
+        store
+            .publish_recovery_authority(&recovery_authority)
+            .map_err(|_| ExecutionUnavailable)?;
+        active.recovery_authority_sha256 = recovery_authority_sha256;
+        let dns = self.backend.apply_dns(admission, lease, &active.binding)?;
+        active.plan.lease_record.dns_readback = dns;
         store
             .initialize_lease(&active.plan.lease_record)
             .map_err(|_| ExecutionUnavailable)?;
@@ -402,6 +424,21 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
         admission: OrdinaryAdmission,
         lease: LeaseToken,
     ) -> Result<OrdinaryReceipts, ExecutionUnavailable> {
+        if self.active.is_none() {
+            let (active, evidence) = self.recover_active(request, admission, lease)?;
+            match recovered_progress(&active.plan, &evidence)? {
+                RecoveredProgress::Provisioned => self.active = Some(active),
+                RecoveredProgress::Terminal(receipts) => {
+                    self.active = Some(active);
+                    return Ok(receipts);
+                }
+                RecoveredProgress::AuthorityOnly
+                | RecoveredProgress::Clean(_)
+                | RecoveredProgress::Ambiguous => {
+                    return Err(ExecutionUnavailable);
+                }
+            }
+        }
         let active = self.active.as_mut().ok_or(ExecutionUnavailable)?;
         if active.request != request
             || active.admission != admission
@@ -424,6 +461,22 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
         )?;
         let store = EvidenceStore::new(active.plan.evidence_root.clone())
             .map_err(|_| ExecutionUnavailable)?;
+        let completed_at_unix_ns = terminal
+            .ordering
+            .last()
+            .map(|record| record.timestamp_unix_ns)
+            .ok_or(ExecutionUnavailable)?;
+        store
+            .publish_terminal(&TerminalRecord {
+                schema_version: 1,
+                lease_id: active.plan.binding.lease_id.clone(),
+                event_binding: active.plan.event_binding,
+                recovery_authority_sha256: active.recovery_authority_sha256,
+                conclusion: terminal_conclusion(terminal.conclusion),
+                evidence_set_digest: Digest32(terminal.evidence_set_digest),
+                completed_at_unix_ns,
+            })
+            .map_err(|_| ExecutionUnavailable)?;
         append_ordering(&store, &terminal.ordering)?;
         active.terminal_published = true;
         Ok(OrdinaryReceipts {
@@ -439,6 +492,32 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
         lease: LeaseToken,
         stop: OrdinaryStop,
     ) -> Result<OrdinaryCleanup, ExecutionUnavailable> {
+        if self.active.is_none() {
+            if self.prepared.is_some() {
+                return Err(ExecutionUnavailable);
+            }
+            let (active, evidence) = match self.recover_active(request, admission, lease) {
+                Ok(recovered) => recovered,
+                Err(ExecutionUnavailable) => return Ok(ambiguous_cleanup()),
+            };
+            match recovered_progress(&active.plan, &evidence) {
+                Ok(RecoveredProgress::AuthorityOnly) => {
+                    if matches!(stop, OrdinaryStop::Recovery | OrdinaryStop::Expired) {
+                        let _ = self.backend.reconcile(lease, stop);
+                    }
+                    return Ok(ambiguous_cleanup());
+                }
+                Ok(RecoveredProgress::Clean(cleanup)) => return Ok(cleanup),
+                Ok(RecoveredProgress::Ambiguous) | Err(ExecutionUnavailable) => {
+                    return Ok(ambiguous_cleanup());
+                }
+                Ok(RecoveredProgress::Provisioned) => {
+                    let _ = self.backend.reconcile(lease, stop);
+                    return Ok(ambiguous_cleanup());
+                }
+                Ok(RecoveredProgress::Terminal(_)) => self.active = Some(active),
+            }
+        }
         let active = self.active.take().ok_or(ExecutionUnavailable)?;
         if active.request != request || active.admission != admission || active.lease != lease {
             self.active = Some(active);
@@ -479,6 +558,409 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
             disposition: CleanupDisposition::Clean,
             teardown_digest: cleanup.teardown.teardown_sha256.0,
         })
+    }
+}
+
+impl<S: NormalJobSource, B> ProductionOrdinaryEngine<S, B> {
+    fn recover_active(
+        &mut self,
+        request: AdmitAttemptRequest,
+        admission: OrdinaryAdmission,
+        lease: LeaseToken,
+    ) -> Result<(ActiveJob, RecoveryEvidence), ExecutionUnavailable> {
+        if self.prepared.is_some() || !lease_matches(admission, lease) {
+            return Err(ExecutionUnavailable);
+        }
+        let plan = self.source.recover(request, admission, lease)?;
+        plan.validate_identity(request, admission)?;
+        let binding = plan
+            .binding
+            .clone()
+            .validate_phase1(&plan.validation.context())
+            .map_err(|_| ExecutionUnavailable)?;
+        let store =
+            EvidenceStore::new(plan.evidence_root.clone()).map_err(|_| ExecutionUnavailable)?;
+        let evidence = store
+            .read_recovery(&plan.binding.lease_id)
+            .map_err(|_| ExecutionUnavailable)?
+            .ok_or(ExecutionUnavailable)?;
+        let expected_authority = recovery_authority(request, admission, lease, &plan)?;
+        let authority = match &evidence {
+            RecoveryEvidence::AuthorityOnly { authority } => authority,
+            RecoveryEvidence::Provisioned { authority, .. } => authority.as_ref(),
+        };
+        if *authority != expected_authority {
+            return Err(ExecutionUnavailable);
+        }
+        let recovery_authority_sha256 = recovery_authority_digest(&expected_authority);
+        let (terminal_published, provision_complete) = match &evidence {
+            RecoveryEvidence::AuthorityOnly { .. } => (false, false),
+            RecoveryEvidence::Provisioned {
+                lease, terminal, ..
+            } => {
+                if !recovered_lease_matches(&plan, lease)
+                    || terminal.as_ref().is_some_and(|terminal| {
+                        terminal.recovery_authority_sha256 != recovery_authority_sha256
+                    })
+                {
+                    return Err(ExecutionUnavailable);
+                }
+                (terminal.is_some(), true)
+            }
+        };
+        Ok((
+            ActiveJob {
+                request,
+                admission,
+                lease,
+                plan,
+                binding,
+                recovery_authority_sha256,
+                terminal_published,
+                provision_complete,
+            },
+            evidence,
+        ))
+    }
+}
+
+enum RecoveredProgress {
+    AuthorityOnly,
+    Provisioned,
+    Terminal(OrdinaryReceipts),
+    Clean(OrdinaryCleanup),
+    Ambiguous,
+}
+
+fn recovered_progress(
+    plan: &NormalJobPlan,
+    evidence: &RecoveryEvidence,
+) -> Result<RecoveredProgress, ExecutionUnavailable> {
+    let RecoveryEvidence::Provisioned {
+        terminal,
+        ordering,
+        teardown,
+        reconcile,
+        ..
+    } = evidence
+    else {
+        return Ok(RecoveredProgress::AuthorityOnly);
+    };
+    validate_ordering_batch(
+        ordering
+            .get(..PROVISIONED_SEQUENCE.len())
+            .ok_or(ExecutionUnavailable)?,
+        &PROVISIONED_SEQUENCE,
+        1,
+        plan.event_binding,
+        &plan.binding.lease_id,
+    )?;
+    let terminal_end = PROVISIONED_SEQUENCE.len() + TERMINAL_PREFIX.len();
+    let suffix_end = terminal_end + TERMINAL_SUFFIX.len();
+    let has_terminal_order = ordering.len() >= terminal_end;
+    if has_terminal_order {
+        validate_ordering_batch(
+            &ordering[PROVISIONED_SEQUENCE.len()..terminal_end],
+            &TERMINAL_PREFIX,
+            FIRST_TERMINAL_SEQUENCE,
+            plan.event_binding,
+            &plan.binding.lease_id,
+        )?;
+    }
+    let receipts = match (terminal, has_terminal_order) {
+        (None, false) if ordering.len() == PROVISIONED_SEQUENCE.len() => None,
+        (Some(terminal), true) if ordering.len() >= terminal_end => {
+            let final_terminal = &ordering[terminal_end - 1];
+            if terminal.lease_id != plan.binding.lease_id
+                || terminal.event_binding != plan.event_binding
+                || terminal.completed_at_unix_ns != final_terminal.timestamp_unix_ns
+            {
+                return Err(ExecutionUnavailable);
+            }
+            Some(OrdinaryReceipts {
+                conclusion: lease_conclusion(terminal.conclusion),
+                evidence_set_digest: terminal.evidence_set_digest.0,
+            })
+        }
+        _ => return Err(ExecutionUnavailable),
+    };
+
+    match (teardown, reconcile) {
+        (None, None) if ordering.len() == PROVISIONED_SEQUENCE.len() => {
+            Ok(RecoveredProgress::Provisioned)
+        }
+        (None, None) if ordering.len() == terminal_end => Ok(RecoveredProgress::Terminal(
+            receipts.ok_or(ExecutionUnavailable)?,
+        )),
+        (Some(teardown), Some(reconcile)) if ordering.len() == suffix_end => {
+            validate_ordering_batch(
+                &ordering[terminal_end..suffix_end],
+                &TERMINAL_SUFFIX,
+                FIRST_TERMINAL_SEQUENCE + TERMINAL_PREFIX.len() as u64,
+                plan.event_binding,
+                &plan.binding.lease_id,
+            )?;
+            if cleanup_matches(plan, teardown, reconcile) {
+                Ok(RecoveredProgress::Clean(OrdinaryCleanup {
+                    disposition: CleanupDisposition::Clean,
+                    teardown_digest: teardown.teardown_sha256.0,
+                }))
+            } else {
+                Ok(RecoveredProgress::Ambiguous)
+            }
+        }
+        _ => Err(ExecutionUnavailable),
+    }
+}
+
+fn recovery_authority(
+    request: AdmitAttemptRequest,
+    admission: OrdinaryAdmission,
+    lease: LeaseToken,
+    plan: &NormalJobPlan,
+) -> Result<RecoveryAuthorityRecord, ExecutionUnavailable> {
+    Ok(RecoveryAuthorityRecord {
+        schema_version: 1,
+        lease_id: plan.binding.lease_id.clone(),
+        controller_lease_id: lease.lease_id(),
+        run_id: lease.run_id(),
+        attempt: lease.attempt(),
+        signed_request_digest: Digest32(lease.signed_request_digest()),
+        signer: Digest32(lease.signer().0),
+        generation: lease.generation(),
+        deadline_at: lease.deadline_at(),
+        request_context_sha256: hash_request_context(request),
+        admission_context_sha256: hash_admission_context(admission),
+        lease_context_sha256: hash_lease_context(lease),
+        plan_identity_sha256: hash_plan_identity(plan)?,
+        validation_authority_sha256: hash_validation_authority(&plan.validation),
+        event_binding: plan.event_binding,
+    })
+}
+
+fn recovery_authority_digest(authority: &RecoveryAuthorityRecord) -> Digest32 {
+    let mut bytes = canonical_domain(b"buzz-ci-recovery-authority-v1");
+    canonical_u16(&mut bytes, authority.schema_version);
+    canonical_text(&mut bytes, &authority.lease_id);
+    bytes.extend_from_slice(&authority.controller_lease_id);
+    bytes.extend_from_slice(&authority.run_id);
+    canonical_u32(&mut bytes, authority.attempt);
+    bytes.extend_from_slice(&authority.signed_request_digest.0);
+    bytes.extend_from_slice(&authority.signer.0);
+    canonical_u64(&mut bytes, authority.generation);
+    canonical_u64(&mut bytes, authority.deadline_at);
+    bytes.extend_from_slice(&authority.request_context_sha256.0);
+    bytes.extend_from_slice(&authority.admission_context_sha256.0);
+    bytes.extend_from_slice(&authority.lease_context_sha256.0);
+    bytes.extend_from_slice(&authority.plan_identity_sha256.0);
+    bytes.extend_from_slice(&authority.validation_authority_sha256.0);
+    canonical_event_binding(&mut bytes, authority.event_binding);
+    sha256(&bytes)
+}
+
+fn hash_request_context(request: AdmitAttemptRequest) -> Digest32 {
+    let mut bytes = canonical_domain(b"buzz-ci-admit-attempt-request-v1");
+    bytes.extend_from_slice(&request.signed_request_digest);
+    bytes.extend_from_slice(&request.actor_pubkey);
+    bytes.extend_from_slice(&request.audience_digest);
+    bytes.extend_from_slice(&request.idempotency_digest);
+    bytes.extend_from_slice(&request.source_pin_event_id);
+    bytes.extend_from_slice(&request.workflow_digest);
+    bytes.extend_from_slice(&request.job_manifest_digest);
+    bytes.extend_from_slice(&request.isolation_profile_digest);
+    bytes.extend_from_slice(&request.run_id);
+    canonical_git_oid(&mut bytes, request.tip_oid);
+    canonical_git_oid(&mut bytes, request.base_oid);
+    canonical_u64(&mut bytes, request.issued_at);
+    canonical_u64(&mut bytes, request.expires_at);
+    canonical_u32(&mut bytes, request.wall_timeout_seconds);
+    canonical_u32(&mut bytes, request.attempt);
+    canonical_u32(&mut bytes, request.parent_attempt);
+    bytes.push(request.trust_class as u8);
+    sha256(&bytes)
+}
+
+fn hash_admission_context(admission: OrdinaryAdmission) -> Digest32 {
+    let mut bytes = canonical_domain(b"buzz-ci-ordinary-admission-v1");
+    canonical_git_oid(&mut bytes, admission.host.integrated_candidate_sha);
+    bytes.extend_from_slice(&admission.host.broker_build_identity);
+    bytes.extend_from_slice(&admission.host.host_profile_digest);
+    bytes.extend_from_slice(&admission.host.suite_identity);
+    bytes.extend_from_slice(&admission.job.request_digest);
+    bytes.extend_from_slice(&admission.job.manifest_digest);
+    bytes.extend_from_slice(&admission.job.isolation_profile_digest);
+    canonical_git_oid(&mut bytes, admission.job.source_oid);
+    canonical_git_oid(&mut bytes, admission.job.base_oid);
+    bytes.extend_from_slice(&admission.job.job_identity);
+    bytes.extend_from_slice(&admission.lease_id);
+    bytes.extend_from_slice(&admission.run_id);
+    canonical_u32(&mut bytes, admission.attempt);
+    bytes.extend_from_slice(&admission.signer.0);
+    bytes.extend_from_slice(&admission.nonce);
+    canonical_u64(&mut bytes, admission.expires_at);
+    canonical_u32(&mut bytes, admission.wall_timeout_seconds);
+    bytes.push(match admission.trust_class {
+        AdmissionTrustClass::QualificationFixture => 1,
+        AdmissionTrustClass::AcceptedReviewed => 2,
+        AdmissionTrustClass::Unaccepted => 3,
+    });
+    sha256(&bytes)
+}
+
+fn hash_lease_context(lease: LeaseToken) -> Digest32 {
+    let mut bytes = canonical_domain(b"buzz-ci-ordinary-lease-v1");
+    bytes.extend_from_slice(&lease.lease_id());
+    bytes.extend_from_slice(&lease.run_id());
+    canonical_u32(&mut bytes, lease.attempt());
+    bytes.extend_from_slice(&lease.signed_request_digest());
+    bytes.extend_from_slice(&lease.signer().0);
+    canonical_u64(&mut bytes, lease.generation());
+    bytes.extend_from_slice(&lease.nonce());
+    canonical_u64(&mut bytes, lease.deadline_at());
+    sha256(&bytes)
+}
+
+fn hash_plan_identity(plan: &NormalJobPlan) -> Result<Digest32, ExecutionUnavailable> {
+    let mut bytes = canonical_domain(b"buzz-ci-normal-job-plan-v1");
+    canonical_blob(
+        &mut bytes,
+        &serde_json::to_vec(&plan.binding).map_err(|_| ExecutionUnavailable)?,
+    );
+    canonical_path(&mut bytes, &plan.evidence_root)?;
+    canonical_blob(
+        &mut bytes,
+        &serde_json::to_vec(&plan.lease_record).map_err(|_| ExecutionUnavailable)?,
+    );
+    canonical_event_binding(&mut bytes, plan.event_binding);
+    canonical_path(&mut bytes, &plan.act.binary)?;
+    bytes.extend_from_slice(&plan.act.binary_sha256);
+    canonical_path(&mut bytes, &plan.act.working_directory)?;
+    canonical_path(&mut bytes, &plan.act.home_directory)?;
+    canonical_path(&mut bytes, &plan.act.workflow_path)?;
+    canonical_text(&mut bytes, &plan.act.job_id);
+    canonical_text(&mut bytes, &plan.act.image);
+    canonical_path(&mut bytes, &plan.act.secrets_path)?;
+    canonical_path(&mut bytes, &plan.act.vars_path)?;
+    canonical_path(&mut bytes, &plan.act.env_path)?;
+    canonical_path(&mut bytes, &plan.act.inputs_path)?;
+    canonical_path(&mut bytes, &plan.act.proxy_socket)?;
+    canonical_text(&mut bytes, &plan.act.executor_unit);
+    canonical_text(&mut bytes, &plan.act.runtime_unit);
+    canonical_text(&mut bytes, &plan.act.lease_slice);
+    Ok(sha256(&bytes))
+}
+
+fn hash_validation_authority(authority: &BindingValidationAuthority) -> Digest32 {
+    let mut bytes = canonical_domain(b"buzz-ci-phase1-validation-authority-v1");
+    canonical_u64(&mut bytes, authority.now_unix_seconds);
+    canonical_u64(&mut bytes, authority.max_expiry_horizon_seconds);
+    canonical_u64(&mut bytes, authority.forbidden_host_uids.len() as u64);
+    authority
+        .forbidden_host_uids
+        .iter()
+        .for_each(|uid| canonical_u32(&mut bytes, *uid));
+    canonical_text(&mut bytes, &authority.expected_engine_version);
+    canonical_text(&mut bytes, &authority.expected_arch);
+    sha256(&bytes)
+}
+
+fn canonical_domain(domain: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(512);
+    canonical_blob(&mut bytes, domain);
+    bytes
+}
+
+fn canonical_blob(bytes: &mut Vec<u8>, value: &[u8]) {
+    canonical_u64(bytes, value.len() as u64);
+    bytes.extend_from_slice(value);
+}
+
+fn canonical_text(bytes: &mut Vec<u8>, value: &str) {
+    canonical_blob(bytes, value.as_bytes());
+}
+
+fn canonical_path(bytes: &mut Vec<u8>, value: &Path) -> Result<(), ExecutionUnavailable> {
+    canonical_text(bytes, value.to_str().ok_or(ExecutionUnavailable)?);
+    Ok(())
+}
+
+fn canonical_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn canonical_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn canonical_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn canonical_git_oid(bytes: &mut Vec<u8>, value: GitOid) {
+    match value {
+        GitOid::Sha1(oid) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&oid);
+        }
+        GitOid::Sha256(oid) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&oid);
+        }
+    }
+}
+
+fn canonical_event_binding(bytes: &mut Vec<u8>, binding: CiEventBinding) {
+    bytes.extend_from_slice(&binding.request_event_id_46105);
+    bytes.extend_from_slice(&binding.teardown_event_id_46106);
+}
+
+fn sha256(bytes: &[u8]) -> Digest32 {
+    Digest32(Sha256::digest(bytes).into())
+}
+
+fn recovered_lease_matches(plan: &NormalJobPlan, lease: &LeaseRecord) -> bool {
+    lease.lease_id == plan.binding.lease_id
+        && lease.lease_unit == plan.lease_record.lease_unit
+        && lease.cgroup_path == plan.lease_record.cgroup_path
+        && lease.workspace_dir == plan.lease_record.workspace_dir
+        && lease.sanitized_artifact_store_path == plan.lease_record.sanitized_artifact_store_path
+        && lease.sanitized_log_store_path == plan.lease_record.sanitized_log_store_path
+}
+
+fn cleanup_matches(
+    plan: &NormalJobPlan,
+    teardown: &TeardownRecord,
+    reconcile: &ReconcileRecord,
+) -> bool {
+    teardown.lease_id == plan.binding.lease_id
+        && teardown.event_binding == plan.event_binding
+        && teardown.lease_unit == plan.lease_record.lease_unit
+        && teardown.cgroup_path == plan.lease_record.cgroup_path
+        && reconcile.lease_id == plan.binding.lease_id
+        && reconcile.lease_unit == plan.lease_record.lease_unit
+        && reconcile.cgroup_path == plan.lease_record.cgroup_path
+        && reconcile.state == ReconcileState::Clean
+        && reconcile.reuse_allowed
+        && teardown.teardown_sha256 != Digest32([0; 32])
+}
+
+fn terminal_conclusion(conclusion: LeaseConclusion) -> TerminalConclusion {
+    match conclusion {
+        LeaseConclusion::Success => TerminalConclusion::Success,
+        LeaseConclusion::Failure => TerminalConclusion::Failure,
+        LeaseConclusion::Cancelled => TerminalConclusion::Cancelled,
+        LeaseConclusion::TimedOut => TerminalConclusion::TimedOut,
+        LeaseConclusion::InfrastructureFailure => TerminalConclusion::InfrastructureFailure,
+    }
+}
+
+fn lease_conclusion(conclusion: TerminalConclusion) -> LeaseConclusion {
+    match conclusion {
+        TerminalConclusion::Success => LeaseConclusion::Success,
+        TerminalConclusion::Failure => LeaseConclusion::Failure,
+        TerminalConclusion::Cancelled => LeaseConclusion::Cancelled,
+        TerminalConclusion::TimedOut => LeaseConclusion::TimedOut,
+        TerminalConclusion::InfrastructureFailure => LeaseConclusion::InfrastructureFailure,
     }
 }
 
@@ -728,7 +1210,7 @@ fn oid_hex(oid: GitOid) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, fs, os::unix::fs::symlink, rc::Rc};
 
     use buzz_ci_broker_protocol::{Operation, TrustClass};
     use buzz_ci_isolation_contract::{
@@ -746,8 +1228,9 @@ mod tests {
             QualificationPermit, VerifiedSigner,
         },
         evidence::{
-            LeaseLimits, ReconciledResource, ResourcePropertyReadback, SeccompEvidence,
-            SECCOMP_PROFILE_PATH, SECCOMP_PROFILE_SHA256,
+            atomic_publish, LeaseLimits, ReconciledResource, ResourcePropertyReadback,
+            SeccompEvidence, ROOT_READ_ONLY_FILE_MODE, SECCOMP_PROFILE_PATH,
+            SECCOMP_PROFILE_SHA256,
         },
     };
 
@@ -766,7 +1249,10 @@ mod tests {
         Cleanup,
     }
 
-    struct OnePlan(Option<NormalJobPlan>);
+    struct OnePlan {
+        prepared: Option<NormalJobPlan>,
+        recovered: Option<(LeaseToken, NormalJobPlan)>,
+    }
 
     impl NormalJobSource for OnePlan {
         fn prepare(
@@ -774,7 +1260,23 @@ mod tests {
             _request: AdmitAttemptRequest,
             _admission: OrdinaryAdmission,
         ) -> Result<NormalJobPlan, ExecutionUnavailable> {
-            self.0.take().ok_or(ExecutionUnavailable)
+            self.prepared.take().ok_or(ExecutionUnavailable)
+        }
+
+        fn recover(
+            &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
+            lease: LeaseToken,
+        ) -> Result<NormalJobPlan, ExecutionUnavailable> {
+            let (expected, _) = self.recovered.as_ref().ok_or(ExecutionUnavailable)?;
+            if *expected != lease {
+                return Err(ExecutionUnavailable);
+            }
+            self.recovered
+                .take()
+                .map(|(_, plan)| plan)
+                .ok_or(ExecutionUnavailable)
         }
     }
 
@@ -783,6 +1285,8 @@ mod tests {
         log: Rc<RefCell<Vec<&'static str>>>,
         event_binding: CiEventBinding,
         lease_id: String,
+        terminal_conclusion: LeaseConclusion,
+        clean_reconcile: bool,
         incomplete_teardown: bool,
         bad_terminal_order: bool,
     }
@@ -892,7 +1396,7 @@ mod tests {
                 records.swap(1, 2);
             }
             Ok(NormalTerminalEvidence {
-                conclusion: LeaseConclusion::Success,
+                conclusion: self.terminal_conclusion,
                 evidence_set_digest: [61; 32],
                 ordering: records,
             })
@@ -907,6 +1411,7 @@ mod tests {
             self.fail_if(FailStage::Cleanup)?;
             let lease_unit = "buzzci-normal.slice".to_owned();
             let cgroup_path = PathBuf::from("/buzzci.slice/buzzci-normal.slice");
+            let clean = self.clean_reconcile;
             Ok(NormalReconcileEvidence {
                 teardown: TeardownRecord {
                     lease_id: self.lease_id.clone(),
@@ -924,20 +1429,21 @@ mod tests {
                     lease_id: self.lease_id.clone(),
                     lease_unit,
                     cgroup_path,
-                    state: ReconcileState::Clean,
-                    emptied: true,
-                    quarantined: false,
+                    state: if clean {
+                        ReconcileState::Clean
+                    } else {
+                        ReconcileState::Quarantined
+                    },
+                    emptied: clean,
+                    quarantined: !clean,
                     before_reuse: true,
-                    emptied_resources: vec![
-                        ReconciledResource::LeaseUnit,
-                        ReconciledResource::Cgroup,
-                        ReconciledResource::Workspace,
-                        ReconciledResource::NetworkNamespace,
-                        ReconciledResource::RuntimeSocket,
-                        ReconciledResource::ProxyObjectState,
-                    ],
-                    quarantined_resources: Vec::new(),
-                    reuse_allowed: true,
+                    emptied_resources: if clean { clean_resources() } else { Vec::new() },
+                    quarantined_resources: if clean {
+                        Vec::new()
+                    } else {
+                        vec![ReconciledResource::LeaseUnit]
+                    },
+                    reuse_allowed: clean,
                     observed_at_unix_ns: 12,
                 },
                 ordering: batch(
@@ -958,6 +1464,17 @@ mod tests {
             direct_53_refused: true,
             allowed_tuples_only: true,
         }
+    }
+
+    fn clean_resources() -> Vec<ReconciledResource> {
+        vec![
+            ReconciledResource::LeaseUnit,
+            ReconciledResource::Cgroup,
+            ReconciledResource::Workspace,
+            ReconciledResource::NetworkNamespace,
+            ReconciledResource::RuntimeSocket,
+            ReconciledResource::ProxyObjectState,
+        ]
     }
 
     fn ordering(
@@ -1226,15 +1743,113 @@ mod tests {
             log: Rc::clone(&log),
             event_binding: fixture.event_binding,
             lease_id: fixture.lease_id.clone(),
+            terminal_conclusion: LeaseConclusion::Success,
+            clean_reconcile: true,
             incomplete_teardown,
             bad_terminal_order,
         };
         let plan = clone_plan(&fixture);
         (
             fixture,
-            ProductionOrdinaryEngine::new(OnePlan(Some(plan)), backend),
+            ProductionOrdinaryEngine::new(
+                OnePlan {
+                    prepared: Some(plan),
+                    recovered: None,
+                },
+                backend,
+            ),
             log,
         )
+    }
+
+    fn recovery_engine(
+        fixture: &OrdinaryFixture,
+        terminal_conclusion: LeaseConclusion,
+        clean_reconcile: bool,
+    ) -> (TestEngine, Rc<RefCell<Vec<&'static str>>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let backend = FakeBackend {
+            fail: FailStage::None,
+            log: Rc::clone(&log),
+            event_binding: fixture.event_binding,
+            lease_id: fixture.lease_id.clone(),
+            terminal_conclusion,
+            clean_reconcile,
+            incomplete_teardown: false,
+            bad_terminal_order: false,
+        };
+        let engine = ProductionOrdinaryEngine::new(
+            OnePlan {
+                prepared: None,
+                recovered: Some((fixture.lease, clone_plan(fixture))),
+            },
+            backend,
+        );
+        (engine, log)
+    }
+
+    fn seed_provisioned(fixture: &OrdinaryFixture, conclusion: LeaseConclusion) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let backend = FakeBackend {
+            fail: FailStage::None,
+            log,
+            event_binding: fixture.event_binding,
+            lease_id: fixture.lease_id.clone(),
+            terminal_conclusion: conclusion,
+            clean_reconcile: true,
+            incomplete_teardown: false,
+            bad_terminal_order: false,
+        };
+        let mut engine = ProductionOrdinaryEngine::new(
+            OnePlan {
+                prepared: Some(clone_plan(fixture)),
+                recovered: None,
+            },
+            backend,
+        );
+        engine
+            .preflight(fixture.request, fixture.admission)
+            .unwrap();
+        engine
+            .provision(fixture.request, fixture.admission, fixture.lease)
+            .unwrap();
+    }
+
+    fn seed_authority_only(fixture: &OrdinaryFixture) {
+        EvidenceStore::new(fixture.plan.evidence_root.clone())
+            .unwrap()
+            .publish_recovery_authority(
+                &recovery_authority(
+                    fixture.request,
+                    fixture.admission,
+                    fixture.lease,
+                    &fixture.plan,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn seed_terminal(fixture: &OrdinaryFixture, conclusion: LeaseConclusion) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let backend = FakeBackend {
+            fail: FailStage::None,
+            log,
+            event_binding: fixture.event_binding,
+            lease_id: fixture.lease_id.clone(),
+            terminal_conclusion: conclusion,
+            clean_reconcile: true,
+            incomplete_teardown: false,
+            bad_terminal_order: false,
+        };
+        let mut engine = ProductionOrdinaryEngine::new(
+            OnePlan {
+                prepared: Some(clone_plan(fixture)),
+                recovered: None,
+            },
+            backend,
+        );
+        run_to_terminal(fixture, &mut engine).unwrap();
     }
 
     fn clone_plan(fixture: &OrdinaryFixture) -> NormalJobPlan {
@@ -1377,6 +1992,398 @@ mod tests {
                 OrdinaryStop::Completed(LeaseConclusion::Success),
             )
             .is_err());
+    }
+
+    #[test]
+    fn restart_after_authority_publish_reconciles_recovery_or_expiry_but_remains_ambiguous() {
+        for stop in [OrdinaryStop::Recovery, OrdinaryStop::Expired] {
+            let fixture = ordinary_fixture();
+            seed_authority_only(&fixture);
+
+            let (mut receipt_engine, receipt_log) =
+                recovery_engine(&fixture, LeaseConclusion::Success, true);
+            assert!(receipt_engine
+                .read_receipts(fixture.request, fixture.admission, fixture.lease)
+                .is_err());
+            assert!(receipt_log.borrow().is_empty());
+
+            let (mut engine, log) = recovery_engine(&fixture, LeaseConclusion::Success, true);
+            let cleanup = engine
+                .reconcile(fixture.request, fixture.admission, fixture.lease, stop)
+                .unwrap();
+
+            assert_eq!(cleanup, ambiguous_cleanup());
+            assert_eq!(log.borrow().as_slice(), ["cleanup"]);
+        }
+    }
+
+    #[test]
+    fn authority_only_recovery_refuses_missing_or_tampered_authority_without_backend_actions() {
+        let missing_fixture = ordinary_fixture();
+        let (mut missing_engine, missing_log) =
+            recovery_engine(&missing_fixture, LeaseConclusion::Success, true);
+        assert_eq!(
+            missing_engine
+                .reconcile(
+                    missing_fixture.request,
+                    missing_fixture.admission,
+                    missing_fixture.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(missing_log.borrow().is_empty());
+
+        let tampered_fixture = ordinary_fixture();
+        seed_authority_only(&tampered_fixture);
+        let paths = EvidenceStore::new(tampered_fixture.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&tampered_fixture.lease_id)
+            .unwrap();
+        let mut authority: RecoveryAuthorityRecord =
+            serde_json::from_slice(&fs::read(&paths.recovery_authority).unwrap()).unwrap();
+        authority.plan_identity_sha256 = Digest32([99; 32]);
+        let mut bytes = serde_json::to_vec(&authority).unwrap();
+        bytes.push(b'\n');
+        atomic_publish(&paths.recovery_authority, &bytes, ROOT_READ_ONLY_FILE_MODE).unwrap();
+        let (mut tampered_engine, tampered_log) =
+            recovery_engine(&tampered_fixture, LeaseConclusion::Success, true);
+        assert_eq!(
+            tampered_engine
+                .reconcile(
+                    tampered_fixture.request,
+                    tampered_fixture.admission,
+                    tampered_fixture.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(tampered_log.borrow().is_empty());
+
+        let unexpected_fixture = ordinary_fixture();
+        seed_authority_only(&unexpected_fixture);
+        let unexpected_paths = EvidenceStore::new(unexpected_fixture.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&unexpected_fixture.lease_id)
+            .unwrap();
+        atomic_publish(&unexpected_paths.ordering, b"", ROOT_READ_ONLY_FILE_MODE).unwrap();
+        let (mut unexpected_engine, unexpected_log) =
+            recovery_engine(&unexpected_fixture, LeaseConclusion::Success, true);
+        assert_eq!(
+            unexpected_engine
+                .reconcile(
+                    unexpected_fixture.request,
+                    unexpected_fixture.admission,
+                    unexpected_fixture.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(unexpected_log.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_after_provisioning_reads_terminal_without_reprovisioning() {
+        let fixture = ordinary_fixture();
+        seed_provisioned(&fixture, LeaseConclusion::Success);
+        let (mut engine, log) = recovery_engine(&fixture, LeaseConclusion::Success, true);
+
+        let receipts = engine
+            .read_receipts(fixture.request, fixture.admission, fixture.lease)
+            .unwrap();
+
+        assert_eq!(receipts.conclusion, LeaseConclusion::Success);
+        assert_eq!(receipts.evidence_set_digest, [61; 32]);
+        assert_eq!(log.borrow().as_slice(), ["terminal"]);
+    }
+
+    #[test]
+    fn restart_refuses_recovery_authority_field_tampering_before_backend_actions() {
+        let fixture = ordinary_fixture();
+        seed_provisioned(&fixture, LeaseConclusion::Success);
+        let paths = EvidenceStore::new(fixture.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&fixture.lease_id)
+            .unwrap();
+        let mut authority: RecoveryAuthorityRecord =
+            serde_json::from_slice(&fs::read(&paths.recovery_authority).unwrap()).unwrap();
+        authority.plan_identity_sha256 = Digest32([99; 32]);
+        let mut bytes = serde_json::to_vec(&authority).unwrap();
+        bytes.push(b'\n');
+        atomic_publish(&paths.recovery_authority, &bytes, ROOT_READ_ONLY_FILE_MODE).unwrap();
+        let (mut engine, log) = recovery_engine(&fixture, LeaseConclusion::Success, true);
+
+        assert!(engine
+            .read_receipts(fixture.request, fixture.admission, fixture.lease)
+            .is_err());
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_refuses_terminal_authority_hash_mismatch_before_backend_actions() {
+        let fixture = ordinary_fixture();
+        seed_terminal(&fixture, LeaseConclusion::Success);
+        let paths = EvidenceStore::new(fixture.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&fixture.lease_id)
+            .unwrap();
+        let mut terminal: TerminalRecord =
+            serde_json::from_slice(&fs::read(&paths.terminal).unwrap()).unwrap();
+        terminal.recovery_authority_sha256 = Digest32([99; 32]);
+        let mut bytes = serde_json::to_vec(&terminal).unwrap();
+        bytes.push(b'\n');
+        atomic_publish(&paths.terminal, &bytes, ROOT_READ_ONLY_FILE_MODE).unwrap();
+        let (mut engine, log) = recovery_engine(&fixture, LeaseConclusion::Success, true);
+
+        assert!(engine
+            .read_receipts(fixture.request, fixture.admission, fixture.lease)
+            .is_err());
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_refuses_missing_recovery_authority_before_backend_actions() {
+        let fixture = ordinary_fixture();
+        seed_provisioned(&fixture, LeaseConclusion::Success);
+        let paths = EvidenceStore::new(fixture.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&fixture.lease_id)
+            .unwrap();
+        fs::remove_file(paths.recovery_authority).unwrap();
+        let (mut engine, log) = recovery_engine(&fixture, LeaseConclusion::Success, true);
+
+        assert_eq!(
+            engine
+                .reconcile(
+                    fixture.request,
+                    fixture.admission,
+                    fixture.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_replays_exact_persisted_success_and_failure_receipts() {
+        for conclusion in [LeaseConclusion::Success, LeaseConclusion::Failure] {
+            let fixture = ordinary_fixture();
+            seed_terminal(&fixture, conclusion);
+            let (mut engine, log) = recovery_engine(&fixture, LeaseConclusion::TimedOut, true);
+
+            let receipts = engine
+                .read_receipts(fixture.request, fixture.admission, fixture.lease)
+                .unwrap();
+
+            assert_eq!(receipts.conclusion, conclusion);
+            assert_eq!(receipts.evidence_set_digest, [61; 32]);
+            assert!(log.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn restart_rejects_wrong_lease_and_generation_before_backend_actions() {
+        let fixture = ordinary_fixture();
+        seed_provisioned(&fixture, LeaseConclusion::Success);
+        let (mut engine, log) = recovery_engine(&fixture, LeaseConclusion::Success, true);
+        let wrong_lease = lease_variant(&fixture, [99; 16], fixture.lease.generation());
+        let wrong_generation = lease_variant(
+            &fixture,
+            fixture.lease.lease_id(),
+            fixture.lease.generation() + 1,
+        );
+
+        assert!(engine
+            .read_receipts(fixture.request, fixture.admission, wrong_lease)
+            .is_err());
+        assert!(engine
+            .read_receipts(fixture.request, fixture.admission, wrong_generation)
+            .is_err());
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_refuses_malformed_and_symlinked_evidence() {
+        let malformed = ordinary_fixture();
+        seed_provisioned(&malformed, LeaseConclusion::Success);
+        let malformed_paths = EvidenceStore::new(malformed.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&malformed.lease_id)
+            .unwrap();
+        atomic_publish(&malformed_paths.ordering, b"{", ROOT_READ_ONLY_FILE_MODE).unwrap();
+        let (mut malformed_engine, malformed_log) =
+            recovery_engine(&malformed, LeaseConclusion::Success, true);
+        assert_eq!(
+            malformed_engine
+                .reconcile(
+                    malformed.request,
+                    malformed.admission,
+                    malformed.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(malformed_log.borrow().is_empty());
+
+        let linked = ordinary_fixture();
+        seed_provisioned(&linked, LeaseConclusion::Success);
+        let linked_paths = EvidenceStore::new(linked.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&linked.lease_id)
+            .unwrap();
+        fs::remove_file(&linked_paths.ordering).unwrap();
+        symlink(&linked_paths.lease, &linked_paths.ordering).unwrap();
+        let (mut linked_engine, linked_log) =
+            recovery_engine(&linked, LeaseConclusion::Success, true);
+        assert_eq!(
+            linked_engine
+                .reconcile(
+                    linked.request,
+                    linked.admission,
+                    linked.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(linked_log.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_refuses_partial_and_mismatched_evidence() {
+        let partial = ordinary_fixture();
+        seed_terminal(&partial, LeaseConclusion::Success);
+        let partial_store = EvidenceStore::new(partial.plan.evidence_root.clone()).unwrap();
+        partial_store
+            .publish_teardown(&TeardownRecord {
+                lease_id: partial.lease_id.clone(),
+                event_binding: partial.event_binding,
+                lease_unit: partial.plan.lease_record.lease_unit.clone(),
+                cgroup_path: partial.plan.lease_record.cgroup_path.clone(),
+                unit_inactive: true,
+                cgroup_procs_empty: true,
+                mounts_removed: true,
+                dirs_removed: true,
+                teardown_sha256: Digest32([62; 32]),
+                completed_at_unix_ns: 10,
+            })
+            .unwrap();
+        let (mut partial_engine, partial_log) =
+            recovery_engine(&partial, LeaseConclusion::Success, true);
+        assert_eq!(
+            partial_engine
+                .reconcile(
+                    partial.request,
+                    partial.admission,
+                    partial.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(partial_log.borrow().is_empty());
+
+        let mismatched = ordinary_fixture();
+        seed_provisioned(&mismatched, LeaseConclusion::Success);
+        let mismatched_paths = EvidenceStore::new(mismatched.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&mismatched.lease_id)
+            .unwrap();
+        let mut lease: LeaseRecord =
+            serde_json::from_slice(&fs::read(&mismatched_paths.lease).unwrap()).unwrap();
+        lease.workspace_dir = "/var/lib/buzzci/workspaces/other".into();
+        let mut bytes = serde_json::to_vec(&lease).unwrap();
+        bytes.push(b'\n');
+        atomic_publish(&mismatched_paths.lease, &bytes, ROOT_READ_ONLY_FILE_MODE).unwrap();
+        let (mut mismatched_engine, mismatched_log) =
+            recovery_engine(&mismatched, LeaseConclusion::Success, true);
+        assert_eq!(
+            mismatched_engine
+                .reconcile(
+                    mismatched.request,
+                    mismatched.admission,
+                    mismatched.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert!(mismatched_log.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_requires_complete_clean_reconcile_proof_for_reuse() {
+        let clean = ordinary_fixture();
+        seed_terminal(&clean, LeaseConclusion::Success);
+        let (mut cleanup_engine, cleanup_log) =
+            recovery_engine(&clean, LeaseConclusion::Success, true);
+        let cleanup = cleanup_engine
+            .reconcile(
+                clean.request,
+                clean.admission,
+                clean.lease,
+                OrdinaryStop::Recovery,
+            )
+            .unwrap();
+        assert_eq!(cleanup.disposition, CleanupDisposition::Clean);
+        assert_eq!(cleanup.teardown_digest, [62; 32]);
+        assert_eq!(cleanup_log.borrow().as_slice(), ["cleanup"]);
+
+        let (mut proof_engine, proof_log) =
+            recovery_engine(&clean, LeaseConclusion::Failure, false);
+        let proven = proof_engine
+            .reconcile(
+                clean.request,
+                clean.admission,
+                clean.lease,
+                OrdinaryStop::Recovery,
+            )
+            .unwrap();
+        assert_eq!(proven.disposition, CleanupDisposition::Clean);
+        assert_eq!(proven.teardown_digest, [62; 32]);
+        assert!(proof_log.borrow().is_empty());
+
+        let ambiguous = ordinary_fixture();
+        seed_terminal(&ambiguous, LeaseConclusion::Failure);
+        let (mut ambiguous_engine, ambiguous_log) =
+            recovery_engine(&ambiguous, LeaseConclusion::Failure, false);
+        assert_eq!(
+            ambiguous_engine
+                .reconcile(
+                    ambiguous.request,
+                    ambiguous.admission,
+                    ambiguous.lease,
+                    OrdinaryStop::Recovery,
+                )
+                .unwrap(),
+            ambiguous_cleanup()
+        );
+        assert_eq!(ambiguous_log.borrow().as_slice(), ["cleanup"]);
+        let ambiguous_paths = EvidenceStore::new(ambiguous.plan.evidence_root.clone())
+            .unwrap()
+            .paths(&ambiguous.lease_id)
+            .unwrap();
+        assert!(!ambiguous_paths.teardown.exists());
+        assert!(!ambiguous_paths.reconcile.exists());
+    }
+
+    fn lease_variant(fixture: &OrdinaryFixture, lease_id: [u8; 16], generation: u64) -> LeaseToken {
+        LeaseToken::from_durable(DurableLeaseFields {
+            lease_id,
+            run_id: fixture.lease.run_id(),
+            attempt: fixture.lease.attempt(),
+            signed_request_digest: fixture.lease.signed_request_digest(),
+            signer: fixture.lease.signer(),
+            generation,
+            nonce: fixture.lease.nonce(),
+            deadline_at: fixture.lease.deadline_at(),
+        })
     }
 
     #[derive(Clone)]
