@@ -1078,6 +1078,48 @@ mod tests {
     }
 
     #[test]
+    fn complete_attempt_frame_fingerprints_are_frozen() {
+        let request_id = [42; 16];
+        let request = encode_request(request_id, Request::CompleteAttempt(complete()));
+        assert_eq!(
+            legacy_fingerprint(request.as_bytes()),
+            "6ed3264e960fe632d23c31d26bdcd64f966e56ad54d1a87d3bcdaf3126514c3f"
+        );
+
+        let response = BrokerResponse {
+            code: ResponseCode::NotProvisioned,
+            retry_after_millis: 0,
+            attempt_id: [8; 16],
+            run_id: [9; 16],
+            accepted_request_digest: digest(10),
+            job_manifest_digest: digest(11),
+            tip_oid: Some(oid()),
+            broker_state: BrokerState::Reconciling,
+            conclusion: Conclusion::InfrastructureFailure,
+            terminal_reason: 2,
+            generation: 3,
+            accepted_at: 100,
+            updated_at: 101,
+            lease_generation: 4,
+            evidence_set_digest: [0; 32],
+            teardown_digest: [0; 32],
+            attempt: 1,
+        };
+        let response = encode_response(
+            FrameHeader {
+                operation: Operation::CompleteAttempt,
+                request_id,
+            },
+            response,
+        );
+        assert_eq!(get_u16(response.as_bytes(), 6), 0x8006);
+        assert_eq!(
+            legacy_fingerprint(response.as_bytes()),
+            "f149611278ea4d836de62d8c792c5b68a394b34def63c35714c9787b1f505d5c"
+        );
+    }
+
+    #[test]
     fn every_request_round_trips() {
         let requests = [
             Request::Hello(HelloRequest {
