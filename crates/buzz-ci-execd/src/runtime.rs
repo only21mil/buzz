@@ -52,6 +52,8 @@ pub(crate) const MAX_STATE_BYTES: u64 = 128 * 1024;
 pub(crate) const FORMAT_VERSION: u8 = 1;
 pub(crate) const COORDINATOR_LOCK_FILE: &str = "authority-state-v1.lock";
 pub(crate) const COORDINATOR_MARKER_FILE: &str = ".authority-state-v1.pending";
+/// Operator action after a stale fixed-name state temporary blocks publication.
+pub const STATE_TEMPORARY_EXISTS_RECOVERY: &str = "Stop every buzz-ci-execd state writer, remove /var/lib/buzzci/activation/.state-v1.json.tmp, then restart buzz-ci-execd.";
 
 /// Why authority or controller state did not open capacity.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -80,6 +82,9 @@ pub enum RuntimeLoadError {
     /// Atomic state publication failed before durable completion.
     #[error("runtime state persistence failed")]
     PersistFailed,
+    /// The fixed-name atomic-publication temporary already exists.
+    #[error("runtime state temporary already exists")]
+    StateTemporaryExists,
 }
 
 /// Result of bootstrapping the fixed authority and durable state.
@@ -348,6 +353,9 @@ impl DurableStateStore {
             .state_revision
             .checked_add(1)
             .ok_or(RuntimeLoadError::PersistFailed)?;
+        // Shared locking is safe only while one writer exists. Fixed-name create_new
+        // serializes accidental concurrent writes; a second writer requires an
+        // exclusive lock or another proven mechanism.
         let _lock = acquire_runtime_lock(&self.paths, FlockArg::LockShared, self.expected_uid)?;
         self.validate_commit_base()?;
         persist_to_validated_path(
@@ -880,9 +888,13 @@ pub(crate) fn persist_to_validated_path(
         .write(true)
         .mode(STATE_MODE)
         .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
-    let mut file = options
-        .open(&temporary)
-        .map_err(|_| RuntimeLoadError::PersistFailed)?;
+    let mut file = options.open(&temporary).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            RuntimeLoadError::StateTemporaryExists
+        } else {
+            RuntimeLoadError::PersistFailed
+        }
+    })?;
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|_| RuntimeLoadError::PersistFailed)?;
@@ -2372,15 +2384,20 @@ mod tests {
         let mut store = fixture.store();
         let temporary = fixture.paths.activation_root.join(".state-v1.json.tmp");
         fs::write(&temporary, b"untrusted-stale-temporary").unwrap();
+        let temporary_before = temporary.symlink_metadata().unwrap();
         let state_before = fixture.state_bytes();
 
         assert_eq!(
             store.commit(ActivationController::new(ROOT).snapshot()),
-            Err(RuntimeLoadError::PersistFailed)
+            Err(RuntimeLoadError::StateTemporaryExists)
         );
         assert_eq!(store.revision(), 1);
         assert_eq!(fixture.state_bytes(), state_before);
-        assert_eq!(fs::read(temporary).unwrap(), b"untrusted-stale-temporary");
+        let temporary_after = temporary.symlink_metadata().unwrap();
+        assert_eq!(
+            file_identity(&temporary_after),
+            file_identity(&temporary_before)
+        );
     }
 
     #[test]

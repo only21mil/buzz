@@ -19,9 +19,23 @@ use crate::{
     control::{AdmissionBoundaryError, ClosedDispatch, ControlDispatch},
     runtime::{
         prepare_runtime, DurableStateStore, ReadyValidationTarget, RuntimeBootstrap,
-        RuntimeLoadError, RuntimePreparation, ServiceAuthority,
+        RuntimeLoadError, RuntimePreparation, ServiceAuthority, STATE_TEMPORARY_EXISTS_RECOVERY,
     },
 };
+
+fn operator_persistence_log(error: RuntimeLoadError) -> Option<String> {
+    (error == RuntimeLoadError::StateTemporaryExists).then(|| {
+        format!(
+            r#"{{"error":"state_temporary_exists","recovery":"{STATE_TEMPORARY_EXISTS_RECOVERY}"}}"#
+        )
+    })
+}
+
+fn log_operator_persistence_error(error: RuntimeLoadError) {
+    if let Some(line) = operator_persistence_log(error) {
+        eprintln!("{line}");
+    }
+}
 
 /// Service-owned authority boundary. Wire signer claims cannot implement it.
 pub trait AdmissionAuthority {
@@ -388,22 +402,26 @@ where
     Q: QualificationExecutor,
 {
     fn commit(&mut self, recovery_lease: Option<LeaseToken>) -> bool {
-        if self.store.commit(self.controller.snapshot()).is_ok() {
-            true
-        } else {
-            self.controller
-                .quarantine_after_commit_failure(recovery_lease);
-            false
+        match self.store.commit(self.controller.snapshot()) {
+            Ok(()) => true,
+            Err(error) => {
+                log_operator_persistence_error(error);
+                self.controller
+                    .quarantine_after_commit_failure(recovery_lease);
+                false
+            }
         }
     }
 
     fn commit_qualification(&mut self, recovery_lease: QualificationLease) -> bool {
-        if self.store.commit(self.controller.snapshot()).is_ok() {
-            true
-        } else {
-            self.controller
-                .quarantine_qualification_after_commit_failure(recovery_lease);
-            false
+        match self.store.commit(self.controller.snapshot()) {
+            Ok(()) => true,
+            Err(error) => {
+                log_operator_persistence_error(error);
+                self.controller
+                    .quarantine_qualification_after_commit_failure(recovery_lease);
+                false
+            }
         }
     }
 
@@ -819,7 +837,8 @@ where
         RuntimeBootstrap::Loaded(runtime) => {
             BootstrapDispatch::Loaded(Box::new(runtime.compose(ordinary, qualification)))
         }
-        RuntimeBootstrap::NotProvisioned(_) | RuntimeBootstrap::Quarantined { .. } => {
+        RuntimeBootstrap::NotProvisioned(reason) | RuntimeBootstrap::Quarantined { reason, .. } => {
+            log_operator_persistence_error(reason);
             BootstrapDispatch::Closed(ClosedDispatch::new())
         }
     }
@@ -1175,6 +1194,20 @@ mod tests {
             self.commits.borrow_mut().push(snapshot);
             Ok(())
         }
+    }
+
+    #[test]
+    fn stale_state_temporary_log_names_condition_and_recovery() {
+        assert_eq!(
+            operator_persistence_log(RuntimeLoadError::StateTemporaryExists).as_deref(),
+            Some(
+                r#"{"error":"state_temporary_exists","recovery":"Stop every buzz-ci-execd state writer, remove /var/lib/buzzci/activation/.state-v1.json.tmp, then restart buzz-ci-execd."}"#
+            )
+        );
+        assert_eq!(
+            operator_persistence_log(RuntimeLoadError::PersistFailed),
+            None
+        );
     }
 
     #[derive(Clone)]
