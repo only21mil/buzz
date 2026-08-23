@@ -471,7 +471,7 @@ async fn populated_migration_preserves_legacy_approval_and_backfills_resume_stat
          VALUES ($1, $2, $3, $4, 'gate', 2, 'owner', NOW() + interval '1 hour')",
     )
     .bind(ids.community_id)
-    .bind(vec![0x33; 32])
+    .bind(vec![0x33u8; 32])
     .bind(ids.workflow_id)
     .bind(ids.run_id)
     .execute(&pool)
