@@ -10,8 +10,8 @@
 
 use buzz_core::CommunityId;
 use buzz_db::workflow_approval::{
-    create_workflow_approval_gate, CreateWorkflowApprovalGateOutcome,
-    CreateWorkflowApprovalGateParams,
+    create_workflow_approval_gate, ApprovalActionSummary, ApprovalRequestPayload, ApprovalRole,
+    CanonicalApprovalPolicy, CreateWorkflowApprovalGateParams, WorkflowApprovalGateCreationOutcome,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -36,8 +36,7 @@ struct GateSpec {
     definition_hash: Vec<u8>,
     step_id: String,
     step_index: i32,
-    policy_snapshot: Value,
-    resolved_approver_pubkeys: Vec<Vec<u8>>,
+    policy: CanonicalApprovalPolicy,
     action_summary: String,
     expires_at: DateTime<Utc>,
     prior_step_outputs: Value,
@@ -50,9 +49,12 @@ enum ObservedCreate {
     Reused { approval_id: Uuid, generation: i64 },
     Conflict,
     StaleGeneration { current_generation: i64 },
+    NoEligibleApprovers,
 }
 
 async fn create_gate(pool: &PgPool, spec: &GateSpec) -> buzz_db::Result<ObservedCreate> {
+    let action_summary = ApprovalActionSummary::new(spec.action_summary.clone())?;
+    let request_payload = ApprovalRequestPayload::new(json!({"class": "approval_requested"}))?;
     let outcome = create_workflow_approval_gate(
         pool,
         CreateWorkflowApprovalGateParams {
@@ -64,34 +66,31 @@ async fn create_gate(pool: &PgPool, spec: &GateSpec) -> buzz_db::Result<Observed
             definition_hash: &spec.definition_hash,
             step_id: &spec.step_id,
             step_index: spec.step_index,
-            policy_snapshot: &spec.policy_snapshot,
-            resolved_approver_pubkeys: &spec.resolved_approver_pubkeys,
-            action_summary: &spec.action_summary,
+            policy: &spec.policy,
+            action_summary: &action_summary,
             expires_at: spec.expires_at,
             prior_step_outputs: &spec.prior_step_outputs,
             waiting_trace_entry: &spec.waiting_trace_entry,
+            request_payload: &request_payload,
         },
     )
     .await?;
 
     Ok(match outcome {
-        CreateWorkflowApprovalGateOutcome::Created {
-            approval_id,
-            generation,
-        } => ObservedCreate::Created {
-            approval_id,
-            generation,
+        WorkflowApprovalGateCreationOutcome::Created { gate, .. } => ObservedCreate::Created {
+            approval_id: gate.approval_id,
+            generation: gate.gate_generation,
         },
-        CreateWorkflowApprovalGateOutcome::Reused {
-            approval_id,
-            generation,
-        } => ObservedCreate::Reused {
-            approval_id,
-            generation,
+        WorkflowApprovalGateCreationOutcome::Reused { gate, .. } => ObservedCreate::Reused {
+            approval_id: gate.approval_id,
+            generation: gate.gate_generation,
         },
-        CreateWorkflowApprovalGateOutcome::Conflict => ObservedCreate::Conflict,
-        CreateWorkflowApprovalGateOutcome::StaleGeneration { current_generation } => {
+        WorkflowApprovalGateCreationOutcome::Conflict => ObservedCreate::Conflict,
+        WorkflowApprovalGateCreationOutcome::StaleGeneration { current_generation } => {
             ObservedCreate::StaleGeneration { current_generation }
+        }
+        WorkflowApprovalGateCreationOutcome::NoEligibleApprovers => {
+            ObservedCreate::NoEligibleApprovers
         }
     })
 }
@@ -155,6 +154,17 @@ impl Fixture {
             .await
             .expect("insert resolved approver");
         insert_channel(&pool, community_id, ids.channel_id, &owner).await;
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+             VALUES ($1, $2, $3, 'owner'), ($1, $2, $4, 'admin')",
+        )
+        .bind(ids.community_id)
+        .bind(ids.channel_id)
+        .bind(&owner)
+        .bind(&approver)
+        .execute(&pool)
+        .await
+        .expect("insert active approval members");
 
         let definition = json!({
             "trigger": {"on": "message_posted"},
@@ -219,8 +229,11 @@ impl Fixture {
             definition_hash: self.definition_hash.clone(),
             step_id: "approve-release".to_owned(),
             step_index: 2,
-            policy_snapshot: json!({"kind": "role", "role": "owner"}),
-            resolved_approver_pubkeys: vec![self.approver.clone()],
+            policy: CanonicalApprovalPolicy::new(
+                vec![self.approver.clone()],
+                vec![ApprovalRole::Owner],
+            )
+            .expect("valid approval policy"),
             action_summary: "release the prepared artifact".to_owned(),
             expires_at: Utc::now() + Duration::hours(1),
             prior_step_outputs: json!({
@@ -321,7 +334,7 @@ async fn persistence_snapshot(
     .await
     .expect("read workflow run persistence");
     let approvals = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(a) FROM workflow_approvals a \
+        "SELECT to_jsonb(a) FROM workflow_approval_gates a \
          WHERE community_id = $1 AND run_id = $2 ORDER BY step_index",
     )
     .bind(community.as_uuid())
@@ -330,8 +343,10 @@ async fn persistence_snapshot(
     .await
     .expect("read workflow approval persistence");
     let outbox = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(o) FROM workflow_outbox o \
-         WHERE community_id = $1 AND run_id = $2 ORDER BY sequence",
+        "SELECT to_jsonb(o) FROM workflow_approval_outbox o \
+         JOIN workflow_approval_gates g \
+           ON g.community_id = o.community_id AND g.id = o.approval_id \
+         WHERE o.community_id = $1 AND g.run_id = $2 ORDER BY o.id",
     )
     .bind(community.as_uuid())
     .bind(run_id)
@@ -362,21 +377,31 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
 }
 
 fn assert_bound_gate(row: &Value, fixture: &Fixture, spec: &GateSpec, approval_id: Uuid) {
-    assert_eq!(field(row, "approval_id"), &json!(approval_id));
+    assert_eq!(field(row, "id"), &json!(approval_id));
     assert_eq!(field(row, "community_id"), &json!(fixture.ids.community_id));
     assert_eq!(field(row, "channel_id"), &json!(fixture.ids.channel_id));
     assert_eq!(field(row, "workflow_id"), &json!(fixture.ids.workflow_id));
     assert_eq!(field(row, "run_id"), &json!(fixture.ids.run_id));
     assert_eq!(field(row, "step_id"), &json!(spec.step_id));
     assert_eq!(field(row, "step_index"), &json!(spec.step_index));
-    assert_eq!(field(row, "gate_generation"), &json!(2));
-    assert_eq!(field(row, "policy_snapshot"), &spec.policy_snapshot);
+    assert_eq!(field(row, "generation"), &json!(2));
+    assert_eq!(
+        field(row, "policy_snapshot"),
+        &serde_json::to_value(&spec.policy).expect("serialize expected policy")
+    );
+    assert_eq!(
+        field(row, "resolved_approver_set"),
+        &json!({
+            "pubkeys": [hex::encode(&fixture.owner), hex::encode(&fixture.approver)],
+            "roles": ["owner"]
+        })
+    );
     assert_eq!(field(row, "status"), "pending");
 }
 
 #[tokio::test]
 #[ignore = "requires Postgres and exclusive access to the public schema"]
-async fn populated_migration_preserves_waiting_gate_and_backfills_slice_one_contract() {
+async fn populated_migration_preserves_legacy_approval_and_backfills_resume_state() {
     let pool = connect_pool().await;
     sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
         .execute(&pool)
@@ -480,11 +505,25 @@ async fn populated_migration_preserves_waiting_gate_and_backfills_slice_one_cont
     .bind(ids.run_id)
     .fetch_one(&pool)
     .await
-    .expect("read migrated approval");
-    assert!(field(&approval, "approval_id").is_string());
-    assert_eq!(field(&approval, "channel_id"), &json!(ids.channel_id));
-    assert_eq!(field(&approval, "gate_generation"), &json!(7));
-    assert!(field(&approval, "policy_snapshot").is_object());
+    .expect("read retained legacy approval");
+    assert_eq!(
+        field(&approval, "token"),
+        &json!("\\x3333333333333333333333333333333333333333333333333333333333333333")
+    );
+    assert_eq!(field(&approval, "approver_spec"), "owner");
+    let gate_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM workflow_approval_gates \
+         WHERE community_id = $1 AND run_id = $2",
+    )
+    .bind(ids.community_id)
+    .bind(ids.run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count new approval gates");
+    assert_eq!(
+        gate_count, 0,
+        "0031 must not rewrite legacy token approvals"
+    );
 
     let state_version_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
@@ -551,6 +590,77 @@ async fn stale_generation_rolls_back_gate_run_and_outbox_writes() {
     );
     let after = persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
     assert_eq!(after, before, "a stale fence must roll back every write");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn no_current_policy_match_returns_without_gate_run_or_outbox_writes() {
+    let fixture = Fixture::new().await;
+    sqlx::query(
+        "UPDATE channel_members SET removed_at = now() \
+         WHERE community_id = $1 AND channel_id = $2",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.channel_id)
+    .execute(&fixture.pool)
+    .await
+    .expect("remove all policy matches");
+    let before =
+        persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+
+    let outcome = create_gate(&fixture.pool, &fixture.gate_spec())
+        .await
+        .expect("resolve an unsatisfied policy");
+    assert_eq!(outcome, ObservedCreate::NoEligibleApprovers);
+    let after = persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+    assert_eq!(after, before, "an unsatisfied policy must not write");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn membership_changes_and_gate_creation_share_the_channel_lock() {
+    let fixture = Fixture::new().await;
+    let before =
+        persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+    let mut holder = fixture.pool.begin().await.expect("begin membership change");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "buzz_channel_membership:{}:{}",
+            fixture.ids.community_id, fixture.ids.channel_id
+        ))
+        .execute(&mut *holder)
+        .await
+        .expect("hold channel membership lock");
+
+    let task_pool = fixture.pool.clone();
+    let task_spec = fixture.gate_spec();
+    let mut gate_task = tokio::spawn(async move { create_gate(&task_pool, &task_spec).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut gate_task)
+            .await
+            .is_err(),
+        "gate creation must wait behind the membership lock"
+    );
+
+    sqlx::query(
+        "UPDATE channel_members SET removed_at = now() \
+         WHERE community_id = $1 AND channel_id = $2",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.channel_id)
+    .execute(&mut *holder)
+    .await
+    .expect("remove approvers while holding membership lock");
+    holder.commit().await.expect("commit membership change");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), gate_task)
+        .await
+        .expect("gate creation unblocks")
+        .expect("gate task joins")
+        .expect("gate creation returns an outcome");
+    assert_eq!(outcome, ObservedCreate::NoEligibleApprovers);
+    let after = persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+    assert_eq!(after, before, "serialized no-match creation must not write");
 }
 
 #[tokio::test]
@@ -650,7 +760,10 @@ async fn tenant_and_channel_collisions_fail_closed() {
     let mut wrong_channel = fixture.gate_spec();
     wrong_channel.channel_id = wrong_channel_id;
     assert!(
-        create_gate(&fixture.pool, &wrong_channel).await.is_err(),
+        matches!(
+            create_gate(&fixture.pool, &wrong_channel).await,
+            Err(_) | Ok(ObservedCreate::Conflict)
+        ),
         "the run's tenant is insufficient without its exact bound channel"
     );
 
@@ -737,8 +850,10 @@ async fn outbox_deduplicates_replays_and_orders_gate_requests() {
     );
 
     let rows: Vec<(i64, String, Uuid)> = sqlx::query_as(
-        "SELECT sequence, dedupe_key, run_id FROM workflow_outbox \
-         WHERE community_id = $1 AND channel_id = $2 ORDER BY sequence",
+        "SELECT o.id, o.dedupe_key, g.run_id FROM workflow_approval_outbox o \
+         JOIN workflow_approval_gates g \
+           ON g.community_id = o.community_id AND g.id = o.approval_id \
+         WHERE o.community_id = $1 AND g.channel_id = $2 ORDER BY o.id",
     )
     .bind(fixture.ids.community_id)
     .bind(fixture.ids.channel_id)
@@ -768,9 +883,9 @@ enum FailPoint {
 impl FailPoint {
     fn table(self) -> &'static str {
         match self {
-            Self::ApprovalInsert => "workflow_approvals",
+            Self::ApprovalInsert => "workflow_approval_gates",
             Self::RunUpdate => "workflow_runs",
-            Self::OutboxInsert => "workflow_outbox",
+            Self::OutboxInsert => "workflow_approval_outbox",
         }
     }
 
@@ -870,7 +985,7 @@ async fn approval_row_and_request_payload_have_no_raw_token_contract() {
 
     let forbidden_columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = 'workflow_approvals' \
+         WHERE table_schema = 'public' AND table_name = 'workflow_approval_gates' \
            AND column_name IN ('token', 'approval_token', 'raw_approval_token')",
     )
     .fetch_all(&fixture.pool)
@@ -884,7 +999,7 @@ async fn approval_row_and_request_payload_have_no_raw_token_contract() {
     let persisted =
         persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
     assert_eq!(persisted.approvals.len(), 1);
-    assert!(field(&persisted.approvals[0], "approval_id").is_string());
+    assert!(field(&persisted.approvals[0], "id").is_string());
     assert_eq!(persisted.outbox.len(), 1);
     let payload = field(&persisted.outbox[0], "payload");
     assert!(
@@ -920,7 +1035,10 @@ async fn approval_row_and_request_payload_have_no_raw_token_contract() {
         .collect();
     assert_eq!(
         p_tags,
-        vec![json!(["p", hex::encode(&fixture.approver)])],
+        vec![
+            json!(["p", hex::encode(&fixture.owner)]),
+            json!(["p", hex::encode(&fixture.approver)]),
+        ],
         "request must contain exactly one p tag per resolved approver"
     );
 }
