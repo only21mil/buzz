@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -16,10 +17,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use buzz_ci_broker_protocol::GitOid;
 use buzz_ci_isolation_contract::ValidatedAttemptLeaseBinding;
 use buzz_ci_policy_proxy::{
-    CanonicalCreate, EffectiveContainerSpec, InheritedOneShotConnector, InheritedProxy,
-    PolicyManifest, PreStartObserver, ProxyError, ProxyPolicy, TransportLimits, UpstreamCapability,
-    VerifiedStart,
+    Admission, CanonicalCreate, DockerMethod, EffectiveContainerSpec, InheritedOneShotConnector,
+    InheritedProxy, OneShotUpstreamConnector, PolicyManifest, PreStartObserver, ProxyError,
+    ProxyPolicy, TransportLimits, UpstreamCapability, VerifiedStart,
 };
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -35,6 +37,8 @@ use crate::seccomp_exec::{persist_oci_prestart_observation, SeccompExecError};
 
 const LISTENER_MODE: u32 = 0o660;
 const MAX_LEASE_OBJECTS: usize = 32;
+const MAX_PODMAN_HEADER_BYTES: usize = 32 * 1024;
+const MAX_PODMAN_HEADER_COUNT: usize = 64;
 
 /// Immutable broker-owned paths and evidence facts for one policy proxy.
 #[derive(Clone, Debug)]
@@ -416,6 +420,631 @@ impl<P: PrestartPersister> BrokerProxyLease<P> {
     }
 }
 
+/// One authenticated rootless Podman descriptor acquisition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PodmanLaunchOperation {
+    /// Canonical container creation on a fresh descriptor.
+    Create,
+    /// Fresh inspection followed by start of the exact created object.
+    InspectStart {
+        /// Full runtime object ID returned by create.
+        object_id: String,
+    },
+}
+
+/// Typed refusal while acquiring a one-shot rootless Podman descriptor.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PodmanDescriptorError {
+    /// The descriptor, peer, or capability does not match the lease.
+    #[error("Podman descriptor identity refused")]
+    Identity,
+    /// The authenticated descriptor transport failed closed.
+    #[error("Podman descriptor transport failed")]
+    Transport,
+}
+
+/// Trusted source of one authenticated descriptor per launch operation.
+///
+/// Implementors consume a broker-authenticated capability channel. They must
+/// never resolve an executor-provided socket path, URL, or environment value.
+pub trait PodmanLaunchDescriptorSource {
+    /// Acquire a descriptor bound to the exact lease and operation.
+    fn acquire(
+        &mut self,
+        capability: &UpstreamCapability,
+        operation: &PodmanLaunchOperation,
+    ) -> Result<InheritedOneShotConnector, PodmanDescriptorError>;
+}
+
+/// Broker-owned capability for canonical create and authenticated pre-start.
+///
+/// The first descriptor carries only canonical create. A second descriptor
+/// carries fresh inspect and, only after the observer persists the exact
+/// effective specification, start. Any ambiguity after create leaves the
+/// capability poisoned with the object ID retained for reconciliation.
+pub struct BrokerPodmanLaunch<P: PrestartPersister, S: PodmanLaunchDescriptorSource> {
+    lease: LeaseToken,
+    capability: UpstreamCapability,
+    policy: ProxyPolicy,
+    observer: ProxyLeaseObserver<P>,
+    source: S,
+    limits: TransportLimits,
+    retained_object_id: Option<String>,
+    consumed: bool,
+    poisoned: bool,
+}
+
+impl<P: PrestartPersister, S: PodmanLaunchDescriptorSource> BrokerPodmanLaunch<P, S> {
+    /// Canonicalize create, verify a fresh inspect, persist the observation,
+    /// and then issue start on the same authenticated descriptor.
+    pub fn create_inspect_persist_start(
+        &mut self,
+        lease: LeaseToken,
+        requested_create: &[u8],
+    ) -> Result<String, ProxyLeaseError> {
+        if lease != self.lease {
+            return Err(ProxyLeaseError::DescriptorIdentity);
+        }
+        if self.consumed || self.poisoned {
+            return Err(ProxyLeaseError::LaunchState);
+        }
+        self.consumed = true;
+        if requested_create.len() > self.limits.request_body_bytes {
+            return Err(ProxyLeaseError::Create);
+        }
+        let create =
+            match self
+                .policy
+                .admit(DockerMethod::Post, "/containers/create", requested_create)?
+            {
+                Admission::Create(create) => create,
+                _ => return Err(ProxyLeaseError::LaunchState),
+            };
+        if create.body.len() > self.limits.request_body_bytes {
+            self.policy.abort_create(&create)?;
+            return Err(ProxyLeaseError::Create);
+        }
+
+        let create_response = match launch_exchange(
+            &mut self.source,
+            &self.capability,
+            &PodmanLaunchOperation::Create,
+            DockerMethod::Post,
+            &create.target,
+            &create.body,
+            self.limits,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self.policy.abort_create(&create);
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        if !create_response.success() {
+            self.policy.abort_create(&create)?;
+            return Err(ProxyLeaseError::Create);
+        }
+        let object_id = match podman_object_id(&create_response.body) {
+            Ok(object_id) => object_id,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        self.retained_object_id = Some(object_id.clone());
+        if self
+            .policy
+            .record_created(object_id.clone(), &create)
+            .is_err()
+        {
+            self.poisoned = true;
+            return Err(ProxyLeaseError::Create);
+        }
+
+        if let Err(error) = self.inspect_persist_start(&create, &object_id) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(object_id)
+    }
+
+    /// Whether runtime state is ambiguous and cleanup is mandatory.
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Exact created object retained for later reconciliation.
+    pub fn retained_object_id(&self) -> Option<&str> {
+        self.retained_object_id.as_deref()
+    }
+
+    /// Reconcile the exact retained object through the existing bounded path.
+    pub fn reconcile<R: PodmanReconcileRunner>(
+        &mut self,
+        lease: LeaseToken,
+        runner: &mut R,
+    ) -> Result<(), ProxyLeaseError> {
+        if lease != self.lease {
+            return Err(ProxyLeaseError::DescriptorIdentity);
+        }
+        let object_id = self
+            .retained_object_id
+            .clone()
+            .ok_or(ProxyLeaseError::LaunchState)?;
+        reconcile_podman_objects(runner, &self.capability, &BTreeSet::from([object_id]))?;
+        self.retained_object_id = None;
+        Ok(())
+    }
+
+    fn inspect_persist_start(
+        &mut self,
+        create: &CanonicalCreate,
+        object_id: &str,
+    ) -> Result<(), ProxyLeaseError> {
+        let operation = PodmanLaunchOperation::InspectStart {
+            object_id: object_id.to_owned(),
+        };
+        let mut connector = self
+            .source
+            .acquire(&self.capability, &operation)
+            .map_err(descriptor_error)?;
+        let mut upstream = connector
+            .connect(&self.capability)
+            .map_err(|_| ProxyLeaseError::DescriptorIdentity)?;
+        configure_podman_stream(&upstream, self.limits)?;
+
+        let inspect = exchange_connected(
+            &mut upstream,
+            DockerMethod::Get,
+            &format!("/containers/{object_id}/json"),
+            &[],
+            self.limits.response_body_bytes,
+        )
+        .map_err(|_| ProxyLeaseError::Inspect)?;
+        if !inspect.success() {
+            return Err(ProxyLeaseError::Inspect);
+        }
+        let effective =
+            decode_podman_effective_spec(&inspect.body).map_err(|_| ProxyLeaseError::Inspect)?;
+        let proof = self
+            .policy
+            .verify_pre_start(object_id, &effective)
+            .map_err(|_| ProxyLeaseError::Inspect)?;
+        let retained_create = self
+            .policy
+            .created_request(object_id)
+            .map_err(|_| ProxyLeaseError::Inspect)?;
+        if retained_create != create {
+            return Err(ProxyLeaseError::Inspect);
+        }
+        self.observer
+            .observe_pre_start(create, object_id, &effective, &proof)?;
+
+        let start = exchange_connected(
+            &mut upstream,
+            DockerMethod::Post,
+            &format!("/containers/{object_id}/start"),
+            &[],
+            self.limits.response_body_bytes,
+        )
+        .map_err(|_| ProxyLeaseError::Start)?;
+        if !start.success() || !start.body.is_empty() {
+            return Err(ProxyLeaseError::Start);
+        }
+        self.policy
+            .commit_started(&proof)
+            .map_err(|_| ProxyLeaseError::Start)?;
+        self.observer
+            .observe_started(object_id)
+            .map_err(|_| ProxyLeaseError::Start)
+    }
+}
+
+/// Build the broker-owned launch capability from authenticated authority.
+#[allow(clippy::too_many_arguments)]
+pub fn build_broker_podman_launch<P, S>(
+    authority: ProxyLeaseAuthority,
+    admission: OrdinaryAdmission,
+    lease: LeaseToken,
+    validated: &ValidatedAttemptLeaseBinding,
+    manifest: PolicyManifest,
+    source: S,
+    persister: P,
+    limits: TransportLimits,
+) -> Result<BrokerPodmanLaunch<P, S>, ProxyLeaseError>
+where
+    P: PrestartPersister,
+    S: PodmanLaunchDescriptorSource,
+{
+    validate_authenticated_binding(admission, lease, validated, &manifest)?;
+    if limits.request_body_bytes == 0
+        || limits.response_body_bytes == 0
+        || limits.io_timeout.is_zero()
+    {
+        return Err(ProxyLeaseError::Authority);
+    }
+    let policy = ProxyPolicy::install(manifest, validated)?;
+    let capability = UpstreamCapability::from_validated_lease(validated);
+    if capability.lease_id() != validated.as_binding().lease_id {
+        return Err(ProxyLeaseError::DescriptorIdentity);
+    }
+    let observer = ProxyLeaseObserver::production(
+        admission,
+        lease,
+        validated.as_binding().lease_id.clone(),
+        authority,
+        persister,
+    )?;
+    Ok(BrokerPodmanLaunch {
+        lease,
+        capability,
+        policy,
+        observer,
+        source,
+        limits,
+        retained_object_id: None,
+        consumed: false,
+        poisoned: false,
+    })
+}
+
+struct PodmanHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+impl PodmanHttpResponse {
+    fn success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+fn launch_exchange<S: PodmanLaunchDescriptorSource>(
+    source: &mut S,
+    capability: &UpstreamCapability,
+    operation: &PodmanLaunchOperation,
+    method: DockerMethod,
+    target: &str,
+    body: &[u8],
+    limits: TransportLimits,
+) -> Result<PodmanHttpResponse, ProxyLeaseError> {
+    let mut connector = source
+        .acquire(capability, operation)
+        .map_err(descriptor_error)?;
+    let mut upstream = connector
+        .connect(capability)
+        .map_err(|_| ProxyLeaseError::DescriptorIdentity)?;
+    configure_podman_stream(&upstream, limits)?;
+    exchange_connected(
+        &mut upstream,
+        method,
+        target,
+        body,
+        limits.response_body_bytes,
+    )
+    .map_err(|_| ProxyLeaseError::Create)
+}
+
+fn descriptor_error(error: PodmanDescriptorError) -> ProxyLeaseError {
+    match error {
+        PodmanDescriptorError::Identity => ProxyLeaseError::DescriptorIdentity,
+        PodmanDescriptorError::Transport => ProxyLeaseError::DescriptorTransport,
+    }
+}
+
+fn configure_podman_stream(
+    stream: &UnixStream,
+    limits: TransportLimits,
+) -> Result<(), ProxyLeaseError> {
+    stream.set_read_timeout(Some(limits.io_timeout))?;
+    stream.set_write_timeout(Some(limits.io_timeout))?;
+    Ok(())
+}
+
+fn exchange_connected(
+    stream: &mut UnixStream,
+    method: DockerMethod,
+    target: &str,
+    body: &[u8],
+    max_response: usize,
+) -> Result<PodmanHttpResponse, ProxyError> {
+    if body.len() > 1024 * 1024
+        || target.is_empty()
+        || !target.starts_with('/')
+        || target.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
+    {
+        return Err(ProxyError::Transport(
+            "invalid broker-built Podman request".into(),
+        ));
+    }
+    let method = match method {
+        DockerMethod::Get => "GET",
+        DockerMethod::Post => "POST",
+        _ => {
+            return Err(ProxyError::Transport(
+                "launch capability supports only GET and POST".into(),
+            ))
+        }
+    };
+    write!(
+        stream,
+        "{method} {target} HTTP/1.1\r\nHost: podman\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .map_err(|_| ProxyError::Transport("Podman request write failed".into()))?;
+    stream
+        .write_all(body)
+        .map_err(|_| ProxyError::Transport("Podman request body write failed".into()))?;
+    stream
+        .flush()
+        .map_err(|_| ProxyError::Transport("Podman request flush failed".into()))?;
+    read_podman_response(stream, max_response)
+}
+
+fn read_podman_response(
+    stream: &mut UnixStream,
+    max_body: usize,
+) -> Result<PodmanHttpResponse, ProxyError> {
+    let mut bytes = Vec::with_capacity(1024);
+    let mut buffer = [0_u8; 1024];
+    let head_end = loop {
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|_| ProxyError::Transport("Podman response read failed".into()))?;
+        if count == 0 {
+            return Err(ProxyError::Transport(
+                "Podman response closed before its header".into(),
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() > MAX_PODMAN_HEADER_BYTES + max_body {
+            return Err(ProxyError::Transport(
+                "Podman response exceeds its bound".into(),
+            ));
+        }
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head_end = end + 4;
+            if head_end > MAX_PODMAN_HEADER_BYTES {
+                return Err(ProxyError::Transport(
+                    "Podman response header exceeds its bound".into(),
+                ));
+            }
+            break head_end;
+        }
+        if bytes.len() > MAX_PODMAN_HEADER_BYTES {
+            return Err(ProxyError::Transport(
+                "Podman response header exceeds its bound".into(),
+            ));
+        }
+    };
+    let head = std::str::from_utf8(&bytes[..head_end - 4])
+        .map_err(|_| ProxyError::Transport("Podman response header is not UTF-8".into()))?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| ProxyError::Transport("Podman response has no status".into()))?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    if status_parts.next() != Some("HTTP/1.1") {
+        return Err(ProxyError::Transport(
+            "Podman response is not HTTP/1.1".into(),
+        ));
+    }
+    let status = status_parts
+        .next()
+        .ok_or_else(|| ProxyError::Transport("Podman response status is missing".into()))?
+        .parse::<u16>()
+        .map_err(|_| ProxyError::Transport("Podman response status is invalid".into()))?;
+    if !(200..600).contains(&status) || status == 101 {
+        return Err(ProxyError::Transport(
+            "Podman informational or upgrade response refused".into(),
+        ));
+    }
+    let mut content_length = None;
+    for (index, line) in lines.enumerate() {
+        if index >= MAX_PODMAN_HEADER_COUNT
+            || line.is_empty()
+            || line.starts_with([' ', '\t'])
+            || !line.is_ascii()
+        {
+            return Err(ProxyError::Transport(
+                "Podman response header is malformed".into(),
+            ));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| ProxyError::Transport("Podman response header is malformed".into()))?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(ProxyError::Transport(
+                "Podman transfer encoding is refused".into(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(ProxyError::Transport(
+                    "duplicate Podman content length".into(),
+                ));
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| ProxyError::Transport("invalid Podman content length".into()))?,
+            );
+        }
+    }
+    let content_length = match (content_length, status) {
+        (Some(content_length), _) => content_length,
+        (None, 204 | 304) => 0,
+        (None, _) => {
+            return Err(ProxyError::Transport(
+                "Podman content length is missing".into(),
+            ))
+        }
+    };
+    if content_length > max_body || bytes.len() - head_end > content_length {
+        return Err(ProxyError::Transport(
+            "Podman response body exceeds its bound".into(),
+        ));
+    }
+    let received_body = bytes.len() - head_end;
+    bytes.resize(head_end + content_length, 0);
+    stream
+        .read_exact(&mut bytes[head_end + received_body..])
+        .map_err(|_| ProxyError::Transport("Podman response body is incomplete".into()))?;
+    Ok(PodmanHttpResponse {
+        status,
+        body: bytes[head_end..].to_vec(),
+    })
+}
+
+fn podman_object_id(body: &[u8]) -> Result<String, ProxyLeaseError> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| ProxyLeaseError::Create)?;
+    let object_id = value
+        .get("Id")
+        .and_then(Value::as_str)
+        .ok_or(ProxyLeaseError::Create)?;
+    if !safe_object_id(object_id) {
+        return Err(ProxyLeaseError::Create);
+    }
+    Ok(object_id.to_owned())
+}
+
+fn decode_podman_effective_spec(body: &[u8]) -> Result<EffectiveContainerSpec, ProxyError> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| ProxyError::Transport("Podman inspect JSON is invalid".into()))?;
+    let config = podman_object_field(&value, "Config")?;
+    let host = podman_object_field(&value, "HostConfig")?;
+    let networking = podman_object_field(&value, "NetworkSettings")?;
+    let devices = podman_array_field(host, "Devices")?;
+    let port_bindings = podman_nested_object_field(host, "PortBindings")?;
+    if !devices.is_empty() || !port_bindings.is_empty() {
+        return Err(ProxyError::Transport(
+            "Podman inspect reports forbidden device or port state".into(),
+        ));
+    }
+    let networks = podman_nested_object_field(networking, "Networks")?;
+    let restart = podman_nested_object_field(host, "RestartPolicy")?;
+    let log = podman_nested_object_field(host, "LogConfig")?;
+    Ok(EffectiveContainerSpec {
+        image: podman_string_field(config, "Image")?,
+        user: podman_string_field(config, "User")?,
+        binds: podman_strings_field(host, "Binds")?,
+        network_mode: podman_string_field(host, "NetworkMode")?,
+        readonly_rootfs: podman_bool_field(host, "ReadonlyRootfs")?,
+        cap_drop: podman_strings_field(host, "CapDrop")?,
+        cap_add: podman_strings_field(host, "CapAdd")?,
+        privileged: podman_bool_field(host, "Privileged")?,
+        security_opt: podman_strings_field(host, "SecurityOpt")?,
+        pids_limit: podman_u64_field(host, "PidsLimit")?,
+        memory: podman_u64_field(host, "Memory")?,
+        memory_swap: podman_u64_field(host, "MemorySwap")?,
+        shm_size: podman_u64_field(host, "ShmSize")?,
+        nano_cpus: podman_u64_field(host, "NanoCpus")?,
+        devices: Vec::new(),
+        port_bindings: BTreeMap::new(),
+        publish_all_ports: podman_bool_field(host, "PublishAllPorts")?,
+        pid_mode: podman_string_field(host, "PidMode")?,
+        ipc_mode: podman_string_field(host, "IpcMode")?,
+        uts_mode: podman_string_field(host, "UTSMode")?,
+        cgroupns_mode: podman_string_field(host, "CgroupnsMode")?,
+        userns_mode: podman_string_field(host, "UsernsMode")?,
+        restart_policy: podman_string_field(restart, "Name")?,
+        log_driver: podman_string_field(log, "Type")?,
+        network_endpoints: networks.keys().cloned().collect(),
+        labels: podman_string_map_field(config, "Labels")?,
+    })
+}
+
+fn podman_object_field<'a>(
+    value: &'a Value,
+    name: &str,
+) -> Result<&'a serde_json::Map<String, Value>, ProxyError> {
+    value
+        .get(name)
+        .and_then(Value::as_object)
+        .ok_or_else(|| ProxyError::Transport(format!("Podman inspect {name} is not an object")))
+}
+
+fn podman_nested_object_field<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<&'a serde_json::Map<String, Value>, ProxyError> {
+    value
+        .get(name)
+        .and_then(Value::as_object)
+        .ok_or_else(|| ProxyError::Transport(format!("Podman inspect {name} is not an object")))
+}
+
+fn podman_array_field<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<&'a Vec<Value>, ProxyError> {
+    value
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProxyError::Transport(format!("Podman inspect {name} is not an array")))
+}
+
+fn podman_strings_field(
+    value: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Vec<String>, ProxyError> {
+    podman_array_field(value, name)?
+        .iter()
+        .map(|item| {
+            item.as_str().map(str::to_owned).ok_or_else(|| {
+                ProxyError::Transport(format!("Podman inspect {name} contains a non-string"))
+            })
+        })
+        .collect()
+}
+
+fn podman_string_field(
+    value: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<String, ProxyError> {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| ProxyError::Transport(format!("Podman inspect {name} is not a string")))
+}
+
+fn podman_bool_field(
+    value: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<bool, ProxyError> {
+    value
+        .get(name)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ProxyError::Transport(format!("Podman inspect {name} is not a bool")))
+}
+
+fn podman_u64_field(value: &serde_json::Map<String, Value>, name: &str) -> Result<u64, ProxyError> {
+    value
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProxyError::Transport(format!("Podman inspect {name} is not a u64")))
+}
+
+fn podman_string_map_field(
+    value: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<BTreeMap<String, String>, ProxyError> {
+    podman_nested_object_field(value, name)?
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_owned()))
+                .ok_or_else(|| {
+                    ProxyError::Transport(format!("Podman inspect {name} contains a non-string"))
+                })
+        })
+        .collect()
+}
+
 /// Build broker-owned descriptors from authenticated authority only.
 #[allow(clippy::too_many_arguments)]
 pub fn build_broker_proxy_lease<P: PrestartPersister>(
@@ -593,6 +1222,21 @@ pub enum ProxyLeaseError {
     /// The derived listener already exists.
     #[error("derived proxy listener already exists")]
     ListenerExists,
+    /// The broker-side launch capability was consumed or used out of order.
+    #[error("Podman launch capability state refused")]
+    LaunchState,
+    /// Canonical create failed or returned an invalid object identity.
+    #[error("Podman canonical create failed")]
+    Create,
+    /// Fresh pre-start inspection failed or drifted from policy.
+    #[error("Podman pre-start inspection failed")]
+    Inspect,
+    /// Start failed after the persisted pre-start observation.
+    #[error("Podman start failed and requires reconciliation")]
+    Start,
+    /// The authenticated descriptor channel was unavailable.
+    #[error("Podman descriptor transport failed")]
+    DescriptorTransport,
     /// Runtime objects are duplicated, malformed, missing, or unexpected.
     #[error("Podman object inventory is ambiguous")]
     AmbiguousObjects,
@@ -673,7 +1317,9 @@ fn oid_hex(oid: GitOid) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::{Read, Write};
     use std::os::unix::fs::FileTypeExt;
+    use std::sync::{Arc, Mutex};
 
     use buzz_ci_isolation_contract::{
         AttemptLeaseBinding, BrokerObjectHandle, CgroupHandle, EngineKind as SharedEngineKind,
@@ -1119,6 +1765,311 @@ mod tests {
         fn now_ns(&mut self) -> Result<u64, ProxyLeaseError> {
             self.0.pop_front().ok_or(ProxyLeaseError::Clock)
         }
+    }
+
+    #[derive(Clone)]
+    struct RecordingPersister(Arc<Mutex<Vec<&'static str>>>);
+
+    impl PrestartPersister for RecordingPersister {
+        fn persist(
+            &mut self,
+            _admission: &OrdinaryAdmission,
+            _lease: LeaseToken,
+            _create: &CanonicalCreate,
+            _proof: &VerifiedStart,
+            _effective: &EffectiveContainerSpec,
+        ) -> Result<(), SeccompExecError> {
+            self.0.lock().unwrap().push("persist");
+            Ok(())
+        }
+    }
+
+    struct ScriptedLaunchDescriptors {
+        inspect_body: Vec<u8>,
+        ordering: Arc<Mutex<Vec<&'static str>>>,
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
+        fail_start: bool,
+    }
+
+    impl PodmanLaunchDescriptorSource for ScriptedLaunchDescriptors {
+        fn acquire(
+            &mut self,
+            capability: &UpstreamCapability,
+            operation: &PodmanLaunchOperation,
+        ) -> Result<InheritedOneShotConnector, PodmanDescriptorError> {
+            let (broker, mut runtime) = UnixStream::pair().unwrap();
+            let operation = operation.clone();
+            let inspect_body = self.inspect_body.clone();
+            let ordering = Arc::clone(&self.ordering);
+            let requests = Arc::clone(&self.requests);
+            let fail_start = self.fail_start;
+            std::thread::spawn(move || match operation {
+                PodmanLaunchOperation::Create => {
+                    let request = read_test_request(&mut runtime);
+                    ordering.lock().unwrap().push("create");
+                    requests.lock().unwrap().push(request);
+                    write_test_response(&mut runtime, 201, "Created", br#"{"Id":"container-1"}"#);
+                }
+                PodmanLaunchOperation::InspectStart { object_id } => {
+                    assert_eq!(object_id, "container-1");
+                    let inspect = read_test_request(&mut runtime);
+                    ordering.lock().unwrap().push("inspect");
+                    requests.lock().unwrap().push(inspect);
+                    write_test_response(&mut runtime, 200, "OK", &inspect_body);
+                    let start = read_test_request(&mut runtime);
+                    ordering.lock().unwrap().push("start");
+                    requests.lock().unwrap().push(start);
+                    if !fail_start {
+                        write_test_response(&mut runtime, 204, "No Content", &[]);
+                    }
+                }
+            });
+            InheritedOneShotConnector::new(broker, capability.clone())
+                .map_err(|_| PodmanDescriptorError::Identity)
+        }
+    }
+
+    fn read_test_request(stream: &mut UnixStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        let head = std::str::from_utf8(&request).unwrap();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .map(|value| value.parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let head_len = request.len();
+        request.resize(head_len + content_length, 0);
+        stream.read_exact(&mut request[head_len..]).unwrap();
+        request
+    }
+
+    fn write_test_response(stream: &mut UnixStream, status: u16, reason: &str, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    }
+
+    fn inspect_body(manifest: &PolicyManifest) -> Vec<u8> {
+        let expected = effective(manifest);
+        serde_json::to_vec(&serde_json::json!({
+            "Config": {
+                "Image": expected.image,
+                "User": expected.user,
+                "Labels": expected.labels,
+            },
+            "HostConfig": {
+                "Binds": expected.binds,
+                "NetworkMode": expected.network_mode,
+                "ReadonlyRootfs": expected.readonly_rootfs,
+                "CapDrop": expected.cap_drop,
+                "CapAdd": expected.cap_add,
+                "Privileged": expected.privileged,
+                "SecurityOpt": expected.security_opt,
+                "PidsLimit": expected.pids_limit,
+                "Memory": expected.memory,
+                "MemorySwap": expected.memory_swap,
+                "ShmSize": expected.shm_size,
+                "NanoCpus": expected.nano_cpus,
+                "Devices": expected.devices,
+                "PortBindings": expected.port_bindings,
+                "PublishAllPorts": expected.publish_all_ports,
+                "PidMode": expected.pid_mode,
+                "IpcMode": expected.ipc_mode,
+                "UTSMode": expected.uts_mode,
+                "CgroupnsMode": expected.cgroupns_mode,
+                "UsernsMode": expected.userns_mode,
+                "RestartPolicy": {"Name": expected.restart_policy},
+                "LogConfig": {"Type": expected.log_driver},
+            },
+            "NetworkSettings": {"Networks": {}},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn production_launch_capability_owns_create_inspect_persist_start_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let ordering = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let source = ScriptedLaunchDescriptors {
+            inspect_body: inspect_body(&manifest),
+            ordering: Arc::clone(&ordering),
+            requests: Arc::clone(&requests),
+            fail_start: false,
+        };
+        let persister = RecordingPersister(Arc::clone(&ordering));
+        let image = manifest.isolation_profile.image_digest.clone();
+        let mut launch = build_broker_podman_launch(
+            authority(&root),
+            admission,
+            lease,
+            &validated,
+            manifest,
+            source,
+            persister,
+            TransportLimits::default(),
+        )
+        .unwrap();
+
+        let object_id = launch
+            .create_inspect_persist_start(
+                lease,
+                &serde_json::to_vec(&serde_json::json!({
+                    "Image": image,
+                    "Cmd": ["true"],
+                    "WorkingDir": "/workspace",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(object_id, "container-1");
+        assert_eq!(
+            *ordering.lock().unwrap(),
+            ["create", "inspect", "persist", "start"]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with(b"POST /containers/create?name="));
+        assert!(requests[1].starts_with(b"GET /containers/container-1/json HTTP/1.1"));
+        assert!(requests[2].starts_with(b"POST /containers/container-1/start HTTP/1.1"));
+        let body_start = requests[0]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let create_body = &requests[0][body_start..];
+        let create: serde_json::Value = serde_json::from_slice(create_body).unwrap();
+        assert_eq!(create["HostConfig"]["Privileged"], false);
+        assert_eq!(create["HostConfig"]["NetworkMode"], "none");
+        assert!(launch.retained_object_id().is_some());
+        assert!(!launch.is_poisoned());
+    }
+
+    #[test]
+    fn record_created_failure_retains_exact_id_for_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let ordering = Arc::new(Mutex::new(Vec::new()));
+        let source = ScriptedLaunchDescriptors {
+            inspect_body: inspect_body(&manifest),
+            ordering: Arc::clone(&ordering),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            fail_start: false,
+        };
+        let persister = RecordingPersister(Arc::clone(&ordering));
+        let image = manifest.isolation_profile.image_digest.clone();
+        let requested_create = serde_json::to_vec(&serde_json::json!({"Image": image})).unwrap();
+        let mut launch = build_broker_podman_launch(
+            authority(&root),
+            admission,
+            lease,
+            &validated,
+            manifest,
+            source,
+            persister,
+            TransportLimits::default(),
+        )
+        .unwrap();
+        let Admission::Create(existing) = launch
+            .policy
+            .admit(DockerMethod::Post, "/containers/create", &requested_create)
+            .unwrap()
+        else {
+            panic!("create admission")
+        };
+        launch
+            .policy
+            .record_created("container-1".into(), &existing)
+            .unwrap();
+
+        assert!(matches!(
+            launch.create_inspect_persist_start(lease, &requested_create),
+            Err(ProxyLeaseError::Create)
+        ));
+        assert!(launch.is_poisoned());
+        assert_eq!(launch.retained_object_id(), Some("container-1"));
+        assert_eq!(*ordering.lock().unwrap(), ["create"]);
+
+        let mut cleanup = runner(vec![
+            vec![PodmanObject {
+                id: "container-1".into(),
+                running: false,
+            }],
+            vec![],
+        ]);
+        launch.reconcile(lease, &mut cleanup).unwrap();
+        assert_eq!(cleanup.actions, ["list", "delete:container-1", "list"]);
+        assert!(launch.retained_object_id().is_none());
+    }
+
+    #[test]
+    fn ambiguous_start_poison_requires_exact_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let ordering = Arc::new(Mutex::new(Vec::new()));
+        let source = ScriptedLaunchDescriptors {
+            inspect_body: inspect_body(&manifest),
+            ordering: Arc::clone(&ordering),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            fail_start: true,
+        };
+        let persister = RecordingPersister(Arc::clone(&ordering));
+        let image = manifest.isolation_profile.image_digest.clone();
+        let mut launch = build_broker_podman_launch(
+            authority(&root),
+            admission,
+            lease,
+            &validated,
+            manifest,
+            source,
+            persister,
+            TransportLimits::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            launch.create_inspect_persist_start(
+                lease,
+                &serde_json::to_vec(&serde_json::json!({"Image": image})).unwrap(),
+            ),
+            Err(ProxyLeaseError::Start)
+        ));
+        assert!(launch.is_poisoned());
+        assert_eq!(launch.retained_object_id(), Some("container-1"));
+        assert_eq!(
+            *ordering.lock().unwrap(),
+            ["create", "inspect", "persist", "start"]
+        );
+
+        let mut cleanup = runner(vec![
+            vec![PodmanObject {
+                id: "container-1".into(),
+                running: true,
+            }],
+            vec![],
+        ]);
+        launch.reconcile(lease, &mut cleanup).unwrap();
+        assert_eq!(
+            cleanup.actions,
+            ["list", "stop:container-1", "delete:container-1", "list"]
+        );
+        assert!(launch.retained_object_id().is_none());
     }
 
     #[test]
