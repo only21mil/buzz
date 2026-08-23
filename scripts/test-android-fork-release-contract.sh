@@ -195,8 +195,8 @@ PY
 readonly runner_temp_verifier_command='"$RUNNER_TEMP/trusted-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/scripts/verify-android-fork-release-unsigned-apk.sh" '"\\"
 
 count_active_runner_temp_verifiers() {
-  awk -v expected="$runner_temp_verifier_command" '
-    { sub(/^[[:space:]]*/, ""); if ($0 == expected) count += 1 }
+  EXPECTED_RUNNER_TEMP_VERIFIER_COMMAND="$runner_temp_verifier_command" awk '
+    { sub(/^[[:space:]]*/, ""); if ($0 == ENVIRON["EXPECTED_RUNNER_TEMP_VERIFIER_COMMAND"]) count += 1 }
     END { print count + 0 }
   ' <<<"$1"
 }
@@ -263,6 +263,9 @@ grep -Fq 'BUZZ_ANDROID_RELEASE_SIGNING: external' <<<"$build_job" || \
   (( move_line < hermit_line )) || fail "trusted handoff policy is not moved before Hermit activation"
   [[ "$(count_active_runner_temp_verifiers "$build_job")" -eq 1 ]] || \
     fail "networked build must actively invoke the runner-temp unsigned handoff verifier exactly once"
+  duplicated_verifier_job="$build_job"$'\n'"$runner_temp_verifier_command"
+  [[ "$(count_active_runner_temp_verifiers "$duplicated_verifier_job")" -eq 2 ]] || \
+    fail "duplicated active runner-temp verifier fixture does not count twice"
   commented_verifier_job="${build_job/"$runner_temp_verifier_command"/"# $runner_temp_verifier_command"}"
   [[ "$commented_verifier_job" != "$build_job" ]] || fail "commented verifier fixture did not mutate the job"
   [[ "$(count_active_runner_temp_verifiers "$commented_verifier_job")" -eq 0 ]] || \
