@@ -997,6 +997,8 @@ mod tests {
         assert_eq!(migrations[30].version, 31);
         let approval_foundations = migrations[30].sql.as_str();
         assert!(approval_foundations.contains("ADD VALUE 'resume_pending'"));
+        assert!(approval_foundations.contains("ALTER TABLE workflows"));
+        assert!(approval_foundations.contains("ADD COLUMN deleted_at TIMESTAMPTZ"));
         assert!(approval_foundations.contains("ADD COLUMN next_step INTEGER NOT NULL"));
         assert!(approval_foundations.contains("ADD COLUMN step_outputs JSONB NOT NULL"));
         assert!(approval_foundations.contains("MAX(step_index) + 1 AS next_step"));
@@ -1005,9 +1007,13 @@ mod tests {
         assert!(approval_foundations.contains("policy_snapshot JSONB NOT NULL"));
         assert!(approval_foundations.contains("resolved_approver_set JSONB NOT NULL"));
         assert!(approval_foundations.contains("UNIQUE (community_id, run_id, step_index)"));
-        assert!(!approval_foundations.contains("workflow_approval_gates_workflow_fkey"));
-        assert!(!approval_foundations.contains("workflow_approval_gates_run_binding_fkey"));
-        assert!(approval_foundations.contains("immutable audit identities"));
+        assert!(approval_foundations.contains("workflow_approval_gates_workflow_fkey"));
+        assert!(approval_foundations.contains("workflow_approval_gates_run_binding_fkey"));
+        assert!(approval_foundations
+            .contains("REFERENCES workflows (community_id, id) ON DELETE NO ACTION"));
+        assert!(approval_foundations.contains(
+            "REFERENCES workflow_runs (community_id, id, workflow_id) ON DELETE NO ACTION"
+        ));
         assert!(!approval_foundations.contains("ALTER TABLE workflow_approvals"));
         assert!(!approval_foundations.contains("DROP TABLE workflow_approvals"));
         assert!(approval_foundations.contains("CREATE TABLE workflow_approval_outbox"));
@@ -1017,6 +1023,27 @@ mod tests {
         assert!(approval_foundations.contains("published_event_id BYTEA"));
         assert!(!approval_foundations.contains("nostr_kind"));
         assert!(!approval_foundations.contains("state_version"));
+
+        assert!(desired_schema.contains("'waiting_approval', 'resume_pending'"));
+        assert!(desired_schema.contains("deleted_at      TIMESTAMPTZ"));
+        assert!(desired_schema.contains("next_step           INTEGER NOT NULL DEFAULT 0"));
+        assert!(desired_schema.contains("step_outputs        JSONB NOT NULL DEFAULT '{}'::jsonb"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_approval_gates"));
+        assert!(desired_schema.contains("workflow_approval_gates_workflow_fkey"));
+        assert!(desired_schema.contains("workflow_approval_gates_run_binding_fkey"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_gates_status"));
+        assert!(desired_schema.contains("CREATE FUNCTION enforce_workflow_approval_history()"));
+        assert!(desired_schema.contains("CREATE TRIGGER workflow_approval_history_update"));
+        assert!(desired_schema.contains("CREATE TRIGGER workflow_approval_history_delete"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_approval_outbox"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_outbox_due"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_outbox_recovery"));
+        assert!(
+            desired_schema.contains("CREATE FUNCTION enforce_workflow_approval_outbox_identity()")
+        );
+        assert!(
+            desired_schema.contains("CREATE TRIGGER workflow_approval_outbox_identity_immutable")
+        );
     }
 
     #[test]
