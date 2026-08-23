@@ -394,27 +394,61 @@ pub(crate) async fn publish_agent_directory_record(
         "publishing kind:10100 agent directory record"
     );
 
-    // Fail closed on a relay duplicate: a replaceable-event submit the relay
-    // judged not-new (same created_at, or content already present) means our
-    // read-merge-write lost a race with another writer (the fleet timer).
-    // Treating it as success would overwrite newer timer fields with our stale
-    // view. The error propagates so the refresh is not silently reported done.
+    // Fail closed on a relay duplicate. The relay's POST /events returns
+    // {"event_id", "accepted", "message"}; a stale replaceable write (same
+    // created_at or content already present, i.e. our read-merge-write lost a
+    // race with the fleet timer) comes back as accepted:true with a message
+    // starting "duplicate:". Rejections are HTTP 400 and become a RelayError
+    // before any body is parsed, so the accepted:false branch is defensive
+    // only. The response classification is a pure function so the wire shapes
+    // are testable.
     let resp = rest.submit_event(&event).await?;
-    if let Some(obj) = resp.as_object() {
-        if obj.get("duplicate").and_then(Value::as_bool) == Some(true) {
-            return Err(RelayError::Http(format!(
-                "kind:10100 submit reported duplicate; skipping (stale read or concurrent writer)"
-            )));
-        }
-        if obj.get("accepted").and_then(Value::as_bool) == Some(false) {
-            return Err(RelayError::Http(format!(
-                "kind:10100 submit rejected: {}",
-                obj.get("message").and_then(Value::as_str).unwrap_or("unknown")
-            )));
-        }
+    if let Some(err) = classify_submit_response(&resp) {
+        return Err(RelayError::Http(err));
     }
 
     Ok(())
+}
+
+/// Classify the relay's POST /events response into success or a non-deployable
+/// outcome. Returns `Some(message)` when the write must NOT be reported as
+/// done:
+///
+/// - `duplicate`: `accepted == true` with `message` starting `"duplicate:"`.
+///   The relay judged the replaceable event not-new, so a concurrent writer
+///   (the fleet timer) may have newer fields and our stale view must not
+///   overwrite them.
+/// - `rejected`: `accepted == false` (defensive; rejections are HTTP 400 and
+///   surface as a `RelayError` before a body reaches us).
+/// - `empty`: `submit_event` returns `Value::Null` on an empty 200 body. That
+///   is not a duplicate signal and not a success signal either; treat it as
+///   unknown and fail closed so a silent drop is never reported as done.
+///
+/// Anything else is treated as success.
+fn classify_submit_response(resp: &Value) -> Option<String> {
+    // Empty 200 body: submit_event returns Value::Null. Neither a duplicate
+    // signal nor a success signal; fail closed so a silent drop is never
+    // reported as done.
+    if resp.is_null() {
+        return Some("kind:10100 submit returned an empty response; cannot confirm acceptance".to_string());
+    }
+    let obj = resp.as_object()?;
+    let accepted = obj.get("accepted").and_then(Value::as_bool).unwrap_or(true);
+    let message = obj.get("message").and_then(Value::as_str).unwrap_or("");
+
+    if accepted && message.starts_with("duplicate:") {
+        return Some(
+            "kind:10100 submit reported duplicate; skipping (stale read or concurrent writer)"
+                .to_string(),
+        );
+    }
+    if !accepted {
+        return Some(format!(
+            "kind:10100 submit rejected: {}",
+            if message.is_empty() { "unknown" } else { message }
+        ));
+    }
+    None
 }
 
 /// Publish the record derived from the agent's active memberships. This is
@@ -817,6 +851,34 @@ mod tests {
         ];
         let latest = latest_agent_profile_event(&events).unwrap();
         assert_eq!(latest["id"].as_str().unwrap(), "aaa");
+    }
+
+    /// The relay's real wire shapes for a POST /events submit: a stale
+    /// duplicate is accepted:true with message "duplicate:..."; a new accepted
+    /// write is accepted:true with a normal event_id/message; an empty 200
+    /// body arrives as Value::Null. The classifier must fail closed on the
+    /// duplicate and the empty body and pass the new accepted write.
+    #[test]
+    fn classify_submit_response_holds_live_wire_shapes() {
+        // A new accepted replaceable write (the normal case).
+        let accepted_new = json!({"event_id": "abc", "accepted": true, "message": "saved"});
+        assert!(classify_submit_response(&accepted_new).is_none());
+
+        // A stale duplicate: the exact failure the race guard must catch.
+        let duplicate = json!({"event_id": "abc", "accepted": true, "message": "duplicate: such event already exists"});
+        let err = classify_submit_response(&duplicate).expect("duplicate must fail closed");
+        assert!(err.contains("duplicate"), "error should name the duplicate: {err}");
+
+        // Empty 200 body: submit_event returns Value::Null; must fail closed,
+        // never reported as a silent success.
+        let empty = Value::Null;
+        let err = classify_submit_response(&empty).expect("empty body must fail closed");
+        assert!(err.contains("empty"), "error should name the empty response: {err}");
+
+        // Defensive: an explicit accepted:false rejects even when no 400.
+        let rejected = json!({"event_id": "abc", "accepted": false, "message": "denied"});
+        let err = classify_submit_response(&rejected).expect("accepted:false must fail closed");
+        assert!(err.contains("rejected"), "error should name the rejection: {err}");
     }
 
     /// `retain_existing_tags` keeps non-auth tags and returns the single
