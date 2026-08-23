@@ -30,6 +30,8 @@ pub mod materializer_evidence;
 #[cfg(target_os = "linux")]
 pub mod normal_engine;
 #[cfg(target_os = "linux")]
+pub mod normal_source;
+#[cfg(target_os = "linux")]
 pub mod production_composition;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod proxy_lease;
