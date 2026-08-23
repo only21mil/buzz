@@ -20,6 +20,7 @@ use crate::workflow_run_transition::acquire_workflow_approval_channel_lock;
 pub const ACTION_SUMMARY_MAX_BYTES: usize = 2_000;
 /// Maximum serialized size of a request lifecycle payload.
 pub const REQUEST_PAYLOAD_MAX_BYTES: usize = 65_536;
+const REQUEST_PAYLOAD_ALLOWED_FIELDS: [&str; 2] = ["class", "timeout_seconds"];
 
 /// A built-in channel role that may satisfy an approval policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -174,21 +175,10 @@ impl ApprovalActionSummary {
 pub struct ApprovalRequestPayload(Value);
 
 impl ApprovalRequestPayload {
-    /// Validate an object payload and reject fields that could carry raw gate
-    /// authority, frozen definitions, prior outputs, headers, or credentials.
+    /// Validate the exact caller-owned request fields.
     pub fn new(payload: Value) -> Result<Self> {
-        if !payload.is_object() {
-            return Err(DbError::InvalidData(
-                "approval request payload must be a JSON object".to_owned(),
-            ));
-        }
-        reject_forbidden_payload_fields(&payload)?;
-        let size = serde_json::to_vec(&payload)?.len();
-        if size > REQUEST_PAYLOAD_MAX_BYTES {
-            return Err(DbError::InvalidData(format!(
-                "approval request payload exceeds {REQUEST_PAYLOAD_MAX_BYTES} serialized bytes"
-            )));
-        }
+        validate_request_payload_fields(&payload)?;
+        validate_request_payload_size(&payload)?;
         Ok(Self(payload))
     }
 
@@ -371,7 +361,7 @@ pub async fn create_workflow_approval_gate(
           AND run.id = $2
           AND workflow.channel_id = $3
           AND workflow.deleted_at IS NULL
-        FOR UPDATE OF run
+        FOR UPDATE OF run, workflow
         "#,
     )
     .bind(params.community_id.as_uuid())
@@ -622,12 +612,17 @@ fn validate_waiting_trace_entry(params: &CreateWorkflowApprovalGateParams<'_>) -
     if entry.get("step_id").and_then(Value::as_str) != Some(params.step_id)
         || entry.get("step_index").and_then(Value::as_i64) != Some(i64::from(params.step_index))
         || entry.get("status").and_then(Value::as_str) != Some("waiting_approval")
+        || entry.len() != 3
+        || entry
+            .keys()
+            .any(|key| !matches!(key.as_str(), "step_id" | "step_index" | "status"))
     {
         return Err(DbError::InvalidData(
-            "waiting trace entry must bind the exact step and waiting_approval status".to_owned(),
+            "waiting trace entry must contain only the exact step and waiting_approval status"
+                .to_owned(),
         ));
     }
-    reject_forbidden_payload_fields(params.waiting_trace_entry)
+    Ok(())
 }
 
 fn resolved_approver_set(policy: &CanonicalApprovalPolicy, approvers: &ResolvedApprovers) -> Value {
@@ -685,37 +680,51 @@ fn validate_pubkey(pubkey: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn reject_forbidden_payload_fields(value: &Value) -> Result<()> {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                let normalized = key.to_ascii_lowercase();
-                if normalized.contains("token")
-                    || matches!(
-                        normalized.as_str(),
-                        "definition"
-                            | "definition_snapshot"
-                            | "step_outputs"
-                            | "outputs"
-                            | "headers"
-                            | "secret"
-                            | "secrets"
-                            | "credentials"
-                    )
-                {
-                    return Err(DbError::InvalidData(format!(
-                        "approval request payload contains forbidden field '{key}'"
-                    )));
-                }
-                reject_forbidden_payload_fields(value)?;
-            }
+fn validate_request_payload_fields(value: &Value) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Err(DbError::InvalidData(
+            "approval request payload must be a JSON object".to_owned(),
+        ));
+    };
+    if object.len() != REQUEST_PAYLOAD_ALLOWED_FIELDS.len()
+        || REQUEST_PAYLOAD_ALLOWED_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Err(DbError::InvalidData(
+            "approval request payload must contain exactly class and timeout_seconds".to_owned(),
+        ));
+    }
+    for key in object.keys() {
+        if !REQUEST_PAYLOAD_ALLOWED_FIELDS.contains(&key.as_str()) {
+            return Err(DbError::InvalidData(format!(
+                "approval request payload contains unsupported field '{key}'"
+            )));
         }
-        Value::Array(values) => {
-            for value in values {
-                reject_forbidden_payload_fields(value)?;
-            }
-        }
-        _ => {}
+    }
+    if object.get("class").and_then(Value::as_str) != Some("approval_requested") {
+        return Err(DbError::InvalidData(
+            "approval request payload class is invalid".to_owned(),
+        ));
+    }
+    if object
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .is_none_or(|seconds| seconds == 0)
+    {
+        return Err(DbError::InvalidData(
+            "approval request payload timeout_seconds must be a positive integer".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_request_payload_size(value: &Value) -> Result<()> {
+    let size = serde_json::to_vec(value)?.len();
+    if size > REQUEST_PAYLOAD_MAX_BYTES {
+        return Err(DbError::InvalidData(format!(
+            "approval request payload exceeds {REQUEST_PAYLOAD_MAX_BYTES} serialized bytes"
+        )));
     }
     Ok(())
 }
@@ -933,7 +942,7 @@ fn bound_request_payload(
         ),
     );
     let payload = Value::Object(payload);
-    ApprovalRequestPayload::new(payload.clone())?;
+    validate_request_payload_size(&payload)?;
     Ok(payload)
 }
 
@@ -1133,22 +1142,58 @@ mod tests {
     }
 
     #[test]
-    fn request_payload_rejects_private_or_unbounded_data() {
+    fn request_payload_accepts_only_the_exact_caller_fields() {
         assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "approval_id": Uuid::new_v4(),
-            "action_summary": "review deploy"
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
         }))
         .is_ok());
+        for field in [
+            "password",
+            "authorization",
+            "cookie",
+            "api_key",
+            "private_key",
+            "approval_token",
+            "definition_snapshot",
+            "step_outputs",
+        ] {
+            let mut payload = serde_json::json!({
+                "class": "approval_requested",
+                "timeout_seconds": 3_600
+            })
+            .as_object()
+            .cloned()
+            .expect("request payload object");
+            payload.insert(field.to_owned(), Value::String("private".to_owned()));
+            assert!(
+                ApprovalRequestPayload::new(Value::Object(payload)).is_err(),
+                "unexpectedly accepted {field}"
+            );
+        }
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"class": "approval_requested"}),
+            serde_json::json!({"timeout_seconds": 3_600}),
+            serde_json::json!({
+                "class": "wrong",
+                "timeout_seconds": 3_600
+            }),
+            serde_json::json!({
+                "class": "approval_requested",
+                "timeout_seconds": "3600"
+            }),
+        ] {
+            assert!(ApprovalRequestPayload::new(payload).is_err());
+        }
         assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "nested": {"approval_token": "raw"}
+            "class": {"password": "private"},
+            "timeout_seconds": 3_600
         }))
         .is_err());
         assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "step_outputs": {"secret": "value"}
-        }))
-        .is_err());
-        assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "summary": "x".repeat(REQUEST_PAYLOAD_MAX_BYTES)
+            "class": "approval_requested",
+            "timeout_seconds": 0
         }))
         .is_err());
     }
@@ -1208,7 +1253,8 @@ mod tests {
             "status": "waiting_approval"
         });
         let request = ApprovalRequestPayload::new(serde_json::json!({
-            "class": "approval_requested"
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
         }))
         .expect("request");
         let params = CreateWorkflowApprovalGateParams {
@@ -1276,7 +1322,11 @@ mod tests {
             "step_index": 1,
             "status": "waiting_approval"
         });
-        let request = ApprovalRequestPayload::new(serde_json::json!({})).expect("request");
+        let request = ApprovalRequestPayload::new(serde_json::json!({
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
+        }))
+        .expect("request");
         let params = CreateWorkflowApprovalGateParams {
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             channel_id: Uuid::new_v4(),
@@ -1319,7 +1369,8 @@ mod tests {
             {"step_id": "approve-release", "step_index": 2, "status": "waiting_approval"}
         ]);
         let request = ApprovalRequestPayload::new(serde_json::json!({
-            "class": "approval_requested"
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
         }))
         .expect("request");
 

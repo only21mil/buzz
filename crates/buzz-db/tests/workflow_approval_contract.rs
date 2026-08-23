@@ -252,7 +252,10 @@ impl Fixture {
                 "step_index": 2,
                 "status": "waiting_approval"
             }),
-            request_payload: json!({"class": "approval_requested"}),
+            request_payload: json!({
+                "class": "approval_requested",
+                "timeout_seconds": 3_600
+            }),
         }
     }
 
@@ -674,6 +677,64 @@ async fn membership_changes_and_gate_creation_share_the_channel_lock() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn workflow_channel_changes_and_gate_creation_share_the_workflow_row_lock() {
+    let fixture = Fixture::new().await;
+    let replacement_channel_id = Uuid::new_v4();
+    insert_channel(
+        &fixture.pool,
+        fixture.community_id,
+        replacement_channel_id,
+        &fixture.owner,
+    )
+    .await;
+    let before =
+        persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+
+    let mut holder = fixture.pool.begin().await.expect("begin workflow change");
+    sqlx::query("SELECT id FROM workflows WHERE community_id = $1 AND id = $2 FOR UPDATE")
+        .bind(fixture.ids.community_id)
+        .bind(fixture.ids.workflow_id)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("hold workflow row lock");
+
+    let task_pool = fixture.pool.clone();
+    let task_spec = fixture.gate_spec();
+    let mut gate_task = tokio::spawn(async move { create_gate(&task_pool, &task_spec).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut gate_task)
+            .await
+            .is_err(),
+        "gate creation must wait behind the workflow row lock"
+    );
+
+    sqlx::query(
+        "UPDATE workflows SET channel_id = $3, updated_at = now() \
+         WHERE community_id = $1 AND id = $2",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.workflow_id)
+    .bind(replacement_channel_id)
+    .execute(&mut *holder)
+    .await
+    .expect("move workflow while holding its row lock");
+    holder
+        .commit()
+        .await
+        .expect("commit workflow channel change");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), gate_task)
+        .await
+        .expect("gate creation unblocks")
+        .expect("gate task joins")
+        .expect("gate creation returns an outcome");
+    assert_eq!(outcome, ObservedCreate::Conflict);
+    let after = persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+    assert_eq!(after, before, "a stale workflow binding must not write");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn identical_gate_replay_reuses_gate_and_outbox_without_mutation() {
     let fixture = Fixture::new().await;
     let spec = fixture.gate_spec();
@@ -756,7 +817,21 @@ async fn replay_requires_exact_run_gate_trace_policy_expiry_and_request() {
 
     let mut changed_waiting = spec.clone();
     changed_waiting.waiting_trace_entry["display"] = json!("different");
-    mutations.push(("waiting trace", changed_waiting));
+    let waiting_error = create_gate(&fixture.pool, &changed_waiting)
+        .await
+        .expect_err("an overbroad waiting trace must fail validation");
+    assert!(
+        waiting_error
+            .to_string()
+            .contains("waiting trace entry must contain only the exact step"),
+        "unexpected waiting trace validation error: {waiting_error}"
+    );
+    let after_invalid_waiting =
+        persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+    assert_eq!(
+        after_invalid_waiting, before,
+        "an invalid waiting trace mutated the winning gate"
+    );
 
     let mut changed_policy = spec.clone();
     changed_policy.policy =

@@ -587,7 +587,10 @@ pub enum StepResult {
     /// Step completed normally. Output is stored in `step_outputs`.
     Completed(JsonValue),
     /// Step requests suspension (approval gate). Execution must pause.
-    Suspended(ApprovalSuspension),
+    Suspended {
+        /// Opaque compatibility handle for the pending in-process suspension.
+        approval_token: String,
+    },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
 }
@@ -805,7 +808,14 @@ pub async fn dispatch_action(
                 timeout_seconds = suspension.timeout_secs,
                 "RequestApproval"
             );
-            Ok(StepResult::Suspended(suspension))
+            let approval_token = Uuid::new_v4().to_string();
+            engine.store_approval_suspension(
+                approval_token.clone(),
+                community_id,
+                run_id,
+                suspension,
+            )?;
+            Ok(StepResult::Suspended { approval_token })
         }
 
         Delay { duration } => {
@@ -1556,7 +1566,7 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
 pub struct ExecutionResult {
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
-    pub approval: Option<ApprovalSuspension>,
+    pub approval_token: Option<String>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
@@ -1573,10 +1583,10 @@ pub struct ExecutionResult {
 /// 3. Dispatches the action.
 /// 4. Stores the step output for use by later steps.
 ///
-/// On `RequestApproval`: returns `ExecutionResult` with structured approval
-/// suspension data. Caller must finalize the durable gate transaction.
+/// On `RequestApproval`: returns `ExecutionResult` with an opaque compatibility
+/// handle. Caller must finalize the durable gate transaction.
 ///
-/// Returns `ExecutionResult` with `approval = None` on normal completion.
+/// Returns `ExecutionResult` with `approval_token = None` on normal completion.
 ///
 /// Enforces `engine.config.max_concurrent` via a semaphore — returns
 /// [`WorkflowError::CapacityExceeded`] immediately if all permits are taken.
@@ -1798,13 +1808,13 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended(approval) => {
+            StepResult::Suspended { approval_token } => {
                 info!(
                     run_id = %run_id, step = %step.id,
                     "Step suspended — awaiting approval"
                 );
                 return Ok(ExecutionResult {
-                    approval: Some(approval),
+                    approval_token: Some(approval_token),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1822,7 +1832,7 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
-        approval: None,
+        approval_token: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,
@@ -1833,6 +1843,26 @@ async fn execute_steps(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn public_result_compatibility_shapes_are_preserved() {
+        let step_result = StepResult::Suspended {
+            approval_token: "compatibility-handle".to_owned(),
+        };
+        let StepResult::Suspended { approval_token } = step_result else {
+            panic!("expected suspended result");
+        };
+        let result = ExecutionResult {
+            approval_token: Some(approval_token),
+            step_index: 2,
+            step_outputs: HashMap::new(),
+            trace: Vec::new(),
+        };
+        assert_eq!(
+            result.approval_token.as_deref(),
+            Some("compatibility-handle")
+        );
+    }
 
     fn make_trigger() -> TriggerContext {
         TriggerContext {

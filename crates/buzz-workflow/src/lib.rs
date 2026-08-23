@@ -42,7 +42,9 @@ pub use schema::{ActionDef, Step, TriggerDef, WorkflowDef};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use buzz_core::kind::{event_kind_u32, is_workflow_execution_kind, KIND_REACTION};
 use buzz_core::tenant::CommunityId;
@@ -55,6 +57,85 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+const APPROVAL_SUSPENSION_MAX_ENTRIES: usize = 10_000;
+const APPROVAL_SUSPENSION_TTL: Duration = Duration::from_secs(300);
+
+struct PendingApprovalSuspension {
+    community_id: CommunityId,
+    run_id: Uuid,
+    inserted_at: Instant,
+    suspension: ApprovalSuspension,
+}
+
+struct ApprovalSuspensionStore {
+    entries: Mutex<HashMap<String, PendingApprovalSuspension>>,
+    max_entries: usize,
+    ttl: Duration,
+}
+
+impl ApprovalSuspensionStore {
+    fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            max_entries,
+            ttl,
+        }
+    }
+
+    fn insert(
+        &self,
+        approval_token: String,
+        community_id: CommunityId,
+        run_id: Uuid,
+        suspension: ApprovalSuspension,
+        now: Instant,
+    ) -> Result<(), WorkflowError> {
+        let mut entries = self.entries.lock().map_err(|_| {
+            WorkflowError::Database("approval suspension store is unavailable".to_owned())
+        })?;
+        entries.retain(|_, pending| now.saturating_duration_since(pending.inserted_at) < self.ttl);
+        if entries.len() >= self.max_entries || entries.contains_key(&approval_token) {
+            return Err(WorkflowError::CapacityExceeded);
+        }
+        entries.insert(
+            approval_token,
+            PendingApprovalSuspension {
+                community_id,
+                run_id,
+                inserted_at: now,
+                suspension,
+            },
+        );
+        Ok(())
+    }
+
+    fn take(
+        &self,
+        approval_token: &str,
+        community_id: CommunityId,
+        run_id: Uuid,
+        now: Instant,
+    ) -> Result<Option<ApprovalSuspension>, WorkflowError> {
+        let mut entries = self.entries.lock().map_err(|_| {
+            WorkflowError::Database("approval suspension store is unavailable".to_owned())
+        })?;
+        let Some(pending) = entries.get(approval_token) else {
+            return Ok(None);
+        };
+        let expired = now.saturating_duration_since(pending.inserted_at) >= self.ttl;
+        if !expired && (pending.community_id != community_id || pending.run_id != run_id) {
+            return Ok(None);
+        }
+        let pending = entries
+            .remove(approval_token)
+            .expect("approval suspension existed while the store lock was held");
+        if expired {
+            return Ok(None);
+        }
+        Ok(Some(pending.suspension))
+    }
+}
 
 /// Runtime configuration for the workflow engine.
 #[derive(Clone, Debug)]
@@ -90,6 +171,9 @@ pub struct WorkflowEngine {
     /// Action sink for executing side-effects (SendMessage, etc.).
     /// Late-initialized via [`set_action_sink`] after `AppState` construction.
     pub(crate) action_sink: OnceLock<Arc<dyn ActionSink>>,
+    /// One-shot structured gate state behind the source-compatible public
+    /// approval handle. Successful finalization removes the entry.
+    approval_suspensions: ApprovalSuspensionStore,
     /// Short-TTL cache for the per-event enabled-workflow lookup, keyed
     /// `(community_id, channel_id)`. Most channels have no workflows, so this
     /// removes one SELECT from nearly every ingested event.
@@ -118,6 +202,10 @@ impl WorkflowEngine {
             run_semaphore,
             last_fired: DashMap::new(),
             action_sink: OnceLock::new(),
+            approval_suspensions: ApprovalSuspensionStore::new(
+                APPROVAL_SUSPENSION_MAX_ENTRIES,
+                APPROVAL_SUSPENSION_TTL,
+            ),
             workflow_cache: moka::sync::Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(10))
@@ -197,6 +285,32 @@ impl WorkflowEngine {
         })
     }
 
+    pub(crate) fn store_approval_suspension(
+        &self,
+        approval_token: String,
+        community_id: CommunityId,
+        run_id: Uuid,
+        suspension: ApprovalSuspension,
+    ) -> Result<(), WorkflowError> {
+        self.approval_suspensions.insert(
+            approval_token,
+            community_id,
+            run_id,
+            suspension,
+            Instant::now(),
+        )
+    }
+
+    fn take_approval_suspension(
+        &self,
+        approval_token: &str,
+        community_id: CommunityId,
+        run_id: Uuid,
+    ) -> Result<Option<ApprovalSuspension>, WorkflowError> {
+        self.approval_suspensions
+            .take(approval_token, community_id, run_id, Instant::now())
+    }
+
     /// Parse and validate a YAML workflow definition.
     ///
     /// Returns `(WorkflowDef, canonical_json)` on success. The canonical JSON
@@ -225,7 +339,7 @@ impl WorkflowEngine {
         match result {
             Ok(result) => {
                 let ExecutionResult {
-                    approval,
+                    approval_token,
                     step_index,
                     step_outputs,
                     trace,
@@ -233,7 +347,22 @@ impl WorkflowEngine {
                 let mut full_trace = prefix;
                 full_trace.extend(trace);
 
-                if let Some(approval) = approval {
+                if let Some(approval_token) = approval_token {
+                    let approval = match self.take_approval_suspension(
+                        &approval_token,
+                        community_id,
+                        run_id,
+                    ) {
+                        Ok(Some(approval)) => approval,
+                        Ok(None) => {
+                            tracing::error!(run_id = %run_id, "Approval suspension handle is unavailable");
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::error!(run_id = %run_id, "Approval suspension lookup failed: {error}");
+                            return;
+                        }
+                    };
                     self.finalize_approval_gate(
                         community_id,
                         run_id,
@@ -1329,6 +1458,90 @@ fn trigger_matches_event(trigger: &TriggerDef, kind_u32: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_approval_suspension() -> ApprovalSuspension {
+        use buzz_db::workflow_approval::{
+            ApprovalActionSummary, ApprovalRequestPayload, ApprovalRole, CanonicalApprovalPolicy,
+        };
+
+        let now = Utc::now();
+        ApprovalSuspension {
+            step_id: "approve".to_owned(),
+            message: "approve release".to_owned(),
+            expected_generation: 1,
+            policy: CanonicalApprovalPolicy::new(Vec::new(), vec![ApprovalRole::Owner])
+                .expect("approval policy"),
+            timeout_secs: 3_600,
+            created_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            action_summary: ApprovalActionSummary::new("approve release").expect("action summary"),
+            request_payload: ApprovalRequestPayload::new(serde_json::json!({
+                "class": "approval_requested",
+                "timeout_seconds": 3_600
+            }))
+            .expect("request payload"),
+        }
+    }
+
+    #[test]
+    fn approval_suspension_handles_are_owned_one_shot_and_bounded() {
+        let store = ApprovalSuspensionStore::new(1, Duration::from_secs(60));
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let run_id = Uuid::new_v4();
+        let other_run_id = Uuid::new_v4();
+        let now = Instant::now();
+
+        store
+            .insert(
+                "first".to_owned(),
+                community_id,
+                run_id,
+                test_approval_suspension(),
+                now,
+            )
+            .expect("store first suspension");
+        assert!(store
+            .take("first", community_id, other_run_id, now)
+            .expect("cross-run lookup")
+            .is_none());
+        assert!(matches!(
+            store.insert(
+                "second".to_owned(),
+                community_id,
+                other_run_id,
+                test_approval_suspension(),
+                now,
+            ),
+            Err(WorkflowError::CapacityExceeded)
+        ));
+        assert!(store
+            .take("first", community_id, run_id, now)
+            .expect("owned lookup")
+            .is_some());
+        assert!(store
+            .take("first", community_id, run_id, now)
+            .expect("one-shot replay")
+            .is_none());
+
+        store
+            .insert(
+                "expired".to_owned(),
+                community_id,
+                run_id,
+                test_approval_suspension(),
+                now,
+            )
+            .expect("store expiring suspension");
+        assert!(store
+            .take(
+                "expired",
+                community_id,
+                run_id,
+                now + Duration::from_secs(60),
+            )
+            .expect("expired lookup")
+            .is_none());
+    }
 
     #[test]
     fn cron_fire_instant_matches_within_window() {
