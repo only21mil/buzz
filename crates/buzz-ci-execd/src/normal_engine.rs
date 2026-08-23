@@ -13,6 +13,7 @@ use buzz_ci_broker_protocol::{
 use buzz_ci_isolation_contract::{
     AttemptLeaseBinding, Phase1ValidationContext, ValidatedAttemptLeaseBinding,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -37,6 +38,8 @@ const FIRST_TERMINAL_SEQUENCE: u64 = 3;
 /// Reviewed `nektos/act` v0.2.89 Linux x86_64 binary digest.
 pub const PINNED_ACT_SHA256: &str =
     "6be37b104430efc210d5130495bedcff2dc7cd6780a38d88f3d205e7f1185cc1";
+/// Fixed content-addressed installation path for the reviewed `act` binary.
+pub const PINNED_ACT_PATH: &str = "/usr/local/libexec/buzzci/act-0.2.89";
 
 const TERMINAL_PREFIX: [OrderingEvent; 7] = [
     OrderingEvent::Stop,
@@ -55,7 +58,7 @@ const TERMINAL_SUFFIX: [OrderingEvent; 3] = [
 ];
 
 /// Root-owned validation inputs used to consume an untrusted lease binding.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BindingValidationAuthority {
     pub now_unix_seconds: u64,
     pub max_expiry_horizon_seconds: u64,
@@ -65,9 +68,13 @@ pub struct BindingValidationAuthority {
 }
 
 impl BindingValidationAuthority {
-    fn context(&self) -> Phase1ValidationContext<'_> {
+    pub(crate) fn context(&self) -> Phase1ValidationContext<'_> {
+        self.context_at(self.now_unix_seconds)
+    }
+
+    pub(crate) fn context_at(&self, now_unix_seconds: u64) -> Phase1ValidationContext<'_> {
         Phase1ValidationContext {
-            now_unix_seconds: self.now_unix_seconds,
+            now_unix_seconds,
             max_expiry_horizon_seconds: self.max_expiry_horizon_seconds,
             forbidden_host_uids: &self.forbidden_host_uids,
             expected_engine_version: &self.expected_engine_version,
@@ -77,7 +84,7 @@ impl BindingValidationAuthority {
 }
 
 /// Exact `act` invocation selected by root-owned policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActLaunchPlan {
     pub binary: PathBuf,
     pub binary_sha256: [u8; 32],
@@ -154,7 +161,8 @@ impl ActLaunchPlan {
             &self.inputs_path,
             &self.proxy_socket,
         ];
-        if hex::encode(self.binary_sha256) != PINNED_ACT_SHA256
+        if self.binary != Path::new(PINNED_ACT_PATH)
+            || hex::encode(self.binary_sha256) != PINNED_ACT_SHA256
             || paths.iter().any(|path| !safe_absolute(path))
             || self.job_id.is_empty()
             || !safe_token(&self.job_id)
@@ -183,7 +191,7 @@ pub struct NormalJobPlan {
 }
 
 impl NormalJobPlan {
-    fn validate_identity(
+    pub(crate) fn validate_identity(
         &self,
         request: AdmitAttemptRequest,
         admission: OrdinaryAdmission,
