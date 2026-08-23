@@ -802,52 +802,41 @@ async fn approval_history_survives_workflow_deletion() {
     .await
     .expect("delete workflow");
 
-    let workflow_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM workflows WHERE community_id = $1 AND id = $2")
-            .bind(fixture.ids.community_id)
-            .bind(fixture.ids.workflow_id)
-            .fetch_one(&fixture.pool)
-            .await
-            .expect("count deleted workflow");
-    assert_eq!(workflow_count, 0, "workflow deletion remains a hard delete");
-
-    let run_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM workflow_runs WHERE community_id = $1 AND id = $2",
+    let tombstone: (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT enabled, deleted_at FROM workflows WHERE community_id = $1 AND id = $2",
     )
     .bind(fixture.ids.community_id)
-    .bind(fixture.ids.run_id)
+    .bind(fixture.ids.workflow_id)
     .fetch_one(&fixture.pool)
     .await
-    .expect("count deleted run");
-    assert_eq!(run_count, 0, "workflow run still follows workflow deletion");
+    .expect("read workflow tombstone");
+    assert!(!tombstone.0, "soft deletion must disable the workflow");
+    assert!(tombstone.1.is_some(), "soft deletion must set deleted_at");
+    assert!(
+        matches!(
+            buzz_db::workflow::get_workflow(
+                &fixture.pool,
+                fixture.community_id,
+                fixture.ids.workflow_id,
+            )
+            .await,
+            Err(buzz_db::DbError::NotFound(_))
+        ),
+        "public workflow reads must hide tombstones"
+    );
 
-    let approvals = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(a) FROM workflow_approval_gates a \
-         WHERE community_id = $1 AND run_id = $2 ORDER BY step_index",
-    )
-    .bind(fixture.ids.community_id)
-    .bind(fixture.ids.run_id)
-    .fetch_all(&fixture.pool)
-    .await
-    .expect("read retained workflow approval history");
-    let outbox = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(o) FROM workflow_approval_outbox o \
-         JOIN workflow_approval_gates g \
-           ON g.community_id = o.community_id AND g.id = o.approval_id \
-         WHERE o.community_id = $1 AND g.run_id = $2 ORDER BY o.id",
-    )
-    .bind(fixture.ids.community_id)
-    .bind(fixture.ids.run_id)
-    .fetch_all(&fixture.pool)
-    .await
-    .expect("read retained workflow approval outbox");
+    let after = persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
     assert_eq!(
-        approvals, before.approvals,
-        "approval history must survive deletion"
+        after.run, before.run,
+        "the workflow run must survive soft deletion unchanged"
     );
     assert_eq!(
-        outbox, before.outbox,
-        "approval outbox must survive deletion"
+        after.approvals, before.approvals,
+        "approval history bytes must survive soft deletion unchanged"
+    );
+    assert_eq!(
+        after.outbox, before.outbox,
+        "approval outbox bytes must survive soft deletion unchanged"
     );
 }
 

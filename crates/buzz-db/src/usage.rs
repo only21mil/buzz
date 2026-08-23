@@ -181,6 +181,7 @@ pub async fn workflow_counts(pool: &PgPool) -> Result<Vec<CommunityWorkflowCount
         r#"
         SELECT community_id, status::text, COUNT(*) AS count
         FROM workflows
+        WHERE deleted_at IS NULL
         GROUP BY community_id, status
         "#,
     )
@@ -717,6 +718,48 @@ mod tests {
         assert!(
             after_row.is_none(),
             "no stream row after last channel deleted — poller will zero-fill"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn test_workflow_counts_excludes_soft_deleted_rows() {
+        let pool = get_pool().await;
+        let (community_uuid, community, _) = make_community(&pool).await;
+        let owner = random_pubkey();
+        insert_user(&pool, community_uuid, &owner, false).await;
+
+        let workflow_id = crate::workflow::create_workflow(
+            &pool,
+            community,
+            None,
+            &owner,
+            "counted-workflow",
+            "{}",
+            &[0x42; 32],
+        )
+        .await
+        .expect("create counted workflow");
+        let before = workflow_counts(&pool)
+            .await
+            .expect("workflow counts before");
+        assert_eq!(
+            before
+                .iter()
+                .find(|row| row.community_id == community_uuid && row.status == "active")
+                .map(|row| row.count),
+            Some(1)
+        );
+
+        crate::workflow::delete_workflow(&pool, community, workflow_id)
+            .await
+            .expect("soft-delete counted workflow");
+        let after = workflow_counts(&pool).await.expect("workflow counts after");
+        assert!(
+            after
+                .iter()
+                .all(|row| row.community_id != community_uuid || row.status != "active"),
+            "soft-deleted workflows must not contribute to usage counts"
         );
     }
 }
