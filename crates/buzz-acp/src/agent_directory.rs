@@ -115,7 +115,7 @@ pub(crate) fn project_member_channels(
             Some((*id, meta.name.clone()))
         })
         .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by_key(|a| a.0);
     out
 }
 

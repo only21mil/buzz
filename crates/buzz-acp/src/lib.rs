@@ -1920,10 +1920,7 @@ async fn tokio_main() -> Result<()> {
     // the verified startup owner first (BUZZ_AUTH_TAG owner, or the configured
     // fallback) so a BUZZ_AUTH_TAG-only deployment never publishes an empty
     // list, then union any explicit --respond-to-allowlist set.
-    let mut directory_allowlist: Vec<String> = startup_owner
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut directory_allowlist: Vec<String> = startup_owner.iter().cloned().collect::<Vec<_>>();
     for pk in config.respond_to_allowlist.iter() {
         if !directory_allowlist.iter().any(|s| s == pk) {
             directory_allowlist.push(pk.clone());
