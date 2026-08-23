@@ -1005,8 +1005,9 @@ mod tests {
         assert!(approval_foundations.contains("policy_snapshot JSONB NOT NULL"));
         assert!(approval_foundations.contains("resolved_approver_set JSONB NOT NULL"));
         assert!(approval_foundations.contains("UNIQUE (community_id, run_id, step_index)"));
-        assert!(approval_foundations.contains("FOREIGN KEY (community_id, run_id, workflow_id)"));
-        assert!(approval_foundations.contains("ON DELETE NO ACTION"));
+        assert!(!approval_foundations.contains("workflow_approval_gates_workflow_fkey"));
+        assert!(!approval_foundations.contains("workflow_approval_gates_run_binding_fkey"));
+        assert!(approval_foundations.contains("immutable audit identities"));
         assert!(!approval_foundations.contains("ALTER TABLE workflow_approvals"));
         assert!(!approval_foundations.contains("DROP TABLE workflow_approvals"));
         assert!(approval_foundations.contains("CREATE TABLE workflow_approval_outbox"));

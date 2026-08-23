@@ -74,13 +74,9 @@ CREATE TABLE workflow_approval_gates (
     CONSTRAINT workflow_approval_gates_channel_fkey
         FOREIGN KEY (community_id, channel_id)
         REFERENCES channels (community_id, id) ON DELETE NO ACTION,
-    CONSTRAINT workflow_approval_gates_workflow_fkey
-        FOREIGN KEY (community_id, workflow_id)
-        REFERENCES workflows (community_id, id) ON DELETE NO ACTION,
-    CONSTRAINT workflow_approval_gates_run_binding_fkey
-        FOREIGN KEY (community_id, run_id, workflow_id)
-        REFERENCES workflow_runs (community_id, id, workflow_id)
-        ON DELETE NO ACTION,
+    -- workflow_id and run_id are immutable audit identities, not live foreign
+    -- keys. Workflow deletion cascades through workflow_runs, while approval
+    -- evidence and its outbox rows must survive that deletion.
     CONSTRAINT workflow_approval_gates_actor_snapshot_complete
         CHECK (
             (decision_actor_pubkey IS NULL
