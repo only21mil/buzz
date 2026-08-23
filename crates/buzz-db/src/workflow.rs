@@ -283,10 +283,11 @@ pub struct ApprovalRecord {
 // -- Workflow CRUD ------------------------------------------------------------
 
 /// Insert a new workflow record. Returns the new workflow's UUID.
-/// New workflows start as `active` and `enabled = TRUE`.
+/// New workflows start as `active` and preserve the caller-supplied enabled state.
 ///
 /// NOTE: see the cache-invalidation note on [`update_workflow`]. The relay's
-/// creation path is [`upsert_workflow`] via event ingest. (No current callers.)
+/// creation path is [`upsert_workflow`] via event ingest. (No production callers.)
+#[allow(clippy::too_many_arguments)]
 pub async fn create_workflow(
     pool: &PgPool,
     community_id: CommunityId,
@@ -295,6 +296,7 @@ pub async fn create_workflow(
     name: &str,
     definition_json: &str,
     definition_hash: &[u8],
+    enabled: bool,
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
@@ -302,7 +304,7 @@ pub async fn create_workflow(
         r#"
         INSERT INTO workflows
             (id, community_id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', TRUE)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', $8)
         "#,
     )
     .bind(id)
@@ -312,6 +314,7 @@ pub async fn create_workflow(
     .bind(channel_id)
     .bind(definition_json)
     .bind(definition_hash)
+    .bind(enabled)
     .execute(pool)
     .await?;
 
@@ -333,16 +336,18 @@ pub async fn upsert_workflow(
     name: &str,
     definition_json: &str,
     definition_hash: &[u8],
+    enabled: bool,
 ) -> Result<()> {
     let row = sqlx::query(
         r#"
         INSERT INTO workflows
             (community_id, id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', TRUE)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', $8)
         ON CONFLICT (community_id, id) DO UPDATE
         SET name = EXCLUDED.name,
             definition = EXCLUDED.definition,
             definition_hash = EXCLUDED.definition_hash,
+            enabled = EXCLUDED.enabled,
             updated_at = NOW()
         WHERE workflows.owner_pubkey = EXCLUDED.owner_pubkey
           AND workflows.channel_id IS NOT DISTINCT FROM EXCLUDED.channel_id
@@ -357,6 +362,7 @@ pub async fn upsert_workflow(
     .bind(channel_id)
     .bind(definition_json)
     .bind(definition_hash)
+    .bind(enabled)
     .fetch_optional(pool)
     .await?;
 
@@ -1877,6 +1883,7 @@ mod tests {
             "f1-attack-workflow",
             r#"{"trigger":{"on":"schedule"},"steps":[]}"#,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("create workflow");
@@ -2562,6 +2569,7 @@ mod tests {
             "departing-a",
             def,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("wf departing a");
@@ -2573,6 +2581,7 @@ mod tests {
             "departing-b",
             def,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("wf departing b");
@@ -2584,6 +2593,7 @@ mod tests {
             "staying-a",
             def,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("wf staying a");

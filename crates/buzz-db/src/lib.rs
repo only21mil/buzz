@@ -3640,6 +3640,7 @@ impl Db {
     }
 
     /// Create a new workflow.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_workflow(
         &self,
         community_id: CommunityId,
@@ -3648,6 +3649,7 @@ impl Db {
         name: &str,
         definition_json: &str,
         definition_hash: &[u8],
+        enabled: bool,
     ) -> Result<Uuid> {
         workflow::create_workflow(
             &self.pool,
@@ -3657,6 +3659,7 @@ impl Db {
             name,
             definition_json,
             definition_hash,
+            enabled,
         )
         .await
     }
@@ -3672,6 +3675,7 @@ impl Db {
         name: &str,
         definition_json: &str,
         definition_hash: &[u8],
+        enabled: bool,
     ) -> Result<()> {
         workflow::upsert_workflow(
             &self.pool,
@@ -3682,6 +3686,7 @@ impl Db {
             name,
             definition_json,
             definition_hash,
+            enabled,
         )
         .await
     }

@@ -789,6 +789,7 @@ async fn handle_workflow_def(
             &workflow_name,
             &definition_json_final,
             &hash,
+            def.enabled,
         )
         .await
         .map_err(|e| match e {
