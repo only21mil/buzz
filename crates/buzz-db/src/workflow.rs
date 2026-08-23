@@ -82,6 +82,8 @@ pub enum RunStatus {
     Running,
     /// Run is suspended waiting for an approval gate.
     WaitingApproval,
+    /// A durable worker may claim the approved run for continuation.
+    ResumePending,
     /// Run finished successfully.
     Completed,
     /// Run terminated with an error.
@@ -96,6 +98,7 @@ impl fmt::Display for RunStatus {
             RunStatus::Pending => write!(f, "pending"),
             RunStatus::Running => write!(f, "running"),
             RunStatus::WaitingApproval => write!(f, "waiting_approval"),
+            RunStatus::ResumePending => write!(f, "resume_pending"),
             RunStatus::Completed => write!(f, "completed"),
             RunStatus::Failed => write!(f, "failed"),
             RunStatus::Cancelled => write!(f, "cancelled"),
@@ -110,6 +113,7 @@ impl FromStr for RunStatus {
             "pending" => Ok(RunStatus::Pending),
             "running" => Ok(RunStatus::Running),
             "waiting_approval" => Ok(RunStatus::WaitingApproval),
+            "resume_pending" => Ok(RunStatus::ResumePending),
             "completed" => Ok(RunStatus::Completed),
             "failed" => Ok(RunStatus::Failed),
             "cancelled" => Ok(RunStatus::Cancelled),
@@ -207,6 +211,10 @@ pub struct WorkflowRunRecord {
     pub definition_hash: Vec<u8>,
     /// Optimistic transition fence for durable resume workers.
     pub generation: i64,
+    /// First workflow step that has not completed durably.
+    pub next_step: i32,
+    /// Durable outputs keyed by completed step ID.
+    pub step_outputs: serde_json::Value,
     /// Current execution status of this run.
     pub status: RunStatus,
     /// Raw event ID bytes that triggered this run, if any.
@@ -843,6 +851,7 @@ pub async fn get_workflow_run(
     let row = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+               next_step, step_outputs,
                status::text AS status, trigger_event_id, current_step, execution_trace,
                trigger_context, started_at, completed_at, error_message, created_at
         FROM workflow_runs
@@ -869,6 +878,7 @@ pub async fn list_workflow_runs(
     let rows = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+               next_step, step_outputs,
                status::text AS status, trigger_event_id, current_step, execution_trace,
                trigger_context, started_at, completed_at, error_message, created_at
         FROM workflow_runs
@@ -1178,6 +1188,8 @@ fn row_to_run_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         definition_snapshot: row.try_get("definition_snapshot")?,
         definition_hash: row.try_get("definition_hash")?,
         generation: row.try_get("generation")?,
+        next_step: row.try_get("next_step")?,
+        step_outputs: row.try_get("step_outputs")?,
         status,
         trigger_event_id: row.try_get("trigger_event_id")?,
         current_step: row.try_get("current_step")?,
@@ -1284,6 +1296,7 @@ mod tests {
         assert_eq!(RunStatus::Pending.to_string(), "pending");
         assert_eq!(RunStatus::Running.to_string(), "running");
         assert_eq!(RunStatus::WaitingApproval.to_string(), "waiting_approval");
+        assert_eq!(RunStatus::ResumePending.to_string(), "resume_pending");
         assert_eq!(RunStatus::Completed.to_string(), "completed");
         assert_eq!(RunStatus::Failed.to_string(), "failed");
         assert_eq!(RunStatus::Cancelled.to_string(), "cancelled");
@@ -1295,6 +1308,7 @@ mod tests {
             "pending",
             "running",
             "waiting_approval",
+            "resume_pending",
             "completed",
             "failed",
             "cancelled",
@@ -1483,6 +1497,8 @@ mod tests {
             definition_snapshot: serde_json::json!({ "steps": [] }),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 2,
+            step_outputs: serde_json::json!({"s1": {"ok": true}}),
             status: RunStatus::Running,
             trigger_event_id: Some(trigger_event_id.clone()),
             current_step: 2,
@@ -1504,6 +1520,8 @@ mod tests {
         );
         assert_eq!(record.definition_hash, vec![0x42; 32]);
         assert_eq!(record.generation, 1);
+        assert_eq!(record.next_step, 2);
+        assert_eq!(record.step_outputs, serde_json::json!({"s1": {"ok": true}}));
         assert_eq!(record.status, RunStatus::Running);
         assert_eq!(record.trigger_event_id, Some(trigger_event_id));
         assert_eq!(record.current_step, 2);
@@ -1522,6 +1540,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 0,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,
@@ -1548,6 +1568,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 3,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Failed,
             trigger_event_id: None,
             current_step: 1,
@@ -1582,6 +1604,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 4,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Completed,
             trigger_event_id: None,
             current_step: 2,
@@ -1607,6 +1631,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 0,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,

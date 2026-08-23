@@ -5,11 +5,35 @@
 //! run's tenant, status, and generation.
 
 use buzz_core::CommunityId;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::workflow::RunStatus;
 use crate::Result;
+
+/// Namespace shared with channel membership mutations.
+const CHANNEL_MEMBERSHIP_LOCK_NAMESPACE: &str = "buzz_channel_membership:";
+
+/// Acquire the channel-membership advisory lock for an approval transaction.
+///
+/// This must remain the first database statement after `BEGIN`. The key is
+/// byte-for-byte identical to the private membership helper in `channel.rs`, so
+/// gate creation and later approval decisions serialize with role changes.
+pub(crate) async fn acquire_workflow_approval_channel_lock(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "{CHANNEL_MEMBERSHIP_LOCK_NAMESPACE}{}:{}",
+            community_id.as_uuid(),
+            channel_id
+        ))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
 /// Result of a generation-fenced workflow-run transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
