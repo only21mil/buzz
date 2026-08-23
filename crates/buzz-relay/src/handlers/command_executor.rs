@@ -910,7 +910,7 @@ async fn handle_workflow_trigger(
         ..Default::default()
     };
     if !event.content.is_empty() {
-        if let Some(parsed) = serde_json::from_str::<serde_json::Value>(&event.content).ok() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&event.content) {
             trigger_ctx.webhook_body = Some(parsed.clone());
             if let serde_json::Value::Object(map) = parsed {
                 for (k, v) in map {
