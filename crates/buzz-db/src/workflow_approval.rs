@@ -366,6 +366,7 @@ pub async fn create_workflow_approval_gate(
         WHERE run.community_id = $1
           AND run.id = $2
           AND workflow.channel_id = $3
+          AND workflow.deleted_at IS NULL
         FOR UPDATE OF run
         "#,
     )
