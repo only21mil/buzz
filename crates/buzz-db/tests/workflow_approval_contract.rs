@@ -418,7 +418,7 @@ async fn populated_migration_preserves_legacy_approval_and_backfills_resume_stat
 
     let ids = FixtureIds::random();
     let owner = vec![0x31; 32];
-    let definition_hash = vec![0x32; 32];
+    let definition_hash = vec![0x32u8; 32];
     let definition = json!({"steps": [{"id": "one"}, {"id": "two"}, {"id": "gate"}]});
     let community = CommunityId::from_uuid(ids.community_id);
     sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
