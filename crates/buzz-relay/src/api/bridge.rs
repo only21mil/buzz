@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, RawQuery, State},
+    extract::{OriginalUri, Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Json,
 };
@@ -2048,6 +2048,144 @@ async fn synthesize_presence(
     Some(events)
 }
 
+// ── Workflow run reads ────────────────────────────────────────────────────────
+
+const WORKFLOW_RUNS_DEFAULT_LIMIT: u32 = 20;
+const WORKFLOW_RUNS_MAX_LIMIT: u32 = 100;
+
+#[derive(serde::Deserialize, Default)]
+/// Optional query controls for workflow run history.
+pub struct WorkflowRunsQuery {
+    limit: Option<u32>,
+}
+
+fn workflow_runs_limit(requested: Option<u32>) -> i64 {
+    requested
+        .unwrap_or(WORKFLOW_RUNS_DEFAULT_LIMIT)
+        .min(WORKFLOW_RUNS_MAX_LIMIT) as i64
+}
+
+fn workflow_runs_access_allowed(
+    workflow: &buzz_db::workflow::WorkflowRecord,
+    authenticated_pubkey: &[u8],
+    active_channel_member: bool,
+) -> bool {
+    workflow.channel_id.is_some()
+        && workflow.owner_pubkey == authenticated_pubkey
+        && active_channel_member
+}
+
+fn path_with_query(uri: &axum::http::Uri) -> &str {
+    uri.path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| uri.path())
+}
+
+fn workflow_run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
+    serde_json::json!({
+        "id": run.id,
+        "workflow_id": run.workflow_id,
+        "status": run.status,
+        "current_step": run.current_step,
+        "execution_trace": run.execution_trace,
+        "error_message": run.error_message,
+        "started_at": run.started_at.map(|timestamp| timestamp.timestamp()),
+        "completed_at": run.completed_at.map(|timestamp| timestamp.timestamp()),
+        "created_at": run.created_at.timestamp(),
+    })
+}
+
+fn workflow_not_found() -> (StatusCode, Json<Value>) {
+    not_found("workflow not found")
+}
+
+/// `GET /workflows/{workflow_id}/runs` returns authoritative workflow run rows.
+///
+/// The caller must sign the exact request URL, own the workflow, and remain an
+/// active member of its channel. Workflow enablement is intentionally not part
+/// of this read gate so an owner can inspect a disabled workflow's history.
+pub async fn workflow_runs(
+    State(state): State<Arc<AppState>>,
+    Path(workflow_id): Path<uuid::Uuid>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    Query(query): Query<WorkflowRunsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
+    let expected_url = nip98_expected_url(
+        &state.config.relay_url,
+        &tenant,
+        path_with_query(&original_uri),
+    );
+    let (pubkey, event_id_bytes) = verify_bridge_auth(
+        &headers,
+        "GET",
+        &expected_url,
+        None,
+        state.config.require_auth_token,
+    )?;
+    enforce_http_admission(&state, &tenant, &pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+
+    let authenticated_pubkey = pubkey.to_bytes();
+    let auth_tag = headers.get("x-auth-tag").and_then(|value| value.to_str().ok());
+    super::relay_members::enforce_relay_membership(
+        &state,
+        tenant.community(),
+        &authenticated_pubkey,
+        auth_tag,
+    )
+    .await?;
+
+    let workflow = state
+        .db
+        .get_workflow(tenant.community(), workflow_id)
+        .await
+        .map_err(|error| match error {
+            buzz_db::DbError::NotFound(_) => workflow_not_found(),
+            other => internal_error(&format!("get workflow for run history: {other}")),
+        })?;
+    let active_channel_member = match workflow.channel_id {
+        Some(channel_id) if workflow.owner_pubkey == authenticated_pubkey => state
+            .db
+            .is_member(tenant.community(), channel_id, &authenticated_pubkey)
+            .await
+            .map_err(|error| {
+                internal_error(&format!("check workflow run history membership: {error}"))
+            })?,
+        _ => false,
+    };
+    if !workflow_runs_access_allowed(&workflow, &authenticated_pubkey, active_channel_member) {
+        return Err(workflow_not_found());
+    }
+
+    let runs = state
+        .db
+        .list_workflow_runs(
+            tenant.community(),
+            workflow_id,
+            workflow_runs_limit(query.limit),
+        )
+        .await
+        .map_err(|error| internal_error(&format!("list workflow runs: {error}")))?;
+
+    Ok(Json(Value::Array(
+        runs.iter().map(workflow_run_json).collect(),
+    )))
+}
+
 // ── Moderation queue reads (L6 — Quinn) ───────────────────────────────────────
 //
 // Mod-only structured rows (`moderation_reports`/`moderation_actions`/
@@ -2271,6 +2409,154 @@ mod tests {
             .expect("sign auth event")
             .id
             .to_bytes()
+    }
+
+    fn workflow_run_record(
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        error_message: Option<&str>,
+    ) -> buzz_db::workflow::WorkflowRunRecord {
+        buzz_db::workflow::WorkflowRunRecord {
+            id: uuid::Uuid::parse_str("10000000-0000-0000-0000-000000000001").expect("run id"),
+            community_id: buzz_core::CommunityId::from_uuid(
+                uuid::Uuid::parse_str("20000000-0000-0000-0000-000000000002")
+                    .expect("community id"),
+            ),
+            workflow_id: uuid::Uuid::parse_str("30000000-0000-0000-0000-000000000003")
+                .expect("workflow id"),
+            status: buzz_db::workflow::RunStatus::Failed,
+            trigger_event_id: None,
+            current_step: 2,
+            execution_trace: serde_json::json!([{"step_id": "notify", "status": "failed"}]),
+            trigger_context: None,
+            started_at,
+            completed_at,
+            error_message: error_message.map(str::to_owned),
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("created timestamp"),
+        }
+    }
+
+    fn workflow_record(
+        owner_pubkey: &[u8],
+        channel_id: Option<uuid::Uuid>,
+    ) -> buzz_db::workflow::WorkflowRecord {
+        buzz_db::workflow::WorkflowRecord {
+            id: uuid::Uuid::new_v4(),
+            community_id: buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
+            name: "disabled history".to_owned(),
+            owner_pubkey: owner_pubkey.to_vec(),
+            channel_id,
+            definition: serde_json::json!({}),
+            definition_hash: vec![0u8; 32],
+            status: buzz_db::workflow::WorkflowStatus::Disabled,
+            enabled: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn workflow_run_serializer_uses_bare_database_contract_and_epoch_seconds() {
+        let run = workflow_run_record(
+            chrono::DateTime::from_timestamp(1_700_000_001, 0),
+            chrono::DateTime::from_timestamp(1_700_000_002, 0),
+            Some("webhook failed"),
+        );
+        let value = workflow_run_json(&run);
+        let object = value.as_object().expect("workflow run object");
+
+        assert_eq!(
+            object.len(),
+            9,
+            "wire response must contain only run fields"
+        );
+        for key in [
+            "id",
+            "workflow_id",
+            "status",
+            "current_step",
+            "execution_trace",
+            "error_message",
+            "started_at",
+            "completed_at",
+            "created_at",
+        ] {
+            assert!(object.contains_key(key), "missing run field {key}");
+        }
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["started_at"], 1_700_000_001);
+        assert_eq!(value["completed_at"], 1_700_000_002);
+        assert_eq!(value["created_at"], 1_700_000_000);
+        assert!(value["execution_trace"].is_array());
+    }
+
+    #[test]
+    fn workflow_run_serializer_preserves_nullable_fields_as_json_null() {
+        let value = workflow_run_json(&workflow_run_record(None, None, None));
+
+        assert!(value["error_message"].is_null());
+        assert!(value["started_at"].is_null());
+        assert!(value["completed_at"].is_null());
+    }
+
+    #[test]
+    fn workflow_run_authorization_requires_owner_and_active_channel_membership() {
+        let owner = [7u8; 32];
+        let other = [8u8; 32];
+        let channel_id = uuid::Uuid::new_v4();
+        let disabled_workflow = workflow_record(&owner, Some(channel_id));
+
+        assert!(workflow_runs_access_allowed(
+            &disabled_workflow,
+            &owner,
+            true
+        ));
+        assert!(!workflow_runs_access_allowed(
+            &disabled_workflow,
+            &other,
+            true
+        ));
+        assert!(!workflow_runs_access_allowed(
+            &disabled_workflow,
+            &owner,
+            false
+        ));
+        assert!(!workflow_runs_access_allowed(
+            &workflow_record(&owner, None),
+            &owner,
+            true
+        ));
+    }
+
+    #[test]
+    fn workflow_run_missing_and_unauthorized_responses_share_generic_not_found_shape() {
+        let (status, body) = workflow_not_found();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0, serde_json::json!({"error": "workflow not found"}));
+    }
+
+    #[test]
+    fn workflow_run_limit_defaults_to_twenty_and_caps_at_one_hundred() {
+        assert_eq!(workflow_runs_limit(None), 20);
+        assert_eq!(workflow_runs_limit(Some(7)), 7);
+        assert_eq!(workflow_runs_limit(Some(101)), 100);
+    }
+
+    #[test]
+    fn workflow_run_nip98_auth_binds_the_exact_query_bearing_url() {
+        let tenant = fresh_tenant("runs.example");
+        let uri: axum::http::Uri = "/workflows/30000000-0000-0000-0000-000000000003/runs?limit=7"
+            .parse()
+            .expect("request uri");
+        let exact_url = nip98_expected_url("wss://config.example", &tenant, path_with_query(&uri));
+        let bare_url = nip98_expected_url("wss://config.example", &tenant, uri.path());
+        let keys = Keys::generate();
+        let event_json = build_nip98_event_json(&keys, &exact_url, "GET");
+        let headers = nip98_auth_headers(&event_json);
+
+        assert!(verify_bridge_auth(&headers, "GET", &exact_url, None, true).is_ok());
+        assert!(verify_bridge_auth(&headers, "GET", &bare_url, None, true).is_err());
     }
 
     #[test]

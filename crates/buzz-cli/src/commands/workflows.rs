@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::client::{
@@ -57,39 +58,78 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
     Ok(())
 }
 
-/// Get workflow run history — query kinds [46001, 46002, 46003].
-///
-/// NOTE: The relay does not currently emit workflow execution events (46001-46003).
-/// Run history is stored in the workflow_runs DB table, not as Nostr events.
-/// This command will return an empty array until the relay adds event emission
-/// or a dedicated REST endpoint for run history.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowRunStatus {
+    Pending,
+    Running,
+    WaitingApproval,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WorkflowRun {
+    id: uuid::Uuid,
+    workflow_id: uuid::Uuid,
+    status: WorkflowRunStatus,
+    current_step: i32,
+    execution_trace: Vec<serde_json::Value>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    error_message: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    started_at: Option<i64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    completed_at: Option<i64>,
+    created_at: i64,
+}
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+fn parse_workflow_runs_response(response: &str) -> Result<Vec<WorkflowRun>, CliError> {
+    serde_json::from_str(response)
+        .map_err(|error| CliError::Other(format!("invalid workflow runs response: {error}")))
+}
+
+fn workflow_runs_limit(limit: Option<u32>) -> u32 {
+    limit.unwrap_or(20).min(100)
+}
+
+fn workflow_runs_path(workflow_id: &str, limit: Option<u32>) -> String {
+    format!(
+        "/workflows/{workflow_id}/runs?limit={}",
+        workflow_runs_limit(limit)
+    )
+}
+
+async fn fetch_workflow_runs_json(
+    client: &BuzzClient,
+    workflow_id: &str,
+    limit: Option<u32>,
+) -> Result<String, CliError> {
+    validate_uuid(workflow_id)?;
+    let response = client
+        .get_authed(&workflow_runs_path(workflow_id, limit))
+        .await?;
+    let runs = parse_workflow_runs_response(&response)?;
+    serde_json::to_string(&runs)
+        .map_err(|error| CliError::Other(format!("workflow runs serialization failed: {error}")))
+}
+
+/// Get authoritative workflow run history from the relay database.
 pub async fn cmd_get_workflow_runs(
     client: &BuzzClient,
     workflow_id: &str,
     limit: Option<u32>,
 ) -> Result<(), CliError> {
-    validate_uuid(workflow_id)?;
-    let limit = limit.unwrap_or(20).min(100);
-    let filter = serde_json::json!({
-        "kinds": [46001, 46002, 46003],
-        "#d": [workflow_id],
-        "limit": limit
-    });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let normalized: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "event_id": e.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "kind": e.get("kind").and_then(|v| v.as_u64()).unwrap_or(0),
-                "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-                "tags": e.get("tags").cloned().unwrap_or(serde_json::json!([])),
-            })
-        })
-        .collect();
-    let output = serde_json::to_string(&normalized).unwrap_or_default();
+    let output = fetch_workflow_runs_json(client, workflow_id, limit).await?;
     println!("{output}");
     Ok(())
 }
@@ -239,5 +279,188 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             // approved is already a bool — no parse_bool_flag needed
             cmd_approve_step(client, &token, approved, note.as_deref()).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{extract::OriginalUri, http::HeaderMap, routing::get, Router};
+    use nostr::Keys;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct RunServerState {
+        response: String,
+        requests: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    async fn run_history_response(
+        axum::extract::State(state): axum::extract::State<RunServerState>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> String {
+        state.requests.lock().expect("request log").push((
+            uri.path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or_else(|| uri.path())
+                .to_owned(),
+            headers.contains_key(axum::http::header::AUTHORIZATION),
+        ));
+        state.response
+    }
+
+    async fn run_history_server(response: String) -> (BuzzClient, Arc<Mutex<Vec<(String, bool)>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = RunServerState {
+            response,
+            requests: requests.clone(),
+        };
+        let app = Router::new()
+            .fallback(get(run_history_response))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind run history test relay");
+        let address = listener.local_addr().expect("test relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("run history test relay");
+        });
+
+        let client = BuzzClient::new(
+            format!("http://{address}"),
+            Keys::generate(),
+            None,
+            None,
+        )
+        .expect("test client");
+        (client, requests)
+    }
+
+    fn valid_run() -> serde_json::Value {
+        serde_json::json!({
+            "id": "10000000-0000-0000-0000-000000000001",
+            "workflow_id": "30000000-0000-0000-0000-000000000003",
+            "status": "failed",
+            "current_step": 2,
+            "execution_trace": [{"step_id": "notify", "status": "failed"}],
+            "error_message": "webhook failed",
+            "started_at": 1700000001,
+            "completed_at": null,
+            "created_at": 1700000000
+        })
+    }
+
+    #[test]
+    fn workflow_runs_response_accepts_a_bare_typed_array() {
+        let response = serde_json::to_string(&vec![valid_run()]).expect("serialize fixture");
+        let runs = parse_workflow_runs_response(&response).expect("parse workflow runs");
+        let output = serde_json::to_value(runs).expect("serialize parsed runs");
+
+        assert!(output.is_array());
+        assert_eq!(output[0]["id"], valid_run()["id"]);
+        assert_eq!(output[0]["status"], "failed");
+        assert_eq!(output[0]["current_step"], 2);
+        assert_eq!(output[0]["execution_trace"], valid_run()["execution_trace"]);
+        assert_eq!(output[0]["error_message"], "webhook failed");
+        assert_eq!(output[0]["started_at"], 1_700_000_001i64);
+        assert!(output[0]["completed_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn workflow_runs_fetch_uses_nip98_get_and_default_limit() {
+        let response = serde_json::to_string(&vec![valid_run()]).expect("serialize fixture");
+        let (client, requests) = run_history_server(response).await;
+        let workflow_id = "30000000-0000-0000-0000-000000000003";
+
+        let output = fetch_workflow_runs_json(&client, workflow_id, None)
+            .await
+            .expect("fetch workflow runs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).expect("output json")[0]
+                ["error_message"],
+            "webhook failed"
+        );
+        assert_eq!(
+            requests.lock().expect("request log").as_slice(),
+            &[(
+                format!("/workflows/{workflow_id}/runs?limit=20"),
+                true
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_runs_fetch_caps_limit_and_preserves_a_real_empty_array() {
+        let (client, requests) = run_history_server("[]".to_owned()).await;
+        let workflow_id = "30000000-0000-0000-0000-000000000003";
+
+        let output = fetch_workflow_runs_json(&client, workflow_id, Some(101))
+            .await
+            .expect("fetch empty workflow runs");
+        assert_eq!(output, "[]");
+        assert_eq!(
+            requests.lock().expect("request log").as_slice(),
+            &[(
+                format!("/workflows/{workflow_id}/runs?limit=100"),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn genuine_empty_workflow_runs_response_stays_an_empty_array() {
+        let runs = parse_workflow_runs_response("[]").expect("parse empty response");
+        assert_eq!(
+            serde_json::to_string(&runs).expect("serialize empty runs"),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn malformed_or_enveloped_workflow_runs_responses_fail() {
+        assert!(parse_workflow_runs_response("not json").is_err());
+        assert!(parse_workflow_runs_response(r#"{"runs": []}"#).is_err());
+        assert!(parse_workflow_runs_response(r#"[{"id": ]"#).is_err());
+    }
+
+    #[test]
+    fn workflow_runs_response_rejects_every_missing_required_field() {
+        for field in [
+            "id",
+            "workflow_id",
+            "status",
+            "current_step",
+            "execution_trace",
+            "error_message",
+            "started_at",
+            "completed_at",
+            "created_at",
+        ] {
+            let mut run = valid_run();
+            run.as_object_mut()
+                .expect("run object")
+                .remove(field)
+                .expect("fixture field");
+            let response = serde_json::to_string(&vec![run]).expect("serialize fixture");
+            assert!(
+                parse_workflow_runs_response(&response).is_err(),
+                "missing {field} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_runs_response_requires_execution_trace_to_be_an_array() {
+        let mut run = valid_run();
+        run["execution_trace"] = serde_json::json!({"step_id": "notify"});
+        let response = serde_json::to_string(&vec![run]).expect("serialize fixture");
+
+        assert!(parse_workflow_runs_response(&response).is_err());
     }
 }
