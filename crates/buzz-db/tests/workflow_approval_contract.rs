@@ -824,6 +824,12 @@ async fn approval_history_survives_workflow_deletion() {
         ),
         "public workflow reads must hide tombstones"
     );
+    assert!(matches!(
+        create_gate(&fixture.pool, &spec)
+            .await
+            .expect("deleted workflow gate attempt returns an outcome"),
+        ObservedCreate::Conflict
+    ));
 
     let after = persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
     assert_eq!(

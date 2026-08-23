@@ -834,12 +834,17 @@ pub async fn create_workflow_run(
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
-    sqlx::query(
+    let inserted = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO workflow_runs
             (community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
              status, trigger_event_id, current_step, execution_trace, trigger_context)
-        VALUES ($1, $2, $3, $4, $5, 1, 'pending', $6, 0, '[]', $7)
+        SELECT $1, $2, workflow.id, $4, $5, 1, 'pending', $6, 0, '[]', $7
+        FROM workflows AS workflow
+        WHERE workflow.community_id = $1
+          AND workflow.id = $3
+          AND workflow.deleted_at IS NULL
+        RETURNING id
         "#,
     )
     .bind(community_id.as_uuid())
@@ -849,8 +854,12 @@ pub async fn create_workflow_run(
     .bind(definition_hash)
     .bind(trigger_event_id)
     .bind(trigger_context)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
+
+    if inserted.is_none() {
+        return Err(DbError::NotFound(format!("workflow {workflow_id}")));
+    }
 
     Ok(id)
 }
@@ -2327,6 +2336,22 @@ mod tests {
         assert!(
             deleted_claim.is_none(),
             "a deleted workflow must not accept a scheduled claim"
+        );
+        assert!(
+            matches!(
+                create_workflow_run(
+                    &pool,
+                    community_a,
+                    shared_workflow_id,
+                    None,
+                    None,
+                    &serde_json::json!({}),
+                    &[0x42; 32],
+                )
+                .await,
+                Err(DbError::NotFound(_))
+            ),
+            "a deleted workflow must not accept a new run"
         );
         let surviving_b = get_workflow(&pool, community_b, shared_workflow_id)
             .await
