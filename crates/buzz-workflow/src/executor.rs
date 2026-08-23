@@ -53,10 +53,9 @@ impl TriggerContext {
     /// `webhook_fields`, then walks the preserved body for dotted paths
     /// (`trigger.commit.sha`). `None` for unknown names.
     ///
-    /// A field name containing a dot is only ever resolved against the body
-    /// tree; an exact top-level webhook field (no dot) keeps first claim via
-    /// `webhook_fields`, so the flattened names existing definitions rely on
-    /// still win over a same-named scalar in the tree.
+    /// Exact top-level webhook fields keep first claim, including names that
+    /// contain dots. The body walk is the fallback when no literal flattened
+    /// field exists, preserving definitions written before nested access.
     ///
     /// Returns an owned `String` (not a `&str`) because a nested body walk
     /// must stringify numbers and booleans that are not stored as text.
@@ -563,6 +562,18 @@ pub fn resolve_step_templates(
             from: t(from)?,
             matchers: matchers.clone(),
         }),
+        ReadState { key } => Ok(ReadState { key: t(key)? }),
+        WriteState {
+            key,
+            value,
+            expires_in,
+            expected_revision,
+        } => Ok(WriteState {
+            key: t(key)?,
+            value: t(value)?,
+            expires_in: t(expires_in)?,
+            expected_revision: t_opt(expected_revision)?,
+        }),
     }
 }
 
@@ -810,6 +821,175 @@ pub async fn dispatch_action(
             let out = run_extract_output(from, matchers, trigger_ctx, step_outputs)?;
             Ok(StepResult::Completed(serde_json::Value::Object(out)))
         }
+
+        ReadState { key } => {
+            validate_state_key(key)?;
+            let entry = engine
+                .db
+                .read_workflow_state_for_run(community_id, run_id, key)
+                .await?;
+
+            Ok(StepResult::Completed(read_state_output(entry)))
+        }
+
+        WriteState {
+            key,
+            value,
+            expires_in,
+            expected_revision,
+        } => {
+            validate_state_key(key)?;
+            validate_state_value(value)?;
+            let expires_in_secs = parse_state_expiry(expires_in)?;
+            let expected_revision = parse_expected_revision(expected_revision.as_deref())?;
+            let outcome = engine
+                .db
+                .write_workflow_state(
+                    community_id,
+                    run_id,
+                    step_id,
+                    key,
+                    value,
+                    expires_in_secs as i64,
+                    expected_revision,
+                )
+                .await?;
+
+            Ok(StepResult::Completed(write_state_output(outcome)?))
+        }
+    }
+}
+
+const STATE_KEY_MAX_BYTES: usize = 512;
+const STATE_VALUE_MAX_BYTES: usize = 64 * 1024;
+const STATE_EXPIRY_MAX_SECS: u64 = 365 * 24 * 60 * 60;
+
+fn validate_state_key(key: &str) -> Result<(), WorkflowError> {
+    if key.is_empty() || key.len() > STATE_KEY_MAX_BYTES {
+        return Err(WorkflowError::InvalidDefinition(format!(
+            "state key must be 1..={STATE_KEY_MAX_BYTES} bytes (got {})",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_state_value(value: &str) -> Result<(), WorkflowError> {
+    if value.len() > STATE_VALUE_MAX_BYTES {
+        return Err(WorkflowError::InvalidDefinition(format!(
+            "state value must be <={STATE_VALUE_MAX_BYTES} bytes (got {})",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+fn parse_state_expiry(expires_in: &str) -> Result<u64, WorkflowError> {
+    let expires_in = expires_in.trim();
+    let seconds = if let Some(days) = expires_in.strip_suffix('d') {
+        days.trim()
+            .parse::<u64>()
+            .map_err(|_| {
+                WorkflowError::InvalidDefinition(format!(
+                    "WriteState: invalid expires_in: {expires_in}"
+                ))
+            })?
+            .checked_mul(24 * 60 * 60)
+            .ok_or_else(|| {
+                WorkflowError::InvalidDefinition(format!(
+                    "WriteState: expires_in overflow: {expires_in}"
+                ))
+            })?
+    } else {
+        parse_duration_secs(expires_in)?
+    };
+    if !(1..=STATE_EXPIRY_MAX_SECS).contains(&seconds) {
+        return Err(WorkflowError::InvalidDefinition(format!(
+            "WriteState: expires_in must be 1s..=365d (got {seconds}s)"
+        )));
+    }
+    Ok(seconds)
+}
+
+fn parse_expected_revision(revision: Option<&str>) -> Result<Option<&str>, WorkflowError> {
+    let Some(revision) = revision else {
+        return Ok(None);
+    };
+    let revision = revision.trim();
+    if revision == "0" {
+        return Ok(Some(revision));
+    }
+
+    let (incarnation, counter) = revision.split_once(':').ok_or_else(|| {
+        WorkflowError::InvalidDefinition(
+            "WriteState: expected_revision must be 0 or <uuid>:<counter>".into(),
+        )
+    })?;
+    let incarnation = Uuid::parse_str(incarnation).map_err(|_| {
+        WorkflowError::InvalidDefinition(
+            "WriteState: expected_revision must contain a valid UUID".into(),
+        )
+    })?;
+    let counter = counter.parse::<i64>().map_err(|_| {
+        WorkflowError::InvalidDefinition(
+            "WriteState: expected_revision counter must be a positive integer".into(),
+        )
+    })?;
+    if counter <= 0 {
+        return Err(WorkflowError::InvalidDefinition(
+            "WriteState: expected_revision counter must be greater than zero".into(),
+        ));
+    }
+    if format!("{incarnation}:{counter}") != revision {
+        return Err(WorkflowError::InvalidDefinition(
+            "WriteState: expected_revision must use canonical <uuid>:<counter> form".into(),
+        ));
+    }
+    Ok(Some(revision))
+}
+
+fn read_state_output(entry: Option<buzz_db::WorkflowStateEntry>) -> JsonValue {
+    match entry {
+        Some(entry) => serde_json::json!({
+            "found": true,
+            "value": entry.value,
+            "revision": entry.revision.to_string(),
+        }),
+        None => serde_json::json!({
+            "found": false,
+            "value": null,
+            "revision": "0",
+        }),
+    }
+}
+
+fn write_state_output(
+    outcome: buzz_db::WorkflowStateWriteOutcome,
+) -> Result<JsonValue, WorkflowError> {
+    use buzz_db::WorkflowStateWriteOutcome;
+
+    match outcome {
+        WorkflowStateWriteOutcome::Written { value, revision } => Ok(serde_json::json!({
+            "written": true,
+            "value": value,
+            "revision": revision.to_string(),
+        })),
+        WorkflowStateWriteOutcome::Conflict {
+            current_value,
+            current_revision,
+        } => Ok(serde_json::json!({
+            "written": false,
+            "value": current_value,
+            "revision": current_revision
+                .map(|revision| revision.to_string())
+                .unwrap_or_else(|| "0".to_owned()),
+        })),
+        WorkflowStateWriteOutcome::LimitExceeded { limit } => Err(WorkflowError::Database(
+            format!("WriteState: state limit exceeded: {limit:?}"),
+        )),
+        WorkflowStateWriteOutcome::RequestConflict => Err(WorkflowError::Database(
+            "WriteState: this run and step were retried with different inputs".into(),
+        )),
     }
 }
 
@@ -1701,6 +1881,140 @@ mod tests {
     #[test]
     fn parse_duration_invalid() {
         assert!(parse_duration_secs("not-a-duration").is_err());
+    }
+
+    #[test]
+    fn state_key_uses_utf8_byte_limits() {
+        assert!(validate_state_key("a").is_ok());
+        assert!(validate_state_key(&"a".repeat(STATE_KEY_MAX_BYTES)).is_ok());
+        assert!(validate_state_key("").is_err());
+        assert!(validate_state_key(&"a".repeat(STATE_KEY_MAX_BYTES + 1)).is_err());
+        assert!(validate_state_key(&"é".repeat(STATE_KEY_MAX_BYTES / 2)).is_ok());
+        assert!(validate_state_key(&"é".repeat(STATE_KEY_MAX_BYTES / 2 + 1)).is_err());
+    }
+
+    #[test]
+    fn state_value_enforces_64_kib_bytes() {
+        assert!(validate_state_value(&"a".repeat(STATE_VALUE_MAX_BYTES)).is_ok());
+        assert!(validate_state_value(&"a".repeat(STATE_VALUE_MAX_BYTES + 1)).is_err());
+        assert!(validate_state_value(&"é".repeat(STATE_VALUE_MAX_BYTES / 2)).is_ok());
+        assert!(validate_state_value(&"é".repeat(STATE_VALUE_MAX_BYTES / 2 + 1)).is_err());
+    }
+
+    #[test]
+    fn state_expiry_accepts_only_one_second_through_365_days() {
+        assert_eq!(parse_state_expiry("1s").unwrap(), 1);
+        assert_eq!(parse_state_expiry("365d").unwrap(), STATE_EXPIRY_MAX_SECS);
+        assert!(parse_state_expiry("0s").is_err());
+        assert!(parse_state_expiry("366d").is_err());
+    }
+
+    #[test]
+    fn expected_revision_accepts_create_only_and_canonical_tokens() {
+        let token = "11111111-2222-4333-8444-555555555555:42";
+        assert_eq!(parse_expected_revision(None).unwrap(), None);
+        assert_eq!(parse_expected_revision(Some("0")).unwrap(), Some("0"));
+        assert_eq!(parse_expected_revision(Some(token)).unwrap(), Some(token));
+        assert!(parse_expected_revision(Some("")).is_err());
+        assert!(parse_expected_revision(Some("11111111-2222-4333-8444-555555555555:0")).is_err());
+        assert!(parse_expected_revision(Some("11111111-2222-4333-8444-555555555555:-1")).is_err());
+        assert!(parse_expected_revision(Some("11111111-2222-4333-8444-555555555555:042")).is_err());
+    }
+
+    #[test]
+    fn state_action_templates_resolve_all_runtime_fields() {
+        let trigger = make_trigger();
+        let step = Step {
+            id: "write".into(),
+            name: None,
+            if_expr: None,
+            timeout_secs: None,
+            action: ActionDef::WriteState {
+                key: "counter/{{trigger.author}}".into(),
+                value: "{{trigger.text}}".into(),
+                expires_in: "{{trigger.timestamp}}s".into(),
+                expected_revision: Some("{{steps.read.output.revision}}".into()),
+            },
+        };
+        let outputs = HashMap::from([(
+            "read".into(),
+            json!({ "revision": "11111111-2222-4333-8444-555555555555:7" }),
+        )]);
+
+        let resolved = resolve_step_templates(&step, &trigger, &outputs).unwrap();
+        assert!(matches!(
+            resolved,
+            ActionDef::WriteState {
+                key,
+                value,
+                expires_in,
+                expected_revision: Some(expected_revision),
+            } if key == "counter/abc123def456"
+                && value == "P1 incident in production"
+                && expires_in == "1700000000s"
+                && expected_revision == "11111111-2222-4333-8444-555555555555:7"
+        ));
+    }
+
+    #[test]
+    fn state_outputs_are_flat_and_cas_conflict_is_data() {
+        let revision: buzz_db::WorkflowStateRevision =
+            serde_json::from_str("\"11111111-2222-4333-8444-555555555555:7\"").unwrap();
+        let read = read_state_output(Some(buzz_db::WorkflowStateEntry {
+            value: "old".into(),
+            revision,
+            expires_at: chrono::Utc::now(),
+        }));
+        assert_eq!(
+            read,
+            json!({
+                "found": true,
+                "value": "old",
+                "revision": "11111111-2222-4333-8444-555555555555:7",
+            })
+        );
+        assert_eq!(
+            read_state_output(None),
+            json!({ "found": false, "value": null, "revision": "0" })
+        );
+
+        let written = write_state_output(buzz_db::WorkflowStateWriteOutcome::Written {
+            value: "new".into(),
+            revision,
+        })
+        .unwrap();
+        assert_eq!(
+            written,
+            json!({
+                "written": true,
+                "value": "new",
+                "revision": "11111111-2222-4333-8444-555555555555:7",
+            })
+        );
+
+        let conflict = write_state_output(buzz_db::WorkflowStateWriteOutcome::Conflict {
+            current_value: Some("old".into()),
+            current_revision: Some(revision),
+        })
+        .expect("CAS conflict is a completed output");
+        assert_eq!(
+            conflict,
+            json!({
+                "written": false,
+                "value": "old",
+                "revision": "11111111-2222-4333-8444-555555555555:7",
+            })
+        );
+
+        let absent_conflict = write_state_output(buzz_db::WorkflowStateWriteOutcome::Conflict {
+            current_value: None,
+            current_revision: None,
+        })
+        .expect("absent CAS conflict is a completed output");
+        assert_eq!(
+            absent_conflict,
+            json!({ "written": false, "value": null, "revision": "0" })
+        );
     }
 
     #[test]

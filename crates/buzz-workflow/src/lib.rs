@@ -403,6 +403,8 @@ impl WorkflowEngine {
                     workflow.id,
                     Some(&trigger_event_id_bytes),
                     Some(&trigger_ctx_json),
+                    &workflow.definition,
+                    &workflow.definition_hash,
                 )
                 .await
             {
@@ -665,6 +667,8 @@ impl WorkflowEngine {
                         workflow.id,
                         None, // no trigger event for cron
                         trigger_ctx_json.as_ref(),
+                        &workflow.definition,
+                        &workflow.definition_hash,
                     )
                     .await
                 {

@@ -1920,7 +1920,14 @@ pub async fn workflow_webhook(
 
     let run_id = state
         .db
-        .create_workflow_run(community_id, id, None, trigger_ctx_json.as_ref())
+        .create_workflow_run(
+            community_id,
+            id,
+            None,
+            trigger_ctx_json.as_ref(),
+            &workflow.definition,
+            &workflow.definition_hash,
+        )
         .await
         .map_err(|e| super::internal_error(&format!("db error: {e}")))?;
 

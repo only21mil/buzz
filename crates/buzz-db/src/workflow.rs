@@ -201,6 +201,12 @@ pub struct WorkflowRunRecord {
     pub community_id: CommunityId,
     /// The workflow definition that was executed.
     pub workflow_id: Uuid,
+    /// Immutable canonical workflow definition captured when this run was created.
+    pub definition_snapshot: serde_json::Value,
+    /// SHA-256 hash of `definition_snapshot`.
+    pub definition_hash: Vec<u8>,
+    /// Optimistic transition fence for durable resume workers.
+    pub generation: i64,
     /// Current execution status of this run.
     pub status: RunStatus,
     /// Raw event ID bytes that triggered this run, if any.
@@ -794,25 +800,32 @@ pub async fn delete_workflow_for_owner(
 /// `trigger_context` is the serialized `TriggerContext` for this run. It is stored
 /// so that post-approval resume steps can restore the original trigger data and
 /// correctly resolve `{{trigger.*}}` template variables.
+/// `definition_snapshot` and `definition_hash` must be the exact canonical
+/// definition and hash selected by the caller for this run.
 pub async fn create_workflow_run(
     pool: &PgPool,
     community_id: CommunityId,
     workflow_id: Uuid,
     trigger_event_id: Option<&[u8]>,
     trigger_context: Option<&serde_json::Value>,
+    definition_snapshot: &serde_json::Value,
+    definition_hash: &[u8],
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
     sqlx::query(
         r#"
         INSERT INTO workflow_runs
-            (community_id, id, workflow_id, status, trigger_event_id, current_step, execution_trace, trigger_context)
-        VALUES ($1, $2, $3, 'pending', $4, 0, '[]', $5)
+            (community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+             status, trigger_event_id, current_step, execution_trace, trigger_context)
+        VALUES ($1, $2, $3, $4, $5, 1, 'pending', $6, 0, '[]', $7)
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(workflow_id)
+    .bind(definition_snapshot)
+    .bind(definition_hash)
     .bind(trigger_event_id)
     .bind(trigger_context)
     .execute(pool)
@@ -829,8 +842,9 @@ pub async fn get_workflow_run(
 ) -> Result<WorkflowRunRecord> {
     let row = sqlx::query(
         r#"
-        SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
-               execution_trace, trigger_context, started_at, completed_at, error_message, created_at
+        SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+               status::text AS status, trigger_event_id, current_step, execution_trace,
+               trigger_context, started_at, completed_at, error_message, created_at
         FROM workflow_runs
         WHERE community_id = $1 AND id = $2
         "#,
@@ -854,8 +868,9 @@ pub async fn list_workflow_runs(
     let limit = limit.min(1000);
     let rows = sqlx::query(
         r#"
-        SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
-               execution_trace, trigger_context, started_at, completed_at, error_message, created_at
+        SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+               status::text AS status, trigger_event_id, current_step, execution_trace,
+               trigger_context, started_at, completed_at, error_message, created_at
         FROM workflow_runs
         WHERE community_id = $1 AND workflow_id = $2
         ORDER BY created_at DESC
@@ -1160,6 +1175,9 @@ fn row_to_run_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         id,
         community_id: CommunityId::from_uuid(community_id),
         workflow_id,
+        definition_snapshot: row.try_get("definition_snapshot")?,
+        definition_hash: row.try_get("definition_hash")?,
+        generation: row.try_get("generation")?,
         status,
         trigger_event_id: row.try_get("trigger_event_id")?,
         current_step: row.try_get("current_step")?,
@@ -1462,6 +1480,9 @@ mod tests {
             id,
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id,
+            definition_snapshot: serde_json::json!({ "steps": [] }),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
             status: RunStatus::Running,
             trigger_event_id: Some(trigger_event_id.clone()),
             current_step: 2,
@@ -1477,6 +1498,12 @@ mod tests {
 
         assert_eq!(record.id, id);
         assert_eq!(record.workflow_id, workflow_id);
+        assert_eq!(
+            record.definition_snapshot,
+            serde_json::json!({ "steps": [] })
+        );
+        assert_eq!(record.definition_hash, vec![0x42; 32]);
+        assert_eq!(record.generation, 1);
         assert_eq!(record.status, RunStatus::Running);
         assert_eq!(record.trigger_event_id, Some(trigger_event_id));
         assert_eq!(record.current_step, 2);
@@ -1492,6 +1519,9 @@ mod tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,
@@ -1515,6 +1545,9 @@ mod tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
             status: RunStatus::Failed,
             trigger_event_id: None,
             current_step: 1,
@@ -1546,6 +1579,9 @@ mod tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
             status: RunStatus::Completed,
             trigger_event_id: None,
             current_step: 2,
@@ -1568,6 +1604,9 @@ mod tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,
@@ -1915,9 +1954,19 @@ mod tests {
             .expect("claim wins");
 
         // Create the run the won claim is responsible for, then attach it.
-        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
-            .await
-            .expect("create run ok");
+        let definition_snapshot = serde_json::json!({});
+        let definition_hash = [0x42; 32];
+        let run_id = create_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("create run ok");
 
         let attached =
             attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, run_id)
@@ -1944,9 +1993,17 @@ mod tests {
 
         // A second attach is a no-op: the `workflow_run_id IS NULL` guard means
         // an already-linked claim is never re-pointed to a different run.
-        let other_run = create_workflow_run(&pool, community, workflow_id, None, None)
-            .await
-            .expect("create second run ok");
+        let other_run = create_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("create second run ok");
         let reattached =
             attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, other_run)
                 .await
@@ -2224,13 +2281,31 @@ mod tests {
         let channel_id = Uuid::new_v4();
         insert_workflow_with_ids(&pool, community_a, workflow_id, channel_id, "wf-A").await;
         insert_workflow_with_ids(&pool, community_b, workflow_id, Uuid::new_v4(), "wf-B").await;
+        let definition_snapshot = serde_json::json!({});
+        let definition_hash = [0x42; 32];
 
-        let run_a = create_workflow_run(&pool, community_a, workflow_id, None, None)
-            .await
-            .expect("run A");
-        let run_b = create_workflow_run(&pool, community_b, workflow_id, None, None)
-            .await
-            .expect("run B");
+        let run_a = create_workflow_run(
+            &pool,
+            community_a,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("run A");
+        let run_b = create_workflow_run(
+            &pool,
+            community_b,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("run B");
 
         let token = "shared-approval-token";
         let expires = Utc::now() + chrono::Duration::hours(1);
