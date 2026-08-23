@@ -669,6 +669,7 @@ mod tests {
             "state test",
             "{}",
             &[0x52; 32],
+            true,
         )
         .await
         .expect("insert workflow");

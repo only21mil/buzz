@@ -737,6 +737,7 @@ mod tests {
             "counted-workflow",
             "{}",
             &[0x42; 32],
+            true,
         )
         .await
         .expect("create counted workflow");

@@ -1801,6 +1801,7 @@ steps:
                 "sec006-event",
                 &def_json,
                 &[0u8; 32],
+                true,
             )
             .await
             .expect("create workflow");
@@ -1867,6 +1868,7 @@ steps:
                 "hook-member",
                 &def_json,
                 &[0u8; 32],
+                true,
             )
             .await
             .expect("create member workflow");
@@ -1878,6 +1880,7 @@ steps:
                 "hook-owner",
                 &def_json,
                 &[1u8; 32],
+                true,
             )
             .await
             .expect("create owner workflow");

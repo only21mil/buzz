@@ -163,6 +163,7 @@ impl Fixture {
             "workflow-state-contract",
             r#"{"trigger":{"on":"message_posted"},"steps":[]}"#,
             &[0x52; 32],
+            true,
         )
         .await
         .expect("insert workflow");
