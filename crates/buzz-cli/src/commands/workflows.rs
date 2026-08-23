@@ -9,6 +9,35 @@ use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
 
 // TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
+fn workflow_lookup_filter(channel_id: &str, workflow_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [30620],
+        "#h": [channel_id],
+        "#d": [workflow_id],
+        "limit": 1
+    })
+}
+
+fn require_workflow_lookup(
+    response: &str,
+    channel_id: &str,
+    workflow_id: &str,
+) -> Result<(), CliError> {
+    let events: Vec<serde_json::Value> = serde_json::from_str(response)
+        .map_err(|e| CliError::Other(format!("invalid workflow lookup response: {e}")))?;
+
+    if events
+        .iter()
+        .any(|event| extract_d_tag(event) == workflow_id)
+    {
+        return Ok(());
+    }
+
+    Err(CliError::NotFound(format!(
+        "workflow {workflow_id} not found in channel {channel_id}"
+    )))
+}
+
 /// List workflows in a channel — query kind:30620 workflow definition events.
 pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
     validate_uuid(channel_id)?;
@@ -124,6 +153,10 @@ pub async fn cmd_update_workflow(
 ) -> Result<(), CliError> {
     let channel_uuid = parse_uuid(channel_id)?;
     let wf_uuid = parse_uuid(workflow_id)?;
+    let lookup = client
+        .query(&workflow_lookup_filter(channel_id, workflow_id))
+        .await?;
+    require_workflow_lookup(&lookup, channel_id, workflow_id)?;
     let yaml_definition = read_or_stdin(yaml)?;
 
     let builder = buzz_sdk::build_workflow_update(channel_uuid, wf_uuid, &yaml_definition)
@@ -133,6 +166,56 @@ pub async fn cmd_update_workflow(
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{require_workflow_lookup, workflow_lookup_filter};
+    use crate::error::CliError;
+
+    const CHANNEL_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const WORKFLOW_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+    #[test]
+    fn update_lookup_is_scoped_to_channel_and_workflow() {
+        assert_eq!(
+            workflow_lookup_filter(CHANNEL_ID, WORKFLOW_ID),
+            serde_json::json!({
+                "kinds": [30620],
+                "#h": [CHANNEL_ID],
+                "#d": [WORKFLOW_ID],
+                "limit": 1
+            })
+        );
+    }
+
+    #[test]
+    fn update_lookup_accepts_the_requested_workflow() {
+        let response = serde_json::json!([{
+            "tags": [["d", WORKFLOW_ID], ["h", CHANNEL_ID]]
+        }])
+        .to_string();
+
+        require_workflow_lookup(&response, CHANNEL_ID, WORKFLOW_ID).unwrap();
+    }
+
+    #[test]
+    fn update_lookup_rejects_an_unknown_workflow() {
+        let err = require_workflow_lookup("[]", CHANNEL_ID, WORKFLOW_ID).unwrap_err();
+
+        assert!(matches!(err, CliError::NotFound(_)));
+        assert_eq!(
+            err.to_string(),
+            format!("workflow {WORKFLOW_ID} not found in channel {CHANNEL_ID}")
+        );
+    }
+
+    #[test]
+    fn update_lookup_rejects_a_malformed_response() {
+        let err = require_workflow_lookup("not-json", CHANNEL_ID, WORKFLOW_ID).unwrap_err();
+
+        assert!(matches!(err, CliError::Other(_)));
+    }
 }
 
 /// Delete a workflow — sign and submit a kind:5 deletion event.
