@@ -372,13 +372,26 @@ pub fn build_eval_context(
         .webhook_body
         .clone()
         .unwrap_or(serde_json::json!(null));
+    // The flat fields snapshot lets body_path mirror get_field's precedence:
+    // an exact top-level key wins, the tree is the fallback. This keeps one
+    // webhook meaning the same thing in both languages.
+    let flat_snapshot = trigger_ctx.webhook_fields.clone();
     ctx.set_function(
         "body_path".into(),
-        Function::new(move |args| {
-            let args = args.as_fixed_len_tuple(1)?;
-            let path = args[0].as_string()?;
-            let value = json_path_to_eval(&body_snapshot, path.as_str())
-                .unwrap_or(Value::String(String::new()));
+        Function::new(move |arg| {
+            // Single-argument function: evalexpr passes the argument directly,
+            // not as a one-element tuple, so match the str_len pattern.
+            let path = arg.as_string()?;
+            // Mirror get_field: check the flat map for the literal key first,
+            // then walk the tree. A bare key keeps winning so existing
+            // definitions that read a flattened dotted key are unchanged.
+            let flat_value = flat_snapshot
+                .get(path.as_str())
+                .map(|v| Value::String(v.clone()));
+            let value = flat_value.unwrap_or_else(|| {
+                json_path_to_eval(&body_snapshot, path.as_str())
+                    .unwrap_or(Value::String(String::new()))
+            });
             Ok(value)
         }),
     )
@@ -821,9 +834,18 @@ fn run_extract_output(
     let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     for (out_name, matcher_name) in matchers {
         let result = run_matcher(matcher_name, &field_value)?;
-        out.insert(format!("{out_name}").into(), serde_json::to_value(&result.value).unwrap_or(serde_json::json!("")));
-        out.insert(format!("{out_name}_found").into(), serde_json::to_value(&result.found).unwrap_or(serde_json::json!(false)));
-        out.insert(format!("{out_name}_count").into(), serde_json::to_value(&result.count).unwrap_or(serde_json::json!(0)));
+        out.insert(
+            format!("{out_name}").into(),
+            serde_json::to_value(&result.value).unwrap_or(serde_json::json!("")),
+        );
+        out.insert(
+            format!("{out_name}_found").into(),
+            serde_json::to_value(&result.found).unwrap_or(serde_json::json!(false)),
+        );
+        out.insert(
+            format!("{out_name}_count").into(),
+            serde_json::to_value(&result.count).unwrap_or(serde_json::json!(0)),
+        );
     }
     Ok(out)
 }
@@ -862,7 +884,11 @@ fn run_matcher(name: &str, field: &str) -> Result<MatchResult, WorkflowError> {
             if count > 0 {
                 value = find_first_sha(field).unwrap_or(String::new());
             }
-            Ok(MatchResult { value, found: count > 0, count })
+            Ok(MatchResult {
+                value,
+                found: count > 0,
+                count,
+            })
         }
         // `wf_word`: a bounded word token (ASCII letters and digits, no
         // separators). First match plus count, matching the same shape.
@@ -872,7 +898,11 @@ fn run_matcher(name: &str, field: &str) -> Result<MatchResult, WorkflowError> {
             if count > 0 {
                 value = find_first_word(field).unwrap_or(String::new());
             }
-            Ok(MatchResult { value, found: count > 0, count })
+            Ok(MatchResult {
+                value,
+                found: count > 0,
+                count,
+            })
         }
         other => Err(WorkflowError::InvalidDefinition(format!(
             "extract: unknown matcher '{other}' (expected wf_sha or wf_word)"
@@ -902,14 +932,13 @@ fn count_sha_matches(s: &str) -> usize {
 
 /// First SHA token, or `None` when the field has none.
 fn find_first_sha(s: &str) -> Option<String> {
-    s.split_whitespace()
-        .find_map(|t| {
-            if is_sha_token(t) {
-                Some(t.to_owned())
-            } else {
-                None
-            }
-        })
+    s.split_whitespace().find_map(|t| {
+        if is_sha_token(t) {
+            Some(t.to_owned())
+        } else {
+            None
+        }
+    })
 }
 
 /// Count word tokens (whitespace-delimited, non-empty).
@@ -2001,9 +2030,15 @@ mod tests {
     #[test]
     fn trigger_context_get_field_known_fields() {
         let ctx = make_trigger();
-        assert_eq!(ctx.get_field("text"), Some("P1 incident in production".to_owned()));
+        assert_eq!(
+            ctx.get_field("text"),
+            Some("P1 incident in production".to_owned())
+        );
         assert_eq!(ctx.get_field("author"), Some("abc123def456".to_owned()));
-        assert_eq!(ctx.get_field("channel_id"), Some("channel-uuid-here".to_owned()));
+        assert_eq!(
+            ctx.get_field("channel_id"),
+            Some("channel-uuid-here".to_owned())
+        );
         assert_eq!(ctx.get_field("timestamp"), Some("1700000000".to_owned()));
         assert_eq!(ctx.get_field("emoji"), Some("fire".to_owned()));
         assert_eq!(ctx.get_field("message_id"), Some("event-id-hex".to_owned()));
@@ -2175,12 +2210,51 @@ mod tests {
         assert!(cond_ok);
 
         // Template resolves the value from the real arm's flat key.
-        let template_out = resolve_template(
-            "sha={{steps.extract.output.sha}}",
-            &ctx,
-            &step_outputs,
-        )
-        .expect("template must resolve");
+        let template_out =
+            resolve_template("sha={{steps.extract.output.sha}}", &ctx, &step_outputs)
+                .expect("template must resolve");
         assert_eq!(template_out, format!("sha={sha}"));
+    }
+
+    // Regression for the review-leg disagreement: when a webhook body carries
+    // both a top-level key literally named "a.b" and a nested a.b, both
+    // consumers must return the same value. Per the orchestrator's ruling the
+    // flat top-level key wins (backward-compatible for existing definitions),
+    // and body_path mirrors get_field so the languages agree.
+    #[tokio::test]
+    async fn dotted_name_flat_wins_and_consumers_agree() {
+        let mut ctx = make_trigger();
+        ctx.webhook_body = Some(serde_json::json!({
+            "a.b": "flat",
+            "a": { "b": "nested" },
+        }));
+        ctx.webhook_fields
+            .insert("a.b".to_owned(), "flat".to_owned());
+        ctx.webhook_fields
+            .insert("a".to_owned(), "{\"b\":\"nested\"}".to_owned());
+
+        // Template path: flat key wins.
+        let template_value = ctx.get_field("a.b").expect("get_field should resolve");
+        assert_eq!(template_value, "flat");
+
+        // Condition path: body_path("a.b") must also return flat, proving the
+        // two languages agree (equality is the invariant, flat is the policy).
+        let condition_sees_flat =
+            evaluate_condition("body_path(\"a.b\") == \"flat\"", &ctx, &HashMap::new())
+                .await
+                .expect("body_path expression evaluates");
+        assert!(
+            condition_sees_flat,
+            "body_path must match get_field: flat wins"
+        );
+
+        let condition_sees_nested =
+            evaluate_condition("body_path(\"a.b\") == \"nested\"", &ctx, &HashMap::new())
+                .await
+                .expect("body_path expression evaluates");
+        assert!(
+            !condition_sees_nested,
+            "body_path must not see nested when flat key exists"
+        );
     }
 }
