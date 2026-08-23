@@ -794,24 +794,38 @@ pub async fn dispatch_action(
         }
 
         Extract { from, matchers } => {
-            let field_value = resolve_variable(from, trigger_ctx, step_outputs).unwrap_or_default();
-            // Emit three flat keys per matcher: `<name>`, `<name>_found`,
-            // `<name>_count`. Both consumers (build_eval_context for
-            // conditions, json_get_str for templates) read exactly one level,
-            // so a nested {value,found,count} object would never surface the
-            // flag where a condition can test it. Flat keys keep the shared
-            // evaluators untouched and make `steps_ID_output_<name>_found`
-            // reachable.
-            let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-            for (out_name, matcher_name) in matchers {
-                let result = run_matcher(matcher_name, &field_value)?;
-                out.insert(format!("{out_name}").into(), serde_json::to_value(&result.value).unwrap_or(serde_json::json!("")));
-                out.insert(format!("{out_name}_found").into(), serde_json::to_value(&result.found).unwrap_or(serde_json::json!(false)));
-                out.insert(format!("{out_name}_count").into(), serde_json::to_value(&result.count).unwrap_or(serde_json::json!(0)));
-            }
+            let out = run_extract_output(from, matchers, trigger_ctx, step_outputs)?;
             Ok(StepResult::Completed(serde_json::Value::Object(out)))
         }
     }
+}
+
+/// Build the flat output map for an `extract` step.
+///
+/// Emits three flat keys per matcher: `<name>`, `<name>_found`,
+/// `<name>_count`. Both consumers (build_eval_context for conditions,
+/// json_get_str for templates) read exactly one level, so a nested
+/// {value,found,count} object would never surface the flag where a condition
+/// can test it. Flat keys keep the shared evaluators untouched and make
+/// `steps_ID_output_<name>_found` reachable.
+///
+/// This is the production code path the dispatch arm calls; the unit test
+/// calls it directly so the assertion depends on the real arm, not a copy.
+fn run_extract_output(
+    from: &str,
+    matchers: &HashMap<String, String>,
+    trigger_ctx: &TriggerContext,
+    step_outputs: &HashMap<String, JsonValue>,
+) -> Result<serde_json::Map<String, serde_json::Value>, WorkflowError> {
+    let field_value = resolve_variable(from, trigger_ctx, step_outputs).unwrap_or_default();
+    let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (out_name, matcher_name) in matchers {
+        let result = run_matcher(matcher_name, &field_value)?;
+        out.insert(format!("{out_name}").into(), serde_json::to_value(&result.value).unwrap_or(serde_json::json!("")));
+        out.insert(format!("{out_name}_found").into(), serde_json::to_value(&result.found).unwrap_or(serde_json::json!(false)));
+        out.insert(format!("{out_name}_count").into(), serde_json::to_value(&result.count).unwrap_or(serde_json::json!(0)));
+    }
+    Ok(out)
 }
 
 /// A single matcher result: the captured value (empty if no match) plus a
@@ -2135,22 +2149,22 @@ mod tests {
     // {{steps.extract.output.sha.value}} will resolve verbatim (template).
     #[tokio::test]
     async fn extract_output_reaches_condition_and_template() {
-        let sha = "6407ed82b9869a112e234a19b328511c90db6647";
-        let field_value = format!("FROZEN {sha}").to_owned();
+        let sha = "050ac722106c2e04fba83315ef0bd498472ae99b";
+        let mut ctx = make_trigger();
+        ctx.text = format!("FROZEN {sha}").to_owned();
 
-        // Mirror the dispatch arm: run the matcher, then insert flat keys.
-        let result = run_matcher("wf_sha", &field_value).expect("match should not fail");
-        let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-        out.insert("sha".to_owned(), serde_json::to_value(&result.value).unwrap_or(serde_json::json!(0)));
-        out.insert("sha_found".to_owned(), serde_json::to_value(&result.found).unwrap_or(serde_json::json!(false)));
-        out.insert("sha_count".to_owned(), serde_json::to_value(&result.count).unwrap_or(serde_json::json!(0)));
+        // Call the production helper the dispatch arm uses, not a copy. If
+        // extract ever changes (e.g. back to a nested object), this
+        // test fails because the assertion depends on the real arm.
+        let mut matchers: HashMap<String, String> = HashMap::new();
+        matchers.insert("sha".to_owned(), "wf_sha".to_owned());
+        let out = run_extract_output("trigger.text", &matchers, &ctx, &HashMap::new())
+            .expect("extract should not fail");
 
         let mut step_outputs: HashMap<String, JsonValue> = HashMap::new();
         step_outputs.insert("extract".to_owned(), serde_json::Value::Object(out));
 
-        let ctx = make_trigger();
-
-        // Condition sees the flat flag.
+        // Condition sees the flat flag from the real arm's output.
         let cond_ok = evaluate_condition(
             "steps_extract_output_sha_found == true && steps_extract_output_sha_count == 1",
             &ctx,
@@ -2160,7 +2174,7 @@ mod tests {
         .expect("condition must evaluate");
         assert!(cond_ok);
 
-        // Template resolves the value from the flat key.
+        // Template resolves the value from the real arm's flat key.
         let template_out = resolve_template(
             "sha={{steps.extract.output.sha}}",
             &ctx,
