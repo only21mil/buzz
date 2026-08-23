@@ -114,6 +114,7 @@ test("relayAgentIsSharedWithUser: accepts allowlist agents for the current user"
 
 test("relayAgentCanRespondInChannel: requires exact channel membership and viewer access", () => {
   const agent = {
+    pubkey: PUB_B,
     respondTo: "allowlist",
     respondToAllowlist: [CURRENT_PUBKEY],
     channelIds: ["general"],
@@ -130,6 +131,88 @@ test("relayAgentCanRespondInChannel: requires exact channel membership and viewe
   assert.equal(
     relayAgentCanRespondInChannel(agent, "general", OTHER_OWNER_PUBKEY),
     false,
+  );
+});
+
+test("relayAgentCanRespondInChannel: stale directory record keeps a channel agent member eligible", () => {
+  // The agent's directory record (kind 10100) is stale: it does not list
+  // "general", yet the agent is a channel member with a bot role.
+  const agent = {
+    pubkey: PUB_B,
+    respondTo: "allowlist",
+    respondToAllowlist: [CURRENT_PUBKEY],
+    channelIds: [],
+  };
+  const channelAgentMemberPubkeys = new Set([PUB_B]);
+
+  // Without the membership fallback, the stale record hides the agent.
+  assert.equal(
+    relayAgentCanRespondInChannel(agent, "general", CURRENT_PUBKEY),
+    false,
+  );
+  // With the membership fallback, the agent stays eligible.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      agent,
+      "general",
+      CURRENT_PUBKEY,
+      channelAgentMemberPubkeys,
+    ),
+    true,
+  );
+  // The respondTo policy gate still applies: a non-allowlisted viewer is rejected.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      agent,
+      "general",
+      OTHER_OWNER_PUBKEY,
+      channelAgentMemberPubkeys,
+    ),
+    false,
+  );
+  // Membership is channel-scoped: the fallback set is only valid for the
+  // channel being queried. An empty set (no agent members in "other") does
+  // not grant eligibility there.
+  assert.equal(
+    relayAgentCanRespondInChannel(agent, "other", CURRENT_PUBKEY, new Set()),
+    false,
+  );
+});
+
+test("getMentionableAgentPubkeys: stale directory record keeps a channel agent member mentionable", () => {
+  // The relay agent's directory record omits "general", but it is a channel
+  // member with a bot role.
+  const relayAgents = [
+    {
+      pubkey: PUB_B,
+      respondTo: "anyone",
+      respondToAllowlist: [],
+      channelIds: [],
+    },
+  ];
+
+  // Without the membership fallback, the stale record hides the agent.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      currentPubkey: CURRENT_PUBKEY,
+      eligibilityScope: { type: "channel", channelId: "general" },
+      managedAgentPubkeys: [],
+      relayAgents,
+      sharedChannelIds: new Set(["general"]),
+    }),
+    new Set([]),
+  );
+  // With the membership fallback, the agent stays mentionable.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      currentPubkey: CURRENT_PUBKEY,
+      eligibilityScope: { type: "channel", channelId: "general" },
+      managedAgentPubkeys: [],
+      relayAgents,
+      sharedChannelIds: new Set(["general"]),
+      channelAgentMemberPubkeys: new Set([PUB_B]),
+    }),
+    new Set([PUB_B]),
   );
 });
 

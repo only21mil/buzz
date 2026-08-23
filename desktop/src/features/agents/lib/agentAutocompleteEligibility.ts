@@ -31,13 +31,30 @@ export function relayAgentIsSharedWithUser(
 }
 
 export function relayAgentCanRespondInChannel(
-  agent: Pick<RelayAgent, "channelIds" | "respondTo" | "respondToAllowlist">,
+  agent: Pick<
+    RelayAgent,
+    "pubkey" | "channelIds" | "respondTo" | "respondToAllowlist"
+  >,
   channelId: string,
   currentPubkey?: string | null,
+  channelAgentMemberPubkeys?: ReadonlySet<string>,
 ) {
-  return (
-    agent.channelIds.includes(channelId) &&
-    relayAgentIsSharedWithUser(agent, new Set([channelId]), currentPubkey)
+  const inDirectory = agent.channelIds.includes(channelId);
+  // Membership is the stronger signal: a channel member with an agent role
+  // stays eligible even when its directory record (kind 10100) is stale and
+  // omits the channel. Treat the agent as present in the channel so the
+  // shared-channel overlap check below succeeds; the respondTo policy gate
+  // still applies.
+  const isAgentMember =
+    channelAgentMemberPubkeys?.has(normalizePubkey(agent.pubkey)) ?? false;
+  if (!inDirectory && !isAgentMember) return false;
+  const effectiveAgent = isAgentMember
+    ? { ...agent, channelIds: [...agent.channelIds, channelId] }
+    : agent;
+  return relayAgentIsSharedWithUser(
+    effectiveAgent,
+    new Set([channelId]),
+    currentPubkey,
   );
 }
 
@@ -52,12 +69,17 @@ export function getMentionableAgentPubkeys({
   managedAgentPubkeys,
   relayAgents,
   sharedChannelIds,
+  channelAgentMemberPubkeys,
 }: {
   currentPubkey?: string | null;
   eligibilityScope: AgentEligibilityScope;
   managedAgentPubkeys: Iterable<string>;
   relayAgents: readonly RelayAgent[] | undefined;
   sharedChannelIds: ReadonlySet<string>;
+  /** Pubkeys of channel members that have an agent role (bot), used as a
+   * fallback when a relay agent's directory record is stale and omits the
+   * channel. Only consulted for `{ type: "channel" }` eligibility scopes. */
+  channelAgentMemberPubkeys?: ReadonlySet<string>;
 }) {
   const pubkeys = new Set(
     [...managedAgentPubkeys].map((pubkey) => normalizePubkey(pubkey)),
@@ -73,6 +95,7 @@ export function getMentionableAgentPubkeys({
               agent,
               eligibilityScope.channelId,
               currentPubkey,
+              channelAgentMemberPubkeys,
             );
     if (isAllowed) {
       pubkeys.add(normalizePubkey(agent.pubkey));
