@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 30);
+        assert_eq!(migrations.len(), 31);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -990,6 +990,60 @@ mod tests {
         assert!(workflow_state.contains("FOREIGN KEY (community_id, run_id, workflow_id)"));
         assert!(desired_schema.contains("CREATE TABLE workflow_state"));
         assert!(desired_schema.contains("CREATE TABLE workflow_state_receipts"));
+
+        // Approval gates use the run snapshot/generation from 0029, store the
+        // exact resume point and prior outputs, and enqueue semantic lifecycle
+        // records without replacing the still-live legacy token approval table.
+        assert_eq!(migrations[30].version, 31);
+        let approval_foundations = migrations[30].sql.as_str();
+        assert!(approval_foundations.contains("ADD VALUE 'resume_pending'"));
+        assert!(approval_foundations.contains("ALTER TABLE workflows"));
+        assert!(approval_foundations.contains("ADD COLUMN deleted_at TIMESTAMPTZ"));
+        assert!(approval_foundations.contains("ADD COLUMN next_step INTEGER NOT NULL"));
+        assert!(approval_foundations.contains("ADD COLUMN step_outputs JSONB NOT NULL"));
+        assert!(approval_foundations.contains("MAX(step_index) + 1 AS next_step"));
+        assert!(approval_foundations.contains("FROM workflow_approvals"));
+        assert!(approval_foundations.contains("CREATE TABLE workflow_approval_gates"));
+        assert!(approval_foundations.contains("policy_snapshot JSONB NOT NULL"));
+        assert!(approval_foundations.contains("resolved_approver_set JSONB NOT NULL"));
+        assert!(approval_foundations.contains("UNIQUE (community_id, run_id, step_index)"));
+        assert!(approval_foundations.contains("workflow_approval_gates_workflow_fkey"));
+        assert!(approval_foundations.contains("workflow_approval_gates_run_binding_fkey"));
+        assert!(approval_foundations
+            .contains("REFERENCES workflows (community_id, id) ON DELETE NO ACTION"));
+        assert!(approval_foundations.contains(
+            "REFERENCES workflow_runs (community_id, id, workflow_id) ON DELETE NO ACTION"
+        ));
+        assert!(!approval_foundations.contains("ALTER TABLE workflow_approvals"));
+        assert!(!approval_foundations.contains("DROP TABLE workflow_approvals"));
+        assert!(approval_foundations.contains("CREATE TABLE workflow_approval_outbox"));
+        assert!(approval_foundations.contains("id BIGINT GENERATED ALWAYS AS IDENTITY"));
+        assert!(approval_foundations.contains("payload_version SMALLINT NOT NULL DEFAULT 1"));
+        assert!(approval_foundations.contains("UNIQUE (community_id, dedupe_key)"));
+        assert!(approval_foundations.contains("published_event_id BYTEA"));
+        assert!(!approval_foundations.contains("nostr_kind"));
+        assert!(!approval_foundations.contains("state_version"));
+
+        assert!(desired_schema.contains("'waiting_approval', 'resume_pending'"));
+        assert!(desired_schema.contains("deleted_at      TIMESTAMPTZ"));
+        assert!(desired_schema.contains("next_step           INTEGER NOT NULL DEFAULT 0"));
+        assert!(desired_schema.contains("step_outputs        JSONB NOT NULL DEFAULT '{}'::jsonb"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_approval_gates"));
+        assert!(desired_schema.contains("workflow_approval_gates_workflow_fkey"));
+        assert!(desired_schema.contains("workflow_approval_gates_run_binding_fkey"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_gates_status"));
+        assert!(desired_schema.contains("CREATE FUNCTION enforce_workflow_approval_history()"));
+        assert!(desired_schema.contains("CREATE TRIGGER workflow_approval_history_update"));
+        assert!(desired_schema.contains("CREATE TRIGGER workflow_approval_history_delete"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_approval_outbox"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_outbox_due"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_outbox_recovery"));
+        assert!(
+            desired_schema.contains("CREATE FUNCTION enforce_workflow_approval_outbox_identity()")
+        );
+        assert!(
+            desired_schema.contains("CREATE TRIGGER workflow_approval_outbox_identity_immutable")
+        );
     }
 
     #[test]
@@ -1167,6 +1221,191 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn populated_workflow_approval_upgrade_sets_resume_defaults_and_retains_history() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(30, &pool)
+            .await
+            .expect("apply migrations 1-30");
+
+        let community_id = uuid::Uuid::new_v4();
+        let workflow_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
+        let channel_id = uuid::Uuid::new_v4();
+        let owner_pubkey = vec![0x42_u8; 32];
+        let definition_hash = vec![0x31_u8; 32];
+        let token_hash = vec![0x99_u8; 32];
+
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("approval-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert community");
+        sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(&owner_pubkey)
+            .execute(&pool)
+            .await
+            .expect("insert workflow owner");
+        sqlx::query(
+            "INSERT INTO channels (community_id, id, name, created_by) \
+             VALUES ($1, $2, 'approvals', $3)",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&owner_pubkey)
+        .execute(&pool)
+        .await
+        .expect("insert channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+             VALUES ($1, $2, $3, 'owner')",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&owner_pubkey)
+        .execute(&pool)
+        .await
+        .expect("insert channel owner");
+        sqlx::query(
+            "INSERT INTO workflows \
+             (community_id, id, name, owner_pubkey, channel_id, definition, definition_hash) \
+             VALUES ($1, $2, 'approval migration', $3, $4, $5, $6)",
+        )
+        .bind(community_id)
+        .bind(workflow_id)
+        .bind(&owner_pubkey)
+        .bind(channel_id)
+        .bind(serde_json::json!({"steps": []}))
+        .bind(&definition_hash)
+        .execute(&pool)
+        .await
+        .expect("insert workflow");
+        sqlx::query(
+            "INSERT INTO workflow_runs \
+             (community_id, id, workflow_id, definition_snapshot, definition_hash, generation, \
+              status, current_step, execution_trace) \
+             VALUES ($1, $2, $3, $4, $5, 7, 'waiting_approval', 1, $6)",
+        )
+        .bind(community_id)
+        .bind(run_id)
+        .bind(workflow_id)
+        .bind(serde_json::json!({"steps": []}))
+        .bind(&definition_hash)
+        .bind(serde_json::json!([
+            {"step_id": "prepare", "status": "completed", "output": {"value": 21}}
+        ]))
+        .execute(&pool)
+        .await
+        .expect("insert waiting run");
+        sqlx::query(
+            "INSERT INTO workflow_approvals \
+             (community_id, token, workflow_id, run_id, step_id, step_index, \
+              approver_spec, status, expires_at) \
+             VALUES ($1, $2, $3, $4, 'approve', 1, $5, 'pending', now() + interval '1 day')",
+        )
+        .bind(community_id)
+        .bind(&token_hash)
+        .bind(workflow_id)
+        .bind(run_id)
+        .bind(hex::encode(&owner_pubkey))
+        .execute(&pool)
+        .await
+        .expect("insert legacy approval");
+
+        MIGRATOR
+            .run_to(31, &pool)
+            .await
+            .expect("upgrade populated approval tables");
+
+        let (next_step, step_outputs, generation): (i32, serde_json::Value, i64) = sqlx::query_as(
+            "SELECT next_step, step_outputs, generation \
+                 FROM workflow_runs WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id)
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read migrated run state");
+        assert_eq!(next_step, 2, "approval step i=1 must resume at i+1");
+        assert_eq!(step_outputs, serde_json::json!({"prepare": {"value": 21}}));
+        assert_eq!(generation, 7, "0031 must reuse the run generation");
+
+        let retained_legacy: (Vec<u8>, String, String) = sqlx::query_as(
+            "SELECT token, approver_spec, status::text FROM workflow_approvals \
+             WHERE community_id = $1 AND run_id = $2",
+        )
+        .bind(community_id)
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read retained legacy approval");
+        assert_eq!(
+            retained_legacy,
+            (token_hash, hex::encode(&owner_pubkey), "pending".into())
+        );
+
+        let legacy_token_column_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'workflow_approvals' \
+                   AND column_name = 'token' \
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect approval columns");
+        assert!(
+            legacy_token_column_exists,
+            "0031 must retain token-hash authority"
+        );
+
+        let raw_token = "legacy-api-still-live-after-0031";
+        crate::workflow::create_approval(
+            &pool,
+            crate::workflow::CreateApprovalParams {
+                community_id: buzz_core::CommunityId::from_uuid(community_id),
+                token: raw_token,
+                workflow_id,
+                run_id,
+                step_id: "legacy-create-get",
+                step_index: 2,
+                approver_spec: "owner",
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        )
+        .await
+        .expect("legacy create approval after 0031");
+        let created = crate::workflow::get_approval(
+            &pool,
+            buzz_core::CommunityId::from_uuid(community_id),
+            raw_token,
+        )
+        .await
+        .expect("legacy get approval after 0031");
+        assert_eq!(created.workflow_id, workflow_id);
+        assert_eq!(created.run_id, run_id);
+        assert_eq!(created.step_id, "legacy-create-get");
+        assert_eq!(created.status, crate::workflow::ApprovalStatus::Pending);
+
+        let new_gate_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_approval_gates WHERE community_id = $1",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count immutable approval gates");
+        assert_eq!(
+            new_gate_count, 0,
+            "legacy rows must not be rewritten as new gates"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn pre_0007_ambiguous_nip_rs_data_blocks_without_mutation_and_allows_retry() {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
@@ -1232,7 +1471,12 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        let latest = MIGRATOR
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("embedded migrations");
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(latest));
     }
 
     #[tokio::test]

@@ -82,6 +82,8 @@ pub enum RunStatus {
     Running,
     /// Run is suspended waiting for an approval gate.
     WaitingApproval,
+    /// A durable worker may claim the approved run for continuation.
+    ResumePending,
     /// Run finished successfully.
     Completed,
     /// Run terminated with an error.
@@ -96,6 +98,7 @@ impl fmt::Display for RunStatus {
             RunStatus::Pending => write!(f, "pending"),
             RunStatus::Running => write!(f, "running"),
             RunStatus::WaitingApproval => write!(f, "waiting_approval"),
+            RunStatus::ResumePending => write!(f, "resume_pending"),
             RunStatus::Completed => write!(f, "completed"),
             RunStatus::Failed => write!(f, "failed"),
             RunStatus::Cancelled => write!(f, "cancelled"),
@@ -110,6 +113,7 @@ impl FromStr for RunStatus {
             "pending" => Ok(RunStatus::Pending),
             "running" => Ok(RunStatus::Running),
             "waiting_approval" => Ok(RunStatus::WaitingApproval),
+            "resume_pending" => Ok(RunStatus::ResumePending),
             "completed" => Ok(RunStatus::Completed),
             "failed" => Ok(RunStatus::Failed),
             "cancelled" => Ok(RunStatus::Cancelled),
@@ -207,6 +211,10 @@ pub struct WorkflowRunRecord {
     pub definition_hash: Vec<u8>,
     /// Optimistic transition fence for durable resume workers.
     pub generation: i64,
+    /// First workflow step that has not completed durably.
+    pub next_step: i32,
+    /// Durable outputs keyed by completed step ID.
+    pub step_outputs: serde_json::Value,
     /// Current execution status of this run.
     pub status: RunStatus,
     /// Raw event ID bytes that triggered this run, if any.
@@ -338,6 +346,7 @@ pub async fn upsert_workflow(
             updated_at = NOW()
         WHERE workflows.owner_pubkey = EXCLUDED.owner_pubkey
           AND workflows.channel_id IS NOT DISTINCT FROM EXCLUDED.channel_id
+          AND workflows.deleted_at IS NULL
         RETURNING id
         "#,
     )
@@ -376,7 +385,7 @@ pub async fn get_workflow(
         SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
-        WHERE community_id = $1 AND id = $2
+        WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
         "#,
     )
     .bind(community_id.as_uuid())
@@ -407,7 +416,7 @@ pub async fn list_channel_workflows(
         SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
-        WHERE community_id = $1 AND channel_id = $2
+        WHERE community_id = $1 AND channel_id = $2 AND deleted_at IS NULL
         ORDER BY created_at DESC
         LIMIT $3 OFFSET $4
         "#,
@@ -442,6 +451,7 @@ pub async fn list_enabled_channel_workflows(
           AND channel_id = $2
           AND status = 'active'
           AND enabled = TRUE
+          AND deleted_at IS NULL
         ORDER BY created_at DESC
         LIMIT $3
         "#,
@@ -469,6 +479,7 @@ pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRec
         JOIN communities c ON c.id = w.community_id
         WHERE w.status = 'active'
           AND w.enabled = TRUE
+          AND w.deleted_at IS NULL
           AND w.definition->'trigger'->>'on' = 'schedule'
           AND c.archived_at IS NULL
         ORDER BY w.created_at ASC
@@ -510,7 +521,7 @@ pub async fn claim_scheduled_workflow_fire(
         INSERT INTO scheduled_workflow_fires (community_id, workflow_id, scheduled_for)
         SELECT w.community_id, w.id, $3
         FROM workflows w
-        WHERE w.community_id = $1 AND w.id = $2
+        WHERE w.community_id = $1 AND w.id = $2 AND w.deleted_at IS NULL
         ON CONFLICT (community_id, workflow_id, scheduled_for) DO NOTHING
         RETURNING community_id, workflow_id, scheduled_for, claimed_at
         "#,
@@ -635,7 +646,7 @@ pub async fn update_workflow(
         r#"
         UPDATE workflows
         SET name = $1, definition = $2::jsonb, definition_hash = $3
-        WHERE community_id = $4 AND id = $5
+        WHERE community_id = $4 AND id = $5 AND deleted_at IS NULL
         "#,
     )
     .bind(name)
@@ -667,7 +678,7 @@ pub async fn update_workflow_status(
         r#"
         UPDATE workflows
         SET status = $1::workflow_status
-        WHERE community_id = $2 AND id = $3
+        WHERE community_id = $2 AND id = $3 AND deleted_at IS NULL
         "#,
     )
     .bind(status.to_string())
@@ -697,7 +708,7 @@ pub async fn set_workflow_enabled(
         r#"
         UPDATE workflows
         SET enabled = $1
-        WHERE community_id = $2 AND id = $3
+        WHERE community_id = $2 AND id = $3 AND deleted_at IS NULL
         "#,
     )
     .bind(enabled)
@@ -730,7 +741,11 @@ pub async fn disable_workflows_for_owner_in_channel(
         r#"
         UPDATE workflows
         SET enabled = FALSE
-        WHERE community_id = $1 AND channel_id = $2 AND owner_pubkey = $3 AND enabled = TRUE
+        WHERE community_id = $1
+          AND channel_id = $2
+          AND owner_pubkey = $3
+          AND enabled = TRUE
+          AND deleted_at IS NULL
         "#,
     )
     .bind(community_id.as_uuid())
@@ -743,18 +758,22 @@ pub async fn disable_workflows_for_owner_in_channel(
     Ok(affected)
 }
 
-/// Delete a workflow and all its runs/approvals (CASCADE).
+/// Soft-delete a workflow while retaining its runs and approval history.
 ///
 /// NOTE: see the cache-invalidation note on [`update_workflow`]. The relay's
 /// deletion path uses [`delete_workflow_for_owner`], which returns the
 /// `channel_id` needed for invalidation. (No current callers.)
 pub async fn delete_workflow(pool: &PgPool, community_id: CommunityId, id: Uuid) -> Result<()> {
-    let affected = sqlx::query("DELETE FROM workflows WHERE community_id = $1 AND id = $2")
-        .bind(community_id.as_uuid())
-        .bind(id)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let affected = sqlx::query(
+        "UPDATE workflows \
+         SET enabled = FALSE, deleted_at = NOW(), updated_at = NOW() \
+         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
 
     if affected == 0 {
         return Err(DbError::NotFound(format!("workflow {id}")));
@@ -762,11 +781,11 @@ pub async fn delete_workflow(pool: &PgPool, community_id: CommunityId, id: Uuid)
     Ok(())
 }
 
-/// Delete a workflow only when it belongs to `owner_pubkey`.
+/// Soft-delete a workflow only when it belongs to `owner_pubkey`.
 ///
 /// Used by event-driven deletion paths where the workflow UUID is attacker
-/// controlled. Keeping the owner predicate in the DELETE statement avoids a
-/// check-then-delete race and ensures a caller cannot delete another user's
+/// controlled. Keeping the owner predicate in the UPDATE statement avoids a
+/// check-then-update race and ensures a caller cannot delete another user's
 /// workflow just by learning its UUID.
 ///
 /// Returns the deleted workflow's `channel_id` so the caller can invalidate
@@ -778,7 +797,9 @@ pub async fn delete_workflow_for_owner(
     owner_pubkey: &[u8],
 ) -> Result<Option<Uuid>> {
     let row = sqlx::query(
-        "DELETE FROM workflows WHERE community_id = $1 AND id = $2 AND owner_pubkey = $3 \
+        "UPDATE workflows \
+         SET enabled = FALSE, deleted_at = NOW(), updated_at = NOW() \
+         WHERE community_id = $1 AND id = $2 AND owner_pubkey = $3 AND deleted_at IS NULL \
          RETURNING channel_id",
     )
     .bind(community_id.as_uuid())
@@ -813,12 +834,17 @@ pub async fn create_workflow_run(
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
-    sqlx::query(
+    let inserted = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO workflow_runs
             (community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
              status, trigger_event_id, current_step, execution_trace, trigger_context)
-        VALUES ($1, $2, $3, $4, $5, 1, 'pending', $6, 0, '[]', $7)
+        SELECT $1, $2, workflow.id, $4, $5, 1, 'pending', $6, 0, '[]', $7
+        FROM workflows AS workflow
+        WHERE workflow.community_id = $1
+          AND workflow.id = $3
+          AND workflow.deleted_at IS NULL
+        RETURNING id
         "#,
     )
     .bind(community_id.as_uuid())
@@ -828,8 +854,12 @@ pub async fn create_workflow_run(
     .bind(definition_hash)
     .bind(trigger_event_id)
     .bind(trigger_context)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
+
+    if inserted.is_none() {
+        return Err(DbError::NotFound(format!("workflow {workflow_id}")));
+    }
 
     Ok(id)
 }
@@ -843,6 +873,7 @@ pub async fn get_workflow_run(
     let row = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+               next_step, step_outputs,
                status::text AS status, trigger_event_id, current_step, execution_trace,
                trigger_context, started_at, completed_at, error_message, created_at
         FROM workflow_runs
@@ -869,6 +900,7 @@ pub async fn list_workflow_runs(
     let rows = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+               next_step, step_outputs,
                status::text AS status, trigger_event_id, current_step, execution_trace,
                trigger_context, started_at, completed_at, error_message, created_at
         FROM workflow_runs
@@ -1178,6 +1210,8 @@ fn row_to_run_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         definition_snapshot: row.try_get("definition_snapshot")?,
         definition_hash: row.try_get("definition_hash")?,
         generation: row.try_get("generation")?,
+        next_step: row.try_get("next_step")?,
+        step_outputs: row.try_get("step_outputs")?,
         status,
         trigger_event_id: row.try_get("trigger_event_id")?,
         current_step: row.try_get("current_step")?,
@@ -1225,7 +1259,10 @@ pub async fn find_by_owner_and_name(
         SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
-        WHERE community_id = $1 AND owner_pubkey = $2 AND name = $3
+        WHERE community_id = $1
+          AND owner_pubkey = $2
+          AND name = $3
+          AND deleted_at IS NULL
         LIMIT 1
         "#,
     )
@@ -1284,6 +1321,7 @@ mod tests {
         assert_eq!(RunStatus::Pending.to_string(), "pending");
         assert_eq!(RunStatus::Running.to_string(), "running");
         assert_eq!(RunStatus::WaitingApproval.to_string(), "waiting_approval");
+        assert_eq!(RunStatus::ResumePending.to_string(), "resume_pending");
         assert_eq!(RunStatus::Completed.to_string(), "completed");
         assert_eq!(RunStatus::Failed.to_string(), "failed");
         assert_eq!(RunStatus::Cancelled.to_string(), "cancelled");
@@ -1295,6 +1333,7 @@ mod tests {
             "pending",
             "running",
             "waiting_approval",
+            "resume_pending",
             "completed",
             "failed",
             "cancelled",
@@ -1483,6 +1522,8 @@ mod tests {
             definition_snapshot: serde_json::json!({ "steps": [] }),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 2,
+            step_outputs: serde_json::json!({"s1": {"ok": true}}),
             status: RunStatus::Running,
             trigger_event_id: Some(trigger_event_id.clone()),
             current_step: 2,
@@ -1504,6 +1545,8 @@ mod tests {
         );
         assert_eq!(record.definition_hash, vec![0x42; 32]);
         assert_eq!(record.generation, 1);
+        assert_eq!(record.next_step, 2);
+        assert_eq!(record.step_outputs, serde_json::json!({"s1": {"ok": true}}));
         assert_eq!(record.status, RunStatus::Running);
         assert_eq!(record.trigger_event_id, Some(trigger_event_id));
         assert_eq!(record.current_step, 2);
@@ -1522,6 +1565,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 0,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,
@@ -1548,6 +1593,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 3,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Failed,
             trigger_event_id: None,
             current_step: 1,
@@ -1582,6 +1629,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 4,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Completed,
             trigger_event_id: None,
             current_step: 2,
@@ -1607,6 +1656,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 0,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,
@@ -2248,19 +2299,119 @@ mod tests {
             .await
             .expect("delete A's workflow");
 
-        // A's row is gone; B's identical-UUID row survives untouched.
+        // A's tombstone is hidden by public reads; B's identical-UUID row
+        // survives untouched.
         assert!(
             matches!(
                 get_workflow(&pool, community_a, shared_workflow_id).await,
                 Err(DbError::NotFound(_))
             ),
-            "A's workflow must be deleted"
+            "A's workflow tombstone must be hidden"
+        );
+        let tombstone: (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT enabled, deleted_at FROM workflows \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_a.as_uuid())
+        .bind(shared_workflow_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read A's workflow tombstone");
+        assert!(!tombstone.0, "A's deleted workflow must be disabled");
+        assert!(
+            tombstone.1.is_some(),
+            "A's deleted workflow must retain a tombstone timestamp"
+        );
+        assert!(
+            matches!(
+                delete_workflow(&pool, community_a, shared_workflow_id).await,
+                Err(DbError::NotFound(_))
+            ),
+            "an already deleted workflow must be NotFound"
+        );
+        let deleted_claim =
+            claim_scheduled_workflow_fire(&pool, community_a, shared_workflow_id, Utc::now())
+                .await
+                .expect("claim against deleted workflow must not error");
+        assert!(
+            deleted_claim.is_none(),
+            "a deleted workflow must not accept a scheduled claim"
+        );
+        assert!(
+            matches!(
+                create_workflow_run(
+                    &pool,
+                    community_a,
+                    shared_workflow_id,
+                    None,
+                    None,
+                    &serde_json::json!({}),
+                    &[0x42; 32],
+                )
+                .await,
+                Err(DbError::NotFound(_))
+            ),
+            "a deleted workflow must not accept a new run"
         );
         let surviving_b = get_workflow(&pool, community_b, shared_workflow_id)
             .await
             .expect("B's workflow must survive A's delete");
         assert_eq!(surviving_b.community_id, community_b);
         assert_eq!(surviving_b.name, "wf-B");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_delete_is_atomic_and_returns_the_tombstoned_channel() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let owner = vec![0xb2; 32];
+        insert_workflow_with_ids(&pool, community, workflow_id, channel_id, "owned").await;
+
+        assert!(
+            matches!(
+                delete_workflow_for_owner(&pool, community, workflow_id, &[0xc3; 32]).await,
+                Err(DbError::NotFound(_))
+            ),
+            "a non-owner cannot delete the workflow"
+        );
+        get_workflow(&pool, community, workflow_id)
+            .await
+            .expect("failed owner predicate must leave the workflow live");
+
+        let returned_channel =
+            delete_workflow_for_owner(&pool, community, workflow_id, owner.as_slice())
+                .await
+                .expect("owner soft delete");
+        assert_eq!(returned_channel, Some(channel_id));
+        assert!(
+            matches!(
+                get_workflow(&pool, community, workflow_id).await,
+                Err(DbError::NotFound(_))
+            ),
+            "public reads must hide the owner-deleted workflow"
+        );
+
+        let tombstone: (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT enabled, deleted_at FROM workflows \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(workflow_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read owner-deleted tombstone");
+        assert!(!tombstone.0);
+        assert!(tombstone.1.is_some());
+        assert!(
+            matches!(
+                delete_workflow_for_owner(&pool, community, workflow_id, owner.as_slice()).await,
+                Err(DbError::NotFound(_))
+            ),
+            "an already owner-deleted workflow must be NotFound"
+        );
     }
 
     /// Issue 4 (approval path): the same approval token can hash to the same

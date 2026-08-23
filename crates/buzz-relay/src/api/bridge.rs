@@ -2436,6 +2436,8 @@ mod tests {
             definition_snapshot: serde_json::json!({}),
             definition_hash: vec![0x42; 32],
             generation: 1,
+            next_step: 3,
+            step_outputs: serde_json::json!({}),
             status: buzz_db::workflow::RunStatus::Failed,
             trigger_event_id: None,
             current_step: 2,

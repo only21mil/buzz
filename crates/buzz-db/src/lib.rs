@@ -53,6 +53,8 @@ pub mod usage;
 pub mod user;
 /// Workflow, run, and approval persistence.
 pub mod workflow;
+/// Atomic workflow approval-gate creation and request outbox persistence.
+pub mod workflow_approval;
 /// Generation-fenced workflow-run status transitions.
 pub mod workflow_run_transition;
 /// Durable workflow-scoped key/value state.
@@ -60,6 +62,9 @@ pub mod workflow_state;
 
 pub use error::{DbError, Result};
 pub use event::{EventQuery, ReactionEventInsertOutcome, DEFAULT_MAX_PAGE_LIMIT};
+pub use workflow_approval::{
+    WorkflowApprovalGateCreationOutcome, WorkflowApprovalGateRecord, WorkflowApprovalRequestRecord,
+};
 pub use workflow_run_transition::WorkflowRunTransitionOutcome;
 pub use workflow_state::{
     WorkflowStateEntry, WorkflowStateLimit, WorkflowStateRevision, WorkflowStateWriteOutcome,
@@ -3989,6 +3994,14 @@ impl Db {
             expected_revision,
         )
         .await
+    }
+
+    /// Atomically create or exactly reuse a workflow approval gate and request.
+    pub async fn create_workflow_approval_gate(
+        &self,
+        params: workflow_approval::CreateWorkflowApprovalGateParams<'_>,
+    ) -> Result<WorkflowApprovalGateCreationOutcome> {
+        workflow_approval::create_workflow_approval_gate(&self.pool, params).await
     }
 
     /// Create an approval request.
