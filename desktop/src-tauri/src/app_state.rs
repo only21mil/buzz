@@ -106,6 +106,14 @@ pub struct AppState {
     /// `(agent pubkey, relay URL)` runtime identity.
     /// Populated when the harness emits `session_config_captured` observer events.
     pub session_config_cache: Mutex<HashMap<ManagedAgentRuntimeKey, SessionConfigCache>>,
+    /// Last relay-confirmed channel-member agent profile name by pubkey.
+    ///
+    /// A valid ownership proof inserts an entry and a valid profile without
+    /// ownership removes it. Failed, empty, or unparseable profile lookups may
+    /// reuse an entry so a transient relay failure does not remove a known
+    /// agent from the mention picker. The cache is process-local and clears on
+    /// app restart.
+    pub channel_member_profile_cache: Mutex<HashMap<String, Option<String>>>,
     /// IOKit power assertion state — prevents idle sleep while agents run.
     pub prevent_sleep: Arc<Mutex<crate::prevent_sleep::PreventSleepState>>,
     /// In-process mesh-llm node started by Buzz Desktop.
@@ -216,6 +224,7 @@ pub fn build_app_state() -> AppState {
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
+        channel_member_profile_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
         huddle_audio: Default::default(),
         app_handle: Mutex::new(None),

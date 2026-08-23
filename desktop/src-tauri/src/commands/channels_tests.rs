@@ -22,10 +22,187 @@ fn ev_at(kind: u16, content: &str, tags: Vec<Vec<&str>>, created_at: Timestamp) 
         .expect("sign")
 }
 
+fn oa_profile_event(content: &str) -> nostr::Event {
+    let agent_keys = Keys::generate();
+    oa_profile_event_with_keys(content, &agent_keys)
+}
+
+fn oa_profile_event_with_keys(content: &str, agent_keys: &Keys) -> nostr::Event {
+    let owner_keys = Keys::generate();
+    let agent_pubkey = agent_keys.public_key();
+    let auth_tag_json =
+        buzz_sdk_pkg::nip_oa::compute_auth_tag(&owner_keys, &agent_pubkey, "").unwrap();
+    let auth_tag: Vec<String> = serde_json::from_str(&auth_tag_json).unwrap();
+
+    EventBuilder::new(Kind::Metadata, content)
+        .tag(Tag::parse(auth_tag).unwrap())
+        .sign_with_keys(agent_keys)
+        .unwrap()
+}
+
 // A 64-hex pubkey (nostr p-tags require 32-byte hex).
 const PK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const PK_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+#[test]
+fn profile_ownership_marks_non_bot_members_as_agents() {
+    let agent_profile = oa_profile_event(r#"{"display_name":"Admin agent"}"#);
+    let human_profile = ev(0, r#"{"display_name":"Human member"}"#, vec![]);
+    let legacy_bot = Keys::generate().public_key().to_hex();
+    let agent_pubkey = agent_profile.pubkey.to_hex();
+    let human_pubkey = human_profile.pubkey.to_hex();
+    let membership = ev(
+        39002,
+        "",
+        vec![
+            vec!["d", "chan-1"],
+            vec!["p", &agent_pubkey, "", "admin"],
+            vec!["p", &human_pubkey, "", "member"],
+            vec!["p", &legacy_bot, "", "bot"],
+        ],
+    );
+    let mut response = nostr_convert::channel_members_from_event(&membership).unwrap();
+
+    assert!(!response.members[0].is_agent);
+    assert!(!response.members[1].is_agent);
+    assert!(response.members[2].is_agent);
+    let profile_events = [agent_profile, human_profile];
+    let mut profile_cache = std::collections::HashMap::new();
+    enrich_channel_members_from_profile_events(
+        &mut response,
+        Ok::<_, &str>(&profile_events),
+        &mut profile_cache,
+    );
+
+    assert!(response.members[0].is_agent);
+    assert_eq!(response.members[0].role, "admin");
+    assert_eq!(
+        response.members[0].display_name.as_deref(),
+        Some("Admin agent")
+    );
+    assert!(!response.members[1].is_agent);
+    assert_eq!(response.members[1].role, "member");
+    assert!(response.members[2].is_agent);
+    assert_eq!(response.members[2].role, "bot");
+}
+
+#[test]
+fn cached_agent_profile_survives_timeout_and_empty_lookup() {
+    let agent_profile = oa_profile_event(r#"{"display_name":"Admin agent"}"#);
+    let agent_pubkey = agent_profile.pubkey.to_hex();
+    let membership = ev(
+        39002,
+        "",
+        vec![
+            vec!["d", "chan-1"],
+            vec!["p", &agent_pubkey, "", "admin"],
+        ],
+    );
+    let mut profile_cache = std::collections::HashMap::new();
+    let mut fresh = nostr_convert::channel_members_from_event(&membership).unwrap();
+
+    enrich_channel_members_from_profile_events(
+        &mut fresh,
+        Ok::<_, &str>(std::slice::from_ref(&agent_profile)),
+        &mut profile_cache,
+    );
+    assert!(fresh.members[0].is_agent);
+    assert_eq!(
+        profile_cache.get(&agent_pubkey),
+        Some(&Some("Admin agent".to_string()))
+    );
+
+    let mut after_timeout = nostr_convert::channel_members_from_event(&membership).unwrap();
+    enrich_channel_members_from_profile_events(
+        &mut after_timeout,
+        Err("relay timeout"),
+        &mut profile_cache,
+    );
+    assert!(after_timeout.members[0].is_agent);
+    assert_eq!(
+        after_timeout.members[0].display_name.as_deref(),
+        Some("Admin agent")
+    );
+
+    let mut after_empty = nostr_convert::channel_members_from_event(&membership).unwrap();
+    enrich_channel_members_from_profile_events(
+        &mut after_empty,
+        Ok::<_, &str>(&[]),
+        &mut profile_cache,
+    );
+    assert!(after_empty.members[0].is_agent);
+    assert_eq!(
+        after_empty.members[0].display_name.as_deref(),
+        Some("Admin agent")
+    );
+}
+
+#[test]
+fn unparseable_owned_profile_still_marks_and_caches_agent() {
+    let agent_profile = oa_profile_event("not json");
+    let agent_pubkey = agent_profile.pubkey.to_hex();
+    let membership = ev(
+        39002,
+        "",
+        vec![
+            vec!["d", "chan-1"],
+            vec!["p", &agent_pubkey, "", "admin"],
+        ],
+    );
+    let mut response = nostr_convert::channel_members_from_event(&membership).unwrap();
+    let mut profile_cache = std::collections::HashMap::new();
+
+    enrich_channel_members_from_profile_events(
+        &mut response,
+        Ok::<_, &str>(std::slice::from_ref(&agent_profile)),
+        &mut profile_cache,
+    );
+
+    assert!(response.members[0].is_agent);
+    assert_eq!(response.members[0].display_name, None);
+    assert_eq!(profile_cache.get(&agent_pubkey), Some(&None));
+}
+
+#[test]
+fn valid_non_agent_profile_clears_cached_agent_status() {
+    let agent_keys = Keys::generate();
+    let agent_profile =
+        oa_profile_event_with_keys(r#"{"display_name":"Former agent"}"#, &agent_keys);
+    let agent_pubkey = agent_profile.pubkey.to_hex();
+    let human_profile = EventBuilder::new(
+        Kind::Metadata,
+        r#"{"display_name":"Human profile"}"#,
+    )
+    .sign_with_keys(&agent_keys)
+    .unwrap();
+    let membership = ev(
+        39002,
+        "",
+        vec![
+            vec!["d", "chan-1"],
+            vec!["p", &agent_pubkey, "", "admin"],
+        ],
+    );
+    let mut profile_cache = std::collections::HashMap::new();
+    let mut initial = nostr_convert::channel_members_from_event(&membership).unwrap();
+    enrich_channel_members_from_profile_events(
+        &mut initial,
+        Ok::<_, &str>(std::slice::from_ref(&agent_profile)),
+        &mut profile_cache,
+    );
+    assert!(initial.members[0].is_agent);
+
+    let mut response = nostr_convert::channel_members_from_event(&membership).unwrap();
+    enrich_channel_members_from_profile_events(
+        &mut response,
+        Ok::<_, &str>(std::slice::from_ref(&human_profile)),
+        &mut profile_cache,
+    );
+
+    assert!(!response.members[0].is_agent);
+    assert!(!profile_cache.contains_key(&agent_pubkey));
+}
 
 #[test]
 fn directory_cursor_keeps_same_second_tiebreaker() {
