@@ -102,10 +102,9 @@ pub struct AppState {
     /// Ordering: written once in `setup()` with `Ordering::Release`; read in
     /// `get_identity` with `Ordering::Acquire`.
     pub reset_failed: AtomicBool,
-    /// Cached ACP session config from running agents, keyed by canonical
-    /// `(agent pubkey, relay URL)` runtime identity.
-    /// Populated when the harness emits `session_config_captured` observer events.
+    /// ACP session config keyed by canonical `(agent pubkey, relay URL)` runtime identity.
     pub session_config_cache: Mutex<HashMap<ManagedAgentRuntimeKey, SessionConfigCache>>,
+    pub channel_member_profile_cache: Mutex<HashMap<String, Option<String>>>, // clears on restart
     /// IOKit power assertion state — prevents idle sleep while agents run.
     pub prevent_sleep: Arc<Mutex<crate::prevent_sleep::PreventSleepState>>,
     /// In-process mesh-llm node started by Buzz Desktop.
@@ -216,6 +215,7 @@ pub fn build_app_state() -> AppState {
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
+        channel_member_profile_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
         huddle_audio: Default::default(),
         app_handle: Mutex::new(None),

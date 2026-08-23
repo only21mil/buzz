@@ -398,6 +398,56 @@ pub async fn get_channel_details(
         .ok_or_else(|| "channel not found".to_string())
 }
 
+fn enrich_channel_members_from_profile_events<E>(
+    response: &mut ChannelMembersResponse,
+    profile_events: Result<&[nostr::Event], E>,
+    profile_cache: &mut std::collections::HashMap<String, Option<String>>,
+) {
+    let mut latest_profiles = std::collections::HashMap::new();
+    if let Ok(events) = profile_events {
+        for event in events {
+            let pubkey = event.pubkey.to_hex();
+            let replace = latest_profiles
+                .get(&pubkey)
+                .is_none_or(|current: &&nostr::Event| event.created_at > current.created_at);
+            if replace {
+                latest_profiles.insert(pubkey, event);
+            }
+        }
+    }
+
+    for member in &mut response.members {
+        let role_is_agent = member.role == "bot";
+        if let Some(event) = latest_profiles.get(&member.pubkey) {
+            let display_name = nostr_convert::profile_info_from_event(event)
+                .ok()
+                .and_then(|profile| profile.display_name)
+                .or_else(|| {
+                    profile_cache
+                        .get(&member.pubkey)
+                        .and_then(|display_name| display_name.clone())
+                });
+            let is_agent = nostr_convert::profile_has_valid_oa_owner(event);
+            if is_agent {
+                profile_cache.insert(member.pubkey.clone(), display_name.clone());
+            } else {
+                profile_cache.remove(&member.pubkey);
+            }
+            if member.display_name.is_none() {
+                member.display_name = display_name;
+            }
+            member.is_agent = role_is_agent || is_agent;
+        } else if let Some(display_name) = profile_cache.get(&member.pubkey) {
+            if member.display_name.is_none() {
+                member.display_name = display_name.clone();
+            }
+            member.is_agent = true;
+        } else {
+            member.is_agent = role_is_agent;
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn get_channel_members(
     channel_id: String,
@@ -430,36 +480,16 @@ pub async fn get_channel_members(
                 "limit": pubkeys.len()
             })],
         )
-        .await
-        .unwrap_or_default();
-
-        // Build pubkey → profile display metadata from kind:0 events.
-        let mut profile_map = std::collections::HashMap::new();
-        for ev in &profile_events {
-            let pk = ev.pubkey.to_hex();
-            if let Ok(profile) = nostr_convert::profile_info_from_event(ev) {
-                profile_map.insert(
-                    pk,
-                    (
-                        profile.display_name,
-                        nostr_convert::profile_has_valid_oa_owner(ev),
-                    ),
-                );
-            }
-        }
-
-        // Populate profile-derived fields on each member.
-        for member in &mut response.members {
-            if member.role == "bot" {
-                member.is_agent = true;
-            }
-            if let Some((display_name, is_agent)) = profile_map.get(&member.pubkey) {
-                if member.display_name.is_none() {
-                    member.display_name = display_name.clone();
-                }
-                member.is_agent = member.is_agent || *is_agent;
-            }
-        }
+        .await;
+        let mut profile_cache = state
+            .channel_member_profile_cache
+            .lock()
+            .map_err(|_| "channel member profile cache lock poisoned".to_string())?;
+        enrich_channel_members_from_profile_events(
+            &mut response,
+            profile_events.as_deref(),
+            &mut profile_cache,
+        );
     }
 
     Ok(response)
