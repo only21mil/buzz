@@ -271,6 +271,7 @@ grep -Fq 'BUZZ_ANDROID_RELEASE_SIGNING: external' <<<"$build_job" || \
         if (index(stripped, "verify-android-fork-release-unsigned-apk.sh") > 0) print $0
       }
     ' <<<"$build_job" | cat -A >&2
+    printf 'expected: %s\n' "$runner_temp_verifier_command" | cat -A >&2
     fail "networked build must actively invoke the runner-temp unsigned handoff verifier exactly once"
   fi
   duplicated_verifier_job="$build_job"$'\n'"$runner_temp_verifier_command"
