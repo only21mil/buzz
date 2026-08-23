@@ -46,7 +46,9 @@ pub(crate) struct ChannelMeta {
 /// "metadata present but correctly excluded": a member channel absent from
 /// this map is a genuinely missing read, the condition the refresh guard
 /// fails closed on, never an archived channel.
-pub(crate) fn channel_meta_from_events(meta_events: &Value) -> std::collections::HashMap<Uuid, ChannelMeta> {
+pub(crate) fn channel_meta_from_events(
+    meta_events: &Value,
+) -> std::collections::HashMap<Uuid, ChannelMeta> {
     let mut map = std::collections::HashMap::new();
     if let Some(arr) = meta_events.as_array() {
         for ev in arr {
@@ -74,7 +76,9 @@ pub(crate) fn channel_meta_from_events(meta_events: &Value) -> std::collections:
                 }
             }
             let Some(d) = d_val else { continue };
-            let Ok(uuid) = d.parse::<Uuid>() else { continue };
+            let Ok(uuid) = d.parse::<Uuid>() else {
+                continue;
+            };
             let channel_type = if declared_type == Some("dm") || is_hidden {
                 "dm".to_string()
             } else {
@@ -143,7 +147,10 @@ fn fresh_record_defaults(allowlist: &[String]) -> serde_json::Map<String, Value>
         "respond_to_allowlist".into(),
         json!(allowlist.iter().collect::<Vec<_>>()),
     );
-    map.insert("channel_add_policy".into(), Value::String("owner_only".into()));
+    map.insert(
+        "channel_add_policy".into(),
+        Value::String("owner_only".into()),
+    );
     map.insert("status".into(), Value::String("online".into()));
     map
 }
@@ -216,7 +223,9 @@ fn retain_existing_tags(existing: &Value) -> (Vec<Tag>, Option<Tag>) {
     let mut tags = Vec::new();
     let mut stored_auth = None;
     for raw_tag in raw_tags {
-        let Some(values) = raw_tag.as_array() else { continue };
+        let Some(values) = raw_tag.as_array() else {
+            continue;
+        };
         let strs: Vec<String> = values
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
@@ -335,12 +344,14 @@ pub(crate) async fn fetch_member_channels(
     // Step 1: kind:39002 group-members events where #p includes this agent.
     let p_tag = SingleLetterTag::lowercase(Alphabet::P);
     let member_filter = nostr::Filter::new()
-        .kind(Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16))
+        .kind(Kind::Custom(
+            buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+        ))
         .custom_tags(p_tag, [pubkey_hex.as_str()]);
     let member_events = rest.query(&[member_filter]).await?;
-    let member_arr = member_events
-        .as_array()
-        .ok_or_else(|| RelayError::Http("expected JSON array from /query (group members)".into()))?;
+    let member_arr = member_events.as_array().ok_or_else(|| {
+        RelayError::Http("expected JSON array from /query (group members)".into())
+    })?;
 
     let mut member_ids: Vec<Uuid> = Vec::new();
     for ev in member_arr {
@@ -368,7 +379,9 @@ pub(crate) async fn fetch_member_channels(
     let d_tag = SingleLetterTag::lowercase(Alphabet::D);
     let d_values: Vec<String> = member_ids.iter().map(|u| u.to_string()).collect();
     let meta_filter = nostr::Filter::new()
-        .kind(Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16))
+        .kind(Kind::Custom(
+            buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16,
+        ))
         .custom_tags(d_tag, d_values);
     let meta_events = rest.query(&[meta_filter]).await?;
     let metas = channel_meta_from_events(&meta_events);
@@ -480,7 +493,9 @@ fn classify_submit_response(resp: &Value) -> Option<String> {
     // signal nor a success signal; fail closed so a silent drop is never
     // reported as done.
     if resp.is_null() {
-        return Some("kind:10100 submit returned an empty response; cannot confirm acceptance".to_string());
+        return Some(
+            "kind:10100 submit returned an empty response; cannot confirm acceptance".to_string(),
+        );
     }
     let obj = resp.as_object()?;
     let accepted = obj.get("accepted").and_then(Value::as_bool).unwrap_or(true);
@@ -495,7 +510,11 @@ fn classify_submit_response(resp: &Value) -> Option<String> {
     if !accepted {
         return Some(format!(
             "kind:10100 submit rejected: {}",
-            if message.is_empty() { "unknown" } else { message }
+            if message.is_empty() {
+                "unknown"
+            } else {
+                message
+            }
         ));
     }
     None
@@ -553,15 +572,9 @@ pub(crate) async fn refresh_agent_directory_record(
         return;
     }
 
-    if let Err(e) = publish_agent_directory_record(
-        rest,
-        keys,
-        display_name,
-        &channels,
-        allowlist,
-        fresh_auth,
-    )
-    .await
+    if let Err(e) =
+        publish_agent_directory_record(rest, keys, display_name, &channels, allowlist, fresh_auth)
+            .await
     {
         tracing::warn!("failed to publish kind:10100 agent directory record: {e}");
     }
@@ -597,8 +610,8 @@ mod tests {
         ];
         let allowlist = vec!["owner".to_string()];
 
-        let content = build_agent_profile_content("new-name", &pairs, Some(existing), &allowlist)
-            .unwrap();
+        let content =
+            build_agent_profile_content("new-name", &pairs, Some(existing), &allowlist).unwrap();
 
         let parsed: Value = serde_json::from_str(&content).unwrap();
         let obj = parsed.as_object().expect("content is a JSON object");
@@ -738,12 +751,13 @@ mod tests {
     #[test]
     fn merge_existing_with_membership_change_parses_equal_to_expected() {
         let live = Uuid::new_v4();
-        let existing = r#"{"display_name":"old","channel_ids":["dead"],"channel_add_policy":"nobody"}"#;
+        let existing =
+            r#"{"display_name":"old","channel_ids":["dead"],"channel_add_policy":"nobody"}"#;
         let allowlist = vec!["owner".to_string()];
         let pairs = vec![(live, "general".to_string())];
 
-        let content = build_agent_profile_content("New", &pairs, Some(existing), &allowlist)
-            .unwrap();
+        let content =
+            build_agent_profile_content("New", &pairs, Some(existing), &allowlist).unwrap();
         let parsed: Value = serde_json::from_str(&content).unwrap();
         let expected: Value = serde_json::json!({
             // Existing curated display_name is preserved on merge.
@@ -752,7 +766,10 @@ mod tests {
             "channels": ["general"],
             "channel_add_policy": "nobody",
         });
-        assert_eq!(parsed, expected, "merged record must parse equal to expected");
+        assert_eq!(
+            parsed, expected,
+            "merged record must parse equal to expected"
+        );
     }
 
     /// The signed event is a valid kind:10100 with correct content and
@@ -761,8 +778,8 @@ mod tests {
     fn sign_event_produces_valid_kind_10100_with_monotonic_timestamp() {
         let keys = make_keys();
         let allowlist = vec!["owner".to_string()];
-        let content = build_agent_profile_content("test-agent", &proj(&uuids(1)), None, &allowlist)
-            .unwrap();
+        let content =
+            build_agent_profile_content("test-agent", &proj(&uuids(1)), None, &allowlist).unwrap();
 
         let existing = json!({
             "created_at": 1000u64,
@@ -786,8 +803,8 @@ mod tests {
     fn sign_event_without_existing_uses_now() {
         let keys = make_keys();
         let allowlist = vec!["owner".to_string()];
-        let content = build_agent_profile_content("fresh", &proj(&uuids(1)), None, &allowlist)
-            .unwrap();
+        let content =
+            build_agent_profile_content("fresh", &proj(&uuids(1)), None, &allowlist).unwrap();
         let event = sign_agent_profile_event(&keys, &content, vec![], None, None, None).unwrap();
         assert!(event.created_at.as_secs() > 0);
     }
@@ -799,8 +816,9 @@ mod tests {
     #[test]
     fn republish_preserves_stored_auth_when_no_fresh_auth() {
         let keys = make_keys();
-        let existing_auth = Tag::parse(["auth", "4a34c131deadbeef", "created_at<4294967295", "sig"])
-            .expect("valid auth tag");
+        let existing_auth =
+            Tag::parse(["auth", "4a34c131deadbeef", "created_at<4294967295", "sig"])
+                .expect("valid auth tag");
         let existing = json!({
             "created_at": 1000u64,
             "content": r#"{"display_name":"old","channel_ids":["x"]}"#,
@@ -874,9 +892,13 @@ mod tests {
     fn merge_preserves_existing_curated_display_name() {
         let live = Uuid::new_v4();
         let existing = r#"{"display_name":"Curated Name","name":"Curated Name","channel_ids":["old"],"channel_add_policy":"nobody"}"#;
-        let content =
-            build_agent_profile_content("buzz-sats-agent@foo.service", &[(live, "general".into())], Some(existing), &["owner".into()])
-                .unwrap();
+        let content = build_agent_profile_content(
+            "buzz-sats-agent@foo.service",
+            &[(live, "general".into())],
+            Some(existing),
+            &["owner".into()],
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["display_name"], "Curated Name");
         assert_eq!(parsed["name"], "Curated Name");
@@ -891,9 +913,13 @@ mod tests {
     fn merge_seeds_display_name_when_existing_lacks_it() {
         let live = Uuid::new_v4();
         let existing = r#"{"channel_ids":["old"],"channel_add_policy":"nobody"}"#;
-        let content =
-            build_agent_profile_content("buzz-sats-agent@foo.service", &[(live, "general".into())], Some(existing), &["owner".into()])
-                .unwrap();
+        let content = build_agent_profile_content(
+            "buzz-sats-agent@foo.service",
+            &[(live, "general".into())],
+            Some(existing),
+            &["owner".into()],
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["display_name"], "buzz-sats-agent@foo.service");
     }
@@ -935,18 +961,27 @@ mod tests {
         // A stale duplicate: the exact failure the race guard must catch.
         let duplicate = json!({"event_id": "abc", "accepted": true, "message": "duplicate: such event already exists"});
         let err = classify_submit_response(&duplicate).expect("duplicate must fail closed");
-        assert!(err.contains("duplicate"), "error should name the duplicate: {err}");
+        assert!(
+            err.contains("duplicate"),
+            "error should name the duplicate: {err}"
+        );
 
         // Empty 200 body: submit_event returns Value::Null; must fail closed,
         // never reported as a silent success.
         let empty = Value::Null;
         let err = classify_submit_response(&empty).expect("empty body must fail closed");
-        assert!(err.contains("empty"), "error should name the empty response: {err}");
+        assert!(
+            err.contains("empty"),
+            "error should name the empty response: {err}"
+        );
 
         // Defensive: an explicit accepted:false rejects even when no 400.
         let rejected = json!({"event_id": "abc", "accepted": false, "message": "denied"});
         let err = classify_submit_response(&rejected).expect("accepted:false must fail closed");
-        assert!(err.contains("rejected"), "error should name the rejection: {err}");
+        assert!(
+            err.contains("rejected"),
+            "error should name the rejection: {err}"
+        );
     }
 
     /// `retain_existing_tags` keeps non-auth tags and returns the single
@@ -988,7 +1023,10 @@ mod tests {
         assert_eq!(map[&live].channel_type, "stream");
         assert_eq!(map[&dm].channel_type, "dm");
         let archived_meta = &map[&archived];
-        assert!(archived_meta.archived, "archived channel must stay in the map");
+        assert!(
+            archived_meta.archived,
+            "archived channel must stay in the map"
+        );
         assert_eq!(archived_meta.name, "Dead");
     }
 
