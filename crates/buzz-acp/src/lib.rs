@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod agent_directory;
 mod config;
 mod engram_fetch;
 mod filter;
@@ -1902,6 +1903,23 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
+    // Publish the kind:10100 agent directory record so the Desktop @ picker
+    // can resolve this agent and its channels. This runs after relay
+    // connection and channel subscriptions are established, and refreshes
+    // the record whenever channel membership changes (see the kind 44100/
+    // 44101 handler below).
+    let directory_rest_client = relay.rest_client();
+    let directory_keys = config.keys.clone();
+    let directory_display_name =
+        crate::config::normalize_agent_command_identity(&config.agent_command);
+    agent_directory::refresh_agent_directory_record(
+        &directory_rest_client,
+        &directory_keys,
+        &directory_display_name,
+        &subscribed_channel_ids,
+    )
+    .await;
+
     if config.lazy_pool {
         emit_runtime_lifecycle(
             observer.as_ref(),
@@ -2451,6 +2469,15 @@ async fn tokio_main() -> Result<()> {
                                         );
                                     }
                                 }
+                                // Refresh the kind:10100 directory record so the
+                                // Desktop @ picker reflects the channel change.
+                                agent_directory::refresh_agent_directory_record(
+                                    &directory_rest_client,
+                                    &directory_keys,
+                                    &directory_display_name,
+                                    &subscribed_channel_ids,
+                                )
+                                .await;
                                 continue;
                             }
 
