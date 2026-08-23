@@ -1916,15 +1916,19 @@ async fn tokio_main() -> Result<()> {
     let directory_keys = config.keys.clone();
     let directory_display_name =
         crate::config::normalize_agent_command_identity(&config.agent_command);
-    let directory_allowlist: Vec<String> = if config.respond_to_allowlist.is_empty() {
-        config
-            .agent_owner
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        config.respond_to_allowlist.iter().cloned().collect()
-    };
+    // The allowlist seeds the first-ever record's respond_to_allowlist. Use
+    // the verified startup owner first (BUZZ_AUTH_TAG owner, or the configured
+    // fallback) so a BUZZ_AUTH_TAG-only deployment never publishes an empty
+    // list, then union any explicit --respond-to-allowlist set.
+    let mut directory_allowlist: Vec<String> = startup_owner
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for pk in config.respond_to_allowlist.iter() {
+        if !directory_allowlist.iter().any(|s| s == pk) {
+            directory_allowlist.push(pk.clone());
+        }
+    }
     agent_directory::refresh_agent_directory_record(
         &directory_rest_client,
         &directory_keys,

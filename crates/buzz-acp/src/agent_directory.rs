@@ -164,10 +164,16 @@ pub(crate) fn build_agent_profile_content(
         }
     };
 
-    object.insert(
-        "display_name".to_string(),
-        Value::String(display_name.to_string()),
-    );
+    // On a merge (existing content present) preserve the curated display_name
+    // from the existing record unless it is absent; on a fresh record use the
+    // supplied name. A membership-only refresh must not clobber a display name
+    // the owner set on the relay.
+    if object.get("display_name").is_none() {
+        object.insert(
+            "display_name".to_string(),
+            Value::String(display_name.to_string()),
+        );
+    }
     object.insert("channel_ids".to_string(), json!(channel_ids));
     object.insert("channels".to_string(), json!(channel_names));
 
@@ -229,8 +235,9 @@ fn combine_auth_tag(stored_auth: Option<Tag>, fresh_auth: Option<Tag>) -> Vec<Ta
 
 /// Find the latest kind:10100 event from a query result array.
 ///
-/// Events arrive newest-first from the relay; we still pick by `created_at`
-/// (then `id` as a tiebreaker) to be robust against ordering changes.
+/// Picks by `created_at`, then (for a created_at tie) by the LOWEST event id,
+/// which is what NIP-01 replaceable-event semantics expect: among records with
+/// the same timestamp, the earliest id is the stable one, not the greatest.
 pub(crate) fn latest_agent_profile_event(events: &[Value]) -> Option<&Value> {
     events.iter().max_by(|left, right| {
         left.get("created_at")
@@ -238,10 +245,13 @@ pub(crate) fn latest_agent_profile_event(events: &[Value]) -> Option<&Value> {
             .unwrap_or(0)
             .cmp(&right.get("created_at").and_then(Value::as_u64).unwrap_or(0))
             .then_with(|| {
-                left.get("id")
+                // Equal created_at: lower id wins (ascending compare on the
+                // reversed axis keeps max_by selecting the lower id).
+                right
+                    .get("id")
                     .and_then(Value::as_str)
                     .unwrap_or("")
-                    .cmp(right.get("id").and_then(Value::as_str).unwrap_or(""))
+                    .cmp(left.get("id").and_then(Value::as_str).unwrap_or(""))
             })
     })
 }
@@ -384,7 +394,26 @@ pub(crate) async fn publish_agent_directory_record(
         "publishing kind:10100 agent directory record"
     );
 
-    rest.submit_event(&event).await?;
+    // Fail closed on a relay duplicate: a replaceable-event submit the relay
+    // judged not-new (same created_at, or content already present) means our
+    // read-merge-write lost a race with another writer (the fleet timer).
+    // Treating it as success would overwrite newer timer fields with our stale
+    // view. The error propagates so the refresh is not silently reported done.
+    let resp = rest.submit_event(&event).await?;
+    if let Some(obj) = resp.as_object() {
+        if obj.get("duplicate").and_then(Value::as_bool) == Some(true) {
+            return Err(RelayError::Http(format!(
+                "kind:10100 submit reported duplicate; skipping (stale read or concurrent writer)"
+            )));
+        }
+        if obj.get("accepted").and_then(Value::as_bool) == Some(false) {
+            return Err(RelayError::Http(format!(
+                "kind:10100 submit rejected: {}",
+                obj.get("message").and_then(Value::as_str).unwrap_or("unknown")
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -411,6 +440,17 @@ pub(crate) async fn refresh_agent_directory_record(
             return;
         }
     };
+
+    // A lagging membership query that returns zero channels would publish an
+    // empty record and hide the agent everywhere. That is never correct while
+    // the agent is online with subscriptions, so fail closed and keep the
+    // previous record instead of silently publishing an empty projection.
+    if channels.is_empty() {
+        tracing::warn!(
+            "kind:10100 refresh found zero active member channels; keeping the previous record"
+        );
+        return;
+    }
 
     if let Err(e) = publish_agent_directory_record(
         rest,
@@ -481,7 +521,9 @@ mod tests {
             assert!(names.contains(name));
         }
 
-        assert_eq!(obj["display_name"].as_str().unwrap(), "new-name");
+        // Existing curated display_name is preserved on a membership-only
+        // merge; the supplied name only seeds a fresh record.
+        assert_eq!(obj["display_name"].as_str().unwrap(), "old-name");
         assert_eq!(obj["channel_add_policy"].as_str().unwrap(), "owner_only");
         assert!(obj["custom"]["keep"].as_bool().unwrap());
     }
@@ -602,7 +644,8 @@ mod tests {
             .unwrap();
         let parsed: Value = serde_json::from_str(&content).unwrap();
         let expected: Value = serde_json::json!({
-            "display_name": "New",
+            // Existing curated display_name is preserved on merge.
+            "display_name": "old",
             "channel_ids": [live.to_string()],
             "channels": ["general"],
             "channel_add_policy": "nobody",
@@ -722,6 +765,37 @@ mod tests {
         assert_eq!(auth_tags[0].as_slice(), fresh.as_slice());
     }
 
+    /// Regression for the GPT review finding: a membership-only merge must
+    /// preserve the existing curated display_name, not replace it with the
+    /// normalized executable name. Fails on revision 2, passes on this fix.
+    #[test]
+    fn merge_preserves_existing_curated_display_name() {
+        let live = Uuid::new_v4();
+        let existing = r#"{"display_name":"Curated Name","name":"Curated Name","channel_ids":["old"],"channel_add_policy":"nobody"}"#;
+        let content =
+            build_agent_profile_content("buzz-sats-agent@foo.service", &[(live, "general".into())], Some(existing), &["owner".into()])
+                .unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["display_name"], "Curated Name");
+        assert_eq!(parsed["name"], "Curated Name");
+        assert_eq!(parsed["channel_ids"][0], live.to_string());
+        assert_eq!(parsed["channels"][0], "general");
+    }
+
+    /// Regression: a merge onto an existing record that lacks display_name
+    /// seeds it from the supplied name (the only case the supplied name may
+    /// apply on a merge).
+    #[test]
+    fn merge_seeds_display_name_when_existing_lacks_it() {
+        let live = Uuid::new_v4();
+        let existing = r#"{"channel_ids":["old"],"channel_add_policy":"nobody"}"#;
+        let content =
+            build_agent_profile_content("buzz-sats-agent@foo.service", &[(live, "general".into())], Some(existing), &["owner".into()])
+                .unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["display_name"], "buzz-sats-agent@foo.service");
+    }
+
     /// `latest_agent_profile_event` picks the newest by created_at.
     #[test]
     fn latest_agent_profile_picks_newest() {
@@ -730,6 +804,19 @@ mod tests {
         let events = vec![older, newer];
         let latest = latest_agent_profile_event(&events).unwrap();
         assert_eq!(latest["id"].as_str().unwrap(), "bbb");
+    }
+
+    /// NIP-01 tie-break: for equal created_at, the LOWEST id wins (stable
+    /// replaceable-event selection), not the greatest. Fails on revision 2.
+    #[test]
+    fn latest_agent_profile_uses_lowest_id_on_created_at_tie() {
+        let events = vec![
+            json!({"created_at": 100u64, "id": "ddd"}),
+            json!({"created_at": 100u64, "id": "bbb"}),
+            json!({"created_at": 100u64, "id": "aaa"}),
+        ];
+        let latest = latest_agent_profile_event(&events).unwrap();
+        assert_eq!(latest["id"].as_str().unwrap(), "aaa");
     }
 
     /// `retain_existing_tags` keeps non-auth tags and returns the single
