@@ -36,11 +36,16 @@ pub(crate) struct ChannelMeta {
     pub archived: bool,
 }
 
-/// Reduce kind:39000 metadata events into a channel-id map, skipping archived
-/// channels and marking DM channels so the caller can exclude them.
+/// Reduce kind:39000 metadata events into a channel-id map, marking DM and
+/// archived channels so the caller can exclude them.
 ///
-/// Mirrors the fleet directory-sync timer's read: a channel is excluded when
-/// its metadata is archived=true or its declared type (or hidden flag) is dm.
+/// Mirrors the fleet directory-sync timer's read: a channel is excluded from
+/// the published record when its metadata is archived=true or its declared
+/// type (or hidden flag) is dm. Archived channels are KEPT in the map with
+/// `archived: true`, so "no metadata row" is distinguishable from
+/// "metadata present but correctly excluded": a member channel absent from
+/// this map is a genuinely missing read, the condition the refresh guard
+/// fails closed on, never an archived channel.
 pub(crate) fn channel_meta_from_events(meta_events: &Value) -> std::collections::HashMap<Uuid, ChannelMeta> {
     let mut map = std::collections::HashMap::new();
     if let Some(arr) = meta_events.as_array() {
@@ -70,9 +75,6 @@ pub(crate) fn channel_meta_from_events(meta_events: &Value) -> std::collections:
             }
             let Some(d) = d_val else { continue };
             let Ok(uuid) = d.parse::<Uuid>() else { continue };
-            if archived {
-                continue;
-            }
             let channel_type = if declared_type == Some("dm") || is_hidden {
                 "dm".to_string()
             } else {
@@ -83,7 +85,7 @@ pub(crate) fn channel_meta_from_events(meta_events: &Value) -> std::collections:
                 ChannelMeta {
                     name: name.unwrap_or("unknown").to_string(),
                     channel_type,
-                    archived: false,
+                    archived,
                 },
             );
         }
@@ -111,6 +113,24 @@ pub(crate) fn project_member_channels(
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Member channel ids whose kind:39000 metadata is absent from the read map.
+///
+/// Archived and DM channels still carry metadata (with their `archived` and
+/// `t` tags), so a channel landing here is a genuinely missing read, not an
+/// intentional exclusion. The refresh guard fails closed on these.
+pub(crate) fn member_channels_missing_metadata(
+    member_ids: &[Uuid],
+    metas: &std::collections::HashMap<Uuid, ChannelMeta>,
+) -> Vec<Uuid> {
+    let mut missing: Vec<Uuid> = member_ids
+        .iter()
+        .copied()
+        .filter(|id| !metas.contains_key(id))
+        .collect();
+    missing.sort_unstable();
+    missing
 }
 
 /// Default content for a first-ever record, seeded from the fixed Sats policy
@@ -301,6 +321,10 @@ pub(crate) fn sign_agent_profile_event(
 /// not configured subscriptions. DM channels are excluded on purpose (they are
 /// per-user conversations, not directory entries) and archived channels are
 /// excluded because they are unusable.
+///
+/// Returns the member channels whose metadata could not be read, so the
+/// refresh can fail closed on a partial metadata read instead of silently
+/// publishing a projection missing the agent from real channels.
 pub(crate) async fn fetch_member_channels(
     rest: &RestClient,
     keys: &Keys,
@@ -349,7 +373,24 @@ pub(crate) async fn fetch_member_channels(
     let meta_events = rest.query(&[meta_filter]).await?;
     let metas = channel_meta_from_events(&meta_events);
 
-    Ok(project_member_channels(&member_ids, &metas))
+    let channels = project_member_channels(&member_ids, &metas);
+    let missing = member_channels_missing_metadata(&member_ids, &metas);
+    if !missing.is_empty() {
+        tracing::warn!(
+            missing = ?missing,
+            members = member_ids.len(),
+            "kind:10100 metadata read missing {} channel{}; failing closed",
+            missing.len(),
+            if missing.len() == 1 { "" } else { "s" }
+        );
+        return Err(RelayError::Http(format!(
+            "incomplete kind:39000 metadata read; missing {} of {} member channels",
+            missing.len(),
+            member_ids.len()
+        )));
+    }
+
+    Ok(channels)
 }
 
 /// Publish (or refresh) the agent's kind:10100 directory record.
@@ -402,6 +443,15 @@ pub(crate) async fn publish_agent_directory_record(
     // before any body is parsed, so the accepted:false branch is defensive
     // only. The response classification is a pure function so the wire shapes
     // are testable.
+    //
+    // This guard catches only the LOSING half of the race: a stale write that
+    // submits and gets told duplicate. The winning half, a same-timestamp
+    // write whose event id sorts lower than ours, is accepted by the relay
+    // with no duplicate signal and would clobber concurrent fields (the
+    // timer's). That residual is accepted here because the deployment plan
+    // makes this code the sole writer: the timer is retired in the same
+    // landing, so no concurrent writer exists in any window this guard runs
+    // in, which is what makes it sound.
     let resp = rest.submit_event(&event).await?;
     if let Some(err) = classify_submit_response(&resp) {
         return Err(RelayError::Http(err));
@@ -467,6 +517,14 @@ pub(crate) async fn refresh_agent_directory_record(
     _subscribed_channel_ids: &HashSet<Uuid>,
     fresh_auth: Option<Tag>,
 ) {
+    // `fetch_member_channels` fails closed on a partial kind:39000 metadata
+    // read: any member channel whose metadata row is missing returns an error,
+    // and we keep the previous record instead of publishing a projection that
+    // silently drops the agent from real channels. Using the previous record
+    // happens only on the assumption we still hold current owner auth; the
+    // republish path would submit without auth if the stored record predates
+    // any existing record on the relay, but publish fails closed on an empty
+    // or duplicate response rather than reporting done.
     let channels = match fetch_member_channels(rest, keys).await {
         Ok(channels) => channels,
         Err(e) => {
@@ -479,6 +537,15 @@ pub(crate) async fn refresh_agent_directory_record(
     // empty record and hide the agent everywhere. That is never correct while
     // the agent is online with subscriptions, so fail closed and keep the
     // previous record instead of silently publishing an empty projection.
+    //
+    // The reverse is a deliberate trade-off shared with the fleet directory
+    // timer: after the final membership is removed the projection is
+    // legitimately empty, so this guard also suppresses the empty publish that
+    // a full removal would want, leaving a stale record containing the last
+    // pre-removal channel until a future non-empty refresh replaces it. That
+    // matches the retiring timer's own semantics (it errors on empty
+    // membership too), and correctness here prefers a record that still lists
+    // the agent somewhere over publishing a blank one that hides it everywhere.
     if channels.is_empty() {
         tracing::warn!(
             "kind:10100 refresh found zero active member channels; keeping the previous record"
@@ -623,6 +690,7 @@ mod tests {
 
     /// Gate: DM-plus-archived exclusion. A member channel whose metadata is
     /// DM or archived must be dropped from the projection; the survivor stays.
+    /// The map still carries the archived row; only the projection omits it.
     #[test]
     fn dm_and_archived_channels_are_excluded() {
         let live = Uuid::new_v4();
@@ -902,7 +970,9 @@ mod tests {
     }
 
     /// Channel-metadata reduction: DM and archived are flagged so the
-    /// projection excludes them; a normal stream keeps its name.
+    /// projection excludes them; a normal stream keeps its name. Archived
+    /// channels stay in the map with archived=true so "metadata present but
+    /// correctly excluded" stays distinguishable from a missing read.
     #[test]
     fn channel_meta_reduction_flags_dm_and_archived() {
         let live = Uuid::new_v4();
@@ -914,9 +984,83 @@ mod tests {
             {"tags": [["d", archived.to_string()], ["name", "Dead"], ["archived", "true"]]},
         ]);
         let map = channel_meta_from_events(&meta);
-        assert_eq!(map.len(), 2); // archived is skipped entirely
+        assert_eq!(map.len(), 3);
         assert_eq!(map[&live].channel_type, "stream");
         assert_eq!(map[&dm].channel_type, "dm");
-        assert!(!map.contains_key(&archived));
+        let archived_meta = &map[&archived];
+        assert!(archived_meta.archived, "archived channel must stay in the map");
+        assert_eq!(archived_meta.name, "Dead");
+    }
+
+    /// Gate for the GPT-review finding 2: a member channel whose kind:39000
+    /// metadata is genuinely absent is reported as missing so the refresh can
+    /// fail closed, while DM and archived memberships are NOT missing (their
+    /// metadata exists with the type/archived tags). Fails on revision 4,
+    /// where an archived membership was dropped from the metadata map and
+    /// would have read as missing.
+    #[test]
+    fn member_channels_missing_metadata_distinguishes_absent_from_excluded() {
+        let live = Uuid::new_v4();
+        let dm = Uuid::new_v4();
+        let archived = Uuid::new_v4();
+        let phantom = Uuid::new_v4();
+        let member_ids = vec![live, dm, archived, phantom];
+
+        let metas: std::collections::HashMap<Uuid, ChannelMeta> = [
+            (
+                live,
+                ChannelMeta {
+                    name: "Live".into(),
+                    channel_type: "stream".into(),
+                    archived: false,
+                },
+            ),
+            (
+                dm,
+                ChannelMeta {
+                    name: "Direct".into(),
+                    channel_type: "dm".into(),
+                    archived: false,
+                },
+            ),
+            (
+                archived,
+                ChannelMeta {
+                    name: "Dead".into(),
+                    channel_type: "stream".into(),
+                    archived: true,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let missing = member_channels_missing_metadata(&member_ids, &metas);
+        assert_eq!(
+            missing,
+            vec![phantom],
+            "only the truly absent membership is missing; DM and archived are not"
+        );
+    }
+
+    /// The fail-closed condition: any missing metadata row trips the guard,
+    /// no matter how complete the rest of the projection is.
+    #[test]
+    fn member_channels_missing_metadata_fails_closed_on_any_absent_row() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let metas: std::collections::HashMap<Uuid, ChannelMeta> = [(
+            a,
+            ChannelMeta {
+                name: "A".into(),
+                channel_type: "stream".into(),
+                archived: false,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let missing = member_channels_missing_metadata(&[a, b], &metas);
+        assert_eq!(missing, vec![b], "the absent membership must be flagged");
     }
 }
