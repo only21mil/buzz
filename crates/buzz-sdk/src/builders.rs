@@ -1614,7 +1614,11 @@ pub fn build_dm_open(pubkeys: &[&str]) -> Result<EventBuilder, SdkError> {
 pub fn build_dm_add_member(channel_id: Uuid, pubkey: &str) -> Result<EventBuilder, SdkError> {
     let pk = check_pubkey_hex(pubkey, "pubkey")?;
     let tags = vec![tag(&["h", &channel_id.to_string()])?, tag(&["p", &pk])?];
-    Ok(EventBuilder::new(Kind::Custom(KIND_DM_ADD_MEMBER as u16), "").tags(tags))
+    Ok(
+        EventBuilder::new(Kind::Custom(KIND_DM_ADD_MEMBER as u16), "")
+            .tags(tags)
+            .allow_self_tagging(),
+    )
 }
 
 /// Build a presence update event (kind 20001).
@@ -3944,6 +3948,20 @@ mod tests {
         assert_eq!(ev.kind.as_u16(), 41011);
         assert!(has_tag(&ev, "h", &cid.to_string()));
         assert!(has_tag(&ev, "p", &pk));
+    }
+
+    #[test]
+    fn dm_add_member_preserves_self_target() {
+        let cid = Uuid::from_u128(3);
+        let signer = fixed_keys();
+        let target = signer.public_key().to_hex();
+        let ev = build_dm_add_member(cid, &target)
+            .unwrap()
+            .sign_with_keys(&signer)
+            .expect("sign");
+        assert_eq!(ev.kind.as_u16(), 41011);
+        assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert!(has_tag(&ev, "p", &target));
     }
 
     #[test]
