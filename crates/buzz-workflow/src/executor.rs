@@ -12,6 +12,10 @@
 use std::collections::HashMap;
 
 use buzz_core::tenant::CommunityId;
+use buzz_db::workflow_approval::{
+    ApprovalActionSummary, ApprovalRequestPayload, ApprovalRole, CanonicalApprovalPolicy,
+};
+use chrono::{DateTime, TimeDelta, Utc};
 use evalexpr::HashMapContext;
 use nostr::ToBech32;
 use serde_json::Value as JsonValue;
@@ -583,10 +587,7 @@ pub enum StepResult {
     /// Step completed normally. Output is stored in `step_outputs`.
     Completed(JsonValue),
     /// Step requests suspension (approval gate). Execution must pause.
-    Suspended {
-        /// Token used to resume or reject this approval gate.
-        approval_token: String,
-    },
+    Suspended(ApprovalSuspension),
     /// Step was skipped due to `if:` condition being false.
     Skipped,
 }
@@ -782,20 +783,29 @@ pub async fn dispatch_action(
             message,
             timeout,
         } => {
-            let timeout_str = timeout.as_deref().unwrap_or("24h");
+            let expected_generation = engine
+                .db
+                .get_workflow_run(community_id, run_id)
+                .await
+                .map_err(|_| {
+                    WorkflowError::Database("RequestApproval run state is unavailable".to_owned())
+                })?
+                .generation;
+            let suspension = build_approval_suspension(
+                step_id,
+                from,
+                message,
+                timeout.as_deref(),
+                expected_generation,
+                Utc::now(),
+            )?;
             info!(
-                run_id = %run_id, step = step_id,
-                "RequestApproval from={from} timeout={timeout_str}: {message}"
+                run_id = %run_id,
+                step = step_id,
+                timeout_seconds = suspension.timeout_secs,
+                "RequestApproval"
             );
-
-            let token = generate_approval_token(run_id, step_id);
-
-            // TODO (WF-08): create approval record in DB, emit kind:46010.
-            // For now, return Suspended with the token so the caller can persist state.
-
-            Ok(StepResult::Suspended {
-                approval_token: token,
-            })
+            Ok(StepResult::Suspended(suspension))
         }
 
         Delay { duration } => {
@@ -1131,14 +1141,176 @@ fn find_first_word(s: &str) -> Option<String> {
     s.split_whitespace().next().map(|w| w.to_owned())
 }
 
-/// Generate a cryptographically random approval token.
-///
-/// Uses `Uuid::new_v4()` which draws from the OS CSPRNG (via the `getrandom`
-/// crate). The `run_id` and `step_id` parameters are accepted for logging
-/// context but are not mixed into the token — the UUID's own randomness is
-/// sufficient and avoids the predictability of time-based entropy.
-fn generate_approval_token(_run_id: Uuid, _step_id: &str) -> String {
-    Uuid::new_v4().to_string()
+const DEFAULT_APPROVAL_TIMEOUT: &str = "24h";
+
+/// Bounded suspension state handed to run finalization.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalSuspension {
+    /// Stable identifier of the frozen approval step.
+    pub(crate) step_id: String,
+    /// Resolved caller-reviewed action summary.
+    pub(crate) message: String,
+    /// Run generation held before the gate transaction advances it.
+    pub(crate) expected_generation: i64,
+    /// Canonical immutable approval policy.
+    pub(crate) policy: CanonicalApprovalPolicy,
+    /// Parsed positive timeout used to derive `expires_at`.
+    pub(crate) timeout_secs: u64,
+    /// Clock instant used to derive the fixed expiry.
+    pub(crate) created_at: DateTime<Utc>,
+    /// Fixed expiry retained across an exact finalization replay.
+    pub(crate) expires_at: DateTime<Utc>,
+    /// Bounded summary safe to copy into the request outbox payload.
+    pub(crate) action_summary: ApprovalActionSummary,
+    /// Safe caller-owned portion of the request outbox payload.
+    pub(crate) request_payload: ApprovalRequestPayload,
+}
+
+fn invalid_approval_policy() -> WorkflowError {
+    WorkflowError::InvalidDefinition(
+        "RequestApproval policy must be owner, admin, or a lowercase 64-hex pubkey".to_owned(),
+    )
+}
+
+pub(crate) fn parse_approval_policy(
+    policy: &str,
+) -> Result<CanonicalApprovalPolicy, WorkflowError> {
+    let (pubkeys, roles) = match policy {
+        "owner" => (Vec::new(), vec![ApprovalRole::Owner]),
+        "admin" => (Vec::new(), vec![ApprovalRole::Admin]),
+        exact
+            if exact.len() == 64
+                && exact
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) =>
+        {
+            let pubkey = hex::decode(exact).map_err(|_| invalid_approval_policy())?;
+            (vec![pubkey], Vec::new())
+        }
+        _ => return Err(invalid_approval_policy()),
+    };
+    CanonicalApprovalPolicy::new(pubkeys, roles).map_err(|_| invalid_approval_policy())
+}
+
+fn approval_timeout_secs(timeout: Option<&str>) -> Result<u64, WorkflowError> {
+    let timeout = timeout.unwrap_or(DEFAULT_APPROVAL_TIMEOUT);
+    let seconds = parse_duration_secs(timeout).map_err(|_| {
+        WorkflowError::InvalidDefinition(
+            "RequestApproval timeout must be a positive duration".to_owned(),
+        )
+    })?;
+    if seconds == 0 {
+        return Err(WorkflowError::InvalidDefinition(
+            "RequestApproval timeout must be a positive duration".to_owned(),
+        ));
+    }
+    Ok(seconds)
+}
+
+fn approval_expires_at(
+    now: DateTime<Utc>,
+    timeout_secs: u64,
+) -> Result<DateTime<Utc>, WorkflowError> {
+    let seconds = i64::try_from(timeout_secs).map_err(|_| {
+        WorkflowError::InvalidDefinition("RequestApproval timeout is out of range".to_owned())
+    })?;
+    let delta = TimeDelta::try_seconds(seconds).ok_or_else(|| {
+        WorkflowError::InvalidDefinition("RequestApproval timeout is out of range".to_owned())
+    })?;
+    now.checked_add_signed(delta).ok_or_else(|| {
+        WorkflowError::InvalidDefinition("RequestApproval expiry is out of range".to_owned())
+    })
+}
+
+fn approval_request_payload(timeout_secs: u64) -> Result<ApprovalRequestPayload, WorkflowError> {
+    ApprovalRequestPayload::new(serde_json::json!({
+        "class": "approval_requested",
+        "timeout_seconds": timeout_secs,
+    }))
+    .map_err(|_| WorkflowError::InvalidDefinition("RequestApproval payload is invalid".to_owned()))
+}
+
+fn build_approval_suspension(
+    step_id: &str,
+    policy: &str,
+    message: &str,
+    timeout: Option<&str>,
+    expected_generation: i64,
+    now: DateTime<Utc>,
+) -> Result<ApprovalSuspension, WorkflowError> {
+    let policy = parse_approval_policy(policy)?;
+    let timeout_secs = approval_timeout_secs(timeout)?;
+    let expires_at = approval_expires_at(now, timeout_secs)?;
+    let action_summary = ApprovalActionSummary::new(message).map_err(|_| {
+        WorkflowError::InvalidDefinition("RequestApproval message is invalid".to_owned())
+    })?;
+    let request_payload = approval_request_payload(timeout_secs)?;
+
+    Ok(ApprovalSuspension {
+        step_id: step_id.to_owned(),
+        message: action_summary.as_str().to_owned(),
+        expected_generation,
+        policy,
+        timeout_secs,
+        created_at: now,
+        expires_at,
+        action_summary,
+        request_payload,
+    })
+}
+
+pub(crate) fn waiting_approval_trace(step_id: &str, step_index: i32) -> JsonValue {
+    serde_json::json!({
+        "step_id": step_id,
+        "step_index": step_index,
+        "status": "waiting_approval",
+    })
+}
+
+pub(crate) fn validate_frozen_approval_step(
+    def: &WorkflowDef,
+    step_index: usize,
+    trigger_ctx: &TriggerContext,
+    step_outputs: &HashMap<String, JsonValue>,
+    suspension: &ApprovalSuspension,
+) -> Result<(), WorkflowError> {
+    let step = def.steps.get(step_index).ok_or_else(|| {
+        WorkflowError::InvalidDefinition(
+            "RequestApproval suspension does not match the frozen definition".to_owned(),
+        )
+    })?;
+    if step.id != suspension.step_id {
+        return Err(WorkflowError::InvalidDefinition(
+            "RequestApproval suspension does not match the frozen definition".to_owned(),
+        ));
+    }
+    let resolved_action = resolve_step_templates(step, trigger_ctx, step_outputs)?;
+    let ActionDef::RequestApproval {
+        from,
+        message,
+        timeout,
+    } = resolved_action
+    else {
+        return Err(WorkflowError::InvalidDefinition(
+            "RequestApproval suspension does not match the frozen definition".to_owned(),
+        ));
+    };
+    let policy = parse_approval_policy(&from)?;
+    let timeout_secs = approval_timeout_secs(timeout.as_deref())?;
+    let expires_at = approval_expires_at(suspension.created_at, timeout_secs)?;
+    let request_payload = approval_request_payload(timeout_secs)?;
+    if message != suspension.message
+        || suspension.action_summary.as_str() != suspension.message
+        || policy != suspension.policy
+        || timeout_secs != suspension.timeout_secs
+        || expires_at != suspension.expires_at
+        || request_payload != suspension.request_payload
+    {
+        return Err(WorkflowError::InvalidDefinition(
+            "RequestApproval suspension does not match the frozen definition".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Parse a duration string like "5m", "1h", "30s" into seconds.
@@ -1377,14 +1549,14 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
 /// Rich return type from `execute_run` / `execute_from_step`.
 ///
 /// Carries enough information for the caller to:
-/// - Persist the approval record when suspended at a `RequestApproval` step.
+/// - Persist an immutable approval gate when suspended at a `RequestApproval` step.
 /// - Update the run's execution trace and current step in the DB.
 /// - Resume execution from the correct step after approval.
 #[derive(Debug)]
 pub struct ExecutionResult {
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
-    pub approval_token: Option<String>,
+    pub approval: Option<ApprovalSuspension>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
@@ -1401,10 +1573,10 @@ pub struct ExecutionResult {
 /// 3. Dispatches the action.
 /// 4. Stores the step output for use by later steps.
 ///
-/// On `RequestApproval`: returns `ExecutionResult` with `approval_token = Some(token)`.
-/// Caller must persist the approval record and update the run status.
+/// On `RequestApproval`: returns `ExecutionResult` with structured approval
+/// suspension data. Caller must finalize the durable gate transaction.
 ///
-/// Returns `ExecutionResult` with `approval_token = None` on normal completion.
+/// Returns `ExecutionResult` with `approval = None` on normal completion.
 ///
 /// Enforces `engine.config.max_concurrent` via a semaphore — returns
 /// [`WorkflowError::CapacityExceeded`] immediately if all permits are taken.
@@ -1626,15 +1798,13 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
+            StepResult::Suspended(approval) => {
                 info!(
                     run_id = %run_id, step = %step.id,
-                    "Step suspended — awaiting approval (token: <redacted>)"
+                    "Step suspended — awaiting approval"
                 );
-                // Return the token and current state so the caller can persist the
-                // approval record and update the run's execution trace.
                 return Ok(ExecutionResult {
-                    approval_token: Some(approval_token),
+                    approval: Some(approval),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1652,7 +1822,7 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
-        approval_token: None,
+        approval: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,
@@ -1881,6 +2051,229 @@ mod tests {
     #[test]
     fn parse_duration_invalid() {
         assert!(parse_duration_secs("not-a-duration").is_err());
+    }
+
+    #[test]
+    fn approval_policy_accepts_only_canonical_forms() {
+        let owner = parse_approval_policy("owner").unwrap();
+        assert_eq!(owner.roles(), &[ApprovalRole::Owner]);
+        let admin = parse_approval_policy("admin").unwrap();
+        assert_eq!(admin.roles(), &[ApprovalRole::Admin]);
+
+        let exact_hex = "ab".repeat(32);
+        let exact = parse_approval_policy(&exact_hex).unwrap();
+        assert_eq!(exact.exact_pubkeys(), &[exact_hex]);
+
+        let invalid = vec![
+            String::new(),
+            "Owner".to_owned(),
+            " owner".to_owned(),
+            "@release-manager".to_owned(),
+            "release-manager".to_owned(),
+            "moderator".to_owned(),
+            "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq".to_owned(),
+            "AB".repeat(32),
+            "a".repeat(63),
+        ];
+        for invalid in invalid {
+            assert!(
+                parse_approval_policy(&invalid).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_timeout_defaults_and_fails_closed() {
+        let now = DateTime::parse_from_rfc3339("2026-08-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let defaulted =
+            build_approval_suspension("approve", "owner", "Ship release", None, 7, now).unwrap();
+        assert_eq!(defaulted.timeout_secs, 24 * 60 * 60);
+        assert_eq!(defaulted.expires_at, now + TimeDelta::hours(24));
+
+        assert!(
+            build_approval_suspension("approve", "owner", "Ship release", Some("0s"), 7, now)
+                .is_err()
+        );
+        assert!(build_approval_suspension(
+            "approve",
+            "owner",
+            "Ship release",
+            Some("18446744073709551615h"),
+            7,
+            now,
+        )
+        .is_err());
+        assert!(approval_expires_at(now, u64::MAX).is_err());
+        assert!(approval_expires_at(DateTime::<Utc>::MAX_UTC, 1).is_err());
+    }
+
+    #[test]
+    fn approval_request_payload_and_summary_are_safe() {
+        let now = DateTime::parse_from_rfc3339("2026-08-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let suspension = build_approval_suspension(
+            "approve_release",
+            "admin",
+            "Deploy release 2026.08.23",
+            Some("1h"),
+            3,
+            now,
+        )
+        .unwrap();
+        assert_eq!(suspension.message, "Deploy release 2026.08.23");
+        assert_eq!(
+            suspension.action_summary.as_str(),
+            "Deploy release 2026.08.23"
+        );
+        assert_eq!(
+            suspension.request_payload.as_value(),
+            &json!({
+                "class": "approval_requested",
+                "timeout_seconds": 3_600,
+            })
+        );
+        let changed_timeout = build_approval_suspension(
+            "approve_release",
+            "admin",
+            "Deploy release 2026.08.23",
+            Some("2h"),
+            3,
+            now,
+        )
+        .expect("valid approval suspension");
+        assert_ne!(changed_timeout.request_payload, suspension.request_payload);
+        let published = format!(
+            "{} {}",
+            suspension.action_summary.as_str(),
+            suspension.request_payload.as_value()
+        )
+        .to_ascii_lowercase();
+        for forbidden in [
+            "token",
+            "definition",
+            "header",
+            "secret",
+            "credential",
+            "step_outputs",
+            "outputs",
+        ] {
+            assert!(!published.contains(forbidden));
+        }
+        assert!(build_approval_suspension(
+            "approve_release",
+            "admin",
+            &"x".repeat(2_001),
+            Some("1h"),
+            3,
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn waiting_trace_has_only_the_bound_display_fields() {
+        assert_eq!(
+            waiting_approval_trace("approve_release", 2),
+            json!({
+                "step_id": "approve_release",
+                "step_index": 2,
+                "status": "waiting_approval",
+            })
+        );
+    }
+
+    #[test]
+    fn structured_approval_suspension_matches_frozen_step() {
+        let now = DateTime::parse_from_rfc3339("2026-08-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let suspension = build_approval_suspension(
+            "approve",
+            "owner",
+            "Deploy P1 fix for abc123def456",
+            Some("30m"),
+            11,
+            now,
+        )
+        .unwrap();
+        assert_eq!(suspension.step_id, "approve");
+        assert_eq!(suspension.expected_generation, 11);
+        assert_eq!(suspension.timeout_secs, 1_800);
+        assert_eq!(suspension.expires_at, now + TimeDelta::minutes(30));
+
+        let (def, _) = crate::schema::parse_yaml(
+            "name: Approval\ntrigger:\n  on: webhook\nsteps:\n  - id: approve\n    action: request_approval\n    from: owner\n    message: Deploy P1 fix for {{trigger.author}}\n    timeout: 30m\n",
+        )
+        .unwrap();
+        let trigger = make_trigger();
+        let outputs = HashMap::new();
+        validate_frozen_approval_step(&def, 0, &trigger, &outputs, &suspension).unwrap();
+
+        let changed_message = build_approval_suspension(
+            "approve",
+            "owner",
+            "Deploy a different fix",
+            Some("30m"),
+            11,
+            now,
+        )
+        .unwrap();
+        assert!(
+            validate_frozen_approval_step(&def, 0, &trigger, &outputs, &changed_message).is_err()
+        );
+
+        let changed_policy = build_approval_suspension(
+            "approve",
+            "admin",
+            "Deploy P1 fix for abc123def456",
+            Some("30m"),
+            11,
+            now,
+        )
+        .unwrap();
+        assert!(
+            validate_frozen_approval_step(&def, 0, &trigger, &outputs, &changed_policy).is_err()
+        );
+
+        let changed_timeout = build_approval_suspension(
+            "approve",
+            "owner",
+            "Deploy P1 fix for abc123def456",
+            Some("31m"),
+            11,
+            now,
+        )
+        .unwrap();
+        assert!(
+            validate_frozen_approval_step(&def, 0, &trigger, &outputs, &changed_timeout).is_err()
+        );
+
+        let mut changed_summary = suspension.clone();
+        changed_summary.action_summary =
+            ApprovalActionSummary::new("Deploy a different fix").expect("valid bounded summary");
+        assert!(
+            validate_frozen_approval_step(&def, 0, &trigger, &outputs, &changed_summary).is_err()
+        );
+
+        let mut changed_expiry = suspension.clone();
+        changed_expiry.expires_at += TimeDelta::seconds(1);
+        assert!(
+            validate_frozen_approval_step(&def, 0, &trigger, &outputs, &changed_expiry).is_err()
+        );
+
+        let mut changed_payload = suspension.clone();
+        changed_payload.request_payload = ApprovalRequestPayload::new(json!({
+            "class": "approval_requested",
+            "timeout_seconds": 1_801,
+        }))
+        .expect("safe bounded payload");
+        assert!(
+            validate_frozen_approval_step(&def, 0, &trigger, &outputs, &changed_payload).is_err()
+        );
     }
 
     #[test]

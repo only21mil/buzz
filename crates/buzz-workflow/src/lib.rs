@@ -37,7 +37,7 @@ pub mod schema;
 
 pub use action_sink::{ActionSink, ActionSinkError};
 pub use error::{PartialProgress, WorkflowError};
-pub use executor::ExecutionResult;
+pub use executor::{ApprovalSuspension, ExecutionResult};
 pub use schema::{ActionDef, Step, TriggerDef, WorkflowDef};
 
 use std::collections::HashMap;
@@ -47,6 +47,9 @@ use std::sync::OnceLock;
 use buzz_core::kind::{event_kind_u32, is_workflow_execution_kind, KIND_REACTION};
 use buzz_core::tenant::CommunityId;
 use buzz_db::workflow::RunStatus;
+use buzz_db::workflow_approval::{
+    CreateWorkflowApprovalGateParams, WorkflowApprovalGateCreationOutcome,
+};
 use buzz_db::Db;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -221,37 +224,27 @@ impl WorkflowEngine {
 
         match result {
             Ok(result) => {
+                let ExecutionResult {
+                    approval,
+                    step_index,
+                    step_outputs,
+                    trace,
+                } = result;
                 let mut full_trace = prefix;
-                full_trace.extend(result.trace);
-                let trace_json = serde_json::Value::Array(full_trace);
-                let step_count = result.step_index as i32;
+                full_trace.extend(trace);
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
-                            community_id,
-                            run_id,
-                            RunStatus::Failed,
-                            step_count,
-                            &trace_json,
-                            Some("approval gates not yet implemented — see WF-08"),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
-                        );
-                    }
+                if let Some(approval) = approval {
+                    self.finalize_approval_gate(
+                        community_id,
+                        run_id,
+                        step_index,
+                        step_outputs,
+                        full_trace,
+                        approval,
+                    )
+                    .await;
                 } else {
+                    let trace_json = serde_json::Value::Array(full_trace);
                     tracing::info!(run_id = %run_id, "Workflow run completed");
                     if let Err(e) = self
                         .db
@@ -259,7 +252,7 @@ impl WorkflowEngine {
                             community_id,
                             run_id,
                             RunStatus::Completed,
-                            step_count,
+                            step_index as i32,
                             &trace_json,
                             None,
                         )
@@ -295,6 +288,289 @@ impl WorkflowEngine {
                     );
                 }
             }
+        }
+    }
+
+    async fn finalize_approval_gate(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        step_index: usize,
+        step_outputs: HashMap<String, serde_json::Value>,
+        failure_trace: Vec<serde_json::Value>,
+        approval: ApprovalSuspension,
+    ) {
+        let expected_generation = approval.expected_generation;
+        let step_index_i32 = match i32::try_from(step_index) {
+            Ok(index) => index,
+            Err(_) => {
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    i32::MAX,
+                    failure_trace,
+                    "approval gate step index is out of range",
+                )
+                .await;
+                return;
+            }
+        };
+
+        let run = match self.db.get_workflow_run(community_id, run_id).await {
+            Ok(run) => run,
+            Err(_) => {
+                tracing::error!(run_id = %run_id, "Approval gate run lookup failed");
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate database error",
+                )
+                .await;
+                return;
+            }
+        };
+
+        let frozen_def: WorkflowDef = match serde_json::from_value(run.definition_snapshot.clone())
+        {
+            Ok(def) => def,
+            Err(_) => {
+                tracing::warn!(run_id = %run_id, "Frozen approval definition is invalid");
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate frozen definition is invalid",
+                )
+                .await;
+                return;
+            }
+        };
+        let trigger_ctx = match run
+            .trigger_context
+            .as_ref()
+            .map(|value| serde_json::from_value(value.clone()))
+        {
+            Some(Ok(trigger_ctx)) => trigger_ctx,
+            _ => {
+                tracing::warn!(run_id = %run_id, "Frozen approval trigger context is invalid");
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate frozen trigger context is invalid",
+                )
+                .await;
+                return;
+            }
+        };
+        if executor::validate_frozen_approval_step(
+            &frozen_def,
+            step_index,
+            &trigger_ctx,
+            &step_outputs,
+            &approval,
+        )
+        .is_err()
+        {
+            tracing::warn!(run_id = %run_id, "Approval suspension rejected");
+            self.fail_approval_gate(
+                community_id,
+                run_id,
+                expected_generation,
+                step_index_i32,
+                failure_trace,
+                "approval gate suspension does not match frozen definition",
+            )
+            .await;
+            return;
+        }
+
+        let workflow = match self.db.get_workflow(community_id, run.workflow_id).await {
+            Ok(workflow) => workflow,
+            Err(_) => {
+                tracing::error!(run_id = %run_id, "Approval workflow lookup failed");
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate database error",
+                )
+                .await;
+                return;
+            }
+        };
+        let Some(channel_id) = workflow.channel_id else {
+            self.fail_approval_gate(
+                community_id,
+                run_id,
+                expected_generation,
+                step_index_i32,
+                failure_trace,
+                "approval gate requires a workflow channel",
+            )
+            .await;
+            return;
+        };
+
+        let prior_step_outputs = match serde_json::to_value(&step_outputs) {
+            Ok(outputs) => outputs,
+            Err(_) => {
+                tracing::error!(run_id = %run_id, "Approval outputs serialization failed");
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate suspension data is invalid",
+                )
+                .await;
+                return;
+            }
+        };
+        let waiting_trace_entry =
+            executor::waiting_approval_trace(&approval.step_id, step_index_i32);
+        let prior_execution_trace = serde_json::Value::Array(failure_trace.clone());
+        let create_gate = || {
+            self.db
+                .create_workflow_approval_gate(CreateWorkflowApprovalGateParams {
+                    community_id,
+                    channel_id,
+                    workflow_id: run.workflow_id,
+                    run_id,
+                    definition_hash: &run.definition_hash,
+                    step_id: &approval.step_id,
+                    step_index: step_index_i32,
+                    expected_generation: approval.expected_generation,
+                    policy: &approval.policy,
+                    action_summary: &approval.action_summary,
+                    expires_at: approval.expires_at,
+                    prior_step_outputs: &prior_step_outputs,
+                    prior_execution_trace: &prior_execution_trace,
+                    waiting_trace_entry: &waiting_trace_entry,
+                    request_payload: &approval.request_payload,
+                })
+        };
+        let outcome = match create_gate().await {
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %error,
+                    "Approval gate transaction returned an ambiguous error; retrying exact creation"
+                );
+                create_gate().await
+            }
+            outcome => outcome,
+        };
+
+        match outcome {
+            Ok(
+                WorkflowApprovalGateCreationOutcome::Created { .. }
+                | WorkflowApprovalGateCreationOutcome::Reused { .. },
+            ) => {
+                tracing::info!(
+                    run_id = %run_id,
+                    step_index,
+                    "Workflow run is waiting for approval"
+                );
+            }
+            Ok(WorkflowApprovalGateCreationOutcome::Conflict) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    step_index,
+                    "Approval gate creation lost a conflicting transition"
+                );
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate conflict",
+                )
+                .await;
+            }
+            Ok(WorkflowApprovalGateCreationOutcome::StaleGeneration { current_generation }) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    step_index,
+                    current_generation,
+                    "Approval gate creation lost the generation fence"
+                );
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate stale generation",
+                )
+                .await;
+            }
+            Ok(WorkflowApprovalGateCreationOutcome::NoEligibleApprovers) => {
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate has no eligible approvers",
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    run_id = %run_id,
+                    error = %error,
+                    "Approval gate exact retry failed"
+                );
+                self.fail_approval_gate(
+                    community_id,
+                    run_id,
+                    expected_generation,
+                    step_index_i32,
+                    failure_trace,
+                    "approval gate database error",
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn fail_approval_gate(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_index: i32,
+        trace: Vec<serde_json::Value>,
+        reason: &'static str,
+    ) {
+        tracing::warn!(run_id = %run_id, reason, "Workflow approval gate failed");
+        if self
+            .db
+            .fail_running_workflow_run(
+                community_id,
+                run_id,
+                expected_generation,
+                step_index,
+                &serde_json::Value::Array(trace),
+                reason,
+            )
+            .await
+            .is_err()
+        {
+            tracing::error!(run_id = %run_id, "Failed to mark approval run failed");
         }
     }
 

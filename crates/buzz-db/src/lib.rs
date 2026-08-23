@@ -3946,6 +3946,28 @@ impl Db {
         .await
     }
 
+    /// Mark a running workflow failed only if its generation still matches.
+    pub async fn fail_running_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+        error: &str,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        workflow_run_transition::fail_running_workflow_run(
+            &self.pool,
+            community_id,
+            id,
+            expected_generation,
+            current_step,
+            trace,
+            error,
+        )
+        .await
+    }
+
     /// Read a live workflow-state value by workflow id.
     pub async fn read_workflow_state(
         &self,

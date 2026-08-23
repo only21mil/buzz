@@ -91,6 +91,54 @@ pub async fn transition_workflow_run(
     }
 }
 
+/// Mark a running workflow failed only while its generation still matches.
+///
+/// This is the error-path counterpart to [`transition_workflow_run`]. It keeps
+/// the status fence, trace, error, completion timestamp, and generation
+/// advance in one statement so a stale executor cannot overwrite a newer
+/// waiting or terminal state.
+pub async fn fail_running_workflow_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    expected_generation: i64,
+    current_step: i32,
+    trace: &serde_json::Value,
+    error: &str,
+) -> Result<WorkflowRunTransitionOutcome> {
+    let row = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'failed',
+            current_step = $1,
+            execution_trace = $2,
+            error_message = $3,
+            completed_at = NOW(),
+            generation = generation + 1
+        WHERE community_id = $4
+          AND id = $5
+          AND status = 'running'
+          AND generation = $6
+        RETURNING generation
+        "#,
+    )
+    .bind(current_step)
+    .bind(trace)
+    .bind(error)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(expected_generation)
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(row) => Ok(WorkflowRunTransitionOutcome::Applied {
+            generation: row.try_get("generation")?,
+        }),
+        None => Ok(WorkflowRunTransitionOutcome::Conflict),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +312,114 @@ mod tests {
             run_state(&pool, community_id, run_id).await,
             ("waiting_approval".to_owned(), 4)
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fenced_failure_cannot_overwrite_a_waiting_gate() {
+        let pool = setup_pool().await;
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let workflow_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        insert_run(
+            &pool,
+            community_id,
+            workflow_id,
+            run_id,
+            RunStatus::WaitingApproval,
+            4,
+        )
+        .await;
+        let before = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(r) FROM workflow_runs r WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read waiting run");
+
+        let outcome = fail_running_workflow_run(
+            &pool,
+            community_id,
+            run_id,
+            3,
+            2,
+            &serde_json::json!([{"status": "failed"}]),
+            "stale finalizer",
+        )
+        .await
+        .expect("attempt fenced failure");
+
+        assert_eq!(outcome, WorkflowRunTransitionOutcome::Conflict);
+        let after = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(r) FROM workflow_runs r WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read waiting run after conflict");
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fenced_failure_closes_the_original_running_generation() {
+        let pool = setup_pool().await;
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        let workflow_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        insert_run(
+            &pool,
+            community_id,
+            workflow_id,
+            run_id,
+            RunStatus::Running,
+            3,
+        )
+        .await;
+        let trace = serde_json::json!([{"step_id": "approve", "status": "failed"}]);
+
+        let outcome = fail_running_workflow_run(
+            &pool,
+            community_id,
+            run_id,
+            3,
+            2,
+            &trace,
+            "approval gate conflict",
+        )
+        .await
+        .expect("fail the matching running generation");
+
+        assert_eq!(
+            outcome,
+            WorkflowRunTransitionOutcome::Applied { generation: 4 }
+        );
+        let row = sqlx::query(
+            "SELECT status::text AS status, generation, current_step, execution_trace, \
+                    error_message, completed_at IS NOT NULL AS completed \
+             FROM workflow_runs WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read failed run");
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "failed");
+        assert_eq!(row.try_get::<i64, _>("generation").unwrap(), 4);
+        assert_eq!(row.try_get::<i32, _>("current_step").unwrap(), 2);
+        assert_eq!(
+            row.try_get::<serde_json::Value, _>("execution_trace")
+                .unwrap(),
+            trace
+        );
+        assert_eq!(
+            row.try_get::<String, _>("error_message").unwrap(),
+            "approval gate conflict"
+        );
+        assert!(row.try_get::<bool, _>("completed").unwrap());
     }
 
     #[tokio::test]
