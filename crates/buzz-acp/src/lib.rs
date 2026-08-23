@@ -1912,10 +1912,20 @@ async fn tokio_main() -> Result<()> {
     let directory_keys = config.keys.clone();
     let directory_display_name =
         crate::config::normalize_agent_command_identity(&config.agent_command);
+    let directory_allowlist: Vec<String> = if config.respond_to_allowlist.is_empty() {
+        config
+            .agent_owner
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        config.respond_to_allowlist.iter().cloned().collect()
+    };
     agent_directory::refresh_agent_directory_record(
         &directory_rest_client,
         &directory_keys,
         &directory_display_name,
+        &directory_allowlist,
         &subscribed_channel_ids,
     )
     .await;
@@ -2475,6 +2485,7 @@ async fn tokio_main() -> Result<()> {
                                     &directory_rest_client,
                                     &directory_keys,
                                     &directory_display_name,
+                                    &directory_allowlist,
                                     &subscribed_channel_ids,
                                 )
                                 .await;

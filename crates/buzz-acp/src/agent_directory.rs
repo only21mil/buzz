@@ -2,16 +2,19 @@
 //!
 //! buzz-acp never published its own kind:10100 record, so an agent joined to a
 //! new channel stayed hidden in the Desktop @ picker — the directory record
-//! lacked the channel. This module reads the current record (if any), updates
-//! `channel_ids`, and republishes through the HTTP bridge, preserving every
+//! lacked the channel. This module reads the current record (if any), derives
+//! the active channel set from kind:39002 memberships minus DM and archived
+//! channels, and republishes through the HTTP bridge, preserving every
 //! existing field and tag.
 //!
 //! The record is replaceable (NIP-01 kind 10000–19999), keyed by `(pubkey,
 //! kind)`. The relay's `handle_agent_profile` side effect reads
 //! `channel_add_policy` from the content JSON; the Desktop reads
 //! `display_name`, `channel_ids`, and other optional fields. We preserve all
-//! existing content fields and tags on republish and only overwrite
-//! `channel_ids`.
+//! existing content fields and tags on republish, overwrite `channel_ids` and
+//! `channels` (names, in the same sorted order), and seed missing defaults on
+//! a first-ever record (respond_to, respond_to_allowlist, channel_add_policy,
+//! status) exactly like the fleet directory-sync timer.
 
 use std::collections::HashSet;
 
@@ -22,18 +25,127 @@ use uuid::Uuid;
 
 use crate::relay::{RelayError, RestClient};
 
+/// One discovered channel from kind:39000 metadata, reduced to what the
+/// directory record needs: id, display name, and whether it is a DM and/or
+/// archived. DM and archived channels are excluded from the published record,
+/// matching the timer's contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChannelMeta {
+    pub name: String,
+    pub channel_type: String,
+    pub archived: bool,
+}
+
+/// Reduce kind:39000 metadata events into a channel-id map, skipping archived
+/// channels and marking DM channels so the caller can exclude them.
+///
+/// Mirrors the fleet directory-sync timer's read: a channel is excluded when
+/// its metadata is archived=true or its declared type (or hidden flag) is dm.
+pub(crate) fn channel_meta_from_events(meta_events: &Value) -> std::collections::HashMap<Uuid, ChannelMeta> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(arr) = meta_events.as_array() {
+        for ev in arr {
+            let tags = match ev.get("tags").and_then(|t| t.as_array()) {
+                Some(t) => t,
+                None => continue,
+            };
+            let mut d_val = None;
+            let mut name = None;
+            let mut archived = false;
+            let mut declared_type = None;
+            let mut is_hidden = false;
+            for tag in tags {
+                if let Some(arr) = tag.as_array() {
+                    match arr.first().and_then(|v| v.as_str()) {
+                        Some("d") => d_val = arr.get(1).and_then(|v| v.as_str()),
+                        Some("name") => name = arr.get(1).and_then(|v| v.as_str()),
+                        Some("archived") => {
+                            archived = arr.get(1).and_then(|v| v.as_str()) == Some("true")
+                        }
+                        Some("hidden") => is_hidden = true,
+                        Some("t") => declared_type = arr.get(1).and_then(|v| v.as_str()),
+                        _ => {}
+                    }
+                }
+            }
+            let Some(d) = d_val else { continue };
+            let Ok(uuid) = d.parse::<Uuid>() else { continue };
+            if archived {
+                continue;
+            }
+            let channel_type = if declared_type == Some("dm") || is_hidden {
+                "dm".to_string()
+            } else {
+                declared_type.unwrap_or("stream").to_string()
+            };
+            map.insert(
+                uuid,
+                ChannelMeta {
+                    name: name.unwrap_or("unknown").to_string(),
+                    channel_type,
+                    archived: false,
+                },
+            );
+        }
+    }
+    map
+}
+
+/// The pure channel projection: given the member channel UUIDs and the
+/// metadata map, return the sorted (id, name) pairs for channels that are
+/// neither archived nor DM. Sort order is by channel id (UUID string), like
+/// the timer, so the `channel_ids` and `channels` arrays line up.
+pub(crate) fn project_member_channels(
+    member_ids: &[Uuid],
+    metas: &std::collections::HashMap<Uuid, ChannelMeta>,
+) -> Vec<(Uuid, String)> {
+    let mut out: Vec<(Uuid, String)> = member_ids
+        .iter()
+        .filter_map(|id| {
+            let meta = metas.get(id)?;
+            if meta.archived || meta.channel_type == "dm" {
+                return None;
+            }
+            Some((*id, meta.name.clone()))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Default content for a first-ever record, seeded from the fixed Sats policy
+/// table exactly like the directory-sync timer (respond_to allowlist with the
+/// owner/allowlist set, channel_add_policy owner_only, status online).
+fn fresh_record_defaults(allowlist: &[String]) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("respond_to".into(), Value::String("allowlist".into()));
+    map.insert(
+        "respond_to_allowlist".into(),
+        json!(allowlist.iter().collect::<Vec<_>>()),
+    );
+    map.insert("channel_add_policy".into(), Value::String("owner_only".into()));
+    map.insert("status".into(), Value::String("online".into()));
+    map
+}
+
 /// The kind:10100 content JSON, built or updated from the current channel set.
 ///
-/// If `existing_content` is `Some`, every field is preserved and `channel_ids`
-/// is overwritten with `channel_ids`. If `None`, a fresh record is created with
-/// `display_name` and `channel_ids`.
+/// If `existing_content` is `Some`, every existing field is preserved,
+/// `display_name` is overwritten, and `channel_ids` plus `channels` (names in
+/// the same order) are written from the projection. If `None`, a fresh record
+/// is created with `display_name`, `channel_ids`, `channels`, and the policy
+/// defaults.
 ///
 /// This is the pure, testable core — no I/O.
 pub(crate) fn build_agent_profile_content(
     display_name: &str,
-    channel_ids: &[Uuid],
+    channels: &[(Uuid, String)],
     existing_content: Option<&str>,
+    allowlist: &[String],
 ) -> Result<String, serde_json::Error> {
+    let channel_ids: Vec<String> = channels.iter().map(|(id, _)| id.to_string()).collect();
+    let channel_names: Vec<String> = channels.iter().map(|(_, name)| name.clone()).collect();
+
     let mut object = match existing_content {
         Some(raw) => {
             let parsed: Value = serde_json::from_str(raw)?;
@@ -42,20 +154,22 @@ pub(crate) fn build_agent_profile_content(
                 .ok_or_else(|| serde::de::Error::custom("kind:10100 content is not a JSON object"))?
                 .clone()
         }
-        None => serde_json::Map::new(),
+        None => {
+            let mut defaults = fresh_record_defaults(allowlist);
+            defaults.insert(
+                "display_name".to_string(),
+                Value::String(display_name.to_string()),
+            );
+            defaults
+        }
     };
 
     object.insert(
         "display_name".to_string(),
         Value::String(display_name.to_string()),
     );
-    object.insert(
-        "channel_ids".to_string(),
-        json!(channel_ids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()),
-    );
+    object.insert("channel_ids".to_string(), json!(channel_ids));
+    object.insert("channels".to_string(), json!(channel_names));
 
     serde_json::to_string(&Value::Object(object))
 }
@@ -135,17 +249,76 @@ pub(crate) fn sign_agent_profile_event(
         .map_err(|e| RelayError::AuthFailed(e.to_string()))
 }
 
+/// Query kind:39002 memberships for this agent, then pull kind:39000 metadata
+/// and reduce to the active (non-DM, non-archived) channel set sorted by id.
+///
+/// This is the read side of the timer contract: publish active memberships,
+/// not configured subscriptions. DM channels are excluded on purpose (they are
+/// per-user conversations, not directory entries) and archived channels are
+/// excluded because they are unusable.
+pub(crate) async fn fetch_member_channels(
+    rest: &RestClient,
+    keys: &Keys,
+) -> Result<Vec<(Uuid, String)>, RelayError> {
+    let pubkey_hex = keys.public_key().to_hex();
+    use nostr::{Alphabet, SingleLetterTag};
+
+    // Step 1: kind:39002 group-members events where #p includes this agent.
+    let p_tag = SingleLetterTag::lowercase(Alphabet::P);
+    let member_filter = nostr::Filter::new()
+        .kind(Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16))
+        .custom_tags(p_tag, [pubkey_hex.as_str()]);
+    let member_events = rest.query(&[member_filter]).await?;
+    let member_arr = member_events
+        .as_array()
+        .ok_or_else(|| RelayError::Http("expected JSON array from /query (group members)".into()))?;
+
+    let mut member_ids: Vec<Uuid> = Vec::new();
+    for ev in member_arr {
+        if let Some(tags) = ev.get("tags").and_then(|t| t.as_array()) {
+            for tag in tags {
+                if let Some(arr) = tag.as_array() {
+                    if arr.first().and_then(|v| v.as_str()) == Some("d") {
+                        if let Some(d_val) = arr.get(1).and_then(|v| v.as_str()) {
+                            if let Ok(uuid) = d_val.parse::<Uuid>() {
+                                member_ids.push(uuid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    member_ids.sort_unstable();
+    member_ids.dedup();
+
+    // Step 2: kind:39000 metadata for the discovered channels.
+    if member_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+    let d_values: Vec<String> = member_ids.iter().map(|u| u.to_string()).collect();
+    let meta_filter = nostr::Filter::new()
+        .kind(Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16))
+        .custom_tags(d_tag, d_values);
+    let meta_events = rest.query(&[meta_filter]).await?;
+    let metas = channel_meta_from_events(&meta_events);
+
+    Ok(project_member_channels(&member_ids, &metas))
+}
+
 /// Publish (or refresh) the agent's kind:10100 directory record.
 ///
-/// Reads the current record (if any), merges `channel_ids` into the content
-/// while preserving all other fields and tags, signs, and submits via the HTTP
-/// bridge. Best-effort: errors are logged and returned but never crash the
-/// harness.
+/// Reads the current record (if any), merges the active member channel
+/// projection into the content while preserving all other fields and tags,
+/// signs, and submits via the HTTP bridge. Best-effort: errors are logged and
+/// returned but never crash the harness.
 pub(crate) async fn publish_agent_directory_record(
     rest: &RestClient,
     keys: &Keys,
     display_name: &str,
-    channel_ids: &[Uuid],
+    channels: &[(Uuid, String)],
+    allowlist: &[String],
 ) -> Result<(), RelayError> {
     let pubkey_hex = keys.public_key().to_hex();
 
@@ -162,7 +335,7 @@ pub(crate) async fn publish_agent_directory_record(
     let existing = latest_agent_profile_event(event_arr);
     let existing_content = existing.and_then(|e| e.get("content").and_then(Value::as_str));
 
-    let content = build_agent_profile_content(display_name, channel_ids, existing_content)
+    let content = build_agent_profile_content(display_name, channels, existing_content, allowlist)
         .map_err(|e| RelayError::Http(format!("kind:10100 content build error: {e}")))?;
 
     let tags = retain_existing_tags(existing.unwrap_or(&Value::Null));
@@ -171,7 +344,7 @@ pub(crate) async fn publish_agent_directory_record(
 
     tracing::info!(
         pubkey = %pubkey_hex,
-        channels = channel_ids.len(),
+        channels = channels.len(),
         "publishing kind:10100 agent directory record"
     );
 
@@ -179,21 +352,28 @@ pub(crate) async fn publish_agent_directory_record(
     Ok(())
 }
 
-/// Convenience: publish with a `HashSet` of channel IDs (the shape the event
-/// loop tracks as `subscribed_channel_ids`).
+/// Publish the record derived from the agent's active memberships. This is
+/// what the startup and membership-change callers invoke: it re-reads
+/// kind:39002 membership and kind:39000 metadata from the relay, so the record
+/// reflects the canonical active set even after a batch of membership changes.
 pub(crate) async fn refresh_agent_directory_record(
     rest: &RestClient,
     keys: &Keys,
     display_name: &str,
-    subscribed_channel_ids: &HashSet<Uuid>,
+    allowlist: &[String],
+    _subscribed_channel_ids: &HashSet<Uuid>,
 ) {
-    let channel_ids: Vec<Uuid> = {
-        let mut v: Vec<Uuid> = subscribed_channel_ids.iter().copied().collect();
-        v.sort_unstable();
-        v
+    let channels = match fetch_member_channels(rest, keys).await {
+        Ok(channels) => channels,
+        Err(e) => {
+            tracing::warn!("failed to read memberships for kind:10100 record: {e}");
+            return;
+        }
     };
 
-    if let Err(e) = publish_agent_directory_record(rest, keys, display_name, &channel_ids).await {
+    if let Err(e) = publish_agent_directory_record(rest, keys, display_name, &channels, allowlist)
+        .await
+    {
         tracing::warn!("failed to publish kind:10100 agent directory record: {e}");
     }
 }
@@ -211,61 +391,175 @@ mod tests {
         (0..n).map(|_| Uuid::new_v4()).collect()
     }
 
-    /// Core test: the content builder merges `channel_ids` into an existing
-    /// record while preserving other fields. This fails on the unfixed code
-    /// because there is no builder function at all — calling
-    /// `build_agent_profile_content` would be a compile error.
+    fn proj(ids: &[Uuid]) -> Vec<(Uuid, String)> {
+        ids.iter().map(|&u| (u, format!("chan-{}", u))).collect()
+    }
+
+    /// Core test: the content builder merges channel_ids + channels into an
+    /// existing record while preserving other fields. Fails on the unfixed
+    /// code because the builder had no channel-names or allowlist support.
     #[test]
     fn build_content_preserves_existing_fields_and_overwrites_channel_ids() {
         let existing = r#"{"display_name":"old-name","channel_ids":["dead-beef"],"channel_add_policy":"owner_only","custom":{"keep":true}}"#;
-        let channels = uuids(3);
+        let pairs = vec![
+            (Uuid::new_v4(), "one".to_string()),
+            (Uuid::new_v4(), "two".to_string()),
+            (Uuid::new_v4(), "three".to_string()),
+        ];
+        let allowlist = vec!["owner".to_string()];
 
-        let content = build_agent_profile_content("new-name", &channels, Some(existing)).unwrap();
+        let content = build_agent_profile_content("new-name", &pairs, Some(existing), &allowlist)
+            .unwrap();
 
         let parsed: Value = serde_json::from_str(&content).unwrap();
         let obj = parsed.as_object().expect("content is a JSON object");
 
-        // channel_ids overwritten with the new set.
         let ids: Vec<String> = obj["channel_ids"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
+        let names: Vec<String> = obj["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         assert_eq!(ids.len(), 3);
-        for ch in &channels {
-            assert!(ids.contains(&ch.to_string()));
+        assert_eq!(names, vec!["one", "two", "three"]);
+        for (id, name) in &pairs {
+            assert!(ids.contains(&id.to_string()));
+            assert!(names.contains(name));
         }
 
-        // display_name overwritten.
         assert_eq!(obj["display_name"].as_str().unwrap(), "new-name");
-
-        // Existing fields preserved.
         assert_eq!(obj["channel_add_policy"].as_str().unwrap(), "owner_only");
         assert!(obj["custom"]["keep"].as_bool().unwrap());
     }
 
-    /// Fresh record (no existing content) gets display_name + channel_ids only.
+    /// Fresh record (no existing content) gets display_name + channel_ids +
+    /// channels + the policy defaults, not just two fields.
     #[test]
     fn build_content_from_scratch_has_display_name_and_channel_ids() {
-        let channels = uuids(2);
-        let content = build_agent_profile_content("agent-1", &channels, None).unwrap();
+        let pairs = proj(&uuids(2));
+        let allowlist = vec!["owner".to_string(), "team".to_string()];
+        let content = build_agent_profile_content("agent-1", &pairs, None, &allowlist).unwrap();
 
         let parsed: Value = serde_json::from_str(&content).unwrap();
         let obj = parsed.as_object().unwrap();
 
         assert_eq!(obj["display_name"].as_str().unwrap(), "agent-1");
         assert_eq!(obj["channel_ids"].as_array().unwrap().len(), 2);
-        // No stray fields.
-        assert_eq!(obj.len(), 2);
+        assert_eq!(obj["channels"].as_array().unwrap().len(), 2);
+        assert_eq!(obj["respond_to"].as_str().unwrap(), "allowlist");
+        assert_eq!(obj["channel_add_policy"].as_str().unwrap(), "owner_only");
+        let al = obj["respond_to_allowlist"].as_array().unwrap();
+        assert_eq!(al.len(), 2);
     }
 
-    /// Empty channel set produces an empty channel_ids array.
+    /// Gate: from-scratch with ten keys/channels present, non-empty, names in
+    /// order. The projection and builder must keep ids and names aligned even
+    /// with ten memberships, and a fresh record is non-empty (not the two
+    /// fields only, and not missing the names array).
     #[test]
-    fn build_content_with_zero_channels() {
-        let content = build_agent_profile_content("solo", &[], None).unwrap();
+    fn from_scratch_ten_channels_names_in_order() {
+        let ids = uuids(10);
+        let pairs: Vec<(Uuid, String)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &u)| (u, format!("channel-{:02}", i)))
+            .collect();
+        let allowlist = vec!["owner".to_string()];
+        let content = build_agent_profile_content("ten", &pairs, None, &allowlist).unwrap();
+
         let parsed: Value = serde_json::from_str(&content).unwrap();
-        assert!(parsed["channel_ids"].as_array().unwrap().is_empty());
+        let obj = parsed.as_object().unwrap();
+        let ids_out: Vec<String> = obj["channel_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let names_out: Vec<String> = obj["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(ids_out.len(), 10, "all ten channel ids present");
+        assert_eq!(names_out.len(), 10, "all ten channel names present");
+        assert!(!ids_out.is_empty() && !names_out.is_empty());
+        for i in 0..10 {
+            assert_eq!(ids_out[i], ids[i].to_string());
+            assert_eq!(names_out[i], format!("channel-{:02}", i));
+        }
+    }
+
+    /// Gate: DM-plus-archived exclusion. A member channel whose metadata is
+    /// DM or archived must be dropped from the projection; the survivor stays.
+    #[test]
+    fn dm_and_archived_channels_are_excluded() {
+        let live = Uuid::new_v4();
+        let dm = Uuid::new_v4();
+        let archived = Uuid::new_v4();
+        let member_ids = vec![live, dm, archived];
+
+        let metas: std::collections::HashMap<Uuid, ChannelMeta> = [
+            (
+                live,
+                ChannelMeta {
+                    name: "Live".into(),
+                    channel_type: "stream".into(),
+                    archived: false,
+                },
+            ),
+            (
+                dm,
+                ChannelMeta {
+                    name: "Direct".into(),
+                    channel_type: "dm".into(),
+                    archived: false,
+                },
+            ),
+            (
+                archived,
+                ChannelMeta {
+                    name: "Dead".into(),
+                    channel_type: "stream".into(),
+                    archived: true,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let projected = project_member_channels(&member_ids, &metas);
+        assert_eq!(projected, vec![(live, "Live".to_string())]);
+    }
+
+    /// Gate: merge-existing with a membership change parsed-equal to the
+    /// expected content. The builder must overwrite channel_ids + channels on
+    /// a change and preserve the rest, and the result must equal the expected
+    /// JSON exactly (id and name shown in sync).
+    #[test]
+    fn merge_existing_with_membership_change_parses_equal_to_expected() {
+        let live = Uuid::new_v4();
+        let existing = r#"{"display_name":"old","channel_ids":["dead"],"channel_add_policy":"nobody"}"#;
+        let allowlist = vec!["owner".to_string()];
+        let pairs = vec![(live, "general".to_string())];
+
+        let content = build_agent_profile_content("New", &pairs, Some(existing), &allowlist)
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        let expected: Value = serde_json::json!({
+            "display_name": "New",
+            "channel_ids": [live.to_string()],
+            "channels": ["general"],
+            "channel_add_policy": "nobody",
+        });
+        assert_eq!(parsed, expected, "merged record must parse equal to expected");
     }
 
     /// The signed event is a valid kind:10100 with correct content and
@@ -273,10 +567,10 @@ mod tests {
     #[test]
     fn sign_event_produces_valid_kind_10100_with_monotonic_timestamp() {
         let keys = make_keys();
-        let channels = uuids(1);
-        let content = build_agent_profile_content("test-agent", &channels, None).unwrap();
+        let allowlist = vec!["owner".to_string()];
+        let content = build_agent_profile_content("test-agent", &proj(&uuids(1)), None, &allowlist)
+            .unwrap();
 
-        // Existing event with created_at = 1000.
         let existing = json!({
             "created_at": 1000u64,
             "content": r#"{"display_name":"old"}"#,
@@ -289,7 +583,6 @@ mod tests {
 
         assert_eq!(event.kind.as_u16(), KIND_AGENT_PROFILE as u16);
         assert!(event.created_at.as_secs() >= 1001);
-        // Content round-trips as valid JSON.
         let parsed: Value = serde_json::from_str(&event.content).unwrap();
         assert_eq!(parsed["display_name"].as_str().unwrap(), "test-agent");
     }
@@ -298,7 +591,9 @@ mod tests {
     #[test]
     fn sign_event_without_existing_uses_now() {
         let keys = make_keys();
-        let content = build_agent_profile_content("fresh", &uuids(1), None).unwrap();
+        let allowlist = vec!["owner".to_string()];
+        let content = build_agent_profile_content("fresh", &proj(&uuids(1)), None, &allowlist)
+            .unwrap();
         let event = sign_agent_profile_event(&keys, &content, vec![], None).unwrap();
         assert!(event.created_at.as_secs() > 0);
     }
@@ -324,27 +619,27 @@ mod tests {
             ]
         });
         let tags = retain_existing_tags(&existing);
-        // auth dropped, custom + d kept.
         assert_eq!(tags.len(), 2);
         assert_eq!(tags[0].as_slice()[0].as_str(), "custom");
         assert_eq!(tags[1].as_slice()[0].as_str(), "d");
     }
 
-    /// Round-trip: build content from an existing event, sign, and verify the
-    /// signed event's content parses back with the right channel_ids.
+    /// Channel-metadata reduction: DM and archived are flagged so the
+    /// projection excludes them; a normal stream keeps its name.
     #[test]
-    fn full_build_and_sign_round_trip() {
-        let keys = make_keys();
-        let channels = uuids(4);
-        let existing_content =
-            r#"{"display_name":"v1","channel_ids":["x"],"channel_add_policy":"nobody"}"#;
-
-        let content = build_agent_profile_content("v2", &channels, Some(existing_content)).unwrap();
-        let event = sign_agent_profile_event(&keys, &content, vec![], None).unwrap();
-
-        let parsed: Value = serde_json::from_str(&event.content).unwrap();
-        assert_eq!(parsed["display_name"].as_str().unwrap(), "v2");
-        assert_eq!(parsed["channel_add_policy"].as_str().unwrap(), "nobody");
-        assert_eq!(parsed["channel_ids"].as_array().unwrap().len(), 4);
+    fn channel_meta_reduction_flags_dm_and_archived() {
+        let live = Uuid::new_v4();
+        let dm = Uuid::new_v4();
+        let archived = Uuid::new_v4();
+        let meta = json!([
+            {"tags": [["d", live.to_string()], ["name", "general"], ["t", "stream"]]},
+            {"tags": [["d", dm.to_string()], ["name", "Direct"], ["t", "dm"]]},
+            {"tags": [["d", archived.to_string()], ["name", "Dead"], ["archived", "true"]]},
+        ]);
+        let map = channel_meta_from_events(&meta);
+        assert_eq!(map.len(), 2); // archived is skipped entirely
+        assert_eq!(map[&live].channel_type, "stream");
+        assert_eq!(map[&dm].channel_type, "dm");
+        assert!(!map.contains_key(&archived));
     }
 }
