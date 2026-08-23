@@ -144,6 +144,13 @@ pub enum ActionDef {
         /// Duration string (e.g. `"5m"`, `"1h"`).
         duration: String,
     },
+    /// Extract named values from a field using purpose-built matchers.
+    Extract {
+        /// Field to scan (supports template variables, e.g. `trigger.text`).
+        from: String,
+        /// Matcher list: output name → matcher name.
+        matchers: HashMap<String, String>,
+    },
 }
 
 impl WorkflowDef {

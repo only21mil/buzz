@@ -546,6 +546,10 @@ pub fn resolve_step_templates(
         Delay { duration } => Ok(Delay {
             duration: duration.clone(),
         }),
+        Extract { from, matchers } => Ok(Extract {
+            from: t(from)?,
+            matchers: matchers.clone(),
+        }),
     }
 }
 
@@ -614,6 +618,9 @@ fn resolve_send_message_channel(
 ///
 /// `RequestApproval` returns `StepResult::Suspended` — the caller must
 /// persist state and stop the execution loop.
+///
+/// `step_outputs` carries prior step outputs so the `Extract` action can
+/// resolve its `from` field against variables from earlier steps.
 pub async fn dispatch_action(
     step_id: &str,
     action: &ActionDef,
@@ -621,6 +628,7 @@ pub async fn dispatch_action(
     community_id: CommunityId,
     run_id: Uuid,
     trigger_ctx: &TriggerContext,
+    step_outputs: &HashMap<String, JsonValue>,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
@@ -784,7 +792,111 @@ pub async fn dispatch_action(
                 serde_json::json!({ "slept_secs": secs }),
             ))
         }
+
+        Extract { from, matchers } => {
+            let field_value = resolve_variable(from, trigger_ctx, step_outputs).unwrap_or_default();
+            let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+            for (out_name, matcher_name) in matchers {
+                let result = run_matcher(matcher_name, &field_value)?;
+                out.insert(out_name.clone(), serde_json::to_value(&result).unwrap_or(serde_json::json!(null)));
+            }
+            Ok(StepResult::Completed(serde_json::Value::Object(out)))
+        }
     }
+}
+
+/// A single matcher result: the captured value (empty if no match) plus a
+/// boolean presence flag. The flag is what makes the handoff linter safe:
+/// a step that finds nothing must not fail the run; the next step's
+/// condition can test `<name>_found` and decide the correction path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MatchResult {
+    /// First match, or empty string when nothing matched.
+    pub value: String,
+    /// True when at least one match was found.
+    pub found: bool,
+    /// Total number of matches in the scanned field.
+    pub count: usize,
+}
+
+/// Run a named purpose-built matcher against a field value.
+///
+/// Matchers are finite-state single passes over the input, never a general
+/// regex engine. No backreferences, no alternation, no user-supplied pattern
+/// — the inputs are bounded strings and the scanners terminate in linear
+/// time. This is deliberate: a user-supplied regex against arbitrary message
+/// text is a denial-of-service waiting to happen, and the conditions engine
+/// already caps expression length and runs with a timeout.
+fn run_matcher(name: &str, field: &str) -> Result<MatchResult, WorkflowError> {
+    match name {
+        // `wf_sha`: exactly 40 lowercase hex characters, matching the fleet
+        // handoff protocol. Accepts nothing else (no uppercase, no prefixes),
+        // because a linter that accepts what the watchdog rejects is worse
+        // than no linter.
+        "wf_sha" => {
+            let count = count_sha_matches(field);
+            let mut value = String::new();
+            if count > 0 {
+                value = find_first_sha(field).unwrap_or(String::new());
+            }
+            Ok(MatchResult { value, found: count > 0, count })
+        }
+        // `wf_word`: a bounded word token (ASCII letters and digits, no
+        // separators). First match plus count, matching the same shape.
+        "wf_word" => {
+            let count = count_word_matches(field);
+            let mut value = String::new();
+            if count > 0 {
+                value = find_first_word(field).unwrap_or(String::new());
+            }
+            Ok(MatchResult { value, found: count > 0, count })
+        }
+        other => Err(WorkflowError::InvalidDefinition(format!(
+            "extract: unknown matcher '{other}' (expected wf_sha or wf_word)"
+        ))),
+    }
+}
+
+/// A lowercase-hex byte check: `0-9` or `a-f`. Used for SHA tokens.
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+}
+
+/// A token is a SHA candidate when it is exactly 40 lowercase hex bytes.
+///
+/// The fleet protocol is 40 lowercase hex. Uppercase does not match; a
+/// linter that accepted what the watchdog rejects would be worse than none.
+fn is_sha_token(token: &str) -> bool {
+    token.len() == 40 && token.bytes().all(is_lower_hex)
+}
+
+/// Count SHA tokens in a field. Tokens are whitespace-delimited so a FROZEN
+/// post carrying two 40-hex runs (one in prose, one in a pasted command)
+/// counts both.
+fn count_sha_matches(s: &str) -> usize {
+    s.split_whitespace().filter(|t| is_sha_token(t)).count()
+}
+
+/// First SHA token, or `None` when the field has none.
+fn find_first_sha(s: &str) -> Option<String> {
+    s.split_whitespace()
+        .find_map(|t| {
+            if is_sha_token(t) {
+                Some(t.to_owned())
+            } else {
+                None
+            }
+        })
+}
+
+/// Count word tokens (whitespace-delimited, non-empty).
+fn count_word_matches(s: &str) -> usize {
+    s.split_whitespace().filter(|w| !w.is_empty()).count()
+}
+
+/// First word token, or `None` when the field is empty.
+fn find_first_word(s: &str) -> Option<String> {
+    s.split_whitespace().next().map(|w| w.to_owned())
 }
 
 /// Generate a cryptographically random approval token.
@@ -1243,6 +1355,7 @@ async fn execute_steps(
                 community_id,
                 run_id,
                 trigger_ctx,
+                &step_outputs,
             ),
         )
         .await;
@@ -1933,5 +2046,74 @@ mod tests {
             resolve_send_message_channel(Some(&override_channel_id.to_string()), "", None)
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
+    }
+
+    // ─── Extract action matchers ──────────────────────────────────────────
+
+    #[test]
+    fn extract_wf_sha_matches_exactly_40_lower_hex() {
+        let sha = "6407ed82b9869a112e234a19b328511c90db6647";
+        let result = run_matcher("wf_sha", &format!("FROZEN {sha}").to_owned())
+            .expect("valid wf_sha should match");
+        assert!(result.found);
+        assert_eq!(result.count, 1);
+        assert_eq!(result.value, sha);
+    }
+
+    #[test]
+    fn extract_wf_sha_rejects_uppercase_and_short() {
+        let upper = "6407ED82B9869A112E234A19B328511C90DB6647";
+        let result = run_matcher("wf_sha", &upper).expect("no match should not error");
+        assert!(!result.found);
+        assert_eq!(result.count, 0);
+        assert_eq!(result.value, "");
+
+        let short = "6407ed82";
+        let result = run_matcher("wf_sha", &short).expect("short sha should not error");
+        assert!(!result.found);
+    }
+
+    #[test]
+    fn extract_wf_sha_counts_multiple_matches() {
+        let sha = "6407ed82b9869a112e234a19b328511c90db6647";
+        let other = "992d18c93aff34be5572f8b3bf656b679d823c36";
+        let field = format!("{sha} and also {other}");
+        let result = run_matcher("wf_sha", &field).expect("two shas should match");
+        assert!(result.found);
+        assert_eq!(result.count, 2);
+        // First match is the first token in the field.
+        assert_eq!(result.value, sha);
+    }
+
+    #[test]
+    fn extract_wf_sha_no_match_emits_empty_with_found_false() {
+        let field = "no SHA here just words";
+        let result = run_matcher("wf_sha", &field).expect("no match should not error");
+        assert!(!result.found);
+        assert_eq!(result.count, 0);
+        assert_eq!(result.value, "");
+    }
+
+    #[test]
+    fn extract_wf_word_first_and_count() {
+        let field = "alpha beta gamma";
+        let result = run_matcher("wf_word", &field).expect("words should match");
+        assert!(result.found);
+        assert_eq!(result.count, 3);
+        assert_eq!(result.value, "alpha");
+    }
+
+    #[test]
+    fn extract_wf_word_empty_field_returns_empty() {
+        let result = run_matcher("wf_word", "").expect("empty field should not error");
+        assert!(!result.found);
+        assert_eq!(result.count, 0);
+        assert_eq!(result.value, "");
+    }
+
+    #[test]
+    fn extract_unknown_matcher_rejected() {
+        let err = run_matcher("bogus", "anything").unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidDefinition(_)));
     }
 }
