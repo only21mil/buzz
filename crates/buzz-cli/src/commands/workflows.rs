@@ -332,13 +332,8 @@ mod tests {
                 .expect("run history test relay");
         });
 
-        let client = BuzzClient::new(
-            format!("http://{address}"),
-            Keys::generate(),
-            None,
-            None,
-        )
-        .expect("test client");
+        let client = BuzzClient::new(format!("http://{address}"), Keys::generate(), None, None)
+            .expect("test client");
         (client, requests)
     }
 
@@ -388,10 +383,7 @@ mod tests {
         );
         assert_eq!(
             requests.lock().expect("request log").as_slice(),
-            &[(
-                format!("/workflows/{workflow_id}/runs?limit=20"),
-                true
-            )]
+            &[(format!("/workflows/{workflow_id}/runs?limit=20"), true)]
         );
     }
 
@@ -406,10 +398,7 @@ mod tests {
         assert_eq!(output, "[]");
         assert_eq!(
             requests.lock().expect("request log").as_slice(),
-            &[(
-                format!("/workflows/{workflow_id}/runs?limit=100"),
-                true
-            )]
+            &[(format!("/workflows/{workflow_id}/runs?limit=100"), true)]
         );
     }
 

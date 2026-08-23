@@ -2140,7 +2140,9 @@ pub async fn workflow_runs(
     check_nip98_replay(&state, &tenant, event_id_bytes).await?;
 
     let authenticated_pubkey = pubkey.to_bytes();
-    let auth_tag = headers.get("x-auth-tag").and_then(|value| value.to_str().ok());
+    let auth_tag = headers
+        .get("x-auth-tag")
+        .and_then(|value| value.to_str().ok());
     super::relay_members::enforce_relay_membership(
         &state,
         tenant.community(),
