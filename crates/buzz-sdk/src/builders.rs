@@ -606,7 +606,9 @@ pub fn build_add_member(
     if let Some(r) = role {
         tags.push(tag(&["role", r.as_str()])?);
     }
-    Ok(EventBuilder::new(Kind::Custom(9000), "").tags(tags))
+    Ok(EventBuilder::new(Kind::Custom(9000), "")
+        .tags(tags)
+        .allow_self_tagging())
 }
 
 /// Build a NIP-29 remove-member event (kind 9001).
@@ -619,7 +621,9 @@ pub fn build_remove_member(
         tag(&["h", &channel_id.to_string()])?,
         tag(&["p", &target_pubkey.to_ascii_lowercase()])?,
     ];
-    Ok(EventBuilder::new(Kind::Custom(9001), "").tags(tags))
+    Ok(EventBuilder::new(Kind::Custom(9001), "")
+        .tags(tags)
+        .allow_self_tagging())
 }
 
 /// Build a NIP-29 leave-request event (kind 9022).
@@ -2256,6 +2260,14 @@ mod tests {
         Keys::generate()
     }
 
+    fn fixed_keys() -> Keys {
+        let secret = nostr::SecretKey::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("valid secret key");
+        Keys::new(secret)
+    }
+
     fn sign(b: EventBuilder) -> nostr::Event {
         b.sign_with_keys(&keys()).expect("sign")
     }
@@ -2879,12 +2891,41 @@ mod tests {
     }
 
     #[test]
+    fn add_member_preserves_self_target() {
+        let cid = Uuid::from_u128(1);
+        let signer = fixed_keys();
+        let target = signer.public_key().to_hex();
+        let ev = build_add_member(cid, &target, Some(MemberRole::Admin))
+            .unwrap()
+            .sign_with_keys(&signer)
+            .expect("sign");
+        assert_eq!(ev.kind.as_u16(), 9000);
+        assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert!(has_tag(&ev, "p", &target));
+        assert!(has_tag(&ev, "role", "admin"));
+    }
+
+    #[test]
     fn remove_member_happy_path() {
         let cid = uuid();
         let pubkey = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
         let ev = sign(build_remove_member(cid, pubkey).unwrap());
         assert_eq!(ev.kind.as_u16(), 9001);
         assert!(has_tag(&ev, "p", pubkey));
+    }
+
+    #[test]
+    fn remove_member_preserves_self_target() {
+        let cid = Uuid::from_u128(2);
+        let signer = fixed_keys();
+        let target = signer.public_key().to_hex();
+        let ev = build_remove_member(cid, &target)
+            .unwrap()
+            .sign_with_keys(&signer)
+            .expect("sign");
+        assert_eq!(ev.kind.as_u16(), 9001);
+        assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert!(has_tag(&ev, "p", &target));
     }
 
     #[test]
