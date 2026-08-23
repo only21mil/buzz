@@ -835,16 +835,16 @@ fn run_extract_output(
     for (out_name, matcher_name) in matchers {
         let result = run_matcher(matcher_name, &field_value)?;
         out.insert(
-            format!("{out_name}").into(),
-            serde_json::to_value(&result.value).unwrap_or(serde_json::json!("")),
+            out_name.clone(),
+            serde_json::to_value(&result.value).unwrap_or_default(),
         );
         out.insert(
-            format!("{out_name}_found").into(),
-            serde_json::to_value(&result.found).unwrap_or(serde_json::json!(false)),
+            format!("{out_name}_found"),
+            serde_json::to_value(result.found).unwrap_or_default(),
         );
         out.insert(
-            format!("{out_name}_count").into(),
-            serde_json::to_value(&result.count).unwrap_or(serde_json::json!(0)),
+            format!("{out_name}_count"),
+            serde_json::to_value(result.count).unwrap_or_default(),
         );
     }
     Ok(out)
@@ -882,7 +882,7 @@ fn run_matcher(name: &str, field: &str) -> Result<MatchResult, WorkflowError> {
             let count = count_sha_matches(field);
             let mut value = String::new();
             if count > 0 {
-                value = find_first_sha(field).unwrap_or(String::new());
+                value = find_first_sha(field).unwrap_or_default();
             }
             Ok(MatchResult {
                 value,
@@ -896,7 +896,7 @@ fn run_matcher(name: &str, field: &str) -> Result<MatchResult, WorkflowError> {
             let count = count_word_matches(field);
             let mut value = String::new();
             if count > 0 {
-                value = find_first_word(field).unwrap_or(String::new());
+                value = find_first_word(field).unwrap_or_default();
             }
             Ok(MatchResult {
                 value,
@@ -2121,13 +2121,13 @@ mod tests {
     #[test]
     fn extract_wf_sha_rejects_uppercase_and_short() {
         let upper = "6407ED82B9869A112E234A19B328511C90DB6647";
-        let result = run_matcher("wf_sha", &upper).expect("no match should not error");
+        let result = run_matcher("wf_sha", upper).expect("no match should not error");
         assert!(!result.found);
         assert_eq!(result.count, 0);
         assert_eq!(result.value, "");
 
         let short = "6407ed82";
-        let result = run_matcher("wf_sha", &short).expect("short sha should not error");
+        let result = run_matcher("wf_sha", short).expect("short sha should not error");
         assert!(!result.found);
     }
 
@@ -2146,7 +2146,7 @@ mod tests {
     #[test]
     fn extract_wf_sha_no_match_emits_empty_with_found_false() {
         let field = "no SHA here just words";
-        let result = run_matcher("wf_sha", &field).expect("no match should not error");
+        let result = run_matcher("wf_sha", field).expect("no match should not error");
         assert!(!result.found);
         assert_eq!(result.count, 0);
         assert_eq!(result.value, "");
@@ -2155,7 +2155,7 @@ mod tests {
     #[test]
     fn extract_wf_word_first_and_count() {
         let field = "alpha beta gamma";
-        let result = run_matcher("wf_word", &field).expect("words should match");
+        let result = run_matcher("wf_word", field).expect("words should match");
         assert!(result.found);
         assert_eq!(result.count, 3);
         assert_eq!(result.value, "alpha");
