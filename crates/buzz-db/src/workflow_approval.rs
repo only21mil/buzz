@@ -20,6 +20,7 @@ use crate::workflow_run_transition::acquire_workflow_approval_channel_lock;
 pub const ACTION_SUMMARY_MAX_BYTES: usize = 2_000;
 /// Maximum serialized size of a request lifecycle payload.
 pub const REQUEST_PAYLOAD_MAX_BYTES: usize = 65_536;
+const REQUEST_PAYLOAD_ALLOWED_FIELDS: [&str; 2] = ["class", "timeout_seconds"];
 
 /// A built-in channel role that may satisfy an approval policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -174,21 +175,10 @@ impl ApprovalActionSummary {
 pub struct ApprovalRequestPayload(Value);
 
 impl ApprovalRequestPayload {
-    /// Validate an object payload and reject fields that could carry raw gate
-    /// authority, frozen definitions, prior outputs, headers, or credentials.
+    /// Validate the exact caller-owned request fields.
     pub fn new(payload: Value) -> Result<Self> {
-        if !payload.is_object() {
-            return Err(DbError::InvalidData(
-                "approval request payload must be a JSON object".to_owned(),
-            ));
-        }
-        reject_forbidden_payload_fields(&payload)?;
-        let size = serde_json::to_vec(&payload)?.len();
-        if size > REQUEST_PAYLOAD_MAX_BYTES {
-            return Err(DbError::InvalidData(format!(
-                "approval request payload exceeds {REQUEST_PAYLOAD_MAX_BYTES} serialized bytes"
-            )));
-        }
+        validate_request_payload_fields(&payload)?;
+        validate_request_payload_size(&payload)?;
         Ok(Self(payload))
     }
 
@@ -224,6 +214,8 @@ pub struct CreateWorkflowApprovalGateParams<'a> {
     pub expires_at: DateTime<Utc>,
     /// Complete durable outputs of steps before this approval step.
     pub prior_step_outputs: &'a Value,
+    /// Complete display trace before this approval step.
+    pub prior_execution_trace: &'a Value,
     /// Exact display-only trace item appended when the run starts waiting.
     pub waiting_trace_entry: &'a Value,
     /// Request lifecycle payload for the durable outbox.
@@ -329,9 +321,10 @@ fn classify_run_gate_state(
 ///
 /// The channel advisory lock is the transaction's first database statement.
 /// The function then locks and fences the run, resolves the policy from active
-/// channel membership, creates the immutable gate, stores `next_step =
-/// step_index + 1` and prior outputs, appends one waiting trace item, advances
-/// the run generation, and inserts one request outbox row.
+/// channel membership, creates the immutable gate, stores `current_step =
+/// step_index`, `next_step = step_index + 1`, prior outputs, and the complete
+/// prior trace plus one waiting item, advances the run generation, and inserts
+/// one request outbox row.
 /// Any mismatch returns [`WorkflowApprovalGateCreationOutcome::Conflict`] and
 /// rolls back every write. An exact retry after commit returns `Reused`.
 pub async fn create_workflow_approval_gate(
@@ -357,7 +350,8 @@ pub async fn create_workflow_approval_gate(
     let run = sqlx::query(
         r#"
         SELECT run.workflow_id, run.status::text AS status, run.definition_hash,
-               run.generation, run.next_step, run.step_outputs, run.execution_trace,
+               run.generation, run.current_step, run.next_step, run.step_outputs,
+               run.execution_trace,
                clock_timestamp() AS database_now
         FROM workflow_runs AS run
         JOIN workflows AS workflow
@@ -367,7 +361,7 @@ pub async fn create_workflow_approval_gate(
           AND run.id = $2
           AND workflow.channel_id = $3
           AND workflow.deleted_at IS NULL
-        FOR UPDATE OF run
+        FOR UPDATE OF run, workflow
         "#,
     )
     .bind(params.community_id.as_uuid())
@@ -430,21 +424,24 @@ pub async fn create_workflow_approval_gate(
             r#"
             UPDATE workflow_runs
             SET status = 'waiting_approval',
-                next_step = $1,
-                step_outputs = $2,
-                execution_trace = execution_trace || jsonb_build_array($3::jsonb),
+                current_step = $1,
+                next_step = $2,
+                step_outputs = $3,
+                execution_trace = $4::jsonb || jsonb_build_array($5::jsonb),
                 generation = generation + 1
-            WHERE community_id = $4
-              AND id = $5
-              AND workflow_id = $6
+            WHERE community_id = $6
+              AND id = $7
+              AND workflow_id = $8
               AND status = 'running'
-              AND generation = $7
-              AND definition_hash = $8
+              AND generation = $9
+              AND definition_hash = $10
             RETURNING generation
             "#,
         )
+        .bind(params.step_index)
         .bind(next_step)
         .bind(params.prior_step_outputs)
+        .bind(params.prior_execution_trace)
         .bind(params.waiting_trace_entry)
         .bind(params.community_id.as_uuid())
         .bind(params.run_id)
@@ -520,13 +517,15 @@ pub async fn create_workflow_approval_gate(
             }
         }
         RunGateState::Replay { .. } => {
+            let stored_current_step: i32 = run.try_get("current_step")?;
             let stored_next_step: i32 = run.try_get("next_step")?;
             let stored_outputs: Value = run.try_get("step_outputs")?;
             let stored_trace: Value = run.try_get("execution_trace")?;
-            if stored_next_step != next_step
+            let expected_trace = expected_execution_trace(&params)?;
+            if stored_current_step != params.step_index
+                || stored_next_step != next_step
                 || stored_outputs != *params.prior_step_outputs
-                || stored_trace.as_array().and_then(|trace| trace.last())
-                    != Some(params.waiting_trace_entry)
+                || stored_trace != expected_trace
             {
                 tx.rollback().await?;
                 return Ok(WorkflowApprovalGateCreationOutcome::Conflict);
@@ -585,8 +584,23 @@ fn validate_params(params: &CreateWorkflowApprovalGateParams<'_>) -> Result<()> 
             "prior workflow step outputs must be a JSON object".to_owned(),
         ));
     }
+    if !params.prior_execution_trace.is_array() {
+        return Err(DbError::InvalidData(
+            "prior workflow execution trace must be a JSON array".to_owned(),
+        ));
+    }
     validate_waiting_trace_entry(params)?;
     Ok(())
+}
+
+fn expected_execution_trace(params: &CreateWorkflowApprovalGateParams<'_>) -> Result<Value> {
+    let Some(mut trace) = params.prior_execution_trace.as_array().cloned() else {
+        return Err(DbError::InvalidData(
+            "prior workflow execution trace must be a JSON array".to_owned(),
+        ));
+    };
+    trace.push(params.waiting_trace_entry.clone());
+    Ok(Value::Array(trace))
 }
 
 fn validate_waiting_trace_entry(params: &CreateWorkflowApprovalGateParams<'_>) -> Result<()> {
@@ -598,12 +612,17 @@ fn validate_waiting_trace_entry(params: &CreateWorkflowApprovalGateParams<'_>) -
     if entry.get("step_id").and_then(Value::as_str) != Some(params.step_id)
         || entry.get("step_index").and_then(Value::as_i64) != Some(i64::from(params.step_index))
         || entry.get("status").and_then(Value::as_str) != Some("waiting_approval")
+        || entry.len() != 3
+        || entry
+            .keys()
+            .any(|key| !matches!(key.as_str(), "step_id" | "step_index" | "status"))
     {
         return Err(DbError::InvalidData(
-            "waiting trace entry must bind the exact step and waiting_approval status".to_owned(),
+            "waiting trace entry must contain only the exact step and waiting_approval status"
+                .to_owned(),
         ));
     }
-    reject_forbidden_payload_fields(params.waiting_trace_entry)
+    Ok(())
 }
 
 fn resolved_approver_set(policy: &CanonicalApprovalPolicy, approvers: &ResolvedApprovers) -> Value {
@@ -661,37 +680,51 @@ fn validate_pubkey(pubkey: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn reject_forbidden_payload_fields(value: &Value) -> Result<()> {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                let normalized = key.to_ascii_lowercase();
-                if normalized.contains("token")
-                    || matches!(
-                        normalized.as_str(),
-                        "definition"
-                            | "definition_snapshot"
-                            | "step_outputs"
-                            | "outputs"
-                            | "headers"
-                            | "secret"
-                            | "secrets"
-                            | "credentials"
-                    )
-                {
-                    return Err(DbError::InvalidData(format!(
-                        "approval request payload contains forbidden field '{key}'"
-                    )));
-                }
-                reject_forbidden_payload_fields(value)?;
-            }
+fn validate_request_payload_fields(value: &Value) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Err(DbError::InvalidData(
+            "approval request payload must be a JSON object".to_owned(),
+        ));
+    };
+    if object.len() != REQUEST_PAYLOAD_ALLOWED_FIELDS.len()
+        || REQUEST_PAYLOAD_ALLOWED_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Err(DbError::InvalidData(
+            "approval request payload must contain exactly class and timeout_seconds".to_owned(),
+        ));
+    }
+    for key in object.keys() {
+        if !REQUEST_PAYLOAD_ALLOWED_FIELDS.contains(&key.as_str()) {
+            return Err(DbError::InvalidData(format!(
+                "approval request payload contains unsupported field '{key}'"
+            )));
         }
-        Value::Array(values) => {
-            for value in values {
-                reject_forbidden_payload_fields(value)?;
-            }
-        }
-        _ => {}
+    }
+    if object.get("class").and_then(Value::as_str) != Some("approval_requested") {
+        return Err(DbError::InvalidData(
+            "approval request payload class is invalid".to_owned(),
+        ));
+    }
+    if object
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .is_none_or(|seconds| seconds == 0)
+    {
+        return Err(DbError::InvalidData(
+            "approval request payload timeout_seconds must be a positive integer".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_request_payload_size(value: &Value) -> Result<()> {
+    let size = serde_json::to_vec(value)?.len();
+    if size > REQUEST_PAYLOAD_MAX_BYTES {
+        return Err(DbError::InvalidData(format!(
+            "approval request payload exceeds {REQUEST_PAYLOAD_MAX_BYTES} serialized bytes"
+        )));
     }
     Ok(())
 }
@@ -909,13 +942,164 @@ fn bound_request_payload(
         ),
     );
     let payload = Value::Object(payload);
-    ApprovalRequestPayload::new(payload.clone())?;
+    validate_request_payload_size(&payload)?;
     Ok(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::user::ensure_user;
+
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+
+    struct PostgresGateFixture {
+        pool: PgPool,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        workflow_id: Uuid,
+        run_id: Uuid,
+        definition_hash: Vec<u8>,
+        policy: CanonicalApprovalPolicy,
+        expires_at: DateTime<Utc>,
+    }
+
+    impl PostgresGateFixture {
+        async fn new(initial_execution_trace: &Value) -> Self {
+            let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            let pool = PgPool::connect(&database_url)
+                .await
+                .expect("connect to test DB");
+            crate::migration::run_migrations(&pool)
+                .await
+                .expect("run migrations");
+
+            let community_id = CommunityId::from_uuid(Uuid::new_v4());
+            let channel_id = Uuid::new_v4();
+            let workflow_id = Uuid::new_v4();
+            let run_id = Uuid::new_v4();
+            let owner = vec![0x71; 32];
+            let approver = vec![0x72; 32];
+            let definition_hash = vec![0x73; 32];
+            let definition = serde_json::json!({
+                "trigger": {"on": "message_posted"},
+                "steps": [
+                    {"id": "prepare", "run": "prepare"},
+                    {"id": "optional", "run": "optional"},
+                    {"id": "approve-release", "approval": {"role": "owner"}}
+                ]
+            });
+
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_id.as_uuid())
+                .bind(format!(
+                    "approval-trace-{}.test",
+                    community_id.as_uuid().simple()
+                ))
+                .execute(&pool)
+                .await
+                .expect("insert community");
+            ensure_user(&pool, community_id, &owner)
+                .await
+                .expect("insert owner");
+            ensure_user(&pool, community_id, &approver)
+                .await
+                .expect("insert approver");
+            sqlx::query(
+                "INSERT INTO channels (community_id, id, name, created_by) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(channel_id)
+            .bind(format!("approval-trace-{}", channel_id.simple()))
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .expect("insert channel");
+            sqlx::query(
+                "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+                 VALUES ($1, $2, $3, 'owner'), ($1, $2, $4, 'admin')",
+            )
+            .bind(community_id.as_uuid())
+            .bind(channel_id)
+            .bind(&owner)
+            .bind(&approver)
+            .execute(&pool)
+            .await
+            .expect("insert channel members");
+            sqlx::query(
+                "INSERT INTO workflows \
+                 (community_id, id, name, owner_pubkey, channel_id, definition, definition_hash) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(workflow_id)
+            .bind(format!("approval-trace-{}", workflow_id.simple()))
+            .bind(&owner)
+            .bind(channel_id)
+            .bind(&definition)
+            .bind(&definition_hash)
+            .execute(&pool)
+            .await
+            .expect("insert workflow");
+            sqlx::query(
+                "INSERT INTO workflow_runs \
+                 (community_id, id, workflow_id, definition_snapshot, definition_hash, generation, \
+                  status, current_step, next_step, step_outputs, execution_trace) \
+                 VALUES ($1, $2, $3, $4, $5, 7, 'running', 0, 0, '{}'::jsonb, $6)",
+            )
+            .bind(community_id.as_uuid())
+            .bind(run_id)
+            .bind(workflow_id)
+            .bind(&definition)
+            .bind(&definition_hash)
+            .bind(initial_execution_trace)
+            .execute(&pool)
+            .await
+            .expect("insert workflow run");
+
+            Self {
+                pool,
+                community_id,
+                channel_id,
+                workflow_id,
+                run_id,
+                definition_hash,
+                policy: CanonicalApprovalPolicy::new(vec![approver], vec![ApprovalRole::Owner])
+                    .expect("approval policy"),
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            }
+        }
+
+        fn params<'a>(
+            &'a self,
+            summary: &'a ApprovalActionSummary,
+            outputs: &'a Value,
+            prior_trace: &'a Value,
+            waiting: &'a Value,
+            request: &'a ApprovalRequestPayload,
+        ) -> CreateWorkflowApprovalGateParams<'a> {
+            CreateWorkflowApprovalGateParams {
+                community_id: self.community_id,
+                channel_id: self.channel_id,
+                workflow_id: self.workflow_id,
+                run_id: self.run_id,
+                definition_hash: &self.definition_hash,
+                step_id: "approve-release",
+                step_index: 2,
+                expected_generation: 7,
+                policy: &self.policy,
+                action_summary: summary,
+                expires_at: self.expires_at,
+                prior_step_outputs: outputs,
+                prior_execution_trace: prior_trace,
+                waiting_trace_entry: waiting,
+                request_payload: request,
+            }
+        }
+    }
 
     #[test]
     fn policy_and_resolved_approvers_are_canonical() {
@@ -958,22 +1142,58 @@ mod tests {
     }
 
     #[test]
-    fn request_payload_rejects_private_or_unbounded_data() {
+    fn request_payload_accepts_only_the_exact_caller_fields() {
         assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "approval_id": Uuid::new_v4(),
-            "action_summary": "review deploy"
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
         }))
         .is_ok());
+        for field in [
+            "password",
+            "authorization",
+            "cookie",
+            "api_key",
+            "private_key",
+            "approval_token",
+            "definition_snapshot",
+            "step_outputs",
+        ] {
+            let mut payload = serde_json::json!({
+                "class": "approval_requested",
+                "timeout_seconds": 3_600
+            })
+            .as_object()
+            .cloned()
+            .expect("request payload object");
+            payload.insert(field.to_owned(), Value::String("private".to_owned()));
+            assert!(
+                ApprovalRequestPayload::new(Value::Object(payload)).is_err(),
+                "unexpectedly accepted {field}"
+            );
+        }
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"class": "approval_requested"}),
+            serde_json::json!({"timeout_seconds": 3_600}),
+            serde_json::json!({
+                "class": "wrong",
+                "timeout_seconds": 3_600
+            }),
+            serde_json::json!({
+                "class": "approval_requested",
+                "timeout_seconds": "3600"
+            }),
+        ] {
+            assert!(ApprovalRequestPayload::new(payload).is_err());
+        }
         assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "nested": {"approval_token": "raw"}
+            "class": {"password": "private"},
+            "timeout_seconds": 3_600
         }))
         .is_err());
         assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "step_outputs": {"secret": "value"}
-        }))
-        .is_err());
-        assert!(ApprovalRequestPayload::new(serde_json::json!({
-            "summary": "x".repeat(REQUEST_PAYLOAD_MAX_BYTES)
+            "class": "approval_requested",
+            "timeout_seconds": 0
         }))
         .is_err());
     }
@@ -1026,13 +1246,15 @@ mod tests {
         let approvers = ResolvedApprovers::new(vec![approver.clone()]).expect("approvers");
         let summary = ApprovalActionSummary::new("release candidate").expect("summary");
         let outputs = serde_json::json!({"build": {"private": "not published"}});
+        let prior_trace = serde_json::json!([]);
         let waiting = serde_json::json!({
             "step_id": "approve-release",
             "step_index": 2,
             "status": "waiting_approval"
         });
         let request = ApprovalRequestPayload::new(serde_json::json!({
-            "class": "approval_requested"
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
         }))
         .expect("request");
         let params = CreateWorkflowApprovalGateParams {
@@ -1048,6 +1270,7 @@ mod tests {
             action_summary: &summary,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             prior_step_outputs: &outputs,
+            prior_execution_trace: &prior_trace,
             waiting_trace_entry: &waiting,
             request_payload: &request,
         };
@@ -1073,6 +1296,17 @@ mod tests {
         let serialized = serde_json::to_string(&payload).expect("serialize payload");
         assert!(!serialized.contains("not published"));
         assert!(!serialized.to_ascii_lowercase().contains("token"));
+
+        assert_eq!(
+            expected_execution_trace(&params).expect("expected execution trace"),
+            serde_json::json!([waiting])
+        );
+        let invalid_trace = serde_json::json!({});
+        let invalid_params = CreateWorkflowApprovalGateParams {
+            prior_execution_trace: &invalid_trace,
+            ..params
+        };
+        assert!(validate_params(&invalid_params).is_err());
     }
 
     #[test]
@@ -1082,12 +1316,17 @@ mod tests {
         let summary = ApprovalActionSummary::new("inspect change").expect("summary");
         let definition_hash = vec![0x41; 32];
         let outputs = serde_json::json!({});
+        let prior_trace = serde_json::json!([]);
         let wrong_waiting = serde_json::json!({
             "step_id": "other",
             "step_index": 1,
             "status": "waiting_approval"
         });
-        let request = ApprovalRequestPayload::new(serde_json::json!({})).expect("request");
+        let request = ApprovalRequestPayload::new(serde_json::json!({
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
+        }))
+        .expect("request");
         let params = CreateWorkflowApprovalGateParams {
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             channel_id: Uuid::new_v4(),
@@ -1101,10 +1340,96 @@ mod tests {
             action_summary: &summary,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             prior_step_outputs: &outputs,
+            prior_execution_trace: &prior_trace,
             waiting_trace_entry: &wrong_waiting,
             request_payload: &request,
         };
 
         assert!(validate_params(&params).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn prior_trace_is_persisted_once_and_replay_does_not_append() {
+        let fixture = PostgresGateFixture::new(&serde_json::json!([])).await;
+        let summary = ApprovalActionSummary::new("release candidate").expect("summary");
+        let outputs = serde_json::json!({"prepare": {"artifact": "candidate"}});
+        let prior_trace = serde_json::json!([
+            {"step_id": "prepare", "step_index": 0, "status": "completed"},
+            {"step_id": "optional", "step_index": 1, "status": "skipped"}
+        ]);
+        let waiting = serde_json::json!({
+            "step_id": "approve-release",
+            "step_index": 2,
+            "status": "waiting_approval"
+        });
+        let expected_trace = serde_json::json!([
+            {"step_id": "prepare", "step_index": 0, "status": "completed"},
+            {"step_id": "optional", "step_index": 1, "status": "skipped"},
+            {"step_id": "approve-release", "step_index": 2, "status": "waiting_approval"}
+        ]);
+        let request = ApprovalRequestPayload::new(serde_json::json!({
+            "class": "approval_requested",
+            "timeout_seconds": 3_600
+        }))
+        .expect("request");
+
+        let created = create_workflow_approval_gate(
+            &fixture.pool,
+            fixture.params(&summary, &outputs, &prior_trace, &waiting, &request),
+        )
+        .await
+        .expect("create gate");
+        let (approval_id, outbox_id) = match created {
+            WorkflowApprovalGateCreationOutcome::Created { gate, request } => {
+                (gate.approval_id, request.outbox_id)
+            }
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let replayed = create_workflow_approval_gate(
+            &fixture.pool,
+            fixture.params(&summary, &outputs, &prior_trace, &waiting, &request),
+        )
+        .await
+        .expect("replay gate");
+        match replayed {
+            WorkflowApprovalGateCreationOutcome::Reused { gate, request } => {
+                assert_eq!(gate.approval_id, approval_id);
+                assert_eq!(request.outbox_id, outbox_id);
+            }
+            other => panic!("expected Reused, got {other:?}"),
+        }
+
+        let row = sqlx::query(
+            "SELECT status::text AS status, generation, current_step, next_step, \
+                    step_outputs, execution_trace \
+             FROM workflow_runs WHERE community_id = $1 AND id = $2",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .bind(fixture.run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read workflow run");
+        assert_eq!(
+            row.try_get::<String, _>("status").expect("status"),
+            "waiting_approval"
+        );
+        assert_eq!(row.try_get::<i64, _>("generation").expect("generation"), 8);
+        assert_eq!(
+            row.try_get::<i32, _>("current_step").expect("current step"),
+            2
+        );
+        assert_eq!(row.try_get::<i32, _>("next_step").expect("next step"), 3);
+        assert_eq!(
+            row.try_get::<Value, _>("step_outputs")
+                .expect("step outputs"),
+            outputs
+        );
+        assert_eq!(
+            row.try_get::<Value, _>("execution_trace")
+                .expect("execution trace"),
+            expected_trace
+        );
     }
 }

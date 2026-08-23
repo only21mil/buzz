@@ -131,7 +131,8 @@ pub enum ActionDef {
     },
     /// Suspend execution and request approval.
     RequestApproval {
-        /// User mention or role (e.g. `"@release-manager"`).
+        /// `owner`, `admin`, or a lowercase 64-hex pubkey. Templates may
+        /// resolve to one of those canonical forms at execution time.
         from: String,
         /// Message shown to the approver.
         message: String,
@@ -262,6 +263,15 @@ impl WorkflowDef {
                             step.id
                         )));
                     }
+                }
+                ActionDef::RequestApproval { from, .. }
+                    if !from.contains("{{")
+                        && crate::executor::parse_approval_policy(from).is_err() =>
+                {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "request_approval step '{}' requires from to be owner, admin, or a lowercase 64-hex pubkey",
+                        step.id
+                    )));
                 }
                 _ => {}
             }
@@ -419,7 +429,7 @@ mod tests {
             "  - id: topic\n    action: set_channel_topic\n    topic: Status active\n",
             "  - id: react\n    action: add_reaction\n    emoji: white_check_mark\n",
             "  - id: hook\n    action: call_webhook\n    url: https://hooks.example.com/notify\n    method: POST\n",
-            "  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: Approve?\n    timeout: 4h\n",
+            "  - id: approve\n    action: request_approval\n    from: admin\n    message: Approve?\n    timeout: 4h\n",
             "  - id: wait\n    action: delay\n    duration: 5m\n",
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
@@ -455,7 +465,7 @@ mod tests {
             "name: Deploy Approval\n",
             "trigger:\n  on: webhook\n",
             "steps:\n",
-            "  - id: request\n    action: request_approval\n    from: '@engineering-lead'\n",
+            "  - id: request\n    action: request_approval\n    from: owner\n",
             "    message: Approve deploy?\n    timeout: 4h\n",
             "  - id: notify_approved\n    if: 'steps_request_output_approved == true'\n",
             "    action: send_message\n    text: Deploy approved\n",
@@ -464,6 +474,18 @@ mod tests {
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
         assert_eq!(def.steps.len(), 3);
+    }
+
+    #[test]
+    fn approval_policy_rejects_unresolvable_mentions_at_definition_time() {
+        let yaml = "name: Approval\ntrigger:\n  on: webhook\nsteps:\n  - id: approve\n    action: request_approval\n    from: '@engineering-lead'\n    message: Approve?\n";
+        assert!(parse_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn approval_policy_allows_a_runtime_template() {
+        let yaml = "name: Approval\ntrigger:\n  on: webhook\nsteps:\n  - id: approve\n    action: request_approval\n    from: '{{trigger.author}}'\n    message: Approve?\n";
+        assert!(parse_yaml(yaml).is_ok());
     }
 
     #[test]
