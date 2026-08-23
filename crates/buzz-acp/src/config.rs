@@ -2821,21 +2821,26 @@ channels = "ALL"
     }
 
     #[test]
-    fn allowed_respond_to_full_path_unset_allows_all() {
-        // No --allowed-respond-to flag → anyone is accepted.
+    fn allowed_respond_to_full_path_all_modes_allowed() {
+        // Pass --allowed-respond-to with all modes explicitly so the test does
+        // not read BUZZ_ACP_ALLOWED_RESPOND_TO from the process environment.
+        // The env var is #[arg(env)] on the same field, so without an explicit
+        // flag clap falls back to it and the test fails on any shell that sets it.
         let args = CliArgs::try_parse_from([
             "buzz-acp",
             "--private-key",
             TEST_PRIVATE_KEY,
             "--respond-to",
             "anyone",
+            "--allowed-respond-to",
+            "anyone,owner-only,allowlist,nobody",
         ])
         .expect("clap should parse args");
         let result = Config::from_args(args);
 
         assert!(
             result.is_ok(),
-            "from_args should accept any mode when allowed list is unset: {result:?}"
+            "from_args should accept any mode when all modes are allowed: {result:?}"
         );
     }
 
@@ -2843,12 +2848,19 @@ channels = "ALL"
 
     #[test]
     fn max_turn_duration_at_ceiling_is_accepted() {
+        // Pass --allowed-respond-to explicitly so the test does not read
+        // BUZZ_ACP_ALLOWED_RESPOND_TO from the environment. Without it, clap
+        // feeds the ambient value, and if it excludes the default
+        // respond-to=owner-only the test fails even though it is not about
+        // respond-to at all.
         let args = CliArgs::try_parse_from([
             "buzz-acp",
             "--private-key",
             TEST_PRIVATE_KEY,
             "--max-turn-duration",
             &MAX_TURN_DURATION_CEILING_SECS.to_string(),
+            "--allowed-respond-to",
+            "anyone,owner-only,allowlist,nobody",
         ])
         .expect("clap should parse args");
         let result = Config::from_args(args);
