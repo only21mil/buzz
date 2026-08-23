@@ -261,8 +261,18 @@ grep -Fq 'BUZZ_ANDROID_RELEASE_SIGNING: external' <<<"$build_job" || \
   hermit_line="$(grep -nF 'cashapp/activate-hermit@' <<<"$build_job" | cut -d: -f1)"
   (( checkout_line < move_line )) || fail "trusted handoff policy checkout does not precede its runner-temp move"
   (( move_line < hermit_line )) || fail "trusted handoff policy is not moved before Hermit activation"
-  [[ "$(count_active_runner_temp_verifiers "$build_job")" -eq 1 ]] || \
+  runner_temp_verifier_count="$(count_active_runner_temp_verifiers "$build_job")"
+  if [[ "$runner_temp_verifier_count" -ne 1 ]]; then
+    printf 'runner-temp unsigned handoff verifier count: %s\n' "$runner_temp_verifier_count" >&2
+    awk '
+      {
+        stripped = $0
+        sub(/^[[:space:]]*/, "", stripped)
+        if (index(stripped, "verify-android-fork-release-unsigned-apk.sh") > 0) print $0
+      }
+    ' <<<"$build_job" | cat -A >&2
     fail "networked build must actively invoke the runner-temp unsigned handoff verifier exactly once"
+  fi
   duplicated_verifier_job="$build_job"$'\n'"$runner_temp_verifier_command"
   [[ "$(count_active_runner_temp_verifiers "$duplicated_verifier_job")" -eq 2 ]] || \
     fail "duplicated active runner-temp verifier fixture does not count twice"
