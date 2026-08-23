@@ -199,6 +199,21 @@ fn reaction_emoji_for_storage(content: &str) -> &str {
     }
 }
 
+fn validate_reaction_target_channel(
+    target_channel: Option<Uuid>,
+    requested_channel: Uuid,
+) -> Result<(), ActionSinkError> {
+    match target_channel {
+        Some(target_channel) if target_channel == requested_channel => Ok(()),
+        Some(_) => Err(ActionSinkError::InvalidInput(format!(
+            "reaction target is not in requested channel {requested_channel}"
+        ))),
+        None => Err(ActionSinkError::InvalidInput(
+            "reaction target is not channel-scoped".into(),
+        )),
+    }
+}
+
 impl ActionSink for RelayActionSink {
     fn send_message(
         &self,
@@ -443,19 +458,7 @@ impl ActionSink for RelayActionSink {
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?
                 .ok_or_else(|| ActionSinkError::TargetNotFound(target_event_id.clone()))?;
-            match target.channel_id {
-                Some(target_channel) if target_channel == channel_uuid => {}
-                Some(target_channel) => {
-                    return Err(ActionSinkError::InvalidInput(format!(
-                        "reaction target belongs to channel {target_channel}, not {channel_id_canonical}"
-                    )));
-                }
-                None => {
-                    return Err(ActionSinkError::InvalidInput(
-                        "reaction target is not channel-scoped".into(),
-                    ));
-                }
-            }
+            validate_reaction_target_channel(target.channel_id, channel_uuid)?;
 
             let channel = state
                 .db
@@ -591,6 +594,27 @@ mod tests {
     fn empty_reaction_content_uses_nip25_like_for_storage() {
         assert_eq!(reaction_emoji_for_storage(""), "+");
         assert_eq!(reaction_emoji_for_storage("👍"), "👍");
+    }
+
+    #[test]
+    fn cross_channel_reaction_error_redacts_foreign_channel() {
+        let requested = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .expect("requested channel UUID");
+        let foreign =
+            Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("foreign channel UUID");
+
+        let error = validate_reaction_target_channel(Some(foreign), requested)
+            .expect_err("cross-channel target must be rejected");
+        let ActionSinkError::InvalidInput(message) = error else {
+            panic!("cross-channel target returned the wrong error variant");
+        };
+
+        assert_eq!(
+            message,
+            format!("reaction target is not in requested channel {requested}")
+        );
+        assert!(message.contains(&requested.to_string()));
+        assert!(!message.contains(&foreign.to_string()));
     }
 
     #[test]
