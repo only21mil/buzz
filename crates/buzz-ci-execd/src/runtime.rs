@@ -542,6 +542,16 @@ pub(crate) struct RuntimePaths {
     pub(crate) state_file: PathBuf,
 }
 
+/// Exact ordinary authority recovered from the same root-owned runtime files
+/// that control durable dispatch.
+pub(crate) struct ReopenedOrdinaryAuthority {
+    pub(crate) request: AdmitAttemptRequest,
+    pub(crate) admission: OrdinaryAdmission,
+    pub(crate) recovery_lease: Option<LeaseToken>,
+    pub(crate) authority_revision: u64,
+    pub(crate) authority_sha256: [u8; 32],
+}
+
 impl RuntimePaths {
     pub(crate) fn canonical() -> Self {
         Self {
@@ -655,6 +665,33 @@ fn prepare_from_paths_for_owner(
         paths: paths.clone(),
         expected_uid,
     }))
+}
+
+/// Reopen the ordinary request and any retained opaque lease without restoring
+/// or mutating the controller. Production job plans use this instead of caller
+/// claims for request, signer, generation, and deadline authority.
+pub(crate) fn reopen_ordinary_authority(
+    paths: &RuntimePaths,
+    now: u64,
+    expected_uid: u32,
+) -> Result<ReopenedOrdinaryAuthority, RuntimeLoadError> {
+    let prepared = match prepare_from_paths_for_owner(paths, now, expected_uid) {
+        RuntimePreparation::Prepared(prepared) => prepared,
+        RuntimePreparation::NotProvisioned(error)
+        | RuntimePreparation::Quarantined { reason: error, .. } => return Err(error),
+    };
+    let ordinary = prepared
+        .authority
+        .ordinary
+        .as_ref()
+        .ok_or(RuntimeLoadError::NotProvisioned)?;
+    Ok(ReopenedOrdinaryAuthority {
+        request: ordinary.request,
+        admission: ordinary.admission,
+        recovery_lease: prepared.snapshot.active_lease,
+        authority_revision: prepared.authority.revision,
+        authority_sha256: prepared.authority_sha256,
+    })
 }
 
 fn persist_quarantine(

@@ -26,7 +26,7 @@ pub use route::{CanonicalRoute, DockerMethod, DockerRoute};
 pub use state::{AttemptPhase, ObjectLedger};
 pub use transport::{
     ArchiveDirection, ArchiveGrant, HijackGrant, InheritedOneShotConnector, InheritedProxy,
-    NoopPreStartObserver, OneShotUpstreamConnector, PreStartObserver, TransportLimits,
+    LifecycleEvent, LifecycleObserver, LifecyclePhase, OneShotUpstreamConnector, TransportLimits,
     UpstreamCapability,
 };
 

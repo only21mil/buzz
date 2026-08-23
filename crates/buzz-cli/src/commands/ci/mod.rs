@@ -1,7 +1,7 @@
 use clap::Subcommand;
-
-// Candidate A compiles and tests these pure helpers before relay/API v1.2
-// supplies the signer-authority and watch transport wiring used by dispatch.
+pub mod dispatch;
+pub mod read_commands;
+// Helper modules encode the frozen wire contract (dead_code: relay-side surface).
 #[allow(dead_code)]
 pub mod evidence;
 #[allow(dead_code)]

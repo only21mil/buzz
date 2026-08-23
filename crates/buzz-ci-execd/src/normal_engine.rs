@@ -13,6 +13,7 @@ use buzz_ci_broker_protocol::{
 use buzz_ci_isolation_contract::{
     AttemptLeaseBinding, Phase1ValidationContext, ValidatedAttemptLeaseBinding,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -37,6 +38,8 @@ const FIRST_TERMINAL_SEQUENCE: u64 = 3;
 /// Reviewed `nektos/act` v0.2.89 Linux x86_64 binary digest.
 pub const PINNED_ACT_SHA256: &str =
     "6be37b104430efc210d5130495bedcff2dc7cd6780a38d88f3d205e7f1185cc1";
+/// Fixed content-addressed installation path for the reviewed `act` binary.
+pub const PINNED_ACT_PATH: &str = "/usr/local/libexec/buzzci/act-0.2.89";
 
 const TERMINAL_PREFIX: [OrderingEvent; 7] = [
     OrderingEvent::Stop,
@@ -55,7 +58,7 @@ const TERMINAL_SUFFIX: [OrderingEvent; 3] = [
 ];
 
 /// Root-owned validation inputs used to consume an untrusted lease binding.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BindingValidationAuthority {
     pub now_unix_seconds: u64,
     pub max_expiry_horizon_seconds: u64,
@@ -65,9 +68,13 @@ pub struct BindingValidationAuthority {
 }
 
 impl BindingValidationAuthority {
-    fn context(&self) -> Phase1ValidationContext<'_> {
+    pub(crate) fn context(&self) -> Phase1ValidationContext<'_> {
+        self.context_at(self.now_unix_seconds)
+    }
+
+    pub(crate) fn context_at(&self, now_unix_seconds: u64) -> Phase1ValidationContext<'_> {
         Phase1ValidationContext {
-            now_unix_seconds: self.now_unix_seconds,
+            now_unix_seconds,
             max_expiry_horizon_seconds: self.max_expiry_horizon_seconds,
             forbidden_host_uids: &self.forbidden_host_uids,
             expected_engine_version: &self.expected_engine_version,
@@ -77,7 +84,7 @@ impl BindingValidationAuthority {
 }
 
 /// Exact `act` invocation selected by root-owned policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActLaunchPlan {
     pub binary: PathBuf,
     pub binary_sha256: [u8; 32],
@@ -154,7 +161,8 @@ impl ActLaunchPlan {
             &self.inputs_path,
             &self.proxy_socket,
         ];
-        if hex::encode(self.binary_sha256) != PINNED_ACT_SHA256
+        if self.binary != Path::new(PINNED_ACT_PATH)
+            || hex::encode(self.binary_sha256) != PINNED_ACT_SHA256
             || paths.iter().any(|path| !safe_absolute(path))
             || self.job_id.is_empty()
             || !safe_token(&self.job_id)
@@ -183,7 +191,7 @@ pub struct NormalJobPlan {
 }
 
 impl NormalJobPlan {
-    fn validate_identity(
+    pub(crate) fn validate_identity(
         &self,
         request: AdmitAttemptRequest,
         admission: OrdinaryAdmission,
@@ -264,18 +272,17 @@ pub trait NormalExecutionBackend {
         store: &EvidenceStore,
     ) -> Result<(), ExecutionUnavailable>;
 
-    /// Complete create, effective-spec inspection, seccomp persistence, and
-    /// start. The pre-start observer must commit before this method succeeds.
-    fn proxy_create_inspect_start(
+    /// Prepare the per-lease policy proxy, then launch the pinned Act command.
+    /// Act remains the sole container client through `DOCKER_HOST`; this
+    /// method must not issue Docker create or start requests itself.
+    fn run_act_through_proxy(
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
+        plan: &ActLaunchPlan,
         binding: &ValidatedAttemptLeaseBinding,
         store: &EvidenceStore,
     ) -> Result<(), ExecutionUnavailable>;
-
-    /// Launch only the supplied pinned command in its exact executor unit.
-    fn start_act(&mut self, plan: &ActLaunchPlan) -> Result<(), ExecutionUnavailable>;
 
     fn terminal_evidence(
         &mut self,
@@ -411,9 +418,13 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
             .map_err(|_| ExecutionUnavailable)?;
         self.backend
             .materialize(&active.plan, &active.binding, &store)?;
-        self.backend
-            .proxy_create_inspect_start(admission, lease, &active.binding, &store)?;
-        self.backend.start_act(&active.plan.act)?;
+        self.backend.run_act_through_proxy(
+            admission,
+            lease,
+            &active.plan.act,
+            &active.binding,
+            &store,
+        )?;
         active.provision_complete = true;
         Ok(())
     }
@@ -1257,8 +1268,7 @@ mod tests {
         Preflight,
         Dns,
         Materialize,
-        Proxy,
-        Act,
+        ActThroughProxy,
         Terminal,
         Cleanup,
     }
@@ -1350,15 +1360,26 @@ mod tests {
             self.fail_if(FailStage::Materialize)
         }
 
-        fn proxy_create_inspect_start(
+        fn run_act_through_proxy(
             &mut self,
             _admission: OrdinaryAdmission,
             _lease: LeaseToken,
+            plan: &ActLaunchPlan,
             _binding: &ValidatedAttemptLeaseBinding,
             store: &EvidenceStore,
         ) -> Result<(), ExecutionUnavailable> {
-            self.push("prestart");
-            self.fail_if(FailStage::Proxy)?;
+            self.push("proxy-ready");
+            self.fail_if(FailStage::ActThroughProxy)?;
+            self.push("act-start");
+            assert_eq!(plan.environment()?.len(), 4);
+            assert!(plan
+                .environment()?
+                .iter()
+                .any(|(key, value)| key == "DOCKER_HOST" && value.contains("proxy.sock")));
+            assert!(!plan
+                .argv()?
+                .iter()
+                .any(|value| value.contains("DOCKER_HOST")));
             store
                 .append_ordering(&ordering(
                     &self.lease_id,
@@ -1375,22 +1396,6 @@ mod tests {
                     OrderingEvent::Start,
                 ))
                 .map_err(|_| ExecutionUnavailable)?;
-            self.push("proxy-start");
-            Ok(())
-        }
-
-        fn start_act(&mut self, plan: &ActLaunchPlan) -> Result<(), ExecutionUnavailable> {
-            self.push("act-start");
-            self.fail_if(FailStage::Act)?;
-            assert_eq!(plan.environment()?.len(), 4);
-            assert!(plan
-                .environment()?
-                .iter()
-                .any(|(key, value)| key == "DOCKER_HOST" && value.contains("proxy.sock")));
-            assert!(!plan
-                .argv()?
-                .iter()
-                .any(|value| value.contains("DOCKER_HOST")));
             Ok(())
         }
 
@@ -1887,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_enforces_prestart_and_publishes_clean_teardown() {
+    fn provision_arms_proxy_before_act_without_broker_runtime_requests() {
         let (fixture, mut engine, log) = build_engine(FailStage::None, false, false);
         let receipts = run_to_terminal(&fixture, &mut engine).unwrap();
         assert_eq!(receipts.conclusion, LeaseConclusion::Success);
@@ -1907,8 +1912,7 @@ mod tests {
                 "preflight",
                 "dns",
                 "materialize",
-                "prestart",
-                "proxy-start",
+                "proxy-ready",
                 "act-start",
                 "terminal",
                 "cleanup"
@@ -1921,8 +1925,7 @@ mod tests {
         for stage in [
             FailStage::Dns,
             FailStage::Materialize,
-            FailStage::Proxy,
-            FailStage::Act,
+            FailStage::ActThroughProxy,
         ] {
             let (fixture, mut engine, _) = build_engine(stage, false, false);
             engine

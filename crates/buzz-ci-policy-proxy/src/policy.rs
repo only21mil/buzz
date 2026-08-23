@@ -46,6 +46,13 @@ pub struct CanonicalExec {
     operation_id: u64,
 }
 
+impl CanonicalExec {
+    /// Return the exact owned container this exec-create targets.
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
+}
+
 /// Security-sensitive effective container fields returned by pre-start inspect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,8 +176,34 @@ pub struct ProxyPolicy {
     pending_creates: BTreeMap<u64, String>,
     created_requests: BTreeMap<String, CanonicalCreate>,
     pending_execs: BTreeMap<u64, String>,
+    container_lifecycle: ContainerLifecycle,
     executor_uid: u32,
     runtime_uid: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContainerLifecycle {
+    AwaitCreate,
+    Creating {
+        operation_id: u64,
+        fingerprint: String,
+    },
+    Created {
+        container_id: String,
+    },
+    Starting {
+        container_id: String,
+    },
+    Started {
+        container_id: String,
+    },
+    Deleting {
+        container_id: String,
+        was_started: bool,
+    },
+    Removed {
+        container_id: String,
+    },
 }
 
 impl ProxyPolicy {
@@ -210,6 +243,7 @@ impl ProxyPolicy {
             pending_creates: BTreeMap::new(),
             created_requests: BTreeMap::new(),
             pending_execs: BTreeMap::new(),
+            container_lifecycle: ContainerLifecycle::AwaitCreate,
             executor_uid,
             runtime_uid,
         })
@@ -219,6 +253,16 @@ impl ProxyPolicy {
     pub(crate) fn install_for_test(manifest: PolicyManifest) -> Result<Self, ProxyError> {
         manifest.validate()?;
         Self::install_validated(manifest, 65_532, 65_533)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_for_transport_test(
+        manifest: PolicyManifest,
+        executor_uid: u32,
+        runtime_uid: u32,
+    ) -> Result<Self, ProxyError> {
+        manifest.validate()?;
+        Self::install_validated(manifest, executor_uid, runtime_uid)
     }
 
     /// Dedicated executor UID permitted on the proxy listener.
@@ -296,7 +340,14 @@ impl ProxyPolicy {
             DockerRoute::VolumeList => Ok(Admission::LocalResponse(
                 br#"{"Volumes":[],"Warnings":[]}"#.to_vec(),
             )),
-            DockerRoute::ContainerCreate => self.canonical_create(body).map(Admission::Create),
+            DockerRoute::ContainerCreate => {
+                if self.container_lifecycle != ContainerLifecycle::AwaitCreate {
+                    return Err(ProxyError::StateRefused(
+                        "container create is permitted exactly once".into(),
+                    ));
+                }
+                self.canonical_create(body).map(Admission::Create)
+            }
             DockerRoute::ContainerInspect { id }
             | DockerRoute::ContainerAttach { id }
             | DockerRoute::ContainerLogs { id } => {
@@ -313,14 +364,14 @@ impl ProxyPolicy {
                 })
             }
             DockerRoute::ContainerStart { id } => {
-                self.ledger.container_fingerprint(&id)?;
+                self.require_created_container(&id)?;
                 Ok(Admission::NeedsPreStartProof {
                     container_id: id,
                     target: canonical_target,
                 })
             }
             DockerRoute::ContainerDelete { id } => {
-                self.ledger.container_fingerprint(&id)?;
+                self.begin_delete(&id)?;
                 Ok(Admission::Delete {
                     container_id: id,
                     target: canonical_target,
@@ -366,6 +417,17 @@ impl ProxyPolicy {
         container_id: String,
         approved: &CanonicalCreate,
     ) -> Result<(), ProxyError> {
+        if !matches!(
+            &self.container_lifecycle,
+            ContainerLifecycle::Creating {
+                operation_id,
+                fingerprint,
+            } if *operation_id == approved.operation_id && fingerprint == &approved.fingerprint
+        ) {
+            return Err(ProxyError::StateRefused(
+                "create result does not match create lifecycle state".into(),
+            ));
+        }
         if self.pending_creates.get(&approved.operation_id) != Some(&approved.fingerprint) {
             return Err(ProxyError::StateRefused(
                 "create result has no matching pending request".into(),
@@ -374,14 +436,31 @@ impl ProxyPolicy {
         self.pending_creates.remove(&approved.operation_id);
         self.ledger
             .record_container(container_id.clone(), approved.fingerprint.clone())?;
-        self.created_requests.insert(container_id, approved.clone());
+        self.created_requests
+            .insert(container_id.clone(), approved.clone());
+        self.container_lifecycle = ContainerLifecycle::Created { container_id };
         Ok(())
     }
 
     /// Abandon a pending create after a failed upstream response.
     pub fn abort_create(&mut self, approved: &CanonicalCreate) -> Result<(), ProxyError> {
-        match self.pending_creates.remove(&approved.operation_id) {
-            Some(fingerprint) if fingerprint == approved.fingerprint => Ok(()),
+        match (
+            self.pending_creates.remove(&approved.operation_id),
+            &self.container_lifecycle,
+        ) {
+            (
+                Some(fingerprint),
+                ContainerLifecycle::Creating {
+                    operation_id,
+                    fingerprint: lifecycle_fingerprint,
+                },
+            ) if fingerprint == approved.fingerprint
+                && *operation_id == approved.operation_id
+                && lifecycle_fingerprint == &approved.fingerprint =>
+            {
+                self.container_lifecycle = ContainerLifecycle::AwaitCreate;
+                Ok(())
+            }
             _ => Err(ProxyError::StateRefused(
                 "create request is not pending".into(),
             )),
@@ -395,6 +474,7 @@ impl ProxyPolicy {
         container_id: &str,
         effective: &EffectiveContainerSpec,
     ) -> Result<VerifiedStart, ProxyError> {
+        self.require_created_container(container_id)?;
         let create_fingerprint = self.ledger.container_fingerprint(container_id)?;
         let expected = self.expected_effective_spec();
         if effective != &expected {
@@ -418,6 +498,15 @@ impl ProxyPolicy {
 
     /// Commit start state only after the upstream runtime reports success.
     pub fn commit_started(&mut self, proof: &VerifiedStart) -> Result<(), ProxyError> {
+        match &self.container_lifecycle {
+            ContainerLifecycle::Starting { container_id }
+                if container_id == &proof.container_id => {}
+            _ => {
+                return Err(ProxyError::StateRefused(
+                    "start commit has no matching start intent".into(),
+                ));
+            }
+        }
         if self.ledger.container_fingerprint(&proof.container_id)?
             != proof.create_fingerprint.as_str()
         {
@@ -425,11 +514,59 @@ impl ProxyPolicy {
                 "container ownership changed after pre-start proof".into(),
             ));
         }
-        self.ledger.mark_started(&proof.container_id)
+        self.ledger.mark_started(&proof.container_id)?;
+        self.container_lifecycle = ContainerLifecycle::Started {
+            container_id: proof.container_id.clone(),
+        };
+        Ok(())
+    }
+
+    /// Bind a verified pre-start proof to the one pending start operation.
+    pub fn begin_start(&mut self, proof: &VerifiedStart) -> Result<(), ProxyError> {
+        self.require_created_container(&proof.container_id)?;
+        if self.ledger.container_fingerprint(&proof.container_id)?
+            != proof.create_fingerprint.as_str()
+        {
+            return Err(ProxyError::StateRefused(
+                "pre-start proof no longer matches the owned container".into(),
+            ));
+        }
+        self.container_lifecycle = ContainerLifecycle::Starting {
+            container_id: proof.container_id.clone(),
+        };
+        Ok(())
+    }
+
+    /// Resolve a start that received a definite upstream rejection or was not sent.
+    pub fn abort_start(&mut self, proof: &VerifiedStart) -> Result<(), ProxyError> {
+        match &self.container_lifecycle {
+            ContainerLifecycle::Starting { container_id }
+                if container_id == &proof.container_id =>
+            {
+                self.container_lifecycle = ContainerLifecycle::Created {
+                    container_id: container_id.clone(),
+                };
+                Ok(())
+            }
+            _ => Err(ProxyError::StateRefused(
+                "start request is not pending".into(),
+            )),
+        }
     }
 
     /// Commit deletion only after the upstream runtime reports success.
     pub fn commit_deleted(&mut self, container_id: &str) -> Result<(), ProxyError> {
+        if !matches!(
+            &self.container_lifecycle,
+            ContainerLifecycle::Deleting {
+                container_id: deleting,
+                ..
+            } if deleting == container_id
+        ) {
+            return Err(ProxyError::StateRefused(
+                "delete commit has no matching delete intent".into(),
+            ));
+        }
         if !self.created_requests.contains_key(container_id) {
             return Err(ProxyError::StateRefused(
                 "deleted container lacked its canonical create record".into(),
@@ -437,6 +574,57 @@ impl ProxyPolicy {
         }
         self.ledger.remove_container(container_id)?;
         self.created_requests.remove(container_id);
+        self.container_lifecycle = ContainerLifecycle::Removed {
+            container_id: container_id.into(),
+        };
+        Ok(())
+    }
+
+    /// Bind one owned container to a pending delete mutation.
+    pub fn begin_delete(&mut self, container_id: &str) -> Result<(), ProxyError> {
+        self.ledger.container_fingerprint(container_id)?;
+        let was_started = match &self.container_lifecycle {
+            ContainerLifecycle::Created {
+                container_id: owned,
+            } if owned == container_id => false,
+            ContainerLifecycle::Started {
+                container_id: owned,
+            } if owned == container_id => true,
+            _ => {
+                return Err(ProxyError::StateRefused(
+                    "delete requires the one created or started container".into(),
+                ));
+            }
+        };
+        self.container_lifecycle = ContainerLifecycle::Deleting {
+            container_id: container_id.into(),
+            was_started,
+        };
+        Ok(())
+    }
+
+    /// Resolve a delete that was refused before mutation could occur.
+    pub fn abort_delete(&mut self, container_id: &str) -> Result<(), ProxyError> {
+        let was_started = match &self.container_lifecycle {
+            ContainerLifecycle::Deleting {
+                container_id: deleting,
+                was_started,
+            } if deleting == container_id => *was_started,
+            _ => {
+                return Err(ProxyError::StateRefused(
+                    "delete request is not pending".into(),
+                ));
+            }
+        };
+        self.container_lifecycle = if was_started {
+            ContainerLifecycle::Started {
+                container_id: container_id.into(),
+            }
+        } else {
+            ContainerLifecycle::Created {
+                container_id: container_id.into(),
+            }
+        };
         Ok(())
     }
 
@@ -456,8 +644,9 @@ impl ProxyPolicy {
                 "exec result has no matching pending request".into(),
             ));
         }
+        self.ledger.record_exec(exec_id, &approved.container_id)?;
         self.pending_execs.remove(&approved.operation_id);
-        self.ledger.record_exec(exec_id, &approved.container_id)
+        Ok(())
     }
 
     /// Abandon a pending exec create after a failed upstream response.
@@ -478,7 +667,15 @@ impl ProxyPolicy {
                 "seal may begin from Running only".into(),
             ));
         }
-        if !self.pending_creates.is_empty() || !self.pending_execs.is_empty() {
+        if !self.pending_creates.is_empty()
+            || !self.pending_execs.is_empty()
+            || matches!(
+                self.container_lifecycle,
+                ContainerLifecycle::Creating { .. }
+                    | ContainerLifecycle::Starting { .. }
+                    | ContainerLifecycle::Deleting { .. }
+            )
+        {
             return Err(ProxyError::StateRefused(
                 "seal cannot begin with pending upstream mutations".into(),
             ));
@@ -603,6 +800,10 @@ impl ProxyPolicy {
         let fingerprint = hex::encode(hasher.finalize());
         self.pending_creates
             .insert(operation_id, fingerprint.clone());
+        self.container_lifecycle = ContainerLifecycle::Creating {
+            operation_id,
+            fingerprint: fingerprint.clone(),
+        };
         Ok(CanonicalCreate {
             target: format!(
                 "/containers/create?name=buzz-ci-{}-{}",
@@ -693,6 +894,45 @@ impl ProxyPolicy {
             .checked_add(1)
             .ok_or_else(|| ProxyError::StateRefused("operation sequence exhausted".into()))?;
         Ok(operation)
+    }
+
+    fn require_created_container(&self, container_id: &str) -> Result<(), ProxyError> {
+        match &self.container_lifecycle {
+            ContainerLifecycle::Created {
+                container_id: owned,
+            } if owned == container_id => Ok(()),
+            ContainerLifecycle::Created { .. } => Err(ProxyError::StateRefused(
+                "start ID does not match the one created container".into(),
+            )),
+            ContainerLifecycle::Starting { .. } | ContainerLifecycle::Started { .. } => Err(
+                ProxyError::StateRefused("container start is permitted exactly once".into()),
+            ),
+            _ => Err(ProxyError::StateRefused(
+                "container has not completed create".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn lifecycle_snapshot(&self) -> (crate::LifecyclePhase, Option<&str>) {
+        match &self.container_lifecycle {
+            ContainerLifecycle::AwaitCreate => (crate::LifecyclePhase::AwaitCreate, None),
+            ContainerLifecycle::Creating { .. } => (crate::LifecyclePhase::Creating, None),
+            ContainerLifecycle::Created { container_id } => {
+                (crate::LifecyclePhase::Created, Some(container_id))
+            }
+            ContainerLifecycle::Starting { container_id } => {
+                (crate::LifecyclePhase::Starting, Some(container_id))
+            }
+            ContainerLifecycle::Started { container_id } => {
+                (crate::LifecyclePhase::Started, Some(container_id))
+            }
+            ContainerLifecycle::Deleting { container_id, .. } => {
+                (crate::LifecyclePhase::Deleting, Some(container_id))
+            }
+            ContainerLifecycle::Removed { container_id } => {
+                (crate::LifecyclePhase::Removed, Some(container_id))
+            }
+        }
     }
 }
 
@@ -1361,6 +1601,7 @@ mod tests {
         assert!(policy.verify_pre_start("container-1", &effective).is_err());
         let effective = policy.expected_effective_spec();
         let proof = policy.verify_pre_start("container-1", &effective).unwrap();
+        policy.begin_start(&proof).unwrap();
         policy.commit_started(&proof).unwrap();
 
         for security_opt in ["seccomp=unconfined", "unknown-security-option"] {
@@ -1438,6 +1679,7 @@ mod tests {
             ),
             Err(ProxyError::StateRefused(_))
         ));
+        policy.begin_start(&proof).unwrap();
         policy.commit_started(&proof).unwrap();
 
         // Admission alone is prepare-only. A failed upstream delete leaves the
@@ -1508,6 +1750,7 @@ mod tests {
         let proof = policy
             .verify_pre_start("container-1", &policy.expected_effective_spec())
             .unwrap();
+        policy.begin_start(&proof).unwrap();
         policy.commit_started(&proof).unwrap();
         policy.begin_seal().unwrap();
         assert!(policy.finish_seal().is_err());

@@ -11,14 +11,15 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_ci_broker_protocol::GitOid;
 use buzz_ci_isolation_contract::ValidatedAttemptLeaseBinding;
 use buzz_ci_policy_proxy::{
     CanonicalCreate, EffectiveContainerSpec, InheritedOneShotConnector, InheritedProxy,
-    PolicyManifest, PreStartObserver, ProxyError, ProxyPolicy, TransportLimits, UpstreamCapability,
-    VerifiedStart,
+    LifecycleEvent, LifecycleObserver, PolicyManifest, ProxyError, ProxyPolicy, TransportLimits,
+    UpstreamCapability, VerifiedStart,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -30,11 +31,36 @@ use crate::evidence::{
     EffectiveSpecProof, EvidenceStore, OrderingEvent, OrderingRecord, ProxyDecisionReason,
     ProxyDecisionRecord, ProxyObjectRecord, ProxyRoute, ProxyVerdict,
 };
+use crate::proxy_journal::{
+    CanonicalCreateAuthority, ProxyJournalFact, ProxyJournalStore, ProxyJournalStoreError,
+    ProxyMutationIntent, ReconcileObject,
+};
 use crate::seccomp_activation::SeccompInstallCapability;
 use crate::seccomp_exec::{persist_oci_prestart_observation, SeccompExecError};
 
 const LISTENER_MODE: u32 = 0o660;
 const MAX_LEASE_OBJECTS: usize = 32;
+const UPSTREAM_CAPABILITY_DIGEST_DOMAIN: &[u8] = b"buzz-ci/upstream-capability/v1\0";
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_CONSTRUCTION_AFTER_AUTHORITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SocketIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
 
 /// Immutable broker-owned paths and evidence facts for one policy proxy.
 #[derive(Clone, Debug)]
@@ -158,6 +184,9 @@ pub struct ProxyLeaseObserver<P, C = SystemProxyClock> {
     lease_id: String,
     authority: ProxyLeaseAuthority,
     store: EvidenceStore,
+    journal_store: Arc<ProxyJournalStore>,
+    event_binding: CiEventBinding,
+    upstream_capability_sha256: Digest32,
     persister: P,
     clock: C,
     started_object: Option<String>,
@@ -169,15 +198,21 @@ impl<P: PrestartPersister> ProxyLeaseObserver<P, SystemProxyClock> {
         lease: LeaseToken,
         lease_id: String,
         authority: ProxyLeaseAuthority,
+        journal_store: Arc<ProxyJournalStore>,
+        upstream_capability_sha256: Digest32,
         persister: P,
     ) -> Result<Self, ProxyLeaseError> {
         let store = EvidenceStore::new(authority.evidence_root.clone())?;
+        let event_binding = authority.event_binding;
         Ok(Self {
             admission,
             lease,
             lease_id,
             authority,
             store,
+            journal_store,
+            event_binding,
+            upstream_capability_sha256,
             persister,
             clock: SystemProxyClock,
             started_object: None,
@@ -185,7 +220,96 @@ impl<P: PrestartPersister> ProxyLeaseObserver<P, SystemProxyClock> {
     }
 }
 
-impl<P: PrestartPersister, C: ProxyClock> PreStartObserver for ProxyLeaseObserver<P, C> {
+impl<P: PrestartPersister, C: ProxyClock> LifecycleObserver for ProxyLeaseObserver<P, C> {
+    fn observe_lifecycle(&mut self, event: LifecycleEvent<'_>) -> Result<(), ProxyError> {
+        if let LifecycleEvent::Started { container_id } = event {
+            if self.started_object.as_deref() != Some(container_id) {
+                return Err(ProxyError::StateRefused(
+                    "start does not match persisted pre-start evidence".into(),
+                ));
+            }
+        }
+
+        let fact = match event {
+            LifecycleEvent::CreateIntent { create } => {
+                ProxyJournalFact::create_intent(canonical_create_authority(create)?)
+            }
+            LifecycleEvent::CreateRejected { create } => {
+                ProxyJournalFact::create_rejected(canonical_create_authority(create)?)
+            }
+            LifecycleEvent::Created {
+                create,
+                container_id,
+            } => ProxyJournalFact::created(
+                canonical_create_authority(create)?,
+                container_id.to_owned(),
+            ),
+            LifecycleEvent::StartIntent { container_id } => {
+                ProxyJournalFact::start_intent(container_id.to_owned())
+            }
+            LifecycleEvent::StartRejected { container_id } => {
+                ProxyJournalFact::start_rejected(container_id.to_owned())
+            }
+            LifecycleEvent::Started { container_id } => {
+                ProxyJournalFact::started(container_id.to_owned())
+            }
+            LifecycleEvent::ExecCreateIntent { exec } => {
+                ProxyJournalFact::exec_create_intent(exec.container_id().to_owned())
+            }
+            LifecycleEvent::ExecCreateRejected { exec } => {
+                ProxyJournalFact::exec_create_rejected(exec.container_id().to_owned())
+            }
+            LifecycleEvent::ExecCreated { exec, exec_id } => {
+                ProxyJournalFact::exec_created(exec.container_id().to_owned(), exec_id.to_owned())
+            }
+            LifecycleEvent::DeleteIntent { container_id } => {
+                ProxyJournalFact::delete_intent(container_id.to_owned())
+            }
+            LifecycleEvent::DeleteRejected { container_id } => {
+                ProxyJournalFact::delete_rejected(container_id.to_owned())
+            }
+            LifecycleEvent::Removed { container_id } => {
+                ProxyJournalFact::removed(container_id.to_owned())
+            }
+            LifecycleEvent::Poisoned {
+                phase,
+                container_id,
+            } => ProxyJournalFact::poisoned(phase, container_id.map(str::to_owned))
+                .map_err(|_| ProxyError::Transport("proxy journal persistence failed".into()))?,
+            _ => {
+                return Err(ProxyError::Transport(
+                    "unsupported proxy lifecycle journal event".into(),
+                ));
+            }
+        };
+        let timestamp = self.journal_timestamp()?;
+        self.journal_store
+            .append(
+                &self.lease_id,
+                self.event_binding,
+                self.upstream_capability_sha256,
+                timestamp,
+                fact,
+            )
+            .map_err(|_| ProxyError::Transport("proxy journal persistence failed".into()))?;
+
+        if let LifecycleEvent::Started { container_id } = event {
+            self.store
+                .append_ordering(&OrderingRecord {
+                    lease_id: self.lease_id.clone(),
+                    sequence: 2,
+                    event_binding: self.event_binding,
+                    event: OrderingEvent::Start,
+                    object_id: Some(container_id.to_owned()),
+                    timestamp_unix_ns: timestamp,
+                    status_event_id: None,
+                    verdict_event_id: None,
+                })
+                .map_err(|_| ProxyError::Transport("proxy start ordering failed".into()))?;
+        }
+        Ok(())
+    }
+
     fn observe_pre_start(
         &mut self,
         create: &CanonicalCreate,
@@ -224,33 +348,19 @@ impl<P: PrestartPersister, C: ProxyClock> PreStartObserver for ProxyLeaseObserve
         self.started_object = Some(container_id.to_owned());
         Ok(())
     }
-
-    fn observe_started(&mut self, container_id: &str) -> Result<(), ProxyError> {
-        if self.started_object.as_deref() != Some(container_id) {
-            return Err(ProxyError::StateRefused(
-                "start does not match persisted pre-start evidence".into(),
-            ));
-        }
-        let timestamp = self
-            .clock
-            .now_ns()
-            .map_err(|_| ProxyError::Transport("proxy evidence clock failed".into()))?;
-        self.store
-            .append_ordering(&OrderingRecord {
-                lease_id: self.lease_id.clone(),
-                sequence: 2,
-                event_binding: self.authority.event_binding,
-                event: OrderingEvent::Start,
-                object_id: Some(container_id.to_owned()),
-                timestamp_unix_ns: timestamp,
-                status_event_id: None,
-                verdict_event_id: None,
-            })
-            .map_err(|_| ProxyError::Transport("proxy start ordering failed".into()))
-    }
 }
 
 impl<P, C> ProxyLeaseObserver<P, C> {
+    fn journal_timestamp(&mut self) -> Result<u64, ProxyError>
+    where
+        C: ProxyClock,
+    {
+        match self.clock.now_ns() {
+            Ok(timestamp) if timestamp != 0 => Ok(timestamp),
+            _ => Err(ProxyError::Transport("proxy evidence clock failed".into())),
+        }
+    }
+
     fn record_allowed_decisions(
         &self,
         create: &CanonicalCreate,
@@ -366,6 +476,10 @@ pub struct BrokerProxyLease<P: PrestartPersister> {
     listener_path: PathBuf,
     lease: LeaseToken,
     capability: UpstreamCapability,
+    journal_store: Arc<ProxyJournalStore>,
+    lease_id: String,
+    event_binding: CiEventBinding,
+    recovery_clock: SystemProxyClock,
     proxy: InheritedProxy<InheritedOneShotConnector, ProxyLeaseObserver<P>>,
 }
 
@@ -405,13 +519,23 @@ impl<P: PrestartPersister> BrokerProxyLease<P> {
         &mut self,
         lease: LeaseToken,
         runner: &mut R,
-        retained_ids: &BTreeSet<String>,
     ) -> Result<(), ProxyLeaseError> {
         if lease != self.lease {
             return Err(ProxyLeaseError::DescriptorIdentity);
         }
-        reconcile_podman_objects(runner, &self.capability, retained_ids)?;
-        fs::remove_file(&self.listener_path)?;
+        reconcile_podman_objects(
+            runner,
+            &self.capability,
+            &self.journal_store,
+            &self.lease_id,
+            self.event_binding,
+            &mut self.recovery_clock,
+        )?;
+        match fs::remove_file(&self.listener_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 }
@@ -428,12 +552,41 @@ pub fn build_broker_proxy_lease<P: PrestartPersister>(
     persister: P,
     limits: TransportLimits,
 ) -> Result<BrokerProxyLease<P>, ProxyLeaseError> {
+    let journal_store = Arc::new(ProxyJournalStore::open(&authority.evidence_root)?);
+    build_broker_proxy_lease_with_journal_store(
+        authority,
+        admission,
+        lease,
+        validated,
+        manifest,
+        upstream,
+        persister,
+        limits,
+        journal_store,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_broker_proxy_lease_with_journal_store<P: PrestartPersister>(
+    authority: ProxyLeaseAuthority,
+    admission: OrdinaryAdmission,
+    lease: LeaseToken,
+    validated: &ValidatedAttemptLeaseBinding,
+    manifest: PolicyManifest,
+    upstream: UnixStream,
+    persister: P,
+    limits: TransportLimits,
+    journal_store: Arc<ProxyJournalStore>,
+) -> Result<BrokerProxyLease<P>, ProxyLeaseError> {
     validate_authenticated_binding(admission, lease, validated, &manifest)?;
     let policy = ProxyPolicy::install(manifest, validated)?;
     let capability = UpstreamCapability::from_validated_lease(validated);
     if capability.lease_id() != validated.as_binding().lease_id {
         return Err(ProxyLeaseError::DescriptorIdentity);
     }
+    let lease_id = validated.as_binding().lease_id.clone();
+    let event_binding = authority.event_binding;
+    let upstream_capability_sha256 = upstream_capability_digest(&capability);
     let connector = InheritedOneShotConnector::new(upstream, capability.clone())?;
     prepare_broker_directory(&authority.listener_root)?;
     let listener_path = authority.listener_root.join(format!(
@@ -444,41 +597,78 @@ pub fn build_broker_proxy_lease<P: PrestartPersister>(
     if listener_path.exists() {
         return Err(ProxyLeaseError::ListenerExists);
     }
-    let listener = UnixListener::bind(&listener_path)?;
-    nix::unistd::chown(
-        &listener_path,
-        Some(nix::unistd::geteuid()),
-        Some(nix::unistd::Gid::from_raw(authority.listener_gid)),
-    )?;
-    fs::set_permissions(&listener_path, fs::Permissions::from_mode(LISTENER_MODE))?;
-    let socket = fs::symlink_metadata(&listener_path)?;
-    if !socket.file_type().is_socket()
-        || socket.uid() != nix::unistd::geteuid().as_raw()
-        || socket.gid() != authority.listener_gid
-    {
-        return Err(ProxyLeaseError::Authority);
-    }
-    let observer = ProxyLeaseObserver::production(
-        admission,
-        lease,
+    let journal_creation = journal_store.create_initial(
         validated.as_binding().lease_id.clone(),
-        authority,
-        persister,
+        authority.event_binding,
+        upstream_capability_sha256,
     )?;
-    let proxy = InheritedProxy::new_with_observer(
-        listener,
-        connector,
-        capability.clone(),
-        limits,
-        policy,
-        observer,
-    )?;
-    Ok(BrokerProxyLease {
-        listener_path,
-        lease,
-        capability,
-        proxy,
-    })
+    let mut listener_identity = None;
+    let result = (|| {
+        let listener = UnixListener::bind(&listener_path)?;
+        let created_socket = fs::symlink_metadata(&listener_path)?;
+        if !created_socket.file_type().is_socket() {
+            return Err(ProxyLeaseError::Authority);
+        }
+        listener_identity = Some(SocketIdentity::from_metadata(&created_socket));
+        nix::unistd::chown(
+            &listener_path,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::Gid::from_raw(authority.listener_gid)),
+        )?;
+        fs::set_permissions(&listener_path, fs::Permissions::from_mode(LISTENER_MODE))?;
+        let socket = fs::symlink_metadata(&listener_path)?;
+        if !socket.file_type().is_socket()
+            || socket.uid() != nix::unistd::geteuid().as_raw()
+            || socket.gid() != authority.listener_gid
+            || SocketIdentity::from_metadata(&socket) != listener_identity.unwrap()
+        {
+            return Err(ProxyLeaseError::Authority);
+        }
+        #[cfg(test)]
+        FAIL_CONSTRUCTION_AFTER_AUTHORITY.with(|fail| {
+            if fail.replace(false) {
+                Err(ProxyLeaseError::Authority)
+            } else {
+                Ok(())
+            }
+        })?;
+        let observer = ProxyLeaseObserver::production(
+            admission,
+            lease,
+            validated.as_binding().lease_id.clone(),
+            authority,
+            Arc::clone(&journal_store),
+            upstream_capability_sha256,
+            persister,
+        )?;
+        let proxy = InheritedProxy::new_with_observer(
+            listener,
+            connector,
+            capability.clone(),
+            limits,
+            policy,
+            observer,
+        )?;
+        Ok(BrokerProxyLease {
+            listener_path: listener_path.clone(),
+            lease,
+            capability,
+            journal_store: Arc::clone(&journal_store),
+            lease_id,
+            event_binding,
+            recovery_clock: SystemProxyClock,
+            proxy,
+        })
+    })();
+    if result.is_err() {
+        let listener_cleanup = listener_identity
+            .map(|identity| remove_created_listener(&listener_path, identity))
+            .transpose();
+        let journal_cleanup = journal_store.remove_created(journal_creation);
+        listener_cleanup?;
+        journal_cleanup?;
+    }
+    result
 }
 
 fn validate_authenticated_binding(
@@ -545,38 +735,180 @@ pub trait PodmanReconcileRunner {
     ) -> Result<(), ProxyLeaseError>;
 }
 
-/// Reconcile exactly the object IDs retained by the policy ledger.
-pub fn reconcile_podman_objects<R: PodmanReconcileRunner>(
+/// Reconcile the exact lease-labelled runtime inventory proven by the durable journal.
+pub(crate) fn reconcile_podman_objects<R: PodmanReconcileRunner, C: ProxyClock>(
     runner: &mut R,
     capability: &UpstreamCapability,
-    retained_ids: &BTreeSet<String>,
+    journal_store: &Arc<ProxyJournalStore>,
+    expected_lease_id: &str,
+    expected_event_binding: CiEventBinding,
+    clock: &mut C,
 ) -> Result<(), ProxyLeaseError> {
-    if retained_ids.is_empty()
-        || retained_ids.len() > MAX_LEASE_OBJECTS
-        || retained_ids.iter().any(|id| !safe_object_id(id))
-    {
-        return Err(ProxyLeaseError::AmbiguousObjects);
+    if capability.lease_id() != expected_lease_id {
+        return Err(ProxyLeaseError::DescriptorIdentity);
     }
+    let upstream_capability_sha256 = upstream_capability_digest(capability);
+    let mut replay = journal_store.load(
+        expected_lease_id,
+        expected_event_binding,
+        upstream_capability_sha256,
+    )?;
+    if replay.is_clean_terminal() {
+        return Ok(());
+    }
+
     let observed = runner.list(capability)?;
-    let observed_ids = observed
+    validate_runtime_inventory(&observed)?;
+    replay = append_reconcile_fact(
+        journal_store,
+        expected_lease_id,
+        expected_event_binding,
+        upstream_capability_sha256,
+        clock,
+        ProxyJournalFact::reconcile_inventory(
+            observed
+                .iter()
+                .map(|object| ReconcileObject {
+                    id: object.id.clone(),
+                    running: object.running,
+                })
+                .collect(),
+        ),
+    )?;
+
+    loop {
+        match replay.unresolved_intent {
+            Some(ProxyMutationIntent::Stop) => {
+                let object_id = replay
+                    .reconcile
+                    .pending_object_id
+                    .clone()
+                    .ok_or(ProxyLeaseError::Journal)?;
+                runner.stop(capability, &object_id)?;
+                replay = append_reconcile_fact(
+                    journal_store,
+                    expected_lease_id,
+                    expected_event_binding,
+                    upstream_capability_sha256,
+                    clock,
+                    ProxyJournalFact::stopped(object_id),
+                )?;
+            }
+            Some(ProxyMutationIntent::DeleteObject) => {
+                let object_id = replay
+                    .reconcile
+                    .pending_object_id
+                    .clone()
+                    .ok_or(ProxyLeaseError::Journal)?;
+                runner.delete(capability, &object_id)?;
+                replay = append_reconcile_fact(
+                    journal_store,
+                    expected_lease_id,
+                    expected_event_binding,
+                    upstream_capability_sha256,
+                    clock,
+                    ProxyJournalFact::deleted_object(object_id),
+                )?;
+            }
+            Some(_) => return Err(ProxyLeaseError::Journal),
+            None => {
+                let Some((object_id, running)) = replay
+                    .reconcile
+                    .current_objects
+                    .iter()
+                    .next()
+                    .map(|(id, running)| (id.clone(), *running))
+                else {
+                    break;
+                };
+                if running {
+                    replay = append_reconcile_fact(
+                        journal_store,
+                        expected_lease_id,
+                        expected_event_binding,
+                        upstream_capability_sha256,
+                        clock,
+                        ProxyJournalFact::stop_intent(object_id),
+                    )?;
+                } else {
+                    replay = append_reconcile_fact(
+                        journal_store,
+                        expected_lease_id,
+                        expected_event_binding,
+                        upstream_capability_sha256,
+                        clock,
+                        ProxyJournalFact::delete_object_intent(object_id),
+                    )?;
+                }
+            }
+        }
+    }
+
+    let final_observed = runner.list(capability)?;
+    validate_runtime_inventory(&final_observed)?;
+    if !final_observed.is_empty() {
+        return Err(ProxyLeaseError::ObjectsRemain);
+    }
+    append_reconcile_fact(
+        journal_store,
+        expected_lease_id,
+        expected_event_binding,
+        upstream_capability_sha256,
+        clock,
+        ProxyJournalFact::reconcile_inventory(Vec::new()),
+    )?;
+    append_reconcile_fact(
+        journal_store,
+        expected_lease_id,
+        expected_event_binding,
+        upstream_capability_sha256,
+        clock,
+        ProxyJournalFact::reconcile_verified_empty(),
+    )?;
+    if !journal_store
+        .load(
+            expected_lease_id,
+            expected_event_binding,
+            upstream_capability_sha256,
+        )?
+        .is_clean_terminal()
+    {
+        return Err(ProxyLeaseError::Journal);
+    }
+    Ok(())
+}
+
+fn append_reconcile_fact<C: ProxyClock>(
+    journal_store: &Arc<ProxyJournalStore>,
+    lease_id: &str,
+    event_binding: CiEventBinding,
+    upstream_capability_sha256: Digest32,
+    clock: &mut C,
+    fact: ProxyJournalFact,
+) -> Result<crate::proxy_journal::ProxyJournalReplay, ProxyLeaseError> {
+    let timestamp = clock.now_ns()?;
+    if timestamp == 0 {
+        return Err(ProxyLeaseError::Clock);
+    }
+    Ok(journal_store.append(
+        lease_id,
+        event_binding,
+        upstream_capability_sha256,
+        timestamp,
+        fact,
+    )?)
+}
+
+fn validate_runtime_inventory(objects: &[PodmanObject]) -> Result<(), ProxyLeaseError> {
+    let object_ids = objects
         .iter()
-        .map(|object| object.id.clone())
+        .map(|object| object.id.as_str())
         .collect::<BTreeSet<_>>();
-    if observed.len() > MAX_LEASE_OBJECTS
-        || observed.len() != observed_ids.len()
-        || observed.iter().any(|object| !safe_object_id(&object.id))
-        || &observed_ids != retained_ids
+    if objects.len() > MAX_LEASE_OBJECTS
+        || objects.len() != object_ids.len()
+        || objects.iter().any(|object| !safe_object_id(&object.id))
     {
         return Err(ProxyLeaseError::AmbiguousObjects);
-    }
-    for object in observed {
-        if object.running {
-            runner.stop(capability, &object.id)?;
-        }
-        runner.delete(capability, &object.id)?;
-    }
-    if !runner.list(capability)?.is_empty() {
-        return Err(ProxyLeaseError::ObjectsRemain);
     }
     Ok(())
 }
@@ -614,12 +946,21 @@ pub enum ProxyLeaseError {
     /// Evidence publication failed.
     #[error(transparent)]
     Evidence(#[from] evidence::PublicationError),
+    /// Durable lifecycle journal operation failed.
+    #[error("durable proxy lifecycle journal operation failed")]
+    Journal,
     /// Broker listener filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// Broker socket ownership operation failed.
     #[error(transparent)]
     Ownership(#[from] nix::errno::Errno),
+}
+
+impl From<ProxyJournalStoreError> for ProxyLeaseError {
+    fn from(_error: ProxyJournalStoreError) -> Self {
+        Self::Journal
+    }
 }
 
 fn safe_object_id(value: &str) -> bool {
@@ -650,6 +991,47 @@ fn digest32(bytes: &[u8]) -> Digest32 {
     Digest32(Sha256::digest(bytes).into())
 }
 
+fn upstream_capability_digest(capability: &UpstreamCapability) -> Digest32 {
+    let mut digest = Sha256::new();
+    digest.update(UPSTREAM_CAPABILITY_DIGEST_DOMAIN);
+    for field in [
+        capability.lease_id().as_bytes(),
+        capability.token().as_bytes(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest.update(capability.runtime_uid().to_be_bytes());
+    Digest32(digest.finalize().into())
+}
+
+fn remove_created_listener(
+    listener_path: &Path,
+    expected: SocketIdentity,
+) -> Result<(), ProxyLeaseError> {
+    let metadata = match fs::symlink_metadata(listener_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_socket() || SocketIdentity::from_metadata(&metadata) != expected {
+        return Err(ProxyLeaseError::Authority);
+    }
+    fs::remove_file(listener_path)?;
+    Ok(())
+}
+
+fn canonical_create_authority(
+    create: &CanonicalCreate,
+) -> Result<CanonicalCreateAuthority, ProxyError> {
+    CanonicalCreateAuthority::new(
+        create.fingerprint.clone(),
+        create.target.clone(),
+        digest32(&create.body),
+    )
+    .map_err(|_| ProxyError::Transport("proxy journal persistence failed".into()))
+}
+
 fn fixed_seccomp_digest() -> Result<Digest32, evidence::PublicationError> {
     let bytes = hex::decode(evidence::SECCOMP_PROFILE_SHA256)
         .map_err(|_| evidence::PublicationError::RecordMismatch)?;
@@ -673,7 +1055,10 @@ fn oid_hex(oid: GitOid) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::Read;
     use std::os::unix::fs::FileTypeExt;
+    use std::process::Command;
+    use std::time::Duration;
 
     use buzz_ci_isolation_contract::{
         AttemptLeaseBinding, BrokerObjectHandle, CgroupHandle, EngineKind as SharedEngineKind,
@@ -693,6 +1078,7 @@ mod tests {
     use crate::evidence::{
         DnsReadback, LeaseLimits, LeaseRecord, ResourcePropertyReadback, SeccompEvidence,
     };
+    use crate::proxy_journal::ProxyJournal;
 
     #[derive(Default)]
     struct FakePersister {
@@ -761,8 +1147,50 @@ mod tests {
         }
     }
 
+    struct JournalFailureRunner {
+        journal_path: PathBuf,
+        actions: Vec<String>,
+    }
+
+    impl PodmanReconcileRunner for JournalFailureRunner {
+        fn list(
+            &mut self,
+            _capability: &UpstreamCapability,
+        ) -> Result<Vec<PodmanObject>, ProxyLeaseError> {
+            self.actions.push("list".into());
+            Ok(vec![PodmanObject {
+                id: "one".into(),
+                running: true,
+            }])
+        }
+
+        fn stop(
+            &mut self,
+            _capability: &UpstreamCapability,
+            object_id: &str,
+        ) -> Result<(), ProxyLeaseError> {
+            self.actions.push(format!("stop:{object_id}"));
+            fs::set_permissions(&self.journal_path, fs::Permissions::from_mode(0o644))?;
+            Ok(())
+        }
+
+        fn delete(
+            &mut self,
+            _capability: &UpstreamCapability,
+            object_id: &str,
+        ) -> Result<(), ProxyLeaseError> {
+            self.actions.push(format!("delete:{object_id}"));
+            Ok(())
+        }
+    }
+
     fn capability() -> UpstreamCapability {
         let (_, _, validated, _) = binding_fixture();
+        UpstreamCapability::from_validated_lease(&validated)
+    }
+
+    fn capability_with_runtime(token: char, uid_offset: u32) -> UpstreamCapability {
+        let (_, _, validated, _) = binding_fixture_with_runtime(token, uid_offset);
         UpstreamCapability::from_validated_lease(&validated)
     }
 
@@ -775,72 +1203,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reconciliation_stops_deletes_and_proves_empty() {
-        let objects = vec![
-            PodmanObject {
-                id: "one".into(),
-                running: true,
-            },
-            PodmanObject {
-                id: "two".into(),
-                running: false,
-            },
-        ];
-        let mut fake = runner(vec![objects, vec![]]);
-        reconcile_podman_objects(
-            &mut fake,
-            &capability(),
-            &BTreeSet::from(["one".into(), "two".into()]),
-        )
-        .unwrap();
-        assert_eq!(
-            fake.actions,
-            ["list", "stop:one", "delete:one", "delete:two", "list"]
-        );
+    fn recovery_event_binding() -> CiEventBinding {
+        CiEventBinding {
+            request_event_id_46105: [1; 32],
+            teardown_event_id_46106: [2; 32],
+        }
     }
 
-    #[test]
-    fn reconciliation_fails_on_inventory_stop_delete_and_residue() {
-        let retained = BTreeSet::from(["one".into()]);
-        let mut ambiguous = runner(vec![vec![PodmanObject {
-            id: "other".into(),
-            running: true,
-        }]]);
-        assert!(matches!(
-            reconcile_podman_objects(&mut ambiguous, &capability(), &retained),
-            Err(ProxyLeaseError::AmbiguousObjects)
-        ));
-
-        let mut stop = runner(vec![vec![PodmanObject {
-            id: "one".into(),
-            running: true,
-        }]]);
-        stop.stop_fail = true;
-        assert!(matches!(
-            reconcile_podman_objects(&mut stop, &capability(), &retained),
-            Err(ProxyLeaseError::Stop)
-        ));
-
-        let mut delete = runner(vec![vec![PodmanObject {
-            id: "one".into(),
-            running: false,
-        }]]);
-        delete.delete_fail = true;
-        assert!(matches!(
-            reconcile_podman_objects(&mut delete, &capability(), &retained),
-            Err(ProxyLeaseError::Delete)
-        ));
-
-        let residue = vec![PodmanObject {
-            id: "one".into(),
-            running: false,
-        }];
-        let mut remains = runner(vec![residue.clone(), residue]);
-        assert!(matches!(
-            reconcile_podman_objects(&mut remains, &capability(), &retained),
-            Err(ProxyLeaseError::ObjectsRemain)
-        ));
+    fn recovery_create_authority() -> CanonicalCreateAuthority {
+        CanonicalCreateAuthority::new(
+            "a".repeat(64),
+            "/containers/create?name=recovery".into(),
+            Digest32([3; 32]),
+        )
+        .unwrap()
     }
 
     // The complete admission fixture below mirrors dns_activation tests. It
@@ -851,7 +1227,19 @@ mod tests {
         ValidatedAttemptLeaseBinding,
         PolicyManifest,
     ) {
-        let runtime_uid = nix::unistd::geteuid().as_raw();
+        binding_fixture_with_runtime('2', 0)
+    }
+
+    fn binding_fixture_with_runtime(
+        runtime_token: char,
+        runtime_uid_offset: u32,
+    ) -> (
+        OrdinaryAdmission,
+        LeaseToken,
+        ValidatedAttemptLeaseBinding,
+        PolicyManifest,
+    ) {
+        let runtime_uid = nix::unistd::geteuid().as_raw() + runtime_uid_offset;
         assert_ne!(runtime_uid, 0, "tests require an unprivileged process");
         let run_id = [13; 16];
         let admission = OrdinaryAdmission {
@@ -925,7 +1313,7 @@ mod tests {
                 quota_token: token('5'),
             },
             runtime_endpoint: RuntimeEndpointIdentity::InheritedFd {
-                token: token('2'),
+                token: token(runtime_token),
                 owner_uid: runtime_uid,
             },
             cgroup: CgroupHandle {
@@ -1113,12 +1501,712 @@ mod tests {
             .unwrap();
     }
 
+    fn test_journal_store(root: &TempDir) -> Arc<ProxyJournalStore> {
+        Arc::new(
+            ProxyJournalStore::open_with_expected_owner(
+                root.path().join("evidence"),
+                nix::unistd::getuid().as_raw(),
+                nix::unistd::getgid().as_raw(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn initialize_journal(
+        root: &TempDir,
+        lease_id: &str,
+        event_binding: CiEventBinding,
+    ) -> Arc<ProxyJournalStore> {
+        let store = test_journal_store(root);
+        store
+            .create_initial(
+                lease_id.to_owned(),
+                event_binding,
+                upstream_capability_digest(&capability()),
+            )
+            .unwrap();
+        store
+    }
+
+    fn read_journal(root: &TempDir, lease_id: &str) -> ProxyJournal {
+        read_journal_at(root.path(), lease_id)
+    }
+
+    fn read_journal_at(root: &Path, lease_id: &str) -> ProxyJournal {
+        let path = root
+            .join("evidence")
+            .join(format!("proxy-journal-{lease_id}.json"));
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn append_journal_facts(
+        store: &Arc<ProxyJournalStore>,
+        lease_id: &str,
+        event_binding: CiEventBinding,
+        facts: impl IntoIterator<Item = ProxyJournalFact>,
+    ) {
+        for (index, fact) in facts.into_iter().enumerate() {
+            store
+                .append(
+                    lease_id,
+                    event_binding,
+                    upstream_capability_digest(&capability()),
+                    index as u64 + 1,
+                    fact,
+                )
+                .unwrap();
+        }
+    }
+
+    fn recovery_journal(
+        root: &TempDir,
+        facts: impl IntoIterator<Item = ProxyJournalFact>,
+    ) -> (Arc<ProxyJournalStore>, String, CiEventBinding) {
+        let (_, _, _, manifest) = binding_fixture();
+        initialize_evidence(root, &manifest.lease_id);
+        let event_binding = recovery_event_binding();
+        let store = initialize_journal(root, &manifest.lease_id, event_binding);
+        append_journal_facts(&store, &manifest.lease_id, event_binding, facts);
+        (store, manifest.lease_id, event_binding)
+    }
+
+    fn reconcile_recovery(
+        fake: &mut FakeRunner,
+        store: &Arc<ProxyJournalStore>,
+        lease_id: &str,
+        event_binding: CiEventBinding,
+    ) -> Result<(), ProxyLeaseError> {
+        reconcile_podman_objects(
+            fake,
+            &capability(),
+            store,
+            lease_id,
+            event_binding,
+            &mut FakeClock((100..=200).collect()),
+        )
+    }
+
+    fn journal_facts(root: &TempDir, lease_id: &str) -> Vec<ProxyJournalFact> {
+        read_journal(root, lease_id)
+            .entries
+            .into_iter()
+            .map(|entry| entry.fact)
+            .collect()
+    }
+
     struct FakeClock(VecDeque<u64>);
 
     impl ProxyClock for FakeClock {
         fn now_ns(&mut self) -> Result<u64, ProxyLeaseError> {
             self.0.pop_front().ok_or(ProxyLeaseError::Clock)
         }
+    }
+
+    #[test]
+    fn reconciliation_uses_journal_inventory_and_proves_durable_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let create = recovery_create_authority();
+        let (store, lease_id, event_binding) =
+            recovery_journal(&root, [ProxyJournalFact::create_intent(create.clone())]);
+        let mut fake = runner(vec![
+            vec![PodmanObject {
+                id: "one".into(),
+                running: true,
+            }],
+            vec![],
+        ]);
+
+        reconcile_recovery(&mut fake, &store, &lease_id, event_binding).unwrap();
+
+        assert_eq!(fake.actions, ["list", "stop:one", "delete:one", "list"]);
+        assert_eq!(
+            journal_facts(&root, &lease_id),
+            [
+                ProxyJournalFact::create_intent(create),
+                ProxyJournalFact::reconcile_inventory(vec![ReconcileObject {
+                    id: "one".into(),
+                    running: true,
+                }]),
+                ProxyJournalFact::stop_intent("one".into()),
+                ProxyJournalFact::stopped("one".into()),
+                ProxyJournalFact::delete_object_intent("one".into()),
+                ProxyJournalFact::deleted_object("one".into()),
+                ProxyJournalFact::reconcile_inventory(vec![]),
+                ProxyJournalFact::reconcile_verified_empty(),
+            ]
+        );
+        assert!(store
+            .load(
+                &lease_id,
+                event_binding,
+                upstream_capability_digest(&capability()),
+            )
+            .unwrap()
+            .is_clean_terminal());
+    }
+
+    #[test]
+    fn recovery_refuses_same_lease_wrong_token_or_runtime_uid_before_listing() {
+        for wrong_capability in [
+            capability_with_runtime('6', 0),
+            capability_with_runtime('2', 1),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, lease_id, event_binding) = recovery_journal(
+                &root,
+                [ProxyJournalFact::create_intent(recovery_create_authority())],
+            );
+            let mut fake = runner(vec![vec![]]);
+
+            assert!(matches!(
+                reconcile_podman_objects(
+                    &mut fake,
+                    &wrong_capability,
+                    &store,
+                    &lease_id,
+                    event_binding,
+                    &mut FakeClock((100..=200).collect()),
+                ),
+                Err(ProxyLeaseError::Journal)
+            ));
+            assert!(fake.actions.is_empty());
+        }
+    }
+
+    #[test]
+    fn journal_header_persists_only_the_upstream_capability_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let capability = capability();
+        let (_store, lease_id, _event_binding) = recovery_journal(&root, []);
+        let bytes = fs::read(
+            root.path()
+                .join("evidence")
+                .join(format!("proxy-journal-{lease_id}.json")),
+        )
+        .unwrap();
+
+        assert!(!bytes
+            .windows(capability.token().len())
+            .any(|window| window == capability.token().as_bytes()));
+        assert_eq!(
+            read_journal(&root, &lease_id).upstream_capability_sha256,
+            upstream_capability_digest(&capability)
+        );
+    }
+
+    #[test]
+    fn known_id_extra_or_different_inventory_refuses_before_mutation() {
+        for observed in [
+            vec![PodmanObject {
+                id: "other".into(),
+                running: true,
+            }],
+            vec![
+                PodmanObject {
+                    id: "known".into(),
+                    running: true,
+                },
+                PodmanObject {
+                    id: "extra".into(),
+                    running: false,
+                },
+            ],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let create = recovery_create_authority();
+            let (store, lease_id, event_binding) = recovery_journal(
+                &root,
+                [
+                    ProxyJournalFact::create_intent(create.clone()),
+                    ProxyJournalFact::created(create, "known".into()),
+                ],
+            );
+            let mut fake = runner(vec![observed]);
+
+            assert!(matches!(
+                reconcile_recovery(&mut fake, &store, &lease_id, event_binding),
+                Err(ProxyLeaseError::Journal)
+            ));
+            assert_eq!(fake.actions, ["list"]);
+            assert_eq!(journal_facts(&root, &lease_id).len(), 2);
+        }
+    }
+
+    #[test]
+    fn removed_and_invalid_inventories_refuse_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let create = recovery_create_authority();
+        let (store, lease_id, event_binding) = recovery_journal(
+            &root,
+            [
+                ProxyJournalFact::create_intent(create.clone()),
+                ProxyJournalFact::created(create, "known".into()),
+                ProxyJournalFact::delete_intent("known".into()),
+                ProxyJournalFact::removed("known".into()),
+            ],
+        );
+        let mut removed = runner(vec![vec![PodmanObject {
+            id: "known".into(),
+            running: false,
+        }]]);
+        assert!(matches!(
+            reconcile_recovery(&mut removed, &store, &lease_id, event_binding),
+            Err(ProxyLeaseError::Journal)
+        ));
+        assert_eq!(removed.actions, ["list"]);
+
+        for observed in [
+            vec![
+                PodmanObject {
+                    id: "duplicate".into(),
+                    running: true,
+                },
+                PodmanObject {
+                    id: "duplicate".into(),
+                    running: false,
+                },
+            ],
+            vec![PodmanObject {
+                id: "bad/id".into(),
+                running: true,
+            }],
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, lease_id, event_binding) = recovery_journal(
+                &root,
+                [ProxyJournalFact::create_intent(recovery_create_authority())],
+            );
+            let mut invalid = runner(vec![observed]);
+            assert!(matches!(
+                reconcile_recovery(&mut invalid, &store, &lease_id, event_binding),
+                Err(ProxyLeaseError::AmbiguousObjects)
+            ));
+            assert_eq!(invalid.actions, ["list"]);
+        }
+    }
+
+    #[test]
+    fn crashed_stop_intent_resumes_without_second_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, lease_id, event_binding) = recovery_journal(
+            &root,
+            [
+                ProxyJournalFact::create_intent(recovery_create_authority()),
+                ProxyJournalFact::reconcile_inventory(vec![ReconcileObject {
+                    id: "one".into(),
+                    running: true,
+                }]),
+                ProxyJournalFact::stop_intent("one".into()),
+            ],
+        );
+        let mut fake = runner(vec![
+            vec![PodmanObject {
+                id: "one".into(),
+                running: true,
+            }],
+            vec![],
+        ]);
+
+        reconcile_recovery(&mut fake, &store, &lease_id, event_binding).unwrap();
+
+        assert_eq!(fake.actions, ["list", "stop:one", "delete:one", "list"]);
+        assert_eq!(
+            journal_facts(&root, &lease_id)
+                .iter()
+                .filter(|fact| matches!(fact, ProxyJournalFact::StopIntent { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_stop_intent_does_not_repeat_stop() {
+        for (initial, expected_actions) in [
+            (
+                vec![PodmanObject {
+                    id: "one".into(),
+                    running: false,
+                }],
+                vec!["list", "delete:one", "list"],
+            ),
+            (vec![], vec!["list", "list"]),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, lease_id, event_binding) = recovery_journal(
+                &root,
+                [
+                    ProxyJournalFact::create_intent(recovery_create_authority()),
+                    ProxyJournalFact::reconcile_inventory(vec![ReconcileObject {
+                        id: "one".into(),
+                        running: true,
+                    }]),
+                    ProxyJournalFact::stop_intent("one".into()),
+                ],
+            );
+            let mut fake = runner(vec![initial, vec![]]);
+
+            reconcile_recovery(&mut fake, &store, &lease_id, event_binding).unwrap();
+
+            assert_eq!(fake.actions, expected_actions);
+        }
+    }
+
+    #[test]
+    fn crashed_delete_intent_resumes_or_accepts_absence_without_second_intent() {
+        for (initial, expected_actions) in [
+            (
+                vec![PodmanObject {
+                    id: "one".into(),
+                    running: false,
+                }],
+                vec!["list", "delete:one", "list"],
+            ),
+            (vec![], vec!["list", "list"]),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, lease_id, event_binding) = recovery_journal(
+                &root,
+                [
+                    ProxyJournalFact::create_intent(recovery_create_authority()),
+                    ProxyJournalFact::reconcile_inventory(vec![ReconcileObject {
+                        id: "one".into(),
+                        running: false,
+                    }]),
+                    ProxyJournalFact::delete_object_intent("one".into()),
+                ],
+            );
+            let mut fake = runner(vec![initial, vec![]]);
+
+            reconcile_recovery(&mut fake, &store, &lease_id, event_binding).unwrap();
+
+            assert_eq!(fake.actions, expected_actions);
+            assert_eq!(
+                journal_facts(&root, &lease_id)
+                    .iter()
+                    .filter(|fact| matches!(fact, ProxyJournalFact::DeleteObjectIntent { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    fn journal_observer(
+        root: &TempDir,
+        admission: OrdinaryAdmission,
+        lease: LeaseToken,
+        lease_id: &str,
+    ) -> ProxyLeaseObserver<FakePersister, FakeClock> {
+        let authority = authority(root);
+        let journal_store = initialize_journal(root, lease_id, authority.event_binding);
+        ProxyLeaseObserver {
+            admission,
+            lease,
+            lease_id: lease_id.to_owned(),
+            event_binding: authority.event_binding,
+            authority,
+            store: EvidenceStore::new(root.path().join("evidence")).unwrap(),
+            journal_store,
+            upstream_capability_sha256: upstream_capability_digest(&capability()),
+            persister: FakePersister::default(),
+            clock: FakeClock((1..=64).collect()),
+            started_object: None,
+        }
+    }
+
+    #[test]
+    fn lifecycle_events_append_one_exact_ordered_journal_fact() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let mut policy = ProxyPolicy::install(manifest.clone(), &validated).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "Image": manifest.isolation_profile.image_digest,
+            "Cmd": ["true"],
+            "WorkingDir": "/workspace"
+        }))
+        .unwrap();
+        let Admission::Create(create) = policy
+            .admit(
+                buzz_ci_policy_proxy::DockerMethod::Post,
+                "/containers/create",
+                &body,
+            )
+            .unwrap()
+        else {
+            panic!("create admission")
+        };
+        policy
+            .record_created("container-1".into(), &create)
+            .unwrap();
+        let effective = effective(&manifest);
+        let proof = policy.verify_pre_start("container-1", &effective).unwrap();
+        policy.begin_start(&proof).unwrap();
+        policy.commit_started(&proof).unwrap();
+        let Admission::ExecCreate(exec) = policy
+            .admit(
+                buzz_ci_policy_proxy::DockerMethod::Post,
+                "/containers/container-1/exec",
+                br#"{"Cmd":["true"]}"#,
+            )
+            .unwrap()
+        else {
+            panic!("exec admission")
+        };
+
+        let mut observer = journal_observer(&root, admission, lease, &manifest.lease_id);
+        for event in [
+            LifecycleEvent::CreateIntent { create: &create },
+            LifecycleEvent::CreateRejected { create: &create },
+            LifecycleEvent::CreateIntent { create: &create },
+            LifecycleEvent::Created {
+                create: &create,
+                container_id: "container-1",
+            },
+        ] {
+            observer.observe_lifecycle(event).unwrap();
+        }
+        observer
+            .observe_pre_start(&create, "container-1", &effective, &proof)
+            .unwrap();
+        for event in [
+            LifecycleEvent::StartIntent {
+                container_id: "container-1",
+            },
+            LifecycleEvent::StartRejected {
+                container_id: "container-1",
+            },
+            LifecycleEvent::StartIntent {
+                container_id: "container-1",
+            },
+            LifecycleEvent::Started {
+                container_id: "container-1",
+            },
+            LifecycleEvent::ExecCreateIntent { exec: &exec },
+            LifecycleEvent::ExecCreateRejected { exec: &exec },
+            LifecycleEvent::ExecCreateIntent { exec: &exec },
+            LifecycleEvent::ExecCreated {
+                exec: &exec,
+                exec_id: "exec-1",
+            },
+            LifecycleEvent::DeleteIntent {
+                container_id: "container-1",
+            },
+            LifecycleEvent::DeleteRejected {
+                container_id: "container-1",
+            },
+            LifecycleEvent::DeleteIntent {
+                container_id: "container-1",
+            },
+            LifecycleEvent::Removed {
+                container_id: "container-1",
+            },
+        ] {
+            observer.observe_lifecycle(event).unwrap();
+        }
+
+        let create_authority = canonical_create_authority(&create).unwrap();
+        let expected = vec![
+            ProxyJournalFact::create_intent(create_authority.clone()),
+            ProxyJournalFact::create_rejected(create_authority.clone()),
+            ProxyJournalFact::create_intent(create_authority.clone()),
+            ProxyJournalFact::created(create_authority, "container-1".into()),
+            ProxyJournalFact::start_intent("container-1".into()),
+            ProxyJournalFact::start_rejected("container-1".into()),
+            ProxyJournalFact::start_intent("container-1".into()),
+            ProxyJournalFact::started("container-1".into()),
+            ProxyJournalFact::exec_create_intent("container-1".into()),
+            ProxyJournalFact::exec_create_rejected("container-1".into()),
+            ProxyJournalFact::exec_create_intent("container-1".into()),
+            ProxyJournalFact::exec_created("container-1".into(), "exec-1".into()),
+            ProxyJournalFact::delete_intent("container-1".into()),
+            ProxyJournalFact::delete_rejected("container-1".into()),
+            ProxyJournalFact::delete_intent("container-1".into()),
+            ProxyJournalFact::removed("container-1".into()),
+        ];
+        let journal = read_journal(&root, &manifest.lease_id);
+        assert_eq!(
+            journal
+                .entries
+                .iter()
+                .map(|entry| entry.fact.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(journal
+            .entries
+            .iter()
+            .all(|entry| entry.timestamp_unix_ns != 0));
+
+        let poison_root = tempfile::tempdir().unwrap();
+        initialize_evidence(&poison_root, &manifest.lease_id);
+        let mut poisoned = journal_observer(&poison_root, admission, lease, &manifest.lease_id);
+        poisoned
+            .observe_lifecycle(LifecycleEvent::CreateIntent { create: &create })
+            .unwrap();
+        poisoned
+            .observe_lifecycle(LifecycleEvent::Poisoned {
+                phase: buzz_ci_policy_proxy::LifecyclePhase::Creating,
+                container_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            read_journal(&poison_root, &manifest.lease_id)
+                .entries
+                .last()
+                .unwrap()
+                .fact,
+            ProxyJournalFact::poisoned(buzz_ci_policy_proxy::LifecyclePhase::Creating, None,)
+                .unwrap()
+        );
+
+        let bound_poison_root = tempfile::tempdir().unwrap();
+        initialize_evidence(&bound_poison_root, &manifest.lease_id);
+        let mut bound_poisoned =
+            journal_observer(&bound_poison_root, admission, lease, &manifest.lease_id);
+        bound_poisoned
+            .observe_lifecycle(LifecycleEvent::CreateIntent { create: &create })
+            .unwrap();
+        bound_poisoned
+            .observe_lifecycle(LifecycleEvent::Created {
+                create: &create,
+                container_id: "container-1",
+            })
+            .unwrap();
+        bound_poisoned.started_object = Some("container-1".into());
+        bound_poisoned
+            .observe_lifecycle(LifecycleEvent::StartIntent {
+                container_id: "container-1",
+            })
+            .unwrap();
+        bound_poisoned
+            .observe_lifecycle(LifecycleEvent::Poisoned {
+                phase: buzz_ci_policy_proxy::LifecyclePhase::Starting,
+                container_id: Some("container-1"),
+            })
+            .unwrap();
+        assert_eq!(
+            read_journal(&bound_poison_root, &manifest.lease_id)
+                .entries
+                .last()
+                .unwrap()
+                .fact,
+            ProxyJournalFact::poisoned(
+                buzz_ci_policy_proxy::LifecyclePhase::Starting,
+                Some("container-1".into()),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn journal_initialization_failure_creates_no_listener() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let authority = authority(&root);
+        let listener_path = authority.listener_root.join(format!(
+            "proxy-{}-{}.sock",
+            hex::encode(lease.lease_id()),
+            lease.generation()
+        ));
+        let journal_store = test_journal_store(&root);
+        journal_store
+            .create_initial(
+                manifest.lease_id.clone(),
+                authority.event_binding,
+                upstream_capability_digest(&capability()),
+            )
+            .unwrap();
+        let (upstream, _runtime) = UnixStream::pair().unwrap();
+
+        assert!(matches!(
+            build_broker_proxy_lease_with_journal_store(
+                authority,
+                admission,
+                lease,
+                &validated,
+                manifest,
+                upstream,
+                FakePersister::default(),
+                TransportLimits::default(),
+                journal_store,
+            ),
+            Err(ProxyLeaseError::Journal)
+        ));
+        assert!(!listener_path.exists());
+        assert!(root
+            .path()
+            .join("evidence")
+            .join(format!(
+                "proxy-journal-{}.json",
+                validated.as_binding().lease_id
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn started_journal_persistence_precedes_start_ordering_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let mut policy = ProxyPolicy::install(manifest.clone(), &validated).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "Image": manifest.isolation_profile.image_digest,
+            "Cmd": ["true"],
+            "WorkingDir": "/workspace"
+        }))
+        .unwrap();
+        let Admission::Create(create) = policy
+            .admit(
+                buzz_ci_policy_proxy::DockerMethod::Post,
+                "/containers/create",
+                &body,
+            )
+            .unwrap()
+        else {
+            panic!("create admission")
+        };
+        policy
+            .record_created("container-1".into(), &create)
+            .unwrap();
+        let effective = effective(&manifest);
+        let proof = policy.verify_pre_start("container-1", &effective).unwrap();
+        let mut observer = journal_observer(&root, admission, lease, &manifest.lease_id);
+        observer
+            .observe_lifecycle(LifecycleEvent::CreateIntent { create: &create })
+            .unwrap();
+        observer
+            .observe_lifecycle(LifecycleEvent::Created {
+                create: &create,
+                container_id: "container-1",
+            })
+            .unwrap();
+        observer
+            .observe_pre_start(&create, "container-1", &effective, &proof)
+            .unwrap();
+        observer
+            .observe_lifecycle(LifecycleEvent::StartIntent {
+                container_id: "container-1",
+            })
+            .unwrap();
+        let ordering = observer.store.paths(&manifest.lease_id).unwrap().ordering;
+        fs::remove_file(&ordering).unwrap();
+        fs::create_dir(&ordering).unwrap();
+
+        assert!(matches!(
+            observer.observe_lifecycle(LifecycleEvent::Started {
+                container_id: "container-1",
+            }),
+            Err(ProxyError::Transport(message)) if message == "proxy start ordering failed"
+        ));
+        assert!(matches!(
+            read_journal(&root, &manifest.lease_id)
+                .entries
+                .last()
+                .unwrap()
+                .fact,
+            ProxyJournalFact::Started { ref container_id } if container_id == "container-1"
+        ));
     }
 
     #[test]
@@ -1148,21 +2236,43 @@ mod tests {
             .unwrap();
         let effective = effective(&manifest);
         let proof = policy.verify_pre_start("container-1", &effective).unwrap();
+        let authority = authority(&root);
+        let journal_store = initialize_journal(&root, &manifest.lease_id, authority.event_binding);
         let mut observer = ProxyLeaseObserver {
             admission,
             lease,
             lease_id: manifest.lease_id.clone(),
-            authority: authority(&root),
+            event_binding: authority.event_binding,
+            authority,
             store: EvidenceStore::new(root.path().join("evidence")).unwrap(),
+            journal_store,
+            upstream_capability_sha256: upstream_capability_digest(&capability()),
             persister: FakePersister::default(),
-            clock: FakeClock(VecDeque::from([10, 20])),
+            clock: FakeClock((10..=60).collect()),
             started_object: None,
         };
         observer
+            .observe_lifecycle(LifecycleEvent::CreateIntent { create: &create })
+            .unwrap();
+        observer
+            .observe_lifecycle(LifecycleEvent::Created {
+                create: &create,
+                container_id: "container-1",
+            })
+            .unwrap();
+        observer
             .observe_pre_start(&create, "container-1", &effective, &proof)
             .unwrap();
-        policy.commit_started(&proof).unwrap();
-        observer.observe_started("container-1").unwrap();
+        observer
+            .observe_lifecycle(LifecycleEvent::StartIntent {
+                container_id: "container-1",
+            })
+            .unwrap();
+        observer
+            .observe_lifecycle(LifecycleEvent::Started {
+                container_id: "container-1",
+            })
+            .unwrap();
         assert_eq!(observer.persister.calls, 1);
         let paths = observer.store.paths(&manifest.lease_id).unwrap();
         assert!(paths.proxy_object(1).unwrap().is_file());
@@ -1204,12 +2314,17 @@ mod tests {
 
         let effective = effective(&manifest);
         let proof = policy.verify_pre_start("container-1", &effective).unwrap();
+        let authority = authority(&root);
+        let journal_store = initialize_journal(&root, &manifest.lease_id, authority.event_binding);
         let mut observer = ProxyLeaseObserver {
             admission,
             lease,
             lease_id: manifest.lease_id.clone(),
-            authority: authority(&root),
+            event_binding: authority.event_binding,
+            authority,
             store: EvidenceStore::new(root.path().join("evidence")).unwrap(),
+            journal_store,
+            upstream_capability_sha256: upstream_capability_digest(&capability()),
             persister: FakePersister {
                 fail: true,
                 calls: 0,
@@ -1244,8 +2359,9 @@ mod tests {
         wrong_manifest.request_event_id = "1".repeat(64);
         let (upstream, _runtime) = UnixStream::pair().unwrap();
         let root = tempfile::tempdir().unwrap();
+        initialize_evidence(&root, &manifest.lease_id);
         assert!(matches!(
-            build_broker_proxy_lease(
+            build_broker_proxy_lease_with_journal_store(
                 authority(&root),
                 admission,
                 lease,
@@ -1254,6 +2370,7 @@ mod tests {
                 upstream,
                 FakePersister::default(),
                 TransportLimits::default(),
+                test_journal_store(&root),
             ),
             Err(ProxyLeaseError::Proxy(ProxyError::InvalidManifest(_)))
         ));
@@ -1265,7 +2382,7 @@ mod tests {
         let (admission, lease, validated, manifest) = binding_fixture();
         initialize_evidence(&root, &manifest.lease_id);
         let (upstream, _runtime) = UnixStream::pair().unwrap();
-        let mut broker = build_broker_proxy_lease(
+        let mut broker = build_broker_proxy_lease_with_journal_store(
             authority(&root),
             admission,
             lease,
@@ -1274,6 +2391,7 @@ mod tests {
             upstream,
             FakePersister::default(),
             TransportLimits::default(),
+            test_journal_store(&root),
         )
         .unwrap();
         assert!(fs::metadata(broker.listener_path())
@@ -1294,12 +2412,67 @@ mod tests {
     }
 
     #[test]
-    fn lease_token_gates_reconciliation_and_listener_removal() {
+    fn failed_transport_construction_removes_only_created_authority_and_retries() {
         let root = tempfile::tempdir().unwrap();
         let (admission, lease, validated, manifest) = binding_fixture();
         initialize_evidence(&root, &manifest.lease_id);
+        let authority = authority(&root);
+        let listener_path = authority.listener_root.join(format!(
+            "proxy-{}-{}.sock",
+            hex::encode(lease.lease_id()),
+            lease.generation()
+        ));
+        let journal_path = authority
+            .evidence_root
+            .join(format!("proxy-journal-{}.json", manifest.lease_id));
+        let journal_store = test_journal_store(&root);
         let (upstream, _runtime) = UnixStream::pair().unwrap();
-        let mut broker = build_broker_proxy_lease(
+        FAIL_CONSTRUCTION_AFTER_AUTHORITY.with(|fail| fail.set(true));
+
+        assert!(matches!(
+            build_broker_proxy_lease_with_journal_store(
+                authority.clone(),
+                admission,
+                lease,
+                &validated,
+                manifest.clone(),
+                upstream,
+                FakePersister::default(),
+                TransportLimits::default(),
+                Arc::clone(&journal_store),
+            ),
+            Err(ProxyLeaseError::Authority)
+        ));
+        assert!(!listener_path.exists());
+        assert!(!journal_path.exists());
+
+        let (upstream, _runtime) = UnixStream::pair().unwrap();
+        let broker = build_broker_proxy_lease_with_journal_store(
+            authority,
+            admission,
+            lease,
+            &validated,
+            manifest,
+            upstream,
+            FakePersister::default(),
+            TransportLimits::default(),
+            journal_store,
+        )
+        .unwrap();
+        assert_eq!(broker.listener_path(), listener_path);
+        assert!(journal_path.exists());
+    }
+
+    #[test]
+    fn broker_proxy_install_writes_zero_runtime_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let (upstream, mut runtime) = UnixStream::pair().unwrap();
+        runtime
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let _broker = build_broker_proxy_lease_with_journal_store(
             authority(&root),
             admission,
             lease,
@@ -1308,8 +2481,72 @@ mod tests {
             upstream,
             FakePersister::default(),
             TransportLimits::default(),
+            test_journal_store(&root),
         )
         .unwrap();
+
+        let mut byte = [0_u8; 1];
+        assert!(matches!(
+            runtime.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+    }
+
+    fn build_recovery_broker(
+        root: &TempDir,
+    ) -> (
+        BrokerProxyLease<FakePersister>,
+        LeaseToken,
+        String,
+        CiEventBinding,
+    ) {
+        let (admission, lease, validated, manifest) = binding_fixture();
+        let lease_id = manifest.lease_id.clone();
+        initialize_evidence(root, &lease_id);
+        let authority = authority(root);
+        let event_binding = authority.event_binding;
+        let (upstream, _runtime) = UnixStream::pair().unwrap();
+        let broker = build_broker_proxy_lease_with_journal_store(
+            authority,
+            admission,
+            lease,
+            &validated,
+            manifest,
+            upstream,
+            FakePersister::default(),
+            TransportLimits::default(),
+            test_journal_store(root),
+        )
+        .unwrap();
+        (broker, lease, lease_id, event_binding)
+    }
+
+    fn seed_broker_create_intent(
+        broker: &BrokerProxyLease<FakePersister>,
+        lease_id: &str,
+        event_binding: CiEventBinding,
+    ) {
+        broker
+            .journal_store
+            .append(
+                lease_id,
+                event_binding,
+                upstream_capability_digest(&broker.capability),
+                1,
+                ProxyJournalFact::create_intent(recovery_create_authority()),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn lease_token_gates_reconciliation_and_listener_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut broker, lease, lease_id, event_binding) = build_recovery_broker(&root);
+        seed_broker_create_intent(&broker, &lease_id, event_binding);
         let path = broker.listener_path().to_owned();
         let mut wrong = lease;
         wrong = LeaseToken::from_durable(DurableLeaseFields {
@@ -1322,12 +2559,12 @@ mod tests {
             nonce: wrong.nonce(),
             deadline_at: wrong.deadline_at(),
         });
-        let retained = BTreeSet::from(["one".into()]);
         let mut unused = runner(vec![]);
         assert!(matches!(
-            broker.reconcile(wrong, &mut unused, &retained),
+            broker.reconcile(wrong, &mut unused),
             Err(ProxyLeaseError::DescriptorIdentity)
         ));
+        assert!(unused.actions.is_empty());
         assert!(path.exists());
         let mut cleanup = runner(vec![
             vec![PodmanObject {
@@ -1336,7 +2573,281 @@ mod tests {
             }],
             vec![],
         ]);
-        broker.reconcile(lease, &mut cleanup, &retained).unwrap();
+        broker.reconcile(lease, &mut cleanup).unwrap();
         assert!(!path.exists());
+        assert!(broker
+            .journal_store
+            .load(
+                &lease_id,
+                event_binding,
+                upstream_capability_digest(&broker.capability),
+            )
+            .unwrap()
+            .is_clean_terminal());
+    }
+
+    #[test]
+    fn listener_survives_list_stop_delete_storage_and_residue_failures() {
+        {
+            let root = tempfile::tempdir().unwrap();
+            let (mut broker, lease, lease_id, event_binding) = build_recovery_broker(&root);
+            seed_broker_create_intent(&broker, &lease_id, event_binding);
+            let path = broker.listener_path().to_owned();
+            let mut fake = FakeRunner {
+                lists: VecDeque::from([Err(ProxyLeaseError::AmbiguousObjects)]),
+                stop_fail: false,
+                delete_fail: false,
+                actions: Vec::new(),
+            };
+            assert!(matches!(
+                broker.reconcile(lease, &mut fake),
+                Err(ProxyLeaseError::AmbiguousObjects)
+            ));
+            assert!(path.exists());
+        }
+
+        {
+            let root = tempfile::tempdir().unwrap();
+            let (mut broker, lease, lease_id, event_binding) = build_recovery_broker(&root);
+            seed_broker_create_intent(&broker, &lease_id, event_binding);
+            let path = broker.listener_path().to_owned();
+            let mut fake = runner(vec![vec![PodmanObject {
+                id: "one".into(),
+                running: true,
+            }]]);
+            fake.stop_fail = true;
+            assert!(matches!(
+                broker.reconcile(lease, &mut fake),
+                Err(ProxyLeaseError::Stop)
+            ));
+            assert!(path.exists());
+            assert!(matches!(
+                journal_facts(&root, &lease_id).last(),
+                Some(ProxyJournalFact::StopIntent { container_id }) if container_id == "one"
+            ));
+        }
+
+        {
+            let root = tempfile::tempdir().unwrap();
+            let (mut broker, lease, lease_id, event_binding) = build_recovery_broker(&root);
+            seed_broker_create_intent(&broker, &lease_id, event_binding);
+            let path = broker.listener_path().to_owned();
+            let mut fake = runner(vec![vec![PodmanObject {
+                id: "one".into(),
+                running: false,
+            }]]);
+            fake.delete_fail = true;
+            assert!(matches!(
+                broker.reconcile(lease, &mut fake),
+                Err(ProxyLeaseError::Delete)
+            ));
+            assert!(path.exists());
+            assert!(matches!(
+                journal_facts(&root, &lease_id).last(),
+                Some(ProxyJournalFact::DeleteObjectIntent { object_id }) if object_id == "one"
+            ));
+        }
+
+        {
+            let root = tempfile::tempdir().unwrap();
+            let (mut broker, lease, lease_id, event_binding) = build_recovery_broker(&root);
+            seed_broker_create_intent(&broker, &lease_id, event_binding);
+            let path = broker.listener_path().to_owned();
+            let journal_path = root
+                .path()
+                .join("evidence")
+                .join(format!("proxy-journal-{lease_id}.json"));
+            let mut fake = JournalFailureRunner {
+                journal_path: journal_path.clone(),
+                actions: Vec::new(),
+            };
+            assert!(matches!(
+                broker.reconcile(lease, &mut fake),
+                Err(ProxyLeaseError::Journal)
+            ));
+            assert_eq!(fake.actions, ["list", "stop:one"]);
+            assert!(path.exists());
+            fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(
+                journal_facts(&root, &lease_id).last(),
+                Some(ProxyJournalFact::StopIntent { container_id }) if container_id == "one"
+            ));
+        }
+
+        {
+            let root = tempfile::tempdir().unwrap();
+            let (mut broker, lease, lease_id, event_binding) = build_recovery_broker(&root);
+            seed_broker_create_intent(&broker, &lease_id, event_binding);
+            let path = broker.listener_path().to_owned();
+            let residue = vec![PodmanObject {
+                id: "one".into(),
+                running: false,
+            }];
+            let mut fake = runner(vec![
+                vec![PodmanObject {
+                    id: "one".into(),
+                    running: true,
+                }],
+                residue,
+            ]);
+            assert!(matches!(
+                broker.reconcile(lease, &mut fake),
+                Err(ProxyLeaseError::ObjectsRemain)
+            ));
+            assert!(path.exists());
+            assert!(matches!(
+                journal_facts(&root, &lease_id).last(),
+                Some(ProxyJournalFact::DeletedObject { object_id }) if object_id == "one"
+            ));
+        }
+    }
+
+    #[test]
+    fn already_clean_replay_skips_runtime_and_retries_listener_unlink() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut broker, lease, lease_id, event_binding) = build_recovery_broker(&root);
+        append_journal_facts(
+            &broker.journal_store,
+            &lease_id,
+            event_binding,
+            [
+                ProxyJournalFact::reconcile_inventory(vec![]),
+                ProxyJournalFact::reconcile_verified_empty(),
+            ],
+        );
+        let path = broker.listener_path().to_owned();
+        let mut unused = runner(vec![]);
+
+        broker.reconcile(lease, &mut unused).unwrap();
+
+        assert!(unused.actions.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn journal_restart_process() {
+        let Some(root) = std::env::var_os("BUZZ_PROXY_JOURNAL_RESTART_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("BUZZ_PROXY_JOURNAL_RESTART_PHASE").unwrap();
+        let root = PathBuf::from(root);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let evidence_root = root.join("evidence");
+        let (_, _, _, manifest) = binding_fixture();
+        let event_binding = recovery_event_binding();
+        if phase == "write" {
+            fs::create_dir(&evidence_root).unwrap();
+            fs::set_permissions(&evidence_root, fs::Permissions::from_mode(0o700)).unwrap();
+            let store = ProxyJournalStore::open_with_expected_owner(
+                &evidence_root,
+                nix::unistd::getuid().as_raw(),
+                nix::unistd::getgid().as_raw(),
+            )
+            .unwrap();
+            store
+                .create_initial(
+                    manifest.lease_id.clone(),
+                    event_binding,
+                    upstream_capability_digest(&capability()),
+                )
+                .unwrap();
+            store
+                .append(
+                    &manifest.lease_id,
+                    event_binding,
+                    upstream_capability_digest(&capability()),
+                    1,
+                    ProxyJournalFact::create_intent(recovery_create_authority()),
+                )
+                .unwrap();
+            std::process::exit(86);
+        }
+
+        assert_eq!(phase, "recover");
+        let store = Arc::new(
+            ProxyJournalStore::open_with_expected_owner(
+                &evidence_root,
+                nix::unistd::getuid().as_raw(),
+                nix::unistd::getgid().as_raw(),
+            )
+            .unwrap(),
+        );
+        let mut fake = runner(vec![
+            vec![PodmanObject {
+                id: "orphan".into(),
+                running: true,
+            }],
+            vec![],
+        ]);
+        reconcile_podman_objects(
+            &mut fake,
+            &capability(),
+            &store,
+            &manifest.lease_id,
+            event_binding,
+            &mut FakeClock((100..=200).collect()),
+        )
+        .unwrap();
+        assert_eq!(
+            fake.actions,
+            ["list", "stop:orphan", "delete:orphan", "list"]
+        );
+    }
+
+    #[test]
+    fn fresh_process_create_intent_reopens_and_reconciles() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("BUZZ_PROXY_JOURNAL_RESTART_ROOT", root.path())
+            .env("BUZZ_PROXY_JOURNAL_RESTART_PHASE", "write")
+            .arg("--exact")
+            .arg("proxy_lease::tests::journal_restart_process")
+            .arg("--nocapture")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86));
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("BUZZ_PROXY_JOURNAL_RESTART_ROOT", root.path())
+            .env("BUZZ_PROXY_JOURNAL_RESTART_PHASE", "recover")
+            .arg("--exact")
+            .arg("proxy_lease::tests::journal_restart_process")
+            .arg("--nocapture")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (_, _, _, manifest) = binding_fixture();
+        let lease_id = manifest.lease_id;
+        assert_eq!(
+            read_journal_at(root.path(), &lease_id)
+                .entries
+                .into_iter()
+                .map(|entry| entry.fact)
+                .collect::<Vec<_>>(),
+            [
+                ProxyJournalFact::create_intent(recovery_create_authority()),
+                ProxyJournalFact::reconcile_inventory(vec![ReconcileObject {
+                    id: "orphan".into(),
+                    running: true,
+                }]),
+                ProxyJournalFact::stop_intent("orphan".into()),
+                ProxyJournalFact::stopped("orphan".into()),
+                ProxyJournalFact::delete_object_intent("orphan".into()),
+                ProxyJournalFact::deleted_object("orphan".into()),
+                ProxyJournalFact::reconcile_inventory(vec![]),
+                ProxyJournalFact::reconcile_verified_empty(),
+            ]
+        );
     }
 }
