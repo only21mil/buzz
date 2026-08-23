@@ -159,10 +159,8 @@ impl ProductionAdapters {
 
     /// Discover the complete fixed production backend set.
     ///
-    /// The current integration base lacks the DNS activation binding, opaque
-    /// policy-proxy create/start capabilities, ordinary job runner, and concrete
-    /// qualification cleanup runner. Until those land together, discovery is
-    /// intentionally closed rather than assembling a partial host path.
+    /// Discovery remains closed until every production proof source and host
+    /// execution adapter is bound. It never assembles a partial host path.
     pub fn canonical() -> Result<Self, ProductionCompositionError> {
         Err(ProductionCompositionError::HostBackendsMissing)
     }

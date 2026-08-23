@@ -272,18 +272,17 @@ pub trait NormalExecutionBackend {
         store: &EvidenceStore,
     ) -> Result<(), ExecutionUnavailable>;
 
-    /// Complete create, effective-spec inspection, seccomp persistence, and
-    /// start. The pre-start observer must commit before this method succeeds.
-    fn proxy_create_inspect_start(
+    /// Prepare the per-lease policy proxy, then launch the pinned Act command.
+    /// Act remains the sole container client through `DOCKER_HOST`; this
+    /// method must not issue Docker create or start requests itself.
+    fn run_act_through_proxy(
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
+        plan: &ActLaunchPlan,
         binding: &ValidatedAttemptLeaseBinding,
         store: &EvidenceStore,
     ) -> Result<(), ExecutionUnavailable>;
-
-    /// Launch only the supplied pinned command in its exact executor unit.
-    fn start_act(&mut self, plan: &ActLaunchPlan) -> Result<(), ExecutionUnavailable>;
 
     fn terminal_evidence(
         &mut self,
@@ -419,9 +418,13 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
             .map_err(|_| ExecutionUnavailable)?;
         self.backend
             .materialize(&active.plan, &active.binding, &store)?;
-        self.backend
-            .proxy_create_inspect_start(admission, lease, &active.binding, &store)?;
-        self.backend.start_act(&active.plan.act)?;
+        self.backend.run_act_through_proxy(
+            admission,
+            lease,
+            &active.plan.act,
+            &active.binding,
+            &store,
+        )?;
         active.provision_complete = true;
         Ok(())
     }
@@ -1265,8 +1268,7 @@ mod tests {
         Preflight,
         Dns,
         Materialize,
-        Proxy,
-        Act,
+        ActThroughProxy,
         Terminal,
         Cleanup,
     }
@@ -1358,15 +1360,26 @@ mod tests {
             self.fail_if(FailStage::Materialize)
         }
 
-        fn proxy_create_inspect_start(
+        fn run_act_through_proxy(
             &mut self,
             _admission: OrdinaryAdmission,
             _lease: LeaseToken,
+            plan: &ActLaunchPlan,
             _binding: &ValidatedAttemptLeaseBinding,
             store: &EvidenceStore,
         ) -> Result<(), ExecutionUnavailable> {
-            self.push("prestart");
-            self.fail_if(FailStage::Proxy)?;
+            self.push("proxy-ready");
+            self.fail_if(FailStage::ActThroughProxy)?;
+            self.push("act-start");
+            assert_eq!(plan.environment()?.len(), 4);
+            assert!(plan
+                .environment()?
+                .iter()
+                .any(|(key, value)| key == "DOCKER_HOST" && value.contains("proxy.sock")));
+            assert!(!plan
+                .argv()?
+                .iter()
+                .any(|value| value.contains("DOCKER_HOST")));
             store
                 .append_ordering(&ordering(
                     &self.lease_id,
@@ -1383,22 +1396,6 @@ mod tests {
                     OrderingEvent::Start,
                 ))
                 .map_err(|_| ExecutionUnavailable)?;
-            self.push("proxy-start");
-            Ok(())
-        }
-
-        fn start_act(&mut self, plan: &ActLaunchPlan) -> Result<(), ExecutionUnavailable> {
-            self.push("act-start");
-            self.fail_if(FailStage::Act)?;
-            assert_eq!(plan.environment()?.len(), 4);
-            assert!(plan
-                .environment()?
-                .iter()
-                .any(|(key, value)| key == "DOCKER_HOST" && value.contains("proxy.sock")));
-            assert!(!plan
-                .argv()?
-                .iter()
-                .any(|value| value.contains("DOCKER_HOST")));
             Ok(())
         }
 
@@ -1895,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_enforces_prestart_and_publishes_clean_teardown() {
+    fn provision_arms_proxy_before_act_without_broker_runtime_requests() {
         let (fixture, mut engine, log) = build_engine(FailStage::None, false, false);
         let receipts = run_to_terminal(&fixture, &mut engine).unwrap();
         assert_eq!(receipts.conclusion, LeaseConclusion::Success);
@@ -1915,8 +1912,7 @@ mod tests {
                 "preflight",
                 "dns",
                 "materialize",
-                "prestart",
-                "proxy-start",
+                "proxy-ready",
                 "act-start",
                 "terminal",
                 "cleanup"
@@ -1929,8 +1925,7 @@ mod tests {
         for stage in [
             FailStage::Dns,
             FailStage::Materialize,
-            FailStage::Proxy,
-            FailStage::Act,
+            FailStage::ActThroughProxy,
         ] {
             let (fixture, mut engine, _) = build_engine(stage, false, false);
             engine
