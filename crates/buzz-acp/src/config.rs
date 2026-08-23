@@ -2641,16 +2641,78 @@ channels = "ALL"
 
     #[test]
     fn idle_timeout_must_be_less_than_max_turn_duration() {
-        // The guard in Config::from_args rejects idle >= max_turn.
-        // Exercise the same logic: if idle >= max_turn, it's invalid.
-        let idle = 3600u64;
-        let max_turn = 3600u64;
+        // Drive Config::from_args through CliArgs::try_parse_from so the guard
+        // at the real call site is exercised, not a copy of its logic.
+        // --allowed-respond-to is passed explicitly to avoid reading
+        // BUZZ_ACP_ALLOWED_RESPOND_TO from the environment.
+
+        // Equal values must be rejected (>=, not just >).
+        let args_equal = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--idle-timeout",
+            "300",
+            "--max-turn-duration",
+            "300",
+            "--allowed-respond-to",
+            "anyone,owner-only,allowlist,nobody",
+        ])
+        .expect("clap should parse args");
+        let result_equal = Config::from_args(args_equal);
         assert!(
-            idle >= max_turn,
-            "test precondition: idle must be >= max_turn to trigger guard"
+            result_equal.is_err(),
+            "equal idle and max_turn must be rejected: {result_equal:?}"
+        );
+        let msg = result_equal.unwrap_err().to_string();
+        assert!(
+            msg.contains("idle_timeout"),
+            "error should name idle_timeout: {msg}"
+        );
+        assert!(
+            msg.contains("max_turn_duration"),
+            "error should name max_turn_duration: {msg}"
         );
 
-        // And the valid case (const assertion so clippy doesn't flag it):
+        // idle > max_turn must also be rejected.
+        let args_greater = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--idle-timeout",
+            "600",
+            "--max-turn-duration",
+            "300",
+            "--allowed-respond-to",
+            "anyone,owner-only,allowlist,nobody",
+        ])
+        .expect("clap should parse args");
+        let result_greater = Config::from_args(args_greater);
+        assert!(
+            result_greater.is_err(),
+            "idle > max_turn must be rejected: {result_greater:?}"
+        );
+
+        // idle < max_turn must be accepted (the guard's happy path).
+        let args_valid = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--idle-timeout",
+            "300",
+            "--max-turn-duration",
+            "600",
+            "--allowed-respond-to",
+            "anyone,owner-only,allowlist,nobody",
+        ])
+        .expect("clap should parse args");
+        let result_valid = Config::from_args(args_valid);
+        assert!(
+            result_valid.is_ok(),
+            "idle < max_turn must be accepted: {result_valid:?}"
+        );
+
+        // And the const defaults still satisfy the invariant.
         const {
             assert!(DEFAULT_IDLE_TIMEOUT_SECS < DEFAULT_MAX_TURN_DURATION_SECS);
         }
