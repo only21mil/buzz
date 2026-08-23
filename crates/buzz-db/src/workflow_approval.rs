@@ -107,6 +107,15 @@ impl CanonicalApprovalPolicy {
     }
 }
 
+impl ApprovalRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 /// Canonical concrete approvers resolved from current channel membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedApprovers(Vec<Vec<u8>>);
@@ -209,8 +218,6 @@ pub struct CreateWorkflowApprovalGateParams<'a> {
     pub expected_generation: i64,
     /// Canonical policy snapshot from the approval step.
     pub policy: &'a CanonicalApprovalPolicy,
-    /// Current concrete channel members resolved under the channel lock.
-    pub resolved_approvers: &'a ResolvedApprovers,
     /// Bounded summary safe for the channel-scoped request event.
     pub action_summary: &'a ApprovalActionSummary,
     /// Database expiry instant for the pending gate.
@@ -281,8 +288,15 @@ pub enum WorkflowApprovalGateCreationOutcome {
         /// Existing durable request row.
         request: WorkflowApprovalRequestRecord,
     },
-    /// A tenant, channel, workflow, state, generation, definition, or payload fence failed.
+    /// A tenant, channel, workflow, state, definition, or payload fence failed.
     Conflict,
+    /// The bound run exists, but its generation no longer matches the caller's snapshot.
+    StaleGeneration {
+        /// Current generation held by the run.
+        current_generation: i64,
+    },
+    /// No active channel member currently satisfies the frozen policy.
+    NoEligibleApprovers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,9 +328,10 @@ fn classify_run_gate_state(
 /// Create or exactly reuse a workflow approval gate in one transaction.
 ///
 /// The channel advisory lock is the transaction's first database statement.
-/// The function then locks and fences the run, creates the immutable gate,
-/// stores `next_step = step_index + 1` and prior outputs, appends one waiting
-/// trace item, advances the run generation, and inserts one request outbox row.
+/// The function then locks and fences the run, resolves the policy from active
+/// channel membership, creates the immutable gate, stores `next_step =
+/// step_index + 1` and prior outputs, appends one waiting trace item, advances
+/// the run generation, and inserts one request outbox row.
 /// Any mismatch returns [`WorkflowApprovalGateCreationOutcome::Conflict`] and
 /// rolls back every write. An exact retry after commit returns `Reused`.
 pub async fn create_workflow_approval_gate(
@@ -377,16 +392,38 @@ pub async fn create_workflow_approval_gate(
         return Ok(WorkflowApprovalGateCreationOutcome::Conflict);
     }
 
-    let run_gate_state =
-        classify_run_gate_state(run_status, run_generation, params.expected_generation);
-    if run_gate_state == RunGateState::Conflict
-        || matches!(run_gate_state, RunGateState::Fresh { .. }) && expires_at <= database_now
-    {
+    let run_gate_state = classify_run_gate_state(
+        run_status.clone(),
+        run_generation,
+        params.expected_generation,
+    );
+    if run_gate_state == RunGateState::Conflict {
+        tx.rollback().await?;
+        if matches!(run_status, RunStatus::Running | RunStatus::WaitingApproval)
+            && run_generation != params.expected_generation
+        {
+            return Ok(WorkflowApprovalGateCreationOutcome::StaleGeneration {
+                current_generation: run_generation,
+            });
+        }
+        return Ok(WorkflowApprovalGateCreationOutcome::Conflict);
+    }
+    if matches!(run_gate_state, RunGateState::Fresh { .. }) && expires_at <= database_now {
         tx.rollback().await?;
         return Ok(WorkflowApprovalGateCreationOutcome::Conflict);
     }
 
     let is_fresh = matches!(run_gate_state, RunGateState::Fresh { .. });
+    let resolved_approvers = if is_fresh {
+        let resolved = resolve_current_approvers(&mut tx, &params).await?;
+        let Some(resolved) = resolved else {
+            tx.rollback().await?;
+            return Ok(WorkflowApprovalGateCreationOutcome::NoEligibleApprovers);
+        };
+        Some(resolved)
+    } else {
+        None
+    };
     if is_fresh {
         let advanced_generation = sqlx::query_scalar::<_, i64>(
             r#"
@@ -422,9 +459,13 @@ pub async fn create_workflow_approval_gate(
     }
 
     let inserted_gate = if is_fresh {
+        let Some(resolved_approvers) = resolved_approvers.as_ref() else {
+            tx.rollback().await?;
+            return Ok(WorkflowApprovalGateCreationOutcome::Conflict);
+        };
         sqlx::query(
             r#"
-            INSERT INTO workflow_approvals
+            INSERT INTO workflow_approval_gates
                 (id, community_id, channel_id, workflow_id, run_id,
                  definition_hash, step_id, step_index, generation,
                  policy_snapshot, resolved_approver_set, status, expires_at)
@@ -444,10 +485,7 @@ pub async fn create_workflow_approval_gate(
         .bind(params.step_index)
         .bind(gate_generation)
         .bind(&policy_json)
-        .bind(resolved_approver_set(
-            params.policy,
-            params.resolved_approvers,
-        ))
+        .bind(resolved_approver_set(params.policy, resolved_approvers))
         .bind(expires_at)
         .fetch_optional(&mut *tx)
         .await?
@@ -502,7 +540,7 @@ pub async fn create_workflow_approval_gate(
     let request = insert_or_load_request(
         &mut tx,
         &params,
-        gate.approval_id,
+        &gate,
         gate_generation,
         expires_at,
         &dedupe_key,
@@ -539,7 +577,6 @@ fn validate_params(params: &CreateWorkflowApprovalGateParams<'_>) -> Result<()> 
         ));
     }
     params.policy.validate_canonical()?;
-    ResolvedApprovers::new(params.resolved_approvers.0.clone())?;
     ApprovalActionSummary::new(params.action_summary.as_str())?;
     ApprovalRequestPayload::new(params.request_payload.as_value().clone())?;
     if !params.prior_step_outputs.is_object() {
@@ -573,6 +610,44 @@ fn resolved_approver_set(policy: &CanonicalApprovalPolicy, approvers: &ResolvedA
         "pubkeys": approvers.as_slice().iter().map(hex::encode).collect::<Vec<_>>(),
         "roles": policy.roles(),
     })
+}
+
+async fn resolve_current_approvers(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    params: &CreateWorkflowApprovalGateParams<'_>,
+) -> Result<Option<ResolvedApprovers>> {
+    let roles = params
+        .policy
+        .roles()
+        .iter()
+        .map(|role| role.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let pubkeys = sqlx::query_scalar::<_, Vec<u8>>(
+        r#"
+        SELECT member.pubkey
+        FROM channel_members AS member
+        WHERE member.community_id = $1
+          AND member.channel_id = $2
+          AND member.removed_at IS NULL
+          AND (
+              encode(member.pubkey, 'hex') = ANY($3::text[])
+              OR member.role::text = ANY($4::text[])
+          )
+        ORDER BY member.pubkey
+        "#,
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.channel_id)
+    .bind(params.policy.exact_pubkeys())
+    .bind(&roles)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    if pubkeys.is_empty() {
+        Ok(None)
+    } else {
+        ResolvedApprovers::new(pubkeys).map(Some)
+    }
 }
 
 fn validate_pubkey(pubkey: &[u8]) -> Result<()> {
@@ -636,7 +711,7 @@ async fn load_gate_for_update(
                definition_hash, step_id, step_index, generation,
                policy_snapshot, resolved_approver_set,
                expires_at, created_at
-        FROM workflow_approvals
+        FROM workflow_approval_gates
         WHERE community_id = $1 AND run_id = $2 AND step_index = $3
         FOR UPDATE
         "#,
@@ -703,19 +778,24 @@ fn gate_matches(
         && gate.step_index == params.step_index
         && gate.gate_generation == gate_generation
         && serde_json::to_value(&gate.policy).ok().as_ref() == Some(policy_json)
-        && gate.resolved_approvers == *params.resolved_approvers
         && gate.expires_at == expires_at
 }
 
 async fn insert_or_load_request(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     params: &CreateWorkflowApprovalGateParams<'_>,
-    approval_id: Uuid,
+    gate: &WorkflowApprovalGateRecord,
     gate_generation: i64,
     expires_at: DateTime<Utc>,
     dedupe_key: &str,
 ) -> Result<Option<WorkflowApprovalRequestRecord>> {
-    let expected_payload = bound_request_payload(params, approval_id, gate_generation, expires_at)?;
+    let expected_payload = bound_request_payload(
+        params,
+        gate.approval_id,
+        &gate.resolved_approvers,
+        gate_generation,
+        expires_at,
+    )?;
     sqlx::query(
         r#"
         INSERT INTO workflow_approval_outbox
@@ -725,7 +805,7 @@ async fn insert_or_load_request(
         "#,
     )
     .bind(params.community_id.as_uuid())
-    .bind(approval_id)
+    .bind(gate.approval_id)
     .bind(&expected_payload)
     .bind(dedupe_key)
     .execute(&mut **tx)
@@ -749,7 +829,7 @@ async fn insert_or_load_request(
     };
     let row_community_id: Uuid = row.try_get("community_id")?;
     let matches = CommunityId::from_uuid(row_community_id) == params.community_id
-        && row.try_get::<Uuid, _>("approval_id")? == approval_id
+        && row.try_get::<Uuid, _>("approval_id")? == gate.approval_id
         && row.try_get::<String, _>("class")? == "approval_requested"
         && row.try_get::<Value, _>("payload")? == expected_payload
         && row.try_get::<String, _>("dedupe_key")? == dedupe_key;
@@ -766,6 +846,7 @@ async fn insert_or_load_request(
 fn bound_request_payload(
     params: &CreateWorkflowApprovalGateParams<'_>,
     approval_id: Uuid,
+    resolved_approvers: &ResolvedApprovers,
     gate_generation: i64,
     expires_at: DateTime<Utc>,
 ) -> Result<Value> {
@@ -818,8 +899,7 @@ fn bound_request_payload(
         Value::Array(
             std::iter::once(serde_json::json!(["h", params.channel_id.to_string()]))
                 .chain(
-                    params
-                        .resolved_approvers
+                    resolved_approvers
                         .as_slice()
                         .iter()
                         .map(|pubkey| serde_json::json!(["p", hex::encode(pubkey)])),
@@ -964,7 +1044,6 @@ mod tests {
             step_index: 2,
             expected_generation: 7,
             policy: &policy,
-            resolved_approvers: &approvers,
             action_summary: &summary,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             prior_step_outputs: &outputs,
@@ -976,8 +1055,14 @@ mod tests {
         let gate_generation = 8;
         let expires_at = DateTime::from_timestamp_micros(params.expires_at.timestamp_micros())
             .expect("normalized expiry");
-        let payload = bound_request_payload(&params, approval_id, gate_generation, expires_at)
-            .expect("bound payload");
+        let payload = bound_request_payload(
+            &params,
+            approval_id,
+            &approvers,
+            gate_generation,
+            expires_at,
+        )
+        .expect("bound payload");
         assert_eq!(payload["approval_id"], approval_id.to_string());
         assert_eq!(payload["generation"], 8);
         assert_eq!(
@@ -993,7 +1078,6 @@ mod tests {
     fn waiting_trace_must_bind_the_exact_gate_step() {
         let policy =
             CanonicalApprovalPolicy::new(vec![], vec![ApprovalRole::Admin]).expect("policy");
-        let approvers = ResolvedApprovers::new(vec![vec![0x31; 32]]).expect("approvers");
         let summary = ApprovalActionSummary::new("inspect change").expect("summary");
         let definition_hash = vec![0x41; 32];
         let outputs = serde_json::json!({});
@@ -1013,7 +1097,6 @@ mod tests {
             step_index: 1,
             expected_generation: 1,
             policy: &policy,
-            resolved_approvers: &approvers,
             action_summary: &summary,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             prior_step_outputs: &outputs,

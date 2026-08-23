@@ -32,62 +32,9 @@ WHERE run.community_id = approval.community_id
   AND run.id = approval.run_id
   AND run.status = 'waiting_approval';
 
--- Bind every approval to the frozen run definition and generation with one FK.
-ALTER TABLE workflow_runs
-    ADD CONSTRAINT workflow_runs_approval_binding_key
-        UNIQUE (community_id, id, workflow_id, definition_hash, generation);
-
--- Replace the legacy token-hash authority table. The old enum is renamed so
--- the replacement type can add unsatisfiable without using a freshly added
--- enum value in the same transaction.
-ALTER TABLE workflow_approvals RENAME TO workflow_approvals_legacy_0031;
-ALTER TABLE workflow_approvals_legacy_0031
-    RENAME CONSTRAINT workflow_approvals_pkey
-    TO workflow_approvals_legacy_0031_pkey;
-ALTER INDEX idx_workflow_approvals_workflow
-    RENAME TO idx_workflow_approvals_legacy_0031_workflow;
-ALTER INDEX idx_workflow_approvals_run
-    RENAME TO idx_workflow_approvals_legacy_0031_run;
-ALTER INDEX idx_workflow_approvals_status
-    RENAME TO idx_workflow_approvals_legacy_0031_status;
-
-ALTER TYPE approval_status RENAME TO approval_status_legacy_0031;
-CREATE TYPE approval_status AS ENUM
-    ('pending', 'granted', 'denied', 'expired', 'unsatisfiable');
-
--- A legacy approval has no stored channel. Recover it from the workflow or run
--- trigger context, but never invent an audit binding when neither is valid.
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM workflow_approvals_legacy_0031 AS approval
-        JOIN workflows AS workflow
-          ON workflow.community_id = approval.community_id
-         AND workflow.id = approval.workflow_id
-        JOIN workflow_runs AS run
-          ON run.community_id = approval.community_id
-         AND run.id = approval.run_id
-         AND run.workflow_id = approval.workflow_id
-        LEFT JOIN channels AS channel
-          ON channel.community_id = approval.community_id
-         AND channel.id = COALESCE(
-             workflow.channel_id,
-             CASE
-                 WHEN run.trigger_context->>'channel_id' ~
-                     '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-                 THEN (run.trigger_context->>'channel_id')::uuid
-             END
-         )
-        WHERE channel.id IS NULL
-    ) THEN
-        RAISE EXCEPTION
-            'workflow approval migration blocked: legacy approval has no valid channel binding';
-    END IF;
-END;
-$$;
-
-CREATE TABLE workflow_approvals (
+-- Keep workflow_approvals unchanged while the relay still serves its legacy
+-- token-hash approval API. New immutable approval gates use a separate table.
+CREATE TABLE workflow_approval_gates (
     community_id UUID NOT NULL REFERENCES communities(id),
     id UUID NOT NULL DEFAULT gen_random_uuid(),
     channel_id UUID NOT NULL,
@@ -100,7 +47,8 @@ CREATE TABLE workflow_approvals (
     policy_snapshot JSONB NOT NULL CHECK (jsonb_typeof(policy_snapshot) = 'object'),
     resolved_approver_set JSONB NOT NULL
         CHECK (jsonb_typeof(resolved_approver_set) = 'object'),
-    status approval_status NOT NULL DEFAULT 'pending',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'granted', 'denied', 'expired', 'unsatisfiable')),
     decision_actor_pubkey BYTEA
         CHECK (decision_actor_pubkey IS NULL OR octet_length(decision_actor_pubkey) = 32),
     decision_actor_role member_role,
@@ -123,18 +71,17 @@ CREATE TABLE workflow_approvals (
     deleted_at TIMESTAMPTZ,
     PRIMARY KEY (community_id, id),
     UNIQUE (community_id, run_id, step_index),
-    CONSTRAINT workflow_approvals_channel_fkey
+    CONSTRAINT workflow_approval_gates_channel_fkey
         FOREIGN KEY (community_id, channel_id)
         REFERENCES channels (community_id, id) ON DELETE NO ACTION,
-    CONSTRAINT workflow_approvals_workflow_fkey
+    CONSTRAINT workflow_approval_gates_workflow_fkey
         FOREIGN KEY (community_id, workflow_id)
         REFERENCES workflows (community_id, id) ON DELETE NO ACTION,
-    CONSTRAINT workflow_approvals_run_binding_fkey
-        FOREIGN KEY (community_id, run_id, workflow_id, definition_hash, generation)
-        REFERENCES workflow_runs
-            (community_id, id, workflow_id, definition_hash, generation)
+    CONSTRAINT workflow_approval_gates_run_binding_fkey
+        FOREIGN KEY (community_id, run_id, workflow_id)
+        REFERENCES workflow_runs (community_id, id, workflow_id)
         ON DELETE NO ACTION,
-    CONSTRAINT workflow_approvals_actor_snapshot_complete
+    CONSTRAINT workflow_approval_gates_actor_snapshot_complete
         CHECK (
             (decision_actor_pubkey IS NULL
                 AND decision_actor_role IS NULL
@@ -147,147 +94,19 @@ CREATE TABLE workflow_approvals (
                 AND actor_is_definition_owner IS NOT NULL
                 AND matched_policy IS NOT NULL)
         ),
-    CONSTRAINT workflow_approvals_denial_note_required
+    CONSTRAINT workflow_approval_gates_denial_note_required
         CHECK (status <> 'denied' OR note IS NOT NULL),
-    CONSTRAINT workflow_approvals_terminal_timestamp
+    CONSTRAINT workflow_approval_gates_terminal_timestamp
         CHECK ((status = 'pending' AND resolved_at IS NULL)
             OR (status <> 'pending' AND resolved_at IS NOT NULL))
 );
 
-INSERT INTO workflow_approvals (
-    community_id, id, channel_id, workflow_id, run_id, definition_hash,
-    step_id, step_index, generation, policy_snapshot,
-    resolved_approver_set, status, decision_actor_pubkey,
-    decision_actor_kind, actor_is_definition_owner, matched_policy, note,
-    requested_at, decided_at, resolved_at, expires_at, created_at
-)
-SELECT
-    approval.community_id,
-    gen_random_uuid(),
-    channel.id,
-    approval.workflow_id,
-    approval.run_id,
-    run.definition_hash,
-    approval.step_id,
-    approval.step_index,
-    run.generation,
-    policy.snapshot,
-    jsonb_build_object(
-        'pubkeys', resolved.pubkeys,
-        'roles', CASE
-            WHEN policy.role_name IS NULL THEN '[]'::jsonb
-            ELSE jsonb_build_array(policy.role_name)
-        END
-    ),
-    CASE
-        WHEN approval.status::text = 'pending'
-             AND (policy.policy_type = 'unsatisfiable'
-                  OR jsonb_array_length(resolved.pubkeys) = 0)
-            THEN 'unsatisfiable'::approval_status
-        ELSE approval.status::text::approval_status
-    END,
-    approval.approver_pubkey,
-    CASE WHEN approval.approver_pubkey IS NULL THEN NULL ELSE 'unknown' END,
-    CASE
-        WHEN approval.approver_pubkey IS NULL THEN NULL
-        ELSE approval.approver_pubkey = workflow.owner_pubkey
-    END,
-    CASE WHEN approval.approver_pubkey IS NULL THEN NULL ELSE policy.snapshot END,
-    CASE
-        WHEN approval.status::text = 'denied'
-             AND (approval.note IS NULL OR btrim(approval.note) = '')
-            THEN 'Legacy denial did not retain a note'
-        WHEN approval.note IS NOT NULL AND octet_length(approval.note) > 2000
-            THEN left(approval.note, 500)
-        ELSE approval.note
-    END,
-    approval.created_at,
-    CASE approval.status::text
-        WHEN 'granted' THEN COALESCE(approval.granted_at, approval.created_at)
-        WHEN 'denied' THEN COALESCE(approval.denied_at, approval.created_at)
-        ELSE NULL
-    END,
-    CASE
-        WHEN approval.status::text = 'pending'
-             AND policy.policy_type <> 'unsatisfiable'
-             AND jsonb_array_length(resolved.pubkeys) > 0
-            THEN NULL
-        WHEN approval.status::text = 'granted'
-            THEN COALESCE(approval.granted_at, approval.created_at)
-        WHEN approval.status::text = 'denied'
-            THEN COALESCE(approval.denied_at, approval.created_at)
-        WHEN approval.status::text = 'expired' THEN approval.expires_at
-        ELSE now()
-    END,
-    approval.expires_at,
-    approval.created_at
-FROM workflow_approvals_legacy_0031 AS approval
-JOIN workflows AS workflow
-  ON workflow.community_id = approval.community_id
- AND workflow.id = approval.workflow_id
-JOIN workflow_runs AS run
-  ON run.community_id = approval.community_id
- AND run.id = approval.run_id
- AND run.workflow_id = approval.workflow_id
-JOIN channels AS channel
-  ON channel.community_id = approval.community_id
- AND channel.id = COALESCE(
-     workflow.channel_id,
-     CASE
-         WHEN run.trigger_context->>'channel_id' ~
-             '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-         THEN (run.trigger_context->>'channel_id')::uuid
-     END
- )
-CROSS JOIN LATERAL (
-    SELECT
-        CASE
-            WHEN approval.approver_spec ~ '^[0-9a-fA-F]{64}$' THEN 'pubkey'
-            WHEN lower(btrim(approval.approver_spec)) IN ('owner', 'admin') THEN 'role'
-            ELSE 'unsatisfiable'
-        END AS policy_type,
-        CASE
-            WHEN lower(btrim(approval.approver_spec)) IN ('owner', 'admin')
-                THEN lower(btrim(approval.approver_spec))
-        END AS role_name,
-        CASE
-            WHEN approval.approver_spec ~ '^[0-9a-fA-F]{64}$'
-                THEN jsonb_build_object(
-                    'type', 'pubkey', 'pubkey', lower(approval.approver_spec))
-            WHEN lower(btrim(approval.approver_spec)) IN ('owner', 'admin')
-                THEN jsonb_build_object(
-                    'type', 'role', 'role', lower(btrim(approval.approver_spec)))
-            ELSE jsonb_build_object(
-                'type', 'unsatisfiable', 'reason', 'legacy_policy_unsupported')
-        END AS snapshot
-) AS policy
-CROSS JOIN LATERAL (
-    SELECT COALESCE(
-        jsonb_agg(encode(member.pubkey, 'hex') ORDER BY member.pubkey),
-        '[]'::jsonb
-    ) AS pubkeys
-    FROM channel_members AS member
-    WHERE member.community_id = approval.community_id
-      AND member.channel_id = channel.id
-      AND member.removed_at IS NULL
-      AND (
-          (policy.policy_type = 'pubkey'
-              AND encode(member.pubkey, 'hex') = lower(approval.approver_spec))
-          OR
-          (policy.policy_type = 'role'
-              AND member.role::text = policy.role_name)
-      )
-) AS resolved;
-
-DROP TABLE workflow_approvals_legacy_0031;
-DROP TYPE approval_status_legacy_0031;
-
-CREATE INDEX idx_workflow_approvals_workflow
-    ON workflow_approvals (community_id, workflow_id);
-CREATE INDEX idx_workflow_approvals_run
-    ON workflow_approvals (community_id, run_id);
-CREATE INDEX idx_workflow_approvals_status
-    ON workflow_approvals (community_id, status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_workflow_approval_gates_workflow
+    ON workflow_approval_gates (community_id, workflow_id);
+CREATE INDEX idx_workflow_approval_gates_run
+    ON workflow_approval_gates (community_id, run_id);
+CREATE INDEX idx_workflow_approval_gates_status
+    ON workflow_approval_gates (community_id, status) WHERE deleted_at IS NULL;
 
 -- Gate identity, frozen policy, and recorded evidence never change. A decision
 -- may fill previously-null evidence once, and a terminal decision cannot reopen.
@@ -353,12 +172,12 @@ END;
 $$;
 
 CREATE TRIGGER workflow_approval_history_update
-BEFORE UPDATE ON workflow_approvals
+BEFORE UPDATE ON workflow_approval_gates
 FOR EACH ROW
 EXECUTE FUNCTION enforce_workflow_approval_history();
 
 CREATE TRIGGER workflow_approval_history_delete
-BEFORE DELETE ON workflow_approvals
+BEFORE DELETE ON workflow_approval_gates
 FOR EACH ROW
 EXECUTE FUNCTION enforce_workflow_approval_history();
 
@@ -396,7 +215,7 @@ CREATE TABLE workflow_approval_outbox (
     UNIQUE (community_id, dedupe_key),
     CONSTRAINT workflow_approval_outbox_approval_fkey
         FOREIGN KEY (community_id, approval_id)
-        REFERENCES workflow_approvals (community_id, id) ON DELETE NO ACTION,
+        REFERENCES workflow_approval_gates (community_id, id) ON DELETE NO ACTION,
     CONSTRAINT workflow_approval_outbox_lease_complete
         CHECK ((lease_owner IS NULL AND lease_expires_at IS NULL)
             OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),

@@ -993,19 +993,22 @@ mod tests {
 
         // Approval gates use the run snapshot/generation from 0029, store the
         // exact resume point and prior outputs, and enqueue semantic lifecycle
-        // records without retaining the legacy token-hash authority column.
+        // records without replacing the still-live legacy token approval table.
         assert_eq!(migrations[30].version, 31);
         let approval_foundations = migrations[30].sql.as_str();
         assert!(approval_foundations.contains("ADD VALUE 'resume_pending'"));
         assert!(approval_foundations.contains("ADD COLUMN next_step INTEGER NOT NULL"));
         assert!(approval_foundations.contains("ADD COLUMN step_outputs JSONB NOT NULL"));
         assert!(approval_foundations.contains("MAX(step_index) + 1 AS next_step"));
-        assert!(approval_foundations.contains("CREATE TABLE workflow_approvals"));
+        assert!(approval_foundations.contains("FROM workflow_approvals"));
+        assert!(approval_foundations.contains("CREATE TABLE workflow_approval_gates"));
         assert!(approval_foundations.contains("policy_snapshot JSONB NOT NULL"));
         assert!(approval_foundations.contains("resolved_approver_set JSONB NOT NULL"));
         assert!(approval_foundations.contains("UNIQUE (community_id, run_id, step_index)"));
+        assert!(approval_foundations.contains("FOREIGN KEY (community_id, run_id, workflow_id)"));
         assert!(approval_foundations.contains("ON DELETE NO ACTION"));
-        assert!(approval_foundations.contains("DROP TABLE workflow_approvals_legacy_0031"));
+        assert!(!approval_foundations.contains("ALTER TABLE workflow_approvals"));
+        assert!(!approval_foundations.contains("DROP TABLE workflow_approvals"));
         assert!(approval_foundations.contains("CREATE TABLE workflow_approval_outbox"));
         assert!(approval_foundations.contains("id BIGINT GENERATED ALWAYS AS IDENTITY"));
         assert!(approval_foundations.contains("payload_version SMALLINT NOT NULL DEFAULT 1"));
@@ -1302,44 +1305,19 @@ mod tests {
         assert_eq!(step_outputs, serde_json::json!({"prepare": {"value": 21}}));
         assert_eq!(generation, 7, "0031 must reuse the run generation");
 
-        let (
-            approval_id,
-            migrated_channel_id,
-            migrated_definition_hash,
-            migrated_generation,
-            policy,
-            resolved,
-            status,
-        ): (
-            uuid::Uuid,
-            uuid::Uuid,
-            Vec<u8>,
-            i64,
-            serde_json::Value,
-            serde_json::Value,
-            String,
-        ) = sqlx::query_as(
-            "SELECT id, channel_id, definition_hash, generation, policy_snapshot, \
-                    resolved_approver_set, status::text \
-             FROM workflow_approvals WHERE community_id = $1 AND run_id = $2",
+        let retained_legacy: (Vec<u8>, String, String) = sqlx::query_as(
+            "SELECT token, approver_spec, status::text FROM workflow_approvals \
+             WHERE community_id = $1 AND run_id = $2",
         )
         .bind(community_id)
         .bind(run_id)
         .fetch_one(&pool)
         .await
-        .expect("read migrated approval");
-        assert_eq!(migrated_channel_id, channel_id);
-        assert_eq!(migrated_definition_hash, definition_hash);
-        assert_eq!(migrated_generation, 7);
+        .expect("read retained legacy approval");
         assert_eq!(
-            policy,
-            serde_json::json!({"type": "pubkey", "pubkey": hex::encode(&owner_pubkey)})
+            retained_legacy,
+            (token_hash, hex::encode(&owner_pubkey), "pending".into())
         );
-        assert_eq!(
-            resolved,
-            serde_json::json!({"pubkeys": [hex::encode(&owner_pubkey)], "roles": []})
-        );
-        assert_eq!(status, "pending");
 
         let legacy_token_column_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS ( \
@@ -1353,68 +1331,49 @@ mod tests {
         .await
         .expect("inspect approval columns");
         assert!(
-            !legacy_token_column_exists,
-            "token authority column must be gone"
+            legacy_token_column_exists,
+            "0031 must retain token-hash authority"
         );
 
-        let outbox_id: i64 = sqlx::query_scalar(
-            "INSERT INTO workflow_approval_outbox \
-             (community_id, approval_id, class, payload, dedupe_key) \
-             VALUES ($1, $2, 'approval_requested', $3, 'request:approve') \
-             RETURNING id",
+        let raw_token = "legacy-api-still-live-after-0031";
+        crate::workflow::create_approval(
+            &pool,
+            crate::workflow::CreateApprovalParams {
+                community_id: buzz_core::CommunityId::from_uuid(community_id),
+                token: raw_token,
+                workflow_id,
+                run_id,
+                step_id: "legacy-create-get",
+                step_index: 2,
+                approver_spec: "owner",
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        )
+        .await
+        .expect("legacy create approval after 0031");
+        let created = crate::workflow::get_approval(
+            &pool,
+            buzz_core::CommunityId::from_uuid(community_id),
+            raw_token,
+        )
+        .await
+        .expect("legacy get approval after 0031");
+        assert_eq!(created.workflow_id, workflow_id);
+        assert_eq!(created.run_id, run_id);
+        assert_eq!(created.step_id, "legacy-create-get");
+        assert_eq!(created.status, crate::workflow::ApprovalStatus::Pending);
+
+        let new_gate_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_approval_gates WHERE community_id = $1",
         )
         .bind(community_id)
-        .bind(approval_id)
-        .bind(serde_json::json!({"approval_id": approval_id}))
         .fetch_one(&pool)
         .await
-        .expect("insert lifecycle outbox row");
-        assert!(
-            outbox_id > 0,
-            "outbox IDs must be ordered positive integers"
+        .expect("count immutable approval gates");
+        assert_eq!(
+            new_gate_count, 0,
+            "legacy rows must not be rewritten as new gates"
         );
-
-        let workflow_delete =
-            sqlx::query("DELETE FROM workflows WHERE community_id = $1 AND id = $2")
-                .bind(community_id)
-                .bind(workflow_id)
-                .execute(&pool)
-                .await;
-        assert!(
-            workflow_delete.is_err(),
-            "workflow deletion must not cascade retained approval evidence"
-        );
-
-        let approval_delete =
-            sqlx::query("DELETE FROM workflow_approvals WHERE community_id = $1 AND id = $2")
-                .bind(community_id)
-                .bind(approval_id)
-                .execute(&pool)
-                .await;
-        assert!(
-            approval_delete.is_err(),
-            "approval history uses soft deletion"
-        );
-
-        let retained_approvals: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM workflow_approvals WHERE community_id = $1 AND id = $2",
-        )
-        .bind(community_id)
-        .bind(approval_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count retained approvals");
-        let retained_outbox: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM workflow_approval_outbox \
-             WHERE community_id = $1 AND approval_id = $2",
-        )
-        .bind(community_id)
-        .bind(approval_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count retained outbox rows");
-        assert_eq!(retained_approvals, 1);
-        assert_eq!(retained_outbox, 1);
     }
 
     #[tokio::test]
