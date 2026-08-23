@@ -29,6 +29,9 @@ pub enum ActionSinkError {
     /// Message content is empty or whitespace-only.
     #[error("empty message content")]
     EmptyContent,
+    /// The target event does not exist in the workflow's community.
+    #[error("target event not found: {0}")]
+    TargetNotFound(String),
 }
 
 impl From<ActionSinkError> for crate::WorkflowError {
@@ -66,4 +69,19 @@ pub trait ActionSink: Send + Sync {
         text: &str,
         author_pubkey: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
+
+    /// Add a reaction to an event on behalf of a workflow owner.
+    ///
+    /// The sink must resolve the target inside `community_id`, verify that it
+    /// belongs to `channel_id`, and attribute the relay-signed event to
+    /// `author_pubkey`. `Ok(Some(event_id))` means a reaction event was stored;
+    /// `Ok(None)` means the same actor already has that reaction active.
+    fn add_reaction(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        target_event_id: &str,
+        emoji: &str,
+        author_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ActionSinkError>> + Send + '_>>;
 }

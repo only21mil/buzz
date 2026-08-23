@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use buzz_core::kind::KIND_STREAM_MESSAGE;
+use buzz_core::kind::{KIND_REACTION, KIND_STREAM_MESSAGE};
 use buzz_core::tenant::CommunityId;
 use buzz_workflow::action_sink::{ActionSink, ActionSinkError};
 use chrono::Utc;
@@ -166,6 +166,36 @@ impl RelayActionSink {
         Self {
             state: Arc::downgrade(state),
         }
+    }
+}
+
+fn build_workflow_reaction_event(
+    relay_keypair: &nostr::Keys,
+    target_event_id: nostr::EventId,
+    emoji: &str,
+    author_pubkey_hex: &str,
+) -> Result<nostr::Event, ActionSinkError> {
+    // `actor` carries the workflow-owner identity. A `p` tag would have
+    // NIP-25 target-author meaning and must not be repurposed here.
+    buzz_sdk::build_reaction(target_event_id, emoji)
+        .map_err(|e| ActionSinkError::EventBuild(e.to_string()))?
+        .tag(
+            Tag::parse(["actor", author_pubkey_hex])
+                .map_err(|e| ActionSinkError::EventBuild(format!("actor tag: {e}")))?,
+        )
+        .tag(
+            Tag::parse(["buzz:workflow", "true"])
+                .map_err(|e| ActionSinkError::EventBuild(format!("workflow tag: {e}")))?,
+        )
+        .sign_with_keys(relay_keypair)
+        .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))
+}
+
+fn reaction_emoji_for_storage(content: &str) -> &str {
+    if content.is_empty() {
+        "+"
+    } else {
+        content
     }
 }
 
@@ -362,6 +392,150 @@ impl ActionSink for RelayActionSink {
             Ok(event_id_hex)
         })
     }
+
+    fn add_reaction(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        target_event_id: &str,
+        emoji: &str,
+        author_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ActionSinkError>> + Send + '_>> {
+        let channel_id = channel_id.to_owned();
+        let target_event_id = target_event_id.to_owned();
+        let emoji = emoji.to_owned();
+        let author_pubkey = author_pubkey.to_owned();
+
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+
+            let host = state
+                .db
+                .lookup_community_host(community_id)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    ActionSinkError::Database(format!(
+                        "workflow run community {community_id} is not mapped to a host"
+                    ))
+                })?;
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
+
+            let channel_uuid = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
+            let channel_id_canonical = channel_uuid.to_string();
+            let target_id = nostr::EventId::from_hex(&target_event_id).map_err(|e| {
+                ActionSinkError::InvalidInput(format!("invalid target event ID: {e}"))
+            })?;
+            let target_id_bytes = target_id.as_bytes().to_vec();
+            let author_pubkey = nostr::PublicKey::from_hex(&author_pubkey).map_err(|e| {
+                ActionSinkError::InvalidInput(format!("invalid author pubkey: {e}"))
+            })?;
+            let author_pubkey_bytes = author_pubkey.to_bytes().to_vec();
+            let author_pubkey_hex = author_pubkey.to_hex();
+
+            let target = state
+                .db
+                .get_event_by_id(tenant.community(), &target_id_bytes)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| ActionSinkError::TargetNotFound(target_event_id.clone()))?;
+            match target.channel_id {
+                Some(target_channel) if target_channel == channel_uuid => {}
+                Some(target_channel) => {
+                    return Err(ActionSinkError::InvalidInput(format!(
+                        "reaction target belongs to channel {target_channel}, not {channel_id_canonical}"
+                    )));
+                }
+                None => {
+                    return Err(ActionSinkError::InvalidInput(
+                        "reaction target is not channel-scoped".into(),
+                    ));
+                }
+            }
+
+            let channel = state
+                .db
+                .get_channel(tenant.community(), channel_uuid)
+                .await
+                .map_err(|e| match &e {
+                    buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::NotFound(_) => {
+                        ActionSinkError::ChannelNotFound(channel_id_canonical.clone())
+                    }
+                    _ => ActionSinkError::Database(e.to_string()),
+                })?;
+            if channel.archived_at.is_some() {
+                return Err(ActionSinkError::ChannelArchived(
+                    channel_id_canonical.clone(),
+                ));
+            }
+            let is_member = state
+                .is_member_cached(tenant.community(), channel_uuid, &author_pubkey_bytes)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+            if !is_member && channel.visibility != "open" {
+                return Err(ActionSinkError::InvalidInput(
+                    "workflow owner does not have access to reaction target channel".into(),
+                ));
+            }
+
+            let event = build_workflow_reaction_event(
+                &state.relay_keypair,
+                target_id,
+                &emoji,
+                &author_pubkey_hex,
+            )?;
+            let event_id_hex = event.id.to_hex();
+            let stored_emoji = reaction_emoji_for_storage(&event.content);
+
+            let outcome = state
+                .db
+                .insert_reaction_event_with_thread_metadata(
+                    tenant.community(),
+                    &event,
+                    Some(channel_uuid),
+                    None,
+                    &target_id_bytes,
+                    &author_pubkey_bytes,
+                    stored_emoji,
+                )
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+
+            match outcome {
+                buzz_db::ReactionEventInsertOutcome::TargetMissing => {
+                    Err(ActionSinkError::TargetNotFound(target_event_id))
+                }
+                buzz_db::ReactionEventInsertOutcome::Duplicate => Ok(None),
+                buzz_db::ReactionEventInsertOutcome::Inserted {
+                    stored_event,
+                    was_inserted,
+                } => {
+                    if was_inserted {
+                        let _ = dispatch_persistent_event(
+                            &tenant,
+                            &state,
+                            &stored_event,
+                            KIND_REACTION,
+                            &author_pubkey_hex,
+                            None,
+                        )
+                        .await;
+                    }
+                    info!(
+                        event_id = %event_id_hex,
+                        channel_id = %channel_id_canonical,
+                        author = %author_pubkey,
+                        "Workflow AddReaction: posting kind {KIND_REACTION} event"
+                    );
+                    Ok(Some(event_id_hex))
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +549,48 @@ mod tests {
     // A 64-char hex pubkey built from a single repeated nibble, for readable tests.
     fn pk(nibble: char) -> String {
         std::iter::repeat_n(nibble, 64).collect()
+    }
+
+    #[test]
+    fn workflow_reaction_event_preserves_owner_and_recursion_guard() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let target = nostr::EventId::from_hex(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("target event id");
+
+        let event = build_workflow_reaction_event(&relay, target, "👍", &owner)
+            .expect("workflow reaction event");
+
+        assert_eq!(event.kind.as_u16(), KIND_REACTION as u16);
+        assert_eq!(event.content, "👍");
+        assert_eq!(event.pubkey, relay.public_key());
+        assert!(event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("e")
+                && parts.get(1).map(String::as_str) == Some(target.to_hex().as_str())
+        }));
+        assert!(event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("actor")
+                && parts.get(1).map(String::as_str) == Some(owner.as_str())
+        }));
+        assert!(event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("buzz:workflow")
+                && parts.get(1).map(String::as_str) == Some("true")
+        }));
+        assert!(!event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice().first().map(String::as_str) == Some("p")));
+    }
+
+    #[test]
+    fn empty_reaction_content_uses_nip25_like_for_storage() {
+        assert_eq!(reaction_emoji_for_storage(""), "+");
+        assert_eq!(reaction_emoji_for_storage("👍"), "👍");
     }
 
     #[test]

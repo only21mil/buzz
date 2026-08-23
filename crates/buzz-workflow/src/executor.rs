@@ -727,23 +727,39 @@ pub async fn dispatch_action(
                 ));
             }
 
-            #[cfg(feature = "reqwest")]
-            {
-                let result = add_reaction_impl(&trigger_ctx.message_id, emoji).await?;
-                Ok(StepResult::Completed(result))
-            }
+            let wf_run = engine
+                .db
+                .get_workflow_run(community_id, run_id)
+                .await
+                .map_err(|e| {
+                    WorkflowError::WebhookError(format!(
+                        "AddReaction: failed to load workflow run {run_id}: {e}"
+                    ))
+                })?;
+            let workflow = engine
+                .db
+                .get_workflow(community_id, wf_run.workflow_id)
+                .await
+                .map_err(|e| {
+                    WorkflowError::WebhookError(format!(
+                        "AddReaction: failed to load workflow {}: {e}",
+                        wf_run.workflow_id
+                    ))
+                })?;
+            let channel_id =
+                resolve_send_message_channel(None, &trigger_ctx.channel_id, workflow.channel_id)?;
+            let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
 
-            #[cfg(not(feature = "reqwest"))]
-            {
-                warn!(
-                    run_id = %run_id,
-                    step = step_id,
-                    "AddReaction: reqwest feature not enabled, skipping HTTP call"
-                );
-                Ok(StepResult::Completed(
-                    serde_json::json!({ "added": false, "skipped": true }),
-                ))
-            }
+            let result = add_reaction_via_sink(
+                engine.action_sink()?,
+                community_id,
+                &channel_id,
+                &trigger_ctx.message_id,
+                emoji,
+                &owner_pubkey_hex,
+            )
+            .await?;
+            Ok(StepResult::Completed(result))
         }
 
         CallWebhook {
@@ -1310,68 +1326,35 @@ async fn call_webhook_impl(
     }))
 }
 
-/// Returns a shared `reqwest::Client` reused across all workflow HTTP calls.
-/// Sharing a single client reuses the underlying connection pool.
-#[cfg(feature = "reqwest")]
-fn shared_http_client() -> &'static reqwest::Client {
-    use std::sync::LazyLock;
-    use std::time::Duration;
-    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("HTTP client build must succeed")
-    });
-    &CLIENT
-}
-
-/// POST `{"emoji": emoji}` to `POST /api/messages/{message_id}/reactions`.
-#[cfg(feature = "reqwest")]
-async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, WorkflowError> {
-    let base_url =
-        std::env::var("BUZZ_RELAY_BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_owned());
-
-    let url = format!("{base_url}/api/messages/{message_id}/reactions");
-
-    let client = shared_http_client();
-
-    let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({ "emoji": emoji }));
-
-    if let Ok(token) = std::env::var("BUZZ_API_TOKEN") {
-        req = req.header("Authorization", format!("Bearer {token}"));
-    } else if let Ok(pubkey) = std::env::var("BUZZ_RELAY_PUBKEY") {
-        req = req.header("X-Pubkey", pubkey);
-    }
-
-    let resp = req
-        .send()
+async fn add_reaction_via_sink(
+    sink: &dyn crate::ActionSink,
+    community_id: CommunityId,
+    channel_id: &str,
+    target_event_id: &str,
+    emoji: &str,
+    author_pubkey: &str,
+) -> Result<JsonValue, WorkflowError> {
+    let event_id = sink
+        .add_reaction(
+            community_id,
+            channel_id,
+            target_event_id,
+            emoji,
+            author_pubkey,
+        )
         .await
-        .map_err(|e| WorkflowError::WebhookError(format!("AddReaction HTTP error: {e}")))?;
+        .map_err(WorkflowError::from)?;
 
-    let status = resp.status();
-
-    if !status.is_success() {
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_owned());
-        return Err(WorkflowError::WebhookError(format!(
-            "AddReaction: relay returned {status} for message {message_id}: {body}"
-        )));
-    }
-
-    let body_text = resp.text().await.unwrap_or_else(|_| String::new());
-    let body_json: JsonValue = serde_json::from_str(&body_text)
-        .unwrap_or_else(|_| serde_json::json!({ "raw": body_text }));
-
-    Ok(serde_json::json!({
-        "added": true,
-        "status": status.as_u16(),
-        "response": body_json,
-    }))
+    Ok(match event_id {
+        Some(event_id) => serde_json::json!({
+            "added": true,
+            "event_id": event_id,
+        }),
+        None => serde_json::json!({
+            "added": false,
+            "duplicate": true,
+        }),
+    })
 }
 
 /// Rich return type from `execute_run` / `execute_from_step`.
@@ -1662,7 +1645,59 @@ async fn execute_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_sink::{ActionSink, ActionSinkError};
     use serde_json::json;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReactionCall {
+        community_id: CommunityId,
+        channel_id: String,
+        target_event_id: String,
+        emoji: String,
+        author_pubkey: String,
+    }
+
+    #[derive(Default)]
+    struct RecordingActionSink {
+        reactions: Mutex<Vec<ReactionCall>>,
+    }
+
+    impl ActionSink for RecordingActionSink {
+        fn send_message(
+            &self,
+            _community_id: CommunityId,
+            _channel_id: &str,
+            _text: &str,
+            _author_pubkey: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+            Box::pin(async { unreachable!("send_message is not part of this regression") })
+        }
+
+        fn add_reaction(
+            &self,
+            community_id: CommunityId,
+            channel_id: &str,
+            target_event_id: &str,
+            emoji: &str,
+            author_pubkey: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ActionSinkError>> + Send + '_>>
+        {
+            self.reactions
+                .lock()
+                .expect("recording sink lock")
+                .push(ReactionCall {
+                    community_id,
+                    channel_id: channel_id.to_owned(),
+                    target_event_id: target_event_id.to_owned(),
+                    emoji: emoji.to_owned(),
+                    author_pubkey: author_pubkey.to_owned(),
+                });
+            Box::pin(async { Ok(Some("reaction-event-id".to_owned())) })
+        }
+    }
 
     fn make_trigger() -> TriggerContext {
         TriggerContext {
@@ -1675,6 +1710,43 @@ mod tests {
             webhook_fields: HashMap::new(),
             webhook_body: None,
         }
+    }
+
+    #[tokio::test]
+    async fn add_reaction_dispatches_to_action_sink_without_http() {
+        let sink = RecordingActionSink::default();
+        let community_id = CommunityId::from_uuid(Uuid::nil());
+
+        let result = add_reaction_via_sink(
+            &sink,
+            community_id,
+            "11111111-1111-1111-1111-111111111111",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "👍",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await
+        .expect("reaction should reach action sink");
+
+        assert_eq!(
+            result,
+            json!({ "added": true, "event_id": "reaction-event-id" })
+        );
+        assert_eq!(
+            sink.reactions
+                .lock()
+                .expect("recording sink lock")
+                .as_slice(),
+            &[ReactionCall {
+                community_id,
+                channel_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+                target_event_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                emoji: "👍".to_owned(),
+                author_pubkey: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+            }]
+        );
     }
 
     #[test]
