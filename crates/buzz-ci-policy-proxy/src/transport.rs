@@ -206,11 +206,13 @@ pub enum LifecyclePhase {
     Starting,
     /// The one owned container received a successful start acknowledgement.
     Started,
+    /// Delete intent exists and its upstream result is unresolved.
+    Deleting,
     /// The one owned container was deleted and may not be recreated.
     Removed,
 }
 
-/// Typed lifecycle fact emitted at each create/start mutation boundary.
+/// Typed lifecycle fact emitted at each create, start, exec, and delete boundary.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleEvent<'a> {
@@ -243,6 +245,38 @@ pub enum LifecycleEvent<'a> {
     },
     /// A successful empty acknowledgement committed start.
     Started {
+        /// Full owned container ID.
+        container_id: &'a str,
+    },
+    /// Emitted before the first upstream exec-create byte.
+    ExecCreateIntent {
+        /// Exact canonical exec-create capability that the runtime will receive.
+        exec: &'a CanonicalExec,
+    },
+    /// A complete upstream response definitely rejected exec-create.
+    ExecCreateRejected {
+        /// Exact canonical exec-create capability rejected by the runtime.
+        exec: &'a CanonicalExec,
+    },
+    /// A successful exec-create returned this full runtime ID.
+    ExecCreated {
+        /// Exact canonical exec-create capability bound to the returned ID.
+        exec: &'a CanonicalExec,
+        /// Full runtime exec ID.
+        exec_id: &'a str,
+    },
+    /// Emitted before the first upstream container-delete byte.
+    DeleteIntent {
+        /// Full owned container ID.
+        container_id: &'a str,
+    },
+    /// A complete upstream response definitely rejected delete.
+    DeleteRejected {
+        /// Full owned container ID.
+        container_id: &'a str,
+    },
+    /// A successful delete removed the full owned container ID.
+    Removed {
         /// Full owned container ID.
         container_id: &'a str,
     },
@@ -389,15 +423,14 @@ impl<C: OneShotUpstreamConnector, O: LifecycleObserver> InheritedProxy<C, O> {
         ) {
             Ok(outcome) => {
                 if outcome.upstream_closed && outcome.mutated {
-                    self.poison();
+                    self.poison()?;
                 }
                 Ok(())
             }
             Err(failure) => {
-                if failure.poison {
-                    self.poison();
-                }
+                let poison = failure.poison.then(|| self.poison()).transpose();
                 let _ = write_error_response(&mut executor, failure.status, failure.public_message);
+                poison?;
                 Err(failure.error)
             }
         }
@@ -408,17 +441,17 @@ impl<C: OneShotUpstreamConnector, O: LifecycleObserver> InheritedProxy<C, O> {
         self.poisoned
     }
 
-    fn poison(&mut self) {
+    fn poison(&mut self) -> Result<(), ProxyError> {
         if self.poisoned {
-            return;
+            return Ok(());
         }
         self.poisoned = true;
         let (phase, container_id) = self.policy.lifecycle_snapshot();
         let container_id = container_id.map(str::to_owned);
-        let _ = self.observer.observe_lifecycle(LifecycleEvent::Poisoned {
+        self.observer.observe_lifecycle(LifecycleEvent::Poisoned {
             phase,
             container_id: container_id.as_deref(),
-        });
+        })
     }
 }
 
@@ -502,6 +535,7 @@ impl PreparedRequest {
         match &self.admission {
             Admission::Create(approved) => policy.abort_create(approved),
             Admission::ExecCreate(approved) => policy.abort_exec(approved),
+            Admission::Delete { container_id, .. } => policy.abort_delete(container_id),
             _ => Ok(()),
         }
     }
@@ -619,6 +653,7 @@ fn serve_prepared(
                     ))
                 })?,
                 policy,
+                observer,
                 &approved,
                 max_response,
             )?;
@@ -650,25 +685,19 @@ fn serve_prepared(
             target,
         } => {
             upstream_used = true;
-            let response = exchange(
+            let response = handle_delete(
                 upstream.as_deref_mut().ok_or_else(|| {
                     ConnectionFailure::before_upstream(ProxyError::Transport(
                         "delete lacks a runtime descriptor".into(),
                     ))
                 })?,
-                DockerMethod::Delete,
+                policy,
+                observer,
+                &container_id,
                 &target,
-                &[],
                 max_response,
-            )
-            .map_err(ConnectionFailure::after_upstream)?;
-            if response.is_success() {
-                validate_empty_ack(&response.body).map_err(ConnectionFailure::after_upstream)?;
-                policy
-                    .commit_deleted(&container_id)
-                    .map_err(ConnectionFailure::after_upstream)?;
-                mutated = true;
-            }
+            )?;
+            mutated = response.is_success();
             response
         }
         Admission::Wait {
@@ -802,9 +831,16 @@ fn handle_create(
 fn handle_exec_create(
     upstream: &mut UnixStream,
     policy: &mut ProxyPolicy,
+    observer: &mut impl LifecycleObserver,
     approved: &CanonicalExec,
     max_response: usize,
 ) -> Result<HttpResponse, ConnectionFailure> {
+    observer
+        .observe_lifecycle(LifecycleEvent::ExecCreateIntent { exec: approved })
+        .map_err(|error| {
+            let _ = policy.abort_exec(approved);
+            ConnectionFailure::before_upstream(error)
+        })?;
     let response = exchange(
         upstream,
         DockerMethod::Post,
@@ -812,22 +848,68 @@ fn handle_exec_create(
         &approved.body,
         max_response,
     )
-    .map_err(|error| {
-        let _ = policy.abort_exec(approved);
-        ConnectionFailure::after_upstream(error)
-    })?;
+    .map_err(ConnectionFailure::after_upstream)?;
     if response.is_success() {
-        let id = response_object_id(&response.body).map_err(|error| {
-            let _ = policy.abort_exec(approved);
-            ConnectionFailure::after_upstream(error)
-        })?;
+        let id = response_object_id(&response.body).map_err(ConnectionFailure::after_upstream)?;
         policy
-            .record_exec(id, approved)
+            .record_exec(id.clone(), approved)
             .map_err(ConnectionFailure::after_upstream)?;
-    } else {
+        observer
+            .observe_lifecycle(LifecycleEvent::ExecCreated {
+                exec: approved,
+                exec_id: &id,
+            })
+            .map_err(ConnectionFailure::after_upstream)?;
+    } else if is_definite_mutation_rejection(response.status) {
+        observer
+            .observe_lifecycle(LifecycleEvent::ExecCreateRejected { exec: approved })
+            .map_err(ConnectionFailure::after_upstream)?;
         policy
             .abort_exec(approved)
             .map_err(ConnectionFailure::after_upstream)?;
+    } else {
+        return Err(ConnectionFailure::after_upstream(ProxyError::Transport(
+            "exec-create response does not prove that no runtime mutation occurred".into(),
+        )));
+    }
+    Ok(response)
+}
+
+fn handle_delete(
+    upstream: &mut UnixStream,
+    policy: &mut ProxyPolicy,
+    observer: &mut impl LifecycleObserver,
+    container_id: &str,
+    target: &str,
+    max_response: usize,
+) -> Result<HttpResponse, ConnectionFailure> {
+    observer
+        .observe_lifecycle(LifecycleEvent::DeleteIntent { container_id })
+        .map_err(|error| {
+            let _ = policy.abort_delete(container_id);
+            ConnectionFailure::before_upstream(error)
+        })?;
+    let response = exchange(upstream, DockerMethod::Delete, target, &[], max_response)
+        .map_err(ConnectionFailure::after_upstream)?;
+    if response.is_success() {
+        validate_empty_ack(&response.body).map_err(ConnectionFailure::after_upstream)?;
+        policy
+            .commit_deleted(container_id)
+            .map_err(ConnectionFailure::after_upstream)?;
+        observer
+            .observe_lifecycle(LifecycleEvent::Removed { container_id })
+            .map_err(ConnectionFailure::after_upstream)?;
+    } else if is_definite_mutation_rejection(response.status) {
+        observer
+            .observe_lifecycle(LifecycleEvent::DeleteRejected { container_id })
+            .map_err(ConnectionFailure::after_upstream)?;
+        policy
+            .abort_delete(container_id)
+            .map_err(ConnectionFailure::after_upstream)?;
+    } else {
+        return Err(ConnectionFailure::after_upstream(ProxyError::Transport(
+            "delete response does not prove that no runtime mutation occurred".into(),
+        )));
     }
     Ok(response)
 }
@@ -1927,6 +2009,12 @@ mod tests {
                 LifecycleEvent::StartIntent { .. } => "start-intent",
                 LifecycleEvent::StartRejected { .. } => "start-rejected",
                 LifecycleEvent::Started { .. } => "started",
+                LifecycleEvent::ExecCreateIntent { .. } => "exec-create-intent",
+                LifecycleEvent::ExecCreateRejected { .. } => "exec-create-rejected",
+                LifecycleEvent::ExecCreated { .. } => "exec-created",
+                LifecycleEvent::DeleteIntent { .. } => "delete-intent",
+                LifecycleEvent::DeleteRejected { .. } => "delete-rejected",
+                LifecycleEvent::Removed { .. } => "removed",
                 LifecycleEvent::Poisoned { .. } => "poisoned",
             };
             self.events.lock().unwrap().push(label);
@@ -2005,6 +2093,24 @@ mod tests {
                     format!("start-rejected:{container_id}")
                 }
                 LifecycleEvent::Started { container_id } => format!("started:{container_id}"),
+                LifecycleEvent::ExecCreateIntent { exec } => {
+                    format!("exec-create-intent:{}", exec.container_id())
+                }
+                LifecycleEvent::ExecCreateRejected { exec } => {
+                    format!("exec-create-rejected:{}", exec.container_id())
+                }
+                LifecycleEvent::ExecCreated { exec, exec_id } => {
+                    format!("exec-created:{}:{exec_id}", exec.container_id())
+                }
+                LifecycleEvent::DeleteIntent { container_id } => {
+                    format!("delete-intent:{container_id}")
+                }
+                LifecycleEvent::DeleteRejected { container_id } => {
+                    format!("delete-rejected:{container_id}")
+                }
+                LifecycleEvent::Removed { container_id } => {
+                    format!("removed:{container_id}")
+                }
                 LifecycleEvent::Poisoned {
                     phase,
                     container_id,
@@ -2069,6 +2175,15 @@ mod tests {
         record_created_container(transport_policy())
     }
 
+    fn transport_policy_with_started_container() -> ProxyPolicy {
+        let mut policy = transport_policy_with_created_container();
+        let expected = decode_effective_spec(&inspect_body()).unwrap();
+        let proof = policy.verify_pre_start("owned", &expected).unwrap();
+        policy.begin_start(&proof).unwrap();
+        policy.commit_started(&proof).unwrap();
+        policy
+    }
+
     fn record_created_container(mut policy: ProxyPolicy) -> ProxyPolicy {
         let Admission::Create(create) = policy
             .admit(
@@ -2085,6 +2200,103 @@ mod tests {
         };
         policy.record_created("owned".into(), &create).unwrap();
         policy
+    }
+
+    fn assert_exec_create_response_is_ambiguous(response: Vec<u8>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+        let runtime_events = Arc::clone(&events);
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024 * 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned/exec");
+            runtime_events.lock().unwrap().push("exec-create-byte");
+            runtime.write_all(&response).unwrap();
+        });
+        let mut policy = transport_policy_with_started_container();
+        let Admission::ExecCreate(exec) = policy
+            .admit(
+                DockerMethod::Post,
+                "/containers/owned/exec",
+                br#"{"Cmd":["true"]}"#,
+            )
+            .unwrap()
+        else {
+            panic!("exec admission");
+        };
+        let mut observer = RecordingObserver {
+            events: Arc::clone(&events),
+            fail: false,
+            fail_on_event: None,
+        };
+        let failure =
+            handle_exec_create(&mut proxy, &mut policy, &mut observer, &exec, 1024 * 1024)
+                .unwrap_err();
+        runtime_handle.join().unwrap();
+        assert!(failure.poison);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["exec-create-intent", "exec-create-byte"]
+        );
+        assert!(policy.begin_seal().is_err());
+    }
+
+    #[test]
+    fn exec_created_observer_failure_retains_owned_exec_and_poisons() {
+        let (listener, listener_address) = test_listener();
+        let (upstream, mut runtime) = UnixStream::pair().unwrap();
+        let connector = InheritedOneShotConnector::new(upstream, transport_capability()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut proxy = InheritedProxy::new_with_observer(
+            listener,
+            connector,
+            transport_capability(),
+            TransportLimits::default(),
+            transport_policy_with_started_container(),
+            RecordingObserver {
+                events: Arc::clone(&events),
+                fail: false,
+                fail_on_event: Some("exec-created"),
+            },
+        )
+        .unwrap();
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024 * 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned/exec");
+            let body = br#"{"Id":"exec-one"}"#;
+            write!(
+                runtime,
+                "HTTP/1.1 201 Created\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            runtime.write_all(body).unwrap();
+        });
+        let body = br#"{"Cmd":["true"]}"#;
+        let executor = executor_exchange(
+            &listener_address,
+            format!(
+                "POST /containers/owned/exec HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            )
+            .into_bytes(),
+        );
+        let error = proxy.serve_once().unwrap_err();
+        runtime_handle.join().unwrap();
+        let _ = executor.join().unwrap();
+        assert!(proxy.is_poisoned());
+        assert!(matches!(
+            error,
+            ProxyError::Transport(message) if message.contains("exec-created persistence failure")
+        ));
+        assert!(proxy
+            .policy
+            .admit(DockerMethod::Get, "/exec/exec-one/json", &[])
+            .is_ok());
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["exec-create-intent", "exec-created", "poisoned"]
+        );
     }
 
     #[test]
@@ -2347,6 +2559,451 @@ mod tests {
             policy.lifecycle_snapshot(),
             (LifecyclePhase::Starting, Some("owned"))
         );
+    }
+
+    #[test]
+    fn exec_create_ambiguity_retains_pending_state() {
+        for (status, reason) in [
+            (409, "Conflict"),
+            (500, "Internal Server Error"),
+            (502, "Bad Gateway"),
+            (503, "Service Unavailable"),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+            let runtime_events = Arc::clone(&events);
+            let runtime_handle = thread::spawn(move || {
+                let request = read_request(&mut runtime, 1024 * 1024).unwrap();
+                assert_eq!(request.target, "/containers/owned/exec");
+                runtime_events.lock().unwrap().push("exec-create-byte");
+                write!(
+                    runtime,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let mut policy = transport_policy_with_started_container();
+            let Admission::ExecCreate(exec) = policy
+                .admit(
+                    DockerMethod::Post,
+                    "/containers/owned/exec",
+                    br#"{"Cmd":["true"]}"#,
+                )
+                .unwrap()
+            else {
+                panic!("exec admission");
+            };
+            let mut observer = RecordingObserver {
+                events: Arc::clone(&events),
+                fail: false,
+                fail_on_event: None,
+            };
+            let failure =
+                handle_exec_create(&mut proxy, &mut policy, &mut observer, &exec, 1024 * 1024)
+                    .unwrap_err();
+            runtime_handle.join().unwrap();
+            assert!(failure.poison, "status {status}");
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["exec-create-intent", "exec-create-byte"],
+                "status {status}"
+            );
+            assert!(policy.begin_seal().is_err(), "status {status}");
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+        let runtime_events = Arc::clone(&events);
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024 * 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned/exec");
+            runtime_events.lock().unwrap().push("exec-create-byte");
+        });
+        let mut policy = transport_policy_with_started_container();
+        let Admission::ExecCreate(exec) = policy
+            .admit(
+                DockerMethod::Post,
+                "/containers/owned/exec",
+                br#"{"Cmd":["true"]}"#,
+            )
+            .unwrap()
+        else {
+            panic!("exec admission");
+        };
+        let mut observer = RecordingObserver {
+            events: Arc::clone(&events),
+            fail: false,
+            fail_on_event: None,
+        };
+        let failure =
+            handle_exec_create(&mut proxy, &mut policy, &mut observer, &exec, 1024 * 1024)
+                .unwrap_err();
+        runtime_handle.join().unwrap();
+        assert!(failure.poison);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["exec-create-intent", "exec-create-byte"]
+        );
+        assert!(policy.begin_seal().is_err());
+
+        assert_exec_create_response_is_ambiguous(
+            b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+        );
+        assert_exec_create_response_is_ambiguous(
+            b"HTTP/1.1 201 Created\r\nContent-Length: 32\r\n\r\n{\"Id\":\"partial".to_vec(),
+        );
+    }
+
+    fn assert_delete_response_is_ambiguous(response: Vec<u8>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+        let runtime_events = Arc::clone(&events);
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned?force=1&v=1");
+            runtime_events.lock().unwrap().push("delete-byte");
+            runtime.write_all(&response).unwrap();
+        });
+        let mut policy = transport_policy_with_started_container();
+        let Admission::Delete {
+            container_id,
+            target,
+        } = policy
+            .admit(DockerMethod::Delete, "/containers/owned?force=1&v=1", &[])
+            .unwrap()
+        else {
+            panic!("delete admission");
+        };
+        let mut observer = RecordingObserver {
+            events: Arc::clone(&events),
+            fail: false,
+            fail_on_event: None,
+        };
+        let failure = handle_delete(
+            &mut proxy,
+            &mut policy,
+            &mut observer,
+            &container_id,
+            &target,
+            1024,
+        )
+        .unwrap_err();
+        runtime_handle.join().unwrap();
+        assert!(failure.poison);
+        assert_eq!(*events.lock().unwrap(), ["delete-intent", "delete-byte"]);
+        assert_eq!(
+            policy.lifecycle_snapshot(),
+            (LifecyclePhase::Deleting, Some("owned"))
+        );
+    }
+
+    #[test]
+    fn exec_create_rejections_emit_ordered_resolution_facts() {
+        for (status, reason) in [
+            (400, "Bad Request"),
+            (401, "Unauthorized"),
+            (403, "Forbidden"),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+            let runtime_events = Arc::clone(&events);
+            let runtime_handle = thread::spawn(move || {
+                let request = read_request(&mut runtime, 1024 * 1024).unwrap();
+                assert_eq!(request.target, "/containers/owned/exec");
+                runtime_events.lock().unwrap().push("exec-create-byte");
+                write!(
+                    runtime,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let mut policy = transport_policy_with_started_container();
+            let Admission::ExecCreate(exec) = policy
+                .admit(
+                    DockerMethod::Post,
+                    "/containers/owned/exec",
+                    br#"{"Cmd":["true"]}"#,
+                )
+                .unwrap()
+            else {
+                panic!("exec admission");
+            };
+            let mut observer = RecordingObserver {
+                events: Arc::clone(&events),
+                fail: false,
+                fail_on_event: None,
+            };
+            let response =
+                handle_exec_create(&mut proxy, &mut policy, &mut observer, &exec, 1024 * 1024)
+                    .unwrap();
+            runtime_handle.join().unwrap();
+            assert_eq!(response.status, status);
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "exec-create-intent",
+                    "exec-create-byte",
+                    "exec-create-rejected",
+                ]
+            );
+            assert!(policy.begin_seal().is_ok());
+        }
+    }
+
+    #[test]
+    fn delete_lifecycle_is_write_ahead_and_ambiguous_until_resolved() {
+        for (status, reason) in [
+            (409, "Conflict"),
+            (500, "Internal Server Error"),
+            (502, "Bad Gateway"),
+            (503, "Service Unavailable"),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+            let runtime_events = Arc::clone(&events);
+            let runtime_handle = thread::spawn(move || {
+                let request = read_request(&mut runtime, 1024).unwrap();
+                assert_eq!(request.target, "/containers/owned?force=1&v=1");
+                runtime_events.lock().unwrap().push("delete-byte");
+                write!(
+                    runtime,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let mut policy = transport_policy_with_started_container();
+            let Admission::Delete {
+                container_id,
+                target,
+            } = policy
+                .admit(DockerMethod::Delete, "/containers/owned?force=1&v=1", &[])
+                .unwrap()
+            else {
+                panic!("delete admission");
+            };
+            let mut observer = RecordingObserver {
+                events: Arc::clone(&events),
+                fail: false,
+                fail_on_event: None,
+            };
+            let failure = handle_delete(
+                &mut proxy,
+                &mut policy,
+                &mut observer,
+                &container_id,
+                &target,
+                1024,
+            )
+            .unwrap_err();
+            runtime_handle.join().unwrap();
+            assert!(failure.poison, "status {status}");
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["delete-intent", "delete-byte"],
+                "status {status}"
+            );
+            assert_eq!(
+                policy.lifecycle_snapshot(),
+                (LifecyclePhase::Deleting, Some("owned")),
+                "status {status}"
+            );
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+        let runtime_events = Arc::clone(&events);
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024).unwrap();
+            assert_eq!(request.target, "/containers/owned?force=1&v=1");
+            runtime_events.lock().unwrap().push("delete-byte");
+            runtime
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let mut policy = transport_policy_with_started_container();
+        let Admission::Delete {
+            container_id,
+            target,
+        } = policy
+            .admit(DockerMethod::Delete, "/containers/owned?force=1&v=1", &[])
+            .unwrap()
+        else {
+            panic!("delete admission");
+        };
+        let mut observer = RecordingObserver {
+            events: Arc::clone(&events),
+            fail: false,
+            fail_on_event: None,
+        };
+        handle_delete(
+            &mut proxy,
+            &mut policy,
+            &mut observer,
+            &container_id,
+            &target,
+            1024,
+        )
+        .unwrap();
+        runtime_handle.join().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["delete-intent", "delete-byte", "removed"]
+        );
+        assert_eq!(
+            policy.lifecycle_snapshot(),
+            (LifecyclePhase::Removed, Some("owned"))
+        );
+
+        assert_delete_response_is_ambiguous(Vec::new());
+        assert_delete_response_is_ambiguous(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx".to_vec(),
+        );
+        assert_delete_response_is_ambiguous(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 8\r\n\r\npar".to_vec(),
+        );
+    }
+
+    #[test]
+    fn delete_rejections_restore_created_or_started_phase() {
+        for started in [false, true] {
+            for (status, reason) in [
+                (400, "Bad Request"),
+                (401, "Unauthorized"),
+                (403, "Forbidden"),
+            ] {
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+                let runtime_events = Arc::clone(&events);
+                let runtime_handle = thread::spawn(move || {
+                    let request = read_request(&mut runtime, 1024).unwrap();
+                    assert_eq!(request.target, "/containers/owned?force=1&v=1");
+                    runtime_events.lock().unwrap().push("delete-byte");
+                    write!(
+                        runtime,
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .unwrap();
+                });
+                let mut policy = if started {
+                    transport_policy_with_started_container()
+                } else {
+                    transport_policy_with_created_container()
+                };
+                let Admission::Delete {
+                    container_id,
+                    target,
+                } = policy
+                    .admit(DockerMethod::Delete, "/containers/owned?force=1&v=1", &[])
+                    .unwrap()
+                else {
+                    panic!("delete admission");
+                };
+                let mut observer = RecordingObserver {
+                    events: Arc::clone(&events),
+                    fail: false,
+                    fail_on_event: None,
+                };
+                let response = handle_delete(
+                    &mut proxy,
+                    &mut policy,
+                    &mut observer,
+                    &container_id,
+                    &target,
+                    1024,
+                )
+                .unwrap();
+                runtime_handle.join().unwrap();
+                assert_eq!(response.status, status);
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    ["delete-intent", "delete-byte", "delete-rejected"]
+                );
+                assert_eq!(
+                    policy.lifecycle_snapshot(),
+                    (
+                        if started {
+                            LifecyclePhase::Started
+                        } else {
+                            LifecyclePhase::Created
+                        },
+                        Some("owned"),
+                    ),
+                );
+            }
+        }
+
+        let (listener, listener_address) = test_listener();
+        let calls = Arc::new(Mutex::new(0));
+        let mut proxy = InheritedProxy::new_with_observer(
+            listener,
+            CountingConnector {
+                calls: Arc::clone(&calls),
+            },
+            transport_capability(),
+            TransportLimits::default(),
+            transport_policy_with_started_container(),
+            NoopLifecycleObserver,
+        )
+        .unwrap();
+        let executor = executor_exchange(
+            &listener_address,
+            b"DELETE /containers/owned?force=1&v=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+        );
+        assert!(proxy.serve_once().is_err());
+        let _ = executor.join().unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(
+            proxy.policy.lifecycle_snapshot(),
+            (LifecyclePhase::Started, Some("owned"))
+        );
+    }
+
+    #[test]
+    fn poison_observer_failure_is_returned_while_memory_stays_poisoned() {
+        let (listener, listener_address) = test_listener();
+        let (upstream, mut runtime) = UnixStream::pair().unwrap();
+        let connector = InheritedOneShotConnector::new(upstream, transport_capability()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut proxy = InheritedProxy::new_with_observer(
+            listener,
+            connector,
+            transport_capability(),
+            TransportLimits::default(),
+            transport_policy(),
+            RecordingObserver {
+                events: Arc::clone(&events),
+                fail: false,
+                fail_on_event: Some("poisoned"),
+            },
+        )
+        .unwrap();
+        let runtime_handle = thread::spawn(move || {
+            let request = read_request(&mut runtime, 1024 * 1024).unwrap();
+            assert!(request.target.starts_with("/containers/create?name="));
+            runtime
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let body = format!(r#"{{"Image":"sha256:{}"}}"#, "c".repeat(64));
+        let executor = executor_exchange(
+            &listener_address,
+            format!(
+                "POST /containers/create HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .into_bytes(),
+        );
+        let error = proxy.serve_once().unwrap_err();
+        runtime_handle.join().unwrap();
+        let _ = executor.join().unwrap();
+        assert!(proxy.is_poisoned());
+        assert!(matches!(
+            error,
+            ProxyError::Transport(message) if message.contains("poisoned persistence failure")
+        ));
+        assert_eq!(*events.lock().unwrap(), ["create-intent", "poisoned"]);
     }
 
     #[test]
