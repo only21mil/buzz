@@ -2,6 +2,8 @@
 
 pub mod admin;
 pub mod bridge;
+/// CI preflight route (`POST /ci/preflight`).
+pub mod ci;
 pub mod events;
 pub mod git;
 pub mod invites;

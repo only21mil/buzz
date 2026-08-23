@@ -14,19 +14,21 @@ use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
     KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
-    KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
-    KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER, KIND_FOLLOW_SET, KIND_FORUM_COMMENT,
-    KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-    KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE,
-    KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
-    KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
-    KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
-    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
-    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
-    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
+    KIND_CANVAS, KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_GRANT,
+    KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS,
+    KIND_CI_TEARDOWN_ATTESTATION, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER,
+    KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER,
+    KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
+    KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+    KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+    KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES,
+    KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED,
+    KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
+    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
+    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
+    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
     KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
     KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT, KIND_REACTION,
     KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
@@ -414,7 +416,15 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_STREAM_MESSAGE_DIFF
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
-        | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
+        | KIND_FORUM_COMMENT
+        | KIND_CI_REQUEST
+        | KIND_CI_RUN_STATUS
+        | KIND_CI_JOB_STATUS
+        | KIND_CI_LOG_REFERENCE
+        | KIND_CI_ARTIFACT_REFERENCE
+        | KIND_CI_EVIDENCE_FINALIZED
+        | KIND_CI_TEARDOWN_ATTESTATION
+        | KIND_CI_GRANT => Ok(Scope::MessagesWrite),
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
@@ -662,6 +672,14 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_HUDDLE_PARTICIPANT_LEFT
             | KIND_HUDDLE_ENDED
             | KIND_HUDDLE_GUIDELINES
+            | KIND_CI_REQUEST
+            | KIND_CI_RUN_STATUS
+            | KIND_CI_JOB_STATUS
+            | KIND_CI_LOG_REFERENCE
+            | KIND_CI_ARTIFACT_REFERENCE
+            | KIND_CI_EVIDENCE_FINALIZED
+            | KIND_CI_TEARDOWN_ATTESTATION
+            | KIND_CI_GRANT
     )
 }
 
@@ -2451,6 +2469,144 @@ async fn ingest_event_inner(
         crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
+    // CI kinds 46100-46106: validate the signed CI envelope, tags, and signer
+    // authority before storage.  Kind 46100 (request) checks the envelope + tags
+    // + actor==signer but does NOT require the signer to be in the authorized
+    // status-signer set (the actor is the requester, not a status signer).
+    // Kinds 46101-46106 require the signer to be an active grant holder in
+    // `ci_grants` for the event's (channel, target_repo_a) at the event's
+    // recorded time.
+    if matches!(kind_u32, KIND_CI_REQUEST | KIND_CI_RUN_STATUS | KIND_CI_JOB_STATUS
+        | KIND_CI_LOG_REFERENCE | KIND_CI_ARTIFACT_REFERENCE
+        | KIND_CI_EVIDENCE_FINALIZED | KIND_CI_TEARDOWN_ATTESTATION)
+    {
+        let ch_id = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: CI events must include an h tag".into())
+        })?;
+        let ch_id_str = ch_id.to_string();
+        let now = chrono::Utc::now();
+
+        // For 46101-46106, load the authorized signer set from ci_grants.
+        // For 46100, pass an empty set — validate_signed_ci_event checks the
+        // envelope + tags + actor==signer but does not consult the signer set
+        // for the request kind.
+        let signers: std::collections::HashSet<String> = if kind_u32 == KIND_CI_REQUEST {
+            std::collections::HashSet::new()
+        } else {
+            // Parse target_repo_a from the envelope content to scope the grant
+            // lookup.  All CI status envelopes carry `target_repo_a` as a
+            // top-level JSON field.
+            let parsed: serde_json::Value = serde_json::from_str(&event.content)
+                .map_err(|_| {
+                    IngestError::Rejected("invalid: CI event content is not valid JSON".into())
+                })?;
+            let target_repo_a = parsed.get("target_repo_a").and_then(|v| v.as_str()).ok_or_else(|| {
+                IngestError::Rejected("invalid: CI event missing target_repo_a".into())
+            })?;
+            state
+                .db
+                .get_active_ci_signers(tenant.community(), ch_id, target_repo_a, now)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: ci grant lookup: {e}")))?
+                .into_iter()
+                .collect()
+        };
+
+        buzz_core::ci::validate_signed_ci_event(&event, &ch_id_str, &signers)
+            .map_err(|e| IngestError::Rejected(format!("invalid: CI event: {e}")))?;
+    }
+
+    // Kind 46107: CI signer grant.  Verify the submitter is the channel
+    // owner/admin, then upsert into ci_grants with the validity window and
+    // signer pubkey from the event's tags.
+    if kind_u32 == KIND_CI_GRANT {
+        let ch_id = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: CI grant must include an h tag".into())
+        })?;
+        let signer_pubkey = event
+            .tags
+            .iter()
+            .find_map(|t| {
+                let parts = t.as_slice();
+                if parts.len() >= 2 && parts[0] == "p" {
+                    Some(parts[1].as_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                IngestError::Rejected("invalid: CI grant must include a p tag".into())
+            })?;
+        let target_repo_a = event
+            .tags
+            .iter()
+            .find_map(|t| {
+                let parts = t.as_slice();
+                if parts.len() >= 2 && parts[0] == "a" {
+                    Some(parts[1].as_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                IngestError::Rejected("invalid: CI grant must include an a tag".into())
+            })?;
+
+        // Verify the submitter is the channel owner/admin.
+        let actor_bytes = event.pubkey.to_bytes().to_vec();
+        let role = state
+            .db
+            .get_member_role(tenant.community(), ch_id, &actor_bytes)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: role check: {e}")))?;
+        if !matches!(role.as_deref(), Some("owner") | Some("admin")) {
+            return Err(IngestError::AuthFailed(
+                "restricted: only channel owners/admins may grant CI signers".into(),
+            ));
+        }
+
+        // Parse the validity window from optional `valid_from`/`valid_until` tags.
+        let now = chrono::Utc::now();
+        let valid_from = event
+            .tags
+            .iter()
+            .find_map(|t| {
+                let parts = t.as_slice();
+                if parts.len() >= 2 && parts[0] == "valid_from" {
+                    parts[1].as_str().parse::<i64>().ok()
+                } else {
+                    None
+                }
+            })
+            .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or(now))
+            .unwrap_or(now);
+        let valid_until = event.tags.iter().find_map(|t| {
+            let parts = t.as_slice();
+            if parts.len() >= 2 && parts[0] == "valid_until" {
+                parts[1].as_str().parse::<i64>().ok()
+            } else {
+                None
+            }
+        });
+        let valid_until =
+            valid_until.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
+
+        let granted_by = event.pubkey.to_hex();
+        state
+            .db
+            .upsert_ci_grant(
+                tenant.community(),
+                ch_id,
+                &target_repo_a,
+                &signer_pubkey,
+                valid_from,
+                valid_until,
+                &granted_by,
+            )
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: ci grant upsert: {e}")))?;
     }
 
     // Processed here (verify consent, mutate archived_identities, emit the
@@ -5353,5 +5509,182 @@ mod tests {
             counts.get(&("ws".to_owned(), "invalid".to_owned())),
             Some(&1)
         );
+    }
+
+    // ── CI ingest validation tests ─────────────────────────────────────
+
+    use buzz_core::ci::{validate_signed_ci_event, CiRunState, CiRunStatusEnvelope};
+    use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_RUN_STATUS};
+    use std::collections::HashSet;
+
+    /// Build a valid kind 46101 (run status) event signed by `signer_keys`.
+    fn build_run_status_event(
+        signer_keys: &Keys,
+        channel_id: &str,
+        target_repo_a: &str,
+    ) -> Event {
+        let signer_hex = signer_keys.public_key().to_hex();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let envelope = CiRunStatusEnvelope {
+            schema_version: 1,
+            request_event_id: format!("{:064x}", 1u128),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            workflow_id: "wf-1".to_string(),
+            target_repo_a: target_repo_a.to_string(),
+            tip_oid: format!("{:040x}", 1u128),
+            base_oid: format!("{:040x}", 1u128),
+            attempt: 1,
+            sequence: 1,
+            state: CiRunState::Queued,
+            conclusion: None,
+            reason: None,
+            started_at: Some(now),
+            finished_at: None,
+            job_ids: vec!["job_1".to_string()],
+            relay_signer: signer_hex,
+        };
+        let content = serde_json::to_string(&envelope).unwrap();
+        let h_tag = nostr::Tag::parse(["h", channel_id]).unwrap();
+        let a_tag = nostr::Tag::parse(["a", target_repo_a]).unwrap();
+        let run_tag = nostr::Tag::parse(["run", &envelope.run_id]).unwrap();
+        let workflow_tag = nostr::Tag::parse(["workflow", &envelope.workflow_id]).unwrap();
+        let c_tag = nostr::Tag::parse(["c", &envelope.tip_oid]).unwrap();
+        let attempt_tag = nostr::Tag::parse(["attempt", "1"]).unwrap();
+        let e_tag =
+            nostr::Tag::parse(["e", &envelope.request_event_id, "", "request"]).unwrap();
+        EventBuilder::new(Kind::Custom(KIND_CI_RUN_STATUS as u16), content)
+            .tags([h_tag, a_tag, run_tag, workflow_tag, c_tag, attempt_tag, e_tag])
+            .sign_with_keys(signer_keys)
+            .expect("sign run status event")
+    }
+
+    /// A kind 46101 event from a signer NOT in the authorized set must be
+    /// rejected by validate_signed_ci_event.
+    #[test]
+    fn ci_run_status_from_unauthorized_signer_is_rejected() {
+        let signer_keys = Keys::generate();
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let owner_hex = format!("{:064x}", 1u128);
+        let target_repo_a = format!("30617:{owner_hex}:test-repo");
+
+        let event = build_run_status_event(&signer_keys, &channel_id, &target_repo_a);
+        let signers: HashSet<String> = HashSet::new();
+        let result = validate_signed_ci_event(&event, &channel_id, &signers);
+        assert!(
+            result.is_err(),
+            "run status from an unauthorized signer must be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.0.contains("unauthorized") || err.0.contains("signer"),
+            "error must mention signer authority: {err}"
+        );
+    }
+
+    /// A kind 46101 event from a signer IN the authorized set must be
+    /// accepted by validate_signed_ci_event.
+    #[test]
+    fn ci_run_status_from_authorized_signer_is_accepted() {
+        let signer_keys = Keys::generate();
+        let signer_hex = signer_keys.public_key().to_hex();
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let owner_hex = format!("{:064x}", 2u128);
+        let target_repo_a = format!("30617:{owner_hex}:test-repo");
+
+        let event = build_run_status_event(&signer_keys, &channel_id, &target_repo_a);
+        let signers: HashSet<String> = [signer_hex].into_iter().collect();
+        let result = validate_signed_ci_event(&event, &channel_id, &signers);
+        assert!(
+            result.is_ok(),
+            "run status from an authorized signer must be accepted: {:?}",
+            result.err()
+        );
+    }
+
+    /// A kind 46101 event whose `relay_signer` does not match the event
+    /// signer's pubkey must be rejected even when the signer is in the
+    /// authorized set.
+    #[test]
+    fn ci_run_status_signer_mismatch_is_rejected() {
+        let signer_keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let other_hex = other_keys.public_key().to_hex();
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let owner_hex = format!("{:064x}", 3u128);
+        let target_repo_a = format!("30617:{owner_hex}:test-repo");
+
+        let signer_hex = signer_keys.public_key().to_hex();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let envelope = CiRunStatusEnvelope {
+            schema_version: 1,
+            request_event_id: format!("{:064x}", 10u128),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            workflow_id: "wf-mismatch".to_string(),
+            target_repo_a: target_repo_a.clone(),
+            tip_oid: format!("{:040x}", 1u128),
+            base_oid: format!("{:040x}", 1u128),
+            attempt: 1,
+            sequence: 1,
+            state: CiRunState::Queued,
+            conclusion: None,
+            reason: None,
+            started_at: Some(now),
+            finished_at: None,
+            job_ids: vec!["job_1".to_string()],
+            relay_signer: other_hex.clone(),
+        };
+        let content = serde_json::to_string(&envelope).unwrap();
+        let h_tag = nostr::Tag::parse(["h", &channel_id]).unwrap();
+        let a_tag = nostr::Tag::parse(["a", &target_repo_a]).unwrap();
+        let run_tag = nostr::Tag::parse(["run", &envelope.run_id]).unwrap();
+        let workflow_tag = nostr::Tag::parse(["workflow", &envelope.workflow_id]).unwrap();
+        let c_tag = nostr::Tag::parse(["c", &envelope.tip_oid]).unwrap();
+        let attempt_tag = nostr::Tag::parse(["attempt", "1"]).unwrap();
+        let e_tag =
+            nostr::Tag::parse(["e", &envelope.request_event_id, "", "request"]).unwrap();
+        let event = EventBuilder::new(Kind::Custom(KIND_CI_RUN_STATUS as u16), content)
+            .tags([h_tag, a_tag, run_tag, workflow_tag, c_tag, attempt_tag, e_tag])
+            .sign_with_keys(&signer_keys)
+            .expect("sign mismatched run status event");
+
+        let signers: HashSet<String> = [signer_hex, other_hex].into_iter().collect();
+        let result = validate_signed_ci_event(&event, &channel_id, &signers);
+        assert!(
+            result.is_err(),
+            "signer mismatch between event and envelope must be rejected"
+        );
+    }
+
+    /// A kind 46107 (CI grant) event with the required `h`, `a`, and `p` tags
+    /// must be parseable by the grant handler.
+    #[test]
+    fn ci_grant_event_has_required_tags() {
+        let owner_keys = Keys::generate();
+        let signer_keys = Keys::generate();
+        let channel_id = uuid::Uuid::new_v4();
+        let owner_hex = format!("{:064x}", 4u128);
+        let target_repo_a = format!("30617:{owner_hex}:test-repo");
+        let signer_hex = signer_keys.public_key().to_hex();
+
+        let event = EventBuilder::new(Kind::Custom(KIND_CI_GRANT as u16), "")
+            .tags([
+                nostr::Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                nostr::Tag::parse(["a", &target_repo_a]).unwrap(),
+                nostr::Tag::parse(["p", &signer_hex]).unwrap(),
+                nostr::Tag::parse(["valid_from", "1000000000"]).unwrap(),
+            ])
+            .sign_with_keys(&owner_keys)
+            .expect("sign grant event");
+
+        assert_eq!(event.kind.as_u16() as u32, KIND_CI_GRANT);
+        assert!(event.tags.iter().any(|t| t.kind().to_string() == "h"));
+        assert!(event.tags.iter().any(|t| t.kind().to_string() == "a"));
+        assert!(event.tags.iter().any(|t| t.kind().to_string() == "p"));
     }
 }

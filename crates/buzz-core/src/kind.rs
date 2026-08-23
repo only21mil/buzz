@@ -568,6 +568,13 @@ pub const KIND_CI_ARTIFACT_REFERENCE: u32 = 46104;
 pub const KIND_CI_EVIDENCE_FINALIZED: u32 = 46105;
 /// Signed proof that the CI attempt lease is empty after teardown.
 pub const KIND_CI_TEARDOWN_ATTESTATION: u32 = 46106;
+/// CI control-plane signer grant: authorizes a signer to sign kind 46101-46106
+/// status events for a repository channel. Carries `h` (channel), `a`
+/// (target repo coordinate `30617:<owner>:<repo_id>`), and `p` (signer pubkey)
+/// tags, plus `valid_from`/`valid_until` validity-window tags. Ingested by the
+/// relay's grant validator, which upserts into `ci_grants` after verifying the
+/// submitter is the channel owner/admin.
+pub const KIND_CI_GRANT: u32 = 46107;
 /// Trigger workflow execution.
 pub const KIND_WORKFLOW_TRIGGER: u32 = 46020;
 /// Grant pending approval.

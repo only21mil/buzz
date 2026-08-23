@@ -15,6 +15,8 @@ pub mod admin_moderation;
 pub mod api_token;
 /// Relay-scoped archived identity persistence (NIP-IA).
 pub mod archived_identities;
+/// CI control-plane signer grants (kind 46107).
+pub mod ci_grants;
 /// Channel and membership persistence.
 pub mod channel;
 /// Direct message channel persistence.
@@ -2499,6 +2501,43 @@ impl Db {
         pubkey: &[u8],
     ) -> Result<Option<String>> {
         channel::get_member_role(&self.pool, community_id, channel_id, pubkey).await
+    }
+
+    /// Upsert a CI control-plane signer grant.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_ci_grant(
+        &self,
+        community: CommunityId,
+        channel_id: Uuid,
+        target_repo_a: &str,
+        signer_pubkey: &str,
+        valid_from: chrono::DateTime<chrono::Utc>,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+        granted_by: &str,
+    ) -> Result<()> {
+        ci_grants::upsert_ci_grant(
+            &self.pool,
+            community,
+            channel_id,
+            target_repo_a,
+            signer_pubkey,
+            valid_from,
+            valid_until,
+            granted_by,
+        )
+        .await
+    }
+
+    /// Get the active CI signer pubkeys for a channel + repo at `now`.
+    pub async fn get_active_ci_signers(
+        &self,
+        community: CommunityId,
+        channel_id: Uuid,
+        target_repo_a: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<String>> {
+        ci_grants::get_active_ci_signers(&self.pool, community, channel_id, target_repo_a, now)
+            .await
     }
 
     /// Archive ephemeral channels whose TTL deadline has passed.
