@@ -174,35 +174,57 @@ pub(crate) fn build_agent_profile_content(
     serde_json::to_string(&Value::Object(object))
 }
 
-/// Extract tag vectors from an existing kind:10100 event JSON, filtering out
-/// any stale `auth` tags (the CLI republish path does the same — a fresh auth
-/// tag will be injected by `sign_event` if the caller has one).
-fn retain_existing_tags(existing: &Value) -> Vec<Tag> {
+/// Extract tag vectors from an existing kind:10100 event JSON.
+///
+/// Keeps every non-auth tag. Auth handling is left to `combine_auth_tag`:
+/// the stored auth tag is preserved so a republish never strips the owner
+/// attestation when no fresh one is available, and is replaced by a fresh one
+/// when the caller has it. Exactly one auth tag is kept.
+fn retain_existing_tags(existing: &Value) -> (Vec<Tag>, Option<Tag>) {
     let empty = vec![];
     let raw_tags = existing
         .get("tags")
         .and_then(|t| t.as_array())
         .unwrap_or(&empty);
 
-    raw_tags
-        .iter()
-        .filter_map(|raw_tag| {
-            let values = raw_tag.as_array()?;
-            let strs: Vec<String> = values
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-            if strs.is_empty() {
-                return None;
+    let mut tags = Vec::new();
+    let mut stored_auth = None;
+    for raw_tag in raw_tags {
+        let Some(values) = raw_tag.as_array() else { continue };
+        let strs: Vec<String> = values
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if strs.is_empty() {
+            continue;
+        }
+        if strs[0] == "auth" {
+            // Keep the stored attestation; the combine step decides whether a
+            // fresh one replaces it. A record with multiple auth tags fails
+            // closed rather than silently choosing one.
+            if stored_auth.is_some() {
+                continue;
             }
-            // Drop stale auth tags — the caller's sign path re-injects a
-            // current attestation if configured.
-            if strs[0] == "auth" {
-                return None;
-            }
-            Tag::parse(strs).ok()
-        })
-        .collect()
+            stored_auth = Tag::parse(&strs).ok();
+            continue;
+        }
+        if let Ok(tag) = Tag::parse(&strs) {
+            tags.push(tag);
+        }
+    }
+    (tags, stored_auth)
+}
+
+/// Resolve the single auth tag to attach, exactly like the directory-sync
+/// timer: a fresh auth (from the caller's BUZZ_AUTH_TAG) replaces the stored
+/// one; otherwise the stored one is preserved byte-identical. The chosen tag
+/// is appended last, so an event never carries two auth tags and never loses
+/// the owner attestation that makes mentions wake seats.
+fn combine_auth_tag(stored_auth: Option<Tag>, fresh_auth: Option<Tag>) -> Vec<Tag> {
+    match fresh_auth {
+        Some(tag) => vec![tag],
+        None => stored_auth.into_iter().collect(),
+    }
 }
 
 /// Find the latest kind:10100 event from a query result array.
@@ -229,16 +251,29 @@ pub(crate) fn latest_agent_profile_event(events: &[Value]) -> Option<&Value> {
 /// `created_at` is set to `max(existing_created_at + 1, now)` when an existing
 /// event is present, so the relay's replaceable-event logic picks up the new
 /// record. Without this, a same-second republish would be deduplicated.
+///
+/// `stored_auth` is the auth tag retained from the existing record;
+/// `fresh_auth` is the current owner attestation from BUZZ_AUTH_TAG. When a
+/// fresh one is present it replaces the stored one; otherwise the stored one
+/// is preserved byte-identical. Exactly one auth tag is attached, appended
+/// last, matching the directory-sync timer.
 pub(crate) fn sign_agent_profile_event(
     keys: &Keys,
     content: &str,
     mut tags: Vec<Tag>,
     existing: Option<&Value>,
+    stored_auth: Option<Tag>,
+    fresh_auth: Option<Tag>,
 ) -> Result<nostr::Event, RelayError> {
     let created_at = match existing.and_then(|e| e.get("created_at").and_then(Value::as_u64)) {
         Some(prev) => Timestamp::from(prev.saturating_add(1).max(Timestamp::now().as_secs())),
         None => Timestamp::now(),
     };
+
+    // Exactly one auth tag (fresh replaces stored; stored preserved when no
+    // fresh is available), appended last so it never carries two attestations.
+    tags.retain(|t| t.as_slice().first().map(String::as_str) != Some("auth"));
+    tags.extend(combine_auth_tag(stored_auth, fresh_auth));
 
     let builder = EventBuilder::new(Kind::Custom(KIND_AGENT_PROFILE as u16), content)
         .tags(tags.drain(..))
@@ -319,6 +354,7 @@ pub(crate) async fn publish_agent_directory_record(
     display_name: &str,
     channels: &[(Uuid, String)],
     allowlist: &[String],
+    fresh_auth: Option<Tag>,
 ) -> Result<(), RelayError> {
     let pubkey_hex = keys.public_key().to_hex();
 
@@ -338,9 +374,9 @@ pub(crate) async fn publish_agent_directory_record(
     let content = build_agent_profile_content(display_name, channels, existing_content, allowlist)
         .map_err(|e| RelayError::Http(format!("kind:10100 content build error: {e}")))?;
 
-    let tags = retain_existing_tags(existing.unwrap_or(&Value::Null));
+    let (tags, stored_auth) = retain_existing_tags(existing.unwrap_or(&Value::Null));
 
-    let event = sign_agent_profile_event(keys, &content, tags, existing)?;
+    let event = sign_agent_profile_event(keys, &content, tags, existing, stored_auth, fresh_auth)?;
 
     tracing::info!(
         pubkey = %pubkey_hex,
@@ -356,12 +392,17 @@ pub(crate) async fn publish_agent_directory_record(
 /// what the startup and membership-change callers invoke: it re-reads
 /// kind:39002 membership and kind:39000 metadata from the relay, so the record
 /// reflects the canonical active set even after a batch of membership changes.
+///
+/// `fresh_auth` is the owner attestation parsed from BUZZ_AUTH_TAG; it is
+/// attached (replacing any stored auth) when present, otherwise the stored
+/// auth tag is preserved. A republish therefore never strips the attestation.
 pub(crate) async fn refresh_agent_directory_record(
     rest: &RestClient,
     keys: &Keys,
     display_name: &str,
     allowlist: &[String],
     _subscribed_channel_ids: &HashSet<Uuid>,
+    fresh_auth: Option<Tag>,
 ) {
     let channels = match fetch_member_channels(rest, keys).await {
         Ok(channels) => channels,
@@ -371,8 +412,15 @@ pub(crate) async fn refresh_agent_directory_record(
         }
     };
 
-    if let Err(e) = publish_agent_directory_record(rest, keys, display_name, &channels, allowlist)
-        .await
+    if let Err(e) = publish_agent_directory_record(
+        rest,
+        keys,
+        display_name,
+        &channels,
+        allowlist,
+        fresh_auth,
+    )
+    .await
     {
         tracing::warn!("failed to publish kind:10100 agent directory record: {e}");
     }
@@ -579,7 +627,8 @@ mod tests {
             "pubkey": keys.public_key().to_hex(),
         });
 
-        let event = sign_agent_profile_event(&keys, &content, vec![], Some(&existing)).unwrap();
+        let event =
+            sign_agent_profile_event(&keys, &content, vec![], Some(&existing), None, None).unwrap();
 
         assert_eq!(event.kind.as_u16(), KIND_AGENT_PROFILE as u16);
         assert!(event.created_at.as_secs() >= 1001);
@@ -594,8 +643,83 @@ mod tests {
         let allowlist = vec!["owner".to_string()];
         let content = build_agent_profile_content("fresh", &proj(&uuids(1)), None, &allowlist)
             .unwrap();
-        let event = sign_agent_profile_event(&keys, &content, vec![], None).unwrap();
+        let event = sign_agent_profile_event(&keys, &content, vec![], None, None, None).unwrap();
         assert!(event.created_at.as_secs() > 0);
+    }
+
+    /// Discriminating auth test: an existing kind:10100 record carrying one
+    /// auth tag republishes with that same tag byte-identical when no fresh
+    /// auth is available. This fails on the old code, which dropped the stored
+    /// auth and injected nothing, stripping the owner attestation.
+    #[test]
+    fn republish_preserves_stored_auth_when_no_fresh_auth() {
+        let keys = make_keys();
+        let existing_auth = Tag::parse(["auth", "4a34c131deadbeef", "created_at<4294967295", "sig"])
+            .expect("valid auth tag");
+        let existing = json!({
+            "created_at": 1000u64,
+            "content": r#"{"display_name":"old","channel_ids":["x"]}"#,
+            "tags": [["auth", "4a34c131deadbeef", "created_at<4294967295", "sig"]],
+            "id": "abc",
+            "pubkey": keys.public_key().to_hex(),
+        });
+
+        let (tags, stored_auth) = retain_existing_tags(&existing);
+        let event = sign_agent_profile_event(
+            &keys,
+            r#"{"display_name":"old","channel_ids":["y"]}"#,
+            tags,
+            Some(&existing),
+            stored_auth,
+            None,
+        )
+        .unwrap();
+
+        let auth_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(String::as_str) == Some("auth"))
+            .collect();
+        assert_eq!(auth_tags.len(), 1, "exactly one auth tag preserved");
+        assert_eq!(
+            auth_tags[0].as_slice(),
+            existing_auth.as_slice(),
+            "stored auth tag preserved byte-identical"
+        );
+    }
+
+    /// A fresh auth (from BUZZ_AUTH_TAG) replaces the stored auth, exactly one
+    /// appended last — so the record never carries two attestations.
+    #[test]
+    fn fresh_auth_replaces_stored_auth_exactly_one() {
+        let keys = make_keys();
+        let existing = json!({
+            "created_at": 1000u64,
+            "content": r#"{"display_name":"old"}"#,
+            "tags": [["auth", "deadbeef", "label", "oldsig"]],
+            "id": "abc",
+            "pubkey": keys.public_key().to_hex(),
+        });
+        let fresh = Tag::parse(["auth", "cafe", "label", "newsig"]).unwrap();
+
+        let (tags, stored_auth) = retain_existing_tags(&existing);
+        let event = sign_agent_profile_event(
+            &keys,
+            r#"{"display_name":"old"}"#,
+            tags,
+            Some(&existing),
+            stored_auth,
+            Some(fresh.clone()),
+        )
+        .unwrap();
+
+        let auth_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(String::as_str) == Some("auth"))
+            .collect();
+        assert_eq!(auth_tags.len(), 1);
+        assert_eq!(auth_tags[0].as_slice(), fresh.as_slice());
     }
 
     /// `latest_agent_profile_event` picks the newest by created_at.
@@ -608,9 +732,10 @@ mod tests {
         assert_eq!(latest["id"].as_str().unwrap(), "bbb");
     }
 
-    /// `retain_existing_tags` drops stale `auth` tags but keeps everything else.
+    /// `retain_existing_tags` keeps non-auth tags and returns the single
+    /// stored auth tag separately so the sign path can preserve or replace it.
     #[test]
-    fn retain_tags_drops_auth_keeps_rest() {
+    fn retain_tags_keeps_rest_and_returns_stored_auth() {
         let existing = json!({
             "tags": [
                 ["auth", "deadbeef", "label", "sig"],
@@ -618,10 +743,13 @@ mod tests {
                 ["d", "some-id"],
             ]
         });
-        let tags = retain_existing_tags(&existing);
+        let (tags, stored_auth) = retain_existing_tags(&existing);
         assert_eq!(tags.len(), 2);
         assert_eq!(tags[0].as_slice()[0].as_str(), "custom");
         assert_eq!(tags[1].as_slice()[0].as_str(), "d");
+        let stored = stored_auth.expect("stored auth tag is retained");
+        assert_eq!(stored.as_slice()[0].as_str(), "auth");
+        assert_eq!(stored.as_slice()[1].as_str(), "deadbeef");
     }
 
     /// Channel-metadata reduction: DM and archived are flagged so the

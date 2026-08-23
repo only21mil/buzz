@@ -1719,10 +1719,14 @@ async fn tokio_main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
 
-    let mut relay =
-        HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
-            .await
-            .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
+    let mut relay = HarnessRelay::connect(
+        &config.relay_url,
+        &config.keys,
+        &pubkey_hex,
+        relay_auth_tag.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
     // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
@@ -1927,6 +1931,7 @@ async fn tokio_main() -> Result<()> {
         &directory_display_name,
         &directory_allowlist,
         &subscribed_channel_ids,
+        relay_auth_tag.clone(),
     )
     .await;
 
@@ -2487,6 +2492,7 @@ async fn tokio_main() -> Result<()> {
                                     &directory_display_name,
                                     &directory_allowlist,
                                     &subscribed_channel_ids,
+                                    relay_auth_tag.clone(),
                                 )
                                 .await;
                                 continue;
