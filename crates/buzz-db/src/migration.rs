@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -957,6 +957,39 @@ mod tests {
             long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
         );
         assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+
+        // Workflow runs retain the exact definition they started with. The
+        // additive migration backfills existing rows through the tenant-scoped
+        // workflow foreign key before making both snapshot columns required.
+        assert_eq!(migrations[28].version, 29);
+        let workflow_run_snapshots = migrations[28].sql.as_str();
+        assert!(workflow_run_snapshots.contains("ADD COLUMN definition_snapshot JSONB"));
+        assert!(workflow_run_snapshots.contains("ADD COLUMN definition_hash BYTEA"));
+        assert!(workflow_run_snapshots.contains("ADD COLUMN generation BIGINT NOT NULL DEFAULT 1"));
+        assert!(workflow_run_snapshots.contains("workflow.community_id = run.community_id"));
+        assert!(workflow_run_snapshots.contains("workflow.id = run.workflow_id"));
+        assert!(workflow_run_snapshots.contains("ALTER COLUMN definition_snapshot SET NOT NULL"));
+        assert!(workflow_run_snapshots.contains("ALTER COLUMN definition_hash SET NOT NULL"));
+        assert!(workflow_run_snapshots.contains("octet_length(definition_hash) = 32"));
+        assert!(workflow_run_snapshots.contains("UNIQUE (community_id, id, workflow_id)"));
+        assert!(desired_schema.contains("definition_snapshot JSONB NOT NULL"));
+        assert!(desired_schema.contains("generation          BIGINT NOT NULL DEFAULT 1"));
+        assert!(desired_schema.contains("UNIQUE (community_id, id, workflow_id)"));
+
+        // Durable workflow state is tenant/workflow scoped. Receipt identities
+        // bind the run to the same workflow so one run cannot write state for
+        // another definition.
+        assert_eq!(migrations[29].version, 30);
+        let workflow_state = migrations[29].sql.as_str();
+        assert!(workflow_state.contains("CREATE TABLE workflow_state"));
+        assert!(workflow_state.contains("PRIMARY KEY (community_id, workflow_id, state_key)"));
+        assert!(workflow_state.contains("octet_length(state_key) BETWEEN 1 AND 512"));
+        assert!(workflow_state.contains("octet_length(value) <= 65536"));
+        assert!(workflow_state.contains("CREATE TABLE workflow_state_receipts"));
+        assert!(workflow_state.contains("octet_length(request_hash) = 32"));
+        assert!(workflow_state.contains("FOREIGN KEY (community_id, run_id, workflow_id)"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_state"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_state_receipts"));
     }
 
     #[test]

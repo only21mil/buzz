@@ -151,6 +151,23 @@ pub enum ActionDef {
         /// Matcher list: output name → matcher name.
         matchers: HashMap<String, String>,
     },
+    /// Read a workflow-scoped state value.
+    ReadState {
+        /// State key (supports template variables).
+        key: String,
+    },
+    /// Write a workflow-scoped state value with a required expiry.
+    WriteState {
+        /// State key (supports template variables).
+        key: String,
+        /// State value (supports template variables).
+        value: String,
+        /// Duration until the value expires (supports template variables).
+        expires_in: String,
+        /// Optional revision for compare-and-swap writes. Revision `0` is create-only.
+        #[serde(default)]
+        expected_revision: Option<String>,
+    },
 }
 
 impl WorkflowDef {
@@ -209,6 +226,44 @@ impl WorkflowDef {
                     "duplicate step id: {}",
                     step.id
                 )));
+            }
+
+            match &step.action {
+                ActionDef::ReadState { key } if key.trim().is_empty() => {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "read_state step '{}' requires a non-empty key",
+                        step.id
+                    )));
+                }
+                ActionDef::WriteState {
+                    key,
+                    value: _,
+                    expires_in,
+                    expected_revision,
+                } => {
+                    if key.trim().is_empty() {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "write_state step '{}' requires a non-empty key",
+                            step.id
+                        )));
+                    }
+                    if expires_in.trim().is_empty() {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "write_state step '{}' requires a non-empty expires_in",
+                            step.id
+                        )));
+                    }
+                    if expected_revision
+                        .as_ref()
+                        .is_some_and(|revision| revision.trim().is_empty())
+                    {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "write_state step '{}' requires a non-empty expected_revision when provided",
+                            step.id
+                        )));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -893,6 +948,123 @@ mod tests {
         assert!(matches!(
             trigger,
             TriggerDef::DiffPosted { filter: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn state_actions_round_trip_yaml_and_canonical_json() {
+        let yaml = concat!(
+            "name: Stateful workflow\ntrigger:\n  on: webhook\nsteps:\n",
+            "  - id: read_counter\n    action: read_state\n    key: counters/{{trigger.author}}\n",
+            "  - id: write_counter\n    action: write_state\n",
+            "    key: counters/{{trigger.author}}\n    value: '{{steps.read_counter.output.value}}'\n",
+            "    expires_in: 24h\n    expected_revision: '{{steps.read_counter.output.revision}}'\n",
+        );
+        let (def, json) = parse_yaml(yaml).expect("state actions should parse");
+        assert!(matches!(
+            &def.steps[0].action,
+            ActionDef::ReadState { key } if key == "counters/{{trigger.author}}"
+        ));
+        assert!(matches!(
+            &def.steps[1].action,
+            ActionDef::WriteState {
+                key,
+                value,
+                expires_in,
+                expected_revision: Some(expected_revision),
+            } if key == "counters/{{trigger.author}}"
+                && value == "{{steps.read_counter.output.value}}"
+                && expires_in == "24h"
+                && expected_revision == "{{steps.read_counter.output.revision}}"
+        ));
+
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("JSON round-trip");
+        assert!(matches!(
+            &reparsed.steps[1].action,
+            ActionDef::WriteState {
+                expected_revision: Some(revision),
+                ..
+            } if revision == "{{steps.read_counter.output.revision}}"
+        ));
+
+        let back = serde_yaml::to_string(&def).expect("YAML round-trip");
+        let round_tripped: WorkflowDef = serde_yaml::from_str(&back).expect("reparse YAML");
+        assert!(matches!(
+            &round_tripped.steps[0].action,
+            ActionDef::ReadState { key } if key == "counters/{{trigger.author}}"
+        ));
+    }
+
+    #[test]
+    fn write_state_allows_create_only_revision_zero() {
+        let yaml = concat!(
+            "name: Create state\ntrigger:\n  on: webhook\nsteps:\n",
+            "  - id: create\n    action: write_state\n    key: release\n",
+            "    value: pending\n    expires_in: 1h\n    expected_revision: '0'\n",
+        );
+        let (def, _) = parse_yaml(yaml).expect("revision zero should be valid");
+        assert!(matches!(
+            &def.steps[0].action,
+            ActionDef::WriteState {
+                expected_revision: Some(revision),
+                ..
+            } if revision == "0"
+        ));
+    }
+
+    #[test]
+    fn state_action_validation_rejects_blank_fields() {
+        for (field, action) in [
+            ("read key", "action: read_state\n    key: '  '\n"),
+            (
+                "write key",
+                "action: write_state\n    key: ''\n    value: value\n    expires_in: 1h\n",
+            ),
+            (
+                "write expiry",
+                "action: write_state\n    key: key\n    value: value\n    expires_in: ''\n",
+            ),
+            (
+                "expected revision",
+                "action: write_state\n    key: key\n    value: value\n    expires_in: 1h\n    expected_revision: '  '\n",
+            ),
+        ] {
+            let yaml = format!(
+                "name: Invalid state\ntrigger:\n  on: webhook\nsteps:\n  - id: state\n    {action}"
+            );
+            assert!(
+                matches!(
+                    parse_yaml(&yaml),
+                    Err(WorkflowError::InvalidDefinition(_))
+                ),
+                "{field} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn write_state_requires_expiry() {
+        let yaml = concat!(
+            "name: Missing expiry\ntrigger:\n  on: webhook\nsteps:\n",
+            "  - id: write\n    action: write_state\n    key: key\n    value: value\n",
+        );
+        assert!(matches!(
+            parse_yaml(yaml),
+            Err(WorkflowError::InvalidYaml(_))
+        ));
+    }
+
+    #[test]
+    fn write_state_allows_an_empty_string_value() {
+        let yaml = concat!(
+            "name: Empty value\ntrigger:\n  on: webhook\nsteps:\n",
+            "  - id: clear\n    action: write_state\n    key: key\n",
+            "    value: ''\n    expires_in: 1h\n",
+        );
+        let (def, _) = parse_yaml(yaml).expect("empty state values are valid");
+        assert!(matches!(
+            &def.steps[0].action,
+            ActionDef::WriteState { value, .. } if value.is_empty()
         ));
     }
 }

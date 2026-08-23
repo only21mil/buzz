@@ -400,6 +400,9 @@ CREATE TABLE workflow_runs (
     community_id        UUID NOT NULL REFERENCES communities(id),
     id                  UUID NOT NULL DEFAULT gen_random_uuid(),
     workflow_id         UUID NOT NULL,
+    definition_snapshot JSONB NOT NULL,
+    definition_hash     BYTEA NOT NULL CHECK (octet_length(definition_hash) = 32),
+    generation          BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
     status              run_status NOT NULL DEFAULT 'pending',
     trigger_event_id    BYTEA,
     current_step        INT NOT NULL DEFAULT 0,
@@ -410,12 +413,58 @@ CREATE TABLE workflow_runs (
     error_message       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, id),
+    UNIQUE (community_id, id, workflow_id),
     FOREIGN KEY (community_id, workflow_id)
         REFERENCES workflows (community_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+
+-- ── Workflow state ───────────────────────────────────────────────────────────
+
+CREATE TABLE workflow_state (
+    community_id      UUID NOT NULL REFERENCES communities(id),
+    workflow_id       UUID NOT NULL,
+    state_key         TEXT NOT NULL CHECK (octet_length(state_key) BETWEEN 1 AND 512),
+    value             TEXT NOT NULL CHECK (octet_length(value) <= 65536),
+    state_incarnation UUID NOT NULL DEFAULT gen_random_uuid(),
+    revision          BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    expires_at        TIMESTAMPTZ NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, workflow_id, state_key),
+    FOREIGN KEY (community_id, workflow_id)
+        REFERENCES workflows (community_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_workflow_state_expires_at ON workflow_state (expires_at);
+
+CREATE TABLE workflow_state_receipts (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    workflow_id  UUID NOT NULL,
+    run_id       UUID NOT NULL,
+    step_id      VARCHAR(64) NOT NULL,
+    request_hash BYTEA NOT NULL CHECK (octet_length(request_hash) = 32),
+    result       JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, run_id, step_id),
+    FOREIGN KEY (community_id, workflow_id)
+        REFERENCES workflows (community_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (community_id, run_id, workflow_id)
+        REFERENCES workflow_runs (community_id, id, workflow_id) ON DELETE CASCADE
+);
+
+CREATE FUNCTION reject_workflow_state_receipt_update()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$ BEGIN
+    RAISE EXCEPTION 'workflow state receipts are immutable';
+END; $$;
+
+CREATE TRIGGER workflow_state_receipt_immutable
+BEFORE UPDATE ON workflow_state_receipts
+FOR EACH ROW EXECUTE FUNCTION reject_workflow_state_receipt_update();
 
 -- ── Workflow approvals ────────────────────────────────────────────────────────
 -- token-hash lookup scoped: approval token grants cannot act on another

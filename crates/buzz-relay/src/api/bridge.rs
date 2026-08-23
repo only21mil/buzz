@@ -1920,7 +1920,14 @@ pub async fn workflow_webhook(
 
     let run_id = state
         .db
-        .create_workflow_run(community_id, id, None, trigger_ctx_json.as_ref())
+        .create_workflow_run(
+            community_id,
+            id,
+            None,
+            trigger_ctx_json.as_ref(),
+            &workflow.definition,
+            &workflow.definition_hash,
+        )
         .await
         .map_err(|e| super::internal_error(&format!("db error: {e}")))?;
 
@@ -2426,6 +2433,9 @@ mod tests {
             ),
             workflow_id: uuid::Uuid::parse_str("30000000-0000-0000-0000-000000000003")
                 .expect("workflow id"),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
             status: buzz_db::workflow::RunStatus::Failed,
             trigger_event_id: None,
             current_step: 2,

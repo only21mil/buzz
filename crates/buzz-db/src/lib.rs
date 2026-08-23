@@ -53,9 +53,17 @@ pub mod usage;
 pub mod user;
 /// Workflow, run, and approval persistence.
 pub mod workflow;
+/// Generation-fenced workflow-run status transitions.
+pub mod workflow_run_transition;
+/// Durable workflow-scoped key/value state.
+pub mod workflow_state;
 
 pub use error::{DbError, Result};
 pub use event::{EventQuery, ReactionEventInsertOutcome, DEFAULT_MAX_PAGE_LIMIT};
+pub use workflow_run_transition::WorkflowRunTransitionOutcome;
+pub use workflow_state::{
+    WorkflowStateEntry, WorkflowStateLimit, WorkflowStateRevision, WorkflowStateWriteOutcome,
+};
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
@@ -3856,6 +3864,8 @@ impl Db {
         workflow_id: Uuid,
         trigger_event_id: Option<&[u8]>,
         trigger_context: Option<&serde_json::Value>,
+        definition_snapshot: &serde_json::Value,
+        definition_hash: &[u8],
     ) -> Result<Uuid> {
         workflow::create_workflow_run(
             &self.pool,
@@ -3863,6 +3873,8 @@ impl Db {
             workflow_id,
             trigger_event_id,
             trigger_context,
+            definition_snapshot,
+            definition_hash,
         )
         .await
     }
@@ -3904,6 +3916,77 @@ impl Db {
             current_step,
             trace,
             error,
+        )
+        .await
+    }
+
+    /// Change a workflow run's status only while its status and generation
+    /// still match the caller's snapshot.
+    pub async fn transition_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_status: workflow::RunStatus,
+        expected_generation: i64,
+        next_status: workflow::RunStatus,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        workflow_run_transition::transition_workflow_run(
+            &self.pool,
+            community_id,
+            id,
+            expected_status,
+            expected_generation,
+            next_status,
+        )
+        .await
+    }
+
+    /// Read a live workflow-state value by workflow id.
+    pub async fn read_workflow_state(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        key: &str,
+    ) -> Result<Option<WorkflowStateEntry>> {
+        workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
+    }
+
+    /// Read a live workflow-state value after resolving its workflow from a run.
+    pub async fn read_workflow_state_for_run(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        key: &str,
+    ) -> Result<Option<WorkflowStateEntry>> {
+        workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
+    }
+
+    /// Delete at most `limit` expired workflow-state rows.
+    pub async fn purge_expired_workflow_state(&self, limit: u32) -> Result<u64> {
+        workflow_state::purge_expired_workflow_state(&self.pool, limit).await
+    }
+
+    /// Write state for the workflow that owns a run.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_workflow_state(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        step_id: &str,
+        key: &str,
+        value: &str,
+        expires_in_secs: i64,
+        expected_revision: Option<&str>,
+    ) -> Result<WorkflowStateWriteOutcome> {
+        workflow_state::write_workflow_state(
+            &self.pool,
+            community_id,
+            run_id,
+            step_id,
+            key,
+            value,
+            expires_in_secs,
+            expected_revision,
         )
         .await
     }
