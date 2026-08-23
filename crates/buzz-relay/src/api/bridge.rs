@@ -1874,11 +1874,17 @@ pub async fn workflow_webhook(
         };
 
     // Build trigger context from webhook body fields.
+    //
+    // The top-level fields are flattened into `webhook_fields` (a String map)
+    // for backward compatibility with existing definitions. The full parsed
+    // body is preserved in `webhook_body` so nested objects and arrays stay
+    // reachable by dotted path in templates (`{{trigger.a.b.c}}`).
     let mut trigger_ctx = buzz_workflow::executor::TriggerContext {
         channel_id: workflow
             .channel_id
             .map(|ch| ch.to_string())
             .unwrap_or_default(),
+        webhook_body: body_json.clone(),
         ..Default::default()
     };
     if let Some(Value::Object(ref map)) = body_json {

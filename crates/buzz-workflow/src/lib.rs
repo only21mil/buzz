@@ -1011,6 +1011,7 @@ pub fn build_trigger_context(event: &buzz_core::StoredEvent) -> executor::Trigge
         emoji,
         message_id,
         webhook_fields: HashMap::new(),
+        webhook_body: None,
     }
 }
 

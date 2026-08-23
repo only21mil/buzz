@@ -37,26 +37,99 @@ pub struct TriggerContext {
     pub emoji: String,
     /// Event ID of the triggering message (hex string).
     pub message_id: String,
-    /// Arbitrary webhook body fields (webhook trigger).
+    /// Arbitrary webhook body fields (webhook trigger). Top-level fields,
+    /// flattened to strings.
     pub webhook_fields: HashMap<String, String>,
+    /// Full parsed webhook body preserved for nested access by dotted path.
+    /// `None` for non-webhook triggers.
+    #[serde(default)]
+    pub webhook_body: Option<JsonValue>,
 }
 
 impl TriggerContext {
     /// Look up a trigger field by name.
     ///
-    /// Returns `Some(&str)` for known fields; for webhook triggers, also
-    /// checks `webhook_fields`. Returns `None` for unknown names.
-    pub fn get_field(&self, name: &str) -> Option<&str> {
+    /// Returns `Some` for known fields; for webhook triggers, also checks
+    /// `webhook_fields`, then walks the preserved body for dotted paths
+    /// (`trigger.commit.sha`). `None` for unknown names.
+    ///
+    /// A field name containing a dot is only ever resolved against the body
+    /// tree; an exact top-level webhook field (no dot) keeps first claim via
+    /// `webhook_fields`, so the flattened names existing definitions rely on
+    /// still win over a same-named scalar in the tree.
+    ///
+    /// Returns an owned `String` (not a `&str`) because a nested body walk
+    /// must stringify numbers and booleans that are not stored as text.
+    pub fn get_field(&self, name: &str) -> Option<String> {
         match name {
-            "text" => Some(&self.text),
-            "author" => Some(&self.author),
-            "channel_id" => Some(&self.channel_id),
-            "timestamp" => Some(&self.timestamp),
-            "emoji" => Some(&self.emoji),
-            "message_id" => Some(&self.message_id),
-            other => self.webhook_fields.get(other).map(|s| s.as_str()),
+            "text" => Some(self.text.clone()),
+            "author" => Some(self.author.clone()),
+            "channel_id" => Some(self.channel_id.clone()),
+            "timestamp" => Some(self.timestamp.clone()),
+            "emoji" => Some(self.emoji.clone()),
+            "message_id" => Some(self.message_id.clone()),
+            other => {
+                if let Some(v) = self.webhook_fields.get(other) {
+                    return Some(v.clone());
+                }
+                if other.contains('.') {
+                    if let Some(body) = &self.webhook_body {
+                        return json_path_to_str(body, other);
+                    }
+                }
+                None
+            }
         }
     }
+}
+
+/// Resolve a dotted path against a JSON tree and stringify the value at it.
+///
+/// Segments are split on `.`. Object keys are looked up by exact name; array
+/// segments must be ASCII digits and index into the array. Returns `None` for
+/// a missing segment, a non-object/non-array intermediate, or an out-of-range
+/// index. The final value uses the same string conversion as the rest of the
+/// trigger context.
+fn json_path_to_str(body: &JsonValue, dotted: &str) -> Option<String> {
+    json_path_to_value(body, dotted).map(json_to_string)
+}
+
+/// Resolve a dotted path against a JSON tree and return the raw value at it.
+///
+/// Shares the walking rules with [`json_path_to_str`]; the caller decides
+/// whether to stringify (templates) or convert to an evalexpr value
+/// (conditions).
+fn json_path_to_value<'a>(body: &'a JsonValue, dotted: &str) -> Option<&'a JsonValue> {
+    let mut current = body;
+    for key in dotted.split('.') {
+        if key.is_empty() {
+            return None;
+        }
+        match current {
+            JsonValue::Object(map) => {
+                let next = map.get(key)?;
+                current = next;
+            }
+            JsonValue::Array(items) => {
+                if !key.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                let idx = key.parse().unwrap_or(usize::MAX);
+                if idx < items.len() {
+                    current = &items[idx];
+                } else {
+                    return None;
+                }
+            }
+            _other => return None,
+        }
+    }
+    Some(current)
+}
+
+/// Convert a dotted-path body value to an evalexpr value (for `body_path`).
+fn json_path_to_eval(body: &JsonValue, dotted: &str) -> Option<evalexpr::Value> {
+    json_path_to_value(body, dotted).map(json_value_to_eval)
 }
 
 /// Resolve `{{trigger.X}}` and `{{steps.ID.output.X}}` placeholders in a string.
@@ -129,7 +202,7 @@ fn resolve_variable(
     step_outputs: &HashMap<String, JsonValue>,
 ) -> Option<String> {
     if let Some(field) = path.strip_prefix("trigger.") {
-        return trigger_ctx.get_field(field).map(|s| s.to_owned());
+        return trigger_ctx.get_field(field);
     }
 
     // Pattern: `steps.STEP_ID.output.FIELD`
@@ -285,6 +358,31 @@ pub fn build_eval_context(
         ctx.set_value(var_name, Value::String(val.clone()))
             .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
     }
+
+    // Register a `body_path()` helper so conditions can read nested webhook
+    // fields. Templates refer to the same data as `{{trigger.a.b.c}}` (dotted
+    // path); evalexpr cannot name dotted identifiers, so the condition
+    // spelling is a function call: `body_path("a.b.c")`. Both spellings walk
+    // the same preserved body tree, and the docs in this file state that
+    // contract so the two languages do not drift. The helper reads only
+    // `webhook_body`, never the standard trigger fields, so a nested object
+    // named `trigger` or `steps` can never shadow the standard trigger_ or
+    // steps_ variables.
+    let body_snapshot = trigger_ctx
+        .webhook_body
+        .clone()
+        .unwrap_or(serde_json::json!(null));
+    ctx.set_function(
+        "body_path".into(),
+        Function::new(move |args| {
+            let args = args.as_fixed_len_tuple(1)?;
+            let path = args[0].as_string()?;
+            let value = json_path_to_eval(&body_snapshot, path.as_str())
+                .unwrap_or(Value::String(String::new()));
+            Ok(value)
+        }),
+    )
+    .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
 
     let trigger_fields = [
         ("trigger_text", trigger_ctx.text.as_str()),
@@ -1230,6 +1328,7 @@ mod tests {
             emoji: "fire".to_owned(),
             message_id: "event-id-hex".to_owned(),
             webhook_fields: HashMap::new(),
+            webhook_body: None,
         }
     }
 
@@ -1766,12 +1865,12 @@ mod tests {
     #[test]
     fn trigger_context_get_field_known_fields() {
         let ctx = make_trigger();
-        assert_eq!(ctx.get_field("text"), Some("P1 incident in production"));
-        assert_eq!(ctx.get_field("author"), Some("abc123def456"));
-        assert_eq!(ctx.get_field("channel_id"), Some("channel-uuid-here"));
-        assert_eq!(ctx.get_field("timestamp"), Some("1700000000"));
-        assert_eq!(ctx.get_field("emoji"), Some("fire"));
-        assert_eq!(ctx.get_field("message_id"), Some("event-id-hex"));
+        assert_eq!(ctx.get_field("text"), Some("P1 incident in production".to_owned()));
+        assert_eq!(ctx.get_field("author"), Some("abc123def456".to_owned()));
+        assert_eq!(ctx.get_field("channel_id"), Some("channel-uuid-here".to_owned()));
+        assert_eq!(ctx.get_field("timestamp"), Some("1700000000".to_owned()));
+        assert_eq!(ctx.get_field("emoji"), Some("fire".to_owned()));
+        assert_eq!(ctx.get_field("message_id"), Some("event-id-hex".to_owned()));
     }
 
     #[test]
@@ -1786,7 +1885,7 @@ mod tests {
         let mut ctx = make_trigger();
         ctx.webhook_fields
             .insert("repo".to_owned(), "buzz".to_owned());
-        assert_eq!(ctx.get_field("repo"), Some("buzz"));
+        assert_eq!(ctx.get_field("repo"), Some("buzz".to_owned()));
     }
 
     #[test]
@@ -1799,6 +1898,7 @@ mod tests {
         assert_eq!(ctx.emoji, "");
         assert_eq!(ctx.message_id, "");
         assert!(ctx.webhook_fields.is_empty());
+        assert!(ctx.webhook_body.is_none());
     }
 
     #[test]
