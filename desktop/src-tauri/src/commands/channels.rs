@@ -398,6 +398,37 @@ pub async fn get_channel_details(
         .ok_or_else(|| "channel not found".to_string())
 }
 
+fn enrich_channel_members_from_profile_events(
+    response: &mut ChannelMembersResponse,
+    profile_events: &[nostr::Event],
+) {
+    let mut profile_map = std::collections::HashMap::new();
+    for event in profile_events {
+        let pubkey = event.pubkey.to_hex();
+        if let Ok(profile) = nostr_convert::profile_info_from_event(event) {
+            profile_map.insert(
+                pubkey,
+                (
+                    profile.display_name,
+                    nostr_convert::profile_has_valid_oa_owner(event),
+                ),
+            );
+        }
+    }
+
+    for member in &mut response.members {
+        if member.role == "bot" {
+            member.is_agent = true;
+        }
+        if let Some((display_name, is_agent)) = profile_map.get(&member.pubkey) {
+            if member.display_name.is_none() {
+                member.display_name = display_name.clone();
+            }
+            member.is_agent = member.is_agent || *is_agent;
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn get_channel_members(
     channel_id: String,
@@ -432,34 +463,7 @@ pub async fn get_channel_members(
         )
         .await
         .unwrap_or_default();
-
-        // Build pubkey → profile display metadata from kind:0 events.
-        let mut profile_map = std::collections::HashMap::new();
-        for ev in &profile_events {
-            let pk = ev.pubkey.to_hex();
-            if let Ok(profile) = nostr_convert::profile_info_from_event(ev) {
-                profile_map.insert(
-                    pk,
-                    (
-                        profile.display_name,
-                        nostr_convert::profile_has_valid_oa_owner(ev),
-                    ),
-                );
-            }
-        }
-
-        // Populate profile-derived fields on each member.
-        for member in &mut response.members {
-            if member.role == "bot" {
-                member.is_agent = true;
-            }
-            if let Some((display_name, is_agent)) = profile_map.get(&member.pubkey) {
-                if member.display_name.is_none() {
-                    member.display_name = display_name.clone();
-                }
-                member.is_agent = member.is_agent || *is_agent;
-            }
-        }
+        enrich_channel_members_from_profile_events(&mut response, &profile_events);
     }
 
     Ok(response)

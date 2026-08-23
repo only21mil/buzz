@@ -19,7 +19,7 @@ export type ChannelAgentSessionAgent = Pick<
   ManagedAgent,
   "pubkey" | "name" | "status"
 > & {
-  agentSource: "managed" | "member-bot" | "relay";
+  agentSource: "managed" | "member-agent" | "relay";
   canInterruptTurn: boolean;
   channelIds?: string[];
   channels?: string[];
@@ -90,7 +90,7 @@ export function buildChannelAgentSessionCandidates({
 
   for (const member of channelMembers ?? []) {
     const key = normalizePubkey(member.pubkey);
-    if (member.role !== "bot" || byPubkey.has(key)) {
+    if ((member.role !== "bot" && !member.isAgent) || byPubkey.has(key)) {
       continue;
     }
 
@@ -98,7 +98,7 @@ export function buildChannelAgentSessionCandidates({
       pubkey: member.pubkey,
       name: member.displayName ?? truncatePubkey(member.pubkey),
       status: "deployed",
-      agentSource: "member-bot",
+      agentSource: "member-agent",
       canInterruptTurn: false,
     });
   }
@@ -124,10 +124,10 @@ export function getChannelAgentSessionAgents({
   const memberPubkeys = channelMembers
     ? new Set(channelMembers.map((member) => normalizePubkey(member.pubkey)))
     : null;
-  const botMemberPubkeys = channelMembers
+  const agentMemberPubkeys = channelMembers
     ? new Set(
         channelMembers
-          .filter((member) => member.role === "bot")
+          .filter((member) => member.role === "bot" || member.isAgent)
           .map((member) => normalizePubkey(member.pubkey)),
       )
     : null;
@@ -142,8 +142,10 @@ export function getChannelAgentSessionAgents({
       channelIds.includes(activeChannelId) ||
       channels.includes(activeChannel.name);
 
-    if (agent.agentSource === "member-bot") {
-      return botMemberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel;
+    if (agent.agentSource === "member-agent") {
+      return (
+        agentMemberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel
+      );
     }
 
     if (agent.agentSource === "managed") {

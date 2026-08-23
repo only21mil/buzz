@@ -22,10 +22,60 @@ fn ev_at(kind: u16, content: &str, tags: Vec<Vec<&str>>, created_at: Timestamp) 
         .expect("sign")
 }
 
+fn oa_profile_event(content: &str) -> nostr::Event {
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let agent_pubkey = agent_keys.public_key();
+    let auth_tag_json =
+        buzz_sdk_pkg::nip_oa::compute_auth_tag(&owner_keys, &agent_pubkey, "").unwrap();
+    let auth_tag: Vec<String> = serde_json::from_str(&auth_tag_json).unwrap();
+
+    EventBuilder::new(Kind::Metadata, content)
+        .tag(Tag::parse(auth_tag).unwrap())
+        .sign_with_keys(&agent_keys)
+        .unwrap()
+}
+
 // A 64-hex pubkey (nostr p-tags require 32-byte hex).
 const PK_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const PK_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+#[test]
+fn profile_ownership_marks_non_bot_members_as_agents() {
+    let agent_profile = oa_profile_event(r#"{"display_name":"Admin agent"}"#);
+    let human_profile = ev(0, r#"{"display_name":"Human member"}"#, vec![]);
+    let legacy_bot = Keys::generate().public_key().to_hex();
+    let agent_pubkey = agent_profile.pubkey.to_hex();
+    let human_pubkey = human_profile.pubkey.to_hex();
+    let membership = ev(
+        39002,
+        "",
+        vec![
+            vec!["d", "chan-1"],
+            vec!["p", &agent_pubkey, "", "admin"],
+            vec!["p", &human_pubkey, "", "member"],
+            vec!["p", &legacy_bot, "", "bot"],
+        ],
+    );
+    let mut response = nostr_convert::channel_members_from_event(&membership).unwrap();
+
+    assert!(!response.members[0].is_agent);
+    assert!(!response.members[1].is_agent);
+    assert!(response.members[2].is_agent);
+    enrich_channel_members_from_profile_events(&mut response, &[agent_profile, human_profile]);
+
+    assert!(response.members[0].is_agent);
+    assert_eq!(response.members[0].role, "admin");
+    assert_eq!(
+        response.members[0].display_name.as_deref(),
+        Some("Admin agent")
+    );
+    assert!(!response.members[1].is_agent);
+    assert_eq!(response.members[1].role, "member");
+    assert!(response.members[2].is_agent);
+    assert_eq!(response.members[2].role, "bot");
+}
 
 #[test]
 fn directory_cursor_keeps_same_second_tiebreaker() {
