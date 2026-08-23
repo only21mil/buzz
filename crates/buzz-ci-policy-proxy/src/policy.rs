@@ -46,6 +46,13 @@ pub struct CanonicalExec {
     operation_id: u64,
 }
 
+impl CanonicalExec {
+    /// Return the exact owned container this exec-create targets.
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
+}
+
 /// Security-sensitive effective container fields returned by pre-start inspect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +196,10 @@ enum ContainerLifecycle {
     },
     Started {
         container_id: String,
+    },
+    Deleting {
+        container_id: String,
+        was_started: bool,
     },
     Removed {
         container_id: String,
@@ -360,7 +371,7 @@ impl ProxyPolicy {
                 })
             }
             DockerRoute::ContainerDelete { id } => {
-                self.ledger.container_fingerprint(&id)?;
+                self.begin_delete(&id)?;
                 Ok(Admission::Delete {
                     container_id: id,
                     target: canonical_target,
@@ -545,6 +556,17 @@ impl ProxyPolicy {
 
     /// Commit deletion only after the upstream runtime reports success.
     pub fn commit_deleted(&mut self, container_id: &str) -> Result<(), ProxyError> {
+        if !matches!(
+            &self.container_lifecycle,
+            ContainerLifecycle::Deleting {
+                container_id: deleting,
+                ..
+            } if deleting == container_id
+        ) {
+            return Err(ProxyError::StateRefused(
+                "delete commit has no matching delete intent".into(),
+            ));
+        }
         if !self.created_requests.contains_key(container_id) {
             return Err(ProxyError::StateRefused(
                 "deleted container lacked its canonical create record".into(),
@@ -554,6 +576,54 @@ impl ProxyPolicy {
         self.created_requests.remove(container_id);
         self.container_lifecycle = ContainerLifecycle::Removed {
             container_id: container_id.into(),
+        };
+        Ok(())
+    }
+
+    /// Bind one owned container to a pending delete mutation.
+    pub fn begin_delete(&mut self, container_id: &str) -> Result<(), ProxyError> {
+        self.ledger.container_fingerprint(container_id)?;
+        let was_started = match &self.container_lifecycle {
+            ContainerLifecycle::Created {
+                container_id: owned,
+            } if owned == container_id => false,
+            ContainerLifecycle::Started {
+                container_id: owned,
+            } if owned == container_id => true,
+            _ => {
+                return Err(ProxyError::StateRefused(
+                    "delete requires the one created or started container".into(),
+                ));
+            }
+        };
+        self.container_lifecycle = ContainerLifecycle::Deleting {
+            container_id: container_id.into(),
+            was_started,
+        };
+        Ok(())
+    }
+
+    /// Resolve a delete that was refused before mutation could occur.
+    pub fn abort_delete(&mut self, container_id: &str) -> Result<(), ProxyError> {
+        let was_started = match &self.container_lifecycle {
+            ContainerLifecycle::Deleting {
+                container_id: deleting,
+                was_started,
+            } if deleting == container_id => *was_started,
+            _ => {
+                return Err(ProxyError::StateRefused(
+                    "delete request is not pending".into(),
+                ));
+            }
+        };
+        self.container_lifecycle = if was_started {
+            ContainerLifecycle::Started {
+                container_id: container_id.into(),
+            }
+        } else {
+            ContainerLifecycle::Created {
+                container_id: container_id.into(),
+            }
         };
         Ok(())
     }
@@ -574,8 +644,9 @@ impl ProxyPolicy {
                 "exec result has no matching pending request".into(),
             ));
         }
+        self.ledger.record_exec(exec_id, &approved.container_id)?;
         self.pending_execs.remove(&approved.operation_id);
-        self.ledger.record_exec(exec_id, &approved.container_id)
+        Ok(())
     }
 
     /// Abandon a pending exec create after a failed upstream response.
@@ -596,7 +667,15 @@ impl ProxyPolicy {
                 "seal may begin from Running only".into(),
             ));
         }
-        if !self.pending_creates.is_empty() || !self.pending_execs.is_empty() {
+        if !self.pending_creates.is_empty()
+            || !self.pending_execs.is_empty()
+            || matches!(
+                self.container_lifecycle,
+                ContainerLifecycle::Creating { .. }
+                    | ContainerLifecycle::Starting { .. }
+                    | ContainerLifecycle::Deleting { .. }
+            )
+        {
             return Err(ProxyError::StateRefused(
                 "seal cannot begin with pending upstream mutations".into(),
             ));
@@ -846,6 +925,9 @@ impl ProxyPolicy {
             }
             ContainerLifecycle::Started { container_id } => {
                 (crate::LifecyclePhase::Started, Some(container_id))
+            }
+            ContainerLifecycle::Deleting { container_id, .. } => {
+                (crate::LifecyclePhase::Deleting, Some(container_id))
             }
             ContainerLifecycle::Removed { container_id } => {
                 (crate::LifecyclePhase::Removed, Some(container_id))
