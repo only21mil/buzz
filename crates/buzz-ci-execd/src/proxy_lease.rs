@@ -17,8 +17,8 @@ use buzz_ci_broker_protocol::GitOid;
 use buzz_ci_isolation_contract::ValidatedAttemptLeaseBinding;
 use buzz_ci_policy_proxy::{
     CanonicalCreate, EffectiveContainerSpec, InheritedOneShotConnector, InheritedProxy,
-    PolicyManifest, PreStartObserver, ProxyError, ProxyPolicy, TransportLimits, UpstreamCapability,
-    VerifiedStart,
+    LifecycleEvent, LifecycleObserver, PolicyManifest, ProxyError, ProxyPolicy, TransportLimits,
+    UpstreamCapability, VerifiedStart,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -185,7 +185,34 @@ impl<P: PrestartPersister> ProxyLeaseObserver<P, SystemProxyClock> {
     }
 }
 
-impl<P: PrestartPersister, C: ProxyClock> PreStartObserver for ProxyLeaseObserver<P, C> {
+impl<P: PrestartPersister, C: ProxyClock> LifecycleObserver for ProxyLeaseObserver<P, C> {
+    fn observe_lifecycle(&mut self, event: LifecycleEvent<'_>) -> Result<(), ProxyError> {
+        let LifecycleEvent::Started { container_id } = event else {
+            return Ok(());
+        };
+        if self.started_object.as_deref() != Some(container_id) {
+            return Err(ProxyError::StateRefused(
+                "start does not match persisted pre-start evidence".into(),
+            ));
+        }
+        let timestamp = self
+            .clock
+            .now_ns()
+            .map_err(|_| ProxyError::Transport("proxy evidence clock failed".into()))?;
+        self.store
+            .append_ordering(&OrderingRecord {
+                lease_id: self.lease_id.clone(),
+                sequence: 2,
+                event_binding: self.authority.event_binding,
+                event: OrderingEvent::Start,
+                object_id: Some(container_id.to_owned()),
+                timestamp_unix_ns: timestamp,
+                status_event_id: None,
+                verdict_event_id: None,
+            })
+            .map_err(|_| ProxyError::Transport("proxy start ordering failed".into()))
+    }
+
     fn observe_pre_start(
         &mut self,
         create: &CanonicalCreate,
@@ -223,30 +250,6 @@ impl<P: PrestartPersister, C: ProxyClock> PreStartObserver for ProxyLeaseObserve
             .map_err(|_| ProxyError::Transport("proxy pre-start ordering failed".into()))?;
         self.started_object = Some(container_id.to_owned());
         Ok(())
-    }
-
-    fn observe_started(&mut self, container_id: &str) -> Result<(), ProxyError> {
-        if self.started_object.as_deref() != Some(container_id) {
-            return Err(ProxyError::StateRefused(
-                "start does not match persisted pre-start evidence".into(),
-            ));
-        }
-        let timestamp = self
-            .clock
-            .now_ns()
-            .map_err(|_| ProxyError::Transport("proxy evidence clock failed".into()))?;
-        self.store
-            .append_ordering(&OrderingRecord {
-                lease_id: self.lease_id.clone(),
-                sequence: 2,
-                event_binding: self.authority.event_binding,
-                event: OrderingEvent::Start,
-                object_id: Some(container_id.to_owned()),
-                timestamp_unix_ns: timestamp,
-                status_event_id: None,
-                verdict_event_id: None,
-            })
-            .map_err(|_| ProxyError::Transport("proxy start ordering failed".into()))
     }
 }
 
@@ -673,7 +676,9 @@ fn oid_hex(oid: GitOid) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::Read;
     use std::os::unix::fs::FileTypeExt;
+    use std::time::Duration;
 
     use buzz_ci_isolation_contract::{
         AttemptLeaseBinding, BrokerObjectHandle, CgroupHandle, EngineKind as SharedEngineKind,
@@ -1161,8 +1166,11 @@ mod tests {
         observer
             .observe_pre_start(&create, "container-1", &effective, &proof)
             .unwrap();
-        policy.commit_started(&proof).unwrap();
-        observer.observe_started("container-1").unwrap();
+        observer
+            .observe_lifecycle(LifecycleEvent::Started {
+                container_id: "container-1",
+            })
+            .unwrap();
         assert_eq!(observer.persister.calls, 1);
         let paths = observer.store.paths(&manifest.lease_id).unwrap();
         assert!(paths.proxy_object(1).unwrap().is_file());
@@ -1291,6 +1299,38 @@ mod tests {
         assert!(!broker.is_poisoned());
         let (next, _runtime) = UnixStream::pair().unwrap();
         broker.replace_upstream(lease, next).unwrap();
+    }
+
+    #[test]
+    fn broker_proxy_install_writes_zero_runtime_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (admission, lease, validated, manifest) = binding_fixture();
+        initialize_evidence(&root, &manifest.lease_id);
+        let (upstream, mut runtime) = UnixStream::pair().unwrap();
+        runtime
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let _broker = build_broker_proxy_lease(
+            authority(&root),
+            admission,
+            lease,
+            &validated,
+            manifest,
+            upstream,
+            FakePersister::default(),
+            TransportLimits::default(),
+        )
+        .unwrap();
+
+        let mut byte = [0_u8; 1];
+        assert!(matches!(
+            runtime.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
     }
 
     #[test]
