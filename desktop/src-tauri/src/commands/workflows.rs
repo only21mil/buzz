@@ -78,14 +78,20 @@ pub async fn get_channel_workflows(
 ) -> Result<Vec<WorkflowWire>, String> {
     let events = query_relay(
         &state,
-        &[serde_json::json!({
-            "kinds": [30620],
-            "#h": [channel_id],
-        })],
+        &[
+            serde_json::json!({
+                "kinds": [30620],
+                "#h": [channel_id],
+            }),
+            serde_json::json!({ "kinds": [5] }),
+        ],
     )
     .await?;
 
-    Ok(events.iter().map(workflow_from_event).collect())
+    Ok(buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
+        .into_iter()
+        .map(workflow_from_event)
+        .collect())
 }
 
 /// Fetch workflows across many channels in a single relay round-trip.
@@ -108,14 +114,20 @@ pub async fn get_channels_workflows(
 
     let events = query_relay(
         &state,
-        &[serde_json::json!({
-            "kinds": [30620],
-            "#h": channel_ids,
-        })],
+        &[
+            serde_json::json!({
+                "kinds": [30620],
+                "#h": channel_ids,
+            }),
+            serde_json::json!({ "kinds": [5] }),
+        ],
     )
     .await?;
 
-    Ok(events.iter().map(workflow_from_event).collect())
+    Ok(buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
+        .into_iter()
+        .map(workflow_from_event)
+        .collect())
 }
 
 #[tauri::command]
