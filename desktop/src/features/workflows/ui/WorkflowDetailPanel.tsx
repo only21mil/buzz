@@ -47,8 +47,11 @@ export function WorkflowDetailPanel({
 
   async function handleTrigger() {
     try {
-      await triggerMutation.mutateAsync();
+      const response = await triggerMutation.mutateAsync();
       await runsQuery.refetch();
+      if (response.runId !== null) {
+        setSelectedRunId(response.runId);
+      }
     } catch {
       // React Query stores the error; keep the current selection unchanged.
     }
@@ -191,7 +194,7 @@ export function WorkflowDetailPanel({
                                   <ChevronRight className="h-4 w-4 text-muted-foreground" />
                                 )}
                                 <span className="truncate font-mono text-xs font-medium">
-                                  {run.id.slice(0, 8)}
+                                  {isSelected ? run.id : run.id.slice(0, 8)}
                                 </span>
                                 <RunStatusBadge status={run.status} />
                               </div>
