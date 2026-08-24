@@ -95,6 +95,10 @@ buzz repos status --id my-repo
 buzz repos stage-ci --id my-repo --source-ref refs/heads/pr/9 --commit <H> --expected-github-ci absent
 buzz repos promote --id my-repo --base <B> --head <H> --source-ref refs/heads/pr/9 --ci-ref refs/heads/buzz-ci/<H> --required-check test
 
+# Compute lifecycle state without changing Buzz or GitHub
+buzz repos reconcile --id my-repo
+buzz repos reconcile --id my-repo --pr <exact-64-hex-Buzz-PR-id> --limit 1
+
 # Bootstrap only; never use this as the ongoing synchronization direction
 buzz repos import-main --id my-repo --commit <exact-40-hex-GitHub-main>
 
@@ -112,6 +116,15 @@ Buzz owns branches, pull requests, and the only `main` transition. GitHub is an
 exact-ref CI mirror. It receives commits already fetched from Buzz, runs checks
 at those exact commits, and mirrors Buzz main only after the Buzz CAS succeeds.
 GitHub drift is never imported by the ongoing operator flow.
+
+`repos reconcile` computes repository lifecycle state from Buzz issues, pull
+requests, trusted status events, exact commits, GitHub CI, and both `main` refs.
+The current signer must own the repository announcement. `--pr` narrows the
+report to one exact Buzz pull request ID. `--limit` applies only after the
+command correlates work items, so newer unrelated events cannot hide an older
+match. Version 1 never writes to Buzz or GitHub. Missing links, conflicting
+records, failed CI, or ref drift produce a blocker in the JSON report and a
+nonzero exit instead of guessing or repairing state.
 
 `repos stage-ci` verifies a Buzz source ref at exact `H`, fetches it from Buzz,
 pushes that object to deterministic `refs/heads/buzz-ci/H` under an explicit
@@ -254,8 +267,9 @@ is a separate transaction. Print and persist every returned event ID privately
 before continuing. To resume, read the private checkpoint, fetch by exact event
 ID, PR number, or SHA, and verify the stable external-ID marker and links. If a
 retry finds a duplicate marker, missing link, or ID/SHA mismatch, stop without
-writing and reconcile it; do not create a second record. There is no lifecycle
-sync command and no cross-system rollback.
+writing and reconcile it; do not create a second record. `repos reconcile`
+performs that read-only inspection; there is no automatic lifecycle sync or
+cross-system rollback.
 
 ## Commands
 

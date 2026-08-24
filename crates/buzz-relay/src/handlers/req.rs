@@ -786,9 +786,10 @@ pub(crate) fn count_fallback_exceeded(candidate_count: usize) -> bool {
 ///
 /// Pushed constraints: kinds, authors (single or multi), ids, since, until,
 /// channel_id (#h single), #p (single), #d (single, NIP-33-only kinds), #e (any),
+/// #a (any),
 /// channel_ids (injected by caller).
 ///
-/// Anything else (multi-#p, #t, #a, search, multi-#h, #d on non-NIP-33)
+/// Anything else (multi-#p, #t, search, multi-#h, #d on non-NIP-33)
 /// requires post-filtering and cannot use the fast COUNT path.
 pub fn filter_fully_pushable(filter: &Filter) -> bool {
     // Check if filter exclusively targets NIP-33 kinds (needed for #d pushability).
@@ -824,8 +825,11 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
             "e" => {
                 // #e is fully pushed (any count) via JSONB containment.
             }
+            "a" => {
+                // #a is fully pushed (any count) via positional JSONB matching.
+            }
             _ => {
-                // Any other generic tag (#t, #a, etc.) is not pushed.
+                // Any other generic tag (#t, etc.) is not pushed.
                 if !tag_values.is_empty() {
                     return false;
                 }
@@ -940,6 +944,15 @@ fn filter_to_query_params(
         }
     });
 
+    // Push #a into SQL before ORDER/LIMIT. Repository-coordinate requests can
+    // otherwise underfill when newer events for unrelated coordinates occupy
+    // the candidate page before the relay's exact post-filter runs.
+    let a_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::A);
+    let a_tags = filter
+        .generic_tags
+        .get(&a_tag_key)
+        .map(|values| values.iter().map(|v| v.to_string()).collect::<Vec<_>>());
+
     // Push single-value #p tag into SQL via event_mentions join.
     // This is critical for gift-wrap (kind:1059) and membership notification
     // queries where >500 events for other recipients would otherwise push
@@ -998,6 +1011,7 @@ fn filter_to_query_params(
         authors,
         ids,
         e_tags,
+        a_tags,
         ..EventQuery::for_community(community)
     }
 }
@@ -1790,6 +1804,38 @@ mod tests {
             buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
         );
         assert_eq!(q5.d_tag, None);
+    }
+
+    #[test]
+    fn a_tag_pushdown_preserves_single_and_multi_value_filters() {
+        let a_tag = SingleLetterTag::lowercase(Alphabet::A);
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        let first =
+            "30617:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:one";
+        let second =
+            "30617:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:two";
+
+        let single = Filter::new()
+            .kind(nostr::Kind::Custom(1_621))
+            .custom_tags(a_tag, [first]);
+        let query = filter_to_query_params(&single, None, community);
+        assert_eq!(query.a_tags, Some(vec![first.to_string()]));
+        assert!(filter_fully_pushable(&single));
+
+        let multiple = Filter::new()
+            .kind(nostr::Kind::Custom(1_621))
+            .custom_tags(a_tag, [first, second]);
+        let query = filter_to_query_params(&multiple, None, community);
+        assert_eq!(
+            query.a_tags,
+            Some(vec![first.to_string(), second.to_string()])
+        );
+        assert!(filter_fully_pushable(&multiple));
+
+        let empty = Filter::new().custom_tags(a_tag, std::iter::empty::<&str>());
+        let query = filter_to_query_params(&empty, None, community);
+        assert_eq!(query.a_tags, Some(Vec::new()));
+        assert!(filter_fully_pushable(&empty));
     }
 
     #[test]

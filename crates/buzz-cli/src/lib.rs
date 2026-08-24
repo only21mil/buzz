@@ -1182,6 +1182,21 @@ pub enum ReposCmd {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Compute the cross-system lifecycle state for this repository.
+    ///
+    /// Version 1 is read-only. It reports contradictions and blockers instead
+    /// of changing Buzz or GitHub state.
+    Reconcile {
+        /// Repository identifier (d-tag). The current signer must own it.
+        #[arg(long)]
+        id: String,
+        /// Limit reconciliation to one exact Buzz pull request event ID.
+        #[arg(long)]
+        pr: Option<String>,
+        /// Maximum number of computed work items, applied after correlation.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: Option<u32>,
+    },
     /// Remove one of your repository announcements via NIP-09 (kind:5).
     ///
     /// This unpublishes the repository and disables Git access; it does not
@@ -2430,6 +2445,49 @@ mod tests {
                 Cmd::Repos(ReposCmd::Rm { id }) if id == "vogel-vault"
             ));
         }
+    }
+
+    #[test]
+    fn repo_reconcile_parses_exact_scope_and_positive_limit() {
+        let pr = "a".repeat(64);
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "reconcile",
+            "--id",
+            "vogel-vault",
+            "--pr",
+            &pr,
+            "--limit",
+            "7",
+        ])
+        .expect("repos reconcile flags should parse");
+
+        let Cmd::Repos(ReposCmd::Reconcile {
+            id,
+            pr: parsed_pr,
+            limit,
+        }) = cli.command
+        else {
+            panic!("expected repos reconcile");
+        };
+        assert_eq!(id, "vogel-vault");
+        assert_eq!(parsed_pr.as_deref(), Some(pr.as_str()));
+        assert_eq!(limit, Some(7));
+    }
+
+    #[test]
+    fn repo_reconcile_rejects_zero_limit() {
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "reconcile",
+            "--id",
+            "vogel-vault",
+            "--limit",
+            "0",
+        ])
+        .is_err());
     }
 
     #[test]

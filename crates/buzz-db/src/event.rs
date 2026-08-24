@@ -70,6 +70,10 @@ pub struct EventQuery {
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
+    /// Restrict results to events with an `a` tag whose second element equals any value.
+    /// Applied before SQL ordering and limiting so unrelated coordinates cannot
+    /// consume a coordinate-scoped page.
+    pub a_tags: Option<Vec<String>>,
     /// Restrict results to events in any of these channels, while retaining
     /// channel-less global events. Applied before SQL `LIMIT` so access-filtered
     /// historical pages have exact exhaustion semantics.
@@ -121,6 +125,7 @@ impl EventQuery {
             authors: None,
             ids: None,
             e_tags: None,
+            a_tags: None,
             channel_ids: None,
             max_limit: None,
             shared_gated_reader: None,
@@ -363,6 +368,9 @@ pub(crate) async fn query_events_on(
     if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
         return Ok(vec![]);
     }
+    if q.a_tags.as_deref().is_some_and(|a| a.is_empty()) {
+        return Ok(vec![]);
+    }
 
     let clamp = q.max_limit.unwrap_or(DEFAULT_MAX_PAGE_LIMIT);
     let limit_val = q.limit.unwrap_or(100).min(clamp);
@@ -482,6 +490,22 @@ pub(crate) async fn query_events_on(
                 qb.push_bind(containment);
             }
             qb.push(")");
+        }
+    }
+
+    // Generic #a pushdown with positional matching. Nostr tag filters compare
+    // the tag name and second element; trailing relay/marker fields remain valid.
+    if let Some(ref a_tags) = q.a_tags {
+        if !a_tags.is_empty() {
+            qb.push(format!(
+                " AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS a_tag \
+                 WHERE a_tag->>0 = 'a' AND a_tag->>1 IN ("
+            ));
+            let mut sep = qb.separated(", ");
+            for value in a_tags {
+                sep.push_bind(value.clone());
+            }
+            qb.push("))");
         }
     }
 
@@ -640,6 +664,9 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
         return Ok(0);
     }
+    if q.a_tags.as_deref().is_some_and(|a| a.is_empty()) {
+        return Ok(0);
+    }
 
     let mut qb: QueryBuilder<sqlx::Postgres> = if let Some(ref p_hex) = q.p_tag_hex {
         let mut b = QueryBuilder::new(
@@ -735,6 +762,20 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
                 qb.push_bind(containment);
             }
             qb.push(")");
+        }
+    }
+
+    if let Some(ref a_tags) = q.a_tags {
+        if !a_tags.is_empty() {
+            qb.push(format!(
+                " AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS a_tag \
+                 WHERE a_tag->>0 = 'a' AND a_tag->>1 IN ("
+            ));
+            let mut sep = qb.separated(", ");
+            for value in a_tags {
+                sep.push_bind(value.clone());
+            }
+            qb.push("))");
         }
     }
 
@@ -1876,6 +1917,92 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(created_at))
             .sign_with_keys(&Keys::generate())
             .expect("sign timestamped event")
+    }
+
+    fn make_event_with_a_tag_at(
+        kind: u16,
+        content: &str,
+        coordinate: &str,
+        created_at: u64,
+    ) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(kind), content)
+            .tags([Tag::parse(["a", coordinate, "wss://relay.example"])
+                .expect("parse coordinate tag")])
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(&Keys::generate())
+            .expect("sign timestamped coordinate event")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn a_tag_scope_is_applied_before_historical_page_limit() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let base = 1_800_000_000;
+        let target_a = "30617:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:one";
+        let target_b = "30617:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:two";
+
+        for offset in 10..13 {
+            let event = make_event_with_a_tag_at(
+                1_621,
+                "newer foreign coordinate",
+                "30617:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:foreign",
+                base + offset,
+            );
+            insert_event(&pool, community, &event, None)
+                .await
+                .expect("insert foreign coordinate");
+        }
+        let older_a = make_event_with_a_tag_at(1_621, "older target a", target_a, base + 2);
+        insert_event(&pool, community, &older_a, None)
+            .await
+            .expect("insert target a");
+        let older_b = make_event_with_a_tag_at(1_621, "older target b", target_b, base + 1);
+        insert_event(&pool, community, &older_b, None)
+            .await
+            .expect("insert target b");
+
+        let single = query_events(
+            &pool,
+            &EventQuery {
+                kinds: Some(vec![1_621]),
+                a_tags: Some(vec![target_a.to_string()]),
+                limit: Some(1),
+                ..EventQuery::for_community(community)
+            },
+        )
+        .await
+        .expect("query one coordinate");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].event.id, older_a.id);
+
+        let multiple = query_events(
+            &pool,
+            &EventQuery {
+                kinds: Some(vec![1_621]),
+                a_tags: Some(vec![target_a.to_string(), target_b.to_string()]),
+                limit: Some(2),
+                ..EventQuery::for_community(community)
+            },
+        )
+        .await
+        .expect("query either coordinate");
+        assert_eq!(multiple.len(), 2);
+        assert_eq!(multiple[0].event.id, older_a.id);
+        assert_eq!(multiple[1].event.id, older_b.id);
+
+        let count = count_events(
+            &pool,
+            &EventQuery {
+                kinds: Some(vec![1_621]),
+                a_tags: Some(vec![target_a.to_string(), target_b.to_string()]),
+                ..EventQuery::for_community(community)
+            },
+        )
+        .await
+        .expect("count either coordinate");
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]

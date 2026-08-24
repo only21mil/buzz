@@ -129,6 +129,48 @@ struct PromoteRequest<'a> {
     required_checks: &'a [String],
 }
 
+/// Exact inputs for a read-only lifecycle proof.
+///
+/// The CI ref is derived from `head`; callers cannot point the proof at an
+/// unrelated hosted ref. An empty `required_checks` list skips the GitHub
+/// Checks API while retaining exact Git ref and ancestry readbacks.
+pub(super) struct LifecycleSnapshotRequest<'a> {
+    pub(super) base: &'a str,
+    pub(super) head: &'a str,
+    pub(super) source_ref: &'a str,
+    pub(super) required_checks: &'a [String],
+}
+
+/// Stable, read-only evidence for the Git portion of a repository lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(super) struct LifecycleSnapshot {
+    pub(super) repo_id: String,
+    pub(super) buzz_url: String,
+    pub(super) github_url: String,
+    pub(super) github_owner: String,
+    pub(super) github_repo: String,
+    pub(super) base: String,
+    pub(super) head: String,
+    pub(super) source_ref: String,
+    pub(super) github_ci_ref: String,
+    pub(super) buzz_main: String,
+    pub(super) buzz_head: String,
+    pub(super) buzz_head_target: String,
+    pub(super) buzz_source: Option<String>,
+    pub(super) github_main: Option<String>,
+    pub(super) github_ci_commit: Option<String>,
+    pub(super) base_is_ancestor_of_head: bool,
+    pub(super) required_checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleRefSnapshot {
+    buzz: RemoteState,
+    buzz_source: Option<String>,
+    github_main: Option<String>,
+    github_ci: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct CheckRunsResponse {
     check_runs: Vec<CheckRun>,
@@ -681,6 +723,134 @@ fn require_exact_head(state: &RemoteState, commit: &str) -> Result<(), CliError>
         ));
     }
     Ok(())
+}
+
+fn require_consistent_head(state: &RemoteState) -> Result<String, CliError> {
+    let main = state
+        .main
+        .as_deref()
+        .ok_or_else(|| CliError::NotFound("Buzz canonical main is absent".into()))?;
+    require_exact_head(state, main)?;
+    Ok(main.to_owned())
+}
+
+fn read_lifecycle_refs(
+    repo: &GitRepo,
+    remotes: &RepoRemotes,
+    source_ref: &str,
+    ci_ref: &str,
+) -> Result<LifecycleRefSnapshot, CliError> {
+    Ok(LifecycleRefSnapshot {
+        buzz: repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?,
+        buzz_source: repo.remote_ref(
+            &remotes.buzz_url,
+            RemoteAuth::Buzz,
+            "Buzz source",
+            source_ref,
+        )?,
+        github_main: repo.github_main(&remotes.github.clone_url)?,
+        github_ci: repo.remote_ref(
+            &remotes.github.clone_url,
+            RemoteAuth::GitHub,
+            "GitHub CI",
+            ci_ref,
+        )?,
+    })
+}
+
+fn require_unchanged_lifecycle_refs(
+    before: &LifecycleRefSnapshot,
+    after: &LifecycleRefSnapshot,
+) -> Result<(), CliError> {
+    if before != after {
+        return Err(CliError::Conflict(
+            "a Buzz or GitHub ref moved during the lifecycle readback".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn buzz_ref_for_head<'a>(
+    refs: &LifecycleRefSnapshot,
+    source_ref: &'a str,
+    head: &str,
+) -> Result<&'a str, CliError> {
+    if refs.buzz_source.as_deref() == Some(head) {
+        Ok(source_ref)
+    } else if refs.buzz.main.as_deref() == Some(head) {
+        Ok(MAIN_REF)
+    } else {
+        Err(CliError::Conflict(
+            "neither Buzz source nor Buzz main equals the requested lifecycle head".into(),
+        ))
+    }
+}
+
+/// Read exact hosted refs and prove ancestry without mutating either remote.
+///
+/// The only Git mutation is a fetch into a private temporary bare repository.
+/// Hosted refs are read once before GitHub checks and once afterward; any
+/// movement fails the snapshot rather than returning mixed-time evidence.
+pub(super) async fn read_lifecycle_snapshot(
+    client: &BuzzClient,
+    announcement: &Event,
+    request: LifecycleSnapshotRequest<'_>,
+) -> Result<LifecycleSnapshot, CliError> {
+    let base = exact_oid(request.base, "lifecycle base")?;
+    let head = exact_oid(request.head, "lifecycle head")?;
+    if base == head {
+        return Err(CliError::Usage(
+            "lifecycle base and head must differ".into(),
+        ));
+    }
+    let source_ref = validate_branch_ref(request.source_ref, "lifecycle source ref")?;
+    let ci_ref = ci_ref_for(&head);
+    let remotes = derive_remotes(client, announcement)?;
+    let github_auth = github_auth_from_env()?;
+    let repo = GitRepo::new(auth_from_client(client), github_auth.clone())?;
+    let before = read_lifecycle_refs(&repo, &remotes, &source_ref, &ci_ref)?;
+    let buzz_main = require_consistent_head(&before.buzz)?;
+    let head_ref = buzz_ref_for_head(&before, &source_ref, &head)?;
+    repo.fetch_ref(
+        &remotes.buzz_url,
+        RemoteAuth::Buzz,
+        "Buzz lifecycle head",
+        head_ref,
+        BUZZ_SOURCE_TRACKING_REF,
+        &head,
+    )?;
+    let base_is_ancestor_of_head = repo.is_ancestor(&base, &head)?;
+    if !request.required_checks.is_empty() {
+        let checks = github_check_runs(&remotes.github, &github_auth, &head).await?;
+        evaluate_required_checks(request.required_checks, &checks, &head)?;
+    }
+    let after = read_lifecycle_refs(&repo, &remotes, &source_ref, &ci_ref)?;
+    require_unchanged_lifecycle_refs(&before, &after)?;
+
+    Ok(LifecycleSnapshot {
+        repo_id: remotes.repo_id,
+        buzz_url: remotes.buzz_url,
+        github_url: remotes.github.clone_url,
+        github_owner: remotes.github.owner,
+        github_repo: remotes.github.repo,
+        base,
+        head,
+        source_ref,
+        github_ci_ref: ci_ref,
+        buzz_main,
+        buzz_head: before
+            .buzz
+            .head
+            .ok_or_else(|| CliError::Other("Buzz HEAD missing after exact readback".into()))?,
+        buzz_head_target: before.buzz.head_target.ok_or_else(|| {
+            CliError::Other("Buzz HEAD target missing after exact readback".into())
+        })?,
+        buzz_source: before.buzz_source,
+        github_main: before.github_main,
+        github_ci_commit: before.github_ci,
+        base_is_ancestor_of_head,
+        required_checks: request.required_checks.to_vec(),
+    })
 }
 
 fn auth_from_client(client: &BuzzClient) -> GitAuth {
@@ -1346,6 +1516,138 @@ mod tests {
             git(&self.work, ["commit", "-m", "two"]);
             git(&self.work, ["rev-parse", "HEAD"])
         }
+    }
+
+    fn lifecycle_refs(oid: &str) -> LifecycleRefSnapshot {
+        LifecycleRefSnapshot {
+            buzz: RemoteState {
+                main: Some(oid.to_string()),
+                head: Some(oid.to_string()),
+                head_target: Some(MAIN_REF.to_string()),
+            },
+            buzz_source: Some(oid.to_string()),
+            github_main: Some(oid.to_string()),
+            github_ci: Some(oid.to_string()),
+        }
+    }
+
+    #[test]
+    fn lifecycle_readback_requires_consistent_buzz_head_and_detects_movement() {
+        let oid = "a".repeat(40);
+        let before = lifecycle_refs(&oid);
+        assert_eq!(
+            require_consistent_head(&before.buzz).expect("consistent Buzz HEAD"),
+            oid
+        );
+        assert!(require_unchanged_lifecycle_refs(&before, &before).is_ok());
+
+        let mut moved = before.clone();
+        moved.github_ci = Some("b".repeat(40));
+        assert!(matches!(
+            require_unchanged_lifecycle_refs(&before, &moved),
+            Err(CliError::Conflict(message)) if message.contains("moved during")
+        ));
+
+        let mut detached = before.buzz.clone();
+        detached.head_target = None;
+        assert!(matches!(
+            require_consistent_head(&detached),
+            Err(CliError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_head_object_uses_exact_source_then_exact_main() {
+        let head = "a".repeat(40);
+        let mut refs = lifecycle_refs(&head);
+        assert_eq!(
+            buzz_ref_for_head(&refs, "refs/heads/work", &head).expect("source ref at head"),
+            "refs/heads/work"
+        );
+
+        refs.buzz_source = None;
+        assert_eq!(
+            buzz_ref_for_head(&refs, "refs/heads/work", &head).expect("main ref at head"),
+            MAIN_REF
+        );
+
+        refs.buzz.main = Some("b".repeat(40));
+        assert!(matches!(
+            buzz_ref_for_head(&refs, "refs/heads/work", &head),
+            Err(CliError::Conflict(message)) if message.contains("neither Buzz source")
+        ));
+    }
+
+    #[test]
+    fn lifecycle_snapshot_serialization_contains_no_auth_material() {
+        let oid = "a".repeat(40);
+        let snapshot = LifecycleSnapshot {
+            repo_id: "fixture".into(),
+            buzz_url: "https://relay.example/git/owner/fixture".into(),
+            github_url: "https://github.com/owner/fixture.git".into(),
+            github_owner: "owner".into(),
+            github_repo: "fixture".into(),
+            base: "b".repeat(40),
+            head: oid.clone(),
+            source_ref: "refs/heads/work".into(),
+            github_ci_ref: ci_ref_for(&oid),
+            buzz_main: oid.clone(),
+            buzz_head: oid.clone(),
+            buzz_head_target: MAIN_REF.into(),
+            buzz_source: Some(oid.clone()),
+            github_main: Some(oid.clone()),
+            github_ci_commit: Some(oid),
+            base_is_ancestor_of_head: true,
+            required_checks: vec!["test".into()],
+        };
+        let value = serde_json::to_value(snapshot).expect("serialize lifecycle snapshot");
+        let object = value.as_object().expect("snapshot object");
+        assert!(!object.keys().any(|key| {
+            key.contains("token") || key.contains("private") || key.contains("credential")
+        }));
+    }
+
+    #[test]
+    fn lifecycle_ref_snapshot_reads_each_exact_hosted_ref() {
+        let fixture = Fixture::new();
+        execute_import(
+            &fixture.remotes(),
+            Fixture::auth(),
+            Fixture::github_auth(),
+            &fixture.first,
+        )
+        .expect("bootstrap Buzz main");
+        let head = fixture.next_commit();
+        let source_ref = "refs/heads/work/fixture";
+        let source_refspec = format!("HEAD:{source_ref}");
+        git(
+            &fixture.work,
+            ["push", fixture.buzz.as_str(), source_refspec.as_str()],
+        );
+        let staged = execute_stage(
+            &fixture.remotes(),
+            Fixture::auth(),
+            Fixture::github_auth(),
+            source_ref,
+            &head,
+            None,
+        )
+        .expect("stage deterministic CI ref");
+
+        let repo = GitRepo::new(Fixture::auth(), Fixture::github_auth())
+            .expect("create read-only repository");
+        let refs = read_lifecycle_refs(
+            &repo,
+            &fixture.remotes(),
+            source_ref,
+            &staged.github_ci_ref,
+        )
+        .expect("read exact lifecycle refs");
+        assert_eq!(refs.buzz.main.as_deref(), Some(fixture.first.as_str()));
+        assert_eq!(refs.buzz.head.as_deref(), Some(fixture.first.as_str()));
+        assert_eq!(refs.buzz_source.as_deref(), Some(head.as_str()));
+        assert_eq!(refs.github_main.as_deref(), Some(fixture.first.as_str()));
+        assert_eq!(refs.github_ci.as_deref(), Some(head.as_str()));
     }
 
     #[test]
