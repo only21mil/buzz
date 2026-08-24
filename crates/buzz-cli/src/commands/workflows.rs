@@ -10,26 +10,35 @@ use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
 
 // TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
-/// List workflows in a channel — query kind:30620 workflow definition events.
+/// List live workflows in a channel, folding replacements and NIP-09 deletions.
 pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
     validate_uuid(channel_id)?;
-    let filter = serde_json::json!({
-        "kinds": [30620],
-        "#h": [channel_id]
-    });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let workflows: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "workflow_id": extract_d_tag(e),
-                "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-                "pubkey": e.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""),
+    let filters = [
+        serde_json::json!({
+            "kinds": [30620],
+            "#h": [channel_id]
+        }),
+        serde_json::json!({ "kinds": [5] }),
+    ];
+    let resp = client.query_multi(&filters).await?;
+    let events: Vec<nostr::Event> = serde_json::from_str(&resp).unwrap_or_default();
+    let workflows: Vec<serde_json::Value> =
+        buzz_sdk::workflow_fold::fold_workflow_definitions(&events)
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "workflow_id": e.tags.iter().find_map(|tag| {
+                        let parts = tag.as_slice();
+                        (parts.first().map(String::as_str) == Some("d"))
+                            .then(|| parts.get(1).cloned())
+                            .flatten()
+                    }),
+                    "content": e.content,
+                    "created_at": e.created_at.as_secs(),
+                    "pubkey": e.pubkey.to_hex(),
+                })
             })
-        })
-        .collect();
+            .collect();
     let output = serde_json::to_string(&workflows).unwrap_or_default();
     println!("{output}");
     Ok(())
