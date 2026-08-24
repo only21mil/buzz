@@ -189,19 +189,23 @@ fn workflow_wire_serializes_with_snake_case_keys() {
 }
 
 #[test]
-fn runs_and_approvals_serialize_to_bare_empty_array() {
-    // Regression guard for the crash class this fix closed. The frontend
-    // wrappers `getWorkflowRuns` / `getRunApprovals` do `raw.map(...)`, so the
-    // Rust side MUST return a bare JSON array. A wrapped `{ runs: [...] }` /
-    // `{ approvals: [...] }` shape would make `.map()` throw and crash the
-    // detail panel — the same TypeError class as the original page bug.
-    //
-    // The commands take `State<AppState>`, so we can't invoke them directly in
-    // a unit test; instead we pin the exact value they return (`Vec::new()` of
-    // their `Vec<Value>` element type) and assert its serialized shape.
-    let runs: Vec<Value> = Vec::new();
+fn workflow_runs_path_defaults_and_caps_the_limit() {
+    let workflow_id = uuid::Uuid::parse_str(WF).expect("workflow UUID");
+    assert_eq!(
+        workflow_runs_path(workflow_id, None),
+        format!("/workflows/{WF}/runs?limit=20")
+    );
+    assert_eq!(
+        workflow_runs_path(workflow_id, Some(101)),
+        format!("/workflows/{WF}/runs?limit=100")
+    );
+}
+
+#[test]
+fn approvals_serialize_to_a_bare_empty_array() {
+    // Approval reconstruction remains a separate follow-up. Keep its response
+    // as a bare array because the frontend wrapper calls `raw.map(...)`.
     let approvals: Vec<Value> = Vec::new();
-    assert_eq!(serde_json::to_string(&runs).expect("serialize runs"), "[]");
     assert_eq!(
         serde_json::to_string(&approvals).expect("serialize approvals"),
         "[]"
