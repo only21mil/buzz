@@ -12,11 +12,57 @@ import {
   channelScopedBotTypingPubkeyKey,
   mergeMemberAgentFlagsIntoProfiles,
 } from "./useChannelActivityTyping.ts";
+import {
+  buildChannelAgentSessionCandidates,
+  getChannelAgentSessionAgents,
+} from "./useChannelAgentSessions.ts";
 
 const AGENT =
   "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
 const AGENT_2 =
   "dcba4321dcba4321dcba4321dcba4321dcba4321dcba4321dcba4321dcba4321";
+const AGENT_3 =
+  "1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd";
+const HUMAN =
+  "4321dcba4321dcba4321dcba4321dcba4321dcba4321dcba4321dcba4321dcba";
+const HUMAN_2 =
+  "5678abcd5678abcd5678abcd5678abcd5678abcd5678abcd5678abcd5678abcd";
+
+describe("channel agent session candidate membership", () => {
+  it("keeps profile-confirmed admin and member agents without admitting humans", () => {
+    const channelMembers = [
+      { pubkey: AGENT, role: "bot", isAgent: false },
+      { pubkey: AGENT_2, role: "admin", isAgent: true },
+      { pubkey: AGENT_3, role: "member", isAgent: true },
+      { pubkey: HUMAN, role: "admin", isAgent: false },
+      { pubkey: HUMAN_2, role: "member", isAgent: false },
+    ];
+    const candidates = buildChannelAgentSessionCandidates({
+      channelMembers,
+      managedAgents: [],
+      relayAgents: [],
+    });
+
+    assert.deepEqual(
+      candidates.map((agent) => agent.pubkey),
+      [AGENT, AGENT_2, AGENT_3],
+    );
+    assert.ok(
+      candidates.every((agent) => agent.agentSource === "member-agent"),
+    );
+
+    const scoped = getChannelAgentSessionAgents({
+      activeChannel: { name: "general" },
+      activeChannelId: "channel-1",
+      agents: candidates,
+      channelMembers,
+    });
+    assert.deepEqual(
+      scoped.map((agent) => agent.pubkey),
+      [AGENT, AGENT_2, AGENT_3],
+    );
+  });
+});
 
 describe("channelScopedBotTypingPubkeyKey", () => {
   it("excludes thread-scoped typing entries", () => {
