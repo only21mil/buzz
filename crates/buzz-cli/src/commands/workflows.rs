@@ -64,6 +64,7 @@ enum WorkflowRunStatus {
     Pending,
     Running,
     WaitingApproval,
+    ResumePending,
     Completed,
     Failed,
     Cancelled,
@@ -365,6 +366,17 @@ mod tests {
         assert_eq!(output[0]["error_message"], "webhook failed");
         assert_eq!(output[0]["started_at"], 1_700_000_001i64);
         assert!(output[0]["completed_at"].is_null());
+    }
+
+    #[test]
+    fn workflow_runs_response_accepts_resume_pending_status() {
+        let mut run = valid_run();
+        run["status"] = serde_json::json!("resume_pending");
+        let response = serde_json::to_string(&vec![run]).expect("serialize fixture");
+
+        let runs = parse_workflow_runs_response(&response).expect("parse resume-pending run");
+        let output = serde_json::to_value(runs).expect("serialize parsed runs");
+        assert_eq!(output[0]["status"], "resume_pending");
     }
 
     #[tokio::test]

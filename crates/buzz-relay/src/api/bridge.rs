@@ -2094,12 +2094,41 @@ fn workflow_run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
         "workflow_id": run.workflow_id,
         "status": run.status,
         "current_step": run.current_step,
-        "execution_trace": run.execution_trace,
+        "execution_trace": redacted_workflow_run_trace(&run.execution_trace),
         "error_message": run.error_message,
         "started_at": run.started_at.map(|timestamp| timestamp.timestamp()),
         "completed_at": run.completed_at.map(|timestamp| timestamp.timestamp()),
         "created_at": run.created_at.timestamp(),
     })
+}
+
+fn redacted_workflow_run_trace(trace: &Value) -> Value {
+    let Some(entries) = trace.as_array() else {
+        return Value::Array(Vec::new());
+    };
+
+    Value::Array(
+        entries
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|entry| {
+                let mut display = serde_json::Map::new();
+                for key in [
+                    "step_id",
+                    "step_index",
+                    "status",
+                    "started_at",
+                    "completed_at",
+                    "error",
+                ] {
+                    if let Some(value) = entry.get(key) {
+                        display.insert(key.to_owned(), value.clone());
+                    }
+                }
+                Value::Object(display)
+            })
+            .collect(),
+    )
 }
 
 fn workflow_not_found() -> (StatusCode, Json<Value>) {
@@ -2441,7 +2470,11 @@ mod tests {
             status: buzz_db::workflow::RunStatus::Failed,
             trigger_event_id: None,
             current_step: 2,
-            execution_trace: serde_json::json!([{"step_id": "notify", "status": "failed"}]),
+            execution_trace: serde_json::json!([{
+                "step_id": "notify",
+                "status": "failed",
+                "output": {"token": "must-not-leave-the-relay"}
+            }]),
             trigger_context: None,
             started_at,
             completed_at,
@@ -2503,6 +2536,7 @@ mod tests {
         assert_eq!(value["completed_at"], 1_700_000_002);
         assert_eq!(value["created_at"], 1_700_000_000);
         assert!(value["execution_trace"].is_array());
+        assert!(value["execution_trace"][0].get("output").is_none());
     }
 
     #[test]
@@ -2571,6 +2605,21 @@ mod tests {
 
         assert!(verify_bridge_auth(&headers, "GET", &exact_url, None, true).is_ok());
         assert!(verify_bridge_auth(&headers, "GET", &bare_url, None, true).is_err());
+    }
+
+    #[test]
+    fn workflow_run_endpoint_requires_authentication() {
+        let headers = HeaderMap::new();
+        let result = verify_bridge_auth(
+            &headers,
+            "GET",
+            "https://runs.example/workflows/30000000-0000-0000-0000-000000000003/runs?limit=20",
+            None,
+            true,
+        );
+
+        let (status, _) = result.expect_err("missing auth must be rejected");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
