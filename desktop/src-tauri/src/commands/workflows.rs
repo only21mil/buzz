@@ -1,5 +1,5 @@
 use reqwest::Method;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 
@@ -49,6 +49,24 @@ pub struct WorkflowSaveWire {
     pub workflow: WorkflowWire,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_secret: Option<String>,
+}
+
+/// Acknowledgement returned after the relay accepts a manual workflow trigger.
+///
+/// The relay includes the persisted run id in its `response:` message for a
+/// newly-created run. A duplicate event is still accepted but has no run id,
+/// so that case is represented as `null` instead of being guessed locally.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WorkflowTriggerWire {
+    pub event_id: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowTriggerAck {
+    run_id: String,
 }
 
 // ── Reads ────────────────────────────────────────────────────────────────────
@@ -248,10 +266,10 @@ pub async fn delete_workflow(
 pub async fn trigger_workflow(
     workflow_id: String,
     state: State<'_, AppState>,
-) -> Result<Value, String> {
+) -> Result<WorkflowTriggerWire, String> {
     let builder = events::build_workflow_trigger(&workflow_id)?;
     let result = submit_event(builder, &state).await?;
-    Ok(serde_json::json!({ "event_id": result.event_id }))
+    trigger_workflow_wire(workflow_id, result.event_id, &result.message)
 }
 
 // ── Approvals ────────────────────────────────────────────────────────────────
@@ -294,6 +312,33 @@ pub async fn deny_approval(
 }
 
 // ── Helpers (pure, unit-tested in workflows_tests.rs) ─────────────────────────
+
+fn trigger_workflow_wire(
+    workflow_id: String,
+    event_id: String,
+    message: &str,
+) -> Result<WorkflowTriggerWire, String> {
+    // The relay acknowledges a replayed event without creating another run.
+    // Keep that accepted acknowledgement truthful instead of treating the
+    // missing run id as a protocol error or inventing one.
+    let run_id = if message == "duplicate: already processed" {
+        None
+    } else {
+        let ack: WorkflowTriggerAck = parse_command_response(message)
+            .map_err(|error| format!("invalid workflow trigger response: {error}"))?;
+        if ack.run_id.trim().is_empty() {
+            return Err("workflow trigger response contained an empty run_id".to_string());
+        }
+        Some(ack.run_id)
+    };
+
+    Ok(WorkflowTriggerWire {
+        event_id,
+        workflow_id,
+        run_id,
+        status: "accepted".to_string(),
+    })
+}
 
 fn current_pubkey_hex(state: &AppState) -> Result<String, String> {
     let keys = state.keys.lock().map_err(|e| e.to_string())?;

@@ -47,8 +47,8 @@ export function WorkflowDetailPanel({
 
   async function handleTrigger() {
     try {
-      const response = await triggerMutation.mutateAsync();
-      setSelectedRunId(response.runId);
+      await triggerMutation.mutateAsync();
+      await runsQuery.refetch();
     } catch {
       // React Query stores the error; keep the current selection unchanged.
     }
@@ -120,6 +120,15 @@ export function WorkflowDetailPanel({
       {triggerMutation.isError ? (
         <div className="border-b px-4 py-2 text-xs text-red-400">
           Failed to trigger workflow
+        </div>
+      ) : null}
+      {triggerMutation.isSuccess &&
+      triggerMutation.data?.status === "accepted" ? (
+        <div
+          className="border-b px-4 py-2 text-xs text-muted-foreground"
+          role="status"
+        >
+          Trigger accepted. Run history is refreshing.
         </div>
       ) : null}
 

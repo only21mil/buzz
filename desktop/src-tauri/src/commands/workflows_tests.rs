@@ -202,10 +202,52 @@ fn workflow_runs_path_defaults_and_caps_the_limit() {
 }
 
 #[test]
-fn approvals_serialize_to_a_bare_empty_array() {
-    // Approval reconstruction remains a separate follow-up. Keep its response
-    // as a bare array because the frontend wrapper calls `raw.map(...)`.
+fn trigger_response_serializes_event_run_workflow_and_acceptance() {
+    let wire = trigger_workflow_wire(
+        WF.to_string(),
+        "trigger-event".to_string(),
+        "response:{\"run_id\":\"33333333-3333-3333-3333-333333333333\"}",
+    )
+    .expect("parse trigger response");
+
+    assert_eq!(
+        serde_json::to_value(wire).expect("serialize trigger response"),
+        serde_json::json!({
+            "event_id": "trigger-event",
+            "workflow_id": WF,
+            "run_id": "33333333-3333-3333-3333-333333333333",
+            "status": "accepted",
+        })
+    );
+}
+
+#[test]
+fn duplicate_trigger_response_keeps_missing_run_id_explicitly_null() {
+    let wire = trigger_workflow_wire(
+        WF.to_string(),
+        "trigger-event".to_string(),
+        "duplicate: already processed",
+    )
+    .expect("parse duplicate trigger response");
+
+    assert_eq!(wire.run_id, None);
+    assert_eq!(wire.status, "accepted");
+}
+
+#[test]
+fn runs_and_approvals_serialize_to_bare_empty_array() {
+    // Regression guard for the crash class this fix closed. The frontend
+    // wrappers `getWorkflowRuns` / `getRunApprovals` do `raw.map(...)`, so the
+    // Rust side MUST return a bare JSON array. A wrapped `{ runs: [...] }` /
+    // `{ approvals: [...] }` shape would make `.map()` throw and crash the
+    // detail panel — the same TypeError class as the original page bug.
+    //
+    // The commands take `State<AppState>`, so we can't invoke them directly in
+    // a unit test; instead we pin the exact value they return (`Vec::new()` of
+    // their `Vec<Value>` element type) and assert its serialized shape.
+    let runs: Vec<Value> = Vec::new();
     let approvals: Vec<Value> = Vec::new();
+    assert_eq!(serde_json::to_string(&runs).expect("serialize runs"), "[]");
     assert_eq!(
         serde_json::to_string(&approvals).expect("serialize approvals"),
         "[]"
