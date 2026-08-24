@@ -4,7 +4,7 @@
 // create/update record shaping.
 
 use super::*;
-use nostr::{EventBuilder, Keys, Kind, Tag};
+use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
 /// Build a signed kind:30620 workflow definition event with the given YAML
 /// content and d/h tags.
@@ -18,6 +18,71 @@ fn wf_event(d: &str, h: &str, yaml: &str) -> nostr::Event {
         .tags(tags)
         .sign_with_keys(&keys)
         .expect("sign")
+}
+
+fn workflow_definition(keys: &Keys, workflow_id: &str, created_at: u64) -> nostr::Event {
+    EventBuilder::new(Kind::Custom(30620), YAML)
+        .tags(vec![
+            Tag::parse(["d", workflow_id]).expect("d tag"),
+            Tag::parse(["h", CHAN]).expect("h tag"),
+        ])
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(keys)
+        .expect("sign workflow")
+}
+
+fn workflow_tombstone(keys: &Keys, workflow_id: &str, created_at: u64) -> nostr::Event {
+    let coordinate = format!("30620:{}:{workflow_id}", keys.public_key().to_hex());
+    EventBuilder::new(Kind::EventDeletion, "")
+        .tags(vec![Tag::parse(["a", coordinate.as_str()]).expect("a tag")])
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(keys)
+        .expect("sign workflow tombstone")
+}
+
+fn collect_paged_fixture(mut source: Vec<nostr::Event>) -> Vec<nostr::Event> {
+    source.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
+    });
+    let mut collected = Vec::new();
+
+    for kind in [30620, 5] {
+        let mut filter = serde_json::json!({"kinds": [kind]});
+        loop {
+            let until = filter.get("until").and_then(Value::as_u64);
+            let before_id = filter.get("before_id").and_then(Value::as_str);
+            let page: Vec<_> = source
+                .iter()
+                .filter(|event| event.kind.as_u16() == kind)
+                .filter(|event| match (until, before_id) {
+                    (Some(until), Some(before_id)) => {
+                        event.created_at.as_secs() < until
+                            || (event.created_at.as_secs() == until
+                                && event.id.to_hex().as_str() > before_id)
+                    }
+                    _ => true,
+                })
+                .take(WORKFLOW_QUERY_PAGE_SIZE)
+                .cloned()
+                .collect();
+            if page.is_empty() {
+                break;
+            }
+            let done = page.len() < WORKFLOW_QUERY_PAGE_SIZE;
+            if !done {
+                advance_workflow_cursor(&mut filter, &page);
+            }
+            collected.extend(page);
+            if done {
+                break;
+            }
+        }
+    }
+
+    collected
 }
 
 const CHAN: &str = "11111111-1111-1111-1111-111111111111";
@@ -34,6 +99,31 @@ steps:
   - id: reply
     action: post_message
 ";
+
+#[test]
+fn paged_workflow_queries_keep_an_old_tombstone_in_the_fold() {
+    let owner = Keys::generate();
+    let live_id = "33333333-3333-3333-3333-333333333333";
+    let events = collect_paged_fixture(vec![
+        workflow_definition(&owner, live_id, 40),
+        workflow_definition(&owner, WF, 5),
+        workflow_tombstone(&owner, "55555555-5555-5555-5555-555555555555", 30),
+        workflow_tombstone(&owner, "44444444-4444-4444-4444-444444444444", 20),
+        workflow_tombstone(&owner, WF, 10),
+    ]);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == Kind::EventDeletion)
+            .count(),
+        3,
+        "the old tombstone must arrive from the second deletion page"
+    );
+
+    let folded = buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events);
+    assert_eq!(folded.len(), 1);
+    assert_eq!(tag_value(folded[0], "d").as_deref(), Some(live_id));
+}
 
 #[test]
 fn workflow_from_event_maps_all_fields() {

@@ -96,6 +96,9 @@ case "${args}" in
     if [[ ${TEST_SCENARIO} == post_swap_failure && ${state} == new ]]; then
       exit 1
     fi
+    if [[ ${TEST_SCENARIO} == stalled_probe && ${state} == new ]]; then
+      sleep 60
+    fi
     exit 0
     ;;
   *" compose "*" ps -q relay "*)
@@ -173,6 +176,7 @@ ENV
     BUZZ_DEPLOY_BUILD_ROOT="${case_dir}/build" \
     BUZZ_DEPLOY_HEALTH_ATTEMPTS=1 \
     BUZZ_DEPLOY_HEALTH_INTERVAL=0 \
+    BUZZ_DEPLOY_PROBE_TIMEOUT=0.1 \
     "${deploy_script}" "${test_commit}" >"${case_dir}/output" 2>&1
   rc=$?
   set -e
@@ -210,5 +214,12 @@ assert_contains "${scratch}/post_swap_failure/output" 'prior service was restore
 swap_count=$(grep -c 'up -d --no-deps --force-recreate relay' "${scratch}/post_swap_failure/commands.log")
 [[ ${swap_count} -eq 2 ]] || fail "post-swap failure made ${swap_count} recreate calls, expected 2"
 assert_contains "${scratch}/post_swap_failure/commands.log" 'BUZZ_IMAGE=localhost/buzz-relay:rollback-'
+
+run_case stalled_probe failure
+assert_contains "${scratch}/stalled_probe/output" 'ROLLBACK SUCCEEDED'
+assert_contains "${scratch}/stalled_probe/output" 'prior service was restored'
+stalled_swap_count=$(grep -c 'up -d --no-deps --force-recreate relay' "${scratch}/stalled_probe/commands.log")
+[[ ${stalled_swap_count} -eq 2 ]] || fail "stalled probe made ${stalled_swap_count} recreate calls, expected 2"
+assert_contains "${scratch}/stalled_probe/commands.log" 'BUZZ_IMAGE=localhost/buzz-relay:rollback-'
 
 printf 'PASS: deploy-local stubbed scenarios\n'

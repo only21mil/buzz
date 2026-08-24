@@ -71,14 +71,61 @@ struct WorkflowTriggerAck {
 
 // ── Reads ────────────────────────────────────────────────────────────────────
 
+#[cfg(not(test))]
+const WORKFLOW_QUERY_PAGE_SIZE: usize = 1_000;
+#[cfg(test)]
+const WORKFLOW_QUERY_PAGE_SIZE: usize = 2;
+const WORKFLOW_QUERY_MAX_PAGES: usize = 20;
+
+fn advance_workflow_cursor(filter: &mut Value, page: &[nostr::Event]) {
+    let last = page
+        .last()
+        .expect("a full workflow query page has a last event");
+    filter["until"] = serde_json::json!(last.created_at.as_secs());
+    filter["before_id"] = serde_json::json!(last.id.to_hex());
+}
+
+async fn query_workflow_events(
+    state: &AppState,
+    filters: impl IntoIterator<Item = Value>,
+) -> Result<Vec<nostr::Event>, String> {
+    let mut events = Vec::new();
+
+    for mut filter in filters {
+        for page_number in 1..=WORKFLOW_QUERY_MAX_PAGES {
+            filter["limit"] = serde_json::json!(WORKFLOW_QUERY_PAGE_SIZE);
+            let page = query_relay(state, std::slice::from_ref(&filter)).await?;
+
+            if page.is_empty() {
+                break;
+            }
+            if page.len() < WORKFLOW_QUERY_PAGE_SIZE {
+                events.extend(page);
+                break;
+            }
+            if page_number == WORKFLOW_QUERY_MAX_PAGES {
+                return Err(format!(
+                    "workflow query exceeded the bounded scan of {} events",
+                    WORKFLOW_QUERY_PAGE_SIZE * WORKFLOW_QUERY_MAX_PAGES
+                ));
+            }
+
+            advance_workflow_cursor(&mut filter, &page);
+            events.extend(page);
+        }
+    }
+
+    Ok(events)
+}
+
 #[tauri::command]
 pub async fn get_channel_workflows(
     channel_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<WorkflowWire>, String> {
-    let events = query_relay(
+    let events = query_workflow_events(
         &state,
-        &[
+        [
             serde_json::json!({
                 "kinds": [30620],
                 "#h": [channel_id],
@@ -103,8 +150,8 @@ pub async fn get_channel_workflows(
 /// relay POSTs. A nostr `#h` filter matches ANY of its listed values, so one
 /// query with all channel ids returns the same set. Each `WorkflowWire` carries
 /// its own `channel_id` (from the event's `h` tag), so the frontend can still
-/// group results by channel. Neither this nor the per-channel command sets a
-/// `limit`, so batching does not change result completeness.
+/// group results by channel. Both commands page definitions and tombstones to
+/// exhaustion with the relay's composite cursor.
 #[tauri::command]
 pub async fn get_channels_workflows(
     channel_ids: Vec<String>,
@@ -114,9 +161,9 @@ pub async fn get_channels_workflows(
         return Ok(Vec::new());
     }
 
-    let events = query_relay(
+    let events = query_workflow_events(
         &state,
-        &[
+        [
             serde_json::json!({
                 "kinds": [30620],
                 "#h": channel_ids,

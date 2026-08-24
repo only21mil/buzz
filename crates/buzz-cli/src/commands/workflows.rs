@@ -9,18 +9,70 @@ use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
 
 // TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
+#[cfg(not(test))]
+const WORKFLOW_QUERY_PAGE_SIZE: usize = 1_000;
+#[cfg(test)]
+const WORKFLOW_QUERY_PAGE_SIZE: usize = 2;
+const WORKFLOW_QUERY_MAX_PAGES: usize = 20;
+
+fn advance_workflow_cursor(filter: &mut serde_json::Value, page: &[nostr::Event]) {
+    let last = page
+        .last()
+        .expect("a full workflow query page has a last event");
+    filter["until"] = serde_json::json!(last.created_at.as_secs());
+    filter["before_id"] = serde_json::json!(last.id.to_hex());
+}
+
+async fn query_workflow_events(
+    client: &BuzzClient,
+    filters: impl IntoIterator<Item = serde_json::Value>,
+) -> Result<Vec<nostr::Event>, CliError> {
+    let mut events = Vec::new();
+
+    for mut filter in filters {
+        for page_number in 1..=WORKFLOW_QUERY_MAX_PAGES {
+            filter["limit"] = serde_json::json!(WORKFLOW_QUERY_PAGE_SIZE);
+            let response = client.query(&filter).await?;
+            let page: Vec<nostr::Event> = serde_json::from_str(&response).map_err(|error| {
+                CliError::Other(format!("invalid workflow query response: {error}"))
+            })?;
+
+            if page.is_empty() {
+                break;
+            }
+            if page.len() < WORKFLOW_QUERY_PAGE_SIZE {
+                events.extend(page);
+                break;
+            }
+            if page_number == WORKFLOW_QUERY_MAX_PAGES {
+                return Err(CliError::Other(format!(
+                    "workflow query exceeded the bounded scan of {} events",
+                    WORKFLOW_QUERY_PAGE_SIZE * WORKFLOW_QUERY_MAX_PAGES
+                )));
+            }
+
+            advance_workflow_cursor(&mut filter, &page);
+            events.extend(page);
+        }
+    }
+
+    Ok(events)
+}
+
 /// List live workflows in a channel, folding replacements and NIP-09 deletions.
 pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
     validate_uuid(channel_id)?;
-    let filters = [
-        serde_json::json!({
-            "kinds": [30620],
-            "#h": [channel_id]
-        }),
-        serde_json::json!({ "kinds": [5] }),
-    ];
-    let resp = client.query_multi(&filters).await?;
-    let events: Vec<nostr::Event> = serde_json::from_str(&resp).unwrap_or_default();
+    let events = query_workflow_events(
+        client,
+        [
+            serde_json::json!({
+                "kinds": [30620],
+                "#h": [channel_id]
+            }),
+            serde_json::json!({ "kinds": [5] }),
+        ],
+    )
+    .await?;
     let workflows: Vec<serde_json::Value> =
         buzz_sdk::workflow_fold::fold_workflow_definitions(&events)
             .into_iter()
@@ -332,8 +384,13 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::{extract::OriginalUri, http::HeaderMap, routing::get, Router};
-    use nostr::Keys;
+    use axum::{
+        extract::{OriginalUri, State},
+        http::HeaderMap,
+        routing::{get, post},
+        Json, Router,
+    };
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -383,6 +440,91 @@ mod tests {
         (client, requests)
     }
 
+    #[derive(Clone)]
+    struct WorkflowQueryState {
+        events: Arc<Vec<nostr::Event>>,
+    }
+
+    async fn workflow_query_response(
+        State(state): State<WorkflowQueryState>,
+        Json(filters): Json<Vec<serde_json::Value>>,
+    ) -> Json<Vec<nostr::Event>> {
+        let filter = filters.first().cloned().unwrap_or_default();
+        let kind = filter
+            .get("kinds")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|kinds| kinds.first())
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default() as u16;
+        let limit = filter
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(WORKFLOW_QUERY_PAGE_SIZE as u64) as usize;
+        let until = filter.get("until").and_then(serde_json::Value::as_u64);
+        let before_id = filter.get("before_id").and_then(serde_json::Value::as_str);
+        let events = state
+            .events
+            .iter()
+            .filter(|event| event.kind.as_u16() == kind)
+            .filter(|event| match (until, before_id) {
+                (Some(until), Some(before_id)) => {
+                    event.created_at.as_secs() < until
+                        || (event.created_at.as_secs() == until
+                            && event.id.to_hex().as_str() > before_id)
+                }
+                _ => true,
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        Json(events)
+    }
+
+    async fn workflow_query_server(mut events: Vec<nostr::Event>) -> BuzzClient {
+        events.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
+        });
+        let app = Router::new()
+            .route("/query", post(workflow_query_response))
+            .with_state(WorkflowQueryState {
+                events: Arc::new(events),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind workflow query test relay");
+        let address = listener.local_addr().expect("workflow query relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("workflow query test relay");
+        });
+        BuzzClient::new(format!("http://{address}"), Keys::generate(), None, None)
+            .expect("workflow test client")
+    }
+
+    fn workflow_definition(keys: &Keys, workflow_id: &str, created_at: u64) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(30620), "name: paged\nenabled: true\n")
+            .tags(vec![
+                Tag::parse(["d", workflow_id]).expect("d tag"),
+                Tag::parse(["h", "11111111-1111-1111-1111-111111111111"]).expect("h tag"),
+            ])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("sign workflow")
+    }
+
+    fn workflow_tombstone(keys: &Keys, workflow_id: &str, created_at: u64) -> nostr::Event {
+        let coordinate = format!("30620:{}:{workflow_id}", keys.public_key().to_hex());
+        EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::parse(["a", coordinate.as_str()]).expect("a tag")])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("sign workflow tombstone")
+    }
+
     fn valid_run() -> serde_json::Value {
         serde_json::json!({
             "id": "10000000-0000-0000-0000-000000000001",
@@ -395,6 +537,55 @@ mod tests {
             "completed_at": null,
             "created_at": 1700000000
         })
+    }
+
+    #[tokio::test]
+    async fn paged_workflow_queries_keep_an_old_tombstone_in_the_fold() {
+        let owner = Keys::generate();
+        let deleted_id = "22222222-2222-2222-2222-222222222222";
+        let live_id = "33333333-3333-3333-3333-333333333333";
+        let events = vec![
+            workflow_definition(&owner, live_id, 40),
+            workflow_definition(&owner, deleted_id, 5),
+            workflow_tombstone(&owner, "55555555-5555-5555-5555-555555555555", 30),
+            workflow_tombstone(&owner, "44444444-4444-4444-4444-444444444444", 20),
+            workflow_tombstone(&owner, deleted_id, 10),
+        ];
+        let client = workflow_query_server(events).await;
+
+        let events = query_workflow_events(
+            &client,
+            [
+                serde_json::json!({"kinds": [30620], "#h": ["11111111-1111-1111-1111-111111111111"]}),
+                serde_json::json!({"kinds": [5]}),
+            ],
+        )
+        .await
+        .expect("page workflows and tombstones");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == Kind::EventDeletion)
+                .count(),
+            3,
+            "the old tombstone must arrive from the second deletion page"
+        );
+
+        let folded = buzz_sdk::workflow_fold::fold_workflow_definitions(&events);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(
+            folded[0]
+                .tags
+                .iter()
+                .find_map(|tag| {
+                    let values = tag.as_slice();
+                    (values.first().map(String::as_str) == Some("d"))
+                        .then(|| values.get(1).cloned())
+                        .flatten()
+                })
+                .as_deref(),
+            Some(live_id)
+        );
     }
 
     #[test]

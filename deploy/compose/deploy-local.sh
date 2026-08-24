@@ -9,6 +9,7 @@ build_root=${BUZZ_DEPLOY_BUILD_ROOT:-${HOME}/work/buzz-relay-deploys}
 log_root=${BUZZ_DEPLOY_LOG_ROOT:-${HOME}/.local/state/buzz-relay/deploys}
 health_attempts=${BUZZ_DEPLOY_HEALTH_ATTEMPTS:-30}
 health_interval=${BUZZ_DEPLOY_HEALTH_INTERVAL:-2}
+probe_timeout=${BUZZ_DEPLOY_PROBE_TIMEOUT:-5}
 
 usage() {
   printf 'Usage: %s <full-40-character-commit>\n' "${0##*/}" >&2
@@ -23,8 +24,10 @@ if [[ ! ${commit} =~ ^[0-9a-f]{40}$ ]]; then
   printf 'REFUSED: commit must be exactly 40 lowercase hexadecimal characters\n' >&2
   exit 64
 fi
-if [[ ! ${health_attempts} =~ ^[1-9][0-9]*$ ]] || [[ ! ${health_interval} =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-  printf 'REFUSED: health attempt and interval settings must be positive numbers\n' >&2
+if [[ ! ${health_attempts} =~ ^[1-9][0-9]*$ ]] || \
+  [[ ! ${health_interval} =~ ^[0-9]+([.][0-9]+)?$ ]] || \
+  [[ ! ${probe_timeout} =~ ^([1-9][0-9]*|0[.][0-9]*[1-9][0-9]*)$ ]]; then
+  printf 'REFUSED: health attempts, interval, and probe timeout must be positive numbers\n' >&2
   exit 64
 fi
 [[ -x ${run_local} ]] || {
@@ -84,9 +87,9 @@ relay_container() {
 
 probe_relay() {
   local container=$1
-  docker exec "${container}" bash -ec \
+  timeout --foreground "${probe_timeout}" docker exec "${container}" bash -ec \
     'exec 3<>/dev/tcp/127.0.0.1/8080; printf "GET /_readiness HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3; grep -q "200 OK" <&3'
-  docker exec "${container}" bash -ec \
+  timeout --foreground "${probe_timeout}" docker exec "${container}" bash -ec \
     'exec 3<>/dev/tcp/127.0.0.1/3000; printf "GET / HTTP/1.1\r\nHost: localhost\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n" >&3; response=$(cat <&3); grep -q "200 OK" <<<"$response"; grep -q '"'"'supported_nips'"'"' <<<"$response"'
 }
 
