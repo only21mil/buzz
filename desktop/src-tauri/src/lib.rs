@@ -3,6 +3,7 @@ mod app_menu;
 mod app_state;
 mod archive;
 mod builderlab;
+mod channel_member_profiles;
 mod commands;
 mod deep_link;
 mod egress_guard;
