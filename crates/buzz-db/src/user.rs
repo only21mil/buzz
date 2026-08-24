@@ -54,6 +54,53 @@ pub async fn ensure_user(pool: &PgPool, community_id: CommunityId, pubkey: &[u8]
     Ok(result.rows_affected() == 1)
 }
 
+/// Ensure an agent and its owner exist, then associate the agent with that owner.
+///
+/// The operation is idempotent under concurrent calls for the same pair. It
+/// returns `false` when the agent is already associated with a different owner;
+/// an existing association is never overwritten.
+pub async fn ensure_agent_owner_association(
+    pool: &PgPool,
+    community_id: CommunityId,
+    agent_pubkey: &[u8],
+    owner_pubkey: &[u8],
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (community_id, pubkey)
+        VALUES ($1, $2)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(owner_pubkey)
+    .execute(&mut *tx)
+    .await?;
+
+    let associated = sqlx::query_scalar::<_, Vec<u8>>(
+        r#"
+        INSERT INTO users (community_id, pubkey, agent_owner_pubkey)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (community_id, pubkey) DO UPDATE
+        SET agent_owner_pubkey = EXCLUDED.agent_owner_pubkey
+        WHERE users.agent_owner_pubkey IS NULL
+           OR users.agent_owner_pubkey = EXCLUDED.agent_owner_pubkey
+        RETURNING agent_owner_pubkey
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(agent_pubkey)
+    .bind(owner_pubkey)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+
+    tx.commit().await?;
+    Ok(associated)
+}
+
 /// Get a single user record by pubkey.
 pub async fn get_user(
     pool: &PgPool,
@@ -583,6 +630,43 @@ mod tests {
             .expect("get policy")
             .expect("should be Some");
         assert_eq!(owner, Some(owner1), "original owner should be preserved");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn test_ensure_agent_owner_association_is_idempotent_and_scoped() {
+        let db = setup_db().await;
+        let community = make_community(&db.pool).await;
+        let agent = random_pubkey();
+        let owner = random_pubkey();
+        let different_owner = random_pubkey();
+        let unrelated = random_pubkey();
+
+        let (first, concurrent) = tokio::join!(
+            ensure_agent_owner_association(&db.pool, community, &agent, &owner),
+            ensure_agent_owner_association(&db.pool, community, &agent, &owner),
+        );
+        assert!(first.expect("first association"));
+        assert!(concurrent.expect("concurrent association"));
+        assert!(is_agent_owner(&db.pool, community, &agent, &owner)
+            .await
+            .expect("owner association check"));
+        assert!(
+            !ensure_agent_owner_association(&db.pool, community, &agent, &different_owner)
+                .await
+                .expect("conflicting association"),
+            "a different owner must not replace the first association"
+        );
+
+        ensure_user(&db.pool, community, &unrelated)
+            .await
+            .expect("ensure unrelated user");
+        assert!(
+            !is_agent_owner(&db.pool, community, &unrelated, &owner)
+                .await
+                .expect("unrelated ownership check"),
+            "an unrelated key must remain unassociated"
+        );
     }
 
     /// set_channel_add_policy should return Err when the pubkey does not exist

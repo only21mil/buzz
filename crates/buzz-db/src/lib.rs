@@ -2647,6 +2647,18 @@ impl Db {
         user::set_agent_owner(&self.pool, community_id, agent_pubkey, owner_pubkey).await
     }
 
+    /// Idempotently ensure an agent is associated with an owner.
+    /// Returns `false` if the agent is already associated with a different owner.
+    pub async fn ensure_agent_owner_association(
+        &self,
+        community_id: CommunityId,
+        agent_pubkey: &[u8],
+        owner_pubkey: &[u8],
+    ) -> Result<bool> {
+        user::ensure_agent_owner_association(&self.pool, community_id, agent_pubkey, owner_pubkey)
+            .await
+    }
+
     /// Get the channel_add_policy and agent_owner_pubkey for a user.
     pub async fn get_agent_channel_policy(
         &self,
