@@ -1,0 +1,38 @@
+services:
+  relay:
+    env_file: !override
+      - "${BUZZ_SERVICE_ENV_FILE:?set BUZZ_SERVICE_ENV_FILE}"
+    environment:
+      BUZZ_AUTO_MIGRATE: "false"
+      BUZZ_SERVE_GIT_WEB_GUI: "true"
+      BUZZ_REQUIRE_AUTH_TOKEN: "true"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
+      BUZZ_REQUIRE_MEDIA_GET_AUTH: "true"
+      BUZZ_ALLOW_NIP_OA_AUTH: "true"
+      BUZZ_PAIRING_RELAY_URL: ${BUZZ_PAIRING_RELAY_URL:-wss://framework-desktop.tail69757d.ts.net:38444}
+      BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:?set BUZZ_RELAY_PRIVATE_KEY}
+      BUZZ_GIT_HOOK_HMAC_SECRET: ${BUZZ_GIT_HOOK_HMAC_SECRET:?set BUZZ_GIT_HOOK_HMAC_SECRET}
+      RELAY_OWNER_PUBKEY: ${RELAY_OWNER_PUBKEY:?set RELAY_OWNER_PUBKEY}
+    ports: !override
+      - "127.0.0.1:${BUZZ_HTTP_PORT:-3000}:3000"
+
+  pair-relay:
+    image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
+    entrypoint: ["/usr/local/bin/buzz-pair-relay"]
+    environment:
+      BUZZ_PAIR_RELAY_BIND_ADDR: 0.0.0.0:5000
+    ports:
+      - "127.0.0.1:${BUZZ_PAIR_RELAY_PORT:-5000}:5000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/5000; printf \"GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n\" >&3; grep -q \"101 Switching Protocols\" <&3'",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - buzz-net
