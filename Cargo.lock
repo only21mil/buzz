@@ -1037,6 +1037,7 @@ dependencies = [
  "buzz-persona",
  "buzz-sdk",
  "buzz-test-client",
+ "buzz-workflow",
  "buzz-ws-client",
  "bytes",
  "chrono",

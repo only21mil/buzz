@@ -19,20 +19,49 @@ pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result
     });
     let resp = client.query(&filter).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let workflows: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "workflow_id": extract_d_tag(e),
-                "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-                "pubkey": e.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""),
-            })
-        })
-        .collect();
+    let workflows: Vec<serde_json::Value> = events.iter().map(workflow_list_item).collect();
     let output = serde_json::to_string(&workflows).unwrap_or_default();
     println!("{output}");
     Ok(())
+}
+
+fn workflow_list_item(event: &serde_json::Value) -> serde_json::Value {
+    let content = event
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let mut item = serde_json::json!({
+        "workflow_id": extract_d_tag(event),
+        "content": content,
+        "created_at": event
+            .get("created_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        "pubkey": event
+            .get("pubkey")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+    });
+
+    match buzz_workflow::WorkflowEngine::parse_yaml(content) {
+        Ok((definition, _)) => {
+            let object = item
+                .as_object_mut()
+                .expect("workflow list item is an object");
+            object.insert("name".into(), serde_json::json!(definition.name));
+            object.insert("enabled".into(), serde_json::json!(definition.enabled));
+        }
+        Err(error) => {
+            let object = item
+                .as_object_mut()
+                .expect("workflow list item is an object");
+            object.insert("name".into(), serde_json::Value::Null);
+            object.insert("enabled".into(), serde_json::Value::Null);
+            object.insert("parse_error".into(), serde_json::json!(error.to_string()));
+        }
+    }
+
+    item
 }
 
 /// Get a single workflow definition.
@@ -416,6 +445,53 @@ mod tests {
         assert!(parse_workflow_runs_response("not json").is_err());
         assert!(parse_workflow_runs_response(r#"{"runs": []}"#).is_err());
         assert!(parse_workflow_runs_response(r#"[{"id": ]"#).is_err());
+    }
+
+    fn workflow_event(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "content": content,
+            "created_at": 1_700_000_000,
+            "pubkey": "aabbcc",
+            "tags": [["d", "workflow-1"]],
+        })
+    }
+
+    #[test]
+    fn workflow_list_item_populates_name_and_default_enabled() {
+        let item = workflow_list_item(&workflow_event(
+            "name: Incident Alert\ntrigger:\n  on: webhook\nsteps:\n  - id: notify\n    action: send_message\n    text: hello\n",
+        ));
+
+        assert_eq!(item["workflow_id"], "workflow-1");
+        assert_eq!(item["name"], "Incident Alert");
+        assert_eq!(item["enabled"], true);
+        assert!(item.get("parse_error").is_none());
+    }
+
+    #[test]
+    fn workflow_list_item_preserves_explicit_disabled_state() {
+        let item = workflow_list_item(&workflow_event(
+            "name: Disabled\nenabled: false\ntrigger:\n  on: webhook\nsteps:\n  - id: notify\n    action: send_message\n    text: hello\n",
+        ));
+
+        assert_eq!(item["name"], "Disabled");
+        assert_eq!(item["enabled"], false);
+        assert!(item.get("parse_error").is_none());
+    }
+
+    #[test]
+    fn workflow_list_item_keeps_malformed_rows_with_parse_error() {
+        let item = workflow_list_item(&workflow_event("name: [broken"));
+
+        assert_eq!(item["workflow_id"], "workflow-1");
+        assert_eq!(item["content"], "name: [broken");
+        assert_eq!(item["created_at"], 1_700_000_000u64);
+        assert_eq!(item["pubkey"], "aabbcc");
+        assert!(item["name"].is_null());
+        assert!(item["enabled"].is_null());
+        assert!(item["parse_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()));
     }
 
     #[test]
