@@ -1,5 +1,5 @@
 use crate::client::BuzzClient;
-use crate::commands::with_git_provenance;
+use crate::commands::{query_repo_events, with_git_provenance};
 use crate::error::CliError;
 use crate::validate::{
     read_file_or_stdin, read_or_stdin, sdk_err, validate_hex64, validate_repo_id,
@@ -140,23 +140,15 @@ pub async fn cmd_list_prs(
     validate_repo_id(repo_id)?;
 
     let a_value = format!("30617:{repo_owner}:{repo_id}");
-    let mut filter = serde_json::json!({
-        "kinds": [1618],
-        "#a": [a_value]
-    });
+    let mut filter = serde_json::json!({"kinds": [1618]});
 
     if let Some(pk) = author {
         validate_hex64(pk)?;
         filter["authors"] = serde_json::json!([pk]);
     }
-    if let Some(l) = label {
-        filter["#t"] = serde_json::json!([l]);
-    }
-    if let Some(n) = limit {
-        filter["limit"] = serde_json::json!(n);
-    }
-
-    let resp = client.query(&filter).await?;
+    let events = query_repo_events(client, filter, &a_value, label, limit).await?;
+    let resp = serde_json::to_string(&events)
+        .map_err(|e| CliError::Other(format!("failed to serialize PR list: {e}")))?;
     println!("{resp}");
     Ok(())
 }
