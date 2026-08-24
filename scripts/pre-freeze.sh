@@ -255,8 +255,13 @@ check_clean_tree() {
         return 1
     fi
     while IFS= read -r -d '' entry; do
-        status_code="${entry:0:2}"
-        path="${entry:3}"
+        if [[ "${entry:2:1}" == ' ' ]]; then
+            status_code="${entry:0:2}"
+            path="${entry:3}"
+        else
+            status_code=""
+            path="$entry"
+        fi
         if [[ "$status_code" == '??' ]] && is_generated_untracked_path "$path"; then
             continue
         fi
