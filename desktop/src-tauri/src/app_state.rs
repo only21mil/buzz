@@ -12,10 +12,10 @@ use tauri::{AppHandle, Manager};
 #[cfg(feature = "mesh-llm")]
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::{channel_member_profiles::ChannelMemberProfileCache, huddle::HuddleState};
 pub(crate) use crate::identity_storage::{IdentityStorage, RecoveryState, ResolvedIdentity};
 use crate::managed_agents::config_bridge::SessionConfigCache;
 use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
+use crate::{channel_member_profiles::ChannelMemberProfileCache, huddle::HuddleState};
 
 pub struct AppState {
     pub keys: Mutex<Keys>,

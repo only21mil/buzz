@@ -404,10 +404,7 @@ fn enrich_channel_members_from_profile_events<E>(
     profile_events: Result<&[nostr::Event], E>,
     relay_scope: &str,
     request_id: u64,
-    profile_cache: &mut std::collections::HashMap<
-        (String, String),
-        ChannelMemberProfileCacheEntry,
-    >,
+    profile_cache: &mut std::collections::HashMap<(String, String), ChannelMemberProfileCacheEntry>,
 ) {
     let mut latest_profiles = std::collections::HashMap::new();
     if let Ok(events) = profile_events {
@@ -453,11 +450,7 @@ fn enrich_channel_members_from_profile_events<E>(
                 ChannelMemberProfileCacheEntry {
                     request_id,
                     is_agent,
-                    display_name: if is_agent {
-                        display_name.clone()
-                    } else {
-                        None
-                    },
+                    display_name: if is_agent { display_name.clone() } else { None },
                 },
             );
             if member.display_name.is_none() {
