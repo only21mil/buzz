@@ -412,9 +412,9 @@ buzz workflows runs --workflow "$WF_ID" | jq .
 # workflows approve — requires a workflow run waiting for approval
 # This is hard to test ad-hoc without a workflow that has an approval gate.
 # Test the validation instead:
-buzz workflows approve --token "00000000-0000-0000-0000-000000000000" 2>&1 || true
-# Should fail with relay error (token not found), not a validation error
-# To test the deny path: buzz workflows approve --token <UUID> --approved false
+buzz workflows approve --approval "00000000-0000-0000-0000-000000000000" 2>&1 || true
+# Should fail with a relay approval-not-found/current-state error, not UUID validation
+# To test the deny path: buzz workflows approve --approval <UUID> --approved false
 
 # workflows delete
 buzz workflows delete --workflow "$WF_ID" | jq .

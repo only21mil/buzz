@@ -63,6 +63,8 @@ pub mod workflow_state;
 pub use error::{DbError, Result};
 pub use event::{EventQuery, ReactionEventInsertOutcome, DEFAULT_MAX_PAGE_LIMIT};
 pub use workflow_approval::{
+    ApprovalDecisionPayload, DecideWorkflowApprovalGateParams, WorkflowApprovalDecision,
+    WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome,
     WorkflowApprovalGateCreationOutcome, WorkflowApprovalGateRecord, WorkflowApprovalRequestRecord,
 };
 pub use workflow_run_transition::WorkflowRunTransitionOutcome;
@@ -4029,6 +4031,24 @@ impl Db {
         params: workflow_approval::CreateWorkflowApprovalGateParams<'_>,
     ) -> Result<WorkflowApprovalGateCreationOutcome> {
         workflow_approval::create_workflow_approval_gate(&self.pool, params).await
+    }
+
+    /// Locate a tenant-bound approval gate without treating its UUID as authority.
+    pub async fn lookup_workflow_approval_gate(
+        &self,
+        community_id: CommunityId,
+        approval_id: Uuid,
+    ) -> Result<Option<WorkflowApprovalGateRecord>> {
+        workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
+            .await
+    }
+
+    /// Atomically apply or exactly reuse a signed workflow approval decision.
+    pub async fn decide_workflow_approval_gate(
+        &self,
+        params: workflow_approval::DecideWorkflowApprovalGateParams<'_>,
+    ) -> Result<WorkflowApprovalDecisionOutcome> {
+        workflow_approval::decide_workflow_approval_gate(&self.pool, params).await
     }
 
     /// Create an approval request.

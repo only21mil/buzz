@@ -10,8 +10,11 @@
 
 use buzz_core::CommunityId;
 use buzz_db::workflow_approval::{
-    create_workflow_approval_gate, ApprovalActionSummary, ApprovalRequestPayload, ApprovalRole,
-    CanonicalApprovalPolicy, CreateWorkflowApprovalGateParams, WorkflowApprovalGateCreationOutcome,
+    create_workflow_approval_gate, decide_workflow_approval_gate, ApprovalActionSummary,
+    ApprovalDecisionPayload, ApprovalRequestPayload, ApprovalRole, CanonicalApprovalPolicy,
+    CreateWorkflowApprovalGateParams, DecideWorkflowApprovalGateParams,
+    WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome,
+    WorkflowApprovalGateCreationOutcome,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -96,6 +99,45 @@ async fn create_gate(pool: &PgPool, spec: &GateSpec) -> buzz_db::Result<Observed
             ObservedCreate::NoEligibleApprovers
         }
     })
+}
+
+async fn decide_gate(
+    fixture: &Fixture,
+    approval_id: Uuid,
+    actor: &[u8],
+    decision: &str,
+    note: Option<&str>,
+    event_marker: u8,
+) -> buzz_db::Result<WorkflowApprovalDecisionOutcome> {
+    let payload = ApprovalDecisionPayload::new(json!({
+        "decision": decision,
+        "note": note,
+    }))?;
+    let event_id = vec![event_marker; 32];
+    let signature = vec![event_marker.wrapping_add(1); 64];
+    let tags = json!([["d", approval_id.to_string()]]);
+    let content = json!({"decision": decision, "note": note}).to_string();
+    decide_workflow_approval_gate(
+        &fixture.pool,
+        DecideWorkflowApprovalGateParams {
+            community_id: fixture.community_id,
+            approval_id,
+            actor_pubkey: actor,
+            actor_kind: "human",
+            payload: &payload,
+            event: WorkflowApprovalDecisionEvent {
+                event_id: &event_id,
+                pubkey: actor,
+                created_at: Utc::now(),
+                kind: if decision == "grant" { 46_030 } else { 46_031 },
+                tags: &tags,
+                content: &content,
+                signature: &signature,
+                received_at: Utc::now(),
+            },
+        },
+    )
+    .await
 }
 
 #[derive(Clone, Debug)]
@@ -1088,6 +1130,7 @@ async fn outbox_deduplicates_replays_and_orders_gate_requests() {
 enum FailPoint {
     ApprovalInsert,
     RunUpdate,
+    EventInsert,
     OutboxInsert,
 }
 
@@ -1096,6 +1139,7 @@ impl FailPoint {
         match self {
             Self::ApprovalInsert => "workflow_approval_gates",
             Self::RunUpdate => "workflow_runs",
+            Self::EventInsert => "events",
             Self::OutboxInsert => "workflow_approval_outbox",
         }
     }
@@ -1103,7 +1147,7 @@ impl FailPoint {
     fn operation(self) -> &'static str {
         match self {
             Self::RunUpdate => "UPDATE",
-            Self::ApprovalInsert | Self::OutboxInsert => "INSERT",
+            Self::ApprovalInsert | Self::EventInsert | Self::OutboxInsert => "INSERT",
         }
     }
 }
@@ -1170,6 +1214,54 @@ async fn transaction_abort_after_each_write_leaves_no_partial_state() {
         let after =
             persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
         assert_eq!(after, before, "fault point {index} leaked partial state");
+    }
+
+    for (index, point) in [FailPoint::EventInsert, FailPoint::OutboxInsert]
+        .into_iter()
+        .enumerate()
+    {
+        let fixture = Fixture::new().await;
+        let (approval_id, _) = created_receipt(
+            create_gate(&fixture.pool, &fixture.gate_spec())
+                .await
+                .expect("create gate before decision fault"),
+        );
+        let before =
+            persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+        let suffix = format!("decision_{}_{}", fixture.ids.run_id.simple(), index);
+        let (trigger, function) = install_fail_trigger(&fixture.pool, point, &suffix).await;
+
+        let result = decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.approver,
+            "grant",
+            None,
+            0x90 + index as u8,
+        )
+        .await;
+        remove_fail_trigger(&fixture.pool, point, &trigger, &function).await;
+        assert!(result.is_err(), "decision fault injection must abort");
+
+        let after =
+            persistence_snapshot(&fixture.pool, fixture.community_id, fixture.ids.run_id).await;
+        assert_eq!(
+            after, before,
+            "decision fault point {index} leaked run, gate, or outbox state"
+        );
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND d_tag = $2",
+        )
+        .bind(fixture.ids.community_id)
+        .bind(approval_id.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rolled-back decision events");
+        assert_eq!(
+            event_count, 0,
+            "decision event must roll back with the transaction"
+        );
     }
 }
 
@@ -1251,5 +1343,448 @@ async fn approval_row_and_request_payload_have_no_raw_token_contract() {
             json!(["p", hex::encode(&fixture.approver)]),
         ],
         "request must contain exactly one p tag per resolved approver"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn decision_grant_is_atomic_generation_fenced_and_exactly_replayable() {
+    let fixture = Fixture::new().await;
+    let spec = fixture.gate_spec();
+    let (approval_id, gate_generation) = created_receipt(
+        create_gate(&fixture.pool, &spec)
+            .await
+            .expect("create approval gate"),
+    );
+    assert_eq!(gate_generation, 2);
+
+    let applied = decide_gate(
+        &fixture,
+        approval_id,
+        &fixture.approver,
+        "grant",
+        Some("ship it"),
+        0xa1,
+    )
+    .await
+    .expect("grant approval");
+    assert_eq!(
+        applied,
+        WorkflowApprovalDecisionOutcome::Applied {
+            run_id: fixture.ids.run_id,
+            generation: 3,
+        }
+    );
+
+    let row: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object(\
+            'run_status', run.status::text, 'generation', run.generation,\
+            'next_step', run.next_step, 'completed_at', run.completed_at,\
+            'gate_status', gate.status, 'actor', encode(gate.decision_actor_pubkey, 'hex'),\
+            'role', gate.decision_actor_role::text, 'matched', gate.matched_policy,\
+            'decision_event', encode(gate.decision_event_id, 'hex')) \
+         FROM workflow_runs run JOIN workflow_approval_gates gate \
+           ON gate.community_id = run.community_id AND gate.run_id = run.id \
+         WHERE run.community_id = $1 AND run.id = $2",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read granted gate and run");
+    assert_eq!(row["run_status"], "resume_pending");
+    assert_eq!(row["generation"], 3);
+    assert_eq!(row["next_step"], 3);
+    assert!(row["completed_at"].is_null());
+    assert_eq!(row["gate_status"], "granted");
+    assert_eq!(row["actor"], hex::encode(&fixture.approver));
+    assert_eq!(row["role"], "admin");
+    assert_eq!(row["matched"]["kind"], "exact_pubkey");
+    assert_eq!(row["decision_event"], hex::encode(vec![0xa1; 32]));
+    let decision_event: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object(\
+            'pubkey', encode(pubkey, 'hex'), 'kind', kind, 'tags', tags,\
+            'content', content, 'signature', encode(sig, 'hex'),\
+            'channel_id', channel_id, 'd_tag', d_tag) \
+         FROM events WHERE community_id = $1 AND id = $2",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(vec![0xa1; 32])
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read persisted signed decision event");
+    assert_eq!(decision_event["pubkey"], hex::encode(&fixture.approver));
+    assert_eq!(decision_event["kind"], 46_030);
+    assert_eq!(
+        decision_event["tags"],
+        json!([["d", approval_id.to_string()]])
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            decision_event["content"]
+                .as_str()
+                .expect("decision event content text")
+        )
+        .expect("decision event content JSON"),
+        json!({"decision": "grant", "note": "ship it"})
+    );
+    assert_eq!(decision_event["signature"], hex::encode(vec![0xa2; 64]));
+    assert_eq!(decision_event["channel_id"], json!(fixture.ids.channel_id));
+    assert_eq!(decision_event["d_tag"], json!(approval_id.to_string()));
+    let lifecycle_classes: Vec<String> = sqlx::query_scalar(
+        "SELECT class FROM workflow_approval_outbox \
+         WHERE community_id = $1 AND approval_id = $2 AND class <> 'approval_requested' \
+         ORDER BY class",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(approval_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read lifecycle rows");
+    assert_eq!(
+        lifecycle_classes,
+        vec!["approval_granted", "workflow_resume_pending"]
+    );
+
+    assert_eq!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.approver,
+            "grant",
+            Some("ship it"),
+            0xa1,
+        )
+        .await
+        .expect("replay grant"),
+        WorkflowApprovalDecisionOutcome::Reused {
+            run_id: fixture.ids.run_id,
+            generation: 3,
+        }
+    );
+    assert_eq!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.approver,
+            "deny",
+            Some("changed mind"),
+            0xa2,
+        )
+        .await
+        .expect("conflicting decision"),
+        WorkflowApprovalDecisionOutcome::Conflict
+    );
+    for (actor, note, marker) in [
+        (fixture.approver.as_slice(), Some("ship it"), 0xa3),
+        (fixture.approver.as_slice(), Some("different note"), 0xa1),
+        (fixture.owner.as_slice(), Some("ship it"), 0xa1),
+    ] {
+        assert_eq!(
+            decide_gate(&fixture, approval_id, actor, "grant", note, marker)
+                .await
+                .expect("conflicting replay"),
+            WorkflowApprovalDecisionOutcome::Conflict
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn decision_deny_cancels_without_advancing_the_resume_cursor() {
+    let fixture = Fixture::new().await;
+    let spec = fixture.gate_spec();
+    let (approval_id, _) = created_receipt(
+        create_gate(&fixture.pool, &spec)
+            .await
+            .expect("create approval gate"),
+    );
+    assert!(matches!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.owner,
+            "deny",
+            Some("release rejected"),
+            0xb1,
+        )
+        .await
+        .expect("deny approval"),
+        WorkflowApprovalDecisionOutcome::Applied { generation: 3, .. }
+    ));
+    let run: (String, i64, i32, Option<DateTime<Utc>>, Option<String>) = sqlx::query_as(
+        "SELECT status::text, generation, next_step, completed_at, error_message \
+         FROM workflow_runs WHERE community_id = $1 AND id = $2",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read denied run");
+    assert_eq!(run.0, "cancelled");
+    assert_eq!(run.1, 3);
+    assert_eq!(run.2, 3, "deny must not execute or advance a later step");
+    assert!(run.3.is_some());
+    assert_eq!(
+        run.4.as_deref(),
+        Some("workflow cancelled: approval denied")
+    );
+    let classes: Vec<String> = sqlx::query_scalar(
+        "SELECT class FROM workflow_approval_outbox \
+         WHERE community_id = $1 AND approval_id = $2 AND class <> 'approval_requested' \
+         ORDER BY class",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(approval_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read denial lifecycle rows");
+    assert_eq!(classes, vec!["approval_denied", "workflow_cancelled"]);
+    assert_eq!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.owner,
+            "deny",
+            Some("release rejected"),
+            0xb1,
+        )
+        .await
+        .expect("replay denial"),
+        WorkflowApprovalDecisionOutcome::Reused {
+            run_id: fixture.ids.run_id,
+            generation: 3,
+        }
+    );
+    assert_eq!(
+        decide_gate(&fixture, approval_id, &fixture.owner, "grant", None, 0xb2,)
+            .await
+            .expect("conflicting grant after denial"),
+        WorkflowApprovalDecisionOutcome::Conflict
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn decision_rejects_wrong_tenant_removed_member_role_drift_stale_generation_and_expiry() {
+    let fixture = Fixture::new().await;
+    let mut spec = fixture.gate_spec();
+    spec.policy =
+        CanonicalApprovalPolicy::new(vec![], vec![ApprovalRole::Admin]).expect("admin policy");
+    let (approval_id, _) = created_receipt(
+        create_gate(&fixture.pool, &spec)
+            .await
+            .expect("create role-bound gate"),
+    );
+
+    let wrong_tenant = Fixture::insert(fixture.pool.clone(), FixtureIds::random(), 0xc1).await;
+    assert_eq!(
+        decide_gate(
+            &wrong_tenant,
+            approval_id,
+            &wrong_tenant.approver,
+            "grant",
+            None,
+            0xc2,
+        )
+        .await
+        .expect("wrong tenant decision"),
+        WorkflowApprovalDecisionOutcome::Conflict
+    );
+
+    sqlx::query(
+        "UPDATE channel_members SET role = 'member' \
+         WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.channel_id)
+    .bind(&fixture.approver)
+    .execute(&fixture.pool)
+    .await
+    .expect("demote admin");
+    assert_eq!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.approver,
+            "grant",
+            None,
+            0xc3,
+        )
+        .await
+        .expect("role drift decision"),
+        WorkflowApprovalDecisionOutcome::Unauthorized
+    );
+
+    let decoy_channel = Uuid::new_v4();
+    insert_channel(
+        &fixture.pool,
+        fixture.community_id,
+        decoy_channel,
+        &fixture.owner,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'admin')",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(decoy_channel)
+    .bind(&fixture.approver)
+    .execute(&fixture.pool)
+    .await
+    .expect("insert approver only in decoy channel");
+    sqlx::query(
+        "UPDATE channel_members SET removed_at = NOW() \
+         WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.channel_id)
+    .bind(&fixture.approver)
+    .execute(&fixture.pool)
+    .await
+    .expect("remove approver");
+    assert_eq!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.approver,
+            "grant",
+            None,
+            0xc4,
+        )
+        .await
+        .expect("decoy-channel member decision"),
+        WorkflowApprovalDecisionOutcome::Unauthorized
+    );
+
+    sqlx::query(
+        "UPDATE channel_members SET removed_at = NULL, role = 'admin' \
+         WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.channel_id)
+    .bind(&fixture.approver)
+    .execute(&fixture.pool)
+    .await
+    .expect("restore approver");
+    sqlx::query(
+        "UPDATE workflow_runs SET generation = generation + 1 \
+         WHERE community_id = $1 AND id = $2",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.run_id)
+    .execute(&fixture.pool)
+    .await
+    .expect("advance run generation");
+    assert_eq!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.approver,
+            "grant",
+            None,
+            0xc5,
+        )
+        .await
+        .expect("stale generation decision"),
+        WorkflowApprovalDecisionOutcome::Conflict
+    );
+
+    let expiry_fixture = Fixture::new().await;
+    let mut expiry_spec = expiry_fixture.gate_spec();
+    expiry_spec.expires_at = Utc::now() + Duration::milliseconds(25);
+    let (expiry_id, _) = created_receipt(
+        create_gate(&expiry_fixture.pool, &expiry_spec)
+            .await
+            .expect("create short approval gate"),
+    );
+    sqlx::query("SELECT pg_sleep(0.05)")
+        .execute(&expiry_fixture.pool)
+        .await
+        .expect("pass database expiry");
+    assert_eq!(
+        decide_gate(
+            &expiry_fixture,
+            expiry_id,
+            &expiry_fixture.approver,
+            "grant",
+            None,
+            0xc6,
+        )
+        .await
+        .expect("expired decision"),
+        WorkflowApprovalDecisionOutcome::Expired
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn exact_pubkey_policy_survives_role_drift_but_not_channel_removal() {
+    let fixture = Fixture::new().await;
+    let mut spec = fixture.gate_spec();
+    spec.policy = CanonicalApprovalPolicy::new(vec![fixture.approver.clone()], vec![])
+        .expect("exact pubkey policy");
+    let (approval_id, _) = created_receipt(
+        create_gate(&fixture.pool, &spec)
+            .await
+            .expect("create exact-key gate"),
+    );
+    sqlx::query(
+        "UPDATE channel_members SET role = 'member' \
+         WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.channel_id)
+    .bind(&fixture.approver)
+    .execute(&fixture.pool)
+    .await
+    .expect("change exact approver role");
+    assert!(matches!(
+        decide_gate(
+            &fixture,
+            approval_id,
+            &fixture.approver,
+            "grant",
+            None,
+            0xd1,
+        )
+        .await
+        .expect("exact-key decision after role drift"),
+        WorkflowApprovalDecisionOutcome::Applied { .. }
+    ));
+
+    let removed_fixture = Fixture::new().await;
+    let mut removed_spec = removed_fixture.gate_spec();
+    removed_spec.policy =
+        CanonicalApprovalPolicy::new(vec![removed_fixture.approver.clone()], vec![])
+            .expect("removed-member exact pubkey policy");
+    let (removed_approval_id, _) = created_receipt(
+        create_gate(&removed_fixture.pool, &removed_spec)
+            .await
+            .expect("create removed-member gate"),
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at = NOW() \
+         WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+    )
+    .bind(removed_fixture.ids.community_id)
+    .bind(removed_fixture.ids.channel_id)
+    .bind(&removed_fixture.approver)
+    .execute(&removed_fixture.pool)
+    .await
+    .expect("remove exact-key approver");
+    assert_eq!(
+        decide_gate(
+            &removed_fixture,
+            removed_approval_id,
+            &removed_fixture.approver,
+            "grant",
+            None,
+            0xd2,
+        )
+        .await
+        .expect("exact-key decision after channel removal"),
+        WorkflowApprovalDecisionOutcome::Unauthorized
     );
 }
