@@ -88,10 +88,12 @@ pub async fn get_channel_workflows(
     )
     .await?;
 
-    Ok(buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
-        .into_iter()
-        .map(workflow_from_event)
-        .collect())
+    Ok(
+        buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
+            .into_iter()
+            .map(workflow_from_event)
+            .collect(),
+    )
 }
 
 /// Fetch workflows across many channels in a single relay round-trip.
@@ -124,10 +126,12 @@ pub async fn get_channels_workflows(
     )
     .await?;
 
-    Ok(buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
-        .into_iter()
-        .map(workflow_from_event)
-        .collect())
+    Ok(
+        buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
+            .into_iter()
+            .map(workflow_from_event)
+            .collect(),
+    )
 }
 
 #[tauri::command]
