@@ -949,17 +949,17 @@ pub enum WorkflowsCmd {
     },
     /// Approve or deny a workflow step
     #[command(
-        after_help = "Examples:\n  buzz workflows approve --token <UUID>\n  buzz workflows approve --token <UUID> --approved false --note \"needs revision\""
+        after_help = "Examples:\n  buzz workflows approve --approval <UUID>\n  buzz workflows approve --approval <UUID> --approved false --note \"needs revision\""
     )]
     Approve {
-        /// The approval token UUID (from the approval request)
+        /// Public approval-gate UUID from the approval request
         #[arg(long)]
-        token: String,
+        approval: String,
         /// Approve (true) or deny (false) the step
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         approved: bool,
-        /// Optional note to include with the approval/denial
-        #[arg(long)]
+        /// Optional for approval; required and non-blank for denial
+        #[arg(long, required_if_eq("approved", "false"))]
         note: Option<String>,
     },
 }
@@ -2149,6 +2149,51 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn workflow_approval_uses_public_approval_id_not_token_contract() {
+        let approval_id = "6cb54514-bc14-47dc-a9e9-cbf0de5b243e";
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "workflows",
+            "approve",
+            "--approval",
+            approval_id,
+            "--approved",
+            "false",
+            "--note",
+            "needs revision",
+        ])
+        .expect("public approval ID should parse");
+        let Cmd::Workflows(WorkflowsCmd::Approve {
+            approval,
+            approved,
+            note,
+        }) = cli.command
+        else {
+            panic!("expected workflow approval command");
+        };
+        assert_eq!(approval, approval_id);
+        assert!(!approved);
+        assert_eq!(note.as_deref(), Some("needs revision"));
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "workflows",
+            "approve",
+            "--approval",
+            approval_id,
+            "--approved",
+            "false",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["buzz", "workflows", "approve", "--approval", approval_id,])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["buzz", "workflows", "approve", "--token", approval_id,]).is_err()
+        );
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::client::{
     extract_d_tag, extract_relay_response_field, normalize_write_response, print_create_response,
@@ -232,18 +231,24 @@ pub async fn cmd_trigger_workflow(
 /// Approve or deny a workflow step — sign and submit a kind:46030 (grant) or 46031 (deny) event.
 pub async fn cmd_approve_step(
     client: &BuzzClient,
-    approval_token: &str,
+    approval_id: &str,
     approved: bool,
     note: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_uuid(approval_token)?;
+    validate_uuid(approval_id)?;
+
+    if !approved && note.is_none_or(|note| note.trim().is_empty()) {
+        return Err(CliError::Usage(
+            "--note is required when denying an approval".into(),
+        ));
+    }
 
     let content = note.unwrap_or("");
 
-    // The relay expects d-tag = hex(SHA256(token)), not the raw token UUID.
-    let token_hash = hex::encode(Sha256::digest(approval_token.as_bytes()));
+    // The public UUID only locates the gate. The signed actor and the gate's
+    // immutable policy establish authority at the relay.
     let builder =
-        buzz_sdk::build_workflow_approval(&token_hash, approved, content).map_err(sdk_err)?;
+        buzz_sdk::build_workflow_approval(approval_id, approved, content).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
@@ -272,12 +277,12 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             cmd_get_workflow_runs(client, &workflow, limit).await
         }
         WorkflowsCmd::Approve {
-            token,
+            approval,
             approved,
             note,
         } => {
             // approved is already a bool — no parse_bool_flag needed
-            cmd_approve_step(client, &token, approved, note.as_deref()).await
+            cmd_approve_step(client, &approval, approved, note.as_deref()).await
         }
     }
 }

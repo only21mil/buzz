@@ -1570,18 +1570,20 @@ pub fn build_workflow_trigger(workflow_id: Uuid) -> Result<EventBuilder, SdkErro
 
 /// Build a workflow approval event — kind 46030 (grant) or 46031 (deny).
 ///
-/// - `token_hash`: hex-encoded SHA-256 of the approval token UUID (d-tag).
-///   Must be exactly 64 hex characters.
+/// - `approval_id`: public approval-gate UUID (d-tag). The identifier locates
+///   the gate but grants no authority; the relay authorizes the signed actor.
 /// - `approved`: `true` emits kind 46030 (grant), `false` emits kind 46031 (deny)
-/// - `note`: optional human-readable note as event content
+/// - `note`: optional for grants; denials require a non-empty note after trimming
 pub fn build_workflow_approval(
-    token_hash: &str,
+    approval_id: &str,
     approved: bool,
     note: &str,
 ) -> Result<EventBuilder, SdkError> {
-    if token_hash.len() != 64 || !token_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+    let approval_id = Uuid::parse_str(approval_id)
+        .map_err(|_| SdkError::InvalidInput("approval_id must be a UUID".into()))?;
+    if !approved && note.trim().is_empty() {
         return Err(SdkError::InvalidInput(
-            "token_hash must be a 64-character hex SHA-256 digest".into(),
+            "workflow denial requires a non-empty note".into(),
         ));
     }
     let kind = if approved {
@@ -1589,8 +1591,17 @@ pub fn build_workflow_approval(
     } else {
         KIND_APPROVAL_DENY
     };
-    let tags = vec![tag(&["d", token_hash])?];
-    Ok(EventBuilder::new(Kind::Custom(kind as u16), note).tags(tags))
+    let tags = vec![tag(&["d", &approval_id.to_string()])?];
+    let content = serde_json::json!({
+        "decision": if approved { "grant" } else { "deny" },
+        "note": if note.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(note.to_owned())
+        },
+    })
+    .to_string();
+    Ok(EventBuilder::new(Kind::Custom(kind as u16), content).tags(tags))
 }
 
 /// Build a DM open event (kind 41010).
@@ -3885,31 +3896,54 @@ mod tests {
 
     #[test]
     fn workflow_approval_grant() {
-        let hash = "a".repeat(64);
-        let ev = sign(build_workflow_approval(&hash, true, "lgtm").unwrap());
+        let approval_id = uuid();
+        let ev = sign(build_workflow_approval(&approval_id.to_string(), true, "lgtm").unwrap());
         assert_eq!(ev.kind.as_u16(), 46030);
-        assert!(has_tag(&ev, "d", &hash));
-        assert_eq!(ev.content, "lgtm");
+        assert!(has_tag(&ev, "d", &approval_id.to_string()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ev.content).unwrap(),
+            serde_json::json!({"decision": "grant", "note": "lgtm"})
+        );
     }
 
     #[test]
     fn workflow_approval_deny() {
-        let hash = "b".repeat(64);
-        let ev = sign(build_workflow_approval(&hash, false, "").unwrap());
+        let approval_id = uuid();
+        let ev = sign(
+            build_workflow_approval(&approval_id.to_string(), false, "needs revision").unwrap(),
+        );
         assert_eq!(ev.kind.as_u16(), 46031);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ev.content).unwrap(),
+            serde_json::json!({"decision": "deny", "note": "needs revision"})
+        );
     }
 
     #[test]
-    fn workflow_approval_rejects_bad_token_hash() {
-        let err = build_workflow_approval("not-hex", true, "").unwrap_err();
+    fn workflow_approval_deny_rejects_blank_note() {
+        let approval_id = uuid().to_string();
+        for note in ["", " \t\n"] {
+            let err = build_workflow_approval(&approval_id, false, note).unwrap_err();
+            assert!(matches!(err, SdkError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn workflow_approval_rejects_bad_approval_id() {
+        let err = build_workflow_approval("not-a-uuid", true, "").unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 
     #[test]
-    fn workflow_approval_rejects_short_hash() {
-        let short = "a".repeat(32);
-        let err = build_workflow_approval(&short, true, "").unwrap_err();
-        assert!(matches!(err, SdkError::InvalidInput(_)));
+    fn workflow_approval_canonicalizes_uuid() {
+        let approval_id = uuid();
+        let upper = approval_id.to_string().to_ascii_uppercase();
+        let ev = sign(build_workflow_approval(&upper, true, "").unwrap());
+        assert!(has_tag(&ev, "d", &approval_id.to_string()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ev.content).unwrap(),
+            serde_json::json!({"decision": "grant", "note": null})
+        );
     }
 
     #[test]

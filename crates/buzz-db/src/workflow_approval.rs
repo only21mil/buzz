@@ -21,6 +21,8 @@ pub const ACTION_SUMMARY_MAX_BYTES: usize = 2_000;
 /// Maximum serialized size of a request lifecycle payload.
 pub const REQUEST_PAYLOAD_MAX_BYTES: usize = 65_536;
 const REQUEST_PAYLOAD_ALLOWED_FIELDS: [&str; 2] = ["class", "timeout_seconds"];
+const DECISION_PAYLOAD_ALLOWED_FIELDS: [&str; 2] = ["decision", "note"];
+const DECISION_NOTE_MAX_BYTES: usize = 2_000;
 
 /// A built-in channel role that may satisfy an approval policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -291,6 +293,153 @@ pub enum WorkflowApprovalGateCreationOutcome {
     NoEligibleApprovers,
 }
 
+/// A signed decision applied to a pending workflow approval gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowApprovalDecision {
+    /// Permit the frozen run to become eligible for a durable resume lease.
+    Grant,
+    /// Cancel the frozen run without executing any later workflow step.
+    Deny,
+}
+
+impl WorkflowApprovalDecision {
+    fn gate_status(self) -> &'static str {
+        match self {
+            Self::Grant => "granted",
+            Self::Deny => "denied",
+        }
+    }
+}
+
+/// Strictly allowlisted decision content derived from the signed event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDecisionPayload {
+    decision: WorkflowApprovalDecision,
+    note: Option<String>,
+}
+
+impl ApprovalDecisionPayload {
+    /// Validate a JSON object containing only `decision` and optional `note`.
+    pub fn new(value: Value) -> Result<Self> {
+        let object = value.as_object().ok_or_else(|| {
+            DbError::InvalidData("approval decision payload must be a JSON object".to_owned())
+        })?;
+        if object.len() > DECISION_PAYLOAD_ALLOWED_FIELDS.len()
+            || object
+                .keys()
+                .any(|field| !DECISION_PAYLOAD_ALLOWED_FIELDS.contains(&field.as_str()))
+        {
+            return Err(DbError::InvalidData(
+                "approval decision payload contains an unknown field".to_owned(),
+            ));
+        }
+        let decision = match object.get("decision").and_then(Value::as_str) {
+            Some("grant") => WorkflowApprovalDecision::Grant,
+            Some("deny") => WorkflowApprovalDecision::Deny,
+            _ => {
+                return Err(DbError::InvalidData(
+                    "approval decision must be grant or deny".to_owned(),
+                ))
+            }
+        };
+        let note = match object.get("note") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(note)) if !note.trim().is_empty() => {
+                if note.len() > DECISION_NOTE_MAX_BYTES {
+                    return Err(DbError::InvalidData(format!(
+                        "approval decision note exceeds {DECISION_NOTE_MAX_BYTES} UTF-8 bytes"
+                    )));
+                }
+                Some(note.clone())
+            }
+            Some(Value::String(_)) => None,
+            Some(_) => {
+                return Err(DbError::InvalidData(
+                    "approval decision note must be text".to_owned(),
+                ))
+            }
+        };
+        if decision == WorkflowApprovalDecision::Deny && note.is_none() {
+            return Err(DbError::InvalidData(
+                "denial requires a non-empty note".to_owned(),
+            ));
+        }
+        Ok(Self { decision, note })
+    }
+
+    /// The validated decision.
+    pub fn decision(&self) -> WorkflowApprovalDecision {
+        self.decision
+    }
+
+    /// The validated note, if supplied.
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+}
+
+/// Raw fields of a signature-verified decision event stored with the decision.
+pub struct WorkflowApprovalDecisionEvent<'a> {
+    /// Exact 32-byte Nostr event identifier.
+    pub event_id: &'a [u8],
+    /// Exact 32-byte signing pubkey. It must equal the decision actor.
+    pub pubkey: &'a [u8],
+    /// Signed Nostr creation time.
+    pub created_at: DateTime<Utc>,
+    /// Signed decision kind (`46030` grant or `46031` deny).
+    pub kind: i32,
+    /// Canonical serialized Nostr tags.
+    pub tags: &'a Value,
+    /// Signed event content.
+    pub content: &'a str,
+    /// Exact 64-byte Schnorr signature.
+    pub signature: &'a [u8],
+    /// Relay receipt time.
+    pub received_at: DateTime<Utc>,
+}
+
+/// Inputs to the atomic signed-actor decision transaction.
+pub struct DecideWorkflowApprovalGateParams<'a> {
+    /// Server-resolved tenant.
+    pub community_id: CommunityId,
+    /// Public, non-authorizing gate identifier.
+    pub approval_id: Uuid,
+    /// Signature-verified actor pubkey.
+    pub actor_pubkey: &'a [u8],
+    /// Evidence-only actor kind (`human`, `agent`, `bot`, or `unknown`).
+    pub actor_kind: &'a str,
+    /// Strictly allowlisted decision payload.
+    pub payload: &'a ApprovalDecisionPayload,
+    /// Signature-verified event persisted atomically with the decision.
+    pub event: WorkflowApprovalDecisionEvent<'a>,
+}
+
+/// Result of attempting to decide a workflow approval gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum WorkflowApprovalDecisionOutcome {
+    /// The pending gate and waiting run transitioned atomically.
+    Applied {
+        /// Frozen run affected by the decision.
+        run_id: Uuid,
+        /// New run generation after the decision.
+        generation: i64,
+    },
+    /// An exact signed-event replay found the already committed decision.
+    Reused {
+        /// Frozen run affected by the original decision.
+        run_id: Uuid,
+        /// Generation immediately after the original decision.
+        generation: i64,
+    },
+    /// The actor is not a current active member satisfying the frozen policy.
+    Unauthorized,
+    /// Database time has reached or passed the gate expiry.
+    Expired,
+    /// A tenant, binding, state, generation, event, or replay fence failed.
+    Conflict,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunGateState {
     Fresh { gate_generation: i64 },
@@ -557,6 +706,498 @@ pub async fn create_workflow_approval_gate(
     } else {
         Ok(WorkflowApprovalGateCreationOutcome::Reused { gate, request })
     }
+}
+
+/// Locate a gate inside one tenant without treating its public UUID as authority.
+pub async fn lookup_workflow_approval_gate(
+    pool: &PgPool,
+    community_id: CommunityId,
+    approval_id: Uuid,
+) -> Result<Option<WorkflowApprovalGateRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, community_id, channel_id, workflow_id, run_id,
+               definition_hash, step_id, step_index, generation,
+               policy_snapshot, resolved_approver_set, expires_at, created_at
+        FROM workflow_approval_gates
+        WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(approval_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(row_to_gate).transpose()
+}
+
+/// Apply or exactly reuse a signed grant/deny decision in one transaction.
+///
+/// The gate UUID only locates immutable state. Authorization is re-evaluated
+/// from current active channel membership against the frozen policy while the
+/// membership advisory lock is held. The signed event, gate evidence, run
+/// transition, and two lifecycle outbox rows commit atomically.
+pub async fn decide_workflow_approval_gate(
+    pool: &PgPool,
+    params: DecideWorkflowApprovalGateParams<'_>,
+) -> Result<WorkflowApprovalDecisionOutcome> {
+    validate_decision_params(&params)?;
+    let Some(locator) =
+        lookup_workflow_approval_gate(pool, params.community_id, params.approval_id).await?
+    else {
+        return Ok(WorkflowApprovalDecisionOutcome::Conflict);
+    };
+
+    let mut tx = pool.begin().await?;
+    acquire_workflow_approval_channel_lock(&mut tx, params.community_id, locator.channel_id)
+        .await?;
+
+    let run = sqlx::query(
+        r#"
+        SELECT run.status::text AS status, run.definition_hash, run.generation,
+               run.current_step, run.next_step, workflow.owner_pubkey,
+               workflow.channel_id, workflow.deleted_at,
+               clock_timestamp() AS database_now
+        FROM workflow_runs AS run
+        JOIN workflows AS workflow
+          ON workflow.community_id = run.community_id
+         AND workflow.id = run.workflow_id
+        WHERE run.community_id = $1 AND run.id = $2 AND run.workflow_id = $3
+        FOR UPDATE OF run, workflow
+        "#,
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(locator.run_id)
+    .bind(locator.workflow_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(run) = run else {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Conflict);
+    };
+
+    let gate = sqlx::query(
+        r#"
+        SELECT id, channel_id, workflow_id, run_id, definition_hash,
+               step_index, generation, policy_snapshot, status,
+               decision_actor_pubkey, decision_actor_role::text AS decision_actor_role,
+               decision_actor_kind, actor_is_definition_owner, matched_policy,
+               note, decision_event_id, expires_at, deleted_at
+        FROM workflow_approval_gates
+        WHERE community_id = $1 AND id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.approval_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(gate) = gate else {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Conflict);
+    };
+
+    let gate_channel: Uuid = gate.try_get("channel_id")?;
+    let gate_workflow: Uuid = gate.try_get("workflow_id")?;
+    let gate_run: Uuid = gate.try_get("run_id")?;
+    let gate_hash: Vec<u8> = gate.try_get("definition_hash")?;
+    let gate_step: i32 = gate.try_get("step_index")?;
+    let gate_generation: i64 = gate.try_get("generation")?;
+    let gate_status: String = gate.try_get("status")?;
+    let gate_deleted_at: Option<DateTime<Utc>> = gate.try_get("deleted_at")?;
+    let run_channel: Option<Uuid> = run.try_get("channel_id")?;
+    let run_deleted_at: Option<DateTime<Utc>> = run.try_get("deleted_at")?;
+    let run_hash: Vec<u8> = run.try_get("definition_hash")?;
+    let run_generation: i64 = run.try_get("generation")?;
+    let database_now: DateTime<Utc> = run.try_get("database_now")?;
+    let expires_at: DateTime<Utc> = gate.try_get("expires_at")?;
+
+    if gate_channel != locator.channel_id
+        || gate_workflow != locator.workflow_id
+        || gate_run != locator.run_id
+        || gate_hash != locator.definition_hash
+        || gate_generation != locator.gate_generation
+        || run_channel != Some(locator.channel_id)
+        || run_deleted_at.is_some()
+        || gate_deleted_at.is_some()
+    {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Conflict);
+    }
+
+    let next_generation = gate_generation.checked_add(1).ok_or_else(|| {
+        DbError::InvalidData("workflow run generation cannot advance past i64::MAX".to_owned())
+    })?;
+    if gate_status != "pending" {
+        let replay = exact_decision_replay(&gate, &params)?
+            && exact_decision_event_replay(&mut tx, &params, locator.channel_id).await?;
+        tx.rollback().await?;
+        return Ok(if replay {
+            WorkflowApprovalDecisionOutcome::Reused {
+                run_id: locator.run_id,
+                generation: next_generation,
+            }
+        } else {
+            WorkflowApprovalDecisionOutcome::Conflict
+        });
+    }
+
+    if database_now >= expires_at {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Expired);
+    }
+
+    let expected_next_step = gate_step.checked_add(1).ok_or_else(|| {
+        DbError::InvalidData("workflow approval step cannot advance past i32::MAX".to_owned())
+    })?;
+    let run_status: RunStatus = run.try_get::<String, _>("status")?.parse()?;
+    let run_current_step: i32 = run.try_get("current_step")?;
+    let run_next_step: i32 = run.try_get("next_step")?;
+    if run_status != RunStatus::WaitingApproval
+        || run_generation != gate_generation
+        || run_hash != gate_hash
+        || run_current_step != gate_step
+        || run_next_step != expected_next_step
+    {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Conflict);
+    }
+
+    let member = sqlx::query(
+        r#"
+        SELECT member.role::text AS role, user_row.agent_type
+        FROM channel_members AS member
+        JOIN channels AS channel
+          ON channel.community_id = member.community_id
+         AND channel.id = member.channel_id
+         AND channel.deleted_at IS NULL
+        JOIN users AS user_row
+          ON user_row.community_id = member.community_id
+         AND user_row.pubkey = member.pubkey
+         AND user_row.deactivated_at IS NULL
+        WHERE member.community_id = $1 AND member.channel_id = $2
+          AND member.pubkey = $3 AND member.removed_at IS NULL
+        "#,
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(locator.channel_id)
+    .bind(params.actor_pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(member) = member else {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Unauthorized);
+    };
+    let actor_role: String = member.try_get("role")?;
+    let policy: CanonicalApprovalPolicy = serde_json::from_value(gate.try_get("policy_snapshot")?)?;
+    policy.validate_canonical()?;
+    let actor_hex = hex::encode(params.actor_pubkey);
+    let matched_policy = if policy.exact_pubkeys().binary_search(&actor_hex).is_ok() {
+        serde_json::json!({"kind": "exact_pubkey", "value": actor_hex})
+    } else if policy
+        .roles()
+        .iter()
+        .any(|role| role.as_str() == actor_role)
+    {
+        serde_json::json!({"kind": "role", "value": actor_role})
+    } else {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Unauthorized);
+    };
+    let owner_pubkey: Vec<u8> = run.try_get("owner_pubkey")?;
+    let actor_is_definition_owner = owner_pubkey.as_slice() == params.actor_pubkey;
+    let actor_kind = if params.actor_kind == "unknown" {
+        member
+            .try_get::<Option<String>, _>("agent_type")?
+            .map_or("human", |_| "agent")
+    } else {
+        params.actor_kind
+    };
+
+    let run_status = match params.payload.decision() {
+        WorkflowApprovalDecision::Grant => "resume_pending",
+        WorkflowApprovalDecision::Deny => "cancelled",
+    };
+    let completed_at = if params.payload.decision() == WorkflowApprovalDecision::Deny {
+        Some(database_now)
+    } else {
+        None
+    };
+    let error_message = if params.payload.decision() == WorkflowApprovalDecision::Deny {
+        Some("workflow cancelled: approval denied")
+    } else {
+        None
+    };
+    let advanced = sqlx::query_scalar::<_, i64>(
+        r#"
+        UPDATE workflow_runs
+        SET status = $1::run_status, generation = generation + 1,
+            completed_at = $2, error_message = $3
+        WHERE community_id = $4 AND id = $5 AND workflow_id = $6
+          AND status = 'waiting_approval' AND generation = $7
+          AND definition_hash = $8 AND current_step = $9 AND next_step = $10
+        RETURNING generation
+        "#,
+    )
+    .bind(run_status)
+    .bind(completed_at)
+    .bind(error_message)
+    .bind(params.community_id.as_uuid())
+    .bind(locator.run_id)
+    .bind(locator.workflow_id)
+    .bind(gate_generation)
+    .bind(&gate_hash)
+    .bind(gate_step)
+    .bind(expected_next_step)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if advanced != Some(next_generation) {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Conflict);
+    }
+
+    let decided = sqlx::query(
+        r#"
+        UPDATE workflow_approval_gates
+        SET status = $1, decision_actor_pubkey = $2,
+            decision_actor_role = $3::member_role, decision_actor_kind = $4,
+            actor_is_definition_owner = $5, matched_policy = $6,
+            note = $7, decision_event_id = $8, decided_at = $9, resolved_at = $9
+        WHERE community_id = $10 AND id = $11 AND status = 'pending'
+          AND generation = $12 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(params.payload.decision().gate_status())
+    .bind(params.actor_pubkey)
+    .bind(&actor_role)
+    .bind(actor_kind)
+    .bind(actor_is_definition_owner)
+    .bind(&matched_policy)
+    .bind(params.payload.note())
+    .bind(params.event.event_id)
+    .bind(database_now)
+    .bind(params.community_id.as_uuid())
+    .bind(params.approval_id)
+    .bind(gate_generation)
+    .execute(&mut *tx)
+    .await?;
+    if decided.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(WorkflowApprovalDecisionOutcome::Conflict);
+    }
+
+    insert_decision_event(&mut tx, &params, locator.channel_id).await?;
+    insert_decision_outbox(&mut tx, &params, &locator, next_generation).await?;
+    tx.commit().await?;
+    Ok(WorkflowApprovalDecisionOutcome::Applied {
+        run_id: locator.run_id,
+        generation: next_generation,
+    })
+}
+
+fn validate_decision_params(params: &DecideWorkflowApprovalGateParams<'_>) -> Result<()> {
+    validate_pubkey(params.actor_pubkey)?;
+    validate_pubkey(params.event.pubkey)?;
+    if params.actor_pubkey != params.event.pubkey {
+        return Err(DbError::InvalidData(
+            "approval decision actor does not match event signer".to_owned(),
+        ));
+    }
+    if params.event.event_id.len() != 32 || params.event.signature.len() != 64 {
+        return Err(DbError::InvalidData(
+            "approval decision event identity or signature has the wrong length".to_owned(),
+        ));
+    }
+    if !matches!(params.actor_kind, "human" | "agent" | "bot" | "unknown") {
+        return Err(DbError::InvalidData(
+            "approval decision actor kind is invalid".to_owned(),
+        ));
+    }
+    let expected_kind = match params.payload.decision() {
+        WorkflowApprovalDecision::Grant => 46_030,
+        WorkflowApprovalDecision::Deny => 46_031,
+    };
+    if params.event.kind != expected_kind {
+        return Err(DbError::InvalidData(
+            "approval decision event does not match the validated decision".to_owned(),
+        ));
+    }
+    let signed_payload = serde_json::from_str(params.event.content)
+        .map_err(|_| {
+            DbError::InvalidData("approval decision event content must be JSON".to_owned())
+        })
+        .and_then(ApprovalDecisionPayload::new)?;
+    if signed_payload != *params.payload {
+        return Err(DbError::InvalidData(
+            "approval decision event content does not match the validated decision".to_owned(),
+        ));
+    }
+    let tags = params.event.tags.as_array().ok_or_else(|| {
+        DbError::InvalidData("approval decision event tags must be an array".to_owned())
+    })?;
+    let d_tags: Vec<&str> = tags
+        .iter()
+        .filter_map(|tag| tag.as_array())
+        .filter(|tag| tag.first().and_then(Value::as_str) == Some("d"))
+        .filter_map(|tag| tag.get(1).and_then(Value::as_str))
+        .collect();
+    let expected_id = params.approval_id.to_string();
+    if d_tags.as_slice() != [expected_id.as_str()] {
+        return Err(DbError::InvalidData(
+            "approval decision event must contain exactly one canonical gate ID".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn exact_decision_replay(
+    gate: &sqlx::postgres::PgRow,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+) -> Result<bool> {
+    Ok(
+        gate.try_get::<String, _>("status")? == params.payload.decision().gate_status()
+            && gate
+                .try_get::<Option<Vec<u8>>, _>("decision_actor_pubkey")?
+                .as_deref()
+                == Some(params.actor_pubkey)
+            && gate
+                .try_get::<Option<Vec<u8>>, _>("decision_event_id")?
+                .as_deref()
+                == Some(params.event.event_id)
+            && gate.try_get::<Option<String>, _>("note")?.as_deref() == params.payload.note(),
+    )
+}
+
+async fn exact_decision_event_replay(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+    channel_id: Uuid,
+) -> Result<bool> {
+    let Some(existing) = lookup_decision_event(tx, params).await? else {
+        return Ok(false);
+    };
+    decision_event_matches(&existing, params, channel_id)
+}
+
+async fn lookup_decision_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+) -> Result<Option<sqlx::postgres::PgRow>> {
+    sqlx::query(
+        r#"
+        SELECT pubkey, created_at, kind, tags, content, sig, channel_id, d_tag
+        FROM events
+        WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.event.event_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+fn decision_event_matches(
+    existing: &sqlx::postgres::PgRow,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+    channel_id: Uuid,
+) -> Result<bool> {
+    Ok(
+        existing.try_get::<Vec<u8>, _>("pubkey")?.as_slice() == params.event.pubkey
+            && existing.try_get::<DateTime<Utc>, _>("created_at")? == params.event.created_at
+            && existing.try_get::<i32, _>("kind")? == params.event.kind
+            && existing.try_get::<Value, _>("tags")? == *params.event.tags
+            && existing.try_get::<String, _>("content")? == params.event.content
+            && existing.try_get::<Vec<u8>, _>("sig")?.as_slice() == params.event.signature
+            && existing.try_get::<Option<Uuid>, _>("channel_id")? == Some(channel_id)
+            && existing.try_get::<Option<String>, _>("d_tag")?.as_deref()
+                == Some(params.approval_id.to_string().as_str()),
+    )
+}
+
+async fn insert_decision_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+    channel_id: Uuid,
+) -> Result<()> {
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO events
+            (community_id, id, pubkey, created_at, kind, tags, content, sig,
+             received_at, channel_id, d_tag)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.event.event_id)
+    .bind(params.event.pubkey)
+    .bind(params.event.created_at)
+    .bind(params.event.kind)
+    .bind(params.event.tags)
+    .bind(params.event.content)
+    .bind(params.event.signature)
+    .bind(params.event.received_at)
+    .bind(channel_id)
+    .bind(params.approval_id.to_string())
+    .execute(&mut **tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        let existing = lookup_decision_event(tx, params).await?;
+        let Some(existing) = existing else {
+            return Err(DbError::InvalidData(
+                "approval decision event ID conflicts with hidden event state".to_owned(),
+            ));
+        };
+        if !decision_event_matches(&existing, params, channel_id)? {
+            return Err(DbError::InvalidData(
+                "approval decision event ID conflicts with different event data".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn insert_decision_outbox(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+    gate: &WorkflowApprovalGateRecord,
+    generation: i64,
+) -> Result<()> {
+    let (approval_class, run_class) = match params.payload.decision() {
+        WorkflowApprovalDecision::Grant => ("approval_granted", "workflow_resume_pending"),
+        WorkflowApprovalDecision::Deny => ("approval_denied", "workflow_cancelled"),
+    };
+    let payload = serde_json::json!({
+        "approval_id": gate.approval_id,
+        "channel_id": gate.channel_id,
+        "workflow_id": gate.workflow_id,
+        "run_id": gate.run_id,
+        "generation": generation,
+        "decision": params.payload.decision().gate_status(),
+    });
+    validate_request_payload_size(&payload)?;
+    for (class, suffix) in [(approval_class, "decision"), (run_class, "run")] {
+        let dedupe_key = format!(
+            "workflow-approval-{suffix}:{}:{}",
+            gate.approval_id,
+            params.payload.decision().gate_status()
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_approval_outbox
+                (community_id, approval_id, class, payload, dedupe_key)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(params.community_id.as_uuid())
+        .bind(gate.approval_id)
+        .bind(class)
+        .bind(&payload)
+        .bind(&dedupe_key)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 fn validate_params(params: &CreateWorkflowApprovalGateParams<'_>) -> Result<()> {
@@ -1196,6 +1837,52 @@ mod tests {
             "timeout_seconds": 0
         }))
         .is_err());
+    }
+
+    #[test]
+    fn decision_payload_accepts_only_decision_and_bounded_note() {
+        assert!(ApprovalDecisionPayload::new(serde_json::json!({
+            "decision": "grant"
+        }))
+        .is_ok());
+        assert!(ApprovalDecisionPayload::new(serde_json::json!({
+            "decision": "deny",
+            "note": "needs revision"
+        }))
+        .is_ok());
+        assert!(ApprovalDecisionPayload::new(serde_json::json!({
+            "decision": "deny"
+        }))
+        .is_err());
+        assert!(ApprovalDecisionPayload::new(serde_json::json!({
+            "decision": "deny",
+            "note": "   "
+        }))
+        .is_err());
+        assert!(ApprovalDecisionPayload::new(serde_json::json!({
+            "decision": "grant",
+            "note": "x".repeat(DECISION_NOTE_MAX_BYTES + 1)
+        }))
+        .is_err());
+        for field in [
+            "token",
+            "authorization",
+            "cookie",
+            "api_key",
+            "private_key",
+            "definition_snapshot",
+            "step_outputs",
+        ] {
+            let mut payload = serde_json::json!({"decision": "grant"})
+                .as_object()
+                .cloned()
+                .expect("decision payload object");
+            payload.insert(field.to_owned(), Value::String("private".to_owned()));
+            assert!(
+                ApprovalDecisionPayload::new(Value::Object(payload)).is_err(),
+                "unexpectedly accepted {field}"
+            );
+        }
     }
 
     #[test]
