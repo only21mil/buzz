@@ -531,7 +531,7 @@ pub enum MessagesCmd {
 pub enum ChannelsCmd {
     /// List channels visible to the current identity
     #[command(
-        after_help = "Examples:\n  buzz channels list\n  buzz channels list --visibility open"
+        after_help = "Examples:\n  buzz channels list\n  buzz channels list --visibility open\n  buzz channels list --include-archived"
     )]
     List {
         /// Filter by visibility
@@ -540,6 +540,9 @@ pub enum ChannelsCmd {
         /// Only show channels where the current identity is a member
         #[arg(long, default_value_t = false)]
         member: bool,
+        /// Include archived channels in results
+        #[arg(long, default_value_t = false)]
+        include_archived: bool,
         /// Maximum number of channels to return [default: 500]
         #[arg(long)]
         limit: Option<u32>,
