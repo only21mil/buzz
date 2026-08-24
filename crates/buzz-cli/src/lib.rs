@@ -958,8 +958,8 @@ pub enum WorkflowsCmd {
         /// Approve (true) or deny (false) the step
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         approved: bool,
-        /// Optional note to include with the approval/denial
-        #[arg(long)]
+        /// Optional for approval; required and non-blank for denial
+        #[arg(long, required_if_eq("approved", "false"))]
         note: Option<String>,
     },
 }
@@ -2177,6 +2177,20 @@ mod tests {
         assert_eq!(approval, approval_id);
         assert!(!approved);
         assert_eq!(note.as_deref(), Some("needs revision"));
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "workflows",
+            "approve",
+            "--approval",
+            approval_id,
+            "--approved",
+            "false",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["buzz", "workflows", "approve", "--approval", approval_id,])
+                .is_ok()
+        );
         assert!(
             Cli::try_parse_from(["buzz", "workflows", "approve", "--token", approval_id,]).is_err()
         );

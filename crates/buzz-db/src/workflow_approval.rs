@@ -828,7 +828,8 @@ pub async fn decide_workflow_approval_gate(
         DbError::InvalidData("workflow run generation cannot advance past i64::MAX".to_owned())
     })?;
     if gate_status != "pending" {
-        let replay = exact_decision_replay(&gate, &params)?;
+        let replay = exact_decision_replay(&gate, &params)?
+            && exact_decision_event_replay(&mut tx, &params, locator.channel_id).await?;
         tx.rollback().await?;
         return Ok(if replay {
             WorkflowApprovalDecisionOutcome::Reused {
@@ -1066,6 +1067,53 @@ fn exact_decision_replay(
     )
 }
 
+async fn exact_decision_event_replay(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+    channel_id: Uuid,
+) -> Result<bool> {
+    let Some(existing) = lookup_decision_event(tx, params).await? else {
+        return Ok(false);
+    };
+    decision_event_matches(&existing, params, channel_id)
+}
+
+async fn lookup_decision_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+) -> Result<Option<sqlx::postgres::PgRow>> {
+    sqlx::query(
+        r#"
+        SELECT pubkey, created_at, kind, tags, content, sig, channel_id, d_tag
+        FROM events
+        WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(params.community_id.as_uuid())
+    .bind(params.event.event_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+fn decision_event_matches(
+    existing: &sqlx::postgres::PgRow,
+    params: &DecideWorkflowApprovalGateParams<'_>,
+    channel_id: Uuid,
+) -> Result<bool> {
+    Ok(
+        existing.try_get::<Vec<u8>, _>("pubkey")?.as_slice() == params.event.pubkey
+            && existing.try_get::<DateTime<Utc>, _>("created_at")? == params.event.created_at
+            && existing.try_get::<i32, _>("kind")? == params.event.kind
+            && existing.try_get::<Value, _>("tags")? == *params.event.tags
+            && existing.try_get::<String, _>("content")? == params.event.content
+            && existing.try_get::<Vec<u8>, _>("sig")?.as_slice() == params.event.signature
+            && existing.try_get::<Option<Uuid>, _>("channel_id")? == Some(channel_id)
+            && existing.try_get::<Option<String>, _>("d_tag")?.as_deref()
+                == Some(params.approval_id.to_string().as_str()),
+    )
+}
+
 async fn insert_decision_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     params: &DecideWorkflowApprovalGateParams<'_>,
@@ -1094,31 +1142,13 @@ async fn insert_decision_event(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() == 0 {
-        let existing = sqlx::query(
-            r#"
-            SELECT pubkey, kind, tags, content, sig, channel_id, d_tag
-            FROM events
-            WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(params.community_id.as_uuid())
-        .bind(params.event.event_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+        let existing = lookup_decision_event(tx, params).await?;
         let Some(existing) = existing else {
             return Err(DbError::InvalidData(
                 "approval decision event ID conflicts with hidden event state".to_owned(),
             ));
         };
-        let exact = existing.try_get::<Vec<u8>, _>("pubkey")?.as_slice() == params.event.pubkey
-            && existing.try_get::<i32, _>("kind")? == params.event.kind
-            && existing.try_get::<Value, _>("tags")? == *params.event.tags
-            && existing.try_get::<String, _>("content")? == params.event.content
-            && existing.try_get::<Vec<u8>, _>("sig")?.as_slice() == params.event.signature
-            && existing.try_get::<Option<Uuid>, _>("channel_id")? == Some(channel_id)
-            && existing.try_get::<Option<String>, _>("d_tag")?.as_deref()
-                == Some(params.approval_id.to_string().as_str());
-        if !exact {
+        if !decision_event_matches(&existing, params, channel_id)? {
             return Err(DbError::InvalidData(
                 "approval decision event ID conflicts with different event data".to_owned(),
             ));

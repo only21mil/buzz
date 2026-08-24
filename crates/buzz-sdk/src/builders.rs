@@ -1573,7 +1573,7 @@ pub fn build_workflow_trigger(workflow_id: Uuid) -> Result<EventBuilder, SdkErro
 /// - `approval_id`: public approval-gate UUID (d-tag). The identifier locates
 ///   the gate but grants no authority; the relay authorizes the signed actor.
 /// - `approved`: `true` emits kind 46030 (grant), `false` emits kind 46031 (deny)
-/// - `note`: optional human-readable note as event content
+/// - `note`: optional for grants; denials require a non-empty note after trimming
 pub fn build_workflow_approval(
     approval_id: &str,
     approved: bool,
@@ -1581,6 +1581,11 @@ pub fn build_workflow_approval(
 ) -> Result<EventBuilder, SdkError> {
     let approval_id = Uuid::parse_str(approval_id)
         .map_err(|_| SdkError::InvalidInput("approval_id must be a UUID".into()))?;
+    if !approved && note.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "workflow denial requires a non-empty note".into(),
+        ));
+    }
     let kind = if approved {
         KIND_APPROVAL_GRANT
     } else {
@@ -3915,6 +3920,15 @@ mod tests {
     }
 
     #[test]
+    fn workflow_approval_deny_rejects_blank_note() {
+        let approval_id = uuid().to_string();
+        for note in ["", " \t\n"] {
+            let err = build_workflow_approval(&approval_id, false, note).unwrap_err();
+            assert!(matches!(err, SdkError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
     fn workflow_approval_rejects_bad_approval_id() {
         let err = build_workflow_approval("not-a-uuid", true, "").unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
@@ -3926,6 +3940,10 @@ mod tests {
         let upper = approval_id.to_string().to_ascii_uppercase();
         let ev = sign(build_workflow_approval(&upper, true, "").unwrap());
         assert!(has_tag(&ev, "d", &approval_id.to_string()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ev.content).unwrap(),
+            serde_json::json!({"decision": "grant", "note": null})
+        );
     }
 
     #[test]

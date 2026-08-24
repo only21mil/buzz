@@ -109,14 +109,52 @@ async fn decide_gate(
     note: Option<&str>,
     event_marker: u8,
 ) -> buzz_db::Result<WorkflowApprovalDecisionOutcome> {
+    let event = decision_event_fixture(approval_id, actor, decision, note, event_marker);
+    decide_gate_event(fixture, approval_id, actor, decision, note, &event).await
+}
+
+#[derive(Clone)]
+struct DecisionEventFixture {
+    event_id: Vec<u8>,
+    pubkey: Vec<u8>,
+    created_at: DateTime<Utc>,
+    kind: i32,
+    tags: Value,
+    content: String,
+    signature: Vec<u8>,
+}
+
+fn decision_event_fixture(
+    approval_id: Uuid,
+    actor: &[u8],
+    decision: &str,
+    note: Option<&str>,
+    event_marker: u8,
+) -> DecisionEventFixture {
+    DecisionEventFixture {
+        event_id: vec![event_marker; 32],
+        pubkey: actor.to_vec(),
+        created_at: DateTime::from_timestamp(1_700_000_000 + i64::from(event_marker), 0)
+            .expect("stable decision event timestamp"),
+        kind: if decision == "grant" { 46_030 } else { 46_031 },
+        tags: json!([["d", approval_id.to_string()]]),
+        content: json!({"decision": decision, "note": note}).to_string(),
+        signature: vec![event_marker.wrapping_add(1); 64],
+    }
+}
+
+async fn decide_gate_event(
+    fixture: &Fixture,
+    approval_id: Uuid,
+    actor: &[u8],
+    decision: &str,
+    note: Option<&str>,
+    event: &DecisionEventFixture,
+) -> buzz_db::Result<WorkflowApprovalDecisionOutcome> {
     let payload = ApprovalDecisionPayload::new(json!({
         "decision": decision,
         "note": note,
     }))?;
-    let event_id = vec![event_marker; 32];
-    let signature = vec![event_marker.wrapping_add(1); 64];
-    let tags = json!([["d", approval_id.to_string()]]);
-    let content = json!({"decision": decision, "note": note}).to_string();
     decide_workflow_approval_gate(
         &fixture.pool,
         DecideWorkflowApprovalGateParams {
@@ -126,13 +164,13 @@ async fn decide_gate(
             actor_kind: "human",
             payload: &payload,
             event: WorkflowApprovalDecisionEvent {
-                event_id: &event_id,
-                pubkey: actor,
-                created_at: Utc::now(),
-                kind: if decision == "grant" { 46_030 } else { 46_031 },
-                tags: &tags,
-                content: &content,
-                signature: &signature,
+                event_id: &event.event_id,
+                pubkey: &event.pubkey,
+                created_at: event.created_at,
+                kind: event.kind,
+                tags: &event.tags,
+                content: &event.content,
+                signature: &event.signature,
                 received_at: Utc::now(),
             },
         },
@@ -1462,6 +1500,45 @@ async fn decision_grant_is_atomic_generation_fenced_and_exactly_replayable() {
             generation: 3,
         }
     );
+    let exact_event = decision_event_fixture(
+        approval_id,
+        &fixture.approver,
+        "grant",
+        Some("ship it"),
+        0xa1,
+    );
+    let mut altered_events = Vec::new();
+    let mut altered_signature = exact_event.clone();
+    altered_signature.signature = vec![0xfe; 64];
+    altered_events.push(("signature", altered_signature));
+    let mut altered_content = exact_event.clone();
+    altered_content.content = r#"{"decision":"grant","note":"ship it" }"#.to_owned();
+    altered_events.push(("content bytes", altered_content));
+    let mut altered_tags = exact_event.clone();
+    altered_tags.tags = json!([
+        ["d", approval_id.to_string()],
+        ["client", "approval-contract"]
+    ]);
+    altered_events.push(("tags", altered_tags));
+    let mut altered_created_at = exact_event;
+    altered_created_at.created_at += Duration::seconds(1);
+    altered_events.push(("created_at", altered_created_at));
+    for (field, event) in altered_events {
+        assert_eq!(
+            decide_gate_event(
+                &fixture,
+                approval_id,
+                &fixture.approver,
+                "grant",
+                Some("ship it"),
+                &event,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("altered {field} replay failed: {error}")),
+            WorkflowApprovalDecisionOutcome::Conflict,
+            "altered signed {field} must not be reused",
+        );
+    }
     assert_eq!(
         decide_gate(
             &fixture,

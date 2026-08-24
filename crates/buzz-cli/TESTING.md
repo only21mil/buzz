@@ -414,7 +414,7 @@ buzz workflows runs --workflow "$WF_ID" | jq .
 # Test the validation instead:
 buzz workflows approve --approval "00000000-0000-0000-0000-000000000000" 2>&1 || true
 # Should fail with a relay approval-not-found/current-state error, not UUID validation
-# To test the deny path: buzz workflows approve --approval <UUID> --approved false
+# To test the deny path: buzz workflows approve --approval <UUID> --approved false --note "needs revision"
 
 # workflows delete
 buzz workflows delete --workflow "$WF_ID" | jq .
@@ -650,7 +650,7 @@ buzz channels delete --channel "$FORUM_ID" | jq .
 | 39 | `workflows trigger` | ☐ | |
 | 40 | `workflows runs` | ☐ | |
 | 41 | `workflows get` | ☐ | |
-| 42 | `workflows approve` | ☐ | Validation only (needs approval gate); bare = approve, `--approved false` = deny |
+| 42 | `workflows approve` | ☐ | Validation only (needs approval gate); bare = approve, denial requires `--approved false --note "reason"` |
 | 43 | `feed get` | ☐ | |
 | 44 | `social publish` | ☐ | |
 | 45 | `social set-contacts` | ☐ | |
