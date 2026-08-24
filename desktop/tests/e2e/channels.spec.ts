@@ -3472,7 +3472,7 @@ test("members sidebar hides relay agents that are not authorized", async ({
   ).toHaveCount(0);
 });
 
-test("members sidebar can invite and remove managed agents", async ({
+test("members sidebar can invite, change role, and remove managed agents", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -3521,6 +3521,25 @@ test("members sidebar can invite and remove managed agents", async ({
     "char",
   );
   await expectMembersTriggerCount(page, initialMemberCount + 1);
+
+  await openMemberMenu(page, TEST_IDENTITIES.charlie.pubkey);
+  await page
+    .getByTestId(`sidebar-change-role-${TEST_IDENTITIES.charlie.pubkey}`)
+    .hover();
+  await expect(
+    page.getByTestId(`sidebar-role-admin-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId(`sidebar-role-member-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId(`sidebar-role-guest-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId(`sidebar-role-owner-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
 
   await openMemberMenu(page, TEST_IDENTITIES.charlie.pubkey);
   await page
@@ -4260,6 +4279,9 @@ test("bulk remove stays hidden when row-level remove is not allowed", async ({
   await expect(page.getByTestId(`sidebar-member-${alicePubkey}`)).toBeVisible();
   await expect(
     page.getByTestId(`sidebar-member-menu-${alicePubkey}`),
+  ).toHaveCount(0);
+  await expect(
+    page.getByTestId(`sidebar-change-role-${alicePubkey}`),
   ).toHaveCount(0);
 
   // Bulk agent controls only render when hasControllableManagedBots is true.

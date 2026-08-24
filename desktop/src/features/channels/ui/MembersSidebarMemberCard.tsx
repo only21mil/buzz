@@ -154,7 +154,10 @@ export function MembersSidebarMemberCard({
   const canModerateMember =
     canModerate && !memberIsBot && member.role !== "owner";
   const hasActions = memberIsBot
-    ? Boolean(managedAgent) || canRemoveMember || canViewActivity
+    ? Boolean(managedAgent) ||
+      canRemoveMember ||
+      canChangeRole ||
+      canViewActivity
     : canRemoveMember || canChangeRole || canModerateMember;
 
   const memberIdentity = (
@@ -328,8 +331,7 @@ function MemberActionsMenu({
   onViewActivity?: (pubkey: string) => void;
   pairAction?: ManagedAgentPairAction;
 }) {
-  const showChangeRole =
-    canChangeRole && !memberIsBot && member.role !== "owner";
+  const showChangeRole = canChangeRole && member.role !== "owner";
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
 
