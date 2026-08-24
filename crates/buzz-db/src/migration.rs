@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1044,6 +1044,21 @@ mod tests {
         assert!(
             desired_schema.contains("CREATE TRIGGER workflow_approval_outbox_identity_immutable")
         );
+
+        // CI signed events remain canonical in `events`; the additive index
+        // pins one immutable run identity and serializes per-run watch cursors.
+        assert_eq!(migrations[31].version, 32);
+        let ci_storage = migrations[31].sql.as_str();
+        assert!(ci_storage.contains("CREATE TABLE ci_runs"));
+        assert!(ci_storage.contains("CREATE TABLE ci_run_events"));
+        assert!(ci_storage.contains("PRIMARY KEY (community_id, run_id, watch_cursor)"));
+        assert!(ci_storage.contains("UNIQUE (community_id, event_id)"));
+        assert!(ci_storage.contains("idx_ci_run_events_run_sequence"));
+        assert!(ci_storage.contains("idx_ci_run_events_job_sequence"));
+        assert!(!ci_storage.contains("lease_generation"));
+        assert!(desired_schema.contains("CREATE TABLE ci_runs"));
+        assert!(desired_schema.contains("CREATE TABLE ci_run_events"));
+        assert!(desired_schema.contains("CREATE TRIGGER ci_run_identity_immutable"));
     }
 
     #[test]

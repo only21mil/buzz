@@ -204,6 +204,14 @@ pub struct Config {
     /// skipped — a typo must not silently disable an operator.
     pub relay_operator_pubkeys: Vec<String>,
 
+    /// Owner-configured CI control-plane pubkeys authorized to publish kinds
+    /// 46101–46106.
+    ///
+    /// Empty by default, which fails closed for status and evidence ingest.
+    /// Set via `BUZZ_CI_STATUS_SIGNER_PUBKEYS` as a comma-separated list of
+    /// 64-character lowercase hexadecimal pubkeys.
+    pub ci_status_signer_pubkeys: std::collections::HashSet<String>,
+
     /// Allow NIP-OA owner attestation for relay membership.
     ///
     /// When `true` and `require_relay_membership` is also `true`, agents
@@ -310,6 +318,35 @@ fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
             "{name} must be valid Unicode"
         ))),
     }
+}
+
+fn parse_pubkey_set_env(name: &str) -> Result<std::collections::HashSet<String>, ConfigError> {
+    let raw = match std::env::var(name) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(std::collections::HashSet::new()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "{name} must be valid Unicode"
+            )))
+        }
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let entry = entry.to_ascii_lowercase();
+            if entry.len() != 64
+                || !entry
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ConfigError::InvalidValue(format!(
+                    "{name} entry is not a valid 64-character hexadecimal pubkey: {entry:?}"
+                )));
+            }
+            Ok(entry)
+        })
+        .collect()
 }
 
 fn rate_limit_config_from_env() -> Result<buzz_auth::RateLimitConfig, ConfigError> {
@@ -688,6 +725,8 @@ impl Config {
             ));
         }
 
+        let ci_status_signer_pubkeys = parse_pubkey_set_env("BUZZ_CI_STATUS_SIGNER_PUBKEYS")?;
+
         let auth = buzz_auth::AuthConfig {
             rate_limits: rate_limit_config_from_env()?,
         };
@@ -1018,6 +1057,7 @@ impl Config {
             relay_owner_pubkey,
             relay_operator_api_origin,
             relay_operator_pubkeys,
+            ci_status_signer_pubkeys,
             allow_nip_oa_auth,
             media,
             media_max_concurrent_uploads,
@@ -1135,6 +1175,10 @@ mod tests {
         assert!(
             config.relay_operator_pubkeys.is_empty(),
             "relay_operator_pubkeys should default empty (provisioning disabled)"
+        );
+        assert!(
+            config.ci_status_signer_pubkeys.is_empty(),
+            "CI status signer authority should default empty"
         );
         assert!(
             !config.allow_nip_oa_auth,
@@ -1543,6 +1587,39 @@ mod tests {
         assert!(matches!(
             result,
             Err(ConfigError::InvalidValue(ref msg)) if msg.contains("RELAY_OPERATOR_PUBKEYS")
+        ));
+    }
+
+    #[test]
+    fn ci_status_signers_parse_dedupe_and_normalize() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var(
+            "BUZZ_CI_STATUS_SIGNER_PUBKEYS",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let config = Config::from_env().expect("config");
+        std::env::remove_var("BUZZ_CI_STATUS_SIGNER_PUBKEYS");
+
+        assert_eq!(config.ci_status_signer_pubkeys.len(), 2);
+        assert!(config
+            .ci_status_signer_pubkeys
+            .contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(config
+            .ci_status_signer_pubkeys
+            .contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn ci_status_signers_reject_invalid_entry() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_CI_STATUS_SIGNER_PUBKEYS", "not-a-pubkey");
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_CI_STATUS_SIGNER_PUBKEYS");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_CI_STATUS_SIGNER_PUBKEYS")
         ));
     }
 

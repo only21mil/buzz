@@ -14,7 +14,9 @@ use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
     KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
-    KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
+    KIND_CANVAS, KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
+    KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
+    KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
     KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER, KIND_FOLLOW_SET, KIND_FORUM_COMMENT,
     KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH,
     KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE,
@@ -51,6 +53,19 @@ use crate::conformance::{
 };
 
 const REPO_RECONCILED_MESSAGE: &str = "reconciled: repository provisioning ready";
+
+fn is_ci_event_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_CI_REQUEST
+            | KIND_CI_RUN_STATUS
+            | KIND_CI_JOB_STATUS
+            | KIND_CI_LOG_REFERENCE
+            | KIND_CI_ARTIFACT_REFERENCE
+            | KIND_CI_EVIDENCE_FINALIZED
+            | KIND_CI_TEARDOWN_ATTESTATION
+    )
+}
 
 fn validate_custom_emoji_tags(event: &Event) -> Result<(), IngestError> {
     for tag in event.tags.iter() {
@@ -475,8 +490,29 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
         KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
         KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
+        // CI requests and control-plane facts use the existing background-job
+        // capability. Repository membership and signer authority are enforced
+        // independently after the channel is resolved.
+        KIND_CI_REQUEST
+        | KIND_CI_RUN_STATUS
+        | KIND_CI_JOB_STATUS
+        | KIND_CI_LOG_REFERENCE
+        | KIND_CI_ARTIFACT_REFERENCE
+        | KIND_CI_EVIDENCE_FINALIZED
+        | KIND_CI_TEARDOWN_ATTESTATION => Ok(Scope::JobsWrite),
         _ => Err("restricted: unknown event kind"),
     }
+}
+
+fn enforce_kind_scope(kind: u32, event: &Event, scopes: &[Scope]) -> Result<(), IngestError> {
+    let required = required_scope_for_kind(kind, event)
+        .map_err(|message| IngestError::Rejected(message.into()))?;
+    if !scopes.contains(&required) {
+        return Err(IngestError::AuthFailed(format!(
+            "restricted: insufficient scope (need {required})"
+        )));
+    }
+    Ok(())
 }
 
 /// Extract a channel UUID from the `"h"` NIP-29 group tag.
@@ -2041,10 +2077,8 @@ async fn ingest_event_inner(
         ));
     }
 
-    let required = match required_scope_for_kind(kind_u32, &event) {
-        Ok(scope) => scope,
-        Err(msg) => return Err(IngestError::Rejected(msg.into())),
-    };
+    required_scope_for_kind(kind_u32, &event)
+        .map_err(|message| IngestError::Rejected(message.into()))?;
     // NIP-43: relay admin commands are global — channel-scoped tokens cannot
     // issue them even if the event has no `h` tag (is_global_only_kind strips
     // channel_id, but we still need to reject the token itself).
@@ -2061,12 +2095,7 @@ async fn ingest_event_inner(
             "restricted: leave requests require a global token".into(),
         ));
     }
-    if !auth.scopes().contains(&required) {
-        return Err(IngestError::AuthFailed(format!(
-            "restricted: insufficient scope (need {})",
-            required
-        )));
-    }
+    enforce_kind_scope(kind_u32, &event, auth.scopes())?;
 
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
@@ -2485,6 +2514,22 @@ async fn ingest_event_inner(
             }
         }
     }
+
+    let validated_ci_event = if is_ci_event_kind(kind_u32) {
+        let ch_id = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: CI events require a channel h tag".into())
+        })?;
+        Some(
+            buzz_core::ci::validate_signed_ci_event(
+                &event,
+                &ch_id.to_string(),
+                &state.config.ci_status_signer_pubkeys,
+            )
+            .map_err(|error| IngestError::Rejected(error.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     // NIP-09: kind:5 may reference targets via `e` tag (regular events) OR
     // `a` tag (addressable/parameterized-replaceable events like kind:30620).
@@ -2974,7 +3019,26 @@ async fn ingest_event_inner(
         });
     }
 
-    let (stored_event, was_inserted) = if buzz_core::kind::is_replaceable(kind_u32) {
+    let (stored_event, was_inserted) = if let Some(validated) = &validated_ci_event {
+        let ch_id = channel_id.expect("validated CI event has a channel");
+        match state
+            .db
+            .store_ci_event(tenant.community(), ch_id, &event, validated)
+            .await
+        {
+            Ok(buzz_db::ci::StoreCiEventOutcome::Stored(record)) => (record.stored_event, true),
+            Ok(buzz_db::ci::StoreCiEventOutcome::Reused(record)) => (record.stored_event, false),
+            Err(buzz_db::DbError::InvalidData(message))
+            | Err(buzz_db::DbError::NotFound(message)) => {
+                return Err(IngestError::Rejected(format!("invalid: {message}")));
+            }
+            Err(error) => {
+                return Err(IngestError::Internal(format!(
+                    "error: database error: {error}"
+                )));
+            }
+        }
+    } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
         state
@@ -3556,6 +3620,34 @@ mod tests {
             required_scope_for_kind(KIND_LONG_FORM, &dummy).unwrap(),
             Scope::MessagesWrite,
         );
+    }
+
+    #[test]
+    fn ci_kinds_require_jobs_write_and_reject_message_scope() {
+        let event = make_dummy_event();
+        for kind in [
+            KIND_CI_REQUEST,
+            KIND_CI_RUN_STATUS,
+            KIND_CI_JOB_STATUS,
+            KIND_CI_LOG_REFERENCE,
+            KIND_CI_ARTIFACT_REFERENCE,
+            KIND_CI_EVIDENCE_FINALIZED,
+            KIND_CI_TEARDOWN_ATTESTATION,
+        ] {
+            assert_eq!(
+                required_scope_for_kind(kind, &event).expect("known CI kind"),
+                Scope::JobsWrite
+            );
+            assert!(
+                enforce_kind_scope(kind, &event, &[Scope::JobsWrite]).is_ok(),
+                "kind {kind} should accept jobs:write"
+            );
+            assert!(matches!(
+                enforce_kind_scope(kind, &event, &[Scope::MessagesWrite]),
+                Err(IngestError::AuthFailed(message))
+                    if message == "restricted: insufficient scope (need jobs:write)"
+            ));
+        }
     }
 
     #[test]
