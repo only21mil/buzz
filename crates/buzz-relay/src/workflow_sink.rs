@@ -707,5 +707,29 @@ mod integration_tests {
             p_tag_targets.contains(&agent_hex.as_str()),
             "mentioned member {agent_hex} must be p-tagged so it wakes; got {p_tag_targets:?}"
         );
+
+        // Issue 681b9ba6 regression: a kind:9 event carrying the mentioned
+        // agent's `p` tag must ALSO materialize a users row for the relay-signed
+        // workflow-sink identity. That row is what the ACP inbound author gate
+        // (`is_owner_or_sibling`, crates/buzz-acp/src/lib.rs:152) reads to
+        // attribute the event to its human owner via NIP-OA — without it, the
+        // owner lookup fails closed and the mention never wakes the seat.
+        let relay_pk = state.relay_keypair.public_key();
+        let relay_bytes = relay_pk.to_bytes().to_vec();
+        let user = state
+            .db
+            .get_user(community, &relay_bytes)
+            .await
+            .expect("db query")
+            .expect("relay sink identity must have a users row after sending a kind:9 that mentions a member");
+        let owned_by_author = state
+            .db
+            .is_agent_owner(community, &relay_bytes, &author.public_key().to_bytes())
+            .await
+            .expect("db ownership check");
+        assert!(
+            owned_by_author,
+            "relay sink identity must be wired to the workflow owner so the mention wakes that owner's agent; user row: {user:?}"
+        );
     }
 }
