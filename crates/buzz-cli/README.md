@@ -96,8 +96,8 @@ buzz repos stage-ci --id my-repo --source-ref refs/heads/pr/9 --commit <H> --exp
 buzz repos promote --id my-repo --base <B> --head <H> --source-ref refs/heads/pr/9 --ci-ref refs/heads/buzz-ci/<H> --required-check test
 
 # Compute lifecycle state without changing Buzz or GitHub
-buzz repos reconcile --id my-repo
-buzz repos reconcile --id my-repo --pr <exact-64-hex-Buzz-PR-id> --limit 1
+buzz repos reconcile --id my-repo --dry-run
+buzz repos reconcile --id my-repo --pr <exact-64-hex-Buzz-PR-id> --limit 1 --dry-run
 
 # Bootstrap only; never use this as the ongoing synchronization direction
 buzz repos import-main --id my-repo --commit <exact-40-hex-GitHub-main>
@@ -122,9 +122,11 @@ requests, trusted status events, exact commits, GitHub CI, and both `main` refs.
 The current signer must own the repository announcement. `--pr` narrows the
 report to one exact Buzz pull request ID. `--limit` applies only after the
 command correlates work items, so newer unrelated events cannot hide an older
-match. Version 1 never writes to Buzz or GitHub. Missing links, conflicting
-records, failed CI, or ref drift produce a blocker in the JSON report and a
-nonzero exit instead of guessing or repairing state.
+match. The reducer keys every external change by repository coordinate and
+exact final SHA. `--dry-run` prints actions with `action`, `repo`, `sha`,
+`root_event`, and `evidence`; version 1 never writes to Buzz or GitHub. Missing
+roots and duplicate heads become explicit actions. Malformed evidence,
+incomplete pagination, or ref drift returns a nonzero error instead of guessing.
 
 `repos stage-ci` verifies a Buzz source ref at exact `H`, fetches it from Buzz,
 pushes that object to deterministic `refs/heads/buzz-ci/H` under an explicit

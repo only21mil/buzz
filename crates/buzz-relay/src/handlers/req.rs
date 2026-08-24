@@ -1810,10 +1810,8 @@ mod tests {
     fn a_tag_pushdown_preserves_single_and_multi_value_filters() {
         let a_tag = SingleLetterTag::lowercase(Alphabet::A);
         let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
-        let first =
-            "30617:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:one";
-        let second =
-            "30617:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:two";
+        let first = "30617:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:one";
+        let second = "30617:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:two";
 
         let single = Filter::new()
             .kind(nostr::Kind::Custom(1_621))

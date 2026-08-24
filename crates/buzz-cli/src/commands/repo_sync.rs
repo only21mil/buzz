@@ -4,6 +4,7 @@
 //! caller-owned kind:30617 announcement is the only source of remote URLs,
 //! Buzz is the source for every ongoing write; `import-main` is bootstrap-only.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::process::{Command, Output};
 
@@ -134,7 +135,8 @@ struct PromoteRequest<'a> {
 /// The CI ref is derived from `head`; callers cannot point the proof at an
 /// unrelated hosted ref. An empty `required_checks` list skips the GitHub
 /// Checks API while retaining exact Git ref and ancestry readbacks.
-pub(super) struct LifecycleSnapshotRequest<'a> {
+#[cfg(test)]
+struct LifecycleSnapshotRequest<'a> {
     pub(super) base: &'a str,
     pub(super) head: &'a str,
     pub(super) source_ref: &'a str,
@@ -142,8 +144,9 @@ pub(super) struct LifecycleSnapshotRequest<'a> {
 }
 
 /// Stable, read-only evidence for the Git portion of a repository lifecycle.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(super) struct LifecycleSnapshot {
+struct LifecycleSnapshot {
     pub(super) repo_id: String,
     pub(super) buzz_url: String,
     pub(super) github_url: String,
@@ -163,6 +166,7 @@ pub(super) struct LifecycleSnapshot {
     pub(super) required_checks: Vec<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LifecycleRefSnapshot {
     buzz: RemoteState,
@@ -190,10 +194,421 @@ struct CheckApp {
     id: u64,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GitHubPull {
+    number: u64,
+    merged_at: Option<String>,
+    merge_commit_sha: Option<String>,
+    head: GitHubPullHead,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GitHubPullHead {
+    #[serde(rename = "ref")]
+    branch: String,
+    sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ExternalChange {
+    sha: String,
+    head_sha: Option<String>,
+    branch: Option<String>,
+    external_ids: BTreeSet<String>,
+    sources: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct RecordRoot {
+    event_id: String,
+    kind: u16,
+    created_at: u64,
+    head_sha: Option<String>,
+    branch: Option<String>,
+    external_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct StatusRecord {
+    event_id: String,
+    kind: u16,
+    author: String,
+    delegated_owner: Option<String>,
+    root_event: String,
+    merge_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(super) struct ReconcileAction {
+    action: &'static str,
+    repo: String,
+    sha: String,
+    root_event: Option<String>,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ReducerInput {
+    repo: String,
+    trusted_status_authors: BTreeSet<String>,
+    scope_root: Option<String>,
+    changes: Vec<ExternalChange>,
+    roots: Vec<RecordRoot>,
+    statuses: Vec<StatusRecord>,
+}
+
+struct ReconcileHeads {
+    coordinate: String,
+    buzz_main: String,
+    github_main: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromoteStart {
     Initial,
     ResumeAfterBuzzAdvance,
+}
+
+fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+    event.tags.iter().find_map(|tag| {
+        let values = tag.as_slice();
+        (values.first().map(String::as_str) == Some(name))
+            .then(|| values.get(1).map(String::as_str))
+            .flatten()
+    })
+}
+
+fn tag_values_set(event: &Event, name: &str) -> BTreeSet<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let values = tag.as_slice();
+            (values.first().map(String::as_str) == Some(name))
+                .then(|| values.get(1).cloned())
+                .flatten()
+        })
+        .collect()
+}
+
+fn root_marker(event: &Event) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        let values = tag.as_slice();
+        (values.first().map(String::as_str) == Some("e")
+            && values.get(3).map(String::as_str) == Some("root"))
+        .then(|| values.get(1).cloned())
+        .flatten()
+    })
+}
+
+fn conditions_authorize(event: &Event, conditions: &str) -> bool {
+    conditions.split('&').all(|clause| {
+        if clause.is_empty() {
+            true
+        } else if let Some(kind) = clause.strip_prefix("kind=") {
+            kind.parse::<u16>().ok() == Some(event.kind.as_u16())
+        } else if let Some(until) = clause.strip_prefix("created_at<") {
+            until
+                .parse::<u64>()
+                .is_ok_and(|until| event.created_at.as_secs() < until)
+        } else if let Some(since) = clause.strip_prefix("created_at>") {
+            since
+                .parse::<u64>()
+                .is_ok_and(|since| event.created_at.as_secs() > since)
+        } else {
+            false
+        }
+    })
+}
+
+fn verified_delegated_owner(event: &Event) -> Option<String> {
+    let mut auth_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("auth"));
+    let auth = auth_tags.next()?;
+    if auth_tags.next().is_some() {
+        return None;
+    }
+    let values = auth.as_slice();
+    let conditions = values.get(2)?;
+    let json = serde_json::to_string(values).ok()?;
+    let owner = buzz_sdk::nip_oa::verify_auth_tag(&json, &event.pubkey).ok()?;
+    conditions_authorize(event, conditions).then(|| owner.to_hex())
+}
+
+fn reducer_key(repo: &str, sha: &str) -> String {
+    format!("repo-sync-v1:{repo}:{sha}")
+}
+
+fn record_root(event: Event) -> Result<RecordRoot, CliError> {
+    let kind = event.kind.as_u16();
+    if !matches!(kind, 1_618 | 1_621) {
+        return Err(CliError::Other(format!(
+            "reconciler root query returned unexpected kind {kind}"
+        )));
+    }
+    let head_sha = tag_value(&event, "c")
+        .map(|value| exact_oid(value, "record c tag"))
+        .transpose()?;
+    Ok(RecordRoot {
+        event_id: event.id.to_hex(),
+        kind,
+        created_at: event.created_at.as_secs(),
+        head_sha,
+        branch: tag_value(&event, "branch-name").map(str::to_owned),
+        external_ids: tag_values_set(&event, "i"),
+    })
+}
+
+fn status_record(event: Event) -> Result<StatusRecord, CliError> {
+    let kind = event.kind.as_u16();
+    if !matches!(kind, 1_630..=1_633) {
+        return Err(CliError::Other(format!(
+            "reconciler status query returned unexpected kind {kind}"
+        )));
+    }
+    let root_event = root_marker(&event).ok_or_else(|| {
+        CliError::Other(format!(
+            "status event {} is missing its root marker",
+            event.id
+        ))
+    })?;
+    let merge_sha = tag_value(&event, "merge-commit")
+        .map(|value| exact_oid(value, "status merge-commit tag"))
+        .transpose()?;
+    Ok(StatusRecord {
+        event_id: event.id.to_hex(),
+        kind,
+        author: event.pubkey.to_hex(),
+        delegated_owner: verified_delegated_owner(&event),
+        root_event,
+        merge_sha,
+    })
+}
+
+fn trusted_status(input: &ReducerInput, status: &StatusRecord) -> bool {
+    input.trusted_status_authors.contains(&status.author)
+        || status
+            .delegated_owner
+            .as_ref()
+            .is_some_and(|owner| input.trusted_status_authors.contains(owner))
+}
+
+fn root_order(root: &RecordRoot) -> (u64, &str) {
+    (root.created_at, root.event_id.as_str())
+}
+
+fn survivor<'a>(roots: impl IntoIterator<Item = &'a RecordRoot>) -> Option<&'a RecordRoot> {
+    roots.into_iter().min_by_key(|root| root_order(root))
+}
+
+fn roots_for_change<'a>(input: &'a ReducerInput, change: &ExternalChange) -> Vec<&'a RecordRoot> {
+    let exact_status_roots: BTreeSet<&str> = input
+        .statuses
+        .iter()
+        .filter(|status| {
+            status.kind == 1_631
+                && status.merge_sha.as_deref() == Some(change.sha.as_str())
+                && trusted_status(input, status)
+        })
+        .map(|status| status.root_event.as_str())
+        .collect();
+    let exact: Vec<_> = input
+        .roots
+        .iter()
+        .filter(|root| exact_status_roots.contains(root.event_id.as_str()))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    let key = reducer_key(&input.repo, &change.sha);
+    let keyed: Vec<_> = input
+        .roots
+        .iter()
+        .filter(|root| root.external_ids.contains(&key))
+        .collect();
+    if !keyed.is_empty() {
+        return keyed;
+    }
+
+    let by_external_id: Vec<_> = input
+        .roots
+        .iter()
+        .filter(|root| !root.external_ids.is_disjoint(&change.external_ids))
+        .collect();
+    if !by_external_id.is_empty() {
+        return by_external_id;
+    }
+
+    if let Some(head_sha) = change.head_sha.as_deref() {
+        let by_head: Vec<_> = input
+            .roots
+            .iter()
+            .filter(|root| root.head_sha.as_deref() == Some(head_sha))
+            .collect();
+        if !by_head.is_empty() {
+            return by_head;
+        }
+    }
+
+    Vec::new()
+}
+
+fn has_trusted_final_status(input: &ReducerInput, root: &RecordRoot, sha: &str) -> bool {
+    input.statuses.iter().any(|status| {
+        status.kind == 1_631
+            && status.root_event == root.event_id
+            && status.merge_sha.as_deref() == Some(sha)
+            && trusted_status(input, status)
+    })
+}
+
+fn dedupe_action(repo: &str, sha: &str, roots: &[&RecordRoot]) -> Option<ReconcileAction> {
+    if roots.len() < 2 {
+        return None;
+    }
+    let survivor = survivor(roots.iter().copied())?;
+    let duplicates: Vec<&str> = roots
+        .iter()
+        .filter(|root| root.event_id != survivor.event_id)
+        .map(|root| root.event_id.as_str())
+        .collect();
+    Some(ReconcileAction {
+        action: "dedupe",
+        repo: repo.to_owned(),
+        sha: sha.to_owned(),
+        root_event: Some(survivor.event_id.clone()),
+        evidence: serde_json::json!({
+            "survivor": survivor.event_id,
+            "duplicates": duplicates,
+        }),
+    })
+}
+
+fn reduce_reconciliation(mut input: ReducerInput) -> Vec<ReconcileAction> {
+    let mut unique_changes = BTreeMap::new();
+    for change in std::mem::take(&mut input.changes) {
+        merge_external_change(&mut unique_changes, change);
+    }
+    input.changes = unique_changes.into_values().collect();
+
+    let mut actions = Vec::new();
+    let mut emitted_dedupe = BTreeSet::new();
+    let mut claimed_roots = BTreeSet::new();
+    let mut roots_by_head: BTreeMap<&str, Vec<&RecordRoot>> = BTreeMap::new();
+    for root in &input.roots {
+        if let Some(head) = root.head_sha.as_deref() {
+            roots_by_head.entry(head).or_default().push(root);
+        }
+    }
+    for (head, roots) in roots_by_head {
+        if input
+            .scope_root
+            .as_ref()
+            .is_some_and(|scope| !roots.iter().any(|root| root.event_id == *scope))
+        {
+            continue;
+        }
+        if let Some(action) = dedupe_action(&input.repo, head, &roots) {
+            emitted_dedupe.insert(
+                action
+                    .root_event
+                    .clone()
+                    .expect("dedupe action always has a survivor"),
+            );
+            actions.push(action);
+        }
+    }
+
+    for change in &input.changes {
+        let roots = roots_for_change(&input, change);
+        if input
+            .scope_root
+            .as_ref()
+            .is_some_and(|scope| !roots.iter().any(|root| root.event_id == *scope))
+        {
+            continue;
+        }
+        if let Some(action) = dedupe_action(&input.repo, &change.sha, &roots) {
+            let survivor = action
+                .root_event
+                .clone()
+                .expect("dedupe action always has a survivor");
+            if emitted_dedupe.insert(survivor) {
+                actions.push(action);
+            }
+        }
+        let root = survivor(
+            roots
+                .iter()
+                .copied()
+                .filter(|root| !claimed_roots.contains(&root.event_id)),
+        );
+        let Some(root) = root else {
+            actions.push(ReconcileAction {
+                action: "create",
+                repo: input.repo.clone(),
+                sha: change.sha.clone(),
+                root_event: None,
+                evidence: serde_json::json!({
+                    "key": reducer_key(&input.repo, &change.sha),
+                    "head_sha": change.head_sha,
+                    "branch": change.branch,
+                    "sources": change.sources,
+                }),
+            });
+            continue;
+        };
+        claimed_roots.insert(root.event_id.clone());
+        if !has_trusted_final_status(&input, root, &change.sha) {
+            let observed_status_events: Vec<_> = input
+                .statuses
+                .iter()
+                .filter(|status| status.root_event == root.event_id)
+                .map(|status| {
+                    serde_json::json!({
+                        "event_id": status.event_id,
+                        "kind": status.kind,
+                        "merge_sha": status.merge_sha,
+                        "trusted": trusted_status(&input, status),
+                    })
+                })
+                .collect();
+            actions.push(ReconcileAction {
+                action: "status",
+                repo: input.repo.clone(),
+                sha: change.sha.clone(),
+                root_event: Some(root.event_id.clone()),
+                evidence: serde_json::json!({
+                    "required_kind": 1631,
+                    "required_merge_commit": change.sha,
+                    "trusted_authors": input.trusted_status_authors,
+                    "matched_root_kind": root.kind,
+                    "matched_head_sha": root.head_sha,
+                    "matched_branch": root.branch,
+                    "observed_status_events": observed_status_events,
+                }),
+            });
+        }
+    }
+    actions.sort_by(|left, right| {
+        (&left.sha, left.action, &left.root_event).cmp(&(
+            &right.sha,
+            right.action,
+            &right.root_event,
+        ))
+    });
+    actions
+}
+
+fn plan_reconciliation(input: ReducerInput, limit: Option<u32>) -> Vec<ReconcileAction> {
+    let mut actions = reduce_reconciliation(input);
+    if let Some(limit) = limit {
+        actions.truncate(limit as usize);
+    }
+    actions
 }
 
 fn exact_oid(value: &str, flag: &str) -> Result<String, CliError> {
@@ -636,6 +1051,26 @@ impl GitRepo {
         }
     }
 
+    fn first_parent_commits(&self, reference: &str) -> Result<Vec<String>, CliError> {
+        let output = self.output(
+            RemoteAuth::None,
+            "list first-parent commits",
+            ["rev-list", "--first-parent", reference],
+        )?;
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CliError::Other("git returned invalid commit history".into()))?;
+        let commits: Vec<String> = stdout
+            .lines()
+            .map(|value| exact_oid(value, "first-parent commit"))
+            .collect::<Result<_, _>>()?;
+        if commits.len() > 100_000 {
+            return Err(CliError::Other(
+                "repository main exceeds the 100,000-commit reconciliation ceiling".into(),
+            ));
+        }
+        Ok(commits)
+    }
+
     fn push_ref(
         &self,
         url: &str,
@@ -734,6 +1169,7 @@ fn require_consistent_head(state: &RemoteState) -> Result<String, CliError> {
     Ok(main.to_owned())
 }
 
+#[cfg(test)]
 fn read_lifecycle_refs(
     repo: &GitRepo,
     remotes: &RepoRemotes,
@@ -758,6 +1194,7 @@ fn read_lifecycle_refs(
     })
 }
 
+#[cfg(test)]
 fn require_unchanged_lifecycle_refs(
     before: &LifecycleRefSnapshot,
     after: &LifecycleRefSnapshot,
@@ -770,6 +1207,7 @@ fn require_unchanged_lifecycle_refs(
     Ok(())
 }
 
+#[cfg(test)]
 fn buzz_ref_for_head<'a>(
     refs: &LifecycleRefSnapshot,
     source_ref: &'a str,
@@ -791,7 +1229,9 @@ fn buzz_ref_for_head<'a>(
 /// The only Git mutation is a fetch into a private temporary bare repository.
 /// Hosted refs are read once before GitHub checks and once afterward; any
 /// movement fails the snapshot rather than returning mixed-time evidence.
-pub(super) async fn read_lifecycle_snapshot(
+#[cfg(test)]
+#[allow(dead_code)]
+async fn read_lifecycle_snapshot(
     client: &BuzzClient,
     announcement: &Event,
     request: LifecycleSnapshotRequest<'_>,
@@ -1081,6 +1521,212 @@ async fn github_check_runs(
     ))
 }
 
+async fn github_merged_pulls(
+    github: &GitHubRepo,
+    auth: &GitHubAuth,
+) -> Result<Vec<GitHubPull>, CliError> {
+    let client = reqwest::Client::new();
+    let mut merged = Vec::new();
+    for page in 1..=100_u16 {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
+            github.owner, github.repo
+        );
+        let response = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header(reqwest::header::USER_AGENT, "buzz-cli-repo-sync")
+            .bearer_auth(&auth.token)
+            .send()
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(CliError::Auth(format!(
+                "GitHub pull request query was rejected (HTTP {})",
+                status.as_u16()
+            )));
+        }
+        if !status.is_success() {
+            return Err(CliError::Other(format!(
+                "GitHub pull request query failed (HTTP {})",
+                status.as_u16()
+            )));
+        }
+        let pulls: Vec<GitHubPull> = response.json().await?;
+        let count = pulls.len();
+        merged.extend(pulls.into_iter().filter(|pull| pull.merged_at.is_some()));
+        if count < 100 {
+            return Ok(merged);
+        }
+    }
+    Err(CliError::Other(
+        "GitHub returned at least 10,000 closed pull requests; reconciliation completeness is unproven"
+            .into(),
+    ))
+}
+
+fn merge_external_change(
+    changes: &mut BTreeMap<String, ExternalChange>,
+    mut incoming: ExternalChange,
+) {
+    match changes.get_mut(&incoming.sha) {
+        Some(existing) => {
+            existing.external_ids.append(&mut incoming.external_ids);
+            existing.sources.append(&mut incoming.sources);
+            if existing.head_sha.is_none() {
+                existing.head_sha = incoming.head_sha;
+            }
+            if existing.branch.is_none() {
+                existing.branch = incoming.branch;
+            }
+        }
+        None => {
+            changes.insert(incoming.sha.clone(), incoming);
+        }
+    }
+}
+
+async fn collect_external_changes(
+    client: &BuzzClient,
+    announcement: &Event,
+) -> Result<(ReconcileHeads, Vec<ExternalChange>), CliError> {
+    let remotes = derive_remotes(client, announcement)?;
+    let github_auth = github_auth_from_env()?;
+    let repo = GitRepo::new(auth_from_client(client), github_auth.clone())?;
+    let buzz = repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?;
+    let buzz_main = require_consistent_head(&buzz)?;
+    let github_main = repo
+        .github_main(&remotes.github.clone_url)?
+        .ok_or_else(|| CliError::NotFound("GitHub canonical main is absent".into()))?;
+    repo.fetch_ref(
+        &remotes.buzz_url,
+        RemoteAuth::Buzz,
+        "Buzz main",
+        MAIN_REF,
+        BUZZ_TRACKING_REF,
+        &buzz_main,
+    )?;
+
+    let mut changes = BTreeMap::new();
+    for sha in repo.first_parent_commits(BUZZ_TRACKING_REF)? {
+        merge_external_change(
+            &mut changes,
+            ExternalChange {
+                sha: sha.clone(),
+                head_sha: Some(sha),
+                branch: None,
+                external_ids: BTreeSet::new(),
+                sources: BTreeSet::from(["relay-main".to_string()]),
+            },
+        );
+    }
+
+    for pull in github_merged_pulls(&remotes.github, &github_auth).await? {
+        let merge_sha = pull.merge_commit_sha.as_deref().ok_or_else(|| {
+            CliError::Other(format!(
+                "merged GitHub pull request {} has no merge commit SHA",
+                pull.number
+            ))
+        })?;
+        let sha = exact_oid(merge_sha, "GitHub merge commit")?;
+        let head_sha = exact_oid(&pull.head.sha, "GitHub pull request head")?;
+        let external_ids = BTreeSet::from([
+            format!(
+                "github:{}/{}#{}",
+                remotes.github.owner, remotes.github.repo, pull.number
+            ),
+            format!(
+                "https://github.com/{}/{}/pull/{}",
+                remotes.github.owner, remotes.github.repo, pull.number
+            ),
+        ]);
+        merge_external_change(
+            &mut changes,
+            ExternalChange {
+                sha,
+                head_sha: Some(head_sha),
+                branch: Some(pull.head.branch),
+                external_ids,
+                sources: BTreeSet::from([format!("github-pr:{}", pull.number)]),
+            },
+        );
+    }
+    let buzz_after = repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?;
+    let github_after = repo.github_main(&remotes.github.clone_url)?;
+    if require_consistent_head(&buzz_after)? != buzz_main
+        || github_after.as_deref() != Some(github_main.as_str())
+    {
+        return Err(CliError::Conflict(
+            "Buzz or GitHub main moved during reconciliation; rerun the dry-run".into(),
+        ));
+    }
+    let coordinate = format!("30617:{}:{}", announcement.pubkey.to_hex(), remotes.repo_id);
+    Ok((
+        ReconcileHeads {
+            coordinate,
+            buzz_main,
+            github_main,
+        },
+        changes.into_values().collect(),
+    ))
+}
+
+fn verify_reconcile_heads(
+    client: &BuzzClient,
+    announcement: &Event,
+    expected: &ReconcileHeads,
+) -> Result<(), CliError> {
+    let remotes = derive_remotes(client, announcement)?;
+    let repo = GitRepo::new(auth_from_client(client), github_auth_from_env()?)?;
+    let buzz = repo.ls_remote(&remotes.buzz_url, RemoteAuth::Buzz, "Buzz")?;
+    let github = repo.github_main(&remotes.github.clone_url)?;
+    if require_consistent_head(&buzz)? != expected.buzz_main
+        || github.as_deref() != Some(expected.github_main.as_str())
+    {
+        return Err(CliError::Conflict(
+            "Buzz or GitHub main moved during reconciliation; rerun the dry-run".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn query_reconcile_events(
+    client: &BuzzClient,
+    coordinate: &str,
+) -> Result<(Vec<RecordRoot>, Vec<StatusRecord>), CliError> {
+    let root_values = client
+        .query_all(reconcile_filter(coordinate, &[1_618, 1_621]))
+        .await?;
+    let status_values = client
+        .query_all(reconcile_filter(coordinate, &[1_630, 1_631, 1_632, 1_633]))
+        .await?;
+    let roots = root_values
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| CliError::Other(format!("invalid root event JSON: {error}")))
+                .and_then(record_root)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let statuses = status_values
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| CliError::Other(format!("invalid status event JSON: {error}")))
+                .and_then(status_record)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((roots, statuses))
+}
+
+fn reconcile_filter(coordinate: &str, kinds: &[u16]) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": kinds,
+        "#a": [coordinate],
+    })
+}
+
 fn classify_promote_start(
     buzz_main: Option<&str>,
     github_main: Option<&str>,
@@ -1298,6 +1944,46 @@ async fn execute_promote(
     })
 }
 
+pub async fn cmd_reconcile(
+    client: &BuzzClient,
+    announcement: &Event,
+    pr: Option<&str>,
+    limit: Option<u32>,
+    _dry_run: bool,
+) -> Result<(), CliError> {
+    if let Some(pr) = pr {
+        crate::validate::validate_hex64(pr)?;
+    }
+    let (heads, changes) = collect_external_changes(client, announcement).await?;
+    let (roots, statuses) = query_reconcile_events(client, &heads.coordinate).await?;
+    verify_reconcile_heads(client, announcement, &heads)?;
+    if let Some(pr) = pr {
+        if !roots.iter().any(|root| root.event_id == pr) {
+            return Err(CliError::NotFound(format!(
+                "pull request root {pr} was not found at {}",
+                heads.coordinate
+            )));
+        }
+    }
+    let actions = plan_reconciliation(
+        ReducerInput {
+            repo: heads.coordinate,
+            trusted_status_authors: BTreeSet::from([announcement.pubkey.to_hex()]),
+            scope_root: pr.map(str::to_owned),
+            changes,
+            roots,
+            statuses,
+        },
+        limit,
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&actions)
+            .map_err(|error| CliError::Other(format!("failed to serialize actions: {error}")))?
+    );
+    Ok(())
+}
+
 pub async fn cmd_status(client: &BuzzClient, announcement: &Event) -> Result<(), CliError> {
     let remotes = derive_remotes(client, announcement)?;
     let repo = GitRepo::new(auth_from_client(client), github_auth_from_env()?)?;
@@ -1424,6 +2110,236 @@ mod tests {
     use super::*;
     use nostr::{Keys, Tag};
     use std::path::Path;
+
+    fn reducer_fixture(value: serde_json::Value) -> ReducerInput {
+        serde_json::from_value(value).expect("valid reducer fixture")
+    }
+
+    fn base_fixture(changes: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "repo": "30617:owner:repo",
+            "trusted_status_authors": ["owner"],
+            "scope_root": null,
+            "changes": changes,
+            "roots": [],
+            "statuses": [],
+        })
+    }
+
+    #[test]
+    fn reducer_retry_uses_one_sha_keyed_root() {
+        let merge = "a".repeat(40);
+        let head = "b".repeat(40);
+        let change = serde_json::json!([{
+            "sha": merge,
+            "head_sha": head,
+            "branch": "sats/fix",
+            "external_ids": [],
+            "sources": ["github-pr:105"],
+        }]);
+        let first = plan_reconciliation(reducer_fixture(base_fixture(change.clone())), None);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].action, "create");
+        assert_eq!(first[0].root_event, None);
+
+        let key = reducer_key("30617:owner:repo", &merge);
+        let mut retry = base_fixture(change);
+        retry["roots"] = serde_json::json!([{
+            "event_id": "root-one",
+            "kind": 1618,
+            "created_at": 1,
+            "head_sha": head,
+            "branch": "sats/fix",
+            "external_ids": [key],
+        }]);
+        let pending_status = plan_reconciliation(reducer_fixture(retry.clone()), None);
+        assert_eq!(pending_status.len(), 1);
+        assert_eq!(pending_status[0].action, "status");
+        assert_eq!(pending_status[0].root_event.as_deref(), Some("root-one"));
+
+        retry["statuses"] = serde_json::json!([{
+            "event_id": "status-one",
+            "kind": 1631,
+            "author": "owner",
+            "delegated_owner": null,
+            "root_event": "root-one",
+            "merge_sha": merge,
+        }]);
+        let converged = reducer_fixture(retry);
+        assert!(plan_reconciliation(converged.clone(), None).is_empty());
+        assert!(plan_reconciliation(converged, None).is_empty());
+    }
+
+    #[test]
+    fn one_root_is_never_assigned_to_two_final_shas() {
+        let head = "5".repeat(40);
+        let mut fixture = base_fixture(serde_json::json!([
+            {
+                "sha": "6".repeat(40),
+                "head_sha": head,
+                "branch": "same",
+                "external_ids": [],
+                "sources": ["github-pr:1"],
+            },
+            {
+                "sha": "7".repeat(40),
+                "head_sha": head,
+                "branch": "same",
+                "external_ids": [],
+                "sources": ["github-pr:2"],
+            }
+        ]));
+        fixture["roots"] = serde_json::json!([{
+            "event_id": "only-root",
+            "kind": 1618,
+            "created_at": 1,
+            "head_sha": head,
+            "branch": "same",
+            "external_ids": [],
+        }]);
+        let actions = plan_reconciliation(reducer_fixture(fixture), None);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.action == "status")
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.action == "create")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn exact_sha_status_wins_over_branch_drift() {
+        let merge = "c".repeat(40);
+        let mut fixture = base_fixture(serde_json::json!([{
+            "sha": merge,
+            "head_sha": "d".repeat(40),
+            "branch": "sats/cache-v4",
+            "external_ids": [],
+            "sources": ["github-pr:105"],
+        }]));
+        fixture["roots"] = serde_json::json!([
+            {
+                "event_id": "stale-pr-105",
+                "kind": 1618,
+                "created_at": 1,
+                "head_sha": "e".repeat(40),
+                "branch": "sats/cache",
+                "external_ids": [],
+            },
+            {
+                "event_id": "branch-only-record",
+                "kind": 1618,
+                "created_at": 2,
+                "head_sha": "f".repeat(40),
+                "branch": "sats/cache-v4",
+                "external_ids": [],
+            }
+        ]);
+        fixture["statuses"] = serde_json::json!([{
+            "event_id": "trusted-final",
+            "kind": 1631,
+            "author": "owner",
+            "delegated_owner": null,
+            "root_event": "stale-pr-105",
+            "merge_sha": merge,
+        }]);
+        assert!(plan_reconciliation(reducer_fixture(fixture), None).is_empty());
+    }
+
+    #[test]
+    fn duplicate_heads_emit_one_deterministic_dedupe_action() {
+        let head = "1".repeat(40);
+        let mut fixture = base_fixture(serde_json::json!([]));
+        fixture["roots"] = serde_json::json!([
+            {
+                "event_id": "newer",
+                "kind": 1618,
+                "created_at": 20,
+                "head_sha": head,
+                "branch": "same",
+                "external_ids": [],
+            },
+            {
+                "event_id": "survivor",
+                "kind": 1618,
+                "created_at": 10,
+                "head_sha": head,
+                "branch": "same",
+                "external_ids": [],
+            }
+        ]);
+        let actions = plan_reconciliation(reducer_fixture(fixture), None);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "dedupe");
+        assert_eq!(actions[0].root_event.as_deref(), Some("survivor"));
+        assert_eq!(
+            actions[0].evidence["duplicates"],
+            serde_json::json!(["newer"])
+        );
+    }
+
+    #[test]
+    fn reconcile_filters_page_before_output_limit() {
+        let filter = reconcile_filter("30617:owner:repo", &[1_618, 1_621]);
+        assert_eq!(filter["#a"], serde_json::json!(["30617:owner:repo"]));
+        assert!(filter.get("limit").is_none());
+
+        let changes = serde_json::json!([
+            {
+                "sha": "2".repeat(40),
+                "head_sha": null,
+                "branch": null,
+                "external_ids": [],
+                "sources": ["relay-main"],
+            },
+            {
+                "sha": "3".repeat(40),
+                "head_sha": null,
+                "branch": null,
+                "external_ids": [],
+                "sources": ["relay-main"],
+            }
+        ]);
+        let actions = plan_reconciliation(reducer_fixture(base_fixture(changes)), Some(1));
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "create");
+    }
+
+    #[test]
+    fn dry_run_plan_is_pure_and_has_the_action_contract() {
+        let changes = serde_json::json!([{
+            "sha": "4".repeat(40),
+            "head_sha": null,
+            "branch": null,
+            "external_ids": [],
+            "sources": ["relay-main"],
+        }]);
+        let fixture = reducer_fixture(base_fixture(changes));
+        let before = serde_json::to_value(&fixture.changes).expect("serialize fixture");
+        let actions = plan_reconciliation(fixture.clone(), None);
+        let after = serde_json::to_value(&fixture.changes).expect("serialize fixture");
+        assert_eq!(before, after);
+        let output = serde_json::to_value(&actions).expect("serialize dry-run actions");
+        let action = output[0].as_object().expect("action object");
+        assert_eq!(
+            action.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "action".to_string(),
+                "evidence".to_string(),
+                "repo".to_string(),
+                "root_event".to_string(),
+                "sha".to_string(),
+            ])
+        );
+    }
 
     fn git<I, S>(cwd: &Path, args: I) -> String
     where
@@ -1636,13 +2552,9 @@ mod tests {
 
         let repo = GitRepo::new(Fixture::auth(), Fixture::github_auth())
             .expect("create read-only repository");
-        let refs = read_lifecycle_refs(
-            &repo,
-            &fixture.remotes(),
-            source_ref,
-            &staged.github_ci_ref,
-        )
-        .expect("read exact lifecycle refs");
+        let refs =
+            read_lifecycle_refs(&repo, &fixture.remotes(), source_ref, &staged.github_ci_ref)
+                .expect("read exact lifecycle refs");
         assert_eq!(refs.buzz.main.as_deref(), Some(fixture.first.as_str()));
         assert_eq!(refs.buzz.head.as_deref(), Some(fixture.first.as_str()));
         assert_eq!(refs.buzz_source.as_deref(), Some(head.as_str()));

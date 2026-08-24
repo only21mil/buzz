@@ -1926,8 +1926,9 @@ mod tests {
         created_at: u64,
     ) -> nostr::Event {
         EventBuilder::new(Kind::Custom(kind), content)
-            .tags([Tag::parse(["a", coordinate, "wss://relay.example"])
-                .expect("parse coordinate tag")])
+            .tags([
+                Tag::parse(["a", coordinate, "wss://relay.example"]).expect("parse coordinate tag")
+            ])
             .custom_created_at(nostr::Timestamp::from(created_at))
             .sign_with_keys(&Keys::generate())
             .expect("sign timestamped coordinate event")

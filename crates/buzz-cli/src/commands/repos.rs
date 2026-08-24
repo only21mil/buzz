@@ -777,13 +777,15 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
         }
         ReposCmd::Get { id, owner } => cmd_get_repo(client, &id, owner.as_deref()).await,
         ReposCmd::List { owner, limit } => cmd_list_repos(client, owner.as_deref(), limit).await,
-        ReposCmd::Reconcile { id, pr, limit } => {
-            let _announcement = current_repo(client, &id).await?;
-            Err(CliError::Other(format!(
-                "repository lifecycle reconciler integration is pending (repo={id}, pr={}, limit={})",
-                pr.as_deref().unwrap_or("all"),
-                limit.map_or_else(|| "all".to_string(), |value| value.to_string()),
-            )))
+        ReposCmd::Reconcile {
+            id,
+            pr,
+            limit,
+            dry_run,
+        } => {
+            let announcement = current_repo(client, &id).await?;
+            super::repo_sync::cmd_reconcile(client, &announcement, pr.as_deref(), limit, dry_run)
+                .await
         }
         ReposCmd::Rm { id } => cmd_rm(client, &id).await,
         ReposCmd::Status { id } => {

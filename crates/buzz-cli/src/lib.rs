@@ -1196,6 +1196,9 @@ pub enum ReposCmd {
         /// Maximum number of computed work items, applied after correlation.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         limit: Option<u32>,
+        /// Print the reducer plan without writing. Version 1 is always read-only.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Remove one of your repository announcements via NIP-09 (kind:5).
     ///
@@ -2460,6 +2463,7 @@ mod tests {
             &pr,
             "--limit",
             "7",
+            "--dry-run",
         ])
         .expect("repos reconcile flags should parse");
 
@@ -2467,6 +2471,7 @@ mod tests {
             id,
             pr: parsed_pr,
             limit,
+            dry_run,
         }) = cli.command
         else {
             panic!("expected repos reconcile");
@@ -2474,6 +2479,7 @@ mod tests {
         assert_eq!(id, "vogel-vault");
         assert_eq!(parsed_pr.as_deref(), Some(pr.as_str()));
         assert_eq!(limit, Some(7));
+        assert!(dry_run);
     }
 
     #[test]
@@ -2691,6 +2697,7 @@ mod tests {
                 "list",
                 "promote",
                 "protect",
+                "reconcile",
                 "rm",
                 "stage-ci",
                 "status"
@@ -2770,7 +2777,7 @@ mod tests {
             ("pr", 5),
             ("projects", 7),
             ("reactions", 3),
-            ("repos", 10),
+            ("repos", 11),
             ("social", 7),
             ("upload", 1),
             ("users", 5),
