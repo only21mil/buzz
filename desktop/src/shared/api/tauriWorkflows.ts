@@ -62,10 +62,60 @@ type RawWorkflowApproval = {
 };
 
 type RawTriggerWorkflowResponse = {
-  run_id: string;
+  event_id: string;
+  run_id: string | null;
   workflow_id: string;
-  status: string;
+  status: "accepted";
 };
+
+/**
+ * Validate the Rust trigger acknowledgement at the API boundary.
+ *
+ * `invokeTauri<T>` only provides a compile-time assertion. Keep this runtime
+ * check here so a stale or malformed relay response cannot turn into an
+ * object full of `undefined` fields in the UI.
+ */
+export function parseRawTriggerWorkflowResponse(
+  value: unknown,
+): RawTriggerWorkflowResponse {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("invalid trigger_workflow response");
+  }
+
+  const raw = value as Record<string, unknown>;
+  const eventId =
+    typeof raw.event_id === "string" && raw.event_id.length > 0
+      ? raw.event_id
+      : undefined;
+  const workflowId =
+    typeof raw.workflow_id === "string" && raw.workflow_id.length > 0
+      ? raw.workflow_id
+      : undefined;
+  const runId =
+    raw.run_id === null
+      ? null
+      : typeof raw.run_id === "string" && raw.run_id.length > 0
+        ? raw.run_id
+        : undefined;
+
+  if (
+    eventId === undefined ||
+    workflowId === undefined ||
+    runId === undefined
+  ) {
+    throw new Error("invalid trigger_workflow response");
+  }
+  if (raw.status !== "accepted") {
+    throw new Error("invalid trigger_workflow response status");
+  }
+
+  return {
+    event_id: eventId,
+    run_id: runId,
+    workflow_id: workflowId,
+    status: "accepted",
+  };
+}
 
 type RawApprovalActionResponse = {
   token: string;
@@ -141,6 +191,7 @@ function fromRawTriggerResponse(
   raw: RawTriggerWorkflowResponse,
 ): TriggerWorkflowResponse {
   return {
+    eventId: raw.event_id,
     runId: raw.run_id,
     workflowId: raw.workflow_id,
     status: raw.status,
@@ -241,9 +292,8 @@ export async function getRunApprovals(
 export async function triggerWorkflow(
   workflowId: string,
 ): Promise<TriggerWorkflowResponse> {
-  const raw = await invokeTauri<RawTriggerWorkflowResponse>(
-    "trigger_workflow",
-    { workflowId },
+  const raw = parseRawTriggerWorkflowResponse(
+    await invokeTauri<unknown>("trigger_workflow", { workflowId }),
   );
   return fromRawTriggerResponse(raw);
 }

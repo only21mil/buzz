@@ -325,6 +325,9 @@ test("workflow mutations publish create/update/delete/trigger wire events", asyn
     ]);
     assert.deepEqual(result, {
       event_id: client.calls.published[0].signed.id,
+      workflow_id: "workflow-id",
+      run_id: null,
+      status: "accepted",
     });
     assert.equal(getUnregisteredCommandMissCount(), 0);
   });

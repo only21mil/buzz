@@ -243,11 +243,9 @@ test("triggers a workflow from the detail panel", async ({ page }) => {
   ).toBeVisible();
 
   await expect(
-    page
-      .getByTestId("workflow-detail-panel")
-      .getByTestId("workflow-selected-run"),
-  ).toBeVisible();
-  await expect(
-    page.getByTestId("workflow-detail-panel").getByTestId("workflow-run-trace"),
-  ).toContainText("step_1");
+    page.getByTestId("workflow-detail-panel").getByRole("status"),
+  ).toContainText("Trigger accepted");
+  await expect(page.getByTestId("workflow-detail-panel")).toContainText(
+    "mock-run-",
+  );
 });

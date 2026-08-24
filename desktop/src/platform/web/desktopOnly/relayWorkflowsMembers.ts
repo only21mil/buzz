@@ -636,7 +636,12 @@ export function registerRelayWorkflowsMembersCommands(
       { kind: 46020, content: "", tags: [["d", workflowId]] },
       "triggering the workflow",
     );
-    return { event_id: response.event_id };
+    return {
+      event_id: response.event_id,
+      workflow_id: workflowId,
+      run_id: null,
+      status: "accepted",
+    };
   });
   register("update_profile_at_relay", (body) =>
     updateProfileAtRelay(body, identity, client),

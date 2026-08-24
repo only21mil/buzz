@@ -66,9 +66,10 @@ export type WorkflowApproval = {
 };
 
 export type TriggerWorkflowResponse = {
-  runId: string;
+  eventId: string;
+  runId: string | null;
   workflowId: string;
-  status: string;
+  status: "accepted";
 };
 
 export type ApprovalActionResponse = {

@@ -189,6 +189,39 @@ fn workflow_wire_serializes_with_snake_case_keys() {
 }
 
 #[test]
+fn trigger_response_serializes_event_run_workflow_and_acceptance() {
+    let wire = trigger_workflow_wire(
+        WF.to_string(),
+        "trigger-event".to_string(),
+        "response:{\"run_id\":\"33333333-3333-3333-3333-333333333333\"}",
+    )
+    .expect("parse trigger response");
+
+    assert_eq!(
+        serde_json::to_value(wire).expect("serialize trigger response"),
+        serde_json::json!({
+            "event_id": "trigger-event",
+            "workflow_id": WF,
+            "run_id": "33333333-3333-3333-3333-333333333333",
+            "status": "accepted",
+        })
+    );
+}
+
+#[test]
+fn duplicate_trigger_response_keeps_missing_run_id_explicitly_null() {
+    let wire = trigger_workflow_wire(
+        WF.to_string(),
+        "trigger-event".to_string(),
+        "duplicate: already processed",
+    )
+    .expect("parse duplicate trigger response");
+
+    assert_eq!(wire.run_id, None);
+    assert_eq!(wire.status, "accepted");
+}
+
+#[test]
 fn runs_and_approvals_serialize_to_bare_empty_array() {
     // Regression guard for the crash class this fix closed. The frontend
     // wrappers `getWorkflowRuns` / `getRunApprovals` do `raw.map(...)`, so the

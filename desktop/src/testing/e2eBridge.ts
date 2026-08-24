@@ -3505,9 +3505,10 @@ function handleTriggerWorkflow(args: { workflowId: string }) {
   const run = buildMockWorkflowRun(workflow);
   mockWorkflowRuns = [run, ...mockWorkflowRuns];
   return {
+    event_id: `mock-trigger-${run.id}`,
     run_id: run.id,
     workflow_id: workflow.id,
-    status: run.status,
+    status: "accepted",
   };
 }
 
