@@ -5,6 +5,7 @@ mod agent_directory;
 mod config;
 mod engram_fetch;
 mod filter;
+mod inbox_cursor;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -37,6 +38,7 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
+use inbox_cursor::{CursorLoadStatus, InboxCursorStore};
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
@@ -1701,17 +1703,40 @@ async fn tokio_main() -> Result<()> {
     let mut pool_ready = !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
 
-    // Capture a startup watermark BEFORE connecting to the relay. This timestamp
-    // is used for membership notification replay (via startup_watermark) and as
-    // the initial subscribe_since for channels discovered at startup. The Subscribe
-    // handler falls back to subscribe_since when last_seen is None, closing the
-    // blind spot between "agents ready" and "first REQ sent".
+    // Capture a startup watermark BEFORE connecting to the relay. A missing or
+    // corrupt durable cursor keeps the legacy `watermark - 5s` replay path.
     let startup_watermark: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
     let pubkey_hex = config.keys.public_key().to_hex();
+    let mut inbox_cursor =
+        InboxCursorStore::load(&config.state_dir, &pubkey_hex, startup_watermark);
+    match inbox_cursor.load_status() {
+        CursorLoadStatus::Loaded => tracing::info!(
+            path = %inbox_cursor.path().display(),
+            "loaded durable inbox cursor"
+        ),
+        CursorLoadStatus::Missing => tracing::warn!(
+            path = %inbox_cursor.path().display(),
+            "durable inbox cursor is missing; falling back to startup watermark replay (now - 5s)"
+        ),
+        CursorLoadStatus::Corrupt => tracing::error!(
+            path = %inbox_cursor.path().display(),
+            "durable inbox cursor is unreadable or corrupt; falling back to startup watermark replay (now - 5s)"
+        ),
+    }
+    let inbox_catchup_floor =
+        inbox_cursor.catchup_since(startup_watermark, config.inbox_catchup_max_age_secs);
+    if let Some(cursor_timestamp) = inbox_catchup_floor.age_truncated_from {
+        tracing::warn!(
+            cursor_timestamp,
+            catchup_since = inbox_catchup_floor.since,
+            max_age_secs = config.inbox_catchup_max_age_secs,
+            "inbox cursor exceeds the configured catch-up age; older queued mentions will be skipped"
+        );
+    }
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
     let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
@@ -1728,11 +1753,12 @@ async fn tokio_main() -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
-    // Tell the relay background task the watermark so it can use
-    // `since = watermark - 5s` on the first REQ instead of `since=now`.
+    // Tell the relay background task the durable replay floor so the live
+    // subscription overlaps startup catch-up. Missing/corrupt state supplies
+    // the legacy startup timestamp here, preserving `now - 5s` behavior.
     // Best-effort: a failure here is non-fatal (we just lose the startup window
     // protection, which is the same as the pre-fix behaviour).
-    if let Err(e) = relay.set_startup_watermark(startup_watermark).await {
+    if let Err(e) = relay.set_startup_watermark(inbox_catchup_floor.since).await {
         tracing::warn!("failed to set startup watermark: {e}");
     }
 
@@ -1869,9 +1895,56 @@ async fn tokio_main() -> Result<()> {
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
+
+    // Query durable backlog before installing live channel subscriptions.
+    // The subsequent REQs deliberately overlap this floor; InboxCursorStore's
+    // in-process event-id set suppresses duplicates across the two sources.
+    let mut startup_catchup = VecDeque::new();
+    if inbox_cursor.has_durable_cursor() && !channel_filters.is_empty() {
+        match inbox_cursor::fetch_startup_catchup(
+            &relay.rest_client(),
+            &channel_filters,
+            &pubkey_hex,
+            inbox_catchup_floor.since,
+            config.inbox_catchup_max_events,
+        )
+        .await
+        {
+            Ok(batch) => {
+                if batch.count_truncated {
+                    tracing::warn!(
+                        admitted = batch.events.len(),
+                        max_events = config.inbox_catchup_max_events,
+                        skipped_filter_groups = batch.skipped_filter_groups,
+                        "startup inbox catch-up hit its event bound; older matching mentions were skipped"
+                    );
+                }
+                tracing::info!(
+                    events = batch.events.len(),
+                    since = inbox_catchup_floor.since,
+                    "startup inbox catch-up complete"
+                );
+                startup_catchup = batch.events;
+            }
+            Err(error) => tracing::error!(
+                %error,
+                since = inbox_catchup_floor.since,
+                "startup inbox catch-up query failed; live replay remains active"
+            ),
+        }
+    }
     let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
     for (channel_id, filter) in &channel_filters {
-        if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
+        if let Err(e) = relay
+            .subscribe_channel_from(
+                *channel_id,
+                filter.clone(),
+                inbox_cursor
+                    .has_durable_cursor()
+                    .then_some(inbox_catchup_floor.since),
+            )
+            .await
+        {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
         } else {
             subscribed_channel_ids.insert(*channel_id);
@@ -2356,7 +2429,12 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
-                buzz_event = relay.next_event() => {
+                buzz_event = async {
+                    match startup_catchup.pop_front() {
+                        Some(event) => Some(event),
+                        None => relay.next_event().await,
+                    }
+                } => {
                     let _ = result_rx; // end split borrow before relay handling
                     match buzz_event {
                         Some(buzz_event) => {
@@ -2499,8 +2577,18 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            if !inbox_cursor.begin_event(&buzz_event.event) {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    event_id = %buzz_event.event.id,
+                                    "skipping inbox event already handled or seen during startup catch-up"
+                                );
+                                continue;
+                            }
+
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
+                                inbox_cursor.mark_processed([&buzz_event.event]);
                                 continue;
                             }
 
@@ -2521,6 +2609,7 @@ async fn tokio_main() -> Result<()> {
                                             "shutdown command from owner — exiting gracefully"
                                         );
                                         let _ = shutdown_tx.send(());
+                                        inbox_cursor.mark_processed([&buzz_event.event]);
                                         continue;
                                     }
                                 }
@@ -2556,6 +2645,7 @@ async fn tokio_main() -> Result<()> {
                                                 "!cancel received but no in-flight task — no-op"
                                             );
                                         }
+                                        inbox_cursor.mark_processed([&buzz_event.event]);
                                         continue; // consume event — do NOT push to queue
                                     }
                                 }
@@ -2601,6 +2691,7 @@ async fn tokio_main() -> Result<()> {
                                                 "!rotate received — invalidated idle channel session(s)"
                                             );
                                         }
+                                        inbox_cursor.mark_processed([&buzz_event.event]);
                                         continue; // consume event — do NOT push to queue
                                     }
                                 }
@@ -2650,6 +2741,7 @@ async fn tokio_main() -> Result<()> {
                                         is_dm,
                                         reason,
                                     );
+                                    inbox_cursor.mark_processed([&buzz_event.event]);
                                     continue;
                                 }
                             }
@@ -2673,6 +2765,7 @@ async fn tokio_main() -> Result<()> {
                                 Some(m) => m.prompt_tag,
                                 None => {
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
+                                    inbox_cursor.mark_processed([&buzz_event.event]);
                                     continue;
                                 }
                             };
@@ -2692,12 +2785,16 @@ async fn tokio_main() -> Result<()> {
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
                             let prompt_tag_for_steer = prompt_tag.clone();
-                            let accepted = queue.push(QueuedEvent {
+                            let push_outcome = queue.push_detailed(QueuedEvent {
                                 channel_id: buzz_event.channel_id,
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
                             });
+                            let accepted = push_outcome.accepted;
+                            if let Some(evicted) = push_outcome.evicted.as_ref() {
+                                inbox_cursor.mark_processed([evicted]);
+                            }
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -2709,6 +2806,8 @@ async fn tokio_main() -> Result<()> {
                                 tokio::spawn(async move {
                                     pool::reaction_add(&rc, &eid, "👀").await;
                                 });
+                            } else {
+                                inbox_cursor.mark_processed([&event_for_steer]);
                             }
                             // Event is already queued. If mode requires it AND
                             // the channel has an in-flight task, fire cancel —
@@ -2885,6 +2984,7 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    Some(&mut inbox_cursor),
                 )
                 .await
                     == LoopAction::Exit
@@ -3056,6 +3156,7 @@ async fn tokio_main() -> Result<()> {
                 }
                 if drop_withheld {
                     queue.remove_event(channel_id, &event_id);
+                    inbox_cursor.mark_processed_id(&event_id);
                 }
                 if release_withheld {
                     queue.release_native_steer(channel_id, &event_id);
@@ -3469,10 +3570,9 @@ fn dispatch_pending(
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, affinity_hit, "agent_claimed");
 
-        let recoverable_batch = match ctx.dedup_mode {
-            DedupMode::Queue => Some(batch.clone()),
-            DedupMode::Drop => None,
-        };
+        // Keep a task-local batch copy for terminal inbox accounting in both
+        // dedup modes. Panic recovery below still requeues only in Queue mode.
+        let recoverable_batch = Some(batch.clone());
 
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
@@ -3597,9 +3697,24 @@ async fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    inbox_cursor: Option<&mut InboxCursorStore>,
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
+    let tracked_events = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .and_then(|meta| meta.recoverable_batch.as_ref())
+        .map(|batch| {
+            batch
+                .events
+                .iter()
+                .chain(batch.cancelled_events.iter())
+                .map(|event| event.event.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
@@ -3612,6 +3727,14 @@ async fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+    let mut inbox_events_terminal = matches!(result.outcome, PromptOutcome::Ok(_))
+        || (matches!(result.source, PromptSource::Channel(_))
+            && matches!(config.dedup_mode, DedupMode::Drop))
+        || (result.batch.is_none()
+            && matches!(
+                result.outcome,
+                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+            ));
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -3642,6 +3765,7 @@ async fn handle_prompt_result(
                 // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
+                inbox_events_terminal = false;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -3660,6 +3784,7 @@ async fn handle_prompt_result(
                 );
                 spawn_failure_notice(rest_client, &batch, content);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
+                inbox_events_terminal = true;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -3678,8 +3803,10 @@ async fn handle_prompt_result(
                     );
                     spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
+                    inbox_events_terminal = true;
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
+                    inbox_events_terminal = false;
                 }
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
@@ -3696,6 +3823,7 @@ async fn handle_prompt_result(
                     and then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
+                inbox_events_terminal = true;
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -3710,6 +3838,9 @@ async fn handle_prompt_result(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                 );
                 spawn_failure_notice(rest_client, &dead, content);
+                inbox_events_terminal = true;
+            } else {
+                inbox_events_terminal = false;
             }
         } else {
             tracing::debug!(
@@ -3718,6 +3849,13 @@ async fn handle_prompt_result(
                 "dropping failed batch for removed channel"
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
+            inbox_events_terminal = true;
+        }
+    }
+
+    if inbox_events_terminal {
+        if let Some(inbox_cursor) = inbox_cursor {
+            inbox_cursor.mark_processed(tracked_events.iter());
         }
     }
 
@@ -3988,7 +4126,7 @@ fn recover_panicked_agent(
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
-            if !removed_channels.contains(&ch) {
+            if matches!(config.dedup_mode, DedupMode::Queue) && !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
                 let _ = queue.requeue(batch);
@@ -6542,6 +6680,9 @@ mod build_mcp_servers_tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
+            state_dir: std::path::PathBuf::from("./.buzz-acp/state"),
+            inbox_catchup_max_age_secs: config::DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS,
+            inbox_catchup_max_events: config::DEFAULT_INBOX_CATCHUP_MAX_EVENTS as usize,
             context_message_limit: 12,
             max_turns_per_session: 0,
             session_idle_ttl_secs: 2700,
@@ -6766,6 +6907,9 @@ mod error_outcome_emission_tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
+            state_dir: std::path::PathBuf::from("./.buzz-acp/state"),
+            inbox_catchup_max_age_secs: config::DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS,
+            inbox_catchup_max_events: config::DEFAULT_INBOX_CATCHUP_MAX_EVENTS as usize,
             context_message_limit: 12,
             max_turns_per_session: 0,
             session_idle_ttl_secs: 2700,
@@ -6882,6 +7026,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7049,6 +7194,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 Some(observer.clone()),
                 None,
+                None,
             )
             .await;
             let events = observer.snapshot();
@@ -7138,6 +7284,7 @@ mod error_outcome_emission_tests {
                 &mut crash_history,
                 &respawn_tx,
                 &mut respawn_tasks,
+                None,
                 None,
                 None,
             )
@@ -7246,6 +7393,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                None,
             )
             .await;
             (
@@ -7337,6 +7485,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7431,6 +7580,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7547,6 +7697,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7680,6 +7831,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7864,6 +8016,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            None,
         )
         .await;
 
@@ -7948,6 +8101,7 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
             None,
             None,
         )

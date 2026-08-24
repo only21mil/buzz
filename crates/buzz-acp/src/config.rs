@@ -35,6 +35,14 @@ pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
 pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
 
+/// Default maximum age for durable inbox catch-up queries (24 hours).
+pub(crate) const DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS: u64 = 86_400;
+
+/// Default maximum number of events returned by one inbox catch-up query.
+/// Kept below the relay's 1,000-event ceiling so one extra row can detect
+/// truncation.
+pub(crate) const DEFAULT_INBOX_CATCHUP_MAX_EVENTS: u32 = 999;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to parse nostr keys: {0}")]
@@ -341,6 +349,29 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_CONFIG", default_value = "./buzz-acp.toml")]
     pub config: PathBuf,
 
+    /// Directory for durable process-local harness state. The inbox cursor is
+    /// namespaced by the agent's public key inside this directory.
+    #[arg(long, env = "BUZZ_ACP_STATE_DIR", default_value = "./.buzz-acp/state")]
+    pub state_dir: PathBuf,
+
+    /// Oldest inbox history a restart may query from the relay.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_INBOX_CATCHUP_MAX_AGE",
+        default_value_t = DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS,
+        value_parser = clap::value_parser!(u64).range(5..)
+    )]
+    pub inbox_catchup_max_age: u64,
+
+    /// Maximum number of events admitted by startup catch-up.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_INBOX_CATCHUP_MAX_EVENTS",
+        default_value_t = DEFAULT_INBOX_CATCHUP_MAX_EVENTS,
+        value_parser = clap::value_parser!(u32).range(1..=999)
+    )]
+    pub inbox_catchup_max_events: u32,
+
     #[arg(long, env = "BUZZ_ACP_DEDUP", default_value = "queue", value_enum)]
     pub dedup: DedupMode,
 
@@ -531,6 +562,9 @@ pub struct Config {
     pub channels_override: Option<Vec<String>>,
     pub no_mention_filter: bool,
     pub config_path: PathBuf,
+    pub state_dir: PathBuf,
+    pub inbox_catchup_max_age_secs: u64,
+    pub inbox_catchup_max_events: usize,
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
@@ -1102,6 +1136,9 @@ impl Config {
             channels_override: args.channels,
             no_mention_filter: args.no_mention_filter,
             config_path: args.config,
+            state_dir: args.state_dir,
+            inbox_catchup_max_age_secs: args.inbox_catchup_max_age,
+            inbox_catchup_max_events: args.inbox_catchup_max_events as usize,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
             session_idle_ttl_secs: args.session_idle_ttl,
@@ -1480,6 +1517,9 @@ mod tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: PathBuf::from("./buzz-acp.toml"),
+            state_dir: PathBuf::from("./.buzz-acp/state"),
+            inbox_catchup_max_age_secs: DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS,
+            inbox_catchup_max_events: DEFAULT_INBOX_CATCHUP_MAX_EVENTS as usize,
             context_message_limit: 12,
             max_turns_per_session: 0,
             session_idle_ttl_secs: 2700,

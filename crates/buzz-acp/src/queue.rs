@@ -51,6 +51,13 @@ pub struct QueuedEvent {
     pub prompt_tag: String,
 }
 
+/// Detailed result for the harness path that must account durably for queue
+/// policy drops. Unit tests use a boolean wrapper around this result.
+pub struct PushOutcome {
+    pub accepted: bool,
+    pub evicted: Option<Event>,
+}
+
 /// A single event inside a [`FlushBatch`].
 #[derive(Debug, Clone)]
 pub struct BatchEvent {
@@ -227,7 +234,14 @@ impl EventQueue {
     /// silently discarded (debug-logged).
     ///
     /// Returns `true` if the event was accepted, `false` if dropped.
+    #[cfg(test)]
     pub fn push(&mut self, event: QueuedEvent) -> bool {
+        self.push_detailed(event).accepted
+    }
+
+    /// Push an event and return any oldest event intentionally evicted by the
+    /// per-channel depth cap.
+    pub fn push_detailed(&mut self, event: QueuedEvent) -> PushOutcome {
         if matches!(self.dedup_mode, DedupMode::Drop)
             && self.in_flight_channels.contains(&event.channel_id)
         {
@@ -235,20 +249,29 @@ impl EventQueue {
                 channel_id = %event.channel_id,
                 "dropping event for in-flight channel (drop mode)"
             );
-            return false;
+            return PushOutcome {
+                accepted: false,
+                evicted: None,
+            };
         }
         let queue = self.queues.entry(event.channel_id).or_default();
         // Enforce per-channel depth cap: drop oldest to make room.
-        if queue.len() >= MAX_PENDING_PER_CHANNEL {
-            queue.pop_front();
+        let evicted = if queue.len() >= MAX_PENDING_PER_CHANNEL {
+            let evicted = queue.pop_front().map(|queued| queued.event);
             tracing::warn!(
                 channel_id = %event.channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "queue depth cap reached — dropped oldest event"
             );
-        }
+            evicted
+        } else {
+            None
+        };
         queue.push_back(event);
-        true
+        PushOutcome {
+            accepted: true,
+            evicted,
+        }
     }
 
     /// Try to flush the next batch.
