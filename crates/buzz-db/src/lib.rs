@@ -17,6 +17,8 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel and membership persistence.
 pub mod channel;
+/// Durable Buzz-native CI ingest index and queries.
+pub mod ci;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -2190,6 +2192,17 @@ impl Db {
             }
         }
         Ok(result)
+    }
+
+    /// Atomically persist a validated CI event and its per-run query index.
+    pub async fn store_ci_event(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        event: &nostr::Event,
+        envelope: &buzz_core::ci::ValidatedCiEnvelope,
+    ) -> Result<ci::StoreCiEventOutcome> {
+        ci::store_ci_event(&self.pool, community_id, channel_id, event, envelope).await
     }
 
     /// Atomically insert a kind:7 reaction event and its reaction row.
