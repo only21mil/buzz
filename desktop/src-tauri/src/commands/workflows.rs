@@ -131,9 +131,9 @@ pub async fn get_workflow_runs(
         .map_err(|_| "workflow ID must be a UUID".to_string())?;
     let path = workflow_runs_path(workflow_id, limit);
     let url = format!("{}{}", relay_api_base_url_with_override(&state), path);
-    let auth = build_nip98_auth_header(&Method::GET, &url, &[], &state)?;
 
     crate::relay_admission::wait_for_rate_limit().await;
+    let auth = build_nip98_auth_header(&Method::GET, &url, &[], &state)?;
     let response = state
         .http_client
         .get(&url)
