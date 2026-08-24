@@ -46,6 +46,28 @@ keypair.
 
 Run `./run.sh backup-hint` for the backup checklist.
 
+## Framework desktop production deploy
+
+The localhost production override keeps the Compose project name `buzz-prod`,
+binds the relay to `127.0.0.1:3000`, and disables startup migrations. Supply the
+non-secret Compose settings file separately from the mode-`0600` secret file:
+
+```bash
+export BUZZ_COMPOSE_ENV_FILE=/path/to/compose.env
+export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
+./deploy-local.sh 0123456789abcdef0123456789abcdef01234567
+```
+
+`deploy-local.sh` accepts one full commit ID. It builds that exact clean commit,
+dumps Postgres, compares the image migration set with `_sqlx_migrations`, and
+runs the new image's `buzz-admin migrate` before swapping only `relay`. It then
+checks readiness, NIP-11, the running image ID, and the relay binary hash. A
+failed post-swap check restores the prior image and verifies it before exiting
+nonzero. Deploy records default to `$HOME/.local/state/buzz-relay/deploys`.
+
+Do not use `run-local.sh up` as an upgrade command. Use `deploy-local.sh` so the
+backup, migration check, and rollback path cannot be skipped.
+
 ## Validation
 
 Before sharing an install link publicly, verify a fresh install with:
