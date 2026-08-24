@@ -497,21 +497,46 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v != "false")
         .unwrap_or(true)
     {
-        let race_width = std::env::var("BUZZ_GIT_PROBE_WRITERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32);
-        let race_rounds = std::env::var("BUZZ_GIT_PROBE_ROUNDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
+        let positive_env = |name: &str, default: usize| -> anyhow::Result<usize> {
+            match std::env::var(name) {
+                Ok(raw) => raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{name} must be a positive integer, got {raw:?}")
+                    }),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(anyhow::anyhow!("{name} is invalid: {error}")),
+            }
+        };
+        let non_negative_env = |name: &str, default: usize| -> anyhow::Result<usize> {
+            match std::env::var(name) {
+                Ok(raw) => raw.parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!("{name} must be a non-negative integer, got {raw:?}")
+                }),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(anyhow::anyhow!("{name} is invalid: {error}")),
+            }
+        };
+        let race_width = positive_env("BUZZ_GIT_PROBE_WRITERS", 32)?;
+        let race_rounds = positive_env("BUZZ_GIT_PROBE_ROUNDS", 3)?;
+        let racer_timeout_secs = positive_env("BUZZ_GIT_PROBE_RACER_TIMEOUT_SECS", 10)?;
+        let probe_timeout_secs = positive_env("BUZZ_GIT_PROBE_TIMEOUT_SECS", 60)?;
+        let transport_retries = non_negative_env("BUZZ_GIT_PROBE_TRANSPORT_RETRIES", 1)?;
         let cfg = buzz_relay::api::git::store::ProbeConfig {
             race_width,
             race_rounds,
+            racer_timeout: std::time::Duration::from_secs(racer_timeout_secs as u64),
+            probe_timeout: std::time::Duration::from_secs(probe_timeout_secs as u64),
+            transport_retries,
         };
         tracing::info!(
             race_width,
             race_rounds,
+            racer_timeout_secs,
+            probe_timeout_secs,
+            transport_retries,
             "running git object-store conformance probe (A3 gate)"
         );
         let report = state

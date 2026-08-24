@@ -22,7 +22,9 @@
 //! *detectable*, not silent — that is what A1's "create-only + content-address"
 //! discipline buys us, independent of bucket immutability features.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use s3::creds::Credentials;
@@ -99,14 +101,21 @@ pub enum StoreError {
 
 /// Configuration for `GitStore::run_conformance_probe`.
 ///
-/// Defaults: 32-way concurrency, 3 rounds. The probe is a deployment gate —
-/// run at startup, fail-closed. See `docs/git-on-object-storage.md` §Conformance.
+/// Defaults: 32-way concurrency, 3 rounds, 10 seconds per racer, 60 seconds
+/// overall, and one transport retry. The probe is a deployment gate. Run it at
+/// startup and fail closed. See `docs/git-on-object-storage.md` §Conformance.
 #[derive(Debug, Clone)]
 pub struct ProbeConfig {
     /// How many tasks race per round. Must be ≥ 2.
     pub race_width: usize,
     /// How many rounds to run each race phase.
     pub race_rounds: usize,
+    /// Maximum elapsed time for one racer, including transport retries.
+    pub racer_timeout: Duration,
+    /// Maximum elapsed time for the complete probe.
+    pub probe_timeout: Duration,
+    /// Number of retries after a transport-unknown result.
+    pub transport_retries: usize,
 }
 
 impl Default for ProbeConfig {
@@ -114,6 +123,9 @@ impl Default for ProbeConfig {
         Self {
             race_width: 32,
             race_rounds: 3,
+            racer_timeout: Duration::from_secs(10),
+            probe_timeout: Duration::from_secs(60),
+            transport_retries: 1,
         }
     }
 }
@@ -126,20 +138,15 @@ pub struct ProbeReport {
     pub race_width: usize,
     /// Rounds executed per race phase.
     pub race_rounds: usize,
-    /// Total number of *transport-unknown* per-racer outcomes across all
-    /// race rounds (sum of both `if_match_race` and `if_none_match_race`
-    /// phases). A "transport-unknown" is a pre-classification failure —
-    /// `S3Error::{Reqwest, Http, Io}` — that means the racer never got a
-    /// classified response from the backend, so its outcome is neither
-    /// evidence for nor against A3 linearizability. Such racers are
-    /// dropped from the observer set (see the race phases for the
-    /// invariant: `classified >= 2` and `winners == 1` *among classified
-    /// observers*).
+    /// Total number of transport-unknown attempts retried across both race
+    /// phases. A transport-unknown result is a pre-classification
+    /// `S3Error::{Reqwest, Http, Io}`. A racer must return a classified result
+    /// within its retry and time budgets or the probe fails.
     ///
     /// Surfaced on the admission log line so a slowly-degrading backend
     /// shows up before it's a probe failure: a passing probe with
-    /// non-zero `transport_drops` is "admitted with degraded
-    /// observation count," not silently flaky.
+    /// non-zero `transport_drops` is admitted after a bounded recovery, not
+    /// silently flaky.
     pub transport_drops: usize,
 }
 
@@ -147,7 +154,8 @@ pub struct ProbeReport {
 #[derive(Debug, thiserror::Error)]
 #[error("conformance probe failed in phase '{phase}' (round {round}, key {key}): {reason}")]
 pub struct ProbeFailure {
-    /// One of `sequential`, `if_match_race`, `if_none_match_race`, `etag_consistency`.
+    /// Probe phase such as `sequential`, `if_match_race`,
+    /// `if_none_match_race`, `etag_consistency`, `cleanup`, or `config`.
     pub phase: &'static str,
     /// Round index (0-based) when this phase ran multiple rounds.
     pub round: usize,
@@ -161,6 +169,148 @@ impl From<ProbeFailure> for StoreError {
     fn from(f: ProbeFailure) -> Self {
         StoreError::Probe(f)
     }
+}
+
+#[derive(Debug)]
+enum RacerFailure {
+    Deadline,
+    TransportExhausted { attempts: usize, error: String },
+    Backend(StoreError),
+}
+
+#[derive(Debug)]
+struct RacerResult<T> {
+    outcome: T,
+    transport_drops: usize,
+}
+
+fn is_transport_drop(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Backend(S3Error::Reqwest(_) | S3Error::Http(_) | S3Error::Io(_))
+    )
+}
+
+async fn run_racer_with_retry<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    transport_retries: usize,
+    mut operation: F,
+) -> Result<RacerResult<T>, RacerFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    let mut transport_drops = 0;
+    for attempt in 0..=transport_retries {
+        let result = tokio::time::timeout_at(deadline, operation())
+            .await
+            .map_err(|_| RacerFailure::Deadline)?;
+        match result {
+            Ok(outcome) => {
+                return Ok(RacerResult {
+                    outcome,
+                    transport_drops,
+                });
+            }
+            Err(error) if is_transport_drop(&error) => {
+                transport_drops += 1;
+                if attempt == transport_retries {
+                    return Err(RacerFailure::TransportExhausted {
+                        attempts: attempt + 1,
+                        error: error.to_string(),
+                    });
+                }
+            }
+            Err(error) => return Err(RacerFailure::Backend(error)),
+        }
+    }
+    unreachable!("inclusive retry loop always returns")
+}
+
+async fn run_probe_race<T, F, Fut>(
+    phase: &'static str,
+    round: usize,
+    key: &str,
+    cfg: &ProbeConfig,
+    probe_deadline: tokio::time::Instant,
+    operation: F,
+) -> Result<Vec<RacerResult<T>>, ProbeFailure>
+where
+    F: Fn(usize) -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    let racer_deadline = (tokio::time::Instant::now() + cfg.racer_timeout).min(probe_deadline);
+    let operation = &operation;
+    let outcomes = futures_util::future::join_all((0..cfg.race_width).map(|racer| {
+        run_racer_with_retry(racer_deadline, cfg.transport_retries, move || {
+            operation(racer)
+        })
+    }))
+    .await;
+
+    outcomes
+        .into_iter()
+        .enumerate()
+        .map(|(racer, outcome)| {
+            outcome
+                .inspect(|result| {
+                    if result.transport_drops > 0 {
+                        tracing::warn!(
+                            phase,
+                            round,
+                            racer,
+                            transport_drops = result.transport_drops,
+                            "probe racer recovered after bounded transport retry"
+                        );
+                    }
+                })
+                .map_err(|failure| ProbeFailure {
+                    phase,
+                    round,
+                    key: key.to_owned(),
+                    reason: match failure {
+                        RacerFailure::Deadline if racer_deadline == probe_deadline => format!(
+                            "whole-probe deadline of {:?} exceeded while awaiting racer {racer}",
+                            cfg.probe_timeout
+                        ),
+                        RacerFailure::Deadline => {
+                            format!("racer {racer} exceeded deadline of {:?}", cfg.racer_timeout)
+                        }
+                        RacerFailure::TransportExhausted { attempts, error } => format!(
+                            "racer {racer} transport failed after {attempts} attempt(s): {error}"
+                        ),
+                        RacerFailure::Backend(error) => format!("racer {racer}: {error}"),
+                    },
+                })
+        })
+        .collect()
+}
+
+async fn run_probe_step<T, Fut>(
+    phase: &'static str,
+    round: usize,
+    key: &str,
+    probe_timeout: Duration,
+    probe_deadline: tokio::time::Instant,
+    operation: Fut,
+) -> Result<T, ProbeFailure>
+where
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    tokio::time::timeout_at(probe_deadline, operation)
+        .await
+        .map_err(|_| ProbeFailure {
+            phase,
+            round,
+            key: key.to_owned(),
+            reason: format!("whole-probe deadline of {probe_timeout:?} exceeded"),
+        })?
+        .map_err(|error| ProbeFailure {
+            phase,
+            round,
+            key: key.to_owned(),
+            reason: error.to_string(),
+        })
 }
 
 /// Object-store client for git refs.
@@ -572,19 +722,23 @@ impl GitStore {
     ///    `put_pointer(IfMatch(...))` and assert `Won`. Tests that the token
     ///    is opaque and stable between read and CAS.
     pub async fn run_conformance_probe(&self, cfg: ProbeConfig) -> Result<ProbeReport, StoreError> {
-        use std::sync::Arc;
-        if cfg.race_width < 2 || cfg.race_rounds == 0 {
+        if cfg.race_width < 2
+            || cfg.race_rounds == 0
+            || cfg.racer_timeout.is_zero()
+            || cfg.probe_timeout.is_zero()
+        {
             return Err(ProbeFailure {
                 phase: "config",
                 round: 0,
                 key: String::new(),
                 reason: format!(
-                    "race_width must be ≥ 2 and race_rounds ≥ 1, got {}/{}",
-                    cfg.race_width, cfg.race_rounds
+                    "race_width must be ≥ 2, race_rounds ≥ 1, and deadlines non-zero; got {}/{}, racer={:?}, probe={:?}",
+                    cfg.race_width, cfg.race_rounds, cfg.racer_timeout, cfg.probe_timeout
                 ),
             }
             .into());
         }
+        let probe_deadline = tokio::time::Instant::now() + cfg.probe_timeout;
         let nonce = uuid::Uuid::new_v4();
         let pointer_key = format!("probe/pointer-{nonce}");
         // Accumulator for *transport-unknown* per-racer outcomes across both
@@ -594,16 +748,28 @@ impl GitStore {
         // -- Phase 1: sequential --------------------------------------------------
         for round in 0..cfg.race_rounds {
             let body = format!("probe-sequential-{nonce}-{round}").into_bytes();
-            let key = self.put_pack(&body).await?;
-            let got = self
-                .get_verified(&key, &Self::digest_hex(&body))
-                .await
-                .map_err(|e| ProbeFailure {
-                    phase: "sequential",
-                    round,
-                    key: key.clone(),
-                    reason: format!("read-after-write failed: {e}"),
-                })?;
+            let key = run_probe_step(
+                "sequential",
+                round,
+                "",
+                cfg.probe_timeout,
+                probe_deadline,
+                self.put_pack(&body),
+            )
+            .await?;
+            let got = run_probe_step(
+                "sequential",
+                round,
+                &key,
+                cfg.probe_timeout,
+                probe_deadline,
+                self.get_verified(&key, &Self::digest_hex(&body)),
+            )
+            .await
+            .map_err(|mut failure| {
+                failure.reason = format!("read-after-write failed: {}", failure.reason);
+                failure
+            })?;
             if got[..] != body[..] {
                 return Err(ProbeFailure {
                     phase: "sequential",
@@ -618,10 +784,27 @@ impl GitStore {
         // -- Phase 2: if_match_race -----------------------------------------------
         // Seed the pointer with a known value, then race N IfMatch updates.
         let seed = b"probe-pointer-seed".to_vec();
-        let _ = self.bucket.delete_object(&pointer_key).await; // ignore 404
-        let seed_outcome = self
-            .put_pointer(&pointer_key, &seed, Precond::IfNoneMatchStar)
-            .await?;
+        run_probe_step(
+            "if_match_race",
+            0,
+            &pointer_key,
+            cfg.probe_timeout,
+            probe_deadline,
+            async {
+                let _ = self.bucket.delete_object(&pointer_key).await;
+                Ok(())
+            },
+        )
+        .await?;
+        let seed_outcome = run_probe_step(
+            "if_match_race",
+            0,
+            &pointer_key,
+            cfg.probe_timeout,
+            probe_deadline,
+            self.put_pointer(&pointer_key, &seed, Precond::IfNoneMatchStar),
+        )
+        .await?;
         let mut etag = match seed_outcome {
             CasOutcome::Won(e) => e,
             CasOutcome::LostRace => {
@@ -636,76 +819,36 @@ impl GitStore {
         };
         for round in 0..cfg.race_rounds {
             let arc_self: Arc<&Self> = Arc::new(self);
-            let mut tasks = Vec::with_capacity(cfg.race_width);
-            for i in 0..cfg.race_width {
-                let me = Arc::clone(&arc_self);
-                let pkey = pointer_key.clone();
-                let et = etag.clone();
-                let body = format!("round={round},racer={i},nonce={nonce}").into_bytes();
-                tasks.push(async move { me.put_pointer(&pkey, &body, Precond::IfMatch(et)).await });
-            }
-            let outcomes = futures_util::future::join_all(tasks).await;
-            // Drop-and-floor classification. A `Reqwest`/`Http`/`Io` error
-            // means the racer never got a classified response from the
-            // backend (couldn't open a socket, send flaked, etc.); its
-            // outcome is *unknown*, not negative. A3 is a claim about
-            // **observers**: dropping unknowns from the observer set
-            // sharpens the assertion ("exactly one winner among observers")
-            // and avoids smuggling a network-stack test into the
-            // conformance probe. Parse/decode errors (`Utf8`,
-            // `ReqwestHeaderToStr`, `SerdeXml`, ...) and `HttpFailWithBody`
-            // stay in the catch-all — those mean the backend *did* answer
-            // but not in the contract shape, which is a real conformance
-            // signal.
+            let outcomes = run_probe_race(
+                "if_match_race",
+                round,
+                &pointer_key,
+                &cfg,
+                probe_deadline,
+                |i| {
+                    let me = Arc::clone(&arc_self);
+                    let pkey = pointer_key.clone();
+                    let et = etag.clone();
+                    let body = format!("round={round},racer={i},nonce={nonce}").into_bytes();
+                    async move { me.put_pointer(&pkey, &body, Precond::IfMatch(et)).await }
+                },
+            )
+            .await?;
             let mut classified = 0usize;
             let mut winners = 0usize;
             let mut new_etag: Option<ETag> = None;
-            for (i, outcome) in outcomes.into_iter().enumerate() {
-                match outcome {
-                    Ok(CasOutcome::Won(e)) => {
+            for outcome in outcomes {
+                transport_drops += outcome.transport_drops;
+                match outcome.outcome {
+                    CasOutcome::Won(e) => {
                         classified += 1;
                         winners += 1;
                         new_etag = Some(e);
                     }
-                    Ok(CasOutcome::LostRace) => {
+                    CasOutcome::LostRace => {
                         classified += 1;
                     }
-                    Err(StoreError::Backend(
-                        S3Error::Reqwest(_) | S3Error::Http(_) | S3Error::Io(_),
-                    )) => {
-                        transport_drops += 1;
-                        tracing::warn!(
-                            phase = "if_match_race",
-                            round,
-                            racer = i,
-                            "transport drop (pre-classification: socket/send failure)"
-                        );
-                    }
-                    Err(e) => {
-                        return Err(ProbeFailure {
-                            phase: "if_match_race",
-                            round,
-                            key: pointer_key,
-                            reason: format!("racer {i}: {e}"),
-                        }
-                        .into())
-                    }
                 }
-            }
-            // A3 needs ≥2 observers to *see* a race. With 31/32 classified
-            // and 1 transport drop, the race is well-observed; with 0/32
-            // classified the probe didn't run at all — fail closed.
-            if classified < 2 {
-                return Err(ProbeFailure {
-                    phase: "if_match_race",
-                    round,
-                    key: pointer_key,
-                    reason: format!(
-                        "race not observed: classified={classified}, transport_drops={}",
-                        cfg.race_width - classified
-                    ),
-                }
-                .into());
             }
             if winners != 1 {
                 return Err(ProbeFailure {
@@ -728,82 +871,61 @@ impl GitStore {
             let body = format!("probe-inm-race-{nonce}-{round}").into_bytes();
             let key = Self::content_key("probe/inm-race", &body);
             // Clean slate.
-            let _ = self.bucket.delete_object(&key).await;
+            run_probe_step(
+                "if_none_match_race",
+                round,
+                &key,
+                cfg.probe_timeout,
+                probe_deadline,
+                async {
+                    let _ = self.bucket.delete_object(&key).await;
+                    Ok(())
+                },
+            )
+            .await?;
             let arc_self: Arc<&Self> = Arc::new(self);
-            let mut tasks = Vec::with_capacity(cfg.race_width);
-            for _ in 0..cfg.race_width {
-                let me = Arc::clone(&arc_self);
-                let k = key.clone();
-                let b = body.clone();
-                tasks.push(async move { me.put_immutable_raw(&k, &b).await });
-            }
-            let results = futures_util::future::join_all(tasks).await;
-            // Drop-and-floor: same classification rule as Phase 2. Drop
-            // `Reqwest`/`Http`/`Io` (pre-classification — socket/send
-            // failure); count 2xx + 412 as the classified observers. Any
-            // other status or any non-transport `StoreError` is a real
-            // conformance signal and fails closed.
+            let results = run_probe_race(
+                "if_none_match_race",
+                round,
+                &key,
+                &cfg,
+                probe_deadline,
+                |_| {
+                    let me = Arc::clone(&arc_self);
+                    let k = key.clone();
+                    let b = body.clone();
+                    async move { me.put_immutable_raw(&k, &b).await }
+                },
+            )
+            .await?;
             let mut classified = 0usize;
             let mut twos = 0usize;
             let mut twelves = 0usize;
-            for (i, r) in results.into_iter().enumerate() {
-                match r {
-                    Ok(200..=299) => {
+            for (racer, result) in results.into_iter().enumerate() {
+                transport_drops += result.transport_drops;
+                match result.outcome {
+                    200..=299 => {
                         classified += 1;
                         twos += 1;
                     }
-                    Ok(412) => {
+                    412 => {
                         classified += 1;
                         twelves += 1;
                     }
-                    Ok(code) => {
+                    code => {
                         return Err(ProbeFailure {
                             phase: "if_none_match_race",
                             round,
                             key,
-                            reason: format!("racer {i}: unexpected status {code}"),
-                        }
-                        .into())
-                    }
-                    Err(StoreError::Backend(
-                        S3Error::Reqwest(_) | S3Error::Http(_) | S3Error::Io(_),
-                    )) => {
-                        transport_drops += 1;
-                        tracing::warn!(
-                            phase = "if_none_match_race",
-                            round,
-                            racer = i,
-                            "transport drop (pre-classification: socket/send failure)"
-                        );
-                    }
-                    Err(e) => {
-                        return Err(ProbeFailure {
-                            phase: "if_none_match_race",
-                            round,
-                            key,
-                            reason: format!("racer {i} backend error: {e}"),
+                            reason: format!("racer {racer}: unexpected status {code}"),
                         }
                         .into())
                     }
                 }
-            }
-            // Floor: A3 needs ≥2 observers to *see* a race.
-            if classified < 2 {
-                return Err(ProbeFailure {
-                    phase: "if_none_match_race",
-                    round,
-                    key,
-                    reason: format!(
-                        "race not observed: classified={classified}, transport_drops={}",
-                        cfg.race_width - classified
-                    ),
-                }
-                .into());
             }
             // Create-only contract: exactly 1×2xx + (classified − 1)×412
-            // *among observers*. The previous fixed `race_width − 1` would
-            // false-positive on any transport drop; this expression honors
-            // the drop-and-floor invariant.
+            // among the full racer set. Transport drops must recover within
+            // their bounded retry or the round fails before classification.
             if twos != 1 || twelves != classified - 1 {
                 return Err(ProbeFailure {
                     phase: "if_none_match_race",
@@ -818,15 +940,19 @@ impl GitStore {
             }
             // Final bytes must equal the racers' bytes (content-addressed: any
             // winner stored the same bytes by construction).
-            let read = self
-                .get_verified(&key, &Self::digest_hex(&body))
-                .await
-                .map_err(|e| ProbeFailure {
-                    phase: "if_none_match_race",
-                    round,
-                    key: key.clone(),
-                    reason: format!("post-race verified read failed: {e}"),
-                })?;
+            let read = run_probe_step(
+                "if_none_match_race",
+                round,
+                &key,
+                cfg.probe_timeout,
+                probe_deadline,
+                self.get_verified(&key, &Self::digest_hex(&body)),
+            )
+            .await
+            .map_err(|mut failure| {
+                failure.reason = format!("post-race verified read failed: {}", failure.reason);
+                failure
+            })?;
             if read[..] != body[..] {
                 return Err(ProbeFailure {
                     phase: "if_none_match_race",
@@ -842,19 +968,31 @@ impl GitStore {
         // GET pointer, take its ETag, CAS-update with that ETag, expect Won.
         // Proves the token round-trips opaquely between read and write.
         for round in 0..cfg.race_rounds {
-            let (et, _bytes) =
-                self.get_pointer(&pointer_key)
-                    .await?
-                    .ok_or_else(|| ProbeFailure {
-                        phase: "etag_consistency",
-                        round,
-                        key: pointer_key.clone(),
-                        reason: "pointer vanished mid-probe".into(),
-                    })?;
+            let (et, _bytes) = run_probe_step(
+                "etag_consistency",
+                round,
+                &pointer_key,
+                cfg.probe_timeout,
+                probe_deadline,
+                self.get_pointer(&pointer_key),
+            )
+            .await?
+            .ok_or_else(|| ProbeFailure {
+                phase: "etag_consistency",
+                round,
+                key: pointer_key.clone(),
+                reason: "pointer vanished mid-probe".into(),
+            })?;
             let body = format!("probe-etag-{round}-{nonce}").into_bytes();
-            match self
-                .put_pointer(&pointer_key, &body, Precond::IfMatch(et))
-                .await?
+            match run_probe_step(
+                "etag_consistency",
+                round,
+                &pointer_key,
+                cfg.probe_timeout,
+                probe_deadline,
+                self.put_pointer(&pointer_key, &body, Precond::IfMatch(et)),
+            )
+            .await?
             {
                 CasOutcome::Won(_) => {}
                 CasOutcome::LostRace => {
@@ -871,7 +1009,18 @@ impl GitStore {
 
         // Cleanup pointer (immutable probe writes accumulate by design; the
         // bucket's retention policy handles them, not the probe).
-        let _ = self.bucket.delete_object(&pointer_key).await;
+        run_probe_step(
+            "cleanup",
+            0,
+            &pointer_key,
+            cfg.probe_timeout,
+            probe_deadline,
+            async {
+                let _ = self.bucket.delete_object(&pointer_key).await;
+                Ok(())
+            },
+        )
+        .await?;
 
         Ok(ProbeReport {
             race_width: cfg.race_width,
@@ -913,6 +1062,7 @@ impl GitStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn idx_key_uses_pack_digest_namespace() {
@@ -943,6 +1093,103 @@ mod tests {
             GitStore::classify_cas(r),
             Err(StoreError::Backend(S3Error::HttpFailWithBody(403, _)))
         ));
+    }
+
+    #[tokio::test]
+    async fn stalled_racer_fails_with_named_phase_before_test_timeout() {
+        let cfg = ProbeConfig {
+            race_width: 2,
+            racer_timeout: Duration::from_millis(20),
+            probe_timeout: Duration::from_secs(1),
+            transport_retries: 1,
+            ..ProbeConfig::default()
+        };
+        let probe_deadline = tokio::time::Instant::now() + cfg.probe_timeout;
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            run_probe_race(
+                "if_match_race",
+                2,
+                "probe/stalled",
+                &cfg,
+                probe_deadline,
+                |racer| async move {
+                    if racer == 1 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(racer)
+                },
+            ),
+        )
+        .await
+        .expect("probe race must honor its own deadline")
+        .expect_err("stalled racer must fail the probe race");
+
+        assert_eq!(result.phase, "if_match_race");
+        assert_eq!(result.round, 2);
+        assert!(result.reason.contains("racer 1 exceeded deadline"));
+    }
+
+    #[tokio::test]
+    async fn transport_drop_retries_once_within_racer_deadline() {
+        let cfg = ProbeConfig {
+            race_width: 2,
+            racer_timeout: Duration::from_secs(1),
+            probe_timeout: Duration::from_secs(2),
+            transport_retries: 1,
+            ..ProbeConfig::default()
+        };
+        let attempts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let probe_deadline = tokio::time::Instant::now() + cfg.probe_timeout;
+        let results = run_probe_race(
+            "if_none_match_race",
+            0,
+            "probe/retry",
+            &cfg,
+            probe_deadline,
+            |racer| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    if attempts[racer].fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(StoreError::Backend(S3Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "injected transport drop",
+                        ))));
+                    }
+                    Ok(racer)
+                }
+            },
+        )
+        .await
+        .expect("one transport retry should recover each racer");
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.transport_drops == 1));
+        assert_eq!(attempts[0].load(Ordering::SeqCst), 2);
+        assert_eq!(attempts[1].load(Ordering::SeqCst), 2);
+
+        let exhausted_cfg = ProbeConfig {
+            transport_retries: 0,
+            ..cfg
+        };
+        let failure = run_probe_race(
+            "if_none_match_race",
+            3,
+            "probe/exhausted",
+            &exhausted_cfg,
+            tokio::time::Instant::now() + exhausted_cfg.probe_timeout,
+            |_| async {
+                Err::<usize, _>(StoreError::Backend(S3Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "persistent injected transport drop",
+                ))))
+            },
+        )
+        .await
+        .expect_err("exhausted transport retries must fail the round");
+        assert_eq!(failure.phase, "if_none_match_race");
+        assert_eq!(failure.round, 3);
+        assert!(failure.reason.contains("racer 0 transport failed"));
     }
 
     #[test]
@@ -1181,6 +1428,7 @@ mod probe {
             .run_conformance_probe(ProbeConfig {
                 race_width: 8,
                 race_rounds: 2,
+                ..ProbeConfig::default()
             })
             .await
             .expect("conformance probe");
