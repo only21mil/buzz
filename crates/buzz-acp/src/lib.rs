@@ -2972,23 +2972,6 @@ async fn tokio_main() -> Result<()> {
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if matches!(result.outcome, PromptOutcome::Ok(_)) {
-                    let completed_events = pool
-                        .task_map()
-                        .values()
-                        .find(|meta| meta.agent_index == result.agent.index)
-                        .and_then(|meta| meta.recoverable_batch.as_ref())
-                        .map(|batch| {
-                            batch
-                                .events
-                                .iter()
-                                .chain(batch.cancelled_events.iter())
-                                .map(|event| event.event.clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    inbox_cursor.mark_processed(completed_events.iter());
-                }
                 if handle_prompt_result(
                     &mut pool,
                     &mut queue,
@@ -3001,6 +2984,7 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    Some(&mut inbox_cursor),
                 )
                 .await
                     == LoopAction::Exit
@@ -3713,9 +3697,24 @@ async fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    inbox_cursor: Option<&mut InboxCursorStore>,
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
+    let tracked_events = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .and_then(|meta| meta.recoverable_batch.as_ref())
+        .map(|batch| {
+            batch
+                .events
+                .iter()
+                .chain(batch.cancelled_events.iter())
+                .map(|event| event.event.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
@@ -3728,6 +3727,14 @@ async fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+    let mut inbox_events_terminal = matches!(result.outcome, PromptOutcome::Ok(_))
+        || (matches!(result.source, PromptSource::Channel(_))
+            && matches!(config.dedup_mode, DedupMode::Drop))
+        || (result.batch.is_none()
+            && matches!(
+                result.outcome,
+                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+            ));
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -3758,6 +3765,7 @@ async fn handle_prompt_result(
                 // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
+                inbox_events_terminal = false;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -3776,6 +3784,7 @@ async fn handle_prompt_result(
                 );
                 spawn_failure_notice(rest_client, &batch, content);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
+                inbox_events_terminal = true;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -3794,8 +3803,10 @@ async fn handle_prompt_result(
                     );
                     spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
+                    inbox_events_terminal = true;
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
+                    inbox_events_terminal = false;
                 }
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
@@ -3812,6 +3823,7 @@ async fn handle_prompt_result(
                     and then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
+                inbox_events_terminal = true;
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -3826,6 +3838,9 @@ async fn handle_prompt_result(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                 );
                 spawn_failure_notice(rest_client, &dead, content);
+                inbox_events_terminal = true;
+            } else {
+                inbox_events_terminal = false;
             }
         } else {
             tracing::debug!(
@@ -3834,6 +3849,13 @@ async fn handle_prompt_result(
                 "dropping failed batch for removed channel"
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
+            inbox_events_terminal = true;
+        }
+    }
+
+    if inbox_events_terminal {
+        if let Some(inbox_cursor) = inbox_cursor {
+            inbox_cursor.mark_processed(tracked_events.iter());
         }
     }
 
@@ -7005,6 +7027,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            None,
         )
         .await;
 
@@ -7171,6 +7194,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 Some(observer.clone()),
                 None,
+                None,
             )
             .await;
             let events = observer.snapshot();
@@ -7260,6 +7284,7 @@ mod error_outcome_emission_tests {
                 &mut crash_history,
                 &respawn_tx,
                 &mut respawn_tasks,
+                None,
                 None,
                 None,
             )
@@ -7368,6 +7393,7 @@ mod error_outcome_emission_tests {
                 &mut respawn_tasks,
                 None,
                 None,
+                None,
             )
             .await;
             (
@@ -7459,6 +7485,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7553,6 +7580,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7669,6 +7697,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7802,6 +7831,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         )
         .await;
@@ -7986,6 +8016,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             None,
             None,
+            None,
         )
         .await;
 
@@ -8070,6 +8101,7 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
             None,
             None,
         )
