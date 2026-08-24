@@ -1447,7 +1447,7 @@ async fn decision_grant_is_atomic_generation_fenced_and_exactly_replayable() {
          FROM events WHERE community_id = $1 AND id = $2",
     )
     .bind(fixture.ids.community_id)
-    .bind(vec![0xa1; 32])
+    .bind(vec![0xa1_u8; 32])
     .fetch_one(&fixture.pool)
     .await
     .expect("read persisted signed decision event");
