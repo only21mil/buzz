@@ -106,8 +106,9 @@ pub trait ActionSink: Send + Sync {
     ///
     /// The sink must resolve the target inside `community_id`, verify that it
     /// belongs to `channel_id`, and attribute the relay-signed event to
-    /// `author_pubkey`. `Ok(Some(event_id))` means a reaction event was stored;
-    /// `Ok(None)` means the same actor already has that reaction active.
+    /// `author_pubkey`. `Ok(Some(event_id))` means the deterministic reaction
+    /// event exists, whether inserted now or recovered during replay. `Ok(None)`
+    /// means a different event already represents the same active reaction.
     fn add_reaction(
         &self,
         effect: ActionEffectContext,

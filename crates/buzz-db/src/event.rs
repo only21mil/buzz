@@ -1307,6 +1307,7 @@ pub async fn insert_event_with_thread_metadata(
 /// Ordering is load-bearing: resolve target, upsert/reactivate the reaction row,
 /// check `rows_affected`, then insert the kind:7 event. Active duplicates return
 /// before event insertion so duplicate reactions never store a duplicate kind:7.
+/// An exact event replay returns the original event as an idempotent success.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_reaction_event_with_thread_metadata(
     pool: &PgPool,
@@ -1349,7 +1350,25 @@ pub async fn insert_reaction_event_with_thread_metadata(
     .await?;
 
     if !reaction_inserted {
+        let replayed_event = sqlx::query(
+            "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id \
+             FROM events WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(reaction_event.id.as_bytes())
+        .fetch_optional(&mut *tx)
+        .await?;
         tx.rollback().await?;
+        if let Some(row) = replayed_event {
+            let stored_event = row_to_stored_event(row)?.ok_or_else(|| {
+                DbError::InvalidData("stored reaction replay could not be reconstructed".to_owned())
+            })?;
+            return Ok(ReactionEventInsertOutcome::Inserted {
+                stored_event: Box::new(stored_event),
+                was_inserted: false,
+            });
+        }
         return Ok(ReactionEventInsertOutcome::Duplicate);
     }
 
@@ -2014,6 +2033,28 @@ mod tests {
                 ..
             }
         ));
+
+        let replay = insert_reaction_event_with_thread_metadata(
+            &pool,
+            community,
+            &first,
+            None,
+            None,
+            target.id.as_bytes(),
+            &actor_pubkey,
+            "👍",
+        )
+        .await
+        .expect("replay first reaction insert");
+        let ReactionEventInsertOutcome::Inserted {
+            stored_event,
+            was_inserted,
+        } = replay
+        else {
+            panic!("exact reaction-event replay must recover the first success");
+        };
+        assert!(!was_inserted, "replay must not insert a second event");
+        assert_eq!(stored_event.event.id, first.id);
 
         let duplicate = insert_reaction_event_with_thread_metadata(
             &pool,

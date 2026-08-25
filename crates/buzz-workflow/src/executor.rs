@@ -2499,6 +2499,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn add_reaction_crash_window_replay_preserves_first_fire_output() {
+        let sink = RecordingActionSink::default();
+        let effect = crate::ActionEffectContext {
+            idempotency_key: Uuid::nil(),
+            claimed_at: DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp"),
+        };
+        let community_id = CommunityId::from_uuid(Uuid::nil());
+
+        let first = add_reaction_via_sink(
+            &sink,
+            effect,
+            community_id,
+            "11111111-1111-1111-1111-111111111111",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "👍",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await
+        .expect("first reaction fire");
+        let replay = add_reaction_via_sink(
+            &sink,
+            effect,
+            community_id,
+            "11111111-1111-1111-1111-111111111111",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "👍",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await
+        .expect("reaction replay after crash window");
+
+        assert_eq!(replay, first, "replay output must equal the first fire");
+        assert_eq!(
+            replay,
+            json!({ "added": true, "event_id": "reaction-event-id" })
+        );
+    }
+
     #[test]
     fn resolve_trigger_text() {
         let ctx = make_trigger();
