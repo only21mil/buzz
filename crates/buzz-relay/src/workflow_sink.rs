@@ -962,7 +962,7 @@ mod integration_tests {
                 &channel.id.to_string(),
                 "heads up @Robby — please take a look",
                 &author_hex,
-                &[agent_hex.clone()],
+                std::slice::from_ref(&agent_hex),
             )
             .await
             .expect("send_message");
