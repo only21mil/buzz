@@ -281,6 +281,8 @@ mod tests {
     // Env vars are process-global — serialize tests that mutate them to prevent
     // cross-test races when the suite runs with multiple threads.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Tracing callsite interest is process-global even when dispatches are scoped.
+    static SUBSCRIBER_LOCK: Mutex<()> = Mutex::new(());
 
     // Helper: read service.name from the Resource's schema_url-independent KV list.
     fn service_name_from(resource: &Resource) -> Option<String> {
@@ -306,6 +308,7 @@ mod tests {
 
     #[test]
     fn trace_context_json_correlates_nested_span_logs() {
+        let _guard = SUBSCRIBER_LOCK.lock().unwrap();
         let output = Arc::new(Mutex::new(Vec::new()));
         let output_writer = Arc::clone(&output);
         let exporter = InMemorySpanExporter::default();
@@ -473,6 +476,7 @@ mod tests {
 
     #[test]
     fn trace_context_lookup_does_not_enable_callsites() {
+        let _guard = SUBSCRIBER_LOCK.lock().unwrap();
         let context_lookup = TraceContextLookup::default();
         let subscriber = tracing_subscriber::registry().with(
             context_lookup

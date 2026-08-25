@@ -1996,6 +1996,7 @@ mod tests {
         use crate::state::AppState;
 
         pub(super) fn test_config() -> crate::config::Config {
+            let _guard = crate::config::ENV_MUTEX.lock().unwrap();
             let mut config = crate::config::Config::from_env().expect("default config loads");
             config.require_relay_membership = false;
             config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -2015,7 +2016,6 @@ mod tests {
                     .await
                     .expect("pubsub manager"),
             );
-            let audit = buzz_audit::AuditService::new(pool.clone());
             let auth = buzz_auth::AuthService::new(config.auth.clone());
             let search = buzz_search::SearchService::new(pool.clone());
             let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
@@ -2024,11 +2024,11 @@ mod tests {
             ));
             let media_storage =
                 buzz_media::MediaStorage::new(&config.media).expect("media storage");
-            let (state, _audit_shutdown) = AppState::new(
+            let (state, audit_shutdown) = AppState::new(
                 config,
                 db,
                 redis_pool,
-                audit,
+                None::<buzz_audit::AuditService>,
                 pubsub,
                 auth,
                 search,
@@ -2036,6 +2036,9 @@ mod tests {
                 Keys::generate(),
                 media_storage,
             );
+            audit_shutdown
+                .drain(std::time::Duration::from_secs(1))
+                .await;
             Arc::new(state)
         }
 

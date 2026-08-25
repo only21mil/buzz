@@ -7,6 +7,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
+/// Serializes test-only process environment reads and mutations.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Default maximum inbound WebSocket frame size in bytes.
 ///
 /// Must comfortably exceed accepted event content sizes after Nostr JSON and
@@ -1048,11 +1052,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Mutex to serialize tests that mutate environment variables.
-    // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
-    // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Look up against a fixed set, standing in for process env.
     fn env_of<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {
