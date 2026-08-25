@@ -16,6 +16,7 @@ use buzz_db::workflow_approval::{
     WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome,
     WorkflowApprovalGateCreationOutcome,
 };
+use buzz_db::{WorkflowEffectClaimOutcome, WorkflowEffectMarkOutcome};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use sqlx::migrate::Migrator;
@@ -1162,6 +1163,227 @@ async fn outbox_deduplicates_replays_and_orders_gate_requests() {
     );
     assert_eq!(rows[0].2, fixture.ids.run_id);
     assert_eq!(rows[1].2, run_id);
+}
+
+async fn reclaim_running_generation(fixture: &Fixture) -> i64 {
+    sqlx::query_scalar(
+        "UPDATE workflow_runs SET generation = generation + 1 \
+         WHERE community_id = $1 AND id = $2 AND status = 'running' \
+         RETURNING generation",
+    )
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.run_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("reclaim running workflow generation")
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn crash_after_effect_fired_recovers_without_double_post() {
+    let fixture = Fixture::new().await;
+    let effect_spec = json!({"send_message": {"text": "ship it"}});
+    let claim = buzz_db::workflow_effect::claim_workflow_effect(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+        1,
+        "notify",
+        0,
+        "send_message",
+        &effect_spec,
+    )
+    .await
+    .expect("claim message effect");
+    let WorkflowEffectClaimOutcome::Ready(_) = claim else {
+        panic!("new message effect must be ready");
+    };
+
+    let mut sink_calls = 0;
+    sink_calls += 1;
+    assert_eq!(
+        buzz_db::workflow_effect::mark_workflow_effect_fired(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id,
+            1,
+            "notify",
+            0,
+            &json!({"sent": true, "event_id": "event-1"}),
+        )
+        .await
+        .expect("mark message effect fired"),
+        WorkflowEffectMarkOutcome::Applied
+    );
+
+    let generation = reclaim_running_generation(&fixture).await;
+    let replay = buzz_db::workflow_effect::claim_workflow_effect(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+        generation,
+        "notify",
+        0,
+        "send_message",
+        &effect_spec,
+    )
+    .await
+    .expect("recover message effect");
+    assert_eq!(
+        replay,
+        WorkflowEffectClaimOutcome::Fired(json!({
+            "sent": true,
+            "event_id": "event-1"
+        }))
+    );
+    assert_eq!(sink_calls, 1, "recovery must not post the message again");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn crash_after_claim_before_fire_reuses_identity_and_fires_once() {
+    let fixture = Fixture::new().await;
+    let effect_spec = json!({"call_webhook": {"url": "https://example.test/hook"}});
+    let first = buzz_db::workflow_effect::claim_workflow_effect(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+        1,
+        "deliver",
+        0,
+        "call_webhook",
+        &effect_spec,
+    )
+    .await
+    .expect("claim webhook effect");
+    let WorkflowEffectClaimOutcome::Ready(first_claim) = first else {
+        panic!("new webhook effect must be ready");
+    };
+
+    let generation = reclaim_running_generation(&fixture).await;
+    let recovered = buzz_db::workflow_effect::claim_workflow_effect(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+        generation,
+        "deliver",
+        0,
+        "call_webhook",
+        &effect_spec,
+    )
+    .await
+    .expect("recover claimed webhook effect");
+    let WorkflowEffectClaimOutcome::Ready(recovered_claim) = recovered else {
+        panic!("an unfired claim must remain ready after reclaim");
+    };
+    assert_eq!(recovered_claim, first_claim, "recovery must reuse the key");
+
+    let mut sink_calls = 0;
+    sink_calls += 1;
+    assert_eq!(
+        buzz_db::workflow_effect::mark_workflow_effect_fired(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id,
+            generation,
+            "deliver",
+            0,
+            &json!({"status": 202}),
+        )
+        .await
+        .expect("mark recovered webhook fired"),
+        WorkflowEffectMarkOutcome::Applied
+    );
+
+    let generation = reclaim_running_generation(&fixture).await;
+    assert_eq!(
+        buzz_db::workflow_effect::claim_workflow_effect(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id,
+            generation,
+            "deliver",
+            0,
+            "call_webhook",
+            &effect_spec,
+        )
+        .await
+        .expect("replay fired webhook effect"),
+        WorkflowEffectClaimOutcome::Fired(json!({"status": 202}))
+    );
+    assert_eq!(sink_calls, 1, "claim recovery must fire the webhook once");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn reclaimed_run_skips_fired_steps_and_only_fires_pending_effects() {
+    let fixture = Fixture::new().await;
+    let first_spec = json!({"send_message": {"text": "first"}});
+    let second_spec = json!({"send_message": {"text": "second"}});
+    let WorkflowEffectClaimOutcome::Ready(_) = buzz_db::workflow_effect::claim_workflow_effect(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+        1,
+        "first",
+        0,
+        "send_message",
+        &first_spec,
+    )
+    .await
+    .expect("claim first step effect") else {
+        panic!("first step effect must be ready");
+    };
+    let first_sink_calls = 1;
+    let mut second_sink_calls = 0;
+    assert_eq!(
+        buzz_db::workflow_effect::mark_workflow_effect_fired(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id,
+            1,
+            "first",
+            0,
+            &json!({"event_id": "first-event"}),
+        )
+        .await
+        .expect("mark first step fired"),
+        WorkflowEffectMarkOutcome::Applied
+    );
+
+    let generation = reclaim_running_generation(&fixture).await;
+    assert!(matches!(
+        buzz_db::workflow_effect::claim_workflow_effect(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id,
+            generation,
+            "first",
+            0,
+            "send_message",
+            &first_spec,
+        )
+        .await
+        .expect("replay first step"),
+        WorkflowEffectClaimOutcome::Fired(_)
+    ));
+    let WorkflowEffectClaimOutcome::Ready(_) = buzz_db::workflow_effect::claim_workflow_effect(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+        generation,
+        "second",
+        0,
+        "send_message",
+        &second_spec,
+    )
+    .await
+    .expect("claim second step effect") else {
+        panic!("pending second step effect must be ready");
+    };
+    second_sink_calls += 1;
+    assert_eq!(first_sink_calls, 1, "the earlier step must not re-fire");
+    assert_eq!(second_sink_calls, 1, "the pending step must fire once");
 }
 
 #[derive(Clone, Copy)]
