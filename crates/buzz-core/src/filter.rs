@@ -12,9 +12,11 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 }
 
 /// Result-level read authorization for relay-signed events whose content is
-/// private to a single viewer. Currently gates `KIND_DM_VISIBILITY` and
-/// `KIND_AGENT_TURN_METRIC`: the reader MUST equal the event's `#p` tag
-/// (owner). Returns `true` for every other kind.
+/// private to a single viewer. For `KIND_DM_VISIBILITY` and
+/// `KIND_AGENT_TURN_METRIC`, the reader MUST equal the event's `#p` tag.
+/// `KIND_AGENT_ENGRAM` additionally permits the event author, since agents read
+/// their own memory. The relay layer separately verifies that an engram's `#p`
+/// is the agent's attested owner. Returns `true` for every other kind.
 ///
 /// This guards every delivery surface — WS historical pull (`req.rs`), HTTP
 /// bridge (`bridge.rs`), and live fan-out (`event.rs`) — so a query that
@@ -22,7 +24,15 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 /// a known event id) still cannot read another user's private event.
 pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str) -> bool {
     let kind = crate::kind::event_kind_u32(event);
-    if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
+    if kind != crate::kind::KIND_DM_VISIBILITY
+        && kind != crate::kind::KIND_AGENT_ENGRAM
+        && kind != crate::kind::KIND_AGENT_TURN_METRIC
+    {
+        return true;
+    }
+    if kind == crate::kind::KIND_AGENT_ENGRAM
+        && event.pubkey.to_hex().eq_ignore_ascii_case(reader_pubkey_hex)
+    {
         return true;
     }
     let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
@@ -296,5 +306,29 @@ mod tests {
             !reader_authorized_for_event(&metric, &agent_keys.public_key().to_hex()),
             "the authoring agent must NOT be authorized to read its own metric event (owner-only)"
         );
+    }
+
+    #[test]
+    fn reader_authorized_for_event_allows_only_engram_agent_or_claimed_owner() {
+        let agent = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let unrelated = Keys::generate().public_key().to_hex();
+        let engram = EventBuilder::new(
+            Kind::Custom(crate::kind::KIND_AGENT_ENGRAM as u16),
+            "encrypted",
+        )
+        .tags([
+            Tag::parse(["d", &"a".repeat(64)]).unwrap(),
+            Tag::parse(["p", &owner]).unwrap(),
+        ])
+        .sign_with_keys(&agent)
+        .expect("sign");
+
+        assert!(reader_authorized_for_event(
+            &engram,
+            &agent.public_key().to_hex()
+        ));
+        assert!(reader_authorized_for_event(&engram, &owner));
+        assert!(!reader_authorized_for_event(&engram, &unrelated));
     }
 }

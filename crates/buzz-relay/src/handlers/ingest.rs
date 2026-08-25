@@ -2566,6 +2566,19 @@ async fn ingest_event_inner(
     if kind_u32 == KIND_AGENT_ENGRAM {
         validate_engram_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        if !crate::handlers::req::event_visible_to_reader(
+            state,
+            tenant.community(),
+            &event,
+            event.pubkey.as_bytes(),
+        )
+        .await
+        {
+            return Err(IngestError::AuthFailed(
+                "restricted: agent-engram `p` tag must be the attested owner of this agent"
+                    .into(),
+            ));
+        }
     }
 
     if kind_u32 == KIND_AGENT_TURN_METRIC {

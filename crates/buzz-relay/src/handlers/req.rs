@@ -11,6 +11,7 @@ use buzz_core::kind::{
     KIND_DM_VISIBILITY, P_GATED_KINDS, RESULT_GATED_KINDS, SHARED_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
+use buzz_core::CommunityId;
 use buzz_db::EventQuery;
 use buzz_pubsub::EventTopic;
 use hex;
@@ -389,7 +390,14 @@ pub async fn handle_req(
             // Also enforces author-only kinds (30300/30350) and the persona
             // shared-gate (kind:30175 without ["shared","true"]). Single call
             // covers all three gated event classes.
-            if !event_visible_to_reader(&stored.event, &pubkey_bytes) {
+            if !event_visible_to_reader(
+                &state,
+                conn.tenant.community(),
+                &stored.event,
+                &pubkey_bytes,
+            )
+            .await
+            {
                 continue;
             }
 
@@ -722,7 +730,14 @@ async fn handle_search_req(
                     }
                     // Result-level gate: covers author-only, persona shared-gate,
                     // and result-gated kinds in one call.
-                    if !event_visible_to_reader(&stored.event, reader_pubkey_bytes) {
+                    if !event_visible_to_reader(
+                        state,
+                        tenant.community(),
+                        &stored.event,
+                        reader_pubkey_bytes,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     // Dedup AFTER acceptance — an event that fails filter A's constraints
@@ -1205,6 +1220,15 @@ pub(crate) fn result_gated_count_safe_for_pushdown(
     filter: &Filter,
     authed_pubkey_hex: &str,
 ) -> bool {
+    // Engram visibility also depends on the durable NIP-OA agent-owner
+    // relation, which SQL tag pushdown alone cannot prove.
+    if filter.kinds.as_ref().is_none_or(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| kind.as_u16() as u32 == KIND_AGENT_ENGRAM)
+    }) {
+        return false;
+    }
     let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
     filter
         .generic_tags
@@ -1241,7 +1265,51 @@ pub(crate) fn is_author_only_event(event: &nostr::Event, requester_pubkey_bytes:
 /// Call this from every read surface — both WS (REQ/COUNT/fan-out) and HTTP
 /// (NIP-98 `/query`, `/count`, FTS search) — instead of inlining the three
 /// individual predicates at each site.
-pub(crate) fn event_visible_to_reader(event: &nostr::Event, requester_pubkey_bytes: &[u8]) -> bool {
+pub(crate) async fn event_visible_to_reader(
+    state: &AppState,
+    community: CommunityId,
+    event: &nostr::Event,
+    requester_pubkey_bytes: &[u8],
+) -> bool {
+    if event.kind.as_u16() as u32 == KIND_AGENT_ENGRAM {
+        let mut p_tags = event.tags.iter().filter_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.len() >= 2 && parts[0].as_str() == "p").then_some(parts[1].as_str())
+        });
+        let Some(owner_hex) = p_tags.next() else {
+            return false;
+        };
+        if p_tags.next().is_some() {
+            return false;
+        }
+        let Ok(owner_bytes) = hex::decode(owner_hex) else {
+            return false;
+        };
+        if owner_bytes.len() != 32 {
+            return false;
+        }
+        let cache_key = (community, event.pubkey.to_bytes().to_vec(), owner_bytes.clone());
+        let owner_matches = match state.observer_owner_cache.get(&cache_key) {
+            Some(value) => value,
+            None => match state
+                .db
+                .is_agent_owner(community, event.pubkey.as_bytes(), &owner_bytes)
+                .await
+            {
+                Ok(value) => {
+                    state.observer_owner_cache.insert(cache_key, value);
+                    value
+                }
+                Err(error) => {
+                    warn!(%error, "engram owner lookup failed, hiding event");
+                    false
+                }
+            },
+        };
+        if !owner_matches {
+            return false;
+        }
+    }
     if is_author_only_event(event, requester_pubkey_bytes) {
         return false;
     }
@@ -2085,6 +2153,16 @@ mod tests {
             buzz_core::kind::KIND_AGENT_TURN_METRIC as u16,
         ));
         // No #p tag — fallback required.
+        assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+
+    #[test]
+    fn engram_count_never_skips_attested_owner_result_check() {
+        let (owner, _agent, _other) = three_pubkeys();
+        let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
+        let f = nostr::Filter::new()
+            .kind(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16))
+            .custom_tags(p_tag, [owner.clone()]);
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
     }
 }

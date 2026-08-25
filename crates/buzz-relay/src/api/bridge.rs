@@ -1304,7 +1304,14 @@ async fn query_events_authed(
                     // Also enforces author-only kinds (30300/30350) and the persona
                     // shared-gate (kind:30175 without ["shared","true"]). Single call
                     // covers all three gated event classes.
-                    if !crate::handlers::req::event_visible_to_reader(&se.event, &pubkey_bytes) {
+                    if !crate::handlers::req::event_visible_to_reader(
+                        state,
+                        tenant.community(),
+                        &se.event,
+                        &pubkey_bytes,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     if let Ok(v) = serde_json::to_value(&se.event) {
@@ -1517,9 +1524,13 @@ async fn count_events_authed(
                                 continue;
                             }
                             if !crate::handlers::req::event_visible_to_reader(
+                                state,
+                                tenant.community(),
                                 &se.event,
                                 &pubkey_bytes,
-                            ) {
+                            )
+                            .await
+                            {
                                 continue;
                             }
                             total += 1;
@@ -1587,9 +1598,13 @@ async fn count_events_authed(
                                 continue;
                             }
                             if !crate::handlers::req::event_visible_to_reader(
+                                state,
+                                tenant.community(),
                                 &se.event,
                                 &pubkey_bytes,
-                            ) {
+                            )
+                            .await
+                            {
                                 continue;
                             }
                             total += 1;
@@ -1770,7 +1785,14 @@ async fn handle_bridge_search(
             // branch cannot currently return unshared persona content — but the
             // check here ensures that a future FTS allowlist change cannot silently
             // reopen the bypass.
-            if !crate::handlers::req::event_visible_to_reader(&stored.event, pubkey_bytes) {
+            if !crate::handlers::req::event_visible_to_reader(
+                state,
+                tenant.community(),
+                &stored.event,
+                pubkey_bytes,
+            )
+            .await
+            {
                 continue;
             }
             // Dedup across filters.
@@ -3242,8 +3264,9 @@ mod tests {
             .kind(Kind::Custom(30174))
             .custom_tags(p_tag, [&owner_a]);
 
-        // 30174 is not owner-gated, so any reader hex is fine here.
-        let reader = Keys::generate().public_key().to_hex();
+        // This pure search helper checks NIP-01 matching. The async caller adds
+        // the durable attested-owner result gate before delivery.
+        let reader = owner_a.clone();
         assert!(
             search_hit_accepted(&filter, &env_for_a, &[], &reader),
             "envelope addressed to owner_a must be returned"
