@@ -3033,6 +3033,9 @@ async fn ingest_event_inner(
             | Err(buzz_db::DbError::NotFound(message)) => {
                 return Err(IngestError::Rejected(format!("invalid: {message}")));
             }
+            Err(buzz_db::DbError::Conflict(message)) => {
+                return Err(IngestError::Rejected(format!("conflict: {message}")));
+            }
             Err(error) => {
                 return Err(IngestError::Internal(format!(
                     "error: database error: {error}"

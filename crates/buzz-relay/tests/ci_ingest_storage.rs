@@ -94,6 +94,121 @@ fn signed_request(keys: &Keys, channel_id: Uuid, request: &CiRequestEnvelope) ->
     .expect("sign request")
 }
 
+fn rerun_request(
+    initial: &CiRequestEnvelope,
+    job_id: &str,
+    parent_attempt: u32,
+) -> CiRequestEnvelope {
+    let mut rerun = initial.clone();
+    rerun.request_type = CiRequestType::Rerun;
+    rerun.job_ids = vec![job_id.to_string()];
+    rerun.attempt = parent_attempt + 1;
+    rerun.parent_attempt = Some(parent_attempt);
+    rerun.parent_run_id = Some(initial.run_id.clone());
+    rerun.idempotency_key = Uuid::new_v4().to_string();
+    rerun
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selected_job_status(
+    control: &Keys,
+    channel_id: Uuid,
+    request: &CiRequestEnvelope,
+    request_event_id: &str,
+    job_id: &str,
+    attempt: u32,
+    parent_attempt: Option<u32>,
+    sequence: u64,
+    state: CiJobState,
+    also_reruns: &[&str],
+) -> Event {
+    let terminal = state.is_terminal();
+    let envelope = CiJobStatusEnvelope {
+        schema_version: CI_SCHEMA_VERSION,
+        request_event_id: request_event_id.to_owned(),
+        run_id: request.run_id.clone(),
+        workflow_id: request.workflow_id.clone(),
+        target_repo_a: request.target_repo_a.clone(),
+        tip_oid: request.tip_oid.clone(),
+        base_oid: request.base_oid.clone(),
+        job_id: job_id.into(),
+        name: job_id.into(),
+        attempt,
+        parent_attempt,
+        sequence,
+        state,
+        conclusion: terminal.then(|| match state {
+            CiJobState::Success => "success".into(),
+            CiJobState::Failure => "failure".into(),
+            _ => "terminal".into(),
+        }),
+        reason: None,
+        required: true,
+        skip_policy: CiSkipPolicy::Forbid,
+        selected_job_instance: job_id.into(),
+        also_reruns: also_reruns
+            .iter()
+            .map(|job_id| (*job_id).to_string())
+            .collect(),
+        started_at: (sequence >= 2).then_some(1_800_000_010),
+        finished_at: terminal.then_some(1_800_000_020),
+        log_ref: None,
+        artifact_refs: Vec::new(),
+        relay_signer: control.public_key().to_hex(),
+    };
+    EventBuilder::new(
+        Kind::Custom(buzz_core::kind::KIND_CI_JOB_STATUS as u16),
+        serde_json::to_string(&envelope).expect("serialize selected job status"),
+    )
+    .tags(job_status_tags(&channel_id.to_string(), &envelope).expect("selected job status tags"))
+    .sign_with_keys(control)
+    .expect("sign selected job status")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn store_selected_job_chain(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    control: &Keys,
+    request: &CiRequestEnvelope,
+    request_event: &Event,
+    job_id: &str,
+    attempt: u32,
+    parent_attempt: Option<u32>,
+    terminal_state: CiJobState,
+    also_reruns: &[&str],
+    authorized_status_signers: &HashSet<String>,
+) {
+    for (sequence, state) in [
+        (1, CiJobState::Queued),
+        (2, CiJobState::Running),
+        (3, terminal_state),
+    ] {
+        let event = selected_job_status(
+            control,
+            channel_id,
+            request,
+            &request_event.id.to_hex(),
+            job_id,
+            attempt,
+            parent_attempt,
+            sequence,
+            state,
+            also_reruns,
+        );
+        store(
+            pool,
+            community_id,
+            channel_id,
+            &event,
+            authorized_status_signers,
+        )
+        .await
+        .expect("store selected job status fixture");
+    }
+}
+
 fn job_status(
     control: &Keys,
     channel_id: Uuid,
@@ -782,4 +897,157 @@ async fn request_and_status_chain_round_trip_into_reducer() {
         .await,
         Err(buzz_db::DbError::InvalidData(_))
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn stale_fanout_rerun_is_rejected_without_poisoning_selected_graph() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let authorized_status_signers = HashSet::from([control.public_key().to_hex()]);
+
+    let mut initial = request(&actor, Uuid::new_v4());
+    initial.job_ids = vec!["build".into(), "test".into()];
+    let initial_event = signed_request(&actor, channel_id, &initial);
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &initial_event,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store initial request");
+    for job_id in ["build", "test"] {
+        store_selected_job_chain(
+            &pool,
+            community_id,
+            channel_id,
+            &control,
+            &initial,
+            &initial_event,
+            job_id,
+            1,
+            None,
+            CiJobState::Failure,
+            &[],
+            &authorized_status_signers,
+        )
+        .await;
+    }
+
+    let build_rerun = rerun_request(&initial, "build", 1);
+    let build_rerun_event = signed_request(&actor, channel_id, &build_rerun);
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &build_rerun_event,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store build rerun");
+    store_selected_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &build_rerun,
+        &build_rerun_event,
+        "build",
+        2,
+        Some(1),
+        CiJobState::Success,
+        &["test"],
+        &authorized_status_signers,
+    )
+    .await;
+    store_selected_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &build_rerun,
+        &build_rerun_event,
+        "test",
+        2,
+        Some(1),
+        CiJobState::Failure,
+        &[],
+        &authorized_status_signers,
+    )
+    .await;
+
+    let stale_test_rerun = rerun_request(&initial, "test", 1);
+    let stale_test_rerun_event = signed_request(&actor, channel_id, &stale_test_rerun);
+    assert!(matches!(
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &stale_test_rerun_event,
+            &authorized_status_signers,
+        )
+        .await,
+        Err(buzz_db::DbError::Conflict(message)) if message.contains("currently selects attempt 2")
+    ));
+
+    let reducer_after_rejection = load_ci_reducer_events(
+        &pool,
+        community_id,
+        channel_id,
+        Uuid::parse_str(&initial.run_id).unwrap(),
+    )
+    .await
+    .expect("load graph after rejected rerun");
+    assert_eq!(reducer_after_rejection.request_events.len(), 2);
+
+    let fresh_test_rerun = rerun_request(&initial, "test", 2);
+    let fresh_test_rerun_event = signed_request(&actor, channel_id, &fresh_test_rerun);
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &fresh_test_rerun_event,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store fresh test rerun");
+    store_selected_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &fresh_test_rerun,
+        &fresh_test_rerun_event,
+        "test",
+        3,
+        Some(2),
+        CiJobState::Success,
+        &[],
+        &authorized_status_signers,
+    )
+    .await;
+
+    let reducer_events = load_ci_reducer_events(
+        &pool,
+        community_id,
+        channel_id,
+        Uuid::parse_str(&initial.run_id).unwrap(),
+    )
+    .await
+    .expect("load completable graph");
+    let graph = reduce_signed_ci_graph(&SignedCiGraphInput {
+        channel_id: channel_id.to_string(),
+        authorized_status_signers,
+        request_events: reducer_events.request_events,
+        job_status_events: reducer_events.job_status_events,
+    })
+    .expect("rejected stale rerun must leave a completable selected graph");
+    assert_eq!(
+        graph.selected_job_attempts,
+        vec![("build".into(), 2), ("test".into(), 3)]
+    );
 }

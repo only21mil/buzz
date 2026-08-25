@@ -442,6 +442,49 @@ async fn prepare_request(
     }
     let parent_attempt = i32::try_from(request.parent_attempt.unwrap_or(0))
         .map_err(|_| DbError::InvalidData("CI parent attempt exceeds i32".into()))?;
+    let selected_attempt: i32 = sqlx::query_scalar(
+        r#"
+        WITH selected_attempts AS (
+            SELECT 1 AS attempt
+            UNION ALL
+            SELECT rerun.attempt
+            FROM ci_run_events AS rerun
+            WHERE rerun.community_id=$1 AND rerun.run_id=$2
+              AND rerun.event_kind=$3 AND rerun.attempt>1 AND rerun.job_id=$4
+            UNION ALL
+            SELECT primary_status.attempt
+            FROM ci_run_events AS rerun
+            JOIN ci_run_events AS primary_status
+              ON primary_status.community_id=rerun.community_id
+             AND primary_status.run_id=rerun.run_id
+             AND primary_status.request_event_id=rerun.event_id
+             AND primary_status.event_kind=$5
+             AND primary_status.job_id=rerun.job_id
+             AND primary_status.attempt=rerun.attempt
+             AND primary_status.sequence=1
+            JOIN events AS stored
+              ON stored.community_id=primary_status.community_id
+             AND stored.created_at=primary_status.event_created_at
+             AND stored.id=primary_status.event_id
+            WHERE rerun.community_id=$1 AND rerun.run_id=$2
+              AND rerun.event_kind=$3 AND rerun.attempt>1
+              AND (stored.content::jsonb -> 'also_reruns') ? $4
+        )
+        SELECT MAX(attempt) FROM selected_attempts
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(KIND_CI_REQUEST as i32)
+    .bind(job_id)
+    .bind(KIND_CI_JOB_STATUS as i32)
+    .fetch_one(&mut **tx)
+    .await?;
+    if selected_attempt != parent_attempt {
+        return Err(DbError::Conflict(format!(
+            "CI rerun parent attempt {parent_attempt} is stale; job {job_id} currently selects attempt {selected_attempt}"
+        )));
+    }
     let parent_state: Option<String> = sqlx::query_scalar(
         r#"
         SELECT status_state FROM ci_run_events
@@ -459,7 +502,7 @@ async fn prepare_request(
     .await?;
     if parent_state.as_deref() != Some("failure") {
         return Err(DbError::InvalidData(
-            "CI rerun parent job is not a selected terminal failure".into(),
+            "CI rerun parent job is not a terminal failure".into(),
         ));
     }
     Ok(())

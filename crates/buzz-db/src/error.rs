@@ -33,6 +33,10 @@ pub enum DbError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The requested write conflicts with the currently selected durable state.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// The caller lacks permission for the requested operation.
     #[error("access denied: {0}")]
     AccessDenied(String),
