@@ -68,6 +68,25 @@ nonzero. Deploy records default to `$HOME/.local/state/buzz-relay/deploys`.
 Do not use `run-local.sh up` as an upgrade command. Use `deploy-local.sh` so the
 backup, migration check, and rollback path cannot be skipped.
 
+## Deployment traps
+
+- PostgreSQL may print boolean results as `t` or `true`, with whitespace around
+  either value. `deploy-local.sh` trims the result and accepts only those two
+  spellings. It refuses `f`, `false`, empty output, and other text.
+- The relay image entrypoint is `/usr/local/bin/buzz-relay`. A command such as
+  `docker run <image> buzz-admin migrate` starts the relay and passes
+  `buzz-admin migrate` to it as arguments. Image admin commands must override
+  the entrypoint, for example:
+
+  ```bash
+  docker run --rm --entrypoint /usr/local/bin/buzz-admin <image> migrate
+  ```
+
+  `deploy-local.sh` uses the same override for its Compose migration command.
+- At this commit, `run-local.sh:54` includes `BUZZ_IMAGE` in its
+  `sudo --preserve-env` list. Older production copies dropped it across
+  `sudo`; the safe form for those copies is `sudo env BUZZ_IMAGE=<image> …`.
+
 ## Validation
 
 Before sharing an install link publicly, verify a fresh install with:

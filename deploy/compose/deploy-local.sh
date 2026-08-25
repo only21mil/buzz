@@ -63,6 +63,13 @@ compose_with_image() {
   BUZZ_IMAGE=${image} "${run_local}" "$@"
 }
 
+pg_boolean_true() {
+  local value=${1-}
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  [[ ${value} == t || ${value} == true ]]
+}
+
 container_image_id() {
   local image_id
   image_id=$(docker inspect --format '{{.Image}}' "$1")
@@ -138,7 +145,7 @@ rollback() {
     return 1
   fi
   IFS='|' read -r rollback_db_migration rollback_db_success <<<"${rollback_db_state}"
-  if [[ ! ${rollback_db_migration} =~ ^[0-9]+$ ]] || [[ ${rollback_db_success} != t ]]; then
+  if [[ ! ${rollback_db_migration} =~ ^[0-9]+$ ]] || ! pg_boolean_true "${rollback_db_success}"; then
     printf 'AUTOMATIC ROLLBACK REFUSED: database migration state is %s. Prior image requires at most %d. Database dump: %s\n' \
       "${rollback_db_state}" "${prior_required_migration}" "${dump_file}" >&2
     return 1
@@ -274,7 +281,7 @@ read_db_migration() {
   table_present=$(compose exec -T postgres sh -euc \
     'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "$1"' sh \
     "SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-  if [[ ${table_present} == t ]]; then
+  if pg_boolean_true "${table_present}"; then
     row=$(compose exec -T postgres sh -euc \
       'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "$1"' sh \
       "SELECT version || '|' || success FROM _sqlx_migrations ORDER BY version DESC LIMIT 1")
@@ -290,7 +297,7 @@ IFS='|' read -r db_migration db_success <<<"${db_state}"
   printf 'REFUSED: invalid migration version returned by database: %s\n' "${db_state}" >&2
   exit 1
 }
-if [[ ${db_success} != t ]]; then
+if ! pg_boolean_true "${db_success}"; then
   printf 'REFUSED: database migration %s is recorded with success=%s\n' "${db_migration}" "${db_success}" >&2
   exit 1
 fi
@@ -310,7 +317,7 @@ if ((db_migration < required_migration)); then
   fi
   db_state=$(read_db_migration)
   IFS='|' read -r db_migration db_success <<<"${db_state}"
-  if [[ ! ${db_migration} =~ ^[0-9]+$ ]] || [[ ${db_success} != t ]] || ((db_migration != required_migration)); then
+  if [[ ! ${db_migration} =~ ^[0-9]+$ ]] || ! pg_boolean_true "${db_success}" || ((db_migration != required_migration)); then
     printf 'REFUSED: database state after migrate is %s, expected %d|t; relay image was not swapped\n' \
       "${db_state}" "${required_migration}" >&2
     exit 1
