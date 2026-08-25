@@ -361,6 +361,7 @@ steps:
     #[derive(Default)]
     struct RecordingActionSink {
         messages: Mutex<Vec<MessageCall>>,
+        resolved_mentions: Mutex<Vec<String>>,
     }
 
     impl RecordingActionSink {
@@ -370,9 +371,31 @@ steps:
                 .expect("recording action sink lock")
                 .clone()
         }
+
+        fn set_resolved_mentions(&self, pubkeys: Vec<String>) {
+            *self
+                .resolved_mentions
+                .lock()
+                .expect("resolved mentions lock") = pubkeys;
+        }
     }
 
     impl ActionSink for RecordingActionSink {
+        fn resolve_message_mentions(
+            &self,
+            _community_id: CommunityId,
+            _channel_id: &str,
+            _text: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, ActionSinkError>> + Send + '_>>
+        {
+            let pubkeys = self
+                .resolved_mentions
+                .lock()
+                .expect("resolved mentions lock")
+                .clone();
+            Box::pin(async move { Ok(pubkeys) })
+        }
+
         fn send_message(
             &self,
             effect: ActionEffectContext,
@@ -894,6 +917,9 @@ steps:
             panic!("new message claim must be ready");
         };
         assert!(fixture.sink.messages().is_empty());
+        fixture.sink.set_resolved_mentions(vec![
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        ]);
 
         expire_claim(&fixture, claimed_generation).await;
         let outcome = run_workflow_resume_sweep_once(

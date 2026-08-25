@@ -1266,6 +1266,22 @@ async fn crash_after_claim_before_fire_reuses_identity_and_fires_once() {
     let WorkflowEffectClaimOutcome::Ready(first_claim) = first else {
         panic!("new webhook effect must be ready");
     };
+    let persisted_payload: Value = sqlx::query_scalar(
+        "SELECT effect_payload FROM workflow_effect_claims \
+         WHERE community_id = $1 AND run_id = $2 AND step_id = $3 AND effect_index = 0",
+    )
+    .bind(fixture.community_id.as_uuid())
+    .bind(fixture.ids.run_id)
+    .bind("deliver")
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read persisted webhook payload");
+    assert_eq!(persisted_payload, first_claim.effect_payload);
+    assert_eq!(persisted_payload["body"], original_payload["body"]);
+    assert_eq!(
+        persisted_payload["idempotency_key"],
+        first_claim.idempotency_key.to_string()
+    );
 
     let generation = reclaim_running_generation(&fixture).await;
     let changed_payload = json!({

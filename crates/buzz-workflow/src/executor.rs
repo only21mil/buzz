@@ -2249,13 +2249,13 @@ mod tests {
                 .expect("deliver webhook attempt");
         }
         let requests = receiver.await.expect("join webhook stub");
-        let split = |request: &[u8]| {
+        fn split(request: &[u8]) -> (&[u8], &[u8]) {
             let header_end = request
                 .windows(4)
                 .position(|part| part == b"\r\n\r\n")
                 .expect("request header terminator");
             (&request[..header_end], &request[header_end + 4..])
-        };
+        }
         let (first_headers, first_body) = split(&requests[0]);
         let (second_headers, second_body) = split(&requests[1]);
         assert_eq!(first_body, second_body, "webhook retry body changed");
