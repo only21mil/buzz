@@ -231,7 +231,7 @@ impl InboxCursorStore {
     /// Events first exposed with a timestamp older than the retained floor can
     /// still be lost; long downtime is also bounded by the configured catch-up
     /// maximum age.
-    fn advance_contiguous_cursor(&mut self, now: u64) -> bool {
+    fn advance_contiguous_cursor(&mut self, _now: u64) -> bool {
         let frontier = match self.pending.first() {
             Some(oldest_pending) => self.completed.range(..oldest_pending.clone()).next_back(),
             None => self.completed.last(),
@@ -241,9 +241,7 @@ impl InboxCursorStore {
             return false;
         };
         let candidate = EventCursor {
-            created_at: frontier
-                .created_at
-                .min(now.saturating_sub(self.reorder_window_secs)),
+            created_at: frontier.created_at.saturating_sub(self.reorder_window_secs),
             event_id: frontier.event_id.clone(),
         };
         let advances = self
@@ -566,10 +564,26 @@ mod tests {
         assert!(store.begin_event(&older));
         assert!(store.begin_event(&newer));
         store.mark_processed_at([&newer], 110);
-        assert_eq!(store.catchup_since(110, 1_000).since, 80);
+        assert_eq!(store.catchup_since(110, 1_000).since, 70);
 
         store.mark_processed_at([&older], 110);
-        assert_eq!(store.catchup_since(110, 1_000).since, 100);
+        assert_eq!(store.catchup_since(110, 1_000).since, 90);
+
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn old_frontier_keeps_replay_floor_behind_frontier() {
+        let temp = std::env::temp_dir().join(format!("buzz-acp-inbox-{}", Uuid::new_v4()));
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let frontier = signed_event(&keys, channel_id, 100, "old frontier");
+        let pubkey = keys.public_key().to_hex();
+
+        let mut store = InboxCursorStore::load(&temp, &pubkey, 995, 10);
+        store.mark_processed_at([&frontier], 1_000);
+
+        assert_eq!(store.catchup_since(1_000, 1_000).since, 90);
 
         std::fs::remove_dir_all(temp).unwrap();
     }
@@ -593,7 +607,7 @@ mod tests {
 
         let mut first = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
         first.mark_processed_at([&newer], now);
-        assert_eq!(first.catchup_since(now, 86_400).since, now - 300);
+        assert_eq!(first.catchup_since(now, 86_400).since, now - 310);
         drop(first);
 
         let mut restarted = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
