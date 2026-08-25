@@ -532,6 +532,11 @@ Note: Both `TriggerDef` and `ActionDef` use serde internally-tagged enums. Trigg
 | `request_approval` | Suspend execution; fields: `from`, `message`, `timeout` (default 24h) |
 | `delay` | Pause execution (max 300 seconds) |
 
+Workflow messages and reactions are exactly-once: the claim stores the fully
+rendered payload, retries rebuild the same signed event, and relay event storage
+deduplicates its ID. Webhooks cannot make that guarantee across the network.
+They follow the at-least-once contract above.
+
 **Template variables:** `{{trigger.text}}`, `{{trigger.author}}`, `{{steps.ID.output.FIELD}}`. Single-pass resolution (not recursive). Unknown variables left as literal text.
 
 **Condition evaluation:** `evalexpr` with `HashMapContext`. Dot notation converted to underscores (`trigger.text` → `trigger_text`). Custom functions registered: `str_contains`, `str_starts_with`, `str_ends_with`, `str_len`. 100ms timeout prevents adversarial expressions from blocking.

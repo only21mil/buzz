@@ -691,6 +691,16 @@ struct SendMessageEffectPayload {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AddReactionEffectPayload {
+    channel_id: String,
+    target_event_id: String,
+    emoji: String,
+    author_pubkey: String,
+    #[serde(default)]
+    idempotency_key: Option<Uuid>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct WebhookEffectPayload {
     url: String,
     method: String,
@@ -852,6 +862,11 @@ async fn dispatch_action_with_generation(
                         "stored send_message effect payload is invalid: {error}"
                     ))
                 })?;
+            if payload.idempotency_key != Some(claim.idempotency_key) {
+                return Err(WorkflowError::Database(
+                    "stored send_message effect payload has a mismatched idempotency key".into(),
+                ));
+            }
 
             info!(
                 run_id = %run_id,
@@ -903,35 +918,11 @@ async fn dispatch_action_with_generation(
         }
 
         AddReaction { emoji } => {
-            let candidate_payload = serde_json::json!({
-                "channel_id": trigger_ctx.channel_id,
-                "target_event_id": trigger_ctx.message_id,
-                "emoji": emoji,
-            });
-            let (claim, generation) = match prepare_effect(
-                engine,
-                community_id,
-                run_id,
-                step_id,
-                "add_reaction",
-                action,
-                &candidate_payload,
-                claimed_generation,
-            )
-            .await?
-            {
-                PreparedEffect::AlreadyFired(output) => {
-                    return Ok(StepResult::Completed(output));
-                }
-                PreparedEffect::Fire { claim, generation } => (claim, generation),
-            };
-            info!(run_id = %run_id, step = step_id, "AddReaction → :{emoji}:");
             if trigger_ctx.message_id.is_empty() {
                 return Err(WorkflowError::InvalidDefinition(
                     "AddReaction: no trigger.message_id available".into(),
                 ));
             }
-
             let wf_run = engine
                 .db
                 .get_workflow_run(community_id, run_id)
@@ -953,7 +944,47 @@ async fn dispatch_action_with_generation(
                 })?;
             let channel_id =
                 resolve_send_message_channel(None, &trigger_ctx.channel_id, workflow.channel_id)?;
-            let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+            let candidate_payload = serde_json::to_value(AddReactionEffectPayload {
+                channel_id,
+                target_event_id: trigger_ctx.message_id.clone(),
+                emoji: emoji.clone(),
+                author_pubkey: hex::encode(&workflow.owner_pubkey),
+                idempotency_key: None,
+            })
+            .map_err(|error| {
+                WorkflowError::Database(format!(
+                    "failed to serialize add_reaction effect payload: {error}"
+                ))
+            })?;
+            let (claim, generation) = match prepare_effect(
+                engine,
+                community_id,
+                run_id,
+                step_id,
+                "add_reaction",
+                action,
+                &candidate_payload,
+                claimed_generation,
+            )
+            .await?
+            {
+                PreparedEffect::AlreadyFired(output) => {
+                    return Ok(StepResult::Completed(output));
+                }
+                PreparedEffect::Fire { claim, generation } => (claim, generation),
+            };
+            let payload: AddReactionEffectPayload =
+                serde_json::from_value(claim.effect_payload.clone()).map_err(|error| {
+                    WorkflowError::Database(format!(
+                        "stored add_reaction effect payload is invalid: {error}"
+                    ))
+                })?;
+            if payload.idempotency_key != Some(claim.idempotency_key) {
+                return Err(WorkflowError::Database(
+                    "stored add_reaction effect payload has a mismatched idempotency key".into(),
+                ));
+            }
+            info!(run_id = %run_id, step = step_id, "AddReaction delivery");
 
             let result = add_reaction_via_sink(
                 engine.action_sink()?,
@@ -962,10 +993,10 @@ async fn dispatch_action_with_generation(
                     claimed_at: claim.claimed_at,
                 },
                 community_id,
-                &channel_id,
-                &trigger_ctx.message_id,
-                emoji,
-                &owner_pubkey_hex,
+                &payload.channel_id,
+                &payload.target_event_id,
+                &payload.emoji,
+                &payload.author_pubkey,
             )
             .await?;
             mark_effect_fired(engine, community_id, run_id, step_id, generation, result).await
