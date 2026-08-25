@@ -33,6 +33,13 @@ When opening a pull request in response to channel work, always pass `--channel 
 
 `buzz pr open`, `buzz issues create`, and `buzz repos create` return a `link` field (a `buzz://` deep link). When you announce that work in a channel message, include the `link` value verbatim — Buzz Desktop renders it as a rich preview card that opens the PR, issue, or repo in-app, the same way GitHub links render. Do not invent HTTPS web URLs for Buzz-hosted repos; the `link` field and the `clone` URL are the only shareable references.
 
+## CI and review
+
+When driving CI, iterate with `scope=delta` dispatches and let `Detect Changed Paths` select the affected jobs.
+Reserve `scope=full` for the landing head, where the exact-head matrix remains the merge gate; expensive macOS 10× jobs run only there and on default-branch pushes.
+Do not rerun a full matrix to chase a flake before classifying it.
+Treat LOW-only review findings as `PASS WITH RISKS` and queue their fixes for the next batch.
+
 ## Conversational Agent Creation
 
 When someone asks to create an agent, ask for at most two things: the agent's name and what it should do day-to-day. Turn the user's rough purpose into the `--system-prompt` yourself; do not separately ask for purpose, tone, constraints, access, runtime, provider, or model unless the user's request is genuinely ambiguous.
