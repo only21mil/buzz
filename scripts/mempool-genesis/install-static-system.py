@@ -196,10 +196,17 @@ def package_fingerprint(entries: list[dict[str, object]]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def exact_manifest(package: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+def exact_manifest(
+    package: Path, raw: bytes | None = None
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     manifest_path = package / MANIFEST_NAME
     require_regular(manifest_path, 1000, 0o600)
-    manifest = load_json(manifest_path)
+    if raw is None:
+        manifest = load_json(manifest_path)
+    else:
+        manifest = json.loads(raw, object_pairs_hook=reject_duplicates)
+        if not isinstance(manifest, dict):
+            raise ValueError("JSON root must be an object")
     if set(manifest) != MANIFEST_KEYS or manifest["schema"] != SCHEMA:
         raise ValueError("invalid install package manifest")
     package_id = manifest["package_id"]
@@ -411,12 +418,35 @@ def bind_accepted_manifest(
             raise ValueError(f"accepted closure fingerprint mismatch: {name}")
 
 
+def accepted_manifest_bytes(
+    package: Path, state_path: Path, attestation: dict[str, str]
+) -> bytes:
+    bundle, _artifact_fingerprint = accepted_bundle(state_path, attestation)
+    fingerprints = bundle.get("fingerprints")
+    expected = (
+        fingerprints.get("manifest_sha256")
+        if isinstance(fingerprints, dict)
+        else None
+    )
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("accepted bundle lacks fingerprint: manifest_sha256")
+    manifest_path = package / MANIFEST_NAME
+    require_regular(manifest_path, 1000, 0o600)
+    raw = manifest_path.read_bytes()
+    if len(raw) > 64 * 1024:
+        raise ValueError("JSON file is too large")
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("accepted closure fingerprint mismatch: manifest_sha256")
+    return raw
+
+
 def verify_package(
     package: Path, state_path: Path
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     require_directory(package, 1000, 0o700)
     attestation = check_closure(state_path)
-    manifest, entries = exact_manifest(package)
+    manifest_raw = accepted_manifest_bytes(package, state_path, attestation)
+    manifest, entries = exact_manifest(package, manifest_raw)
     opened: list[int] = []
     try:
         for entry in entries:

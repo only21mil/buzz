@@ -105,6 +105,9 @@ class StaticManifestTests(unittest.TestCase):
         ).hexdigest()
         manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
         package_fingerprints = {
+            "manifest_sha256": hashlib.sha256(
+                (package / MODULE.MANIFEST_NAME).read_bytes()
+            ).hexdigest(),
             "package_fingerprint": manifest["package_fingerprint"],
             "desktop_launcher_sha256": manifest["desktop_launcher_sha256"],
             "desktop_previous_launcher_sha256": manifest[
@@ -298,6 +301,43 @@ class StaticManifestTests(unittest.TestCase):
                 MODULE, "check_closure", return_value=self.make_attestation(state)
             ),
             self.assertRaisesRegex(ValueError, "package source hash drift"),
+        ):
+            MODULE.verify_package(package, state)
+
+    def test_verify_package_rejects_post_freeze_package_id_mutation(self) -> None:
+        temporary, package = self.make_package()
+        self.addCleanup(temporary.cleanup)
+        state = self.make_closure(package)
+        manifest_path = package / MODULE.MANIFEST_NAME
+        manifest = json.loads(manifest_path.read_text())
+        manifest["package_id"] = "mempool-genesis-static-mutated"
+        manifest_path.write_text(json.dumps(manifest))
+        manifest_path.chmod(0o600)
+        with (
+            mock.patch.object(
+                MODULE, "check_closure", return_value=self.make_attestation(state)
+            ),
+            self.assertRaisesRegex(ValueError, "manifest_sha256"),
+        ):
+            MODULE.verify_package(package, state)
+
+    def test_verify_package_rejects_missing_manifest_fingerprint(self) -> None:
+        temporary, package = self.make_package()
+        self.addCleanup(temporary.cleanup)
+        state = self.make_closure(package)
+        bundle_path = package / "evidence.json"
+        bundle = json.loads(bundle_path.read_text())
+        del bundle["fingerprints"]["manifest_sha256"]
+        bundle_path.write_text(json.dumps(bundle))
+        closure = json.loads(state.read_text())
+        revision = closure["revisions"]["1"]
+        revision["bundle_digest"] = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        state.write_text(json.dumps(closure))
+        with (
+            mock.patch.object(
+                MODULE, "check_closure", return_value=self.make_attestation(state)
+            ),
+            self.assertRaisesRegex(ValueError, "lacks fingerprint: manifest_sha256"),
         ):
             MODULE.verify_package(package, state)
 
