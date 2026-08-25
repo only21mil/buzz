@@ -2519,13 +2519,54 @@ async fn ingest_event_inner(
         let ch_id = channel_id.ok_or_else(|| {
             IngestError::Rejected("invalid: CI events require a channel h tag".into())
         })?;
+
+        // B1 authorized-signer composition.
+        //
+        // ORDERING (fail-closed):
+        // 1. Kind 46100 (CI_REQUEST): the actor IS the requester — the signer
+        //    set is DEFINED as empty, so validate_signed_ci_event checks the
+        //    envelope + tags + actor==signer and never consults the signer set.
+        // 2. Kinds 46101-46106: signers must be authorized. The granted set is
+        //    the UNION of canonical's owner-configured static signers
+        //    `config.ci_status_signer_pubkeys` AND the active `ci_grants` rows
+        //    for (community, channel, target_repo_a) now resolved via
+        //    Db::get_active_ci_signers. The union is taken here so neither the
+        //    config-based set nor the grant set can ever be silently dropped:
+        //    if BOTH are empty, validate_signed_ci_event rejects the event
+        //    (unauthorized signer).
+        // Canonical's static validation is retained verbatim on the union below,
+        // not replaced.
+        let signers: std::collections::HashSet<String> = if kind_u32 == KIND_CI_REQUEST {
+            std::collections::HashSet::new()
+        } else {
+            // Every 46101-46106 envelope carries the immutable NIP-34 repository
+            // coordinate `target_repo_a` as a top-level JSON field; it scopes the
+            // grant lookup to the exact repository the event is about.
+            let parsed: serde_json::Value = serde_json::from_str(&event.content).map_err(|_| {
+                IngestError::Rejected("invalid: CI event content is not valid JSON".into())
+            })?;
+            let target_repo_a = parsed
+                .get("target_repo_a")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    IngestError::Rejected("invalid: CI event missing target_repo_a".into())
+                })?;
+
+            let now = chrono::Utc::now();
+            let mut signers: std::collections::HashSet<String> =
+                state.config.ci_status_signer_pubkeys.clone();
+            let grant_signers = state
+                .db
+                .get_active_ci_signers(tenant.community(), ch_id, target_repo_a, now)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: ci grant lookup: {e}")))?;
+            signers.extend(grant_signers);
+            signers
+        };
+
         Some(
-            buzz_core::ci::validate_signed_ci_event(
-                &event,
-                &ch_id.to_string(),
-                &state.config.ci_status_signer_pubkeys,
-            )
-            .map_err(|error| IngestError::Rejected(error.to_string()))?,
+            buzz_core::ci::validate_signed_ci_event(&event, &ch_id.to_string(), &signers)
+                .map_err(|error| IngestError::Rejected(error.to_string()))?,
         )
     } else {
         None

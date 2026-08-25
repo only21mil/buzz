@@ -1692,3 +1692,92 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod b1_ci_grants_ordering {
+    //! A4 test-only hook for B1 lane objective 4: `0035_ci_grants` must run
+    //! only after 0029..0034.
+    //!
+    //! This module is additive-only (never edits or re-binds migration
+    //! indexes inside the main test module). It asserts the *semantic*
+    //! ordering: the workflow snapshot/state/approval/CI-event storage base
+    //! (0029-0034) must still occupy versions 29-34, and the CI-signer-grant
+    //! migration — when it exists — must be version 35 at the vector tail and
+    //! must not have displaced any of 0029-0034.
+    //!
+    //! The count assertion is deliberately conditional: before A2 lands 0035
+    //! the embedded migrator contains 34 migrations and this module is
+    //! vacuously satisfied; once 0035 lands it must appear exactly as version
+    //! 35 after 0034. That keeps the shared tree green across both states.
+
+    use super::MIGRATOR;
+
+    #[test]
+    fn ci_grants_lands_only_after_workflow_and_ci_storage_base() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+
+        // Pre-0035 state: exactly the canonical 34-migration spine. If 0035 is
+        // absent this whole contract is vacuous and the existing len==34 test
+        // governs; this hook only pins the relative order.
+        let ci_grants_pos = migrations.iter().position(|m| m.description == "ci grants");
+        let Some(ci_grants) = ci_grants_pos else {
+            assert_eq!(
+                migrations.len(),
+                34,
+                "pre-0035 migration count changed unexpectedly"
+            );
+            return;
+        };
+
+        // 0035_ci_grants.sql must have sqlx version 35.
+        assert_eq!(
+            migrations[ci_grants].version, 35,
+            "0035_ci_grants must be migration version 35"
+        );
+
+        // The base the workflow/CI ingestion depends on must remain in place
+        // (semantic index): index 28 is 0029_workflow_run_snapshots and the
+        // sequence 29-34 (vector indexes 28..=33) is unchanged. This is the
+        // "index 34 semantic vs index 28 workflow snapshots" binding: the tail
+        // migration is exactly one past 0034's vector slot, and 0029 has not
+        // been replaced or displaced.
+        let snapshot = &migrations[28];
+        assert_eq!(snapshot.version, 29, "index 28 must be 0029");
+        assert_eq!(
+            &*snapshot.description, "workflow run snapshots",
+            "index 28 must still be 0029_workflow_run_snapshots"
+        );
+
+        let tail_versions: Vec<i64> = migrations.iter().map(|m| m.version).collect();
+        let tail = &tail_versions[29..35];
+        assert_eq!(
+            tail,
+            &[30, 31, 32, 33, 34, 35],
+            "migration 0035 must land immediately after 0034 with no renumbering of 0030-0034"
+        );
+
+        // And `ci_grants` must sit at the final vector index (35 in 1-based
+        // terms, i.e. vector index 34 because 0001 occupies index 0).
+        assert_eq!(
+            ci_grants, 34,
+            "0035_ci_grants must be the last migration (vector index 34)"
+        );
+
+        // Fact-bound: the migration itself must create the grants table with
+        // the B1 authorizer's PK and window columns.
+        let sql = migrations[ci_grants].sql.as_str();
+        assert!(
+            sql.contains("CREATE TABLE ci_grants"),
+            "0035_ci_grants must create the ci_grants table"
+        );
+        assert!(
+            sql.contains("PRIMARY KEY (community_id, channel_id, target_repo_a, signer_pubkey)"),
+            "0035_ci_grants must key on the full (community, channel, repo, signer) tuple"
+        );
+        assert!(
+            sql.contains("valid_from") && sql.contains("valid_until"),
+            "0035_ci_grants must carry the validity window columns"
+        );
+    }
+}

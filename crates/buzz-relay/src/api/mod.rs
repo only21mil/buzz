@@ -2,6 +2,11 @@
 
 pub mod admin;
 pub mod bridge;
+/// CI preflight HTTP handler (`POST /ci/preflight`, NIP-98 auth).
+///
+/// Module file lands via sibling worktree A1 (`crates/buzz-relay/src/api/ci.rs`);
+/// the declaration resolves at Phase-B assembly when A1's file is added.
+pub mod ci;
 pub mod events;
 pub mod git;
 pub mod invites;

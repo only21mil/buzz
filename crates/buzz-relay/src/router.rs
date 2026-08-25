@@ -72,6 +72,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", post(api::bridge::submit_event))
         .route("/query", post(api::bridge::query_events))
         .route("/count", post(api::bridge::count_events))
+        // CI preflight (NIP-98 auth)
+        .route("/ci/preflight", post(api::ci::ci_preflight))
         .route(
             "/workflows/{workflow_id}/runs",
             get(api::bridge::workflow_runs),
