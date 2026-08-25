@@ -2792,11 +2792,7 @@ mod tests {
             reaction_output,
             json!({"added": true, "event_id": "reaction-event-id"})
         );
-        let calls_after_recovery = sink
-            .reactions
-            .lock()
-            .expect("recording sink lock")
-            .len();
+        let calls_after_recovery = sink.reactions.lock().expect("recording sink lock").len();
         let fired_replay = dispatch_action_with_generation(
             "reaction",
             &reaction_action,
@@ -2814,10 +2810,7 @@ mod tests {
         };
         assert_eq!(fired_output, reaction_output);
         assert_eq!(
-            sink.reactions
-                .lock()
-                .expect("recording sink lock")
-                .len(),
+            sink.reactions.lock().expect("recording sink lock").len(),
             calls_after_recovery,
             "fired replay must not call the sink again"
         );
