@@ -13,6 +13,9 @@ use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAg
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
+const CHANNEL_QUERY_PAGE_SIZE: u32 = 500;
+const CHANNEL_QUERY_MAX_PAGES: u32 = 20;
+
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "channel_id": extract_d_tag(e),
@@ -44,6 +47,169 @@ fn include_channel(event: &serde_json::Value, include_archived: bool) -> bool {
     include_archived || !is_channel_archived(event)
 }
 
+fn channel_matches(
+    event: &serde_json::Value,
+    include_archived: bool,
+    visibility: Option<&str>,
+) -> bool {
+    if !include_channel(event, include_archived) {
+        return false;
+    }
+    let Some(visibility) = visibility else {
+        return true;
+    };
+    let nip29_tag = if visibility == "open" {
+        "public"
+    } else {
+        visibility
+    };
+    event
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag.as_array().is_some_and(|values| {
+                    values.len() == 1
+                        && values.first().and_then(serde_json::Value::as_str) == Some(nip29_tag)
+                })
+            })
+        })
+}
+
+fn advance_channel_query_cursor(
+    filter: &mut serde_json::Value,
+    page: &[serde_json::Value],
+) -> Result<(), CliError> {
+    let last = page
+        .last()
+        .ok_or_else(|| CliError::Other("cannot advance an empty channel query page".into()))?;
+    let created_at = last
+        .get("created_at")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CliError::Other("channel query event missing created_at".into()))?;
+    let id = last
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| CliError::Other("channel query event missing valid id".into()))?;
+    filter["until"] = serde_json::json!(created_at);
+    filter["before_id"] = serde_json::json!(id);
+    Ok(())
+}
+
+async fn query_filtered_channel_events<F>(
+    client: &BuzzClient,
+    mut filter: serde_json::Value,
+    result_limit: u32,
+    predicate: F,
+) -> Result<Vec<serde_json::Value>, CliError>
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    if result_limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut matches = Vec::new();
+    for page_number in 1..=CHANNEL_QUERY_MAX_PAGES {
+        filter["limit"] = serde_json::json!(CHANNEL_QUERY_PAGE_SIZE);
+        let page = client
+            .query_paginated(filter.clone(), CHANNEL_QUERY_PAGE_SIZE)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+
+        for event in &page {
+            if predicate(event) {
+                matches.push(event.clone());
+                if matches.len() >= result_limit as usize {
+                    break;
+                }
+            }
+        }
+        if matches.len() >= result_limit as usize || page.len() < CHANNEL_QUERY_PAGE_SIZE as usize {
+            break;
+        }
+        if page_number == CHANNEL_QUERY_MAX_PAGES {
+            return Err(CliError::Other(format!(
+                "channel query exceeded the bounded scan of {} events",
+                CHANNEL_QUERY_PAGE_SIZE as u64 * CHANNEL_QUERY_MAX_PAGES as u64
+            )));
+        }
+        advance_channel_query_cursor(&mut filter, &page)?;
+    }
+    Ok(matches)
+}
+
+async fn query_list_channel_events(
+    client: &BuzzClient,
+    member: Option<bool>,
+    include_archived: bool,
+    visibility: Option<&str>,
+    result_limit: u32,
+) -> Result<Vec<serde_json::Value>, CliError> {
+    if result_limit == 0 {
+        return Ok(Vec::new());
+    }
+    if member != Some(true) {
+        return query_filtered_channel_events(
+            client,
+            serde_json::json!({"kinds": [39000]}),
+            result_limit,
+            |event| channel_matches(event, include_archived, visibility),
+        )
+        .await;
+    }
+
+    let my_pk = client.keys().public_key().to_hex();
+    let mut member_filter = serde_json::json!({
+        "kinds": [39002],
+        "#p": [my_pk],
+    });
+    let mut channels = Vec::new();
+    let mut seen_channel_ids = HashSet::new();
+    for page_number in 1..=CHANNEL_QUERY_MAX_PAGES {
+        member_filter["limit"] = serde_json::json!(CHANNEL_QUERY_PAGE_SIZE);
+        let page = client
+            .query_paginated(member_filter.clone(), CHANNEL_QUERY_PAGE_SIZE)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        let channel_ids = page
+            .iter()
+            .map(extract_d_tag)
+            .filter(|channel_id| !channel_id.is_empty())
+            .filter(|channel_id| seen_channel_ids.insert(channel_id.clone()))
+            .collect::<Vec<_>>();
+        if !channel_ids.is_empty() {
+            let remaining = result_limit.saturating_sub(channels.len() as u32);
+            let metadata = query_filtered_channel_events(
+                client,
+                serde_json::json!({"kinds": [39000], "#d": channel_ids}),
+                remaining,
+                |event| channel_matches(event, include_archived, visibility),
+            )
+            .await?;
+            channels.extend(metadata);
+        }
+        if channels.len() >= result_limit as usize || page.len() < CHANNEL_QUERY_PAGE_SIZE as usize
+        {
+            break;
+        }
+        if page_number == CHANNEL_QUERY_MAX_PAGES {
+            return Err(CliError::Other(format!(
+                "member channel query exceeded the bounded scan of {} events",
+                CHANNEL_QUERY_PAGE_SIZE as u64 * CHANNEL_QUERY_MAX_PAGES as u64
+            )));
+        }
+        advance_channel_query_cursor(&mut member_filter, &page)?;
+    }
+    channels.truncate(result_limit as usize);
+    Ok(channels)
+}
+
 pub async fn cmd_list_channels(
     client: &BuzzClient,
     visibility: Option<&str>,
@@ -53,71 +219,16 @@ pub async fn cmd_list_channels(
     format: &crate::OutputFormat,
 ) -> Result<(), CliError> {
     let effective_limit = limit.unwrap_or(500);
-    let events = if member == Some(true) {
-        // Step 1: find channel IDs where we're a member (kind:39002)
-        let my_pk = client.keys().public_key().to_hex();
-        let member_filter = serde_json::json!({
-            "kinds": [39002],
-            "#p": [my_pk],
-        });
-        let member_events = client
-            .query_paginated(member_filter, effective_limit)
-            .await?;
-        let channel_ids: Vec<String> = member_events
-            .iter()
-            .map(extract_d_tag)
-            .filter(|id| !id.is_empty())
-            .collect();
-        if channel_ids.is_empty() {
-            println!("[]");
-            return Ok(());
-        }
-        // Step 2: fetch kind:39000 metadata for those channels.
-        let metadata_filter = serde_json::json!({
-            "kinds": [39000],
-            "#d": channel_ids,
-        });
-        client
-            .query_paginated(metadata_filter, effective_limit)
-            .await?
-    } else {
-        let filter = serde_json::json!({
-            "kinds": [39000],
-        });
-        client.query_paginated(filter, effective_limit).await?
-    };
+    let events = query_list_channel_events(
+        client,
+        member,
+        include_archived,
+        visibility,
+        effective_limit,
+    )
+    .await?;
 
-    let channels: Vec<serde_json::Value> = events
-        .iter()
-        .filter(|e| {
-            if !include_channel(e, include_archived) {
-                return false;
-            }
-            if let Some(vis) = visibility {
-                // NIP-29: relay emits ["public"] or ["private"] single-element tags
-                let nip29_tag = match vis {
-                    "open" => "public",
-                    _ => vis,
-                };
-                e.get("tags")
-                    .and_then(|t| t.as_array())
-                    .map(|tags| {
-                        tags.iter().any(|tag| {
-                            tag.as_array()
-                                .map(|a| {
-                                    a.len() == 1
-                                        && a.first().and_then(|v| v.as_str()) == Some(nip29_tag)
-                                })
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            } else {
-                true
-            }
-        })
-        .map(extract_channel_metadata)
-        .collect();
+    let channels: Vec<serde_json::Value> = events.iter().map(extract_channel_metadata).collect();
     let output = match format {
         crate::OutputFormat::Compact => {
             let compact: Vec<serde_json::Value> = channels
@@ -153,18 +264,21 @@ pub async fn cmd_search_channels(
         return Err(CliError::Usage("--query cannot be empty".into()));
     }
 
-    let filter = serde_json::json!({
-        "kinds": [39000],
-    });
-    let arr = client.query_paginated(filter, limit).await?;
-
     let needle = query.to_ascii_lowercase();
-    let mut matches: Vec<ChannelSummary> = arr
-        .iter()
-        .filter_map(ChannelSummary::from_event)
-        .filter(|c| if include_archived { true } else { !c.archived })
-        .filter(|c| name_matches(&c.name, &needle, exact))
-        .collect();
+    let arr = query_filtered_channel_events(
+        client,
+        serde_json::json!({"kinds": [39000]}),
+        limit,
+        |event| {
+            ChannelSummary::from_event(event).is_some_and(|channel| {
+                (include_archived || !channel.archived)
+                    && name_matches(&channel.name, &needle, exact)
+            })
+        },
+    )
+    .await?;
+    let mut matches: Vec<ChannelSummary> =
+        arr.iter().filter_map(ChannelSummary::from_event).collect();
     matches.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
@@ -1318,12 +1432,20 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use nostr::Keys;
+    use tokio::net::TcpListener;
+
     use super::{
         apply_cardinality_rule, build_template_report, cmd_set_add_policy,
         extract_channel_metadata, finalize_roster_resolution, include_channel, is_channel_archived,
-        merge_agent_profile_policy, name_matches, resolve_roster_with_archive_filter,
-        validate_ttl_seconds, ArchivedExclusion, ChannelSummary, ResolvedAgent, RosterResolution,
-        SkippedSlug,
+        merge_agent_profile_policy, name_matches, query_list_channel_events,
+        resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion,
+        ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
     };
     use crate::client::BuzzClient;
     use crate::CliError;
@@ -1331,6 +1453,79 @@ mod tests {
 
     fn event(tags: serde_json::Value) -> serde_json::Value {
         json!({ "tags": tags })
+    }
+
+    #[derive(Clone)]
+    struct ChannelQueryState {
+        events: Arc<Vec<serde_json::Value>>,
+    }
+
+    async fn channel_query_response(
+        State(state): State<ChannelQueryState>,
+        Json(filters): Json<Vec<serde_json::Value>>,
+    ) -> Json<Vec<serde_json::Value>> {
+        let filter = filters.first().cloned().unwrap_or_default();
+        let limit = filter
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(500) as usize;
+        let until = filter.get("until").and_then(serde_json::Value::as_u64);
+        let before_id = filter.get("before_id").and_then(serde_json::Value::as_str);
+        Json(
+            state
+                .events
+                .iter()
+                .filter(|event| match (until, before_id) {
+                    (Some(until), Some(before_id)) => {
+                        let created_at = event["created_at"].as_u64().unwrap();
+                        let id = event["id"].as_str().unwrap();
+                        created_at < until || (created_at == until && id > before_id)
+                    }
+                    _ => true,
+                })
+                .take(limit)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    async fn channel_query_client(mut events: Vec<serde_json::Value>) -> BuzzClient {
+        events.sort_by(|left, right| {
+            right["created_at"]
+                .as_u64()
+                .cmp(&left["created_at"].as_u64())
+                .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+        });
+        let app = Router::new()
+            .route("/query", post(channel_query_response))
+            .with_state(ChannelQueryState {
+                events: Arc::new(events),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind channel query test relay");
+        let address = listener.local_addr().expect("channel query relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("channel query test relay");
+        });
+        BuzzClient::new(format!("http://{address}"), Keys::generate(), None, None)
+            .expect("channel query test client")
+    }
+
+    fn paged_channel_event(seed: u64, archived: bool) -> serde_json::Value {
+        json!({
+            "id": format!("{seed:064x}"),
+            "kind": 39000,
+            "created_at": 2_000 - seed,
+            "tags": [
+                ["d", uuid::Uuid::from_u128(u128::from(seed) + 1).to_string()],
+                ["name", format!("channel-{seed}")],
+                ["archived", archived.to_string()],
+                ["public"]
+            ]
+        })
     }
 
     #[test]
@@ -1398,6 +1593,29 @@ mod tests {
         assert!(!include_channel(&archived, false));
         assert!(include_channel(&archived, true));
         assert!(include_channel(&live, false));
+    }
+
+    #[tokio::test]
+    async fn archived_heavy_scan_fills_requested_live_channel_limit() {
+        let mut events = (0..503)
+            .map(|seed| paged_channel_event(seed, true))
+            .collect::<Vec<_>>();
+        events.extend((503..506).map(|seed| paged_channel_event(seed, false)));
+        let client = channel_query_client(events).await;
+
+        let channels = query_list_channel_events(&client, None, false, None, 3)
+            .await
+            .expect("scan archived-heavy channel fixture");
+
+        assert_eq!(channels.len(), 3);
+        assert!(channels.iter().all(|event| !is_channel_archived(event)));
+        assert_eq!(
+            channels
+                .iter()
+                .map(|event| super::extract_tag_value(event, "name"))
+                .collect::<Vec<_>>(),
+            vec!["channel-503", "channel-504", "channel-505"]
+        );
     }
 
     #[test]
