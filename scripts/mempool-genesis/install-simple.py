@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 import tempfile
+from typing import NamedTuple
 
 
 MANIFEST_NAME = "install-package.manifest.json"
@@ -80,6 +81,37 @@ EXPECTED_ENTRIES = {
 }
 
 
+class TargetReport(NamedTuple):
+    entry: dict[str, object]
+    target_text: str
+    lexical_target: Path
+    resolved_parent: Path
+    resolved_target: Path
+    target_status: str
+    parent_status: str
+    parent_uid: int | None
+    parent_gid: int | None
+    parent_mode: int | None
+    world_writable: bool | None
+    owner_expectation: str
+    owner_met: bool
+    symlink_resolved: bool
+    elevation_needed: bool
+    target_uid: int | None
+    target_gid: int | None
+    blockers: tuple[str, ...]
+
+
+class PreflightResult(NamedTuple):
+    entries: list[dict[str, object]]
+    planned: list[tuple[dict[str, object], Path, int, int]]
+    target_reports: list[TargetReport]
+    credential_dir: Path
+    credential_dir_status: str
+    identity_error: str | None
+    blockers: list[str]
+
+
 def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -126,6 +158,12 @@ def load_and_verify_manifest(
         raise ValueError(
             "manifest is missing: " + ", ".join(sorted(missing_manifest_fields))
         )
+    unexpected_manifest_fields = manifest.keys() - REQUIRED_MANIFEST_FIELDS
+    if unexpected_manifest_fields:
+        raise ValueError(
+            "manifest has unexpected fields: "
+            + ", ".join(sorted(unexpected_manifest_fields))
+        )
     if manifest["package_id"] != EXPECTED_PACKAGE_ID:
         raise ValueError("package ID mismatch")
     if (
@@ -144,6 +182,11 @@ def load_and_verify_manifest(
         missing = REQUIRED_ENTRY_FIELDS - raw_entry.keys()
         if missing:
             raise ValueError(f"entry {number} is missing: {', '.join(sorted(missing))}")
+        unexpected = raw_entry.keys() - REQUIRED_ENTRY_FIELDS
+        if unexpected:
+            raise ValueError(
+                f"entry {number} has unexpected fields: {', '.join(sorted(unexpected))}"
+            )
     actual_fingerprint = package_fingerprint(entries)
     if actual_fingerprint != EXPECTED_PACKAGE_FINGERPRINT:
         raise ValueError("reviewed package fingerprint mismatch")
@@ -225,40 +268,245 @@ def rooted_path(root: Path, absolute_path: str) -> Path:
     return root / absolute_path.lstrip("/")
 
 
-def require_safe_directory(path: Path, owner_uid: int) -> Path:
-    resolved = Path(os.path.realpath(path))
-    try:
-        metadata = resolved.stat()
-    except OSError as error:
-        raise ValueError(f"target parent does not exist: {path}") from error
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError(f"target parent is not a directory: {path}")
-    if metadata.st_uid != owner_uid:
-        raise ValueError(f"target parent is not root-owned: {path}")
-    if metadata.st_mode & stat.S_IWOTH:
-        raise ValueError(f"target parent is world-writable: {path}")
-    return resolved
-
-
 def target_exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
-def preflight_targets(
-    entries: list[dict[str, object]], root: Path, owner_uid: int
-) -> list[tuple[dict[str, object], Path]]:
-    planned: list[tuple[dict[str, object], Path]] = []
+def _path_status(path: Path) -> tuple[str, OSError | None]:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return "absent", None
+    except OSError as error:
+        return "unreadable", error
+    return "EXISTS", None
+
+
+def _inspect_targets(
+    entries: list[dict[str, object]],
+    root: Path,
+) -> tuple[
+    list[TargetReport],
+    list[tuple[dict[str, object], Path, int, int]],
+    list[str],
+]:
+    reports: list[TargetReport] = []
+    planned: list[tuple[dict[str, object], Path, int, int]] = []
+    blockers: list[str] = []
+    resolved_targets: set[Path] = set()
     for entry in entries:
         target_text = str(entry["target"])
         lexical_target = rooted_path(root, target_text)
-        if target_exists(lexical_target):
-            raise ValueError(f"target already exists: {target_text}")
-        resolved_parent = require_safe_directory(lexical_target.parent, owner_uid)
+        target_status, target_error = _path_status(lexical_target)
+        target_blockers: list[str] = []
+        elevation_needed = isinstance(target_error, PermissionError)
+        if target_status == "EXISTS":
+            target_blockers.append(f"target already exists: {target_text}")
+        elif target_status == "unreadable":
+            target_blockers.append(
+                f"target unreadable: {target_text} "
+                f"(elevation needed: {'yes' if elevation_needed else 'unknown'})"
+            )
+
+        lexical_parent = lexical_target.parent
+        resolved_parent = Path(os.path.realpath(lexical_parent))
         resolved_target = resolved_parent / lexical_target.name
-        if target_exists(resolved_target):
-            raise ValueError(f"resolved target already exists: {target_text}")
-        planned.append((entry, resolved_target))
+        symlink_resolved = resolved_parent != Path(os.path.abspath(lexical_parent))
+        parent_status = "present"
+        parent_uid: int | None = None
+        parent_gid: int | None = None
+        parent_mode: int | None = None
+        world_writable: bool | None = None
+        try:
+            parent_metadata = resolved_parent.stat()
+        except FileNotFoundError:
+            parent_status = "absent"
+            target_blockers.append(f"target parent does not exist: {lexical_parent}")
+        except OSError as error:
+            parent_status = "unreadable"
+            elevation_needed = elevation_needed or isinstance(error, PermissionError)
+            target_blockers.append(
+                f"target parent unreadable: {lexical_parent} "
+                f"(elevation needed: "
+                f"{'yes' if isinstance(error, PermissionError) else 'unknown'})"
+            )
+        else:
+            parent_uid = parent_metadata.st_uid
+            parent_gid = parent_metadata.st_gid
+            parent_mode = stat.S_IMODE(parent_metadata.st_mode)
+            world_writable = bool(parent_metadata.st_mode & stat.S_IWOTH)
+            if not stat.S_ISDIR(parent_metadata.st_mode):
+                target_blockers.append(
+                    f"target parent is not a directory: {lexical_parent}"
+                )
+            if world_writable:
+                target_blockers.append(
+                    f"target parent is world-writable: {lexical_parent}"
+                )
+
+        owner = entry["owner"]
+        if owner == "static":
+            owner_expectation = "static->root parent"
+            owner_met = parent_uid == 0
+            if parent_status == "present" and not owner_met:
+                target_blockers.append(
+                    f"target parent is not root-owned: {lexical_parent}"
+                )
+            target_uid = 0
+            target_gid = 0
+        elif owner == "desktop":
+            owner_expectation = "desktop->non-root parent"
+            owner_met = parent_uid is not None and parent_uid != 0
+            if parent_status == "present" and not owner_met:
+                target_blockers.append(
+                    f"desktop target parent is root-owned: {lexical_parent}"
+                )
+            target_uid = parent_uid
+            target_gid = parent_gid
+        else:
+            owner_expectation = f"{owner}->unsupported parent"
+            owner_met = False
+            target_uid = None
+            target_gid = None
+            target_blockers.append(f"unsupported target owner: {owner}")
+
+        declared_basename = Path(target_text).name
+        if (
+            not resolved_target.is_absolute()
+            or not declared_basename
+            or resolved_target.name != declared_basename
+        ):
+            target_blockers.append(f"resolved target basename mismatch: {target_text}")
+        if resolved_target in resolved_targets:
+            target_blockers.append(f"resolved target collision: {target_text}")
+        resolved_targets.add(resolved_target)
+        if not target_blockers and target_uid is not None and target_gid is not None:
+            planned.append((entry, resolved_target, target_uid, target_gid))
+        blockers.extend(target_blockers)
+        reports.append(
+            TargetReport(
+                entry=entry,
+                target_text=target_text,
+                lexical_target=lexical_target,
+                resolved_parent=resolved_parent,
+                resolved_target=resolved_target,
+                target_status=target_status,
+                parent_status=parent_status,
+                parent_uid=parent_uid,
+                parent_gid=parent_gid,
+                parent_mode=parent_mode,
+                world_writable=world_writable,
+                owner_expectation=owner_expectation,
+                owner_met=owner_met,
+                symlink_resolved=symlink_resolved,
+                elevation_needed=elevation_needed,
+                target_uid=target_uid,
+                target_gid=target_gid,
+                blockers=tuple(target_blockers),
+            )
+        )
+    return reports, planned, blockers
+
+
+def preflight_targets(
+    entries: list[dict[str, object]], root: Path
+) -> list[tuple[dict[str, object], Path, int, int]]:
+    _, planned, blockers = _inspect_targets(entries, root)
+    if blockers:
+        raise ValueError(blockers[0])
     return planned
+
+
+def _expected_target_entries() -> list[dict[str, object]]:
+    return [
+        {"target": target, "owner": contract[1]}
+        for target, contract in EXPECTED_ENTRIES.items()
+    ]
+
+
+def preflight(
+    package: Path,
+    manifest_path: Path,
+    *,
+    root: Path = Path("/"),
+) -> PreflightResult:
+    blockers: list[str] = []
+    identity_error: str | None = None
+    try:
+        entries = load_and_verify_manifest(package, manifest_path)
+    except Exception as error:
+        identity_error = str(error)
+        blockers.append(identity_error)
+        entries = _expected_target_entries()
+
+    target_reports, planned, target_blockers = _inspect_targets(entries, root)
+    blockers.extend(target_blockers)
+
+    credential_dir = rooted_path(root, "/etc/buzz-agents/credentials")
+    credential_status, credential_error = _path_status(credential_dir)
+    if credential_status == "unreadable":
+        blockers.append(
+            "credential directory unreadable: "
+            f"{credential_dir} (elevation needed: "
+            f"{'yes' if isinstance(credential_error, PermissionError) else 'unknown'})"
+        )
+    elif credential_status == "EXISTS":
+        try:
+            metadata = credential_dir.stat()
+        except OSError as error:
+            blockers.append(
+                "credential directory unreadable: "
+                f"{credential_dir} (elevation needed: "
+                f"{'yes' if isinstance(error, PermissionError) else 'unknown'})"
+            )
+        else:
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                blockers.append(
+                    "existing credential directory is not root-owned mode 0700"
+                )
+    else:
+        credential_parent = credential_dir.parent
+        resolved_parent = Path(os.path.realpath(credential_parent))
+        try:
+            parent_metadata = resolved_parent.stat()
+        except FileNotFoundError:
+            blockers.append(
+                f"credential directory parent does not exist: {credential_parent}"
+            )
+        except OSError as error:
+            blockers.append(
+                "credential directory parent unreadable: "
+                f"{credential_parent} (elevation needed: "
+                f"{'yes' if isinstance(error, PermissionError) else 'unknown'})"
+            )
+        else:
+            if not stat.S_ISDIR(parent_metadata.st_mode):
+                blockers.append(
+                    f"credential directory parent is not a directory: {credential_parent}"
+                )
+            if parent_metadata.st_mode & stat.S_IWOTH:
+                blockers.append(
+                    f"credential directory parent is world-writable: {credential_parent}"
+                )
+            if parent_metadata.st_uid != 0:
+                blockers.append(
+                    "credential directory parent is not root-owned: "
+                    f"{credential_parent}"
+                )
+
+    return PreflightResult(
+        entries=entries,
+        planned=planned,
+        target_reports=target_reports,
+        credential_dir=credential_dir,
+        credential_dir_status=credential_status,
+        identity_error=identity_error,
+        blockers=blockers,
+    )
 
 
 def install_one(
@@ -279,7 +527,18 @@ def install_one(
             temporary.flush()
             os.fsync(temporary.fileno())
             os.fchmod(temporary.fileno(), mode)
-            os.fchown(temporary.fileno(), owner_uid, owner_gid)
+            try:
+                os.fchown(temporary.fileno(), owner_uid, owner_gid)
+            except PermissionError:
+                # MG_INSTALL_TEST=1 lets a non-root test process exercise static
+                # installs in a fixture tree. With the shipped default (unset),
+                # every chown is mandatory and a failure aborts the install.
+                if not (
+                    owner_uid == 0
+                    and os.getuid() != 0
+                    and os.environ.get("MG_INSTALL_TEST") == "1"
+                ):
+                    raise
         os.rename(temporary_name, target)
     except Exception:
         try:
@@ -316,35 +575,19 @@ def install(
     manifest_path: Path,
     *,
     root: Path = Path("/"),
-    owner_uid: int = 0,
-    owner_gid: int = 0,
 ) -> int:
-    try:
-        entries = load_and_verify_manifest(package, manifest_path)
-        planned = preflight_targets(entries, root, owner_uid)
-        credential_dir = rooted_path(root, "/etc/buzz-agents/credentials")
-        if target_exists(credential_dir):
-            metadata = credential_dir.stat()
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != owner_uid
-                or stat.S_IMODE(metadata.st_mode) != 0o700
-            ):
-                raise ValueError(
-                    "existing credential directory is not root-owned mode 0700"
-                )
-        else:
-            require_safe_directory(credential_dir.parent, owner_uid)
-    except Exception as error:
-        print(f"INSTALL REFUSED: {error}")
+    result = preflight(package, manifest_path, root=root)
+    if result.blockers:
+        print(f"INSTALL REFUSED: {result.blockers[0]}")
         return 1
 
-    if not target_exists(credential_dir):
-        print(f"PLAN CREATE DIRECTORY {credential_dir} mode=0700 owner={owner_uid}:{owner_gid}")
-    for entry, target in planned:
+    credential_dir = result.credential_dir
+    if result.credential_dir_status == "absent":
+        print(f"PLAN CREATE DIRECTORY {credential_dir} mode=0700 owner=0:0")
+    for entry, target, target_uid, target_gid in result.planned:
         print(
             f"PLAN INSTALL {package / str(entry['source'])} -> {target} "
-            f"mode={entry['install_mode']} owner={owner_uid}:{owner_gid}"
+            f"mode={entry['install_mode']} owner={target_uid}:{target_gid}"
         )
 
     created_targets: list[Path] = []
@@ -353,15 +596,15 @@ def install(
         if not target_exists(credential_dir):
             credential_dir.mkdir(mode=0o700)
             credential_dir_created = True
-            os.chown(credential_dir, owner_uid, owner_gid)
+            os.chown(credential_dir, 0, 0)
             os.chmod(credential_dir, 0o700)
-        for entry, target in planned:
+        for entry, target, target_uid, target_gid in result.planned:
             install_one(
                 package.resolve(strict=True) / str(entry["source"]),
                 target,
                 int(str(entry["install_mode"]), 8),
-                owner_uid,
-                owner_gid,
+                target_uid,
+                target_gid,
             )
             created_targets.append(target)
     except Exception as error:
@@ -376,8 +619,61 @@ def install(
     return 0
 
 
+def _display_value(value: object | None) -> str:
+    return "unreadable" if value is None else str(value)
+
+
+def check(
+    package: Path,
+    manifest_path: Path,
+    *,
+    root: Path = Path("/"),
+) -> int:
+    result = preflight(package, manifest_path, root=root)
+    if result.identity_error is None:
+        print("PINNED IDENTITY: MET")
+    else:
+        print(f"PINNED IDENTITY: UNMET ({result.identity_error})")
+
+    for report in result.target_reports:
+        mode = (
+            "unreadable"
+            if report.parent_mode is None
+            else f"0{report.parent_mode:03o}"
+        )
+        world_writable = (
+            "unreadable"
+            if report.world_writable is None
+            else "yes" if report.world_writable else "no"
+        )
+        print(
+            f"TARGET {report.target_text}; {report.target_status}; "
+            f"resolved-parent={report.resolved_parent}; "
+            f"parent={report.parent_status}; "
+            f"owner-uid={_display_value(report.parent_uid)}; mode={mode}; "
+            f"world-writable={world_writable}; "
+            f"owner-expectation={report.owner_expectation} "
+            f"{'MET' if report.owner_met else 'UNMET'}; "
+            f"symlink-resolved={'yes' if report.symlink_resolved else 'no'}; "
+            f"elevation-needed={'yes' if report.elevation_needed else 'no'}"
+        )
+
+    print(
+        f"CREDENTIAL DIRECTORY {result.credential_dir}; "
+        f"{result.credential_dir_status}"
+    )
+    if result.blockers:
+        print("PREFLIGHT BLOCKERS:")
+        for blocker in result.blockers:
+            print(f"- {blocker}")
+        return 1
+    print("PREFLIGHT OK: real install would proceed")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true")
     parser.add_argument("--package", required=True)
     parser.add_argument("--manifest")
     args = parser.parse_args()
@@ -388,7 +684,8 @@ def main() -> None:
         if args.manifest
         else package / MANIFEST_NAME
     )
-    sys.exit(install(package, manifest_path))
+    action = check if args.check else install
+    sys.exit(action(package, manifest_path))
 
 
 if __name__ == "__main__":
