@@ -526,13 +526,17 @@ else:
             mock.patch.object(MODULE.os, "uname", return_value=SimpleNamespace(nodename="framework-desktop")),
             mock.patch.object(
                 MODULE,
-                "verify_package",
-                return_value=({"package_id": "mempool-genesis-static-test"}, [entry]),
+                "verified_package",
+                return_value=(
+                    {"package_id": "mempool-genesis-static-test"},
+                    [entry],
+                    {str(target): b"reviewed payload"},
+                ),
             ),
             mock.patch.object(MODULE, "require_services_stopped"),
             mock.patch.object(MODULE, "require_directory"),
             mock.patch.object(MODULE, "prepare_directories", return_value=False),
-            mock.patch.object(MODULE, "atomic_copy_fd", side_effect=fail_first_live_copy),
+            mock.patch.object(MODULE, "atomic_copy_bytes", side_effect=fail_first_live_copy),
             mock.patch.object(MODULE, "restore_changed") as restore,
             mock.patch.object(MODULE.subprocess, "run"),
             mock.patch.object(MODULE.os, "fchown"),
@@ -545,6 +549,49 @@ else:
         receipts = list(backup_root.glob("*/receipt.json"))
         self.assertEqual(len(receipts), 1)
         self.assertEqual(MODULE.load_json(receipts[0])["install_state"], "rolled_back")
+
+    def test_source_mutation_after_verification_never_reaches_live_target(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / "package-source"
+        target = root / "live-target"
+        original = b"reviewed policy bytes"
+        mutated = b"unreviewed mutated policy"
+        source.write_bytes(original)
+        source.chmod(0o600)
+        digest = hashlib.sha256(original).hexdigest()
+
+        with mock.patch.object(MODULE.os, "fstat") as fstat:
+            real_stat = source.stat()
+            fstat.return_value = SimpleNamespace(
+                st_mode=real_stat.st_mode,
+                st_uid=1000,
+                st_gid=1000,
+                st_nlink=1,
+            )
+            verified = MODULE.read_verified_source(source, digest, 0o600)
+
+        source.write_bytes(mutated)
+        observed_live: list[bytes | None] = []
+        real_replace = MODULE.os.replace
+
+        def observe_replace(staged: str | Path, live: str | Path) -> None:
+            self.assertEqual(Path(staged).read_bytes(), original)
+            observed_live.append(Path(live).read_bytes() if Path(live).exists() else None)
+            real_replace(staged, live)
+            observed_live.append(Path(live).read_bytes())
+
+        with (
+            mock.patch.object(MODULE, "require_directory"),
+            mock.patch.object(MODULE.os, "chown"),
+            mock.patch.object(MODULE.os, "fchown"),
+            mock.patch.object(MODULE.os, "replace", side_effect=observe_replace),
+        ):
+            MODULE.atomic_copy_bytes(verified, digest, target, 0o600, 0, 0)
+
+        self.assertEqual(target.read_bytes(), original)
+        self.assertNotIn(mutated, observed_live)
 
 
 if __name__ == "__main__":

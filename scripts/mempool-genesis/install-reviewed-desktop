@@ -51,13 +51,8 @@ if [[ -e $final_app || -L $final_app ]]; then
   [[ $(stat -c '%U:%G:%a:%h' "$final_app") == "victor:victor:${app_mode#0}:1" ]]
   [[ $(sha256sum -- "$final_app" | cut -d' ' -f1) == "$app_hash" ]]
 else
-  temporary=$(mktemp /home/victor/work/buzz-client/.Buzz-install.XXXXXX)
-  trap 'test ! -e "${temporary:-}" || unlink "$temporary"' EXIT
-  install -m "$app_mode" "$source_app" "$temporary"
-  [[ $(sha256sum -- "$temporary" | cut -d' ' -f1) == "$app_hash" ]]
-  sync "$temporary"
-  mv -T "$temporary" "$final_app"
-  sync /home/victor/work/buzz-client
+  python3 "$script_dir/install-static-system.py" install-accepted-entry \
+    --package "$package" --state "$state" --role desktop_app
 fi
 
 if [[ $current_launcher_hash == "$launcher_hash" ]]; then
@@ -75,12 +70,7 @@ printf 'buzz-desktop-launcher-rollback-v1\t%s\t%s\n' \
 [[ $(stat -c '%U:%G:%a:%h' "$rollback/receipt") == victor:victor:600:1 ]]
 sync "$rollback/launch_buzz_desktop.sh" "$rollback/receipt" "$rollback"
 
-temporary=$(mktemp /home/victor/projects/buzz/scripts/.launcher-install.XXXXXX)
-trap 'test ! -e "${temporary:-}" || unlink "$temporary"' EXIT
-install -m "$launcher_mode" "$source_launcher" "$temporary"
-[[ $(sha256sum -- "$temporary" | cut -d' ' -f1) == "$launcher_hash" ]]
-sync "$temporary"
-mv -T "$temporary" "$final_launcher"
-sync /home/victor/projects/buzz/scripts
+python3 "$script_dir/install-static-system.py" install-accepted-entry \
+  --package "$package" --state "$state" --role desktop_launcher
 [[ $(sha256sum -- "$final_launcher" | cut -d' ' -f1) == "$launcher_hash" ]]
 printf '%s\n' INSTALLED

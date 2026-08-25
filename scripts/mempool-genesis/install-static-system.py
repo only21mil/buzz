@@ -119,7 +119,7 @@ def hash_fd(fd: int) -> str:
     return digest.hexdigest()
 
 
-def open_verified_source(path: Path, expected_hash: str, expected_mode: int) -> int:
+def read_verified_source(path: Path, expected_hash: str, expected_mode: int) -> bytes:
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         metadata = os.fstat(fd)
@@ -131,12 +131,15 @@ def open_verified_source(path: Path, expected_hash: str, expected_mode: int) -> 
             or stat.S_IMODE(metadata.st_mode) != expected_mode
         ):
             raise ValueError(f"unsafe package source: {path}")
-        if hash_fd(fd) != expected_hash:
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        if hashlib.sha256(payload).hexdigest() != expected_hash:
             raise ValueError(f"package source hash drift: {path}")
-        return fd
-    except Exception:
+        return payload
+    finally:
         os.close(fd)
-        raise
 
 
 def sync_directory(path: Path) -> None:
@@ -147,22 +150,39 @@ def sync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def atomic_copy_fd(source_fd: int, target: Path, mode: int, uid: int, gid: int) -> None:
+def atomic_copy_bytes(
+    payload: bytes,
+    expected_hash: str,
+    target: Path,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> None:
     parent = target.parent
-    require_directory(parent, 0, stat.S_IMODE(parent.lstat().st_mode))
+    parent_metadata = parent.lstat()
+    require_directory(parent, uid, stat.S_IMODE(parent_metadata.st_mode))
     if parent.lstat().st_mode & 0o022:
-        raise ValueError(f"target directory is writable by non-root: {parent}")
-    temporary_fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=parent)
+        raise ValueError(f"target directory has unsafe mode: {parent}")
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage.", dir=parent))
+    temporary_name = staging / target.name
+    temporary_fd = -1
     try:
+        os.chown(staging, uid, gid)
+        require_directory(staging, uid, 0o700)
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
         os.fchmod(temporary_fd, mode)
         os.fchown(temporary_fd, uid, gid)
-        os.lseek(source_fd, 0, os.SEEK_SET)
-        while chunk := os.read(source_fd, 1024 * 1024):
-            view = memoryview(chunk)
-            while view:
-                written = os.write(temporary_fd, view)
-                view = view[written:]
+        view = memoryview(payload)
+        while view:
+            written = os.write(temporary_fd, view)
+            view = view[written:]
         os.fsync(temporary_fd)
+        if hash_fd(temporary_fd) != expected_hash:
+            raise ValueError(f"staged target verification failed: {target}")
         os.close(temporary_fd)
         temporary_fd = -1
         os.replace(temporary_name, target)
@@ -174,6 +194,19 @@ def atomic_copy_fd(source_fd: int, target: Path, mode: int, uid: int, gid: int) 
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
+        try:
+            staging.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_copy_fd(source_fd: int, target: Path, mode: int, uid: int, gid: int) -> None:
+    chunks: list[bytes] = []
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    while chunk := os.read(source_fd, 1024 * 1024):
+        chunks.append(chunk)
+    payload = b"".join(chunks)
+    atomic_copy_bytes(payload, hashlib.sha256(payload).hexdigest(), target, mode, uid, gid)
 
 
 def copy_path_to_backup(source: Path, target: Path) -> None:
@@ -440,27 +473,28 @@ def accepted_manifest_bytes(
     return raw
 
 
-def verify_package(
+def verified_package(
     package: Path, state_path: Path
-) -> tuple[dict[str, object], list[dict[str, object]]]:
+) -> tuple[dict[str, object], list[dict[str, object]], dict[str, bytes]]:
     require_directory(package, 1000, 0o700)
     attestation = check_closure(state_path)
     manifest_raw = accepted_manifest_bytes(package, state_path, attestation)
     manifest, entries = exact_manifest(package, manifest_raw)
-    opened: list[int] = []
-    try:
-        for entry in entries:
-            opened.append(
-                open_verified_source(
-                    package / str(entry["source"]),
-                    str(entry["sha256"]),
-                    int(str(entry["source_mode"]), 8),
-                )
-            )
-        bind_accepted_manifest(package, manifest, entries, attestation, state_path)
-    finally:
-        for fd in opened:
-            os.close(fd)
+    verified_sources: dict[str, bytes] = {}
+    for entry in entries:
+        verified_sources[str(entry["target"])] = read_verified_source(
+            package / str(entry["source"]),
+            str(entry["sha256"]),
+            int(str(entry["source_mode"]), 8),
+        )
+    bind_accepted_manifest(package, manifest, entries, attestation, state_path)
+    return manifest, entries, verified_sources
+
+
+def verify_package(
+    package: Path, state_path: Path
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    manifest, entries, _verified_sources = verified_package(package, state_path)
     return manifest, entries
 
 
@@ -590,7 +624,7 @@ def remove_created_credential_directory(created: bool) -> None:
 def install(package: Path, state: Path) -> None:
     if os.geteuid() != 0 or os.uname().nodename != "framework-desktop":
         raise ValueError("installer must run as root on framework-desktop")
-    manifest, all_entries = verify_package(package, state)
+    manifest, all_entries, all_verified_sources = verified_package(package, state)
     require_services_stopped()
     package_id = str(manifest["package_id"])
     entries = [entry for entry in all_entries if entry["owner"] == "static"]
@@ -599,13 +633,12 @@ def install(package: Path, state: Path) -> None:
     if backup.exists() or backup.is_symlink():
         raise ValueError("backup/receipt already exists")
 
-    opened: dict[str, int] = {}
+    verified_sources = {
+        str(entry["target"]): all_verified_sources[str(entry["target"])]
+        for entry in entries
+    }
+    all_verified_sources.clear()
     try:
-        for entry in entries:
-            source = package / str(entry["source"])
-            opened[str(entry["target"])] = open_verified_source(
-                source, str(entry["sha256"]), int(str(entry["source_mode"]), 8)
-            )
         subprocess.run(["visudo", "-cf", str(package / "system/buzz-agent-key-handoff.sudoers")], check=True)
         subprocess.run(["systemd-analyze", "verify", str(package / "system/buzz-agent@.service")], check=True)
         BACKUP_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -646,8 +679,9 @@ def install(package: Path, state: Path) -> None:
             for entry in entries:
                 target_text = str(entry["target"])
                 changed.append(target_text)
-                atomic_copy_fd(
-                    opened[target_text],
+                atomic_copy_bytes(
+                    verified_sources[target_text],
+                    str(entry["sha256"]),
                     Path(target_text),
                     int(str(entry["install_mode"]), 8),
                     0,
@@ -681,8 +715,7 @@ def install(package: Path, state: Path) -> None:
             raise
         print(f"INSTALLED {package_id} BACKUP {backup_id}")
     finally:
-        for fd in opened.values():
-            os.close(fd)
+        verified_sources.clear()
 
 
 def rollback(backup_id: str) -> None:
@@ -739,6 +772,12 @@ def main() -> None:
     entry_parser.add_argument(
         "--role", required=True, choices=("desktop_app", "desktop_launcher")
     )
+    install_entry_parser = subparsers.add_parser("install-accepted-entry")
+    install_entry_parser.add_argument("--package", required=True)
+    install_entry_parser.add_argument("--state", required=True)
+    install_entry_parser.add_argument(
+        "--role", required=True, choices=("desktop_app", "desktop_launcher")
+    )
     args = parser.parse_args()
     if args.command == "install":
         package = Path(args.package).resolve(strict=True)
@@ -763,6 +802,24 @@ def main() -> None:
             str(manifest["desktop_previous_launcher_sha256"]),
         ]
         print("\t".join(fields))
+    elif args.command == "install-accepted-entry":
+        if os.geteuid() != 1000:
+            raise ValueError("desktop entry installer must run as UID 1000")
+        package = Path(args.package).resolve(strict=True)
+        state = Path(args.state).resolve(strict=True)
+        _manifest, entries, verified_sources = verified_package(package, state)
+        matching = [entry for entry in entries if entry["role"] == args.role]
+        if len(matching) != 1:
+            raise ValueError("accepted package role is not unique")
+        entry = matching[0]
+        atomic_copy_bytes(
+            verified_sources[str(entry["target"])],
+            str(entry["sha256"]),
+            Path(str(entry["target"])),
+            int(str(entry["install_mode"]), 8),
+            1000,
+            1000,
+        )
     else:
         state = Path(args.state).resolve(strict=True)
         attestation = check_closure(state)
