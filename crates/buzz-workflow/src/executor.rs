@@ -658,6 +658,30 @@ pub async fn dispatch_action(
     trigger_ctx: &TriggerContext,
     step_outputs: &HashMap<String, JsonValue>,
 ) -> Result<StepResult, WorkflowError> {
+    dispatch_action_with_generation(
+        step_id,
+        action,
+        engine,
+        community_id,
+        run_id,
+        trigger_ctx,
+        step_outputs,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_action_with_generation(
+    step_id: &str,
+    action: &ActionDef,
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    trigger_ctx: &TriggerContext,
+    step_outputs: &HashMap<String, JsonValue>,
+    claimed_generation: Option<i64>,
+) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
     match action {
@@ -802,14 +826,21 @@ pub async fn dispatch_action(
             message,
             timeout,
         } => {
-            let expected_generation = engine
-                .db
-                .get_workflow_run(community_id, run_id)
-                .await
-                .map_err(|_| {
-                    WorkflowError::Database("RequestApproval run state is unavailable".to_owned())
-                })?
-                .generation;
+            let expected_generation = match claimed_generation {
+                Some(generation) => generation,
+                None => {
+                    engine
+                        .db
+                        .get_workflow_run(community_id, run_id)
+                        .await
+                        .map_err(|_| {
+                            WorkflowError::Database(
+                                "RequestApproval run state is unavailable".to_owned(),
+                            )
+                        })?
+                        .generation
+                }
+            };
             let suspension = build_approval_suspension(
                 step_id,
                 from,
@@ -1558,6 +1589,22 @@ pub struct ExecutionResult {
     pub trace: Vec<JsonValue>,
 }
 
+/// Durable cursor and generation owned by a claimed approval continuation.
+pub struct ClaimedResume {
+    /// First workflow step that has not executed yet.
+    pub start_index: usize,
+    /// Outputs persisted before the approval gate suspended execution.
+    pub step_outputs: HashMap<String, JsonValue>,
+    /// Generation acquired by the resume driver's database fence.
+    pub generation: i64,
+}
+
+struct ExecutionStart {
+    start_index: usize,
+    step_outputs: Option<HashMap<String, JsonValue>>,
+    claimed_generation: Option<i64>,
+}
+
 /// Execute a workflow run sequentially.
 ///
 /// Steps run in order. Each step:
@@ -1607,7 +1654,19 @@ pub async fn execute_run(
             )
         })?;
 
-    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+    execute_steps(
+        engine,
+        community_id,
+        run_id,
+        def,
+        trigger_ctx,
+        ExecutionStart {
+            start_index: 0,
+            step_outputs: None,
+            claimed_generation: None,
+        },
+    )
+    .await
 }
 
 /// Resume execution from a specific step index (used for approval resume).
@@ -1675,8 +1734,11 @@ pub async fn execute_from_step(
         run_id,
         def,
         trigger_ctx,
-        start_index,
-        initial_outputs,
+        ExecutionStart {
+            start_index,
+            step_outputs: initial_outputs,
+            claimed_generation: None,
+        },
     )
     .await
 }
@@ -1686,16 +1748,17 @@ pub async fn execute_from_step(
 /// The caller must acquire the run with the database status-and-generation
 /// fence before calling this function. Unlike [`execute_from_step`], this does
 /// not write the run status again, so a second worker cannot bypass that claim.
+/// Claimed continuations wait for engine capacity while the relay renews their
+/// lease instead of converting transient saturation into a terminal failure.
 pub async fn execute_claimed_from_step(
     engine: &WorkflowEngine,
     community_id: CommunityId,
     run_id: Uuid,
     def: &WorkflowDef,
     trigger_ctx: &TriggerContext,
-    start_index: usize,
-    initial_outputs: HashMap<String, JsonValue>,
+    resume: ClaimedResume,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
+    let _permit = engine.run_semaphore.acquire().await.map_err(|_| {
         (
             WorkflowError::CapacityExceeded,
             crate::error::PartialProgress::default(),
@@ -1708,8 +1771,11 @@ pub async fn execute_claimed_from_step(
         run_id,
         def,
         trigger_ctx,
-        start_index,
-        Some(initial_outputs),
+        ExecutionStart {
+            start_index: resume.start_index,
+            step_outputs: Some(resume.step_outputs),
+            claimed_generation: Some(resume.generation),
+        },
     )
     .await
 }
@@ -1726,14 +1792,13 @@ async fn execute_steps(
     run_id: Uuid,
     def: &WorkflowDef,
     trigger_ctx: &TriggerContext,
-    start_index: usize,
-    initial_outputs: Option<HashMap<String, JsonValue>>,
+    start: ExecutionStart,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
+    let mut step_outputs: HashMap<String, JsonValue> = start.step_outputs.unwrap_or_default();
     let mut trace: Vec<JsonValue> = Vec::new();
 
     for (i, step) in def.steps.iter().enumerate() {
-        if i < start_index {
+        if i < start.start_index {
             debug!(run_id = %run_id, step = %step.id, "Skipping already-executed step");
             continue;
         }
@@ -1778,7 +1843,7 @@ async fn execute_steps(
             .unwrap_or(engine.config.default_timeout_secs);
         let dispatch_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            dispatch_action(
+            dispatch_action_with_generation(
                 &step.id,
                 &resolved_action,
                 engine,
@@ -1786,6 +1851,7 @@ async fn execute_steps(
                 run_id,
                 trigger_ctx,
                 &step_outputs,
+                start.claimed_generation,
             ),
         )
         .await;

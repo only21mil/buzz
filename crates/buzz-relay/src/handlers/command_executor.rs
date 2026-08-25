@@ -1141,24 +1141,28 @@ async fn handle_canonical_workflow_approval_decision(
                 let engine = Arc::clone(&state.workflow_engine);
                 let db = state.db.clone();
                 let community_id = tenant.community();
+                let sweep_interval = state.config.workflow_resume_sweep_interval;
                 tokio::spawn(async move {
-                    match resume_workflow_from_persisted_cursor(
+                    match crate::workflow_resume::drive_workflow_resume(
                         engine,
                         db,
                         community_id,
                         run_id,
-                        RunStatus::ResumePending,
-                        Some(generation),
-                        false,
+                        generation,
+                        sweep_interval,
                     )
                     .await
                     {
-                        Ok(true) => {}
-                        Ok(false) => tracing::debug!(
-                            %run_id,
-                            generation,
-                            "workflow approval resume was already claimed"
-                        ),
+                        Ok(crate::workflow_resume::WorkflowResumeDriveOutcome::Applied {
+                            ..
+                        }) => {}
+                        Ok(crate::workflow_resume::WorkflowResumeDriveOutcome::Conflict) => {
+                            tracing::debug!(
+                                %run_id,
+                                generation,
+                                "workflow approval resume was already claimed"
+                            )
+                        }
                         Err(error) => tracing::error!(
                             %run_id,
                             generation,
@@ -1427,19 +1431,22 @@ async fn resume_workflow_from_persisted_cursor(
         .map_err(|error| format!("resume claim failed: {error}"))?
     {
         WorkflowRunTransitionOutcome::Conflict => Ok(false),
-        WorkflowRunTransitionOutcome::Applied { .. } => {
+        WorkflowRunTransitionOutcome::Applied { generation } => {
             let result = buzz_workflow::executor::execute_claimed_from_step(
                 &engine,
                 community_id,
                 run_id,
                 &definition,
                 &trigger_context,
-                start_index,
-                step_outputs,
+                buzz_workflow::executor::ClaimedResume {
+                    start_index,
+                    step_outputs,
+                    generation,
+                },
             )
             .await;
             engine
-                .finalize_run(community_id, run_id, result, Some(existing_trace))
+                .finalize_claimed_run(community_id, run_id, generation, result, existing_trace)
                 .await;
             Ok(true)
         }
@@ -1652,28 +1659,32 @@ steps:
             panic!("expected applied decision, got {outcome:?}");
         };
 
-        assert!(resume_workflow_from_persisted_cursor(
-            Arc::clone(&engine),
-            db.clone(),
-            community_id,
-            run_id,
-            RunStatus::ResumePending,
-            Some(generation),
-            false,
-        )
-        .await
-        .expect("resume approved run"));
-        assert!(!resume_workflow_from_persisted_cursor(
-            Arc::clone(&engine),
-            db.clone(),
-            community_id,
-            run_id,
-            RunStatus::ResumePending,
-            Some(generation),
-            false,
-        )
-        .await
-        .expect("replay grant resume"));
+        assert!(matches!(
+            crate::workflow_resume::drive_workflow_resume(
+                Arc::clone(&engine),
+                db.clone(),
+                community_id,
+                run_id,
+                generation,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("resume approved run"),
+            crate::workflow_resume::WorkflowResumeDriveOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            crate::workflow_resume::drive_workflow_resume(
+                Arc::clone(&engine),
+                db.clone(),
+                community_id,
+                run_id,
+                generation,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("replay grant resume"),
+            crate::workflow_resume::WorkflowResumeDriveOutcome::Conflict
+        );
 
         let completed = db
             .get_workflow_run(community_id, run_id)

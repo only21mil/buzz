@@ -420,6 +420,112 @@ impl WorkflowEngine {
         }
     }
 
+    /// Finalize an approval continuation under the generation that claimed it.
+    ///
+    /// Recovery may advance a crashed worker's generation while that worker is
+    /// still winding down. Terminal writes and later approval gates therefore
+    /// keep the original claim generation instead of re-reading mutable state.
+    pub async fn finalize_claimed_run(
+        &self,
+        community_id: CommunityId,
+        run_id: uuid::Uuid,
+        claimed_generation: i64,
+        result: Result<ExecutionResult, (WorkflowError, PartialProgress)>,
+        existing_trace: Vec<serde_json::Value>,
+    ) {
+        match result {
+            Ok(result) => {
+                let ExecutionResult {
+                    approval_token,
+                    step_index,
+                    step_outputs,
+                    trace,
+                } = result;
+                let mut full_trace = existing_trace;
+                full_trace.extend(trace);
+
+                if let Some(approval_token) = approval_token {
+                    let approval = match self.take_approval_suspension(
+                        &approval_token,
+                        community_id,
+                        run_id,
+                    ) {
+                        Ok(Some(approval)) => approval,
+                        Ok(None) => {
+                            tracing::error!(run_id = %run_id, "Claimed approval suspension handle is unavailable");
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::error!(run_id = %run_id, "Claimed approval suspension lookup failed: {error}");
+                            return;
+                        }
+                    };
+                    self.finalize_approval_gate(
+                        community_id,
+                        run_id,
+                        step_index,
+                        step_outputs,
+                        full_trace,
+                        approval,
+                    )
+                    .await;
+                    return;
+                }
+
+                let current_step = i32::try_from(step_index).unwrap_or(i32::MAX);
+                let trace_json = serde_json::Value::Array(full_trace);
+                match self
+                    .db
+                    .complete_running_workflow_run(
+                        community_id,
+                        run_id,
+                        claimed_generation,
+                        current_step,
+                        &trace_json,
+                    )
+                    .await
+                {
+                    Ok(buzz_db::WorkflowRunTransitionOutcome::Applied { .. }) => {
+                        tracing::info!(run_id = %run_id, "Claimed workflow run completed");
+                    }
+                    Ok(buzz_db::WorkflowRunTransitionOutcome::Conflict) => {
+                        tracing::debug!(run_id = %run_id, claimed_generation, "Claimed workflow completion lost its generation fence");
+                    }
+                    Err(error) => {
+                        tracing::error!(run_id = %run_id, "Claimed workflow completion failed: {error}");
+                    }
+                }
+            }
+            Err((error, progress)) => {
+                let mut full_trace = existing_trace;
+                full_trace.extend(progress.trace);
+                let trace_json = serde_json::Value::Array(full_trace);
+                match self
+                    .db
+                    .fail_running_workflow_run(
+                        community_id,
+                        run_id,
+                        claimed_generation,
+                        i32::try_from(progress.step_index).unwrap_or(i32::MAX),
+                        &trace_json,
+                        &error.to_string(),
+                    )
+                    .await
+                {
+                    Ok(buzz_db::WorkflowRunTransitionOutcome::Applied { .. }) => {
+                        tracing::error!(run_id = %run_id, "Claimed workflow run failed: {error}");
+                    }
+                    Ok(buzz_db::WorkflowRunTransitionOutcome::Conflict) => {
+                        tracing::debug!(run_id = %run_id, claimed_generation, "Claimed workflow failure lost its generation fence");
+                    }
+                    Err(db_error) => {
+                        tracing::error!(run_id = %run_id, "Claimed workflow failure could not be persisted: {db_error}");
+                    }
+                }
+            }
+        }
+    }
+
     async fn finalize_approval_gate(
         &self,
         community_id: CommunityId,

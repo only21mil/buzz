@@ -69,7 +69,7 @@ pub use workflow_approval::{
     WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome,
     WorkflowApprovalGateCreationOutcome, WorkflowApprovalGateRecord, WorkflowApprovalRequestRecord,
 };
-pub use workflow_run_transition::WorkflowRunTransitionOutcome;
+pub use workflow_run_transition::{WorkflowResumeCandidate, WorkflowRunTransitionOutcome};
 pub use workflow_state::{
     WorkflowStateEntry, WorkflowStateLimit, WorkflowStateRevision, WorkflowStateWriteOutcome,
 };
@@ -3962,6 +3962,79 @@ impl Db {
             expected_status,
             expected_generation,
             next_status,
+        )
+        .await
+    }
+
+    /// List approval continuations whose pending age or running lease makes
+    /// them eligible for a fenced recovery attempt.
+    pub async fn list_recoverable_workflow_resumes(
+        &self,
+        resume_pending_age_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<WorkflowResumeCandidate>> {
+        workflow_run_transition::list_recoverable_workflow_resumes(
+            &self.pool,
+            resume_pending_age_secs,
+            limit,
+        )
+        .await
+    }
+
+    /// Claim an approved pending run or reclaim an expired resume lease.
+    pub async fn claim_workflow_resume(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_status: workflow::RunStatus,
+        expected_generation: i64,
+        lease_secs: i64,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        workflow_run_transition::claim_workflow_resume(
+            &self.pool,
+            community_id,
+            id,
+            expected_status,
+            expected_generation,
+            lease_secs,
+        )
+        .await
+    }
+
+    /// Renew the approval-resume lease for the caller's exact generation.
+    pub async fn renew_workflow_resume_lease(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        lease_secs: i64,
+    ) -> Result<bool> {
+        workflow_run_transition::renew_workflow_resume_lease(
+            &self.pool,
+            community_id,
+            id,
+            expected_generation,
+            lease_secs,
+        )
+        .await
+    }
+
+    /// Complete a running approval continuation under its exact generation.
+    pub async fn complete_running_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        workflow_run_transition::complete_running_workflow_run(
+            &self.pool,
+            community_id,
+            id,
+            expected_generation,
+            current_step,
+            trace,
         )
         .await
     }

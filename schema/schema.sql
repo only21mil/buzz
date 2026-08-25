@@ -413,17 +413,23 @@ CREATE TABLE workflow_runs (
     execution_trace     JSONB NOT NULL DEFAULT '[]',
     trigger_context     JSONB,
     started_at          TIMESTAMPTZ,
+    resume_lease_expires_at TIMESTAMPTZ,
     completed_at        TIMESTAMPTZ,
     error_message       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, id),
     UNIQUE (community_id, id, workflow_id),
+    CONSTRAINT workflow_runs_resume_lease_running
+        CHECK (resume_lease_expires_at IS NULL OR status = 'running'),
     FOREIGN KEY (community_id, workflow_id)
         REFERENCES workflows (community_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+CREATE INDEX idx_workflow_runs_resume_lease_recovery
+    ON workflow_runs (resume_lease_expires_at, community_id, id)
+    WHERE status = 'running' AND resume_lease_expires_at IS NOT NULL;
 
 -- ── Workflow state ───────────────────────────────────────────────────────────
 
@@ -574,6 +580,9 @@ CREATE INDEX idx_workflow_approval_gates_run
     ON workflow_approval_gates (community_id, run_id);
 CREATE INDEX idx_workflow_approval_gates_status
     ON workflow_approval_gates (community_id, status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_workflow_approval_gates_resume_recovery
+    ON workflow_approval_gates (decided_at, community_id, run_id)
+    WHERE status = 'granted' AND deleted_at IS NULL;
 
 CREATE FUNCTION enforce_workflow_approval_history()
 RETURNS trigger

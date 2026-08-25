@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 32);
+        assert_eq!(migrations.len(), 33);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1018,6 +1018,18 @@ mod tests {
         assert!(!approval_foundations.contains("DROP TABLE workflow_approvals"));
         assert!(approval_foundations.contains("CREATE TABLE workflow_approval_outbox"));
         assert!(approval_foundations.contains("id BIGINT GENERATED ALWAYS AS IDENTITY"));
+
+        // Approval continuations carry a renewable generation-bound lease so
+        // relay startup and periodic recovery can reclaim crashed executors.
+        assert_eq!(migrations[32].version, 33);
+        let workflow_resume_recovery = migrations[32].sql.as_str();
+        assert!(workflow_resume_recovery.contains("ADD COLUMN resume_lease_expires_at"));
+        assert!(workflow_resume_recovery.contains("SET resume_lease_expires_at = '-infinity'"));
+        assert!(workflow_resume_recovery.contains("workflow_runs_resume_lease_running"));
+        assert!(workflow_resume_recovery.contains("idx_workflow_runs_resume_lease_recovery"));
+        assert!(workflow_resume_recovery.contains("idx_workflow_approval_gates_resume_recovery"));
+        assert!(desired_schema.contains("resume_lease_expires_at TIMESTAMPTZ"));
+        assert!(desired_schema.contains("idx_workflow_runs_resume_lease_recovery"));
         assert!(approval_foundations.contains("payload_version SMALLINT NOT NULL DEFAULT 1"));
         assert!(approval_foundations.contains("UNIQUE (community_id, dedupe_key)"));
         assert!(approval_foundations.contains("published_event_id BYTEA"));

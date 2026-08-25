@@ -240,6 +240,13 @@ pub struct Config {
     /// Set `BUZZ_AUDIT_ENABLED=false` for deployments that do not require it.
     pub audit_enabled: bool,
 
+    /// Interval between durable workflow approval recovery passes.
+    /// Set by `BUZZ_WORKFLOW_RESUME_SWEEP_INTERVAL_SECS`; defaults to 10 seconds.
+    pub workflow_resume_sweep_interval: Duration,
+    /// Minimum age before an unclaimed `resume_pending` run enters recovery.
+    /// Set by `BUZZ_WORKFLOW_RESUME_PENDING_AGE_SECS`; defaults to 30 seconds.
+    pub workflow_resume_pending_age: Duration,
+
     /// Optional override for ephemeral channel TTL (in seconds).
     /// When set, any channel created with a TTL tag will use this value instead
     /// of the client-provided one. Useful for testing ephemeral expiry quickly.
@@ -1005,6 +1012,15 @@ impl Config {
             .map(|value| value == "true" || value == "1")
             .unwrap_or(false);
 
+        let workflow_resume_sweep_interval = Duration::from_secs(positive_u64_from_env(
+            "BUZZ_WORKFLOW_RESUME_SWEEP_INTERVAL_SECS",
+            10,
+        )?);
+        let workflow_resume_pending_age = Duration::from_secs(positive_u64_from_env(
+            "BUZZ_WORKFLOW_RESUME_PENDING_AGE_SECS",
+            30,
+        )?);
+
         if let Some(ref dir) = web_dir {
             if !dir.join("index.html").is_file() {
                 return Err(ConfigError::InvalidValue(format!(
@@ -1064,6 +1080,8 @@ impl Config {
             media_max_concurrent_uploads_per_pubkey,
             media_uploads_per_minute,
             audit_enabled,
+            workflow_resume_sweep_interval,
+            workflow_resume_pending_age,
             ephemeral_ttl_override,
             git_repo_path,
             git_pack_cache_path,
@@ -1160,6 +1178,11 @@ mod tests {
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
         assert!(config.slow_client_grace_limit > 0);
+        assert_eq!(
+            config.workflow_resume_sweep_interval,
+            Duration::from_secs(10)
+        );
+        assert_eq!(config.workflow_resume_pending_age, Duration::from_secs(30));
         assert!(
             !config.pubkey_allowlist_enabled,
             "pubkey_allowlist_enabled should default to false"

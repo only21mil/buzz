@@ -50,6 +50,8 @@ pub mod tenant;
 pub mod tunnel;
 /// Webhook secret generation and constant-time comparison.
 pub mod webhook_secret;
+/// Durable workflow approval continuation and crash recovery.
+pub mod workflow_resume;
 /// Workflow action sink — relay-side implementation of [`buzz_workflow::ActionSink`].
 pub mod workflow_sink;
 

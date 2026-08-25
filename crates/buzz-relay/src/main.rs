@@ -650,6 +650,25 @@ async fn main() -> anyhow::Result<()> {
     let wf_cron = Arc::clone(&workflow_engine);
     tokio::spawn(async move { wf_cron.run().await });
 
+    // Approval continuations use a relay-owned startup pass plus periodic
+    // sweep. Every immediate grant and recovery pass enters the same fenced
+    // driver, while its renewable lease lets another pod reclaim a crash.
+    {
+        let resume_engine = Arc::clone(&workflow_engine);
+        let resume_db = state.db.clone();
+        let sweep_interval = state.config.workflow_resume_sweep_interval;
+        let resume_pending_age = state.config.workflow_resume_pending_age;
+        tokio::spawn(async move {
+            buzz_relay::workflow_resume::run_workflow_resume_worker(
+                resume_engine,
+                resume_db,
+                sweep_interval,
+                resume_pending_age,
+            )
+            .await;
+        });
+    }
+
     // Ephemeral channel reaper — archives channels whose TTL deadline has passed.
     // Runs every 60s, matching the workflow cron loop pattern. The SQL UPDATE
     // uses `archived_at IS NULL` as a guard, so concurrent runs from multiple

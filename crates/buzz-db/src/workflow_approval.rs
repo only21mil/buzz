@@ -577,6 +577,7 @@ pub async fn create_workflow_approval_gate(
                 next_step = $2,
                 step_outputs = $3,
                 execution_trace = $4::jsonb || jsonb_build_array($5::jsonb),
+                resume_lease_expires_at = NULL,
                 generation = generation + 1
             WHERE community_id = $6
               AND id = $7
@@ -931,7 +932,8 @@ pub async fn decide_workflow_approval_gate(
         r#"
         UPDATE workflow_runs
         SET status = $1::run_status, generation = generation + 1,
-            completed_at = $2, error_message = $3
+            completed_at = $2, error_message = $3,
+            resume_lease_expires_at = NULL
         WHERE community_id = $4 AND id = $5 AND workflow_id = $6
           AND status = 'waiting_approval' AND generation = $7
           AND definition_hash = $8 AND current_step = $9 AND next_step = $10

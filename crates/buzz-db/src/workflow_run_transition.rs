@@ -11,6 +11,19 @@ use uuid::Uuid;
 use crate::workflow::RunStatus;
 use crate::Result;
 
+/// A relay-owned approval continuation eligible for a fenced recovery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowResumeCandidate {
+    /// Tenant that owns the run.
+    pub community_id: CommunityId,
+    /// Workflow run identifier.
+    pub run_id: Uuid,
+    /// Status observed by the recovery scan.
+    pub status: RunStatus,
+    /// Generation observed by the recovery scan.
+    pub generation: i64,
+}
+
 /// Namespace shared with channel membership mutations.
 const CHANNEL_MEMBERSHIP_LOCK_NAMESPACE: &str = "buzz_channel_membership:";
 
@@ -91,6 +104,186 @@ pub async fn transition_workflow_run(
     }
 }
 
+/// List approved continuations whose durable claim is absent or expired.
+///
+/// `resume_pending` rows age from the canonical grant's database timestamp.
+/// `running` rows are eligible only when a resume worker set a lease and that
+/// lease has expired. The later claim still checks status, generation, and
+/// lease expiry in one update, so this read does not confer ownership.
+pub async fn list_recoverable_workflow_resumes(
+    pool: &PgPool,
+    resume_pending_age_secs: i64,
+    limit: i64,
+) -> Result<Vec<WorkflowResumeCandidate>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT run.community_id, run.id, run.status::text AS status, run.generation
+        FROM workflow_runs AS run
+        WHERE (
+            run.status = 'resume_pending'
+            AND EXISTS (
+                SELECT 1
+                FROM workflow_approval_gates AS gate
+                WHERE gate.community_id = run.community_id
+                  AND gate.run_id = run.id
+                  AND gate.status = 'granted'
+                  AND gate.deleted_at IS NULL
+                  AND gate.generation = run.generation - 1
+                  AND gate.decided_at <= clock_timestamp()
+                      - ($1::bigint * INTERVAL '1 second')
+            )
+        ) OR (
+            run.status = 'running'
+            AND run.resume_lease_expires_at IS NOT NULL
+            AND run.resume_lease_expires_at <= clock_timestamp()
+        )
+        ORDER BY COALESCE(run.resume_lease_expires_at, run.created_at),
+                 run.community_id, run.id
+        LIMIT $2
+        "#,
+    )
+    .bind(resume_pending_age_secs)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let community_id: Uuid = row.try_get("community_id")?;
+            Ok(WorkflowResumeCandidate {
+                community_id: CommunityId::from_uuid(community_id),
+                run_id: row.try_get("id")?,
+                status: row.try_get::<String, _>("status")?.parse()?,
+                generation: row.try_get("generation")?,
+            })
+        })
+        .collect()
+}
+
+/// Claim a pending approval continuation or reclaim its expired running lease.
+///
+/// A successful claim advances the generation and installs a new lease in the
+/// same statement. A running row must have an expired resume lease; ordinary
+/// workflow runs, which have no resume lease, are never reclaimed here.
+pub async fn claim_workflow_resume(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    expected_status: RunStatus,
+    expected_generation: i64,
+    lease_secs: i64,
+) -> Result<WorkflowRunTransitionOutcome> {
+    if !matches!(
+        expected_status,
+        RunStatus::ResumePending | RunStatus::Running
+    ) {
+        return Ok(WorkflowRunTransitionOutcome::Conflict);
+    }
+    let row = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'running',
+            generation = generation + 1,
+            started_at = COALESCE(started_at, clock_timestamp()),
+            resume_lease_expires_at = clock_timestamp()
+                + ($1::bigint * INTERVAL '1 second')
+        WHERE community_id = $2
+          AND id = $3
+          AND status = $4::run_status
+          AND generation = $5
+          AND ($4::run_status = 'resume_pending'
+               OR resume_lease_expires_at <= clock_timestamp())
+        RETURNING generation
+        "#,
+    )
+    .bind(lease_secs)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(expected_status.to_string())
+    .bind(expected_generation)
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(row) => Ok(WorkflowRunTransitionOutcome::Applied {
+            generation: row.try_get("generation")?,
+        }),
+        None => Ok(WorkflowRunTransitionOutcome::Conflict),
+    }
+}
+
+/// Extend the lease only while the caller still owns the running generation.
+pub async fn renew_workflow_resume_lease(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    expected_generation: i64,
+    lease_secs: i64,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET resume_lease_expires_at = clock_timestamp()
+            + ($1::bigint * INTERVAL '1 second')
+        WHERE community_id = $2
+          AND id = $3
+          AND status = 'running'
+          AND generation = $4
+          AND resume_lease_expires_at IS NOT NULL
+        "#,
+    )
+    .bind(lease_secs)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(expected_generation)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// Complete a claimed approval continuation under its running generation.
+pub async fn complete_running_workflow_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    expected_generation: i64,
+    current_step: i32,
+    trace: &serde_json::Value,
+) -> Result<WorkflowRunTransitionOutcome> {
+    let row = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'completed',
+            current_step = $1,
+            execution_trace = $2,
+            error_message = NULL,
+            completed_at = clock_timestamp(),
+            resume_lease_expires_at = NULL,
+            generation = generation + 1
+        WHERE community_id = $3
+          AND id = $4
+          AND status = 'running'
+          AND generation = $5
+        RETURNING generation
+        "#,
+    )
+    .bind(current_step)
+    .bind(trace)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(expected_generation)
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(row) => Ok(WorkflowRunTransitionOutcome::Applied {
+            generation: row.try_get("generation")?,
+        }),
+        None => Ok(WorkflowRunTransitionOutcome::Conflict),
+    }
+}
+
 /// Mark a running workflow failed only while its generation still matches.
 ///
 /// This is the error-path counterpart to [`transition_workflow_run`]. It keeps
@@ -114,6 +307,7 @@ pub async fn fail_running_workflow_run(
             execution_trace = $2,
             error_message = $3,
             completed_at = NOW(),
+            resume_lease_expires_at = NULL,
             generation = generation + 1
         WHERE community_id = $4
           AND id = $5
