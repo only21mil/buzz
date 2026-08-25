@@ -102,12 +102,26 @@ def require_regular(path: Path, uid: int | None, mode: int) -> os.stat_result:
     return metadata
 
 
-def require_directory(path: Path, uid: int, mode: int) -> None:
+def require_directory(path: Path, uid: int, mode: int) -> Path:
     metadata = path.lstat()
+    resolved = path
+    if stat.S_ISLNK(metadata.st_mode):
+        resolved = Path(os.path.realpath(path))
+        components = list(reversed(resolved.parents)) + [resolved]
+        for component in components:
+            component_metadata = component.lstat()
+            if (
+                not stat.S_ISDIR(component_metadata.st_mode)
+                or component_metadata.st_uid != 0
+                or component_metadata.st_mode & 0o022
+            ):
+                raise ValueError(f"unsafe resolved directory component: {component}")
+        metadata = resolved.lstat()
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid or metadata.st_gid != uid:
         raise ValueError(f"unsafe directory: {path}")
     if stat.S_IMODE(metadata.st_mode) != mode:
         raise ValueError(f"wrong directory mode: {path}")
+    return resolved
 
 
 def hash_fd(fd: int) -> str:
@@ -159,12 +173,13 @@ def atomic_copy_bytes(
     gid: int,
 ) -> None:
     parent = target.parent
-    parent_metadata = parent.lstat()
-    require_directory(parent, uid, stat.S_IMODE(parent_metadata.st_mode))
-    if parent.lstat().st_mode & 0o022:
+    parent_metadata = parent.stat()
+    resolved_parent = require_directory(parent, uid, stat.S_IMODE(parent_metadata.st_mode))
+    if resolved_parent.lstat().st_mode & 0o022:
         raise ValueError(f"target directory has unsafe mode: {parent}")
-    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage.", dir=parent))
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage.", dir=resolved_parent))
     temporary_name = staging / target.name
+    resolved_target = resolved_parent / target.name
     temporary_fd = -1
     try:
         os.chown(staging, uid, gid)
@@ -185,8 +200,8 @@ def atomic_copy_bytes(
             raise ValueError(f"staged target verification failed: {target}")
         os.close(temporary_fd)
         temporary_fd = -1
-        os.replace(temporary_name, target)
-        sync_directory(parent)
+        os.replace(temporary_name, resolved_target)
+        sync_directory(resolved_parent)
     finally:
         if temporary_fd >= 0:
             os.close(temporary_fd)

@@ -5,6 +5,7 @@ import importlib.util
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -25,6 +26,25 @@ FREEZE_SPEC.loader.exec_module(FREEZER)
 
 
 class StaticManifestTests(unittest.TestCase):
+    def root_owned_lstat(
+        self, unsafe_writable: set[Path] | None = None, keep_owner: set[Path] | None = None
+    ) -> object:
+        real_lstat = Path.lstat
+        unsafe_writable = unsafe_writable or set()
+        keep_owner = keep_owner or set()
+
+        def lstat(path: Path) -> os.stat_result:
+            metadata = real_lstat(path)
+            values = list(metadata)
+            if path not in keep_owner:
+                values[4] = 0
+                values[5] = 0
+            if path not in unsafe_writable:
+                values[0] &= ~0o022
+            return os.stat_result(values)
+
+        return mock.patch.object(Path, "lstat", autospec=True, side_effect=lstat)
+
     def make_package(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary = tempfile.TemporaryDirectory()
         package = Path(temporary.name)
@@ -583,7 +603,7 @@ else:
             observed_live.append(Path(live).read_bytes())
 
         with (
-            mock.patch.object(MODULE, "require_directory"),
+            mock.patch.object(MODULE, "require_directory", return_value=target.parent),
             mock.patch.object(MODULE.os, "chown"),
             mock.patch.object(MODULE.os, "fchown"),
             mock.patch.object(MODULE.os, "replace", side_effect=observe_replace),
@@ -592,6 +612,84 @@ else:
 
         self.assertEqual(target.read_bytes(), original)
         self.assertNotIn(mutated, observed_live)
+
+    def test_accepts_symlink_to_root_owned_directory(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        real = root / "bin"
+        real.mkdir(mode=0o755)
+        real.chmod(0o755)
+        link = root / "sbin"
+        link.symlink_to(real)
+
+        with self.root_owned_lstat():
+            self.assertEqual(MODULE.require_directory(link, 0, 0o755), real)
+
+    def test_rejects_symlink_to_user_owned_directory(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        real = root / "user-bin"
+        real.mkdir(mode=0o755)
+        real.chmod(0o755)
+        link = root / "sbin"
+        link.symlink_to(real)
+
+        with self.root_owned_lstat(keep_owner={real}):
+            with self.assertRaisesRegex(ValueError, "unsafe resolved directory component"):
+                MODULE.require_directory(link, 0, 0o755)
+
+    def test_rejects_symlink_with_non_root_writable_resolved_parent(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        unsafe_parent = root / "writable"
+        unsafe_parent.mkdir(mode=0o777)
+        unsafe_parent.chmod(0o777)
+        real = unsafe_parent / "bin"
+        real.mkdir(mode=0o755)
+        real.chmod(0o755)
+        link = root / "sbin"
+        link.symlink_to(real)
+
+        with self.root_owned_lstat(unsafe_writable={unsafe_parent}):
+            with self.assertRaisesRegex(ValueError, "unsafe resolved directory component"):
+                MODULE.require_directory(link, 0, 0o755)
+
+    def test_atomic_install_uses_resolved_symlink_parent(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        real = root / "bin"
+        real.mkdir(mode=0o755)
+        real.chmod(0o755)
+        link = root / "sbin"
+        link.symlink_to(real)
+        target = link / "tool"
+        payload = b"reviewed static tool"
+        digest = hashlib.sha256(payload).hexdigest()
+        real_replace = MODULE.os.replace
+        replacements: list[tuple[Path, Path]] = []
+
+        def observe_replace(staged: str | Path, live: str | Path) -> None:
+            staged_path = Path(staged)
+            live_path = Path(live)
+            replacements.append((staged_path, live_path))
+            self.assertEqual(staged_path.parent.parent, real)
+            self.assertEqual(live_path.parent, real)
+            real_replace(staged_path, live_path)
+
+        with (
+            self.root_owned_lstat(),
+            mock.patch.object(MODULE.os, "chown"),
+            mock.patch.object(MODULE.os, "fchown"),
+            mock.patch.object(MODULE.os, "replace", side_effect=observe_replace),
+        ):
+            MODULE.atomic_copy_bytes(payload, digest, target, 0o755, 0, 0)
+
+        self.assertEqual(len(replacements), 1)
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), digest)
 
 
 if __name__ == "__main__":
