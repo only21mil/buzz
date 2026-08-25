@@ -1,8 +1,10 @@
 //! Durable ingest index for signed Buzz-native CI events.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use buzz_core::ci::{
-    CiJobState, CiJobStatusEnvelope, CiRequestEnvelope, CiRequestType, CiRunState,
-    ValidatedCiEnvelope,
+    CiEvidenceFinalizedEnvelope, CiJobState, CiJobStatusEnvelope, CiRequestEnvelope, CiRequestType,
+    CiRunState, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
 };
 use buzz_core::kind::{
     KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
@@ -496,29 +498,361 @@ async fn prepare_linked_event(
         }
     }
     validate_status_sequence(tx, community_id, envelope, projection).await?;
+    match envelope {
+        ValidatedCiEnvelope::EvidenceFinalized(evidence) => {
+            validate_evidence_finalized(tx, community_id, projection.run_id, evidence).await?;
+        }
+        ValidatedCiEnvelope::TeardownAttestation(teardown) => {
+            validate_teardown_attestation(tx, community_id, projection.run_id, teardown).await?;
+        }
+        _ => {}
+    }
     if matches!(
         envelope,
         ValidatedCiEnvelope::RunStatus(status) if status.state == CiRunState::Success
     ) {
-        let terminal_facts: i64 = sqlx::query_scalar(
-            r#"
-            SELECT count(DISTINCT event_kind) FROM ci_run_events
-            WHERE community_id=$1 AND run_id=$2 AND event_kind IN ($3,$4)
-            "#,
-        )
-        .bind(community_id.as_uuid())
-        .bind(projection.run_id)
-        .bind(KIND_CI_EVIDENCE_FINALIZED as i32)
-        .bind(KIND_CI_TEARDOWN_ATTESTATION as i32)
-        .fetch_one(&mut **tx)
-        .await?;
-        if terminal_facts != 2 {
+        validate_terminal_success(tx, community_id, projection.run_id).await?;
+    }
+    Ok(())
+}
+
+async fn validate_terminal_success(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+) -> Result<()> {
+    let evidence: CiEvidenceFinalizedEnvelope =
+        load_terminal_fact(tx, community_id, run_id, KIND_CI_EVIDENCE_FINALIZED).await?;
+    validate_evidence_finalized(tx, community_id, run_id, &evidence).await?;
+
+    let teardown: CiTeardownAttestationEnvelope =
+        load_terminal_fact(tx, community_id, run_id, KIND_CI_TEARDOWN_ATTESTATION).await?;
+    validate_teardown_attestation(tx, community_id, run_id, &teardown).await
+}
+
+async fn validate_evidence_finalized(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+    evidence: &CiEvidenceFinalizedEnvelope,
+) -> Result<()> {
+    let (request_event_id, request) =
+        load_initial_request_identity_tx(tx, community_id, run_id).await?;
+    if evidence.request_event_id != request_event_id
+        || evidence.run_id != request.run_id
+        || evidence.workflow_id != request.workflow_id
+        || evidence.target_repo_a != request.target_repo_a
+        || evidence.tip_oid != request.tip_oid
+    {
+        return Err(DbError::InvalidData(
+            "CI evidence provenance does not match the accepted run".into(),
+        ));
+    }
+
+    let selected =
+        load_selected_terminal_jobs(tx, community_id, run_id, &request_event_id, &request).await?;
+    let max_attempt = selected
+        .iter()
+        .map(|status| status.attempt)
+        .max()
+        .ok_or_else(|| DbError::InvalidData("CI selected job graph is empty".into()))?;
+    if evidence.attempt != max_attempt || evidence.finalized_job_attempts.len() != selected.len() {
+        return Err(DbError::InvalidData(
+            "CI evidence does not exactly match selected job attempts".into(),
+        ));
+    }
+
+    let finalized = evidence
+        .finalized_job_attempts
+        .iter()
+        .map(|job| (job.job_id.as_str(), job))
+        .collect::<BTreeMap<_, _>>();
+    for status in &selected {
+        let fact = finalized.get(status.job_id.as_str()).ok_or_else(|| {
+            DbError::InvalidData("CI evidence omits a selected job attempt".into())
+        })?;
+        if fact.attempt != status.attempt
+            || status.log_ref.as_deref() != Some(fact.log_ref.as_str())
+            || status.artifact_refs != fact.artifact_refs
+        {
             return Err(DbError::InvalidData(
-                "CI terminal success requires stored evidence and teardown facts".into(),
+                "CI evidence references do not match the selected terminal job status".into(),
             ));
+        }
+        require_stored_reference(
+            tx,
+            community_id,
+            run_id,
+            &fact.log_ref,
+            KIND_CI_LOG_REFERENCE,
+            &status.job_id,
+            status.attempt,
+        )
+        .await?;
+        for artifact_ref in &fact.artifact_refs {
+            require_stored_reference(
+                tx,
+                community_id,
+                run_id,
+                artifact_ref,
+                KIND_CI_ARTIFACT_REFERENCE,
+                &status.job_id,
+                status.attempt,
+            )
+            .await?;
         }
     }
     Ok(())
+}
+
+async fn validate_teardown_attestation(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+    teardown: &CiTeardownAttestationEnvelope,
+) -> Result<()> {
+    let (request_event_id, request) =
+        load_initial_request_identity_tx(tx, community_id, run_id).await?;
+    let selected =
+        load_selected_terminal_jobs(tx, community_id, run_id, &request_event_id, &request).await?;
+    let selected_attempts = selected
+        .into_iter()
+        .map(|status| (status.job_id, status.attempt))
+        .collect::<Vec<_>>();
+    teardown
+        .validate_context(&request_event_id, &request, &selected_attempts)
+        .map_err(|error| DbError::InvalidData(format!("invalid CI teardown binding: {error}")))
+}
+
+async fn load_selected_terminal_jobs(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+    initial_request_event_id: &str,
+    initial: &CiRequestEnvelope,
+) -> Result<Vec<CiJobStatusEnvelope>> {
+    let request_rows = sqlx::query(
+        r#"
+        SELECT encode(index.event_id, 'hex') AS event_id,stored.content
+        FROM ci_run_events AS index
+        JOIN events AS stored
+          ON stored.community_id=index.community_id
+         AND stored.created_at=index.event_created_at
+         AND stored.id=index.event_id
+        WHERE index.community_id=$1 AND index.run_id=$2 AND index.event_kind=$3
+        ORDER BY index.watch_cursor
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(KIND_CI_REQUEST as i32)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut requests = Vec::with_capacity(request_rows.len());
+    for row in request_rows {
+        let event_id: String = row.try_get("event_id")?;
+        let envelope: CiRequestEnvelope = serde_json::from_str(row.try_get("content")?)
+            .map_err(|_| DbError::InvalidData("stored CI request content is invalid".into()))?;
+        requests.push((event_id, envelope));
+    }
+    if requests.first().is_none_or(|(event_id, request)| {
+        event_id != initial_request_event_id || request != initial
+    }) {
+        return Err(DbError::InvalidData(
+            "CI selected graph has no canonical initial request".into(),
+        ));
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT stored.content
+        FROM ci_run_events AS index
+        JOIN events AS stored
+          ON stored.community_id=index.community_id
+         AND stored.created_at=index.event_created_at
+         AND stored.id=index.event_id
+        WHERE index.community_id=$1 AND index.run_id=$2 AND index.event_kind=$3
+        ORDER BY index.job_id,index.attempt,index.sequence
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(KIND_CI_JOB_STATUS as i32)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut histories = BTreeMap::new();
+    for row in rows {
+        let status: CiJobStatusEnvelope = serde_json::from_str(row.try_get("content")?)
+            .map_err(|_| DbError::InvalidData("stored CI job status content is invalid".into()))?;
+        histories.insert(
+            (
+                status.request_event_id.clone(),
+                status.job_id.clone(),
+                status.attempt,
+            ),
+            status,
+        );
+    }
+
+    let mut selected_attempts = BTreeMap::new();
+    let mut selected_states = BTreeMap::new();
+    let mut selected_request_ids = BTreeMap::new();
+    let mut consumed = BTreeSet::new();
+    for job_id in &initial.job_ids {
+        let key = (initial_request_event_id.to_string(), job_id.clone(), 1);
+        let status = histories.get(&key).ok_or_else(|| {
+            DbError::InvalidData(format!("CI selected job {job_id} has no status history"))
+        })?;
+        if !status.state.is_terminal() {
+            return Err(DbError::InvalidData(format!(
+                "CI selected job {job_id} is not terminal"
+            )));
+        }
+        selected_attempts.insert(job_id.clone(), 1);
+        selected_states.insert(job_id.clone(), status.state);
+        selected_request_ids.insert(job_id.clone(), initial_request_event_id.to_string());
+        consumed.insert(key);
+    }
+
+    for (request_event_id, request) in requests.iter().skip(1) {
+        if request.request_type != CiRequestType::Rerun {
+            return Err(DbError::InvalidData(
+                "CI selected graph contains a second initial request".into(),
+            ));
+        }
+        let selected_job = &request.job_ids[0];
+        let parent_attempt = request.parent_attempt.ok_or_else(|| {
+            DbError::InvalidData("CI rerun is missing its selected parent attempt".into())
+        })?;
+        if selected_attempts.get(selected_job) != Some(&parent_attempt)
+            || selected_states.get(selected_job) != Some(&CiJobState::Failure)
+        {
+            return Err(DbError::InvalidData(
+                "CI rerun does not advance the selected failed parent".into(),
+            ));
+        }
+        let primary_key = (
+            request_event_id.clone(),
+            selected_job.clone(),
+            request.attempt,
+        );
+        let primary = histories.get(&primary_key).ok_or_else(|| {
+            DbError::InvalidData("CI rerun selected job has no terminal status stream".into())
+        })?;
+        let mut advanced = BTreeSet::from([selected_job.clone()]);
+        advanced.extend(primary.also_reruns.iter().cloned());
+        for job_id in advanced {
+            let key = (request_event_id.clone(), job_id.clone(), request.attempt);
+            let status = histories.get(&key).ok_or_else(|| {
+                DbError::InvalidData(
+                    "CI rerun fan-out job has no matching terminal status stream".into(),
+                )
+            })?;
+            if !status.state.is_terminal() || status.parent_attempt != Some(parent_attempt) {
+                return Err(DbError::InvalidData(
+                    "CI rerun job status is non-terminal or has wrong parent attempt".into(),
+                ));
+            }
+            selected_attempts.insert(job_id.clone(), request.attempt);
+            selected_states.insert(job_id.clone(), status.state);
+            selected_request_ids.insert(job_id, request_event_id.clone());
+            consumed.insert(key);
+        }
+    }
+
+    if consumed.len() != histories.len() {
+        return Err(DbError::InvalidData(
+            "CI status history contains an unselected job attempt".into(),
+        ));
+    }
+
+    let mut selected = Vec::with_capacity(initial.job_ids.len());
+    for job_id in &initial.job_ids {
+        let attempt = selected_attempts[job_id];
+        let request_event_id = &selected_request_ids[job_id];
+        let status = histories
+            .get(&(request_event_id.clone(), job_id.clone(), attempt))
+            .cloned()
+            .ok_or_else(|| DbError::InvalidData("CI selected terminal status is missing".into()))?;
+        if status.required
+            && status.state != CiJobState::Success
+            && !(status.state == CiJobState::Skipped && status.skip_policy == CiSkipPolicy::Allow)
+        {
+            return Err(DbError::InvalidData(format!(
+                "CI selected required job {job_id} is not terminal-good"
+            )));
+        }
+        selected.push(status);
+    }
+    Ok(selected)
+}
+
+async fn require_stored_reference(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+    event_id: &str,
+    event_kind: u32,
+    job_id: &str,
+    attempt: u32,
+) -> Result<()> {
+    let event_id = decode_event_id(event_id)?;
+    let attempt = i32::try_from(attempt)
+        .map_err(|_| DbError::InvalidData("CI evidence attempt exceeds i32".into()))?;
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM ci_run_events
+            WHERE community_id=$1 AND run_id=$2 AND event_id=$3
+              AND event_kind=$4 AND job_id=$5 AND attempt=$6
+        )
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(event_id)
+    .bind(event_kind as i32)
+    .bind(job_id)
+    .bind(attempt)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !exists {
+        return Err(DbError::InvalidData(
+            "CI evidence reference does not resolve to the selected run/job/attempt".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn load_terminal_fact<T: serde::de::DeserializeOwned>(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+    event_kind: u32,
+) -> Result<T> {
+    let content: String = sqlx::query_scalar(
+        r#"
+        SELECT stored.content
+        FROM ci_run_events AS index
+        JOIN events AS stored
+          ON stored.community_id=index.community_id
+         AND stored.created_at=index.event_created_at
+         AND stored.id=index.event_id
+        WHERE index.community_id=$1 AND index.run_id=$2 AND index.event_kind=$3
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(event_kind as i32)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        DbError::InvalidData(
+            "CI terminal success requires stored evidence and teardown facts".into(),
+        )
+    })?;
+    serde_json::from_str(&content)
+        .map_err(|_| DbError::InvalidData("stored CI terminal fact content is invalid".into()))
 }
 
 async fn validate_status_sequence(
@@ -663,9 +997,20 @@ async fn load_initial_request_tx(
     community_id: CommunityId,
     run_id: Uuid,
 ) -> Result<CiRequestEnvelope> {
-    let content: String = sqlx::query_scalar(
+    load_initial_request_identity_tx(tx, community_id, run_id)
+        .await
+        .map(|(_, request)| request)
+}
+
+async fn load_initial_request_identity_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+) -> Result<(String, CiRequestEnvelope)> {
+    let row = sqlx::query(
         r#"
-        SELECT stored.content
+        SELECT encode(run.initial_request_event_id, 'hex') AS request_event_id,
+               stored.content
         FROM ci_runs AS run
         JOIN ci_run_events AS index
           ON index.community_id=run.community_id
@@ -682,8 +1027,11 @@ async fn load_initial_request_tx(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| DbError::InvalidData("CI initial request is missing".into()))?;
-    serde_json::from_str(&content)
-        .map_err(|_| DbError::InvalidData("stored CI request content is invalid".into()))
+    let request_event_id = row.try_get("request_event_id")?;
+    let content: String = row.try_get("content")?;
+    let request = serde_json::from_str(&content)
+        .map_err(|_| DbError::InvalidData("stored CI request content is invalid".into()))?;
+    Ok((request_event_id, request))
 }
 
 async fn load_linked_request_tx(
