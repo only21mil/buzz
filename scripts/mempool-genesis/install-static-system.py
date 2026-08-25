@@ -103,10 +103,9 @@ def require_regular(path: Path, uid: int | None, mode: int) -> os.stat_result:
 
 
 def require_directory(path: Path, uid: int, mode: int) -> Path:
-    metadata = path.lstat()
-    resolved = path
-    if stat.S_ISLNK(metadata.st_mode):
-        resolved = Path(os.path.realpath(path))
+    lexical = Path(os.path.abspath(path))
+    resolved = Path(os.path.realpath(path))
+    if resolved != lexical:
         components = list(reversed(resolved.parents)) + [resolved]
         for component in components:
             component_metadata = component.lstat()
@@ -116,12 +115,19 @@ def require_directory(path: Path, uid: int, mode: int) -> Path:
                 or component_metadata.st_mode & 0o022
             ):
                 raise ValueError(f"unsafe resolved directory component: {component}")
-        metadata = resolved.lstat()
+    metadata = resolved.lstat()
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid or metadata.st_gid != uid:
         raise ValueError(f"unsafe directory: {path}")
     if stat.S_IMODE(metadata.st_mode) != mode:
         raise ValueError(f"wrong directory mode: {path}")
     return resolved
+
+
+def resolved_target_path(path: Path, uid: int) -> Path:
+    parent = path.parent
+    parent_metadata = parent.stat()
+    resolved_parent = require_directory(parent, uid, stat.S_IMODE(parent_metadata.st_mode))
+    return resolved_parent / path.name
 
 
 def hash_fd(fd: int) -> str:
@@ -157,7 +163,9 @@ def read_verified_source(path: Path, expected_hash: str, expected_mode: int) -> 
 
 
 def sync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    metadata = path.stat()
+    resolved = require_directory(path, 0, stat.S_IMODE(metadata.st_mode))
+    fd = os.open(resolved, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         os.fsync(fd)
     finally:
@@ -173,8 +181,7 @@ def atomic_copy_bytes(
     gid: int,
 ) -> None:
     parent = target.parent
-    parent_metadata = parent.stat()
-    resolved_parent = require_directory(parent, uid, stat.S_IMODE(parent_metadata.st_mode))
+    resolved_parent = resolved_target_path(target, uid).parent
     if resolved_parent.lstat().st_mode & 0o022:
         raise ValueError(f"target directory has unsafe mode: {parent}")
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage.", dir=resolved_parent))
@@ -225,7 +232,8 @@ def atomic_copy_fd(source_fd: int, target: Path, mode: int, uid: int, gid: int) 
 
 
 def copy_path_to_backup(source: Path, target: Path) -> None:
-    fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    resolved_source = resolved_target_path(source, 0)
+    fd = os.open(resolved_source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
@@ -531,9 +539,8 @@ def prepare_directories() -> bool:
         Path("/etc/sudoers.d"): 0o750,
         Path("/etc/systemd/system"): 0o755,
     }
-    for path, mode in expected.items():
-        require_directory(path, 0, mode)
-    credential_dir = Path("/etc/buzz-agents/credentials")
+    resolved = {path: require_directory(path, 0, mode) for path, mode in expected.items()}
+    credential_dir = resolved[Path("/etc/buzz-agents")] / "credentials"
     if credential_dir.exists() or credential_dir.is_symlink():
         require_directory(credential_dir, 0, 0o700)
         return False
@@ -553,7 +560,8 @@ def prepare_directories() -> bool:
 
 
 def target_metadata(path: Path) -> dict[str, object]:
-    metadata = path.lstat()
+    resolved = resolved_target_path(path, 0)
+    metadata = resolved.lstat()
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
@@ -561,7 +569,7 @@ def target_metadata(path: Path) -> dict[str, object]:
         or metadata.st_gid != 0
     ):
         raise ValueError(f"unsafe installed target: {path}")
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         digest = hash_fd(fd)
     finally:
@@ -581,13 +589,15 @@ def restore_changed(changed: list[str], previous: dict[str, dict[str, object]], 
         record = previous[target_text]
         if record["exists"]:
             source = backup / "files" / hashlib.sha256(target_text.encode()).hexdigest()
-            fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            resolved_source = resolved_target_path(source, 0)
+            fd = os.open(resolved_source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
             try:
                 atomic_copy_fd(fd, target, int(str(record["mode"]), 8), int(record["uid"]), int(record["gid"]))
             finally:
                 os.close(fd)
         elif target.exists() or target.is_symlink():
-            metadata = target.lstat()
+            resolved_target = resolved_target_path(target, 0)
+            metadata = resolved_target.lstat()
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_nlink != 1
@@ -595,8 +605,8 @@ def restore_changed(changed: list[str], previous: dict[str, dict[str, object]], 
                 or metadata.st_gid != 0
             ):
                 raise ValueError(f"unsafe rollback target: {target}")
-            target.unlink()
-            sync_directory(target.parent)
+            resolved_target.unlink()
+            sync_directory(resolved_target.parent)
 
 
 def timestamped_backup_id(package_id: str, now: datetime | None = None) -> str:
@@ -606,7 +616,8 @@ def timestamped_backup_id(package_id: str, now: datetime | None = None) -> str:
 
 def write_receipt(path: Path, receipt: dict[str, object]) -> None:
     payload = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    temporary_fd, temporary_name = tempfile.mkstemp(prefix=".receipt.", dir=path.parent)
+    resolved_path = resolved_target_path(path, 0)
+    temporary_fd, temporary_name = tempfile.mkstemp(prefix=".receipt.", dir=resolved_path.parent)
     try:
         os.fchmod(temporary_fd, 0o600)
         os.fchown(temporary_fd, 0, 0)
@@ -617,8 +628,8 @@ def write_receipt(path: Path, receipt: dict[str, object]) -> None:
         os.fsync(temporary_fd)
         os.close(temporary_fd)
         temporary_fd = -1
-        os.replace(temporary_name, path)
-        sync_directory(path.parent)
+        os.replace(temporary_name, resolved_path)
+        sync_directory(resolved_path.parent)
     finally:
         if temporary_fd >= 0:
             os.close(temporary_fd)
@@ -632,8 +643,9 @@ def remove_created_credential_directory(created: bool) -> None:
     if not created:
         return
     credential_dir = Path("/etc/buzz-agents/credentials")
-    credential_dir.rmdir()
-    sync_directory(credential_dir.parent)
+    resolved_credential_dir = resolved_target_path(credential_dir, 0)
+    resolved_credential_dir.rmdir()
+    sync_directory(resolved_credential_dir.parent)
 
 
 def install(package: Path, state: Path) -> None:
@@ -644,10 +656,6 @@ def install(package: Path, state: Path) -> None:
     package_id = str(manifest["package_id"])
     entries = [entry for entry in all_entries if entry["owner"] == "static"]
     backup_id = timestamped_backup_id(package_id)
-    backup = BACKUP_ROOT / backup_id
-    if backup.exists() or backup.is_symlink():
-        raise ValueError("backup/receipt already exists")
-
     verified_sources = {
         str(entry["target"]): all_verified_sources[str(entry["target"])]
         for entry in entries
@@ -657,9 +665,14 @@ def install(package: Path, state: Path) -> None:
         subprocess.run(["visudo", "-cf", str(package / "system/buzz-agent-key-handoff.sudoers")], check=True)
         subprocess.run(["systemd-analyze", "verify", str(package / "system/buzz-agent@.service")], check=True)
         BACKUP_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-        require_directory(BACKUP_ROOT, 0, 0o700)
+        resolved_backup_root = require_directory(BACKUP_ROOT, 0, 0o700)
+        backup = resolved_backup_root / backup_id
+        if backup.exists() or backup.is_symlink():
+            raise ValueError("backup/receipt already exists")
         backup.mkdir(mode=0o700)
         (backup / "files").mkdir(mode=0o700)
+        require_directory(backup, 0, 0o700)
+        require_directory(backup / "files", 0, 0o700)
 
         try:
             previous: dict[str, dict[str, object]] = {}
@@ -684,7 +697,7 @@ def install(package: Path, state: Path) -> None:
             write_receipt(receipt_path, receipt)
         except Exception:
             shutil.rmtree(backup)
-            sync_directory(BACKUP_ROOT)
+            sync_directory(resolved_backup_root)
             raise
 
         changed: list[str] = []
@@ -737,8 +750,8 @@ def rollback(backup_id: str) -> None:
     if os.geteuid() != 0 or not BACKUP_ID.fullmatch(backup_id):
         raise ValueError("invalid rollback invocation")
     require_services_stopped()
-    backup = BACKUP_ROOT / backup_id
-    require_directory(backup, 0, 0o700)
+    backup = require_directory(BACKUP_ROOT / backup_id, 0, 0o700)
+    require_directory(backup / "files", 0, 0o700)
     receipt_path = backup / "receipt.json"
     require_regular(receipt_path, 0, 0o600)
     receipt = load_json(receipt_path)

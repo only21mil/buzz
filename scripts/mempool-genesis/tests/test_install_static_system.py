@@ -469,7 +469,7 @@ else:
             "previous": {target: {"exists": False} for target in MODULE.TARGETS},
             "installed": {target: "0" * 64 for target in MODULE.TARGETS},
         }
-        with mock.patch.object(MODULE.os, "fchown"):
+        with self.root_owned_lstat(), mock.patch.object(MODULE.os, "fchown"):
             MODULE.write_receipt(backup / "receipt.json", receipt)
         self.assertEqual(MODULE.load_json(backup / "receipt.json"), receipt)
 
@@ -495,7 +495,11 @@ else:
             mock.patch.object(MODULE, "BACKUP_ROOT", backup_root),
             mock.patch.object(MODULE.os, "geteuid", return_value=0),
             mock.patch.object(MODULE, "require_services_stopped"),
-            mock.patch.object(MODULE, "require_directory"),
+            mock.patch.object(
+                MODULE,
+                "require_directory",
+                side_effect=lambda path, *_args: Path(os.path.realpath(path)),
+            ),
             mock.patch.object(MODULE, "require_regular"),
             mock.patch.object(MODULE, "target_metadata", return_value={"sha256": "0" * 64}),
             mock.patch.object(MODULE, "restore_changed") as restore,
@@ -554,7 +558,11 @@ else:
                 ),
             ),
             mock.patch.object(MODULE, "require_services_stopped"),
-            mock.patch.object(MODULE, "require_directory"),
+            mock.patch.object(
+                MODULE,
+                "require_directory",
+                side_effect=lambda path, *_args: Path(os.path.realpath(path)),
+            ),
             mock.patch.object(MODULE, "prepare_directories", return_value=False),
             mock.patch.object(MODULE, "atomic_copy_bytes", side_effect=fail_first_live_copy),
             mock.patch.object(MODULE, "restore_changed") as restore,
@@ -690,6 +698,100 @@ else:
 
         self.assertEqual(len(replacements), 1)
         self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), digest)
+
+    def test_failed_install_rolls_back_target_in_symlinked_directory(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        real = root / "bin"
+        real.mkdir(mode=0o755)
+        real.chmod(0o755)
+        link = root / "sbin"
+        link.symlink_to(real)
+        target = link / "tool"
+        payload = b"reviewed static tool"
+        digest = hashlib.sha256(payload).hexdigest()
+        entry = {
+            "owner": "static",
+            "role": "static",
+            "source": "payload/tool",
+            "target": str(target),
+            "source_mode": "0755",
+            "install_mode": "0755",
+            "status": "A",
+            "sha256": digest,
+        }
+        backup_root = root / "backups"
+        directory_opens: list[Path] = []
+        real_open = MODULE.os.open
+        systemctl_calls = 0
+
+        def observe_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
+            if flags & os.O_DIRECTORY:
+                directory_opens.append(Path(path))
+            return real_open(path, flags, mode)
+
+        def fail_first_daemon_reload(command: list[str], **_kwargs: object) -> object:
+            nonlocal systemctl_calls
+            if command[0] == "systemctl":
+                systemctl_calls += 1
+                if systemctl_calls == 1:
+                    raise RuntimeError("simulated daemon-reload failure")
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            self.root_owned_lstat(),
+            mock.patch.object(MODULE, "TARGETS", {str(target): ("payload/tool", 0o755)}),
+            mock.patch.object(MODULE, "BACKUP_ROOT", backup_root),
+            mock.patch.object(MODULE.os, "geteuid", return_value=0),
+            mock.patch.object(
+                MODULE.os, "uname", return_value=SimpleNamespace(nodename="framework-desktop")
+            ),
+            mock.patch.object(
+                MODULE,
+                "verified_package",
+                return_value=(
+                    {"package_id": "mempool-genesis-static-test"},
+                    [entry],
+                    {str(target): payload},
+                ),
+            ),
+            mock.patch.object(MODULE, "require_services_stopped"),
+            mock.patch.object(MODULE, "prepare_directories", return_value=False),
+            mock.patch.object(MODULE.os, "chown"),
+            mock.patch.object(MODULE.os, "fchown"),
+            mock.patch.object(MODULE.os, "open", side_effect=observe_open),
+            mock.patch.object(MODULE.subprocess, "run", side_effect=fail_first_daemon_reload),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated daemon-reload failure") as raised:
+                MODULE.install(root / "package", root / "state.json")
+
+        self.assertNotIn("ROLLBACK_REQUIRED", str(raised.exception))
+        self.assertFalse(target.exists())
+        self.assertGreaterEqual(directory_opens.count(real), 2)
+        receipts = list(backup_root.glob("*/receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(MODULE.load_json(receipts[0])["install_state"], "rolled_back")
+
+    def test_rollback_rejects_user_writable_resolved_directory(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        real = root / "writable"
+        real.mkdir(mode=0o777)
+        real.chmod(0o777)
+        link = root / "sbin"
+        link.symlink_to(real)
+        target = link / "tool"
+        target.write_bytes(b"installed target")
+
+        with self.root_owned_lstat(unsafe_writable={real}):
+            with self.assertRaisesRegex(ValueError, "unsafe resolved directory component"):
+                MODULE.restore_changed(
+                    [str(target)], {str(target): {"exists": False}}, root / "backup"
+                )
+
+        self.assertTrue(target.exists())
 
 
 if __name__ == "__main__":
