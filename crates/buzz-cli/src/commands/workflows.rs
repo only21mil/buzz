@@ -15,12 +15,16 @@ const WORKFLOW_QUERY_PAGE_SIZE: usize = 1_000;
 const WORKFLOW_QUERY_PAGE_SIZE: usize = 2;
 const WORKFLOW_QUERY_MAX_PAGES: usize = 20;
 
-fn advance_workflow_cursor(filter: &mut serde_json::Value, page: &[nostr::Event]) {
+fn advance_workflow_cursor(
+    filter: &mut serde_json::Value,
+    page: &[nostr::Event],
+) -> Result<(), CliError> {
     let last = page
         .last()
-        .expect("a full workflow query page has a last event");
+        .ok_or_else(|| CliError::Other("cannot advance an empty workflow query page".into()))?;
     filter["until"] = serde_json::json!(last.created_at.as_secs());
     filter["before_id"] = serde_json::json!(last.id.to_hex());
+    Ok(())
 }
 
 async fn query_workflow_events(
@@ -51,7 +55,7 @@ async fn query_workflow_events(
                 )));
             }
 
-            advance_workflow_cursor(&mut filter, &page);
+            advance_workflow_cursor(&mut filter, &page)?;
             events.extend(page);
         }
     }

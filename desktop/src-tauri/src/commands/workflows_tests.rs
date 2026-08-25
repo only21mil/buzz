@@ -73,7 +73,7 @@ fn collect_paged_fixture(mut source: Vec<nostr::Event>) -> Vec<nostr::Event> {
             }
             let done = page.len() < WORKFLOW_QUERY_PAGE_SIZE;
             if !done {
-                advance_workflow_cursor(&mut filter, &page);
+                assert!(advance_workflow_cursor(&mut filter, &page).is_ok());
             }
             collected.extend(page);
             if done {
