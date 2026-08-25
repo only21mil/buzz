@@ -48,8 +48,10 @@ swapped=0
 rollback_attempted=0
 prior_container=
 prior_image_id=
+prior_required_migration=
 prior_binary_sha=
 rollback_tag=
+dump_file=
 
 compose() {
   "${run_local}" "$@"
@@ -79,6 +81,17 @@ container_binary_sha() {
     return 1
   }
   printf '%s\n' "${binary_sha}"
+}
+
+image_required_migration() {
+  local required
+  required=$(docker inspect --format \
+    '{{index .Config.Labels "org.block.buzz.required-migration"}}' "$1")
+  [[ ${required} =~ ^[0-9]+$ ]] || {
+    printf 'REFUSED: image %s has no valid required-migration label: %s\n' "$1" "${required}" >&2
+    return 1
+  }
+  printf '%d\n' "$((10#${required}))"
 }
 
 relay_container() {
@@ -117,8 +130,25 @@ cleanup_build_worktree() {
 }
 
 rollback() {
-  local rollback_container rollback_image rollback_sha
+  local rollback_container rollback_image rollback_sha rollback_db_state rollback_db_migration rollback_db_success
   rollback_attempted=1
+  if ! rollback_db_state=$(read_db_migration); then
+    printf 'AUTOMATIC ROLLBACK REFUSED: could not read the database migration state. Database dump: %s\n' \
+      "${dump_file}" >&2
+    return 1
+  fi
+  IFS='|' read -r rollback_db_migration rollback_db_success <<<"${rollback_db_state}"
+  if [[ ! ${rollback_db_migration} =~ ^[0-9]+$ ]] || [[ ${rollback_db_success} != t ]]; then
+    printf 'AUTOMATIC ROLLBACK REFUSED: database migration state is %s. Prior image requires at most %d. Database dump: %s\n' \
+      "${rollback_db_state}" "${prior_required_migration}" "${dump_file}" >&2
+    return 1
+  fi
+  if ((rollback_db_migration > prior_required_migration)); then
+    printf 'AUTOMATIC ROLLBACK REFUSED: database migration %d exceeds prior image requirement %d. Database dump: %s\n' \
+      "${rollback_db_migration}" "${prior_required_migration}" "${dump_file}" >&2
+    printf 'LOUD STOP: do not restore the prior image. Operator must restore the dump or roll forward.\n' >&2
+    return 1
+  fi
   printf '\nDEPLOY FAILED AFTER SWAP. ROLLING BACK TO %s\n' "${prior_image_id}" >&2
   if ! compose_with_image "${rollback_tag}" up -d --no-deps --force-recreate relay; then
     printf 'ROLLBACK FAILED: compose could not recreate relay with %s\n' "${prior_image_id}" >&2
@@ -198,6 +228,7 @@ printf '%d\n' "${required_migration}" >"${deploy_dir}/required-migration.txt"
 new_image=localhost/buzz-relay:${commit}
 printf 'Building %s from clean commit worktree\n' "${new_image}"
 docker build --label "org.opencontainers.image.revision=${commit}" \
+  --label "org.block.buzz.required-migration=${required_migration}" \
   -t "${new_image}" -f "${build_worktree}/Dockerfile" "${build_worktree}"
 new_image_id=$(docker image inspect "${new_image}" --format '{{.Id}}')
 [[ ${new_image_id} =~ ^sha256:[0-9a-f]{64}$ ]] || {
@@ -215,16 +246,19 @@ prior_container=$(relay_container)
 }
 prior_image_id=$(container_image_id "${prior_container}")
 prior_image_ref=$(docker inspect --format '{{.Config.Image}}' "${prior_container}")
+prior_required_migration=$(image_required_migration "${prior_container}")
 prior_binary_sha=$(container_binary_sha "${prior_container}")
 printf '%s\n' "${prior_container}" >"${deploy_dir}/prior-container-id.txt"
 printf '%s\n' "${prior_image_id}" >"${deploy_dir}/prior-image-id.txt"
 printf '%s\n' "${prior_image_ref}" >"${deploy_dir}/prior-image-ref.txt"
+printf '%d\n' "${prior_required_migration}" >"${deploy_dir}/prior-required-migration.txt"
 printf '%s\n' "${prior_binary_sha}" >"${deploy_dir}/prior-binary-sha256.txt"
 rollback_tag=localhost/buzz-relay:rollback-${timestamp}-${prior_image_id#sha256:}
 rollback_tag=${rollback_tag:0:127}
 docker image tag "${prior_image_id}" "${rollback_tag}"
 printf '%s\n' "${rollback_tag}" >"${deploy_dir}/rollback-image-tag.txt"
-printf 'Prior image: %s, binary: %s\n' "${prior_image_id}" "${prior_binary_sha}"
+printf 'Prior image: %s, required migration: %d, binary: %s\n' \
+  "${prior_image_id}" "${prior_required_migration}" "${prior_binary_sha}"
 
 dump_file=${deploy_dir}/buzz-prod-before-${timestamp}.dump
 printf 'Writing Postgres custom-format dump: %s\n' "${dump_file}"

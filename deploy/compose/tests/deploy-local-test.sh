@@ -79,6 +79,7 @@ case "${args}" in
   *" build "*) exit 0 ;;
   *" image inspect "*) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;;
   *" image tag "*) exit 0 ;;
+  *"org.block.buzz.required-migration"*) printf '%s\n' "${TEST_PRIOR_REQUIRED_MIGRATION}" ;;
   *" inspect --format {{.Image}} "*)
     case "${state}" in
       old|rollback) printf 'sha256:1111111111111111111111111111111111111111111111111111111111111111\n' ;;
@@ -93,7 +94,7 @@ case "${args}" in
     esac
     ;;
   *" exec "*" bash -ec "*)
-    if [[ ${TEST_SCENARIO} == post_swap_failure && ${state} == new ]]; then
+    if [[ ${TEST_SCENARIO} == post_swap_failure* && ${state} == new ]]; then
       exit 1
     fi
     if [[ ${TEST_SCENARIO} == stalled_probe && ${state} == new ]]; then
@@ -144,11 +145,16 @@ STUB
 run_case() {
   local scenario=$1 expected=$2
   local case_dir=${scratch}/${scenario}
+  local initial_db=28 prior_required_migration=28
+  if [[ ${scenario} == post_swap_failure_unadvanced || ${scenario} == stalled_probe ]]; then
+    initial_db=31
+    prior_required_migration=31
+  fi
   mkdir -p "${case_dir}/bin" "${case_dir}/logs" "${case_dir}/build"
   chmod 700 "${case_dir}"
   make_stubs "${case_dir}/bin"
   printf 'old\n' >"${case_dir}/container-state"
-  printf '28\n' >"${case_dir}/db-state"
+  printf '%d\n' "${initial_db}" >"${case_dir}/db-state"
   : >"${case_dir}/commands.log"
   : >"${case_dir}/compose.env"
   cat >"${case_dir}/secrets.env" <<'ENV'
@@ -168,6 +174,7 @@ ENV
     TEST_COMMAND_LOG="${case_dir}/commands.log" \
     TEST_CONTAINER_STATE="${case_dir}/container-state" \
     TEST_DB_STATE="${case_dir}/db-state" \
+    TEST_PRIOR_REQUIRED_MIGRATION="${prior_required_migration}" \
     TEST_REPO_ROOT="${case_dir}/repo" \
     TEST_COMMIT=${test_commit} \
     BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
@@ -209,11 +216,19 @@ swap_line=$(grep -n 'up -d --no-deps --force-recreate relay' "${healthy_log}" | 
 assert_contains "${scratch}/healthy/output" 'DEPLOY SUCCEEDED'
 
 run_case post_swap_failure failure
-assert_contains "${scratch}/post_swap_failure/output" 'ROLLBACK SUCCEEDED'
-assert_contains "${scratch}/post_swap_failure/output" 'prior service was restored'
+assert_contains "${scratch}/post_swap_failure/output" 'AUTOMATIC ROLLBACK REFUSED: database migration 31 exceeds prior image requirement 28'
+assert_contains "${scratch}/post_swap_failure/output" 'Database dump: .*/buzz-prod-before-.*[.]dump'
+assert_contains "${scratch}/post_swap_failure/output" 'LOUD STOP: do not restore the prior image'
 swap_count=$(grep -c 'up -d --no-deps --force-recreate relay' "${scratch}/post_swap_failure/commands.log")
-[[ ${swap_count} -eq 2 ]] || fail "post-swap failure made ${swap_count} recreate calls, expected 2"
-assert_contains "${scratch}/post_swap_failure/commands.log" 'BUZZ_IMAGE=localhost/buzz-relay:rollback-'
+[[ ${swap_count} -eq 1 ]] || fail "post-swap failure made ${swap_count} recreate calls, expected 1"
+assert_not_contains "${scratch}/post_swap_failure/commands.log" 'BUZZ_IMAGE=localhost/buzz-relay:rollback-'
+
+run_case post_swap_failure_unadvanced failure
+assert_contains "${scratch}/post_swap_failure_unadvanced/output" 'ROLLBACK SUCCEEDED'
+assert_contains "${scratch}/post_swap_failure_unadvanced/output" 'prior service was restored'
+unadvanced_swap_count=$(grep -c 'up -d --no-deps --force-recreate relay' "${scratch}/post_swap_failure_unadvanced/commands.log")
+[[ ${unadvanced_swap_count} -eq 2 ]] || fail "unadvanced post-swap failure made ${unadvanced_swap_count} recreate calls, expected 2"
+assert_contains "${scratch}/post_swap_failure_unadvanced/commands.log" 'BUZZ_IMAGE=localhost/buzz-relay:rollback-'
 
 run_case stalled_probe failure
 assert_contains "${scratch}/stalled_probe/output" 'ROLLBACK SUCCEEDED'
