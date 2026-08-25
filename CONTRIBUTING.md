@@ -255,6 +255,20 @@ just ci
 This is the same check that runs in CI. PRs that fail `just ci` will not be
 merged. If `just ci` fails on formatting, `just fix-all` fixes it in one shot (`rustfmt` + Tauri fmt + desktop, web, and mobile formatters).
 
+### CI cadence and review economics
+
+Use `scope=delta` dispatches while iterating. `Detect Changed Paths` then runs
+only the ci.yml jobs affected by each mid-lineage correction commit. Reserve
+`scope=full` for the landing head: run the exact-head matrix once, keep it as
+the merge gate, and run expensive macOS 10× jobs only on landing heads and
+default-branch pushes.
+
+Do not pay a flake tax. Add retry and cache to workflows for flaky
+infrastructure such as toolchain downloads, and fix order-dependent tests.
+Generate review evidence from git at freeze time with `scripts/tier2-freeze.py`,
+never by hand. LOW-only findings return `PASS WITH RISKS`; queue those fixes
+for the next batch, and reserve `FAIL` for MEDIUM+ findings.
+
 ---
 
 ## Code Style
