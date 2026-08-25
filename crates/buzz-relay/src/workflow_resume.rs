@@ -362,6 +362,7 @@ steps:
     struct RecordingActionSink {
         messages: Mutex<Vec<MessageCall>>,
         resolved_mentions: Mutex<Vec<String>>,
+        mention_resolution_fails: Mutex<bool>,
     }
 
     impl RecordingActionSink {
@@ -378,6 +379,13 @@ steps:
                 .lock()
                 .expect("resolved mentions lock") = pubkeys;
         }
+
+        fn fail_mention_resolution(&self) {
+            *self
+                .mention_resolution_fails
+                .lock()
+                .expect("mention resolution failure lock") = true;
+        }
     }
 
     impl ActionSink for RecordingActionSink {
@@ -388,6 +396,17 @@ steps:
             _text: &str,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, ActionSinkError>> + Send + '_>>
         {
+            if *self
+                .mention_resolution_fails
+                .lock()
+                .expect("mention resolution failure lock")
+            {
+                return Box::pin(async {
+                    Err(ActionSinkError::Database(
+                        "forced mention resolution failure".to_owned(),
+                    ))
+                });
+            }
             let pubkeys = self
                 .resolved_mentions
                 .lock()
@@ -940,6 +959,88 @@ steps:
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
             "recovery must fire the mention pubkeys pinned before live resolution changed"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn effect_recovery_uses_pinned_message_when_live_resolution_fails() {
+        let yaml = r#"
+name: Pinned message recovery
+trigger:
+  on: webhook
+steps:
+  - id: approve
+    action: request_approval
+    from: owner
+    message: Approve delivery
+  - id: execute
+    action: send_message
+    text: pinned message
+"#;
+        let fixture = recovery_fixture_with_yaml(yaml).await;
+        let generation = match grant(&fixture).await {
+            WorkflowApprovalDecisionOutcome::Applied { generation, .. } => generation,
+            other => panic!("expected applied grant, got {other:?}"),
+        };
+        let claimed_generation = claim_resume(&fixture, generation).await;
+        let run = fixture
+            .db
+            .get_workflow_run(fixture.community_id, fixture.run_id)
+            .await
+            .expect("read claimed workflow run");
+        let definition: buzz_workflow::WorkflowDef =
+            serde_json::from_value(run.definition_snapshot).expect("parse workflow definition");
+        let effect_spec =
+            serde_json::to_value(&definition.steps[1].action).expect("serialize message action");
+        let effect_payload = serde_json::json!({
+            "channel_id": "00000000-0000-0000-0000-000000000001",
+            "text": "pinned message",
+            "author_pubkey": hex::encode(&fixture.owner),
+            "mentioned_pubkeys": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        });
+        let claim = fixture
+            .db
+            .claim_workflow_effect(
+                fixture.community_id,
+                fixture.run_id,
+                claimed_generation,
+                "execute",
+                0,
+                "send_message",
+                &effect_spec,
+                &effect_payload,
+            )
+            .await
+            .expect("persist pinned message claim");
+        assert!(matches!(
+            claim,
+            buzz_db::WorkflowEffectClaimOutcome::Ready(_)
+        ));
+        fixture.sink.fail_mention_resolution();
+
+        expire_claim(&fixture, claimed_generation).await;
+        let outcome = run_workflow_resume_sweep_once(
+            Arc::clone(&fixture.engine),
+            fixture.db.clone(),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await
+        .expect("recover pinned message despite failed resolution");
+
+        assert_eq!(outcome.claimed, 1);
+        let calls = fixture.sink.messages();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].mentioned_pubkeys,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
+        let run = fixture
+            .db
+            .get_workflow_run(fixture.community_id, fixture.run_id)
+            .await
+            .expect("read completed workflow run");
+        assert_eq!(run.status, RunStatus::Completed);
     }
 
     #[tokio::test]

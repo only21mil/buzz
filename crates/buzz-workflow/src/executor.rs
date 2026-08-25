@@ -759,6 +759,59 @@ async fn prepare_effect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn load_prepared_effect(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    step_id: &str,
+    effect_kind: &str,
+    action: &ActionDef,
+    claimed_generation: Option<i64>,
+) -> Result<Option<PreparedEffect>, WorkflowError> {
+    let generation = match claimed_generation {
+        Some(generation) => generation,
+        None => {
+            engine
+                .db
+                .get_workflow_run(community_id, run_id)
+                .await?
+                .generation
+        }
+    };
+    let effect_spec = serde_json::to_value(action).map_err(|error| {
+        WorkflowError::Database(format!("failed to serialize workflow effect: {error}"))
+    })?;
+    Ok(
+        match engine
+            .db
+            .load_workflow_effect_claim(
+                community_id,
+                run_id,
+                generation,
+                step_id,
+                0,
+                effect_kind,
+                &effect_spec,
+            )
+            .await?
+        {
+            Some(WorkflowEffectClaimOutcome::Ready(claim)) => {
+                Some(PreparedEffect::Fire { claim, generation })
+            }
+            Some(WorkflowEffectClaimOutcome::Fired(output)) => {
+                Some(PreparedEffect::AlreadyFired(output))
+            }
+            Some(WorkflowEffectClaimOutcome::Conflict) => {
+                return Err(WorkflowError::Database(format!(
+                    "workflow effect {run_id}/{step_id}/0 lost its generation fence"
+                )));
+            }
+            None => None,
+        },
+    )
+}
+
 async fn mark_effect_fired(
     engine: &WorkflowEngine,
     community_id: CommunityId,
@@ -794,6 +847,20 @@ async fn dispatch_action_with_generation(
 
     match action {
         SendMessage { text, channel } => {
+            let prepared = load_prepared_effect(
+                engine,
+                community_id,
+                run_id,
+                step_id,
+                "send_message",
+                action,
+                claimed_generation,
+            )
+            .await?;
+            if let Some(PreparedEffect::AlreadyFired(output)) = &prepared {
+                return Ok(StepResult::Completed(output.clone()));
+            }
+
             // Look up workflow metadata for destination validation and
             // attribution, scoped to the run's community — the same run/workflow
             // UUID may exist in another community, so a bare-id lookup could
@@ -822,40 +889,46 @@ async fn dispatch_action_with_generation(
                 &trigger_ctx.channel_id,
                 workflow.channel_id,
             )?;
-            let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
-            let mentioned_pubkeys = engine
-                .action_sink()?
-                .resolve_message_mentions(community_id, &channel_id, text)
-                .await
-                .map_err(WorkflowError::from)?;
-            let candidate_payload = serde_json::to_value(SendMessageEffectPayload {
-                channel_id,
-                text: text.clone(),
-                author_pubkey: owner_pubkey_hex,
-                mentioned_pubkeys,
-                idempotency_key: None,
-            })
-            .map_err(|error| {
-                WorkflowError::Database(format!(
-                    "failed to serialize send_message effect payload: {error}"
-                ))
-            })?;
-            let (claim, generation) = match prepare_effect(
-                engine,
-                community_id,
-                run_id,
-                step_id,
-                "send_message",
-                action,
-                &candidate_payload,
-                claimed_generation,
-            )
-            .await?
-            {
-                PreparedEffect::AlreadyFired(output) => {
-                    return Ok(StepResult::Completed(output));
+            let (claim, generation) = match prepared {
+                Some(PreparedEffect::Fire { claim, generation }) => (claim, generation),
+                Some(PreparedEffect::AlreadyFired(_)) => unreachable!("handled above"),
+                None => {
+                    let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+                    let mentioned_pubkeys = engine
+                        .action_sink()?
+                        .resolve_message_mentions(community_id, &channel_id, text)
+                        .await
+                        .map_err(WorkflowError::from)?;
+                    let candidate_payload = serde_json::to_value(SendMessageEffectPayload {
+                        channel_id,
+                        text: text.clone(),
+                        author_pubkey: owner_pubkey_hex,
+                        mentioned_pubkeys,
+                        idempotency_key: None,
+                    })
+                    .map_err(|error| {
+                        WorkflowError::Database(format!(
+                            "failed to serialize send_message effect payload: {error}"
+                        ))
+                    })?;
+                    match prepare_effect(
+                        engine,
+                        community_id,
+                        run_id,
+                        step_id,
+                        "send_message",
+                        action,
+                        &candidate_payload,
+                        claimed_generation,
+                    )
+                    .await?
+                    {
+                        PreparedEffect::AlreadyFired(output) => {
+                            return Ok(StepResult::Completed(output));
+                        }
+                        PreparedEffect::Fire { claim, generation } => (claim, generation),
+                    }
                 }
-                PreparedEffect::Fire { claim, generation } => (claim, generation),
             };
             let payload: SendMessageEffectPayload =
                 serde_json::from_value(claim.effect_payload.clone()).map_err(|error| {

@@ -3977,6 +3977,31 @@ impl Db {
         .await
     }
 
+    /// Load an existing external effect under the run's current generation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_workflow_effect_claim(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        effect_kind: &str,
+        effect_spec: &serde_json::Value,
+    ) -> Result<Option<WorkflowEffectClaimOutcome>> {
+        workflow_effect::load_workflow_effect_claim(
+            &self.pool,
+            community_id,
+            run_id,
+            expected_generation,
+            step_id,
+            effect_index,
+            effect_kind,
+            effect_spec,
+        )
+        .await
+    }
+
     /// Mark one claimed effect fired under the run's current generation.
     #[allow(clippy::too_many_arguments)]
     pub async fn mark_workflow_effect_fired(

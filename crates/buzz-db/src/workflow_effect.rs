@@ -45,6 +45,75 @@ pub enum WorkflowEffectMarkOutcome {
     Conflict,
 }
 
+/// Load an existing effect claim while checking the caller's generation fence.
+///
+/// `None` means no claim exists yet. Callers can then resolve live inputs and
+/// create one; a recovered claim returns its pinned payload without requiring
+/// those live lookups to succeed again.
+#[allow(clippy::too_many_arguments)]
+pub async fn load_workflow_effect_claim(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    expected_generation: i64,
+    step_id: &str,
+    effect_index: i16,
+    effect_kind: &str,
+    effect_spec: &Value,
+) -> Result<Option<WorkflowEffectClaimOutcome>> {
+    let mut tx = pool.begin().await?;
+    let owned = sqlx::query(
+        "SELECT 1 FROM workflow_runs WHERE community_id = $1 AND id = $2 \
+         AND status = 'running' AND generation = $3 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(expected_generation)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if owned.is_none() {
+        tx.rollback().await?;
+        return Ok(Some(WorkflowEffectClaimOutcome::Conflict));
+    }
+
+    let row = sqlx::query(
+        "SELECT effect_kind, effect_spec, effect_payload, idempotency_key, claimed_at, fired_at, output \
+         FROM workflow_effect_claims WHERE community_id = $1 AND run_id = $2 \
+         AND step_id = $3 AND effect_index = $4 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(step_id)
+    .bind(effect_index)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    let stored_kind: String = row.try_get("effect_kind")?;
+    let stored_spec: Value = row.try_get("effect_spec")?;
+    if stored_kind != effect_kind || stored_spec != *effect_spec {
+        return Err(DbError::Conflict(format!(
+            "workflow effect {run_id}/{step_id}/{effect_index} was replayed with different inputs"
+        )));
+    }
+
+    let fired_at: Option<DateTime<Utc>> = row.try_get("fired_at")?;
+    let outcome = if fired_at.is_some() {
+        WorkflowEffectClaimOutcome::Fired(row.try_get("output")?)
+    } else {
+        WorkflowEffectClaimOutcome::Ready(WorkflowEffectClaim {
+            idempotency_key: row.try_get("idempotency_key")?,
+            claimed_at: row.try_get("claimed_at")?,
+            effect_payload: row.try_get("effect_payload")?,
+        })
+    };
+    tx.commit().await?;
+    Ok(Some(outcome))
+}
+
 /// Claim an effect while locking and checking the current run generation.
 #[allow(clippy::too_many_arguments)]
 pub async fn claim_workflow_effect(
