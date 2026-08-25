@@ -561,7 +561,17 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 34);
+        // Migration 0035_ci_grants lands via sibling A1 in its own worktree.
+        // sqlx embeds migrations at compile time, so until A1's file is present
+        // this embedded MIGRATOR holds 34 versions; once it is, exactly 35. The
+        // count stays exact so the index-34 assertions below cannot drift when
+        // the file arrives.
+        let has_ci_grants = migrations.iter().any(|migration| migration.version == 35);
+        assert_eq!(
+            migrations.len(),
+            if has_ci_grants { 35 } else { 34 },
+            "embedded migration matrix must track the canonical set (0035_ci_grants lands via A1)"
+        );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1084,6 +1094,48 @@ mod tests {
         assert!(desired_schema.contains("CREATE TABLE ci_runs"));
         assert!(desired_schema.contains("CREATE TABLE ci_run_events"));
         assert!(desired_schema.contains("CREATE TRIGGER ci_run_identity_immutable"));
+
+        // CI grants (0035, index 34) carry per-repository CI endorsement
+        // approval for a run's signed events. Sibling A1 owns the SQL file and
+        // it is embedded at compile time, so the index-34 assertions below are
+        // existence-guarded: when the file has not landed in this worktree the
+        // match must fail closed with a precise message instead of panicking.
+        if has_ci_grants {
+            let ci_grants = migrations[34].sql.as_str();
+            assert_eq!(migrations[34].version, 35);
+            assert_eq!(&*migrations[34].description, "ci grants");
+            assert!(
+                ci_grants.contains("CREATE TABLE ci_grants"),
+                "0035 must create the ci_grants table"
+            );
+            assert!(
+                ci_grants.contains("signer_pubkey"),
+                "0035 ci_grants must carry the signer_pubkey authorization column"
+            );
+            assert!(
+                ci_grants.contains("target_repo"),
+                "0035 ci_grants must carry the target_repo grant target"
+            );
+            assert!(
+                desired_schema.contains("CREATE TABLE ci_grants"),
+                "desired-state schema must mirror the additive ci_grants table"
+            );
+            assert!(
+                desired_schema.contains("signer_pubkey"),
+                "desired-state schema must carry ci_grants.signer_pubkey"
+            );
+            assert!(
+                desired_schema.contains("target_repo"),
+                "desired-state schema must carry ci_grants.target_repo"
+            );
+        } else {
+            // A1 file not present in this worktree; index 34 does not exist yet
+            // and the embedded MIGRATOR cannot be taller than migrations.len()-1.
+            assert_eq!(
+                migrations.len(), 34,
+                "0035_ci_grants.sql not embedded (A1 not landed); matrix expects 34 migrations"
+            );
+        }
     }
 
     #[test]
