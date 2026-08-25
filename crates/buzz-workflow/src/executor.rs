@@ -861,38 +861,37 @@ async fn dispatch_action_with_generation(
                 return Ok(StepResult::Completed(output.clone()));
             }
 
-            // Look up workflow metadata for destination validation and
-            // attribution, scoped to the run's community — the same run/workflow
-            // UUID may exist in another community, so a bare-id lookup could
-            // load the wrong row and drive a side effect under it.
-            let wf_run = engine
-                .db
-                .get_workflow_run(community_id, run_id)
-                .await
-                .map_err(|e| {
-                    WorkflowError::WebhookError(format!(
-                        "SendMessage: failed to load workflow run {run_id}: {e}"
-                    ))
-                })?;
-            let workflow = engine
-                .db
-                .get_workflow(community_id, wf_run.workflow_id)
-                .await
-                .map_err(|e| {
-                    WorkflowError::WebhookError(format!(
-                        "SendMessage: failed to load workflow {}: {e}",
-                        wf_run.workflow_id
-                    ))
-                })?;
-            let channel_id = resolve_send_message_channel(
-                channel.as_deref(),
-                &trigger_ctx.channel_id,
-                workflow.channel_id,
-            )?;
             let (claim, generation) = match prepared {
                 Some(PreparedEffect::Fire { claim, generation }) => (claim, generation),
                 Some(PreparedEffect::AlreadyFired(_)) => unreachable!("handled above"),
                 None => {
+                    // Mutable workflow metadata is needed only to pin a first
+                    // fire. Recovery consumes the stored claim without looking
+                    // the workflow up again.
+                    let wf_run = engine
+                        .db
+                        .get_workflow_run(community_id, run_id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowError::WebhookError(format!(
+                                "SendMessage: failed to load workflow run {run_id}: {e}"
+                            ))
+                        })?;
+                    let workflow = engine
+                        .db
+                        .get_workflow(community_id, wf_run.workflow_id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowError::WebhookError(format!(
+                                "SendMessage: failed to load workflow {}: {e}",
+                                wf_run.workflow_id
+                            ))
+                        })?;
+                    let channel_id = resolve_send_message_channel(
+                        channel.as_deref(),
+                        &trigger_ctx.channel_id,
+                        workflow.channel_id,
+                    )?;
                     let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
                     let mentioned_pubkeys = engine
                         .action_sink()?
@@ -997,55 +996,77 @@ async fn dispatch_action_with_generation(
                     "AddReaction: no trigger.message_id available".into(),
                 ));
             }
-            let wf_run = engine
-                .db
-                .get_workflow_run(community_id, run_id)
-                .await
-                .map_err(|e| {
-                    WorkflowError::WebhookError(format!(
-                        "AddReaction: failed to load workflow run {run_id}: {e}"
-                    ))
-                })?;
-            let workflow = engine
-                .db
-                .get_workflow(community_id, wf_run.workflow_id)
-                .await
-                .map_err(|e| {
-                    WorkflowError::WebhookError(format!(
-                        "AddReaction: failed to load workflow {}: {e}",
-                        wf_run.workflow_id
-                    ))
-                })?;
-            let channel_id =
-                resolve_send_message_channel(None, &trigger_ctx.channel_id, workflow.channel_id)?;
-            let candidate_payload = serde_json::to_value(AddReactionEffectPayload {
-                channel_id,
-                target_event_id: trigger_ctx.message_id.clone(),
-                emoji: emoji.clone(),
-                author_pubkey: hex::encode(&workflow.owner_pubkey),
-                idempotency_key: None,
-            })
-            .map_err(|error| {
-                WorkflowError::Database(format!(
-                    "failed to serialize add_reaction effect payload: {error}"
-                ))
-            })?;
-            let (claim, generation) = match prepare_effect(
+            let prepared = load_prepared_effect(
                 engine,
                 community_id,
                 run_id,
                 step_id,
                 "add_reaction",
                 action,
-                &candidate_payload,
                 claimed_generation,
             )
-            .await?
-            {
-                PreparedEffect::AlreadyFired(output) => {
-                    return Ok(StepResult::Completed(output));
+            .await?;
+            if let Some(PreparedEffect::AlreadyFired(output)) = &prepared {
+                return Ok(StepResult::Completed(output.clone()));
+            }
+            let (claim, generation) = match prepared {
+                Some(PreparedEffect::Fire { claim, generation }) => (claim, generation),
+                Some(PreparedEffect::AlreadyFired(_)) => unreachable!("handled above"),
+                None => {
+                    let wf_run = engine
+                        .db
+                        .get_workflow_run(community_id, run_id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowError::WebhookError(format!(
+                                "AddReaction: failed to load workflow run {run_id}: {e}"
+                            ))
+                        })?;
+                    let workflow = engine
+                        .db
+                        .get_workflow(community_id, wf_run.workflow_id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowError::WebhookError(format!(
+                                "AddReaction: failed to load workflow {}: {e}",
+                                wf_run.workflow_id
+                            ))
+                        })?;
+                    let channel_id = resolve_send_message_channel(
+                        None,
+                        &trigger_ctx.channel_id,
+                        workflow.channel_id,
+                    )?;
+                    let candidate_payload = serde_json::to_value(AddReactionEffectPayload {
+                        channel_id,
+                        target_event_id: trigger_ctx.message_id.clone(),
+                        emoji: emoji.clone(),
+                        author_pubkey: hex::encode(&workflow.owner_pubkey),
+                        idempotency_key: None,
+                    })
+                    .map_err(|error| {
+                        WorkflowError::Database(format!(
+                            "failed to serialize add_reaction effect payload: {error}"
+                        ))
+                    })?;
+                    match prepare_effect(
+                        engine,
+                        community_id,
+                        run_id,
+                        step_id,
+                        "add_reaction",
+                        action,
+                        &candidate_payload,
+                        claimed_generation,
+                    )
+                    .await?
+                    {
+                        PreparedEffect::AlreadyFired(output) => {
+                            return Ok(StepResult::Completed(output));
+                        }
+                        PreparedEffect::Fire { claim, generation } => (claim, generation),
+                    }
                 }
-                PreparedEffect::Fire { claim, generation } => (claim, generation),
             };
             let payload: AddReactionEffectPayload =
                 serde_json::from_value(claim.effect_payload.clone()).map_err(|error| {
@@ -2398,7 +2419,7 @@ mod tests {
             _author_pubkey: &str,
             _mentioned_pubkeys: &[String],
         ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
-            Box::pin(async { unreachable!("send_message is not part of this regression") })
+            Box::pin(async { Ok("message-event-id".to_owned()) })
         }
 
         fn add_reaction(
@@ -2536,6 +2557,231 @@ mod tests {
             replay,
             json!({ "added": true, "event_id": "reaction-event-id" })
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn claimed_message_and_reaction_recover_after_workflow_deletion() {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+        let db = buzz_db::Db::new(&buzz_db::DbConfig {
+            database_url,
+            ..Default::default()
+        })
+        .await
+        .expect("connect test DB");
+        let owner = nostr::Keys::generate();
+        let owner_bytes = owner.public_key().to_bytes().to_vec();
+        let owner_hex = owner.public_key().to_hex();
+        let host = format!("wf-delete-recovery-{}.example", Uuid::new_v4().simple());
+        let community = match db
+            .create_community_with_owner(&host, &owner_hex)
+            .await
+            .expect("create community")
+        {
+            buzz_db::CreateCommunityWithOwnerResult::Created(record) => record.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        db.ensure_user(community, &owner_bytes)
+            .await
+            .expect("ensure workflow owner");
+        let sink = std::sync::Arc::new(RecordingActionSink::default());
+        let engine = WorkflowEngine::new(db.clone(), crate::WorkflowConfig::default());
+        engine.set_action_sink(sink.clone());
+        let trigger = TriggerContext {
+            channel_id: Uuid::new_v4().to_string(),
+            message_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            ..TriggerContext::default()
+        };
+
+        let message_action = ActionDef::SendMessage {
+            text: "committed before marker".to_owned(),
+            channel: None,
+        };
+        let message_workflow = db
+            .create_workflow(
+                community,
+                None,
+                &owner_bytes,
+                "message recovery",
+                r#"{"trigger":{"on":"message_posted"},"steps":[]}"#,
+                &[0; 32],
+                true,
+            )
+            .await
+            .expect("create message workflow");
+        let message_run = db
+            .create_workflow_run(
+                community,
+                message_workflow,
+                None,
+                None,
+                &json!({"steps": []}),
+                &[0; 32],
+            )
+            .await
+            .expect("create message run");
+        let PreparedEffect::Fire {
+            claim: message_claim,
+            generation: message_generation,
+        } = prepare_effect(
+            &engine,
+            community,
+            message_run,
+            "message",
+            "send_message",
+            &message_action,
+            &serde_json::to_value(SendMessageEffectPayload {
+                channel_id: trigger.channel_id.clone(),
+                text: "committed before marker".to_owned(),
+                author_pubkey: owner_hex.clone(),
+                mentioned_pubkeys: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("message payload"),
+            Some(1),
+        )
+        .await
+        .expect("claim message effect")
+        else {
+            panic!("new message effect must be ready");
+        };
+        sink.send_message(
+            crate::ActionEffectContext {
+                idempotency_key: message_claim.idempotency_key,
+                claimed_at: message_claim.claimed_at,
+            },
+            community,
+            &trigger.channel_id,
+            "committed before marker",
+            &owner_hex,
+            &[],
+        )
+        .await
+        .expect("message committed before marker");
+        db.delete_workflow(community, message_workflow)
+            .await
+            .expect("delete message workflow");
+        let message_result = dispatch_action_with_generation(
+            "message",
+            &message_action,
+            &engine,
+            community,
+            message_run,
+            &trigger,
+            &HashMap::new(),
+            Some(message_generation),
+        )
+        .await
+        .expect("recover message after workflow deletion");
+        let StepResult::Completed(message_output) = message_result else {
+            panic!("message recovery must complete");
+        };
+        assert_eq!(
+            message_output,
+            json!({"sent": true, "event_id": "message-event-id"})
+        );
+
+        let reaction_action = ActionDef::AddReaction {
+            emoji: "👍".to_owned(),
+        };
+        let reaction_workflow = db
+            .create_workflow(
+                community,
+                None,
+                &owner_bytes,
+                "reaction recovery",
+                r#"{"trigger":{"on":"reaction_added"},"steps":[]}"#,
+                &[1; 32],
+                true,
+            )
+            .await
+            .expect("create reaction workflow");
+        let reaction_run = db
+            .create_workflow_run(
+                community,
+                reaction_workflow,
+                None,
+                None,
+                &json!({"steps": []}),
+                &[1; 32],
+            )
+            .await
+            .expect("create reaction run");
+        let PreparedEffect::Fire {
+            claim: reaction_claim,
+            generation: reaction_generation,
+        } = prepare_effect(
+            &engine,
+            community,
+            reaction_run,
+            "reaction",
+            "add_reaction",
+            &reaction_action,
+            &serde_json::to_value(AddReactionEffectPayload {
+                channel_id: trigger.channel_id.clone(),
+                target_event_id: trigger.message_id.clone(),
+                emoji: "👍".to_owned(),
+                author_pubkey: owner_hex.clone(),
+                idempotency_key: None,
+            })
+            .expect("reaction payload"),
+            Some(1),
+        )
+        .await
+        .expect("claim reaction effect")
+        else {
+            panic!("new reaction effect must be ready");
+        };
+        sink.add_reaction(
+            crate::ActionEffectContext {
+                idempotency_key: reaction_claim.idempotency_key,
+                claimed_at: reaction_claim.claimed_at,
+            },
+            community,
+            &trigger.channel_id,
+            &trigger.message_id,
+            "👍",
+            &owner_hex,
+        )
+        .await
+        .expect("reaction committed before marker");
+        db.delete_workflow(community, reaction_workflow)
+            .await
+            .expect("delete reaction workflow");
+        let reaction_result = dispatch_action_with_generation(
+            "reaction",
+            &reaction_action,
+            &engine,
+            community,
+            reaction_run,
+            &trigger,
+            &HashMap::new(),
+            Some(reaction_generation),
+        )
+        .await
+        .expect("recover reaction after workflow deletion");
+        let StepResult::Completed(reaction_output) = reaction_result else {
+            panic!("reaction recovery must complete");
+        };
+        assert_eq!(
+            reaction_output,
+            json!({"added": true, "event_id": "reaction-event-id"})
+        );
+
+        for (run_id, step_id, action, kind) in [
+            (message_run, "message", &message_action, "send_message"),
+            (reaction_run, "reaction", &reaction_action, "add_reaction"),
+        ] {
+            assert!(matches!(
+                load_prepared_effect(&engine, community, run_id, step_id, kind, action, Some(1),)
+                    .await
+                    .expect("load fired effect"),
+                Some(PreparedEffect::AlreadyFired(_))
+            ));
+        }
     }
 
     #[test]

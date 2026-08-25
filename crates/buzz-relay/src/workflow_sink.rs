@@ -283,26 +283,6 @@ impl ActionSink for RelayActionSink {
                 .upgrade()
                 .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
 
-            // The run carries its owning community (`community_id`); the
-            // relay-signed kind:9 message belongs to *that* community, never the
-            // deployment default. Re-deriving the tenant from `config.relay_url`
-            // would post a community-B workflow's output into the deployment/
-            // default community under N>1. Read the community's host back to
-            // form a complete TenantContext (host is for labelling only — the
-            // community is already fixed and is never re-derived from it). Fail
-            // closed if the community no longer maps to a host.
-            let host = state
-                .db
-                .lookup_community_host(community_id)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?
-                .ok_or_else(|| {
-                    ActionSinkError::Database(format!(
-                        "workflow run community {community_id} is not mapped to a host"
-                    ))
-                })?;
-            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
-
             // 1. Validate content is not empty/whitespace-only
             if text.trim().is_empty() {
                 return Err(ActionSinkError::EmptyContent);
@@ -313,37 +293,11 @@ impl ActionSink for RelayActionSink {
                 .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
             let channel_id_canonical = channel_uuid.to_string();
 
-            let channel = state
-                .db
-                .get_channel(tenant.community(), channel_uuid)
-                .await
-                .map_err(|e| match &e {
-                    buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::NotFound(_) => {
-                        ActionSinkError::ChannelNotFound(channel_id_canonical.clone())
-                    }
-                    _ => ActionSinkError::Database(e.to_string()),
-                })?;
-
-            if channel.archived_at.is_some() {
-                return Err(ActionSinkError::ChannelArchived(
-                    channel_id_canonical.clone(),
-                ));
-            }
-
             let author_pubkey = nostr::PublicKey::from_hex(&author_pubkey).map_err(|e| {
                 ActionSinkError::InvalidInput(format!("invalid author pubkey: {e}"))
             })?;
             let author_pubkey_bytes = author_pubkey.to_bytes().to_vec();
             let author_pubkey_hex = author_pubkey.to_hex();
-            let is_member = state
-                .is_member_cached(tenant.community(), channel_uuid, &author_pubkey_bytes)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
-            if !is_member && channel.visibility != "open" {
-                return Err(ActionSinkError::InvalidInput(
-                    "workflow owner does not have access to destination channel".into(),
-                ));
-            }
 
             // 3. Build kind:9 Nostr event
             //    - Signed by relay keypair (event.pubkey = relay pubkey)
@@ -388,6 +342,53 @@ impl ActionSink for RelayActionSink {
             let event_id_hex = event.id.to_hex();
             let event_id_bytes = event.id.as_bytes().to_vec();
             let kind_u32 = KIND_STREAM_MESSAGE;
+
+            if state
+                .db
+                .get_event_by_id(community_id, &event_id_bytes)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .is_some()
+            {
+                return Ok(event_id_hex);
+            }
+
+            // Mutable destination checks apply only to the first insertion.
+            let host = state
+                .db
+                .lookup_community_host(community_id)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    ActionSinkError::Database(format!(
+                        "workflow run community {community_id} is not mapped to a host"
+                    ))
+                })?;
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
+            let channel = state
+                .db
+                .get_channel(tenant.community(), channel_uuid)
+                .await
+                .map_err(|e| match &e {
+                    buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::NotFound(_) => {
+                        ActionSinkError::ChannelNotFound(channel_id_canonical.clone())
+                    }
+                    _ => ActionSinkError::Database(e.to_string()),
+                })?;
+            if channel.archived_at.is_some() {
+                return Err(ActionSinkError::ChannelArchived(
+                    channel_id_canonical.clone(),
+                ));
+            }
+            let is_member = state
+                .is_member_cached(tenant.community(), channel_uuid, &author_pubkey_bytes)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+            if !is_member && channel.visibility != "open" {
+                return Err(ActionSinkError::InvalidInput(
+                    "workflow owner does not have access to destination channel".into(),
+                ));
+            }
 
             let event_created_at = {
                 let ts = event.created_at.as_secs() as i64;
@@ -464,18 +465,6 @@ impl ActionSink for RelayActionSink {
                 .upgrade()
                 .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
 
-            let host = state
-                .db
-                .lookup_community_host(community_id)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?
-                .ok_or_else(|| {
-                    ActionSinkError::Database(format!(
-                        "workflow run community {community_id} is not mapped to a host"
-                    ))
-                })?;
-            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
-
             let channel_uuid = Uuid::parse_str(&channel_id)
                 .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
             let channel_id_canonical = channel_uuid.to_string();
@@ -488,6 +477,36 @@ impl ActionSink for RelayActionSink {
             })?;
             let author_pubkey_bytes = author_pubkey.to_bytes().to_vec();
             let author_pubkey_hex = author_pubkey.to_hex();
+
+            let event = build_workflow_reaction_event(
+                &state.relay_keypair,
+                effect,
+                target_id,
+                &emoji,
+                &author_pubkey_hex,
+            )?;
+            let event_id_hex = event.id.to_hex();
+            if state
+                .db
+                .get_event_by_id(community_id, event.id.as_bytes())
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .is_some()
+            {
+                return Ok(Some(event_id_hex));
+            }
+
+            let host = state
+                .db
+                .lookup_community_host(community_id)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    ActionSinkError::Database(format!(
+                        "workflow run community {community_id} is not mapped to a host"
+                    ))
+                })?;
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
 
             let target = state
                 .db
@@ -522,14 +541,6 @@ impl ActionSink for RelayActionSink {
                 ));
             }
 
-            let event = build_workflow_reaction_event(
-                &state.relay_keypair,
-                effect,
-                target_id,
-                &emoji,
-                &author_pubkey_hex,
-            )?;
-            let event_id_hex = event.id.to_hex();
             let stored_emoji = reaction_emoji_for_storage(&event.content);
 
             let outcome = state
@@ -994,5 +1005,136 @@ mod integration_tests {
             p_tag_targets.contains(&agent_hex.as_str()),
             "mentioned member {agent_hex} must be p-tagged so it wakes; got {p_tag_targets:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn claimed_effect_recovery_precedes_archived_channel_validation() {
+        let state = test_state().await;
+        let author = nostr::Keys::generate();
+        let author_hex = author.public_key().to_hex();
+        let host = format!("wf-recovery-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &author_hex)
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(record) => record.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "wf-recovery",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &author.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        let sink = RelayActionSink::new(&state);
+        let claimed_at =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp");
+        let message_effect = ActionEffectContext {
+            idempotency_key: Uuid::new_v4(),
+            claimed_at,
+        };
+        let message_id = sink
+            .send_message(
+                message_effect,
+                community,
+                &channel.id.to_string(),
+                "committed before marker",
+                &author_hex,
+                &[],
+            )
+            .await
+            .expect("first message fire");
+        let reaction_effect = ActionEffectContext {
+            idempotency_key: Uuid::new_v4(),
+            claimed_at,
+        };
+        let reaction_id = sink
+            .add_reaction(
+                reaction_effect,
+                community,
+                &channel.id.to_string(),
+                &message_id,
+                "👍",
+                &author_hex,
+            )
+            .await
+            .expect("first reaction fire")
+            .expect("reaction event id");
+
+        state
+            .db
+            .archive_channel(community, channel.id)
+            .await
+            .expect("archive channel between fire and marker");
+
+        assert_eq!(
+            sink.send_message(
+                message_effect,
+                community,
+                &channel.id.to_string(),
+                "committed before marker",
+                &author_hex,
+                &[],
+            )
+            .await
+            .expect("message recovery"),
+            message_id
+        );
+        assert_eq!(
+            sink.add_reaction(
+                reaction_effect,
+                community,
+                &channel.id.to_string(),
+                &message_id,
+                "👍",
+                &author_hex,
+            )
+            .await
+            .expect("reaction recovery")
+            .expect("recovered reaction event id"),
+            reaction_id
+        );
+
+        let unfired = sink
+            .send_message(
+                ActionEffectContext {
+                    idempotency_key: Uuid::new_v4(),
+                    claimed_at,
+                },
+                community,
+                &channel.id.to_string(),
+                "new effect after archive",
+                &author_hex,
+                &[],
+            )
+            .await
+            .expect_err("unfired claim must still validate archive state");
+        assert!(matches!(unfired, ActionSinkError::ChannelArchived(_)));
+
+        let unfired = sink
+            .add_reaction(
+                ActionEffectContext {
+                    idempotency_key: Uuid::new_v4(),
+                    claimed_at,
+                },
+                community,
+                &channel.id.to_string(),
+                &message_id,
+                "👀",
+                &author_hex,
+            )
+            .await
+            .expect_err("unfired reaction claim must still validate archive state");
+        assert!(matches!(unfired, ActionSinkError::ChannelArchived(_)));
     }
 }
