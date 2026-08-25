@@ -70,6 +70,9 @@ pub struct EventQuery {
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
+    /// Restrict results to events with an `a` tag referencing any of these coordinates.
+    /// Uses the same indexed JSONB containment path as [`Self::e_tags`].
+    pub a_tags: Option<Vec<String>>,
     /// Restrict results to events in any of these channels, while retaining
     /// channel-less global events. Applied before SQL `LIMIT` so access-filtered
     /// historical pages have exact exhaustion semantics.
@@ -121,6 +124,7 @@ impl EventQuery {
             authors: None,
             ids: None,
             e_tags: None,
+            a_tags: None,
             channel_ids: None,
             max_limit: None,
             shared_gated_reader: None,
@@ -363,6 +367,9 @@ pub(crate) async fn query_events_on(
     if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
         return Ok(vec![]);
     }
+    if q.a_tags.as_deref().is_some_and(|a| a.is_empty()) {
+        return Ok(vec![]);
+    }
 
     let clamp = q.max_limit.unwrap_or(DEFAULT_MAX_PAGE_LIMIT);
     let limit_val = q.limit.unwrap_or(100).min(clamp);
@@ -478,6 +485,21 @@ pub(crate) async fn query_events_on(
                 }
                 // Build the JSONB literal: [["e","<hex>"]]
                 let containment = serde_json::json!([["e", hex_id]]);
+                qb.push(format!("{col_prefix}tags @> "));
+                qb.push_bind(containment);
+            }
+            qb.push(")");
+        }
+    }
+
+    if let Some(ref a_tags) = q.a_tags {
+        if !a_tags.is_empty() {
+            qb.push(" AND (");
+            for (i, coordinate) in a_tags.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" OR ");
+                }
+                let containment = serde_json::json!([["a", coordinate]]);
                 qb.push(format!("{col_prefix}tags @> "));
                 qb.push_bind(containment);
             }
@@ -640,6 +662,9 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
         return Ok(0);
     }
+    if q.a_tags.as_deref().is_some_and(|a| a.is_empty()) {
+        return Ok(0);
+    }
 
     let mut qb: QueryBuilder<sqlx::Postgres> = if let Some(ref p_hex) = q.p_tag_hex {
         let mut b = QueryBuilder::new(
@@ -731,6 +756,21 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
                     qb.push(" OR ");
                 }
                 let containment = serde_json::json!([["e", hex_id]]);
+                qb.push(format!("{col_prefix}tags @> "));
+                qb.push_bind(containment);
+            }
+            qb.push(")");
+        }
+    }
+
+    if let Some(ref a_tags) = q.a_tags {
+        if !a_tags.is_empty() {
+            qb.push(" AND (");
+            for (i, coordinate) in a_tags.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" OR ");
+                }
+                let containment = serde_json::json!([["a", coordinate]]);
                 qb.push(format!("{col_prefix}tags @> "));
                 qb.push_bind(containment);
             }

@@ -1201,6 +1201,15 @@ pub enum ReposCmd {
         #[arg(long)]
         id: String,
     },
+    /// List hosted branches and their divergence from the default branch.
+    Branches {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Emit the relay response as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Bootstrap an absent Buzz `main` from exact GitHub `main` once.
     ///
     /// This is not an ongoing synchronization direction.
@@ -2517,6 +2526,20 @@ mod tests {
         assert_eq!(parsed_base, base);
         assert_eq!(parsed_head, head);
         assert_eq!(required_checks, vec!["test"]);
+    }
+
+    #[test]
+    fn repo_branches_parses_human_and_json_modes() {
+        for (args, expected_json) in [
+            (vec!["buzz", "repos", "branches", "--id", "repo"], false),
+            (vec!["buzz", "repos", "branches", "--id", "repo", "--json"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("repos branches should parse");
+            assert!(matches!(
+                cli.command,
+                Cmd::Repos(ReposCmd::Branches { id, json }) if id == "repo" && json == expected_json
+            ));
+        }
     }
 
     #[test]

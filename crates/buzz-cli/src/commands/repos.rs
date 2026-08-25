@@ -9,6 +9,24 @@ use crate::commands::parse_write_response;
 use crate::error::CliError;
 use crate::validate::validate_repo_id;
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct RepositoryBranch {
+    name: String,
+    tip: String,
+    ahead: u64,
+    behind: u64,
+    fully_merged: bool,
+    last_commit_at: i64,
+    open_pr_event_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct RepositoryBranchesResponse {
+    default_branch: String,
+    branches: Vec<RepositoryBranch>,
+    branch_limit: usize,
+}
+
 fn parse_events(json: &str) -> Result<Vec<Event>, CliError> {
     serde_json::from_str(json)
         .map_err(|error| CliError::Other(format!("failed to parse relay response: {error}")))
@@ -751,6 +769,46 @@ async fn cmd_bind_repo(client: &BuzzClient, repo_id: &str, channel: &str) -> Res
     submit_repo_update(client, repo_id, event.id, builder).await
 }
 
+async fn cmd_branches(client: &BuzzClient, repo_id: &str, json: bool) -> Result<(), CliError> {
+    let announcement = current_repo(client, repo_id).await?;
+    let owner = announcement.pubkey.to_hex();
+    let path = format!("/git/{owner}/{repo_id}/branches");
+    let raw = client.get_authed(&path).await?;
+    let response: RepositoryBranchesResponse = serde_json::from_str(&raw)
+        .map_err(|error| CliError::Other(format!("failed to parse branch response: {error}")))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&response)
+                .map_err(|error| CliError::Other(format!("failed to serialize branches: {error}")))?
+        );
+    } else {
+        print!("{}", format_branches(&response));
+    }
+    Ok(())
+}
+
+fn format_branches(response: &RepositoryBranchesResponse) -> String {
+    if response.branches.is_empty() {
+        return format!("No branches. Default branch: {}\n", response.default_branch);
+    }
+    let mut output =
+        String::from("BRANCH\tTIP\tAHEAD\tBEHIND\tFULLY_MERGED\tLAST_COMMIT\tOPEN_PR\n");
+    for branch in &response.branches {
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            branch.name,
+            branch.tip,
+            branch.ahead,
+            branch.behind,
+            branch.fully_merged,
+            branch.last_commit_at,
+            branch.open_pr_event_id.as_deref().unwrap_or("-")
+        ));
+    }
+    output
+}
+
 pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), CliError> {
     use crate::{ReposCmd, ReposProtectCmd};
     match cmd {
@@ -782,6 +840,7 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
             let announcement = current_repo(client, &id).await?;
             crate::commands::repo_sync::cmd_status(client, &announcement).await
         }
+        ReposCmd::Branches { id, json } => cmd_branches(client, &id, json).await,
         ReposCmd::ImportMain { id, commit } => {
             let announcement = current_repo(client, &id).await?;
             crate::commands::repo_sync::cmd_import_main(client, &announcement, &commit).await
@@ -859,8 +918,34 @@ mod tests {
         build_protection_tag, build_rm_event, build_updated_repo_announcement,
         ensure_repo_head_unchanged, next_repo_update_timestamp, plan_repo_announcement,
         protection_rules_json, validate_create_replay_response, validate_rm_response,
-        validate_write_response, RepoAnnouncementPlan, RepoChange,
+        validate_write_response, format_branches, RepoAnnouncementPlan, RepoChange,
+        RepositoryBranch, RepositoryBranchesResponse,
     };
+
+    #[test]
+    fn branch_human_output_preserves_server_order_and_fields() {
+        let response = RepositoryBranchesResponse {
+            default_branch: "main".into(),
+            branch_limit: 200,
+            branches: vec![RepositoryBranch {
+                name: "feature".into(),
+                tip: "a".repeat(40),
+                ahead: 2,
+                behind: 1,
+                fully_merged: false,
+                last_commit_at: 123,
+                open_pr_event_id: Some("b".repeat(64)),
+            }],
+        };
+        let output = format_branches(&response);
+        assert!(
+            output.starts_with(
+                "BRANCH\tTIP\tAHEAD\tBEHIND\tFULLY_MERGED\tLAST_COMMIT\tOPEN_PR\n"
+            )
+        );
+        assert!(output.contains("feature\t"));
+        assert!(output.contains("\t2\t1\tfalse\t123\t"));
+    }
 
     fn signed_repo(tags: Vec<Tag>, content: &str, created_at: u64) -> nostr::Event {
         EventBuilder::new(Kind::Custom(30617), content)

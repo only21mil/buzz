@@ -136,7 +136,8 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(parts.uri.path());
-        let is_snapshot = parts.uri.path().ends_with("/snapshot");
+        let is_rest_read = parts.uri.path().ends_with("/snapshot")
+            || parts.uri.path().ends_with("/branches");
         let expected_url = git_expected_url(&state.config.relay_url, &tenant, path_and_query)
             .ok_or_else(|| {
                 (StatusCode::BAD_REQUEST, "unrecognized git endpoint").into_response()
@@ -165,7 +166,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         // Security is provided by: service-binding in the URL (clone vs push scoped),
         // ±60s timestamp, and the pre-receive hook for push authorization.
         // We pass the method from the event itself so verify_nip98_event always accepts.
-        let event_method = if is_snapshot {
+        let event_method = if is_rest_read {
             method.to_owned()
         } else {
             serde_json::from_str::<serde_json::Value>(&event_json)
@@ -183,8 +184,8 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
 
         // SECURITY: method is intentionally not verified for Smart HTTP. The
         // tautological check (event.method == event.method) is deliberate — see
-        // the comment block above. The snapshot REST route is different: it
-        // verifies the actual GET method and exact URL, including the query.
+        // the comment block above. REST reads verify the actual GET method and
+        // exact URL, including any query.
 
         // body=None: can't buffer streaming pack data to verify payload hash.
         // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
@@ -338,9 +339,13 @@ fn git_expected_url(
         .split_once('?')
         .map_or(path_and_query, |(path, _)| path)
         .ends_with("/snapshot")
+        || path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(path, _)| path)
+            .ends_with("/branches")
     {
-        // Unlike Smart HTTP's reusable repo-root credential, the REST
-        // snapshot signs the exact GET URL, including its query string.
+        // Unlike Smart HTTP's reusable repo-root credential, REST reads sign
+        // the exact GET URL, including any query string.
         return Some(format!("{scheme}://{}{path_and_query}", tenant.host()));
     } else if let Some((prefix, _query)) = path_and_query.split_once("/info/refs") {
         prefix
@@ -493,7 +498,7 @@ pub(crate) async fn authorize_git_read(
     caller: &nostr::PublicKey,
     owner_hex: &str,
     repo_name: &str,
-) -> Result<(), Response> {
+) -> Result<uuid::Uuid, Response> {
     fn denied() -> Response {
         (StatusCode::NOT_FOUND, "repository not found").into_response()
     }
@@ -556,7 +561,7 @@ pub(crate) async fn authorize_git_read(
         .get_member_role(community, channel_id, &caller.to_bytes())
         .await
     {
-        Ok(role) if read_role_allows(role.as_deref()) => Ok(()),
+        Ok(role) if read_role_allows(role.as_deref()) => Ok(channel_id),
         Ok(_) => Err(denied()),
         Err(e) => {
             error!(repo = %repo_name, error = %e, "git read gate: role lookup failed (deny)");
@@ -2033,6 +2038,10 @@ pub fn git_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route(
+            "/git/{owner}/{repo}/branches",
+            get(super::branches::repository_branches),
+        )
+        .route(
             "/git/{owner}/{repo}/snapshot",
             get(super::snapshot::repository_snapshot),
         )
@@ -2552,6 +2561,22 @@ mod track_c_tests {
     }
 
     #[test]
+    fn git_branches_expected_url_is_exact_rest_url() {
+        let tenant = tenant("host-a.example", 1);
+        let expected = git_expected_url(
+            "wss://config-host.example",
+            &tenant,
+            "/git/owner/repo/branches",
+        )
+        .expect("recognized branches path");
+
+        assert_eq!(
+            expected,
+            "https://host-a.example/git/owner/repo/branches"
+        );
+    }
+
+    #[test]
     fn git_snapshot_nip98_rejects_queryless_url_and_wrong_method() {
         let keys = Keys::generate();
         let tenant = tenant("host-a.example", 1);
@@ -2890,7 +2915,7 @@ mod sec005_read_gate_tests {
     /// can assert on the exact bytes a git client would see. A blind
     /// `.is_err()` cannot distinguish the generic 404 from the remediation
     /// 404 — and that distinction IS the security property.
-    async fn denial_parts(result: Result<(), Response>) -> (StatusCode, String) {
+    async fn denial_parts<T: std::fmt::Debug>(result: Result<T, Response>) -> (StatusCode, String) {
         let response = result.expect_err("expected a denial");
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
