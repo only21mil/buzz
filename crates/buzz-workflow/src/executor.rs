@@ -713,6 +713,7 @@ struct WebhookEffectPayload {
 /// Claim one external effect before delivery. Claims are keyed without the run
 /// generation, so a recovered executor consumes the earlier claim. Every
 /// currently implemented effectful action has exactly one effect at index 0.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_effect(
     engine: &WorkflowEngine,
     community_id: CommunityId,
