@@ -17,6 +17,9 @@ import tempfile
 MANIFEST_NAME = "install-package.manifest.json"
 SCHEMA = "buzz-agent-install-package-v2"
 ENTRY_COUNT = 9
+EXPECTED_PACKAGE_ID = "mempool-genesis-static-9faf30181"
+EXPECTED_MANIFEST_SHA256 = "fc706e3b41dfe038ceb4e856ce8469e32a55d40acd367c736f4b6dfcfad5c92e"
+EXPECTED_PACKAGE_FINGERPRINT = "b38fcf16c830003a4fe768500c5590db2c545a4cff72a4304343c8b275f15383"
 REQUIRED_MANIFEST_FIELDS = {
     "schema",
     "package_id",
@@ -107,9 +110,13 @@ def load_and_verify_manifest(
     package: Path, manifest_path: Path
 ) -> list[dict[str, object]]:
     try:
-        manifest = json.loads(
-            manifest_path.read_text(), object_pairs_hook=reject_duplicate_keys
-        )
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read manifest: {error}") from error
+    if hashlib.sha256(manifest_bytes).hexdigest() != EXPECTED_MANIFEST_SHA256:
+        raise ValueError("manifest SHA-256 mismatch")
+    try:
+        manifest = json.loads(manifest_bytes, object_pairs_hook=reject_duplicate_keys)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"cannot read manifest: {error}") from error
     if not isinstance(manifest, dict):
@@ -119,6 +126,8 @@ def load_and_verify_manifest(
         raise ValueError(
             "manifest is missing: " + ", ".join(sorted(missing_manifest_fields))
         )
+    if manifest["package_id"] != EXPECTED_PACKAGE_ID:
+        raise ValueError("package ID mismatch")
     if (
         manifest["schema"] != SCHEMA
         or not isinstance(manifest["package_id"], str)
@@ -129,23 +138,28 @@ def load_and_verify_manifest(
     fingerprint = manifest["package_fingerprint"]
     if not isinstance(entries, list) or len(entries) != ENTRY_COUNT:
         raise ValueError(f"manifest must contain exactly {ENTRY_COUNT} entries")
-    if not isinstance(fingerprint, str) or not SHA256.fullmatch(fingerprint):
-        raise ValueError("invalid package_fingerprint")
-    for field in ("desktop_launcher_sha256", "desktop_previous_launcher_sha256"):
-        value = manifest[field]
-        if not isinstance(value, str) or not SHA256.fullmatch(value):
-            raise ValueError(f"invalid manifest field: {field}")
-
-    package_root = package.resolve(strict=True)
-    seen_sources: set[str] = set()
-    seen_targets: set[str] = set()
-    verified: list[dict[str, object]] = []
     for number, raw_entry in enumerate(entries, start=1):
         if not isinstance(raw_entry, dict):
             raise ValueError(f"entry {number} is not an object")
         missing = REQUIRED_ENTRY_FIELDS - raw_entry.keys()
         if missing:
             raise ValueError(f"entry {number} is missing: {', '.join(sorted(missing))}")
+    actual_fingerprint = package_fingerprint(entries)
+    if actual_fingerprint != EXPECTED_PACKAGE_FINGERPRINT:
+        raise ValueError("reviewed package fingerprint mismatch")
+    if not isinstance(fingerprint, str) or not SHA256.fullmatch(fingerprint):
+        raise ValueError("invalid package_fingerprint")
+    if actual_fingerprint != fingerprint:
+        raise ValueError("package fingerprint mismatch")
+    for field in ("desktop_launcher_sha256", "desktop_previous_launcher_sha256"):
+        value = manifest[field]
+        if not isinstance(value, str) or not SHA256.fullmatch(value):
+            raise ValueError(f"invalid manifest field: {field}")
+
+    seen_sources: set[str] = set()
+    seen_targets: set[str] = set()
+    verified: list[dict[str, object]] = []
+    for number, raw_entry in enumerate(entries, start=1):
         source_text = raw_entry["source"]
         target_text = raw_entry["target"]
         status = raw_entry["status"]
@@ -181,16 +195,6 @@ def load_and_verify_manifest(
         if not isinstance(install_mode, str) or not MODE.fullmatch(install_mode):
             raise ValueError(f"entry {number} has an invalid install_mode")
 
-        try:
-            source = (package_root / source_relative).resolve(strict=True)
-            source.relative_to(package_root)
-        except (OSError, ValueError) as error:
-            raise ValueError(f"invalid package source: {source_text}") from error
-        if not source.is_file():
-            raise ValueError(f"package source is not a regular file: {source_text}")
-        actual_digest = sha256_file(source)
-        if actual_digest != digest:
-            raise ValueError(f"package source hash mismatch: {source_text}")
         verified.append(dict(raw_entry))
 
     if seen_targets != set(EXPECTED_ENTRIES):
@@ -201,8 +205,19 @@ def load_and_verify_manifest(
         or manifest["desktop_launcher_sha256"] != launchers[0]["sha256"]
     ):
         raise ValueError("desktop launcher hash mismatch")
-    if package_fingerprint(verified) != fingerprint:
-        raise ValueError("package fingerprint mismatch")
+    package_root = package.resolve(strict=True)
+    for entry in verified:
+        source_text = str(entry["source"])
+        source_relative = Path(source_text)
+        try:
+            source = (package_root / source_relative).resolve(strict=True)
+            source.relative_to(package_root)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"invalid package source: {source_text}") from error
+        if not source.is_file():
+            raise ValueError(f"package source is not a regular file: {source_text}")
+        if sha256_file(source) != entry["sha256"]:
+            raise ValueError(f"package source hash mismatch: {source_text}")
     return verified
 
 

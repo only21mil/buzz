@@ -20,6 +20,12 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
+SHIPPED_EXPECTED_IDENTITY = (
+    MODULE.EXPECTED_PACKAGE_ID,
+    MODULE.EXPECTED_MANIFEST_SHA256,
+    MODULE.EXPECTED_PACKAGE_FINGERPRINT,
+)
+
 
 TARGETS = [
     "/usr/local/libexec/buzz/verify-installed-agent",
@@ -91,11 +97,21 @@ class InstallSimpleTests(unittest.TestCase):
                 }
             )
         self.write_manifest()
+        self.bind_fixture_identity()
 
     def tearDown(self) -> None:
+        (
+            MODULE.EXPECTED_PACKAGE_ID,
+            MODULE.EXPECTED_MANIFEST_SHA256,
+            MODULE.EXPECTED_PACKAGE_FINGERPRINT,
+        ) = SHIPPED_EXPECTED_IDENTITY
         self.temporary.cleanup()
 
-    def write_manifest(self, fingerprint: str | None = None) -> None:
+    def write_manifest(
+        self,
+        fingerprint: str | None = None,
+        package_id: str = "mempool-genesis-simple-test",
+    ) -> None:
         launcher_hash = next(
             entry["sha256"]
             for entry in self.entries
@@ -103,13 +119,20 @@ class InstallSimpleTests(unittest.TestCase):
         )
         manifest = {
             "schema": MODULE.SCHEMA,
-            "package_id": "mempool-genesis-simple-test",
+            "package_id": package_id,
             "entries": self.entries,
             "desktop_launcher_sha256": launcher_hash,
             "desktop_previous_launcher_sha256": "a" * 64,
             "package_fingerprint": fingerprint or MODULE.package_fingerprint(self.entries),
         }
         (self.package / MODULE.MANIFEST_NAME).write_text(json.dumps(manifest))
+
+    def bind_fixture_identity(self) -> None:
+        """Bind generated positive fixtures without changing shipped defaults."""
+        manifest_path = self.package / MODULE.MANIFEST_NAME
+        MODULE.EXPECTED_PACKAGE_ID = "mempool-genesis-simple-test"
+        MODULE.EXPECTED_MANIFEST_SHA256 = MODULE.sha256_file(manifest_path)
+        MODULE.EXPECTED_PACKAGE_FINGERPRINT = MODULE.package_fingerprint(self.entries)
 
     def run_install(self, **kwargs: object) -> int:
         output = io.StringIO()
@@ -141,8 +164,46 @@ class InstallSimpleTests(unittest.TestCase):
 
     def test_fingerprint_mismatch_is_refused(self) -> None:
         self.write_manifest("0" * 64)
+        MODULE.EXPECTED_MANIFEST_SHA256 = MODULE.sha256_file(
+            self.package / MODULE.MANIFEST_NAME
+        )
         self.assertEqual(self.run_install(), 1)
         self.assertIn("INSTALL REFUSED: package fingerprint mismatch", self.output)
+        self.assert_nothing_installed()
+
+    def test_self_consistent_non_reviewed_package_is_refused_before_write(self) -> None:
+        source = self.package / str(self.entries[0]["source"])
+        payload = b"substituted payload\n"
+        source.write_bytes(payload)
+        self.entries[0]["sha256"] = hashlib.sha256(payload).hexdigest()
+        self.write_manifest(package_id="mempool-genesis-substituted")
+
+        self.assertEqual(self.run_install(), 1)
+        self.assertIn("INSTALL REFUSED: manifest SHA-256 mismatch", self.output)
+        self.assert_nothing_installed()
+
+    def test_non_reviewed_package_id_is_refused(self) -> None:
+        self.write_manifest(package_id="mempool-genesis-substituted")
+        MODULE.EXPECTED_MANIFEST_SHA256 = MODULE.sha256_file(
+            self.package / MODULE.MANIFEST_NAME
+        )
+
+        self.assertEqual(self.run_install(), 1)
+        self.assertIn("INSTALL REFUSED: package ID mismatch", self.output)
+        self.assert_nothing_installed()
+
+    def test_non_reviewed_fingerprint_is_refused(self) -> None:
+        source = self.package / str(self.entries[0]["source"])
+        payload = b"substituted payload\n"
+        source.write_bytes(payload)
+        self.entries[0]["sha256"] = hashlib.sha256(payload).hexdigest()
+        self.write_manifest()
+        MODULE.EXPECTED_MANIFEST_SHA256 = MODULE.sha256_file(
+            self.package / MODULE.MANIFEST_NAME
+        )
+
+        self.assertEqual(self.run_install(), 1)
+        self.assertIn("INSTALL REFUSED: reviewed package fingerprint mismatch", self.output)
         self.assert_nothing_installed()
 
     def test_preexisting_target_is_refused(self) -> None:
