@@ -38,7 +38,7 @@ nostr = { workspace = true }
 # UUID parsing for validate_uuid + event building
 uuid = { workspace = true, features = ["v7"] }
 
-# RFC3339 observer timestamps for owner-reviewed agent draft requests
+# RFC3339 observer timestamps for agent drafts reviewed by Victor or Rachel (equal authority)
 chrono = { workspace = true }
 
 # Typed event builders for all write operations

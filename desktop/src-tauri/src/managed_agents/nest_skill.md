@@ -1,7 +1,7 @@
 ---
 name: buzz-cli
 description: >
-  Buzz CLI for relay operations: owner-reviewed agent drafts, messaging,
+  Buzz CLI for relay operations: agent drafts reviewed by Victor or Rachel (equal authority), messaging,
   channels, DMs, users, workflows, feed, reactions, canvas, social, repos,
   uploads, and agent memory.
 version: 1
@@ -15,7 +15,7 @@ version: 1
 
 `BUZZ_RELAY_URL` defaults to `http://localhost:3000`. In development, the user may need to set this to a staging or production relay URL.
 
-`BUZZ_AUTH_TAG` is required for `buzz agents draft-create` and `buzz agents draft-update` because those commands send owner-reviewed Desktop drafts. If missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
+`BUZZ_AUTH_TAG` is required for `buzz agents draft-create` and `buzz agents draft-update` because those commands send Desktop drafts for review by Victor or Rachel (equal authority). If missing, explain that this managed agent cannot open those agent drafts from chat.
 
 Run the bundled CLI with `--help` and `<command> <subcommand> --help` to discover all flags, arguments, and usage. This skill documents only what `--help` cannot tell you.
 
@@ -30,7 +30,7 @@ buzz agents draft-create \
   --system-prompt "Find reliable sources and summarize them concisely."
 ```
 
-Use the UUID from the current Buzz `[Context]`; do not ask the user for it. Do not ask about runtime, provider, model, credentials, environment variables, or access. Desktop uses the machine's real defaults, and new agents start as **Only me**. The command sends an encrypted draft to the owner's Desktop. It does not create the agent until the owner reviews and saves the form, so report the result as “ready for review,” never “created.”
+Use the UUID from the current Buzz `[Context]`; do not ask the user for it. Do not ask about runtime, provider, model, credentials, environment variables, or access. Desktop uses the machine's real defaults, and new agents start as **Only me**. The command sends an encrypted draft to Buzz Desktop. It does not create the agent until Victor or Rachel (equal authority) reviews and saves the form, so report the result as “ready for review,” never “created.”
 
 For an explicit change to an existing personal agent, use:
 
@@ -53,7 +53,7 @@ Output varies by command group — `--help` shows flags but not response shapes.
 
 **Read commands** (messages, channels, users, feed, workflows): normalized JSON arrays with `sig` stripped. Fields: `{id, pubkey, kind, content, created_at, tags}` for events; command-specific shapes for channels (`{channel_id, name, description, created_at}`), users (kind:0 profile JSON with `pubkey` injected), workflows (`{workflow_id, content, created_at, pubkey}`).
 
-**Write commands**: all return `{event_id, accepted, message}`. Create commands add the generated entity ID: `channels create` → `channel_id`, `dms open` → `dm_id`, `workflows create` → `workflow_id`. Agent draft commands add `{request_id, action, saved: false}` because they only open an owner-reviewed Desktop draft.
+**Write commands**: all return `{event_id, accepted, message}`. Create commands add the generated entity ID: `channels create` → `channel_id`, `dms open` → `dm_id`, `workflows create` → `workflow_id`. Agent draft commands add `{request_id, action, saved: false}` because they only open a Desktop draft for review by Victor or Rachel (equal authority).
 
 **Exceptions to the above patterns:**
 

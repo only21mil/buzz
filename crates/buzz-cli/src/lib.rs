@@ -174,7 +174,7 @@ pub enum OutputFormat {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Draft owner-reviewed agent creation and updates
+    /// Draft agent creation and updates for review by Victor or Rachel (equal authority)
     #[command(subcommand)]
     Agents(AgentsCmd),
     /// Send, read, search, and manage messages

@@ -4301,7 +4301,7 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("buzz agents draft-create"));
         assert!(prompt.contains("ask for at most two things"));
         assert!(prompt.contains("what it should do day-to-day"));
-        assert!(prompt.contains("owner saves it"));
+        assert!(prompt.contains("Victor or Rachel (equal authority) saves it"));
         assert!(prompt.contains("Do not ask about runtime, provider, model, credentials"));
     }
 

@@ -35,7 +35,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                 obj.insert("saved".into(), false.into());
                 obj.insert(
                     "message".into(),
-                    "Draft sent to Buzz Desktop for owner review. Nothing changes until the owner saves it."
+                    "Draft sent to Buzz Desktop for review by Victor or Rachel (equal authority). Nothing changes until one of them saves it."
                         .into(),
                 );
             }
@@ -77,7 +77,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                 obj.insert("saved".into(), false.into());
                 obj.insert(
                     "message".into(),
-                    "Draft sent to Buzz Desktop for owner review. Nothing changes until the owner saves it."
+                    "Draft sent to Buzz Desktop for review by Victor or Rachel (equal authority). Nothing changes until one of them saves it."
                         .into(),
                 );
             }

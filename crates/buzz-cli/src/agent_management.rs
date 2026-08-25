@@ -1,4 +1,4 @@
-//! Owner-reviewed agent draft requests published through Buzz observer frames.
+//! Agent draft requests for review by Victor or Rachel (equal authority), published through Buzz observer frames.
 
 use buzz_core::observer::{encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY};
 use nostr::{Event, Keys, PublicKey};
