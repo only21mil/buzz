@@ -35,7 +35,7 @@ pub mod error;
 pub mod executor;
 pub mod schema;
 
-pub use action_sink::{ActionSink, ActionSinkError};
+pub use action_sink::{ActionEffectContext, ActionSink, ActionSinkError};
 pub use error::{PartialProgress, WorkflowError};
 pub use executor::{ApprovalSuspension, ExecutionResult};
 pub use schema::{ActionDef, Step, TriggerDef, WorkflowDef};

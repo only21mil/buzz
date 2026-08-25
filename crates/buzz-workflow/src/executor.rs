@@ -15,6 +15,7 @@ use buzz_core::tenant::CommunityId;
 use buzz_db::workflow_approval::{
     ApprovalActionSummary, ApprovalRequestPayload, ApprovalRole, CanonicalApprovalPolicy,
 };
+use buzz_db::{WorkflowEffectClaim, WorkflowEffectClaimOutcome, WorkflowEffectMarkOutcome};
 use chrono::{DateTime, TimeDelta, Utc};
 use evalexpr::HashMapContext;
 use nostr::ToBech32;
@@ -671,6 +672,80 @@ pub async fn dispatch_action(
     .await
 }
 
+enum PreparedEffect {
+    Fire {
+        claim: WorkflowEffectClaim,
+        generation: i64,
+    },
+    AlreadyFired(JsonValue),
+}
+
+/// Claim one external effect before delivery. Claims are keyed without the run
+/// generation, so a recovered executor consumes the earlier claim. Every
+/// currently implemented effectful action has exactly one effect at index 0.
+async fn prepare_effect(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    step_id: &str,
+    effect_kind: &str,
+    action: &ActionDef,
+    claimed_generation: Option<i64>,
+) -> Result<PreparedEffect, WorkflowError> {
+    let generation = match claimed_generation {
+        Some(generation) => generation,
+        None => {
+            engine
+                .db
+                .get_workflow_run(community_id, run_id)
+                .await?
+                .generation
+        }
+    };
+    let effect_spec = serde_json::to_value(action).map_err(|error| {
+        WorkflowError::Database(format!("failed to serialize workflow effect: {error}"))
+    })?;
+    match engine
+        .db
+        .claim_workflow_effect(
+            community_id,
+            run_id,
+            generation,
+            step_id,
+            0,
+            effect_kind,
+            &effect_spec,
+        )
+        .await?
+    {
+        WorkflowEffectClaimOutcome::Ready(claim) => Ok(PreparedEffect::Fire { claim, generation }),
+        WorkflowEffectClaimOutcome::Fired(output) => Ok(PreparedEffect::AlreadyFired(output)),
+        WorkflowEffectClaimOutcome::Conflict => Err(WorkflowError::Database(format!(
+            "workflow effect {run_id}/{step_id}/0 lost its generation fence"
+        ))),
+    }
+}
+
+async fn mark_effect_fired(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    step_id: &str,
+    generation: i64,
+    output: JsonValue,
+) -> Result<StepResult, WorkflowError> {
+    match engine
+        .db
+        .mark_workflow_effect_fired(community_id, run_id, generation, step_id, 0, &output)
+        .await?
+    {
+        WorkflowEffectMarkOutcome::Applied => Ok(StepResult::Completed(output)),
+        WorkflowEffectMarkOutcome::Conflict => Err(WorkflowError::Database(format!(
+            "workflow effect {run_id}/{step_id}/0 fired after losing its generation fence"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_action_with_generation(
     step_id: &str,
@@ -686,6 +761,22 @@ async fn dispatch_action_with_generation(
 
     match action {
         SendMessage { text, channel } => {
+            let (claim, generation) = match prepare_effect(
+                engine,
+                community_id,
+                run_id,
+                step_id,
+                "send_message",
+                action,
+                claimed_generation,
+            )
+            .await?
+            {
+                PreparedEffect::AlreadyFired(output) => {
+                    return Ok(StepResult::Completed(output));
+                }
+                PreparedEffect::Fire { claim, generation } => (claim, generation),
+            };
             // Look up workflow metadata for destination validation and
             // attribution, scoped to the run's community — the same run/workflow
             // UUID may exist in another community, so a bare-id lookup could
@@ -725,14 +816,31 @@ async fn dispatch_action_with_generation(
 
             let event_id = engine
                 .action_sink()?
-                .send_message(community_id, &channel_id, text, &owner_pubkey_hex)
+                .send_message(
+                    crate::ActionEffectContext {
+                        idempotency_key: claim.idempotency_key,
+                        claimed_at: claim.claimed_at,
+                    },
+                    community_id,
+                    &channel_id,
+                    text,
+                    &owner_pubkey_hex,
+                )
                 .await
                 .map_err(WorkflowError::from)?;
 
-            Ok(StepResult::Completed(serde_json::json!({
-                "sent": true,
-                "event_id": event_id,
-            })))
+            mark_effect_fired(
+                engine,
+                community_id,
+                run_id,
+                step_id,
+                generation,
+                serde_json::json!({
+                    "sent": true,
+                    "event_id": event_id,
+                }),
+            )
+            .await
         }
 
         SendDm { to, text: _ } => {
@@ -748,6 +856,22 @@ async fn dispatch_action_with_generation(
         }
 
         AddReaction { emoji } => {
+            let (claim, generation) = match prepare_effect(
+                engine,
+                community_id,
+                run_id,
+                step_id,
+                "add_reaction",
+                action,
+                claimed_generation,
+            )
+            .await?
+            {
+                PreparedEffect::AlreadyFired(output) => {
+                    return Ok(StepResult::Completed(output));
+                }
+                PreparedEffect::Fire { claim, generation } => (claim, generation),
+            };
             info!(run_id = %run_id, step = step_id, "AddReaction → :{emoji}:");
             if trigger_ctx.message_id.is_empty() {
                 return Err(WorkflowError::InvalidDefinition(
@@ -780,6 +904,10 @@ async fn dispatch_action_with_generation(
 
             let result = add_reaction_via_sink(
                 engine.action_sink()?,
+                crate::ActionEffectContext {
+                    idempotency_key: claim.idempotency_key,
+                    claimed_at: claim.claimed_at,
+                },
                 community_id,
                 &channel_id,
                 &trigger_ctx.message_id,
@@ -787,7 +915,7 @@ async fn dispatch_action_with_generation(
                 &owner_pubkey_hex,
             )
             .await?;
-            Ok(StepResult::Completed(result))
+            mark_effect_fired(engine, community_id, run_id, step_id, generation, result).await
         }
 
         CallWebhook {
@@ -796,13 +924,31 @@ async fn dispatch_action_with_generation(
             headers,
             body,
         } => {
+            let (claim, generation) = match prepare_effect(
+                engine,
+                community_id,
+                run_id,
+                step_id,
+                "call_webhook",
+                action,
+                claimed_generation,
+            )
+            .await?
+            {
+                PreparedEffect::AlreadyFired(output) => {
+                    return Ok(StepResult::Completed(output));
+                }
+                PreparedEffect::Fire { claim, generation } => (claim, generation),
+            };
             let method_str = method.as_deref().unwrap_or("POST");
             info!(run_id = %run_id, step = step_id, "CallWebhook → {method_str} {url}");
 
             #[cfg(feature = "reqwest")]
             {
-                let result = call_webhook_impl(url, method_str, headers, body).await?;
-                Ok(StepResult::Completed(result))
+                let result =
+                    call_webhook_impl(url, method_str, headers, body, claim.idempotency_key)
+                        .await?;
+                mark_effect_fired(engine, community_id, run_id, step_id, generation, result).await
             }
 
             #[cfg(not(feature = "reqwest"))]
@@ -812,12 +958,20 @@ async fn dispatch_action_with_generation(
                     run_id = %run_id, step = step_id,
                     "CallWebhook: reqwest feature not enabled, skipping HTTP call"
                 );
-                let _ = (headers, body); // suppress unused warnings
-                Ok(StepResult::Completed(serde_json::json!({
-                    "status": 0,
-                    "body": null,
-                    "skipped": true
-                })))
+                let _ = (headers, body, claim); // suppress unused warnings
+                mark_effect_fired(
+                    engine,
+                    community_id,
+                    run_id,
+                    step_id,
+                    generation,
+                    serde_json::json!({
+                        "status": 0,
+                        "body": null,
+                        "skipped": true
+                    }),
+                )
+                .await
             }
         }
 
@@ -1454,6 +1608,7 @@ async fn call_webhook_impl(
     method: &str,
     headers: &Option<std::collections::HashMap<String, String>>,
     body: &Option<String>,
+    idempotency_key: Uuid,
 ) -> Result<JsonValue, WorkflowError> {
     use reqwest::Client;
     use std::time::Duration;
@@ -1492,9 +1647,19 @@ async fn call_webhook_impl(
 
     if let Some(hdrs) = headers {
         for (k, v) in hdrs {
+            if k.eq_ignore_ascii_case("idempotency-key") {
+                return Err(WorkflowError::WebhookError(
+                    "Idempotency-Key is reserved for workflow effect recovery".into(),
+                ));
+            }
             req = req.header(k, v);
         }
     }
+
+    // A claim that survives a crash always reuses this key. Webhook receivers
+    // must honor the standard idempotency contract to collapse the ambiguous
+    // retry where the first request arrived but its fired mark did not commit.
+    req = req.header("Idempotency-Key", idempotency_key.to_string());
 
     if let Some(b) = body {
         req = req.body(b.clone());
@@ -1541,6 +1706,7 @@ async fn call_webhook_impl(
 
 async fn add_reaction_via_sink(
     sink: &dyn crate::ActionSink,
+    effect: crate::ActionEffectContext,
     community_id: CommunityId,
     channel_id: &str,
     target_event_id: &str,
@@ -1549,6 +1715,7 @@ async fn add_reaction_via_sink(
 ) -> Result<JsonValue, WorkflowError> {
     let event_id = sink
         .add_reaction(
+            effect,
             community_id,
             channel_id,
             target_event_id,
@@ -1947,6 +2114,7 @@ mod tests {
     impl ActionSink for RecordingActionSink {
         fn send_message(
             &self,
+            _effect: crate::ActionEffectContext,
             _community_id: CommunityId,
             _channel_id: &str,
             _text: &str,
@@ -1957,6 +2125,7 @@ mod tests {
 
         fn add_reaction(
             &self,
+            _effect: crate::ActionEffectContext,
             community_id: CommunityId,
             channel_id: &str,
             target_event_id: &str,
@@ -2018,6 +2187,10 @@ mod tests {
 
         let result = add_reaction_via_sink(
             &sink,
+            crate::ActionEffectContext {
+                idempotency_key: Uuid::nil(),
+                claimed_at: DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp"),
+            },
             community_id,
             "11111111-1111-1111-1111-111111111111",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

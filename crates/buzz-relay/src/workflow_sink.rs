@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 
 use buzz_core::kind::{KIND_REACTION, KIND_STREAM_MESSAGE};
 use buzz_core::tenant::CommunityId;
-use buzz_workflow::action_sink::{ActionSink, ActionSinkError};
+use buzz_workflow::action_sink::{ActionEffectContext, ActionSink, ActionSinkError};
 use chrono::Utc;
 use nostr::{EventBuilder, Kind, Tag};
 use tracing::info;
@@ -171,6 +171,7 @@ impl RelayActionSink {
 
 fn build_workflow_reaction_event(
     relay_keypair: &nostr::Keys,
+    effect: ActionEffectContext,
     target_event_id: nostr::EventId,
     emoji: &str,
     author_pubkey_hex: &str,
@@ -187,6 +188,13 @@ fn build_workflow_reaction_event(
             Tag::parse(["buzz:workflow", "true"])
                 .map_err(|e| ActionSinkError::EventBuild(format!("workflow tag: {e}")))?,
         )
+        .tag(
+            Tag::parse(["buzz:workflow-effect", &effect.idempotency_key.to_string()])
+                .map_err(|e| ActionSinkError::EventBuild(format!("workflow effect tag: {e}")))?,
+        )
+        .custom_created_at(nostr::Timestamp::from(
+            effect.claimed_at.timestamp().max(0) as u64
+        ))
         .sign_with_keys(relay_keypair)
         .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))
 }
@@ -217,6 +225,7 @@ fn validate_reaction_target_channel(
 impl ActionSink for RelayActionSink {
     fn send_message(
         &self,
+        effect: ActionEffectContext,
         community_id: CommunityId,
         channel_id: &str,
         text: &str,
@@ -309,6 +318,9 @@ impl ActionSink for RelayActionSink {
                     .map_err(|e| ActionSinkError::EventBuild(format!("h tag: {e}")))?,
                 Tag::parse(["buzz:workflow", "true"])
                     .map_err(|e| ActionSinkError::EventBuild(format!("workflow tag: {e}")))?,
+                Tag::parse(["buzz:workflow-effect", &effect.idempotency_key.to_string()]).map_err(
+                    |e| ActionSinkError::EventBuild(format!("workflow effect tag: {e}")),
+                )?,
             ];
 
             // Resolve `@Name` mentions to channel-member pubkeys and append a
@@ -346,6 +358,9 @@ impl ActionSink for RelayActionSink {
             let kind = Kind::from(KIND_STREAM_MESSAGE as u16);
             let event = EventBuilder::new(kind, &text)
                 .tags(tags)
+                .custom_created_at(nostr::Timestamp::from(
+                    effect.claimed_at.timestamp().max(0) as u64
+                ))
                 .sign_with_keys(&state.relay_keypair)
                 .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))?;
 
@@ -410,6 +425,7 @@ impl ActionSink for RelayActionSink {
 
     fn add_reaction(
         &self,
+        effect: ActionEffectContext,
         community_id: CommunityId,
         channel_id: &str,
         target_event_id: &str,
@@ -487,6 +503,7 @@ impl ActionSink for RelayActionSink {
 
             let event = build_workflow_reaction_event(
                 &state.relay_keypair,
+                effect,
                 target_id,
                 &emoji,
                 &author_pubkey_hex,
@@ -563,7 +580,11 @@ mod tests {
         )
         .expect("target event id");
 
-        let event = build_workflow_reaction_event(&relay, target, "👍", &owner)
+        let effect = ActionEffectContext {
+            idempotency_key: Uuid::nil(),
+            claimed_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp"),
+        };
+        let event = build_workflow_reaction_event(&relay, effect, target, "👍", &owner)
             .expect("workflow reaction event");
 
         assert_eq!(event.kind.as_u16(), KIND_REACTION as u16);
@@ -912,6 +933,10 @@ mod integration_tests {
         let sink = RelayActionSink::new(&state);
         let event_id_hex = sink
             .send_message(
+                ActionEffectContext {
+                    idempotency_key: Uuid::new_v4(),
+                    claimed_at: Utc::now(),
+                },
                 community,
                 &channel.id.to_string(),
                 "heads up @Robby — please take a look",

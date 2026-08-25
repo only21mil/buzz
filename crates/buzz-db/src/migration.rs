@@ -1030,6 +1030,18 @@ mod tests {
         assert!(workflow_resume_recovery.contains("idx_workflow_approval_gates_resume_recovery"));
         assert!(desired_schema.contains("resume_lease_expires_at TIMESTAMPTZ"));
         assert!(desired_schema.contains("idx_workflow_runs_resume_lease_recovery"));
+
+        // Effect claims bind one resolved action to a run/step identity across
+        // executor generations and retain the delivery marker after recovery.
+        assert_eq!(migrations[33].version, 34);
+        let workflow_effect_claims = migrations[33].sql.as_str();
+        assert!(workflow_effect_claims.contains("CREATE TABLE workflow_effect_claims"));
+        assert!(workflow_effect_claims
+            .contains("PRIMARY KEY (community_id, run_id, step_id, effect_index)"));
+        assert!(workflow_effect_claims.contains("UNIQUE (community_id, idempotency_key)"));
+        assert!(workflow_effect_claims.contains("workflow_effect_claim_identity_immutable"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_effect_claims"));
+        assert!(desired_schema.contains("workflow_effect_claim_identity_immutable"));
         assert!(approval_foundations.contains("payload_version SMALLINT NOT NULL DEFAULT 1"));
         assert!(approval_foundations.contains("UNIQUE (community_id, dedupe_key)"));
         assert!(approval_foundations.contains("published_event_id BYTEA"));

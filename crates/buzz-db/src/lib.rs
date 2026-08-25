@@ -57,6 +57,8 @@ pub mod user;
 pub mod workflow;
 /// Atomic workflow approval-gate creation and request outbox persistence.
 pub mod workflow_approval;
+/// Durable, generation-independent workflow effect claims.
+pub mod workflow_effect;
 /// Generation-fenced workflow-run status transitions.
 pub mod workflow_run_transition;
 /// Durable workflow-scoped key/value state.
@@ -68,6 +70,9 @@ pub use workflow_approval::{
     ApprovalDecisionPayload, DecideWorkflowApprovalGateParams, WorkflowApprovalDecision,
     WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome,
     WorkflowApprovalGateCreationOutcome, WorkflowApprovalGateRecord, WorkflowApprovalRequestRecord,
+};
+pub use workflow_effect::{
+    WorkflowEffectClaim, WorkflowEffectClaimOutcome, WorkflowEffectMarkOutcome,
 };
 pub use workflow_run_transition::{WorkflowResumeCandidate, WorkflowRunTransitionOutcome};
 pub use workflow_state::{
@@ -3941,6 +3946,54 @@ impl Db {
             current_step,
             trace,
             error,
+        )
+        .await
+    }
+
+    /// Claim one external effect under the run's current generation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_workflow_effect(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        effect_kind: &str,
+        effect_spec: &serde_json::Value,
+    ) -> Result<WorkflowEffectClaimOutcome> {
+        workflow_effect::claim_workflow_effect(
+            &self.pool,
+            community_id,
+            run_id,
+            expected_generation,
+            step_id,
+            effect_index,
+            effect_kind,
+            effect_spec,
+        )
+        .await
+    }
+
+    /// Mark one claimed effect fired under the run's current generation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mark_workflow_effect_fired(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        output: &serde_json::Value,
+    ) -> Result<WorkflowEffectMarkOutcome> {
+        workflow_effect::mark_workflow_effect_fired(
+            &self.pool,
+            community_id,
+            run_id,
+            expected_generation,
+            step_id,
+            effect_index,
+            output,
         )
         .await
     }

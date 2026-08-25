@@ -7,6 +7,21 @@ use std::future::Future;
 use std::pin::Pin;
 
 use buzz_core::tenant::CommunityId;
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+
+/// Stable delivery identity for one claimed workflow effect.
+///
+/// Sinks must use this identity when they can make a retry naturally
+/// idempotent. Relay events use both fields to reproduce the same signed event;
+/// webhook delivery uses `idempotency_key` as the `Idempotency-Key` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionEffectContext {
+    /// UUID fixed by the durable effect claim and reused across generations.
+    pub idempotency_key: Uuid,
+    /// Database timestamp fixed by the first claim.
+    pub claimed_at: DateTime<Utc>,
+}
 
 /// Errors from action sink operations.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +79,7 @@ pub trait ActionSink: Send + Sync {
     /// Returns the event ID hex string on success.
     fn send_message(
         &self,
+        effect: ActionEffectContext,
         community_id: CommunityId,
         channel_id: &str,
         text: &str,
@@ -78,6 +94,7 @@ pub trait ActionSink: Send + Sync {
     /// `Ok(None)` means the same actor already has that reaction active.
     fn add_reaction(
         &self,
+        effect: ActionEffectContext,
         community_id: CommunityId,
         channel_id: &str,
         target_event_id: &str,
