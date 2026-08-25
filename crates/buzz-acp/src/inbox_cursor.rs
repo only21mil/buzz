@@ -231,7 +231,7 @@ impl InboxCursorStore {
     /// Events first exposed with a timestamp older than the retained floor can
     /// still be lost; long downtime is also bounded by the configured catch-up
     /// maximum age.
-    fn advance_contiguous_cursor(&mut self, _now: u64) -> bool {
+    fn advance_contiguous_cursor(&mut self, now: u64) -> bool {
         let frontier = match self.pending.first() {
             Some(oldest_pending) => self.completed.range(..oldest_pending.clone()).next_back(),
             None => self.completed.last(),
@@ -241,7 +241,10 @@ impl InboxCursorStore {
             return false;
         };
         let candidate = EventCursor {
-            created_at: frontier.created_at.saturating_sub(self.reorder_window_secs),
+            created_at: frontier
+                .created_at
+                .min(now)
+                .saturating_sub(self.reorder_window_secs),
             event_id: frontier.event_id.clone(),
         };
         let advances = self
@@ -584,6 +587,42 @@ mod tests {
         store.mark_processed_at([&frontier], 1_000);
 
         assert_eq!(store.catchup_since(1_000, 1_000).since, 90);
+
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn future_frontier_does_not_skip_ordinary_mention_after_restart() {
+        let temp = std::env::temp_dir().join(format!("buzz-acp-inbox-{}", Uuid::new_v4()));
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let now = 100_000;
+        let reorder_window_secs = 300;
+        let future = signed_event(&keys, channel_id, now + 900, "future terminal");
+        let mention = signed_event(&keys, channel_id, now - 1, "ordinary mention");
+        let pubkey = keys.public_key().to_hex();
+
+        let mut first = InboxCursorStore::load(&temp, &pubkey, now - 5, reorder_window_secs);
+        first.mark_processed_at([&future], now);
+        drop(first);
+
+        let mut restarted = InboxCursorStore::load(&temp, &pubkey, now - 5, reorder_window_secs);
+        let floor = restarted.catchup_since(now, 86_400);
+        assert!(floor.since <= now - reorder_window_secs);
+
+        let filters = HashMap::from([(
+            channel_id,
+            ChannelFilter {
+                kinds: Some(vec![1]),
+                require_mention: true,
+            },
+        )]);
+        let rest = mock_query_rest(keys, vec![mention]).await;
+        let caught = fetch_startup_catchup(&rest, &filters, &pubkey, floor.since, 10)
+            .await
+            .unwrap();
+        assert_eq!(caught.events.len(), 1);
+        assert!(restarted.begin_event(&caught.events[0].event));
 
         std::fs::remove_dir_all(temp).unwrap();
     }
