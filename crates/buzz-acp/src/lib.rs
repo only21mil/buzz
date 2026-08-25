@@ -1711,8 +1711,12 @@ async fn tokio_main() -> Result<()> {
         .as_secs();
 
     let pubkey_hex = config.keys.public_key().to_hex();
-    let mut inbox_cursor =
-        InboxCursorStore::load(&config.state_dir, &pubkey_hex, startup_watermark);
+    let mut inbox_cursor = InboxCursorStore::load(
+        &config.state_dir,
+        &pubkey_hex,
+        startup_watermark,
+        config.inbox_reorder_window_secs,
+    );
     match inbox_cursor.load_status() {
         CursorLoadStatus::Loaded => tracing::info!(
             path = %inbox_cursor.path().display(),
@@ -6682,6 +6686,7 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             state_dir: std::path::PathBuf::from("./.buzz-acp/state"),
             inbox_catchup_max_age_secs: config::DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS,
+            inbox_reorder_window_secs: config::DEFAULT_INBOX_REORDER_WINDOW_SECS,
             inbox_catchup_max_events: config::DEFAULT_INBOX_CATCHUP_MAX_EVENTS as usize,
             context_message_limit: 12,
             max_turns_per_session: 0,
@@ -6909,6 +6914,7 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             state_dir: std::path::PathBuf::from("./.buzz-acp/state"),
             inbox_catchup_max_age_secs: config::DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS,
+            inbox_reorder_window_secs: config::DEFAULT_INBOX_REORDER_WINDOW_SECS,
             inbox_catchup_max_events: config::DEFAULT_INBOX_CATCHUP_MAX_EVENTS as usize,
             context_message_limit: 12,
             max_turns_per_session: 0,

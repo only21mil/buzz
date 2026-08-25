@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::config::ChannelFilter;
 use crate::relay::{BuzzEvent, RelayError, RestClient};
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 const RECENT_EVENT_ID_LIMIT: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -70,15 +70,28 @@ pub(crate) struct InboxCursorStore {
     pending: BTreeSet<EventCursor>,
     completed: BTreeSet<EventCursor>,
     fallback_since: u64,
+    reorder_window_secs: u64,
     load_status: CursorLoadStatus,
 }
 
 impl InboxCursorStore {
-    pub(crate) fn load(state_dir: &Path, agent_pubkey_hex: &str, fallback_since: u64) -> Self {
+    pub(crate) fn load(
+        state_dir: &Path,
+        agent_pubkey_hex: &str,
+        fallback_since: u64,
+        reorder_window_secs: u64,
+    ) -> Self {
         let path = state_dir.join(format!("{agent_pubkey_hex}.inbox-cursor.json"));
         let (state, load_status) = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<CursorFile>(&bytes) {
                 Ok(state) if state.version == STATE_VERSION => (state, CursorLoadStatus::Loaded),
+                Ok(mut state) if state.version == 1 => {
+                    if let Some(cursor) = &mut state.last_processed {
+                        cursor.created_at = cursor.created_at.saturating_sub(reorder_window_secs);
+                    }
+                    state.version = STATE_VERSION;
+                    (state, CursorLoadStatus::Loaded)
+                }
                 Ok(_) | Err(_) => (CursorFile::default(), CursorLoadStatus::Corrupt),
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -95,6 +108,7 @@ impl InboxCursorStore {
             pending: BTreeSet::new(),
             completed: BTreeSet::new(),
             fallback_since,
+            reorder_window_secs,
             load_status,
         }
     }
@@ -144,6 +158,10 @@ impl InboxCursorStore {
     /// intentional harness-side skip. A failed write leaves at-least-once
     /// behavior intact because the relay query will return the event again.
     pub(crate) fn mark_processed<'a>(&mut self, events: impl IntoIterator<Item = &'a Event>) {
+        self.mark_processed_at(events, Timestamp::now().as_secs());
+    }
+
+    fn mark_processed_at<'a>(&mut self, events: impl IntoIterator<Item = &'a Event>, now: u64) {
         let mut changed = false;
         for event in events {
             let cursor = EventCursor::from_event(event);
@@ -156,7 +174,7 @@ impl InboxCursorStore {
             self.pending.remove(&cursor);
             self.completed.insert(cursor);
         }
-        changed |= self.advance_contiguous_cursor();
+        changed |= self.advance_contiguous_cursor(now);
         while self.state.recent_event_ids.len() > RECENT_EVENT_ID_LIMIT {
             if let Some(evicted) = self.state.recent_event_ids.pop_front() {
                 self.persisted_ids.remove(&evicted);
@@ -190,7 +208,7 @@ impl InboxCursorStore {
         {
             self.pending.remove(&cursor);
             self.completed.insert(cursor);
-            self.advance_contiguous_cursor();
+            self.advance_contiguous_cursor(Timestamp::now().as_secs());
         }
         while self.state.recent_event_ids.len() > RECENT_EVENT_ID_LIMIT {
             if let Some(evicted) = self.state.recent_event_ids.pop_front() {
@@ -207,16 +225,26 @@ impl InboxCursorStore {
     }
 
     /// Advance only past terminal events that precede every known unfinished
-    /// event. This prevents a fast newer channel turn from moving the durable
-    /// floor beyond an older in-flight mention.
-    fn advance_contiguous_cursor(&mut self) -> bool {
-        let candidate = match self.pending.first() {
+    /// event, while retaining `reorder_window_secs` of timestamp overlap behind
+    /// that frontier. A delayed event within that window is replayed after a
+    /// crash and the persisted ID set deduplicates events already handled.
+    /// Events first exposed with a timestamp older than the retained floor can
+    /// still be lost; long downtime is also bounded by the configured catch-up
+    /// maximum age.
+    fn advance_contiguous_cursor(&mut self, now: u64) -> bool {
+        let frontier = match self.pending.first() {
             Some(oldest_pending) => self.completed.range(..oldest_pending.clone()).next_back(),
             None => self.completed.last(),
         }
         .cloned();
-        let Some(candidate) = candidate else {
+        let Some(frontier) = frontier else {
             return false;
+        };
+        let candidate = EventCursor {
+            created_at: frontier
+                .created_at
+                .min(now.saturating_sub(self.reorder_window_secs)),
+            event_id: frontier.event_id.clone(),
         };
         let advances = self
             .state
@@ -226,7 +254,7 @@ impl InboxCursorStore {
         if advances {
             self.state.last_processed = Some(candidate.clone());
         }
-        self.completed.retain(|cursor| cursor > &candidate);
+        self.completed.retain(|cursor| cursor > &frontier);
         advances
     }
 
@@ -470,7 +498,7 @@ mod tests {
         let mention = signed_event(&keys, channel_id, now - 10, "unfinished");
         let pubkey = keys.public_key().to_hex();
 
-        let mut first = InboxCursorStore::load(&temp, &pubkey, now - 5);
+        let mut first = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
         first.mark_processed([&previous]);
         assert!(first.begin_event(&mention));
         drop(first); // restart before the mention reaches a terminal result
@@ -482,7 +510,7 @@ mod tests {
                 require_mention: true,
             },
         )]);
-        let mut restarted = InboxCursorStore::load(&temp, &pubkey, now - 5);
+        let mut restarted = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
         let floor = restarted.catchup_since(now, 86_400);
         let rest = mock_query_rest(keys.clone(), vec![mention.clone()]).await;
         let caught = fetch_startup_catchup(&rest, &filters, &pubkey, floor.since, 10)
@@ -493,7 +521,7 @@ mod tests {
         restarted.mark_processed([&caught.events[0].event]);
         drop(restarted);
 
-        let mut third = InboxCursorStore::load(&temp, &pubkey, now - 5);
+        let mut third = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
         let rest = mock_query_rest(keys, vec![mention]).await;
         let caught = fetch_startup_catchup(&rest, &filters, &pubkey, floor.since, 10)
             .await
@@ -516,7 +544,7 @@ mod tests {
         let path = temp.join(format!("{pubkey}.inbox-cursor.json"));
         std::fs::write(&path, b"not-json").unwrap();
 
-        let store = InboxCursorStore::load(&temp, &pubkey, 95);
+        let store = InboxCursorStore::load(&temp, &pubkey, 95, 300);
         assert_eq!(store.load_status(), CursorLoadStatus::Corrupt);
         assert_eq!(store.catchup_since(100, 86_400).since, 95);
 
@@ -533,15 +561,63 @@ mod tests {
         let newer = signed_event(&keys, channel_id, 100, "newer completed");
         let pubkey = keys.public_key().to_hex();
 
-        let mut store = InboxCursorStore::load(&temp, &pubkey, 75);
-        store.mark_processed([&previous]);
+        let mut store = InboxCursorStore::load(&temp, &pubkey, 75, 10);
+        store.mark_processed_at([&previous], 90);
         assert!(store.begin_event(&older));
         assert!(store.begin_event(&newer));
-        store.mark_processed([&newer]);
+        store.mark_processed_at([&newer], 110);
         assert_eq!(store.catchup_since(110, 1_000).since, 80);
 
-        store.mark_processed([&older]);
+        store.mark_processed_at([&older], 110);
         assert_eq!(store.catchup_since(110, 1_000).since, 100);
+
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_replays_delayed_older_event_within_reorder_window_once() {
+        let temp = std::env::temp_dir().join(format!("buzz-acp-inbox-{}", Uuid::new_v4()));
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let now = 100_000;
+        let newer = signed_event(&keys, channel_id, now - 10, "newer");
+        let delayed = signed_event(&keys, channel_id, now - 100, "delayed older");
+        let pubkey = keys.public_key().to_hex();
+        let filters = HashMap::from([(
+            channel_id,
+            ChannelFilter {
+                kinds: Some(vec![1]),
+                require_mention: true,
+            },
+        )]);
+
+        let mut first = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
+        first.mark_processed_at([&newer], now);
+        assert_eq!(first.catchup_since(now, 86_400).since, now - 300);
+        drop(first);
+
+        let mut restarted = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
+        let floor = restarted.catchup_since(now, 86_400);
+        let rest = mock_query_rest(keys.clone(), vec![delayed.clone()]).await;
+        let caught = fetch_startup_catchup(&rest, &filters, &pubkey, floor.since, 10)
+            .await
+            .unwrap();
+        assert_eq!(caught.events.len(), 1);
+        assert!(restarted.begin_event(&caught.events[0].event));
+        restarted.mark_processed_at([&caught.events[0].event], now + 1);
+        drop(restarted);
+
+        let mut third = InboxCursorStore::load(&temp, &pubkey, now - 5, 300);
+        let rest = mock_query_rest(keys, vec![delayed]).await;
+        let caught = fetch_startup_catchup(&rest, &filters, &pubkey, floor.since, 10)
+            .await
+            .unwrap();
+        let delivered = caught
+            .events
+            .iter()
+            .filter(|event| third.begin_event(&event.event))
+            .count();
+        assert_eq!(delivered, 0, "delayed replay must be deduplicated");
 
         std::fs::remove_dir_all(temp).unwrap();
     }

@@ -38,6 +38,9 @@ pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
 /// Default maximum age for durable inbox catch-up queries (24 hours).
 pub(crate) const DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS: u64 = 86_400;
 
+/// Default timestamp-reordering overlap retained behind the processed frontier.
+pub(crate) const DEFAULT_INBOX_REORDER_WINDOW_SECS: u64 = 300;
+
 /// Default maximum number of events returned by one inbox catch-up query.
 /// Kept below the relay's 1,000-event ceiling so one extra row can detect
 /// truncation.
@@ -363,6 +366,15 @@ pub struct CliArgs {
     )]
     pub inbox_catchup_max_age: u64,
 
+    /// Safety lag retained behind the newest fully processed inbox event.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_INBOX_REORDER_WINDOW",
+        default_value_t = DEFAULT_INBOX_REORDER_WINDOW_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub inbox_reorder_window: u64,
+
     /// Maximum number of events admitted by startup catch-up.
     #[arg(
         long,
@@ -564,6 +576,7 @@ pub struct Config {
     pub config_path: PathBuf,
     pub state_dir: PathBuf,
     pub inbox_catchup_max_age_secs: u64,
+    pub inbox_reorder_window_secs: u64,
     pub inbox_catchup_max_events: usize,
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
@@ -1107,6 +1120,11 @@ impl Config {
             };
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
+        if args.inbox_reorder_window > args.inbox_catchup_max_age {
+            return Err(ConfigError::ConfigFile(
+                "inbox reorder window must not exceed inbox catch-up max age".into(),
+            ));
+        }
 
         let config = Config {
             keys,
@@ -1138,6 +1156,7 @@ impl Config {
             config_path: args.config,
             state_dir: args.state_dir,
             inbox_catchup_max_age_secs: args.inbox_catchup_max_age,
+            inbox_reorder_window_secs: args.inbox_reorder_window,
             inbox_catchup_max_events: args.inbox_catchup_max_events as usize,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
@@ -1519,6 +1538,7 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             state_dir: PathBuf::from("./.buzz-acp/state"),
             inbox_catchup_max_age_secs: DEFAULT_INBOX_CATCHUP_MAX_AGE_SECS,
+            inbox_reorder_window_secs: DEFAULT_INBOX_REORDER_WINDOW_SECS,
             inbox_catchup_max_events: DEFAULT_INBOX_CATCHUP_MAX_EVENTS as usize,
             context_message_limit: 12,
             max_turns_per_session: 0,
@@ -2877,6 +2897,24 @@ channels = "ALL"
             result.is_ok(),
             "from_args should accept any mode when allowed list is unset: {result:?}"
         );
+    }
+
+    #[test]
+    fn inbox_reorder_window_must_fit_inside_catchup_age() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--inbox-catchup-max-age",
+            "60",
+            "--inbox-reorder-window",
+            "61",
+        ])
+        .expect("clap should parse inbox replay bounds");
+        let error = Config::from_args(args).expect_err("reorder window must fit catch-up age");
+        assert!(error
+            .to_string()
+            .contains("inbox reorder window must not exceed inbox catch-up max age"));
     }
 
     // --- max_turn_duration ceiling gate ---
