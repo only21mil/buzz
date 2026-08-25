@@ -11,9 +11,11 @@ selects only the requested agent entry, derives and verifies the requested
 public key, and writes one lowercase secret scalar to file descriptor 3. The
 root receiver reads the expected public key from a root-owned strict map,
 derives the public key independently, and publishes the matching credential
-under /etc/buzz-agents/credentials through O_TMPFILE and linkat. Existing
-identical credentials are accepted. Different content, unsafe metadata,
-symlinks, and hard links fail closed.
+under /etc/buzz-agents/credentials through O_TMPFILE and linkat. The root
+receiver holds the slug lock, rejects every existing target, then signals the
+controller to start the exporter. It performs no secret read before that
+absent-only gate. Existing files, unsafe metadata, symlinks, and hard links all
+fail closed.
 
 The updated service unit loads that root-owned file with systemd
 LoadCredential. The service user never owns the credential path. Services stay
@@ -41,3 +43,12 @@ public identities:
 AppImage and swaps only the reviewed launcher after preserving the old launcher
 under `rollback-desktop-050ac722106c`. `rollback-reviewed-desktop` restores
 that launcher without deleting the new AppImage or touching application data.
+The installer hashes the bundled launcher at runtime. It accepts the previous
+live launcher only when the terminal evidence bundle records its hash as
+`desktop_previous_launcher_sha256`.
+
+`install-static-system.py` accepts only an evidence v2 files-mode closure whose
+changed-path set and per-path hashes exactly match the package sources it will
+install. It writes a complete rollback receipt before changing system paths.
+Each install uses a UTC timestamped backup ID, which the installer prints; pass
+that exact ID to `rollback --backup-id ID`.

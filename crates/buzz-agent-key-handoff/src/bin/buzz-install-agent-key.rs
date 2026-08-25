@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 
 const MAP_PATH: &str = "/etc/buzz-agents/enrollment-keys.json";
 const CREDENTIAL_DIR: &str = "/etc/buzz-agents/credentials";
+const READY_FD: RawFd = 4;
 
 fn parse_args() -> Result<(Slug, RawFd)> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -101,14 +102,35 @@ fn read_secret(fd: RawFd) -> Result<Zeroizing<String>> {
     exact_secret_line(&bytes)
 }
 
-fn verify_existing(path: &Path, content: &[u8]) -> Result<bool> {
+fn require_target_absent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
+        Ok(_) => bail!("credential target already exists: {}", path.display()),
+    }
+}
+
+fn signal_ready(fd: RawFd) -> Result<()> {
+    require_anonymous_pipe(fd)?;
+    let mut output = unsafe { File::from_raw_fd(fd) };
+    output.write_all(b"R").context("signal receiver readiness")
+}
+
+fn prepare_absent_install(path: &Path, ready_fd: RawFd) -> Result<()> {
+    require_target_absent(path)?;
+    signal_ready(ready_fd)
+}
+
+fn verify_installed(path: &Path, content: &[u8]) -> Result<()> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("credential target is absent after install")
+        }
         Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
     };
     require_secure_regular(&file, path, 0o600)?;
@@ -120,7 +142,7 @@ fn verify_existing(path: &Path, content: &[u8]) -> Result<bool> {
     if data.as_slice() != content {
         bail!("credential exists with different content");
     }
-    Ok(true)
+    Ok(())
 }
 
 fn require_secure_credential_dir(path: &Path) -> Result<File> {
@@ -210,9 +232,6 @@ fn install_absent(path: &Path, content: &[u8]) -> Result<()> {
     } != 0
     {
         let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return Ok(());
-        }
         return Err(error).context("publish credential");
     }
     if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
@@ -235,20 +254,36 @@ fn main() -> Result<()> {
     }
     let (slug, fd) = parse_args()?;
     let _lock = lock_slug(slug)?;
+    let target = Path::new(CREDENTIAL_DIR).join(format!("{}.key", slug.as_str()));
+    prepare_absent_install(&target, READY_FD)?;
     let expected = expected_pubkey(slug)?;
     let secret = read_secret(fd)?;
     let secret_hex = validate_secret_binding(&secret, &expected)?;
     let mut content = Zeroizing::new(secret_hex.as_bytes().to_vec());
     content.push(b'\n');
-    let target = Path::new(CREDENTIAL_DIR).join(format!("{}.key", slug.as_str()));
-    if verify_existing(&target, &content)? {
-        println!("ALREADY_PRESENT {}", slug.as_str());
-        return Ok(());
-    }
     install_absent(&target, &content)?;
-    if !verify_existing(&target, &content)? {
-        bail!("credential readback failed");
-    }
+    verify_installed(&target, &content)?;
     println!("INSTALLED {}", slug.as_str());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_only_gate_rejects_existing_target_before_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("mempool.key");
+        fs::write(&target, b"already present\n").unwrap();
+        let mut ready_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(ready_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert!(prepare_absent_install(&target, ready_fds[1]).is_err());
+        unsafe {
+            libc::close(ready_fds[1]);
+        }
+        let mut readiness = unsafe { File::from_raw_fd(ready_fds[0]) };
+        let mut byte = [0_u8; 1];
+        assert_eq!(readiness.read(&mut byte).unwrap(), 0);
+    }
 }

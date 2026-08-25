@@ -4,11 +4,11 @@ set +x
 umask 077
 
 readonly app_hash=6885d124f0aee6e5f8da83c1e36f47acb3a8b52579ecbf0bf2c9389356b1925b
-readonly launcher_hash=2623a8f941945bc1dce3e75c2b3d655fcf4a17691cbb440020f49816e103ddf0
-readonly old_launcher_hash=48d717292f20b5cab536108f7f1b59e052ffbbcd240b46ffe77e555495a6c878
 readonly final_app=/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage
 readonly final_launcher=/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh
 readonly rollback=/home/victor/work/buzz-client/rollback-desktop-050ac722106c
+script_dir="$(dirname -- "$(readlink -e -- "$0")")"
+readonly script_dir
 
 [[ $# -eq 4 && $1 == --package && $3 == --state ]] || {
   printf '%s\n' 'usage: install-reviewed-desktop --package DIR --state FILE' >&2
@@ -36,9 +36,13 @@ for path in "$source_app" "$source_launcher"; do
   [[ -f $path && ! -L $path && $(stat -c '%U:%G:%h' "$path") == victor:victor:1 ]]
 done
 [[ $(sha256sum -- "$source_app" | cut -d' ' -f1) == "$app_hash" ]]
-[[ $(sha256sum -- "$source_launcher" | cut -d' ' -f1) == "$launcher_hash" ]]
 [[ $(stat -c %a "$source_app") == 755 ]]
 [[ $(stat -c %a "$source_launcher") == 755 ]]
+launcher_hash=$(sha256sum -- "$source_launcher" | cut -d' ' -f1)
+previous_launcher_hash=$(
+  python3 "$script_dir/install-static-system.py" accepted-fingerprint \
+    --state "$state" --name desktop_previous_launcher_sha256
+)
 [[ -z $(pgrep -u victor -x buzz-desktop || true) ]] || {
   printf '%s\n' 'Buzz Desktop is still running' >&2
   exit 1
@@ -64,11 +68,11 @@ if [[ $current_launcher_hash == "$launcher_hash" ]]; then
   printf '%s\n' ALREADY_PRESENT
   exit 0
 fi
-[[ $current_launcher_hash == "$old_launcher_hash" ]]
+[[ $current_launcher_hash == "$previous_launcher_hash" ]]
 [[ ! -e $rollback && ! -L $rollback ]]
 install -d -m 0700 "$rollback"
 install -m 0700 "$final_launcher" "$rollback/launch_buzz_desktop.sh"
-[[ $(sha256sum -- "$rollback/launch_buzz_desktop.sh" | cut -d' ' -f1) == "$old_launcher_hash" ]]
+[[ $(sha256sum -- "$rollback/launch_buzz_desktop.sh" | cut -d' ' -f1) == "$previous_launcher_hash" ]]
 
 temporary=$(mktemp /home/victor/projects/buzz/scripts/.launcher-install.XXXXXX)
 trap 'test ! -e "${temporary:-}" || unlink "$temporary"' EXIT
