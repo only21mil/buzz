@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set +x
+umask 077
+
+readonly secret_dir=/home/victor/.config/sats
+readonly secret_file=${secret_dir}/secrets.env
+readonly appimage=/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage
+readonly appimage_sha256=6885d124f0aee6e5f8da83c1e36f47acb3a8b52579ecbf0bf2c9389356b1925b
+readonly relay_url=wss://framework-desktop.tail69757d.ts.net:38443
+
+fail() {
+  printf 'Buzz desktop launch blocked: %s\n' "$1" >&2
+  exit 1
+}
+
+validate_trusted_directory() {
+  local directory=$1
+  local canonical
+
+  [[ -d ${directory} && ! -L ${directory} ]] || fail "trusted directory is missing or a symlink: ${directory}"
+  canonical=$(readlink -e -- "${directory}") || fail "cannot resolve trusted directory: ${directory}"
+  [[ ${canonical} == "${directory}" && \
+    $(stat -c '%U:%G' -- "${directory}") == victor:victor && \
+    $(stat -c %a -- "${directory}") == 700 && \
+    -w ${directory} && -x ${directory} ]] || fail "trusted directory has unsafe identity, ownership, mode, or access: ${directory}"
+}
+
+validate_trusted_directory /home/victor/.cache
+validate_trusted_directory /home/victor/.cache/tmp
+validate_trusted_directory /home/victor/.cache/huggingface
+validate_trusted_directory /home/victor/.cache/huggingface/hub
+validate_trusted_directory /home/victor/.cache/huggingface/xet
+validate_trusted_directory /home/victor/.cache/mesh-llm
+validate_trusted_directory /home/victor/.cache/mesh-llm/native-runtimes
+
+[[ -d ${secret_dir} && ! -L ${secret_dir} && \
+  $(stat -c '%U:%G:%a' "${secret_dir}") == victor:victor:700 ]] || {
+  printf 'sanctioned secrets directory is missing or unsafe\n' >&2
+  exit 1
+}
+[[ -f ${secret_file} && ! -L ${secret_file} && \
+  $(stat -c '%U:%G:%a:%h' "${secret_file}") == victor:victor:600:1 ]] || {
+  printf 'sanctioned secrets file is missing or unsafe\n' >&2
+  exit 1
+}
+[[ -f ${appimage} && -x ${appimage} ]] || {
+  printf 'Buzz AppImage is missing or not executable: %s\n' "${appimage}" >&2
+  exit 1
+}
+[[ $(sha256sum -- "${appimage}" | cut -d' ' -f1) == "${appimage_sha256}" ]] || {
+  printf 'Buzz AppImage hash does not match the reviewed artifact\n' >&2
+  exit 1
+}
+
+# shellcheck disable=SC1090
+. "${secret_file}"
+[[ ${BUZZ_OWNER_PRIVATE_KEY:-} =~ ^[0-9a-f]{64}$ ]] || {
+  printf 'BUZZ_OWNER_PRIVATE_KEY is missing or invalid\n' >&2
+  exit 1
+}
+
+export BUZZ_PRIVATE_KEY=${BUZZ_OWNER_PRIVATE_KEY}
+export BUZZ_SHARE_IDENTITY=1
+export BUZZ_RELAY_URL=${relay_url}
+export PATH=/home/victor/.local/bin:/usr/local/bin:/usr/bin:/bin
+export TMPDIR=/home/victor/.cache/tmp
+export HF_HUB_CACHE=/home/victor/.cache/huggingface/hub
+export HF_XET_CACHE=/home/victor/.cache/huggingface/xet
+export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR=/home/victor/.cache/mesh-llm/native-runtimes
+unset BUZZ_OWNER_PRIVATE_KEY
+
+exec "${appimage}" "$@"

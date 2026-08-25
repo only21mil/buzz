@@ -881,6 +881,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-agent-key-handoff"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "keyring",
+ "libc",
+ "nostr",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "buzz-audit"
 version = "0.1.0"
 dependencies = [

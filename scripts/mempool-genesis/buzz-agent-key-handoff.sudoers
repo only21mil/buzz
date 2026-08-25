@@ -1,0 +1,3 @@
+Defaults!/usr/local/sbin/buzz-install-agent-key closefrom_override
+Cmnd_Alias BUZZ_AGENT_KEY_INSTALL = /usr/local/sbin/buzz-install-agent-key install --slug mempool --secret-fd 3, /usr/local/sbin/buzz-install-agent-key install --slug genesis --secret-fd 3
+victor ALL=(root) NOPASSWD: BUZZ_AGENT_KEY_INSTALL

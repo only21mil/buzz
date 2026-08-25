@@ -1,0 +1,7 @@
+{
+  "schema": "buzz-agent-enrollment-keys-v1",
+  "keys": {
+    "mempool": "MEMPOOL_64_LOWERCASE_HEX_PUBKEY",
+    "genesis": "GENESIS_64_LOWERCASE_HEX_PUBKEY"
+  }
+}

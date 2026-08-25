@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf '%s\n' 'must run as root' >&2; exit 77; }
+[[ $# -eq 4 && $1 == --mempool-pubkey && $3 == --genesis-pubkey ]] || {
+  printf '%s\n' 'usage: install-enrollment-map --mempool-pubkey HEX --genesis-pubkey HEX' >&2
+  exit 64
+}
+
+mempool="$2"
+genesis="$4"
+[[ $mempool =~ ^[0-9a-f]{64}$ ]]
+[[ $genesis =~ ^[0-9a-f]{64}$ ]]
+[[ $mempool != "$genesis" ]]
+
+dir=/etc/buzz-agents
+target=$dir/enrollment-keys.json
+if [[ -e $dir || -L $dir ]]; then
+  test -d "$dir"
+  test ! -L "$dir"
+  test "$(stat -c '%U:%G:%a' "$dir")" = root:root:755
+else
+  install -d -o root -g root -m 0755 "$dir"
+fi
+expected="$(printf '{"schema":"buzz-agent-enrollment-keys-v1","keys":{"mempool":"%s","genesis":"%s"}}' "$mempool" "$genesis")"
+temporary="$(mktemp "$dir/.enrollment-keys.XXXXXX")"
+trap 'test ! -e "$temporary" || unlink "$temporary"' EXIT
+chmod 0600 "$temporary"
+chown root:root "$temporary"
+printf '%s\n' "$expected" > "$temporary"
+sync "$temporary"
+
+if [[ -e $target || -L $target ]]; then
+  test -f "$target"
+  test ! -L "$target"
+  test "$(stat -c '%U:%G:%a:%h' "$target")" = root:root:600:1
+  cmp -s "$temporary" "$target"
+  printf '%s\n' ALREADY_PRESENT
+  exit 0
+fi
+ln "$temporary" "$target"
+unlink "$temporary"
+sync "$dir"
+test "$(stat -c '%U:%G:%a:%h' "$target")" = root:root:600:1
+printf '%s\n' INSTALLED

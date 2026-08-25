@@ -1,0 +1,48 @@
+[Unit]
+Description=Buzz agent %i
+After=network-online.target
+Wants=network-online.target
+ConditionHost=framework-desktop
+ConditionPathExists=/etc/buzz-agents/review-closure.json
+
+[Service]
+Type=simple
+User=buzz-%i
+Group=buzz-%i
+WorkingDirectory=/home/buzz-%i
+UMask=0077
+Environment=HOME=/home/buzz-%i
+Environment=CODEX_HOME=/home/buzz-%i/.codex
+Environment=XDG_CONFIG_HOME=/home/buzz-%i/.config
+Environment=XDG_CACHE_HOME=/home/buzz-%i/.cache
+Environment=XDG_STATE_HOME=/home/buzz-%i/.local/state
+Environment=TMPDIR=/home/buzz-%i/.tmp
+Environment=PATH=/usr/local/libexec/buzz:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/buzz-agents/%i.env
+LoadCredential=buzz-private-key:/etc/buzz-agents/credentials/%i.key
+RuntimeDirectory=buzz-agents-%i
+RuntimeDirectoryMode=0700
+ExecStartPre=/bin/bash /usr/local/libexec/buzz/verify-installed-agent %i
+ExecStart=/bin/bash /usr/local/libexec/buzz/run-buzz-agent %i
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/buzz-%i/.codex /home/buzz-%i/.cache /home/buzz-%i/.local/state /home/buzz-%i/.tmp /run/buzz-agents-%i
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

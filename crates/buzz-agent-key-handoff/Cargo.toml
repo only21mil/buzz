@@ -1,0 +1,35 @@
+[package]
+name = "buzz-agent-key-handoff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+libc = "0.2"
+nostr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "vendored"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "export-managed-agent-key"
+path = "src/bin/export-managed-agent-key.rs"
+
+[[bin]]
+name = "buzz-install-agent-key"
+path = "src/bin/buzz-install-agent-key.rs"
+
+[[bin]]
+name = "buzz-agent-key-handoff"
+path = "src/bin/buzz-agent-key-handoff.rs"
