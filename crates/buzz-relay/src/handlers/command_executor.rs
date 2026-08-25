@@ -11,17 +11,18 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use nostr::Event;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
 
 use buzz_core::kind::*;
-use buzz_core::tenant::TenantContext;
-use buzz_db::workflow::RunStatus;
+use buzz_core::tenant::{CommunityId, TenantContext};
+use buzz_db::workflow::{ApprovalStatus, RunStatus};
 use buzz_db::{
     ApprovalDecisionPayload, DbError, DecideWorkflowApprovalGateParams, WorkflowApprovalDecision,
-    WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome,
+    WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome, WorkflowRunTransitionOutcome,
 };
 use buzz_workflow::executor::TriggerContext;
 
@@ -69,13 +70,74 @@ pub async fn handle_command(
         KIND_DM_HIDE => handle_dm_hide(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
-        KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => {
-            handle_workflow_approval_decision(tenant, state, &event, &auth).await
-        }
+        KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => match classify_approval_decision(&event)? {
+            ApprovalDecisionRoute::Canonical => {
+                handle_canonical_workflow_approval_decision(tenant, state, &event, &auth).await
+            }
+            ApprovalDecisionRoute::Legacy => {
+                handle_legacy_workflow_approval_decision(tenant, state, &event, &auth).await
+            }
+        },
         _ => Err(IngestError::Rejected(format!(
             "unknown command kind: {kind}"
         ))),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecisionRoute {
+    Canonical,
+    Legacy,
+}
+
+/// Separate the UUID/JSON decision contract from the retained token-hash API.
+///
+/// A decision has exactly one locating reference. Canonical decisions use one
+/// canonical lowercase UUID in a `d` tag. Legacy decisions use one 32-byte hex
+/// token hash in either a `d` or `e` tag. Mixed or repeated references are
+/// rejected instead of guessing which authorization contract should apply.
+fn classify_approval_decision(event: &Event) -> Result<ApprovalDecisionRoute, IngestError> {
+    let references: Vec<(&str, &str)> = event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let kind = tag.kind().to_string();
+            if kind == "d" || kind == "e" {
+                tag.content().map(|content| {
+                    let kind = if kind == "d" { "d" } else { "e" };
+                    (kind, content)
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let [(kind, reference)] = references.as_slice() else {
+        return Err(IngestError::Rejected(
+            "invalid: approval decision reference is missing or ambiguous".into(),
+        ));
+    };
+
+    if *kind == "d" {
+        if let Ok(approval_id) = Uuid::parse_str(reference) {
+            if approval_id.to_string() == *reference {
+                return Ok(ApprovalDecisionRoute::Canonical);
+            }
+            return Err(IngestError::Rejected(
+                "invalid: approval ID must use canonical lowercase UUID form".into(),
+            ));
+        }
+    }
+
+    let token_hash = hex::decode(reference)
+        .map_err(|_| IngestError::Rejected("invalid: bad approval token hash hex".into()))?;
+    if token_hash.len() != 32 {
+        return Err(IngestError::Rejected(
+            "invalid: approval token hash must be 32 bytes".into(),
+        ));
+    }
+    Ok(ApprovalDecisionRoute::Legacy)
 }
 
 /// Result of persisting a command event: either a duplicate (already processed)
@@ -1003,7 +1065,7 @@ async fn handle_workflow_trigger(
     })
 }
 
-async fn handle_workflow_approval_decision(
+async fn handle_canonical_workflow_approval_decision(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
@@ -1074,21 +1136,54 @@ async fn handle_workflow_approval_decision(
         .map_err(|error| IngestError::Internal(format!("error: decide approval: {error}")))?;
     match outcome {
         WorkflowApprovalDecisionOutcome::Applied { run_id, generation }
-        | WorkflowApprovalDecisionOutcome::Reused { run_id, generation } => Ok(IngestResult {
-            event_id: event.id.to_hex(),
-            accepted: true,
-            message: format!(
-                "response:{}",
-                serde_json::json!({
-                    "status": match payload.decision() {
-                        WorkflowApprovalDecision::Grant => "granted",
-                        WorkflowApprovalDecision::Deny => "denied",
-                    },
-                    "run_id": run_id,
-                    "generation": generation,
-                })
-            ),
-        }),
+        | WorkflowApprovalDecisionOutcome::Reused { run_id, generation } => {
+            if payload.decision() == WorkflowApprovalDecision::Grant {
+                let engine = Arc::clone(&state.workflow_engine);
+                let db = state.db.clone();
+                let community_id = tenant.community();
+                tokio::spawn(async move {
+                    match resume_workflow_from_persisted_cursor(
+                        engine,
+                        db,
+                        community_id,
+                        run_id,
+                        RunStatus::ResumePending,
+                        Some(generation),
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::debug!(
+                            %run_id,
+                            generation,
+                            "workflow approval resume was already claimed"
+                        ),
+                        Err(error) => tracing::error!(
+                            %run_id,
+                            generation,
+                            "workflow approval resume failed: {error}"
+                        ),
+                    }
+                });
+            }
+
+            Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::json!({
+                        "status": match payload.decision() {
+                            WorkflowApprovalDecision::Grant => "granted",
+                            WorkflowApprovalDecision::Deny => "denied",
+                        },
+                        "run_id": run_id,
+                        "generation": generation,
+                    })
+                ),
+            })
+        }
         WorkflowApprovalDecisionOutcome::Unauthorized => Err(IngestError::Rejected(
             "forbidden: actor does not satisfy the approval policy".into(),
         )),
@@ -1098,5 +1193,544 @@ async fn handle_workflow_approval_decision(
         WorkflowApprovalDecisionOutcome::Conflict => Err(IngestError::Rejected(
             "invalid: approval decision conflicts with current state".into(),
         )),
+    }
+}
+
+/// Enforce the retained legacy approver specification.
+fn check_legacy_approver_spec(approver_spec: &str, requester_hex: &str) -> Result<(), IngestError> {
+    let spec = approver_spec.trim();
+    if spec.is_empty() || spec == "any" {
+        return Ok(());
+    }
+    if spec.len() == 64 && spec.chars().all(|character| character.is_ascii_hexdigit()) {
+        if requester_hex.eq_ignore_ascii_case(spec) {
+            return Ok(());
+        }
+        return Err(IngestError::Rejected(
+            "forbidden: not the designated approver for this request".into(),
+        ));
+    }
+    Err(IngestError::Rejected(format!(
+        "forbidden: approver spec '{spec}' is not supported"
+    )))
+}
+
+async fn handle_legacy_workflow_approval_decision(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let actor = auth.pubkey().to_bytes().to_vec();
+    let actor_hex = hex::encode(&actor);
+    let token_hash_hex = extract_d_tag(event)
+        .or_else(|| extract_e_tag(event))
+        .ok_or_else(|| IngestError::Rejected("invalid: missing approval reference".into()))?;
+    let token_hash = hex::decode(token_hash_hex)
+        .map_err(|_| IngestError::Rejected("invalid: bad approval token hash hex".into()))?;
+
+    let tx = match persist_command_event(state, tenant, event, None).await? {
+        PersistResult::Duplicate => {
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
+    let decision = if event.kind.as_u16() as u32 == KIND_APPROVAL_GRANT {
+        ApprovalStatus::Granted
+    } else {
+        ApprovalStatus::Denied
+    };
+    let note = (!event.content.is_empty()).then_some(event.content.as_str());
+    let approval = apply_legacy_workflow_approval_decision(
+        &state.db,
+        tenant.community(),
+        &token_hash,
+        &actor,
+        &actor_hex,
+        decision.clone(),
+        note,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|error| IngestError::Internal(format!("error: commit transaction: {error}")))?;
+
+    let community_id = tenant.community();
+    let run_id = approval.run_id;
+    if decision == ApprovalStatus::Granted {
+        let engine = Arc::clone(&state.workflow_engine);
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            match resume_workflow_from_persisted_cursor(
+                engine,
+                db,
+                community_id,
+                run_id,
+                RunStatus::WaitingApproval,
+                None,
+                true,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(%run_id, "legacy workflow approval resume was already claimed")
+                }
+                Err(error) => {
+                    tracing::error!(%run_id, "legacy workflow approval resume failed: {error}")
+                }
+            }
+        });
+    } else {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            let run = match db.get_workflow_run(community_id, run_id).await {
+                Ok(run) => run,
+                Err(error) => {
+                    tracing::error!(%run_id, "legacy approval denial run lookup failed: {error}");
+                    return;
+                }
+            };
+            if run.status != RunStatus::WaitingApproval {
+                return;
+            }
+            let error_message = format!("workflow cancelled: approval denied by {actor_hex}");
+            if let Err(error) = db
+                .update_workflow_run(
+                    community_id,
+                    run_id,
+                    RunStatus::Cancelled,
+                    run.current_step,
+                    &run.execution_trace,
+                    Some(&error_message),
+                )
+                .await
+            {
+                tracing::error!(%run_id, "legacy approval denial failed: {error}");
+            }
+        });
+    }
+
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "status": decision.to_string(),
+                "run_id": run_id,
+            })
+        ),
+    })
+}
+
+async fn apply_legacy_workflow_approval_decision(
+    db: &buzz_db::Db,
+    community_id: CommunityId,
+    token_hash: &[u8],
+    actor: &[u8],
+    actor_hex: &str,
+    decision: ApprovalStatus,
+    note: Option<&str>,
+) -> Result<buzz_db::workflow::ApprovalRecord, IngestError> {
+    let approval = db
+        .get_approval_by_stored_hash(community_id, token_hash)
+        .await
+        .map_err(|_| IngestError::Rejected("invalid: approval not found".into()))?;
+    if approval.status != ApprovalStatus::Pending {
+        return Err(IngestError::Rejected(format!(
+            "invalid: approval already {}",
+            approval.status
+        )));
+    }
+    if Utc::now() > approval.expires_at {
+        return Err(IngestError::Rejected(
+            "invalid: approval token has expired".into(),
+        ));
+    }
+    check_legacy_approver_spec(&approval.approver_spec, actor_hex)?;
+
+    let updated = db
+        .update_approval_by_stored_hash(community_id, token_hash, decision, Some(actor), note)
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!("error: update legacy approval: {error}"))
+        })?;
+    if !updated {
+        return Err(IngestError::Rejected(
+            "invalid: approval already acted on".into(),
+        ));
+    }
+    Ok(approval)
+}
+
+/// Claim and continue the persisted approval cursor.
+///
+/// Canonical decisions supply the generation returned by their atomic decision
+/// transaction. Legacy decisions have no generation in their API, so the
+/// compatibility path snapshots the current waiting generation before claiming.
+async fn resume_workflow_from_persisted_cursor(
+    engine: Arc<buzz_workflow::WorkflowEngine>,
+    db: buzz_db::Db,
+    community_id: CommunityId,
+    run_id: Uuid,
+    expected_status: RunStatus,
+    expected_generation: Option<i64>,
+    allow_missing_trigger_context: bool,
+) -> Result<bool, String> {
+    let run = db
+        .get_workflow_run(community_id, run_id)
+        .await
+        .map_err(|error| format!("run lookup failed: {error}"))?;
+    if run.status != expected_status
+        || expected_generation.is_some_and(|generation| generation != run.generation)
+    {
+        return Ok(false);
+    }
+
+    let start_index = usize::try_from(run.next_step)
+        .map_err(|_| "persisted workflow resume cursor is invalid".to_owned())?;
+    let definition: buzz_workflow::WorkflowDef =
+        serde_json::from_value(run.definition_snapshot.clone())
+            .map_err(|error| format!("frozen workflow definition is invalid: {error}"))?;
+    if start_index > definition.steps.len() {
+        return Err("persisted workflow resume cursor exceeds the frozen definition".to_owned());
+    }
+    let step_outputs = serde_json::from_value(run.step_outputs.clone())
+        .map_err(|error| format!("persisted workflow step outputs are invalid: {error}"))?;
+    let trigger_context = match run.trigger_context.as_ref() {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("frozen workflow trigger context is invalid: {error}"))?,
+        None if allow_missing_trigger_context => TriggerContext::default(),
+        None => return Err("frozen workflow trigger context is missing".to_owned()),
+    };
+    let existing_trace = run
+        .execution_trace
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "persisted workflow execution trace is invalid".to_owned())?;
+
+    match db
+        .transition_workflow_run(
+            community_id,
+            run_id,
+            expected_status,
+            run.generation,
+            RunStatus::Running,
+        )
+        .await
+        .map_err(|error| format!("resume claim failed: {error}"))?
+    {
+        WorkflowRunTransitionOutcome::Conflict => Ok(false),
+        WorkflowRunTransitionOutcome::Applied { .. } => {
+            let result = buzz_workflow::executor::execute_claimed_from_step(
+                &engine,
+                community_id,
+                run_id,
+                &definition,
+                &trigger_context,
+                start_index,
+                step_outputs,
+            )
+            .await;
+            engine
+                .finalize_run(community_id, run_id, result, Some(existing_trace))
+                .await;
+            Ok(true)
+        }
+    }
+}
+
+#[cfg(test)]
+mod approval_decision_tests {
+    use super::*;
+    use buzz_core::channel::{ChannelType, ChannelVisibility};
+    use buzz_db::CreateCommunityWithOwnerResult;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn decision_event(content: &str, tags: Vec<Tag>) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_APPROVAL_GRANT as u16), content)
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .expect("sign decision event")
+    }
+
+    #[test]
+    fn decision_shape_routes_canonical_and_legacy_and_rejects_ambiguity() {
+        let approval_id = Uuid::new_v4().to_string();
+        let token_hash = "ab".repeat(32);
+        let canonical = decision_event(
+            r#"{"decision":"grant","note":null}"#,
+            vec![Tag::parse(["d", approval_id.as_str()]).expect("canonical tag")],
+        );
+        assert_eq!(
+            classify_approval_decision(&canonical).expect("canonical route"),
+            ApprovalDecisionRoute::Canonical
+        );
+
+        let legacy = decision_event(
+            "approved by an old client",
+            vec![Tag::parse(["e", token_hash.as_str()]).expect("legacy tag")],
+        );
+        assert_eq!(
+            classify_approval_decision(&legacy).expect("legacy route"),
+            ApprovalDecisionRoute::Legacy
+        );
+
+        let ambiguous = decision_event(
+            r#"{"decision":"grant","note":null}"#,
+            vec![
+                Tag::parse(["d", approval_id.as_str()]).expect("canonical tag"),
+                Tag::parse(["e", token_hash.as_str()]).expect("legacy tag"),
+            ],
+        );
+        assert!(matches!(
+            classify_approval_decision(&ambiguous),
+            Err(IngestError::Rejected(message))
+                if message == "invalid: approval decision reference is missing or ambiguous"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn canonical_grant_resumes_persisted_cursor_once_and_completes() {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect to test database");
+        buzz_db::migration::run_migrations(&pool)
+            .await
+            .expect("apply test database migrations");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let owner = Keys::generate();
+        let owner_bytes = owner.public_key().to_bytes().to_vec();
+        let host = format!("approval-resume-{}.example", Uuid::new_v4().simple());
+        let community_id = match db
+            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .await
+            .expect("create test community")
+        {
+            CreateCommunityWithOwnerResult::Created(community) => community.id,
+            other => panic!("expected a fresh community, got {other:?}"),
+        };
+        db.ensure_user(community_id, &owner_bytes)
+            .await
+            .expect("insert workflow owner user");
+        let channel = db
+            .create_channel(
+                community_id,
+                "approval-resume",
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                &owner_bytes,
+                None,
+            )
+            .await
+            .expect("create workflow channel");
+
+        let yaml = r#"
+name: Approval resume contract
+trigger:
+  on: webhook
+steps:
+  - id: approve
+    action: request_approval
+    from: owner
+    message: Approve the continuation
+  - id: execute
+    action: extract
+    from: trigger.text
+    matchers:
+      first_word: wf_word
+"#;
+        let (definition, definition_json) =
+            buzz_workflow::WorkflowEngine::parse_yaml(yaml).expect("parse workflow");
+        let definition_value: serde_json::Value =
+            serde_json::from_str(&definition_json).expect("parse canonical definition JSON");
+        let definition_hash = compute_definition_hash(&definition_json);
+        let workflow_id = Uuid::new_v4();
+        db.upsert_workflow(
+            community_id,
+            workflow_id,
+            Some(channel.id),
+            &owner_bytes,
+            "Approval resume contract",
+            &definition_json,
+            &definition_hash,
+            true,
+        )
+        .await
+        .expect("insert workflow");
+        let trigger_context = TriggerContext {
+            text: "execute exactly once".to_owned(),
+            channel_id: channel.id.to_string(),
+            author: owner.public_key().to_hex(),
+            ..TriggerContext::default()
+        };
+        let trigger_json = serde_json::to_value(&trigger_context).expect("serialize trigger");
+        let run_id = db
+            .create_workflow_run(
+                community_id,
+                workflow_id,
+                None,
+                Some(&trigger_json),
+                &definition_value,
+                &definition_hash,
+            )
+            .await
+            .expect("create workflow run");
+        let engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+
+        let suspended = buzz_workflow::executor::execute_from_step(
+            &engine,
+            community_id,
+            run_id,
+            &definition,
+            &trigger_context,
+            0,
+            None,
+        )
+        .await;
+        engine
+            .finalize_run(community_id, run_id, suspended, None)
+            .await;
+        let waiting = db
+            .get_workflow_run(community_id, run_id)
+            .await
+            .expect("read suspended run");
+        assert_eq!(waiting.status, RunStatus::WaitingApproval);
+        assert_eq!(waiting.next_step, 1);
+
+        let approval_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM workflow_approval_gates \
+             WHERE community_id = $1 AND run_id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read approval gate");
+        let decision_json = serde_json::json!({"decision": "grant", "note": null});
+        let decision_content = decision_json.to_string();
+        let decision_payload =
+            ApprovalDecisionPayload::new(decision_json).expect("validate decision payload");
+        let decision_tags = serde_json::json!([["d", approval_id.to_string()]]);
+        let event_id = [0xc1_u8; 32];
+        let signature = [0xc2_u8; 64];
+        let outcome = db
+            .decide_workflow_approval_gate(DecideWorkflowApprovalGateParams {
+                community_id,
+                approval_id,
+                actor_pubkey: &owner_bytes,
+                actor_kind: "human",
+                payload: &decision_payload,
+                event: WorkflowApprovalDecisionEvent {
+                    event_id: &event_id,
+                    pubkey: &owner_bytes,
+                    created_at: Utc::now(),
+                    kind: KIND_APPROVAL_GRANT as i32,
+                    tags: &decision_tags,
+                    content: &decision_content,
+                    signature: &signature,
+                    received_at: Utc::now(),
+                },
+            })
+            .await
+            .expect("grant approval");
+        let WorkflowApprovalDecisionOutcome::Applied { generation, .. } = outcome else {
+            panic!("expected applied decision, got {outcome:?}");
+        };
+
+        assert!(resume_workflow_from_persisted_cursor(
+            Arc::clone(&engine),
+            db.clone(),
+            community_id,
+            run_id,
+            RunStatus::ResumePending,
+            Some(generation),
+            false,
+        )
+        .await
+        .expect("resume approved run"));
+        assert!(!resume_workflow_from_persisted_cursor(
+            Arc::clone(&engine),
+            db.clone(),
+            community_id,
+            run_id,
+            RunStatus::ResumePending,
+            Some(generation),
+            false,
+        )
+        .await
+        .expect("replay grant resume"));
+
+        let completed = db
+            .get_workflow_run(community_id, run_id)
+            .await
+            .expect("read completed run");
+        assert_eq!(completed.status, RunStatus::Completed);
+        let trace = completed
+            .execution_trace
+            .as_array()
+            .expect("execution trace is an array");
+        assert_eq!(trace.len(), 2, "grant replay must not append another step");
+        assert_eq!(trace[0]["step_id"], "approve");
+        assert_eq!(trace[0]["status"], "waiting_approval");
+        assert_eq!(trace[1]["step_id"], "execute");
+        assert_eq!(trace[1]["status"], "completed");
+        assert_eq!(trace[1]["output"]["first_word"], "execute");
+
+        let legacy_token = format!("legacy-{}", Uuid::new_v4());
+        db.create_approval(buzz_db::workflow::CreateApprovalParams {
+            community_id,
+            token: &legacy_token,
+            workflow_id,
+            run_id,
+            step_id: "legacy-approval",
+            step_index: 0,
+            approver_spec: &owner.public_key().to_hex(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        })
+        .await
+        .expect("insert legacy approval");
+        let legacy_hash = Sha256::digest(legacy_token.as_bytes()).to_vec();
+        let legacy_hash_hex = hex::encode(&legacy_hash);
+        let legacy_event = decision_event(
+            "legacy approval",
+            vec![Tag::parse(["d", legacy_hash_hex.as_str()]).expect("legacy token tag")],
+        );
+        assert_eq!(
+            classify_approval_decision(&legacy_event).expect("route legacy decision"),
+            ApprovalDecisionRoute::Legacy
+        );
+        apply_legacy_workflow_approval_decision(
+            &db,
+            community_id,
+            &legacy_hash,
+            &owner_bytes,
+            &owner.public_key().to_hex(),
+            ApprovalStatus::Granted,
+            Some("legacy approval"),
+        )
+        .await
+        .expect("apply legacy decision through token-hash API");
+        assert_eq!(
+            db.get_approval_by_stored_hash(community_id, &legacy_hash)
+                .await
+                .expect("read resolved legacy approval")
+                .status,
+            ApprovalStatus::Granted
+        );
     }
 }

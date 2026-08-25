@@ -1681,6 +1681,39 @@ pub async fn execute_from_step(
     .await
 }
 
+/// Continue a run that a durable resume worker already claimed as `Running`.
+///
+/// The caller must acquire the run with the database status-and-generation
+/// fence before calling this function. Unlike [`execute_from_step`], this does
+/// not write the run status again, so a second worker cannot bypass that claim.
+pub async fn execute_claimed_from_step(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    def: &WorkflowDef,
+    trigger_ctx: &TriggerContext,
+    start_index: usize,
+    initial_outputs: HashMap<String, JsonValue>,
+) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
+    let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
+        (
+            WorkflowError::CapacityExceeded,
+            crate::error::PartialProgress::default(),
+        )
+    })?;
+
+    execute_steps(
+        engine,
+        community_id,
+        run_id,
+        def,
+        trigger_ctx,
+        start_index,
+        Some(initial_outputs),
+    )
+    .await
+}
+
 /// Internal: execute workflow steps starting from `start_index`, without
 /// acquiring the semaphore. Called by both [`execute_run`] and
 /// [`execute_from_step`] after they have already acquired a permit.
