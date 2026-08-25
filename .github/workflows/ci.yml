@@ -4,6 +4,15 @@ on:
     branches: [main, release]
   pull_request:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: "Run the full matrix or only jobs selected by changed paths"
+        type: choice
+        options:
+          - full
+          - delta
+        default: full
+        required: true
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
@@ -109,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
     permissions:
       contents: read
     steps:
@@ -130,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -152,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -244,7 +253,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -310,7 +319,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [changes, desktop-core, desktop-smoke-e2e]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
+    if: always() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
     permissions:
       contents: read
     steps:
@@ -331,7 +340,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -400,7 +409,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes, desktop-e2e-relay]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -576,7 +585,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [changes, desktop-e2e-integration-shard]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
+    if: always() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
     permissions:
       contents: read
     steps:
@@ -593,7 +602,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes, desktop-e2e-relay]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -757,7 +766,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes, desktop-e2e-relay]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -811,7 +820,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.web == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.web == 'true'
     permissions:
       contents: read
     steps:
@@ -846,7 +855,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.mobile == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.mobile == 'true'
     permissions:
       contents: read
     steps:
@@ -923,7 +932,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -958,7 +967,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     strategy:
@@ -997,7 +1006,8 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    # macOS bills 10×; full matrix belongs to landing heads.
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release')) || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full')
     permissions:
       contents: read
     steps:
