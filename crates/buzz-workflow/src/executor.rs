@@ -991,11 +991,6 @@ async fn dispatch_action_with_generation(
         }
 
         AddReaction { emoji } => {
-            if trigger_ctx.message_id.is_empty() {
-                return Err(WorkflowError::InvalidDefinition(
-                    "AddReaction: no trigger.message_id available".into(),
-                ));
-            }
             let prepared = load_prepared_effect(
                 engine,
                 community_id,
@@ -1013,6 +1008,11 @@ async fn dispatch_action_with_generation(
                 Some(PreparedEffect::Fire { claim, generation }) => (claim, generation),
                 Some(PreparedEffect::AlreadyFired(_)) => unreachable!("handled above"),
                 None => {
+                    if trigger_ctx.message_id.is_empty() {
+                        return Err(WorkflowError::InvalidDefinition(
+                            "AddReaction: no trigger.message_id available".into(),
+                        ));
+                    }
                     let wf_run = engine
                         .db
                         .get_workflow_run(community_id, run_id)
@@ -2623,6 +2623,16 @@ mod tests {
             )
             .await
             .expect("create message run");
+        db.update_workflow_run(
+            community,
+            message_run,
+            buzz_db::workflow::RunStatus::Running,
+            0,
+            &json!([]),
+            None,
+        )
+        .await
+        .expect("start message run");
         let PreparedEffect::Fire {
             claim: message_claim,
             generation: message_generation,
@@ -2641,7 +2651,7 @@ mod tests {
                 idempotency_key: None,
             })
             .expect("message payload"),
-            Some(1),
+            None,
         )
         .await
         .expect("claim message effect")
@@ -2710,6 +2720,16 @@ mod tests {
             )
             .await
             .expect("create reaction run");
+        db.update_workflow_run(
+            community,
+            reaction_run,
+            buzz_db::workflow::RunStatus::Running,
+            0,
+            &json!([]),
+            None,
+        )
+        .await
+        .expect("start reaction run");
         let PreparedEffect::Fire {
             claim: reaction_claim,
             generation: reaction_generation,
@@ -2728,7 +2748,7 @@ mod tests {
                 idempotency_key: None,
             })
             .expect("reaction payload"),
-            Some(1),
+            None,
         )
         .await
         .expect("claim reaction effect")
@@ -2751,13 +2771,15 @@ mod tests {
         db.delete_workflow(community, reaction_workflow)
             .await
             .expect("delete reaction workflow");
+        let mut recovery_trigger = trigger.clone();
+        recovery_trigger.message_id.clear();
         let reaction_result = dispatch_action_with_generation(
             "reaction",
             &reaction_action,
             &engine,
             community,
             reaction_run,
-            &trigger,
+            &recovery_trigger,
             &HashMap::new(),
             Some(reaction_generation),
         )
@@ -2769,6 +2791,35 @@ mod tests {
         assert_eq!(
             reaction_output,
             json!({"added": true, "event_id": "reaction-event-id"})
+        );
+        let calls_after_recovery = sink
+            .reactions
+            .lock()
+            .expect("recording sink lock")
+            .len();
+        let fired_replay = dispatch_action_with_generation(
+            "reaction",
+            &reaction_action,
+            &engine,
+            community,
+            reaction_run,
+            &recovery_trigger,
+            &HashMap::new(),
+            Some(reaction_generation),
+        )
+        .await
+        .expect("replay fired reaction after workflow deletion");
+        let StepResult::Completed(fired_output) = fired_replay else {
+            panic!("fired reaction replay must complete");
+        };
+        assert_eq!(fired_output, reaction_output);
+        assert_eq!(
+            sink.reactions
+                .lock()
+                .expect("recording sink lock")
+                .len(),
+            calls_after_recovery,
+            "fired replay must not call the sink again"
         );
 
         for (run_id, step_id, action, kind) in [
