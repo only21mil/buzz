@@ -172,7 +172,7 @@ fn event_has_tag(event: &Value, name: &str, wanted: &str) -> bool {
 fn advance_repo_query_cursor(filter: &mut Value, page: &[Value]) -> Result<(), CliError> {
     let last = page
         .last()
-        .expect("a non-empty repo query page has a last event");
+        .ok_or_else(|| CliError::Other("cannot advance an empty repo query page".into()))?;
     let created_at = last
         .get("created_at")
         .and_then(Value::as_u64)

@@ -80,13 +80,15 @@ pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result
     let workflows: Vec<serde_json::Value> =
         buzz_sdk::workflow_fold::fold_workflow_definitions(&events)
             .into_iter()
-            .map(|event| {
-                let event = serde_json::to_value(event)
-                    .expect("validated nostr workflow event must serialize");
-                workflow_list_item(&event)
+            .map(|event| -> Result<_, CliError> {
+                let event = serde_json::to_value(event).map_err(|error| {
+                    CliError::Other(format!("failed to serialize workflow event: {error}"))
+                })?;
+                Ok(workflow_list_item(&event))
             })
-            .collect();
-    let output = serde_json::to_string(&workflows).unwrap_or_default();
+            .collect::<Result<_, _>>()?;
+    let output = serde_json::to_string(&workflows)
+        .map_err(|error| CliError::Other(format!("failed to serialize workflows: {error}")))?;
     println!("{output}");
     Ok(())
 }
@@ -96,38 +98,41 @@ fn workflow_list_item(event: &serde_json::Value) -> serde_json::Value {
         .get("content")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    let mut item = serde_json::json!({
-        "workflow_id": extract_d_tag(event),
-        "content": content,
-        "created_at": event
-            .get("created_at")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0),
-        "pubkey": event
-            .get("pubkey")
-            .and_then(|value| value.as_str())
-            .unwrap_or(""),
-    });
+    let mut item = serde_json::Map::from_iter([
+        (
+            "workflow_id".into(),
+            serde_json::json!(extract_d_tag(event)),
+        ),
+        ("content".into(), serde_json::json!(content)),
+        (
+            "created_at".into(),
+            serde_json::json!(event
+                .get("created_at")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)),
+        ),
+        (
+            "pubkey".into(),
+            serde_json::json!(event
+                .get("pubkey")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")),
+        ),
+    ]);
 
     match buzz_workflow::WorkflowEngine::parse_yaml(content) {
         Ok((definition, _)) => {
-            let object = item
-                .as_object_mut()
-                .expect("workflow list item is an object");
-            object.insert("name".into(), serde_json::json!(definition.name));
-            object.insert("enabled".into(), serde_json::json!(definition.enabled));
+            item.insert("name".into(), serde_json::json!(definition.name));
+            item.insert("enabled".into(), serde_json::json!(definition.enabled));
         }
         Err(error) => {
-            let object = item
-                .as_object_mut()
-                .expect("workflow list item is an object");
-            object.insert("name".into(), serde_json::Value::Null);
-            object.insert("enabled".into(), serde_json::Value::Null);
-            object.insert("parse_error".into(), serde_json::json!(error.to_string()));
+            item.insert("name".into(), serde_json::Value::Null);
+            item.insert("enabled".into(), serde_json::Value::Null);
+            item.insert("parse_error".into(), serde_json::json!(error.to_string()));
         }
     }
 
-    item
+    serde_json::Value::Object(item)
 }
 
 /// Get a single workflow definition.

@@ -3020,7 +3020,8 @@ async fn ingest_event_inner(
     }
 
     let (stored_event, was_inserted) = if let Some(validated) = &validated_ci_event {
-        let ch_id = channel_id.expect("validated CI event has a channel");
+        let ch_id = channel_id
+            .ok_or_else(|| IngestError::Rejected("invalid: CI event requires a channel".into()))?;
         match state
             .db
             .store_ci_event(tenant.community(), ch_id, &event, validated)
