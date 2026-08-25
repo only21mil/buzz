@@ -325,11 +325,84 @@ mod tests {
         ApprovalDecisionPayload, CreateCommunityWithOwnerResult, DecideWorkflowApprovalGateParams,
         WorkflowApprovalDecisionEvent, WorkflowApprovalDecisionOutcome,
     };
-    use buzz_workflow::executor::TriggerContext;
+    use buzz_workflow::action_sink::{ActionEffectContext, ActionSink, ActionSinkError};
+    use buzz_workflow::executor::{ClaimedResume, TriggerContext};
     use chrono::{DateTime, Utc};
     use nostr::Keys;
     use sha2::{Digest, Sha256};
     use sqlx::PgPool;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    const RECOVERY_YAML: &str = r#"
+name: Approval recovery contract
+trigger:
+  on: webhook
+steps:
+  - id: approve
+    action: request_approval
+    from: owner
+    message: Approve the continuation
+  - id: execute
+    action: extract
+    from: trigger.text
+    matchers:
+      first_word: wf_word
+"#;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MessageCall {
+        effect: ActionEffectContext,
+        text: String,
+    }
+
+    #[derive(Default)]
+    struct RecordingActionSink {
+        messages: Mutex<Vec<MessageCall>>,
+    }
+
+    impl RecordingActionSink {
+        fn messages(&self) -> Vec<MessageCall> {
+            self.messages
+                .lock()
+                .expect("recording action sink lock")
+                .clone()
+        }
+    }
+
+    impl ActionSink for RecordingActionSink {
+        fn send_message(
+            &self,
+            effect: ActionEffectContext,
+            _community_id: CommunityId,
+            _channel_id: &str,
+            text: &str,
+            _author_pubkey: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+            self.messages
+                .lock()
+                .expect("recording action sink lock")
+                .push(MessageCall {
+                    effect,
+                    text: text.to_owned(),
+                });
+            Box::pin(async move { Ok(format!("event-{}", effect.idempotency_key)) })
+        }
+
+        fn add_reaction(
+            &self,
+            _effect: ActionEffectContext,
+            _community_id: CommunityId,
+            _channel_id: &str,
+            _target_event_id: &str,
+            _emoji: &str,
+            _author_pubkey: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ActionSinkError>> + Send + '_>>
+        {
+            Box::pin(async { unreachable!("reaction is not part of recovery fixtures") })
+        }
+    }
 
     struct RecoveryFixture {
         pool: PgPool,
@@ -340,9 +413,14 @@ mod tests {
         approval_id: Uuid,
         owner: Vec<u8>,
         decision_time: DateTime<Utc>,
+        sink: Arc<RecordingActionSink>,
     }
 
     async fn recovery_fixture() -> RecoveryFixture {
+        recovery_fixture_with_yaml(RECOVERY_YAML).await
+    }
+
+    async fn recovery_fixture_with_yaml(yaml: &str) -> RecoveryFixture {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
@@ -380,21 +458,6 @@ mod tests {
             .await
             .expect("create recovery test channel");
 
-        let yaml = r#"
-name: Approval recovery contract
-trigger:
-  on: webhook
-steps:
-  - id: approve
-    action: request_approval
-    from: owner
-    message: Approve the continuation
-  - id: execute
-    action: extract
-    from: trigger.text
-    matchers:
-      first_word: wf_word
-"#;
         let (definition, definition_json) =
             buzz_workflow::WorkflowEngine::parse_yaml(yaml).expect("parse recovery workflow");
         let definition_value =
@@ -436,6 +499,8 @@ steps:
             db.clone(),
             buzz_workflow::WorkflowConfig::default(),
         ));
+        let sink = Arc::new(RecordingActionSink::default());
+        engine.set_action_sink(sink.clone());
         let suspended = buzz_workflow::executor::execute_from_step(
             &engine,
             community_id,
@@ -474,6 +539,7 @@ steps:
             owner: owner_bytes,
             decision_time: DateTime::from_timestamp(Utc::now().timestamp(), 0)
                 .expect("current timestamp is representable"),
+            sink,
         }
     }
 
@@ -507,7 +573,7 @@ steps:
             .expect("grant recovery approval")
     }
 
-    async fn claim_then_expire(fixture: &RecoveryFixture, generation: i64) -> i64 {
+    async fn claim_resume(fixture: &RecoveryFixture, generation: i64) -> i64 {
         let claimed_generation = match fixture
             .db
             .claim_workflow_resume(
@@ -523,6 +589,10 @@ steps:
             WorkflowRunTransitionOutcome::Applied { generation } => generation,
             WorkflowRunTransitionOutcome::Conflict => panic!("initial recovery claim conflicted"),
         };
+        claimed_generation
+    }
+
+    async fn expire_claim(fixture: &RecoveryFixture, claimed_generation: i64) {
         let affected = sqlx::query(
             "UPDATE workflow_runs SET resume_lease_expires_at = clock_timestamp() \
              - INTERVAL '1 second' WHERE community_id = $1 AND id = $2 \
@@ -536,7 +606,44 @@ steps:
         .expect("expire simulated crashed worker lease")
         .rows_affected();
         assert_eq!(affected, 1);
+    }
+
+    async fn claim_then_expire(fixture: &RecoveryFixture, generation: i64) -> i64 {
+        let claimed_generation = claim_resume(fixture, generation).await;
+        expire_claim(fixture, claimed_generation).await;
         claimed_generation
+    }
+
+    async fn execute_claim_without_finalizing(fixture: &RecoveryFixture, claimed_generation: i64) {
+        let run = fixture
+            .db
+            .get_workflow_run(fixture.community_id, fixture.run_id)
+            .await
+            .expect("read claimed workflow run");
+        let definition = serde_json::from_value(run.definition_snapshot)
+            .expect("parse claimed workflow definition");
+        let trigger_context = serde_json::from_value(
+            run.trigger_context
+                .expect("claimed workflow trigger context"),
+        )
+        .expect("parse claimed workflow trigger context");
+        let step_outputs =
+            serde_json::from_value(run.step_outputs).expect("parse claimed workflow outputs");
+        let start_index = usize::try_from(run.next_step).expect("non-negative resume cursor");
+        let result = buzz_workflow::executor::execute_claimed_from_step(
+            &fixture.engine,
+            fixture.community_id,
+            fixture.run_id,
+            &definition,
+            &trigger_context,
+            ClaimedResume {
+                start_index,
+                step_outputs,
+                generation: claimed_generation,
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "claimed execution should succeed");
     }
 
     async fn assert_completed_once(fixture: &RecoveryFixture) {
@@ -685,5 +792,167 @@ steps:
             WorkflowResumeDriveOutcome::Conflict
         );
         assert_completed_once(&fixture).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn effect_recovery_skips_fired_message_after_crash_before_finalize() {
+        let yaml = r#"
+name: Fired effect recovery
+trigger:
+  on: webhook
+steps:
+  - id: approve
+    action: request_approval
+    from: owner
+    message: Approve delivery
+  - id: execute
+    action: send_message
+    text: recovered message
+"#;
+        let fixture = recovery_fixture_with_yaml(yaml).await;
+        let generation = match grant(&fixture).await {
+            WorkflowApprovalDecisionOutcome::Applied { generation, .. } => generation,
+            other => panic!("expected applied grant, got {other:?}"),
+        };
+        let claimed_generation = claim_resume(&fixture, generation).await;
+        execute_claim_without_finalizing(&fixture, claimed_generation).await;
+        assert_eq!(fixture.sink.messages().len(), 1);
+
+        expire_claim(&fixture, claimed_generation).await;
+        let outcome = run_workflow_resume_sweep_once(
+            Arc::clone(&fixture.engine),
+            fixture.db.clone(),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await
+        .expect("recover fired message effect");
+        assert_eq!(outcome.claimed, 1);
+        assert_eq!(
+            fixture.sink.messages().len(),
+            1,
+            "a fired claim must bypass the sink after reclaim"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn effect_recovery_fires_unfired_claim_once_with_same_identity() {
+        let yaml = r#"
+name: Unfired effect recovery
+trigger:
+  on: webhook
+steps:
+  - id: approve
+    action: request_approval
+    from: owner
+    message: Approve delivery
+  - id: execute
+    action: send_message
+    text: claimed message
+"#;
+        let fixture = recovery_fixture_with_yaml(yaml).await;
+        let generation = match grant(&fixture).await {
+            WorkflowApprovalDecisionOutcome::Applied { generation, .. } => generation,
+            other => panic!("expected applied grant, got {other:?}"),
+        };
+        let claimed_generation = claim_resume(&fixture, generation).await;
+        let run = fixture
+            .db
+            .get_workflow_run(fixture.community_id, fixture.run_id)
+            .await
+            .expect("read claimed workflow run");
+        let definition: buzz_workflow::WorkflowDef =
+            serde_json::from_value(run.definition_snapshot).expect("parse workflow definition");
+        let effect_spec =
+            serde_json::to_value(&definition.steps[1].action).expect("serialize message action");
+        let claim = fixture
+            .db
+            .claim_workflow_effect(
+                fixture.community_id,
+                fixture.run_id,
+                claimed_generation,
+                "execute",
+                0,
+                "send_message",
+                &effect_spec,
+            )
+            .await
+            .expect("claim message before firing");
+        let buzz_db::WorkflowEffectClaimOutcome::Ready(claim) = claim else {
+            panic!("new message claim must be ready");
+        };
+        assert!(fixture.sink.messages().is_empty());
+
+        expire_claim(&fixture, claimed_generation).await;
+        let outcome = run_workflow_resume_sweep_once(
+            Arc::clone(&fixture.engine),
+            fixture.db.clone(),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await
+        .expect("recover unfired message effect");
+        assert_eq!(outcome.claimed, 1);
+        let calls = fixture.sink.messages();
+        assert_eq!(calls.len(), 1, "an unfired claim must reach the sink once");
+        assert_eq!(calls[0].effect.idempotency_key, claim.idempotency_key);
+        assert_eq!(calls[0].effect.claimed_at, claim.claimed_at);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn effect_recovery_reclaimed_run_does_not_refire_prior_message() {
+        let yaml = r#"
+name: Prior effect recovery
+trigger:
+  on: webhook
+steps:
+  - id: before
+    action: send_message
+    text: before approval
+  - id: approve
+    action: request_approval
+    from: owner
+    message: Approve delivery
+  - id: after
+    action: send_message
+    text: after approval
+"#;
+        let fixture = recovery_fixture_with_yaml(yaml).await;
+        assert_eq!(
+            fixture
+                .sink
+                .messages()
+                .iter()
+                .map(|call| call.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before approval"]
+        );
+        let generation = match grant(&fixture).await {
+            WorkflowApprovalDecisionOutcome::Applied { generation, .. } => generation,
+            other => panic!("expected applied grant, got {other:?}"),
+        };
+        claim_then_expire(&fixture, generation).await;
+
+        let outcome = run_workflow_resume_sweep_once(
+            Arc::clone(&fixture.engine),
+            fixture.db.clone(),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await
+        .expect("recover run after prior message");
+        assert_eq!(outcome.claimed, 1);
+        assert_eq!(
+            fixture
+                .sink
+                .messages()
+                .iter()
+                .map(|call| call.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before approval", "after approval"]
+        );
     }
 }
