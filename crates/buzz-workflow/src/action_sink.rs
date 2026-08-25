@@ -13,8 +13,10 @@ use uuid::Uuid;
 /// Stable delivery identity for one claimed workflow effect.
 ///
 /// Sinks must use this identity when they can make a retry naturally
-/// idempotent. Relay events use both fields to reproduce the same signed event;
-/// webhook delivery uses `idempotency_key` as the `Idempotency-Key` header.
+/// idempotent. Relay events use both fields and the persisted payload to
+/// reproduce the same signed event. Relay dedup makes those effects
+/// exactly-once. Webhooks are at-least-once: retries reuse the persisted bytes
+/// and `idempotency_key`, so receivers must deduplicate `Idempotency-Key`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActionEffectContext {
     /// UUID fixed by the durable effect claim and reused across generations.
@@ -64,6 +66,19 @@ impl From<ActionSinkError> for crate::WorkflowError {
 /// Returns `Pin<Box<dyn Future>>` for dyn-compatibility — required because
 /// `WorkflowEngine` stores `Arc<dyn ActionSink>`.
 pub trait ActionSink: Send + Sync {
+    /// Resolve message mentions before the durable effect claim is written.
+    ///
+    /// The returned pubkeys become part of the immutable effect payload. A
+    /// retry must deliver those pubkeys and must not resolve names again.
+    fn resolve_message_mentions(
+        &self,
+        _community_id: CommunityId,
+        _channel_id: &str,
+        _text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, ActionSinkError>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Post a message to a channel on behalf of a workflow owner.
     ///
     /// - `community_id`: the server-resolved community that owns the workflow
@@ -84,6 +99,7 @@ pub trait ActionSink: Send + Sync {
         channel_id: &str,
         text: &str,
         author_pubkey: &str,
+        mentioned_pubkeys: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
 
     /// Add a reaction to an event on behalf of a workflow owner.

@@ -1039,6 +1039,7 @@ mod tests {
         assert!(workflow_effect_claims
             .contains("PRIMARY KEY (community_id, run_id, step_id, effect_index)"));
         assert!(workflow_effect_claims.contains("UNIQUE (community_id, idempotency_key)"));
+        assert!(workflow_effect_claims.contains("effect_payload JSONB NOT NULL"));
         assert!(workflow_effect_claims.contains("workflow_effect_claim_identity_immutable"));
         assert!(desired_schema.contains("CREATE TABLE workflow_effect_claims"));
         assert!(desired_schema.contains("workflow_effect_claim_identity_immutable"));

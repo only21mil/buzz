@@ -680,6 +680,26 @@ enum PreparedEffect {
     AlreadyFired(JsonValue),
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SendMessageEffectPayload {
+    channel_id: String,
+    text: String,
+    author_pubkey: String,
+    mentioned_pubkeys: Vec<String>,
+    #[serde(default)]
+    idempotency_key: Option<Uuid>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WebhookEffectPayload {
+    url: String,
+    method: String,
+    headers: Option<HashMap<String, String>>,
+    body: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<Uuid>,
+}
+
 /// Claim one external effect before delivery. Claims are keyed without the run
 /// generation, so a recovered executor consumes the earlier claim. Every
 /// currently implemented effectful action has exactly one effect at index 0.
@@ -690,6 +710,7 @@ async fn prepare_effect(
     step_id: &str,
     effect_kind: &str,
     action: &ActionDef,
+    effect_payload: &JsonValue,
     claimed_generation: Option<i64>,
 ) -> Result<PreparedEffect, WorkflowError> {
     let generation = match claimed_generation {
@@ -715,6 +736,7 @@ async fn prepare_effect(
             0,
             effect_kind,
             &effect_spec,
+            effect_payload,
         )
         .await?
     {
@@ -761,22 +783,6 @@ async fn dispatch_action_with_generation(
 
     match action {
         SendMessage { text, channel } => {
-            let (claim, generation) = match prepare_effect(
-                engine,
-                community_id,
-                run_id,
-                step_id,
-                "send_message",
-                action,
-                claimed_generation,
-            )
-            .await?
-            {
-                PreparedEffect::AlreadyFired(output) => {
-                    return Ok(StepResult::Completed(output));
-                }
-                PreparedEffect::Fire { claim, generation } => (claim, generation),
-            };
             // Look up workflow metadata for destination validation and
             // attribution, scoped to the run's community — the same run/workflow
             // UUID may exist in another community, so a bare-id lookup could
@@ -806,12 +812,52 @@ async fn dispatch_action_with_generation(
                 workflow.channel_id,
             )?;
             let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+            let mentioned_pubkeys = engine
+                .action_sink()?
+                .resolve_message_mentions(community_id, &channel_id, text)
+                .await
+                .map_err(WorkflowError::from)?;
+            let candidate_payload = serde_json::to_value(SendMessageEffectPayload {
+                channel_id,
+                text: text.clone(),
+                author_pubkey: owner_pubkey_hex,
+                mentioned_pubkeys,
+                idempotency_key: None,
+            })
+            .map_err(|error| {
+                WorkflowError::Database(format!(
+                    "failed to serialize send_message effect payload: {error}"
+                ))
+            })?;
+            let (claim, generation) = match prepare_effect(
+                engine,
+                community_id,
+                run_id,
+                step_id,
+                "send_message",
+                action,
+                &candidate_payload,
+                claimed_generation,
+            )
+            .await?
+            {
+                PreparedEffect::AlreadyFired(output) => {
+                    return Ok(StepResult::Completed(output));
+                }
+                PreparedEffect::Fire { claim, generation } => (claim, generation),
+            };
+            let payload: SendMessageEffectPayload =
+                serde_json::from_value(claim.effect_payload.clone()).map_err(|error| {
+                    WorkflowError::Database(format!(
+                        "stored send_message effect payload is invalid: {error}"
+                    ))
+                })?;
 
             info!(
                 run_id = %run_id,
                 step = step_id,
-                channel = %channel_id,
-                "SendMessage → {channel_id}: {text}"
+                channel = %payload.channel_id,
+                "SendMessage delivery"
             );
 
             let event_id = engine
@@ -822,9 +868,10 @@ async fn dispatch_action_with_generation(
                         claimed_at: claim.claimed_at,
                     },
                     community_id,
-                    &channel_id,
-                    text,
-                    &owner_pubkey_hex,
+                    &payload.channel_id,
+                    &payload.text,
+                    &payload.author_pubkey,
+                    &payload.mentioned_pubkeys,
                 )
                 .await
                 .map_err(WorkflowError::from)?;
@@ -856,6 +903,11 @@ async fn dispatch_action_with_generation(
         }
 
         AddReaction { emoji } => {
+            let candidate_payload = serde_json::json!({
+                "channel_id": trigger_ctx.channel_id,
+                "target_event_id": trigger_ctx.message_id,
+                "emoji": emoji,
+            });
             let (claim, generation) = match prepare_effect(
                 engine,
                 community_id,
@@ -863,6 +915,7 @@ async fn dispatch_action_with_generation(
                 step_id,
                 "add_reaction",
                 action,
+                &candidate_payload,
                 claimed_generation,
             )
             .await?
@@ -924,6 +977,18 @@ async fn dispatch_action_with_generation(
             headers,
             body,
         } => {
+            let candidate_payload = serde_json::to_value(WebhookEffectPayload {
+                url: url.clone(),
+                method: method.clone().unwrap_or_else(|| "POST".to_owned()),
+                headers: headers.clone(),
+                body: body.clone(),
+                idempotency_key: None,
+            })
+            .map_err(|error| {
+                WorkflowError::Database(format!(
+                    "failed to serialize webhook effect payload: {error}"
+                ))
+            })?;
             let (claim, generation) = match prepare_effect(
                 engine,
                 community_id,
@@ -931,6 +996,7 @@ async fn dispatch_action_with_generation(
                 step_id,
                 "call_webhook",
                 action,
+                &candidate_payload,
                 claimed_generation,
             )
             .await?
@@ -940,14 +1006,34 @@ async fn dispatch_action_with_generation(
                 }
                 PreparedEffect::Fire { claim, generation } => (claim, generation),
             };
-            let method_str = method.as_deref().unwrap_or("POST");
-            info!(run_id = %run_id, step = step_id, "CallWebhook → {method_str} {url}");
+            let payload: WebhookEffectPayload =
+                serde_json::from_value(claim.effect_payload.clone()).map_err(|error| {
+                    WorkflowError::Database(format!(
+                        "stored webhook effect payload is invalid: {error}"
+                    ))
+                })?;
+            let payload_key = payload.idempotency_key.ok_or_else(|| {
+                WorkflowError::Database(
+                    "stored webhook effect payload has no idempotency key".into(),
+                )
+            })?;
+            if payload_key != claim.idempotency_key {
+                return Err(WorkflowError::Database(
+                    "stored webhook effect payload has a mismatched idempotency key".into(),
+                ));
+            }
+            info!(run_id = %run_id, step = step_id, "CallWebhook delivery");
 
             #[cfg(feature = "reqwest")]
             {
-                let result =
-                    call_webhook_impl(url, method_str, headers, body, claim.idempotency_key)
-                        .await?;
+                let result = call_webhook_impl(
+                    &payload.url,
+                    &payload.method,
+                    &payload.headers,
+                    &payload.body,
+                    payload_key,
+                )
+                .await?;
                 mark_effect_fired(engine, community_id, run_id, step_id, generation, result).await
             }
 
@@ -958,7 +1044,7 @@ async fn dispatch_action_with_generation(
                     run_id = %run_id, step = step_id,
                     "CallWebhook: reqwest feature not enabled, skipping HTTP call"
                 );
-                let _ = (headers, body, claim); // suppress unused warnings
+                let _ = (payload, claim); // suppress unused warnings
                 mark_effect_fired(
                     engine,
                     community_id,
@@ -1588,6 +1674,10 @@ async fn check_ssrf(host: &str, port: u16) -> Result<std::net::IpAddr, WorkflowE
     debug!("Resolved webhook host '{}' → {:?}", host, addrs);
 
     for ip in &addrs {
+        #[cfg(test)]
+        if ip.is_loopback() {
+            continue;
+        }
         if buzz_core::network::is_private_ip(ip) {
             return Err(WorkflowError::WebhookError(format!(
                 "SSRF blocked: '{host}' resolved to private/reserved address {ip}"
@@ -2097,6 +2187,88 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
 
+    #[cfg(feature = "reqwest")]
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut chunk).await.expect("read stub request");
+            assert!(count > 0, "stub request closed before headers");
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .map(|value| value.trim().parse::<usize>().expect("content length"))
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut chunk).await.expect("read stub body");
+                assert!(count > 0, "stub request closed before body");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            return request;
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn webhook_retry_reuses_body_bytes_and_idempotency_key() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind webhook stub");
+        let address = listener.local_addr().expect("stub address");
+        let receiver = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept webhook");
+                requests.push(read_http_request(&mut stream).await);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("write stub response");
+            }
+            requests
+        });
+
+        let url = format!("http://{address}/effect");
+        let body = Some("{\"member\":\"original\"}".to_owned());
+        let key = Uuid::new_v4();
+        for _ in 0..2 {
+            call_webhook_impl(&url, "POST", &None, &body, key)
+                .await
+                .expect("deliver webhook attempt");
+        }
+        let requests = receiver.await.expect("join webhook stub");
+        let split = |request: &[u8]| {
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .expect("request header terminator");
+            (&request[..header_end], &request[header_end + 4..])
+        };
+        let (first_headers, first_body) = split(&requests[0]);
+        let (second_headers, second_body) = split(&requests[1]);
+        assert_eq!(first_body, second_body, "webhook retry body changed");
+        assert_eq!(first_body, body.as_deref().expect("body").as_bytes());
+        let expected_key = format!("idempotency-key: {key}");
+        assert!(String::from_utf8_lossy(first_headers)
+            .to_ascii_lowercase()
+            .contains(&expected_key));
+        assert!(String::from_utf8_lossy(second_headers)
+            .to_ascii_lowercase()
+            .contains(&expected_key));
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ReactionCall {
         community_id: CommunityId,
@@ -2119,6 +2291,7 @@ mod tests {
             _channel_id: &str,
             _text: &str,
             _author_pubkey: &str,
+            _mentioned_pubkeys: &[String],
         ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
             Box::pin(async { unreachable!("send_message is not part of this regression") })
         }

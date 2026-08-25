@@ -223,6 +223,45 @@ fn validate_reaction_target_channel(
 }
 
 impl ActionSink for RelayActionSink {
+    fn resolve_message_mentions(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, ActionSinkError>> + Send + '_>> {
+        let channel_id = channel_id.to_owned();
+        let text = text.to_owned();
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+            let channel_uuid = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
+            let members = state
+                .db
+                .get_members(community_id, channel_uuid)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+            let member_pubkeys: Vec<Vec<u8>> = members.iter().map(|m| m.pubkey.clone()).collect();
+            let users = state
+                .db
+                .get_users_bulk(community_id, &member_pubkeys)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+            let named_members: Vec<(String, String)> = users
+                .into_iter()
+                .filter_map(|user| {
+                    Some((
+                        user.display_name?,
+                        nostr::PublicKey::from_slice(&user.pubkey).ok()?.to_hex(),
+                    ))
+                })
+                .collect();
+            Ok(resolve_mention_pubkeys(&text, &named_members))
+        })
+    }
+
     fn send_message(
         &self,
         effect: ActionEffectContext,
@@ -230,10 +269,12 @@ impl ActionSink for RelayActionSink {
         channel_id: &str,
         text: &str,
         author_pubkey: &str,
+        mentioned_pubkeys: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
+        let mentioned_pubkeys = mentioned_pubkeys.to_owned();
 
         Box::pin(async move {
             // 0. Upgrade weak reference — fails only during shutdown.
@@ -323,29 +364,9 @@ impl ActionSink for RelayActionSink {
                 )?,
             ];
 
-            // Resolve `@Name` mentions to channel-member pubkeys and append a
-            // `p` tag for each (skipping the author, already tagged above). A
-            // resolution failure must not drop the message, so log and proceed
-            // with the base tags.
-            let members = state
-                .db
-                .get_members(tenant.community(), channel_uuid)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
-            let member_pubkeys: Vec<Vec<u8>> = members.iter().map(|m| m.pubkey.clone()).collect();
-            let users = state
-                .db
-                .get_users_bulk(tenant.community(), &member_pubkeys)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
-            let named_members: Vec<(String, String)> = users
-                .into_iter()
-                .filter_map(|u| {
-                    let name = u.display_name?;
-                    Some((name, nostr::PublicKey::from_slice(&u.pubkey).ok()?.to_hex()))
-                })
-                .collect();
-            for mentioned in resolve_mention_pubkeys(&text, &named_members) {
+            // Mention pubkeys were resolved before the claim and are immutable.
+            // Retries build the event from this persisted list, never live names.
+            for mentioned in mentioned_pubkeys {
                 if mentioned == author_pubkey_hex {
                     continue;
                 }
@@ -941,6 +962,7 @@ mod integration_tests {
                 &channel.id.to_string(),
                 "heads up @Robby — please take a look",
                 &author_hex,
+                &[agent_hex.clone()],
             )
             .await
             .expect("send_message");

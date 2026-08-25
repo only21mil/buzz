@@ -115,7 +115,10 @@ pub enum ActionDef {
         /// Emoji name (e.g. `"thumbsup"`).
         emoji: String,
     },
-    /// HTTP POST to an external URL.
+    /// Send an HTTP request to an external URL.
+    ///
+    /// Delivery is at-least-once. Retries reuse the byte-identical rendered
+    /// body and stable `Idempotency-Key`; receivers must deduplicate that key.
     CallWebhook {
         /// Target URL (must be a public HTTPS endpoint).
         url: String,

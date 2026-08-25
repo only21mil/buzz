@@ -528,7 +528,7 @@ Note: Both `TriggerDef` and `ActionDef` use serde internally-tagged enums. Trigg
 | `send_dm` | Direct message to a user (pubkey hex or `{{trigger.author}}`) |
 | `set_channel_topic` | Update channel topic |
 | `add_reaction` | React to the trigger message |
-| `call_webhook` | HTTP POST to external URL (SSRF-protected, redirects disabled, 1 MiB response cap) |
+| `call_webhook` | At-least-once HTTP delivery. Retries reuse the byte-identical rendered body and stable `Idempotency-Key`; receivers must deduplicate that key. SSRF-protected, redirects disabled, 1 MiB response cap. |
 | `request_approval` | Suspend execution; fields: `from`, `message`, `timeout` (default 24h) |
 | `delay` | Pause execution (max 300 seconds) |
 

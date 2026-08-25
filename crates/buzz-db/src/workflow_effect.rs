@@ -13,12 +13,14 @@ use uuid::Uuid;
 use crate::{DbError, Result};
 
 /// Stable identity supplied to an external sink for replay deduplication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowEffectClaim {
     /// Key reused on every attempt to deliver this effect.
     pub idempotency_key: Uuid,
     /// Database time fixed when the effect was first claimed.
     pub claimed_at: DateTime<Utc>,
+    /// Fully rendered delivery input fixed by the first claim.
+    pub effect_payload: Value,
 }
 
 /// Result of claiming a workflow effect under a generation fence.
@@ -55,6 +57,33 @@ pub async fn claim_workflow_effect(
     effect_kind: &str,
     effect_spec: &Value,
 ) -> Result<WorkflowEffectClaimOutcome> {
+    claim_workflow_effect_with_payload(
+        pool,
+        community_id,
+        run_id,
+        expected_generation,
+        step_id,
+        effect_index,
+        effect_kind,
+        effect_spec,
+        effect_spec,
+    )
+    .await
+}
+
+/// Claim an effect and pin its fully rendered delivery payload.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_workflow_effect_with_payload(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    expected_generation: i64,
+    step_id: &str,
+    effect_index: i16,
+    effect_kind: &str,
+    effect_spec: &Value,
+    effect_payload: &Value,
+) -> Result<WorkflowEffectClaimOutcome> {
     let mut tx = pool.begin().await?;
     let owned = sqlx::query(
         "SELECT 1 FROM workflow_runs WHERE community_id = $1 AND id = $2 \
@@ -70,13 +99,25 @@ pub async fn claim_workflow_effect(
         return Ok(WorkflowEffectClaimOutcome::Conflict);
     }
 
+    let idempotency_key = Uuid::new_v4();
+    let mut effect_payload = effect_payload.clone();
+    let payload_object = effect_payload.as_object_mut().ok_or_else(|| {
+        DbError::InvalidData("workflow effect payload must be a JSON object".to_owned())
+    })?;
+    payload_object.insert(
+        "idempotency_key".to_owned(),
+        Value::String(idempotency_key.to_string()),
+    );
+
     let row = sqlx::query(
         r#"
         INSERT INTO workflow_effect_claims
-            (community_id, run_id, step_id, effect_index, effect_kind, effect_spec)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (community_id, run_id, step_id, effect_index, effect_kind, effect_spec,
+             effect_payload, idempotency_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (community_id, run_id, step_id, effect_index) DO NOTHING
-        RETURNING effect_kind, effect_spec, idempotency_key, claimed_at, fired_at, output
+        RETURNING effect_kind, effect_spec, effect_payload, idempotency_key,
+                  claimed_at, fired_at, output
         "#,
     )
     .bind(community_id.as_uuid())
@@ -85,6 +126,8 @@ pub async fn claim_workflow_effect(
     .bind(effect_index)
     .bind(effect_kind)
     .bind(effect_spec)
+    .bind(&effect_payload)
+    .bind(idempotency_key)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -92,7 +135,7 @@ pub async fn claim_workflow_effect(
         match row {
             Some(row) => row,
             None => sqlx::query(
-                "SELECT effect_kind, effect_spec, idempotency_key, claimed_at, fired_at, output \
+                "SELECT effect_kind, effect_spec, effect_payload, idempotency_key, claimed_at, fired_at, output \
                  FROM workflow_effect_claims WHERE community_id = $1 AND run_id = $2 \
                  AND step_id = $3 AND effect_index = $4 FOR UPDATE",
             )
@@ -119,6 +162,7 @@ pub async fn claim_workflow_effect(
         WorkflowEffectClaimOutcome::Ready(WorkflowEffectClaim {
             idempotency_key: row.try_get("idempotency_key")?,
             claimed_at: row.try_get("claimed_at")?,
+            effect_payload: row.try_get("effect_payload")?,
         })
     };
     tx.commit().await?;

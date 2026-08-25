@@ -439,6 +439,7 @@ CREATE TABLE workflow_effect_claims (
     effect_index SMALLINT NOT NULL CHECK (effect_index >= 0),
     effect_kind TEXT NOT NULL CHECK (octet_length(effect_kind) BETWEEN 1 AND 64),
     effect_spec JSONB NOT NULL CHECK (jsonb_typeof(effect_spec) = 'object'),
+    effect_payload JSONB NOT NULL CHECK (jsonb_typeof(effect_payload) = 'object'),
     idempotency_key UUID NOT NULL DEFAULT gen_random_uuid(),
     claimed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     fired_at TIMESTAMPTZ,
@@ -463,6 +464,7 @@ BEGIN
        OR NEW.effect_index IS DISTINCT FROM OLD.effect_index
        OR NEW.effect_kind IS DISTINCT FROM OLD.effect_kind
        OR NEW.effect_spec IS DISTINCT FROM OLD.effect_spec
+       OR NEW.effect_payload IS DISTINCT FROM OLD.effect_payload
        OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
        OR NEW.claimed_at IS DISTINCT FROM OLD.claimed_at THEN
         RAISE EXCEPTION 'workflow effect claim identity is immutable';

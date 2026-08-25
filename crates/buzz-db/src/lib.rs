@@ -3961,8 +3961,9 @@ impl Db {
         effect_index: i16,
         effect_kind: &str,
         effect_spec: &serde_json::Value,
+        effect_payload: &serde_json::Value,
     ) -> Result<WorkflowEffectClaimOutcome> {
-        workflow_effect::claim_workflow_effect(
+        workflow_effect::claim_workflow_effect_with_payload(
             &self.pool,
             community_id,
             run_id,
@@ -3971,6 +3972,7 @@ impl Db {
             effect_index,
             effect_kind,
             effect_spec,
+            effect_payload,
         )
         .await
     }

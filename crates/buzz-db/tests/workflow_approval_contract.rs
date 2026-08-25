@@ -1244,7 +1244,13 @@ async fn crash_after_effect_fired_recovers_without_double_post() {
 async fn crash_after_claim_before_fire_reuses_identity_and_fires_once() {
     let fixture = Fixture::new().await;
     let effect_spec = json!({"call_webhook": {"url": "https://example.test/hook"}});
-    let first = buzz_db::workflow_effect::claim_workflow_effect(
+    let original_payload = json!({
+        "url": "https://example.test/hook",
+        "method": "POST",
+        "headers": {"content-type": "application/json"},
+        "body": "{\"member\":\"original\"}"
+    });
+    let first = buzz_db::workflow_effect::claim_workflow_effect_with_payload(
         &fixture.pool,
         fixture.community_id,
         fixture.ids.run_id,
@@ -1253,6 +1259,7 @@ async fn crash_after_claim_before_fire_reuses_identity_and_fires_once() {
         0,
         "call_webhook",
         &effect_spec,
+        &original_payload,
     )
     .await
     .expect("claim webhook effect");
@@ -1261,7 +1268,13 @@ async fn crash_after_claim_before_fire_reuses_identity_and_fires_once() {
     };
 
     let generation = reclaim_running_generation(&fixture).await;
-    let recovered = buzz_db::workflow_effect::claim_workflow_effect(
+    let changed_payload = json!({
+        "url": "https://example.test/hook",
+        "method": "POST",
+        "headers": {"content-type": "application/json"},
+        "body": "{\"member\":\"changed\"}"
+    });
+    let recovered = buzz_db::workflow_effect::claim_workflow_effect_with_payload(
         &fixture.pool,
         fixture.community_id,
         fixture.ids.run_id,
@@ -1270,6 +1283,7 @@ async fn crash_after_claim_before_fire_reuses_identity_and_fires_once() {
         0,
         "call_webhook",
         &effect_spec,
+        &changed_payload,
     )
     .await
     .expect("recover claimed webhook effect");
@@ -1277,6 +1291,15 @@ async fn crash_after_claim_before_fire_reuses_identity_and_fires_once() {
         panic!("an unfired claim must remain ready after reclaim");
     };
     assert_eq!(recovered_claim, first_claim, "recovery must reuse the key");
+    assert_eq!(
+        recovered_claim.effect_payload["body"], original_payload["body"],
+        "recovery must reuse the originally rendered bytes"
+    );
+    assert_eq!(
+        recovered_claim.effect_payload["idempotency_key"],
+        first_claim.idempotency_key.to_string(),
+        "the stable delivery key must be part of the pinned payload"
+    );
 
     let mut sink_calls = 0;
     sink_calls += 1;

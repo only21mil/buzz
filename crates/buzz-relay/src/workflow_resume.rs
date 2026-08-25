@@ -355,6 +355,7 @@ steps:
     struct MessageCall {
         effect: ActionEffectContext,
         text: String,
+        mentioned_pubkeys: Vec<String>,
     }
 
     #[derive(Default)]
@@ -379,6 +380,7 @@ steps:
             _channel_id: &str,
             text: &str,
             _author_pubkey: &str,
+            mentioned_pubkeys: &[String],
         ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
             self.messages
                 .lock()
@@ -386,6 +388,7 @@ steps:
                 .push(MessageCall {
                     effect,
                     text: text.to_owned(),
+                    mentioned_pubkeys: mentioned_pubkeys.to_owned(),
                 });
             Box::pin(async move { Ok(format!("event-{}", effect.idempotency_key)) })
         }
@@ -867,6 +870,12 @@ steps:
             serde_json::from_value(run.definition_snapshot).expect("parse workflow definition");
         let effect_spec =
             serde_json::to_value(&definition.steps[1].action).expect("serialize message action");
+        let effect_payload = serde_json::json!({
+            "channel_id": "00000000-0000-0000-0000-000000000001",
+            "text": "claimed message",
+            "author_pubkey": hex::encode(&fixture.owner),
+            "mentioned_pubkeys": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        });
         let claim = fixture
             .db
             .claim_workflow_effect(
@@ -877,6 +886,7 @@ steps:
                 0,
                 "send_message",
                 &effect_spec,
+                &effect_payload,
             )
             .await
             .expect("claim message before firing");
@@ -899,6 +909,11 @@ steps:
         assert_eq!(calls.len(), 1, "an unfired claim must reach the sink once");
         assert_eq!(calls[0].effect.idempotency_key, claim.idempotency_key);
         assert_eq!(calls[0].effect.claimed_at, claim.claimed_at);
+        assert_eq!(
+            calls[0].mentioned_pubkeys,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "recovery must fire the mention pubkeys pinned before live resolution changed"
+        );
     }
 
     #[tokio::test]
