@@ -1701,12 +1701,12 @@ pub async fn run_prompt_task(
     //
     // Failure modes (all fail open — no crash, no block):
     //   * no owner configured → skip (no NIP-AE namespace exists)
-    //   * confirmed absence → cache the onboarding nudge so the agent
-    //     learns how to bootstrap itself.
+    //   * confirmed absence → agent-sign and cache the canonical lean core.
+    //     If that write fails, cache the legacy onboarding nudge instead.
     //   * transport / decrypt / parse error → inject nothing. We never
     //     mistake "relay slow or broken" for "no core" — that would invite
     //     the agent to overwrite real, just-unreachable memory.
-    //   * fetch exceeds CORE_FETCH_TIMEOUT → inject nothing, same reason.
+    //   * fetch timeout → inject nothing, same reason. Seed timeout → nudge.
     //
     // Per Tyler's locked spec: NO mid-session refreshes. Re-fetch only
     // happens when a session is invalidated and recreated (see
@@ -1719,26 +1719,16 @@ pub async fn run_prompt_task(
         {
             let is_new_channel_session = !agent.state.has_reusable_channel_session(cid);
             if is_new_channel_session && !agent.state.core_sections.contains_key(cid) {
-                // Bounded — we'd rather start the session with no core hint
-                // than block session creation on a stalled relay.
-                const CORE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-                let fetch = crate::engram_fetch::build_core_section(
+                // The fetch and optional first-run write are independently
+                // bounded inside `build_core_section`.
+                let section = crate::engram_fetch::build_core_section(
                     &ctx.rest_client,
                     &ctx.agent_keys,
                     owner_pk,
-                );
-                let section = match tokio::time::timeout(CORE_FETCH_TIMEOUT, fetch).await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "engram::core",
-                            channel = %cid,
-                            timeout_ms = CORE_FETCH_TIMEOUT.as_millis() as u64,
-                            "core fetch timed out — emitting no section"
-                        );
-                        None
-                    }
-                };
+                    ctx.session_title.as_deref().unwrap_or(&agent.agent_name),
+                    &ctx.relay_url,
+                )
+                .await;
                 if let Some(rendered) = section {
                     tracing::info!(
                         target: "engram::core",
