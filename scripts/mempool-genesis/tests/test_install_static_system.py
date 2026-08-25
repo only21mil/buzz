@@ -5,6 +5,7 @@ import importlib.util
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -16,6 +17,11 @@ SPEC = importlib.util.spec_from_file_location("install_static_system", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+FREEZE_SCRIPT = SCRIPT.parent / "freeze-install-package.py"
+FREEZE_SPEC = importlib.util.spec_from_file_location("freeze_install_package", FREEZE_SCRIPT)
+assert FREEZE_SPEC is not None and FREEZE_SPEC.loader is not None
+FREEZER = importlib.util.module_from_spec(FREEZE_SPEC)
+FREEZE_SPEC.loader.exec_module(FREEZER)
 
 
 class StaticManifestTests(unittest.TestCase):
@@ -24,26 +30,47 @@ class StaticManifestTests(unittest.TestCase):
         package = Path(temporary.name)
         package.chmod(0o700)
         entries = []
-        for target, (source_name, mode) in MODULE.TARGETS.items():
+        contracts = {
+            target: (source_name, "static", "static", mode, mode)
+            for target, (source_name, mode) in MODULE.TARGETS.items()
+        }
+        contracts.update(
+            {
+                target: (source_name, "desktop", role, source_mode, install_mode)
+                for target, (source_name, role, source_mode, install_mode) in MODULE.DESKTOP_TARGETS.items()
+            }
+        )
+        for target, (source_name, owner, role, source_mode, install_mode) in contracts.items():
             source = package / source_name
             source.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             source.write_bytes(target.encode())
-            source.chmod(mode)
+            source.chmod(source_mode)
             entries.append(
                 {
+                    "owner": owner,
+                    "role": role,
                     "source": source_name,
                     "target": target,
-                    "mode": f"{mode:04o}",
+                    "source_mode": f"{source_mode:04o}",
+                    "install_mode": f"{install_mode:04o}",
+                    "status": "A",
                     "sha256": hashlib.sha256(target.encode()).hexdigest(),
                 }
             )
-        manifest = package / "manifest.json"
+        entries.sort(key=lambda entry: entry["target"].encode())
+        launcher_hash = next(
+            entry["sha256"] for entry in entries if entry["role"] == "desktop_launcher"
+        )
+        manifest = package / MODULE.MANIFEST_NAME
         manifest.write_text(
             json.dumps(
                 {
                     "schema": MODULE.SCHEMA,
                     "package_id": "mempool-genesis-static-test",
                     "entries": entries,
+                    "desktop_launcher_sha256": launcher_hash,
+                    "desktop_previous_launcher_sha256": "a" * 64,
+                    "package_fingerprint": MODULE.package_fingerprint(entries),
                 }
             )
         )
@@ -58,7 +85,7 @@ class StaticManifestTests(unittest.TestCase):
         fingerprints: dict[str, str] | None = None,
     ) -> Path:
         if changed_paths is None:
-            manifest = json.loads((package / "manifest.json").read_text())
+            manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
             changed_paths = sorted(
                 [
                     {
@@ -72,16 +99,26 @@ class StaticManifestTests(unittest.TestCase):
             )
         artifact_fingerprint = hashlib.sha256(
             "".join(
-                f'{entry["status"]}\t{entry["sha256"]}\t{entry["path"]}\n'
+                f'{entry["status"]}\t{entry.get("sha256", "-")}\t{entry["path"]}\n'
                 for entry in changed_paths
             ).encode()
         ).hexdigest()
+        manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
+        package_fingerprints = {
+            "package_fingerprint": manifest["package_fingerprint"],
+            "desktop_launcher_sha256": manifest["desktop_launcher_sha256"],
+            "desktop_previous_launcher_sha256": manifest[
+                "desktop_previous_launcher_sha256"
+            ],
+        }
+        if fingerprints is not None:
+            package_fingerprints.update(fingerprints)
         bundle = {
             "schema": "tier2-evidence-v2",
             "revision": 1,
             "candidate": {"mode": "files"},
             "changed_paths": changed_paths,
-            "fingerprints": fingerprints or {},
+            "fingerprints": package_fingerprints,
             "artifact_fingerprint": artifact_fingerprint,
         }
         bundle_path = package / "evidence.json"
@@ -117,9 +154,55 @@ class StaticManifestTests(unittest.TestCase):
     def test_accepts_exact_manifest(self) -> None:
         temporary, package = self.make_package()
         self.addCleanup(temporary.cleanup)
-        package_id, entries = MODULE.exact_manifest(package)
-        self.assertEqual(package_id, "mempool-genesis-static-test")
-        self.assertEqual(len(entries), len(MODULE.TARGETS))
+        manifest, entries = MODULE.exact_manifest(package)
+        self.assertEqual(manifest["package_id"], "mempool-genesis-static-test")
+        self.assertEqual(len(entries), len(MODULE.TARGETS) + len(MODULE.DESKTOP_TARGETS))
+
+    def test_freeze_manifest_is_deterministic(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        repo = root / "repo"
+        binary_dir = repo / "target/release"
+        binary_dir.mkdir(mode=0o700, parents=True)
+        system_dir = repo / "scripts/mempool-genesis"
+        system_dir.mkdir(mode=0o700, parents=True)
+        for _target, (source_name, mode) in MODULE.TARGETS.items():
+            source = (
+                binary_dir / Path(source_name).name
+                if source_name.startswith("bin/")
+                else system_dir / Path(source_name).name
+            )
+            source.write_bytes(source_name.encode())
+            source.chmod(FREEZER.repository_source_modes(source_name, mode)[-1])
+        launcher = system_dir / "launch-buzz-desktop"
+        launcher.write_bytes(b"new launcher")
+        launcher.chmod(0o755)
+        app = root / "Buzz.AppImage"
+        app.write_bytes(b"desktop app")
+        app.chmod(0o755)
+        previous = root / "previous-launcher"
+        previous.write_bytes(b"previous launcher")
+        previous.chmod(0o700)
+
+        for name in ("one", "two"):
+            FREEZER.freeze_package(
+                root / name,
+                "mempool-genesis-static-test",
+                repo,
+                binary_dir,
+                app,
+                previous,
+            )
+        self.assertEqual(
+            (root / "one" / MODULE.MANIFEST_NAME).read_bytes(),
+            (root / "two" / MODULE.MANIFEST_NAME).read_bytes(),
+        )
+        self.assertEqual(
+            (root / "one/system/buzz-agent-key-handoff.sudoers").stat().st_mode
+            & 0o777,
+            0o440,
+        )
 
     def test_rejects_duplicate_json_keys(self) -> None:
         with self.assertRaises(ValueError):
@@ -128,63 +211,183 @@ class StaticManifestTests(unittest.TestCase):
     def test_rejects_manifest_target_drift(self) -> None:
         temporary, package = self.make_package()
         self.addCleanup(temporary.cleanup)
-        manifest = json.loads((package / "manifest.json").read_text())
+        manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
         manifest["entries"][0]["target"] = "/etc/passwd"
-        (package / "manifest.json").write_text(json.dumps(manifest))
-        (package / "manifest.json").chmod(0o600)
+        (package / MODULE.MANIFEST_NAME).write_text(json.dumps(manifest))
+        (package / MODULE.MANIFEST_NAME).chmod(0o600)
         with self.assertRaises(ValueError):
+            MODULE.exact_manifest(package)
+
+    def test_rejects_manifest_entry_missing_sha256(self) -> None:
+        temporary, package = self.make_package()
+        self.addCleanup(temporary.cleanup)
+        manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
+        del manifest["entries"][0]["sha256"]
+        (package / MODULE.MANIFEST_NAME).write_text(json.dumps(manifest))
+        (package / MODULE.MANIFEST_NAME).chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "invalid manifest entry"):
+            MODULE.exact_manifest(package)
+
+    def test_desktop_launcher_hash_mismatch_is_rejected(self) -> None:
+        temporary, package = self.make_package()
+        self.addCleanup(temporary.cleanup)
+        manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
+        manifest["desktop_launcher_sha256"] = "0" * 64
+        (package / MODULE.MANIFEST_NAME).write_text(json.dumps(manifest))
+        (package / MODULE.MANIFEST_NAME).chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "desktop launcher hash mismatch"):
             MODULE.exact_manifest(package)
 
     def test_closure_binding_requires_exact_package_source_set_and_hashes(self) -> None:
         temporary, package = self.make_package()
         self.addCleanup(temporary.cleanup)
-        manifest = json.loads((package / "manifest.json").read_text())
-        sources = {
-            str(package / entry["source"]): entry["sha256"] for entry in manifest["entries"]
-        }
+        manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
+        parsed_manifest, entries = MODULE.exact_manifest(package)
         state = self.make_closure(package)
-        MODULE.bind_accepted_sources(state, sources, self.make_attestation(state))
+        MODULE.bind_accepted_manifest(
+            package, parsed_manifest, entries, self.make_attestation(state), state
+        )
 
         bundle = json.loads((package / "evidence.json").read_text())
         incomplete = bundle["changed_paths"][:-1]
         missing_state = self.make_closure(package, changed_paths=incomplete)
         with self.assertRaisesRegex(ValueError, "exactly"):
-            MODULE.bind_accepted_sources(
-                missing_state, sources, self.make_attestation(missing_state)
+            MODULE.bind_accepted_manifest(
+                package,
+                parsed_manifest,
+                entries,
+                self.make_attestation(missing_state),
+                missing_state,
             )
 
         mismatched = [dict(entry) for entry in bundle["changed_paths"]]
         mismatched[0]["sha256"] = "0" * 64
         mismatch_state = self.make_closure(package, changed_paths=mismatched)
         with self.assertRaisesRegex(ValueError, "hash"):
-            MODULE.bind_accepted_sources(
-                mismatch_state, sources, self.make_attestation(mismatch_state)
+            MODULE.bind_accepted_manifest(
+                package,
+                parsed_manifest,
+                entries,
+                self.make_attestation(mismatch_state),
+                mismatch_state,
             )
+
+        missing_digest = [dict(entry) for entry in bundle["changed_paths"]]
+        del missing_digest[0]["sha256"]
+        missing_digest_state = self.make_closure(
+            package, changed_paths=missing_digest
+        )
+        with self.assertRaisesRegex(ValueError, "invalid closure package entry"):
+            MODULE.bind_accepted_manifest(
+                package,
+                parsed_manifest,
+                entries,
+                self.make_attestation(missing_digest_state),
+                missing_digest_state,
+            )
+
+    def test_verify_package_rejects_launcher_source_byte_drift(self) -> None:
+        temporary, package = self.make_package()
+        self.addCleanup(temporary.cleanup)
+        state = self.make_closure(package)
+        launcher = package / "desktop/launch-buzz-desktop"
+        launcher.write_bytes(b"drift after freeze")
+        launcher.chmod(0o755)
+        with (
+            mock.patch.object(
+                MODULE, "check_closure", return_value=self.make_attestation(state)
+            ),
+            self.assertRaisesRegex(ValueError, "package source hash drift"),
+        ):
+            MODULE.verify_package(package, state)
+
+    def test_desktop_installer_refuses_launcher_hash_mismatch(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        package = root / "package"
+        desktop = package / "desktop"
+        desktop.mkdir(mode=0o700, parents=True)
+        app = desktop / "Buzz_0.5.8_amd64.AppImage"
+        app.write_bytes(b"reviewed app")
+        app.chmod(0o755)
+        launcher = desktop / "launch-buzz-desktop"
+        launcher.write_bytes(b"drifted launcher")
+        launcher.chmod(0o755)
+        state = root / "state.json"
+        state.write_text("{}\n")
+        state.chmod(0o600)
+
+        installer = root / "install-reviewed-desktop"
+        installer.write_bytes((SCRIPT.parent / installer.name).read_bytes())
+        installer.chmod(0o755)
+        expected_app_hash = hashlib.sha256(app.read_bytes()).hexdigest()
+        expected_launcher_hash = hashlib.sha256(b"reviewed launcher").hexdigest()
+        roles_log = root / "accepted-roles.log"
+        verifier = root / "install-static-system.py"
+        verifier.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+package = Path(sys.argv[sys.argv.index("--package") + 1])
+role = sys.argv[sys.argv.index("--role") + 1]
+with Path({str(roles_log)!r}).open("a") as roles:
+    roles.write(role + "\\n")
+if role == "desktop_app":
+    print(
+        f"{{package / 'desktop/Buzz_0.5.8_amd64.AppImage'}}"
+        "\t/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage"
+        "\t0755\t0755\t" + {expected_app_hash!r} + "\t" + "a" * 64
+    )
+else:
+    print(
+        f"{{package / 'desktop/launch-buzz-desktop'}}"
+        "\t/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh"
+        "\t0755\t0700\t" + {expected_launcher_hash!r} + "\t" + "b" * 64
+    )
+"""
+        )
+        verifier.chmod(0o755)
+
+        completed = subprocess.run(
+            [str(installer), "--package", str(package), "--state", str(state)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(roles_log.exists(), completed.stderr)
+        self.assertEqual(
+            roles_log.read_text().splitlines(),
+            ["desktop_app", "desktop_launcher"],
+        )
 
     def test_desktop_previous_launcher_hash_comes_from_accepted_bundle(self) -> None:
         temporary, package = self.make_package()
         self.addCleanup(temporary.cleanup)
-        previous_hash = "a" * 64
+        previous_hash = "b" * 64
         state = self.make_closure(
             package, fingerprints={"desktop_previous_launcher_sha256": previous_hash}
         )
-        self.assertEqual(
-            MODULE.accepted_fingerprint(
-                state,
-                "desktop_previous_launcher_sha256",
-                self.make_attestation(state),
-            ),
-            previous_hash,
-        )
-        with self.assertRaisesRegex(ValueError, "lacks fingerprint"):
-            MODULE.accepted_fingerprint(
-                state, "missing", self.make_attestation(state)
+        manifest, entries = MODULE.exact_manifest(package)
+        with self.assertRaisesRegex(
+            ValueError, "desktop_previous_launcher_sha256"
+        ):
+            MODULE.bind_accepted_manifest(
+                package, manifest, entries, self.make_attestation(state), state
             )
         desktop_installer = (SCRIPT.parent / "install-reviewed-desktop").read_text()
-        self.assertIn('launcher_hash=$(sha256sum -- "$source_launcher"', desktop_installer)
-        self.assertIn("--name desktop_previous_launcher_sha256", desktop_installer)
-        self.assertNotIn("readonly launcher_hash=", desktop_installer)
-        self.assertNotIn("readonly old_launcher_hash=", desktop_installer)
+        self.assertIn("--role desktop_launcher", desktop_installer)
+        self.assertIn(
+            '[[ $current_launcher_hash == "$launcher_hash" || $current_launcher_hash == "$previous_launcher_hash" ]]',
+            desktop_installer,
+        )
+        rollback = (SCRIPT.parent / "rollback-reviewed-desktop").read_text()
+        self.assertIn("buzz-desktop-launcher-rollback-v1", rollback)
+        self.assertNotIn("readonly installed_hash=", rollback)
+        self.assertNotIn("readonly rollback_hash=", rollback)
 
     def test_timestamped_backup_receipt_is_complete_before_install(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -255,20 +458,16 @@ class StaticManifestTests(unittest.TestCase):
         source.write_bytes(b"reviewed payload")
         source.chmod(0o755)
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        manifest = {
-            "schema": MODULE.SCHEMA,
-            "package_id": "mempool-genesis-static-test",
-            "entries": [
-                {
-                    "source": "payload/tool",
-                    "target": str(target),
-                    "mode": "0755",
-                    "sha256": digest,
-                }
-            ],
+        entry = {
+            "owner": "static",
+            "role": "static",
+            "source": "payload/tool",
+            "target": str(target),
+            "source_mode": "0755",
+            "install_mode": "0755",
+            "status": "A",
+            "sha256": digest,
         }
-        (package / "manifest.json").write_text(json.dumps(manifest))
-        (package / "manifest.json").chmod(0o600)
         backup_root = root / "backups"
         saw_prepared_receipt = False
 
@@ -285,9 +484,12 @@ class StaticManifestTests(unittest.TestCase):
             mock.patch.object(MODULE, "BACKUP_ROOT", backup_root),
             mock.patch.object(MODULE.os, "geteuid", return_value=0),
             mock.patch.object(MODULE.os, "uname", return_value=SimpleNamespace(nodename="framework-desktop")),
-            mock.patch.object(MODULE, "check_closure"),
+            mock.patch.object(
+                MODULE,
+                "verify_package",
+                return_value=({"package_id": "mempool-genesis-static-test"}, [entry]),
+            ),
             mock.patch.object(MODULE, "require_services_stopped"),
-            mock.patch.object(MODULE, "bind_accepted_sources"),
             mock.patch.object(MODULE, "require_directory"),
             mock.patch.object(MODULE, "prepare_directories", return_value=False),
             mock.patch.object(MODULE, "atomic_copy_fd", side_effect=fail_first_live_copy),

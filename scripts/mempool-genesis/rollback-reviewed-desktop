@@ -3,10 +3,9 @@ set -euo pipefail
 set +x
 umask 077
 
-readonly installed_hash=2623a8f941945bc1dce3e75c2b3d655fcf4a17691cbb440020f49816e103ddf0
-readonly rollback_hash=48d717292f20b5cab536108f7f1b59e052ffbbcd240b46ffe77e555495a6c878
 readonly launcher=/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh
 readonly backup=/home/victor/work/buzz-client/rollback-desktop-050ac722106c/launch_buzz_desktop.sh
+readonly receipt=/home/victor/work/buzz-client/rollback-desktop-050ac722106c/receipt
 
 [[ $# -eq 0 ]]
 [[ $(id -u) -eq 1000 && $(id -un) == victor ]]
@@ -16,8 +15,14 @@ readonly backup=/home/victor/work/buzz-client/rollback-desktop-050ac722106c/laun
 }
 [[ -f $launcher && ! -L $launcher ]]
 [[ -f $backup && ! -L $backup ]]
+[[ -f $receipt && ! -L $receipt ]]
 [[ $(stat -c '%U:%G:%a:%h' "$launcher") == victor:victor:700:1 ]]
 [[ $(stat -c '%U:%G:%a:%h' "$backup") == victor:victor:700:1 ]]
+[[ $(stat -c '%U:%G:%a:%h' "$receipt") == victor:victor:600:1 ]]
+[[ $(wc -l <"$receipt") -eq 1 ]]
+IFS=$'\t' read -r receipt_schema installed_hash rollback_hash extra <"$receipt"
+[[ $receipt_schema == buzz-desktop-launcher-rollback-v1 && -z $extra ]]
+[[ $installed_hash =~ ^[0-9a-f]{64}$ && $rollback_hash =~ ^[0-9a-f]{64}$ ]]
 [[ $(sha256sum -- "$launcher" | cut -d' ' -f1) == "$installed_hash" ]]
 [[ $(sha256sum -- "$backup" | cut -d' ' -f1) == "$rollback_hash" ]]
 

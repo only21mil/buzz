@@ -39,16 +39,42 @@ public identities:
 7. Start and verify one agent at a time. Add only the approved Sats/Victor
    channels, then DMs and explicit mention/reply tests.
 
+Freeze the static and Desktop install bytes with one manifest:
+
+```sh
+python3 scripts/mempool-genesis/freeze-install-package.py \
+  --package /home/victor/.cache/tmp/mempool-genesis-install-package \
+  --package-id mempool-genesis-install-050ac722 \
+  --desktop-app /path/to/Buzz_0.5.8-fixed-050ac722_amd64.AppImage
+```
+
+The freezer refuses a dirty source worktree, runs
+`cargo build --release -p buzz-agent-key-handoff`, and rechecks that the build
+did not change Git-visible state before copying any package source.
+The freezer reads the current launcher only from
+`/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh`. It copies neither
+that file nor application data. The package owns no prompt files, so the v2
+schema has exactly nine entries: seven static-system sources, the AppImage, and
+the bundled launcher. `install-package.manifest.json` records each target path
+and SHA-256, both launcher hashes, and a package fingerprint over sorted
+`<status>\t<sha256>\t<target>\n` records. The evidence bundle must list the nine
+absolute package source paths in byte order and repeat the manifest's three
+named fingerprints.
+
 `install-reviewed-desktop` never starts the GUI. It installs the pinned
 AppImage and swaps only the reviewed launcher after preserving the old launcher
 under `rollback-desktop-050ac722106c`. `rollback-reviewed-desktop` restores
 that launcher without deleting the new AppImage or touching application data.
 The installer hashes the bundled launcher at runtime. It accepts the previous
 live launcher only when the terminal evidence bundle records its hash as
-`desktop_previous_launcher_sha256`.
+`desktop_previous_launcher_sha256`. Before the launcher swap, it writes both
+accepted hashes to the owner-only rollback receipt. Rollback consumes that
+receipt instead of source-pinned hashes.
 
 `install-static-system.py` accepts only an evidence v2 files-mode closure whose
-changed-path set and per-path hashes exactly match the package sources it will
-install. It writes a complete rollback receipt before changing system paths.
+changed-path set and per-path hashes exactly match all nine manifest sources.
+The static and Desktop installers validate that same full accepted set before
+selecting their schema-owned entries. The static installer writes a complete
+rollback receipt before changing system paths.
 Each install uses a UTC timestamped backup ID, which the installer prints; pass
 that exact ID to `rollback --backup-id ID`.

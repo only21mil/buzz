@@ -3,9 +3,6 @@ set -euo pipefail
 set +x
 umask 077
 
-readonly app_hash=6885d124f0aee6e5f8da83c1e36f47acb3a8b52579ecbf0bf2c9389356b1925b
-readonly final_app=/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage
-readonly final_launcher=/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh
 readonly rollback=/home/victor/work/buzz-client/rollback-desktop-050ac722106c
 script_dir="$(dirname -- "$(readlink -e -- "$0")")"
 readonly script_dir
@@ -27,22 +24,23 @@ state=$(readlink -e -- "$4")
 [[ $(stat -c '%U:%G:%a' /home/victor/work/buzz-client) == victor:victor:755 ]]
 [[ $(stat -c '%U:%G:%a' /home/victor/projects/buzz/scripts) == victor:victor:755 ]]
 
-python3 /home/victor/.agents/skills/codex-review/scripts/tier2_evidence.py check-closure \
-  --state "$state" >/dev/null
-
-source_app=$package/desktop/Buzz_0.5.8_amd64.AppImage
-source_launcher=$package/desktop/launch-buzz-desktop
+IFS=$'\t' read -r source_app final_app source_app_mode app_mode app_hash _ < <(
+  python3 "$script_dir/install-static-system.py" accepted-entry \
+    --package "$package" --state "$state" --role desktop_app
+)
+IFS=$'\t' read -r source_launcher final_launcher source_launcher_mode launcher_mode launcher_hash previous_launcher_hash < <(
+  python3 "$script_dir/install-static-system.py" accepted-entry \
+    --package "$package" --state "$state" --role desktop_launcher
+)
 for path in "$source_app" "$source_launcher"; do
   [[ -f $path && ! -L $path && $(stat -c '%U:%G:%h' "$path") == victor:victor:1 ]]
 done
 [[ $(sha256sum -- "$source_app" | cut -d' ' -f1) == "$app_hash" ]]
-[[ $(stat -c %a "$source_app") == 755 ]]
-[[ $(stat -c %a "$source_launcher") == 755 ]]
-launcher_hash=$(sha256sum -- "$source_launcher" | cut -d' ' -f1)
-previous_launcher_hash=$(
-  python3 "$script_dir/install-static-system.py" accepted-fingerprint \
-    --state "$state" --name desktop_previous_launcher_sha256
-)
+[[ $(stat -c %a "$source_app") == "${source_app_mode#0}" ]]
+[[ $(stat -c %a "$source_launcher") == "${source_launcher_mode#0}" ]]
+[[ $(sha256sum -- "$source_launcher" | cut -d' ' -f1) == "$launcher_hash" ]]
+current_launcher_hash=$(sha256sum -- "$final_launcher" | cut -d' ' -f1)
+[[ $current_launcher_hash == "$launcher_hash" || $current_launcher_hash == "$previous_launcher_hash" ]]
 [[ -z $(pgrep -u victor -x buzz-desktop || true) ]] || {
   printf '%s\n' 'Buzz Desktop is still running' >&2
   exit 1
@@ -50,21 +48,20 @@ previous_launcher_hash=$(
 
 if [[ -e $final_app || -L $final_app ]]; then
   [[ -f $final_app && ! -L $final_app ]]
-  [[ $(stat -c '%U:%G:%a:%h' "$final_app") == victor:victor:755:1 ]]
+  [[ $(stat -c '%U:%G:%a:%h' "$final_app") == "victor:victor:${app_mode#0}:1" ]]
   [[ $(sha256sum -- "$final_app" | cut -d' ' -f1) == "$app_hash" ]]
 else
   temporary=$(mktemp /home/victor/work/buzz-client/.Buzz-install.XXXXXX)
   trap 'test ! -e "${temporary:-}" || unlink "$temporary"' EXIT
-  install -m 0755 "$source_app" "$temporary"
+  install -m "$app_mode" "$source_app" "$temporary"
   [[ $(sha256sum -- "$temporary" | cut -d' ' -f1) == "$app_hash" ]]
   sync "$temporary"
   mv -T "$temporary" "$final_app"
   sync /home/victor/work/buzz-client
 fi
 
-current_launcher_hash=$(sha256sum -- "$final_launcher" | cut -d' ' -f1)
 if [[ $current_launcher_hash == "$launcher_hash" ]]; then
-  [[ $(stat -c '%U:%G:%a:%h' "$final_launcher") == victor:victor:700:1 ]]
+  [[ $(stat -c '%U:%G:%a:%h' "$final_launcher") == "victor:victor:${launcher_mode#0}:1" ]]
   printf '%s\n' ALREADY_PRESENT
   exit 0
 fi
@@ -73,10 +70,14 @@ fi
 install -d -m 0700 "$rollback"
 install -m 0700 "$final_launcher" "$rollback/launch_buzz_desktop.sh"
 [[ $(sha256sum -- "$rollback/launch_buzz_desktop.sh" | cut -d' ' -f1) == "$previous_launcher_hash" ]]
+printf 'buzz-desktop-launcher-rollback-v1\t%s\t%s\n' \
+  "$launcher_hash" "$previous_launcher_hash" >"$rollback/receipt"
+[[ $(stat -c '%U:%G:%a:%h' "$rollback/receipt") == victor:victor:600:1 ]]
+sync "$rollback/launch_buzz_desktop.sh" "$rollback/receipt" "$rollback"
 
 temporary=$(mktemp /home/victor/projects/buzz/scripts/.launcher-install.XXXXXX)
 trap 'test ! -e "${temporary:-}" || unlink "$temporary"' EXIT
-install -m 0700 "$source_launcher" "$temporary"
+install -m "$launcher_mode" "$source_launcher" "$temporary"
 [[ $(sha256sum -- "$temporary" | cut -d' ' -f1) == "$launcher_hash" ]]
 sync "$temporary"
 mv -T "$temporary" "$final_launcher"

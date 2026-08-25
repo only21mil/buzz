@@ -15,7 +15,8 @@ import stat
 import subprocess
 import tempfile
 
-SCHEMA = "buzz-agent-static-package-v1"
+SCHEMA = "buzz-agent-install-package-v2"
+MANIFEST_NAME = "install-package.manifest.json"
 RECEIPT_SCHEMA = "buzz-agent-static-install-receipt-v2"
 REVIEW_TOOL = "/home/victor/.agents/skills/codex-review/scripts/tier2_evidence.py"
 BACKUP_ROOT = Path("/var/lib/buzz-agent-install-backups")
@@ -30,6 +31,40 @@ TARGETS = {
     "/usr/local/sbin/install-enrollment-map": ("system/install-enrollment-map", 0o755),
     "/etc/sudoers.d/buzz-agent-key-handoff": ("system/buzz-agent-key-handoff.sudoers", 0o440),
     "/etc/systemd/system/buzz-agent@.service": ("system/buzz-agent@.service", 0o644),
+}
+
+DESKTOP_TARGETS = {
+    "/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage": (
+        "desktop/Buzz_0.5.8_amd64.AppImage",
+        "desktop_app",
+        0o755,
+        0o755,
+    ),
+    "/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh": (
+        "desktop/launch-buzz-desktop",
+        "desktop_launcher",
+        0o755,
+        0o700,
+    ),
+}
+
+MANIFEST_KEYS = {
+    "schema",
+    "package_id",
+    "entries",
+    "desktop_launcher_sha256",
+    "desktop_previous_launcher_sha256",
+    "package_fingerprint",
+}
+ENTRY_KEYS = {
+    "owner",
+    "role",
+    "source",
+    "target",
+    "source_mode",
+    "install_mode",
+    "status",
+    "sha256",
 }
 
 
@@ -152,35 +187,75 @@ def copy_path_to_backup(source: Path, target: Path) -> None:
         os.close(fd)
 
 
-def exact_manifest(package: Path) -> tuple[str, list[dict[str, object]]]:
-    manifest_path = package / "manifest.json"
+def package_fingerprint(entries: list[dict[str, object]]) -> str:
+    ordered = sorted(entries, key=lambda entry: str(entry["target"]).encode())
+    payload = "".join(
+        f'{entry["status"]}\t{entry["sha256"]}\t{entry["target"]}\n'
+        for entry in ordered
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def exact_manifest(package: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+    manifest_path = package / MANIFEST_NAME
     require_regular(manifest_path, 1000, 0o600)
     manifest = load_json(manifest_path)
-    if set(manifest) != {"schema", "package_id", "entries"} or manifest["schema"] != SCHEMA:
-        raise ValueError("invalid static package manifest")
+    if set(manifest) != MANIFEST_KEYS or manifest["schema"] != SCHEMA:
+        raise ValueError("invalid install package manifest")
     package_id = manifest["package_id"]
     entries = manifest["entries"]
     if not isinstance(package_id, str) or not PACKAGE_ID.fullmatch(package_id):
         raise ValueError("invalid package id")
-    if not isinstance(entries, list) or len(entries) != len(TARGETS):
+    if not isinstance(entries, list) or len(entries) != len(TARGETS) + len(DESKTOP_TARGETS):
         raise ValueError("invalid manifest entry count")
+    expected: dict[str, tuple[str, str, str, int, int]] = {
+        target: (source, "static", "static", mode, mode)
+        for target, (source, mode) in TARGETS.items()
+    }
+    expected.update(
+        {
+            target: (source, "desktop", role, source_mode, install_mode)
+            for target, (source, role, source_mode, install_mode) in DESKTOP_TARGETS.items()
+        }
+    )
     by_target: dict[str, dict[str, object]] = {}
     for raw in entries:
-        if not isinstance(raw, dict) or set(raw) != {"source", "target", "mode", "sha256"}:
+        if not isinstance(raw, dict) or set(raw) != ENTRY_KEYS:
             raise ValueError("invalid manifest entry")
         target = raw["target"]
-        if not isinstance(target, str) or target in by_target or target not in TARGETS:
+        if not isinstance(target, str) or target in by_target or target not in expected:
             raise ValueError("invalid or duplicate manifest target")
-        source, mode = TARGETS[target]
-        if raw["source"] != source or raw["mode"] != f"{mode:04o}":
+        source, owner, role, source_mode, install_mode = expected[target]
+        if (
+            raw["source"] != source
+            or raw["owner"] != owner
+            or raw["role"] != role
+            or raw["source_mode"] != f"{source_mode:04o}"
+            or raw["install_mode"] != f"{install_mode:04o}"
+            or raw["status"] != "A"
+        ):
             raise ValueError("manifest target contract mismatch")
         digest = raw["sha256"]
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("invalid manifest digest")
         by_target[target] = raw
-    if set(by_target) != set(TARGETS):
+    if set(by_target) != set(expected):
         raise ValueError("manifest target set mismatch")
-    return package_id, [by_target[target] for target in TARGETS]
+    ordered = [by_target[target] for target in sorted(expected, key=lambda value: value.encode())]
+    launcher = next(entry for entry in ordered if entry["role"] == "desktop_launcher")
+    for name in (
+        "desktop_launcher_sha256",
+        "desktop_previous_launcher_sha256",
+        "package_fingerprint",
+    ):
+        value = manifest[name]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"invalid manifest fingerprint: {name}")
+    if manifest["desktop_launcher_sha256"] != launcher["sha256"]:
+        raise ValueError("desktop launcher hash mismatch")
+    if manifest["package_fingerprint"] != package_fingerprint(ordered):
+        raise ValueError("package fingerprint mismatch")
+    return manifest, ordered
 
 
 def require_services_stopped() -> None:
@@ -280,13 +355,19 @@ def accepted_bundle(
     return bundle, artifact_fingerprint
 
 
-def bind_accepted_sources(
-    state_path: Path, sources: dict[str, str], attestation: dict[str, str]
+def bind_accepted_manifest(
+    package: Path,
+    manifest: dict[str, object],
+    entries: list[dict[str, object]],
+    attestation: dict[str, str],
+    state_path: Path,
 ) -> None:
     bundle, accepted_fingerprint = accepted_bundle(state_path, attestation)
+    sources = {
+        str(package / str(entry["source"])): str(entry["sha256"])
+        for entry in entries
+    }
     expected_paths = sorted(sources, key=lambda path: path.encode())
-    if any(not os.path.isabs(path) for path in expected_paths):
-        raise ValueError("package source path is not absolute")
     changed_paths = bundle.get("changed_paths")
     if not isinstance(changed_paths, list) or len(changed_paths) != len(expected_paths):
         raise ValueError("closure does not list exactly the installed package sources")
@@ -299,7 +380,7 @@ def bind_accepted_sources(
         path = entry["path"]
         digest = entry["sha256"]
         if (
-            status not in ("A", "M")
+            status != "A"
             or not isinstance(path, str)
             or not os.path.isabs(path)
             or not isinstance(digest, str)
@@ -314,6 +395,43 @@ def bind_accepted_sources(
         raise ValueError("closure package source set or ordering mismatch")
     if hashlib.sha256("".join(canonical).encode()).hexdigest() != accepted_fingerprint:
         raise ValueError("closure artifact fingerprint mismatch")
+
+    fingerprints = bundle.get("fingerprints")
+    if not isinstance(fingerprints, dict):
+        raise ValueError("accepted bundle lacks install package fingerprints")
+    expected_fingerprints = {
+        "package_fingerprint": manifest["package_fingerprint"],
+        "desktop_launcher_sha256": manifest["desktop_launcher_sha256"],
+        "desktop_previous_launcher_sha256": manifest[
+            "desktop_previous_launcher_sha256"
+        ],
+    }
+    for name, expected in expected_fingerprints.items():
+        if fingerprints.get(name) != expected:
+            raise ValueError(f"accepted closure fingerprint mismatch: {name}")
+
+
+def verify_package(
+    package: Path, state_path: Path
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    require_directory(package, 1000, 0o700)
+    attestation = check_closure(state_path)
+    manifest, entries = exact_manifest(package)
+    opened: list[int] = []
+    try:
+        for entry in entries:
+            opened.append(
+                open_verified_source(
+                    package / str(entry["source"]),
+                    str(entry["sha256"]),
+                    int(str(entry["source_mode"]), 8),
+                )
+            )
+        bind_accepted_manifest(package, manifest, entries, attestation, state_path)
+    finally:
+        for fd in opened:
+            os.close(fd)
+    return manifest, entries
 
 
 def accepted_fingerprint(state_path: Path, name: str, attestation: dict[str, str]) -> str:
@@ -442,10 +560,10 @@ def remove_created_credential_directory(created: bool) -> None:
 def install(package: Path, state: Path) -> None:
     if os.geteuid() != 0 or os.uname().nodename != "framework-desktop":
         raise ValueError("installer must run as root on framework-desktop")
-    require_directory(package, 1000, 0o700)
-    attestation = check_closure(state)
+    manifest, all_entries = verify_package(package, state)
     require_services_stopped()
-    package_id, entries = exact_manifest(package)
+    package_id = str(manifest["package_id"])
+    entries = [entry for entry in all_entries if entry["owner"] == "static"]
     backup_id = timestamped_backup_id(package_id)
     backup = BACKUP_ROOT / backup_id
     if backup.exists() or backup.is_symlink():
@@ -456,16 +574,8 @@ def install(package: Path, state: Path) -> None:
         for entry in entries:
             source = package / str(entry["source"])
             opened[str(entry["target"])] = open_verified_source(
-                source, str(entry["sha256"]), int(str(entry["mode"]), 8)
+                source, str(entry["sha256"]), int(str(entry["source_mode"]), 8)
             )
-        bind_accepted_sources(
-            state,
-            {
-                str(package / str(entry["source"])): hash_fd(opened[str(entry["target"])])
-                for entry in entries
-            },
-            attestation,
-        )
         subprocess.run(["visudo", "-cf", str(package / "system/buzz-agent-key-handoff.sudoers")], check=True)
         subprocess.run(["systemd-analyze", "verify", str(package / "system/buzz-agent@.service")], check=True)
         BACKUP_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -506,11 +616,20 @@ def install(package: Path, state: Path) -> None:
             for entry in entries:
                 target_text = str(entry["target"])
                 changed.append(target_text)
-                atomic_copy_fd(opened[target_text], Path(target_text), int(str(entry["mode"]), 8), 0, 0)
+                atomic_copy_fd(
+                    opened[target_text],
+                    Path(target_text),
+                    int(str(entry["install_mode"]), 8),
+                    0,
+                    0,
+                )
             subprocess.run(["systemctl", "daemon-reload"], check=True)
             for entry in entries:
                 metadata = target_metadata(Path(str(entry["target"])))
-                if metadata["sha256"] != entry["sha256"] or metadata["mode"] != entry["mode"]:
+                if (
+                    metadata["sha256"] != entry["sha256"]
+                    or metadata["mode"] != entry["install_mode"]
+                ):
                     raise ValueError("installed target verification failed")
             receipt["install_state"] = "installed"
             write_receipt(receipt_path, receipt)
@@ -584,6 +703,12 @@ def main() -> None:
     fingerprint_parser = subparsers.add_parser("accepted-fingerprint")
     fingerprint_parser.add_argument("--state", required=True)
     fingerprint_parser.add_argument("--name", required=True)
+    entry_parser = subparsers.add_parser("accepted-entry")
+    entry_parser.add_argument("--package", required=True)
+    entry_parser.add_argument("--state", required=True)
+    entry_parser.add_argument(
+        "--role", required=True, choices=("desktop_app", "desktop_launcher")
+    )
     args = parser.parse_args()
     if args.command == "install":
         package = Path(args.package).resolve(strict=True)
@@ -591,6 +716,23 @@ def main() -> None:
         install(package, state)
     elif args.command == "rollback":
         rollback(args.backup_id)
+    elif args.command == "accepted-entry":
+        package = Path(args.package).resolve(strict=True)
+        state = Path(args.state).resolve(strict=True)
+        manifest, entries = verify_package(package, state)
+        matching = [entry for entry in entries if entry["role"] == args.role]
+        if len(matching) != 1:
+            raise ValueError("accepted package role is not unique")
+        entry = matching[0]
+        fields = [
+            str(package / str(entry["source"])),
+            str(entry["target"]),
+            str(entry["source_mode"]),
+            str(entry["install_mode"]),
+            str(entry["sha256"]),
+            str(manifest["desktop_previous_launcher_sha256"]),
+        ]
+        print("\t".join(fields))
     else:
         state = Path(args.state).resolve(strict=True)
         attestation = check_closure(state)
