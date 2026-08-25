@@ -86,7 +86,7 @@ jobs:
       - name: Mark workspace safe for git (containerized job)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: ./.github/actions/activate-hermit
 
       - name: Install appimagetool
         run: |

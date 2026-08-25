@@ -31,7 +31,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: ./.github/actions/activate-hermit
 
       - name: Add Rust target
         run: rustup target add "$TARGET"

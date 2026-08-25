@@ -1,0 +1,28 @@
+name: Activate Hermit reliably
+description: Restore the Hermit bootstrap binary, retry its download, then activate the environment
+
+runs:
+  using: composite
+  steps:
+    - name: Restore Hermit bootstrap cache
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+      with:
+        path: ${{ runner.os == 'macOS' && '~/Library/Caches/hermit/pkg/hermit@stable' || '~/.cache/hermit/pkg/hermit@stable' }}
+        key: hermit-bootstrap-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bin/hermit') }}
+
+    - name: Bootstrap Hermit with retry
+      shell: bash
+      run: |
+        for attempt in 1 2 3; do
+          if ./bin/hermit version; then
+            exit 0
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            echo "Hermit bootstrap failed after 3 attempts" >&2
+            exit 1
+          fi
+          sleep "$((attempt * 5))"
+        done
+
+    - name: Activate Hermit
+      uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1

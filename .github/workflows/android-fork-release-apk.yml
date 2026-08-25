@@ -99,7 +99,7 @@ jobs:
           test ! -L "$trusted_release"
           mv -- "$source" "$trusted_release"
 
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616  # v1
+      - uses: ./.github/actions/activate-hermit
 
       - name: Prime pinned Flutter SDK
         run: flutter --version
