@@ -970,6 +970,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-ci-controld"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-ci-execd"
 version = "0.1.0"
 dependencies = [

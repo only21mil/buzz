@@ -1,0 +1,17 @@
+[package]
+name = "buzz-ci-controld"
+description = "Durable state core for the Buzz CI signing control service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "buzz_ci_controld"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
