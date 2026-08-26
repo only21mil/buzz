@@ -6,10 +6,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -57,8 +58,30 @@ impl ControldConfig {
             if !path.is_absolute() {
                 return Err(ConfigError::RelativePath);
             }
+            if path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::CurDir | Component::ParentDir | Component::Prefix(_)
+                )
+            }) {
+                return Err(ConfigError::PathTraversal);
+            }
         }
         if signer_key_path == runner_socket_path || signer_key_path.starts_with(&runner_output_root)
+        {
+            return Err(ConfigError::UnsafeSignerPath);
+        }
+        let resolved_signer_key_path =
+            fs::canonicalize(&signer_key_path).map_err(|_| ConfigError::UnresolvedPath)?;
+        let resolved_runner_output_root =
+            fs::canonicalize(&runner_output_root).map_err(|_| ConfigError::UnresolvedPath)?;
+        if resolved_signer_key_path != signer_key_path
+            || resolved_runner_output_root != runner_output_root
+        {
+            return Err(ConfigError::PathAlias);
+        }
+        if resolved_signer_key_path == resolved_runner_output_root
+            || resolved_signer_key_path.starts_with(&resolved_runner_output_root)
         {
             return Err(ConfigError::UnsafeSignerPath);
         }
@@ -102,6 +125,12 @@ impl ControldConfig {
 pub enum ConfigError {
     #[error("controld paths must be absolute")]
     RelativePath,
+    #[error("controld paths must not contain parent traversal components")]
+    PathTraversal,
+    #[error("the signer key and runner output root must exist for separation checks")]
+    UnresolvedPath,
+    #[error("the signer key and runner output root must not use symbolic path aliases")]
+    PathAlias,
     #[error("the signer key path overlaps an untrusted runner path")]
     UnsafeSignerPath,
     #[error("poll and liveness durations must be nonzero, with poll shorter than liveness")]
@@ -109,7 +138,7 @@ pub enum ConfigError {
 }
 
 /// Immutable identity for one accepted request attempt.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RunIdentity {
     request_event_id: String,
     run_id: Uuid,
@@ -117,6 +146,35 @@ pub struct RunIdentity {
     target_repo_a: String,
     tip_oid: String,
     workflow_id: String,
+}
+
+impl<'de> Deserialize<'de> for RunIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireIdentity {
+            request_event_id: String,
+            run_id: Uuid,
+            attempt: u32,
+            target_repo_a: String,
+            tip_oid: String,
+            workflow_id: String,
+        }
+
+        let wire = WireIdentity::deserialize(deserializer)?;
+        Self::new(
+            wire.request_event_id,
+            wire.run_id,
+            wire.attempt,
+            wire.target_repo_a,
+            wire.tip_oid,
+            wire.workflow_id,
+        )
+        .map_err(de::Error::custom)
+    }
 }
 
 impl RunIdentity {
@@ -215,10 +273,39 @@ impl RunState {
 }
 
 /// Stored terminal facts needed before a success transition can be proposed.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct TerminalFacts {
     evidence_finalized_event_id: Option<String>,
     teardown_attestation_event_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for TerminalFacts {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireFacts {
+            evidence_finalized_event_id: Option<String>,
+            teardown_attestation_event_id: Option<String>,
+        }
+
+        let wire = WireFacts::deserialize(deserializer)?;
+        for event_id in [
+            wire.evidence_finalized_event_id.as_deref(),
+            wire.teardown_attestation_event_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            require_event_id(event_id).map_err(de::Error::custom)?;
+        }
+        Ok(Self {
+            evidence_finalized_event_id: wire.evidence_finalized_event_id,
+            teardown_attestation_event_id: wire.teardown_attestation_event_id,
+        })
+    }
 }
 
 impl TerminalFacts {
@@ -234,10 +321,15 @@ impl TerminalFacts {
         self.evidence_finalized_event_id.is_some()
             && self.teardown_attestation_event_id.is_some()
     }
+
+    const fn is_empty(&self) -> bool {
+        self.evidence_finalized_event_id.is_none()
+            && self.teardown_attestation_event_id.is_none()
+    }
 }
 
 /// Durable run projection. `sequence` is the current kind-46101 stream sequence.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RunRecord {
     identity: RunIdentity,
     state: RunState,
@@ -248,6 +340,42 @@ pub struct RunRecord {
     reason: Option<String>,
     facts: TerminalFacts,
     terminal_event_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RunRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRecord {
+            identity: RunIdentity,
+            state: RunState,
+            sequence: u64,
+            queued_at: u64,
+            started_at: Option<u64>,
+            finished_at: Option<u64>,
+            reason: Option<String>,
+            facts: TerminalFacts,
+            terminal_event_id: Option<String>,
+        }
+
+        let wire = WireRecord::deserialize(deserializer)?;
+        let record = Self {
+            identity: wire.identity,
+            state: wire.state,
+            sequence: wire.sequence,
+            queued_at: wire.queued_at,
+            started_at: wire.started_at,
+            finished_at: wire.finished_at,
+            reason: wire.reason,
+            facts: wire.facts,
+            terminal_event_id: wire.terminal_event_id,
+        };
+        record.validate_restored().map_err(de::Error::custom)?;
+        Ok(record)
+    }
 }
 
 impl RunRecord {
@@ -398,6 +526,67 @@ impl RunRecord {
         }
         Ok(updated)
     }
+
+    fn validate_restored(&self) -> Result<(), StateError> {
+        require_timestamp(self.queued_at)?;
+        if let Some(started_at) = self.started_at {
+            require_timestamp(started_at)?;
+            if started_at < self.queued_at {
+                return Err(StateError::TimestampRegression);
+            }
+        }
+        if let Some(finished_at) = self.finished_at {
+            require_timestamp(finished_at)?;
+            if finished_at < self.queued_at
+                || self.started_at.is_some_and(|started| finished_at < started)
+            {
+                return Err(StateError::TimestampRegression);
+            }
+        }
+        if let Some(event_id) = self.terminal_event_id.as_deref() {
+            require_event_id(event_id)?;
+        }
+
+        let valid_shape = match self.state {
+            RunState::Queued => {
+                self.sequence == 1
+                    && self.started_at.is_none()
+                    && self.finished_at.is_none()
+                    && self.reason.is_none()
+                    && self.facts.is_empty()
+                    && self.terminal_event_id.is_none()
+            }
+            RunState::Running => {
+                self.sequence == 2
+                    && self.started_at.is_some()
+                    && self.finished_at.is_none()
+                    && self.terminal_event_id.is_none()
+            }
+            RunState::Success => {
+                self.sequence == 3
+                    && self.started_at.is_some()
+                    && self.finished_at.is_some()
+                    && self.facts.permits_success()
+            }
+            RunState::Failure | RunState::TimedOut => {
+                self.sequence == 3
+                    && self.started_at.is_some()
+                    && self.finished_at.is_some()
+            }
+            RunState::Cancelled | RunState::InfrastructureFailure => {
+                self.finished_at.is_some()
+                    && if self.started_at.is_some() {
+                        self.sequence == 3
+                    } else {
+                        self.sequence == 2 && self.facts.is_empty()
+                    }
+            }
+        };
+        if !valid_shape {
+            return Err(StateError::InvalidRecord);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -410,6 +599,8 @@ enum TerminalFactKind {
 pub enum StateError {
     #[error("run identity is invalid")]
     InvalidIdentity,
+    #[error("durable run record violates state invariants")]
+    InvalidRecord,
     #[error("timestamp is zero or exceeds the maximum safe integer")]
     InvalidTimestamp,
     #[error("run transition is not allowed")]
@@ -479,6 +670,29 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "buzz-ci-controld-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create test directory");
+            Self(fs::canonicalize(path).expect("resolve test directory"))
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove test directory");
+        }
+    }
 
     fn identity() -> RunIdentity {
         RunIdentity::new(
@@ -497,6 +711,16 @@ mod tests {
             .expect("queued")
             .transition(RunState::Running, 11, None)
             .expect("running")
+    }
+
+    fn successful() -> RunRecord {
+        running()
+            .with_evidence_finalized("d".repeat(64))
+            .expect("evidence")
+            .with_teardown_attestation("e".repeat(64))
+            .expect("teardown")
+            .transition(RunState::Success, 12, None)
+            .expect("success")
     }
 
     #[test]
@@ -597,5 +821,94 @@ mod tests {
             ),
             Err(ConfigError::UnsafeSignerPath)
         );
+    }
+
+    #[test]
+    fn configuration_rejects_traversal_and_aliases() {
+        let directory = TestDirectory::new();
+        let output_root = directory.0.join("runner-output");
+        let secrets_root = directory.0.join("secrets");
+        fs::create_dir(&output_root).expect("create output root");
+        fs::create_dir(&secrets_root).expect("create secrets root");
+
+        let traversal = secrets_root.join("..").join("runner-output/key");
+        assert_eq!(
+            ControldConfig::new(
+                traversal,
+                directory.0.join("runner.sock"),
+                output_root.clone(),
+                DEFAULT_POLL_INTERVAL,
+                DEFAULT_LIVENESS_WINDOW,
+            ),
+            Err(ConfigError::PathTraversal)
+        );
+
+        let signer_key = secrets_root.join("ci.key");
+        fs::write(&signer_key, b"test key placeholder").expect("write signer placeholder");
+        assert!(ControldConfig::new(
+            signer_key,
+            directory.0.join("runner.sock"),
+            output_root.clone(),
+            DEFAULT_POLL_INTERVAL,
+            DEFAULT_LIVENESS_WINDOW,
+        )
+        .is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let runner_owned_key = output_root.join("key");
+            fs::write(&runner_owned_key, b"runner-owned placeholder")
+                .expect("write runner-owned placeholder");
+            let aliased_signer = secrets_root.join("aliased.key");
+            symlink(&runner_owned_key, &aliased_signer).expect("create signer alias");
+            assert_eq!(
+                ControldConfig::new(
+                    aliased_signer,
+                    directory.0.join("runner.sock"),
+                    output_root,
+                    DEFAULT_POLL_INTERVAL,
+                    DEFAULT_LIVENESS_WINDOW,
+                ),
+                Err(ConfigError::PathAlias)
+            );
+        }
+    }
+
+    #[test]
+    fn deserialization_preserves_identity_constructor_invariants() {
+        let mut wire = serde_json::to_value(identity()).expect("serialize identity");
+        wire["attempt"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<RunIdentity>(wire).is_err());
+    }
+
+    #[test]
+    fn deserialization_preserves_record_constructor_invariants() {
+        for record in [
+            RunRecord::queued(identity(), 10).expect("queued"),
+            running(),
+            successful(),
+        ] {
+            let encoded = serde_json::to_vec(&record).expect("serialize record");
+            let restored: RunRecord =
+                serde_json::from_slice(&encoded).expect("restore valid record");
+            assert_eq!(restored, record);
+        }
+
+        let mut unreachable_running =
+            serde_json::to_value(RunRecord::queued(identity(), 10).expect("queued"))
+                .expect("serialize queued");
+        unreachable_running["state"] = serde_json::json!("running");
+        assert!(serde_json::from_value::<RunRecord>(unreachable_running).is_err());
+
+        let mut success_without_facts =
+            serde_json::to_value(successful()).expect("serialize success");
+        success_without_facts["facts"]["evidence_finalized_event_id"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<RunRecord>(success_without_facts).is_err());
+
+        let mut invalid_sequence = serde_json::to_value(running()).expect("serialize running");
+        invalid_sequence["sequence"] = serde_json::json!(3);
+        assert!(serde_json::from_value::<RunRecord>(invalid_sequence).is_err());
     }
 }

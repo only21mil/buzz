@@ -154,9 +154,15 @@ The runner's last receipt is:
 
 ### 1.4 Evidence spool
 
-The configured shared spool root is `/var/lib/buzzci/runner-output`. Receipt paths are relative UTF-8 paths with no empty, dot, parent, absolute, or symbolic-link component. The runner creates regular files with mode 0600 beneath a directory named by `dispatch_id`, closes them before sending `job_finished`, and never rewrites them afterward.
+The configured shared spool root is `/var/lib/buzzci/runner-output`. Receipt paths are relative UTF-8 paths with no empty, dot, parent, absolute, or symbolic-link component. The runner creates regular files with mode 0600 beneath a directory named by `dispatch_id`, closes them before sending `job_finished`, and never rewrites them afterward. At configuration load, controld rejects parent traversal, unresolved signer or output paths, and any configured signer or output symbolic alias whose canonical path differs from the supplied path. It compares the resolved paths before accepting their separation.
 
-Controld opens each component without following links, verifies the expected owner, mode, regular-file type, byte bound, length, and SHA-256, then uploads scrubbed logs to the relay's authenticated `PUT /ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{log_sha256}` route. It signs kind 46103 only after the PUT response binds the same path and digest. Artifact publication follows the kind-46104 quarantine contract. Controld removes a dispatch spool only after durable evidence publication and kind 46106 acceptance, using the same descriptor-safe constraints.
+Controld opens each component without following links, verifies the expected owner, mode, regular-file type, byte bound, length, and SHA-256, then uploads scrubbed logs to `PUT /ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{log_sha256}`. The PUT uses NIP-98 authentication bound to the exact relay HTTP(S) URL, `PUT` method, and body digest. The dedicated control-plane signer must be a current member of both the non-empty owner-configured CI signer set and the repository's bound channel.
+
+The relay resolves `run_id` to its unique accepted `request_event_id` and admits the upload only when every path coordinate matches that accepted request and its selected signed-manifest job attempt. This server-held run/job binding is the upload capability. No preflight, lookup, response field, or caller-supplied bearer value can create or extend it.
+
+The complete route tuple, including `log_sha256`, is the idempotency key. Controld durably records the intended digest and byte length before upload. The first successful PUT atomically claims both that route and the one log slot for its request/run/job/attempt. A byte-identical retry returns the same binding. A different body or metadata at the same route, or a second digest for the occupied job-attempt slot, is a conflict. The response binds the complete tuple, digest, byte length, and immutable storage identity. Controld accepts an existing result only when all fields match, and signs kind 46103 only after that check. Artifact publication follows the kind-46104 quarantine contract. Controld removes a dispatch spool only after durable evidence publication and kind 46106 acceptance, using the same descriptor-safe constraints.
+
+The crate skeleton enforces configuration-time path separation only. Production wiring still must perform descriptor-relative, no-follow opens and re-check file identity at each access to reject post-configuration swaps, symbolic links, and hard-link aliases. Until that wiring lands, this milestone makes no race-safe signer or spool access claim.
 
 ## 2. Service placement
 
@@ -170,7 +176,7 @@ Controld consumes only stored, relay-accepted kind-46100 events from channels co
 
 The relay's `ci_runs` row provides the unique `run_id` to initial-request mapping. `ci_run_events.watch_cursor` is the durable acceptance order within that run. Controld stores a per-channel input cursor and processes `(watch_cursor, event_id)` without using event `created_at` as order. On reconnect it resumes after the last committed cursor, suppresses the same cursor and event pair, and requests bounded replay for a gap. A cursor conflict or request identity conflict fails closed.
 
-Before assignment, controld reloads the complete request through `GET /ci/runs/{run_id}/request`, validates its signature and immutable coordinates, confirms the signer grant, and obtains the trusted broker manifest. The service is repository-agnostic. Every lookup, lease, receipt, event, log path, and signer authorization stays bound to the request's `target_repo_a`; there is no configured default repository.
+Before assignment, controld reloads the complete request through `GET /ci/runs/{run_id}/request`, validates its signature and immutable coordinates, confirms that its dedicated signer is in the non-empty owner-configured CI signer set, and obtains the trusted broker manifest. The service is repository-agnostic. Every lookup, lease, receipt, event, log path, and signer authorization stays bound to the request's `target_repo_a`; there is no configured default repository.
 
 ## 4. Run lifecycle and publication order
 
@@ -197,7 +203,7 @@ Run and job sequences are separate, begin at 1, and increase without gaps. Contr
 
 Controld uses one dedicated CI signer key with no repository fetch, deploy, release, or general relay authority. The key file lives under the host secrets directory in a mode-0700 parent and is a mode-0600 regular file. Controld opens it without following links, reads it once into memory, never accepts key bytes through argv, and never includes the key or derived secret in environment dumps, logs, receipts, crash reports, or the runner socket.
 
-The signer pubkey must be authorized by non-empty owner configuration in `BUZZ_CI_STATUS_SIGNER_PUBKEYS` or by a repository-scoped kind-46107 grant for the request's `target_repo_a`. Rotation records the authority interval used for each run attempt. A signer that is absent, expired, ambiguous, or outside the repository grant prevents queued acknowledgment and assignment.
+The signer pubkey must be a member of the non-empty owner-configured CI signer set loaded by the relay, CLI, and controld from the same administrative configuration source. No preflight, lookup, status, log, artifact, or other relay response field may supply or extend that set. Rotation is explicit and audited, and an event is valid only when its signer was authorized for the recorded run attempt. An empty set or a configured controld signer outside the set prevents queued acknowledgment and assignment.
 
 ## 6. Crash recovery and liveness
 
