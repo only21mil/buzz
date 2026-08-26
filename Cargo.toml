@@ -36,6 +36,7 @@ members = [
     "crates/buzz-ci-isolation-contract",
     "crates/buzz-ci-materializer",
     "crates/buzz-ci-policy-proxy",
+    "crates/buzz-ci-workflow",
     "examples/countdown-bot",
 ]
 exclude = ["desktop/src-tauri"]

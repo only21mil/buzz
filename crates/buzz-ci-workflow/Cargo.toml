@@ -1,0 +1,15 @@
+[package]
+name = "buzz-ci-workflow"
+description = "Typed workflow schema and static job selection for Buzz CI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hex = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

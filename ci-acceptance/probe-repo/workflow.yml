@@ -1,12 +1,8 @@
 name: buzz-ci-phase2-probe
 
-# Signed-manifest stanza: required_jobs=flaky; optional_jobs=ok,never,slowpoke.
+# Job-level `required` is the sole in-file source for signed manifest policy.
 # The single required job is deliberate: slowpoke must exercise timed_out
 # without preventing the attempt-2 verdict from becoming green.
-manifest:
-  workflow_digest: buzz-ci-phase2-probe-v1
-  required_jobs: [flaky]
-
 on:
   workflow_dispatch:
 
@@ -35,4 +31,3 @@ jobs:
     required: false
     steps:
       - run: ./jobs/slowpoke.sh
-
