@@ -5,7 +5,9 @@ type AgentDefinitionDialogFooterProps = {
   isAvatarUploadPending: boolean;
   isPending: boolean;
   onCancel: () => void;
+  onSecondarySubmit?: () => void;
   publishesCatalogUpdates: boolean;
+  secondarySubmitLabel?: string;
   submitBlockReason: string | null;
   submitLabel: string;
 };
@@ -15,7 +17,9 @@ export function AgentDefinitionDialogFooter({
   isAvatarUploadPending,
   isPending,
   onCancel,
+  onSecondarySubmit,
   publishesCatalogUpdates,
+  secondarySubmitLabel,
   submitBlockReason,
   submitLabel,
 }: AgentDefinitionDialogFooterProps) {
@@ -50,6 +54,17 @@ export function AgentDefinitionDialogFooter({
         >
           Cancel
         </Button>
+        {secondarySubmitLabel && onSecondarySubmit ? (
+          <Button
+            data-testid="persona-dialog-secondary-submit"
+            disabled={!canSubmit}
+            onClick={onSecondarySubmit}
+            type="button"
+            variant="outline"
+          >
+            {secondarySubmitLabel}
+          </Button>
+        ) : null}
         <Button
           data-testid="persona-dialog-submit"
           disabled={!canSubmit}

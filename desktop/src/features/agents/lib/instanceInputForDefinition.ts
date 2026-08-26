@@ -2,7 +2,9 @@ import type {
   AcpRuntime,
   AcpRuntimeCatalogEntry,
   AgentPersona,
+  Channel,
   CreateManagedAgentInput,
+  CreateManagedAgentResponse,
 } from "@/shared/api/types";
 import {
   getDefaultPersonaRuntime,
@@ -158,4 +160,63 @@ export async function buildInstanceInputForDefinition(
     startOnAppLaunch: true,
     backend: { type: "local" },
   };
+}
+
+type CreatedAgentTargetChannel = Pick<Channel, "id" | "name">;
+
+type CreateManagedInstanceForDefinitionArgs = {
+  backendIntent?: BackendIntent;
+  createManagedAgent: (
+    input: CreateManagedAgentInput,
+  ) => Promise<CreateManagedAgentResponse>;
+  mode: "start" | "stopped";
+  persona: AgentPersona;
+  presentCreatedAgent: (
+    created: CreateManagedAgentResponse,
+    targetChannel?: CreatedAgentTargetChannel | null,
+  ) => Promise<void>;
+  runtime: AcpRuntime;
+  targetChannel?: CreatedAgentTargetChannel | null;
+  upload?: UploadMediaBytes;
+};
+
+/**
+ * Creates the managed identity for a saved definition.
+ *
+ * The stopped owner-review path deliberately reuses the canonical input mapping
+ * and changes only the two lifecycle flags. It never calls the channel
+ * presenter, so no membership attachment or ensure-running side effect can
+ * occur. Start mode remains the existing create, spawn, and optional attach
+ * sequence.
+ */
+export async function createManagedInstanceForDefinition({
+  backendIntent,
+  createManagedAgent,
+  mode,
+  persona,
+  presentCreatedAgent,
+  runtime,
+  targetChannel,
+  upload,
+}: CreateManagedInstanceForDefinitionArgs): Promise<CreateManagedAgentResponse> {
+  const mappedInput = await buildInstanceInputForDefinition(
+    persona,
+    runtime,
+    upload,
+    backendIntent,
+  );
+  const input =
+    mode === "stopped"
+      ? {
+          ...mappedInput,
+          spawnAfterCreate: false,
+          startOnAppLaunch: false,
+        }
+      : mappedInput;
+  const created = await createManagedAgent(input);
+  if (mode === "start") {
+    if (created.spawnError) throw new Error(created.spawnError);
+    await presentCreatedAgent(created, targetChannel);
+  }
+  return created;
 }

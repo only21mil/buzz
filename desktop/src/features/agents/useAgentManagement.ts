@@ -19,11 +19,16 @@ import {
 } from "./hooks";
 import {
   availableRuntimesForStart,
-  buildInstanceInputForDefinition,
+  createManagedInstanceForDefinition,
   type BackendIntent,
 } from "./lib/instanceInputForDefinition";
 import { useCreatedAgentChannelAttachment } from "./useCreatedAgentChannelAttachment";
-import { classifyAgentManagementOrigin } from "./agentManagementBuffer";
+import {
+  advanceAgentManagementReview,
+  classifyAgentManagementOrigin,
+  enqueueAgentManagementReview,
+  type AgentManagementReview,
+} from "./agentManagementBuffer";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { resolveManagedAgentAvatarUrl } from "./ui/managedAgentAvatar";
 import type { AgentCreateIntent } from "./ui/agentCreateIntent";
@@ -76,9 +81,17 @@ export function useAgentManagement() {
   const sourceAgentPubkey = React.useRef<string | null>(null);
   const managedAgentsRef = React.useRef(managedAgentsQuery.data);
   const channelsRef = React.useRef(channelsQuery.data);
-  const bufferedRequestsRef = React.useRef<
-    Array<{ agentPubkey: string; request: AgentManagementRequest }>
-  >([]);
+  const bufferedRequestsRef = React.useRef<AgentManagementReview[]>([]);
+  const queuedReviewsRef = React.useRef<AgentManagementReview[]>([]);
+
+  const activateReview = React.useEffectEvent(
+    (review: AgentManagementReview) => {
+      pendingRequestId.current = review.request.requestId;
+      sourceAgentPubkey.current = review.agentPubkey;
+      setError(null);
+      setRequest(review.request);
+    },
+  );
 
   const acceptOwnedRequest = React.useEffectEvent(
     (agentPubkey: string, next: AgentManagementRequest) => {
@@ -94,12 +107,13 @@ export function useAgentManagement() {
         return;
       }
       seenRequestIds.current.add(next.requestId);
-      setError(null);
-      if (pendingRequestId.current === null) {
-        pendingRequestId.current = next.requestId;
-        sourceAgentPubkey.current = agentPubkey;
-        setRequest(next);
-      }
+      const queued = enqueueAgentManagementReview(
+        pendingRequestId.current,
+        queuedReviewsRef.current,
+        { agentPubkey, request: next },
+      );
+      queuedReviewsRef.current = queued.queued;
+      if (queued.activate) activateReview(queued.activate);
     },
   );
 
@@ -204,22 +218,21 @@ export function useAgentManagement() {
         avatarUrl,
       });
 
-      if (intent === "definition_start") {
-        const created = await createAgentMutation.mutateAsync(
-          await buildInstanceInputForDefinition(
-            persona,
-            runtime,
-            undefined,
-            backendIntent ?? undefined,
-          ),
-        );
-        if (created.spawnError) throw new Error(created.spawnError);
+      if (intent === "definition_stopped" || intent === "definition_start") {
         const targetChannel = (channelsQuery.data ?? []).find(
           (channel) => channel.id === request.request.channelId,
         );
-        await createdAgentAttachment.presentCreatedAgent(created, {
-          id: request.request.channelId,
-          name: targetChannel?.name ?? "this channel",
+        await createManagedInstanceForDefinition({
+          backendIntent: backendIntent ?? undefined,
+          createManagedAgent: createAgentMutation.mutateAsync,
+          mode: intent === "definition_stopped" ? "stopped" : "start",
+          persona,
+          presentCreatedAgent: createdAgentAttachment.presentCreatedAgent,
+          runtime,
+          targetChannel: {
+            id: request.request.channelId,
+            name: targetChannel?.name ?? "this channel",
+          },
         });
       }
 
@@ -227,7 +240,9 @@ export function useAgentManagement() {
         queryClient.invalidateQueries({ queryKey: personasQueryKey }),
         queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
       ]);
-      dismiss();
+      // AgentCreateDialogRouter closes the completed create review. Keeping the
+      // queue advance there prevents a successful submit from dismissing both
+      // the current dialog and the next queued review.
       return true;
     } catch (cause) {
       setError(
@@ -260,6 +275,12 @@ export function useAgentManagement() {
   }
 
   function dismiss() {
+    const next = advanceAgentManagementReview(queuedReviewsRef.current);
+    queuedReviewsRef.current = next.queued;
+    if (next.activate) {
+      activateReview(next.activate);
+      return;
+    }
     pendingRequestId.current = null;
     sourceAgentPubkey.current = null;
     setRequest(null);

@@ -15,7 +15,9 @@ export function AgentManagementDialogs() {
           }
           initialValues={management.createInitialValues}
           isDefinitionPending={management.isPending}
+          key={management.request.requestId}
           mode="definition"
+          offerStoppedCreate
           onOpenChange={(open) => {
             if (!open) management.dismiss();
           }}
