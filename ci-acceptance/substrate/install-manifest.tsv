@@ -4,8 +4,10 @@
 -	/etc/buzzci/qualification-cases	root	root	0755	directory
 cargo-bin:buzz-ci-execd	/usr/libexec/buzz-ci-execd	root	root	0755	compiled-binary
 cargo-bin:buzz-ci-acceptance-ctl	/usr/libexec/buzz-ci-acceptance-ctl	root	buzzci-ctl	0750	compiled-binary
+cargo-bin:buzz-ci-runner	/usr/libexec/buzz-ci-runner	root	buzzci-ctl	0750	compiled-binary
 buzz-ci-execd.service	/etc/systemd/system/buzz-ci-execd.service	root	root	0644	file
 buzz-ci-execd.socket	/etc/systemd/system/buzz-ci-execd.socket	root	root	0644	file
+buzz-ci-runner.service	/etc/systemd/system/buzz-ci-runner.service	root	root	0644	file
 -	/etc/systemd/system/buzz-ci-execd.service.d	root	root	0755	directory
 buzz-ci-execd.service.d/10-host-adapters.conf	/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf	root	root	0644	file
 buzz-ci-acceptance-ctl.sudoers	/etc/sudoers.d/buzz-ci-acceptance-ctl	root	root	0440	file
@@ -13,6 +15,7 @@ buzzci-control.tmpfiles	/usr/lib/tmpfiles.d/buzzci-control.conf	root	root	0644	f
 rendered:authority-v1.json.plan	/etc/buzzci/authority/authority-v1.json	root	root	0400	rendered-file
 rendered:host-adapters-v1.json.plan	/etc/buzzci/authority/host-adapters-v1.json	root	root	0400	rendered-file
 rendered:harness.env.plan	/etc/buzzci/harness.env	root	root	0400	rendered-file
+rendered:runner-v1.json.plan	/etc/buzzci/runner-v1.json	buzzci-ctl	buzzci-ctl	0600	rendered-file
 principals.tsv	/usr/share/buzzci/substrate/principals.tsv	root	root	0444	file
 qualification-cases.plan	/usr/share/buzzci/substrate/qualification-cases.plan	root	root	0444	file
 host-paths.plan	/usr/share/buzzci/substrate/host-paths.plan	root	root	0444	file

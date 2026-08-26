@@ -6,6 +6,7 @@ manifest=$script_dir/install-manifest.tsv
 sudoers=$script_dir/buzz-ci-acceptance-ctl.sudoers
 service=$script_dir/buzz-ci-execd.service
 socket=$script_dir/buzz-ci-execd.socket
+runner_service=$script_dir/buzz-ci-runner.service
 dropin=$script_dir/buzz-ci-execd.service.d/10-host-adapters.conf
 tmpfiles=$script_dir/buzzci-control.tmpfiles
 harness=$script_dir/harness.env.plan
@@ -14,6 +15,7 @@ case_plan=$script_dir/qualification-cases.plan
 authority_plan=$script_dir/authority-v1.json.plan
 state_plan=$script_dir/activation-state-v1.json.plan
 adapter_plan=$script_dir/host-adapters-v1.json.plan
+runner_plan=$script_dir/runner-v1.json.plan
 path_plan=$script_dir/host-paths.plan
 
 fail() {
@@ -31,7 +33,7 @@ awk -F '\t' '
   $5 !~ /^0[0-7]{3}$/ { bad = 1 }
   $6 !~ /^(directory|compiled-binary|file|rendered-file)$/ { bad = 1 }
   seen[$2]++ { bad = 1 }
-  END { if (bad || length(seen) != 29) exit 1 }
+  END { if (bad || length(seen) != 32) exit 1 }
 ' "$manifest" || fail 'invalid install manifest'
 
 manifest_row() {
@@ -46,6 +48,12 @@ manifest_row /usr/libexec/buzz-ci-execd \
   $'cargo-bin:buzz-ci-execd\t/usr/libexec/buzz-ci-execd\troot\troot\t0755\tcompiled-binary'
 manifest_row /usr/libexec/buzz-ci-acceptance-ctl \
   $'cargo-bin:buzz-ci-acceptance-ctl\t/usr/libexec/buzz-ci-acceptance-ctl\troot\tbuzzci-ctl\t0750\tcompiled-binary'
+manifest_row /usr/libexec/buzz-ci-runner \
+  $'cargo-bin:buzz-ci-runner\t/usr/libexec/buzz-ci-runner\troot\tbuzzci-ctl\t0750\tcompiled-binary'
+manifest_row /etc/systemd/system/buzz-ci-runner.service \
+  $'buzz-ci-runner.service\t/etc/systemd/system/buzz-ci-runner.service\troot\troot\t0644\tfile'
+manifest_row /etc/buzzci/runner-v1.json \
+  $'rendered:runner-v1.json.plan\t/etc/buzzci/runner-v1.json\tbuzzci-ctl\tbuzzci-ctl\t0600\trendered-file'
 manifest_row /etc/buzzci/authority \
   $'-\t/etc/buzzci/authority\troot\troot\t0700\tdirectory'
 manifest_row /etc/buzzci/authority/authority-v1.json \
@@ -141,6 +149,11 @@ jq -e '
 ' "$authority_plan" >/dev/null || fail 'invalid root authority plan'
 
 jq -e '
+  keys == ["schema_version"] and
+  .schema_version == 1
+' "$runner_plan" >/dev/null || fail 'invalid runner config plan'
+
+jq -e '
   keys == ["activation","active_lease","authority_revision","authority_sha256","committed","last_admission_at","next_lease_generation","nonce_ledger","qualification","revision","state","version"] and
   .version == 1 and
   .revision == 1 and
@@ -213,6 +226,18 @@ grep -Fxq 'SocketGroup=buzzci-ctl' "$socket"
 grep -Fxq 'SocketMode=0600' "$socket"
 grep -Fxq 'DirectoryMode=0711' "$socket"
 grep -Fxq 'Service=buzz-ci-execd.service' "$socket"
+
+grep -Fxq 'User=buzzci-ctl' "$runner_service"
+grep -Fxq 'Group=buzzci-ctl' "$runner_service"
+grep -Fxq 'ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v1.json' "$runner_service"
+grep -Fxq 'NoNewPrivileges=yes' "$runner_service"
+grep -Fxq 'ProtectSystem=strict' "$runner_service"
+grep -Fxq 'ReadOnlyPaths=/etc/buzzci/runner-v1.json /run/buzzci' "$runner_service"
+! rg -n '^ReadWritePaths=' "$runner_service" \
+  || fail 'runner service grants an unfrozen writable path'
+if rg -n '^Exec(Start|StartPre|StartPost)=.*(^|[[:space:]])(/bin/)?(ba|d?a|z|k)?sh([[:space:]]|$)' "$runner_service"; then
+  fail 'runner service invokes a shell'
+fi
 
 grep -Fxq 'User=root' "$service"
 grep -Fxq 'Group=root' "$service"

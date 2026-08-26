@@ -4,10 +4,18 @@
 //! the content-blind broker protocol, drives a separately supplied unprivileged
 //! execution backend, and constructs teardown attestations only from terminal
 //! broker receipts. It does not own privileged resources.
+//!
+//! The daemon's controld-facing transport is intentionally not defined here.
+//! Before the binary can bind its service loop, the frozen controld contract
+//! must specify connection ownership, socket activation and path, peer
+//! authentication, framing and size limits, and assignment/receipt messages.
+//! [`service`] supplies only a protocol-neutral local connection loop.
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod control;
+pub mod service;
 
 use std::collections::HashSet;
 
