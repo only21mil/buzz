@@ -22,6 +22,7 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError("cannot load install package schema")
 INSTALLER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(INSTALLER)
+DESKTOP_APP_SHA256_TOKEN = b"__BUZZ_APPIMAGE_SHA256__"
 
 
 def hash_fd(fd: int) -> str:
@@ -57,6 +58,27 @@ def open_source(
         raise
 
 
+def write_payload(destination: Path, payload: bytes, mode: int) -> str:
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        mode,
+    )
+    try:
+        digest = hashlib.sha256()
+        view = memoryview(payload)
+        while view:
+            written = os.write(destination_fd, view)
+            digest.update(view[:written])
+            view = view[written:]
+        os.fchmod(destination_fd, mode)
+        os.fsync(destination_fd)
+        return digest.hexdigest()
+    finally:
+        os.close(destination_fd)
+
+
 def copy_source(
     source: Path,
     destination: Path,
@@ -78,18 +100,37 @@ def copy_source(
             mode,
         )
         try:
+            digest = hashlib.sha256()
             while chunk := os.read(source_fd, 1024 * 1024):
+                digest.update(chunk)
                 view = memoryview(chunk)
                 while view:
                     written = os.write(destination_fd, view)
                     view = view[written:]
             os.fchmod(destination_fd, mode)
             os.fsync(destination_fd)
+            return digest.hexdigest()
         finally:
             os.close(destination_fd)
-        return hash_fd(source_fd)
     finally:
         os.close(source_fd)
+
+
+def render_desktop_launcher(template: Path, app_sha256: str) -> bytes:
+    source_fd = open_source(template, (0o700, 0o755))
+    try:
+        chunks: list[bytes] = []
+        while chunk := os.read(source_fd, 1024 * 1024):
+            chunks.append(chunk)
+    finally:
+        os.close(source_fd)
+    payload = b"".join(chunks)
+    if payload.count(DESKTOP_APP_SHA256_TOKEN) != 1:
+        raise ValueError("desktop launcher template must contain one AppImage hash token")
+    rendered = payload.replace(DESKTOP_APP_SHA256_TOKEN, app_sha256.encode())
+    if DESKTOP_APP_SHA256_TOKEN in rendered:
+        raise ValueError("desktop launcher AppImage hash token was not fully replaced")
+    return rendered
 
 
 def source_for_entry(
@@ -198,7 +239,35 @@ def freeze_package(
     package.mkdir(mode=0o700)
     try:
         entries = entry_contracts()
+        desktop_app_entry = next(
+            entry for entry in entries if entry["role"] == "desktop_app"
+        )
+        desktop_app_mode = int(str(desktop_app_entry["source_mode"]), 8)
+        desktop_app_entry["sha256"] = copy_source(
+            desktop_app,
+            package / str(desktop_app_entry["source"]),
+            desktop_app_mode,
+            source_modes=repository_source_modes(
+                str(desktop_app_entry["source"]), desktop_app_mode
+            ),
+        )
+        launcher = next(
+            entry for entry in entries if entry["role"] == "desktop_launcher"
+        )
+        launcher_mode = int(str(launcher["source_mode"]), 8)
+        launcher_template = source_for_entry(
+            str(launcher["source"]), repo_root, binary_dir, desktop_app
+        )
+        launcher["sha256"] = write_payload(
+            package / str(launcher["source"]),
+            render_desktop_launcher(
+                launcher_template, str(desktop_app_entry["sha256"])
+            ),
+            launcher_mode,
+        )
         for entry in entries:
+            if entry["role"] in {"desktop_app", "desktop_launcher"}:
+                continue
             source_mode = int(str(entry["source_mode"]), 8)
             source = source_for_entry(
                 str(entry["source"]), repo_root, binary_dir, desktop_app
@@ -210,9 +279,6 @@ def freeze_package(
                 built_binary=str(entry["source"]).startswith("bin/"),
                 source_modes=repository_source_modes(str(entry["source"]), source_mode),
             )
-        launcher = next(
-            entry for entry in entries if entry["role"] == "desktop_launcher"
-        )
         manifest: dict[str, object] = {
             "schema": INSTALLER.SCHEMA,
             "package_id": package_id,

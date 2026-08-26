@@ -35,7 +35,7 @@ TARGETS = [
     "/usr/local/sbin/install-enrollment-map",
     "/etc/sudoers.d/buzz-agent-key-handoff",
     "/etc/systemd/system/buzz-agent@.service",
-    "/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage",
+    "/home/victor/work/buzz-client/Buzz_0.5.8-mempool-genesis_amd64.AppImage",
     "/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh",
 ]
 

@@ -34,7 +34,7 @@ TARGETS = {
 }
 
 DESKTOP_TARGETS = {
-    "/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage": (
+    "/home/victor/work/buzz-client/Buzz_0.5.8-mempool-genesis_amd64.AppImage": (
         "desktop/Buzz_0.5.8_amd64.AppImage",
         "desktop_app",
         0o755,

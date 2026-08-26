@@ -64,7 +64,7 @@ EXPECTED_ENTRIES = {
     "/etc/systemd/system/buzz-agent@.service": (
         "system/buzz-agent@.service", "static", "static", "0644", "0644"
     ),
-    "/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage": (
+    "/home/victor/work/buzz-client/Buzz_0.5.8-mempool-genesis_amd64.AppImage": (
         "desktop/Buzz_0.5.8_amd64.AppImage",
         "desktop",
         "desktop_app",

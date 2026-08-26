@@ -199,7 +199,10 @@ class StaticManifestTests(unittest.TestCase):
             source.write_bytes(source_name.encode())
             source.chmod(FREEZER.repository_source_modes(source_name, mode)[-1])
         launcher = system_dir / "launch-buzz-desktop"
-        launcher.write_bytes(b"new launcher")
+        launcher.write_bytes(
+            b"app=/home/victor/work/buzz-client/Buzz_0.5.8-mempool-genesis_amd64.AppImage\n"
+            b"sha256=__BUZZ_APPIMAGE_SHA256__\n"
+        )
         launcher.chmod(0o755)
         app = root / "Buzz.AppImage"
         app.write_bytes(b"desktop app")
@@ -221,10 +224,42 @@ class StaticManifestTests(unittest.TestCase):
             (root / "one" / MODULE.MANIFEST_NAME).read_bytes(),
             (root / "two" / MODULE.MANIFEST_NAME).read_bytes(),
         )
+        app_hash = hashlib.sha256(b"desktop app").hexdigest()
+        rendered_launcher = (root / "one/desktop/launch-buzz-desktop").read_bytes()
+        self.assertNotIn(FREEZER.DESKTOP_APP_SHA256_TOKEN, rendered_launcher)
+        self.assertEqual(rendered_launcher.count(app_hash.encode()), 1)
+        manifest = json.loads((root / "one" / MODULE.MANIFEST_NAME).read_text())
+        launcher_entry = next(
+            entry for entry in manifest["entries"] if entry["role"] == "desktop_launcher"
+        )
+        self.assertEqual(
+            launcher_entry["sha256"], hashlib.sha256(rendered_launcher).hexdigest()
+        )
         self.assertEqual(
             (root / "one/system/buzz-agent-key-handoff.sudoers").stat().st_mode
             & 0o777,
             0o440,
+        )
+
+    def test_launcher_template_requires_exactly_one_hash_token(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        template = Path(temporary.name) / "launch-buzz-desktop"
+        app_hash = "a" * 64
+
+        for payload in (
+            b"launcher without token\n",
+            FREEZER.DESKTOP_APP_SHA256_TOKEN * 2,
+        ):
+            template.write_bytes(payload)
+            template.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "must contain one"):
+                FREEZER.render_desktop_launcher(template, app_hash)
+
+        template.write_bytes(FREEZER.DESKTOP_APP_SHA256_TOKEN)
+        template.chmod(0o755)
+        self.assertEqual(
+            FREEZER.render_desktop_launcher(template, app_hash), app_hash.encode()
         )
 
     def test_rejects_duplicate_json_keys(self) -> None:
@@ -397,7 +432,7 @@ with Path({str(roles_log)!r}).open("a") as roles:
 if role == "desktop_app":
     print(
         f"{{package / 'desktop/Buzz_0.5.8_amd64.AppImage'}}"
-        "\t/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage"
+        "\t/home/victor/work/buzz-client/Buzz_0.5.8-mempool-genesis_amd64.AppImage"
         "\t0755\t0755\t" + {expected_app_hash!r} + "\t" + "a" * 64
     )
 else:

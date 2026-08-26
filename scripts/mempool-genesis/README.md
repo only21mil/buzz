@@ -47,7 +47,7 @@ Freeze the static and Desktop install bytes with one manifest:
 python3 scripts/mempool-genesis/freeze-install-package.py \
   --package /home/victor/.cache/tmp/mempool-genesis-install-package \
   --package-id mempool-genesis-install-050ac722 \
-  --desktop-app /path/to/Buzz_0.5.8-fixed-050ac722_amd64.AppImage
+  --desktop-app /path/to/Buzz_0.5.8_amd64.AppImage
 ```
 
 The freezer refuses a dirty source worktree, runs
@@ -57,9 +57,14 @@ The freezer reads the current launcher only from
 `/home/victor/projects/buzz/scripts/launch_buzz_desktop.sh`. It copies neither
 that file nor application data. The package owns no prompt files, so the v2
 schema has exactly nine entries: seven static-system sources, the AppImage, and
-the bundled launcher. `install-package.manifest.json` records each target path
-and SHA-256, both launcher hashes, and a package fingerprint over sorted
-`<status>\t<sha256>\t<target>\n` records. The evidence bundle must list the nine
+the rendered launcher. The tracked launcher is a template with exactly one
+AppImage SHA-256 token. The freezer copies the AppImage first, hashes the exact
+bytes written into the package, substitutes that digest into the launcher, and
+targets the absent `Buzz_0.5.8-mempool-genesis_amd64.AppImage` path. The old
+AppImage remains available for launcher rollback. `install-package.manifest.json`
+records each target path and SHA-256, both launcher hashes, and a package
+fingerprint over sorted `<status>\t<sha256>\t<target>\n` records. The evidence
+bundle must list the nine
 absolute package source paths in byte order and repeat the manifest's three
 named fingerprints.
 

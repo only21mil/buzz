@@ -5,8 +5,8 @@ umask 077
 
 readonly secret_dir=/home/victor/.config/sats
 readonly secret_file=${secret_dir}/secrets.env
-readonly appimage=/home/victor/work/buzz-client/Buzz_0.5.8-fixed-050ac722_amd64.AppImage
-readonly appimage_sha256=6885d124f0aee6e5f8da83c1e36f47acb3a8b52579ecbf0bf2c9389356b1925b
+readonly appimage=/home/victor/work/buzz-client/Buzz_0.5.8-mempool-genesis_amd64.AppImage
+readonly appimage_sha256=__BUZZ_APPIMAGE_SHA256__
 readonly relay_url=wss://framework-desktop.tail69757d.ts.net:38443
 
 fail() {
