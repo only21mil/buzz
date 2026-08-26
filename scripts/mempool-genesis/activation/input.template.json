@@ -1,0 +1,5 @@
+{
+  "schema": "buzz-mempool-genesis-activation-input-v1",
+  "mempool_pubkey": "DESKTOP_SAVE_REQUIRED_MEMPOOL_PUBKEY",
+  "genesis_pubkey": "DESKTOP_SAVE_REQUIRED_GENESIS_PUBKEY"
+}
