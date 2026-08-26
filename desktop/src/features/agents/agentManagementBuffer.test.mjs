@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { classifyAgentManagementOrigin } from "./agentManagementBuffer.ts";
+import {
+  advanceAgentManagementReview,
+  classifyAgentManagementOrigin,
+  enqueueAgentManagementReview,
+} from "./agentManagementBuffer.ts";
 
 const AGENT = "a".repeat(64);
 const CHANNEL = "channel-1";
@@ -59,4 +63,53 @@ test("rejects a draft from an agent this Desktop does not own", () => {
     ),
     "reject",
   );
+});
+
+test("serializes Mempool and Genesis review dialogs in arrival order", () => {
+  const mempool = {
+    agentPubkey: AGENT,
+    request: {
+      type: "agent_management_request",
+      action: "create",
+      requestId: "mempool-request",
+      request: {
+        channelId: CHANNEL,
+        displayName: "Mempool",
+        systemPrompt: "Watch the mempool.",
+      },
+    },
+  };
+  const genesis = {
+    agentPubkey: AGENT,
+    request: {
+      type: "agent_management_request",
+      action: "create",
+      requestId: "genesis-request",
+      request: {
+        channelId: CHANNEL,
+        displayName: "Genesis",
+        systemPrompt: "Track chain state.",
+      },
+    },
+  };
+
+  const first = enqueueAgentManagementReview(null, [], mempool);
+  assert.equal(first.activate, mempool);
+  assert.deepEqual(first.queued, []);
+
+  const second = enqueueAgentManagementReview(
+    mempool.request.requestId,
+    first.queued,
+    genesis,
+  );
+  assert.equal(second.activate, null, "active dialog stays open");
+  assert.deepEqual(second.queued, [genesis]);
+
+  const advanced = advanceAgentManagementReview(second.queued);
+  assert.equal(
+    advanced.activate,
+    genesis,
+    "Genesis opens after Mempool closes",
+  );
+  assert.deepEqual(advanced.queued, []);
 });

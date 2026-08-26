@@ -111,12 +111,15 @@ type AgentDefinitionDialogProps = {
   /** Publishes saved changes when the edited agent is shared in the catalog. */
   publishCatalogUpdatesOnSave?: boolean;
   createRunSection?: React.ReactNode;
+  /** Optional explicit alternative to the create form's default submit. */
+  secondarySubmitLabel?: string;
   /** Extra create-mode submit gate (e.g. incomplete provider config). */
   createSubmitBlocked?: boolean;
 };
 
 export type AgentDefinitionSubmitOptions = {
   publishCatalogUpdates: boolean;
+  submitAction: "primary" | "secondary";
 };
 
 export function AgentDefinitionDialog({
@@ -135,6 +138,7 @@ export function AgentDefinitionDialog({
   onSubmit,
   publishCatalogUpdatesOnSave = false,
   createRunSection,
+  secondarySubmitLabel,
   createSubmitBlocked = false,
 }: AgentDefinitionDialogProps) {
   const runtimesLoading = runtimeCatalogStatus === "loading";
@@ -328,7 +332,9 @@ export function AgentDefinitionDialog({
     onOpenChange(next);
   }
 
-  async function handleSubmit() {
+  async function handleSubmit(
+    submitAction: AgentDefinitionSubmitOptions["submitAction"] = "primary",
+  ) {
     // D1: the same localModeSatisfied gate as canSubmit prevents form-submit
     // (Enter) from bypassing a missing credential.
     if (!initialValues || !localModeSatisfied || !canSubmit) return;
@@ -379,12 +385,16 @@ export function AgentDefinitionDialog({
         },
         {
           publishCatalogUpdates: publishCatalogUpdatesOnSave && hasUserChanges,
+          submitAction,
         },
       );
       return;
     }
 
-    await onSubmit(baseInput, { publishCatalogUpdates: false });
+    await onSubmit(baseInput, {
+      publishCatalogUpdates: false,
+      submitAction,
+    });
   }
 
   function handleSubmitForm(event: React.FormEvent<HTMLFormElement>) {
@@ -738,7 +748,15 @@ export function AgentDefinitionDialog({
       isAvatarUploadPending={isAvatarUploadPending}
       isPending={isPending}
       onCancel={() => handleOpenChange(false)}
+      onSecondarySubmit={
+        secondarySubmitLabel
+          ? () => {
+              void handleSubmit("secondary");
+            }
+          : undefined
+      }
       publishesCatalogUpdates={publishCatalogUpdatesOnSave && hasUserChanges}
+      secondarySubmitLabel={secondarySubmitLabel}
       submitBlockReason={null}
       submitLabel={submitLabel}
     />

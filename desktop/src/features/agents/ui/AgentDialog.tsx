@@ -12,7 +12,10 @@ import {
 } from "../lib/agentAccessWarning";
 import { AgentRunLocationProvider } from "./AgentRunLocationContext";
 import type { BackendIntent } from "../lib/instanceInputForDefinition";
-import type { AgentCreateIntent } from "./agentCreateIntent";
+import {
+  resolveAgentReviewCreateIntent,
+  type AgentCreateIntent,
+} from "./agentCreateIntent";
 import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
 import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog";
 import { createPersonaDialogState } from "./personaDialogState";
@@ -31,6 +34,7 @@ type AgentDialogCreateProps = {
   mode: "definition";
   embedded?: boolean;
   submitLabel?: string;
+  offerStoppedCreate?: boolean;
   initialValues?: CreatePersonaInput | null;
   onDirtyChange?: (dirty: boolean) => void;
   onOpenChange: (open: boolean) => void;
@@ -88,7 +92,8 @@ type AgentDialogProps =
 /**
  * Unified entry point (Phase 1B.2/1B.3b/1B.3c): routes an intent to the form
  * that owns it. The definition family renders AgentDefinitionDialog — create
- * mode always starts the agent and includes a WhereToRunSection;
+ * mode includes a WhereToRunSection and normally starts the agent; owned-agent
+ * review may instead mint a stopped identity;
  * definition-edit passes the caller's PersonaDialogState-derived props
  * through unchanged (edit/duplicate/import). instance-edit renders
  * AgentInstanceEditDialog (persistent mount + `open` toggle — its reset
@@ -131,6 +136,7 @@ function AgentCreateDialogRouter({
   runtimes,
   runtimeCatalogStatus,
   submitLabel,
+  offerStoppedCreate = false,
   onDirtyChange,
   onSubmitDefinition,
 }: AgentDialogCreateProps) {
@@ -158,17 +164,28 @@ function AgentCreateDialogRouter({
           />
         }
         createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
-        description={copy.description}
+        description={
+          offerStoppedCreate
+            ? "Create this agent stopped, or start it now."
+            : copy.description
+        }
         embedded={embedded}
         error={definitionError}
         initialValues={initialValues}
         isPending={isDefinitionPending}
         onDirtyChange={onDirtyChange}
         onOpenChange={onOpenChange}
-        onSubmit={async (input) => {
+        onSubmit={async (input, options) => {
+          const intent = offerStoppedCreate
+            ? resolveAgentReviewCreateIntent(
+                options.submitAction === "secondary"
+                  ? "start-now"
+                  : "create-stopped",
+              )
+            : "definition_start";
           const submitted = await onSubmitDefinition(
             input,
-            "definition_start",
+            intent,
             resolveBackendIntent(runDraft),
           );
           if (submitted) {
@@ -179,6 +196,7 @@ function AgentCreateDialogRouter({
         open
         runtimes={runtimes}
         runtimeCatalogStatus={runtimeCatalogStatus}
+        secondarySubmitLabel={offerStoppedCreate ? "Start now" : undefined}
         submitLabel={submitLabel ?? copy.submitLabel}
         title={copy.title}
       />

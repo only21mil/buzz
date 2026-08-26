@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   availableRuntimesForStart,
   buildInstanceInputForDefinition,
+  createManagedInstanceForDefinition,
   resolveStartRuntimeForDefinition,
 } from "./instanceInputForDefinition.ts";
 
@@ -179,6 +180,67 @@ test("no backend intent is byte-identical to the pre-intent mapping", async () =
     startOnAppLaunch: true,
     backend: { type: "local" },
   });
+});
+
+test("stopped owner-review creation mints an identity without spawn, auto-start, or attachment", async () => {
+  const createInputs = [];
+  const attachments = [];
+  const response = {
+    agent: { pubkey: "a".repeat(64), name: "Test Agent" },
+    privateKeyNsec: "nsec-test",
+    profileSyncError: null,
+    spawnError: null,
+  };
+
+  const created = await createManagedInstanceForDefinition({
+    createManagedAgent: async (input) => {
+      createInputs.push(input);
+      return response;
+    },
+    mode: "stopped",
+    persona: persona(),
+    presentCreatedAgent: async (...args) => {
+      attachments.push(args);
+    },
+    runtime: gooseRuntime,
+    targetChannel: { id: "channel-1", name: "Agents" },
+  });
+
+  assert.equal(created, response, "profile-sync result is returned unchanged");
+  assert.equal(createInputs.length, 1, "managed keypair creation runs once");
+  assert.equal(createInputs[0].spawnAfterCreate, false);
+  assert.equal(createInputs[0].startOnAppLaunch, false);
+  assert.equal(attachments.length, 0, "stopped creation never attaches");
+});
+
+test("Start now preserves the existing spawn, auto-start, and attachment flow", async () => {
+  const createInputs = [];
+  const attachments = [];
+  const response = {
+    agent: { pubkey: "b".repeat(64), name: "Test Agent" },
+    privateKeyNsec: "nsec-test",
+    profileSyncError: null,
+    spawnError: null,
+  };
+  const targetChannel = { id: "channel-1", name: "Agents" };
+
+  await createManagedInstanceForDefinition({
+    createManagedAgent: async (input) => {
+      createInputs.push(input);
+      return response;
+    },
+    mode: "start",
+    persona: persona(),
+    presentCreatedAgent: async (...args) => {
+      attachments.push(args);
+    },
+    runtime: gooseRuntime,
+    targetChannel,
+  });
+
+  assert.equal(createInputs[0].spawnAfterCreate, true);
+  assert.equal(createInputs[0].startOnAppLaunch, true);
+  assert.deepEqual(attachments, [[response, targetChannel]]);
 });
 
 test("Buzz shared compute definition carries native provider and auto model", async () => {
