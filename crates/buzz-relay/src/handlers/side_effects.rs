@@ -3266,18 +3266,18 @@ pub async fn reconcile_channel_events(
                 continue;
             }
         };
-        let desired_member_tags =
-            match group_member_tags(&channel_id_str, &members, &agent_pubkeys) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        channel_id = %channel.id,
-                        error = %e,
-                        "reconcile: failed to build member tags"
-                    );
-                    continue;
-                }
-            };
+        let desired_member_tags = match group_member_tags(&channel_id_str, &members, &agent_pubkeys)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    channel_id = %channel.id,
+                    error = %e,
+                    "reconcile: failed to build member tags"
+                );
+                continue;
+            }
+        };
         let has_metadata = existing
             .iter()
             .any(|stored| event_kind_u32(&stored.event) == KIND_NIP29_GROUP_METADATA);
