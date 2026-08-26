@@ -11,12 +11,14 @@
 //!   * an unknown repository (`target_repo_a` that does not resolve) yields a
 //!     structured 4xx, not a 500;
 //!   * a syntactically valid request for a repository the relay can resolve to
-//!     its (host-bound) community returns 501 NOT_IMPLEMENTED while the full
-//!     resolution path is a stub.
+//!     its (host-bound) community runs the full resolution path (membership →
+//!     tip → PR snapshot → trusted-base workflow → job selection) and then
+//!     fails closed with a precise 503 on the policy bounds, which have no
+//!     relay-side producer at a7d497ffc.
 //!
 //! The three checks are separated because the auth path must run before repo
-//! resolution; a request that clears auth and repo validation lands on the 501
-//! branch of the B1 contract.
+//! resolution; a request that clears auth and repo validation land on the
+//! full resolution path and its precise policy fail-closed seam.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -147,15 +149,30 @@ async fn preflight_unknown_repo_returns_structured_4xx() {
 
 #[tokio::test]
 #[ignore = "requires live relay with /ci/preflight wired"]
-async fn preflight_valid_request_is_not_implemented() {
+async fn preflight_valid_request_fails_closed_without_policy_producer() {
     // A valid NIP-98 request for a host-bound community whose repository the
-    // relay can at least scope reaches the preflight stub. Until the full
-    // resolution wiring lands the contract returns 501, not 404/500.
+    // relay can scope reaches the full resolution path (membership → tip →
+    // PR snapshot → trusted-base workflow → job selection) and then fails
+    // closed on the policy bounds, which have no producer in the relay
+    // process at a7d497ffc (broker-owned policy store is execd/broker-side
+    // only). The response is a precise 503, not a blanket 501/404/500.
     let response = preflight_with_host("localhost:3000", &valid_body()).await;
     let status = response.status();
     assert_eq!(
         status,
-        reqwest::StatusCode::NOT_IMPLEMENTED,
-        "valid preflight request should hit the 501 stub, got {status}"
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "valid preflight request should hit the precise policy_unavailable 503, got {status}"
+    );
+    let body = response
+        .text()
+        .await
+        .expect("read service-unavailable body");
+    assert!(
+        body.contains("policy bounds unavailable"),
+        "policy failure must be precise: {body}"
+    );
+    assert!(
+        body.contains("broker-owned policy store"),
+        "policy failure must cite the exact seam: {body}"
     );
 }

@@ -1,0 +1,267 @@
+{
+  "frozen_slice_base": "1543c1ffed7aa193e5cdcaf8560fa18ab8354103",
+  "frozen_slice_canonical": "a7d497ffcb62f6eb5fc117830e3ac114e58f0abf",
+  "new_correction_path_count": 9,
+  "note": "Reconciles the reviewer's 13 rev-1 paths and adds this worktree's new-correction paths: the ci.rs test additions, the DB constraints additions, the two proof scripts, the manifest itself, the membership-seed touch in ci.rs TestHarness, plus the C1R full-preflight field-producer paths this manifest predicts C1R will land. All C1R paths carry \"certainty\": false and a marker until the sibling's actual diff can be measured against the merged tree.",
+  "paths": [
+    {
+      "added": 156,
+      "deleted": 1,
+      "kind": "added",
+      "new-vs-rev1": true,
+      "path": "ci-acceptance/b1-rev2-changed-paths.manifest.json",
+      "phase": "new-correction"
+    },
+    {
+      "added": 4,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-core/src/kind.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 408,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-core/tests/ci_auth_gate.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 303,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-db/src/ci_grants.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 50,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-db/src/lib.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 142,
+      "deleted": 1,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-db/src/migration.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 158,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-db/tests/ci_grants_contract.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 158,
+      "deleted": 0,
+      "kind": "added",
+      "new-vs-rev1": true,
+      "path": "crates/buzz-db/tests/ci_grants_contract.rs",
+      "phase": "new-correction"
+    },
+    {
+      "added": 251,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-relay/src/api/ci.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 806,
+      "deleted": 0,
+      "kind": "added",
+      "new-vs-rev1": true,
+      "path": "crates/buzz-relay/src/api/ci.rs",
+      "phase": "new-correction"
+    },
+    {
+      "added": 5,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-relay/src/api/mod.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 47,
+      "deleted": 6,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-relay/src/handlers/ingest.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 2,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-relay/src/router.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 161,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "crates/buzz-test-client/tests/ci_preflight.rs",
+      "phase": "rev1"
+    },
+    {
+      "added": 35,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "migrations/0035_ci_grants.sql",
+      "phase": "rev1"
+    },
+    {
+      "added": 20,
+      "deleted": 0,
+      "kind": "modified",
+      "new-vs-rev1": false,
+      "path": "schema/schema.sql",
+      "phase": "rev1"
+    },
+    {
+      "added": 131,
+      "deleted": 0,
+      "kind": "added",
+      "new-vs-rev1": true,
+      "path": "scripts/b1-db-grants-basis.sh",
+      "phase": "new-correction"
+    },
+    {
+      "added": 106,
+      "deleted": 0,
+      "kind": "added",
+      "new-vs-rev1": true,
+      "path": "scripts/b1-preflight-route-basis.sh",
+      "phase": "new-correction"
+    },
+    {
+      "added": 0,
+      "deleted": 0,
+      "certainty": false,
+      "kind": "modified",
+      "marker": "C1R_PREDICTED_PRODUCER",
+      "new-vs-rev1": true,
+      "path": "crates/buzz-core/src/ci.rs",
+      "phase": "new-correction"
+    },
+    {
+      "added": 0,
+      "deleted": 0,
+      "certainty": false,
+      "kind": "modified",
+      "marker": "C1R_PREDICTED_PRODUCER",
+      "new-vs-rev1": true,
+      "path": "crates/buzz-ci-materializer/src/manifest.rs",
+      "phase": "new-correction"
+    },
+    {
+      "added": 0,
+      "deleted": 0,
+      "certainty": false,
+      "kind": "modified",
+      "marker": "C1R_PREDICTED_PRODUCER",
+      "new-vs-rev1": true,
+      "path": "crates/buzz-ci-materializer/src/tree.rs",
+      "phase": "new-correction"
+    },
+    {
+      "added": 0,
+      "deleted": 0,
+      "certainty": false,
+      "kind": "modified",
+      "marker": "C1R_PREDICTED_PRODUCER",
+      "new-vs-rev1": true,
+      "path": "crates/buzz-ci-policy-proxy/src/policy.rs",
+      "phase": "new-correction"
+    }
+  ],
+  "inventory": {
+    "schema": "buzz-b1-rev2-inventory/v1",
+    "build": "a7d497ffcb62f6eb5fc117830e3ac114e58f0abf",
+    "captured_at_sha": "a7d497ffcb62f6eb5fc117830e3ac114e58f0abf",
+    "note": "SHA-style inventory of the C3R acceptance additions captured against the frozen canonical build. C1R-predicted producers are listed with certainty=false; their real added/deleted line counts must be filled from C1R's actual diff after integration.",
+    "c3r_acceptance": [
+      {
+        "group": "route-seam-preflight-acceptance",
+        "path": "crates/buzz-relay/src/api/ci.rs",
+        "added_tests": [
+          "preflight_full_response_every_field_present_and_typed",
+          "preflight_workflow_digest_equals_sha256_of_decoded_base64",
+          "preflight_trigger_event_follows_effective_pr_event",
+          "preflight_policy_bounds_are_from_authoritative_source_not_defaults",
+          "route_full_preflight_success_returns_every_field",
+          "route_malformed_coordinate_is_400_in_both_domains",
+          "route_non_member_is_exactly_403",
+          "route_unknown_repo_is_exactly_404_not_501",
+          "route_unresolvable_tip_is_400_or_404_not_501",
+          "route_rejects_old_501_and_blanket_wf_400_contract"
+        ],
+        "phase": "new-correction",
+        "run_status": {
+          "pure_passing_now": 10,
+          "route_need_scratch_db_and_post_c1r": "8 of 9 currently fail on the 501 stub; 1 (malformed coordinate) passes",
+          "integration_gate": "POST-C1R"
+        }
+      },
+      {
+        "group": "db-grants-contract",
+        "path": "crates/buzz-db/tests/ci_grants_contract.rs",
+        "added_tests": [
+          "owner_grant_is_durable_and_visible_to_get_active_ci_signers",
+          "rejected_non_owner_grant_is_never_visible",
+          "malformed_validity_window_is_never_active"
+        ],
+        "phase": "new-correction",
+        "run_status": {
+          "full_suite_via_script": "10/10 PASS (GRANT_SCORE: 10/10)",
+          "script": "scripts/b1-db-grants-basis.sh"
+        }
+      },
+      {
+        "group": "proof-scripts",
+        "paths": [
+          "scripts/b1-db-grants-basis.sh",
+          "scripts/b1-preflight-route-basis.sh"
+        ],
+        "phase": "new-correction",
+        "design": "deterministic sha256 over verdict lines + pass/fail score line",
+        "run_status": {
+          "db_grants": "works end-to-end",
+          "preflight_route": "runs; currently scores 0/N on the stub (honest pre-C1R record)"
+        }
+      },
+      {
+        "group": "manifest",
+        "path": "ci-acceptance/b1-rev2-changed-paths.manifest.json",
+        "phase": "new-correction"
+      }
+    ],
+    "c1r_predicted_producers": [
+      "crates/buzz-core/src/ci.rs",
+      "crates/buzz-ci-materializer/src/manifest.rs",
+      "crates/buzz-ci-materializer/src/tree.rs",
+      "crates/buzz-ci-policy-proxy/src/policy.rs"
+    ]
+  },
+  "paths_listed_count": 22,
+  "reconciled_to_reviewer_count": 13,
+  "rev1_path_count": 13,
+  "schema": "buzz-b1-rev2-changed-paths/v1",
+  "total_path_count_at_rev2": 22,
+  "total_path_count_with_predicted_c1r": 22,
+  "unique_path_count_at_rev2": 19
+}
