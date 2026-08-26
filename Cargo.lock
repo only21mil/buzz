@@ -1045,6 +1045,7 @@ name = "buzz-ci-runner"
 version = "0.1.0"
 dependencies = [
  "buzz-ci-broker-protocol",
+ "buzz-ci-controld",
  "buzz-core",
  "hex",
  "nix 0.31.3",

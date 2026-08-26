@@ -85,9 +85,7 @@ impl ControldConfig {
         {
             return Err(ConfigError::UnsafeSignerPath);
         }
-        if poll_interval.is_zero()
-            || liveness_window.is_zero()
-            || poll_interval >= liveness_window
+        if poll_interval.is_zero() || liveness_window.is_zero() || poll_interval >= liveness_window
         {
             return Err(ConfigError::InvalidTiming);
         }
@@ -318,13 +316,11 @@ impl TerminalFacts {
     }
 
     const fn permits_success(&self) -> bool {
-        self.evidence_finalized_event_id.is_some()
-            && self.teardown_attestation_event_id.is_some()
+        self.evidence_finalized_event_id.is_some() && self.teardown_attestation_event_id.is_some()
     }
 
     const fn is_empty(&self) -> bool {
-        self.evidence_finalized_event_id.is_none()
-            && self.teardown_attestation_event_id.is_none()
+        self.evidence_finalized_event_id.is_none() && self.teardown_attestation_event_id.is_none()
     }
 }
 
@@ -470,18 +466,12 @@ impl RunRecord {
     }
 
     /// Bind an accepted kind-46105 fact before terminal success publication.
-    pub fn with_evidence_finalized(
-        &self,
-        event_id: String,
-    ) -> Result<Self, StateError> {
+    pub fn with_evidence_finalized(&self, event_id: String) -> Result<Self, StateError> {
         self.with_terminal_fact(event_id, TerminalFactKind::EvidenceFinalized)
     }
 
     /// Bind an accepted kind-46106 fact before terminal success publication.
-    pub fn with_teardown_attestation(
-        &self,
-        event_id: String,
-    ) -> Result<Self, StateError> {
+    pub fn with_teardown_attestation(&self, event_id: String) -> Result<Self, StateError> {
         self.with_terminal_fact(event_id, TerminalFactKind::TeardownAttestation)
     }
 
@@ -569,9 +559,7 @@ impl RunRecord {
                     && self.facts.permits_success()
             }
             RunState::Failure | RunState::TimedOut => {
-                self.sequence == 3
-                    && self.started_at.is_some()
-                    && self.finished_at.is_some()
+                self.sequence == 3 && self.started_at.is_some() && self.finished_at.is_some()
             }
             RunState::Cancelled | RunState::InfrastructureFailure => {
                 self.finished_at.is_some()
@@ -740,9 +728,7 @@ mod tests {
                     (current, next),
                     (
                         RunState::Queued,
-                        RunState::Running
-                            | RunState::Cancelled
-                            | RunState::InfrastructureFailure
+                        RunState::Running | RunState::Cancelled | RunState::InfrastructureFailure
                     ) | (
                         RunState::Running,
                         RunState::Success

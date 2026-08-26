@@ -1,6 +1,7 @@
 d /run/buzzci 0711 root root -
 d /run/netns 0755 root root -
 d /var/lib/buzzci 0700 root root -
+d /var/lib/buzzci/runner-output 0700 buzzci-ctl buzzci-ctl -
 d /var/lib/buzzci/activation 0700 root root -
 d /var/lib/buzzci/activation/receipts 0700 root root -
 d /var/lib/buzzci/activation/receipts/cleanup 0700 root root -

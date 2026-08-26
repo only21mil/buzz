@@ -1,7 +1,7 @@
 //! Secure loading for runner-owned configuration.
 //!
-//! Controld-facing transport fields do not belong here until that contract is
-//! frozen. Version 1 therefore carries only its schema marker.
+//! The reviewed version-1 contract supplies only the peer UID. Socket and
+//! output paths remain fixed crate constants and cannot be selected here.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -20,6 +20,8 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 pub struct RunnerConfig {
     /// Configuration schema. Version 1 is the only accepted value.
     pub schema_version: u32,
+    /// Dedicated controld account accepted by `SO_PEERCRED`.
+    pub controld_uid: u32,
 }
 
 /// Fail-closed configuration loading failures.
@@ -37,6 +39,8 @@ pub enum ConfigError {
     InvalidJson(#[source] serde_json::Error),
     #[error("runner configuration schema is unsupported")]
     UnsupportedSchema,
+    #[error("runner controld UID must be nonzero")]
+    InvalidPeerUid,
 }
 
 impl RunnerConfig {
@@ -76,6 +80,9 @@ impl RunnerConfig {
         if config.schema_version != 1 {
             return Err(ConfigError::UnsupportedSchema);
         }
+        if config.controld_uid == 0 {
+            return Err(ConfigError::InvalidPeerUid);
+        }
         Ok(config)
     }
 }
@@ -98,11 +105,14 @@ mod tests {
     fn loads_exact_mode_0600_version_one_config() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("runner.json");
-        write_config(&path, br#"{"schema_version":1}"#, 0o600);
+        write_config(&path, br#"{"schema_version":1,"controld_uid":962}"#, 0o600);
 
         assert_eq!(
             RunnerConfig::load(&path).expect("valid config"),
-            RunnerConfig { schema_version: 1 }
+            RunnerConfig {
+                schema_version: 1,
+                controld_uid: 962,
+            }
         );
     }
 
@@ -110,7 +120,7 @@ mod tests {
     fn rejects_broad_mode_symlink_and_unknown_fields() {
         let directory = tempdir().expect("tempdir");
         let broad = directory.path().join("broad.json");
-        write_config(&broad, br#"{"schema_version":1}"#, 0o640);
+        write_config(&broad, br#"{"schema_version":1,"controld_uid":962}"#, 0o640);
         assert!(matches!(
             RunnerConfig::load(&broad),
             Err(ConfigError::InsecureFile)
@@ -118,7 +128,11 @@ mod tests {
 
         let target = directory.path().join("target.json");
         let linked = directory.path().join("linked.json");
-        write_config(&target, br#"{"schema_version":1}"#, 0o600);
+        write_config(
+            &target,
+            br#"{"schema_version":1,"controld_uid":962}"#,
+            0o600,
+        );
         symlink(&target, &linked).expect("create fixture symlink");
         assert!(matches!(
             RunnerConfig::load(&linked),
@@ -128,12 +142,19 @@ mod tests {
         let unknown = directory.path().join("unknown.json");
         write_config(
             &unknown,
-            br#"{"schema_version":1,"runner_socket":"unfrozen"}"#,
+            br#"{"schema_version":1,"controld_uid":962,"runner_socket":"unfrozen"}"#,
             0o600,
         );
         assert!(matches!(
             RunnerConfig::load(&unknown),
             Err(ConfigError::InvalidJson(_))
+        ));
+
+        let root = directory.path().join("root.json");
+        write_config(&root, br#"{"schema_version":1,"controld_uid":0}"#, 0o600);
+        assert!(matches!(
+            RunnerConfig::load(&root),
+            Err(ConfigError::InvalidPeerUid)
         ));
     }
 }

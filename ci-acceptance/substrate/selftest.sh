@@ -7,6 +7,7 @@ sudoers=$script_dir/buzz-ci-acceptance-ctl.sudoers
 service=$script_dir/buzz-ci-execd.service
 socket=$script_dir/buzz-ci-execd.socket
 runner_service=$script_dir/buzz-ci-runner.service
+runner_socket=$script_dir/buzz-ci-runner.socket
 dropin=$script_dir/buzz-ci-execd.service.d/10-host-adapters.conf
 tmpfiles=$script_dir/buzzci-control.tmpfiles
 harness=$script_dir/harness.env.plan
@@ -29,11 +30,11 @@ awk -F '\t' '
   /^#/ || NF == 0 { next }
   NF != 6 { bad = 1; next }
   $2 !~ /^\// || $2 ~ /(^|\/)\.\.?($|\/)/ { bad = 1 }
-  $3 !~ /^(root|buzzci-ctl)$/ || $4 !~ /^(root|buzzci-ctl)$/ { bad = 1 }
+  $3 !~ /^(root|buzzci-ctl)$/ || $4 !~ /^(root|buzzci-ctl|buzzci-controld)$/ { bad = 1 }
   $5 !~ /^0[0-7]{3}$/ { bad = 1 }
   $6 !~ /^(directory|compiled-binary|file|rendered-file)$/ { bad = 1 }
   seen[$2]++ { bad = 1 }
-  END { if (bad || length(seen) != 32) exit 1 }
+  END { if (bad || length(seen) != 34) exit 1 }
 ' "$manifest" || fail 'invalid install manifest'
 
 manifest_row() {
@@ -52,6 +53,8 @@ manifest_row /usr/libexec/buzz-ci-runner \
   $'cargo-bin:buzz-ci-runner\t/usr/libexec/buzz-ci-runner\troot\tbuzzci-ctl\t0750\tcompiled-binary'
 manifest_row /etc/systemd/system/buzz-ci-runner.service \
   $'buzz-ci-runner.service\t/etc/systemd/system/buzz-ci-runner.service\troot\troot\t0644\tfile'
+manifest_row /etc/systemd/system/buzz-ci-runner.socket \
+  $'buzz-ci-runner.socket\t/etc/systemd/system/buzz-ci-runner.socket\troot\troot\t0644\tfile'
 manifest_row /etc/buzzci/runner-v1.json \
   $'rendered:runner-v1.json.plan\t/etc/buzzci/runner-v1.json\tbuzzci-ctl\tbuzzci-ctl\t0600\trendered-file'
 manifest_row /etc/buzzci/authority \
@@ -88,6 +91,8 @@ manifest_row /run/netns \
   $'-\t/run/netns\troot\troot\t0755\tdirectory'
 manifest_row /var/lib/buzzci \
   $'-\t/var/lib/buzzci\troot\troot\t0700\tdirectory'
+manifest_row /var/lib/buzzci/runner-output \
+  $'-\t/var/lib/buzzci/runner-output\tbuzzci-ctl\tbuzzci-ctl\t0700\tdirectory'
 
 while IFS=$'\t' read -r source _destination _owner _group _mode _kind; do
   [[ -n $source && ${source:0:1} != '#' ]] || continue
@@ -104,12 +109,12 @@ awk -F '\t' '
   NF != 7 { bad = 1; next }
   $1 !~ /^(install|runtime|authority|state|receipt|artifact)$/ { bad = 1 }
   $2 !~ /^\// || $2 ~ /(^|\/)\.\.?($|\/)/ { bad = 1 }
-  $3 !~ /^(root|buzzci-ctl)$/ || $4 !~ /^(root|buzzci-ctl)$/ { bad = 1 }
+  $3 !~ /^(root|buzzci-ctl)$/ || $4 !~ /^(root|buzzci-ctl|buzzci-controld)$/ { bad = 1 }
   $5 !~ /^0[0-7]{3}$/ { bad = 1 }
   $6 !~ /^(compiled-binary|directory|unix-socket|immutable-file|atomic-file|packaged-file)$/ { bad = 1 }
   $7 !~ /^(installer|installer-atomic|installer-then-execd|systemd-tmpfiles|systemd|execd|operating-system|execd-atomic)$/ { bad = 1 }
   seen[$2]++ { bad = 1 }
-  END { if (bad || length(seen) != 21) exit 1 }
+  END { if (bad || length(seen) != 23) exit 1 }
 ' "$path_plan" || fail 'invalid host path contract'
 
 path_row() {
@@ -122,10 +127,14 @@ path_row() {
 
 path_row /run/buzzci/execd.sock \
   $'runtime\t/run/buzzci/execd.sock\tbuzzci-ctl\tbuzzci-ctl\t0600\tunix-socket\tsystemd'
+path_row /run/buzzci/runner-control.sock \
+  $'runtime\t/run/buzzci/runner-control.sock\tbuzzci-ctl\tbuzzci-controld\t0620\tunix-socket\tsystemd'
 path_row /run/netns \
   $'runtime\t/run/netns\troot\troot\t0755\tdirectory\tsystemd-tmpfiles'
 path_row /var/lib/buzzci \
   $'artifact\t/var/lib/buzzci\troot\troot\t0700\tdirectory\tsystemd-tmpfiles'
+path_row /var/lib/buzzci/runner-output \
+  $'artifact\t/var/lib/buzzci/runner-output\tbuzzci-ctl\tbuzzci-ctl\t0700\tdirectory\tsystemd-tmpfiles'
 path_row /var/lib/buzzci/seccomp \
   $'artifact\t/var/lib/buzzci/seccomp\troot\troot\t0700\tdirectory\tsystemd-tmpfiles'
 path_row /var/lib/buzzci/seccomp/v1 \
@@ -149,8 +158,9 @@ jq -e '
 ' "$authority_plan" >/dev/null || fail 'invalid root authority plan'
 
 jq -e '
-  keys == ["schema_version"] and
-  .schema_version == 1
+  keys == ["controld_uid","schema_version"] and
+  .schema_version == 1 and
+  .controld_uid == 963
 ' "$runner_plan" >/dev/null || fail 'invalid runner config plan'
 
 jq -e '
@@ -192,12 +202,13 @@ awk '
     || $3 !~ /^0[0-7]{3}$/ || $4 !~ /^(root|buzzci-ctl)$/ \
     || $5 !~ /^(root|buzzci-ctl)$/ || $6 != "-" { bad = 1 }
   seen[$2]++ { bad = 1 }
-  END { if (bad || length(seen) != 13) exit 1 }
+  END { if (bad || length(seen) != 14) exit 1 }
 ' "$tmpfiles" || fail 'invalid tmpfiles contract'
 for expected in \
   'd /run/buzzci 0711 root root -' \
   'd /run/netns 0755 root root -' \
   'd /var/lib/buzzci 0700 root root -' \
+  'd /var/lib/buzzci/runner-output 0700 buzzci-ctl buzzci-ctl -' \
   'd /var/lib/buzzci/activation 0700 root root -' \
   'd /var/lib/buzzci/activation/receipts 0700 root root -' \
   'd /var/lib/buzzci/activation/receipts/cleanup 0700 root root -' \
@@ -227,14 +238,22 @@ grep -Fxq 'SocketMode=0600' "$socket"
 grep -Fxq 'DirectoryMode=0711' "$socket"
 grep -Fxq 'Service=buzz-ci-execd.service' "$socket"
 
+grep -Fxq 'ListenStream=/run/buzzci/runner-control.sock' "$runner_socket"
+grep -Fxq 'FileDescriptorName=buzz-ci-runner-control' "$runner_socket"
+grep -Fxq 'Accept=no' "$runner_socket"
+grep -Fxq 'SocketUser=buzzci-ctl' "$runner_socket"
+grep -Fxq 'SocketGroup=buzzci-controld' "$runner_socket"
+grep -Fxq 'SocketMode=0620' "$runner_socket"
+grep -Fxq 'DirectoryMode=0711' "$runner_socket"
+grep -Fxq 'Service=buzz-ci-runner.service' "$runner_socket"
+
 grep -Fxq 'User=buzzci-ctl' "$runner_service"
 grep -Fxq 'Group=buzzci-ctl' "$runner_service"
 grep -Fxq 'ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v1.json' "$runner_service"
 grep -Fxq 'NoNewPrivileges=yes' "$runner_service"
 grep -Fxq 'ProtectSystem=strict' "$runner_service"
 grep -Fxq 'ReadOnlyPaths=/etc/buzzci/runner-v1.json /run/buzzci' "$runner_service"
-! rg -n '^ReadWritePaths=' "$runner_service" \
-  || fail 'runner service grants an unfrozen writable path'
+grep -Fxq 'ReadWritePaths=/var/lib/buzzci/runner-output' "$runner_service"
 if rg -n '^Exec(Start|StartPre|StartPost)=.*(^|[[:space:]])(/bin/)?(ba|d?a|z|k)?sh([[:space:]]|$)' "$runner_service"; then
   fail 'runner service invokes a shell'
 fi
@@ -290,6 +309,7 @@ grep -Fxq 'BUZZ_CI_QUALIFICATION_CASE_ROOT=/etc/buzzci/qualification-cases' "$ha
   || fail 'qualification and production controls are aliased'
 
 grep -Fqx $'controller\tbuzzci-ctl\t961\t961\t/var/lib/buzzci/principals/ctl\t/usr/sbin/nologin' "$principals"
+grep -Fqx $'controld\tbuzzci-controld\t963\t963\t/var/lib/buzzci/principals/controld\t/usr/sbin/nologin' "$principals"
 for job_principal in buzzci-mat-01 buzzci-exec-01 buzzci-run-01; do
   job_row=$(awk -F '\t' -v principal="$job_principal" '$2 == principal { print; count++ } END { if (count != 1) exit 1 }' "$principals") \
     || fail "missing or duplicate job principal: $job_principal"

@@ -1,24 +1,29 @@
 //! Sequential local service loop and frozen systemd listener validation.
-//!
-//! This module does not authenticate peers or dispatch execution.
 
 use std::convert::Infallible;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use std::{env, os::fd::AsRawFd, path::Path, process};
 
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{
-    getsockname, getsockopt, sockopt::AcceptConn, sockopt::SockType, SockType as NixSockType,
-    UnixAddr,
+    getsockname, getsockopt, sockopt::AcceptConn, sockopt::PeerCredentials, sockopt::SockType,
+    SockType as NixSockType, UnixAddr,
 };
 
 use thiserror::Error;
 
+use crate::transport::{
+    read_request_frame, ReceiptWriteError, ReceiptWriter, RefusalReason, RunnerReceipt,
+    RUNNER_TRANSPORT_SCHEMA_VERSION,
+};
 #[cfg(target_os = "linux")]
 use crate::transport::{RUNNER_CONTROL_SOCKET_PATH, SYSTEMD_FD_NAME};
+
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Service-loop failures without protocol-specific details.
 #[derive(Debug, Error)]
@@ -27,6 +32,19 @@ pub enum ServiceLoopError {
     Accept(#[source] io::Error),
     #[error("local connection handling failed")]
     Handle(#[source] io::Error),
+}
+
+/// One reviewed-protocol connection failure. No variant grants execution.
+#[derive(Debug, Error)]
+pub enum RunnerConnectionError {
+    #[error("runner control peer is not the configured controld UID")]
+    UnauthorizedPeer,
+    #[error("runner control socket setup failed")]
+    Socket(#[source] io::Error),
+    #[error("runner request frame was rejected")]
+    Frame(#[from] crate::transport::FrameError),
+    #[error("runner refusal receipt could not be written")]
+    Receipt(#[from] ReceiptWriteError),
 }
 
 #[cfg(target_os = "linux")]
@@ -106,6 +124,41 @@ fn nix_io(error: nix::errno::Errno) -> ActivationError {
     ActivationError::Inspect(io::Error::from_raw_os_error(error as i32))
 }
 
+/// Authenticate controld before reading bytes, then return the closed
+/// `backend_unavailable` receipt until the reviewed policy and materializer
+/// providers are composed. This starts the real socket service without
+/// treating peer identity as request authority.
+#[cfg(target_os = "linux")]
+pub fn serve_runner_connection(
+    mut stream: UnixStream,
+    expected_controld_uid: u32,
+) -> Result<(), RunnerConnectionError> {
+    let credentials = getsockopt(&stream, PeerCredentials).map_err(|error| {
+        RunnerConnectionError::Socket(io::Error::from_raw_os_error(error as i32))
+    })?;
+    if credentials.uid() != expected_controld_uid {
+        return Err(RunnerConnectionError::UnauthorizedPeer);
+    }
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
+        .map_err(RunnerConnectionError::Socket)?;
+
+    let request = read_request_frame(&mut stream)?;
+    let (dispatch_id, request_event_id, run_id, attempt) = request.refusal_identity();
+    let refusal = RunnerReceipt::Refused {
+        schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
+        dispatch_id: dispatch_id.to_owned(),
+        request_event_id: request_event_id.to_owned(),
+        run_id: run_id.to_owned(),
+        attempt,
+        receipt_sequence: 1,
+        reason: RefusalReason::BackendUnavailable,
+    };
+    ReceiptWriter::new(&mut stream).send(&refusal)?;
+    Ok(())
+}
+
 /// Hand one local connection to a caller-supplied protocol implementation.
 pub fn serve_connection(
     stream: UnixStream,
@@ -140,11 +193,16 @@ pub fn run_service_loop(
 mod tests {
     use std::io::{Read, Write};
     use std::net::Shutdown;
+    use std::thread;
 
+    #[cfg(target_os = "linux")]
+    use buzz_core::ci::{CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
     #[cfg(target_os = "linux")]
     use tempfile::tempdir;
 
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::transport::{read_frame, write_frame, ExecuteJob, RunnerRequest};
 
     #[test]
     fn protocol_neutral_handler_receives_one_end_of_socket_pair() {
@@ -159,6 +217,89 @@ mod tests {
         .expect("serve connection");
 
         assert_eq!(observed, b"opaque");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request() -> RunnerRequest {
+        RunnerRequest::ExecuteAttempt {
+            schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
+            dispatch_id: "123e4567-e89b-12d3-a456-426614174010".into(),
+            request_event_id: "11".repeat(32),
+            request_event: CiRequestEnvelope {
+                schema_version: CI_SCHEMA_VERSION,
+                request_type: CiRequestType::Run,
+                target_repo_a: format!("30617:{}:buzz", "22".repeat(32)),
+                pr_root_event_id: "33".repeat(32),
+                pr_update_event_id: None,
+                source_clone_url: "https://relay.example/git/repo".into(),
+                immutable_source_ref: "refs/nostr/source".into(),
+                tip_oid: "44".repeat(20),
+                source_branch: "feature".into(),
+                base_ref: "refs/heads/main".into(),
+                base_oid: "55".repeat(20),
+                workflow_id: "ci".into(),
+                workflow_digest: "66".repeat(32),
+                job_ids: vec!["test".into()],
+                run_id: "123e4567-e89b-12d3-a456-426614174011".into(),
+                attempt: 1,
+                parent_attempt: None,
+                parent_run_id: None,
+                trigger_event_id: "33".repeat(32),
+                actor: "77".repeat(32),
+                timeout_seconds: 10,
+                idempotency_key: "123e4567-e89b-12d3-a456-426614174012".into(),
+                issued_at: 1,
+                expires_at: 20,
+            },
+            signed_request_digest: "88".repeat(32),
+            assigned_at: 10,
+            deadline_at: 20,
+            jobs: vec![ExecuteJob {
+                job_id: "test".into(),
+                attempt: 1,
+                parent_attempt: 0,
+                workflow_path: ".github/workflows/ci.yml".into(),
+                job_manifest: "{}".into(),
+                job_manifest_digest: "99".repeat(32),
+                audience_digest: "aa".repeat(32),
+                isolation_profile_digest: "bb".repeat(32),
+            }],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticated_framed_dispatch_gets_closed_backend_refusal() {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let uid = getsockopt(&server, PeerCredentials)
+            .expect("peer credentials")
+            .uid();
+        let worker = thread::spawn(move || serve_runner_connection(server, uid));
+
+        write_frame(&mut client, &request()).expect("request frame");
+        let receipt: RunnerReceipt = read_frame(&mut client).expect("refusal frame");
+        assert!(matches!(
+            receipt,
+            RunnerReceipt::Refused {
+                reason: RefusalReason::BackendUnavailable,
+                receipt_sequence: 1,
+                ..
+            }
+        ));
+        worker.join().expect("join").expect("serve connection");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_uid_is_checked_before_request_bytes_are_read() {
+        let (_client, server) = UnixStream::pair().expect("socket pair");
+        let uid = getsockopt(&server, PeerCredentials)
+            .expect("peer credentials")
+            .uid();
+        assert!(matches!(
+            serve_runner_connection(server, uid.saturating_add(1)),
+            Err(RunnerConnectionError::UnauthorizedPeer)
+        ));
     }
 
     #[cfg(target_os = "linux")]

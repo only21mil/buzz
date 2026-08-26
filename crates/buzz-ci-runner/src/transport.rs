@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Read, Write};
 
+pub use buzz_ci_controld::{RUNNER_CONTROL_SOCKET_PATH, RUNNER_OUTPUT_ROOT};
 use buzz_core::ci::{
     CiJobState, CiRequestEnvelope, CiTeardownAttestationEnvelope, CI_MAX_SAFE_INTEGER,
 };
@@ -16,8 +17,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const RUNNER_CONTROL_SOCKET_PATH: &str = "/run/buzzci/runner-control.sock";
-pub const RUNNER_OUTPUT_ROOT: &str = "/var/lib/buzzci/runner-output";
 pub const SYSTEMD_LISTEN_FD: i32 = 3;
 pub const SYSTEMD_FD_NAME: &str = "buzz-ci-runner-control";
 pub const RUNNER_TRANSPORT_SCHEMA_VERSION: u32 = 1;
@@ -50,21 +49,68 @@ impl RunnerRequest {
     fn has_valid_transport_shape(&self) -> bool {
         match self {
             Self::ExecuteAttempt {
+                dispatch_id,
+                request_event_id,
+                request_event,
+                signed_request_digest,
                 assigned_at,
                 deadline_at,
                 jobs,
                 ..
             } => {
                 let mut job_ids = HashSet::with_capacity(jobs.len());
-                *assigned_at <= CI_MAX_SAFE_INTEGER
+                uuid::Uuid::parse_str(dispatch_id).is_ok()
+                    && is_lower_hex(request_event_id, 64)
+                    && is_lower_hex(signed_request_digest, 64)
+                    && request_event.validate().is_ok()
+                    && *assigned_at > 0
+                    && *assigned_at <= CI_MAX_SAFE_INTEGER
+                    && *deadline_at > *assigned_at
                     && *deadline_at <= CI_MAX_SAFE_INTEGER
+                    && *deadline_at <= request_event.expires_at
+                    && deadline_at.saturating_sub(*assigned_at) <= request_event.timeout_seconds
                     && !jobs.is_empty()
-                    && jobs
+                    && jobs.iter().all(|job| {
+                        !job.job_id.is_empty()
+                            && job.attempt > 0
+                            && !job.workflow_path.is_empty()
+                            && !job.job_manifest.is_empty()
+                            && is_lower_hex(&job.job_manifest_digest, 64)
+                            && is_lower_hex(&job.audience_digest, 64)
+                            && is_lower_hex(&job.isolation_profile_digest, 64)
+                            && job_ids.insert(job.job_id.as_str())
+                    })
+                    && job_ids.len() == request_event.job_ids.len()
+                    && request_event
+                        .job_ids
                         .iter()
-                        .all(|job| !job.job_id.is_empty() && job_ids.insert(job.job_id.as_str()))
+                        .all(|job_id| job_ids.contains(job_id.as_str()))
             }
         }
     }
+
+    pub fn refusal_identity(&self) -> (&str, &str, &str, u32) {
+        match self {
+            Self::ExecuteAttempt {
+                dispatch_id,
+                request_event_id,
+                request_event,
+                ..
+            } => (
+                dispatch_id,
+                request_event_id,
+                request_event.run_id.as_str(),
+                request_event.attempt,
+            ),
+        }
+    }
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

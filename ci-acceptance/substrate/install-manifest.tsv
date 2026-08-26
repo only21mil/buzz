@@ -8,6 +8,7 @@ cargo-bin:buzz-ci-runner	/usr/libexec/buzz-ci-runner	root	buzzci-ctl	0750	compil
 buzz-ci-execd.service	/etc/systemd/system/buzz-ci-execd.service	root	root	0644	file
 buzz-ci-execd.socket	/etc/systemd/system/buzz-ci-execd.socket	root	root	0644	file
 buzz-ci-runner.service	/etc/systemd/system/buzz-ci-runner.service	root	root	0644	file
+buzz-ci-runner.socket	/etc/systemd/system/buzz-ci-runner.socket	root	root	0644	file
 -	/etc/systemd/system/buzz-ci-execd.service.d	root	root	0755	directory
 buzz-ci-execd.service.d/10-host-adapters.conf	/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf	root	root	0644	file
 buzz-ci-acceptance-ctl.sudoers	/etc/sudoers.d/buzz-ci-acceptance-ctl	root	root	0440	file
@@ -22,6 +23,7 @@ host-paths.plan	/usr/share/buzzci/substrate/host-paths.plan	root	root	0444	file
 -	/run/buzzci	root	root	0711	directory
 -	/run/netns	root	root	0755	directory
 -	/var/lib/buzzci	root	root	0700	directory
+-	/var/lib/buzzci/runner-output	buzzci-ctl	buzzci-ctl	0700	directory
 -	/var/lib/buzzci/activation	root	root	0700	directory
 rendered:activation-state-v1.json.plan	/var/lib/buzzci/activation/state-v1.json	root	root	0600	rendered-file
 -	/var/lib/buzzci/activation/receipts	root	root	0700	directory

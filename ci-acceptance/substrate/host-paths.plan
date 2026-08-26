@@ -2,6 +2,7 @@
 install	/usr/libexec/buzz-ci-execd	root	root	0755	compiled-binary	installer
 runtime	/run/buzzci	root	root	0711	directory	systemd-tmpfiles
 runtime	/run/buzzci/execd.sock	buzzci-ctl	buzzci-ctl	0600	unix-socket	systemd
+runtime	/run/buzzci/runner-control.sock	buzzci-ctl	buzzci-controld	0620	unix-socket	systemd
 runtime	/run/netns	root	root	0755	directory	systemd-tmpfiles
 authority	/etc/buzzci/authority	root	root	0700	directory	installer
 authority	/etc/buzzci/authority/authority-v1.json	root	root	0400	immutable-file	installer-atomic
@@ -16,6 +17,7 @@ receipt	/var/lib/buzzci/activation/receipts/seccomp.json	root	root	0600	atomic-f
 state	/var/lib/buzzci/leases	root	root	0700	directory	systemd-tmpfiles
 artifact	/usr/share/containers/seccomp.json	root	root	0644	packaged-file	operating-system
 artifact	/var/lib/buzzci	root	root	0700	directory	systemd-tmpfiles
+artifact	/var/lib/buzzci/runner-output	buzzci-ctl	buzzci-ctl	0700	directory	systemd-tmpfiles
 artifact	/var/lib/buzzci/seccomp	root	root	0700	directory	systemd-tmpfiles
 artifact	/var/lib/buzzci/seccomp/v1	root	root	0700	directory	systemd-tmpfiles
 artifact	/var/lib/buzzci/seccomp/v1/sha256	root	root	0700	directory	systemd-tmpfiles
