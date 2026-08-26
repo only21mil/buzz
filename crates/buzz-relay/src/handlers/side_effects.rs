@@ -1,5 +1,6 @@
 //! NIP-29 and NIP-25 side-effect handlers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use nostr::{Event, EventBuilder, Kind, Tag};
@@ -1143,6 +1144,46 @@ async fn emit_addressable_discovery_event(
     Ok(())
 }
 
+fn group_admin_tags(group_id: &str, members: &[MemberRecord]) -> anyhow::Result<Vec<Tag>> {
+    let mut tags = vec![Tag::parse(["d", group_id])?];
+    for member in members
+        .iter()
+        .filter(|member| member.role == "owner" || member.role == "admin")
+    {
+        let pubkey_hex = hex::encode(&member.pubkey);
+        tags.push(Tag::parse(["p", &pubkey_hex, &member.role])?);
+    }
+    Ok(tags)
+}
+
+fn group_member_tags(
+    group_id: &str,
+    members: &[MemberRecord],
+    agent_pubkeys: &HashSet<Vec<u8>>,
+) -> anyhow::Result<Vec<Tag>> {
+    let mut tags = vec![Tag::parse(["d", group_id])?];
+    for member in members {
+        let pubkey_hex = hex::encode(&member.pubkey);
+        let role = if agent_pubkeys.contains(&member.pubkey) {
+            "bot"
+        } else {
+            &member.role
+        };
+        // NIP-29 convention: ["p", pubkey, relay_url, role]. Empty relay_url
+        // because the canonical relay is implicit (this event is signed by it).
+        tags.push(Tag::parse(["p", &pubkey_hex, "", role])?);
+    }
+    Ok(tags)
+}
+
+fn discovery_tags_match(event: &Event, desired_tags: &[Tag]) -> bool {
+    let mut existing = event.tags.iter().map(Tag::as_slice).collect::<Vec<_>>();
+    let mut desired = desired_tags.iter().map(Tag::as_slice).collect::<Vec<_>>();
+    existing.sort_unstable();
+    desired.sort_unstable();
+    existing == desired
+}
+
 /// Emit NIP-29 group discovery events (39000, 39001, 39002) signed by the relay keypair.
 /// Called after group creation, metadata changes, or membership changes.
 /// Events are stored channel-scoped (`channel_id = Some(...)`) so that existing
@@ -1155,6 +1196,21 @@ pub async fn emit_group_discovery_events(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     channel_id: Uuid,
+) -> anyhow::Result<()> {
+    let agent_pubkeys: HashSet<Vec<u8>> = state
+        .db
+        .get_agent_pubkeys(tenant.community())
+        .await?
+        .into_iter()
+        .collect();
+    emit_group_discovery_events_with_agents(tenant, state, channel_id, &agent_pubkeys).await
+}
+
+async fn emit_group_discovery_events_with_agents(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    agent_pubkeys: &HashSet<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let channel = state.db.get_channel(tenant.community(), channel_id).await?;
     let members = state.db.get_members(tenant.community(), channel_id).await?;
@@ -1226,14 +1282,7 @@ pub async fn emit_group_discovery_events(
     }
 
     {
-        let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
-        for m in members
-            .iter()
-            .filter(|m| m.role == "owner" || m.role == "admin")
-        {
-            let pubkey_hex = hex::encode(&m.pubkey);
-            tags.push(Tag::parse(["p", &pubkey_hex, &m.role])?);
-        }
+        let tags = group_admin_tags(&group_id, &members)?;
         emit_addressable_discovery_event(
             tenant,
             state,
@@ -1246,13 +1295,7 @@ pub async fn emit_group_discovery_events(
     }
 
     {
-        let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
-        for m in &members {
-            let pubkey_hex = hex::encode(&m.pubkey);
-            // NIP-29 convention: ["p", pubkey, relay_url, role]. Empty relay_url
-            // because the canonical relay is implicit (this event is signed by it).
-            tags.push(Tag::parse(["p", &pubkey_hex, "", &m.role])?);
-        }
+        let tags = group_member_tags(&group_id, &members, agent_pubkeys)?;
         emit_addressable_discovery_event(
             tenant,
             state,
@@ -3159,35 +3202,44 @@ pub async fn publish_nip43_member_removed(
     publish_nip43_delta(tenant, state, 8001, target_pubkey_hex, "member-removed").await
 }
 
-/// Reconcile channels that exist in the DB but don't have kind:39000 events.
+/// Reconcile channels whose stored discovery events are missing or stale.
 ///
 /// This handles the case where channels were created via direct SQL inserts
-/// (e.g. test seed scripts) rather than through the Nostr event pipeline.
-/// Emits kind:39000 (metadata) and kind:39002 (members) for each channel
-/// that is missing its discovery events.
+/// (e.g. test seed scripts) rather than through the Nostr event pipeline, and
+/// repairs member heads whose role labels no longer match current discovery
+/// semantics.
 ///
-/// Idempotent: checks for existing kind:39000 events before emitting.
+/// Idempotent: a channel is emitted only when kind:39000 is absent or the
+/// current kind:39002 tags differ from the desired tags.
 pub async fn reconcile_channel_events(
     tenant: &TenantContext,
     state: &Arc<AppState>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u32> {
     use buzz_db::event::EventQuery;
 
     let channels = state.db.list_channels(tenant.community(), None).await?;
     if channels.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
+    let agent_pubkeys: HashSet<Vec<u8>> = state
+        .db
+        .get_agent_pubkeys(tenant.community())
+        .await?
+        .into_iter()
+        .collect();
     let mut reconciled = 0u32;
     for channel in &channels {
-        // Check if kind:39000 event already exists for this channel.
         let channel_id_str = channel.id.to_string();
         let existing = match state
             .db
             .query_events(&EventQuery {
-                kinds: Some(vec![39000]),
+                kinds: Some(vec![39000, 39002]),
                 d_tag: Some(channel_id_str.clone()),
-                limit: Some(1),
+                // Only relay-signed heads count: a client-published event with a
+                // matching d tag must not occupy a slot and suppress repair.
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                limit: Some(2),
                 ..EventQuery::for_community(tenant.community())
             })
             .await
@@ -3203,9 +3255,42 @@ pub async fn reconcile_channel_events(
             }
         };
 
-        if existing.is_empty() {
-            // No discovery event — emit one.
-            if let Err(e) = emit_group_discovery_events(tenant, state, channel.id).await {
+        let members = match state.db.get_members(tenant.community(), channel.id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    channel_id = %channel.id,
+                    error = %e,
+                    "reconcile: failed to load members"
+                );
+                continue;
+            }
+        };
+        let desired_member_tags = match group_member_tags(&channel_id_str, &members, &agent_pubkeys)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    channel_id = %channel.id,
+                    error = %e,
+                    "reconcile: failed to build member tags"
+                );
+                continue;
+            }
+        };
+        let has_metadata = existing
+            .iter()
+            .any(|stored| event_kind_u32(&stored.event) == KIND_NIP29_GROUP_METADATA);
+        let members_are_current = existing
+            .iter()
+            .find(|stored| event_kind_u32(&stored.event) == KIND_NIP29_GROUP_MEMBERS)
+            .is_some_and(|stored| discovery_tags_match(&stored.event, &desired_member_tags));
+
+        if !has_metadata || !members_are_current {
+            if let Err(e) =
+                emit_group_discovery_events_with_agents(tenant, state, channel.id, &agent_pubkeys)
+                    .await
+            {
                 tracing::warn!(
                     channel_id = %channel.id,
                     error = %e,
@@ -3220,7 +3305,7 @@ pub async fn reconcile_channel_events(
     if reconciled > 0 {
         tracing::info!(count = reconciled, "reconciled channel discovery events");
     }
-    Ok(())
+    Ok(reconciled)
 }
 
 /// Publish a kind:13535 archived identities list event (NIP-IA).
@@ -3489,11 +3574,258 @@ fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
 mod tests {
     use super::*;
 
+    fn member(channel_id: Uuid, pubkey_byte: u8, role: &str) -> MemberRecord {
+        MemberRecord {
+            channel_id,
+            pubkey: vec![pubkey_byte; 32],
+            role: role.to_string(),
+            joined_at: chrono::Utc::now(),
+            invited_by: None,
+            removed_at: None,
+        }
+    }
+
     fn deletion_event(tags: impl IntoIterator<Item = Tag>) -> Event {
         EventBuilder::new(Kind::Custom(5), "")
             .tags(tags)
             .sign_with_keys(&nostr::Keys::generate())
             .expect("sign deletion")
+    }
+
+    #[test]
+    fn discovery_roles_label_agents_as_bots_without_changing_admins() {
+        let channel_id = Uuid::new_v4();
+        let agent_admin = member(channel_id, 1, "admin");
+        let human_admin = member(channel_id, 2, "admin");
+        let human_member = member(channel_id, 3, "member");
+        let members = vec![
+            agent_admin.clone(),
+            human_admin.clone(),
+            human_member.clone(),
+        ];
+        let agent_pubkeys = HashSet::from([agent_admin.pubkey.clone()]);
+        let group_id = channel_id.to_string();
+
+        let member_tags =
+            group_member_tags(&group_id, &members, &agent_pubkeys).expect("member tags");
+        assert!(member_tags.contains(
+            &Tag::parse(["p", &hex::encode(&agent_admin.pubkey), "", "bot"])
+                .expect("agent member tag")
+        ));
+        assert!(member_tags.contains(
+            &Tag::parse(["p", &hex::encode(&human_admin.pubkey), "", "admin"])
+                .expect("human admin tag")
+        ));
+        assert!(member_tags.contains(
+            &Tag::parse(["p", &hex::encode(&human_member.pubkey), "", "member"])
+                .expect("human member tag")
+        ));
+
+        let admin_tags = group_admin_tags(&group_id, &members).expect("admin tags");
+        assert!(admin_tags.contains(
+            &Tag::parse(["p", &hex::encode(&agent_admin.pubkey), "admin"])
+                .expect("agent admin tag")
+        ));
+    }
+
+    async fn discovery_test_state() -> (Arc<AppState>, sqlx::PgPool) {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let pool = sqlx::PgPool::connect(&config.database_url)
+            .await
+            .expect("connect to test database");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        (Arc::new(state), pool)
+    }
+
+    async fn discovery_head(
+        state: &AppState,
+        tenant: &TenantContext,
+        channel_id: Uuid,
+        kind: i32,
+    ) -> StoredEvent {
+        state
+            .db
+            .query_events(&buzz_db::event::EventQuery {
+                kinds: Some(vec![kind]),
+                d_tag: Some(channel_id.to_string()),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(tenant.community())
+            })
+            .await
+            .expect("query discovery head")
+            .into_iter()
+            .next()
+            .expect("stored discovery head")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn stale_discovery_member_head_reemits_once_then_is_idempotent() {
+        use buzz_core::channel::{ChannelType, ChannelVisibility};
+        use buzz_db::CreateCommunityWithOwnerResult;
+
+        let (state, pool) = discovery_test_state().await;
+        let owner = nostr::Keys::generate();
+        let host = format!("discovery-reconcile-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(community) => community,
+            other => panic!("expected created community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community.id, host);
+        let owner_pubkey = owner.public_key().to_bytes().to_vec();
+        let agent = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let human_admin = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let human_member = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        for pubkey in [&agent, &human_admin, &human_member] {
+            state
+                .db
+                .ensure_user(community.id, pubkey)
+                .await
+                .expect("insert user");
+        }
+        sqlx::query(
+            "UPDATE users SET agent_type = 'codex' WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community.id.as_uuid())
+        .bind(&agent)
+        .execute(&pool)
+        .await
+        .expect("mark agent identity");
+        let channel = state
+            .db
+            .create_channel(
+                community.id,
+                "discovery-reconcile",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &owner_pubkey,
+                None,
+            )
+            .await
+            .expect("create channel");
+        state
+            .db
+            .add_member(
+                community.id,
+                channel.id,
+                &agent,
+                MemberRole::Admin,
+                Some(&owner_pubkey),
+            )
+            .await
+            .expect("add agent admin");
+        state
+            .db
+            .add_member(
+                community.id,
+                channel.id,
+                &human_admin,
+                MemberRole::Admin,
+                Some(&owner_pubkey),
+            )
+            .await
+            .expect("add human admin");
+        state
+            .db
+            .add_member(
+                community.id,
+                channel.id,
+                &human_member,
+                MemberRole::Member,
+                Some(&owner_pubkey),
+            )
+            .await
+            .expect("add human member");
+
+        emit_group_discovery_events(&tenant, &state, channel.id)
+            .await
+            .expect("emit current discovery heads");
+        let current = discovery_head(&state, &tenant, channel.id, 39002).await;
+        let members = state
+            .db
+            .get_members(community.id, channel.id)
+            .await
+            .expect("fetch members");
+        let stale_tags = group_member_tags(&channel.id.to_string(), &members, &HashSet::new())
+            .expect("stale member tags");
+        let stale_event = EventBuilder::new(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16), "")
+            .tags(stale_tags)
+            .custom_created_at(nostr::Timestamp::from(
+                current.event.created_at.as_secs() + 1,
+            ))
+            .sign_with_keys(&state.relay_keypair)
+            .expect("sign stale head");
+        let (stale, inserted) = state
+            .db
+            .replace_addressable_event(community.id, &stale_event, Some(channel.id))
+            .await
+            .expect("store stale head");
+        assert!(inserted);
+
+        assert_eq!(
+            reconcile_channel_events(&tenant, &state)
+                .await
+                .expect("first reconcile"),
+            1
+        );
+        let repaired = discovery_head(&state, &tenant, channel.id, 39002).await;
+        assert_ne!(repaired.event.id, stale.event.id);
+        let desired_tags = group_member_tags(
+            &channel.id.to_string(),
+            &members,
+            &HashSet::from([agent.clone()]),
+        )
+        .expect("desired member tags");
+        assert!(discovery_tags_match(&repaired.event, &desired_tags));
+
+        assert_eq!(
+            reconcile_channel_events(&tenant, &state)
+                .await
+                .expect("second reconcile"),
+            0
+        );
+        let unchanged = discovery_head(&state, &tenant, channel.id, 39002).await;
+        assert_eq!(unchanged.event.id, repaired.event.id);
+        let admins = discovery_head(&state, &tenant, channel.id, 39001).await;
+        assert!(admins.event.tags.iter().any(|tag| {
+            tag == &Tag::parse(["p", &hex::encode(&agent), "admin"]).expect("agent admin tag")
+        }));
     }
 
     #[test]

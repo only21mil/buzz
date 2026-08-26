@@ -594,52 +594,50 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Emit kind:39000/39002 discovery events for channels that exist in the DB
-    // but don't have corresponding events (e.g. seeded via direct SQL inserts).
-    // Only runs when BUZZ_RECONCILE_CHANNELS=true (dev/CI environments).
-    // Production relays create channels through the event pipeline and don't need this.
-    if std::env::var("BUZZ_RECONCILE_CHANNELS").is_ok() {
-        let reconcile_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            // Resolve the deployment's community from the configured relay URL
-            // host (dev/CI runs single-community), failing closed if the host
-            // isn't mapped — the reconciler is community-scoped now, so there is
-            // no global "all channels" sweep.
-            let tenant = match buzz_relay::tenant::bind_deployment_community(
-                &reconcile_state.db,
-                &reconcile_state.config.relay_url,
+    // Repair missing or stale kind:39000/39002 discovery heads once on every
+    // startup. The content comparison makes correct heads idempotent. Dev/CI
+    // can set BUZZ_RECONCILE_CHANNELS to retain the seed-script retry window.
+    let reconcile_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        // Resolve the deployment's community from the configured relay URL
+        // host, failing closed if it isn't mapped. There is no global sweep.
+        let tenant = match buzz_relay::tenant::bind_deployment_community(
+            &reconcile_state.db,
+            &reconcile_state.config.relay_url,
+        )
+        .await
+        {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "channel reconciliation skipped: relay host is not mapped to a community"
+                );
+                return;
+            }
+        };
+        let attempts = if std::env::var("BUZZ_RECONCILE_CHANNELS").is_ok() {
+            24
+        } else {
+            1
+        };
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            match buzz_relay::handlers::side_effects::reconcile_channel_events(
+                &tenant,
+                &reconcile_state,
             )
             .await
             {
-                Ok(ctx) => ctx,
+                Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        "channel reconciliation skipped: relay host is not mapped to a community"
-                    );
-                    return;
-                }
-            };
-            // Try immediately, then retry every 5s for up to 2 minutes.
-            // Handles CI pattern: relay starts → seed script inserts data → reconciliation.
-            for attempt in 0..24u32 {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-                match buzz_relay::handlers::side_effects::reconcile_channel_events(
-                    &tenant,
-                    &reconcile_state,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "channel reconciliation attempt failed");
-                    }
+                    tracing::warn!(error = %e, "channel reconciliation attempt failed");
                 }
             }
-        });
-    }
+        }
+    });
 
     // Wire the action sink — must happen after AppState (which creates
     // sub_registry, conn_manager) and before the cron loop starts.
