@@ -5,11 +5,15 @@ use anyhow::{bail, Context, Result};
 use buzz_agent_key_handoff::{harden_process, parse_public_key_hex, Slug};
 use rustix::pipe::{pipe_with, PipeFlags};
 use rustix::process::getuid;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{self, Read};
+use std::process::{Child, Command, Stdio};
 
 const EXPORTER: &str = "/usr/local/libexec/buzz/export-managed-agent-key";
 const RECEIVER: &str = "/usr/local/sbin/buzz-install-agent-key";
+
+fn spawn_and_drop_command(mut command: Command) -> io::Result<Child> {
+    command.spawn()
+}
 
 fn set_keyring_environment(command: &mut Command) {
     let runtime_dir = format!("/run/user/{}", getuid().as_raw());
@@ -51,13 +55,16 @@ fn main() -> Result<()> {
     let (secret_read, secret_write) =
         pipe_with(PipeFlags::CLOEXEC).context("create secret pipe")?;
 
-    let mut receiver_command = Command::new("/usr/bin/sudo");
-    receiver_command.env_clear().env("PATH", "/usr/bin:/bin");
-    receiver_command
-        .args(["-n", RECEIVER, "install", "--slug", slug.as_str()])
-        .stdin(Stdio::from(secret_read))
-        .stdout(Stdio::piped());
-    let mut receiver = receiver_command.spawn().context("start receiver")?;
+    let mut receiver = {
+        let mut receiver_command = Command::new("/usr/bin/sudo");
+        receiver_command.env_clear().env("PATH", "/usr/bin:/bin");
+        receiver_command
+            .args(["-n", RECEIVER, "install", "--slug", slug.as_str()])
+            .stdin(Stdio::from(secret_read))
+            .stdout(Stdio::piped());
+        spawn_and_drop_command(receiver_command)
+    }
+    .context("start receiver")?;
     let mut readiness = match receiver.stdout.take() {
         Some(readiness) => readiness,
         None => {
@@ -117,6 +124,19 @@ mod tests {
         assert!(environment
             .iter()
             .any(|(name, _)| *name == OsStr::new("XDG_RUNTIME_DIR")));
+    }
+
+    #[test]
+    fn scoped_receiver_command_releases_parent_pipe_endpoint() {
+        let (read_end, write_end) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+        let mut receiver_command = Command::new("/bin/true");
+        receiver_command.stdin(Stdio::from(read_end));
+        let mut receiver = spawn_and_drop_command(receiver_command).unwrap();
+        assert!(receiver.wait().unwrap().success());
+
+        let mut writer = File::from(write_end);
+        let error = writer.write_all(b"x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]
