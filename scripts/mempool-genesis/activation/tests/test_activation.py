@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime, timezone
 import fcntl
 import hashlib
 import importlib.util
@@ -19,7 +18,6 @@ from unittest import mock
 
 ACTIVATION_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = ACTIVATION_DIR.parents[2]
-TIER2_TOOL = Path("/home/victor/.agents/skills/codex-review/scripts/tier2_evidence.py")
 TEST_ROOT = Path(os.environ.get("MGACT_TEST_ROOT", tempfile.gettempdir()))
 TEST_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
 TEST_ROOT.chmod(0o700)
@@ -150,36 +148,6 @@ def prepare_install_root(root: Path, manifest: dict[str, object]) -> None:
             current.chmod(0o755)
 
 
-def run_tier2(*args: str) -> dict[str, object]:
-    environment = {
-        "HOME": str(Path.home()),
-        "LC_ALL": "C",
-        "PATH": "/usr/local/bin:/usr/bin:/bin",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    completed = subprocess.run(
-        [sys.executable, str(TIER2_TOOL), *args],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=120,
-        env=environment,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(
-            f"tier2 tool failed rc={completed.returncode} stdout={completed.stdout!r} "
-            f"stderr={completed.stderr!r}"
-        )
-    lines = [line for line in completed.stdout.splitlines() if line]
-    if len(lines) != 1:
-        raise AssertionError(f"tier2 tool returned {len(lines)} lines")
-    value = json.loads(lines[0])
-    if not isinstance(value, dict):
-        raise AssertionError("tier2 tool response is not an object")
-    return value
-
-
 class PackageFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
@@ -212,6 +180,9 @@ class PackageFixture(unittest.TestCase):
         )
         return output, manifest
 
+    def evidence_path(self, name: str) -> Path:
+        return self.root / f"{name}-tier2-evidence.json"
+
     def make_receipt(
         self,
         bundle: Path,
@@ -226,153 +197,82 @@ class PackageFixture(unittest.TestCase):
             bundle,
             receipt_path,
             REPO_ROOT,
+            tier2_bundle_output=self.evidence_path(name),
             command_results=pass_results,
             before_snapshot=UNCHANGED_SNAPSHOT,
             after_snapshot=UNCHANGED_SNAPSHOT,
         )
         return receipt_path, receipt
 
-    def make_evidence(self, bundle: Path, manifest: dict[str, object], name: str) -> Path:
-        expected = PREFLIGHT.expected_evidence_inputs(
-            bundle,
-            manifest,
-            str(manifest["review_files_record"]["sha256"]),
-        )
-        changed_paths = []
-        for entry in expected["changed_paths"]:
-            changed_paths.append(
-                {
-                    "status": entry["status"],
-                    "path": str(bundle / str(entry["relative_path"])),
-                    "sha256": entry["sha256"],
-                }
-            )
-        changed_paths.sort(key=lambda item: str(item["path"]).encode())
-        artifact_fingerprint = hashlib.sha256(
-            "".join(
-                f"{entry['status']}\t{entry['sha256']}\t{entry['path']}\n"
-                for entry in changed_paths
-            ).encode()
-        ).hexdigest()
-        evidence = {
-            "schema": "tier2-evidence-v2",
-            "review_id": f"mgact-{name}",
-            "revision": 1,
-            "producer_provider": "gpt",
-            "producer_identity": "mgact-test-producer",
-            "purpose": "Validate one frozen Mempool and Genesis dynamic activation package.",
-            "created_utc": datetime.now(timezone.utc).isoformat(),
-            "candidate": {"mode": "files"},
-            "changed_paths": changed_paths,
-            "invariants": [
-                "The evidence binds the exact package manifest and exact 17-path review-file record.",
-                "The package remains credential-free and both services remain stopped.",
-            ],
-            "commands": [],
-            "fingerprints": expected["fingerprints"],
-            "known_limits": ["Synthetic unit-test review transport; no model is launched."],
-            "artifact_fingerprint": artifact_fingerprint,
-        }
-        evidence_path = self.root / f"{name}-evidence.json"
-        write_private_json(evidence_path, evidence)
-        return evidence_path
-
     def make_tier2(
         self,
-        bundle: Path,
+        _bundle: Path,
         manifest: dict[str, object],
         name: str = "accepted",
         verdict: str = "PASS",
-    ) -> tuple[Path, Path, Path]:
-        evidence_path = self.make_evidence(bundle, manifest, name)
-        state_path = self.root / f"{name}-state.json"
-        capability_path = self.root / f"{name}-capability.json"
-        result_path = self.root / f"{name}-result.json"
-        run_tier2("validate-bundle", "--bundle", str(evidence_path), "--producer", "gpt")
-        run_tier2(
-            "authorize-launch",
-            "--bundle",
-            str(evidence_path),
-            "--state",
-            str(state_path),
-            "--capability",
-            str(capability_path),
-            "--controller-identity",
-            "mgact-test-controller",
-            "--reviewer-provider",
-            "gpt",
+    ) -> tuple[Path, Path]:
+        evidence_path = self.evidence_path(name)
+        state_dir = self.root / f"{name}-tier2-state"
+        engine = str(manifest["tier2_engine"]["path"])
+        completed = subprocess.run(
+            [
+                sys.executable,
+                engine,
+                "prepare",
+                "--bundle",
+                str(evidence_path),
+                "--producer-provider",
+                "gpt",
+                "--controller",
+                "mgact-test-controller",
+                "--state-dir",
+                str(state_dir),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            env={
+                "HOME": str(Path.home()),
+                "LC_ALL": "C",
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
         )
-        claim = run_tier2(
-            "claim-launch",
-            "--state",
-            str(state_path),
-            "--capability",
-            str(capability_path),
-            "--reviewer-identity",
-            "mgact-test-reviewer",
-            "--reviewer-provider",
-            "gpt",
-        )
-        risk_summary = "none" if verdict == "PASS" else "A medium test finding remains."
-        result: dict[str, object] = {
-            "schema": "tier2-review-result-v3",
-            "review_id": claim["review_id"],
-            "revision": claim["revision"],
-            "ordinal": claim["ordinal"],
-            "capability_id": claim["capability_id"],
-            "bundle_digest": claim["bundle_digest"],
-            "artifact_fingerprint": claim["artifact_fingerprint"],
-            "controller_identity": claim["controller_identity"],
-            "producer_provider": claim["producer_provider"],
-            "reviewer_provider": "gpt",
-            "reviewer_identity": "mgact-test-reviewer",
+        if completed.returncode != 0:
+            raise AssertionError(f"tier2 prepare failed: {completed.stderr}")
+        state_path = Path(completed.stdout.strip())
+        state = json.loads(state_path.read_text())
+        reviewer_identity = str(state["route"]["reviewer_identity"])
+        Path(str(state["token_path"])).unlink()
+        state["status"] = "closed"
+        state["verdict"] = {
             "verdict": verdict,
-            "risk_summary": risk_summary,
-            "profile_evidence": {
-                "vehicle": "synthetic-normal-tier2-unit-test",
-                "model": "gpt-5.6-sol",
-                "effort": "xhigh",
-                "selection": "effective-readback",
-                "detail": "The maintained closure engine validates this synthetic result contract.",
-            },
-            "victor_authorized_effort": True,
-            "mutation_check": {
-                "status": "unchanged",
-                "before": claim["artifact_fingerprint"],
-                "after": claim["artifact_fingerprint"],
-                "method": "recomputed package evidence fingerprint",
-            },
-            "completed_utc": datetime.now(timezone.utc).isoformat(),
+            "findings": (
+                []
+                if verdict == "PASS"
+                else [
+                    {
+                        "severity": "LOW" if verdict == "PASS WITH RISKS" else "MEDIUM",
+                        "description": "Synthetic bounded finding.",
+                    }
+                ]
+            ),
+            "evidence_gaps": [],
+            "reviewer_identity": reviewer_identity,
         }
-        if verdict != "PASS":
-            result["risks"] = [{"severity": "medium", "summary": "Synthetic rejection."}]
-        write_private_json(result_path, result)
-        run_tier2(
-            "validate-closure",
-            "--bundle",
-            str(evidence_path),
-            "--result",
-            str(result_path),
-            "--state",
-            str(state_path),
-        )
-        return evidence_path, state_path, result_path
+        write_private_json(state_path, state)
+        return evidence_path, state_path
 
     def closed_package(
         self,
         name: str = "closed",
-    ) -> tuple[
-        Path,
-        dict[str, object],
-        Path,
-        Path,
-        Path,
-        Path,
-    ]:
+    ) -> tuple[Path, dict[str, object], Path, Path, Path]:
         bundle, manifest = self.generate(name)
         receipt, _receipt_value = self.make_receipt(bundle, name)
-        evidence, state, result = self.make_tier2(bundle, manifest, name)
-        return bundle, manifest, receipt, evidence, state, result
+        evidence, state = self.make_tier2(bundle, manifest, name)
+        return bundle, manifest, receipt, evidence, state
 
 
 class ActivationBundleTests(PackageFixture):
@@ -390,14 +290,35 @@ class ActivationBundleTests(PackageFixture):
                 [entry["path"] for entry in manifest["review_files"][slug]],
                 manifest["expected_closure_paths"][slug],
             )
-        evidence_inputs = json.loads(
-            (first / "metadata/tier2-evidence-inputs.json").read_text()
-        )
-        self.assertEqual(evidence_inputs["candidate"], {"mode": "files"})
+        self.assertEqual(manifest["tier2_review"], GENERATOR.TIER2_REVIEW)
         self.assertEqual(
-            [entry["relative_path"] for entry in evidence_inputs["changed_paths"]],
+            manifest["tier2_review"],
+            {
+                "producer_provider": "gpt",
+                "escalate": False,
+                "reviewer_provider": "claude",
+                "model": "claude-opus-5",
+                "effort": "high",
+                "engine_subcommands": ["prepare", "review", "check"],
+            },
+        )
+        self.assertEqual(manifest["tier2_evidence_schema"], "tier2-evidence-v2")
+        self.assertEqual(
+            manifest["tier2_candidate_paths"],
             ["bundle-manifest.json", "metadata/review-files.json"],
         )
+        self.assertFalse((first / "metadata/tier2-evidence-inputs.json").exists())
+        with self.assertRaisesRegex(ValueError, "activation-specific GPT-to-Claude Opus 5 high"):
+            PREFLIGHT.validate_tier2_review(
+                {
+                    "producer_provider": "gpt",
+                    "escalate": True,
+                    "reviewer_provider": "claude",
+                    "model": "claude-fable-5",
+                    "effort": "high",
+                    "engine_subcommands": ["prepare", "review", "check"],
+                }
+            )
         self.assertEqual(
             manifest["ops_targets"][0]["scope"],
             "Victor-owner-authenticated all-open-channel fixed public-key roster",
@@ -456,18 +377,16 @@ class ActivationBundleTests(PackageFixture):
         self.assertFalse(manifest["installable"])
         receipt_path, receipt = self.make_receipt(bundle, "placeholder")
         self.assertEqual(receipt["status"], "BLOCKED_ON_DESKTOP_PUBKEYS")
-        evidence = self.make_evidence(bundle, manifest, "placeholder")
+        self.assertIsNone(receipt["tier2_bundle"])
+        self.assertFalse(self.evidence_path("placeholder").exists())
         fake_state = self.root / "placeholder-state.json"
-        fake_result = self.root / "placeholder-result.json"
-        write_private_json(fake_state, {"schema": "not-a-closure-state"})
-        write_private_json(fake_result, {})
+        write_private_json(fake_state, {"state_schema": "not-a-tier2-state"})
         with self.assertRaisesRegex(ValueError, "incomplete"):
             INSTALLER.load_bundle(
                 bundle,
                 receipt_path,
-                evidence,
+                receipt_path,
                 fake_state,
-                fake_result,
                 REPO_ROOT,
             )
 
@@ -482,24 +401,25 @@ class ActivationBundleTests(PackageFixture):
             self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "allowlist")
             self.assertEqual(values["BUZZ_RELAY_URL"], "wss://framework-desktop.tail69757d.ts.net:38443")
             prompt = (bundle / f"install-root/etc/buzz-agents/prompts/{slug}.md").read_text()
+            source_prompt = (ACTIVATION_DIR / f"templates/{slug}.md").read_text()
+            self.assertEqual(prompt, source_prompt)
             self.assertIn("Victor remains your sole cryptographic owner.", prompt)
             self.assertIn("Your identity and memory scope are Sats/Victor only.", prompt)
             self.assertIn("assignment authority never widens that scope", prompt)
             self.assertIn("framework-desktop", prompt)
             self.assertIn("GPT-5.6 Sol at high reasoning for the root seat", prompt)
             self.assertIn("canon-approved worker profiles and transports", prompt)
-            self.assertIn(
-                "exactly one distinct-identity GPT-5.6 Sol reviewer at explicit `xhigh`",
-                prompt,
-            )
-            self.assertIn(
-                "Claude dispatch, opposite-provider review, and double-model review are retired",
-                prompt,
-            )
+            self.assertIn("current opposite-provider runbook", prompt)
+            self.assertIn("Claude Opus 5 reviewer at high reasoning", prompt)
+            self.assertIn("Claude Fable 5 for security", prompt)
+            self.assertIn("unless Victor or Rachel explicitly overrides it", prompt)
+            self.assertIn("Claude- or parent-produced work", prompt)
+            self.assertIn("GPT-5.6 Sol reviewer at high reasoning", prompt)
+            self.assertIn("Reviewer identity must differ from producer identity", prompt)
+            self.assertIn("Sol `xhigh` is allowed only on explicit Victor or Rachel instruction", prompt)
             self.assertIn("Luna is producer-only and never a reviewer", prompt)
-            self.assertNotIn("current opposite-provider runbook", prompt)
-            self.assertNotIn("Claude Opus 5", prompt)
-            self.assertNotIn("Claude Fable 5", prompt)
+            self.assertNotIn("reviewer at explicit `xhigh`", prompt)
+            self.assertNotIn("opposite-provider review, and double-model review are retired", prompt)
 
     def test_preflight_receipt_reports_readiness_without_review_or_install_claim(self) -> None:
         bundle, _manifest = self.generate()
@@ -507,38 +427,120 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(receipt["status"], "READY_FOR_PARENT_TIER1")
         self.assertFalse(receipt["installable"])
         self.assertEqual(receipt["next_gate"], "parent-tier1-readback")
+        evidence_path = self.evidence_path("preflight")
+        evidence = json.loads(evidence_path.read_text())
+        self.assertEqual(
+            set(evidence),
+            {"schema", "candidate_root", "summary", "paths", "invariants", "commands", "known_limits"},
+        )
+        self.assertEqual(evidence["schema"], "tier2-evidence-v2")
+        self.assertEqual(evidence["candidate_root"], str(bundle))
+        self.assertEqual(evidence["paths"], ["bundle-manifest.json", "metadata/review-files.json"])
+        self.assertEqual(receipt["tier2_bundle"]["path"], str(evidence_path))
         payload = receipt_path.read_text()
         self.assertNotIn('"accepted"', payload)
         self.assertNotIn('"verdict"', payload)
         self.assertFalse((self.root / "review-closure.json").exists())
 
     def test_normal_tier2_acceptance_derives_exact_installed_closure(self) -> None:
-        bundle, manifest, receipt, evidence, state, result = self.closed_package()
+        bundle, manifest, receipt, evidence, state = self.closed_package()
         loaded_manifest, acceptance, targets = INSTALLER.load_bundle(
             bundle,
             receipt,
             evidence,
             state,
-            result,
             REPO_ROOT,
         )
         self.assertEqual(loaded_manifest, manifest)
+        state_value = json.loads(state.read_text())
+        self.assertEqual(state_value["state_schema"], "tier2-state-v2")
+        self.assertEqual(state_value["producer_provider"], "gpt")
+        self.assertFalse(state_value["escalate"])
+        self.assertEqual(
+            {key: state_value["route"][key] for key in ("provider", "model", "effort")},
+            {"provider": "claude", "model": "claude-opus-5", "effort": "high"},
+        )
         self.assertEqual(acceptance.verdict, "PASS")
         closure = next(target for target in targets if target.target == CLOSURE_TARGET)
         self.assertIsNotNone(closure.payload)
         value = json.loads(bytes(closure.payload).decode())
         self.assertTrue(value["accepted"])
-        self.assertEqual(value["review_id"], acceptance.review_id)
-        self.assertEqual(value["result_digest"], acceptance.result_digest)
+        self.assertEqual(value["lineage_id"], acceptance.lineage_id)
+        self.assertEqual(value["state_id"], acceptance.state_id)
+        self.assertEqual(value["verdict_digest"], acceptance.verdict_digest)
+        self.assertEqual(value["candidate_fingerprint"], acceptance.candidate_fingerprint)
         self.assertEqual(value["bundle_digest"], manifest["package_digest"])
         for slug in ("mempool", "genesis"):
             self.assertEqual(len(value["files"][slug]), 17)
             self.assertEqual(value["files"][slug], manifest["review_files"][slug])
 
+    def test_derived_closure_satisfies_the_installed_runtime_contract(self) -> None:
+        bundle, _manifest, receipt, evidence, state = self.closed_package("runtime-contract")
+        _loaded, _acceptance, targets = INSTALLER.load_bundle(
+            bundle,
+            receipt,
+            evidence,
+            state,
+            REPO_ROOT,
+        )
+        closure = next(target for target in targets if target.target == CLOSURE_TARGET)
+        self.assertIsNotNone(closure.payload)
+        closure_text = bytes(closure.payload).decode()
+
+        verifier = (REPO_ROOT / "scripts/mempool-genesis/verify-installed-agent").read_text()
+        prefix = "jq -e --arg slug \"$slug\" --argjson count \"${#expected_paths[@]}\" '\n"
+        suffix = "\n' \"$closure\" >/dev/null"
+        self.assertEqual(verifier.count(prefix), 1)
+        self.assertEqual(verifier.count(suffix), 1)
+        contract = verifier.split(prefix, 1)[1].split(suffix, 1)[0]
+
+        for slug in ("mempool", "genesis"):
+            completed = subprocess.run(
+                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "17", contract],
+                input=closure_text,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        retired = json.loads(closure_text)
+        retired["schema"] = "buzz-agent-review-closure-v1"
+        rejected = subprocess.run(
+            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "17", contract],
+            input=json.dumps(retired),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+
+    def test_tier2_v2_pass_with_risks_is_terminal_and_accepted(self) -> None:
+        bundle, manifest = self.generate("accepted-risks")
+        receipt, _ = self.make_receipt(bundle, "accepted-risks")
+        evidence, state = self.make_tier2(
+            bundle,
+            manifest,
+            "accepted-risks",
+            verdict="PASS WITH RISKS",
+        )
+        _loaded, acceptance, _targets = INSTALLER.load_bundle(
+            bundle,
+            receipt,
+            evidence,
+            state,
+            REPO_ROOT,
+        )
+        self.assertEqual(acceptance.verdict, "PASS WITH RISKS")
+
     def test_normal_tier2_rejection_blocks_preflight(self) -> None:
         bundle, manifest = self.generate("rejected")
         receipt, _ = self.make_receipt(bundle, "rejected")
-        evidence, state, result = self.make_tier2(bundle, manifest, "rejected", verdict="FAIL")
+        evidence, state = self.make_tier2(bundle, manifest, "rejected", verdict="FAIL")
         install_root = self.root / "install-root"
         install_root.mkdir(mode=0o700)
         prepare_install_root(install_root, manifest)
@@ -548,7 +550,6 @@ class ActivationBundleTests(PackageFixture):
                 receipt,
                 evidence,
                 state,
-                result,
                 install_root,
                 REPO_ROOT,
             )
@@ -558,52 +559,64 @@ class ActivationBundleTests(PackageFixture):
     def test_arbitrary_accepted_json_cannot_replace_normal_tier2_state(self) -> None:
         bundle, manifest = self.generate("fake")
         receipt, _ = self.make_receipt(bundle, "fake")
-        evidence = self.make_evidence(bundle, manifest, "fake")
+        evidence = self.evidence_path("fake")
         state = self.root / "fake-state.json"
-        result = self.root / "fake-result.json"
         write_private_json(state, {"accepted": True, "terminal": True, "consumable": True})
-        write_private_json(result, {"accepted": True, "verdict": "PASS"})
         with self.assertRaisesRegex(ValueError, "closure rejected"):
-            INSTALLER.load_bundle(bundle, receipt, evidence, state, result, REPO_ROOT)
+            INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
 
     def test_exact_package_mismatch_rejects_an_otherwise_accepted_review(self) -> None:
         bundle_one, manifest_one = self.generate("one")
         _receipt_one, _ = self.make_receipt(bundle_one, "one")
-        evidence, state, result = self.make_tier2(bundle_one, manifest_one, "one")
+        evidence, state = self.make_tier2(bundle_one, manifest_one, "one")
         inputs_two = self.root / "inputs-two.json"
         write_inputs(inputs_two, "3" * 64, "4" * 64)
         bundle_two, _manifest_two = self.generate("two", inputs=inputs_two)
         receipt_two, _ = self.make_receipt(bundle_two, "two")
-        with self.assertRaisesRegex(ValueError, "exact package and review files"):
+        with self.assertRaisesRegex(ValueError, "evidence binding mismatch"):
             INSTALLER.load_bundle(
                 bundle_two,
                 receipt_two,
                 evidence,
                 state,
-                result,
                 REPO_ROOT,
             )
 
     def test_review_file_mutation_invalidates_package_and_closure(self) -> None:
-        bundle, _manifest, receipt, evidence, state, result = self.closed_package("mutated")
+        bundle, _manifest, receipt, evidence, state = self.closed_package("mutated")
         review_file = bundle / "metadata/review-files.json"
         review_file.write_bytes(review_file.read_bytes() + b" ")
         with self.assertRaisesRegex(ValueError, "source hash mismatch"):
-            INSTALLER.load_bundle(bundle, receipt, evidence, state, result, REPO_ROOT)
+            INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
 
-    def test_normal_tier2_state_binds_the_exact_result_path_and_digest(self) -> None:
-        bundle, _manifest, receipt, evidence, state, result = self.closed_package("result-binding")
-        copied_result = self.root / "copied-result.json"
-        write_file(copied_result, result.read_bytes(), 0o600)
-        with self.assertRaisesRegex(ValueError, "state result path mismatch"):
-            INSTALLER.load_bundle(
-                bundle,
-                receipt,
-                evidence,
-                state,
-                copied_result,
-                REPO_ROOT,
-            )
+    def test_fable_escalation_route_is_rejected_for_this_activation(self) -> None:
+        bundle, _manifest, receipt, evidence, state = self.closed_package("fable-route")
+        value = json.loads(state.read_text())
+        value["escalate"] = True
+        value["route"]["model"] = "claude-fable-5"
+        write_private_json(state, value)
+        with self.assertRaisesRegex(ValueError, "closure rejected"):
+            INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
+
+    def test_retired_sol_xhigh_route_is_rejected(self) -> None:
+        bundle, _manifest, receipt, evidence, state = self.closed_package("retired-route")
+        value = json.loads(state.read_text())
+        value["route"] = {
+            "provider": "gpt",
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+            "reviewer_identity": "gpt:retired-reviewer",
+        }
+        value["verdict"]["reviewer_identity"] = "gpt:retired-reviewer"
+        write_private_json(state, value)
+        with self.assertRaisesRegex(ValueError, "closure rejected"):
+            INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
+
+    def test_expired_tier2_v2_state_is_rejected(self) -> None:
+        bundle, _manifest, receipt, evidence, state = self.closed_package("expired")
+        os.utime(state, (1, 1))
+        with self.assertRaisesRegex(ValueError, "closure rejected"):
+            INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
 
 
 class ActivationCorrectionRegressionTests(PackageFixture):
@@ -621,11 +634,13 @@ class ActivationCorrectionRegressionTests(PackageFixture):
             for command in receipt_commands
         ]
         receipt_path = self.root / "path-independent-receipt.json"
+        evidence_path = self.root / "path-independent-tier2-evidence.json"
         with mock.patch.dict(os.environ, {"PATH": "/bin"}):
             PREFLIGHT.generate_receipt(
                 bundle,
                 receipt_path,
                 REPO_ROOT,
+                tier2_bundle_output=evidence_path,
                 command_results=results,
                 before_snapshot=UNCHANGED_SNAPSHOT,
                 after_snapshot=UNCHANGED_SNAPSHOT,
@@ -635,6 +650,7 @@ class ActivationCorrectionRegressionTests(PackageFixture):
                 receipt_path,
                 bundle,
                 manifest,
+                evidence_path,
                 current_artifact_owner(),
             )
 
@@ -652,14 +668,17 @@ class ActivationCorrectionRegressionTests(PackageFixture):
                 )
 
     def test_sealed_package_verifier_survives_post_freeze_in_place_mutation(self) -> None:
+        verifier_source = ACTIVATION_DIR / "tier2-evidence-verifier.py"
+        self.assertEqual(INSTALLER.TIER2_VERIFIER_MODE, 0o755)
+        self.assertEqual(stat.S_IMODE(verifier_source.lstat().st_mode), 0o755)
         repo = self.root / "verifier-repo"
         verifier = repo / INSTALLER.TIER2_VERIFIER_RELATIVE
-        write_file(verifier, b'print("FROZEN_VERIFIER")\n', 0o700)
+        write_file(verifier, b'print("FROZEN_VERIFIER")\n', INSTALLER.TIER2_VERIFIER_MODE)
         manifest = {
             "generator_sources": [
                 {
                     "path": str(INSTALLER.TIER2_VERIFIER_RELATIVE),
-                    "mode": "0700",
+                    "mode": f"{INSTALLER.TIER2_VERIFIER_MODE:04o}",
                     "sha256": hashlib.sha256(verifier.read_bytes()).hexdigest(),
                 }
             ]
@@ -669,7 +688,7 @@ class ActivationCorrectionRegressionTests(PackageFixture):
         write_file(
             verifier,
             f'from pathlib import Path\nPath({str(marker)!r}).write_text("bad")\n'.encode(),
-            0o700,
+            INSTALLER.TIER2_VERIFIER_MODE,
         )
         required_seals = (
             fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
@@ -749,28 +768,29 @@ class ActivationCorrectionRegressionTests(PackageFixture):
                 INSTALLER.artifact_owner()
 
     def test_sudo_owner_contract_accepts_user_artifacts_and_rejects_wrong_owner(self) -> None:
-        bundle, manifest, receipt, evidence, state, result = self.closed_package("sudo-owner")
+        bundle, manifest, receipt, evidence, state = self.closed_package("sudo-owner")
         owner = current_artifact_owner()
+        receipt_value = json.loads(receipt.read_text())
         acceptance = INSTALLER.validate_tier2_acceptance(
             bundle,
             manifest,
+            receipt_value,
             evidence,
             state,
-            result,
             REPO_ROOT,
             owner,
         )
         self.assertEqual(acceptance.verdict, "PASS")
         wrong = INSTALLER.ArtifactOwner(owner.uid + 1, owner.gid, owner.user, owner.home)
         with self.assertRaisesRegex(ValueError, "wrong owner"):
-            INSTALLER.validate_preflight_receipt(receipt, bundle, manifest, wrong)
-        with self.assertRaisesRegex(ValueError, "unsafe normal Tier 2 evidence bundle"):
+            INSTALLER.validate_preflight_receipt(receipt, bundle, manifest, evidence, wrong)
+        with self.assertRaisesRegex(ValueError, "unsafe Tier 2 v2 evidence bundle"):
             INSTALLER.validate_tier2_acceptance(
                 bundle,
                 manifest,
+                receipt_value,
                 evidence,
                 state,
-                result,
                 REPO_ROOT,
                 wrong,
             )
@@ -800,7 +820,6 @@ class InstallerSafetyTests(PackageFixture):
             self.receipt,
             self.evidence,
             self.state,
-            self.result,
         ) = self.closed_package("installer")
         self.install_root = self.root / "install-root"
         self.install_root.mkdir(mode=0o700)
@@ -813,7 +832,6 @@ class InstallerSafetyTests(PackageFixture):
                 self.receipt,
                 self.evidence,
                 self.state,
-                self.result,
                 self.install_root,
                 REPO_ROOT,
             )
@@ -825,7 +843,6 @@ class InstallerSafetyTests(PackageFixture):
                 self.receipt,
                 self.evidence,
                 self.state,
-                self.result,
                 self.install_root,
                 REPO_ROOT,
             )
@@ -865,7 +882,6 @@ class InstallerSafetyTests(PackageFixture):
                 self.receipt,
                 self.evidence,
                 self.state,
-                self.result,
                 self.install_root,
                 REPO_ROOT,
             )

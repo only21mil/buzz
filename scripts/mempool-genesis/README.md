@@ -41,6 +41,16 @@ public identities:
 7. Start and verify one agent at a time. Add only the approved Sats/Victor
    channels, then DMs and explicit mention/reply tests.
 
+The dynamic package under `activation/` uses the current Tier 2 v2 engine. For
+this one activation, Victor explicitly overrode automatic escalation on
+2026-08-26: the GPT producer route uses one Claude Opus 5 reviewer at `high`
+without `--escalate`. Generic fleet canon still escalates future GPT-produced
+security, authentication, signing, or production-infrastructure work to Claude
+Fable 5 unless Victor or Rachel explicitly overrides it. The installer accepts
+only the same unexpired `tier2-state-v2` file after the installed engine's
+`check` subcommand returns `OK`; there is no separate review result file. See
+`activation/README.md` for the exact `prepare`, `review`, and `check` commands.
+
 Freeze the static and Desktop install bytes with one manifest:
 
 ```sh

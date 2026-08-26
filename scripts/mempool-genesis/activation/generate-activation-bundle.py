@@ -19,10 +19,30 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 TEMPLATE_DIR = SCRIPT_DIR / "templates"
 INPUT_SCHEMA = "buzz-mempool-genesis-activation-input-v1"
-BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v2"
+BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 REVIEW_FILES_SCHEMA = "buzz-agent-review-files-v1"
-EVIDENCE_INPUTS_SCHEMA = "buzz-mempool-genesis-tier2-evidence-inputs-v1"
+TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
+TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
+TIER2_REVIEW = {
+    "producer_provider": "gpt",
+    "escalate": False,
+    "reviewer_provider": "claude",
+    "model": "claude-opus-5",
+    "effort": "high",
+    "engine_subcommands": ["prepare", "review", "check"],
+}
+TIER2_CANDIDATE_PATHS = ("bundle-manifest.json", "metadata/review-files.json")
 BUNDLE_ID = "mempool-genesis-activation-20260825"
+CURRENT_REVIEW_POLICY = (
+    "Any required Tier 2 review follows the current opposite-provider runbook in "
+    "Agent-Shared/adapters/sats-shared-common.md § Verification and review. For GPT-produced "
+    "work, use one independent Claude Opus 5 reviewer at high reasoning. Canon escalation "
+    "moves that Claude leg to Claude Fable 5 for security, authentication, signing, or "
+    "production infrastructure unless Victor or Rachel explicitly overrides it. For Claude- "
+    "or parent-produced work, use one independent GPT-5.6 Sol reviewer at high reasoning. "
+    "Reviewer identity must differ from producer identity. Sol `xhigh` is allowed only on "
+    "explicit Victor or Rachel instruction. Luna is producer-only and never a reviewer."
+)
 OWNER_PUBKEY = "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d"
 ASSIGNER_PUBKEYS = (
     OWNER_PUBKEY,
@@ -292,6 +312,13 @@ def validate_env(payload: bytes, slug: str) -> None:
             raise ValueError(f"{slug} env has wrong {key}")
 
 
+def render_prompt(path: Path, slug: str) -> bytes:
+    text = path.read_text()
+    if text.count(CURRENT_REVIEW_POLICY) != 1:
+        raise ValueError(f"{slug} prompt does not contain exactly one current review-policy block")
+    return text.encode()
+
+
 def validate_prompt(payload: bytes, slug: str) -> None:
     text = payload.decode()
     required = (
@@ -301,10 +328,14 @@ def validate_prompt(payload: bytes, slug: str) -> None:
         "Rachel's or Archimedes Codex's assignment authority never widens that scope",
         "Your identity and memory scope are Sats/Victor only.",
         "inside the private Buzz community on framework-desktop.",
+        CURRENT_REVIEW_POLICY,
     )
     for sentence in required:
         if sentence not in text:
             raise ValueError(f"{slug} prompt misses required authority text: {sentence}")
+    for retired in ("reviewer at explicit `xhigh`", "opposite-provider review, and double-model review are retired"):
+        if retired in text:
+            raise ValueError(f"{slug} prompt retains retired review policy: {retired}")
 
 
 def artifact_fingerprint(records: list[dict[str, object]]) -> str:
@@ -349,6 +380,16 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
             }
         )
     return sorted(records, key=lambda record: record["path"].encode())
+
+
+def tier2_engine_record(path: Path) -> dict[str, str]:
+    resolved = path.resolve(strict=True)
+    metadata = require_regular(resolved, 0o700, owner_uid=os.getuid())
+    return {
+        "path": str(resolved),
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "sha256": sha256_file(resolved),
+    }
 
 
 def git_value(repo_root: Path, *args: str) -> str:
@@ -420,6 +461,7 @@ def generate(
     replace: bool,
 ) -> dict[str, object]:
     pubkeys, complete = load_inputs(inputs_path, allow_placeholders)
+    engine_record = tier2_engine_record(TIER2_ENGINE_PATH)
     output_parent = output.parent.resolve(strict=True)
     parent_metadata = output_parent.lstat()
     if not stat.S_ISDIR(parent_metadata.st_mode) or stat.S_IMODE(parent_metadata.st_mode) & 0o077:
@@ -430,7 +472,7 @@ def generate(
         records: list[dict[str, object]] = []
         for slug in ("mempool", "genesis"):
             env_payload = (TEMPLATE_DIR / f"{slug}.env").read_bytes()
-            prompt_payload = (TEMPLATE_DIR / f"{slug}.md").read_bytes()
+            prompt_payload = render_prompt(TEMPLATE_DIR / f"{slug}.md", slug)
             validate_env(env_payload, slug)
             validate_prompt(prompt_payload, slug)
             add_target(temporary, records, f"/etc/buzz-agents/{slug}.env", env_payload, 0o644)
@@ -511,12 +553,16 @@ def generate(
             "review_files": review_files,
             "expected_closure_paths": {slug: list(paths) for slug, paths in EXPECTED_PATHS.items()},
             "generator_sources": sources,
+            "tier2_review": TIER2_REVIEW,
+            "tier2_engine": engine_record,
+            "tier2_evidence_schema": TIER2_EVIDENCE_SCHEMA,
+            "tier2_candidate_paths": list(TIER2_CANDIDATE_PATHS),
         }
         package_digest = sha256_bytes(canonical_json(digest_input))
 
         review_record = {
             "schema": REVIEW_FILES_SCHEMA,
-            "status": "pending-normal-tier2" if complete else "blocked-on-desktop-pubkeys",
+            "status": "pending-tier2-v2" if complete else "blocked-on-desktop-pubkeys",
             "runtime_artifact_fingerprint": runtime_fingerprint,
             "package_digest": package_digest,
             "files": review_files,
@@ -545,43 +591,13 @@ def generate(
                 "path": str(review_relative),
                 "sha256": sha256_bytes(review_payload),
             },
-            "tier2_evidence_inputs_path": "metadata/tier2-evidence-inputs.json",
+            "tier2_review": TIER2_REVIEW,
+            "tier2_engine": engine_record,
+            "tier2_evidence_schema": TIER2_EVIDENCE_SCHEMA,
+            "tier2_candidate_paths": list(TIER2_CANDIDATE_PATHS),
         }
         manifest_payload = canonical_json(manifest)
         write_bytes(temporary / "bundle-manifest.json", manifest_payload, 0o600)
-
-        evidence_inputs = {
-            "schema": EVIDENCE_INPUTS_SCHEMA,
-            "candidate": {"mode": "files"},
-            "changed_paths": [
-                {
-                    "status": "A",
-                    "relative_path": "bundle-manifest.json",
-                    "sha256": sha256_bytes(manifest_payload),
-                },
-                {
-                    "status": "A",
-                    "relative_path": str(review_relative),
-                    "sha256": sha256_bytes(review_payload),
-                },
-            ],
-            "fingerprints": {
-                "package_digest": package_digest,
-                "review_files_sha256": sha256_bytes(review_payload),
-                "runtime_artifact_fingerprint": runtime_fingerprint,
-            },
-            "required_review": {
-                "reviewer_provider": "gpt",
-                "model": "gpt-5.6-sol",
-                "effort": "xhigh",
-                "normal_tier2": True,
-            },
-        }
-        write_bytes(
-            temporary / "metadata/tier2-evidence-inputs.json",
-            canonical_json(evidence_inputs),
-            0o600,
-        )
         input_contract = {
             "schema": INPUT_SCHEMA,
             "required_after_desktop_save": {

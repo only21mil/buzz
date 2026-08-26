@@ -17,11 +17,22 @@ import tempfile
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
-BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v2"
+BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 BUNDLE_ID = "mempool-genesis-activation-20260825"
-RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v2"
+RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v3"
 REVIEW_FILES_SCHEMA = "buzz-agent-review-files-v1"
-EVIDENCE_INPUTS_SCHEMA = "buzz-mempool-genesis-tier2-evidence-inputs-v1"
+TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
+TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
+TIER2_REVIEW = {
+    "producer_provider": "gpt",
+    "escalate": False,
+    "reviewer_provider": "claude",
+    "model": "claude-opus-5",
+    "effort": "high",
+    "engine_subcommands": ["prepare", "review", "check"],
+}
+TIER2_CANDIDATE_PATHS = ["bundle-manifest.json", "metadata/review-files.json"]
+MAX_TIER2_EVIDENCE_BYTES = 64 * 1024
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 ASSIGNER_PUBKEYS = (
     "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d",
@@ -208,39 +219,92 @@ def artifact_fingerprint(records: list[dict[str, object]]) -> str:
     return sha256_bytes(payload)
 
 
-def expected_evidence_inputs(
+def validate_tier2_review(value: object) -> dict[str, object]:
+    if value != TIER2_REVIEW:
+        raise ValueError(
+            "Tier 2 review route must use the activation-specific GPT-to-Claude Opus 5 high override"
+        )
+    return TIER2_REVIEW
+
+
+def validate_tier2_engine(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {"path", "mode", "sha256"}:
+        raise ValueError("Tier 2 engine record is invalid")
+    path_raw, mode_raw, digest = value.get("path"), value.get("mode"), value.get("sha256")
+    if path_raw != str(TIER2_ENGINE_PATH):
+        raise ValueError("Tier 2 engine path is invalid")
+    path = TIER2_ENGINE_PATH
+    if parse_mode(mode_raw) != 0o700:
+        raise ValueError("Tier 2 engine mode mismatch")
+    if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+        raise ValueError("Tier 2 engine digest is invalid")
+    require_regular(path, 0o700)
+    if sha256_file(path) != digest:
+        raise ValueError("Tier 2 engine changed after package creation")
+    return {"path": path_raw, "mode": str(mode_raw), "sha256": digest}
+
+
+def tier2_command_result(result: dict[str, object]) -> dict[str, object]:
+    command = result.get("command")
+    exit_code = result.get("exit")
+    stdout = result.get("stdout")
+    stderr = result.get("stderr")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(argument, str) or not argument for argument in command)
+        or not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or not isinstance(stdout, str)
+        or not isinstance(stderr, str)
+    ):
+        raise ValueError("preflight command result cannot be represented as Tier 2 evidence")
+    output_parts = []
+    if stdout:
+        output_parts.append("stdout:\n" + stdout)
+    if stderr:
+        output_parts.append("stderr:\n" + stderr)
+    return {
+        "argv": command,
+        "exit_code": exit_code,
+        "output": "\n".join(output_parts) if output_parts else "<no output>",
+    }
+
+
+def expected_tier2_bundle(
     bundle: Path,
     manifest: dict[str, object],
-    review_digest: str,
+    commands: list[dict[str, object]],
 ) -> dict[str, object]:
-    manifest_digest = sha256_file(bundle / "bundle-manifest.json")
-    return {
-        "schema": EVIDENCE_INPUTS_SCHEMA,
-        "candidate": {"mode": "files"},
-        "changed_paths": [
-            {
-                "status": "A",
-                "relative_path": "bundle-manifest.json",
-                "sha256": manifest_digest,
-            },
-            {
-                "status": "A",
-                "relative_path": "metadata/review-files.json",
-                "sha256": review_digest,
-            },
+    validate_tier2_review(manifest.get("tier2_review"))
+    if manifest.get("tier2_evidence_schema") != TIER2_EVIDENCE_SCHEMA:
+        raise ValueError("Tier 2 evidence schema mismatch")
+    if manifest.get("tier2_candidate_paths") != TIER2_CANDIDATE_PATHS:
+        raise ValueError("Tier 2 candidate path set mismatch")
+    value = {
+        "schema": TIER2_EVIDENCE_SCHEMA,
+        "candidate_root": str(bundle.resolve(strict=True)),
+        "summary": (
+            "GPT-produced Mempool and Genesis credential, signing, and production activation "
+            "package; Victor's activation-specific override requires one Claude Opus 5 reviewer "
+            "at high reasoning without automatic escalation."
+        ),
+        "paths": TIER2_CANDIDATE_PATHS,
+        "invariants": [
+            "The review binds the exact package manifest and exact 17-path review-file record.",
+            "The package and review state remain owner-only and credential-free.",
+            "The parent Tier 1 receipt is deterministic evidence only and grants no install authority.",
+            "Mempool and Genesis stay stopped and disabled through review and install preflight.",
+            "Installation remains absent-only for credentials and preserves rollback and exact hashes.",
+            "Prepare must use --producer-provider gpt without --escalate; review and check use the same state.",
         ],
-        "fingerprints": {
-            "package_digest": manifest["package_digest"],
-            "review_files_sha256": review_digest,
-            "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
-        },
-        "required_review": {
-            "reviewer_provider": "gpt",
-            "model": "gpt-5.6-sol",
-            "effort": "xhigh",
-            "normal_tier2": True,
-        },
+        "commands": [tier2_command_result(result) for result in commands],
+        "known_limits": [],
     }
+    payload = canonical_json(value)
+    if len(payload) > MAX_TIER2_EVIDENCE_BYTES:
+        raise ValueError("Tier 2 evidence exceeds the current engine's 64 KiB bound")
+    return value
 
 
 def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
@@ -267,7 +331,10 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         "review_files",
         "expected_closure_paths",
         "review_files_record",
-        "tier2_evidence_inputs_path",
+        "tier2_review",
+        "tier2_engine",
+        "tier2_evidence_schema",
+        "tier2_candidate_paths",
     }
     if set(manifest) != required or manifest.get("schema") != BUNDLE_SCHEMA:
         raise ValueError("package manifest schema or fields mismatch")
@@ -334,7 +401,7 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
     if sha256_file(review_source) != review_digest:
         raise ValueError("review file source hash mismatch")
     review_value = load_json(review_source)
-    expected_review_status = "pending-normal-tier2" if complete else "blocked-on-desktop-pubkeys"
+    expected_review_status = "pending-tier2-v2" if complete else "blocked-on-desktop-pubkeys"
     if review_value != {
         "schema": REVIEW_FILES_SCHEMA,
         "status": expected_review_status,
@@ -344,6 +411,12 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
     }:
         raise ValueError("review file payload mismatch")
 
+    validate_tier2_review(manifest.get("tier2_review"))
+    validate_tier2_engine(manifest.get("tier2_engine"))
+    if manifest.get("tier2_evidence_schema") != TIER2_EVIDENCE_SCHEMA:
+        raise ValueError("Tier 2 evidence schema mismatch")
+    if manifest.get("tier2_candidate_paths") != TIER2_CANDIDATE_PATHS:
+        raise ValueError("Tier 2 candidate path set mismatch")
     digest_input = {
         "schema": BUNDLE_SCHEMA,
         "bundle_id": BUNDLE_ID,
@@ -354,18 +427,14 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         "review_files": files,
         "expected_closure_paths": manifest["expected_closure_paths"],
         "generator_sources": manifest["generator_sources"],
+        "tier2_review": manifest["tier2_review"],
+        "tier2_engine": manifest["tier2_engine"],
+        "tier2_evidence_schema": manifest["tier2_evidence_schema"],
+        "tier2_candidate_paths": manifest["tier2_candidate_paths"],
     }
     package_digest = sha256_bytes(canonical_json(digest_input))
     if manifest.get("package_digest") != package_digest:
         raise ValueError("package digest mismatch")
-
-    evidence_relative = manifest.get("tier2_evidence_inputs_path")
-    if evidence_relative != "metadata/tier2-evidence-inputs.json":
-        raise ValueError("Tier 2 evidence input path mismatch")
-    evidence_source = bundle / str(evidence_relative)
-    require_regular(evidence_source, 0o600)
-    if load_json(evidence_source) != expected_evidence_inputs(bundle, manifest, review_digest):
-        raise ValueError("Tier 2 evidence inputs mismatch")
 
     validate_generator_sources(manifest, repo_root)
     if manifest.get("source_commit") != git_value(repo_root, "rev-parse", "HEAD"):
@@ -510,6 +579,7 @@ def build_receipt(
     commands: list[dict[str, object]],
     before: dict[str, object],
     after: dict[str, object],
+    tier2_bundle: dict[str, object] | None,
 ) -> dict[str, object]:
     commands_passed = all(result.get("exit") == 0 for result in commands)
     unchanged = before == after
@@ -518,7 +588,11 @@ def build_receipt(
         status = "READY_FOR_PARENT_TIER1" if complete else "BLOCKED_ON_DESKTOP_PUBKEYS"
     else:
         status = "FAILED"
-    evidence_path = bundle / str(manifest["tier2_evidence_inputs_path"])
+    if status == "READY_FOR_PARENT_TIER1":
+        if not isinstance(tier2_bundle, dict):
+            raise ValueError("complete green preflight requires a generated Tier 2 v2 evidence bundle")
+    elif tier2_bundle is not None:
+        raise ValueError("blocked or failed preflight must not claim a reviewable Tier 2 bundle")
     return {
         "schema": RECEIPT_SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -533,9 +607,10 @@ def build_receipt(
             "input_status": manifest["input_status"],
             "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
             "review_files_sha256": manifest["review_files_record"]["sha256"],
-            "tier2_evidence_inputs_path": str(evidence_path),
-            "tier2_evidence_inputs_sha256": sha256_file(evidence_path),
+            "tier2_review": manifest["tier2_review"],
+            "tier2_engine_sha256": manifest["tier2_engine"]["sha256"],
         },
+        "tier2_bundle": tier2_bundle,
         "execution_bounds": {
             "installed": False,
             "published": False,
@@ -564,6 +639,7 @@ def generate_receipt(
     output: Path,
     repo_root: Path,
     *,
+    tier2_bundle_output: Path | None = None,
     command_results: list[dict[str, object]] | None = None,
     before_snapshot: dict[str, object] | None = None,
     after_snapshot: dict[str, object] | None = None,
@@ -584,7 +660,25 @@ def generate_receipt(
         else command_results
     )
     after = snapshot(live_paths) if after_snapshot is None else after_snapshot
-    receipt = build_receipt(bundle, manifest, results, before, after)
+    ready = (
+        manifest.get("input_status") == "complete"
+        and all(result.get("exit") == 0 for result in results)
+        and before == after
+    )
+    tier2_record = None
+    if ready:
+        if tier2_bundle_output is None:
+            raise ValueError("green complete preflight requires --tier2-bundle-output")
+        tier2_value = expected_tier2_bundle(bundle, manifest, results)
+        tier2_payload = canonical_json(tier2_value)
+        write_atomic(tier2_bundle_output, tier2_payload)
+        tier2_record = {
+            "path": str(tier2_bundle_output.absolute()),
+            "sha256": sha256_bytes(tier2_payload),
+            "schema": TIER2_EVIDENCE_SCHEMA,
+            "candidate_root": str(bundle.resolve(strict=True)),
+        }
+    receipt = build_receipt(bundle, manifest, results, before, after, tier2_record)
     write_atomic(output, canonical_json(receipt))
     return receipt
 
@@ -593,12 +687,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tier2-bundle-output")
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
     args = parser.parse_args()
     receipt = generate_receipt(
         Path(args.bundle).resolve(strict=True),
         Path(args.output).absolute(),
         Path(args.repo_root).resolve(strict=True),
+        tier2_bundle_output=(
+            Path(args.tier2_bundle_output).absolute() if args.tier2_bundle_output else None
+        ),
     )
     print(
         json.dumps(

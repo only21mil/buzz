@@ -36,13 +36,16 @@ test "$(stat -c '%a' "$closure")" = 644
 test "$(stat -c '%h' "$closure")" = 1
 
 jq -e --arg slug "$slug" --argjson count "${#expected_paths[@]}" '
-  .schema == "buzz-agent-review-closure-v1" and
+  .schema == "buzz-agent-review-closure-v2" and
   .accepted == true and
   (.verdict == "PASS" or .verdict == "PASS WITH RISKS") and
-  (.review_id | type == "string" and length > 0) and
-  (.artifact_fingerprint | test("^[0-9a-f]{64}$")) and
+  (.lineage_id | type == "string" and length > 0) and
+  (.state_id | type == "string" and length > 0) and
+  (.runtime_artifact_fingerprint | test("^[0-9a-f]{64}$")) and
+  (.candidate_fingerprint | test("^[0-9a-f]{64}$")) and
   (.bundle_digest | test("^[0-9a-f]{64}$")) and
-  (.result_digest | test("^[0-9a-f]{64}$")) and
+  (.state_digest | test("^[0-9a-f]{64}$")) and
+  (.verdict_digest | test("^[0-9a-f]{64}$")) and
   (.files[$slug] | type == "array" and length == $count)
 ' "$closure" >/dev/null
 

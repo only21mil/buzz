@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight, install, or roll back one normally reviewed MGACT package."""
+"""Preflight, install, or roll back one Tier 2 v2-reviewed MGACT package."""
 
 from __future__ import annotations
 
@@ -25,11 +25,13 @@ REPO_ROOT = SCRIPT_DIR.parents[2]
 TIER2_VERIFIER_RELATIVE = Path(
     "scripts/mempool-genesis/activation/tier2-evidence-verifier.py"
 )
+TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
+TIER2_VERIFIER_MODE = 0o755
 SUDO_PATH = Path("/usr/bin/sudo")
-BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v2"
-PREFLIGHT_RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v2"
-INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-install-receipt-v2"
-INSTALLED_CLOSURE_SCHEMA = "buzz-agent-review-closure-v1"
+BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
+PREFLIGHT_RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v3"
+INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-install-receipt-v3"
+INSTALLED_CLOSURE_SCHEMA = "buzz-agent-review-closure-v2"
 BUNDLE_ID = "mempool-genesis-activation-20260825"
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -83,13 +85,14 @@ class TargetState:
 
 @dataclass(frozen=True)
 class Tier2Acceptance:
-    review_id: str
+    lineage_id: str
+    state_id: str
     revision: int
     verdict: str
     reviewer_identity: str
-    result_digest: str
+    verdict_digest: str
     evidence_digest: str
-    artifact_fingerprint: str
+    candidate_fingerprint: str
     state_digest: str
 
 
@@ -294,6 +297,7 @@ def validate_preflight_receipt(
     receipt_path: Path,
     bundle: Path,
     manifest: dict[str, object],
+    evidence_path: Path,
     owner: ArtifactOwner,
 ) -> dict[str, object]:
     receipt = load_json(receipt_path, mode=0o600, owner_uid=owner.uid)
@@ -304,6 +308,7 @@ def validate_preflight_receipt(
         "installable",
         "next_gate",
         "bundle",
+        "tier2_bundle",
         "execution_bounds",
         "input_contract",
         "commands",
@@ -326,18 +331,23 @@ def validate_preflight_receipt(
         "input_status": manifest["input_status"],
         "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
         "review_files_sha256": manifest["review_files_record"]["sha256"],
-        "tier2_evidence_inputs_path": str(
-            bundle / str(manifest["tier2_evidence_inputs_path"])
-        ),
-        "tier2_evidence_inputs_sha256": sha256_file(
-            bundle / str(manifest["tier2_evidence_inputs_path"])
-        ),
+        "tier2_review": manifest["tier2_review"],
+        "tier2_engine_sha256": manifest["tier2_engine"]["sha256"],
     }
     if bundle_record.get("path") != str(bundle):
         raise ValueError("preflight receipt package path mismatch")
     for key, value in expected.items():
         if bundle_record.get(key) != value:
             raise ValueError(f"preflight receipt package mismatch: {key}")
+    tier2_record = receipt.get("tier2_bundle")
+    expected_tier2_record = {
+        "path": str(evidence_path),
+        "sha256": sha256_file(evidence_path),
+        "schema": "tier2-evidence-v2",
+        "candidate_root": str(bundle),
+    }
+    if tier2_record != expected_tier2_record:
+        raise ValueError("preflight receipt Tier 2 evidence binding mismatch")
     bounds = receipt.get("execution_bounds")
     expected_bounds = {
         "installed",
@@ -380,12 +390,26 @@ def verifier_source_record(manifest: dict[str, object]) -> dict[str, object]:
     record = matches[0]
     if set(record) != {"path", "mode", "sha256"}:
         raise ValueError("package-bound Tier 2 verifier record is invalid")
-    if parse_mode(record.get("mode")) != 0o700:
+    if parse_mode(record.get("mode")) != TIER2_VERIFIER_MODE:
         raise ValueError("package-bound Tier 2 verifier mode mismatch")
     digest = record.get("sha256")
     if not isinstance(digest, str) or not HEX64.fullmatch(digest):
         raise ValueError("package-bound Tier 2 verifier digest is invalid")
     return record
+
+
+def tier2_engine_record(manifest: dict[str, object]) -> dict[str, str]:
+    record = manifest.get("tier2_engine")
+    if not isinstance(record, dict) or set(record) != {"path", "mode", "sha256"}:
+        raise ValueError("package-bound Tier 2 engine record is invalid")
+    path_raw, mode_raw, digest = record.get("path"), record.get("mode"), record.get("sha256")
+    if path_raw != str(TIER2_ENGINE_PATH):
+        raise ValueError("package-bound Tier 2 engine path is invalid")
+    if parse_mode(mode_raw) != 0o700:
+        raise ValueError("package-bound Tier 2 engine mode mismatch")
+    if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+        raise ValueError("package-bound Tier 2 engine digest is invalid")
+    return {"path": path_raw, "mode": str(mode_raw), "sha256": digest}
 
 
 def open_bound_tier2_verifier(
@@ -400,7 +424,7 @@ def open_bound_tier2_verifier(
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or stat.S_IMODE(metadata.st_mode) != TIER2_VERIFIER_MODE
         ):
             raise ValueError("unsafe package-bound Tier 2 verifier")
         sealed = os.memfd_create(
@@ -444,12 +468,15 @@ def drop_to_artifact_owner(owner: ArtifactOwner) -> None:
 
 def run_tier2_check(
     state_path: Path,
+    evidence_path: Path,
+    bundle: Path,
     manifest: dict[str, object],
     repo_root: Path,
     owner: ArtifactOwner,
 ) -> dict[str, object]:
     require_regular(state_path, mode=0o600, owner_uid=owner.uid)
     descriptor = open_bound_tier2_verifier(manifest, repo_root)
+    engine = tier2_engine_record(manifest)
     environment = {
         "HOME": owner.home,
         "LC_ALL": "C",
@@ -461,9 +488,17 @@ def run_tier2_check(
             [
                 sys.executable,
                 f"/proc/self/fd/{descriptor}",
-                "check-closure",
+                "check",
                 "--state",
                 str(state_path),
+                "--evidence",
+                str(evidence_path),
+                "--candidate-root",
+                str(bundle),
+                "--engine",
+                engine["path"],
+                "--engine-sha256",
+                engine["sha256"],
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -483,67 +518,34 @@ def run_tier2_check(
     lines = [line for line in completed.stdout.splitlines() if line]
     if completed.returncode != 0:
         detail = completed.stderr.strip()
-        raise ValueError(f"normal Tier 2 closure rejected: {detail or completed.returncode}")
+        raise ValueError(f"Tier 2 v2 closure rejected: {detail or completed.returncode}")
     if len(lines) != 1:
-        raise ValueError("normal Tier 2 closure check returned an invalid response count")
+        raise ValueError("Tier 2 v2 closure check returned an invalid response count")
     value = json.loads(lines[0], object_pairs_hook=reject_duplicates)
     if not isinstance(value, dict):
-        raise ValueError("normal Tier 2 closure check did not return an object")
+        raise ValueError("Tier 2 v2 closure check did not return an object")
     return value
-
-
-def expected_tier2_changed_paths(
-    bundle: Path,
-    manifest: dict[str, object],
-    owner: ArtifactOwner,
-) -> list[dict[str, object]]:
-    inputs_path = bundle / str(manifest["tier2_evidence_inputs_path"])
-    expected_inputs = PREFLIGHT_SUPPORT.expected_evidence_inputs(
-        bundle,
-        manifest,
-        str(manifest["review_files_record"]["sha256"]),
-    )
-    if load_json(inputs_path, mode=0o600, owner_uid=owner.uid) != expected_inputs:
-        raise ValueError("package Tier 2 evidence inputs changed")
-    result = []
-    for entry in expected_inputs["changed_paths"]:
-        relative = str(entry["relative_path"])
-        absolute = bundle / relative
-        result.append(
-            {
-                "status": str(entry["status"]),
-                "path": str(absolute),
-                "sha256": str(entry["sha256"]),
-            }
-        )
-    return sorted(result, key=lambda entry: str(entry["path"]).encode())
-
-
-def fingerprint_tier2_paths(paths: list[dict[str, object]]) -> str:
-    payload = "".join(
-        f"{entry['status']}\t{entry['sha256']}\t{entry['path']}\n" for entry in paths
-    ).encode()
-    return sha256_bytes(payload)
 
 
 def validate_tier2_acceptance(
     bundle: Path,
     manifest: dict[str, object],
+    receipt: dict[str, object],
     evidence_path: Path,
     state_path: Path,
-    result_path: Path,
     repo_root: Path,
     owner: ArtifactOwner,
 ) -> Tier2Acceptance:
-    for path, label in (
-        (evidence_path, "evidence bundle"),
-        (state_path, "closure state"),
-        (result_path, "review result"),
+    for path, label, limit in (
+        (evidence_path, "evidence bundle", 64 * 1024),
+        (state_path, "state", 1024 * 1024),
     ):
         try:
             require_regular(path, mode=0o600, owner_uid=owner.uid)
+            if path.lstat().st_size > limit:
+                raise ValueError(f"file exceeds {limit} bytes")
         except Exception as error:
-            raise ValueError(f"unsafe normal Tier 2 {label}: {error}") from error
+            raise ValueError(f"unsafe Tier 2 v2 {label}: {error}") from error
 
     evidence_raw = load_json(
         evidence_path,
@@ -551,141 +553,84 @@ def validate_tier2_acceptance(
         mode=0o600,
         owner_uid=owner.uid,
     )
+    commands = receipt.get("commands")
+    if not isinstance(commands, list):
+        raise ValueError("preflight receipt commands are absent")
+    expected_evidence = PREFLIGHT_SUPPORT.expected_tier2_bundle(bundle, manifest, commands)
+    if evidence_raw != expected_evidence:
+        raise ValueError("Tier 2 v2 evidence does not bind the exact package and Tier 1 results")
     evidence_digest = sha256_file(evidence_path)
-    expected_paths = expected_tier2_changed_paths(bundle, manifest, owner)
-    if evidence_raw.get("schema") != "tier2-evidence-v2":
-        raise ValueError("dynamic package review requires Tier 2 evidence v2 files mode")
-    if evidence_raw.get("candidate") != {"mode": "files"}:
-        raise ValueError("normal Tier 2 evidence candidate mode mismatch")
-    if evidence_raw.get("changed_paths") != expected_paths:
-        raise ValueError("normal Tier 2 evidence does not bind the exact package and review files")
-    expected_artifact_fingerprint = fingerprint_tier2_paths(expected_paths)
-    if evidence_raw.get("artifact_fingerprint") != expected_artifact_fingerprint:
-        raise ValueError("normal Tier 2 evidence artifact fingerprint mismatch")
-    expected_fingerprints = {
-        "package_digest": manifest["package_digest"],
-        "review_files_sha256": manifest["review_files_record"]["sha256"],
-        "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
-    }
-    fingerprints = evidence_raw.get("fingerprints")
-    if not isinstance(fingerprints, dict):
-        raise ValueError("normal Tier 2 evidence fingerprints are absent")
-    for key, value in expected_fingerprints.items():
-        if fingerprints.get(key) != value:
-            raise ValueError(f"normal Tier 2 evidence package fingerprint mismatch: {key}")
 
-    check = run_tier2_check(state_path, manifest, repo_root, owner)
-    required_true = {"ok", "terminal", "accepted", "consumable"}
-    if any(check.get(key) is not True for key in required_true):
-        raise ValueError("normal Tier 2 closure is not terminal, accepted, and consumable")
-    if check.get("subcommand") != "check-closure":
-        raise ValueError("normal Tier 2 closure response type mismatch")
-    if check.get("required_reviewer_providers") != ["gpt"]:
-        raise ValueError("normal Tier 2 closure reviewer roster mismatch")
-    if check.get("bundle_path") != str(evidence_path):
-        raise ValueError("normal Tier 2 closure is bound to a different evidence file")
-    if check.get("bundle_digest") != evidence_digest:
-        raise ValueError("normal Tier 2 closure evidence digest mismatch")
-    if check.get("artifact_schema") != "tier2-evidence-v2":
-        raise ValueError("normal Tier 2 closure evidence schema mismatch")
-    if check.get("artifact_fingerprint") != expected_artifact_fingerprint:
-        raise ValueError("normal Tier 2 closure package fingerprint mismatch")
-
-    result_raw = load_json(
-        result_path,
-        max_bytes=32 * 1024,
-        mode=0o600,
-        owner_uid=owner.uid,
-    )
-    result_digest = sha256_file(result_path)
-    state_raw = load_json(
+    check = run_tier2_check(
         state_path,
-        max_bytes=1024 * 1024,
-        mode=0o600,
-        owner_uid=owner.uid,
+        evidence_path,
+        bundle,
+        manifest,
+        repo_root,
+        owner,
     )
-    state_digest = sha256_file(state_path)
-    if state_raw.get("schema") != "tier2-closure-state-v2":
-        raise ValueError("normal Tier 2 state schema mismatch")
-    if state_digest != check.get("state_digest"):
-        raise ValueError("normal Tier 2 state changed during validation")
-    if result_raw.get("schema") != "tier2-review-result-v3":
-        raise ValueError("normal Tier 2 result must use the current result schema")
-
-    reviewers = check.get("reviewers")
-    if not isinstance(reviewers, dict) or set(reviewers) != {"gpt"}:
-        raise ValueError("normal Tier 2 closure reviewer result is absent")
-    reviewed = reviewers["gpt"]
-    if not isinstance(reviewed, dict):
-        raise ValueError("normal Tier 2 closure reviewer record is invalid")
-    revision = reviewed.get("revision")
-    if not isinstance(revision, int) or revision not in (1, 2):
-        raise ValueError("normal Tier 2 closure revision is invalid")
-    if result_raw.get("review_id") != check.get("review_id"):
-        raise ValueError("normal Tier 2 result review identity mismatch")
-    if result_raw.get("revision") != revision:
-        raise ValueError("normal Tier 2 result revision mismatch")
-    if result_raw.get("reviewer_provider") != "gpt":
-        raise ValueError("normal Tier 2 result reviewer provider mismatch")
-    if result_raw.get("verdict") not in ("PASS", "PASS WITH RISKS"):
-        raise ValueError("normal Tier 2 result verdict is not accepted")
-    if result_raw.get("bundle_digest") != evidence_digest:
-        raise ValueError("normal Tier 2 result evidence digest mismatch")
-    if result_raw.get("artifact_fingerprint") != expected_artifact_fingerprint:
-        raise ValueError("normal Tier 2 result package fingerprint mismatch")
-    if result_digest != reviewed.get("result_digest"):
-        raise ValueError("normal Tier 2 result digest mismatch")
-    if result_raw.get("verdict") != reviewed.get("verdict"):
-        raise ValueError("normal Tier 2 result verdict disagrees with closure state")
-    if result_raw.get("reviewer_identity") != reviewed.get("reviewer_identity"):
-        raise ValueError("normal Tier 2 reviewer identity mismatch")
-    profile = result_raw.get("profile_evidence")
-    if (
-        not isinstance(profile, dict)
-        or profile.get("model") != "gpt-5.6-sol"
-        or profile.get("effort") != "xhigh"
+    expected_keys = {
+        "ok",
+        "subcommand",
+        "state_schema",
+        "producer_provider",
+        "escalated",
+        "route",
+        "lineage_id",
+        "state_id",
+        "revision",
+        "verdict",
+        "reviewer_identity",
+        "evidence_digest",
+        "state_digest",
+        "candidate_fingerprint",
+        "verdict_digest",
+    }
+    if set(check) != expected_keys or check.get("ok") is not True:
+        raise ValueError("Tier 2 v2 closure response fields mismatch")
+    if check.get("subcommand") != "check" or check.get("state_schema") != "tier2-state-v2":
+        raise ValueError("Tier 2 v2 closure response type mismatch")
+    if check.get("producer_provider") != "gpt" or check.get("escalated") is not False:
+        raise ValueError("Tier 2 v2 closure producer or activation override mismatch")
+    if check.get("route") != {
+        "provider": "claude",
+        "model": "claude-opus-5",
+        "effort": "high",
+    }:
+        raise ValueError("Tier 2 v2 closure review route mismatch")
+    if check.get("evidence_digest") != evidence_digest:
+        raise ValueError("Tier 2 v2 closure evidence digest mismatch")
+    if check.get("state_digest") != sha256_file(state_path):
+        raise ValueError("Tier 2 v2 state changed during validation")
+    revision = check.get("revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision not in (1, 2):
+        raise ValueError("Tier 2 v2 closure revision is invalid")
+    if check.get("verdict") not in ("PASS", "PASS WITH RISKS"):
+        raise ValueError("Tier 2 v2 closure verdict is not accepted")
+    for key in (
+        "lineage_id",
+        "state_id",
+        "reviewer_identity",
+        "candidate_fingerprint",
+        "verdict_digest",
     ):
-        raise ValueError("normal Tier 2 result profile mismatch")
-    if result_raw.get("victor_authorized_effort") is not True:
-        raise ValueError("normal Tier 2 result lacks authorized xhigh effort evidence")
-    mutation = result_raw.get("mutation_check")
-    if (
-        not isinstance(mutation, dict)
-        or mutation.get("status") != "unchanged"
-        or mutation.get("before") != mutation.get("after")
-    ):
-        raise ValueError("normal Tier 2 result mutation check failed")
-
-    revisions = state_raw.get("revisions")
-    state_reviewers = state_raw.get("reviewers")
-    state_revision = revisions.get(str(revision)) if isinstance(revisions, dict) else None
-    state_provider = state_reviewers.get("gpt") if isinstance(state_reviewers, dict) else None
-    state_reviewer = (
-        state_provider.get("revisions", {}).get(str(revision))
-        if isinstance(state_provider, dict)
-        else None
-    )
-    if (
-        not isinstance(state_revision, dict)
-        or state_revision.get("bundle_path") != str(evidence_path)
-        or state_revision.get("bundle_digest") != evidence_digest
-        or state_revision.get("artifact_fingerprint") != expected_artifact_fingerprint
-    ):
-        raise ValueError("normal Tier 2 state revision package binding mismatch")
-    if not isinstance(state_reviewer, dict) or state_reviewer.get("result_path") != str(result_path):
-        raise ValueError("normal Tier 2 state result path mismatch")
-    if state_reviewer.get("result_digest") != result_digest:
-        raise ValueError("normal Tier 2 state result digest mismatch")
+        value = check.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Tier 2 v2 closure {key} is absent")
+    for key in ("candidate_fingerprint", "verdict_digest", "state_digest"):
+        if not HEX64.fullmatch(str(check[key])):
+            raise ValueError(f"Tier 2 v2 closure {key} is invalid")
 
     return Tier2Acceptance(
-        review_id=str(check["review_id"]),
+        lineage_id=str(check["lineage_id"]),
+        state_id=str(check["state_id"]),
         revision=revision,
-        verdict=str(result_raw["verdict"]),
-        reviewer_identity=str(result_raw["reviewer_identity"]),
-        result_digest=result_digest,
+        verdict=str(check["verdict"]),
+        reviewer_identity=str(check["reviewer_identity"]),
+        verdict_digest=str(check["verdict_digest"]),
         evidence_digest=evidence_digest,
-        artifact_fingerprint=expected_artifact_fingerprint,
-        state_digest=state_digest,
+        candidate_fingerprint=str(check["candidate_fingerprint"]),
+        state_digest=str(check["state_digest"]),
     )
 
 
@@ -704,10 +649,13 @@ def build_installed_closure(
         {
             "schema": INSTALLED_CLOSURE_SCHEMA,
             "accepted": True,
-            "review_id": acceptance.review_id,
-            "artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
+            "lineage_id": acceptance.lineage_id,
+            "state_id": acceptance.state_id,
+            "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
+            "candidate_fingerprint": acceptance.candidate_fingerprint,
             "bundle_digest": manifest["package_digest"],
-            "result_digest": acceptance.result_digest,
+            "state_digest": acceptance.state_digest,
+            "verdict_digest": acceptance.verdict_digest,
             "verdict": acceptance.verdict,
             "files": files,
         }
@@ -719,7 +667,6 @@ def load_bundle(
     receipt_path: Path,
     evidence_path: Path,
     state_path: Path,
-    result_path: Path,
     repo_root: Path = REPO_ROOT,
 ) -> tuple[dict[str, object], Tier2Acceptance, tuple[Target, ...]]:
     owner = artifact_owner()
@@ -732,13 +679,13 @@ def load_bundle(
         raise ValueError("package public-key inputs are incomplete")
     if manifest.get("installable") is not False:
         raise ValueError("producer package must remain non-installable")
-    validate_preflight_receipt(receipt_path, bundle, manifest, owner)
+    receipt = validate_preflight_receipt(receipt_path, bundle, manifest, evidence_path, owner)
     acceptance = validate_tier2_acceptance(
         bundle,
         manifest,
+        receipt,
         evidence_path,
         state_path,
-        result_path,
         repo_root,
         owner,
     )
@@ -875,7 +822,6 @@ def preflight(
     receipt: Path,
     evidence: Path,
     state: Path,
-    result: Path,
     root: Path,
     repo_root: Path = REPO_ROOT,
 ) -> Preflight:
@@ -885,7 +831,6 @@ def preflight(
             receipt,
             evidence,
             state,
-            result,
             repo_root,
         )
     except Exception as error:
@@ -910,8 +855,8 @@ def preflight(
 
 def render_preflight(value: Preflight, mode: str) -> str:
     bundle_id = value.manifest.get("bundle_id") if value.manifest else "unresolved"
-    review_id = value.acceptance.review_id if value.acceptance else "unresolved"
-    lines = [f"MGACT {mode} bundle={bundle_id} review={review_id}"]
+    lineage_id = value.acceptance.lineage_id if value.acceptance else "unresolved"
+    lines = [f"MGACT {mode} bundle={bundle_id} lineage={lineage_id}"]
     for state in value.targets:
         lines.append(f"TARGET {state.target.target} status={state.status} reason={state.reason}")
     if value.blockers:
@@ -1198,11 +1143,10 @@ def install(
     receipt: Path,
     evidence: Path,
     state: Path,
-    result: Path,
     root: Path,
     repo_root: Path = REPO_ROOT,
 ) -> int:
-    initial = preflight(bundle, receipt, evidence, state, result, root, repo_root)
+    initial = preflight(bundle, receipt, evidence, state, root, repo_root)
     if initial.blockers or initial.manifest is None or initial.acceptance is None:
         print(render_preflight(initial, "install"), end="")
         return 1
@@ -1211,7 +1155,7 @@ def install(
         return 0
     backup_root, lock_handle = prepare_admin_paths(root)
     try:
-        checked = preflight(bundle, receipt, evidence, state, result, root, repo_root)
+        checked = preflight(bundle, receipt, evidence, state, root, repo_root)
         if checked.blockers or checked.manifest is None or checked.acceptance is None:
             print(render_preflight(checked, "install-locked"), end="")
             return 1
@@ -1252,8 +1196,10 @@ def install(
             "preflight_receipt_sha256": sha256_file(receipt),
             "tier2_evidence_sha256": acceptance.evidence_digest,
             "tier2_state_sha256": acceptance.state_digest,
-            "tier2_result_sha256": acceptance.result_digest,
-            "review_id": acceptance.review_id,
+            "tier2_verdict_sha256": acceptance.verdict_digest,
+            "tier2_candidate_fingerprint": acceptance.candidate_fingerprint,
+            "review_lineage_id": acceptance.lineage_id,
+            "review_state_id": acceptance.state_id,
             "review_revision": acceptance.revision,
             "review_verdict": acceptance.verdict,
             "state": "prepared",
@@ -1277,7 +1223,7 @@ def install(
                 verify_previous_state(target, previous[target.target.target])
                 applied.append(target)
                 atomic_copy_source(target.target, target, root)
-            final = preflight(bundle, receipt, evidence, state, result, root, repo_root)
+            final = preflight(bundle, receipt, evidence, state, root, repo_root)
             if final.blockers or any(target.status != "current" for target in final.targets):
                 raise ValueError("post-install preflight did not reach current state")
             install_receipt["state"] = "installed"
@@ -1384,7 +1330,6 @@ def main() -> None:
         child.add_argument("--receipt", required=True)
         child.add_argument("--tier2-evidence", required=True)
         child.add_argument("--tier2-state", required=True)
-        child.add_argument("--tier2-result", required=True)
         child.add_argument("--root", default="/")
         child.add_argument("--repo-root", default=str(REPO_ROOT))
     child = children.add_parser("rollback")
@@ -1398,13 +1343,12 @@ def main() -> None:
     receipt = Path(args.receipt).resolve(strict=True)
     evidence = Path(args.tier2_evidence).resolve(strict=True)
     state = Path(args.tier2_state).resolve(strict=True)
-    result = Path(args.tier2_result).resolve(strict=True)
     repo_root = Path(args.repo_root).resolve(strict=True)
     if args.command in {"check", "dry-run"}:
-        value = preflight(bundle, receipt, evidence, state, result, root, repo_root)
+        value = preflight(bundle, receipt, evidence, state, root, repo_root)
         print(render_preflight(value, args.command), end="")
         raise SystemExit(1 if value.blockers else 0)
-    raise SystemExit(install(bundle, receipt, evidence, state, result, root, repo_root))
+    raise SystemExit(install(bundle, receipt, evidence, state, root, repo_root))
 
 
 if __name__ == "__main__":

@@ -4,18 +4,22 @@ This directory builds a credential-free activation package after Buzz Desktop sa
 
 ## Review order
 
-The normal review policy has two promotion boundaries.
+The work crosses two promotion boundaries.
 
-1. This disabled, unmerged source candidate gets parent Tier 1 readback and deterministic checks. The exact-head code candidate then gets normal Tier 2 before merge.
-2. After Desktop saves two distinct public identities, both managed services must remain stopped and disabled. Freeze the final dynamic package and run a second normal Tier 2. Credential handoff, installation, and activation remain blocked until that review has terminal accepted closure.
+1. The disabled, unmerged source candidate gets parent Tier 1 readback and deterministic checks. The exact code candidate then gets Tier 2 before merge.
+2. After Desktop saves two distinct public identities, both services stay stopped and disabled. Freeze the final dynamic package and run a second Tier 2. Credential handoff, installation, and activation remain blocked until that review has a current terminal accepted closure.
 
-The preflight receipt only reports readiness and records bounded evidence inputs. It cannot close either review, make the package installable, or grant install authority.
+This package is GPT-produced and touches credentials, signing, and production, but Victor explicitly overrode automatic escalation for this one activation on 2026-08-26. Run Tier 2 with `--producer-provider gpt` and no `--escalate`; the engine selects one independent Claude Opus 5 reviewer at `high` reasoning. This activation-specific route does not change generic fleet canon: future GPT-produced security, authentication, signing, or production-infrastructure work escalates the Claude leg to Claude Fable 5 unless Victor or Rachel explicitly overrides it.
+
+The parent Tier 1 receipt is deterministic evidence only. It cannot close review, make the package installable, or grant install authority.
 
 ## Private staging root
 
+The current Tier 2 engine fingerprints Git state when a candidate sits inside a repository. Keep the dynamic package and review state outside every Git worktree so the review covers only the package files.
+
 ```sh
 ACT=/home/victor/work/prog-buzz/wave3/MGACT/.scratch/activation-wt-sats/scripts/mempool-genesis/activation
-STAGE=/home/victor/work/prog-buzz/wave3/MGACT/.scratch/MGACT-staging-r3
+STAGE=/home/victor/work/mgact-activation-staging
 install -d -m 0700 "$STAGE"
 install -m 0600 "$ACT/input.template.json" "$STAGE/inputs.json"
 ```
@@ -29,7 +33,7 @@ The values must differ and must not reuse Victor, Rachel, Sats Codex, Sats Codex
 
 ## Generate
 
-A placeholder preview is incomplete and cannot pass installer validation:
+A placeholder preview is incomplete and cannot pass installer validation.
 
 ```sh
 python3 "$ACT/generate-activation-bundle.py" \
@@ -38,7 +42,7 @@ python3 "$ACT/generate-activation-bundle.py" \
   --allow-placeholders
 ```
 
-After Desktop returns both public keys, generate the final package:
+After Desktop returns both public keys, generate the final package.
 
 ```sh
 python3 "$ACT/generate-activation-bundle.py" \
@@ -47,58 +51,90 @@ python3 "$ACT/generate-activation-bundle.py" \
   --replace
 ```
 
-A complete package reports `input_status=complete`, `ready_for_parent_tier1=true`, and `installable=false`. It contains deterministic `metadata/review-files.json` and `metadata/tier2-evidence-inputs.json` records. Each agent's installed closure inventory has exactly 17 paths.
+A complete package reports `input_status=complete`, `ready_for_parent_tier1=true`, and `installable=false`. The manifest records:
 
-## Preflight receipt
+- producer provider `gpt`;
+- activation-specific non-escalated route `claude-opus-5` at `high`;
+- engine sequence `prepare`, `review`, `check`;
+- the exact SHA-256 of `/home/victor/.agents/skills/codex-review/scripts/tier2`;
+- candidate paths `bundle-manifest.json` and `metadata/review-files.json`.
+
+Each agent's installed closure inventory still has exactly 17 paths.
+
+## Tier 1 receipt and Tier 2 evidence
+
+Run the deterministic preflight as the artifact owner, not root.
 
 ```sh
 python3 "$ACT/make-tier1-receipt.py" \
   --bundle "$STAGE/candidate-final" \
-  --output "$STAGE/preflight-receipt.json"
+  --output "$STAGE/preflight-receipt.json" \
+  --tier2-bundle-output "$STAGE/dynamic-tier2-evidence.json"
 ```
 
-A complete package with green checks returns `READY_FOR_PARENT_TIER1`. A placeholder package returns `BLOCKED_ON_DESKTOP_PUBKEYS`. The receipt records no review verdict and creates no installed closure. Gate selection is independent of caller `PATH`: shellcheck always uses `/home/victor/.npm-global/bin/shellcheck` during normal-user receipt creation, while installer validation only compares the recorded fixed command and never executes that user-owned tool as root.
+A complete package with green checks returns `READY_FOR_PARENT_TIER1`. A placeholder package returns `BLOCKED_ON_DESKTOP_PUBKEYS` and does not create Tier 2 evidence. The receipt records no verdict and creates no installed closure.
 
-## Normal dynamic Tier 2
+`dynamic-tier2-evidence.json` uses the installed engine's exact `tier2-evidence-v2` contract. It names the package as `candidate_root`, lists only the two manifest-owned candidate paths, and carries the observed Tier 1 command results. The receipt binds its absolute path and SHA-256.
 
-The parent controller converts `metadata/tier2-evidence-inputs.json` into a private normal Tier 2 evidence bundle. The evidence bundle must use `tier2-evidence-v2` files mode and bind exactly these two package files by absolute path and SHA-256:
+Shellcheck selection does not depend on caller `PATH`. Receipt generation uses `/home/victor/.npm-global/bin/shellcheck`. Installer validation compares the recorded command and never executes that user-owned tool as root.
 
-- `bundle-manifest.json`
-- `metadata/review-files.json`
+## Tier 2 v2
 
-Its `fingerprints` object must bind the package digest, review-files digest, and runtime artifact fingerprint from the generated inputs. The controller owns the standard evidence validation, launch capability, independent GPT-5.6 Sol `xhigh` review, result recording, and terminal closure checks.
+The parent controller owns this sequence. The state directory must be mode `0700`, private to the artifact owner, and outside the candidate directory and every candidate repository.
 
-Keep these final artifacts under the private staging root, all mode `0600`:
+```sh
+TIER2=/home/victor/.agents/skills/codex-review/scripts/tier2
+STATE_DIR="$STAGE/tier2-r1"
 
-- the evidence bundle
-- the closure state created by `tier2_evidence.py authorize-launch`
-- the `tier2-review-result-v3` result recorded by `tier2_evidence.py validate-closure`
+STATE=$("$TIER2" prepare \
+  --bundle "$STAGE/dynamic-tier2-evidence.json" \
+  --producer-provider gpt \
+  --controller sats-codex-2 \
+  --state-dir "$STATE_DIR")
 
-The source candidate carries an exact reviewed snapshot of the maintained Tier 2 closure engine. The package source inventory binds that verifier by SHA-256. After package validation, the installer opens the source with `O_NOFOLLOW`, copies and hashes the exact bytes into a sealed `memfd`, and runs `/proc/self/fd/N`; replacing or modifying the user-owned source after the freeze cannot change the executed code. Under sudo the verifier drops to the authenticated artifact owner before reading the private closure files. The installer also validates the exact evidence paths, package fingerprints, state binding, result digest, reviewer identity, model, effort, verdict, and unchanged mutation check.
+"$TIER2" review --state "$STATE"
+"$TIER2" check --state "$STATE"
+```
+
+`prepare` freezes one candidate fingerprint and, because this invocation omits `--escalate`, selects Claude Opus 5 at `high`. `review` records the terminal result in the same `tier2-state-v2` file. There is no separate result artifact. `check` rejects failed, stale, expired, mismatched, overridden, or mutated closure state.
+
+If revision 1 fails, follow the engine's revision 2 contract with the same reviewer identity. Do not open another review leg. The shared runbook in `Agent-Shared/adapters/sats-shared-common.md` owns retries and corrected lineages.
+
+Keep the evidence bundle and state file under the private staging root. The launch token is single-use and the engine removes it when review claims it.
 
 ## Read-only installer checks
 
-Both modes call the same preflight function and write nothing:
+Both modes call the same preflight function and write nothing.
 
 ```sh
 sudo python3 "$ACT/install-activation-bundle.py" check \
   --bundle "$STAGE/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
-  --tier2-state "$STAGE/dynamic-tier2-state.json" \
-  --tier2-result "$STAGE/dynamic-tier2-result.json"
+  --tier2-state "$STATE"
 
 sudo python3 "$ACT/install-activation-bundle.py" dry-run \
   --bundle "$STAGE/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
-  --tier2-state "$STAGE/dynamic-tier2-state.json" \
-  --tier2-result "$STAGE/dynamic-tier2-result.json"
+  --tier2-state "$STATE"
 ```
 
-The real-root gate requires `framework-desktop`, root, and both `buzz-agent@mempool.service` and `buzz-agent@genesis.service` to report exactly `inactive` and `disabled`. Private receipt, evidence, state, and result files must be owned by the authenticated sudo invoker; direct-root operation instead requires root-owned artifacts. Malformed, incomplete, or parent-process-forged `SUDO_UID` metadata fails closed. Every target must be classified `add`, `replace`, or `current`, with `writes=0`.
+The installer runs the installed engine's `check` subcommand every time. The package binds both the adapter source and the installed engine by SHA-256. The installer copies the adapter into a sealed `memfd`; the adapter does the same for the engine before executing `/proc/self/fd/N`. Under sudo, the adapter runs as the authenticated artifact owner before it reads private review files.
 
-The staged sweep candidate has separate read-only modes. They require a later approval to use Victor's sanctioned owner credential for relay reads. Mempool and Genesis remain a fixed public-key roster. The script covers every live open channel, uses Victor's owner authority, and never reads either managed agent's private key.
+The adapter requires:
+
+- `tier2-state-v2` with `status=closed`;
+- producer `gpt` and `escalate=false`;
+- route `claude`, `claude-opus-5`, `high`;
+- an accepted `PASS` or `PASS WITH RISKS` result;
+- the exact evidence digest and package candidate fingerprint;
+- no transport override;
+- a current engine `check` result of `OK`.
+
+The real-root gate also requires `framework-desktop`, root, and both `buzz-agent@mempool.service` and `buzz-agent@genesis.service` to report exactly `inactive` and `disabled`. Private receipt, evidence, and state files must belong to the authenticated sudo invoker. Direct-root operation requires root-owned artifacts. Malformed or forged `SUDO_UID` metadata fails closed. Every target must be `add`, `replace`, or `current`, with `writes=0`.
+
+The staged sweep candidate has separate read-only modes. They need later approval to use Victor's sanctioned owner credential for relay reads. Mempool and Genesis remain a fixed public-key roster. The script covers every live open channel, uses Victor's owner authority, and never reads either managed agent's private key.
 
 ```sh
 "$STAGE/candidate-final/ops-root/home/victor/.agents/tools/buzz-sats-channel-sweep.sh" --check
@@ -107,34 +143,35 @@ The staged sweep candidate has separate read-only modes. They require a later ap
 
 ## Install and rollback
 
-Installation is outside this lane. It needs separate Victor or Rachel approval after final normal Tier 2 closure and real-host read-only checks.
+Installation is outside this lane. It needs separate Victor or Rachel approval after terminal Tier 2 closure and real-host read-only checks.
 
 ```sh
 sudo python3 "$ACT/install-activation-bundle.py" install \
   --bundle "$STAGE/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
-  --tier2-state "$STAGE/dynamic-tier2-state.json" \
-  --tier2-result "$STAGE/dynamic-tier2-result.json"
+  --tier2-state "$STATE"
 ```
 
-The installer derives `/etc/buzz-agents/review-closure.json` from the validated normal Tier 2 state and result. It never accepts a caller-authored installed closure. It backs up every changed target, uses same-directory temporary files with `fsync` and `os.replace`, installs the derived closure last, verifies final state, and restores applied targets on failure. An exact second run returns `ALREADY_INSTALLED writes=0` without creating another backup.
+The installer derives `/etc/buzz-agents/review-closure.json` from the validated Tier 2 state. It never accepts a caller-authored installed closure. The installed `buzz-agent-review-closure-v2` record binds the lineage, state, evidence, verdict, runtime files, package digest, and frozen candidate fingerprint. The package-installed `verify-installed-agent` prestart gate validates that same v2 contract before either service can start.
 
-The successful install output contains one backup ID. Roll back only while both services remain stopped and disabled:
+The installer backs up every changed target, uses same-directory temporary files with `fsync` and `os.replace`, installs the derived closure last, verifies final state, and restores applied targets on failure. An exact second run returns `ALREADY_INSTALLED writes=0` without another backup.
+
+The successful install output contains one backup ID. Roll back only while both services remain stopped and disabled.
 
 ```sh
 sudo python3 "$ACT/install-activation-bundle.py" rollback \
   --backup-id FULL_BACKUP_ID
 ```
 
-Backups and install receipts live under `/var/lib/buzz-mgact-backups/` as mode-0700 state. The install lock uses canonical `/run/lock/buzz-mgact-install.lock`; `/var/lock` is not traversed because Fedora exposes it as a symlink to `/run/lock`. Rollback refuses any installed-file digest, owner, mode, hard-link, or symlink drift.
+Backups and install receipts live under `/var/lib/buzz-mgact-backups/` as mode-`0700` state. The install lock is `/run/lock/buzz-mgact-install.lock`. Rollback refuses digest, owner, mode, hard-link, symlink, or content drift.
 
 ## Parent integration order
 
-1. Read back and test only `scripts/mempool-genesis/activation/**`. Leave the disabled intermediate candidate at Tier 1.
-2. Freeze the exact code candidate, run normal Tier 2, and merge only after terminal accepted closure.
+1. Read back and test `scripts/mempool-genesis/activation/**` plus `scripts/mempool-genesis/verify-installed-agent`. Leave the disabled intermediate candidate at Tier 1.
+2. Freeze the exact code candidate. Run Tier 2 and merge only after terminal accepted closure.
 3. Wait for Desktop to return the two public keys while both identities remain stopped. Put only those public values in `inputs.json`.
-4. Generate `candidate-final` without `--allow-placeholders`, then generate the preflight receipt.
-5. Freeze the final dynamic files and run the second normal Tier 2.
-6. Run installer `check` and `dry-run` on the real host. Run sweep `--check` and `--dry-run` only under separate approval to use the live owner credential.
+4. Generate `candidate-final`. Generate the Tier 1 receipt and current Tier 2 evidence.
+5. Complete parent Tier 1 readback. Run `tier2 prepare`, `review`, and `check` on the exact dynamic package.
+6. Run installer `check` and `dry-run` on the real host before the closure expires. Run sweep `--check` and `--dry-run` only with separate approval to use the live owner credential.
 7. Seek separate approval for credential handoff, installation, and activation. Preserve the printed backup ID if installation is approved.
