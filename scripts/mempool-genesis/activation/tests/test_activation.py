@@ -486,12 +486,20 @@ class ActivationBundleTests(PackageFixture):
             self.assertIn("Your identity and memory scope are Sats/Victor only.", prompt)
             self.assertIn("assignment authority never widens that scope", prompt)
             self.assertIn("framework-desktop", prompt)
-            self.assertIn("current opposite-provider runbook", prompt)
-            self.assertIn("Claude Opus 5 reviewer at high reasoning", prompt)
-            self.assertIn("Claude Fable 5 for security, auth, signing, or production infrastructure", prompt)
-            self.assertIn("GPT-5.6 Sol reviewer at high reasoning", prompt)
-            self.assertIn("Sol `xhigh` is allowed only on explicit Victor or Rachel instruction", prompt)
-            self.assertNotIn("opposite-provider, and double-model review are retired", prompt)
+            self.assertIn("GPT-5.6 Sol at high reasoning for the root seat", prompt)
+            self.assertIn("canon-approved worker profiles and transports", prompt)
+            self.assertIn(
+                "exactly one distinct-identity GPT-5.6 Sol reviewer at explicit `xhigh`",
+                prompt,
+            )
+            self.assertIn(
+                "Claude dispatch, opposite-provider review, and double-model review are retired",
+                prompt,
+            )
+            self.assertIn("Luna is producer-only and never a reviewer", prompt)
+            self.assertNotIn("current opposite-provider runbook", prompt)
+            self.assertNotIn("Claude Opus 5", prompt)
+            self.assertNotIn("Claude Fable 5", prompt)
 
     def test_preflight_receipt_reports_readiness_without_review_or_install_claim(self) -> None:
         bundle, _manifest = self.generate()
