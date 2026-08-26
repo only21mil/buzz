@@ -36,6 +36,8 @@ pub mod normal_backend;
 #[cfg(target_os = "linux")]
 pub mod normal_engine;
 #[cfg(target_os = "linux")]
+pub mod normal_qualification;
+#[cfg(target_os = "linux")]
 pub mod normal_source;
 #[cfg(target_os = "linux")]
 pub mod production_composition;
