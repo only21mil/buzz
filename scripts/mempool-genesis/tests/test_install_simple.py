@@ -65,7 +65,7 @@ class InstallSimpleTests(unittest.TestCase):
         self.root = self.base / "root"
         self.package = self.base / "package"
         self.root.mkdir()
-        self.package.mkdir()
+        self.package.mkdir(mode=0o700)
         self.uid = os.getuid()
         self.gid = os.getgid()
         self.desktop_uid = 4242 if self.uid != 4242 else 4243
@@ -91,7 +91,11 @@ class InstallSimpleTests(unittest.TestCase):
             source = self.package / source_name
             source.parent.mkdir(parents=True, exist_ok=True)
             payload = f"reviewed payload {index}\n".encode()
+            source_mode = (
+                "0755" if target.startswith("/home/") else MODES.get(target, "0755")
+            )
             source.write_bytes(payload)
+            source.chmod(int(source_mode, 8))
             self.entries.append(
                 {
                     "owner": "desktop" if target.startswith("/home/") else "static",
@@ -104,7 +108,7 @@ class InstallSimpleTests(unittest.TestCase):
                     ),
                     "source": source_name,
                     "target": target,
-                    "source_mode": "0755" if target.startswith("/home/") else MODES.get(target, "0755"),
+                    "source_mode": source_mode,
                     "status": "A",
                     "sha256": hashlib.sha256(payload).hexdigest(),
                     "install_mode": MODES.get(target, "0755"),
@@ -139,7 +143,9 @@ class InstallSimpleTests(unittest.TestCase):
             "desktop_previous_launcher_sha256": "a" * 64,
             "package_fingerprint": fingerprint or MODULE.package_fingerprint(self.entries),
         }
-        (self.package / MODULE.MANIFEST_NAME).write_text(json.dumps(manifest))
+        manifest_path = self.package / MODULE.MANIFEST_NAME
+        manifest_path.write_text(json.dumps(manifest))
+        manifest_path.chmod(0o600)
 
     def bind_fixture_identity(self) -> None:
         """Bind generated positive fixtures without changing shipped defaults."""
@@ -270,6 +276,33 @@ class InstallSimpleTests(unittest.TestCase):
         (self.package / str(self.entries[3]["source"])).write_text("changed")
         self.assertEqual(self.run_install(), 1)
         self.assertIn("INSTALL REFUSED: package source hash mismatch", self.output)
+        self.assert_nothing_installed()
+
+    def test_source_symlink_is_refused_before_write(self) -> None:
+        source = self.package / SOURCES[3]
+        attacker = self.package / "attacker-receiver"
+        attacker.write_bytes(source.read_bytes())
+        attacker.chmod(0o755)
+        source.unlink()
+        source.symlink_to(attacker)
+
+        self.assertEqual(self.run_install(), 1)
+        self.assertIn("INSTALL REFUSED: cannot open package source", self.output)
+        self.assert_nothing_installed()
+
+    def test_source_hardlink_is_refused_before_write(self) -> None:
+        source = self.package / SOURCES[5]
+        os.link(source, self.package / "hardlinked-sudoers")
+
+        self.assertEqual(self.run_install(), 1)
+        self.assertIn("INSTALL REFUSED: unsafe package source", self.output)
+        self.assert_nothing_installed()
+
+    def test_source_mode_mismatch_is_refused_before_write(self) -> None:
+        (self.package / SOURCES[3]).chmod(0o700)
+
+        self.assertEqual(self.run_install(), 1)
+        self.assertIn("INSTALL REFUSED: unsafe package source", self.output)
         self.assert_nothing_installed()
 
     def test_fingerprint_mismatch_is_refused(self) -> None:
@@ -415,8 +448,79 @@ class InstallSimpleTests(unittest.TestCase):
         self.assertTrue(credential_dir.is_dir())
         self.assertEqual(stat.S_IMODE(credential_dir.stat().st_mode), 0o700)
 
+    def test_unchanged_sources_verify_repeatably_then_install(self) -> None:
+        first_entries, first_sources = MODULE.load_and_verify_manifest(
+            self.package, self.package / MODULE.MANIFEST_NAME
+        )
+        second_entries, second_sources = MODULE.load_and_verify_manifest(
+            self.package, self.package / MODULE.MANIFEST_NAME
+        )
+
+        self.assertEqual(first_entries, second_entries)
+        self.assertEqual(first_sources, second_sources)
+        self.assertEqual(self.run_install(), 0)
+        for entry in self.entries:
+            target = self.installed_path(str(entry["target"]))
+            self.assertEqual(
+                hashlib.sha256(target.read_bytes()).hexdigest(), entry["sha256"]
+            )
+
+    def test_receiver_mutation_after_verification_cannot_reach_root_targets(self) -> None:
+        source = self.package / SOURCES[3]
+        target = self.installed_path(TARGETS[3])
+        reviewed = source.read_bytes()
+        attacker = b"attacker-controlled receiver\n"
+        attacked = False
+        real_target_exists = MODULE.target_exists
+
+        def mutate_after_preflight(path: Path) -> bool:
+            nonlocal attacked
+            if not attacked:
+                attacked = True
+                source.write_bytes(attacker)
+            return real_target_exists(path)
+
+        with mock.patch.object(
+            MODULE, "target_exists", side_effect=mutate_after_preflight
+        ):
+            self.assertEqual(self.run_install(), 0)
+
+        self.assertTrue(attacked)
+        self.assertEqual(target.read_bytes(), reviewed)
+        for static_target in TARGETS[:7]:
+            self.assertNotEqual(self.installed_path(static_target).read_bytes(), attacker)
+
+    def test_sudoers_symlink_swap_after_verification_cannot_reach_root_targets(self) -> None:
+        source = self.package / SOURCES[5]
+        target = self.installed_path(TARGETS[5])
+        reviewed = source.read_bytes()
+        attacker = b"victor ALL=(root) NOPASSWD: ALL\n"
+        attacker_source = self.package / "attacker-sudoers"
+        attacker_source.write_bytes(attacker)
+        attacker_source.chmod(0o440)
+        attacked = False
+        real_target_exists = MODULE.target_exists
+
+        def swap_after_preflight(path: Path) -> bool:
+            nonlocal attacked
+            if not attacked:
+                attacked = True
+                source.unlink()
+                source.symlink_to(attacker_source)
+            return real_target_exists(path)
+
+        with mock.patch.object(MODULE, "target_exists", side_effect=swap_after_preflight):
+            self.assertEqual(self.run_install(), 0)
+
+        self.assertTrue(attacked)
+        self.assertEqual(target.read_bytes(), reviewed)
+        for static_target in TARGETS[:7]:
+            self.assertNotEqual(self.installed_path(static_target).read_bytes(), attacker)
+
     def test_static_chown_test_escape_requires_explicit_flag(self) -> None:
         source = self.package / SOURCES[0]
+        payload = source.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
         target = self.base / "static-test-target"
         with (
             mock.patch.object(os, "getuid", return_value=1000),
@@ -424,7 +528,7 @@ class InstallSimpleTests(unittest.TestCase):
             mock.patch.dict(os.environ, {}, clear=True),
             self.assertRaises(PermissionError),
         ):
-            MODULE.install_one(source, target, 0o755, 0, 0)
+            MODULE.install_one(payload, digest, target, 0o755, 0, 0)
         self.assertFalse(target.exists())
 
         with (
@@ -432,8 +536,8 @@ class InstallSimpleTests(unittest.TestCase):
             mock.patch.object(os, "fchown", side_effect=PermissionError("denied")),
             mock.patch.dict(os.environ, {"MG_INSTALL_TEST": "1"}, clear=True),
         ):
-            MODULE.install_one(source, target, 0o755, 0, 0)
-        self.assertEqual(target.read_bytes(), source.read_bytes())
+            MODULE.install_one(payload, digest, target, 0o755, 0, 0)
+        self.assertEqual(target.read_bytes(), payload)
 
     def test_mid_install_failure_rolls_back_created_files(self) -> None:
         real_install_one = MODULE.install_one
