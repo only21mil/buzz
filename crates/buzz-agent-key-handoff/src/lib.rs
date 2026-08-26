@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use nostr::{FromBech32, Keys, SecretKey};
 use serde::de::{self, MapAccess, Visitor};
@@ -5,7 +7,7 @@ use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Versioned schema identifier for the root-owned public enrollment map.
@@ -228,38 +230,37 @@ pub fn parse_enrollment_map(input: &str) -> Result<EnrollmentKeys> {
 
 pub fn harden_process() -> Result<()> {
     #[cfg(target_os = "linux")]
-    unsafe {
-        let limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
+    {
+        use rustix::process::{
+            set_dumpable_behavior, setrlimit, DumpableBehavior, Resource, Rlimit,
         };
-        if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
-            return Err(std::io::Error::last_os_error()).context("setrlimit RLIMIT_CORE");
-        }
-        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
-            return Err(std::io::Error::last_os_error()).context("prctl PR_SET_DUMPABLE");
-        }
+
+        setrlimit(
+            Resource::Core,
+            Rlimit {
+                current: Some(0),
+                maximum: Some(0),
+            },
+        )
+        .context("setrlimit RLIMIT_CORE")?;
+        set_dumpable_behavior(DumpableBehavior::NotDumpable).context("prctl PR_SET_DUMPABLE")?;
     }
     Ok(())
 }
 
-pub fn require_anonymous_pipe(fd: RawFd) -> Result<()> {
-    if fd <= 2 {
-        bail!("secret descriptor must be greater than 2");
-    }
+pub fn require_anonymous_pipe(fd: BorrowedFd<'_>) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("fstat secret descriptor");
+        use rustix::fs::{fstat, FileType};
+
+        let stat = fstat(fd).context("fstat pipe descriptor")?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Fifo {
+            bail!("descriptor is not a pipe");
         }
-        if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
-            bail!("secret descriptor is not a pipe");
-        }
-        let target =
-            fs::read_link(format!("/proc/self/fd/{fd}")).context("resolve secret descriptor")?;
+        let target = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .context("resolve pipe descriptor")?;
         if !target.to_string_lossy().starts_with("pipe:[") {
-            bail!("secret descriptor is not an anonymous pipe");
+            bail!("descriptor is not an anonymous pipe");
         }
     }
     Ok(())
@@ -288,7 +289,8 @@ pub fn exact_secret_line(input: &[u8]) -> Result<Zeroizing<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
+    use rustix::pipe::{pipe_with, PipeFlags};
+    use std::os::fd::AsFd;
 
     const SK1: &str = "0000000000000000000000000000000000000000000000000000000000000001";
     const PK1: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -354,15 +356,11 @@ mod tests {
 
     #[test]
     fn accepts_only_anonymous_pipe_descriptors() {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        assert!(require_anonymous_pipe(fds[0]).is_ok());
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
+        let (read_end, write_end) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+        assert!(require_anonymous_pipe(read_end.as_fd()).is_ok());
+        assert!(require_anonymous_pipe(write_end.as_fd()).is_ok());
 
         let regular = tempfile::tempfile().unwrap();
-        assert!(require_anonymous_pipe(regular.as_raw_fd()).is_err());
+        assert!(require_anonymous_pipe(regular.as_fd()).is_err());
     }
 }

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![cfg(target_os = "linux")]
 
 use anyhow::{bail, Context, Result};
@@ -5,20 +6,19 @@ use buzz_agent_key_handoff::{
     harden_process, parse_public_key_hex, parse_unique_string_map, require_anonymous_pipe,
     validate_secret_binding,
 };
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use rustix::fs::{flock, open, FlockOperation, Mode, OFlags};
+use rustix::process::getuid;
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::AsFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-fn parse_args() -> Result<(String, RawFd)> {
+fn parse_args() -> Result<String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 4 || args[0] != "--pubkey" || args[2] != "--output-fd" {
-        bail!("usage: export-managed-agent-key --pubkey HEX --output-fd FD");
+    if args.len() != 2 || args[0] != "--pubkey" {
+        bail!("usage: export-managed-agent-key --pubkey HEX");
     }
-    Ok((
-        parse_public_key_hex(&args[1])?,
-        args[3].parse().context("invalid output fd")?,
-    ))
+    parse_public_key_hex(&args[1])
 }
 
 fn normalize_lock_mode(file: &File, uid: u32) -> Result<()> {
@@ -43,27 +43,25 @@ fn normalize_lock_mode(file: &File, uid: u32) -> Result<()> {
 }
 
 fn lock_keyring() -> Result<File> {
-    let uid = unsafe { libc::getuid() };
+    let uid = getuid().as_raw();
     let path = format!("/tmp/buzz-keychain-{uid}-buzz-desktop.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .context("open Buzz keyring lock")?;
+    let fd = open(
+        &path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .context("open Buzz keyring lock")?;
+    let file = File::from(fd);
     normalize_lock_mode(&file, uid)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("lock Buzz keyring");
-    }
+    flock(file.as_fd(), FlockOperation::LockShared).context("lock Buzz keyring")?;
     Ok(file)
 }
 
 fn main() -> Result<()> {
     harden_process()?;
-    let (pubkey, output_fd) = parse_args()?;
-    require_anonymous_pipe(output_fd)?;
+    let pubkey = parse_args()?;
+    let stdout = io::stdout();
+    require_anonymous_pipe(stdout.as_fd())?;
     let _lock = lock_keyring()?;
     let entry = keyring::Entry::new("buzz-desktop", "secrets")
         .context("open Buzz Desktop keyring entry")?;
@@ -78,7 +76,7 @@ fn main() -> Result<()> {
         .remove(&format!("agent:{pubkey}"))
         .context("requested managed-agent key is absent")?;
     let secret_hex = validate_secret_binding(&nsec, &pubkey)?;
-    let mut output = unsafe { File::from_raw_fd(output_fd) };
+    let mut output = stdout.lock();
     output
         .write_all(secret_hex.as_bytes())
         .and_then(|_| output.write_all(b"\n"))
@@ -97,7 +95,7 @@ mod tests {
         let file = named.as_file();
         file.set_permissions(std::fs::Permissions::from_mode(0o644))
             .unwrap();
-        normalize_lock_mode(file, unsafe { libc::getuid() }).unwrap();
+        normalize_lock_mode(file, getuid().as_raw()).unwrap();
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
@@ -107,6 +105,6 @@ mod tests {
         let file = named.as_file();
         file.set_permissions(std::fs::Permissions::from_mode(0o666))
             .unwrap();
-        assert!(normalize_lock_mode(file, unsafe { libc::getuid() }).is_err());
+        assert!(normalize_lock_mode(file, getuid().as_raw()).is_err());
     }
 }

@@ -5,17 +5,19 @@ agents. It does not save Buzz identities, read the live keyring during build or
 review, install credentials, start services, add memberships, open DMs, or send
 messages.
 
-The unprivileged controller creates one anonymous pipe. The exporter reads the
-production Buzz Desktop keyring blob under the same advisory lock as Desktop,
-selects only the requested agent entry, derives and verifies the requested
-public key, and writes one lowercase secret scalar to file descriptor 3. The
-root receiver reads the expected public key from a root-owned strict map,
-derives the public key independently, and publishes the matching credential
-under /etc/buzz-agents/credentials through O_TMPFILE and linkat. The root
-receiver holds the slug lock, rejects every existing target, then signals the
-controller to start the exporter. It performs no secret read before that
-absent-only gate. Existing files, unsafe metadata, symlinks, and hard links all
-fail closed.
+The unprivileged controller creates one anonymous pipe and passes its endpoints
+through standard I/O ownership. The exporter reads the production Buzz Desktop
+keyring blob under the same advisory lock as Desktop, selects only the requested
+agent entry, derives and verifies the requested public key, and writes one
+lowercase secret scalar to stdout. The root receiver reads the secret from stdin,
+reads the expected public key from a root-owned strict map, derives the public
+key independently, and publishes the matching credential under
+/etc/buzz-agents/credentials through O_TMPFILE and linkat. The root receiver
+holds the slug lock, validates both anonymous-pipe channels, rejects every
+existing target, validates the enrollment map, then writes one readiness byte to
+stdout so the controller can start the exporter. It performs no secret read
+before that absent-only gate. Existing files, unsafe metadata, symlinks, and hard
+links all fail closed.
 
 The updated service unit loads that root-owned file with systemd
 LoadCredential. The service user never owns the credential path. Services stay
