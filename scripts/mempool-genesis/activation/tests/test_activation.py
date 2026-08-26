@@ -922,6 +922,47 @@ class InstallerSafetyTests(PackageFixture):
         value = self.preflight()
         self.assertTrue(any("symlink in parent path" in blocker for blocker in value.blockers))
 
+    def test_trusted_sibling_usr_local_sbin_link_installs_and_rolls_back(self) -> None:
+        sbin = self.install_root / "usr/local/sbin"
+        sbin.rmdir()
+        binary_directory = self.install_root / "usr/local/agent-bin"
+        binary_directory.mkdir(mode=0o755)
+        sbin.symlink_to("agent-bin", target_is_directory=True)
+
+        value = self.preflight()
+        self.assertFalse(value.blockers)
+        for target_text in (
+            "/usr/local/sbin/buzz-install-agent-key",
+            "/usr/local/sbin/install-enrollment-map",
+        ):
+            state = next(item for item in value.targets if item.target.target == target_text)
+            self.assertEqual(state.status, "add")
+            self.assertEqual(state.resolved_parent, binary_directory)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.install(), 0)
+        self.assertTrue((binary_directory / "buzz-install-agent-key").is_file())
+        self.assertTrue((binary_directory / "install-enrollment-map").is_file())
+        backup_id = self.only_backup_id()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.rollback(backup_id), 0)
+        self.assertFalse((binary_directory / "buzz-install-agent-key").exists())
+        self.assertFalse((binary_directory / "install-enrollment-map").exists())
+        self.assertTrue(sbin.is_symlink())
+        self.assertEqual(os.readlink(sbin), "agent-bin")
+
+    def test_cross_tree_usr_local_sbin_link_remains_blocked(self) -> None:
+        sbin = self.install_root / "usr/local/sbin"
+        sbin.rmdir()
+        sbin.symlink_to("../../etc", target_is_directory=True)
+        value = self.preflight()
+        self.assertTrue(
+            any(
+                blocker.startswith("/usr/local/sbin/") and "symlink in parent path" in blocker
+                for blocker in value.blockers
+            )
+        )
+
     def test_wrong_package_source_mode_is_rejected(self) -> None:
         source = self.bundle / "install-root/etc/buzz-agents/mempool.env"
         source.chmod(0o600)

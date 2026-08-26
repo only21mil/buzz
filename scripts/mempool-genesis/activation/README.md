@@ -76,7 +76,7 @@ A complete package with green checks returns `READY_FOR_PARENT_TIER1`. A placeho
 
 `dynamic-tier2-evidence.json` uses the installed engine's exact `tier2-evidence-v2` contract. It names the package as `candidate_root`, lists only the two manifest-owned candidate paths, and carries the observed Tier 1 command results. The receipt binds its absolute path and SHA-256.
 
-Shellcheck selection does not depend on caller `PATH`. Receipt generation uses `/home/victor/.npm-global/bin/shellcheck`. Installer validation compares the recorded command and never executes that user-owned tool as root.
+Shellcheck selection does not depend on caller `PATH`. Receipt generation uses `/home/victor/.npm-global/bin/shellcheck`. Installer validation compares the recorded command and never executes that user-owned tool as root. Real-root installer commands use `/usr/bin/python3` explicitly because Fedora's sudo path resolves bare `python3` through `/usr/sbin`, which would not match the recorded command path.
 
 ## Tier 2 v2
 
@@ -107,13 +107,13 @@ Keep the evidence bundle and state file under the private staging root. The laun
 Both modes call the same preflight function and write nothing.
 
 ```sh
-sudo python3 "$ACT/install-activation-bundle.py" check \
+sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" check \
   --bundle "$STAGE/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
   --tier2-state "$STATE"
 
-sudo python3 "$ACT/install-activation-bundle.py" dry-run \
+sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" dry-run \
   --bundle "$STAGE/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
@@ -134,6 +134,8 @@ The adapter requires:
 
 The real-root gate also requires `framework-desktop`, root, and both `buzz-agent@mempool.service` and `buzz-agent@genesis.service` to report exactly `inactive` and `disabled`. Private receipt, evidence, and state files must belong to the authenticated sudo invoker. Direct-root operation requires root-owned artifacts. Malformed or forged `SUDO_UID` metadata fails closed. Every target must be `add`, `replace`, or `current`, with `writes=0`.
 
+Parent symlinks are allowed only when the link owner is trusted, the resolved directory remains inside the install root and below the same already-validated parent tree, and the normal owner and non-writable-directory checks pass. Broken, escaping, cross-tree, writable, or wrong-owner links remain blocked.
+
 The staged sweep candidate has separate read-only modes. They need later approval to use Victor's sanctioned owner credential for relay reads. Mempool and Genesis remain a fixed public-key roster. The script covers every live open channel, uses Victor's owner authority, and never reads either managed agent's private key.
 
 ```sh
@@ -146,7 +148,7 @@ The staged sweep candidate has separate read-only modes. They need later approva
 Installation is outside this lane. It needs separate Victor or Rachel approval after terminal Tier 2 closure and real-host read-only checks.
 
 ```sh
-sudo python3 "$ACT/install-activation-bundle.py" install \
+sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" install \
   --bundle "$STAGE/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
@@ -160,7 +162,7 @@ The installer backs up every changed target, uses same-directory temporary files
 The successful install output contains one backup ID. Roll back only while both services remain stopped and disabled.
 
 ```sh
-sudo python3 "$ACT/install-activation-bundle.py" rollback \
+sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" rollback \
   --backup-id FULL_BACKUP_ID
 ```
 

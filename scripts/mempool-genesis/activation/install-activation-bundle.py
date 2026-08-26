@@ -731,6 +731,23 @@ def root_metadata(root: Path) -> os.stat_result:
     return metadata
 
 
+def trusted_parent_directory(root: Path, link: Path) -> Path | None:
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_parent = link.parent.resolve(strict=True)
+        resolved = link.resolve(strict=True)
+        metadata = resolved.lstat()
+    except (OSError, RuntimeError):
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        return None
+    if resolved == resolved_root or resolved_root not in resolved.parents:
+        return None
+    if resolved == resolved_parent or resolved_parent not in resolved.parents:
+        return None
+    return resolved
+
+
 def walk_parent(root: Path, target: Target) -> tuple[Path | None, str | None]:
     root_metadata(root)
     uid, gid = expected_owner(target, root)
@@ -744,7 +761,13 @@ def walk_parent(root: Path, target: Target) -> tuple[Path | None, str | None]:
         except FileNotFoundError:
             return None, "parent absent"
         if stat.S_ISLNK(metadata.st_mode):
-            return None, "symlink in parent path"
+            if metadata.st_uid not in allowed_owners or metadata.st_gid not in allowed_groups:
+                return None, "parent component owner mismatch"
+            trusted = trusted_parent_directory(root, current)
+            if trusted is None:
+                return None, "symlink in parent path"
+            current = trusted
+            metadata = current.lstat()
         if not stat.S_ISDIR(metadata.st_mode):
             return None, "parent component not directory"
         if stat.S_IMODE(metadata.st_mode) & 0o022:
@@ -1281,20 +1304,22 @@ def rollback(backup_id: str, root: Path) -> int:
             if not isinstance(target_text, str) or not Path(target_text).is_absolute():
                 raise ValueError("invalid rollback target")
             destination = rooted(root, target_text)
-            parent = destination.parent
             record = installed[target_text]
             if not isinstance(record, dict):
                 raise ValueError("invalid installed record")
-            current = parent / destination.name
             target = Target(
                 target_text,
-                current,
+                destination,
                 None,
                 parse_mode(record.get("mode")),
                 int(record.get("uid")),
                 int(record.get("gid")),
                 str(record.get("sha256")),
             )
+            parent, blocker = walk_parent(root, target)
+            if parent is None:
+                raise ValueError(f"rollback parent blocked: {target_text}: {blocker}")
+            current = parent / destination.name
             try:
                 metadata = require_regular(current, links=1)
             except (FileNotFoundError, ValueError) as error:
