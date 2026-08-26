@@ -3236,6 +3236,9 @@ pub async fn reconcile_channel_events(
             .query_events(&EventQuery {
                 kinds: Some(vec![39000, 39002]),
                 d_tag: Some(channel_id_str.clone()),
+                // Only relay-signed heads count: a client-published event with a
+                // matching d tag must not occupy a slot and suppress repair.
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
                 limit: Some(2),
                 ..EventQuery::for_community(tenant.community())
             })
@@ -3252,8 +3255,29 @@ pub async fn reconcile_channel_events(
             }
         };
 
-        let members = state.db.get_members(tenant.community(), channel.id).await?;
-        let desired_member_tags = group_member_tags(&channel_id_str, &members, &agent_pubkeys)?;
+        let members = match state.db.get_members(tenant.community(), channel.id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    channel_id = %channel.id,
+                    error = %e,
+                    "reconcile: failed to load members"
+                );
+                continue;
+            }
+        };
+        let desired_member_tags =
+            match group_member_tags(&channel_id_str, &members, &agent_pubkeys) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        channel_id = %channel.id,
+                        error = %e,
+                        "reconcile: failed to build member tags"
+                    );
+                    continue;
+                }
+            };
         let has_metadata = existing
             .iter()
             .any(|stored| event_kind_u32(&stored.event) == KIND_NIP29_GROUP_METADATA);

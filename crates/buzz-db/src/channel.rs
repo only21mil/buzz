@@ -1050,7 +1050,8 @@ pub async fn get_agent_pubkeys(pool: &PgPool, community_id: CommunityId) -> Resu
         r#"
         SELECT pubkey
         FROM users
-        WHERE community_id = $1 AND agent_type IS NOT NULL
+        WHERE community_id = $1
+          AND (agent_type IS NOT NULL OR agent_owner_pubkey IS NOT NULL)
         ORDER BY pubkey
         "#,
     )
@@ -1688,12 +1689,16 @@ mod tests {
         let pool = setup_pool().await;
         let community_a = CommunityId::from_uuid(make_test_community(&pool).await);
         let community_b = CommunityId::from_uuid(make_test_community(&pool).await);
-        let agent_a = random_pubkey();
+        // Marked the way the live NIP-OA mint path marks agents: owner set, no agent_type.
+        let agent_owner_marked = random_pubkey();
+        // Marked the legacy way: agent_type set, no owner.
+        let agent_type_marked = random_pubkey();
         let human_a = random_pubkey();
         let agent_b = random_pubkey();
 
         for (community, pubkey) in [
-            (community_a, &agent_a),
+            (community_a, &agent_owner_marked),
+            (community_a, &agent_type_marked),
             (community_a, &human_a),
             (community_b, &agent_b),
         ] {
@@ -1702,21 +1707,33 @@ mod tests {
                 .expect("insert user");
         }
         sqlx::query(
+            "UPDATE users SET agent_owner_pubkey = $1 WHERE community_id = $2 AND pubkey = $3",
+        )
+        .bind(&human_a)
+        .bind(community_a.as_uuid())
+        .bind(&agent_owner_marked)
+        .execute(&pool)
+        .await
+        .expect("mark owner-path agent");
+        sqlx::query(
             "UPDATE users SET agent_type = 'codex' WHERE (community_id = $1 AND pubkey = $2) OR (community_id = $3 AND pubkey = $4)",
         )
         .bind(community_a.as_uuid())
-        .bind(&agent_a)
+        .bind(&agent_type_marked)
         .bind(community_b.as_uuid())
         .bind(&agent_b)
         .execute(&pool)
         .await
-        .expect("mark agents");
+        .expect("mark legacy agents");
+
+        let mut expected = vec![agent_owner_marked, agent_type_marked];
+        expected.sort();
 
         let pubkeys = get_agent_pubkeys(&pool, community_a)
             .await
             .expect("fetch agents");
 
-        assert_eq!(pubkeys, vec![agent_a]);
+        assert_eq!(pubkeys, expected);
     }
 
     #[tokio::test]
