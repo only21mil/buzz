@@ -1110,6 +1110,14 @@ def atomic_restore(
     atomic_copy_source(target, state, root)
 
 
+def metadata_matches(metadata: os.stat_result, mode: int, uid: int, gid: int) -> bool:
+    return (
+        stat.S_IMODE(metadata.st_mode) == mode
+        and metadata.st_uid == uid
+        and metadata.st_gid == gid
+    )
+
+
 def restore_targets(
     changed: list[TargetState],
     previous: dict[str, dict[str, object]],
@@ -1133,21 +1141,37 @@ def restore_targets(
                 )
             continue
         current_digest = sha256_file(destination)
+        installed_uid, installed_gid = expected_owner(state.target, root)
+        installed_matches = current_digest == state.target.sha256 and metadata_matches(
+            metadata,
+            state.target.mode,
+            installed_uid,
+            installed_gid,
+        )
         if record["exists"] is True:
-            if current_digest == record["sha256"]:
+            previous_mode = int(str(record["mode"]), 8)
+            previous_uid = int(record["uid"])
+            previous_gid = int(record["gid"])
+            previous_matches = current_digest == record["sha256"] and metadata_matches(
+                metadata,
+                previous_mode,
+                previous_uid,
+                previous_gid,
+            )
+            if previous_matches:
                 continue
-            if current_digest != state.target.sha256:
+            if not installed_matches:
                 raise ValueError(f"installed target drift blocks rollback: {state.target.target}")
             atomic_restore(
                 backup / "files" / str(record["backup_name"]),
                 state,
-                int(str(record["mode"]), 8),
-                int(record["uid"]),
-                int(record["gid"]),
+                previous_mode,
+                previous_uid,
+                previous_gid,
                 root,
             )
         else:
-            if current_digest != state.target.sha256 or metadata.st_nlink != 1:
+            if not installed_matches:
                 raise ValueError(f"installed target drift blocks rollback: {state.target.target}")
             destination.unlink()
             sync_directory(state.resolved_parent)
@@ -1316,9 +1340,6 @@ def rollback(backup_id: str, root: Path) -> int:
             if not isinstance(record, dict):
                 raise ValueError("invalid installed record")
             current = parent / destination.name
-            metadata = require_regular(current, links=1)
-            if sha256_file(current) != record.get("sha256"):
-                raise ValueError(f"installed target drift blocks rollback: {target_text}")
             target = Target(
                 target_text,
                 current,
@@ -1328,9 +1349,20 @@ def rollback(backup_id: str, root: Path) -> int:
                 int(record.get("gid")),
                 str(record.get("sha256")),
             )
+            try:
+                metadata = require_regular(current, links=1)
+            except (FileNotFoundError, ValueError) as error:
+                raise ValueError(
+                    f"installed target drift blocks rollback: {target_text}: {error}"
+                ) from error
             uid, gid = expected_owner(target, root)
-            if metadata.st_uid != uid or metadata.st_gid != gid:
-                raise ValueError(f"installed target owner drift blocks rollback: {target_text}")
+            if sha256_file(current) != target.sha256 or not metadata_matches(
+                metadata,
+                target.mode,
+                uid,
+                gid,
+            ):
+                raise ValueError(f"installed target drift blocks rollback: {target_text}")
             states.append(TargetState(target, destination, parent, "replace", "rollback"))
         receipt["state"] = "rollback_started"
         write_receipt(receipt_path, receipt)

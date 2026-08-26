@@ -816,6 +816,20 @@ class InstallerSafetyTests(PackageFixture):
                 REPO_ROOT,
             )
 
+    def rollback(self, backup_id: str) -> int:
+        with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
+            return INSTALLER.rollback(backup_id, self.install_root)
+
+    def only_backup_id(self) -> str:
+        backup_root = self.install_root / "var/lib/buzz-mgact-backups"
+        backup_ids = [path.name for path in backup_root.iterdir() if path.is_dir()]
+        self.assertEqual(len(backup_ids), 1)
+        return backup_ids[0]
+
+    def target_record(self, target: str) -> dict[str, object]:
+        records = list(self.manifest["runtime_targets"]) + list(self.manifest["ops_targets"])
+        return next(record for record in records if record["target"] == target)
+
     def test_check_and_dry_run_share_read_only_preflight(self) -> None:
         targets = target_names(self.manifest)
         before = target_snapshot(self.install_root, targets)
@@ -914,6 +928,158 @@ class InstallerSafetyTests(PackageFixture):
         self.assertEqual(old_env.read_bytes(), b"old env\n")
         for target in targets:
             if target == "/etc/buzz-agents/mempool.env":
+                continue
+            self.assertFalse(os.path.lexists(self.install_root / target.lstrip("/")), target)
+
+    def test_failed_install_restores_mode_only_replacement(self) -> None:
+        target_text = "/etc/buzz-agents/mempool.env"
+        record = self.target_record(target_text)
+        target_path = self.install_root / target_text.lstrip("/")
+        payload = (self.bundle / str(record["source"])).read_bytes()
+        installed_mode = int(str(record["mode"]), 8)
+        previous_mode = 0o600 if installed_mode != 0o600 else 0o644
+        write_file(target_path, payload, previous_mode)
+        previous_owner = (target_path.lstat().st_uid, target_path.lstat().st_gid)
+        original = INSTALLER.atomic_copy_source
+        failed = False
+
+        def fail_after_mode_only_target(target, state, root):
+            nonlocal failed
+            original(target, state, root)
+            if target.target == target_text and not failed:
+                failed = True
+                raise OSError("injected failure after mode-only replacement")
+
+        with mock.patch.object(
+            INSTALLER,
+            "atomic_copy_source",
+            side_effect=fail_after_mode_only_target,
+        ):
+            with self.assertRaisesRegex(OSError, "mode-only replacement"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.install()
+
+        self.assertEqual(target_path.read_bytes(), payload)
+        restored_metadata = target_path.lstat()
+        self.assertEqual(stat.S_IMODE(restored_metadata.st_mode), previous_mode)
+        self.assertEqual((restored_metadata.st_uid, restored_metadata.st_gid), previous_owner)
+        for target in target_names(self.manifest):
+            if target == target_text:
+                continue
+            self.assertFalse(os.path.lexists(self.install_root / target.lstrip("/")), target)
+        receipt_path = next(
+            (self.install_root / "var/lib/buzz-mgact-backups").glob("*/receipt.json")
+        )
+        self.assertEqual(json.loads(receipt_path.read_text())["state"], "rolled_back")
+
+    def test_manual_rollback_restores_matching_content_metadata(self) -> None:
+        target_text = "/etc/buzz-agents/mempool.env"
+        record = self.target_record(target_text)
+        target_path = self.install_root / target_text.lstrip("/")
+        payload = (self.bundle / str(record["source"])).read_bytes()
+        installed_mode = int(str(record["mode"]), 8)
+        previous_mode = 0o600 if installed_mode != 0o600 else 0o644
+        write_file(target_path, payload, previous_mode)
+        previous_owner = (target_path.lstat().st_uid, target_path.lstat().st_gid)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.install(), 0)
+        self.assertEqual(stat.S_IMODE(target_path.lstat().st_mode), installed_mode)
+        backup_id = self.only_backup_id()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.rollback(backup_id), 0)
+
+        self.assertEqual(target_path.read_bytes(), payload)
+        restored_metadata = target_path.lstat()
+        self.assertEqual(stat.S_IMODE(restored_metadata.st_mode), previous_mode)
+        self.assertEqual((restored_metadata.st_uid, restored_metadata.st_gid), previous_owner)
+
+    def test_manual_rollback_refuses_complete_installed_metadata_drift(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.install(), 0)
+        backup_id = self.only_backup_id()
+        receipt_path = (
+            self.install_root / "var/lib/buzz-mgact-backups" / backup_id / "receipt.json"
+        )
+        target_text = "/etc/buzz-agents/mempool.env"
+        target_path = self.install_root / target_text.lstrip("/")
+
+        def assert_rollback_refused() -> None:
+            with self.assertRaises(ValueError):
+                self.rollback(backup_id)
+            self.assertEqual(json.loads(receipt_path.read_text())["state"], "installed")
+
+        original_require_regular = INSTALLER.require_regular
+
+        def require_with_owner_drift(path, **kwargs):
+            metadata = original_require_regular(path, **kwargs)
+            if Path(path) != target_path:
+                return metadata
+            drifted = mock.Mock()
+            drifted.st_mode = metadata.st_mode
+            drifted.st_nlink = metadata.st_nlink
+            drifted.st_uid = metadata.st_uid + 1
+            drifted.st_gid = metadata.st_gid
+            return drifted
+
+        def require_with_group_drift(path, **kwargs):
+            metadata = original_require_regular(path, **kwargs)
+            if Path(path) != target_path:
+                return metadata
+            drifted = mock.Mock()
+            drifted.st_mode = metadata.st_mode
+            drifted.st_nlink = metadata.st_nlink
+            drifted.st_uid = metadata.st_uid
+            drifted.st_gid = metadata.st_gid + 1
+            return drifted
+
+        with mock.patch.object(
+            INSTALLER,
+            "require_regular",
+            side_effect=require_with_owner_drift,
+        ):
+            assert_rollback_refused()
+        with mock.patch.object(
+            INSTALLER,
+            "require_regular",
+            side_effect=require_with_group_drift,
+        ):
+            assert_rollback_refused()
+
+        hard_link = self.root / "installed-hard-link"
+        os.link(target_path, hard_link)
+        assert_rollback_refused()
+        hard_link.unlink()
+
+        saved_target = self.root / "installed-symlink-source"
+        target_path.rename(saved_target)
+        target_path.symlink_to(saved_target)
+        assert_rollback_refused()
+        target_path.unlink()
+        saved_target.rename(target_path)
+
+        installed_mode = stat.S_IMODE(target_path.lstat().st_mode)
+        target_path.chmod(0o600 if installed_mode != 0o600 else 0o644)
+        assert_rollback_refused()
+
+    def test_manual_rollback_still_restores_different_content(self) -> None:
+        target_text = "/etc/buzz-agents/mempool.env"
+        record = self.target_record(target_text)
+        target_path = self.install_root / target_text.lstrip("/")
+        previous_payload = b"previous different content\n"
+        previous_mode = int(str(record["mode"]), 8)
+        write_file(target_path, previous_payload, previous_mode)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.install(), 0)
+        backup_id = self.only_backup_id()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.rollback(backup_id), 0)
+
+        self.assertEqual(target_path.read_bytes(), previous_payload)
+        self.assertEqual(stat.S_IMODE(target_path.lstat().st_mode), previous_mode)
+        for target in target_names(self.manifest):
+            if target == target_text:
                 continue
             self.assertFalse(os.path.lexists(self.install_root / target.lstrip("/")), target)
 
