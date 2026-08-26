@@ -421,6 +421,35 @@ class ActivationBundleTests(PackageFixture):
             self.assertNotIn("reviewer at explicit `xhigh`", prompt)
             self.assertNotIn("opposite-provider review, and double-model review are retired", prompt)
 
+    def test_root_only_closure_paths_require_privileged_prestart(self) -> None:
+        bundle, manifest = self.generate("privileged-prestart")
+        by_target = {
+            str(record["target"]): record for record in manifest["runtime_targets"]
+        }
+        self.assertEqual(by_target["/etc/buzz-agents/enrollment-keys.json"]["mode"], "0600")
+        self.assertEqual(by_target["/etc/sudoers.d/buzz-agent-key-handoff"]["mode"], "0440")
+        for slug in ("mempool", "genesis"):
+            closure_paths = manifest["expected_closure_paths"][slug]
+            self.assertIn("/etc/buzz-agents/enrollment-keys.json", closure_paths)
+            self.assertIn("/etc/sudoers.d/buzz-agent-key-handoff", closure_paths)
+
+        service = (
+            bundle / "install-root/etc/systemd/system/buzz-agent@.service"
+        ).read_text()
+        self.assertIn("User=buzz-%i\n", service)
+        self.assertIn(
+            "ExecStartPre=+/bin/bash /usr/local/libexec/buzz/verify-installed-agent %i\n",
+            service,
+        )
+        self.assertIn(
+            "ExecStart=/bin/bash /usr/local/libexec/buzz/run-buzz-agent %i\n",
+            service,
+        )
+        self.assertNotIn(
+            "ExecStart=+/bin/bash /usr/local/libexec/buzz/run-buzz-agent %i",
+            service,
+        )
+
     def test_preflight_receipt_reports_readiness_without_review_or_install_claim(self) -> None:
         bundle, _manifest = self.generate()
         receipt_path, receipt = self.make_receipt(bundle)

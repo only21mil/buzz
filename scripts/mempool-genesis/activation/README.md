@@ -155,7 +155,7 @@ sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" install \
   --tier2-state "$STATE"
 ```
 
-The installer derives `/etc/buzz-agents/review-closure.json` from the validated Tier 2 state. It never accepts a caller-authored installed closure. The installed `buzz-agent-review-closure-v2` record binds the lineage, state, evidence, verdict, runtime files, package digest, and frozen candidate fingerprint. The package-installed `verify-installed-agent` prestart gate validates that same v2 contract before either service can start.
+The installer derives `/etc/buzz-agents/review-closure.json` from the validated Tier 2 state. It never accepts a caller-authored installed closure. The installed `buzz-agent-review-closure-v2` record binds the lineage, state, evidence, verdict, runtime files, package digest, and frozen candidate fingerprint. The package-installed `verify-installed-agent` prestart gate validates that same v2 contract before either service can start. Systemd's `+` prefix elevates only this prestart verifier so it can hash the root-only enrollment map and sudoers file; `ExecStart` still runs as `User=buzz-%i` with no privilege prefix.
 
 The installer backs up every changed target, uses same-directory temporary files with `fsync` and `os.replace`, installs the derived closure last, verifies final state, and restores applied targets on failure. An exact second run returns `ALREADY_INSTALLED writes=0` without another backup.
 
