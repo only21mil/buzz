@@ -447,7 +447,7 @@ impl ProxyPolicy {
                     target: canonical_target,
                 })
             }
-            DockerRoute::Archive { id, path } => {
+            DockerRoute::Archive { id, path, .. } => {
                 self.ledger.require_started(&id)?;
                 let direction = match method {
                     DockerMethod::Put => ArchiveDirection::Upload,

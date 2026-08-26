@@ -1020,6 +1020,7 @@ dependencies = [
 name = "buzz-ci-policy-proxy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "buzz-ci-isolation-contract",
  "flate2",
  "hex",

@@ -34,12 +34,13 @@ headers or exposes extra inspect fields.
 PUT/GET container archives are mediated for owned, started containers. The
 proxy validates the complete bounded tar stream before forwarding or returning
 any archive bytes, rejects unsafe entry types and paths, and rebuilds normalized
-ustar output. Exec-create requires an exact manifest-bound argv, environment,
-user, workdir, and
-stream-mode expectation. Only the resulting ledger-owned exec ID may use the
-bounded exec-start hijack relay. The relay requires the exact Docker upgrade,
-caps both byte directions, enforces one deadline, and closes both sockets when
-either side closes. Other archive, attach, log, and hijack routes remain denied.
+ustar output. Archive downloads accept bounded chunked daemon framing and keep
+only the required validated path-stat response header. Exec-create requires an
+exact manifest-bound argv, environment, user, workdir, and stream-mode
+expectation. Only the resulting ledger-owned exec ID may use the bounded
+exec-start hijack relay. The relay requires the exact Docker upgrade, caps both
+byte directions, enforces one deadline, and closes both sockets when either side
+closes. Other archive, attach, log, and hijack routes remain denied.
 
 The root-owned broker must still deliver one-shot descriptors over an
 authenticated capability channel. It must also persist poison and
