@@ -207,6 +207,9 @@ enum Cmd {
     /// Read the activity feed
     #[command(subcommand)]
     Feed(FeedCmd),
+    /// Fetch arbitrary events by ID (raw signed JSON)
+    #[command(subcommand)]
+    Events(EventsCmd),
     /// Publish notes and manage the social graph (NIP-01/02)
     #[command(subcommand)]
     Social(SocialCmd),
@@ -980,6 +983,17 @@ pub enum FeedCmd {
         /// Comma-separated feed types to include: mentions, needs_action, activity, agent_activity
         #[arg(long)]
         types: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EventsCmd {
+    /// Fetch a single arbitrary event by ID (raw signed JSON out)
+    #[command(name = "get")]
+    Get {
+        /// 64-char hex event ID.
+        #[arg(long)]
+        id: String,
     },
 }
 
@@ -2083,6 +2097,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
         Cmd::Ci(sub) => commands::ci::dispatch::dispatch(sub, &client).await,
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
+        Cmd::Events(sub) => commands::events::dispatch(sub, &client).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
@@ -2528,6 +2543,7 @@ mod tests {
             "ci",
             "dms",
             "emoji",
+            "events",
             "feed",
             "issues",
             "media",
