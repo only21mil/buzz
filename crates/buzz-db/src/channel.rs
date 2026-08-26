@@ -1044,6 +1044,22 @@ pub async fn get_bot_members(
     Ok(out)
 }
 
+/// Returns the pubkeys of all agent identities in one community.
+pub async fn get_agent_pubkeys(pool: &PgPool, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT pubkey
+        FROM users
+        WHERE community_id = $1 AND agent_type IS NOT NULL
+        ORDER BY pubkey
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
 /// Bulk-fetch user records by pubkey inside one community.
 ///
 /// Returns only users that exist in the `users` table. Ordering matches input order
@@ -1664,6 +1680,43 @@ mod tests {
             users[0].display_name.as_deref(),
             Some("community-a-profile")
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_agent_pubkeys_filters_by_agent_type_and_community() {
+        let pool = setup_pool().await;
+        let community_a = CommunityId::from_uuid(make_test_community(&pool).await);
+        let community_b = CommunityId::from_uuid(make_test_community(&pool).await);
+        let agent_a = random_pubkey();
+        let human_a = random_pubkey();
+        let agent_b = random_pubkey();
+
+        for (community, pubkey) in [
+            (community_a, &agent_a),
+            (community_a, &human_a),
+            (community_b, &agent_b),
+        ] {
+            ensure_user(&pool, community, pubkey)
+                .await
+                .expect("insert user");
+        }
+        sqlx::query(
+            "UPDATE users SET agent_type = 'codex' WHERE (community_id = $1 AND pubkey = $2) OR (community_id = $3 AND pubkey = $4)",
+        )
+        .bind(community_a.as_uuid())
+        .bind(&agent_a)
+        .bind(community_b.as_uuid())
+        .bind(&agent_b)
+        .execute(&pool)
+        .await
+        .expect("mark agents");
+
+        let pubkeys = get_agent_pubkeys(&pool, community_a)
+            .await
+            .expect("fetch agents");
+
+        assert_eq!(pubkeys, vec![agent_a]);
     }
 
     #[tokio::test]
