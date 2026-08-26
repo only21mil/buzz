@@ -2442,6 +2442,11 @@ impl Db {
         channel::get_bot_members(&self.pool, community_id).await
     }
 
+    /// Returns the pubkeys of all agent identities in one community.
+    pub async fn get_agent_pubkeys(&self, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
+        channel::get_agent_pubkeys(&self.pool, community_id).await
+    }
+
     /// Bulk-fetch user records by pubkey.
     pub async fn get_users_bulk(
         &self,
