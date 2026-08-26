@@ -81,9 +81,7 @@ unsafe fn install_receiver_fds(
         }
         libc::close(ready_fd);
     }
-    if libc::fcntl(SECRET_FD, libc::F_SETFD, 0) < 0
-        || libc::fcntl(READY_FD, libc::F_SETFD, 0) < 0
-    {
+    if libc::fcntl(SECRET_FD, libc::F_SETFD, 0) < 0 || libc::fcntl(READY_FD, libc::F_SETFD, 0) < 0 {
         return Err(io::Error::last_os_error());
     }
     if libc::syscall(

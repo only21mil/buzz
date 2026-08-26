@@ -277,7 +277,10 @@ mod tests {
         let target = directory.path().join("mempool.key");
         fs::write(&target, b"already present\n").unwrap();
         let mut ready_fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(ready_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::pipe2(ready_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
         assert!(prepare_absent_install(&target, ready_fds[1]).is_err());
         unsafe {
             libc::close(ready_fds[1]);
