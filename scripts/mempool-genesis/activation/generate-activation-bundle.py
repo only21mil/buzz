@@ -122,6 +122,11 @@ COMMON_TARGETS = (
         0o755,
     ),
     TargetSpec(
+        "/usr/local/libexec/buzz/codex-code-mode-host",
+        "/usr/local/libexec/buzz/codex-code-mode-host",
+        0o755,
+    ),
+    TargetSpec(
         "/usr/local/libexec/buzz/buzz-acp",
         "/usr/local/libexec/buzz/buzz-acp",
         0o755,
@@ -154,6 +159,7 @@ EXPECTED_PATHS = {
         "/usr/local/libexec/buzz/node",
         "/usr/local/libexec/buzz/codex",
         "/usr/local/libexec/buzz/codex-acp",
+        "/usr/local/libexec/buzz/codex-code-mode-host",
         "/usr/local/libexec/buzz/buzz-acp",
         "/usr/local/libexec/buzz/buzz-dev-mcp",
         "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
@@ -509,8 +515,8 @@ def generate(
             0o600,
         )
         by_target = {str(record["target"]): record for record in records}
-        if len(by_target) != 19 or len(records) != 19:
-            raise ValueError("activation runtime target set must contain 19 unique paths")
+        if len(by_target) != 20 or len(records) != 20:
+            raise ValueError("activation runtime target set must contain 20 unique paths")
         review_files = {
             slug: [
                 {"path": path, "sha256": str(by_target[path]["sha256"])}
@@ -518,8 +524,8 @@ def generate(
             ]
             for slug in ("mempool", "genesis")
         }
-        if any(len(files) != 17 for files in review_files.values()):
-            raise ValueError("each installed review closure must contain exactly 17 paths")
+        if any(len(files) != 18 for files in review_files.values()):
+            raise ValueError("each installed review closure must contain exactly 18 paths")
 
         sweep_template = (TEMPLATE_DIR / "buzz-sats-channel-sweep.sh").read_text()
         sweep_payload = (

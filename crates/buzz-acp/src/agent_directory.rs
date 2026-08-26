@@ -201,6 +201,16 @@ pub(crate) fn build_agent_profile_content(
             Value::String(display_name.to_string()),
         );
     }
+    // A record created before this harness (or by an older Desktop) may lack
+    // the mention-eligibility fields entirely. Desktop's autocomplete hides an
+    // allowlist agent whose record carries no respond_to/respond_to_allowlist,
+    // so seed the same defaults a fresh record gets — but never overwrite a
+    // value the owner already curated on the relay.
+    for (key, value) in fresh_record_defaults(allowlist) {
+        if object.get(&key).is_none() {
+            object.insert(key, value);
+        }
+    }
     object.insert("channel_ids".to_string(), json!(channel_ids));
     object.insert("channels".to_string(), json!(channel_names));
 
@@ -765,10 +775,53 @@ mod tests {
             "channel_ids": [live.to_string()],
             "channels": ["general"],
             "channel_add_policy": "nobody",
+            // Mention-eligibility fields absent from the legacy record are
+            // seeded on merge; the curated channel_add_policy above survives.
+            "respond_to": "allowlist",
+            "respond_to_allowlist": ["owner"],
+            "status": "online",
         });
         assert_eq!(
             parsed, expected,
             "merged record must parse equal to expected"
+        );
+    }
+
+    /// A merge onto a record that predates the mention-eligibility fields
+    /// seeds respond_to and respond_to_allowlist, while a curated existing
+    /// value survives untouched. This fails on the old code, which left both
+    /// fields absent and made Desktop autocomplete hide the agent everywhere.
+    #[test]
+    fn merge_seeds_missing_mention_eligibility_fields() {
+        let allowlist = vec!["owner-a".to_string(), "owner-b".to_string()];
+        let legacy = r#"{"display_name":"Mempool","picture":"p"}"#;
+        let content =
+            build_agent_profile_content("Mempool", &proj(&uuids(2)), Some(legacy), &allowlist)
+                .unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["respond_to"].as_str().unwrap(), "allowlist");
+        assert_eq!(
+            parsed["respond_to_allowlist"],
+            json!(["owner-a", "owner-b"]),
+            "missing allowlist seeded from config"
+        );
+        assert_eq!(parsed["channel_add_policy"].as_str().unwrap(), "owner_only");
+        assert_eq!(parsed["picture"].as_str().unwrap(), "p");
+
+        let curated = r#"{"display_name":"Mempool","respond_to":"anyone","respond_to_allowlist":["curated"]}"#;
+        let content =
+            build_agent_profile_content("Mempool", &proj(&uuids(2)), Some(curated), &allowlist)
+                .unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["respond_to"].as_str().unwrap(),
+            "anyone",
+            "curated respond_to preserved"
+        );
+        assert_eq!(
+            parsed["respond_to_allowlist"],
+            json!(["curated"]),
+            "curated allowlist preserved"
         );
     }
 

@@ -643,8 +643,8 @@ def build_installed_closure(
         raise ValueError("review file map is absent")
     for slug in ("mempool", "genesis"):
         values = files.get(slug)
-        if not isinstance(values, list) or len(values) != 17:
-            raise ValueError(f"{slug} installed closure must contain exactly 17 paths")
+        if not isinstance(values, list) or len(values) != 18:
+            raise ValueError(f"{slug} installed closure must contain exactly 18 paths")
     return canonical_json(
         {
             "schema": INSTALLED_CLOSURE_SCHEMA,
@@ -690,13 +690,13 @@ def load_bundle(
         owner,
     )
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
-    if not isinstance(runtime_raw, list) or len(runtime_raw) != 19:
-        raise ValueError("runtime target count must be 19")
+    if not isinstance(runtime_raw, list) or len(runtime_raw) != 20:
+        raise ValueError("runtime target count must be 20")
     if not isinstance(ops_raw, list) or len(ops_raw) != 1:
         raise ValueError("ops target count must be one")
     runtime_targets = tuple(parse_target(bundle, raw) for raw in runtime_raw)
     ops_targets = tuple(parse_target(bundle, raw) for raw in ops_raw)
-    if len({target.target for target in runtime_targets + ops_targets}) != 20:
+    if len({target.target for target in runtime_targets + ops_targets}) != 21:
         raise ValueError("duplicate install target")
     closure_payload = build_installed_closure(manifest, acceptance)
     closure_target = Target(

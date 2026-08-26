@@ -162,10 +162,10 @@ def validate_review_files(
     normalized: dict[str, list[dict[str, str]]] = {}
     for slug in ("mempool", "genesis"):
         paths, records = expected.get(slug), observed.get(slug)
-        if not isinstance(paths, list) or len(paths) != 17 or len(set(paths)) != 17:
-            raise ValueError(f"{slug} expected closure list must contain 17 unique paths")
-        if not isinstance(records, list) or len(records) != 17:
-            raise ValueError(f"{slug} review file list must contain 17 paths")
+        if not isinstance(paths, list) or len(paths) != 18 or len(set(paths)) != 18:
+            raise ValueError(f"{slug} expected closure list must contain 18 unique paths")
+        if not isinstance(records, list) or len(records) != 18:
+            raise ValueError(f"{slug} review file list must contain 18 paths")
         values: list[dict[str, str]] = []
         for index, record in enumerate(records):
             if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
@@ -291,7 +291,7 @@ def expected_tier2_bundle(
         ),
         "paths": TIER2_CANDIDATE_PATHS,
         "invariants": [
-            "The review binds the exact package manifest and exact 17-path review-file record.",
+            "The review binds the exact package manifest and exact 18-path review-file record.",
             "The package and review state remain owner-only and credential-free.",
             "The parent Tier 1 receipt is deterministic evidence only and grants no install authority.",
             "Mempool and Genesis stay stopped and disabled through review and install preflight.",
@@ -364,14 +364,14 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         raise ValueError("producer package must remain non-installable")
 
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
-    if not isinstance(runtime_raw, list) or len(runtime_raw) != 19:
-        raise ValueError("runtime target count must be 19")
+    if not isinstance(runtime_raw, list) or len(runtime_raw) != 20:
+        raise ValueError("runtime target count must be 20")
     if not isinstance(ops_raw, list) or len(ops_raw) != 1:
         raise ValueError("ops target count must be one")
     runtime = [validate_source_record(bundle, record) for record in runtime_raw]
     ops = [validate_source_record(bundle, record) for record in ops_raw]
     targets = [str(record["target"]) for record in runtime + ops]
-    if len(set(targets)) != 20:
+    if len(set(targets)) != 21:
         raise ValueError("package target set contains a duplicate")
     expected_ops = {
         "target": "/home/victor/.agents/tools/buzz-sats-channel-sweep.sh",

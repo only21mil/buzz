@@ -46,6 +46,7 @@ SYSTEM_SOURCES = {
     "/usr/local/libexec/buzz/node": 0o755,
     "/usr/local/libexec/buzz/codex": 0o755,
     "/usr/local/libexec/buzz/codex-acp": 0o755,
+    "/usr/local/libexec/buzz/codex-code-mode-host": 0o755,
     "/usr/local/libexec/buzz/buzz-acp": 0o755,
     "/usr/local/libexec/buzz/buzz-dev-mcp": 0o755,
     "/usr/lib/systemd/system/service.d/10-timeout-abort.conf": 0o644,
@@ -283,9 +284,9 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(tree_fingerprint(first), tree_fingerprint(second))
         self.assertTrue(manifest["ready_for_parent_tier1"])
         self.assertFalse(manifest["installable"])
-        self.assertEqual(len(manifest["runtime_targets"]), 19)
+        self.assertEqual(len(manifest["runtime_targets"]), 20)
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(manifest["review_files"][slug]), 17)
+            self.assertEqual(len(manifest["review_files"][slug]), 18)
             self.assertEqual(
                 [entry["path"] for entry in manifest["review_files"][slug]],
                 manifest["expected_closure_paths"][slug],
@@ -500,7 +501,7 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(value["candidate_fingerprint"], acceptance.candidate_fingerprint)
         self.assertEqual(value["bundle_digest"], manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(value["files"][slug]), 17)
+            self.assertEqual(len(value["files"][slug]), 18)
             self.assertEqual(value["files"][slug], manifest["review_files"][slug])
 
     def test_derived_closure_satisfies_the_installed_runtime_contract(self) -> None:
@@ -525,7 +526,7 @@ class ActivationBundleTests(PackageFixture):
 
         for slug in ("mempool", "genesis"):
             completed = subprocess.run(
-                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "17", contract],
+                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "18", contract],
                 input=closure_text,
                 check=False,
                 stdout=subprocess.PIPE,
@@ -538,7 +539,7 @@ class ActivationBundleTests(PackageFixture):
         retired = json.loads(closure_text)
         retired["schema"] = "buzz-agent-review-closure-v1"
         rejected = subprocess.run(
-            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "17", contract],
+            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "18", contract],
             input=json.dumps(retired),
             check=False,
             stdout=subprocess.PIPE,
@@ -1012,7 +1013,7 @@ class InstallerSafetyTests(PackageFixture):
         self.assertTrue(closure["accepted"])
         self.assertEqual(closure["bundle_digest"], self.manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(closure["files"][slug]), 17)
+            self.assertEqual(len(closure["files"][slug]), 18)
         first_snapshot = target_snapshot(self.install_root, targets)
         backup_root = self.install_root / "var/lib/buzz-mgact-backups"
         backup_ids = [path.name for path in backup_root.iterdir() if path.is_dir()]

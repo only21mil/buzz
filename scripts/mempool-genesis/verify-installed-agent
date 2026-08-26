@@ -24,6 +24,7 @@ expected_paths=(
   /usr/local/libexec/buzz/node
   /usr/local/libexec/buzz/codex
   /usr/local/libexec/buzz/codex-acp
+  /usr/local/libexec/buzz/codex-code-mode-host
   /usr/local/libexec/buzz/buzz-acp
   /usr/local/libexec/buzz/buzz-dev-mcp
   /usr/lib/systemd/system/service.d/10-timeout-abort.conf
@@ -79,6 +80,7 @@ test "$(stat -c '%a' /usr/local/sbin/install-enrollment-map)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/node)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/codex)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/codex-acp)" = 755
+test "$(stat -c '%a' /usr/local/libexec/buzz/codex-code-mode-host)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-acp)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-dev-mcp)" = 755
 test "$(stat -c '%a' /usr/lib/systemd/system/service.d/10-timeout-abort.conf)" = 644
