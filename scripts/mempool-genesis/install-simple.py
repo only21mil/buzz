@@ -104,6 +104,7 @@ class TargetReport(NamedTuple):
 
 class PreflightResult(NamedTuple):
     entries: list[dict[str, object]]
+    verified_sources: dict[str, bytes]
     planned: list[tuple[dict[str, object], Path, int, int]]
     target_reports: list[TargetReport]
     credential_dir: Path
@@ -121,12 +122,66 @@ def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def sha256_file(path: Path) -> str:
+def hash_fd(fd: int) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(f"unsafe regular file: {path}")
+        return hash_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def read_regular_bytes(
+    path: Path,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+    mode: int,
+    label: str,
+) -> bytes:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ValueError(f"cannot open {label}: {path}: {error}") from error
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != owner_uid
+            or metadata.st_gid != owner_gid
+            or stat.S_IMODE(metadata.st_mode) != mode
+        ):
+            raise ValueError(f"unsafe {label}: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def package_identity(package: Path) -> tuple[Path, int, int]:
+    package_root = Path(os.path.abspath(package))
+    try:
+        metadata = package_root.lstat()
+    except OSError as error:
+        raise ValueError(f"cannot inspect package directory: {error}") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ValueError("unsafe package directory")
+    return package_root, metadata.st_uid, metadata.st_gid
 
 
 def package_fingerprint(entries: list[dict[str, object]]) -> str:
@@ -140,11 +195,15 @@ def package_fingerprint(entries: list[dict[str, object]]) -> str:
 
 def load_and_verify_manifest(
     package: Path, manifest_path: Path
-) -> list[dict[str, object]]:
-    try:
-        manifest_bytes = manifest_path.read_bytes()
-    except OSError as error:
-        raise ValueError(f"cannot read manifest: {error}") from error
+) -> tuple[list[dict[str, object]], dict[str, bytes]]:
+    package_root, package_uid, package_gid = package_identity(package)
+    manifest_bytes = read_regular_bytes(
+        manifest_path,
+        owner_uid=package_uid,
+        owner_gid=package_gid,
+        mode=0o600,
+        label="manifest",
+    )
     if hashlib.sha256(manifest_bytes).hexdigest() != EXPECTED_MANIFEST_SHA256:
         raise ValueError("manifest SHA-256 mismatch")
     try:
@@ -248,20 +307,23 @@ def load_and_verify_manifest(
         or manifest["desktop_launcher_sha256"] != launchers[0]["sha256"]
     ):
         raise ValueError("desktop launcher hash mismatch")
-    package_root = package.resolve(strict=True)
+    # Only immutable, hash-verified bytes cross the preflight/install boundary.
+    # Package paths are never reopened after this loop.
+    verified_sources: dict[str, bytes] = {}
     for entry in verified:
         source_text = str(entry["source"])
-        source_relative = Path(source_text)
-        try:
-            source = (package_root / source_relative).resolve(strict=True)
-            source.relative_to(package_root)
-        except (OSError, ValueError) as error:
-            raise ValueError(f"invalid package source: {source_text}") from error
-        if not source.is_file():
-            raise ValueError(f"package source is not a regular file: {source_text}")
-        if sha256_file(source) != entry["sha256"]:
+        source = package_root / source_text
+        payload = read_regular_bytes(
+            source,
+            owner_uid=package_uid,
+            owner_gid=package_gid,
+            mode=int(str(entry["source_mode"]), 8),
+            label="package source",
+        )
+        if hashlib.sha256(payload).hexdigest() != entry["sha256"]:
             raise ValueError(f"package source hash mismatch: {source_text}")
-    return verified
+        verified_sources[source_text] = payload
+    return verified, verified_sources
 
 
 def rooted_path(root: Path, absolute_path: str) -> Path:
@@ -432,8 +494,9 @@ def preflight(
 ) -> PreflightResult:
     blockers: list[str] = []
     identity_error: str | None = None
+    verified_sources: dict[str, bytes] = {}
     try:
-        entries = load_and_verify_manifest(package, manifest_path)
+        entries, verified_sources = load_and_verify_manifest(package, manifest_path)
     except Exception as error:
         identity_error = str(error)
         blockers.append(identity_error)
@@ -500,6 +563,7 @@ def preflight(
 
     return PreflightResult(
         entries=entries,
+        verified_sources=verified_sources,
         planned=planned,
         target_reports=target_reports,
         credential_dir=credential_dir,
@@ -510,20 +574,24 @@ def preflight(
 
 
 def install_one(
-    source: Path,
+    payload: bytes,
+    expected_hash: str,
     target: Path,
     mode: int,
     owner_uid: int,
     owner_gid: int,
 ) -> None:
+    if hashlib.sha256(payload).hexdigest() != expected_hash:
+        raise ValueError("verified source buffer hash mismatch")
     temporary_fd, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.install.", dir=target.parent
     )
     try:
         with os.fdopen(temporary_fd, "wb", closefd=True) as temporary:
-            with source.open("rb") as package_source:
-                while chunk := package_source.read(1024 * 1024):
-                    temporary.write(chunk)
+            view = memoryview(payload)
+            while view:
+                written = temporary.write(view)
+                view = view[written:]
             temporary.flush()
             os.fsync(temporary.fileno())
             os.fchmod(temporary.fileno(), mode)
@@ -599,8 +667,10 @@ def install(
             os.chown(credential_dir, 0, 0)
             os.chmod(credential_dir, 0o700)
         for entry, target, target_uid, target_gid in result.planned:
+            source_text = str(entry["source"])
             install_one(
-                package.resolve(strict=True) / str(entry["source"]),
+                result.verified_sources[source_text],
+                str(entry["sha256"]),
                 target,
                 int(str(entry["install_mode"]), 8),
                 target_uid,
@@ -678,9 +748,9 @@ def main() -> None:
     parser.add_argument("--manifest")
     args = parser.parse_args()
 
-    package = Path(args.package).resolve(strict=False)
+    package = Path(os.path.abspath(args.package))
     manifest_path = (
-        Path(args.manifest).resolve(strict=False)
+        Path(os.path.abspath(args.manifest))
         if args.manifest
         else package / MANIFEST_NAME
     )
