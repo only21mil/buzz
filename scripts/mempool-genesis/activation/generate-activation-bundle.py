@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -27,12 +29,12 @@ PARITY_RECEIPT_BINDING = {
     "sha256": None,
     "required_before_activation": True,
 }
-TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
+TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v3"
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
 TIER2_ENGINE_MODE = 0o755
-TIER2_ENGINE_SHA256 = "8750c7c2ceced906f825052452aa8f60fe27fc953c801a27ad62053ec2c87242"
-TIER2_ENGINE_SOURCE_COMMIT = "4efbf03a5220b40984e339d88b649220bd235cd7"
-TIER2_ENGINE_SOURCE_TREE = "4e1a8d5859ad353225fa05f218b2f0d1950c56e9"
+TIER2_ENGINE_SHA256 = "a3dadffc4be7da9a50ceff144b1e8db7bcf22598ee0a89556e76b8e5792de06b"
+TIER2_ENGINE_SOURCE_COMMIT = "c4857c02d5ed1de9f8fc7d5f78fe1a171ab0bed2"
+TIER2_ENGINE_SOURCE_TREE = "c5903a023599b8f3ab0981959ac3d8bb444b8be2"
 TIER2_REVIEW = {
     "producer_provider": "gpt",
     "reviewer_provider": "claude",
@@ -40,10 +42,10 @@ TIER2_REVIEW = {
     "effort": "high",
     "engine_subcommands": ["prepare", "review", "check"],
 }
-TIER2_CANDIDATE_PATHS = ("bundle-manifest.json", "metadata/review-files.json")
 BUNDLE_ID = "mempool-genesis-activation-20260825"
-RUNTIME_TARGET_COUNT = 24
-REVIEW_PATH_COUNT = 21
+RUNTIME_TARGET_COUNT = 25
+OPS_TARGET_COUNT = 3
+REVIEW_PATH_COUNT = 22
 CODEX_CLI_PATH = "/usr/local/libexec/buzz/codex"
 CODEX_ACP_PATH = "/usr/local/libexec/buzz/codex-acp"
 NODE_PATH = "/usr/local/libexec/buzz/node"
@@ -176,6 +178,12 @@ COMMON_TARGETS = (
         source_kind="repo",
     ),
     TargetSpec(
+        "/usr/local/libexec/buzz/mempool-genesis-activation-transaction",
+        "scripts/mempool-genesis/activation/activation-transaction.py",
+        0o755,
+        source_kind="repo",
+    ),
+    TargetSpec(
         "/etc/buzz-agents/capability-parity-policy.json",
         "scripts/mempool-genesis/activation/capability-parity-policy.json",
         0o644,
@@ -209,6 +217,7 @@ EXPECTED_PATHS = {
         "/usr/local/libexec/buzz/buzz-dev-mcp",
         "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
         "/usr/local/libexec/buzz/verify-agent-capability-parity",
+        "/usr/local/libexec/buzz/mempool-genesis-activation-transaction",
         "/etc/buzz-agents/capability-parity-policy.json",
     )
     for slug in ("mempool", "genesis")
@@ -226,6 +235,19 @@ def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def canonical_json(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def validate_policy_for_generation(value: object) -> dict[str, object]:
+    validator_path = SCRIPT_DIR / "capability-parity.py"
+    spec = importlib.util.spec_from_file_location("mgact_generator_policy_validator", validator_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load capability parity policy validator")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        return module.validate_policy(value)
+    except module.ParityError as error:
+        raise ValueError(f"capability parity policy is invalid: {error}") from error
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -356,8 +378,9 @@ def validate_env(payload: bytes, slug: str) -> None:
     required = {
         "BUZZ_ACP_AGENT_COMMAND": CODEX_ACP_PATH,
         "BUZZ_ACP_MCP_COMMAND": "/usr/local/libexec/buzz/buzz-dev-mcp",
-        "BUZZ_ACP_RESPOND_TO": "owner-only",
-        "BUZZ_ACP_ALLOWED_RESPOND_TO": "owner-only",
+        "BUZZ_ACP_RESPOND_TO": "allowlist",
+        "BUZZ_ACP_ALLOWED_RESPOND_TO": "allowlist",
+        "BUZZ_ACP_RESPOND_TO_ALLOWLIST": OWNER_PUBKEY,
         "BUZZ_ACP_AGENT_OWNER": OWNER_PUBKEY,
         "BUZZ_RELAY_URL": "wss://framework-desktop.tail69757d.ts.net:38443",
         "CODEX_PATH": CODEX_CLI_PATH,
@@ -366,8 +389,6 @@ def validate_env(payload: bytes, slug: str) -> None:
     for key, expected in required.items():
         if values.get(key) != expected:
             raise ValueError(f"{slug} env has wrong {key}")
-    if "BUZZ_ACP_RESPOND_TO_ALLOWLIST" in values:
-        raise ValueError(f"{slug} env must not carry a responder allowlist")
     if "PATH" in values:
         raise ValueError(f"{slug} env must not override the reviewed service PATH")
 
@@ -419,6 +440,7 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
         SCRIPT_DIR / "tier2-evidence-verifier.py",
         SCRIPT_DIR / "input.template.json",
         SCRIPT_DIR / "capability-parity.py",
+        SCRIPT_DIR / "activation-transaction.py",
         SCRIPT_DIR / "capability-parity-policy.json",
         SCRIPT_DIR / "tests/test_activation.py",
         SCRIPT_DIR / "tests/test_capability_parity.py",
@@ -429,6 +451,13 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
         TEMPLATE_DIR / "buzz-sats-channel-sweep.sh",
         TEMPLATE_DIR / "systemd/buzz-agent@mempool.service.d/ci-migration.conf",
         TEMPLATE_DIR / "systemd/buzz-agent@genesis.service.d/capability-parity.conf",
+        repo_root / "Cargo.lock",
+        repo_root / "crates/buzz-agent-key-handoff/Cargo.toml",
+        repo_root / "crates/buzz-agent-key-handoff/src/lib.rs",
+        repo_root / "crates/buzz-agent-key-handoff/src/parity_signature.rs",
+        repo_root / "crates/buzz-agent-key-handoff/src/bin/buzz-parity-owner-signer.rs",
+        repo_root / "crates/buzz-agent-key-handoff/src/bin/buzz-parity-owner-verifier.rs",
+        repo_root / "crates/buzz-agent-key-handoff/tests/parity_signature_cli.rs",
         repo_root / "scripts/mempool-genesis/buzz-agent@.service",
         repo_root / "scripts/mempool-genesis/verify-installed-agent",
         repo_root / "scripts/mempool-genesis/buzz-agent-key-handoff.sudoers",
@@ -623,17 +652,28 @@ def generate(
                 f"each installed review closure must contain exactly {REVIEW_PATH_COUNT} paths"
             )
 
+        policy_document = validate_policy_for_generation(
+            json.loads(
+                (SCRIPT_DIR / "capability-parity-policy.json").read_text(),
+                object_pairs_hook=reject_duplicates,
+            )
+        )
+        channel_lines = "\n".join(
+            f"  {shlex.quote(channel['channel_id'])}"
+            for channel in policy_document["eligible_channels"]
+        )
         sweep_template = (TEMPLATE_DIR / "buzz-sats-channel-sweep.sh").read_text()
         sweep_payload = (
             sweep_template.replace("__MEMPOOL_PUBLIC_KEY__", pubkeys["mempool"])
             .replace("__GENESIS_PUBLIC_KEY__", pubkeys["genesis"])
+            .replace("__MG_CHANNEL_ALLOWLIST__", channel_lines)
             .encode()
         )
-        if b"__MEMPOOL_PUBLIC_KEY__" in sweep_payload or b"__GENESIS_PUBLIC_KEY__" in sweep_payload:
-            raise ValueError("sweep public-key substitution failed")
+        if b"__MEMPOOL_PUBLIC_KEY__" in sweep_payload or b"__GENESIS_PUBLIC_KEY__" in sweep_payload or b"__MG_CHANNEL_ALLOWLIST__" in sweep_payload:
+            raise ValueError("sweep binding substitution failed")
         sweep_relative = Path("ops-root/home/victor/.agents/tools/buzz-sats-channel-sweep.sh")
         write_bytes(temporary / sweep_relative, sweep_payload, 0o700)
-        ops_record = {
+        sweep_record = {
             "target": "/home/victor/.agents/tools/buzz-sats-channel-sweep.sh",
             "source": str(sweep_relative),
             "mode": "0700",
@@ -642,10 +682,56 @@ def generate(
             "sha256": sha256_bytes(sweep_payload),
             "scope": "Codex-R-matched open and eligible Sats/Victor private membership",
         }
+        ops_records = [sweep_record]
+        for binary in ("buzz-parity-owner-signer", "buzz-parity-owner-verifier"):
+            built = repo_root / "target/release" / binary
+            built_metadata = built.lstat()
+            if (
+                not stat.S_ISREG(built_metadata.st_mode)
+                or stat.S_IMODE(built_metadata.st_mode) != 0o755
+                or built_metadata.st_uid != os.getuid()
+            ):
+                raise ValueError(f"unsafe reviewed build output: {built}")
+            payload = built.read_bytes()
+            relative = Path("ops-root/home/victor/.agents/tools") / binary
+            write_bytes(temporary / relative, payload, 0o700)
+            ops_records.append(
+                {
+                    "target": f"/home/victor/.agents/tools/{binary}",
+                    "source": str(relative),
+                    "mode": "0700",
+                    "uid": 1000,
+                    "gid": 1000,
+                    "sha256": sha256_bytes(payload),
+                    "scope": (
+                        "owner Schnorr parity receipt signing from a sanctioned private file"
+                        if binary.endswith("signer")
+                        else "owner Schnorr parity receipt verification from standard input"
+                    ),
+                }
+            )
+        if len(ops_records) != OPS_TARGET_COUNT:
+            raise ValueError("ops target construction mismatch")
+
+        channel_allowlist_sha256 = sha256_bytes(
+            canonical_json(policy_document["eligible_channels"])
+        )
+        unit_sources = {
+            "template": repo_root / "scripts/mempool-genesis/buzz-agent@.service",
+            "mempool_dropin": TEMPLATE_DIR / "systemd/buzz-agent@mempool.service.d/ci-migration.conf",
+            "genesis_dropin": TEMPLATE_DIR / "systemd/buzz-agent@genesis.service.d/capability-parity.conf",
+        }
+        for label, unit_path in unit_sources.items():
+            if b"AF_NETLINK" in unit_path.read_bytes():
+                raise ValueError(f"{label} unexpectedly permits AF_NETLINK")
+        no_af_netlink = {
+            label: {"path": str(path.relative_to(repo_root)), "sha256": sha256_file(path)}
+            for label, path in unit_sources.items()
+        }
 
         sources = source_inventory(repo_root)
         source_commit = git_value(repo_root, "rev-parse", "HEAD")
-        source_tree = git_value(repo_root, "rev-parse", "HEAD^{tree}")
+        source_tree = git_value(repo_root, "write-tree")
         identities = {
             slug: {
                 "public_key": pubkeys[slug],
@@ -664,6 +750,18 @@ def generate(
             for slug, descriptor in identities.items()
         }
         runtime_fingerprint = artifact_fingerprint(records)
+        tier2_candidate_paths = sorted(
+            [str(record["source"]) for record in records]
+            + [str(record["source"]) for record in ops_records]
+            + [
+                "bundle-manifest.json",
+                "input-contract.json",
+                "metadata/review-files.json",
+            ],
+            key=str.encode,
+        )
+        if len(tier2_candidate_paths) != len(set(tier2_candidate_paths)):
+            raise ValueError("Tier 2 package candidate path inventory contains a duplicate")
         digest_input = {
             "schema": BUNDLE_SCHEMA,
             "bundle_id": BUNDLE_ID,
@@ -674,27 +772,39 @@ def generate(
             "acp_state_dirs": acp_state_dirs,
             "input_status": "complete" if complete else "desktop-save-required",
             "runtime_targets": sorted(records, key=lambda record: str(record["target"]).encode()),
-            "ops_targets": [ops_record],
+            "ops_targets": ops_records,
             "review_files": review_files,
             "expected_closure_paths": {slug: list(paths) for slug, paths in EXPECTED_PATHS.items()},
             "generator_sources": sources,
             "tier2_review": TIER2_REVIEW,
             "tier2_engine": engine_record,
             "tier2_evidence_schema": TIER2_EVIDENCE_SCHEMA,
-            "tier2_candidate_paths": list(TIER2_CANDIDATE_PATHS),
+            "tier2_candidate_paths": tier2_candidate_paths,
             "capability_parity": {
                 "manifest_schema": "buzz-agent-capability-manifest-v1",
                 "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
                 "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
                 "policy": "/etc/buzz-agents/capability-parity-policy.json",
                 "receipt_binding": PARITY_RECEIPT_BINDING,
+                "eligible_channels_sha256": channel_allowlist_sha256,
+                "channel_sweep_target": sweep_record["target"],
+                "owner_signer_target": "/home/victor/.agents/tools/buzz-parity-owner-signer",
+                "owner_verifier_target": "/home/victor/.agents/tools/buzz-parity-owner-verifier",
+                "owner_private_input": {
+                    "transport": "private-file",
+                    "field": "BUZZ_OWNER_PRIVATE_KEY",
+                    "mode": "0600",
+                    "parent_mode": "0700",
+                },
+                "payload_transport": "anonymous-pipe-stdin",
+                "no_af_netlink": no_af_netlink,
             },
         }
         package_digest = sha256_bytes(canonical_json(digest_input))
 
         review_record = {
             "schema": REVIEW_FILES_SCHEMA,
-            "status": "pending-tier2-v2" if complete else "blocked-on-desktop-pubkeys",
+            "status": "pending-tier2-v3" if complete else "blocked-on-desktop-pubkeys",
             "runtime_artifact_fingerprint": runtime_fingerprint,
             "package_digest": package_digest,
             "files": review_files,
@@ -719,7 +829,7 @@ def generate(
             "runtime_artifact_fingerprint": runtime_fingerprint,
             "package_digest": package_digest,
             "runtime_targets": sorted(records, key=lambda record: str(record["target"]).encode()),
-            "ops_targets": [ops_record],
+            "ops_targets": ops_records,
             "review_files": review_files,
             "expected_closure_paths": {slug: list(paths) for slug, paths in EXPECTED_PATHS.items()},
             "review_files_record": {
@@ -729,7 +839,7 @@ def generate(
             "tier2_review": TIER2_REVIEW,
             "tier2_engine": engine_record,
             "tier2_evidence_schema": TIER2_EVIDENCE_SCHEMA,
-            "tier2_candidate_paths": list(TIER2_CANDIDATE_PATHS),
+            "tier2_candidate_paths": tier2_candidate_paths,
             "capability_parity": digest_input["capability_parity"],
         }
         manifest_payload = canonical_json(manifest)

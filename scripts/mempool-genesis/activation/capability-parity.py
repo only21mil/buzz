@@ -23,6 +23,9 @@ POLICY_SCHEMA = "buzz-agent-capability-parity-policy-v1"
 RECEIPT_SCHEMA = "buzz-agent-capability-parity-receipt-v1"
 SEALED_RECEIPT_SCHEMA = "buzz-agent-capability-parity-sealed-receipt-v1"
 SIGNATURE_SCHEMA = "buzz-agent-capability-parity-signature-v1"
+BINDING_SCHEMA = "buzz-agent-activation-binding-v1"
+SIGNER_TARGET_NAME = "buzz-parity-owner-signer"
+VERIFIER_TARGET_NAME = "buzz-parity-owner-verifier"
 CAPTURE_SCHEMA = "buzz-agent-capability-capture-spec-v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX_PREFIX = re.compile(r"^[0-9a-f]{12,16}$")
@@ -65,7 +68,21 @@ REQUIRED_HARDENING = {
     "AmbientCapabilities": [],
 }
 ALLOWED_SCOPES = {"open", "sats-victor-private"}
-SENSITIVE_KEYS = re.compile(r"(^|_)(private_key|token|cookie|oauth|auth_tag_payload|secret_value)($|_)")
+CHANNEL_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+BENIGN_TOKEN_FIELDS = re.compile(
+    r"^(?:tool_output_token_limit|max_output_tokens|token_(?:budget|count|limit|usage))$"
+)
+HARD_SENSITIVE_KEY_FIELDS = re.compile(
+    r"(^|_)(?:private_key|secret_key|api_key|access_key|signing_key|encryption_key|"
+    r"cookie|oauth|client_secret|auth_tag_payload|secret_value)($|_)"
+)
+SENSITIVE_KEY_FIELDS = re.compile(
+    r"(^|_)(?:private_key|secret_key|api_key|access_key|signing_key|encryption_key|"
+    r"token|access_token|refresh_token|api_token|bearer_token|session_token|id_token|"
+    r"cookie|oauth|client_secret|auth_tag_payload|secret_value)($|_)"
+)
 
 
 class ParityError(ValueError):
@@ -126,11 +143,20 @@ def write_private(path: Path, value: object) -> None:
         os.close(descriptor)
 
 
+def secret_bearing_key(key: str) -> bool:
+    normalized = key.lower()
+    if HARD_SENSITIVE_KEY_FIELDS.search(normalized):
+        return True
+    if BENIGN_TOKEN_FIELDS.fullmatch(normalized):
+        return False
+    return SENSITIVE_KEY_FIELDS.search(normalized) is not None
+
+
 def reject_secret_values(value: object, where: str = "$") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             descriptor_role = where.endswith("/secret_files") and key == "buzz_private_key"
-            if SENSITIVE_KEYS.search(key) and not descriptor_role:
+            if secret_bearing_key(key) and not descriptor_role:
                 raise ParityError(f"secret-bearing field is forbidden at {where}/{key}")
             reject_secret_values(child, f"{where}/{key}")
     elif isinstance(value, list):
@@ -182,7 +208,8 @@ def validate_policy(value: object) -> dict[str, Any]:
         value,
         {
             "schema", "owner_pubkey", "reserved_pubkeys", "allowed_identity_differences",
-            "approved_exceptions", "forbidden_path_prefixes",
+            "response_policy", "eligible_channels", "approved_exceptions",
+            "forbidden_path_prefixes",
         },
         "policy",
     )
@@ -197,6 +224,37 @@ def validate_policy(value: object) -> dict[str, Any]:
         for item in policy["allowed_identity_differences"]
     ) or len(set(policy["allowed_identity_differences"])) != len(policy["allowed_identity_differences"]):
         raise ParityError("policy allowed identity differences are invalid")
+    response = exact_keys(
+        policy["response_policy"],
+        {"respond_to", "allowed_respond_to", "responder_allowlist", "owner_pubkey"},
+        "policy/response_policy",
+    )
+    if response != {
+        "respond_to": "allowlist",
+        "allowed_respond_to": "allowlist",
+        "responder_allowlist": [policy["owner_pubkey"]],
+        "owner_pubkey": policy["owner_pubkey"],
+    }:
+        raise ParityError("policy response policy does not match Codex-R")
+    channels = policy["eligible_channels"]
+    if not isinstance(channels, list) or len(channels) != 26:
+        raise ParityError("policy must bind exactly 26 eligible channels")
+    channel_ids: list[str] = []
+    for raw in channels:
+        channel = exact_keys(
+            raw, {"channel_id", "visibility", "scope", "role"}, "policy/eligible_channel"
+        )
+        channel_id = channel["channel_id"]
+        if not isinstance(channel_id, str) or not CHANNEL_ID.fullmatch(channel_id):
+            raise ParityError("policy eligible channel ID is invalid")
+        if channel["scope"] not in ALLOWED_SCOPES:
+            raise ParityError("policy eligible channel scope is invalid")
+        visibility = "open" if channel["scope"] == "open" else "private"
+        if channel["visibility"] != visibility or channel["role"] != "member":
+            raise ParityError("policy eligible channel permissions are invalid")
+        channel_ids.append(channel_id)
+    if channel_ids != sorted(set(channel_ids)):
+        raise ParityError("policy eligible channel IDs are not sorted and unique")
     exceptions = exact_keys(policy["approved_exceptions"], {"mempool", "genesis"}, "exceptions")
     for slug in ("mempool", "genesis"):
         entry = exact_keys(exceptions[slug], {"host_access", "address_families"}, f"exceptions/{slug}")
@@ -334,16 +392,15 @@ def validate_manifest(value: object, role: str, policy: dict[str, Any]) -> dict[
         {"respond_to", "allowed_respond_to", "responder_allowlist", "owner_pubkey"},
         f"{role}/response_policy",
     )
-    if response != {
-        "respond_to": "owner-only",
-        "allowed_respond_to": "owner-only",
-        "responder_allowlist": [],
-        "owner_pubkey": policy["owner_pubkey"],
-    }:
-        raise ParityError(f"{role} response policy is not owner-only")
+    if response != policy["response_policy"]:
+        raise ParityError(f"{role} response policy does not match Codex-R")
 
     if not isinstance(manifest["channels"], list):
         raise ParityError(f"{role} channels are invalid")
+    policy_channels = {
+        item["channel_id"]: (item["visibility"], item["scope"], item["role"])
+        for item in policy["eligible_channels"]
+    }
     seen_channels: set[str] = set()
     live_members: set[str] = set()
     for channel in manifest["channels"]:
@@ -363,6 +420,8 @@ def validate_manifest(value: object, role: str, policy: dict[str, Any]) -> dict[
                 raise ParityError(f"{role} channel scope and visibility mismatch")
             if expected_slug is not None and item["role"] != "member":
                 raise ParityError(f"{role} channel role is not member")
+            if policy_channels.get(cid) != (item["visibility"], item["scope"], item["role"]):
+                raise ParityError(f"{role} channel is outside the reviewed 26-channel allowlist")
             live_members.add(cid)
         if item["archived"] and item["eligible"]:
             raise ParityError(f"{role} archived channel cannot be eligible")
@@ -377,14 +436,22 @@ def validate_manifest(value: object, role: str, policy: dict[str, Any]) -> dict[
     )
     if directory["self_published"] is not True or directory["author_pubkey"] != pubkey:
         raise ParityError(f"{role} directory record is not self-published")
-    if directory["agent_type"] != "codex" or directory["respond_to"] != "owner-only" or directory["allowed_respond_to"] != "owner-only" or directory["responder_allowlist"] != []:
-        raise ParityError(f"{role} directory policy mismatch")
+    directory_response = {
+        "respond_to": directory["respond_to"],
+        "allowed_respond_to": directory["allowed_respond_to"],
+        "responder_allowlist": directory["responder_allowlist"],
+        "owner_pubkey": policy["owner_pubkey"],
+    }
+    if directory["agent_type"] != "codex" or directory_response != policy["response_policy"]:
+        raise ParityError(f"{role} directory policy does not match Codex-R")
     if directory["auth_owner_pubkey"] != policy["owner_pubkey"] or directory["auth_subject_pubkey"] != pubkey:
         raise ParityError(f"{role} directory auth binding mismatch")
     if not isinstance(directory["event_id"], str) or not HEX64.fullmatch(directory["event_id"]):
         raise ParityError(f"{role} directory event id is invalid")
     if directory["channel_ids"] != sorted(live_members):
         raise ParityError(f"{role} directory channels do not equal live membership")
+    if role == "reference" and live_members != set(policy_channels):
+        raise ParityError("reference channels do not equal the reviewed 26-channel allowlist")
 
     profile = exact_keys(
         manifest["profile"],
@@ -542,6 +609,14 @@ def json_differences(reference: object, candidate: object, path: str = "") -> li
     return [] if reference == candidate else [path or "/"]
 
 
+def allowed_identity_difference(path: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        expression = re.escape(pattern).replace(r"\*", "[^/]+")
+        if re.fullmatch(expression, path):
+            return True
+    return False
+
+
 def compare_set(reference: dict[str, Any], mempool: dict[str, Any], genesis: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
     policy = validate_policy(policy)
     manifests = {
@@ -589,9 +664,9 @@ def compare_set(reference: dict[str, Any], mempool: dict[str, Any], genesis: dic
     if len(set(secret_hashes)) != len(secret_hashes):
         raise ParityError("secret files reuse secret material")
 
-    reference_channels = {
+    expected_channels = {
         item["channel_id"]: (item["visibility"], item["scope"], item["role"])
-        for item in reference["channels"] if item["eligible"] and not item["archived"]
+        for item in policy["eligible_channels"]
     }
     unexplained: dict[str, list[str]] = {}
     for slug in ("mempool", "genesis"):
@@ -599,11 +674,6 @@ def compare_set(reference: dict[str, Any], mempool: dict[str, Any], genesis: dic
         candidate_channels = {
             item["channel_id"]: (item["visibility"], item["scope"], item["role"])
             for item in candidate["channels"] if item["eligible"] and not item["archived"]
-        }
-        expected_channels = {
-            cid: (visibility, scope, "member")
-            for cid, (visibility, scope, _role) in reference_channels.items()
-            if scope in ALLOWED_SCOPES
         }
         differences: list[str] = []
         if candidate_channels != expected_channels:
@@ -614,11 +684,11 @@ def compare_set(reference: dict[str, Any], mempool: dict[str, Any], genesis: dic
         if candidate["prompt"]["policy_sha256"] != reference["prompt"]["policy_sha256"]:
             differences.append("/prompt/policy_sha256")
         normalized_diff = json_differences(normalize(reference), normalize(candidate))
-        ignored_prefixes = (
-            "/channels", "/runtime/closure", "/systemd", "/roots", "/secret_files",
-            "/identity", "/prompt", "/directory", "/receipts",
+        differences.extend(
+            path for path in normalized_diff
+            if not path.startswith("/channels")
+            and not allowed_identity_difference(path, policy["allowed_identity_differences"])
         )
-        differences.extend(path for path in normalized_diff if not path.startswith(ignored_prefixes))
         unexplained[slug] = sorted(set(differences))
     flat = [f"{slug}:{path}" for slug, paths in unexplained.items() for path in paths]
     receipt = {
@@ -632,7 +702,7 @@ def compare_set(reference: dict[str, Any], mempool: dict[str, Any], genesis: dic
             "unique_pubkeys": True,
             "unique_auth_tags": True,
             "unique_secret_inodes_paths_and_material": True,
-            "owner_only_response_policy": True,
+            "codex_r_response_policy": True,
             "runtime_closure": not any("/runtime/closure" in item for item in flat),
             "channel_and_member_parity": not any("/channels" in item for item in flat),
             "self_published_directory": True,
@@ -899,6 +969,17 @@ def closure_record(path: Path) -> dict[str, object]:
     }
 
 
+def capture_closure(sources: object, role: str) -> dict[str, dict[str, Any]]:
+    closure_sources = exact_keys(sources, CLOSURE_KEYS, "capture closure")
+    closure: dict[str, dict[str, Any]] = {}
+    for component, path in closure_sources.items():
+        record = closure_record(Path(path))
+        if role != "reference" and component in EXPECTED_CANDIDATE_CLOSURE_PATHS:
+            record["path"] = EXPECTED_CANDIDATE_CLOSURE_PATHS[component]
+        closure[component] = record
+    return closure
+
+
 def auth_tag_from_source(source: object) -> str:
     if not isinstance(source, dict) or source.get("kind") not in {"file", "environment"}:
         raise ParityError("auth-tag source is invalid")
@@ -1007,8 +1088,7 @@ def capture_manifest(spec: dict[str, Any], policy: dict[str, Any]) -> dict[str, 
         if spec["role"] == "reference"
         else sorted(observed_families, key=address_family_order.__getitem__)
     )
-    closure_sources = exact_keys(sources["closure"], CLOSURE_KEYS, "capture closure")
-    closure = {component: closure_record(Path(path)) for component, path in closure_sources.items()}
+    closure = capture_closure(sources["closure"], spec["role"])
     private_source = exact_keys(sources["buzz_private_key"], {"path", "path_class"}, "private-key source")
     codex_source = exact_keys(sources["codex_auth"], {"path", "path_class"}, "Codex-auth source")
     prompt = exact_keys(spec["prompt"], {"identity", "mission", "session_title"}, "capture prompt")
@@ -1085,20 +1165,90 @@ def validate_receipt_digest(receipt: dict[str, Any]) -> None:
         raise ParityError("only a passing parity receipt may be sealed")
 
 
-def command_record(argv: list[str]) -> dict[str, object]:
+def manifest_bound_command_record(
+    argv: list[str], manifest: dict[str, Any], target_name: str
+) -> dict[str, object]:
+    ops_targets = manifest.get("ops_targets")
+    if not isinstance(ops_targets, list):
+        raise ParityError("bundle manifest ops target inventory is absent")
+    matches = [
+        item for item in ops_targets
+        if isinstance(item, dict) and Path(str(item.get("target", ""))).name == target_name
+    ]
+    if len(matches) != 1:
+        raise ParityError(f"bundle manifest has no unique {target_name} ops target")
+    bound = exact_keys(
+        matches[0], {"target", "source", "mode", "uid", "gid", "sha256", "scope"},
+        f"bundle manifest {target_name}",
+    )
+    if argv[0] != bound["target"] or not Path(argv[0]).is_absolute():
+        raise ParityError(f"{target_name} command path is not manifest-bound")
     executable = Path(argv[0])
-    sha256, _metadata = regular_sha256(executable)
+    sha256, metadata = regular_sha256(executable)
+    observed_mode = f"{stat.S_IMODE(metadata.st_mode):04o}"
+    if (
+        bound["mode"] != "0700"
+        or observed_mode != bound["mode"]
+        or metadata.st_uid != bound["uid"]
+        or metadata.st_gid != bound["gid"]
+        or sha256 != bound["sha256"]
+    ):
+        raise ParityError(f"{target_name} executable metadata or digest is not manifest-bound")
     return {
         "argv_sha256": digest(argv),
         "executable": str(executable),
         "executable_sha256": sha256,
+        "mode": observed_mode,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "ops_record_sha256": digest(bound),
     }
 
 
-def seal_receipt(
-    receipt: dict[str, Any], policy: dict[str, Any], signer_argv: list[str], verifier_argv: list[str]
+def activation_binding(bundle_manifest: dict[str, Any]) -> dict[str, object]:
+    required = {
+        "source_commit": re.compile(r"^[0-9a-f]{40}$"),
+        "source_tree": re.compile(r"^[0-9a-f]{40}$"),
+        "package_digest": HEX64,
+        "runtime_artifact_fingerprint": HEX64,
+    }
+    values: dict[str, str] = {}
+    for field, pattern in required.items():
+        value = bundle_manifest.get(field)
+        if not isinstance(value, str) or not pattern.fullmatch(value):
+            raise ParityError(f"bundle manifest {field} is invalid")
+        values[field] = value
+    return {
+        "schema": BINDING_SCHEMA,
+        **values,
+        "bundle_manifest_sha256": digest(bundle_manifest),
+    }
+
+
+def bind_receipt(
+    receipt: dict[str, Any], bundle_manifest: dict[str, Any]
 ) -> dict[str, Any]:
     validate_receipt_digest(receipt)
+    bound = copy.deepcopy(receipt)
+    if "activation_binding" in bound:
+        raise ParityError("parity receipt is already activation-bound")
+    bound.pop("payload_sha256")
+    bound["activation_binding"] = activation_binding(bundle_manifest)
+    bound["payload_sha256"] = digest(bound)
+    return bound
+
+
+def seal_receipt(
+    receipt: dict[str, Any], policy: dict[str, Any], signer_argv: list[str],
+    verifier_argv: list[str], bundle_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    receipt = bind_receipt(receipt, bundle_manifest)
+    signer_record = manifest_bound_command_record(
+        signer_argv, bundle_manifest, SIGNER_TARGET_NAME
+    )
+    verifier_record = manifest_bound_command_record(
+        verifier_argv, bundle_manifest, VERIFIER_TARGET_NAME
+    )
     signature_raw = safe_command(signer_argv, f"{receipt['payload_sha256']}\n".encode())
     try:
         signature = json.loads(signature_raw, object_pairs_hook=_reject_duplicates)
@@ -1123,13 +1273,84 @@ def seal_receipt(
         "schema": SEALED_RECEIPT_SCHEMA,
         "receipt": receipt,
         "signature": signature,
-        "signer": command_record(signer_argv),
-        "verifier": command_record(verifier_argv),
+        "signer": signer_record,
+        "verifier": verifier_record,
         "verified": False,
     }
     safe_command(verifier_argv, canonical_json(envelope))
     envelope["verified"] = True
     envelope["sealed_sha256"] = digest(envelope)
+    safe_command(verifier_argv, canonical_json(envelope))
+    return envelope
+
+
+def verify_sealed_receipt(
+    envelope: dict[str, Any], policy: dict[str, Any], bundle_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    envelope = exact_keys(
+        envelope,
+        {"schema", "receipt", "signature", "signer", "verifier", "verified", "sealed_sha256"},
+        "sealed receipt",
+    )
+    if envelope["schema"] != SEALED_RECEIPT_SCHEMA or envelope["verified"] is not True:
+        raise ParityError("sealed parity receipt is not persistently verified")
+    recorded_seal = envelope["sealed_sha256"]
+    unsigned_envelope = copy.deepcopy(envelope)
+    unsigned_envelope.pop("sealed_sha256")
+    if not isinstance(recorded_seal, str) or not HEX64.fullmatch(recorded_seal):
+        raise ParityError("sealed parity receipt digest is invalid")
+    if digest(unsigned_envelope) != recorded_seal:
+        raise ParityError("sealed parity receipt digest mismatch")
+    receipt = envelope["receipt"]
+    if not isinstance(receipt, dict):
+        raise ParityError("sealed parity receipt payload is invalid")
+    validate_receipt_digest(receipt)
+    if receipt.get("activation_binding") != activation_binding(bundle_manifest):
+        raise ParityError("sealed parity receipt source/package binding mismatch")
+    if receipt.get("policy_sha256") != digest(policy):
+        raise ParityError("sealed parity receipt policy binding mismatch")
+    signature = exact_keys(
+        envelope["signature"],
+        {"schema", "algorithm", "signer_pubkey", "payload_sha256", "signature", "signed_at"},
+        "persisted signature",
+    )
+    if (
+        signature["schema"] != SIGNATURE_SCHEMA
+        or signature["algorithm"] != "schnorr-secp256k1"
+        or signature["signer_pubkey"] != policy["owner_pubkey"]
+        or signature["payload_sha256"] != receipt["payload_sha256"]
+        or not isinstance(signature["signature"], str)
+        or not re.fullmatch(r"[0-9a-f]{128}", signature["signature"])
+        or not isinstance(signature["signed_at"], str)
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", signature["signed_at"])
+    ):
+        raise ParityError("persisted signature binding mismatch")
+    ops_targets = bundle_manifest.get("ops_targets")
+    if not isinstance(ops_targets, list):
+        raise ParityError("bundle manifest ops target inventory is absent")
+    paths: dict[str, Path] = {}
+    for label, target_name in (("signer", SIGNER_TARGET_NAME), ("verifier", VERIFIER_TARGET_NAME)):
+        targets = [
+            item for item in ops_targets
+            if isinstance(item, dict) and Path(str(item.get("target", ""))).name == target_name
+        ]
+        if len(targets) != 1:
+            raise ParityError(f"bundle manifest has no unique owner {label}")
+        path = Path(str(targets[0]["target"]))
+        observed = manifest_bound_command_record([str(path)], bundle_manifest, target_name)
+        recorded = envelope[label]
+        if not isinstance(recorded, dict):
+            raise ParityError(f"persisted {label} record is invalid")
+        for field in (
+            "executable", "executable_sha256", "mode", "uid", "gid", "ops_record_sha256"
+        ):
+            if recorded.get(field) != observed[field]:
+                raise ParityError(f"persisted {label} is not manifest-bound")
+        paths[label] = path
+    safe_command(
+        [str(paths["verifier"]), "--owner-pubkey", policy["owner_pubkey"]],
+        canonical_json(envelope),
+    )
     return envelope
 
 
@@ -1166,9 +1387,22 @@ def main() -> None:
     seal.add_argument("--policy", required=True)
     seal.add_argument("--signer-command", required=True)
     seal.add_argument("--verifier-command", required=True)
+    seal.add_argument("--bundle-manifest", required=True)
     seal.add_argument("--output", required=True)
+    verify = subparsers.add_parser("verify-sealed")
+    verify.add_argument("--receipt", required=True)
+    verify.add_argument("--policy", required=True)
+    verify.add_argument("--bundle-manifest", required=True)
     args = parser.parse_args()
     policy = validate_policy(regular_json(Path(args.policy).resolve(strict=True), owner_only=False))
+    if args.command == "verify-sealed":
+        result = verify_sealed_receipt(
+            regular_json(Path(args.receipt).resolve(strict=True)),
+            policy,
+            regular_json(Path(args.bundle_manifest).resolve(strict=True)),
+        )
+        print(json.dumps({"status": "PASS", "sealed_sha256": result["sealed_sha256"]}, sort_keys=True))
+        return
     output = Path(args.output).absolute()
     if args.command == "build":
         observation = regular_json(Path(args.observation).resolve(strict=True))
@@ -1190,6 +1424,7 @@ def main() -> None:
             policy,
             command_argv(Path(args.signer_command).resolve(strict=True)),
             command_argv(Path(args.verifier_command).resolve(strict=True)),
+            regular_json(Path(args.bundle_manifest).resolve(strict=True)),
         )
     write_private(output, result)
     print(json.dumps({"status": result.get("status", "MANIFEST_WRITTEN"), "output": str(output)}, sort_keys=True))

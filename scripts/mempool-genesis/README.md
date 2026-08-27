@@ -41,10 +41,10 @@ public identities:
 7. Start and verify one agent at a time. Add only the approved Sats/Victor
    channels, then DMs and explicit mention/reply tests.
 
-The dynamic package under `activation/` uses the current Tier 2 v2 engine. The
+The dynamic package under `activation/` uses the current Tier 2 v3 engine. The
 GPT producer route uses one Claude Opus 5 reviewer at `high`; Fable 5 is not a
 review or escalation route. The installer accepts
-only the same unexpired `tier2-state-v2` file after the installed engine's
+only the same unexpired `tier2-state-v3` file after the installed engine's
 `check` subcommand returns `OK`; there is no separate review result file. See
 `activation/README.md` for the exact `prepare`, `review`, and `check` commands.
 

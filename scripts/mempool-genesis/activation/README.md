@@ -17,15 +17,17 @@ This package is GPT-produced and touches credentials, signing, and production. R
 
 The parent Tier 1 receipt is deterministic evidence only. It cannot close review, make the package installable, or grant install authority.
 
-## Private staging root
+## Private package-review worktree
 
-The current Tier 2 engine fingerprints Git state when a candidate sits inside a repository. Keep the dynamic package and review state outside every Git worktree so the review covers only the package files.
+Tier 2 v3 accepts only a Git-worktree root and binds its complete status inventory. Create a clean detached worktree at the source base, generate the package beneath it as the only untracked content, and keep inputs, receipts, evidence, state, and the scope ledger in separate owner-only directories outside that worktree. The preflight rejects any tracked drift, non-package status entry, or package file missing from the manifest-owned inventory.
 
 ```sh
 ACT=/home/victor/work/prog-buzz/wave3/MGACT/.scratch/activation-wt-sats/scripts/mempool-genesis/activation
 STAGE=/home/victor/work/mgact-activation-staging
+PACKAGE_WT=/home/victor/work/mgact-activation-package-wt
 install -d -m 0700 "$STAGE"
 install -m 0600 "$ACT/input.template.json" "$STAGE/inputs.json"
+git -C /home/victor/work/buzz-relay worktree add --detach "$PACKAGE_WT" c672bb2dd4b7ca23fea8f1de8b66b7d36f1a483c
 ```
 
 The template contains placeholders. After Desktop save, replace only these JSON values:
@@ -42,7 +44,7 @@ A placeholder preview is incomplete and cannot pass installer validation.
 ```sh
 python3 "$ACT/generate-activation-bundle.py" \
   --inputs "$STAGE/inputs.json" \
-  --output "$STAGE/candidate-placeholder" \
+  --output "$PACKAGE_WT/candidate-placeholder" \
   --allow-placeholders
 ```
 
@@ -51,7 +53,7 @@ After Desktop returns both public keys, generate the final package.
 ```sh
 python3 "$ACT/generate-activation-bundle.py" \
   --inputs "$STAGE/inputs.json" \
-  --output "$STAGE/candidate-final" \
+  --output "$PACKAGE_WT/candidate-final" \
   --replace
 ```
 
@@ -63,15 +65,15 @@ A complete package reports `input_status=complete`, `ready_for_parent_tier1=true
 - the exact SHA-256 of `/home/victor/.agents/skills/codex-review/scripts/tier2`;
 - candidate paths `bundle-manifest.json` and `metadata/review-files.json`.
 
-Each agent's installed closure inventory has exactly 21 paths, including its effective template fragment, manager drop-in, per-instance drop-in, capability-parity comparator, and approved-differences policy. The prestart verifier compares systemd's actual `FragmentPath` and `DropInPaths` with that closed set and rejects any extra or missing path.
+Each agent's installed closure inventory has exactly 22 paths, including its effective template fragment, manager drop-in, per-instance drop-in, capability-parity comparator, activation transaction tool, and approved-differences policy. The prestart verifier compares systemd's actual `FragmentPath` and `DropInPaths` with that closed set and rejects any extra or missing path.
 
-The environment templates use `respond_to=owner-only`, permit only `owner-only`, carry no responder allowlist, and bind `BUZZ_ACP_STATE_DIR` to the identity-local persistent state path. The package removes the unproven `AF_NETLINK` exception.
+The environment templates match Codex-R's reviewed response policy: `respond_to=allowlist`, `allowed_respond_to=allowlist`, and the sole responder is Victor's owner pubkey. They bind `BUZZ_ACP_STATE_DIR` to the identity-local persistent state path. The package removes the unproven `AF_NETLINK` exception and binds the template and both drop-in hashes that prove it remains absent.
 
 ## Codex-R capability parity
 
 `capability-parity.py` captures or builds redacted `reference`, `mempool`, and `genesis` manifests and compares the set against `capability-parity-policy.json`. `capture` reads only explicitly named local sources: the effective EnvironmentFile, prompt and policy, Codex TOML, Buzz key and Codex auth files, public channel/profile/directory JSON, executable closure, and either an effective systemd fixture or a live system- or user-manager `systemctl show` property allowlist. It never asks systemd for `Environment`, never returns a credential value, and reduces the two secret-file descriptors and owner auth tag to path class, presence, owner/mode/link/inode metadata, length/character class, and a 12-character SHA-256 prefix. Command-backed public-source adapters run a fixed absolute executable with a sanitized environment, no stderr capture, and no secret-looking arguments.
 
-The comparator fails closed on a shared pubkey, auth-tag binding, secret path class, inode, or secret digest; shared users, homes, state, prompts, events, or receipts; a non-owner response policy; runtime closure drift; missing open or eligible Sats/Victor private membership; Rachel/Archimedes private scope; admin elevation; a directory record not authored by that agent; stale directory `channel_ids`; weakened systemd hardening; unapproved `AF_NETLINK`; or broad Victor, Sats, family, vault, browser, or secret-store access. Mempool's six existing CI migration lanes are the only host-path exceptions in the policy. The receipt records the manifest and policy digests, payload digest, allowed identity differences, systemd comparison, approved exceptions, check results, and any unexplained diff.
+The comparator fails closed on a shared pubkey, auth-tag binding, secret path class, inode, or secret digest; shared users, homes, state, prompts, events, or receipts; response-policy drift from Codex-R; drift from the reviewed 26-channel open allowlist; runtime closure drift; Rachel/Archimedes private scope; admin elevation; a directory record not authored by that agent; stale directory `channel_ids`; weakened systemd hardening; unapproved `AF_NETLINK`; or broad Victor, Sats, family, vault, browser, or secret-store access. Mempool's six existing CI migration lanes are the only host-path exceptions in the policy. The receipt records the manifest and policy digests, payload digest, allowed identity differences, systemd comparison, approved exceptions, check results, and any unexplained diff.
 
 Capture Codex-R immediately before freezing the source candidate, then capture Mempool and Genesis from the same public relay snapshot and effective host state. Capture specs and command specs are owner-only JSON; outputs are newly created mode-`0600` files. The role-generic sequence is:
 
@@ -82,7 +84,7 @@ python3 "$ACT/capability-parity.py" capture --spec "$STATE/genesis-capture.json"
 python3 "$ACT/capability-parity.py" compare-set --reference "$STATE/reference-manifest.json" --mempool "$STATE/mempool-manifest.json" --genesis "$STATE/genesis-manifest.json" --policy "$ACT/capability-parity-policy.json" --output "$STATE/parity-receipt.json"
 ```
 
-Activation requires `status=PASS` and empty `unexplained_differences` for both candidates. `seal-receipt` accepts owner-only signer/verifier command specs of schema `buzz-agent-capability-command-v1`. The signer receives only `payload_sha256` on standard input; its public Schnorr result must bind the configured owner pubkey and payload. The verifier receives the redacted envelope on standard input. A failing verifier, wrong owner, wrong digest, malformed signature, tampered receipt, or non-PASS receipt blocks sealing.
+Activation requires `status=PASS` and empty `unexplained_differences` for both candidates. `seal-receipt` accepts owner-only signer/verifier command specs of schema `buzz-agent-capability-command-v1` plus `--bundle-manifest`; before either executable runs, its exact path, `0700` mode, uid/gid, and SHA-256 must match the manifest's corresponding ops record. Before signing, the tool adds the exact source commit, staged source tree, package digest, runtime fingerprint, and canonical bundle-manifest digest to the receipt payload. The maintained `buzz-parity-owner-signer` reads the existing sanctioned `BUZZ_OWNER_PRIVATE_KEY` only from an absolute, single-link `0600` private file inside an owner-controlled `0700` directory and receives only `payload_sha256` through an anonymous standard-input pipe. It BIP-340 signs `SHA256("buzz-agent-capability-parity/signature/v1\\0" || payload_sha256_bytes)`, which prevents reuse as a raw Nostr event-digest signature, and emits only the public envelope. The maintained verifier accepts either the pre-seal envelope or a persisted sealed envelope, recomputes the canonical receipt and sealed-envelope digests, and verifies the owner binding and signature. `verify-sealed` repeats those checks against the persisted manifest and its manifest-bound verifier executable. The systemd prestart gate invokes it for both agents; a missing or changed manifest, receipt, policy, verifier, or binding prevents `ExecStart`. A failing verifier, wrong owner, wrong digest, malformed signature, persisted-envelope tamper, unbound executable, weak private-file metadata, or non-PASS receipt blocks sealing. Build both tools with `cargo build --release -p buzz-agent-key-handoff --bin buzz-parity-owner-signer --bin buzz-parity-owner-verifier` before generating a package; the generator records both binary hashes and their Rust source inventory.
 
 ## Tier 1 receipt and Tier 2 evidence
 
@@ -90,36 +92,40 @@ Run the deterministic preflight as the artifact owner, not root.
 
 ```sh
 python3 "$ACT/make-tier1-receipt.py" \
-  --bundle "$STAGE/candidate-final" \
+  --bundle "$PACKAGE_WT/candidate-final" \
   --output "$STAGE/preflight-receipt.json" \
   --tier2-bundle-output "$STAGE/dynamic-tier2-evidence.json"
 ```
 
 A complete package with green checks returns `READY_FOR_PARENT_TIER1`. A placeholder package returns `BLOCKED_ON_DESKTOP_PUBKEYS` and does not create Tier 2 evidence. The receipt records no verdict and creates no installed closure.
 
-`dynamic-tier2-evidence.json` uses the installed engine's exact `tier2-evidence-v2` contract. It names the package as `candidate_root`, lists only the two manifest-owned candidate paths, and carries the observed Tier 1 command results. The receipt binds its absolute path and SHA-256.
+`dynamic-tier2-evidence.json` uses the installed engine's exact `tier2-evidence-v3` contract. Its `candidate_root` is the package-review worktree root, its paths equal the complete Git status inventory, and every path must be a manifest-owned file beneath the package directory. Commands use v3 `kind=result` records. The receipt binds the evidence's absolute path, candidate root, and SHA-256.
 
 Shellcheck selection does not depend on caller `PATH`. Receipt generation uses `/home/victor/.npm-global/bin/shellcheck`. Installer validation compares the recorded command and never executes that user-owned tool as root. Real-root installer commands use `/usr/bin/python3` explicitly because Fedora's sudo path resolves bare `python3` through `/usr/sbin`, which would not match the recorded command path.
 
-## Tier 2 v2
+## Tier 2 v3
 
 The parent controller owns this sequence. The state directory must be mode `0700`, private to the artifact owner, and outside the candidate directory and every candidate repository.
 
 ```sh
 TIER2=/home/victor/.agents/skills/codex-review/scripts/tier2
 STATE_DIR="$STAGE/tier2-r1"
+LEDGER_DIR="$STAGE/tier2-scope-ledgers"
+SCOPE_ID=mgact-dynamic-package-20260827
 
 STATE=$("$TIER2" prepare \
   --bundle "$STAGE/dynamic-tier2-evidence.json" \
   --producer-provider gpt \
   --controller sats-codex-2 \
+  --scope-id "$SCOPE_ID" \
+  --scope-ledger-dir "$LEDGER_DIR" \
   --state-dir "$STATE_DIR")
 
 "$TIER2" review --state "$STATE"
 "$TIER2" check --state "$STATE"
 ```
 
-`prepare` freezes one candidate fingerprint and selects Claude Opus 5 at `high`. `review` records the terminal result in the same `tier2-state-v2` file. There is no separate result artifact. `check` rejects failed, stale, expired, mismatched, overridden, or mutated closure state.
+`prepare` freezes the complete Git candidate fingerprint, binds the stable promotion/correction scope, and selects Claude Opus 5 at `high`. `review` records the terminal result in the same `tier2-state-v3` file and updates the separate controller-owned scope ledger. There is no separate result artifact. `check` rejects failed, stale, expired, mismatched, overridden, ledger-inconsistent, or mutated closure state.
 
 If revision 1 fails, follow the engine's revision 2 contract with the same reviewer identity. Do not open another review leg. The shared runbook in `Agent-Shared/adapters/sats-shared-common.md` owns retries and corrected lineages.
 
@@ -131,13 +137,13 @@ Both modes call the same preflight function and write nothing.
 
 ```sh
 sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" check \
-  --bundle "$STAGE/candidate-final" \
+  --bundle "$PACKAGE_WT/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
   --tier2-state "$STATE"
 
 sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" dry-run \
-  --bundle "$STAGE/candidate-final" \
+  --bundle "$PACKAGE_WT/candidate-final" \
   --receipt "$STAGE/preflight-receipt.json" \
   --tier2-evidence "$STAGE/dynamic-tier2-evidence.json" \
   --tier2-state "$STATE"
@@ -147,7 +153,7 @@ The installer runs the installed engine's `check` subcommand every time. The pac
 
 The adapter requires:
 
-- `tier2-state-v2` with `status=closed`;
+- `tier2-state-v3` with `status=closed` and a matching passing scope-ledger entry;
 - producer `gpt` with no retired `escalate` field;
 - route `claude`, `claude-opus-5`, `high`;
 - an accepted `PASS` or `PASS WITH RISKS` result;
@@ -165,6 +171,8 @@ The staged sweep candidate has separate read-only modes. They need later approva
 "$STAGE/candidate-final/ops-root/home/victor/.agents/tools/buzz-sats-channel-sweep.sh" --check
 "$STAGE/candidate-final/ops-root/home/victor/.agents/tools/buzz-sats-channel-sweep.sh" --dry-run
 ```
+
+The former combined mutation mode is rejected. An approved activation must use an owner-only transaction directory and the selective `--mempool-apply STATE`, `--mempool-complete STATE GATE`, `--genesis-apply STATE`, and `--genesis-complete STATE GATE` sequence. Genesis phase entry is impossible until the Mempool gate receipt binds the same source/package and reports passing config, credential, membership, and parity gates for the reviewed channel-set digest. The default full sweep performs only the Mempool/Genesis read check; it cannot mutate either managed identity.
 
 ## Install and rollback
 
@@ -190,6 +198,10 @@ sudo /usr/bin/python3 "$ACT/install-activation-bundle.py" rollback \
 ```
 
 Backups and install receipts live under `/var/lib/buzz-mgact-backups/` as mode-`0700` state. The install lock is `/run/lock/buzz-mgact-install.lock`. Rollback refuses digest, owner, mode, hard-link, symlink, or content drift.
+
+Credential handoff and membership activation are covered by the separate `mempool-genesis-activation-transaction` state. `prepare` first verifies the persisted sealed parity envelope and writes canonical manifest/receipt copies under `/var/lib/buzz-agent-activation/current`; that exact directory is consumed by prestart. It records whether each credential was absent or present and stores any bytes only in owner-only backup files. The JSON receipt contains path classes, metadata, length, and a 12-character SHA-256 prefix, never a key value or full key digest. Membership intent is journaled before each relay write and confirmed only after readback. `begin-rollback` validates all credential post-state before atomically consuming its one-use claim; selective rollback then removes only confirmed `member` writes whose current role has not drifted, in reverse order. Unconfirmed writes that are present, role drift, credential byte or metadata drift, a reused claim, or incomplete membership rollback blocks credential restoration. `finish-rollback` restores exact previous bytes and metadata or exact previous absence.
+
+If an activation transaction exists, run its selective rollback before the package installer rollback. The installer refuses package rollback until the matching transaction reports `rolled_back`, its claim is consumed, every membership is reversed, and both credential records are restored. This prevents removing the reviewed runtime while a credential or relay write remains live.
 
 ## Parent integration order
 

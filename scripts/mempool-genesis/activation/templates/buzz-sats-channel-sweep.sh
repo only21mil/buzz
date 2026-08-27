@@ -15,6 +15,8 @@ secret_file=${SATS_SECRET_FILE:-/home/victor/.config/sats/secrets.env}
 skip_file=${SATS_SKIP_FILE:-/home/victor/.config/sats/buzz-channel-sweep.skip}
 log=${SATS_SWEEP_LOG:-/home/victor/.local/state/sats/buzz-channel-sweep.log}
 tools_dir=${SATS_TOOLS_DIR:-/home/victor/.agents/tools}
+transaction_tool=${SATS_ACTIVATION_TRANSACTION_TOOL:-/usr/local/libexec/buzz/mempool-genesis-activation-transaction}
+activation_root=${SATS_ACTIVATION_ROOT:-/}
 BUZZ_BIN=${BUZZ_BIN:-/home/victor/work/buzz-agents/bin/buzz}
 export BUZZ_RELAY_URL=${BUZZ_RELAY_URL:-wss://framework-desktop.tail69757d.ts.net:38443}
 unset BUZZ_AUTH_TAG BUZZ_PRIVATE_KEY
@@ -29,16 +31,44 @@ set -a
 . "$secret_file"
 set +a
 mg_mode=full
+mg_agent=all
+activation_state=
 case ${1:-} in
   "") ;;
   --check) mg_mode=check ;;
   --dry-run) mg_mode=dry-run ;;
-  --mempool-genesis-apply) mg_mode=apply ;;
+  --mempool-genesis-apply)
+    printf '%s\n' 'combined Mempool/Genesis mutation is disabled; use the selective transaction modes' >&2
+    exit 64
+    ;;
+  --mempool-apply|--genesis-apply)
+    mg_mode=apply
+    mg_agent=${1#--}
+    mg_agent=${mg_agent%-apply}
+    activation_state=${2:-}
+    [[ -n $activation_state ]] || { echo 'activation transaction state is required' >&2; exit 64; }
+    ;;
+  --mempool-complete|--genesis-complete)
+    mg_mode=complete
+    mg_agent=${1#--}
+    mg_agent=${mg_agent%-complete}
+    activation_state=${2:-}
+    phase_gate_receipt=${3:-}
+    [[ -n $activation_state && -n $phase_gate_receipt ]] || {
+      echo 'activation transaction state and phase gate receipt are required' >&2
+      exit 64
+    }
+    ;;
+  --activation-rollback)
+    mg_mode=rollback
+    activation_state=${2:-}
+    [[ -n $activation_state ]] || { echo 'activation transaction state is required' >&2; exit 64; }
+    ;;
   --directory-dry-run)
     exec python3 "$tools_dir/buzz-sats-directory-sync.py" --dry-run
     ;;
   *)
-    printf '%s\n' 'usage: buzz-sats-channel-sweep.sh [--check|--dry-run|--mempool-genesis-apply|--directory-dry-run]' >&2
+    printf '%s\n' 'usage: buzz-sats-channel-sweep.sh [--check|--dry-run|--mempool-apply STATE|--mempool-complete STATE GATE|--genesis-apply STATE|--genesis-complete STATE GATE|--activation-rollback STATE|--directory-dry-run]' >&2
     exit 64
     ;;
 esac
@@ -94,6 +124,9 @@ buzz_as() {
   else
     env -u BUZZ_AUTH_TAG BUZZ_PRIVATE_KEY="$key" "$BUZZ_BIN" "$@"
   fi
+}
+activation_transaction() {
+  "$transaction_tool" "$@" >/dev/null
 }
 derive_pubkey() {
   PYTHONPATH=$tools_dir BUZZ_PRIVATE_KEY=$1 python3 -c '
@@ -161,6 +194,9 @@ mg_pubkeys=(
   "__MEMPOOL_PUBLIC_KEY__"
   "__GENESIS_PUBLIC_KEY__"
 )
+mg_channel_allowlist=(
+__MG_CHANNEL_ALLOWLIST__
+)
 mg_reserved_pubkeys=(
   "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d"
   "7806a7beb69ba4fd3b6e9b86d56931a446b62666e9794533f87fb2d1b956684f"
@@ -215,8 +251,16 @@ validate_mg_roster() {
   done
 }
 
+in_mg_allowlist() {
+  local allowed
+  for allowed in "${mg_channel_allowlist[@]}"; do
+    [[ $allowed == "$1" ]] && return 0
+  done
+  return 1
+}
+
 reconcile_mg_channels() {
-  local action=$1 visibility=$2 channel_rows=$3
+  local action=$1 visibility=$2 channel_rows=$3 i=$4
   local cid members owner_role rachel_role codexr_role target label role out verified
   validate_mg_roster || {
     mg_blocked=$((mg_blocked + 1))
@@ -225,6 +269,7 @@ reconcile_mg_channels() {
   while IFS=$'\t' read -r cid _encoded_name; do
     [[ -n $cid ]] || continue
     in_skips "$cid" && continue
+    in_mg_allowlist "$cid" || continue
     if ! members=$(buzz_as "$owner_key" "" channels members --channel "$cid" 2>/dev/null); then
       statusline "owner: Mempool/Genesis member read FAILED $cid"
       mg_blocked=$((mg_blocked + 1))
@@ -246,24 +291,29 @@ reconcile_mg_channels() {
       statusline "owner: Mempool/Genesis skipped non-Codex-R channel $cid"
       continue
     fi
-    for i in "${!mg_pubkeys[@]}"; do
-      target=${mg_pubkeys[$i]}
-      label=${mg_labels[$i]}
-      role=$(member_role "$target" <<<"$members")
-      if [[ $role == member ]]; then
-        mg_already=$((mg_already + 1))
-        continue
-      fi
-      if [[ -n $role ]]; then
-        statusline "$label role mismatch $cid expected=member"
-        mg_blocked=$((mg_blocked + 1))
-        continue
-      fi
-      mg_planned=$((mg_planned + 1))
-      if [[ $action == dry-run ]]; then
-        printf 'PLAN owner add-member visibility=%s channel=%s label=%s pubkey=%s role=member\n' "$visibility" "$cid" "$label" "$target"
-      fi
-      [[ $action == apply ]] || continue
+    target=${mg_pubkeys[$i]}
+    label=${mg_labels[$i]}
+    role=$(member_role "$target" <<<"$members")
+    if [[ $role == member ]]; then
+      mg_already=$((mg_already + 1))
+      continue
+    fi
+    if [[ -n $role ]]; then
+      statusline "$label role mismatch $cid expected=member"
+      mg_blocked=$((mg_blocked + 1))
+      continue
+    fi
+    mg_planned=$((mg_planned + 1))
+    if [[ $action == dry-run ]]; then
+      printf 'PLAN owner add-member visibility=%s channel=%s label=%s pubkey=%s role=member\n' "$visibility" "$cid" "$label" "$target"
+    fi
+    [[ $action == apply ]] || continue
+    if ! activation_transaction plan-membership --state-dir "$activation_state" \
+      --slug "${mg_labels[$i],,}" --channel-id "$cid" --pubkey "$target"; then
+      statusline "$label transaction journal FAILED before membership write $cid"
+      failed=$((failed + 1))
+      continue
+    fi
       if out=$(buzz_as "$owner_key" "" channels add-member --channel "$cid" --pubkey "$target" --role member 2>&1); then
         if ! python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("accepted") is True else 1)' <<<"$out"; then
           statusline "$label owner add-member FAILED $cid: $(sanitize <<<"$out")"
@@ -281,6 +331,12 @@ reconcile_mg_channels() {
           failed=$((failed + 1))
           continue
         fi
+        if ! activation_transaction confirm-membership --state-dir "$activation_state" \
+          --slug "${mg_labels[$i],,}" --channel-id "$cid" --pubkey "$target"; then
+          statusline "$label transaction confirmation FAILED $cid"
+          failed=$((failed + 1))
+          continue
+        fi
         statusline "$label joined $visibility $cid by owner add-member"
         mg_writes=$((mg_writes + 1))
       elif grep -qi 'archived' <<<"$out"; then
@@ -290,9 +346,8 @@ reconcile_mg_channels() {
         statusline "$label owner add-member FAILED $cid: $(sanitize <<<"$out")"
         failed=$((failed + 1))
       fi
-    done
   done <<<"$channel_rows"
-  statusline "Mempool/Genesis $visibility roster: planned=$mg_planned writes=$mg_writes already=$mg_already blocked=$mg_blocked"
+  statusline "${mg_labels[$i]} $visibility roster: planned=$mg_planned writes=$mg_writes already=$mg_already blocked=$mg_blocked"
   [[ $mg_blocked -eq 0 && $failed -eq 0 ]]
 }
 
@@ -309,9 +364,69 @@ if ! mg_private_channels=$(list_live_channels private "$owner_key" "" true 2>/de
 fi
 
 reconcile_mg_parity() {
-  local action=$1
-  reconcile_mg_channels "$action" open "$open_channels"
-  reconcile_mg_channels "$action" private "$mg_private_channels"
+  local action=$1 i
+  local -a indices=(0 1)
+  [[ $mg_agent == mempool ]] && indices=(0)
+  [[ $mg_agent == genesis ]] && indices=(1)
+  for i in "${indices[@]}"; do
+    reconcile_mg_channels "$action" open "$open_channels" "$i"
+    reconcile_mg_channels "$action" private "$mg_private_channels" "$i"
+  done
+}
+
+rollback_mg_activation() {
+  local plan slug cid target confirmed members role out verified
+  activation_transaction begin-rollback --state-dir "$activation_state" --root "$activation_root"
+  plan=$("$transaction_tool" rollback-plan --state-dir "$activation_state") || return 1
+  mapfile -t rollback_rows < <(python3 -c '
+import json,re,sys
+channel = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+pubkey = re.compile(r"^[0-9a-f]{64}$")
+for item in json.load(sys.stdin):
+    if item.get("slug") not in {"mempool","genesis"} or not channel.fullmatch(item.get("channel_id","")) or not pubkey.fullmatch(item.get("pubkey","")):
+        raise SystemExit("invalid rollback membership plan")
+    if not isinstance(item.get("confirmed"), bool):
+        raise SystemExit("invalid rollback confirmation state")
+    print(item["slug"], item["channel_id"], item["pubkey"], str(item["confirmed"]).lower(), sep="\t")
+' <<<"$plan") || return 1
+  for row in "${rollback_rows[@]}"; do
+    IFS=$'\t' read -r slug cid target confirmed <<<"$row"
+    members=$(buzz_as "$owner_key" "" channels members --channel "$cid" 2>/dev/null) || {
+      statusline "$slug membership rollback read FAILED $cid"
+      return 1
+    }
+    role=$(member_role "$target" <<<"$members")
+    if [[ -z $role ]]; then
+      activation_transaction mark-membership-rolled-back --state-dir "$activation_state" \
+        --slug "$slug" --channel-id "$cid" --pubkey "$target"
+      continue
+    fi
+    if [[ $confirmed != true ]]; then
+      statusline "$slug unconfirmed membership intent blocks destructive rollback $cid"
+      return 1
+    fi
+    if [[ $role != member ]]; then
+      statusline "$slug membership drift blocks rollback $cid"
+      return 1
+    fi
+    out=$(buzz_as "$owner_key" "" channels remove-member --channel "$cid" --pubkey "$target" 2>&1) || {
+      statusline "$slug owner remove-member FAILED $cid: $(sanitize <<<"$out")"
+      return 1
+    }
+    python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("accepted") is True else 1)' <<<"$out" || {
+      statusline "$slug owner remove-member rejected $cid"
+      return 1
+    }
+    verified=$(buzz_as "$owner_key" "" channels members --channel "$cid" 2>/dev/null) || return 1
+    [[ -z $(member_role "$target" <<<"$verified") ]] || {
+      statusline "$slug membership rollback verification FAILED $cid"
+      return 1
+    }
+    activation_transaction mark-membership-rolled-back --state-dir "$activation_state" \
+      --slug "$slug" --channel-id "$cid" --pubkey "$target"
+  done
+  activation_transaction finish-rollback --state-dir "$activation_state" --root "$activation_root"
+  statusline "Mempool/Genesis activation rollback complete"
 }
 
 case $mg_mode in
@@ -326,11 +441,22 @@ case $mg_mode in
     exit 0
     ;;
   apply)
+    activation_transaction begin-phase --state-dir "$activation_state" --slug "$mg_agent"
     reconcile_mg_parity apply
     exit 0
     ;;
+  complete)
+    activation_transaction complete-phase --state-dir "$activation_state" \
+      --slug "$mg_agent" --gate-receipt "$phase_gate_receipt"
+    printf '%s\n' "$mg_agent activation phase complete"
+    exit 0
+    ;;
+  rollback)
+    rollback_mg_activation
+    exit 0
+    ;;
   full)
-    reconcile_mg_parity apply || failed=$((failed + 1))
+    reconcile_mg_parity check || failed=$((failed + 1))
     ;;
 esac
 

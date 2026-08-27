@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight, install, or roll back one Tier 2 v2-reviewed MGACT package."""
+"""Preflight, install, or roll back one Tier 2 v3-reviewed MGACT package."""
 
 from __future__ import annotations
 
@@ -27,9 +27,9 @@ TIER2_VERIFIER_RELATIVE = Path(
 )
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
 TIER2_ENGINE_MODE = 0o755
-TIER2_ENGINE_SHA256 = "8750c7c2ceced906f825052452aa8f60fe27fc953c801a27ad62053ec2c87242"
-TIER2_ENGINE_SOURCE_COMMIT = "4efbf03a5220b40984e339d88b649220bd235cd7"
-TIER2_ENGINE_SOURCE_TREE = "4e1a8d5859ad353225fa05f218b2f0d1950c56e9"
+TIER2_ENGINE_SHA256 = "a3dadffc4be7da9a50ceff144b1e8db7bcf22598ee0a89556e76b8e5792de06b"
+TIER2_ENGINE_SOURCE_COMMIT = "c4857c02d5ed1de9f8fc7d5f78fe1a171ab0bed2"
+TIER2_ENGINE_SOURCE_TREE = "c5903a023599b8f3ab0981959ac3d8bb444b8be2"
 TIER2_VERIFIER_MODE = 0o755
 SUDO_PATH = Path("/usr/bin/sudo")
 BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
@@ -39,14 +39,17 @@ LEGACY_TIER1_INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-tier1-install-receip
 INSTALLED_CLOSURE_SCHEMA = "buzz-agent-review-closure-v2"
 BUNDLE_ID = "mempool-genesis-activation-20260825"
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
+ACTIVATION_TRANSACTION_DIR = "/var/lib/buzz-agent-activation/current"
+ACTIVATION_TRANSACTION_SCHEMA = "buzz-mempool-genesis-activation-transaction-v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 BACKUP_ID = re.compile(
     r"^mempool-genesis-activation-20260825-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}\.[0-9]{6}Z$"
 )
-RUNTIME_TARGET_COUNT = 24
-TOTAL_PACKAGE_TARGET_COUNT = 25
-REVIEW_PATH_COUNT = 21
+RUNTIME_TARGET_COUNT = 25
+OPS_TARGET_COUNT = 3
+TOTAL_PACKAGE_TARGET_COUNT = 28
+REVIEW_PATH_COUNT = 22
 LEGACY_V1_BACKUP_ID = (
     "mempool-genesis-activation-20260825-744b636de5ab-"
     "20260827T042741.590691Z"
@@ -487,6 +490,51 @@ def load_json(
     return value
 
 
+def require_activation_transaction_rolled_back(
+    root: Path, install_receipt: dict[str, object]
+) -> None:
+    transaction_dir = rooted(root, ACTIVATION_TRANSACTION_DIR)
+    if not os.path.lexists(transaction_dir):
+        return
+    metadata = transaction_dir.lstat()
+    expected_uid = 0 if root == Path("/") else admin_owner(root)[0]
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != expected_uid
+    ):
+        raise ValueError("activation transaction directory is unsafe")
+    state = load_json(
+        transaction_dir / "state.json", mode=0o600, owner_uid=expected_uid
+    )
+    if (
+        state.get("schema") != ACTIVATION_TRANSACTION_SCHEMA
+        or state.get("state") != "rolled_back"
+        or state.get("claim_used") is not True
+    ):
+        raise ValueError("activation transaction must be rolled back before package rollback")
+    binding = state.get("binding")
+    if not isinstance(binding, dict) or any(
+        binding.get(field) != install_receipt.get(field)
+        for field in ("source_commit", "source_tree", "package_digest")
+    ):
+        raise ValueError("activation transaction does not match the installed package")
+    memberships = state.get("memberships")
+    credentials = state.get("credentials")
+    if (
+        not isinstance(memberships, list)
+        or any(not isinstance(item, dict) or item.get("rolled_back") is not True for item in memberships)
+        or not isinstance(credentials, dict)
+        or set(credentials) != {"mempool", "genesis"}
+        or any(
+            not isinstance(credentials[slug], dict)
+            or credentials[slug].get("restored") is not True
+            for slug in ("mempool", "genesis")
+        )
+    ):
+        raise ValueError("activation transaction rollback receipt is incomplete")
+
+
 def parse_mode(value: object) -> int:
     if not isinstance(value, str) or not re.fullmatch(r"0[0-7]{3}", value):
         raise ValueError("invalid target mode")
@@ -576,11 +624,17 @@ def validate_preflight_receipt(
         if bundle_record.get(key) != value:
             raise ValueError(f"preflight receipt package mismatch: {key}")
     tier2_record = receipt.get("tier2_bundle")
+    evidence_value = load_json(
+        evidence_path,
+        max_bytes=64 * 1024,
+        mode=0o600,
+        owner_uid=owner.uid,
+    )
     expected_tier2_record = {
         "path": str(evidence_path),
         "sha256": sha256_file(evidence_path),
-        "schema": "tier2-evidence-v2",
-        "candidate_root": str(bundle),
+        "schema": "tier2-evidence-v3",
+        "candidate_root": evidence_value.get("candidate_root"),
     }
     if tier2_record != expected_tier2_record:
         raise ValueError("preflight receipt Tier 2 evidence binding mismatch")
@@ -721,7 +775,7 @@ def drop_to_artifact_owner(owner: ArtifactOwner) -> None:
 def run_tier2_check(
     state_path: Path,
     evidence_path: Path,
-    bundle: Path,
+    candidate_root: Path,
     manifest: dict[str, object],
     repo_root: Path,
     owner: ArtifactOwner,
@@ -746,7 +800,7 @@ def run_tier2_check(
                 "--evidence",
                 str(evidence_path),
                 "--candidate-root",
-                str(bundle),
+                str(candidate_root),
                 "--engine",
                 engine["path"],
                 "--engine-sha256",
@@ -770,12 +824,12 @@ def run_tier2_check(
     lines = [line for line in completed.stdout.splitlines() if line]
     if completed.returncode != 0:
         detail = completed.stderr.strip()
-        raise ValueError(f"Tier 2 v2 closure rejected: {detail or completed.returncode}")
+        raise ValueError(f"Tier 2 v3 closure rejected: {detail or completed.returncode}")
     if len(lines) != 1:
-        raise ValueError("Tier 2 v2 closure check returned an invalid response count")
+        raise ValueError("Tier 2 v3 closure check returned an invalid response count")
     value = json.loads(lines[0], object_pairs_hook=reject_duplicates)
     if not isinstance(value, dict):
-        raise ValueError("Tier 2 v2 closure check did not return an object")
+        raise ValueError("Tier 2 v3 closure check did not return an object")
     return value
 
 
@@ -797,7 +851,7 @@ def validate_tier2_acceptance(
             if path.lstat().st_size > limit:
                 raise ValueError(f"file exceeds {limit} bytes")
         except Exception as error:
-            raise ValueError(f"unsafe Tier 2 v2 {label}: {error}") from error
+            raise ValueError(f"unsafe Tier 2 v3 {label}: {error}") from error
 
     evidence_raw = load_json(
         evidence_path,
@@ -810,13 +864,13 @@ def validate_tier2_acceptance(
         raise ValueError("preflight receipt commands are absent")
     expected_evidence = PREFLIGHT_SUPPORT.expected_tier2_bundle(bundle, manifest, commands)
     if evidence_raw != expected_evidence:
-        raise ValueError("Tier 2 v2 evidence does not bind the exact package and Tier 1 results")
+        raise ValueError("Tier 2 v3 evidence does not bind the exact package and Tier 1 results")
     evidence_digest = sha256_file(evidence_path)
 
     check = run_tier2_check(
         state_path,
         evidence_path,
-        bundle,
+        Path(str(evidence_raw["candidate_root"])).resolve(strict=True),
         manifest,
         repo_root,
         owner,
@@ -838,26 +892,26 @@ def validate_tier2_acceptance(
         "verdict_digest",
     }
     if set(check) != expected_keys or check.get("ok") is not True:
-        raise ValueError("Tier 2 v2 closure response fields mismatch")
-    if check.get("subcommand") != "check" or check.get("state_schema") != "tier2-state-v2":
-        raise ValueError("Tier 2 v2 closure response type mismatch")
+        raise ValueError("Tier 2 v3 closure response fields mismatch")
+    if check.get("subcommand") != "check" or check.get("state_schema") != "tier2-state-v3":
+        raise ValueError("Tier 2 v3 closure response type mismatch")
     if check.get("producer_provider") != "gpt":
-        raise ValueError("Tier 2 v2 closure producer mismatch")
+        raise ValueError("Tier 2 v3 closure producer mismatch")
     if check.get("route") != {
         "provider": "claude",
         "model": "claude-opus-5",
         "effort": "high",
     }:
-        raise ValueError("Tier 2 v2 closure review route mismatch")
+        raise ValueError("Tier 2 v3 closure review route mismatch")
     if check.get("evidence_digest") != evidence_digest:
-        raise ValueError("Tier 2 v2 closure evidence digest mismatch")
+        raise ValueError("Tier 2 v3 closure evidence digest mismatch")
     if check.get("state_digest") != sha256_file(state_path):
-        raise ValueError("Tier 2 v2 state changed during validation")
+        raise ValueError("Tier 2 v3 state changed during validation")
     revision = check.get("revision")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision not in (1, 2):
-        raise ValueError("Tier 2 v2 closure revision is invalid")
+        raise ValueError("Tier 2 v3 closure revision is invalid")
     if check.get("verdict") not in ("PASS", "PASS WITH RISKS"):
-        raise ValueError("Tier 2 v2 closure verdict is not accepted")
+        raise ValueError("Tier 2 v3 closure verdict is not accepted")
     for key in (
         "lineage_id",
         "state_id",
@@ -867,10 +921,10 @@ def validate_tier2_acceptance(
     ):
         value = check.get(key)
         if not isinstance(value, str) or not value:
-            raise ValueError(f"Tier 2 v2 closure {key} is absent")
+            raise ValueError(f"Tier 2 v3 closure {key} is absent")
     for key in ("candidate_fingerprint", "verdict_digest", "state_digest"):
         if not HEX64.fullmatch(str(check[key])):
-            raise ValueError(f"Tier 2 v2 closure {key} is invalid")
+            raise ValueError(f"Tier 2 v3 closure {key} is invalid")
 
     return Tier2Acceptance(
         lineage_id=str(check["lineage_id"]),
@@ -975,8 +1029,8 @@ def load_bundle(
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
     if not isinstance(runtime_raw, list) or len(runtime_raw) != RUNTIME_TARGET_COUNT:
         raise ValueError(f"runtime target count must be {RUNTIME_TARGET_COUNT}")
-    if not isinstance(ops_raw, list) or len(ops_raw) != 1:
-        raise ValueError("ops target count must be one")
+    if not isinstance(ops_raw, list) or len(ops_raw) != OPS_TARGET_COUNT:
+        raise ValueError(f"ops target count must be {OPS_TARGET_COUNT}")
     runtime_targets = tuple(parse_target(bundle, raw) for raw in runtime_raw)
     ops_targets = tuple(parse_target(bundle, raw) for raw in ops_raw)
     if (
@@ -2037,6 +2091,7 @@ def rollback(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
         ):
             if not isinstance(receipt.get(name), str) or not HEX64.fullmatch(str(receipt[name])):
                 raise ValueError(f"invalid rollback receipt digest: {name}")
+        require_activation_transaction_rolled_back(root, receipt)
         identities = receipt.get("identities")
         if not isinstance(identities, dict) or set(identities) != {"mempool", "genesis"}:
             raise ValueError("rollback identity descriptor map mismatch")

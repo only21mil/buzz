@@ -38,6 +38,7 @@ def load_module(name: str, filename: str):
 GENERATOR = load_module("mgact_generator_r3_normal", "generate-activation-bundle.py")
 PREFLIGHT = load_module("mgact_preflight_r3_normal", "make-tier1-receipt.py")
 INSTALLER = load_module("mgact_installer_r3_normal", "install-activation-bundle.py")
+TRANSACTION = load_module("mgact_activation_transaction", "activation-transaction.py")
 
 SYSTEM_SOURCES = {
     "/usr/local/libexec/buzz/run-buzz-agent": 0o755,
@@ -174,7 +175,29 @@ class PackageFixture(unittest.TestCase):
         inputs: Path | None = None,
         allow_placeholders: bool = False,
     ) -> tuple[Path, dict[str, object]]:
-        output = self.root / name
+        candidate_root = self.root / f"{name}-candidate"
+        candidate_root.mkdir(mode=0o700)
+        subprocess.run(
+            ["git", "init", "-q", str(candidate_root)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "-C", str(candidate_root), "config", "user.name", "MGACT Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(candidate_root), "config", "user.email", "mgact-test.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(candidate_root), "commit", "-q", "--allow-empty", "-m", "base"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        output = candidate_root / "bundle"
         manifest = GENERATOR.generate(
             inputs or self.inputs,
             output,
@@ -218,6 +241,7 @@ class PackageFixture(unittest.TestCase):
     ) -> tuple[Path, Path]:
         evidence_path = self.evidence_path(name)
         state_dir = self.root / f"{name}-tier2-state"
+        ledger_dir = self.root / f"{name}-tier2-ledger"
         engine = str(manifest["tier2_engine"]["path"])
         completed = subprocess.run(
             [
@@ -232,6 +256,10 @@ class PackageFixture(unittest.TestCase):
                 "mgact-test-controller",
                 "--state-dir",
                 str(state_dir),
+                "--scope-id",
+                f"mgact-test-{name}",
+                "--scope-ledger-dir",
+                str(ledger_dir),
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -268,6 +296,14 @@ class PackageFixture(unittest.TestCase):
             "reviewer_identity": reviewer_identity,
         }
         write_private_json(state_path, state)
+        ledger_path = Path(str(state["ledger_path"]))
+        ledger = json.loads(ledger_path.read_text())
+        entry = next(
+            item for item in ledger["lineages"] if item["lineage_id"] == state["lineage_id"]
+        )
+        entry["status"] = "passed" if verdict in {"PASS", "PASS WITH RISKS"} else "awaiting_revision2"
+        entry["verdict"] = verdict
+        write_private_json(ledger_path, ledger)
         return evidence_path, state_path
 
     def closed_package(
@@ -281,6 +317,16 @@ class PackageFixture(unittest.TestCase):
 
 
 class ActivationBundleTests(PackageFixture):
+    def test_generator_rejects_policy_channel_injection_before_rendering(self) -> None:
+        policy = json.loads(
+            (ACTIVATION_DIR / "capability-parity-policy.json").read_text()
+        )
+        policy["eligible_channels"][0]["channel_id"] = (
+            "03f28d12-d392-4147-a9d6-9f23426dcde0';touch injected;'"
+        )
+        with self.assertRaisesRegex(ValueError, "policy.*invalid|channel ID"):
+            GENERATOR.validate_policy_for_generation(policy)
+
     def test_generator_is_deterministic_and_emits_exact_review_inventory(self) -> None:
         first, manifest = self.generate("first")
         second, second_manifest = self.generate("second")
@@ -288,9 +334,24 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(tree_fingerprint(first), tree_fingerprint(second))
         self.assertTrue(manifest["ready_for_parent_tier1"])
         self.assertFalse(manifest["installable"])
-        self.assertEqual(len(manifest["runtime_targets"]), 24)
+        self.assertEqual(len(manifest["runtime_targets"]), 25)
+        self.assertEqual(len(manifest["ops_targets"]), 3)
+        sweep = (
+            first / "ops-root/home/victor/.agents/tools/buzz-sats-channel-sweep.sh"
+        ).read_text()
+        channel_policy = json.loads(
+            (ACTIVATION_DIR / "capability-parity-policy.json").read_text()
+        )["eligible_channels"]
+        self.assertEqual(len(channel_policy), 26)
+        self.assertTrue(all(channel["channel_id"] in sweep for channel in channel_policy))
+        rendered_channel_lines = [
+            line.strip() for line in sweep.splitlines()
+            if line.strip() in {channel["channel_id"] for channel in channel_policy}
+        ]
+        self.assertEqual(rendered_channel_lines, [channel["channel_id"] for channel in channel_policy])
+        self.assertNotIn("__MG_CHANNEL_ALLOWLIST__", sweep)
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(manifest["review_files"][slug]), 21)
+            self.assertEqual(len(manifest["review_files"][slug]), 22)
             self.assertEqual(
                 [entry["path"] for entry in manifest["review_files"][slug]],
                 manifest["expected_closure_paths"][slug],
@@ -306,15 +367,15 @@ class ActivationBundleTests(PackageFixture):
                 "engine_subcommands": ["prepare", "review", "check"],
             },
         )
-        self.assertEqual(manifest["tier2_evidence_schema"], "tier2-evidence-v2")
+        self.assertEqual(manifest["tier2_evidence_schema"], "tier2-evidence-v3")
         self.assertEqual(
             manifest["tier2_engine"],
             {
                 "path": "/home/victor/.agents/skills/codex-review/scripts/tier2",
                 "mode": "0755",
-                "sha256": "8750c7c2ceced906f825052452aa8f60fe27fc953c801a27ad62053ec2c87242",
-                "source_commit": "4efbf03a5220b40984e339d88b649220bd235cd7",
-                "source_tree": "4e1a8d5859ad353225fa05f218b2f0d1950c56e9",
+                "sha256": "a3dadffc4be7da9a50ceff144b1e8db7bcf22598ee0a89556e76b8e5792de06b",
+                "source_commit": "c4857c02d5ed1de9f8fc7d5f78fe1a171ab0bed2",
+                "source_tree": "c5903a023599b8f3ab0981959ac3d8bb444b8be2",
             },
         )
         self.assertEqual(
@@ -343,7 +404,18 @@ class ActivationBundleTests(PackageFixture):
             PREFLIGHT.validate_tier2_engine(tampered_engine)
         self.assertEqual(
             manifest["tier2_candidate_paths"],
-            ["bundle-manifest.json", "metadata/review-files.json"],
+            sorted(
+                [
+                    str(record["source"])
+                    for record in list(manifest["runtime_targets"]) + list(manifest["ops_targets"])
+                ]
+                + [
+                    "bundle-manifest.json",
+                    "input-contract.json",
+                    "metadata/review-files.json",
+                ],
+                key=str.encode,
+            ),
         )
         self.assertFalse((first / "metadata/tier2-evidence-inputs.json").exists())
         with self.assertRaisesRegex(ValueError, "current GPT-to-Claude Opus 5 high"):
@@ -360,21 +432,13 @@ class ActivationBundleTests(PackageFixture):
             manifest["ops_targets"][0]["scope"],
             "Codex-R-matched open and eligible Sats/Victor private membership",
         )
-        self.assertEqual(
-            manifest["capability_parity"],
-            {
-                "manifest_schema": "buzz-agent-capability-manifest-v1",
-                "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
-                "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
-                "policy": "/etc/buzz-agents/capability-parity-policy.json",
-                "receipt_binding": {
-                    "status": "pending-live-capture",
-                    "path": "metadata/capability-parity-receipt.json",
-                    "sha256": None,
-                    "required_before_activation": True,
-                },
-            },
-        )
+        parity = manifest["capability_parity"]
+        self.assertEqual(parity["owner_signer_target"], "/home/victor/.agents/tools/buzz-parity-owner-signer")
+        self.assertEqual(parity["owner_verifier_target"], "/home/victor/.agents/tools/buzz-parity-owner-verifier")
+        self.assertEqual(parity["payload_transport"], "anonymous-pipe-stdin")
+        self.assertEqual(parity["owner_private_input"]["mode"], "0600")
+        self.assertEqual(set(parity["no_af_netlink"]), {"template", "mempool_dropin", "genesis_dropin"})
+        self.assertRegex(parity["eligible_channels_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             manifest["source_commit"],
             subprocess.run(
@@ -388,7 +452,7 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(
             manifest["source_tree"],
             subprocess.run(
-                ["git", "rev-parse", "HEAD^{tree}"],
+                ["git", "write-tree"],
                 cwd=REPO_ROOT,
                 check=True,
                 stdout=subprocess.PIPE,
@@ -487,13 +551,15 @@ class ActivationBundleTests(PackageFixture):
             )
 
     def test_templates_bind_owner_only_host_state_and_memory_boundary(self) -> None:
-        bundle, _manifest = self.generate()
+        bundle, manifest = self.generate()
         for slug in ("mempool", "genesis"):
             env = (bundle / f"install-root/etc/buzz-agents/{slug}.env").read_text()
             values = dict(line.split("=", 1) for line in env.splitlines())
-            self.assertEqual(values["BUZZ_ACP_RESPOND_TO"], "owner-only")
-            self.assertNotIn("BUZZ_ACP_RESPOND_TO_ALLOWLIST", values)
-            self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "owner-only")
+            self.assertEqual(values["BUZZ_ACP_RESPOND_TO"], "allowlist")
+            self.assertEqual(
+                values["BUZZ_ACP_RESPOND_TO_ALLOWLIST"], GENERATOR.OWNER_PUBKEY
+            )
+            self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "allowlist")
             self.assertEqual(
                 values["BUZZ_ACP_STATE_DIR"],
                 f"/home/buzz-{slug}/.local/state/buzz-acp",
@@ -513,7 +579,7 @@ class ActivationBundleTests(PackageFixture):
             self.assertEqual(stat.S_IMODE(env_path.stat().st_mode), 0o600)
             env_record = next(
                 record
-                for record in _manifest["runtime_targets"]
+                for record in manifest["runtime_targets"]
                 if record["target"] == f"/etc/buzz-agents/{slug}.env"
             )
             self.assertEqual((env_record["mode"], env_record["uid"], env_record["gid"]), ("0600", 0, 0))
@@ -564,6 +630,94 @@ class ActivationBundleTests(PackageFixture):
                 genesis_env + b"BUZZ_ACP_STATE_DIR=/home/buzz-genesis/.local/state/buzz-acp\n",
                 "genesis",
             )
+
+    def test_prestart_response_contract_matches_both_envs_and_rejects_drift(self) -> None:
+        verifier = REPO_ROOT / "scripts/mempool-genesis/verify-installed-agent"
+        policy = ACTIVATION_DIR / "capability-parity-policy.json"
+        expected_owner = GENERATOR.OWNER_PUBKEY.encode()
+        for slug in ("mempool", "genesis"):
+            source = ACTIVATION_DIR / f"templates/{slug}.env"
+            valid = subprocess.run(
+                [
+                    "/usr/bin/bash",
+                    str(verifier),
+                    "--verify-response-contract",
+                    str(source),
+                    str(policy),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr.decode())
+
+            payload = source.read_bytes()
+            drift_cases = {
+                "respond-to mode": payload.replace(
+                    b"BUZZ_ACP_RESPOND_TO=allowlist",
+                    b"BUZZ_ACP_RESPOND_TO=owner-only",
+                    1,
+                ),
+                "allowed-respond-to mode": payload.replace(
+                    b"BUZZ_ACP_ALLOWED_RESPOND_TO=allowlist",
+                    b"BUZZ_ACP_ALLOWED_RESPOND_TO=owner-only",
+                    1,
+                ),
+                "owner allowlist": payload.replace(
+                    b"BUZZ_ACP_RESPOND_TO_ALLOWLIST=" + expected_owner,
+                    b"BUZZ_ACP_RESPOND_TO_ALLOWLIST=" + b"0" * 64,
+                    1,
+                ),
+                "missing allowlist": payload.replace(
+                    b"BUZZ_ACP_RESPOND_TO_ALLOWLIST=" + expected_owner + b"\n",
+                    b"",
+                    1,
+                ),
+                "duplicate allowlist": payload
+                + b"BUZZ_ACP_RESPOND_TO_ALLOWLIST="
+                + expected_owner
+                + b"\n",
+            }
+            for label, drifted_payload in drift_cases.items():
+                with self.subTest(slug=slug, drift=label):
+                    drifted = self.root / f"{slug}-{label.replace(' ', '-')}.env"
+                    write_file(drifted, drifted_payload, 0o600)
+                    rejected = subprocess.run(
+                        [
+                            "/usr/bin/bash",
+                            str(verifier),
+                            "--verify-response-contract",
+                            str(drifted),
+                            str(policy),
+                        ],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                    )
+                    self.assertNotEqual(rejected.returncode, 0)
+
+        drifted_policy_value = json.loads(policy.read_text())
+        drifted_policy_value["response_policy"]["respond_to"] = "owner-only"
+        drifted_policy = self.root / "response-policy-drift.json"
+        write_private_json(drifted_policy, drifted_policy_value)
+        for slug in ("mempool", "genesis"):
+            source = ACTIVATION_DIR / f"templates/{slug}.env"
+            rejected = subprocess.run(
+                [
+                    "/usr/bin/bash",
+                    str(verifier),
+                    "--verify-response-contract",
+                    str(source),
+                    str(drifted_policy),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            )
+            self.assertNotEqual(rejected.returncode, 0)
 
     def test_installer_revalidates_state_dir_before_building_closure(self) -> None:
         targets = []
@@ -736,7 +890,7 @@ class ActivationBundleTests(PackageFixture):
         )
 
     def test_preflight_receipt_reports_readiness_without_review_or_install_claim(self) -> None:
-        bundle, _manifest = self.generate()
+        bundle, manifest = self.generate()
         receipt_path, receipt = self.make_receipt(bundle)
         self.assertEqual(receipt["status"], "READY_FOR_PARENT_TIER1")
         self.assertFalse(receipt["installable"])
@@ -747,9 +901,18 @@ class ActivationBundleTests(PackageFixture):
             set(evidence),
             {"schema", "candidate_root", "summary", "paths", "invariants", "commands", "known_limits"},
         )
-        self.assertEqual(evidence["schema"], "tier2-evidence-v2")
-        self.assertEqual(evidence["candidate_root"], str(bundle))
-        self.assertEqual(evidence["paths"], ["bundle-manifest.json", "metadata/review-files.json"])
+        self.assertEqual(evidence["schema"], "tier2-evidence-v3")
+        self.assertEqual(evidence["candidate_root"], str(bundle.parent))
+        self.assertEqual(
+            evidence["paths"],
+            [f"bundle/{path}" for path in manifest["tier2_candidate_paths"]],
+        )
+        self.assertEqual(
+            evidence["invariants"][0],
+            "The review binds the exact package manifest and 22 review-file paths per agent, "
+            "covering 24 distinct installed paths.",
+        )
+        self.assertNotIn("21-path", json.dumps(evidence))
         self.assertEqual(receipt["tier2_bundle"]["path"], str(evidence_path))
         payload = receipt_path.read_text()
         self.assertNotIn('"accepted"', payload)
@@ -767,7 +930,7 @@ class ActivationBundleTests(PackageFixture):
         )
         self.assertEqual(loaded_manifest, manifest)
         state_value = json.loads(state.read_text())
-        self.assertEqual(state_value["state_schema"], "tier2-state-v2")
+        self.assertEqual(state_value["state_schema"], "tier2-state-v3")
         self.assertEqual(state_value["producer_provider"], "gpt")
         self.assertNotIn("escalate", state_value)
         self.assertEqual(
@@ -790,7 +953,7 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(value["acp_state_dirs"], manifest["acp_state_dirs"])
         self.assertEqual(value["capability_parity"], manifest["capability_parity"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(value["files"][slug]), 21)
+            self.assertEqual(len(value["files"][slug]), 22)
             self.assertEqual(value["files"][slug], manifest["review_files"][slug])
 
     def test_derived_closure_satisfies_the_installed_runtime_contract(self) -> None:
@@ -815,7 +978,7 @@ class ActivationBundleTests(PackageFixture):
 
         for slug in ("mempool", "genesis"):
             completed = subprocess.run(
-                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "21", contract],
+                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "22", contract],
                 input=closure_text,
                 check=False,
                 stdout=subprocess.PIPE,
@@ -828,7 +991,7 @@ class ActivationBundleTests(PackageFixture):
         retired = json.loads(closure_text)
         retired["schema"] = "buzz-agent-review-closure-v1"
         rejected = subprocess.run(
-            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "21", contract],
+            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "22", contract],
             input=json.dumps(retired),
             check=False,
             stdout=subprocess.PIPE,
@@ -838,7 +1001,7 @@ class ActivationBundleTests(PackageFixture):
         )
         self.assertNotEqual(rejected.returncode, 0)
 
-    def test_tier2_v2_pass_with_risks_is_terminal_and_accepted(self) -> None:
+    def test_tier2_v3_pass_with_risks_is_terminal_and_accepted(self) -> None:
         bundle, manifest = self.generate("accepted-risks")
         receipt, _ = self.make_receipt(bundle, "accepted-risks")
         evidence, state = self.make_tier2(
@@ -930,10 +1093,10 @@ class ActivationBundleTests(PackageFixture):
         with self.assertRaisesRegex(ValueError, "closure rejected"):
             INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
 
-    def test_expired_tier2_v2_state_is_rejected(self) -> None:
+    def test_expired_tier2_v3_state_is_rejected(self) -> None:
         bundle, _manifest, receipt, evidence, state = self.closed_package("expired")
         value = json.loads(state.read_text())
-        value["prepared_at_ns"] = 1
+        value["lease_expires_at_ns"] = 1
         write_private_json(state, value)
         with self.assertRaisesRegex(ValueError, "closed review state is stale"):
             INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
@@ -1104,7 +1267,7 @@ class ActivationCorrectionRegressionTests(PackageFixture):
         wrong = INSTALLER.ArtifactOwner(owner.uid + 1, owner.gid, owner.user, owner.home)
         with self.assertRaisesRegex(ValueError, "wrong owner"):
             INSTALLER.validate_preflight_receipt(receipt, bundle, manifest, evidence, wrong)
-        with self.assertRaisesRegex(ValueError, "unsafe Tier 2 v2 evidence bundle"):
+        with self.assertRaisesRegex(ValueError, "unsafe Tier 2 v3 evidence bundle"):
             INSTALLER.validate_tier2_acceptance(
                 bundle,
                 manifest,
@@ -1303,7 +1466,7 @@ class InstallerSafetyTests(PackageFixture):
         self.assertTrue(closure["accepted"])
         self.assertEqual(closure["bundle_digest"], self.manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(closure["files"][slug]), 21)
+            self.assertEqual(len(closure["files"][slug]), 22)
         first_snapshot = target_snapshot(self.install_root, targets)
         backup_root = self.install_root / "var/lib/buzz-mgact-backups"
         backup_ids = [path.name for path in backup_root.iterdir() if path.is_dir()]
@@ -1983,6 +2146,228 @@ class ServiceGateTests(unittest.TestCase):
         self.assertTrue(any("service must be disabled" in blocker for blocker in blockers))
 
 
+class ActivationTransactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.credential_dir = self.root / "etc/buzz-agents/credentials"
+        self.credential_dir.mkdir(mode=0o700, parents=True)
+        self.genesis_credential = self.credential_dir / "genesis.key"
+        self.genesis_before = b"3" * 64 + b"\n"
+        write_file(self.genesis_credential, self.genesis_before, 0o600)
+        self.manifest_path = self.root / "manifest.json"
+        self.receipt_path = self.root / "sealed.json"
+        self.policy_path = self.root / "policy.json"
+        self.parity_path = ACTIVATION_DIR / "capability-parity.py"
+        self.binding = {
+            "schema": "buzz-agent-activation-binding-v1",
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "package_digest": "c" * 64,
+            "runtime_artifact_fingerprint": "d" * 64,
+            "bundle_manifest_sha256": "e" * 64,
+        }
+        self.channel_set = "f" * 64
+        write_private_json(
+            self.manifest_path,
+            {
+                "inputs": {"mempool": "1" * 64, "genesis": "2" * 64},
+                "identities": {
+                    "mempool": {
+                        "public_key": "1" * 64,
+                        "credential_path": "/etc/buzz-agents/credentials/mempool.key",
+                    },
+                    "genesis": {
+                        "public_key": "2" * 64,
+                        "credential_path": "/etc/buzz-agents/credentials/genesis.key",
+                    },
+                },
+                "capability_parity": {"eligible_channels_sha256": self.channel_set},
+            },
+        )
+        write_private_json(self.receipt_path, {"sealed_sha256": "9" * 64})
+        write_private_json(self.policy_path, {"synthetic": True})
+        self.state_dir = self.root / "transaction"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def gate(self, slug: str) -> Path:
+        path = self.root / f"{slug}-gate.json"
+        write_private_json(
+            path,
+            {
+                "schema": TRANSACTION.PHASE_SCHEMA,
+                "status": "PASS",
+                "slug": slug,
+                "binding": self.binding,
+                "gates": {
+                    "config": True,
+                    "credential": True,
+                    "membership": True,
+                    "parity": True,
+                },
+                "channel_set_sha256": self.channel_set,
+            },
+        )
+        return path
+
+    def prepare(self) -> None:
+        parity = SimpleNamespace(
+            ParityError=ValueError,
+            validate_policy=lambda value: value,
+            verify_sealed_receipt=lambda receipt, policy, manifest: receipt,
+            activation_binding=lambda manifest: self.binding,
+        )
+        with mock.patch.object(
+            TRANSACTION, "manifest_bound_runtime_tool"
+        ), mock.patch.object(TRANSACTION, "load_parity_module", return_value=parity):
+            TRANSACTION.prepare(
+                self.manifest_path,
+                self.receipt_path,
+                self.policy_path,
+                self.parity_path,
+                self.state_dir,
+                self.root,
+            )
+
+    def test_mempool_must_complete_before_genesis_and_rollback_is_exact(self) -> None:
+        self.prepare()
+        with self.assertRaisesRegex(TRANSACTION.TransactionError, "blocked by state"):
+            TRANSACTION.begin_phase(self.state_dir, "genesis")
+        TRANSACTION.begin_phase(self.state_dir, "mempool")
+        mempool_credential = self.credential_dir / "mempool.key"
+        mempool_secret = b"4" * 64 + b"\n"
+        write_file(mempool_credential, mempool_secret, 0o600)
+        TRANSACTION.record_credential(self.state_dir, "mempool", self.root)
+        TRANSACTION.plan_membership(
+            self.state_dir,
+            "mempool",
+            "0ed53b38-d6f7-44ba-a2b4-1e685d1fbb1e",
+            "1" * 64,
+        )
+        TRANSACTION.confirm_membership(
+            self.state_dir,
+            "mempool",
+            "0ed53b38-d6f7-44ba-a2b4-1e685d1fbb1e",
+            "1" * 64,
+        )
+        TRANSACTION.complete_phase(self.state_dir, "mempool", self.gate("mempool"))
+        TRANSACTION.begin_phase(self.state_dir, "genesis")
+        genesis_after = b"5" * 64 + b"\n"
+        self.genesis_credential.write_bytes(genesis_after)
+        TRANSACTION.record_credential(self.state_dir, "genesis", self.root)
+        TRANSACTION.plan_membership(
+            self.state_dir,
+            "genesis",
+            "1ec68cd0-3051-45cd-8297-76803e34add0",
+            "2" * 64,
+        )
+        TRANSACTION.confirm_membership(
+            self.state_dir,
+            "genesis",
+            "1ec68cd0-3051-45cd-8297-76803e34add0",
+            "2" * 64,
+        )
+        TRANSACTION.complete_phase(self.state_dir, "genesis", self.gate("genesis"))
+        receipt_text = (self.state_dir / "state.json").read_text()
+        self.assertNotIn(mempool_secret.decode().strip(), receipt_text)
+        self.assertNotIn(genesis_after.decode().strip(), receipt_text)
+        TRANSACTION.begin_rollback(self.state_dir, self.root)
+        plan = TRANSACTION.rollback_plan(self.state_dir)
+        self.assertEqual([item["slug"] for item in plan], ["genesis", "mempool"])
+        for item in plan:
+            TRANSACTION.mark_membership_rolled_back(
+                self.state_dir, item["slug"], item["channel_id"], item["pubkey"]
+            )
+        interrupted = TRANSACTION.read_state(self.state_dir)
+        TRANSACTION.restore_credential(
+            self.state_dir, interrupted["credentials"]["genesis"], self.root
+        )
+        result = TRANSACTION.finish_rollback(self.state_dir, self.root)
+        self.assertEqual(result["state"], "rolled_back")
+        self.assertFalse(mempool_credential.exists())
+        self.assertEqual(self.genesis_credential.read_bytes(), self.genesis_before)
+        with self.assertRaisesRegex(TRANSACTION.TransactionError, "already rolled back"):
+            TRANSACTION.begin_rollback(self.state_dir, self.root)
+
+    def test_credential_drift_refuses_rollback_without_consuming_claim(self) -> None:
+        self.prepare()
+        TRANSACTION.begin_phase(self.state_dir, "mempool")
+        credential = self.credential_dir / "mempool.key"
+        write_file(credential, b"6" * 64 + b"\n", 0o600)
+        TRANSACTION.record_credential(self.state_dir, "mempool", self.root)
+        credential.write_bytes(b"7" * 64 + b"\n")
+        with self.assertRaisesRegex(TRANSACTION.TransactionError, "drift blocks rollback"):
+            TRANSACTION.begin_rollback(self.state_dir, self.root)
+        state = TRANSACTION.read_state(self.state_dir)
+        self.assertFalse(state["claim_used"])
+        self.assertTrue((self.state_dir / "rollback.claim").exists())
+
+    def test_parity_runtime_tool_must_match_manifest_path_metadata_and_digest(self) -> None:
+        tool = (
+            self.root
+            / "usr/local/libexec/buzz/verify-agent-capability-parity"
+        )
+        write_file(tool, b"#!/usr/bin/python3\n", 0o755)
+        metadata = tool.lstat()
+        manifest = {
+            "runtime_targets": [
+                {
+                    "target": "/usr/local/libexec/buzz/verify-agent-capability-parity",
+                    "sha256": hashlib.sha256(tool.read_bytes()).hexdigest(),
+                    "mode": "0755",
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                }
+            ]
+        }
+        TRANSACTION.manifest_bound_runtime_tool(manifest, tool, self.root)
+        manifest["runtime_targets"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(TRANSACTION.TransactionError, "manifest-bound"):
+            TRANSACTION.manifest_bound_runtime_tool(manifest, tool, self.root)
+
+    def test_package_rollback_requires_matching_completed_activation_rollback(self) -> None:
+        receipt = {
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "package_digest": "c" * 64,
+        }
+        with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
+            INSTALLER.require_activation_transaction_rolled_back(self.root, receipt)
+            transaction = (
+                self.root / INSTALLER.ACTIVATION_TRANSACTION_DIR.lstrip("/")
+            )
+            transaction.mkdir(mode=0o700, parents=True)
+            write_private_json(
+                transaction / "state.json",
+                {
+                    "schema": TRANSACTION.STATE_SCHEMA,
+                    "state": "mempool_complete",
+                    "claim_used": False,
+                    "binding": receipt,
+                    "memberships": [],
+                    "credentials": {
+                        "mempool": {"restored": False},
+                        "genesis": {"restored": False},
+                    },
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "must be rolled back"):
+                INSTALLER.require_activation_transaction_rolled_back(self.root, receipt)
+            state = json.loads((transaction / "state.json").read_text())
+            state["state"] = "rolled_back"
+            state["claim_used"] = True
+            state["credentials"]["mempool"]["restored"] = True
+            state["credentials"]["genesis"]["restored"] = True
+            write_private_json(transaction / "state.json", state)
+            INSTALLER.require_activation_transaction_rolled_back(self.root, receipt)
+            receipt["package_digest"] = "d" * 64
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                INSTALLER.require_activation_transaction_rolled_back(self.root, receipt)
+
+
 class SweepCandidateTests(PackageFixture):
     def setUp(self) -> None:
         super().setUp()
@@ -2016,15 +2401,15 @@ class SweepCandidateTests(PackageFixture):
                 "writes": 0,
                 "seen_private_keys": [],
                 "channels": {
-                    "11111111-1111-1111-1111-111111111111": [
+                    "03f28d12-d392-4147-a9d6-9f23426dcde0": [
                         {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"},
                         {"pubkey": "9" * 64, "role": "member"}
                     ],
-                    "22222222-2222-2222-2222-222222222222": [
+                    "0ed53b38-d6f7-44ba-a2b4-1e685d1fbb1e": [
                         {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"},
                         {"pubkey": "9" * 64, "role": "member"}
                     ],
-                    "44444444-4444-4444-4444-444444444444": [
+                    "1ec68cd0-3051-45cd-8297-76803e34add0": [
                         {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "admin"},
                         {"pubkey": "9" * 64, "role": "member"}
                     ],
@@ -2032,7 +2417,7 @@ class SweepCandidateTests(PackageFixture):
             },
         )
         self.skip = self.root / "skip"
-        self.skip.write_text("11111111-1111-1111-1111-111111111111\n")
+        self.skip.write_text("03f28d12-d392-4147-a9d6-9f23426dcde0\n")
         self.buzz = self.root / "buzz-mock.py"
         self.buzz.write_text(
             "#!/usr/bin/env python3\n"
@@ -2045,11 +2430,11 @@ class SweepCandidateTests(PackageFixture):
             "args=sys.argv[1:]\n"
             "if args[:4] == ['channels','list','--visibility','open']:\n"
             " print(json.dumps([\n"
-            "  {'channel_id':'11111111-1111-1111-1111-111111111111','name':'one','archived':False},\n"
-            "  {'channel_id':'22222222-2222-2222-2222-222222222222','name':'two','archived':False},\n"
-            "  {'channel_id':'33333333-3333-3333-3333-333333333333','name':'old','archived':True}]))\n"
+            "  {'channel_id':'03f28d12-d392-4147-a9d6-9f23426dcde0','name':'one','archived':False},\n"
+            "  {'channel_id':'0ed53b38-d6f7-44ba-a2b4-1e685d1fbb1e','name':'two','archived':False},\n"
+            "  {'channel_id':'33333333-3333-3333-3333-333333333333','name':'unreviewed','archived':False}]))\n"
             "elif args[:5] == ['channels','list','--visibility','private','--member']:\n"
-            " print(json.dumps([{'channel_id':'44444444-4444-4444-4444-444444444444','name':'private','archived':False}]))\n"
+            " print(json.dumps([{'channel_id':'1ec68cd0-3051-45cd-8297-76803e34add0','name':'private','archived':False}]))\n"
             "elif args[:2] == ['channels','members']:\n"
             " cid=args[args.index('--channel')+1]; print(json.dumps(state['channels'][cid]))\n"
             "elif args[:2] == ['channels','add-member']:\n"
@@ -2064,7 +2449,7 @@ class SweepCandidateTests(PackageFixture):
         )
         self.buzz.chmod(0o755)
 
-    def run_sweep(self, mode: str, **extra: str) -> subprocess.CompletedProcess[str]:
+    def run_sweep(self, *arguments: str, **extra: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update(
             {
@@ -2074,11 +2459,15 @@ class SweepCandidateTests(PackageFixture):
                 "SATS_SWEEP_LOG": str(self.root / "sweep.log"),
                 "BUZZ_BIN": str(self.buzz),
                 "SWEEP_STATE": str(self.state_file),
+                "SATS_ACTIVATION_TRANSACTION_TOOL": str(
+                    self.bundle
+                    / "install-root/usr/local/libexec/buzz/mempool-genesis-activation-transaction"
+                ),
                 **extra,
             }
         )
         return subprocess.run(
-            [str(self.script), mode],
+            [str(self.script), *arguments],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2086,6 +2475,29 @@ class SweepCandidateTests(PackageFixture):
             env=environment,
             timeout=60,
         )
+
+    def make_transaction(self) -> Path:
+        transaction = self.root / "transaction"
+        transaction.mkdir(mode=0o700)
+        write_private_json(
+            transaction / "bundle-manifest.json",
+            {"inputs": {"mempool": "1" * 64, "genesis": "2" * 64}},
+        )
+        write_private_json(
+            transaction / "state.json",
+            {
+                "schema": TRANSACTION.STATE_SCHEMA,
+                "state": "prepared",
+                "binding": {},
+                "sealed_receipt_sha256": "f" * 64,
+                "claim_sha256": "e" * 64,
+                "claim_used": False,
+                "credentials": {"mempool": {}, "genesis": {}},
+                "memberships": [],
+                "phase_receipts": {},
+            },
+        )
+        return transaction
 
     def test_fixed_public_roster_matches_codexr_open_and_private_membership(self) -> None:
         before = self.state_file.read_bytes()
@@ -2097,21 +2509,33 @@ class SweepCandidateTests(PackageFixture):
         dry_run = self.run_sweep("--dry-run")
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
         self.assertEqual(dry_run.stdout.count("PLAN owner add-member"), 4)
-        self.assertNotIn("11111111-1111-1111-1111-111111111111", dry_run.stdout)
-        self.assertIn("22222222-2222-2222-2222-222222222222", dry_run.stdout)
-        self.assertIn("44444444-4444-4444-4444-444444444444", dry_run.stdout)
+        self.assertNotIn("03f28d12-d392-4147-a9d6-9f23426dcde0", dry_run.stdout)
+        self.assertIn("0ed53b38-d6f7-44ba-a2b4-1e685d1fbb1e", dry_run.stdout)
+        self.assertIn("1ec68cd0-3051-45cd-8297-76803e34add0", dry_run.stdout)
         self.assertNotIn("33333333-3333-3333-3333-333333333333", dry_run.stdout)
         self.assertEqual(json.loads(self.state_file.read_text())["writes"], 0)
-        first = self.run_sweep("--mempool-genesis-apply")
+        combined = self.run_sweep("--mempool-genesis-apply")
+        self.assertEqual(combined.returncode, 64)
+        self.assertIn("selective transaction modes", combined.stderr)
+        transaction = self.make_transaction()
+        blocked_genesis = self.run_sweep("--genesis-apply", str(transaction))
+        self.assertNotEqual(blocked_genesis.returncode, 0)
+        self.assertEqual(json.loads(self.state_file.read_text())["writes"], 0)
+        first = self.run_sweep("--mempool-apply", str(transaction))
         self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
         state = json.loads(self.state_file.read_text())
-        self.assertEqual(state["writes"], 4)
+        self.assertEqual(state["writes"], 2)
+        for members in state["channels"].values():
+            self.assertFalse(any(member["pubkey"] == "2" * 64 for member in members))
         self.assertTrue(state["seen_private_keys"])
         self.assertEqual(set(state["seen_private_keys"]), {self.owner_private})
-        second = self.run_sweep("--mempool-genesis-apply")
-        self.assertEqual(second.returncode, 0, second.stderr)
+        transaction_state = json.loads((transaction / "state.json").read_text())
+        transaction_state["state"] = "mempool_complete"
+        write_private_json(transaction / "state.json", transaction_state)
+        second = self.run_sweep("--genesis-apply", str(transaction))
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(json.loads(self.state_file.read_text())["writes"], 4)
-        self.assertIn("planned=0 writes=0 already=4 blocked=0", second.stdout)
+        self.assertLess(first.stdout.find("Mempool open roster"), first.stdout.find("Mempool private roster"))
 
     def test_non_owner_or_admin_role_blocks_owner_authority(self) -> None:
         value = json.loads(self.state_file.read_text())
@@ -2124,7 +2548,10 @@ class SweepCandidateTests(PackageFixture):
         self.assertNotIn("PLAN owner add-member", result.stdout)
 
     def test_failure_output_redacts_owner_private_key(self) -> None:
-        result = self.run_sweep("--mempool-genesis-apply", SWEEP_LEAK="1")
+        transaction = self.make_transaction()
+        result = self.run_sweep(
+            "--mempool-apply", str(transaction), SWEEP_LEAK="1"
+        )
         self.assertNotEqual(result.returncode, 0)
         output = result.stdout + result.stderr
         self.assertNotIn(self.owner_private, output)

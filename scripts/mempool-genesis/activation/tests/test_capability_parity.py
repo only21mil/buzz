@@ -27,6 +27,7 @@ PARITY = load_module()
 POLICY = PARITY.validate_policy(
     json.loads((ACTIVATION_DIR / "capability-parity-policy.json").read_text())
 )
+REPO_ROOT = ACTIVATION_DIR.parents[2]
 
 
 def descriptor(path: str, owner: str, marker: int) -> dict[str, object]:
@@ -43,6 +44,33 @@ def descriptor(path: str, owner: str, marker: int) -> dict[str, object]:
         "device": marker,
         "inode": 1000 + marker,
         "sha256_prefix": f"{marker:012x}",
+    }
+
+
+def ops_manifest(signer: Path, verifier: Path) -> dict[str, object]:
+    records = []
+    for path, scope in (
+        (signer, "owner Schnorr parity receipt signing from a sanctioned private file"),
+        (verifier, "owner Schnorr parity receipt verification from standard input"),
+    ):
+        sha256, metadata = PARITY.regular_sha256(path)
+        records.append(
+            {
+                "target": str(path),
+                "source": f"synthetic/{path.name}",
+                "mode": "0700",
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+                "sha256": sha256,
+                "scope": scope,
+            }
+        )
+    return {
+        "source_commit": "a" * 40,
+        "source_tree": "b" * 40,
+        "package_digest": "c" * 64,
+        "runtime_artifact_fingerprint": "d" * 64,
+        "ops_targets": records,
     }
 
 
@@ -95,8 +123,9 @@ def manifest(role: str) -> dict[str, object]:
         "group": "root",
     }
     channels = [
-        {"channel_id": "open-a", "visibility": "open", "scope": "open", "role": "member", "archived": False, "eligible": True},
-        {"channel_id": "private-a", "visibility": "private", "scope": "sats-victor-private", "role": "member", "archived": False, "eligible": True},
+        {**channel, "archived": False, "eligible": True}
+        for channel in POLICY["eligible_channels"]
+    ] + [
         {"channel_id": "archived-a", "visibility": "open", "scope": "open", "role": "member", "archived": True, "eligible": False},
     ]
     hardening = copy.deepcopy(PARITY.REQUIRED_HARDENING)
@@ -152,10 +181,10 @@ def manifest(role: str) -> dict[str, object]:
             "max_turn_duration": 7200,
             "turn_liveness_secs": 10,
             "permission_mode": "bypass-permissions",
-            "environment_keys": ["BUZZ_ACP_AGENT_COMMAND", "BUZZ_ACP_ALLOWED_RESPOND_TO", "BUZZ_ACP_RESPOND_TO", "BUZZ_ACP_STATE_DIR", "CODEX_PATH"],
+            "environment_keys": ["BUZZ_ACP_AGENT_COMMAND", "BUZZ_ACP_ALLOWED_RESPOND_TO", "BUZZ_ACP_RESPOND_TO", "BUZZ_ACP_RESPOND_TO_ALLOWLIST", "BUZZ_ACP_STATE_DIR", "CODEX_PATH"],
             "closure": closure,
         },
-        "response_policy": {"respond_to": "owner-only", "allowed_respond_to": "owner-only", "responder_allowlist": [], "owner_pubkey": POLICY["owner_pubkey"]},
+        "response_policy": copy.deepcopy(POLICY["response_policy"]),
         "channels": channels,
         "profile": {
             "author_pubkey": pubkey,
@@ -168,10 +197,10 @@ def manifest(role: str) -> dict[str, object]:
             "self_published": True,
             "author_pubkey": pubkey,
             "agent_type": "codex",
-            "respond_to": "owner-only",
-            "allowed_respond_to": "owner-only",
-            "responder_allowlist": [],
-            "channel_ids": ["open-a", "private-a"],
+            "respond_to": "allowlist",
+            "allowed_respond_to": "allowlist",
+            "responder_allowlist": [POLICY["owner_pubkey"]],
+            "channel_ids": [channel["channel_id"] for channel in POLICY["eligible_channels"]],
             "auth_owner_pubkey": POLICY["owner_pubkey"],
             "auth_subject_pubkey": pubkey,
             "event_id": f"{marker + 2000:064x}",
@@ -230,9 +259,9 @@ class CapabilityParityTests(unittest.TestCase):
             "BUZZ_ACP_MAX_TURN_DURATION": "7200",
             "BUZZ_ACP_TURN_LIVENESS_SECS": "10",
             "BUZZ_ACP_PERMISSION_MODE": "bypass-permissions",
-            "BUZZ_ACP_RESPOND_TO": "owner-only",
-            "BUZZ_ACP_ALLOWED_RESPOND_TO": "owner-only",
-            "BUZZ_ACP_RESPOND_TO_ALLOWLIST": "",
+            "BUZZ_ACP_RESPOND_TO": "allowlist",
+            "BUZZ_ACP_ALLOWED_RESPOND_TO": "allowlist",
+            "BUZZ_ACP_RESPOND_TO_ALLOWLIST": POLICY["owner_pubkey"],
             "BUZZ_ACP_AGENT_OWNER": POLICY["owner_pubkey"],
             "BUZZ_ACP_AUTH_TAG": auth_tag,
         }
@@ -313,10 +342,10 @@ class CapabilityParityTests(unittest.TestCase):
         self.assertEqual(receipt["unexplained_differences"], {"mempool": [], "genesis": []})
         self.assertTrue(all(receipt["checks"].values()))
 
-    def test_owner_only_policy_and_directory_are_required(self) -> None:
-        self.mempool["response_policy"]["respond_to"] = "allowlist"
-        self.mempool["response_policy"]["responder_allowlist"] = [POLICY["owner_pubkey"]]
-        with self.assertRaisesRegex(PARITY.ParityError, "owner-only"):
+    def test_codex_r_allowlist_policy_and_directory_are_required(self) -> None:
+        self.mempool["response_policy"]["respond_to"] = "owner-only"
+        self.mempool["response_policy"]["responder_allowlist"] = []
+        with self.assertRaisesRegex(PARITY.ParityError, "Codex-R"):
             self.compare()
 
     def test_shared_pubkey_auth_tag_inode_path_or_material_fails(self) -> None:
@@ -344,7 +373,7 @@ class CapabilityParityTests(unittest.TestCase):
         with self.assertRaisesRegex(PARITY.ParityError, "role is not member"):
             self.compare()
         self.setUp()
-        self.genesis["directory"]["channel_ids"] = ["open-a"]
+        self.genesis["directory"]["channel_ids"] = [POLICY["eligible_channels"][0]["channel_id"]]
         with self.assertRaisesRegex(PARITY.ParityError, "directory channels"):
             self.compare()
 
@@ -382,6 +411,44 @@ class CapabilityParityTests(unittest.TestCase):
         with self.assertRaisesRegex(PARITY.ParityError, "secret-bearing field"):
             PARITY.build_manifest(observation, "mempool", POLICY)
 
+    def test_secret_scanner_allows_benign_token_limits_and_rejects_secrets(self) -> None:
+        PARITY.reject_secret_values(
+            {"tool_output_token_limit": 4000, "max_output_tokens": 1000, "token_budget": 25}
+        )
+        for field in (
+            "access_token", "api_key", "private_key", "signing_key", "client_secret",
+            "oauth_token", "cookie",
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                PARITY.ParityError, "secret-bearing field"
+            ):
+                PARITY.reject_secret_values({field: "redacted"})
+        for field in (
+            "private_key_tool_output_token_limit",
+            "tool_output_token_limit_private_key",
+            "access_token_tool_output_token_limit",
+        ):
+            with self.subTest(bypass=field), self.assertRaisesRegex(
+                PARITY.ParityError, "secret-bearing field"
+            ):
+                PARITY.reject_secret_values({field: "a" * 64})
+
+    def test_candidate_closure_hashes_physical_source_but_reports_logical_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sources = {}
+            for component in PARITY.CLOSURE_KEYS:
+                source = root / component
+                source.write_text(component)
+                source.chmod(0o644 if component == "service_unit" else 0o755)
+                sources[component] = str(source)
+            closure = PARITY.capture_closure(sources, "mempool")
+        self.assertEqual(
+            closure["buzz_acp"]["path"], PARITY.EXPECTED_CANDIDATE_CLOSURE_PATHS["buzz_acp"]
+        )
+        self.assertRegex(closure["buzz_acp"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(closure["service_unit"]["path"], str(root / "service_unit"))
+
     def test_capture_fixture_is_deterministic_and_secret_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             spec, secret_values = self.capture_fixture(Path(temporary))
@@ -393,7 +460,9 @@ class CapabilityParityTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
         self.assertEqual(first["secret_files"]["buzz_private_key"]["path_class"], "codex-r:buzz-private-key")
         self.assertNotIn("path", first["secret_files"]["buzz_private_key"])
-        self.assertEqual(first["response_policy"]["responder_allowlist"], [])
+        self.assertEqual(
+            first["response_policy"]["responder_allowlist"], [POLICY["owner_pubkey"]]
+        )
 
     def test_capture_rejects_archimedes_rachel_private_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -461,8 +530,8 @@ class CapabilityParityTests(unittest.TestCase):
         receipt = self.compare()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            signer = root / "signer"
-            verifier = root / "verifier"
+            signer = root / "buzz-parity-owner-signer"
+            verifier = root / "buzz-parity-owner-verifier"
             signer.write_text(
                 "#!/usr/bin/python3\n"
                 "import json,sys\n"
@@ -476,17 +545,103 @@ class CapabilityParityTests(unittest.TestCase):
                 "#!/usr/bin/python3\n"
                 "import json,sys\n"
                 "value=json.load(sys.stdin)\n"
-                "raise SystemExit(0 if value['verified'] is False else 1)\n"
+                "raise SystemExit(0 if value['verified'] in (False,True) else 1)\n"
             )
             signer.chmod(0o700)
             verifier.chmod(0o700)
-            sealed = PARITY.seal_receipt(receipt, POLICY, [str(signer)], [str(verifier)])
+            manifest = ops_manifest(signer, verifier)
+            sealed = PARITY.seal_receipt(
+                receipt, POLICY, [str(signer)], [str(verifier)], manifest
+            )
+            verified = PARITY.verify_sealed_receipt(sealed, POLICY, manifest)
+            self.assertEqual(
+                verified["receipt"]["activation_binding"],
+                PARITY.activation_binding(manifest),
+            )
+            wrong = copy.deepcopy(manifest)
+            wrong["ops_targets"][0]["sha256"] = "f" * 64
+            with self.assertRaisesRegex(PARITY.ParityError, "manifest-bound"):
+                PARITY.seal_receipt(
+                    receipt, POLICY, [str(signer)], [str(verifier)], wrong
+                )
+            stub = root / "buzz-parity-owner-signer-stub"
+            stub.write_bytes(signer.read_bytes())
+            stub.chmod(0o700)
+            with self.assertRaisesRegex(PARITY.ParityError, "no unique|manifest-bound"):
+                PARITY.seal_receipt(
+                    receipt, POLICY, [str(stub)], [str(verifier)], manifest
+                )
+            rebound = copy.deepcopy(manifest)
+            rebound["package_digest"] = "e" * 64
+            with self.assertRaisesRegex(PARITY.ParityError, "source/package binding mismatch"):
+                PARITY.verify_sealed_receipt(sealed, POLICY, rebound)
         self.assertTrue(sealed["verified"])
         self.assertRegex(sealed["sealed_sha256"], r"^[0-9a-f]{64}$")
         tampered = copy.deepcopy(receipt)
         tampered["checks"]["runtime_closure"] = False
         with self.assertRaisesRegex(PARITY.ParityError, "digest mismatch"):
             PARITY.validate_receipt_digest(tampered)
+
+    def test_maintained_owner_tools_seal_synthetic_private_safe_receipt(self) -> None:
+        synthetic_owner = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        synthetic_secret = "0" * 63 + "1"
+        policy = copy.deepcopy(POLICY)
+        policy["reserved_pubkeys"][0] = synthetic_owner
+        policy["owner_pubkey"] = synthetic_owner
+        policy["response_policy"]["owner_pubkey"] = synthetic_owner
+        policy["response_policy"]["responder_allowlist"] = [synthetic_owner]
+        policy = PARITY.validate_policy(policy)
+
+        def replace_owner(value):
+            if isinstance(value, dict):
+                return {key: replace_owner(child) for key, child in value.items()}
+            if isinstance(value, list):
+                return [replace_owner(child) for child in value]
+            return synthetic_owner if value == POLICY["owner_pubkey"] else value
+
+        receipt = PARITY.compare_set(
+            replace_owner(self.reference),
+            replace_owner(self.mempool),
+            replace_owner(self.genesis),
+            policy,
+        )
+        self.assertEqual(receipt["status"], "PASS")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            secret_file = root / "secrets.env"
+            secret_file.write_text(f"BUZZ_OWNER_PRIVATE_KEY={synthetic_secret}\n")
+            secret_file.chmod(0o600)
+            signer = root / "buzz-parity-owner-signer"
+            verifier = root / "buzz-parity-owner-verifier"
+            signer.write_bytes((REPO_ROOT / "target/release/buzz-parity-owner-signer").read_bytes())
+            verifier.write_bytes((REPO_ROOT / "target/release/buzz-parity-owner-verifier").read_bytes())
+            signer.chmod(0o700)
+            verifier.chmod(0o700)
+            sealed = PARITY.seal_receipt(
+                receipt,
+                policy,
+                [
+                    str(signer), "--secrets-file", str(secret_file),
+                    "--owner-pubkey", synthetic_owner,
+                    "--signed-at", "2026-08-27T00:00:00Z",
+                ],
+                [str(verifier), "--owner-pubkey", synthetic_owner],
+                ops_manifest(signer, verifier),
+            )
+            PARITY.safe_command(
+                [str(verifier), "--owner-pubkey", synthetic_owner],
+                PARITY.canonical_json(sealed),
+            )
+            persisted_tamper = copy.deepcopy(sealed)
+            persisted_tamper["receipt"]["status"] = "BLOCKED"
+            with self.assertRaisesRegex(PARITY.ParityError, "failed"):
+                PARITY.safe_command(
+                    [str(verifier), "--owner-pubkey", synthetic_owner],
+                    PARITY.canonical_json(persisted_tamper),
+                )
+        self.assertTrue(sealed["verified"])
+        self.assertNotIn(synthetic_secret, PARITY.canonical_json(sealed).decode())
 
 
 if __name__ == "__main__":

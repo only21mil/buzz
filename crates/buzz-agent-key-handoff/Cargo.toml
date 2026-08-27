@@ -11,9 +11,10 @@ publish = false
 anyhow.workspace = true
 hex.workspace = true
 nostr.workspace = true
-rustix = { workspace = true, features = ["pipe", "process"] }
+rustix = { workspace = true, features = ["fs", "pipe", "process"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -33,3 +34,11 @@ path = "src/bin/buzz-install-agent-key.rs"
 [[bin]]
 name = "buzz-agent-key-handoff"
 path = "src/bin/buzz-agent-key-handoff.rs"
+
+[[bin]]
+name = "buzz-parity-owner-signer"
+path = "src/bin/buzz-parity-owner-signer.rs"
+
+[[bin]]
+name = "buzz-parity-owner-verifier"
+path = "src/bin/buzz-parity-owner-verifier.rs"

@@ -21,12 +21,12 @@ BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 BUNDLE_ID = "mempool-genesis-activation-20260825"
 RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v3"
 REVIEW_FILES_SCHEMA = "buzz-agent-review-files-v1"
-TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
+TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v3"
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
 TIER2_ENGINE_MODE = 0o755
-TIER2_ENGINE_SHA256 = "8750c7c2ceced906f825052452aa8f60fe27fc953c801a27ad62053ec2c87242"
-TIER2_ENGINE_SOURCE_COMMIT = "4efbf03a5220b40984e339d88b649220bd235cd7"
-TIER2_ENGINE_SOURCE_TREE = "4e1a8d5859ad353225fa05f218b2f0d1950c56e9"
+TIER2_ENGINE_SHA256 = "a3dadffc4be7da9a50ceff144b1e8db7bcf22598ee0a89556e76b8e5792de06b"
+TIER2_ENGINE_SOURCE_COMMIT = "c4857c02d5ed1de9f8fc7d5f78fe1a171ab0bed2"
+TIER2_ENGINE_SOURCE_TREE = "c5903a023599b8f3ab0981959ac3d8bb444b8be2"
 TIER2_REVIEW = {
     "producer_provider": "gpt",
     "reviewer_provider": "claude",
@@ -34,7 +34,6 @@ TIER2_REVIEW = {
     "effort": "high",
     "engine_subcommands": ["prepare", "review", "check"],
 }
-TIER2_CANDIDATE_PATHS = ["bundle-manifest.json", "metadata/review-files.json"]
 MAX_TIER2_EVIDENCE_BYTES = 64 * 1024
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -51,9 +50,10 @@ PLACEHOLDERS = {
 }
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
 SHELLCHECK_PATH = "/home/victor/.npm-global/bin/shellcheck"
-RUNTIME_TARGET_COUNT = 24
-TOTAL_PACKAGE_TARGET_COUNT = 25
-REVIEW_PATH_COUNT = 21
+RUNTIME_TARGET_COUNT = 25
+OPS_TARGET_COUNT = 3
+TOTAL_PACKAGE_TARGET_COUNT = 28
+REVIEW_PATH_COUNT = 22
 SYSTEMD_FRAGMENT = "/etc/systemd/system/buzz-agent@.service"
 SYSTEMD_MANAGER_DROPIN = "/usr/lib/systemd/system/service.d/10-timeout-abort.conf"
 SYSTEMD_INSTANCE_DROPINS = {
@@ -218,7 +218,7 @@ def validate_generator_sources(manifest: dict[str, object], repo_root: Path) -> 
         if sha256_file(path) != digest:
             raise ValueError(f"generator source changed after package creation: {relative}")
         tree_line = subprocess.run(
-            ["git", "ls-tree", "HEAD", "--", relative],
+            ["git", "ls-files", "--stage", "--", relative],
             cwd=repo_root,
             check=True,
             stdout=subprocess.PIPE,
@@ -227,13 +227,13 @@ def validate_generator_sources(manifest: dict[str, object], repo_root: Path) -> 
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
         ).stdout.strip()
         fields = tree_line.split(None, 3)
-        if len(fields) != 4 or fields[1] != "blob" or fields[3] != relative:
+        if len(fields) != 4 or fields[2] != "0" or fields[3] != relative:
             raise ValueError(f"generator source is absent from source tree: {relative}")
         tree_mode = {"100644": 0o644, "100755": 0o755}.get(fields[0])
         if tree_mode != mode:
             raise ValueError(f"generator source mode is not bound to source tree: {relative}")
         committed = subprocess.run(
-            ["git", "show", f"HEAD:{relative}"],
+            ["git", "show", f":{relative}"],
             cwd=repo_root,
             check=True,
             stdout=subprocess.PIPE,
@@ -324,10 +324,72 @@ def tier2_command_result(result: dict[str, object]) -> dict[str, object]:
     if stderr:
         output_parts.append("stderr:\n" + stderr)
     return {
+        "kind": "result",
         "argv": command,
         "exit_code": exit_code,
         "output": "\n".join(output_parts) if output_parts else "<no output>",
     }
+
+
+def tier2_git_candidate(bundle: Path, manifest: dict[str, object]) -> tuple[Path, list[str]]:
+    probe = subprocess.run(
+        ["git", "-C", str(bundle), "rev-parse", "--show-toplevel"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if probe.returncode != 0:
+        raise ValueError("Tier 2 v3 package candidate must be inside a Git worktree")
+    candidate_root = Path(probe.stdout.strip()).resolve(strict=True)
+    try:
+        bundle_prefix = bundle.resolve(strict=True).relative_to(candidate_root)
+    except ValueError as error:
+        raise ValueError("package escapes its Tier 2 Git candidate root") from error
+
+    package_paths = manifest.get("tier2_candidate_paths")
+    if (
+        not isinstance(package_paths, list)
+        or not package_paths
+        or any(not isinstance(item, str) or not item for item in package_paths)
+        or len(set(package_paths)) != len(package_paths)
+    ):
+        raise ValueError("Tier 2 package candidate path inventory is invalid")
+    actual_paths = sorted(
+        (
+            str(path.relative_to(bundle))
+            for path in bundle.rglob("*")
+            if path.is_file()
+        ),
+        key=str.encode,
+    )
+    if actual_paths != package_paths:
+        raise ValueError("Tier 2 package candidate path inventory does not match package files")
+    prefix = "" if str(bundle_prefix) == "." else f"{bundle_prefix.as_posix()}/"
+    expected_status_paths = [prefix + item for item in package_paths]
+
+    status = subprocess.run(
+        ["git", "-C", str(candidate_root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if status.returncode != 0:
+        raise ValueError("cannot inspect Tier 2 v3 package candidate Git status")
+    fields = status.stdout.split(b"\0")
+    if not fields or fields[-1] != b"":
+        raise ValueError("Tier 2 v3 package candidate Git status is malformed")
+    observed_paths: list[str] = []
+    for raw in fields[:-1]:
+        if not raw.startswith(b"?? "):
+            raise ValueError("Tier 2 v3 package candidate must contain only untracked package files")
+        try:
+            observed_paths.append(raw[3:].decode("utf-8"))
+        except UnicodeDecodeError as error:
+            raise ValueError("Tier 2 v3 package candidate path is not UTF-8") from error
+    if sorted(observed_paths, key=str.encode) != expected_status_paths:
+        raise ValueError("Tier 2 v3 package candidate Git inventory contains non-package drift")
+    return candidate_root, expected_status_paths
 
 
 def expected_tier2_bundle(
@@ -338,24 +400,23 @@ def expected_tier2_bundle(
     validate_tier2_review(manifest.get("tier2_review"))
     if manifest.get("tier2_evidence_schema") != TIER2_EVIDENCE_SCHEMA:
         raise ValueError("Tier 2 evidence schema mismatch")
-    if manifest.get("tier2_candidate_paths") != TIER2_CANDIDATE_PATHS:
-        raise ValueError("Tier 2 candidate path set mismatch")
+    candidate_root, candidate_paths = tier2_git_candidate(bundle, manifest)
     value = {
         "schema": TIER2_EVIDENCE_SCHEMA,
-        "candidate_root": str(bundle.resolve(strict=True)),
+        "candidate_root": str(candidate_root),
         "summary": (
             "GPT-produced Mempool and Genesis credential, signing, and production activation "
             "package; the current opposite-provider contract requires one Claude Opus 5 reviewer "
             "at high reasoning."
         ),
-        "paths": TIER2_CANDIDATE_PATHS,
+        "paths": candidate_paths,
         "invariants": [
-            "The review binds the exact package manifest and exact 21-path review-file record.",
+            "The review binds the exact package manifest and 22 review-file paths per agent, covering 24 distinct installed paths.",
             "The package and review state remain owner-only and credential-free.",
             "The parent Tier 1 receipt is deterministic evidence only and grants no install authority.",
             "Mempool and Genesis stay stopped and disabled through review and install preflight.",
             "Installation remains absent-only for credentials and preserves rollback and exact hashes.",
-            "Prepare must use --producer-provider gpt; review and check use the same state.",
+            "Prepare must use --producer-provider gpt with stable scope binding; review and check use the same state.",
         ],
         "commands": [tier2_command_result(result) for result in commands],
         "known_limits": [],
@@ -453,8 +514,8 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
     if not isinstance(runtime_raw, list) or len(runtime_raw) != RUNTIME_TARGET_COUNT:
         raise ValueError(f"runtime target count must be {RUNTIME_TARGET_COUNT}")
-    if not isinstance(ops_raw, list) or len(ops_raw) != 1:
-        raise ValueError("ops target count must be one")
+    if not isinstance(ops_raw, list) or len(ops_raw) != OPS_TARGET_COUNT:
+        raise ValueError(f"ops target count must be {OPS_TARGET_COUNT}")
     runtime = [validate_source_record(bundle, record) for record in runtime_raw]
     ops = [validate_source_record(bundle, record) for record in ops_raw]
     targets = [str(record["target"]) for record in runtime + ops]
@@ -476,15 +537,17 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
     if packaged_systemd_targets != expected_systemd_targets:
         raise ValueError("packaged systemd fragment/drop-in target set mismatch")
     expected_ops = {
-        "target": "/home/victor/.agents/tools/buzz-sats-channel-sweep.sh",
-        "mode": "0700",
-        "uid": 1000,
-        "gid": 1000,
-        "scope": "Codex-R-matched open and eligible Sats/Victor private membership",
+        "/home/victor/.agents/tools/buzz-sats-channel-sweep.sh":
+            "Codex-R-matched open and eligible Sats/Victor private membership",
+        "/home/victor/.agents/tools/buzz-parity-owner-signer":
+            "owner Schnorr parity receipt signing from a sanctioned private file",
+        "/home/victor/.agents/tools/buzz-parity-owner-verifier":
+            "owner Schnorr parity receipt verification from standard input",
     }
-    for key, value in expected_ops.items():
-        if ops[0].get(key) != value:
-            raise ValueError(f"ops target mismatch: {key}")
+    if {str(record["target"]): record.get("scope") for record in ops} != expected_ops:
+        raise ValueError("ops target provenance mismatch")
+    if any(record.get("mode") != "0700" or record.get("uid") != 1000 or record.get("gid") != 1000 for record in ops):
+        raise ValueError("ops target metadata mismatch")
     files = validate_review_files(manifest, runtime)
     for slug in ("mempool", "genesis"):
         covered = {str(record["path"]) for record in files[slug]}
@@ -512,7 +575,7 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
     if sha256_file(review_source) != review_digest:
         raise ValueError("review file source hash mismatch")
     review_value = load_json(review_source)
-    expected_review_status = "pending-tier2-v2" if complete else "blocked-on-desktop-pubkeys"
+    expected_review_status = "pending-tier2-v3" if complete else "blocked-on-desktop-pubkeys"
     if review_value != {
         "schema": REVIEW_FILES_SCHEMA,
         "status": expected_review_status,
@@ -526,8 +589,29 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
     validate_tier2_engine(manifest.get("tier2_engine"))
     if manifest.get("tier2_evidence_schema") != TIER2_EVIDENCE_SCHEMA:
         raise ValueError("Tier 2 evidence schema mismatch")
-    if manifest.get("tier2_candidate_paths") != TIER2_CANDIDATE_PATHS:
-        raise ValueError("Tier 2 candidate path set mismatch")
+    package_paths = manifest.get("tier2_candidate_paths")
+    if (
+        not isinstance(package_paths, list)
+        or not package_paths
+        or any(not isinstance(item, str) or not item for item in package_paths)
+        or len(set(package_paths)) != len(package_paths)
+    ):
+        raise ValueError("Tier 2 package candidate path inventory is invalid")
+    policy_document = json.loads(
+        (SCRIPT_DIR / "capability-parity-policy.json").read_text(),
+        object_pairs_hook=reject_duplicates,
+    )
+    unit_sources = {
+        "template": REPO_ROOT / "scripts/mempool-genesis/buzz-agent@.service",
+        "mempool_dropin": SCRIPT_DIR / "templates/systemd/buzz-agent@mempool.service.d/ci-migration.conf",
+        "genesis_dropin": SCRIPT_DIR / "templates/systemd/buzz-agent@genesis.service.d/capability-parity.conf",
+    }
+    expected_no_af_netlink = {
+        label: {"path": str(path.relative_to(REPO_ROOT)), "sha256": sha256_file(path)}
+        for label, path in unit_sources.items()
+    }
+    if any(b"AF_NETLINK" in path.read_bytes() for path in unit_sources.values()):
+        raise ValueError("staged unit unexpectedly permits AF_NETLINK")
     if manifest.get("capability_parity") != {
         "manifest_schema": "buzz-agent-capability-manifest-v1",
         "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
@@ -539,6 +623,20 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
             "sha256": None,
             "required_before_activation": True,
         },
+        "eligible_channels_sha256": sha256_bytes(
+            canonical_json(policy_document["eligible_channels"])
+        ),
+        "channel_sweep_target": "/home/victor/.agents/tools/buzz-sats-channel-sweep.sh",
+        "owner_signer_target": "/home/victor/.agents/tools/buzz-parity-owner-signer",
+        "owner_verifier_target": "/home/victor/.agents/tools/buzz-parity-owner-verifier",
+        "owner_private_input": {
+            "transport": "private-file",
+            "field": "BUZZ_OWNER_PRIVATE_KEY",
+            "mode": "0600",
+            "parent_mode": "0700",
+        },
+        "payload_transport": "anonymous-pipe-stdin",
+        "no_af_netlink": expected_no_af_netlink,
     }:
         raise ValueError("capability parity contract mismatch")
     digest_input = {
@@ -574,7 +672,7 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         raise ValueError("package source tree is invalid")
     if source_commit != git_value(repo_root, "rev-parse", "HEAD"):
         raise ValueError("package source commit is stale")
-    if source_tree != git_value(repo_root, "rev-parse", "HEAD^{tree}"):
+    if source_tree != git_value(repo_root, "write-tree"):
         raise ValueError("package source tree is stale")
     if manifest.get("source_branch") != git_value(repo_root, "branch", "--show-current"):
         raise ValueError("package source branch is stale")
@@ -823,7 +921,7 @@ def build_receipt(
         status = "FAILED"
     if status == "READY_FOR_PARENT_TIER1":
         if not isinstance(tier2_bundle, dict):
-            raise ValueError("complete green preflight requires a generated Tier 2 v2 evidence bundle")
+            raise ValueError("complete green preflight requires a generated Tier 2 v3 evidence bundle")
     elif tier2_bundle is not None:
         raise ValueError("blocked or failed preflight must not claim a reviewable Tier 2 bundle")
     return {
@@ -890,7 +988,7 @@ def generate_receipt(
         | {CLOSURE_TARGET}
     )
     before = snapshot(live_paths) if before_snapshot is None else before_snapshot
-    test_root = bundle.parent / ".preflight-unit-tests"
+    test_root = output.parent / ".preflight-unit-tests"
     test_root.mkdir(mode=0o700, exist_ok=True)
     results = (
         [run(command, repo_root, test_root) for command in gate_commands(bundle)]
@@ -914,7 +1012,7 @@ def generate_receipt(
             "path": str(tier2_bundle_output.absolute()),
             "sha256": sha256_bytes(tier2_payload),
             "schema": TIER2_EVIDENCE_SCHEMA,
-            "candidate_root": str(bundle.resolve(strict=True)),
+            "candidate_root": str(tier2_value["candidate_root"]),
         }
     receipt = build_receipt(bundle, manifest, results, before, after, tier2_record)
     write_atomic(output, canonical_json(receipt))
