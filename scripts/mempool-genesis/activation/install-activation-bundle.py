@@ -37,6 +37,7 @@ INSTALLED_CLOSURE_SCHEMA = "buzz-agent-review-closure-v2"
 BUNDLE_ID = "mempool-genesis-activation-20260825"
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
 BACKUP_ID = re.compile(
     r"^mempool-genesis-activation-20260825-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}\.[0-9]{6}Z$"
 )
@@ -554,12 +555,17 @@ def validate_preflight_receipt(
     expected = {
         "manifest_sha256": sha256_file(bundle / "bundle-manifest.json"),
         "bundle_id": manifest["bundle_id"],
+        "source_commit": manifest["source_commit"],
+        "source_tree": manifest["source_tree"],
         "package_digest": manifest["package_digest"],
         "input_status": manifest["input_status"],
         "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
         "review_files_sha256": manifest["review_files_record"]["sha256"],
         "tier2_review": manifest["tier2_review"],
         "tier2_engine_sha256": manifest["tier2_engine"]["sha256"],
+        "identities": manifest["identities"],
+        "acp_state_dirs": manifest["acp_state_dirs"],
+        "capability_parity": manifest["capability_parity"],
     }
     if bundle_record.get("path") != str(bundle):
         raise ValueError("preflight receipt package path mismatch")
@@ -879,12 +885,17 @@ def build_installed_closure(
             "accepted": True,
             "lineage_id": acceptance.lineage_id,
             "state_id": acceptance.state_id,
+            "source_commit": manifest["source_commit"],
+            "source_tree": manifest["source_tree"],
             "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
             "candidate_fingerprint": acceptance.candidate_fingerprint,
             "bundle_digest": manifest["package_digest"],
             "state_digest": acceptance.state_digest,
             "verdict_digest": acceptance.verdict_digest,
             "verdict": acceptance.verdict,
+            "identities": manifest["identities"],
+            "acp_state_dirs": manifest["acp_state_dirs"],
+            "capability_parity": manifest["capability_parity"],
             "files": files,
         }
     )
@@ -1426,6 +1437,72 @@ def installed_records(changed: list[TargetState]) -> dict[str, dict[str, object]
     }
 
 
+def backup_inventory(
+    previous: dict[str, dict[str, object]], backup: Path, root: Path
+) -> dict[str, object]:
+    uid, gid = admin_owner(root)
+    records: list[dict[str, object]] = []
+    for target_text in sorted(previous, key=str.encode):
+        record = previous[target_text]
+        if (
+            not isinstance(record, dict)
+            or (record.get("exists") is not True and record.get("exists") is not False)
+        ):
+            raise ValueError(f"invalid previous record: {target_text}")
+        if record["exists"] is False:
+            if set(record) != {"exists"}:
+                raise ValueError(f"invalid absent previous record: {target_text}")
+            continue
+        if set(record) != {"exists", "backup_name", "sha256", "mode", "uid", "gid"}:
+            raise ValueError(f"invalid present previous record: {target_text}")
+        backup_name = record.get("backup_name")
+        digest = record.get("sha256")
+        if not isinstance(backup_name, str) or not HEX64.fullmatch(backup_name):
+            raise ValueError(f"invalid backup name: {target_text}")
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            raise ValueError(f"invalid previous digest: {target_text}")
+        parse_mode(record.get("mode"))
+        if not isinstance(record.get("uid"), int) or not isinstance(record.get("gid"), int):
+            raise ValueError(f"invalid previous ownership: {target_text}")
+        source = backup / "files" / backup_name
+        metadata = require_regular(source, mode=0o600, owner_uid=uid, links=1)
+        if metadata.st_gid != gid or sha256_file(source) != digest:
+            raise ValueError(f"backup inventory mismatch: {target_text}")
+        records.append(
+            {
+                "target": target_text,
+                "backup_name": backup_name,
+                "sha256": digest,
+                "mode": "0600",
+                "uid": uid,
+                "gid": gid,
+            }
+        )
+    return {"files": records, "sha256": sha256_bytes(canonical_json(records))}
+
+
+def rollback_record(
+    changed: list[TargetState],
+    previous: dict[str, dict[str, object]],
+    installed: dict[str, dict[str, object]],
+    inventory: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "status": "verified",
+        "restored_targets": [state.target.target for state in changed],
+        "previous_sha256": sha256_bytes(canonical_json(previous)),
+        "installed_sha256": sha256_bytes(canonical_json(installed)),
+        "backup_inventory_sha256": inventory["sha256"],
+    }
+
+
+def verify_restored_targets(
+    changed: list[TargetState], previous: dict[str, dict[str, object]]
+) -> None:
+    for state in changed:
+        verify_previous_state(state, previous[state.target.target])
+
+
 def restore_targets(
     changed: list[TargetState],
     previous: dict[str, dict[str, object]],
@@ -1550,12 +1627,20 @@ def install(
                 }
             else:
                 previous[target.target.target] = {"exists": False}
+        inventory = backup_inventory(previous, backup, root)
+        installed = installed_records(changed)
         acceptance = checked.acceptance
         install_receipt: dict[str, object] = {
             "schema": INSTALL_RECEIPT_SCHEMA,
             "backup_id": backup_id,
             "bundle_id": checked.manifest["bundle_id"],
+            "source_commit": checked.manifest["source_commit"],
+            "source_tree": checked.manifest["source_tree"],
+            "manifest_sha256": sha256_file(bundle / "bundle-manifest.json"),
             "package_digest": checked.manifest["package_digest"],
+            "identities": checked.manifest["identities"],
+            "acp_state_dirs": checked.manifest["acp_state_dirs"],
+            "capability_parity": checked.manifest["capability_parity"],
             "preflight_receipt_sha256": sha256_file(receipt),
             "tier2_evidence_sha256": acceptance.evidence_digest,
             "tier2_state_sha256": acceptance.state_digest,
@@ -1568,7 +1653,8 @@ def install(
             "state": "prepared",
             "changed_targets": [target.target.target for target in changed],
             "previous": previous,
-            "installed": installed_records(changed),
+            "installed": installed,
+            "backup_inventory": inventory,
         }
         receipt_path = backup / "receipt.json"
         write_receipt(receipt_path, install_receipt)
@@ -1586,6 +1672,10 @@ def install(
         except Exception:
             try:
                 restore_targets(applied, previous, backup, root)
+                verify_restored_targets(changed, previous)
+                install_receipt["rollback"] = rollback_record(
+                    changed, previous, installed, inventory
+                )
                 install_receipt["state"] = "rolled_back"
                 write_receipt(receipt_path, install_receipt)
             except Exception as rollback_error:
@@ -1880,12 +1970,89 @@ def rollback(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
         receipt_path = backup / "receipt.json"
         require_regular(receipt_path, mode=0o600)
         receipt = load_json(receipt_path)
+        required_receipt_fields = {
+            "schema",
+            "backup_id",
+            "bundle_id",
+            "source_commit",
+            "source_tree",
+            "manifest_sha256",
+            "package_digest",
+            "identities",
+            "acp_state_dirs",
+            "capability_parity",
+            "preflight_receipt_sha256",
+            "tier2_evidence_sha256",
+            "tier2_state_sha256",
+            "tier2_verdict_sha256",
+            "tier2_candidate_fingerprint",
+            "review_lineage_id",
+            "review_state_id",
+            "review_revision",
+            "review_verdict",
+            "state",
+            "changed_targets",
+            "previous",
+            "installed",
+            "backup_inventory",
+        }
         if (
-            receipt.get("schema") != INSTALL_RECEIPT_SCHEMA
+            set(receipt) != required_receipt_fields
+            or not isinstance(receipt.get("source_commit"), str)
+            or not HEX40.fullmatch(str(receipt["source_commit"]))
+            or not isinstance(receipt.get("source_tree"), str)
+            or not HEX40.fullmatch(str(receipt["source_tree"]))
+            or receipt.get("schema") != INSTALL_RECEIPT_SCHEMA
             or receipt.get("backup_id") != backup_id
             or receipt.get("state") != "installed"
         ):
             raise ValueError("backup receipt is not rollback-ready")
+        for name in (
+            "manifest_sha256",
+            "package_digest",
+            "preflight_receipt_sha256",
+            "tier2_evidence_sha256",
+            "tier2_state_sha256",
+            "tier2_verdict_sha256",
+            "tier2_candidate_fingerprint",
+        ):
+            if not isinstance(receipt.get(name), str) or not HEX64.fullmatch(str(receipt[name])):
+                raise ValueError(f"invalid rollback receipt digest: {name}")
+        identities = receipt.get("identities")
+        if not isinstance(identities, dict) or set(identities) != {"mempool", "genesis"}:
+            raise ValueError("rollback identity descriptor map mismatch")
+        if receipt.get("acp_state_dirs") != ACP_STATE_DIRS:
+            raise ValueError("rollback ACP state directory map mismatch")
+        for slug in ("mempool", "genesis"):
+            descriptor = identities.get(slug)
+            expected = {
+                "public_key",
+                "user",
+                "home",
+                "credential_path",
+                "environment_path",
+                "prompt_path",
+                "acp_state_dir",
+                "systemd_unit",
+            }
+            if not isinstance(descriptor, dict) or set(descriptor) != expected:
+                raise ValueError(f"rollback {slug} identity descriptor mismatch")
+            public_key = descriptor.get("public_key")
+            if not isinstance(public_key, str) or not HEX64.fullmatch(public_key):
+                raise ValueError(f"rollback {slug} public key mismatch")
+            if descriptor != {
+                "public_key": public_key,
+                "user": f"buzz-{slug}",
+                "home": f"/home/buzz-{slug}",
+                "credential_path": f"/etc/buzz-agents/credentials/{slug}.key",
+                "environment_path": f"/etc/buzz-agents/{slug}.env",
+                "prompt_path": f"/etc/buzz-agents/prompts/{slug}.md",
+                "acp_state_dir": ACP_STATE_DIRS[slug],
+                "systemd_unit": f"buzz-agent@{slug}.service",
+            }:
+                raise ValueError(f"rollback {slug} identity descriptor mismatch")
+        if identities["mempool"]["public_key"] == identities["genesis"]["public_key"]:
+            raise ValueError("rollback identity public keys are not unique")
         changed = receipt.get("changed_targets")
         previous = receipt.get("previous")
         installed = receipt.get("installed")
@@ -1893,18 +2060,33 @@ def rollback(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
             not isinstance(changed, list)
             or not isinstance(previous, dict)
             or not isinstance(installed, dict)
+            or len(changed) != len(set(changed))
             or set(changed) != set(previous)
             or set(changed) != set(installed)
         ):
             raise ValueError("backup receipt target set mismatch")
+        inventory = backup_inventory(previous, backup, root)
+        if receipt.get("backup_inventory") != inventory:
+            raise ValueError("backup receipt inventory mismatch")
         states: list[TargetState] = []
         for target_text in changed:
             if not isinstance(target_text, str) or not Path(target_text).is_absolute():
                 raise ValueError("invalid rollback target")
             destination = rooted(root, target_text)
             record = installed[target_text]
-            if not isinstance(record, dict):
+            if not isinstance(record, dict) or set(record) != {"sha256", "mode", "uid", "gid"}:
                 raise ValueError("invalid installed record")
+            if not isinstance(record.get("sha256"), str) or not HEX64.fullmatch(
+                str(record["sha256"])
+            ):
+                raise ValueError("invalid installed digest")
+            if (
+                not isinstance(record.get("uid"), int)
+                or isinstance(record.get("uid"), bool)
+                or not isinstance(record.get("gid"), int)
+                or isinstance(record.get("gid"), bool)
+            ):
+                raise ValueError("invalid installed ownership")
             target = Target(
                 target_text,
                 destination,
@@ -1936,6 +2118,8 @@ def rollback(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
         receipt["state"] = "rollback_started"
         write_receipt(receipt_path, receipt)
         restore_targets(states, previous, backup, root)
+        verify_restored_targets(states, previous)
+        receipt["rollback"] = rollback_record(states, previous, installed, inventory)
         receipt["state"] = "rolled_back"
         write_receipt(receipt_path, receipt)
         print(f"ROLLED_BACK backup_id={backup_id}")

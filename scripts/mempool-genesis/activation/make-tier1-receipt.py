@@ -34,6 +34,7 @@ TIER2_REVIEW = {
 TIER2_CANDIDATE_PATHS = ["bundle-manifest.json", "metadata/review-files.json"]
 MAX_TIER2_EVIDENCE_BYTES = 64 * 1024
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
 RESERVED_PUBKEYS = (
     "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d",
     "7806a7beb69ba4fd3b6e9b86d56931a446b62666e9794533f87fb2d1b956684f",
@@ -213,6 +214,31 @@ def validate_generator_sources(manifest: dict[str, object], repo_root: Path) -> 
         require_regular(path, mode)
         if sha256_file(path) != digest:
             raise ValueError(f"generator source changed after package creation: {relative}")
+        tree_line = subprocess.run(
+            ["git", "ls-tree", "HEAD", "--", relative],
+            cwd=repo_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
+        ).stdout.strip()
+        fields = tree_line.split(None, 3)
+        if len(fields) != 4 or fields[1] != "blob" or fields[3] != relative:
+            raise ValueError(f"generator source is absent from source tree: {relative}")
+        tree_mode = {"100644": 0o644, "100755": 0o755}.get(fields[0])
+        if tree_mode != mode:
+            raise ValueError(f"generator source mode is not bound to source tree: {relative}")
+        committed = subprocess.run(
+            ["git", "show", f"HEAD:{relative}"],
+            cwd=repo_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
+        ).stdout
+        if sha256_bytes(committed) != digest:
+            raise ValueError(f"generator source is not bound to source tree: {relative}")
 
 
 def git_value(repo_root: Path, *args: str) -> str:
@@ -332,9 +358,12 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         "schema",
         "bundle_id",
         "source_commit",
+        "source_tree",
         "source_branch",
         "generator_sources",
         "inputs",
+        "identities",
+        "acp_state_dirs",
         "input_status",
         "ready_for_parent_tier1",
         "installable",
@@ -377,6 +406,30 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         raise ValueError("package parent-readback readiness claim is invalid")
     if manifest.get("installable") is not False:
         raise ValueError("producer package must remain non-installable")
+
+    identities = manifest.get("identities")
+    state_dirs = manifest.get("acp_state_dirs")
+    expected_identities = {
+        slug: {
+            "public_key": inputs[slug],
+            "user": f"buzz-{slug}",
+            "home": f"/home/buzz-{slug}",
+            "credential_path": f"/etc/buzz-agents/credentials/{slug}.key",
+            "environment_path": f"/etc/buzz-agents/{slug}.env",
+            "prompt_path": f"/etc/buzz-agents/prompts/{slug}.md",
+            "acp_state_dir": f"/home/buzz-{slug}/.local/state/buzz-acp",
+            "systemd_unit": f"buzz-agent@{slug}.service",
+        }
+        for slug in ("mempool", "genesis")
+    }
+    expected_state_dirs = {
+        slug: f"/home/buzz-{slug}/.local/state/buzz-acp"
+        for slug in ("mempool", "genesis")
+    }
+    if identities != expected_identities:
+        raise ValueError("identity descriptor map mismatch")
+    if state_dirs != expected_state_dirs:
+        raise ValueError("ACP state directory map mismatch")
 
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
     if not isinstance(runtime_raw, list) or len(runtime_raw) != RUNTIME_TARGET_COUNT:
@@ -461,12 +514,22 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
         "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
         "policy": "/etc/buzz-agents/capability-parity-policy.json",
+        "receipt_binding": {
+            "status": "pending-live-capture",
+            "path": "metadata/capability-parity-receipt.json",
+            "sha256": None,
+            "required_before_activation": True,
+        },
     }:
         raise ValueError("capability parity contract mismatch")
     digest_input = {
         "schema": BUNDLE_SCHEMA,
         "bundle_id": BUNDLE_ID,
+        "source_commit": manifest["source_commit"],
+        "source_tree": manifest["source_tree"],
         "inputs": inputs,
+        "identities": identities,
+        "acp_state_dirs": state_dirs,
         "input_status": expected_status,
         "runtime_targets": sorted(runtime, key=lambda record: str(record["target"]).encode()),
         "ops_targets": ops,
@@ -484,8 +547,16 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         raise ValueError("package digest mismatch")
 
     validate_generator_sources(manifest, repo_root)
-    if manifest.get("source_commit") != git_value(repo_root, "rev-parse", "HEAD"):
+    source_commit = manifest.get("source_commit")
+    source_tree = manifest.get("source_tree")
+    if not isinstance(source_commit, str) or not HEX40.fullmatch(source_commit):
+        raise ValueError("package source commit is invalid")
+    if not isinstance(source_tree, str) or not HEX40.fullmatch(source_tree):
+        raise ValueError("package source tree is invalid")
+    if source_commit != git_value(repo_root, "rev-parse", "HEAD"):
         raise ValueError("package source commit is stale")
+    if source_tree != git_value(repo_root, "rev-parse", "HEAD^{tree}"):
+        raise ValueError("package source tree is stale")
     if manifest.get("source_branch") != git_value(repo_root, "branch", "--show-current"):
         raise ValueError("package source branch is stale")
     return manifest
@@ -746,12 +817,17 @@ def build_receipt(
             "path": str(bundle),
             "manifest_sha256": sha256_file(bundle / "bundle-manifest.json"),
             "bundle_id": manifest["bundle_id"],
+            "source_commit": manifest["source_commit"],
+            "source_tree": manifest["source_tree"],
             "package_digest": manifest["package_digest"],
             "input_status": manifest["input_status"],
             "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
             "review_files_sha256": manifest["review_files_record"]["sha256"],
             "tier2_review": manifest["tier2_review"],
             "tier2_engine_sha256": manifest["tier2_engine"]["sha256"],
+            "identities": manifest["identities"],
+            "acp_state_dirs": manifest["acp_state_dirs"],
+            "capability_parity": manifest["capability_parity"],
         },
         "tier2_bundle": tier2_bundle,
         "execution_bounds": {
