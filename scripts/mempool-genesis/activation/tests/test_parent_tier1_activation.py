@@ -210,6 +210,31 @@ class ParentTier1ActivationTests(unittest.TestCase):
                 ["stale live snapshot: /etc/example"],
             )
 
+    def test_changed_unreadable_target_must_still_match_the_package(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/home/victor/work") as temporary:
+            root = Path(temporary)
+            target = root / "etc/root-only"
+            target.parent.mkdir(parents=True)
+            target.write_text("expected")
+            target.chmod(0o440)
+            record = {
+                "target": "/etc/root-only",
+                "mode": "0440",
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+                "sha256": BRIDGE.sha256_file(target),
+            }
+            receipt = {"live_guard": {"after": {"/etc/root-only": {"exists": "unreadable"}}}}
+            manifest = {"runtime_targets": [record], "ops_targets": []}
+            self.assertEqual(BRIDGE.live_snapshot_blockers(receipt, root, manifest), [])
+            target.chmod(0o640)
+            target.write_text("changed")
+            target.chmod(0o440)
+            self.assertEqual(
+                BRIDGE.live_snapshot_blockers(receipt, root, manifest),
+                ["stale live snapshot: /etc/root-only"],
+            )
+
     def test_single_use_claim_survives_reuse_and_crash_after_claim(self) -> None:
         with tempfile.TemporaryDirectory(dir="/home/victor/work") as temporary:
             root = Path(temporary)
@@ -222,6 +247,30 @@ class ParentTier1ActivationTests(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     BRIDGE.create_claim(root, acceptance)
             self.assertTrue(claim.is_file(), "the crash/reuse claim must survive")
+
+    def test_consumed_acceptance_blocks_later_preflight(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/home/victor/work") as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            static = self.static_inputs()
+            acceptance = BRIDGE.Acceptance({}, "b" * 64, BRIDGE.RECEIPT.stat())
+            with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
+                BRIDGE.create_claim(root, acceptance)
+            with mock.patch.object(
+                BRIDGE, "validate_static_inputs", return_value=static
+            ), mock.patch.object(
+                BRIDGE, "validate_acceptance", return_value=acceptance
+            ), mock.patch.object(
+                BRIDGE, "package_targets", return_value=()
+            ), mock.patch.object(
+                BRIDGE, "ordered_targets", return_value=[]
+            ), mock.patch.object(
+                BRIDGE.INSTALLER, "service_blockers", return_value=[]
+            ), mock.patch.object(
+                BRIDGE.INSTALLER, "root_metadata", return_value=root.stat()
+            ):
+                checked = BRIDGE.preflight(root, enforce_live_snapshot=False)
+            self.assertIn("Tier 1 acceptance was already consumed", checked[3])
 
     def test_shared_identity_counts_closure_last_and_execstartpre(self) -> None:
         static = self.static_inputs()
