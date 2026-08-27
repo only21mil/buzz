@@ -410,6 +410,10 @@ class ActivationBundleTests(PackageFixture):
             self.assertEqual(
                 values["BUZZ_ACP_MCP_COMMAND"], "/usr/local/libexec/buzz/buzz-dev-mcp"
             )
+            self.assertEqual(
+                values["BUZZ_ACP_STATE_DIR"],
+                f"/home/buzz-{slug}/.local/state/buzz-acp",
+            )
             self.assertEqual(values["CODEX_PATH"], "/usr/local/libexec/buzz/codex")
             self.assertNotIn("PATH", values)
             env_path = bundle / f"install-root/etc/buzz-agents/{slug}.env"
@@ -447,6 +451,76 @@ class ActivationBundleTests(PackageFixture):
                 ).read_bytes()
                 + b"PATH=/home/buzz-genesis/.local/bin:/usr/bin\n",
                 "genesis",
+            )
+
+        expected = b"/home/buzz-genesis/.local/state/buzz-acp"
+        genesis_env = (ACTIVATION_DIR / "templates/genesis.env").read_bytes()
+        cases = {
+            "relative": b".buzz-acp/state",
+            "shared": b"/home/buzz-shared/.local/state/buzz-acp",
+            "wrong identity": b"/home/buzz-mempool/.local/state/buzz-acp",
+        }
+        for label, replacement in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ValueError, "wrong BUZZ_ACP_STATE_DIR"
+            ):
+                GENERATOR.validate_env(genesis_env.replace(expected, replacement), "genesis")
+
+        with self.assertRaisesRegex(ValueError, "invalid or duplicate env line"):
+            GENERATOR.validate_env(
+                genesis_env + b"BUZZ_ACP_STATE_DIR=/home/buzz-genesis/.local/state/buzz-acp\n",
+                "genesis",
+            )
+
+    def test_installer_revalidates_state_dir_before_building_closure(self) -> None:
+        targets = []
+        for slug in ("mempool", "genesis"):
+            source = self.root / f"installer-{slug}.env"
+            payload = f"BUZZ_ACP_STATE_DIR=/home/buzz-{slug}/.local/state/buzz-acp\n".encode()
+            write_file(source, payload, 0o600)
+            targets.append(
+                INSTALLER.Target(
+                    f"/etc/buzz-agents/{slug}.env",
+                    source,
+                    None,
+                    0o600,
+                    0,
+                    0,
+                    hashlib.sha256(payload).hexdigest(),
+                )
+            )
+        INSTALLER.validate_runtime_state_dirs(tuple(targets))
+
+        genesis = targets[1]
+        wrong = b"BUZZ_ACP_STATE_DIR=.buzz-acp/state\n"
+        write_file(genesis.source, wrong, 0o600)
+        with self.assertRaisesRegex(ValueError, "wrong BUZZ_ACP_STATE_DIR"):
+            INSTALLER.validate_runtime_state_dirs(tuple(targets))
+
+    def test_state_dir_override_survives_bridge_with_read_only_home(self) -> None:
+        write_file(
+            self.system_root / "usr/local/libexec/buzz/run-buzz-agent",
+            b"#!/usr/bin/env bash\nexec /usr/local/libexec/buzz/buzz-acp\n",
+            0o755,
+        )
+        bundle, _manifest = self.generate("state-dir-bridge")
+        service = (
+            bundle / "install-root/etc/systemd/system/buzz-agent@.service"
+        ).read_text()
+        bridge = (
+            bundle / "install-root/usr/local/libexec/buzz/run-buzz-agent"
+        ).read_text()
+
+        self.assertIn("ProtectHome=read-only\n", service)
+        self.assertIn(" /home/buzz-%i/.local/state ", service)
+        self.assertIn("exec /usr/local/libexec/buzz/buzz-acp\n", bridge)
+        self.assertNotIn("unset BUZZ_ACP_STATE_DIR", bridge)
+        for slug in ("mempool", "genesis"):
+            env = (bundle / f"install-root/etc/buzz-agents/{slug}.env").read_text()
+            values = dict(line.split("=", 1) for line in env.splitlines())
+            self.assertEqual(
+                values["BUZZ_ACP_STATE_DIR"],
+                f"/home/buzz-{slug}/.local/state/buzz-acp",
             )
 
     def test_instance_dropins_are_exact_and_fully_covered(self) -> None:
@@ -1380,6 +1454,17 @@ class ServiceGateTests(unittest.TestCase):
                 )
         self.assertIn('  "/run/buzz-agents-$slug"\n', verifier)
         self.assertIn('for state_path in "${state_paths[@]}"; do\n', verifier)
+        self.assertIn(
+            'expected_acp_state_dir="/home/$expected_user/.local/state/buzz-acp"\n',
+            verifier,
+        )
+        self.assertIn(
+            'test "$(grep -c \'^BUZZ_ACP_STATE_DIR=\' "$env_file")" = 1\n', verifier
+        )
+        self.assertIn(
+            'test "${BUZZ_ACP_STATE_DIR:?missing BUZZ_ACP_STATE_DIR}" = '
+            '"$expected_acp_state_dir"\n', verifier
+        )
 
     def test_identity_runtime_preflight_accepts_exact_metadata_access_and_tools(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:

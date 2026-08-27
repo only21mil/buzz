@@ -60,6 +60,10 @@ IDENTITY_STATE_MODES = {
         "/home/buzz-genesis/.tmp": 0o700,
     },
 }
+ACP_STATE_DIRS = {
+    slug: f"/home/buzz-{slug}/.local/state/buzz-acp"
+    for slug in ("mempool", "genesis")
+}
 ROOT_TOOL_PATHS = (
     "/usr/local/libexec/buzz/codex-acp",
     "/usr/local/libexec/buzz/codex",
@@ -695,6 +699,31 @@ def build_installed_closure(
     )
 
 
+def validate_runtime_state_dirs(runtime_targets: tuple[Target, ...]) -> None:
+    by_path = {target.target: target for target in runtime_targets}
+    for slug, expected in ACP_STATE_DIRS.items():
+        env_path = f"/etc/buzz-agents/{slug}.env"
+        target = by_path.get(env_path)
+        if target is None or target.source is None or target.payload is not None:
+            raise ValueError(f"{slug} runtime env target is absent")
+        values: dict[str, str] = {}
+        try:
+            lines = target.source.read_text().splitlines()
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{slug} runtime env is not UTF-8") from error
+        for line in lines:
+            key, separator, value = line.partition("=")
+            if not separator or key in values:
+                raise ValueError(f"invalid or duplicate runtime env line for {slug}: {line}")
+            values[key] = value
+        if values.get("BUZZ_ACP_STATE_DIR") != expected:
+            raise ValueError(f"{slug} runtime env has wrong BUZZ_ACP_STATE_DIR")
+        state_dir = Path(values["BUZZ_ACP_STATE_DIR"])
+        identity_home = Path(f"/home/buzz-{slug}")
+        if not state_dir.is_absolute() or identity_home not in state_dir.parents:
+            raise ValueError(f"{slug} runtime state directory escapes its identity home")
+
+
 def load_bundle(
     bundle: Path,
     receipt_path: Path,
@@ -734,6 +763,7 @@ def load_bundle(
         != TOTAL_PACKAGE_TARGET_COUNT
     ):
         raise ValueError("duplicate install target")
+    validate_runtime_state_dirs(runtime_targets)
     closure_payload = build_installed_closure(manifest, acceptance)
     closure_target = Target(
         CLOSURE_TARGET,

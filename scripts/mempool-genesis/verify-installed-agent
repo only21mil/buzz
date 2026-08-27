@@ -13,9 +13,12 @@ case "$slug" in
 esac
 
 closure=/etc/buzz-agents/review-closure.json
+env_file="/etc/buzz-agents/$slug.env"
+expected_user="buzz-$slug"
+expected_acp_state_dir="/home/$expected_user/.local/state/buzz-acp"
 credential="${CREDENTIALS_DIRECTORY:?missing CREDENTIALS_DIRECTORY}/buzz-private-key"
 expected_paths=(
-  "/etc/buzz-agents/$slug.env"
+  "$env_file"
   "/etc/buzz-agents/prompts/$slug.md"
   /etc/systemd/system/buzz-agent@.service
   "$expected_instance_dropin"
@@ -81,7 +84,10 @@ test "$(stat -c '%U:%G:%a' /etc/buzz-agents/prompts)" = root:root:755
 test "$(stat -c '%U:%G:%a' /etc/buzz-agents/credentials)" = root:root:700
 test "$(stat -c '%U:%G:%a' /usr/local/libexec/buzz)" = root:root:755
 
-test "$(stat -c '%a' "/etc/buzz-agents/$slug.env")" = 600
+test "$(stat -c '%a' "$env_file")" = 600
+test "$(grep -c '^BUZZ_ACP_STATE_DIR=' "$env_file")" = 1
+grep -Fxq "BUZZ_ACP_STATE_DIR=$expected_acp_state_dir" "$env_file"
+test "${BUZZ_ACP_STATE_DIR:?missing BUZZ_ACP_STATE_DIR}" = "$expected_acp_state_dir"
 test "$(stat -c '%a' "/etc/buzz-agents/prompts/$slug.md")" = 644
 test "$(stat -c '%a' /etc/systemd/system/buzz-agent@.service)" = 644
 test "$(stat -c '%a' "$expected_instance_dropin")" = 644
@@ -101,7 +107,6 @@ test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-acp)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-dev-mcp)" = 755
 test "$(stat -c '%a' /usr/lib/systemd/system/service.d/10-timeout-abort.conf)" = 644
 
-expected_user="buzz-$slug"
 state_paths=(
   "/home/$expected_user"
   "/home/$expected_user/.codex"

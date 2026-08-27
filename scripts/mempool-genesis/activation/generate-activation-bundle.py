@@ -63,6 +63,10 @@ PLACEHOLDERS = {
     "mempool": "DESKTOP_SAVE_REQUIRED_MEMPOOL_PUBKEY",
     "genesis": "DESKTOP_SAVE_REQUIRED_GENESIS_PUBKEY",
 }
+ACP_STATE_DIRS = {
+    slug: f"/home/buzz-{slug}/.local/state/buzz-acp"
+    for slug in ("mempool", "genesis")
+}
 
 
 @dataclass(frozen=True)
@@ -334,6 +338,7 @@ def validate_env(payload: bytes, slug: str) -> None:
     required = {
         "BUZZ_ACP_AGENT_COMMAND": CODEX_ACP_PATH,
         "BUZZ_ACP_MCP_COMMAND": "/usr/local/libexec/buzz/buzz-dev-mcp",
+        "BUZZ_ACP_STATE_DIR": ACP_STATE_DIRS[slug],
         "BUZZ_ACP_RESPOND_TO": "allowlist",
         "BUZZ_ACP_RESPOND_TO_ALLOWLIST": ALLOWLIST,
         "BUZZ_ACP_ALLOWED_RESPOND_TO": "allowlist",
