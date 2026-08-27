@@ -1357,6 +1357,10 @@ mod tests {
                     "type": "filter", "hook": "output", "prio": policy.priority(),
                     "policy": "accept"
                 }}),
+                json!({"counter": {
+                    "family": policy.family(), "table": policy.table(),
+                    "name": policy.counter(), "handle": 3, "packets": 0, "bytes": 0
+                }}),
             ];
             for tuple in policy.allowed_tcp_tuples() {
                 objects.push(json!({"rule": {
@@ -1365,6 +1369,7 @@ mod tests {
                         {"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": policy.principal_uid()}},
                         {"match": {"op": "==", "left": {"payload": {"protocol": if tuple.address.is_ipv4() { "ip" } else { "ip6" }, "field": "daddr"}}, "right": tuple.address.to_string()}},
                         {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": tuple.port}},
+                        {"counter": policy.counter()},
                         {"accept": null}
                     ]
                 }}));
@@ -1373,6 +1378,7 @@ mod tests {
                 "family": policy.family(), "table": policy.table(), "chain": policy.chain(),
                 "expr": [
                     {"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": policy.principal_uid()}},
+                    {"counter": policy.counter()},
                     {"drop": null}
                 ]
             }}));

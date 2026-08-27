@@ -1419,7 +1419,16 @@ mod tests {
                 read_only: true,
             }],
             allowed_environment: Vec::new(),
-            expected_execs: Vec::new(),
+            expected_execs: vec![buzz_ci_policy_proxy::ExecExpectation {
+                argv: vec!["true".into()],
+                environment: Vec::new(),
+                user: "65534:65534".into(),
+                working_dir: "/workspace".into(),
+                attach_stdin: false,
+                attach_stdout: false,
+                attach_stderr: false,
+                tty: false,
+            }],
         };
         (admission, lease, validated, manifest)
     }
@@ -1963,7 +1972,7 @@ mod tests {
             .admit(
                 buzz_ci_policy_proxy::DockerMethod::Post,
                 "/containers/container-1/exec",
-                br#"{"Cmd":["true"]}"#,
+                br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#,
             )
             .unwrap()
         else {
