@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import grp
 import hashlib
 import json
@@ -26,6 +27,7 @@ SIGNATURE_SCHEMA = "buzz-agent-capability-parity-signature-v1"
 BINDING_SCHEMA = "buzz-agent-activation-binding-v1"
 SIGNER_TARGET_NAME = "buzz-parity-owner-signer"
 VERIFIER_TARGET_NAME = "buzz-parity-owner-verifier"
+ROOT_VERIFIER_TARGET = "/usr/local/libexec/buzz/buzz-agent-key-handoff"
 CAPTURE_SCHEMA = "buzz-agent-capability-capture-spec-v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX_PREFIX = re.compile(r"^[0-9a-f]{12,16}$")
@@ -1205,6 +1207,146 @@ def manifest_bound_command_record(
     }
 
 
+def validate_persisted_ops_record(
+    record: object, manifest: dict[str, Any], target_name: str
+) -> None:
+    ops_targets = manifest.get("ops_targets")
+    if not isinstance(ops_targets, list):
+        raise ParityError("bundle manifest ops target inventory is absent")
+    matches = [
+        item for item in ops_targets
+        if isinstance(item, dict) and Path(str(item.get("target", ""))).name == target_name
+    ]
+    if len(matches) != 1:
+        raise ParityError(f"bundle manifest has no unique {target_name} ops target")
+    bound = exact_keys(
+        matches[0], {"target", "source", "mode", "uid", "gid", "sha256", "scope"},
+        f"bundle manifest {target_name}",
+    )
+    persisted = exact_keys(
+        record,
+        {
+            "argv_sha256", "executable", "executable_sha256", "mode", "uid", "gid",
+            "ops_record_sha256",
+        },
+        f"persisted {target_name}",
+    )
+    expected = {
+        "executable": bound["target"],
+        "executable_sha256": bound["sha256"],
+        "mode": bound["mode"],
+        "uid": bound["uid"],
+        "gid": bound["gid"],
+        "ops_record_sha256": digest(bound),
+    }
+    if not isinstance(persisted["argv_sha256"], str) or not HEX64.fullmatch(
+        persisted["argv_sha256"]
+    ):
+        raise ParityError(f"persisted {target_name} command digest is invalid")
+    if any(persisted[field] != value for field, value in expected.items()):
+        raise ParityError(f"persisted {target_name} is not manifest-bound")
+
+
+def open_sealed_runtime_verifier(
+    path: Path, manifest: dict[str, Any], root: Path = Path("/")
+) -> int:
+    expected_path = root / ROOT_VERIFIER_TARGET.lstrip("/")
+    if path != expected_path:
+        raise ParityError("root verifier path is not the reviewed runtime target")
+    runtime_targets = manifest.get("runtime_targets")
+    if not isinstance(runtime_targets, list):
+        raise ParityError("bundle manifest runtime target inventory is absent")
+    matches = [
+        item for item in runtime_targets
+        if isinstance(item, dict) and item.get("target") == ROOT_VERIFIER_TARGET
+    ]
+    if len(matches) != 1:
+        raise ParityError("bundle manifest has no unique root verifier runtime target")
+    bound = exact_keys(
+        matches[0], {"target", "source", "mode", "uid", "gid", "sha256"},
+        "bundle manifest root verifier",
+    )
+    if (
+        bound["mode"] != "0755"
+        or bound["uid"] != 0
+        or bound["gid"] != 0
+        or not isinstance(bound["sha256"], str)
+        or not HEX64.fullmatch(bound["sha256"])
+    ):
+        raise ParityError("root verifier manifest ownership, mode, or digest is unsafe")
+
+    source = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    sealed = -1
+    try:
+        metadata = os.fstat(source)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o755
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+        ):
+            raise ParityError("installed root verifier metadata is unsafe")
+        sealed = os.memfd_create(
+            "buzz-parity-runtime-verifier", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        )
+        observed = hashlib.sha256()
+        while chunk := os.read(source, 1024 * 1024):
+            observed.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(sealed, view)
+                if written <= 0:
+                    raise OSError("short write while freezing root verifier")
+                view = view[written:]
+        if observed.hexdigest() != bound["sha256"]:
+            raise ParityError("installed root verifier digest is not manifest-bound")
+        os.fchmod(sealed, 0o500)
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
+        fcntl.fcntl(sealed, fcntl.F_ADD_SEALS, seals)
+        if fcntl.fcntl(sealed, fcntl.F_GET_SEALS) & seals != seals:
+            raise ParityError("root verifier memfd is not fully sealed")
+        os.lseek(sealed, 0, os.SEEK_SET)
+        return sealed
+    except Exception:
+        if sealed >= 0:
+            os.close(sealed)
+        raise
+    finally:
+        os.close(source)
+
+
+def run_runtime_verifier(
+    path: Path, manifest: dict[str, Any], owner_pubkey: str, envelope: dict[str, Any],
+    root: Path = Path("/"),
+) -> None:
+    descriptor = open_sealed_runtime_verifier(path, manifest, root)
+    try:
+        completed = subprocess.run(
+            [
+                f"/proc/self/fd/{descriptor}",
+                "verify-parity-envelope",
+                "--owner-pubkey",
+                owner_pubkey,
+            ],
+            input=canonical_json(envelope),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            pass_fds=(descriptor,),
+        )
+        if completed.returncode != 0:
+            raise ParityError(
+                f"root-owned sealed parity verifier failed with exit {completed.returncode}"
+            )
+        if completed.stdout:
+            raise ParityError("root-owned sealed parity verifier emitted unexpected output")
+    finally:
+        os.close(descriptor)
+
+
 def activation_binding(bundle_manifest: dict[str, Any]) -> dict[str, object]:
     required = {
         "source_commit": re.compile(r"^[0-9a-f]{40}$"),
@@ -1285,7 +1427,8 @@ def seal_receipt(
 
 
 def verify_sealed_receipt(
-    envelope: dict[str, Any], policy: dict[str, Any], bundle_manifest: dict[str, Any]
+    envelope: dict[str, Any], policy: dict[str, Any], bundle_manifest: dict[str, Any],
+    runtime_verifier: Path, root: Path = Path("/"),
 ) -> dict[str, Any]:
     envelope = exact_keys(
         envelope,
@@ -1325,31 +1468,10 @@ def verify_sealed_receipt(
         or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", signature["signed_at"])
     ):
         raise ParityError("persisted signature binding mismatch")
-    ops_targets = bundle_manifest.get("ops_targets")
-    if not isinstance(ops_targets, list):
-        raise ParityError("bundle manifest ops target inventory is absent")
-    paths: dict[str, Path] = {}
     for label, target_name in (("signer", SIGNER_TARGET_NAME), ("verifier", VERIFIER_TARGET_NAME)):
-        targets = [
-            item for item in ops_targets
-            if isinstance(item, dict) and Path(str(item.get("target", ""))).name == target_name
-        ]
-        if len(targets) != 1:
-            raise ParityError(f"bundle manifest has no unique owner {label}")
-        path = Path(str(targets[0]["target"]))
-        observed = manifest_bound_command_record([str(path)], bundle_manifest, target_name)
-        recorded = envelope[label]
-        if not isinstance(recorded, dict):
-            raise ParityError(f"persisted {label} record is invalid")
-        for field in (
-            "executable", "executable_sha256", "mode", "uid", "gid", "ops_record_sha256"
-        ):
-            if recorded.get(field) != observed[field]:
-                raise ParityError(f"persisted {label} is not manifest-bound")
-        paths[label] = path
-    safe_command(
-        [str(paths["verifier"]), "--owner-pubkey", policy["owner_pubkey"]],
-        canonical_json(envelope),
+        validate_persisted_ops_record(envelope[label], bundle_manifest, target_name)
+    run_runtime_verifier(
+        runtime_verifier, bundle_manifest, policy["owner_pubkey"], envelope, root
     )
     return envelope
 
@@ -1393,6 +1515,7 @@ def main() -> None:
     verify.add_argument("--receipt", required=True)
     verify.add_argument("--policy", required=True)
     verify.add_argument("--bundle-manifest", required=True)
+    verify.add_argument("--runtime-verifier", required=True)
     args = parser.parse_args()
     policy = validate_policy(regular_json(Path(args.policy).resolve(strict=True), owner_only=False))
     if args.command == "verify-sealed":
@@ -1400,6 +1523,7 @@ def main() -> None:
             regular_json(Path(args.receipt).resolve(strict=True)),
             policy,
             regular_json(Path(args.bundle_manifest).resolve(strict=True)),
+            Path(args.runtime_verifier),
         )
         print(json.dumps({"status": "PASS", "sealed_sha256": result["sealed_sha256"]}, sort_keys=True))
         return

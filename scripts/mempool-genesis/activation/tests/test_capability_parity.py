@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -70,6 +71,16 @@ def ops_manifest(signer: Path, verifier: Path) -> dict[str, object]:
         "source_tree": "b" * 40,
         "package_digest": "c" * 64,
         "runtime_artifact_fingerprint": "d" * 64,
+        "runtime_targets": [
+            {
+                "target": PARITY.ROOT_VERIFIER_TARGET,
+                "source": "synthetic/root-verifier",
+                "mode": "0755",
+                "uid": 0,
+                "gid": 0,
+                "sha256": "e" * 64,
+            }
+        ],
         "ops_targets": records,
     }
 
@@ -553,7 +564,12 @@ class CapabilityParityTests(unittest.TestCase):
             sealed = PARITY.seal_receipt(
                 receipt, POLICY, [str(signer)], [str(verifier)], manifest
             )
-            verified = PARITY.verify_sealed_receipt(sealed, POLICY, manifest)
+            verifier.chmod(0o000)
+            with mock.patch.object(PARITY, "run_runtime_verifier") as runtime_verifier:
+                verified = PARITY.verify_sealed_receipt(
+                    sealed, POLICY, manifest, Path(PARITY.ROOT_VERIFIER_TARGET)
+                )
+            runtime_verifier.assert_called_once()
             self.assertEqual(
                 verified["receipt"]["activation_binding"],
                 PARITY.activation_binding(manifest),
@@ -574,7 +590,9 @@ class CapabilityParityTests(unittest.TestCase):
             rebound = copy.deepcopy(manifest)
             rebound["package_digest"] = "e" * 64
             with self.assertRaisesRegex(PARITY.ParityError, "source/package binding mismatch"):
-                PARITY.verify_sealed_receipt(sealed, POLICY, rebound)
+                PARITY.verify_sealed_receipt(
+                    sealed, POLICY, rebound, Path(PARITY.ROOT_VERIFIER_TARGET)
+                )
         self.assertTrue(sealed["verified"])
         self.assertRegex(sealed["sealed_sha256"], r"^[0-9a-f]{64}$")
         tampered = copy.deepcopy(receipt)
@@ -618,6 +636,7 @@ class CapabilityParityTests(unittest.TestCase):
             verifier.write_bytes((REPO_ROOT / "target/release/buzz-parity-owner-verifier").read_bytes())
             signer.chmod(0o700)
             verifier.chmod(0o700)
+            tool_manifest = ops_manifest(signer, verifier)
             sealed = PARITY.seal_receipt(
                 receipt,
                 policy,
@@ -627,8 +646,34 @@ class CapabilityParityTests(unittest.TestCase):
                     "--signed-at", "2026-08-27T00:00:00Z",
                 ],
                 [str(verifier), "--owner-pubkey", synthetic_owner],
-                ops_manifest(signer, verifier),
+                tool_manifest,
             )
+            runtime_root = root / "runtime-root"
+            runtime_verifier = runtime_root / PARITY.ROOT_VERIFIER_TARGET.lstrip("/")
+            runtime_verifier.parent.mkdir(parents=True)
+            runtime_verifier.write_bytes(
+                (REPO_ROOT / "target/release/buzz-agent-key-handoff").read_bytes()
+            )
+            runtime_verifier.chmod(0o755)
+            runtime_sha256, _runtime_metadata = PARITY.regular_sha256(runtime_verifier)
+            tool_manifest["runtime_targets"][0]["sha256"] = runtime_sha256
+            real_fstat = PARITY.os.fstat
+
+            def root_owned_fstat(descriptor):
+                observed = real_fstat(descriptor)
+                fields = list(observed)
+                fields[4] = 0
+                fields[5] = 0
+                return os.stat_result(fields)
+
+            with mock.patch.object(PARITY.os, "fstat", side_effect=root_owned_fstat):
+                PARITY.run_runtime_verifier(
+                    runtime_verifier,
+                    tool_manifest,
+                    synthetic_owner,
+                    sealed,
+                    runtime_root,
+                )
             PARITY.safe_command(
                 [str(verifier), "--owner-pubkey", synthetic_owner],
                 PARITY.canonical_json(sealed),

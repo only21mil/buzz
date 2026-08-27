@@ -371,6 +371,10 @@ def load_inputs(path: Path, allow_placeholders: bool) -> tuple[dict[str, str], b
 def validate_env(payload: bytes, slug: str) -> None:
     values: dict[str, str] = {}
     for line in payload.decode().splitlines():
+        if line[:1].isspace():
+            raise ValueError(
+                f"systemd-equivalent leading whitespace is forbidden for {slug}: {line}"
+            )
         key, separator, value = line.partition("=")
         if not separator or key in values:
             raise ValueError(f"invalid or duplicate env line for {slug}: {line}")
@@ -455,6 +459,7 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
         repo_root / "crates/buzz-agent-key-handoff/Cargo.toml",
         repo_root / "crates/buzz-agent-key-handoff/src/lib.rs",
         repo_root / "crates/buzz-agent-key-handoff/src/parity_signature.rs",
+        repo_root / "crates/buzz-agent-key-handoff/src/bin/buzz-agent-key-handoff.rs",
         repo_root / "crates/buzz-agent-key-handoff/src/bin/buzz-parity-owner-signer.rs",
         repo_root / "crates/buzz-agent-key-handoff/src/bin/buzz-parity-owner-verifier.rs",
         repo_root / "crates/buzz-agent-key-handoff/tests/parity_signature_cli.rs",

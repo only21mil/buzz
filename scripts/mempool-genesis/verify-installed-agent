@@ -8,7 +8,17 @@ require_exact_env_value() {
   local key="$2"
   local expected="$3"
   local count
-  count="$(awk -F= -v key="$key" '$1 == key { count += 1 } END { print count + 0 }' "$env_path")"
+  count="$(awk -v key="$key" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      separator = index(line, "=")
+      if (separator > 0 && substr(line, 1, separator - 1) == key) {
+        count += 1
+      }
+    }
+    END { print count + 0 }
+  ' "$env_path")"
   test "$count" = 1
   grep -Fxq "$key=$expected" "$env_path"
 }
@@ -139,7 +149,8 @@ done
 /usr/local/libexec/buzz/verify-agent-capability-parity verify-sealed \
   --receipt "$parity_receipt" \
   --policy /etc/buzz-agents/capability-parity-policy.json \
-  --bundle-manifest "$activation_manifest" >/dev/null
+  --bundle-manifest "$activation_manifest" \
+  --runtime-verifier /usr/local/libexec/buzz/buzz-agent-key-handoff >/dev/null
 
 test "$(stat -c '%a' "$env_file")" = 600
 test "$(stat -c '%a' "/etc/buzz-agents/prompts/$slug.md")" = 644

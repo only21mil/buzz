@@ -2,10 +2,13 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::{bail, Context, Result};
-use buzz_agent_key_handoff::{harden_process, parse_public_key_hex, Slug};
+use buzz_agent_key_handoff::{
+    harden_process, parity_signature, parse_public_key_hex, require_anonymous_pipe, Slug,
+};
 use rustix::pipe::{pipe_with, PipeFlags};
 use rustix::process::getuid;
 use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::process::{Child, Command, Stdio};
 
 const EXPORTER: &str = "/usr/local/libexec/buzz/export-managed-agent-key";
@@ -35,6 +38,19 @@ fn parse_args() -> Result<(Slug, String)> {
     Ok((Slug::parse(&args[1])?, parse_public_key_hex(&args[3])?))
 }
 
+fn verify_parity_envelope(args: &[String]) -> Result<()> {
+    if args.len() != 2 || args[0] != "--owner-pubkey" {
+        bail!("usage: buzz-agent-key-handoff verify-parity-envelope --owner-pubkey HEX");
+    }
+    let owner_pubkey = parse_public_key_hex(&args[1])?;
+    require_anonymous_pipe(io::stdin().as_fd())?;
+    let mut envelope = Vec::new();
+    io::stdin()
+        .take(512 * 1024 + 1)
+        .read_to_end(&mut envelope)?;
+    parity_signature::verify_envelope(&envelope, &owner_pubkey)
+}
+
 fn after_receiver_ready<R: Read, T>(
     readiness: &mut R,
     start_exporter: impl FnOnce() -> Result<T>,
@@ -51,6 +67,10 @@ fn after_receiver_ready<R: Read, T>(
 
 fn main() -> Result<()> {
     harden_process()?;
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("verify-parity-envelope") {
+        return verify_parity_envelope(&arguments[1..]);
+    }
     let (slug, pubkey) = parse_args()?;
     let (secret_read, secret_write) =
         pipe_with(PipeFlags::CLOEXEC).context("create secret pipe")?;

@@ -411,7 +411,7 @@ def expected_tier2_bundle(
         ),
         "paths": candidate_paths,
         "invariants": [
-            "The review binds the exact package manifest and 22 review-file paths per agent, covering 24 distinct installed paths.",
+            "The review binds the exact package manifest and 22 review-file paths per agent, covering 25 distinct installed paths.",
             "The package and review state remain owner-only and credential-free.",
             "The parent Tier 1 receipt is deterministic evidence only and grants no install authority.",
             "Mempool and Genesis stay stopped and disabled through review and install preflight.",

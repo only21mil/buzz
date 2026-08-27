@@ -245,7 +245,13 @@ def prepare(
     manifest_bound_runtime_tool(manifest, parity_tool, root)
     parity = load_parity_module(parity_tool)
     try:
-        parity.verify_sealed_receipt(receipt, parity.validate_policy(policy), manifest)
+        parity.verify_sealed_receipt(
+            receipt,
+            parity.validate_policy(policy),
+            manifest,
+            rooted(root, parity.ROOT_VERIFIER_TARGET),
+            root,
+        )
         binding = parity.activation_binding(manifest)
     except parity.ParityError as error:
         raise TransactionError(f"sealed parity gate failed: {error}") from error

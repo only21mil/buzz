@@ -630,6 +630,14 @@ class ActivationBundleTests(PackageFixture):
                 genesis_env + b"BUZZ_ACP_STATE_DIR=/home/buzz-genesis/.local/state/buzz-acp\n",
                 "genesis",
             )
+        for prefix in (b" ", b"\t"):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(
+                ValueError, "systemd-equivalent leading whitespace"
+            ):
+                GENERATOR.validate_env(
+                    genesis_env + prefix + b"BUZZ_ACP_RESPOND_TO=everyone\n",
+                    "genesis",
+                )
 
     def test_prestart_response_contract_matches_both_envs_and_rejects_drift(self) -> None:
         verifier = REPO_ROOT / "scripts/mempool-genesis/verify-installed-agent"
@@ -674,10 +682,13 @@ class ActivationBundleTests(PackageFixture):
                     b"",
                     1,
                 ),
-                "duplicate allowlist": payload
-                + b"BUZZ_ACP_RESPOND_TO_ALLOWLIST="
-                + expected_owner
-                + b"\n",
+                "duplicate allowlist": (
+                    payload + b"BUZZ_ACP_RESPOND_TO_ALLOWLIST=" + expected_owner + b"\n"
+                ),
+                "space-prefixed duplicate respond-to": payload
+                + b" BUZZ_ACP_RESPOND_TO=everyone\n",
+                "tab-prefixed duplicate allowed-respond-to": payload
+                + b"\tBUZZ_ACP_ALLOWED_RESPOND_TO=everyone\n",
             }
             for label, drifted_payload in drift_cases.items():
                 with self.subTest(slug=slug, drift=label):
@@ -910,7 +921,7 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(
             evidence["invariants"][0],
             "The review binds the exact package manifest and 22 review-file paths per agent, "
-            "covering 24 distinct installed paths.",
+            "covering 25 distinct installed paths.",
         )
         self.assertNotIn("21-path", json.dumps(evidence))
         self.assertEqual(receipt["tier2_bundle"]["path"], str(evidence_path))
@@ -2216,8 +2227,9 @@ class ActivationTransactionTests(unittest.TestCase):
     def prepare(self) -> None:
         parity = SimpleNamespace(
             ParityError=ValueError,
+            ROOT_VERIFIER_TARGET="/usr/local/libexec/buzz/buzz-agent-key-handoff",
             validate_policy=lambda value: value,
-            verify_sealed_receipt=lambda receipt, policy, manifest: receipt,
+            verify_sealed_receipt=lambda receipt, policy, manifest, verifier, root: receipt,
             activation_binding=lambda manifest: self.binding,
         )
         with mock.patch.object(

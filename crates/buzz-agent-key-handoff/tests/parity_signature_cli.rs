@@ -87,7 +87,18 @@ fn signer_and_verifier_are_deterministic_and_fail_closed() {
             &serde_json::to_vec(value).unwrap(),
         )
     };
+    let verify_root_owned = |value: &Value, owner: &str| {
+        pipe_command(
+            Command::new(env!("CARGO_BIN_EXE_buzz-agent-key-handoff")).args([
+                "verify-parity-envelope",
+                "--owner-pubkey",
+                owner,
+            ]),
+            &serde_json::to_vec(value).unwrap(),
+        )
+    };
     assert!(verify(&envelope, PK1).status.success());
+    assert!(verify_root_owned(&envelope, PK1).status.success());
 
     let mut persisted = envelope.clone();
     persisted["verified"] = Value::Bool(true);
@@ -96,11 +107,14 @@ fn signer_and_verifier_are_deterministic_and_fail_closed() {
     persisted["sealed_sha256"] =
         Value::String(hex::encode(Sha256::digest(persisted_canonical)));
     assert!(verify(&persisted, PK1).status.success());
+    assert!(verify_root_owned(&persisted, PK1).status.success());
 
     let mut tampered = envelope.clone();
     tampered["receipt"]["status"] = Value::String("BLOCKED".to_owned());
     assert!(!verify(&tampered, PK1).status.success());
+    assert!(!verify_root_owned(&tampered, PK1).status.success());
     assert!(!verify(&envelope, PK2).status.success());
+    assert!(!verify_root_owned(&envelope, PK2).status.success());
     let mut sealed_tamper = persisted;
     sealed_tamper["verified"] = Value::Bool(false);
     assert!(!verify(&sealed_tamper, PK1).status.success());
