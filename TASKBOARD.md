@@ -1,10 +1,10 @@
 # Buzz CI migration task board
 
-Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `2026-08-27T13:08:59Z`.
+Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `2026-08-27T15:09:59Z`.
 
 ## Routing state
 
-`FROZEN_OWNER_STOP`. The migration remains frozen except for the scoped repository-delivery actions and active web-app parity assignment recorded below. Merge, install, deployment, activation, service, and canon gates remain closed.
+`FROZEN_OWNER_STOP`. The migration remains frozen except for scoped repository delivery, standing CI repair and rerun authority, active web-app parity, completed reviewed Tier 2 fleet install, inventory-only roster planning, and the tracked Simplelift overlap remediation wave below. The program has no plan-level 90-minute stop; authorized work continues until done. Merge, additional install, roster mutation, deployment, activation, service, and canon gates remain closed unless their separate authority is recorded.
 
 | Truth | Value | Evidence |
 |---|---|---|
@@ -56,13 +56,99 @@ These candidates are frozen and locally checked. No downstream authority is impl
 | GitHub mirror ref | `MIRRORED` | [sats/bci-p1-cumulative-successor-20260827](https://github.com/only21mil/buzz/tree/sats/bci-p1-cumulative-successor-20260827) at `d7677e177b9e3732bf92962e00b5d7ba161ce03c` |
 | Buzz issue | `OPEN` | `buzz://issue?id=d3276e465093a35318ffda37f06346caa1ecf5412509ba2d5d33d9e7402648e2&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz` |
 | Buzz PR | `DRAFT` | `buzz://pr?id=5e556209c04dd6bb6d9704a7f009710507290f7b66998e05f7fdf832aa3c6569&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz` |
-| GitHub PR #107 | `DRAFT / RUNNING` | [PR #107](https://github.com/only21mil/buzz/pull/107) at `d7677e177b9e3732bf92962e00b5d7ba161ce03c` |
+| GitHub PR #107 | `DRAFT / PR_CHECKS_COMPLETE` | [PR #107](https://github.com/only21mil/buzz/pull/107) at `d7677e177b9e3732bf92962e00b5d7ba161ce03c` |
+| Web relay feature ref | `PUBLISHED` | `https://framework-desktop.tail69757d.ts.net:38443/git/73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812/buzz#refs/heads/sats/web-app-parity-20260827` at `e627ff05edc57990982687669e3e47326857d1ab` |
+| Web GitHub mirror ref | `MIRRORED` | [sats/web-app-parity-20260827](https://github.com/only21mil/buzz/tree/sats/web-app-parity-20260827) at `e627ff05edc57990982687669e3e47326857d1ab` |
+| Web Buzz PR | `DRAFT` | `buzz://pr?id=3937c0aba0fddd58e954408e0e4eb8f74b9067de6d905e9b136adc085caf007f&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz` |
+| GitHub PR #108 | `DRAFT / PR_CHECKS_COMPLETE` | [PR #108](https://github.com/only21mil/buzz/pull/108) at `e627ff05edc57990982687669e3e47326857d1ab` on base `d7677e177b9e3732bf92962e00b5d7ba161ce03c` |
+
+## Active roster migration inventory
+
+`ACTIVE` inventory. Live changes are `NOT_APPLIED`.
+
+| Current label | Planned label | Planned model/profile |
+|---|---|---|
+| `DSV4F` | `Knots` | `qwen/qwen3.8-flash` |
+| `GSV4F.2` | `Segwit` | `z-ai/glm-5.3-flash` |
+| `GLM5.2` | `Ledger` | `z-ai/glm-5.3-flash` |
+| `Codex-2` | `UTXO` | `preserve current model and reasoning` |
+| `Sat Hermes` | `REMOVE` | tombstone plus service, configuration, and membership cleanup; rollback receipt required |
+
+## Tier 2 fleet installation
+
+| Receipt | Value |
+|---|---|
+| Reviewed commit | `4efbf03a5220b40984e339d88b649220bd235cd7` |
+| Reviewed tree | `4e1a8d5859ad353225fa05f218b2f0d1950c56e9` |
+| State / lineage | `c9555d146e210724ce5992722d243888` / `d98c842a7c14bf75d942251873cc8149` |
+| Verdict / commit check | `PASS_WITH_RISKS` / `OK` |
+| Fleet install | `7` byte/mode/owner-identical paths on Framework and Yoga |
+| Live canaries | `5/5 PASS` |
+| C1 reopen | `COMPLETE` |
+
+## C1 recovery review
+
+| Receipt | Value |
+|---|---|
+| Source candidate | `c9229b6e7202c22ea5bd4f99161aedef5bc68f1f` |
+| Reviewed correction | `5ac44f9ff2d16d61f562e4de16f012ae0be9fd47` / tree `58630357d1fc0040b42d9e849b2f1bd2d43932a6` |
+| Reviewer / verdict | `claude:6502c19de9be662396c3b1cf46858d6e` / `PASS` |
+| Findings | `0` |
+| Exact commit check | `OK` at `5ac44f9ff2d16d61f562e4de16f012ae0be9fd47` |
+| Closure state | `COMPLETE` |
+
+The earlier correction `afe030a4b66b21bb8d3458acc32c29228316a733` remains recorded as a superseded `PASS_WITH_RISKS` attempt whose exact commit check failed the sole-parent requirement.
+
+## Standing CI authorization
+
+`ACTIVE` for GitHub Actions CI and Buzz-native CI across the current Buzz plan. On failure, agents may diagnose, fix, record each new exact SHA and result, and rerun until green; there is no CI attempt limit.
+
+This authority does not change Tier 2 independent-review transport retry law or grant merge, deployment, activation, credential, signing, service, or destructive authority.
+
+## Program timing authorization
+
+`ACTIVE`. The plan-level 90-minute stop is `REMOVED`; authorized work, CI fixes and reruns, audits, and delivery continue until `DONE`.
+
+Each individual Tier 2 state still obeys the installed controller deadline and freshness invariant. An expired state is rerun as a fresh exact-candidate state and stale acceptance is forbidden.
+
+## Simplelift overlap remediation
+
+`ACTIVE / PLANNING_AND_TRACKING_ONLY`. Simplelift is the app and repository; Framework is the host. This wave made no source or live mutation.
+
+| Audit fact | Current truth |
+|---|---|
+| Simplelift checkout | `/home/victor/projects`; main `CLEAN` |
+| Simplelift dev / PR #24 | `bbae6a383727325e83b7480e7c8cbb323de2be20`; `CLOSED / NOT_MERGED / BRANCH_PRESERVED` |
+| Overlap | `101` Buzz files plus LUKS header, rescue bundle, and broken budget gitlink |
+| Live dependency | `9` Buzz seats and desktop launcher depend on the checkout |
+| Roster commits | `WRONG_REPOSITORY / UNPUBLISHED` |
+| Buzz draft PRs | `#107 CLEAN / #108 CLEAN` |
+| Desktop / sweep / directory | `STALE_PIN / FAILED_UNBOUND / FAILED_UNBOUND` |
+| Deploy checkouts | `DUPLICATE_AND_DIRTY`; canonical selection not started |
+| Cross-scope prompts | Archimedes owner lane required |
+
+### Ordered remediation actions
+
+| Order | State | Action |
+|---|---|---|
+| `1` | `COMPLETE` | Close Simplelift PR 24 without merge and initially preserve its branch |
+| `2` | `NOT_STARTED` | Finish reviewed Buzz-owned stable install roots and receipt-bound systemd and desktop cutover |
+| `3` | `NOT_STARTED` | Complete all active in-scope prompts |
+| `4` | `NOT_STARTED` | Execute roster model and Sat Hermes cutover with rollback receipts |
+| `5` | `NOT_STARTED` | Correct MGACT policy and helper behavior |
+| `6` | `NOT_STARTED` | Fix the sweep and directory sync with exact binding |
+| `7` | `NOT_STARTED` | Move desktop to the current reviewed pin |
+| `8` | `NOT_STARTED` | Select one canonical deploy checkout |
+| `9` | `NOT_STARTED` | Preserve legitimate Simplelift dev history through 40985fbe5adb3a1aad08ca3223c744b47b8f425e |
+| `10` | `NOT_STARTED` | Relocate private recovery material and complete history and security handling |
+| `11` | `NOT_STARTED` | Remove contaminated refs and local branches only after readback |
+| `12` | `NOT_STARTED` | Add a Simplelift repository-root CI guard |
 
 ## Active workstreams
 
 | Stable work ID | Owner | Profile | State | Candidate |
 |---|---|---|---|---|
-| `BCI-WEB-PARITY-01` | `/root/web_app_parity` | `gpt-5.6-sol · high` | `INTEGRATING` | `UNKNOWN` |
+| `BCI-WEB-PARITY-01` | `/root/web_app_parity` | `gpt-5.6-sol · high` | `READY_FOR_CI` | `e627ff05edc57990982687669e3e47326857d1ab` |
 
 ## Current candidates
 
@@ -88,15 +174,16 @@ Every row is non-routable while the owner stop remains in force.
 | `BCI-P1-HARD-C4` | Runner integration and promotion | `FROZEN` | `0ace191c25e4b5680779f95965910712eee1dec1` | `88734811828458a10752c9179724cd2e0542aee1` | `UNKNOWN` | Current-schema helper repair; exact-head CI; fresh review; exact promotion |
 | `BCI-P1-HARD-C5` | Production ready proof | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | CONTRADICTED candidate evidence: 81fc41a97790b3dcd31799f8cdbde4996070cc1b, 7d657e9c9850321c250c268d40c095662966baff, e13354dcf735a3204743f2347d06a1e414a4bae6; Candidate identity contradiction requires owner reconciliation; explicit no-push override; dependency integration |
 | `BCI-P1-HARD-C6` | Shared workflow schema | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | CONTRADICTED candidate evidence: 0a6d9541ba3aee1771442b93c7ef57e64fa0135f, 0e5b6ece65d416fde64c14acdd0750c66ce16148; Candidate identity contradiction; current authorized review closure absent; integration and exact-head CI required |
-| `BCI-REVIEW-ENGINE-01` | Portable 5400-second Tier 2 engine | `FROZEN` | `e7023d766b09edca854130c810d2e000a3396174` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; reviewed installation receipt; matching Framework and Yoga hashes |
-| `BCI-REVIEW-C1-RECOVERY-01` | C1 exhausted-transport recovery tool | `FROZEN` | `c9229b6e7202c22ea5bd4f99161aedef5bc68f1f` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; reviewed tool installation; exact legacy-state recovery receipt |
+| `BCI-REVIEW-ENGINE-01` | Portable 5400-second Tier 2 engine | `REVIEW_CLOSED` | `e7023d766b09edca854130c810d2e000a3396174` | `4efbf03a5220b40984e339d88b649220bd235cd7` | `REVIEW_CLOSED` | Cumulative and web candidates need their own exact-head Tier 2 reviews |
+| `BCI-REVIEW-C1-RECOVERY-01` | C1 exhausted-transport recovery tool | `REVIEW_CLOSED` | `c9229b6e7202c22ea5bd4f99161aedef5bc68f1f` | `5ac44f9ff2d16d61f562e4de16f012ae0be9fd47` | `REVIEW_CLOSED` | None recorded |
 | `BCI-GOV-LANDING-FACADE-01` | Current-schema landing facade | `FROZEN` | `be50713557bdedb7fce94967116c6ef054e500b2` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; helper ownership decision; host installation and exact-head use |
 | `BCI-BUZZ-CUMULATIVE-01` | Cumulative Buzz integration | `FROZEN` | `d7677e177b9e3732bf92962e00b5d7ba161ce03c` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; exact-head CI authority; push and PR authority; merge authority; production configuration and host acceptance |
 | `BCI-ECONOMICS-01` | CI economics rebase | `FROZEN` | `99dc03cd123708d9bcd6468f595a15a30a9b1fdf` | `UNKNOWN` | `UNKNOWN` | Exact-head CI; current review and promotion receipt |
 | `BCI-BUDGET-R3-01` | MasonsBudget native CI promotion | `FROZEN` | `ca670fde8399eadb21e3aa9e1a385e0a8b776f4a` | `UNKNOWN` | `UNKNOWN` | MasonsBudget authority; nine CI contexts; fresh review |
 | `BCI-PARITY-01` | Native CI parity promotion | `FROZEN` | `02f24e7af165a414cb2fb09821ed44b5fe6760bf` | `UNKNOWN` | `UNKNOWN` | PR and CI; source landing only; no activation authority |
 | `BCI-MGACT-01` | Mempool and Genesis repair integration | `FROZEN` | `92b1639b99cc2ea5d1c35c569a44fe8c964f528a` | `UNKNOWN` | `NOT_STARTED` | Inactive and uninstalled; Tier 2 review approval; real-host preflight; credentials and signing approval; fresh package and v3 receipt; install and activation authority; live parity |
-| `BCI-WEB-PARITY-01` | Browser and web-app native parity | `INTEGRATING` | `UNKNOWN` | `UNKNOWN` | `NOT_STARTED` | Exact candidate evidence not yet received; tests and deployment evidence pending; do not mark complete |
+| `BCI-WEB-PARITY-01` | Browser and web-app native parity | `READY_FOR_CI` | `e627ff05edc57990982687669e3e47326857d1ab` | `UNKNOWN` | `NOT_STARTED` | Exact-head CI running; Tier 2 not started; installed browser and live relay checks pending; physical device and full accessibility review pending; packaging and deployment pending; do not mark complete |
+| `BCI-ROSTER-MIGRATION-01` | Authorized roster rename and retirement inventory | `FROZEN` | `UNKNOWN` | `UNKNOWN` | `NOT_STARTED` | Inventory active but live changes not applied; exact pre-change inventory pending; service and membership mutation receipts pending; rollback receipt required |
 
 ## Evidence precedence
 

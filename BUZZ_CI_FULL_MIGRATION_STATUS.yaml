@@ -1,13 +1,13 @@
 schema_version: 1
 metadata:
   title: Buzz CI full migration status
-  observed_at: '2026-08-27T13:08:59Z'
+  observed_at: '2026-08-27T15:09:59Z'
   controller: Sats Codex parent lane
   global_state: FROZEN_OWNER_STOP
   stop:
     owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
     thread_event: 76c91baf9383c1693d62701652cd4f61f786946615bb012e9b7a5aec68885d93
-    effect: The migration remains frozen except for the scoped repository-delivery actions and active web-app parity assignment recorded below. Merge, install, deployment, activation, service, and canon gates remain closed.
+    effect: The migration remains frozen except for scoped repository delivery, standing CI repair and rerun authority, active web-app parity, completed reviewed Tier 2 fleet install, inventory-only roster planning, and the tracked Simplelift overlap remediation wave below. The program has no plan-level 90-minute stop; authorized work continues until done. Merge, additional install, roster mutation, deployment, activation, service, and canon gates remain closed unless their separate authority is recorded.
 
 evidence_precedence:
   - tier: 1
@@ -55,7 +55,7 @@ authoritative_truth:
 
 execution_checkpoint:
   date: '2026-08-27'
-  observed_at: '2026-08-27T13:08:59Z'
+  observed_at: '2026-08-27T15:09:59Z'
   scope: SOURCE_ONLY
   evidence_ref: controller final reconciliation handoff for buzz_exec_core
   source_candidates:
@@ -92,14 +92,12 @@ execution_checkpoint:
     mgact_activation: {state: NOT_STARTED, approval_required: true}
     live_parity: {state: NOT_STARTED, approval_required: true}
   remaining_host_contracts:
-    - Reviewed engine installation receipts and matching Framework and Yoga hashes
-    - Exact C1 legacy-state binding, preserved lineage and reviewer, and audited recovery receipt
     - Current-schema landing helper ownership and host installation path
     - Cumulative Buzz production configuration, closed host backends, and exact-head acceptance inputs
     - MGACT real-host preflight, Codex-R parity manifest, distinct identities, credential handoff, v3 rollback receipt, and live channel policy
 
 repository_delivery:
-  observed_at: '2026-08-27T13:08:59Z'
+  observed_at: '2026-08-27T15:09:59Z'
   source_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
   base_sha: 148cad107f22f0b73aab23e559406beafaf57e64
   branch: sats/bci-p1-cumulative-successor-20260827
@@ -123,6 +121,11 @@ repository_delivery:
     status: DRAFT
     event_id: 5e556209c04dd6bb6d9704a7f009710507290f7b66998e05f7fdf832aa3c6569
     draft_status_event_id: bac8c4c943bbd7b82cfc9e32fa140e40c190839210850818d4264aaddc283a40
+    checklist_update_event_id: ebcfdcf56fc0761a6a6f690b9d1af0cf1d07df8cd00938bc5a83af959d9505fe
+    tier2_install_update_event_id: 491086e6ff20391071df66de61b18eadfec42e50705a26c109493410fa6aeaf9
+    c1_review_update_event_id: fa8207d7f1338244c3d4cd2de642496cae67c852a826ceb78066be5c1e4309fa
+    ci_auth_c1_closure_update_event_id: d01f537c60f832b3bca818919aa2d0331b636c4fd245106f89639d9b3945e76d
+    simplelift_remediation_update_event_id: 874dfdaec8b528ee49330d758ff9ab3825095b33af7e82b7a3ae0c5b523892f8
     external_id: buzz-recovery-native-ci-cumulative-d7677e177b9e
     url: buzz://pr?id=5e556209c04dd6bb6d9704a7f009710507290f7b66998e05f7fdf832aa3c6569&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz
   github_pr:
@@ -134,15 +137,261 @@ repository_delivery:
     head_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
     base_ref: main
     base_sha: 148cad107f22f0b73aab23e559406beafaf57e64
-    ci_state: RUNNING
-    check_snapshot: {total: 24, success: 8, skipped: 4, pending: 12, failed: 0}
+    ci_state: PR_CHECKS_COMPLETE
+    ci_observed_at: '2026-08-27T13:37:31Z'
+    check_snapshot: {total: 30, success: 26, skipped: 4, pending: 0, failed: 0}
   required_workflows:
     lifecycle_rule: Full exact-head matrix at the landing SHA plus Tier 2 at the same frozen SHA
     ci_workflow: .github/workflows/ci.yml
     ci_jobs: [changes, rust-lint, unit-tests, desktop-core, desktop-smoke-e2e, desktop, desktop-e2e-relay, desktop-e2e-integration-shard, desktop-e2e-integration, backend-integration, relay-e2e, web, mobile, security, dead-token-guard, server-cross-compile, desktop-build-macos]
     applicable_pr_workflows: [.github/workflows/auto-tag-on-release-pr-merge.yml, .github/workflows/benchmark-harbor.yml, .github/workflows/ci.yml, .github/workflows/desktop-release-candidate.yml, .github/workflows/docker-pr.yml, .github/workflows/helm-chart.yml, .github/workflows/mesh-lifecycle.yml, .github/workflows/push-gateway-helm-chart.yml, .github/workflows/sprig-image.yml]
     github_main_protection: UNPROTECTED
-  missing_gates: [Full exact-head CI closure, Tier 2 terminal verdict and commit check, production adapters, MGACT parity and host acceptance, deploy receipts, separate deployment authority, separate activation authority, web-app parity exact candidate and evidence]
+  missing_gates: [Full exact-head CI closure, Tier 2 terminal verdict and commit check, production adapters, MGACT parity and host acceptance, deploy receipts, separate deployment authority, separate activation authority, dependent web-app parity promotion gates]
+  dependent_web_parity:
+    observed_at: '2026-08-27T15:09:59Z'
+    source_sha: e627ff05edc57990982687669e3e47326857d1ab
+    tree_sha: a2fd47e4b363a94dd1a60636bdecbd31a55e15ce
+    base_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+    branch: sats/web-app-parity-20260827
+    relay:
+      status: PUBLISHED
+      ref: refs/heads/sats/web-app-parity-20260827
+      ref_url: https://framework-desktop.tail69757d.ts.net:38443/git/73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812/buzz#refs/heads/sats/web-app-parity-20260827
+      ref_sha: e627ff05edc57990982687669e3e47326857d1ab
+    github_mirror:
+      status: MIRRORED
+      ref: refs/heads/sats/web-app-parity-20260827
+      ref_url: https://github.com/only21mil/buzz/tree/sats/web-app-parity-20260827
+      ref_sha: e627ff05edc57990982687669e3e47326857d1ab
+    issue_link:
+      issue_event_id: d3276e465093a35318ffda37f06346caa1ecf5412509ba2d5d33d9e7402648e2
+      status_event_id: 7956ea174c11925f5749d8911967fb3085c9295d37e7ddb0110e468b00e1fd9a
+      roster_status_event_id: a477f333ce4be2af72f868e1dbafec55d7ad82b31e95e55df8d21fed932b9132
+      tier2_install_status_event_id: 9fc8d877257e5cca651c2131b8a1513facefc2d4f146984db86b81fd6e3ed759
+      c1_review_status_event_id: 505cb3942ee0aed89e403784a3e825240f6f743999d7cc13c05234bdf85ecea0
+      ci_auth_c1_closure_status_event_id: f6dd61a2c33a8fd021f389f44718f986bb2980e89fcb507b35199b8d5341bb7c
+      simplelift_remediation_status_event_id: 3c2ec0522f6fbbd8900041e759b0bb35eb52c1c41aef26c2d8338af90a2e8f20
+      status: OPEN
+    buzz_pr:
+      status: DRAFT
+      event_id: 3937c0aba0fddd58e954408e0e4eb8f74b9067de6d905e9b136adc085caf007f
+      draft_status_event_id: be2071718bc13114bdcc64bf94c979249ea5e1064cc401fbf633e078cbb9b091
+      checklist_update_event_id: 4a734488fda14416f4a4c9671fbd1aff8e79a545a6ed6a7420cb7c2493207e9c
+      tier2_install_update_event_id: e3a95b25327b78e2b9f600374c077d9d6ea73eebb67a67f8fabcf5a7ba388370
+      c1_review_update_event_id: 5a6abba7ae22402bafa336a5846b5d64eab77779492f11f4d890961eae73ce1f
+      ci_auth_c1_closure_update_event_id: b7eec09e93521efab363a9b2423efcdec9acffc346c71380231c5c34c3bd0d5b
+      simplelift_remediation_update_event_id: b00b5e40883baf91a9ad1e94f51cee0af658e162e6dcd97f1700183167b00512
+      external_id: buzz-web-app-parity-e627ff05edc5
+      url: buzz://pr?id=3937c0aba0fddd58e954408e0e4eb8f74b9067de6d905e9b136adc085caf007f&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz
+    github_pr:
+      status: OPEN
+      draft: true
+      number: 108
+      url: https://github.com/only21mil/buzz/pull/108
+      head_ref: sats/web-app-parity-20260827
+      head_sha: e627ff05edc57990982687669e3e47326857d1ab
+      base_ref: sats/bci-p1-cumulative-successor-20260827
+      base_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+      ci_state: PR_CHECKS_COMPLETE
+      ci_observed_at: '2026-08-27T13:55:28Z'
+      check_snapshot: {total: 21, success: 13, skipped: 8, pending: 0, failed: 0}
+    parent_github_pr:
+      status: OPEN
+      draft: true
+      number: 107
+      url: https://github.com/only21mil/buzz/pull/107
+      head_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+      dependency_checklist_updated: true
+    missing_gates:
+      - Exact-head GitHub CI closure at the web candidate
+      - Independent Tier 2 terminal verdict and successful exact-commit check
+      - Installed Chromium, Firefox, and WebKit receipts
+      - Authenticated relay and cross-tenant authorization checks
+      - Physical Safari and Pixel Fold visual and accessibility checks
+      - Full WCAG and screen-reader review
+      - Background notification and any multi-community origin decisions
+      - Packaging and serving the browser client at /app/
+      - Production routing, deployment, and rollback receipts
+      - Separate merge and deployment authority
+
+tier2_fleet_installation:
+  observed_at: '2026-08-27T13:40:04Z'
+  status: COMPLETE
+  reviewed_commit_sha: 4efbf03a5220b40984e339d88b649220bd235cd7
+  reviewed_tree_sha: 4e1a8d5859ad353225fa05f218b2f0d1950c56e9
+  state_id: c9555d146e210724ce5992722d243888
+  lineage_id: d98c842a7c14bf75d942251873cc8149
+  verdict: PASS_WITH_RISKS
+  commit_check: {result: OK, source_sha: 4efbf03a5220b40984e339d88b649220bd235cd7}
+  installed_paths: 7
+  host_identity_result: BYTE_MODE_OWNER_IDENTICAL
+  framework:
+    status: INSTALLED
+    receipt_dir: /home/victor/work/tier2-promotion-install-4efbf03-framework-20260827-r2
+  yoga:
+    status: INSTALLED
+    receipt_dir: /home/victorv/work/tier2-promotion-install-4efbf03-yoga-20260827-r2
+  live_canaries: {passed: 5, total: 5}
+  attempts:
+    - {revision: 1, result: ROLLED_BACK, cause: mode drift, rollback: COMPLETE}
+    - {revision: 2, result: PASS}
+  c1_reopen_state: COMPLETE
+  tracking:
+    primary_issue_status_event_id: 9fc8d877257e5cca651c2131b8a1513facefc2d4f146984db86b81fd6e3ed759
+    cumulative_buzz_pr_update_event_id: 491086e6ff20391071df66de61b18eadfec42e50705a26c109493410fa6aeaf9
+    web_buzz_pr_update_event_id: e3a95b25327b78e2b9f600374c077d9d6ea73eebb67a67f8fabcf5a7ba388370
+    github_draft_prs_updated: [107, 108]
+
+c1_recovery_review:
+  observed_at: '2026-08-27T14:13:17Z'
+  status: COMPLETE
+  source_candidate_sha: c9229b6e7202c22ea5bd4f99161aedef5bc68f1f
+  correction_sha: 5ac44f9ff2d16d61f562e4de16f012ae0be9fd47
+  correction_tree_sha: 58630357d1fc0040b42d9e849b2f1bd2d43932a6
+  observed_parent_sha: c7cdd80c0cb410929a5b984d21b36ccde9d1a586
+  reviewer: claude:6502c19de9be662396c3b1cf46858d6e
+  terminal_verdict: PASS
+  findings: []
+  commit_check:
+    result: OK
+    source_sha: 5ac44f9ff2d16d61f562e4de16f012ae0be9fd47
+  superseded_attempt:
+    correction_sha: afe030a4b66b21bb8d3458acc32c29228316a733
+    correction_tree_sha: 7288b7d04c46c40d90c6003d2962bf0426d4be3f
+    observed_parent_sha: 5f55fe7f068a8fae14cb427a6d08355cac510bbc
+    reviewer: claude:da444cc9797c933d99b4c8f31b94f829
+    terminal_verdict: PASS_WITH_RISKS
+    findings:
+      - {severity: LOW, finding: archive and transport body caps do not match}
+      - {severity: LOW, finding: archive-query unreachable path must fail closed}
+    commit_check:
+      result: FAIL
+      source_sha: afe030a4b66b21bb8d3458acc32c29228316a733
+      reason: correction does not have reviewed base HEAD as its sole parent
+  tracking:
+    primary_issue_status_event_id: f6dd61a2c33a8fd021f389f44718f986bb2980e89fcb507b35199b8d5341bb7c
+    cumulative_buzz_pr_update_event_id: d01f537c60f832b3bca818919aa2d0331b636c4fd245106f89639d9b3945e76d
+    web_buzz_pr_update_event_id: b7eec09e93521efab363a9b2423efcdec9acffc346c71380231c5c34c3bd0d5b
+    github_draft_prs_updated: [107, 108]
+
+standing_ci_authorization:
+  observed_at: '2026-08-27T14:13:17Z'
+  state: ACTIVE
+  authority: Victor standing authorization for the entire current Buzz plan
+  applies_to: [GitHub Actions CI, Buzz-native CI]
+  on_failure: Diagnose, fix, create a new exact SHA, and rerun until green
+  attempt_limit: NONE
+  required_tracking: Every attempted SHA and result in the primary issue, relevant draft PR, and status ledger
+  exclusions:
+    - Tier 2 independent-review transport retry law is unchanged
+    - Tier 2 reviewer identity, lineage, correction, and exact-commit check limits are unchanged
+    - No merge, deployment, activation, credential, signing, service, or destructive authority
+  tracking:
+    primary_issue_status_event_id: f6dd61a2c33a8fd021f389f44718f986bb2980e89fcb507b35199b8d5341bb7c
+    cumulative_buzz_pr_update_event_id: d01f537c60f832b3bca818919aa2d0331b636c4fd245106f89639d9b3945e76d
+    web_buzz_pr_update_event_id: b7eec09e93521efab363a9b2423efcdec9acffc346c71380231c5c34c3bd0d5b
+    github_draft_prs_updated: [107, 108]
+
+program_timing_authorization:
+  observed_at: '2026-08-27T15:09:59Z'
+  state: ACTIVE
+  authority: Victor timing exception for the entire current Buzz program
+  plan_level_90_minute_stop: REMOVED
+  continue_until: DONE
+  applies_to: [Work, CI fixes and reruns, audits, authorized delivery]
+  tier2_state_law:
+    deadline_source: Installed controller deadline and freshness invariant
+    expired_state: Rerun as a fresh exact-candidate state
+    stale_acceptance: FORBIDDEN
+  non_authorities: [Merge, deployment, activation, credentials, signing, services, destructive actions]
+  tracking:
+    primary_issue_status_event_id: 3c2ec0522f6fbbd8900041e759b0bb35eb52c1c41aef26c2d8338af90a2e8f20
+    cumulative_buzz_pr_update_event_id: 874dfdaec8b528ee49330d758ff9ab3825095b33af7e82b7a3ae0c5b523892f8
+    web_buzz_pr_update_event_id: b00b5e40883baf91a9ad1e94f51cee0af658e162e6dcd97f1700183167b00512
+    github_draft_prs_updated: [107, 108]
+
+simplelift_overlap_remediation:
+  observed_at: '2026-08-27T15:09:59Z'
+  state: ACTIVE
+  scope: PLANNING_AND_TRACKING_ONLY
+  live_mutation_state: NOT_APPLIED_BY_THIS_WAVE
+  identity_direction:
+    simplelift: App and repository
+    framework: Host
+  audit:
+    repository_path: /home/victor/projects
+    main_state: CLEAN
+    dev_sha: bbae6a383727325e83b7480e7c8cbb323de2be20
+    pull_request:
+      repository: only21mil/simplelift
+      number: 24
+      url: https://github.com/only21mil/simplelift/pull/24
+      head_sha: bbae6a383727325e83b7480e7c8cbb323de2be20
+      state: CLOSED
+      merged: false
+      branch_preserved: true
+    overlap:
+      buzz_files: 101
+      includes: [LUKS header, rescue bundle, broken budget gitlink]
+    live_dependencies:
+      buzz_seats: 9
+      desktop_launcher: true
+      source_checkout: /home/victor/projects
+    roster_commits: {repository_state: WRONG_REPOSITORY, publish_state: UNPUBLISHED}
+    buzz_draft_prs:
+      - {number: 107, state: CLEAN, head_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c}
+      - {number: 108, state: CLEAN, head_sha: e627ff05edc57990982687669e3e47326857d1ab}
+    desktop_pin: STALE
+    sweep: {state: FAILED, binding: UNBOUND}
+    directory_sync: {state: FAILED, binding: UNBOUND}
+    deploy_checkouts: {state: DUPLICATE_AND_DIRTY, canonical_selection: NOT_STARTED}
+    cross_scope_archimedes_prompts: OWNER_LANE_REQUIRED
+  ordered_actions:
+    - {order: 1, action: Close Simplelift PR 24 without merge and initially preserve its branch, state: COMPLETE}
+    - {order: 2, action: Finish reviewed Buzz-owned stable install roots and receipt-bound systemd and desktop cutover, state: NOT_STARTED}
+    - {order: 3, action: Complete all active in-scope prompts, state: NOT_STARTED}
+    - {order: 4, action: Execute roster model and Sat Hermes cutover with rollback receipts, state: NOT_STARTED}
+    - {order: 5, action: Correct MGACT policy and helper behavior, state: NOT_STARTED}
+    - {order: 6, action: Fix the sweep and directory sync with exact binding, state: NOT_STARTED}
+    - {order: 7, action: Move desktop to the current reviewed pin, state: NOT_STARTED}
+    - {order: 8, action: Select one canonical deploy checkout, state: NOT_STARTED}
+    - {order: 9, action: Preserve legitimate Simplelift dev history through 40985fbe5adb3a1aad08ca3223c744b47b8f425e, state: NOT_STARTED}
+    - {order: 10, action: Relocate private recovery material and complete history and security handling, state: NOT_STARTED}
+    - {order: 11, action: Remove contaminated refs and local branches only after readback, state: NOT_STARTED}
+    - {order: 12, action: Add a Simplelift repository-root CI guard, state: NOT_STARTED}
+  cross_scope_rule: Archimedes prompts are handled only by their owner lane
+  tracking:
+    primary_issue_status_event_id: 3c2ec0522f6fbbd8900041e759b0bb35eb52c1c41aef26c2d8338af90a2e8f20
+    cumulative_buzz_pr_update_event_id: 874dfdaec8b528ee49330d758ff9ab3825095b33af7e82b7a3ae0c5b523892f8
+    web_buzz_pr_update_event_id: b00b5e40883baf91a9ad1e94f51cee0af658e162e6dcd97f1700183167b00512
+    github_draft_prs_updated: [107, 108]
+
+roster_migration_inventory:
+  observed_at: '2026-08-27T13:40:04Z'
+  state: ACTIVE
+  live_changes: NOT_APPLIED
+  authority: Victor standing full authorization, recorded by controller assignment
+  migrations:
+    - {from: DSV4F, to: Knots, model: qwen/qwen3.8-flash, reasoning: inherited}
+    - {from: GSV4F.2, to: Segwit, model: z-ai/glm-5.3-flash, reasoning: inherited}
+    - {from: GLM5.2, to: Ledger, model: z-ai/glm-5.3-flash, reasoning: inherited}
+    - {from: Codex-2, to: UTXO, model: preserve-current, reasoning: preserve-current}
+  removal:
+    identity: Sat Hermes
+    method: tombstone plus service, configuration, and membership cleanup
+    rollback_receipt_required: true
+  tracking:
+    primary_issue_event_id: d3276e465093a35318ffda37f06346caa1ecf5412509ba2d5d33d9e7402648e2
+    issue_status_event_id: a477f333ce4be2af72f868e1dbafec55d7ad82b31e95e55df8d21fed932b9132
+    cumulative_buzz_pr_update_event_id: ebcfdcf56fc0761a6a6f690b9d1af0cf1d07df8cd00938bc5a83af959d9505fe
+    web_buzz_pr_update_event_id: 4a734488fda14416f4a4c9671fbd1aff8e79a545a6ed6a7420cb7c2493207e9c
+    github_draft_prs_updated: [107, 108]
+  required_receipts:
+    - Pre-change identity, service, configuration, and membership inventory
+    - Per-identity staged change and model readback
+    - Sat Hermes tombstone, stopped-service, configuration-removal, and membership-removal readback
+    - Post-change roster and ownership verification
+    - Exact rollback data and rollback verification
 
 work_items:
   - id: BCI-GOV-DELIVERY-01
@@ -549,44 +798,64 @@ work_items:
   - id: BCI-REVIEW-ENGINE-01
     title: Portable 5400-second Tier 2 engine
     lane: REVIEW-CONTROL
-    program_state: FROZEN
+    program_state: REVIEW_CLOSED
     owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
-    observed_at: '2026-08-27T12:44:41Z'
-    evidence_ref: controller final reconciliation handoff for portable engine source candidate
+    observed_at: '2026-08-27T13:40:04Z'
+    evidence_ref: immutable Tier 2 state and fleet installation receipts
     branch: null
     candidate_sha: e7023d766b09edca854130c810d2e000a3396174
-    review_state: NOT_STARTED
-    promotion_sha: null
+    review_state: REVIEW_CLOSED
+    review_receipt:
+      terminal_state: PASS_WITH_RISKS
+      source_sha: 4efbf03a5220b40984e339d88b649220bd235cd7
+      state_id: c9555d146e210724ce5992722d243888
+      lineage_id: d98c842a7c14bf75d942251873cc8149
+      reviewed_tree_sha: 4e1a8d5859ad353225fa05f218b2f0d1950c56e9
+      check_receipt: {result: OK, source_sha: 4efbf03a5220b40984e339d88b649220bd235cd7}
+    promotion_sha: 4efbf03a5220b40984e339d88b649220bd235cd7
     landing_sha: null
     deployed_sha: null
-    blockers: [Tier 2 review approval, reviewed installation receipt, matching Framework and Yoga hashes]
+    blockers: [Cumulative and web candidates need their own exact-head Tier 2 reviews]
     dependencies: []
     verification_state: UNKNOWN
     evidence:
-      - {tier: 1, ref: controller-final-portable-engine-source, claim: source candidate e7023d766b09edca854130c810d2e000a3396174 is frozen and locally checked}
-      - {tier: 2, ref: framework-tier2-engine-sha256-e56b77f3, claim: installed Framework engine predates this candidate}
-    resolution: {selected_evidence_ref: controller-final-portable-engine-source}
+      - {tier: 1, ref: controller-tier2-fleet-install-receipt, claim: reviewed commit 4efbf03a5220b40984e339d88b649220bd235cd7 passed exact commit check and is installed identically on Framework and Yoga with five live canaries passing}
+      - {tier: 2, ref: immutable-tier2-state-c9555d14, claim: lineage d98c842a7c14bf75d942251873cc8149 closed PASS WITH RISKS}
+    resolution: {selected_evidence_ref: controller-tier2-fleet-install-receipt}
     contradictions: []
 
   - id: BCI-REVIEW-C1-RECOVERY-01
     title: C1 exhausted-transport recovery tool
     lane: REVIEW-CONTROL
-    program_state: FROZEN
+    program_state: REVIEW_CLOSED
     owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
-    observed_at: '2026-08-27T12:44:41Z'
-    evidence_ref: controller final reconciliation handoff for C1 recovery source candidate
+    observed_at: '2026-08-27T14:13:17Z'
+    evidence_ref: corrected terminal Tier 2 PASS and exact commit check OK
     branch: null
     candidate_sha: c9229b6e7202c22ea5bd4f99161aedef5bc68f1f
-    review_state: NOT_STARTED
-    promotion_sha: null
+    review_state: REVIEW_CLOSED
+    correction_sha: 5ac44f9ff2d16d61f562e4de16f012ae0be9fd47
+    correction_tree_sha: 58630357d1fc0040b42d9e849b2f1bd2d43932a6
+    observed_parent_sha: c7cdd80c0cb410929a5b984d21b36ccde9d1a586
+    review_receipt:
+      terminal_state: PASS
+      source_sha: 5ac44f9ff2d16d61f562e4de16f012ae0be9fd47
+      reviewer: claude:6502c19de9be662396c3b1cf46858d6e
+      findings: []
+      check_receipt:
+        result: OK
+        source_sha: 5ac44f9ff2d16d61f562e4de16f012ae0be9fd47
+    promotion_sha: 5ac44f9ff2d16d61f562e4de16f012ae0be9fd47
     landing_sha: null
     deployed_sha: null
-    blockers: [Tier 2 review approval, reviewed tool installation, exact legacy-state recovery receipt]
+    blockers: []
     dependencies: [BCI-REVIEW-ENGINE-01]
     verification_state: UNKNOWN
+    reopen_state: COMPLETE
     evidence:
-      - {tier: 1, ref: controller-final-c1-recovery-source, claim: source candidate c9229b6e7202c22ea5bd4f99161aedef5bc68f1f is frozen and locally checked}
-    resolution: {selected_evidence_ref: controller-final-c1-recovery-source}
+      - {tier: 1, ref: controller-c1-corrected-review-truth, claim: correction 5ac44f9ff2d16d61f562e4de16f012ae0be9fd47 received terminal PASS and its exact commit check is OK}
+      - {tier: 3, ref: framework-c1-corrected-object, claim: correction tree and sole reviewed-base parent were read directly from repository objects}
+    resolution: {selected_evidence_ref: controller-c1-corrected-review-truth}
     contradictions: []
 
   - id: BCI-GOV-LANDING-FACADE-01
@@ -720,18 +989,18 @@ work_items:
   - id: BCI-WEB-PARITY-01
     title: Browser and web-app native parity
     lane: WEB-APP
-    program_state: INTEGRATING
+    program_state: READY_FOR_CI
     owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
-    observed_at: '2026-08-27T13:04:24Z'
-    evidence_ref: controller scoped assignment to /root/web_app_parity
-    branch: null
-    candidate_sha: null
+    observed_at: '2026-08-27T13:37:31Z'
+    evidence_ref: exact candidate and repository delivery readback
+    branch: sats/web-app-parity-20260827
+    candidate_sha: e627ff05edc57990982687669e3e47326857d1ab
     review_state: NOT_STARTED
     promotion_sha: null
     landing_sha: null
     deployed_sha: null
-    blockers: [Exact candidate evidence not yet received, tests and deployment evidence pending, do not mark complete]
-    dependencies: []
+    blockers: [Exact-head CI running, Tier 2 not started, installed browser and live relay checks pending, physical device and full accessibility review pending, packaging and deployment pending, do not mark complete]
+    dependencies: [BCI-BUZZ-CUMULATIVE-01]
     verification_state: UNKNOWN
     scoped_active:
       authority: controller assignment under standing full authorization
@@ -752,6 +1021,33 @@ work_items:
       - Focused unit, integration, end-to-end, and deliberate-failure tests
       - Reviewed deployment and rollback plan
     evidence:
-      - {tier: 1, ref: controller-web-app-parity-assignment, claim: workstream active under /root/web_app_parity with no exact candidate yet}
-    resolution: {selected_evidence_ref: controller-web-app-parity-assignment}
+      - {tier: 1, ref: controller-web-app-parity-candidate-handoff, claim: exact source candidate e627ff05edc57990982687669e3e47326857d1ab and tree a2fd47e4b363a94dd1a60636bdecbd31a55e15ce are frozen on cumulative base d7677e177b9e3732bf92962e00b5d7ba161ce03c}
+      - {tier: 2, ref: repository-web-parity-delivery-readback, claim: authoritative relay and GitHub mirror refs match the candidate and linked Buzz and GitHub draft PRs are open}
+    resolution: {selected_evidence_ref: controller-web-app-parity-candidate-handoff}
+    contradictions: []
+
+  - id: BCI-ROSTER-MIGRATION-01
+    title: Authorized roster rename and retirement inventory
+    lane: ROSTER
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T13:37:31Z'
+    evidence_ref: controller authorized roster migration assignment
+    branch: null
+    candidate_sha: null
+    review_state: NOT_STARTED
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Inventory active but live changes not applied, exact pre-change inventory pending, service and membership mutation receipts pending, rollback receipt required]
+    dependencies: [BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    inventory:
+      state: ACTIVE
+      live_changes: NOT_APPLIED
+      record_ref: roster_migration_inventory
+    evidence:
+      - {tier: 1, ref: controller-roster-migration-authorization, claim: exact rename, model, preserved-profile, and Sat Hermes tombstone inventory is authorized but unapplied}
+      - {tier: 2, ref: repository-roster-tracking-readback, claim: primary issue and both draft PR layers record the active inventory and open receipts}
+    resolution: {selected_evidence_ref: controller-roster-migration-authorization}
     contradictions: []
