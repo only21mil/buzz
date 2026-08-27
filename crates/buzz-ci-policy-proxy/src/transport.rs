@@ -648,6 +648,12 @@ fn serve_prepared(
     } = prepared;
     let max_request = limits.request_body_bytes;
     let max_response = limits.response_body_bytes;
+    let admission = match admission {
+        Admission::Archive(grant) => {
+            Admission::Archive(limit_archive_grant_for_transport(grant, limits))
+        }
+        other => other,
+    };
     if let Admission::ExecStart {
         target,
         exec_id,
@@ -911,6 +917,19 @@ fn serve_prepared(
         upstream_closed,
         mutated,
     })
+}
+
+fn limit_archive_grant_for_transport(
+    mut grant: ArchiveGrant,
+    limits: TransportLimits,
+) -> ArchiveGrant {
+    let body_limit = match grant.direction {
+        ArchiveDirection::Upload => limits.request_body_bytes,
+        ArchiveDirection::Download => limits.response_body_bytes,
+    };
+    grant.max_bytes = grant.max_bytes.min(body_limit);
+    grant.max_total_bytes = grant.max_total_bytes.min(body_limit);
+    grant
 }
 
 fn archive_target(grant: &ArchiveGrant, no_overwrite_dir_non_dir: bool) -> String {
@@ -4725,6 +4744,39 @@ mod tests {
             false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn archive_grants_do_not_exceed_directional_transport_body_caps() {
+        let grant = ArchiveGrant {
+            lease_id: "lease".into(),
+            container_id: "container".into(),
+            container_path: "/workspace".into(),
+            direction: ArchiveDirection::Download,
+            max_bytes: 64 * 1024 * 1024,
+            max_entries: 4096,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_decompression_ratio: 100,
+        };
+        let limits = TransportLimits {
+            request_body_bytes: 2 * 1024 * 1024,
+            response_body_bytes: 4 * 1024 * 1024,
+            io_timeout: Duration::from_secs(30),
+        };
+
+        let download = limit_archive_grant_for_transport(grant.clone(), limits);
+        assert_eq!(download.max_bytes, limits.response_body_bytes);
+        assert_eq!(download.max_total_bytes, limits.response_body_bytes);
+
+        let upload = limit_archive_grant_for_transport(
+            ArchiveGrant {
+                direction: ArchiveDirection::Upload,
+                ..grant
+            },
+            limits,
+        );
+        assert_eq!(upload.max_bytes, limits.request_body_bytes);
+        assert_eq!(upload.max_total_bytes, limits.request_body_bytes);
     }
 
     #[test]

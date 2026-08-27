@@ -234,7 +234,11 @@ impl DockerRoute {
                 match key.as_ref() {
                     "path" => *path = value.into_owned(),
                     "noOverwriteDirNonDir" => *no_overwrite_dir_non_dir = true,
-                    _ => unreachable!("canonical archive query contains only admitted fields"),
+                    _ => {
+                        return Err(ProxyError::RouteRefused(
+                            "canonical archive query contains an unadmitted field".into(),
+                        ));
+                    }
                 }
             }
             if path.is_empty() {
