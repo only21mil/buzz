@@ -23,9 +23,9 @@ RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v3"
 REVIEW_FILES_SCHEMA = "buzz-agent-review-files-v1"
 TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
+TIER2_ENGINE_MODE = 0o750
 TIER2_REVIEW = {
     "producer_provider": "gpt",
-    "escalate": False,
     "reviewer_provider": "claude",
     "model": "claude-opus-5",
     "effort": "high",
@@ -47,6 +47,16 @@ PLACEHOLDERS = {
 }
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
 SHELLCHECK_PATH = "/home/victor/.npm-global/bin/shellcheck"
+RUNTIME_TARGET_COUNT = 22
+TOTAL_PACKAGE_TARGET_COUNT = 23
+REVIEW_PATH_COUNT = 19
+SYSTEMD_FRAGMENT = "/etc/systemd/system/buzz-agent@.service"
+SYSTEMD_MANAGER_DROPIN = "/usr/lib/systemd/system/service.d/10-timeout-abort.conf"
+SYSTEMD_INSTANCE_DROPINS = {
+    "mempool": "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf",
+    "genesis": "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf",
+}
+SYSTEMD_UNITS = ("buzz-agent@mempool.service", "buzz-agent@genesis.service")
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -162,10 +172,16 @@ def validate_review_files(
     normalized: dict[str, list[dict[str, str]]] = {}
     for slug in ("mempool", "genesis"):
         paths, records = expected.get(slug), observed.get(slug)
-        if not isinstance(paths, list) or len(paths) != 18 or len(set(paths)) != 18:
-            raise ValueError(f"{slug} expected closure list must contain 18 unique paths")
-        if not isinstance(records, list) or len(records) != 18:
-            raise ValueError(f"{slug} review file list must contain 18 paths")
+        if (
+            not isinstance(paths, list)
+            or len(paths) != REVIEW_PATH_COUNT
+            or len(set(paths)) != REVIEW_PATH_COUNT
+        ):
+            raise ValueError(
+                f"{slug} expected closure list must contain {REVIEW_PATH_COUNT} unique paths"
+            )
+        if not isinstance(records, list) or len(records) != REVIEW_PATH_COUNT:
+            raise ValueError(f"{slug} review file list must contain {REVIEW_PATH_COUNT} paths")
         values: list[dict[str, str]] = []
         for index, record in enumerate(records):
             if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
@@ -221,9 +237,7 @@ def artifact_fingerprint(records: list[dict[str, object]]) -> str:
 
 def validate_tier2_review(value: object) -> dict[str, object]:
     if value != TIER2_REVIEW:
-        raise ValueError(
-            "Tier 2 review route must use the activation-specific GPT-to-Claude Opus 5 high override"
-        )
+        raise ValueError("Tier 2 review route must use the current GPT-to-Claude Opus 5 high route")
     return TIER2_REVIEW
 
 
@@ -234,11 +248,11 @@ def validate_tier2_engine(value: object) -> dict[str, str]:
     if path_raw != str(TIER2_ENGINE_PATH):
         raise ValueError("Tier 2 engine path is invalid")
     path = TIER2_ENGINE_PATH
-    if parse_mode(mode_raw) != 0o700:
+    if parse_mode(mode_raw) != TIER2_ENGINE_MODE:
         raise ValueError("Tier 2 engine mode mismatch")
     if not isinstance(digest, str) or not HEX64.fullmatch(digest):
         raise ValueError("Tier 2 engine digest is invalid")
-    require_regular(path, 0o700)
+    require_regular(path, TIER2_ENGINE_MODE)
     if sha256_file(path) != digest:
         raise ValueError("Tier 2 engine changed after package creation")
     return {"path": path_raw, "mode": str(mode_raw), "sha256": digest}
@@ -286,17 +300,17 @@ def expected_tier2_bundle(
         "candidate_root": str(bundle.resolve(strict=True)),
         "summary": (
             "GPT-produced Mempool and Genesis credential, signing, and production activation "
-            "package; Victor's activation-specific override requires one Claude Opus 5 reviewer "
-            "at high reasoning without automatic escalation."
+            "package; the current opposite-provider contract requires one Claude Opus 5 reviewer "
+            "at high reasoning."
         ),
         "paths": TIER2_CANDIDATE_PATHS,
         "invariants": [
-            "The review binds the exact package manifest and exact 18-path review-file record.",
+            "The review binds the exact package manifest and exact 19-path review-file record.",
             "The package and review state remain owner-only and credential-free.",
             "The parent Tier 1 receipt is deterministic evidence only and grants no install authority.",
             "Mempool and Genesis stay stopped and disabled through review and install preflight.",
             "Installation remains absent-only for credentials and preserves rollback and exact hashes.",
-            "Prepare must use --producer-provider gpt without --escalate; review and check use the same state.",
+            "Prepare must use --producer-provider gpt; review and check use the same state.",
         ],
         "commands": [tier2_command_result(result) for result in commands],
         "known_limits": [],
@@ -364,15 +378,30 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         raise ValueError("producer package must remain non-installable")
 
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
-    if not isinstance(runtime_raw, list) or len(runtime_raw) != 20:
-        raise ValueError("runtime target count must be 20")
+    if not isinstance(runtime_raw, list) or len(runtime_raw) != RUNTIME_TARGET_COUNT:
+        raise ValueError(f"runtime target count must be {RUNTIME_TARGET_COUNT}")
     if not isinstance(ops_raw, list) or len(ops_raw) != 1:
         raise ValueError("ops target count must be one")
     runtime = [validate_source_record(bundle, record) for record in runtime_raw]
     ops = [validate_source_record(bundle, record) for record in ops_raw]
     targets = [str(record["target"]) for record in runtime + ops]
-    if len(set(targets)) != 21:
+    if len(set(targets)) != TOTAL_PACKAGE_TARGET_COUNT:
         raise ValueError("package target set contains a duplicate")
+    runtime_targets = {str(record["target"]) for record in runtime}
+    expected_systemd_targets = {
+        SYSTEMD_FRAGMENT,
+        SYSTEMD_MANAGER_DROPIN,
+        *SYSTEMD_INSTANCE_DROPINS.values(),
+    }
+    packaged_systemd_targets = {
+        target
+        for target in runtime_targets
+        if target == SYSTEMD_FRAGMENT
+        or target == SYSTEMD_MANAGER_DROPIN
+        or target.startswith("/etc/systemd/system/buzz-agent@")
+    }
+    if packaged_systemd_targets != expected_systemd_targets:
+        raise ValueError("packaged systemd fragment/drop-in target set mismatch")
     expected_ops = {
         "target": "/home/victor/.agents/tools/buzz-sats-channel-sweep.sh",
         "mode": "0700",
@@ -384,6 +413,15 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         if ops[0].get(key) != value:
             raise ValueError(f"ops target mismatch: {key}")
     files = validate_review_files(manifest, runtime)
+    for slug in ("mempool", "genesis"):
+        covered = {str(record["path"]) for record in files[slug]}
+        effective = {
+            SYSTEMD_FRAGMENT,
+            SYSTEMD_MANAGER_DROPIN,
+            SYSTEMD_INSTANCE_DROPINS[slug],
+        }
+        if not effective <= covered:
+            raise ValueError(f"{slug} effective systemd paths escape review closure")
     fingerprint = artifact_fingerprint(runtime)
     if manifest.get("runtime_artifact_fingerprint") != fingerprint:
         raise ValueError("runtime artifact fingerprint mismatch")
@@ -514,6 +552,83 @@ def run(command: list[str], cwd: Path, test_root: Path) -> dict[str, object]:
         }
 
 
+def systemd_verify_command(bundle: Path, *, debug: bool = False) -> list[str]:
+    stage = (bundle / "install-root").resolve(strict=True)
+    if ":" in str(stage):
+        raise ValueError("staged systemd root contains a unit-path separator")
+    unit_path = ":".join(
+        (
+            str(stage / "etc/systemd/system"),
+            str(stage / "usr/lib/systemd/system"),
+            "/usr/lib/systemd/system",
+        )
+    )
+    command = ["/usr/bin/env", f"SYSTEMD_UNIT_PATH={unit_path}"]
+    if debug:
+        command.append("SYSTEMD_LOG_LEVEL=debug")
+    return [*command, "/usr/bin/systemd-analyze", "verify", *SYSTEMD_UNITS]
+
+
+def effective_unit_paths(output: str, unit: str) -> tuple[str, list[str]]:
+    lines = output.splitlines()
+    markers = {f"\t→ Unit {unit}:", f"\t-> Unit {unit}:"}
+    starts = [index for index, line in enumerate(lines) if line in markers]
+    if len(starts) != 1:
+        raise ValueError(f"systemd verification did not report exactly one {unit} block")
+    block_lines: list[str] = []
+    for line in lines[starts[0] + 1 :]:
+        if line.startswith("\t→ Unit ") or line.startswith("\t-> Unit "):
+            break
+        block_lines.append(line)
+    fragments = [
+        line.strip().removeprefix("Fragment Path: ")
+        for line in block_lines
+        if line.strip().startswith("Fragment Path: ")
+    ]
+    dropins = [
+        line.strip().removeprefix("DropIn Path: ")
+        for line in block_lines
+        if line.strip().startswith("DropIn Path: ")
+    ]
+    if len(fragments) != 1:
+        raise ValueError(f"systemd verification reported an invalid {unit} fragment set")
+    return fragments[0], dropins
+
+
+def verify_staged_systemd(bundle: Path) -> dict[str, object]:
+    completed = subprocess.run(
+        systemd_verify_command(bundle, debug=True),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+    )
+    if completed.returncode != 0:
+        raise ValueError(f"staged systemd verification failed with exit {completed.returncode}")
+    output = completed.stdout + completed.stderr
+    stage = (bundle / "install-root").resolve(strict=True)
+    manifest = load_json(bundle / "bundle-manifest.json", mode=0o600)
+    closures = manifest.get("expected_closure_paths")
+    if not isinstance(closures, dict):
+        raise ValueError("staged systemd closure map is absent")
+    observed: dict[str, object] = {}
+    for slug in ("mempool", "genesis"):
+        unit = f"buzz-agent@{slug}.service"
+        fragment, dropins = effective_unit_paths(output, unit)
+        effective = [SYSTEMD_FRAGMENT, SYSTEMD_MANAGER_DROPIN, SYSTEMD_INSTANCE_DROPINS[slug]]
+        expected_fragment = str(stage / SYSTEMD_FRAGMENT.lstrip("/"))
+        expected_dropins = [str(stage / path.lstrip("/")) for path in effective[1:]]
+        if fragment != expected_fragment or dropins != expected_dropins:
+            raise ValueError(f"{slug} effective systemd paths escape the staged inventory")
+        closure = closures.get(slug)
+        if not isinstance(closure, list) or not set(effective) <= set(closure):
+            raise ValueError(f"{slug} effective systemd paths escape the review closure")
+        observed[slug] = {"fragment": effective[0], "dropins": effective[1:]}
+    return observed
+
+
 def gate_commands(bundle: Path) -> list[list[str]]:
     sweep_template = SCRIPT_DIR / "templates/buzz-sats-channel-sweep.sh"
     sweep_candidate = bundle / "ops-root/home/victor/.agents/tools/buzz-sats-channel-sweep.sh"
@@ -532,6 +647,13 @@ def gate_commands(bundle: Path) -> list[list[str]]:
         ],
         ["bash", "-n", str(sweep_template)],
         ["bash", "-n", str(sweep_candidate)],
+        [
+            sys.executable,
+            "-B",
+            str(SCRIPT_DIR / "make-tier1-receipt.py"),
+            "--verify-systemd-stage",
+            str(bundle),
+        ],
     ]
     commands.append(
         [SHELLCHECK_PATH, "-S", "warning", str(sweep_template), str(sweep_candidate)]
@@ -685,11 +807,20 @@ def generate_receipt(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bundle", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--verify-systemd-stage")
+    parser.add_argument("--bundle")
+    parser.add_argument("--output")
     parser.add_argument("--tier2-bundle-output")
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
     args = parser.parse_args()
+    if args.verify_systemd_stage:
+        if args.bundle or args.output or args.tier2_bundle_output:
+            parser.error("--verify-systemd-stage cannot be combined with receipt arguments")
+        observed = verify_staged_systemd(Path(args.verify_systemd_stage).resolve(strict=True))
+        print(json.dumps({"status": "OK", "effective_units": observed}, sort_keys=True))
+        return
+    if not args.bundle or not args.output:
+        parser.error("--bundle and --output are required")
     receipt = generate_receipt(
         Path(args.bundle).resolve(strict=True),
         Path(args.output).absolute(),

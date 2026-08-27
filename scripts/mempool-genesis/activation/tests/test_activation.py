@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -76,7 +77,10 @@ def write_private_json(path: Path, value: object) -> None:
 
 def create_system_sources(root: Path) -> None:
     for absolute, mode in SYSTEM_SOURCES.items():
-        write_file(root / absolute.lstrip("/"), f"fixture {absolute}\n".encode(), mode)
+        payload = f"fixture {absolute}\n".encode()
+        if absolute == "/usr/local/libexec/buzz/codex-acp":
+            payload = b"#!/usr/bin/env node\nconsole.log('fixture');\n"
+        write_file(root / absolute.lstrip("/"), payload, mode)
 
 
 def write_inputs(path: Path, mempool: str, genesis: str) -> None:
@@ -284,9 +288,9 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(tree_fingerprint(first), tree_fingerprint(second))
         self.assertTrue(manifest["ready_for_parent_tier1"])
         self.assertFalse(manifest["installable"])
-        self.assertEqual(len(manifest["runtime_targets"]), 20)
+        self.assertEqual(len(manifest["runtime_targets"]), 22)
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(manifest["review_files"][slug]), 18)
+            self.assertEqual(len(manifest["review_files"][slug]), 19)
             self.assertEqual(
                 [entry["path"] for entry in manifest["review_files"][slug]],
                 manifest["expected_closure_paths"][slug],
@@ -296,7 +300,6 @@ class ActivationBundleTests(PackageFixture):
             manifest["tier2_review"],
             {
                 "producer_provider": "gpt",
-                "escalate": False,
                 "reviewer_provider": "claude",
                 "model": "claude-opus-5",
                 "effort": "high",
@@ -309,11 +312,10 @@ class ActivationBundleTests(PackageFixture):
             ["bundle-manifest.json", "metadata/review-files.json"],
         )
         self.assertFalse((first / "metadata/tier2-evidence-inputs.json").exists())
-        with self.assertRaisesRegex(ValueError, "activation-specific GPT-to-Claude Opus 5 high"):
+        with self.assertRaisesRegex(ValueError, "current GPT-to-Claude Opus 5 high"):
             PREFLIGHT.validate_tier2_review(
                 {
                     "producer_provider": "gpt",
-                    "escalate": True,
                     "reviewer_provider": "claude",
                     "model": "claude-fable-5",
                     "effort": "high",
@@ -324,6 +326,9 @@ class ActivationBundleTests(PackageFixture):
             manifest["ops_targets"][0]["scope"],
             "Victor-owner-authenticated all-open-channel fixed public-key roster",
         )
+        codex_acp = first / "install-root/usr/local/libexec/buzz/codex-acp"
+        self.assertTrue(codex_acp.read_bytes().startswith(b"#!/usr/local/libexec/buzz/node\n"))
+        self.assertNotIn(b"#!/usr/bin/env node", codex_acp.read_bytes())
 
     def test_public_key_validation_rejects_malformed_duplicate_equal_and_reserved(self) -> None:
         cases = {
@@ -401,6 +406,20 @@ class ActivationBundleTests(PackageFixture):
             self.assertEqual(len(values["BUZZ_ACP_RESPOND_TO_ALLOWLIST"].split(",")), 5)
             self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "allowlist")
             self.assertEqual(values["BUZZ_RELAY_URL"], "wss://framework-desktop.tail69757d.ts.net:38443")
+            self.assertEqual(values["BUZZ_ACP_AGENT_COMMAND"], "/usr/local/libexec/buzz/codex-acp")
+            self.assertEqual(
+                values["BUZZ_ACP_MCP_COMMAND"], "/usr/local/libexec/buzz/buzz-dev-mcp"
+            )
+            self.assertEqual(values["CODEX_PATH"], "/usr/local/libexec/buzz/codex")
+            self.assertNotIn("PATH", values)
+            env_path = bundle / f"install-root/etc/buzz-agents/{slug}.env"
+            self.assertEqual(stat.S_IMODE(env_path.stat().st_mode), 0o600)
+            env_record = next(
+                record
+                for record in _manifest["runtime_targets"]
+                if record["target"] == f"/etc/buzz-agents/{slug}.env"
+            )
+            self.assertEqual((env_record["mode"], env_record["uid"], env_record["gid"]), ("0600", 0, 0))
             prompt = (bundle / f"install-root/etc/buzz-agents/prompts/{slug}.md").read_text()
             source_prompt = (ACTIVATION_DIR / f"templates/{slug}.md").read_text()
             self.assertEqual(prompt, source_prompt)
@@ -412,8 +431,7 @@ class ActivationBundleTests(PackageFixture):
             self.assertIn("canon-approved worker profiles and transports", prompt)
             self.assertIn("current opposite-provider runbook", prompt)
             self.assertIn("Claude Opus 5 reviewer at high reasoning", prompt)
-            self.assertIn("Claude Fable 5 for security", prompt)
-            self.assertIn("unless Victor or Rachel explicitly overrides it", prompt)
+            self.assertIn("Fable 5 is not a review or escalation route", prompt)
             self.assertIn("Claude- or parent-produced work", prompt)
             self.assertIn("GPT-5.6 Sol reviewer at high reasoning", prompt)
             self.assertIn("Reviewer identity must differ from producer identity", prompt)
@@ -421,6 +439,101 @@ class ActivationBundleTests(PackageFixture):
             self.assertIn("Luna is producer-only and never a reviewer", prompt)
             self.assertNotIn("reviewer at explicit `xhigh`", prompt)
             self.assertNotIn("opposite-provider review, and double-model review are retired", prompt)
+
+        with self.assertRaisesRegex(ValueError, "must not override the reviewed service PATH"):
+            GENERATOR.validate_env(
+                (
+                    ACTIVATION_DIR / "templates/genesis.env"
+                ).read_bytes()
+                + b"PATH=/home/buzz-genesis/.local/bin:/usr/bin\n",
+                "genesis",
+            )
+
+    def test_instance_dropins_are_exact_and_fully_covered(self) -> None:
+        bundle, manifest = self.generate("dropin-closure")
+        service = (bundle / "install-root/etc/systemd/system/buzz-agent@.service").read_text()
+        self.assertEqual(
+            [line for line in service.splitlines() if line.startswith("ReadWritePaths=")],
+            [
+                "ReadWritePaths=/home/buzz-%i/.codex /home/buzz-%i/.config "
+                "/home/buzz-%i/.cache /home/buzz-%i/.local/state /home/buzz-%i/.tmp "
+                "/run/buzz-agents-%i"
+            ],
+        )
+        cases = {
+            "mempool": (
+                "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf",
+                [f"/home/victor/work/ci-mig/a{index}" for index in range(1, 7)],
+            ),
+            "genesis": (
+                "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf",
+                [],
+            ),
+        }
+        for slug, (dropin, victor_paths) in cases.items():
+            closure = {entry["path"] for entry in manifest["review_files"][slug]}
+            self.assertIn("/etc/systemd/system/buzz-agent@.service", closure)
+            self.assertIn("/usr/lib/systemd/system/service.d/10-timeout-abort.conf", closure)
+            self.assertIn(dropin, closure)
+            payload = (bundle / f"install-root/{dropin.lstrip('/')}").read_text()
+            self.assertIn("ReadWritePaths=\n", payload)
+            read_write_lines = [
+                line for line in payload.splitlines() if line.startswith("ReadWritePaths=")
+            ]
+            self.assertEqual(len(read_write_lines), 2)
+            self.assertEqual(read_write_lines[0], "ReadWritePaths=")
+            write_paths = read_write_lines[1].partition("=")[2].split()
+            self.assertNotIn(f"/home/buzz-{slug}", write_paths)
+            self.assertEqual(
+                write_paths[:6],
+                [
+                    f"/home/buzz-{slug}/.codex",
+                    f"/home/buzz-{slug}/.config",
+                    f"/home/buzz-{slug}/.cache",
+                    f"/home/buzz-{slug}/.local/state",
+                    f"/home/buzz-{slug}/.tmp",
+                    f"/run/buzz-agents-{slug}",
+                ],
+            )
+            for path in victor_paths:
+                self.assertIn(path, payload)
+            if slug == "genesis":
+                self.assertNotIn("/home/victor", payload)
+                self.assertNotIn("/home/buzz-genesis/.npm-global", payload)
+                self.assertIn(
+                    "Environment=PATH=/usr/local/libexec/buzz:/usr/local/bin:/usr/bin:/bin",
+                    payload,
+                )
+
+    def test_effective_systemd_paths_cannot_escape_inventory_or_closure(self) -> None:
+        bundle, _manifest = self.generate("effective-systemd")
+        self.assertEqual(
+            PREFLIGHT.verify_staged_systemd(bundle),
+            {
+                "mempool": {
+                    "fragment": "/etc/systemd/system/buzz-agent@.service",
+                    "dropins": [
+                        "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+                        "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf",
+                    ],
+                },
+                "genesis": {
+                    "fragment": "/etc/systemd/system/buzz-agent@.service",
+                    "dropins": [
+                        "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+                        "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf",
+                    ],
+                },
+            },
+        )
+        write_file(
+            bundle
+            / "install-root/etc/systemd/system/buzz-agent@mempool.service.d/99-unreviewed.conf",
+            b"[Service]\nEnvironment=UNREVIEWED=1\n",
+            0o644,
+        )
+        with self.assertRaisesRegex(ValueError, "escape the staged inventory"):
+            PREFLIGHT.verify_staged_systemd(bundle)
 
     def test_root_only_closure_paths_require_privileged_prestart(self) -> None:
         bundle, manifest = self.generate("privileged-prestart")
@@ -437,6 +550,10 @@ class ActivationBundleTests(PackageFixture):
         service = (
             bundle / "install-root/etc/systemd/system/buzz-agent@.service"
         ).read_text()
+        verifier = (REPO_ROOT / "scripts/mempool-genesis/verify-installed-agent").read_text()
+        self.assertIn("--property=FragmentPath", verifier)
+        self.assertIn("--property=DropInPaths", verifier)
+        self.assertIn('test "${#effective_dropins[@]}" = 2', verifier)
         self.assertIn("User=buzz-%i\n", service)
         self.assertIn(
             "ExecStartPre=+/bin/bash /usr/local/libexec/buzz/verify-installed-agent %i\n",
@@ -485,7 +602,7 @@ class ActivationBundleTests(PackageFixture):
         state_value = json.loads(state.read_text())
         self.assertEqual(state_value["state_schema"], "tier2-state-v2")
         self.assertEqual(state_value["producer_provider"], "gpt")
-        self.assertFalse(state_value["escalate"])
+        self.assertNotIn("escalate", state_value)
         self.assertEqual(
             {key: state_value["route"][key] for key in ("provider", "model", "effort")},
             {"provider": "claude", "model": "claude-opus-5", "effort": "high"},
@@ -501,7 +618,7 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(value["candidate_fingerprint"], acceptance.candidate_fingerprint)
         self.assertEqual(value["bundle_digest"], manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(value["files"][slug]), 18)
+            self.assertEqual(len(value["files"][slug]), 19)
             self.assertEqual(value["files"][slug], manifest["review_files"][slug])
 
     def test_derived_closure_satisfies_the_installed_runtime_contract(self) -> None:
@@ -526,7 +643,7 @@ class ActivationBundleTests(PackageFixture):
 
         for slug in ("mempool", "genesis"):
             completed = subprocess.run(
-                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "18", contract],
+                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "19", contract],
                 input=closure_text,
                 check=False,
                 stdout=subprocess.PIPE,
@@ -539,7 +656,7 @@ class ActivationBundleTests(PackageFixture):
         retired = json.loads(closure_text)
         retired["schema"] = "buzz-agent-review-closure-v1"
         rejected = subprocess.run(
-            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "18", contract],
+            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "19", contract],
             input=json.dumps(retired),
             check=False,
             stdout=subprocess.PIPE,
@@ -619,11 +736,10 @@ class ActivationBundleTests(PackageFixture):
         with self.assertRaisesRegex(ValueError, "source hash mismatch"):
             INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
 
-    def test_fable_escalation_route_is_rejected_for_this_activation(self) -> None:
-        bundle, _manifest, receipt, evidence, state = self.closed_package("fable-route")
+    def test_retired_escalate_field_is_rejected(self) -> None:
+        bundle, _manifest, receipt, evidence, state = self.closed_package("retired-escalate")
         value = json.loads(state.read_text())
         value["escalate"] = True
-        value["route"]["model"] = "claude-fable-5"
         write_private_json(state, value)
         with self.assertRaisesRegex(ValueError, "closure rejected"):
             INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
@@ -995,7 +1111,7 @@ class InstallerSafetyTests(PackageFixture):
 
     def test_wrong_package_source_mode_is_rejected(self) -> None:
         source = self.bundle / "install-root/etc/buzz-agents/mempool.env"
-        source.chmod(0o600)
+        source.chmod(0o644)
         value = self.preflight()
         self.assertTrue(value.blockers)
         self.assertIn("wrong mode", value.blockers[0])
@@ -1013,7 +1129,7 @@ class InstallerSafetyTests(PackageFixture):
         self.assertTrue(closure["accepted"])
         self.assertEqual(closure["bundle_digest"], self.manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(closure["files"][slug]), 18)
+            self.assertEqual(len(closure["files"][slug]), 19)
         first_snapshot = target_snapshot(self.install_root, targets)
         backup_root = self.install_root / "var/lib/buzz-mgact-backups"
         backup_ids = [path.name for path in backup_root.iterdir() if path.is_dir()]
@@ -1239,6 +1355,101 @@ class InstallerSafetyTests(PackageFixture):
 
 
 class ServiceGateTests(unittest.TestCase):
+    def test_stopped_service_gate_requires_persistent_state_and_prestart_checks_runtime(
+        self,
+    ) -> None:
+        verifier = (REPO_ROOT / "scripts/mempool-genesis/verify-installed-agent").read_text()
+        for slug in ("mempool", "genesis"):
+            with self.subTest(slug=slug):
+                expected_user = f"buzz-{slug}"
+                self.assertEqual(
+                    list(INSTALLER.IDENTITY_STATE_MODES[slug]),
+                    [
+                        f"/home/{expected_user}",
+                        f"/home/{expected_user}/.codex",
+                        f"/home/{expected_user}/.config",
+                        f"/home/{expected_user}/.cache",
+                        f"/home/{expected_user}/.local/state",
+                        f"/home/{expected_user}/.tmp",
+                    ],
+                )
+                self.assertNotIn(
+                    f"/run/buzz-agents-{slug}", INSTALLER.IDENTITY_STATE_MODES[slug]
+                )
+        self.assertIn('  "/run/buzz-agents-$slug"\n', verifier)
+        self.assertIn('for state_path in "${state_paths[@]}"; do\n', verifier)
+
+    def test_identity_runtime_preflight_accepts_exact_metadata_access_and_tools(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
+            state_path = Path(temporary)
+            state_path.chmod(0o700)
+            account = SimpleNamespace(
+                pw_dir="/home/buzz-mempool",
+                pw_uid=os.getuid(),
+                pw_gid=os.getgid(),
+            )
+
+            def accessible(_user: str, *command: str) -> subprocess.CompletedProcess[str]:
+                output = ""
+                if command[0:2] == ("/usr/bin/readlink", "-e"):
+                    output = f"{command[-1]}\n"
+                elif command[0] == "/usr/bin/python3":
+                    output = "/usr/local/libexec/buzz/codex\n"
+                return subprocess.CompletedProcess(command, 0, output, "")
+
+            with mock.patch.object(
+                INSTALLER, "IDENTITY_STATE_MODES", {"mempool": {str(state_path): 0o700}}
+            ), mock.patch.object(
+                INSTALLER, "ROOT_TOOL_PATHS", ("/usr/local/libexec/buzz/codex",)
+            ), mock.patch.object(
+                INSTALLER,
+                "ROOT_PATH_COMMANDS",
+                (("codex", "/usr/local/libexec/buzz/codex"),),
+            ), mock.patch.object(
+                INSTALLER.pwd, "getpwnam", return_value=account
+            ), mock.patch.object(
+                INSTALLER, "identity_command", side_effect=accessible
+            ):
+                self.assertEqual(INSTALLER.identity_runtime_blockers(), [])
+
+    def test_identity_runtime_preflight_reports_metadata_access_and_resolution_drift(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
+            state_path = Path(temporary)
+            state_path.chmod(0o755)
+            account = SimpleNamespace(
+                pw_dir="/home/buzz-mempool",
+                pw_uid=os.getuid(),
+                pw_gid=os.getgid(),
+            )
+
+            def blocked(_user: str, *command: str) -> subprocess.CompletedProcess[str]:
+                if command[0] == "/usr/bin/readlink":
+                    return subprocess.CompletedProcess(command, 0, "/unexpected/tool\n", "")
+                if command[0] == "/usr/bin/python3":
+                    return subprocess.CompletedProcess(command, 0, "/unexpected/tool\n", "")
+                if command[0:2] == ("/usr/bin/test", "-w"):
+                    return subprocess.CompletedProcess(command, 1, "", "denied")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(
+                INSTALLER, "IDENTITY_STATE_MODES", {"mempool": {str(state_path): 0o700}}
+            ), mock.patch.object(
+                INSTALLER, "ROOT_TOOL_PATHS", ("/usr/local/libexec/buzz/codex",)
+            ), mock.patch.object(
+                INSTALLER,
+                "ROOT_PATH_COMMANDS",
+                (("codex", "/usr/local/libexec/buzz/codex"),),
+            ), mock.patch.object(
+                INSTALLER.pwd, "getpwnam", return_value=account
+            ), mock.patch.object(
+                INSTALLER, "identity_command", side_effect=blocked
+            ):
+                blockers = INSTALLER.identity_runtime_blockers()
+        self.assertTrue(any("mode mismatch" in blocker for blocker in blockers))
+        self.assertTrue(any("lacks write access" in blocker for blocker in blockers))
+        self.assertTrue(any("resolution mismatch" in blocker for blocker in blockers))
+        self.assertTrue(any("PATH resolution mismatch" in blocker for blocker in blockers))
+
     def test_wrong_host_blocks_real_root(self) -> None:
         def stopped(action: str, _unit: str) -> tuple[int, str]:
             return (3, "inactive") if action == "is-active" else (1, "disabled")

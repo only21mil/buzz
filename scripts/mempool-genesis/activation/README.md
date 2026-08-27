@@ -2,6 +2,10 @@
 
 This directory builds a credential-free activation package after Buzz Desktop saves the two public identities. The generator reads no private key. The installer writes no credential, enables no unit, starts no service, and sends no relay event.
 
+This source is a staged parity candidate only. It packages the template unit and both effective per-instance drop-ins, installs agent EnvironmentFiles as `0600 root:root`, and binds those paths into each installed review closure. Mempool keeps only its identity-local state/runtime paths and the approved `/home/victor/work/ci-mig/a1` through `a6` lanes. Genesis has no Victor-home write path and no writable-user tool path. The package pins `codex-acp`, the Codex CLI, and Node inside `/usr/local/libexec/buzz`; `CODEX_PATH` names the Codex CLI because that is the `codex-acp` child-process contract.
+
+GLM activation remains on hold pending its own current Tier 2 closure and separate activation approval. Nothing in this candidate authorizes a GLM runtime, installation, credential handoff, or service start.
+
 ## Review order
 
 The work crosses two promotion boundaries.
@@ -9,7 +13,7 @@ The work crosses two promotion boundaries.
 1. The disabled, unmerged source candidate gets parent Tier 1 readback and deterministic checks. The exact code candidate then gets Tier 2 before merge.
 2. After Desktop saves two distinct public identities, both services stay stopped and disabled. Freeze the final dynamic package and run a second Tier 2. Credential handoff, installation, and activation remain blocked until that review has a current terminal accepted closure.
 
-This package is GPT-produced and touches credentials, signing, and production, but Victor explicitly overrode automatic escalation for this one activation on 2026-08-26. Run Tier 2 with `--producer-provider gpt` and no `--escalate`; the engine selects one independent Claude Opus 5 reviewer at `high` reasoning. This activation-specific route does not change generic fleet canon: future GPT-produced security, authentication, signing, or production-infrastructure work escalates the Claude leg to Claude Fable 5 unless Victor or Rachel explicitly overrides it.
+This package is GPT-produced and touches credentials, signing, and production. Run Tier 2 with `--producer-provider gpt`; the current opposite-provider engine selects one independent Claude Opus 5 reviewer at `high` reasoning. Fable 5 is not a review or escalation route.
 
 The parent Tier 1 receipt is deterministic evidence only. It cannot close review, make the package installable, or grant install authority.
 
@@ -54,12 +58,12 @@ python3 "$ACT/generate-activation-bundle.py" \
 A complete package reports `input_status=complete`, `ready_for_parent_tier1=true`, and `installable=false`. The manifest records:
 
 - producer provider `gpt`;
-- activation-specific non-escalated route `claude-opus-5` at `high`;
+- current opposite-provider route `claude-opus-5` at `high`;
 - engine sequence `prepare`, `review`, `check`;
 - the exact SHA-256 of `/home/victor/.agents/skills/codex-review/scripts/tier2`;
 - candidate paths `bundle-manifest.json` and `metadata/review-files.json`.
 
-Each agent's installed closure inventory still has exactly 17 paths.
+Each agent's installed closure inventory has exactly 19 paths, including its effective template fragment, manager drop-in, and per-instance drop-in. The prestart verifier compares systemd's actual `FragmentPath` and `DropInPaths` with that closed set and rejects any extra or missing path.
 
 ## Tier 1 receipt and Tier 2 evidence
 
@@ -96,7 +100,7 @@ STATE=$("$TIER2" prepare \
 "$TIER2" check --state "$STATE"
 ```
 
-`prepare` freezes one candidate fingerprint and, because this invocation omits `--escalate`, selects Claude Opus 5 at `high`. `review` records the terminal result in the same `tier2-state-v2` file. There is no separate result artifact. `check` rejects failed, stale, expired, mismatched, overridden, or mutated closure state.
+`prepare` freezes one candidate fingerprint and selects Claude Opus 5 at `high`. `review` records the terminal result in the same `tier2-state-v2` file. There is no separate result artifact. `check` rejects failed, stale, expired, mismatched, overridden, or mutated closure state.
 
 If revision 1 fails, follow the engine's revision 2 contract with the same reviewer identity. Do not open another review leg. The shared runbook in `Agent-Shared/adapters/sats-shared-common.md` owns retries and corrected lineages.
 
@@ -125,14 +129,14 @@ The installer runs the installed engine's `check` subcommand every time. The pac
 The adapter requires:
 
 - `tier2-state-v2` with `status=closed`;
-- producer `gpt` and `escalate=false`;
+- producer `gpt` with no retired `escalate` field;
 - route `claude`, `claude-opus-5`, `high`;
 - an accepted `PASS` or `PASS WITH RISKS` result;
 - the exact evidence digest and package candidate fingerprint;
 - no transport override;
 - a current engine `check` result of `OK`.
 
-The real-root gate also requires `framework-desktop`, root, and both `buzz-agent@mempool.service` and `buzz-agent@genesis.service` to report exactly `inactive` and `disabled`. Private receipt, evidence, and state files must belong to the authenticated sudo invoker. Direct-root operation requires root-owned artifacts. Malformed or forged `SUDO_UID` metadata fails closed. Every target must be `add`, `replace`, or `current`, with `writes=0`.
+The real-root gate also requires `framework-desktop`, root, and both `buzz-agent@mempool.service` and `buzz-agent@genesis.service` to report exactly `inactive` and `disabled`. It checks each identity-local HOME state directory for exact owner, mode, and service-user read/write/search access, then resolves the root-owned `codex-acp`, Codex, and Node paths as each service identity. It does not read EnvironmentFiles or credentials. Private receipt, evidence, and state files must belong to the authenticated sudo invoker. Direct-root operation requires root-owned artifacts. Malformed or forged `SUDO_UID` metadata fails closed. Every target must be `add`, `replace`, or `current`, with `writes=0`.
 
 Parent symlinks are allowed only when the link owner is trusted, the resolved directory remains inside the install root and below the same already-validated parent tree, and the normal owner and non-writable-directory checks pass. Broken, escaping, cross-tree, writable, or wrong-owner links remain blocked.
 

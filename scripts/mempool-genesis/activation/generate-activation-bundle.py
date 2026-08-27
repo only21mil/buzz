@@ -23,9 +23,9 @@ BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 REVIEW_FILES_SCHEMA = "buzz-agent-review-files-v1"
 TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
+TIER2_ENGINE_MODE = 0o750
 TIER2_REVIEW = {
     "producer_provider": "gpt",
-    "escalate": False,
     "reviewer_provider": "claude",
     "model": "claude-opus-5",
     "effort": "high",
@@ -33,15 +33,21 @@ TIER2_REVIEW = {
 }
 TIER2_CANDIDATE_PATHS = ("bundle-manifest.json", "metadata/review-files.json")
 BUNDLE_ID = "mempool-genesis-activation-20260825"
+RUNTIME_TARGET_COUNT = 22
+REVIEW_PATH_COUNT = 19
+CODEX_CLI_PATH = "/usr/local/libexec/buzz/codex"
+CODEX_ACP_PATH = "/usr/local/libexec/buzz/codex-acp"
+NODE_PATH = "/usr/local/libexec/buzz/node"
+ENV_NODE_SHEBANG = b"#!/usr/bin/env node\n"
+PINNED_NODE_SHEBANG = f"#!{NODE_PATH}\n".encode()
 CURRENT_REVIEW_POLICY = (
     "Any required Tier 2 review follows the current opposite-provider runbook in "
-    "Agent-Shared/adapters/sats-shared-common.md § Verification and review. For GPT-produced "
-    "work, use one independent Claude Opus 5 reviewer at high reasoning. Canon escalation "
-    "moves that Claude leg to Claude Fable 5 for security, authentication, signing, or "
-    "production infrastructure unless Victor or Rachel explicitly overrides it. For Claude- "
-    "or parent-produced work, use one independent GPT-5.6 Sol reviewer at high reasoning. "
-    "Reviewer identity must differ from producer identity. Sol `xhigh` is allowed only on "
-    "explicit Victor or Rachel instruction. Luna is producer-only and never a reviewer."
+    "Agent-Shared/adapters/sats-shared-common.md § Verification and review. For GPT- "
+    "or local-produced work, use one independent Claude Opus 5 reviewer at high reasoning. "
+    "For Claude- or parent-produced work, use one independent GPT-5.6 Sol reviewer at high "
+    "reasoning. Fable 5 is not a review or escalation route. Reviewer identity must differ "
+    "from producer identity. Sol `xhigh` is allowed only on explicit Victor or Rachel "
+    "instruction. Luna is producer-only and never a reviewer."
 )
 OWNER_PUBKEY = "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d"
 ASSIGNER_PUBKEYS = (
@@ -73,6 +79,20 @@ COMMON_TARGETS = (
     TargetSpec(
         "/etc/systemd/system/buzz-agent@.service",
         "scripts/mempool-genesis/buzz-agent@.service",
+        0o644,
+        source_kind="repo",
+    ),
+    TargetSpec(
+        "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf",
+        "scripts/mempool-genesis/activation/templates/systemd/"
+        "buzz-agent@mempool.service.d/ci-migration.conf",
+        0o644,
+        source_kind="repo",
+    ),
+    TargetSpec(
+        "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf",
+        "scripts/mempool-genesis/activation/templates/systemd/"
+        "buzz-agent@genesis.service.d/capability-parity.conf",
         0o644,
         source_kind="repo",
     ),
@@ -114,11 +134,11 @@ COMMON_TARGETS = (
         0o755,
         source_kind="repo",
     ),
-    TargetSpec("/usr/local/libexec/buzz/node", "/usr/local/libexec/buzz/node", 0o755),
-    TargetSpec("/usr/local/libexec/buzz/codex", "/usr/local/libexec/buzz/codex", 0o755),
+    TargetSpec(NODE_PATH, NODE_PATH, 0o755),
+    TargetSpec(CODEX_CLI_PATH, CODEX_CLI_PATH, 0o755),
     TargetSpec(
-        "/usr/local/libexec/buzz/codex-acp",
-        "/usr/local/libexec/buzz/codex-acp",
+        CODEX_ACP_PATH,
+        CODEX_ACP_PATH,
         0o755,
     ),
     TargetSpec(
@@ -148,6 +168,11 @@ EXPECTED_PATHS = {
         f"/etc/buzz-agents/{slug}.env",
         f"/etc/buzz-agents/prompts/{slug}.md",
         "/etc/systemd/system/buzz-agent@.service",
+        (
+            "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf"
+            if slug == "mempool"
+            else "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf"
+        ),
         "/usr/local/libexec/buzz/run-buzz-agent",
         "/usr/local/libexec/buzz/verify-installed-agent",
         "/usr/local/libexec/buzz/buzz-agent-key-handoff",
@@ -307,15 +332,20 @@ def validate_env(payload: bytes, slug: str) -> None:
             raise ValueError(f"invalid or duplicate env line for {slug}: {line}")
         values[key] = value
     required = {
+        "BUZZ_ACP_AGENT_COMMAND": CODEX_ACP_PATH,
+        "BUZZ_ACP_MCP_COMMAND": "/usr/local/libexec/buzz/buzz-dev-mcp",
         "BUZZ_ACP_RESPOND_TO": "allowlist",
         "BUZZ_ACP_RESPOND_TO_ALLOWLIST": ALLOWLIST,
         "BUZZ_ACP_ALLOWED_RESPOND_TO": "allowlist",
         "BUZZ_ACP_AGENT_OWNER": OWNER_PUBKEY,
         "BUZZ_RELAY_URL": "wss://framework-desktop.tail69757d.ts.net:38443",
+        "CODEX_PATH": CODEX_CLI_PATH,
     }
     for key, expected in required.items():
         if values.get(key) != expected:
             raise ValueError(f"{slug} env has wrong {key}")
+    if "PATH" in values:
+        raise ValueError(f"{slug} env must not override the reviewed service PATH")
 
 
 def render_prompt(path: Path, slug: str) -> bytes:
@@ -370,6 +400,8 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
         TEMPLATE_DIR / "mempool.md",
         TEMPLATE_DIR / "genesis.md",
         TEMPLATE_DIR / "buzz-sats-channel-sweep.sh",
+        TEMPLATE_DIR / "systemd/buzz-agent@mempool.service.d/ci-migration.conf",
+        TEMPLATE_DIR / "systemd/buzz-agent@genesis.service.d/capability-parity.conf",
         repo_root / "scripts/mempool-genesis/buzz-agent@.service",
         repo_root / "scripts/mempool-genesis/verify-installed-agent",
         repo_root / "scripts/mempool-genesis/buzz-agent-key-handoff.sudoers",
@@ -390,7 +422,7 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
 
 def tier2_engine_record(path: Path) -> dict[str, str]:
     resolved = path.resolve(strict=True)
-    metadata = require_regular(resolved, 0o700, owner_uid=os.getuid())
+    metadata = require_regular(resolved, TIER2_ENGINE_MODE, owner_uid=os.getuid())
     return {
         "path": str(resolved),
         "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
@@ -431,6 +463,23 @@ def add_target(
             "sha256": sha256_bytes(payload),
         }
     )
+
+
+def render_codex_acp(source: Path) -> bytes:
+    require_regular(source)
+    descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    if payload.startswith(ENV_NODE_SHEBANG):
+        return PINNED_NODE_SHEBANG + payload[len(ENV_NODE_SHEBANG) :]
+    if payload.startswith(PINNED_NODE_SHEBANG):
+        return payload
+    raise ValueError("codex-acp source does not use the reviewed Node interpreter contract")
 
 
 def replace_output(temporary: Path, output: Path, replace: bool) -> None:
@@ -481,7 +530,7 @@ def generate(
             prompt_payload = render_prompt(TEMPLATE_DIR / f"{slug}.md", slug)
             validate_env(env_payload, slug)
             validate_prompt(prompt_payload, slug)
-            add_target(temporary, records, f"/etc/buzz-agents/{slug}.env", env_payload, 0o644)
+            add_target(temporary, records, f"/etc/buzz-agents/{slug}.env", env_payload, 0o600)
             add_target(
                 temporary,
                 records,
@@ -491,6 +540,17 @@ def generate(
             )
         for spec in COMMON_TARGETS:
             source = source_path(spec, system_root, repo_root)
+            if spec.target == CODEX_ACP_PATH:
+                add_target(
+                    temporary,
+                    records,
+                    spec.target,
+                    render_codex_acp(source),
+                    spec.mode,
+                    spec.uid,
+                    spec.gid,
+                )
+                continue
             destination = temporary / "install-root" / spec.target.lstrip("/")
             copy_file(source, destination, spec.mode)
             records.append(
@@ -515,8 +575,10 @@ def generate(
             0o600,
         )
         by_target = {str(record["target"]): record for record in records}
-        if len(by_target) != 20 or len(records) != 20:
-            raise ValueError("activation runtime target set must contain 20 unique paths")
+        if len(by_target) != RUNTIME_TARGET_COUNT or len(records) != RUNTIME_TARGET_COUNT:
+            raise ValueError(
+                f"activation runtime target set must contain {RUNTIME_TARGET_COUNT} unique paths"
+            )
         review_files = {
             slug: [
                 {"path": path, "sha256": str(by_target[path]["sha256"])}
@@ -524,8 +586,10 @@ def generate(
             ]
             for slug in ("mempool", "genesis")
         }
-        if any(len(files) != 18 for files in review_files.values()):
-            raise ValueError("each installed review closure must contain exactly 18 paths")
+        if any(len(files) != REVIEW_PATH_COUNT for files in review_files.values()):
+            raise ValueError(
+                f"each installed review closure must contain exactly {REVIEW_PATH_COUNT} paths"
+            )
 
         sweep_template = (TEMPLATE_DIR / "buzz-sats-channel-sweep.sh").read_text()
         sweep_payload = (

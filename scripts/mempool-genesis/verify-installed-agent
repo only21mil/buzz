@@ -3,7 +3,12 @@ set -euo pipefail
 
 slug="${1:-}"
 case "$slug" in
-  mempool|genesis) ;;
+  mempool)
+    expected_instance_dropin=/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf
+    ;;
+  genesis)
+    expected_instance_dropin=/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf
+    ;;
   *) printf '%s\n' "unsupported agent slug" >&2; exit 64 ;;
 esac
 
@@ -13,6 +18,7 @@ expected_paths=(
   "/etc/buzz-agents/$slug.env"
   "/etc/buzz-agents/prompts/$slug.md"
   /etc/systemd/system/buzz-agent@.service
+  "$expected_instance_dropin"
   /usr/local/libexec/buzz/run-buzz-agent
   /usr/local/libexec/buzz/verify-installed-agent
   /usr/local/libexec/buzz/buzz-agent-key-handoff
@@ -29,6 +35,15 @@ expected_paths=(
   /usr/local/libexec/buzz/buzz-dev-mcp
   /usr/lib/systemd/system/service.d/10-timeout-abort.conf
 )
+
+unit="buzz-agent@$slug.service"
+effective_fragment="$(/usr/bin/systemctl show --no-pager --property=FragmentPath --value "$unit")"
+effective_dropins_text="$(/usr/bin/systemctl show --no-pager --property=DropInPaths --value "$unit")"
+read -r -a effective_dropins <<<"$effective_dropins_text"
+test "$effective_fragment" = /etc/systemd/system/buzz-agent@.service
+test "${#effective_dropins[@]}" = 2
+test "${effective_dropins[0]}" = /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+test "${effective_dropins[1]}" = "$expected_instance_dropin"
 
 test -f "$closure"
 test ! -L "$closure"
@@ -66,9 +81,10 @@ test "$(stat -c '%U:%G:%a' /etc/buzz-agents/prompts)" = root:root:755
 test "$(stat -c '%U:%G:%a' /etc/buzz-agents/credentials)" = root:root:700
 test "$(stat -c '%U:%G:%a' /usr/local/libexec/buzz)" = root:root:755
 
-test "$(stat -c '%a' "/etc/buzz-agents/$slug.env")" = 644
+test "$(stat -c '%a' "/etc/buzz-agents/$slug.env")" = 600
 test "$(stat -c '%a' "/etc/buzz-agents/prompts/$slug.md")" = 644
 test "$(stat -c '%a' /etc/systemd/system/buzz-agent@.service)" = 644
+test "$(stat -c '%a' "$expected_instance_dropin")" = 644
 test "$(stat -c '%a' /usr/local/libexec/buzz/run-buzz-agent)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/verify-installed-agent)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-agent-key-handoff)" = 755
@@ -84,6 +100,32 @@ test "$(stat -c '%a' /usr/local/libexec/buzz/codex-code-mode-host)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-acp)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-dev-mcp)" = 755
 test "$(stat -c '%a' /usr/lib/systemd/system/service.d/10-timeout-abort.conf)" = 644
+
+expected_user="buzz-$slug"
+state_paths=(
+  "/home/$expected_user"
+  "/home/$expected_user/.codex"
+  "/home/$expected_user/.config"
+  "/home/$expected_user/.cache"
+  "/home/$expected_user/.local/state"
+  "/home/$expected_user/.tmp"
+  "/run/buzz-agents-$slug"
+)
+for state_path in "${state_paths[@]}"; do
+  test -d "$state_path"
+  test ! -L "$state_path"
+  test "$(stat -c '%U:%G:%a' "$state_path")" = "$expected_user:$expected_user:700"
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -r "$state_path"
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -w "$state_path"
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -x "$state_path"
+done
+for tool_path in \
+  /usr/local/libexec/buzz/codex-acp \
+  /usr/local/libexec/buzz/codex \
+  /usr/local/libexec/buzz/node; do
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -x "$tool_path"
+  test "$(/usr/sbin/runuser -u "$expected_user" -- /usr/bin/readlink -e "$tool_path")" = "$tool_path"
+done
 
 test -f "$credential"
 test ! -L "$credential"

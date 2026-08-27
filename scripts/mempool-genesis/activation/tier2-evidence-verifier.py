@@ -31,6 +31,24 @@ EXPECTED_ROUTE = {
     "model": "claude-opus-5",
     "effort": "high",
 }
+TIER2_ENGINE_MODE = 0o750
+SEALED_ENGINE_LAUNCHER = """\
+import os
+import sys
+
+engine_path = sys.argv[1]
+sealed_path = sys.argv[2]
+with open(sealed_path, "rb", buffering=0) as source:
+    payload = source.read()
+sys.argv = [engine_path, *sys.argv[3:]]
+namespace = {
+    "__name__": "__main__",
+    "__file__": engine_path,
+    "__package__": None,
+    "__cached__": None,
+}
+exec(compile(payload, engine_path, "exec"), namespace)
+"""
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -182,10 +200,8 @@ def validate_state(
 ) -> dict[str, object]:
     if state.get("state_schema") != "tier2-state-v2":
         raise ValueError("Tier 2 state does not use the current tier2-state-v2 schema")
-    if state.get("producer_provider") != "gpt" or state.get("escalate") is not False:
-        raise ValueError(
-            "Tier 2 state does not record the GPT producer and activation-specific non-escalated route"
-        )
+    if state.get("producer_provider") != "gpt" or "escalate" in state:
+        raise ValueError("Tier 2 state does not record the current GPT producer route")
     route = state.get("route")
     if not isinstance(route, dict) or set(route) != {
         "provider",
@@ -290,7 +306,7 @@ def open_sealed_engine(path: Path, expected_digest: str) -> int:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or stat.S_IMODE(metadata.st_mode) != TIER2_ENGINE_MODE
         ):
             raise ValueError("unsafe installed Tier 2 engine")
         sealed = os.memfd_create("mgact-tier2-v2-engine", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
@@ -323,7 +339,17 @@ def run_engine_check(engine: Path, engine_digest: str, state_path: Path) -> None
     descriptor = open_sealed_engine(engine, engine_digest)
     try:
         completed = subprocess.run(
-            [sys.executable, f"/proc/self/fd/{descriptor}", "check", "--state", str(state_path)],
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                SEALED_ENGINE_LAUNCHER,
+                str(engine),
+                f"/proc/self/fd/{descriptor}",
+                "check",
+                "--state",
+                str(state_path),
+            ],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -379,7 +405,6 @@ def check(
         "subcommand": "check",
         "state_schema": "tier2-state-v2",
         "producer_provider": "gpt",
-        "escalated": False,
         "route": EXPECTED_ROUTE,
         **acceptance,
     }

@@ -26,6 +26,7 @@ TIER2_VERIFIER_RELATIVE = Path(
     "scripts/mempool-genesis/activation/tier2-evidence-verifier.py"
 )
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
+TIER2_ENGINE_MODE = 0o750
 TIER2_VERIFIER_MODE = 0o755
 SUDO_PATH = Path("/usr/bin/sudo")
 BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
@@ -38,6 +39,37 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 BACKUP_ID = re.compile(
     r"^mempool-genesis-activation-20260825-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}\.[0-9]{6}Z$"
 )
+RUNTIME_TARGET_COUNT = 22
+TOTAL_PACKAGE_TARGET_COUNT = 23
+REVIEW_PATH_COUNT = 19
+IDENTITY_STATE_MODES = {
+    "mempool": {
+        "/home/buzz-mempool": 0o700,
+        "/home/buzz-mempool/.codex": 0o700,
+        "/home/buzz-mempool/.config": 0o700,
+        "/home/buzz-mempool/.cache": 0o700,
+        "/home/buzz-mempool/.local/state": 0o700,
+        "/home/buzz-mempool/.tmp": 0o700,
+    },
+    "genesis": {
+        "/home/buzz-genesis": 0o700,
+        "/home/buzz-genesis/.codex": 0o700,
+        "/home/buzz-genesis/.config": 0o700,
+        "/home/buzz-genesis/.cache": 0o700,
+        "/home/buzz-genesis/.local/state": 0o700,
+        "/home/buzz-genesis/.tmp": 0o700,
+    },
+}
+ROOT_TOOL_PATHS = (
+    "/usr/local/libexec/buzz/codex-acp",
+    "/usr/local/libexec/buzz/codex",
+    "/usr/local/libexec/buzz/node",
+)
+ROOT_PATH_COMMANDS = (
+    ("codex", "/usr/local/libexec/buzz/codex"),
+    ("node", "/usr/local/libexec/buzz/node"),
+)
+WHICH_PROGRAM = "import shutil,sys; print(shutil.which(sys.argv[1]) or '')"
 sys.dont_write_bytecode = True
 
 
@@ -405,7 +437,7 @@ def tier2_engine_record(manifest: dict[str, object]) -> dict[str, str]:
     path_raw, mode_raw, digest = record.get("path"), record.get("mode"), record.get("sha256")
     if path_raw != str(TIER2_ENGINE_PATH):
         raise ValueError("package-bound Tier 2 engine path is invalid")
-    if parse_mode(mode_raw) != 0o700:
+    if parse_mode(mode_raw) != TIER2_ENGINE_MODE:
         raise ValueError("package-bound Tier 2 engine mode mismatch")
     if not isinstance(digest, str) or not HEX64.fullmatch(digest):
         raise ValueError("package-bound Tier 2 engine digest is invalid")
@@ -574,7 +606,6 @@ def validate_tier2_acceptance(
         "subcommand",
         "state_schema",
         "producer_provider",
-        "escalated",
         "route",
         "lineage_id",
         "state_id",
@@ -590,8 +621,8 @@ def validate_tier2_acceptance(
         raise ValueError("Tier 2 v2 closure response fields mismatch")
     if check.get("subcommand") != "check" or check.get("state_schema") != "tier2-state-v2":
         raise ValueError("Tier 2 v2 closure response type mismatch")
-    if check.get("producer_provider") != "gpt" or check.get("escalated") is not False:
-        raise ValueError("Tier 2 v2 closure producer or activation override mismatch")
+    if check.get("producer_provider") != "gpt":
+        raise ValueError("Tier 2 v2 closure producer mismatch")
     if check.get("route") != {
         "provider": "claude",
         "model": "claude-opus-5",
@@ -643,8 +674,10 @@ def build_installed_closure(
         raise ValueError("review file map is absent")
     for slug in ("mempool", "genesis"):
         values = files.get(slug)
-        if not isinstance(values, list) or len(values) != 18:
-            raise ValueError(f"{slug} installed closure must contain exactly 18 paths")
+        if not isinstance(values, list) or len(values) != REVIEW_PATH_COUNT:
+            raise ValueError(
+                f"{slug} installed closure must contain exactly {REVIEW_PATH_COUNT} paths"
+            )
     return canonical_json(
         {
             "schema": INSTALLED_CLOSURE_SCHEMA,
@@ -690,13 +723,16 @@ def load_bundle(
         owner,
     )
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
-    if not isinstance(runtime_raw, list) or len(runtime_raw) != 20:
-        raise ValueError("runtime target count must be 20")
+    if not isinstance(runtime_raw, list) or len(runtime_raw) != RUNTIME_TARGET_COUNT:
+        raise ValueError(f"runtime target count must be {RUNTIME_TARGET_COUNT}")
     if not isinstance(ops_raw, list) or len(ops_raw) != 1:
         raise ValueError("ops target count must be one")
     runtime_targets = tuple(parse_target(bundle, raw) for raw in runtime_raw)
     ops_targets = tuple(parse_target(bundle, raw) for raw in ops_raw)
-    if len({target.target for target in runtime_targets + ops_targets}) != 21:
+    if (
+        len({target.target for target in runtime_targets + ops_targets})
+        != TOTAL_PACKAGE_TARGET_COUNT
+    ):
         raise ValueError("duplicate install target")
     closure_payload = build_installed_closure(manifest, acceptance)
     closure_target = Target(
@@ -817,6 +853,75 @@ def systemctl_readback(action: str, unit: str) -> tuple[int, str]:
     return completed.returncode, completed.stdout.strip()
 
 
+def identity_command(user: str, *command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/usr/sbin/runuser", "-u", user, "--", *command],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        env={
+            "LC_ALL": "C",
+            "PATH": "/usr/local/libexec/buzz:/usr/local/bin:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    )
+
+
+def identity_runtime_blockers() -> list[str]:
+    blockers: list[str] = []
+    for slug, paths in IDENTITY_STATE_MODES.items():
+        user = f"buzz-{slug}"
+        try:
+            account = pwd.getpwnam(user)
+        except KeyError:
+            blockers.append(f"service identity absent: {user}")
+            continue
+        if account.pw_dir != f"/home/{user}":
+            blockers.append(f"service identity HOME mismatch: {user}")
+        for raw, expected_mode in paths.items():
+            path = Path(raw)
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                blockers.append(f"identity state path unreadable: {raw}: {type(error).__name__}")
+                continue
+            if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+                blockers.append(f"identity state path is not a real directory: {raw}")
+                continue
+            if metadata.st_uid != account.pw_uid or metadata.st_gid != account.pw_gid:
+                blockers.append(f"identity state path owner mismatch: {raw}")
+            if stat.S_IMODE(metadata.st_mode) != expected_mode:
+                blockers.append(f"identity state path mode mismatch: {raw}")
+            for flag, label in (("-r", "read"), ("-w", "write"), ("-x", "search")):
+                result = identity_command(user, "/usr/bin/test", flag, raw)
+                if result.returncode != 0:
+                    blockers.append(f"service identity lacks {label} access: {user}: {raw}")
+        for raw in ROOT_TOOL_PATHS:
+            executable = identity_command(user, "/usr/bin/test", "-x", raw)
+            if executable.returncode != 0:
+                blockers.append(f"service identity cannot execute root tool: {user}: {raw}")
+                continue
+            resolved = identity_command(user, "/usr/bin/readlink", "-e", raw)
+            if resolved.returncode != 0 or resolved.stdout.strip() != raw:
+                blockers.append(f"service identity root tool resolution mismatch: {user}: {raw}")
+        for command_name, expected_path in ROOT_PATH_COMMANDS:
+            resolved = identity_command(
+                user,
+                "/usr/bin/python3",
+                "-I",
+                "-c",
+                WHICH_PROGRAM,
+                command_name,
+            )
+            if resolved.returncode != 0 or resolved.stdout.strip() != expected_path:
+                blockers.append(
+                    f"service identity PATH resolution mismatch: {user}: {command_name}"
+                )
+    return blockers
+
+
 def service_blockers(root: Path) -> list[str]:
     if root != Path("/"):
         return []
@@ -837,6 +942,8 @@ def service_blockers(root: Path) -> list[str]:
             blockers.append(f"service must be stopped: {unit} state={active_state or active_code}")
         if enabled_code != 1 or enabled_state != "disabled":
             blockers.append(f"service must be disabled: {unit} state={enabled_state or enabled_code}")
+    if not blockers:
+        blockers.extend(identity_runtime_blockers())
     return blockers
 
 

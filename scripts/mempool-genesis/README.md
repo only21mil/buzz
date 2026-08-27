@@ -41,15 +41,18 @@ public identities:
 7. Start and verify one agent at a time. Add only the approved Sats/Victor
    channels, then DMs and explicit mention/reply tests.
 
-The dynamic package under `activation/` uses the current Tier 2 v2 engine. For
-this one activation, Victor explicitly overrode automatic escalation on
-2026-08-26: the GPT producer route uses one Claude Opus 5 reviewer at `high`
-without `--escalate`. Generic fleet canon still escalates future GPT-produced
-security, authentication, signing, or production-infrastructure work to Claude
-Fable 5 unless Victor or Rachel explicitly overrides it. The installer accepts
+The dynamic package under `activation/` uses the current Tier 2 v2 engine. The
+GPT producer route uses one Claude Opus 5 reviewer at `high`; Fable 5 is not a
+review or escalation route. The installer accepts
 only the same unexpired `tier2-state-v2` file after the installed engine's
 `check` subcommand returns `OK`; there is no separate review result file. See
 `activation/README.md` for the exact `prepare`, `review`, and `check` commands.
+
+The staged parity source includes both effective per-instance systemd drop-ins,
+mode-`0600` root-owned EnvironmentFiles, exact identity-local write paths, and
+the reviewed root-owned Codex/Node tool closure. It does not authorize install
+or activation. GLM activation remains held for its own current Tier 2 closure
+and separate activation approval.
 
 Freeze the static and Desktop install bytes with one manifest:
 
