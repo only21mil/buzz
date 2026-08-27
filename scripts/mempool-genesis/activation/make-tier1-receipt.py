@@ -34,7 +34,7 @@ TIER2_REVIEW = {
 TIER2_CANDIDATE_PATHS = ["bundle-manifest.json", "metadata/review-files.json"]
 MAX_TIER2_EVIDENCE_BYTES = 64 * 1024
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-ASSIGNER_PUBKEYS = (
+RESERVED_PUBKEYS = (
     "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d",
     "7806a7beb69ba4fd3b6e9b86d56931a446b62666e9794533f87fb2d1b956684f",
     "73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812",
@@ -47,9 +47,9 @@ PLACEHOLDERS = {
 }
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
 SHELLCHECK_PATH = "/home/victor/.npm-global/bin/shellcheck"
-RUNTIME_TARGET_COUNT = 22
-TOTAL_PACKAGE_TARGET_COUNT = 23
-REVIEW_PATH_COUNT = 19
+RUNTIME_TARGET_COUNT = 24
+TOTAL_PACKAGE_TARGET_COUNT = 25
+REVIEW_PATH_COUNT = 21
 SYSTEMD_FRAGMENT = "/etc/systemd/system/buzz-agent@.service"
 SYSTEMD_MANAGER_DROPIN = "/usr/lib/systemd/system/service.d/10-timeout-abort.conf"
 SYSTEMD_INSTANCE_DROPINS = {
@@ -305,7 +305,7 @@ def expected_tier2_bundle(
         ),
         "paths": TIER2_CANDIDATE_PATHS,
         "invariants": [
-            "The review binds the exact package manifest and exact 19-path review-file record.",
+            "The review binds the exact package manifest and exact 21-path review-file record.",
             "The package and review state remain owner-only and credential-free.",
             "The parent Tier 1 receipt is deterministic evidence only and grants no install authority.",
             "Mempool and Genesis stay stopped and disabled through review and install preflight.",
@@ -349,6 +349,7 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         "tier2_engine",
         "tier2_evidence_schema",
         "tier2_candidate_paths",
+        "capability_parity",
     }
     if set(manifest) != required or manifest.get("schema") != BUNDLE_SCHEMA:
         raise ValueError("package manifest schema or fields mismatch")
@@ -367,8 +368,8 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
     if complete:
         if inputs["mempool"] == inputs["genesis"]:
             raise ValueError("Mempool and Genesis public keys are not distinct")
-        if inputs["mempool"] in ASSIGNER_PUBKEYS or inputs["genesis"] in ASSIGNER_PUBKEYS:
-            raise ValueError("agent public keys reuse an assignment-roster identity")
+        if inputs["mempool"] in RESERVED_PUBKEYS or inputs["genesis"] in RESERVED_PUBKEYS:
+            raise ValueError("agent public keys reuse a reserved responder identity")
     expected_status = "complete" if complete else "desktop-save-required"
     if manifest.get("input_status") != expected_status:
         raise ValueError("package input status mismatch")
@@ -407,7 +408,7 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         "mode": "0700",
         "uid": 1000,
         "gid": 1000,
-        "scope": "Victor-owner-authenticated all-open-channel fixed public-key roster",
+        "scope": "Codex-R-matched open and eligible Sats/Victor private membership",
     }
     for key, value in expected_ops.items():
         if ops[0].get(key) != value:
@@ -455,6 +456,13 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         raise ValueError("Tier 2 evidence schema mismatch")
     if manifest.get("tier2_candidate_paths") != TIER2_CANDIDATE_PATHS:
         raise ValueError("Tier 2 candidate path set mismatch")
+    if manifest.get("capability_parity") != {
+        "manifest_schema": "buzz-agent-capability-manifest-v1",
+        "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
+        "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
+        "policy": "/etc/buzz-agents/capability-parity-policy.json",
+    }:
+        raise ValueError("capability parity contract mismatch")
     digest_input = {
         "schema": BUNDLE_SCHEMA,
         "bundle_id": BUNDLE_ID,
@@ -469,6 +477,7 @@ def validate_bundle(bundle: Path, repo_root: Path) -> dict[str, object]:
         "tier2_engine": manifest["tier2_engine"],
         "tier2_evidence_schema": manifest["tier2_evidence_schema"],
         "tier2_candidate_paths": manifest["tier2_candidate_paths"],
+        "capability_parity": manifest["capability_parity"],
     }
     package_digest = sha256_bytes(canonical_json(digest_input))
     if manifest.get("package_digest") != package_digest:
@@ -643,6 +652,18 @@ def gate_commands(bundle: Path) -> list[list[str]]:
             str(SCRIPT_DIR / "tests"),
             "-p",
             "test_activation.py",
+            "-v",
+        ],
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            str(SCRIPT_DIR / "tests"),
+            "-p",
+            "test_capability_parity.py",
             "-v",
         ],
         ["bash", "-n", str(sweep_template)],

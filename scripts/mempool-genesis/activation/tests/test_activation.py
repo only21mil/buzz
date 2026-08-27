@@ -288,9 +288,9 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(tree_fingerprint(first), tree_fingerprint(second))
         self.assertTrue(manifest["ready_for_parent_tier1"])
         self.assertFalse(manifest["installable"])
-        self.assertEqual(len(manifest["runtime_targets"]), 22)
+        self.assertEqual(len(manifest["runtime_targets"]), 24)
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(manifest["review_files"][slug]), 19)
+            self.assertEqual(len(manifest["review_files"][slug]), 21)
             self.assertEqual(
                 [entry["path"] for entry in manifest["review_files"][slug]],
                 manifest["expected_closure_paths"][slug],
@@ -324,7 +324,16 @@ class ActivationBundleTests(PackageFixture):
             )
         self.assertEqual(
             manifest["ops_targets"][0]["scope"],
-            "Victor-owner-authenticated all-open-channel fixed public-key roster",
+            "Codex-R-matched open and eligible Sats/Victor private membership",
+        )
+        self.assertEqual(
+            manifest["capability_parity"],
+            {
+                "manifest_schema": "buzz-agent-capability-manifest-v1",
+                "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
+                "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
+                "policy": "/etc/buzz-agents/capability-parity-policy.json",
+            },
         )
         codex_acp = first / "install-root/usr/local/libexec/buzz/codex-acp"
         self.assertTrue(codex_acp.read_bytes().startswith(b"#!/usr/local/libexec/buzz/node\n"))
@@ -335,7 +344,7 @@ class ActivationBundleTests(PackageFixture):
             "uppercase": ("A" * 64, "2" * 64, "lowercase"),
             "short": ("1" * 63, "2" * 64, "64 lowercase"),
             "equal": ("1" * 64, "1" * 64, "must differ"),
-            "reserved": (GENERATOR.OWNER_PUBKEY, "2" * 64, "assignment-roster"),
+            "reserved": (GENERATOR.OWNER_PUBKEY, "2" * 64, "reserved responder"),
         }
         for name, (mempool, genesis, message) in cases.items():
             with self.subTest(name=name):
@@ -396,15 +405,18 @@ class ActivationBundleTests(PackageFixture):
                 REPO_ROOT,
             )
 
-    def test_templates_bind_exact_allowlist_host_and_memory_boundary(self) -> None:
+    def test_templates_bind_owner_only_host_state_and_memory_boundary(self) -> None:
         bundle, _manifest = self.generate()
         for slug in ("mempool", "genesis"):
             env = (bundle / f"install-root/etc/buzz-agents/{slug}.env").read_text()
             values = dict(line.split("=", 1) for line in env.splitlines())
-            self.assertEqual(values["BUZZ_ACP_RESPOND_TO"], "allowlist")
-            self.assertEqual(values["BUZZ_ACP_RESPOND_TO_ALLOWLIST"], GENERATOR.ALLOWLIST)
-            self.assertEqual(len(values["BUZZ_ACP_RESPOND_TO_ALLOWLIST"].split(",")), 5)
-            self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "allowlist")
+            self.assertEqual(values["BUZZ_ACP_RESPOND_TO"], "owner-only")
+            self.assertNotIn("BUZZ_ACP_RESPOND_TO_ALLOWLIST", values)
+            self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "owner-only")
+            self.assertEqual(
+                values["BUZZ_ACP_STATE_DIR"],
+                f"/home/buzz-{slug}/.local/state/buzz-acp",
+            )
             self.assertEqual(values["BUZZ_RELAY_URL"], "wss://framework-desktop.tail69757d.ts.net:38443")
             self.assertEqual(values["BUZZ_ACP_AGENT_COMMAND"], "/usr/local/libexec/buzz/codex-acp")
             self.assertEqual(
@@ -618,7 +630,7 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(value["candidate_fingerprint"], acceptance.candidate_fingerprint)
         self.assertEqual(value["bundle_digest"], manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(value["files"][slug]), 19)
+            self.assertEqual(len(value["files"][slug]), 21)
             self.assertEqual(value["files"][slug], manifest["review_files"][slug])
 
     def test_derived_closure_satisfies_the_installed_runtime_contract(self) -> None:
@@ -643,7 +655,7 @@ class ActivationBundleTests(PackageFixture):
 
         for slug in ("mempool", "genesis"):
             completed = subprocess.run(
-                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "19", contract],
+                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "21", contract],
                 input=closure_text,
                 check=False,
                 stdout=subprocess.PIPE,
@@ -656,7 +668,7 @@ class ActivationBundleTests(PackageFixture):
         retired = json.loads(closure_text)
         retired["schema"] = "buzz-agent-review-closure-v1"
         rejected = subprocess.run(
-            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "19", contract],
+            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "21", contract],
             input=json.dumps(retired),
             check=False,
             stdout=subprocess.PIPE,
@@ -1131,7 +1143,7 @@ class InstallerSafetyTests(PackageFixture):
         self.assertTrue(closure["accepted"])
         self.assertEqual(closure["bundle_digest"], self.manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(closure["files"][slug]), 19)
+            self.assertEqual(len(closure["files"][slug]), 21)
         first_snapshot = target_snapshot(self.install_root, targets)
         backup_root = self.install_root / "var/lib/buzz-mgact-backups"
         backup_ids = [path.name for path in backup_root.iterdir() if path.is_dir()]
@@ -1372,6 +1384,7 @@ class ServiceGateTests(unittest.TestCase):
                         f"/home/{expected_user}/.config",
                         f"/home/{expected_user}/.cache",
                         f"/home/{expected_user}/.local/state",
+                        f"/home/{expected_user}/.local/state/buzz-acp",
                         f"/home/{expected_user}/.tmp",
                     ],
                 )
@@ -1486,8 +1499,9 @@ class SweepCandidateTests(PackageFixture):
         self.tools = self.root / "tools"
         self.tools.mkdir(mode=0o700)
         (self.tools / "nostr_min.py").write_text(
-            "def pubkey_xonly(_value):\n"
-            f"    return bytes.fromhex('{GENERATOR.OWNER_PUBKEY}')\n"
+            "def pubkey_xonly(value):\n"
+            "    return bytes.fromhex('9' * 64) if value == bytes.fromhex('d' * 64) "
+            f"else bytes.fromhex('{GENERATOR.OWNER_PUBKEY}')\n"
         )
         self.secret_dir = self.root / "secret"
         self.secret_dir.mkdir(mode=0o700)
@@ -1495,10 +1509,12 @@ class SweepCandidateTests(PackageFixture):
         self.owner_private = "a" * 64
         self.mempool_private = "b" * 64
         self.genesis_private = "c" * 64
+        self.codexr_private = "d" * 64
         self.secret_file.write_text(
             f"BUZZ_OWNER_PRIVATE_KEY={self.owner_private}\n"
             f"BUZZ_SATS_MEMPOOL_PRIVATE_KEY={self.mempool_private}\n"
             f"BUZZ_SATS_GENESIS_PRIVATE_KEY={self.genesis_private}\n"
+            f"BUZZ_SATS_CODEX_R_PRIVATE_KEY={self.codexr_private}\n"
         )
         self.secret_file.chmod(0o600)
         self.state_file = self.root / "state.json"
@@ -1509,10 +1525,16 @@ class SweepCandidateTests(PackageFixture):
                 "seen_private_keys": [],
                 "channels": {
                     "11111111-1111-1111-1111-111111111111": [
-                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"}
+                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"},
+                        {"pubkey": "9" * 64, "role": "member"}
                     ],
                     "22222222-2222-2222-2222-222222222222": [
-                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"}
+                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"},
+                        {"pubkey": "9" * 64, "role": "member"}
+                    ],
+                    "44444444-4444-4444-4444-444444444444": [
+                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "admin"},
+                        {"pubkey": "9" * 64, "role": "member"}
                     ],
                 },
             },
@@ -1534,6 +1556,8 @@ class SweepCandidateTests(PackageFixture):
             "  {'channel_id':'11111111-1111-1111-1111-111111111111','name':'one','archived':False},\n"
             "  {'channel_id':'22222222-2222-2222-2222-222222222222','name':'two','archived':False},\n"
             "  {'channel_id':'33333333-3333-3333-3333-333333333333','name':'old','archived':True}]))\n"
+            "elif args[:5] == ['channels','list','--visibility','private','--member']:\n"
+            " print(json.dumps([{'channel_id':'44444444-4444-4444-4444-444444444444','name':'private','archived':False}]))\n"
             "elif args[:2] == ['channels','members']:\n"
             " cid=args[args.index('--channel')+1]; print(json.dumps(state['channels'][cid]))\n"
             "elif args[:2] == ['channels','add-member']:\n"
@@ -1571,7 +1595,7 @@ class SweepCandidateTests(PackageFixture):
             timeout=60,
         )
 
-    def test_fixed_public_roster_covers_all_open_channels_and_is_idempotent(self) -> None:
+    def test_fixed_public_roster_matches_codexr_open_and_private_membership(self) -> None:
         before = self.state_file.read_bytes()
         check = self.run_sweep("--check")
         self.assertEqual(check.returncode, 0, check.stderr)
@@ -1581,7 +1605,9 @@ class SweepCandidateTests(PackageFixture):
         dry_run = self.run_sweep("--dry-run")
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
         self.assertEqual(dry_run.stdout.count("PLAN owner add-member"), 4)
-        self.assertIn("11111111-1111-1111-1111-111111111111", dry_run.stdout)
+        self.assertNotIn("11111111-1111-1111-1111-111111111111", dry_run.stdout)
+        self.assertIn("22222222-2222-2222-2222-222222222222", dry_run.stdout)
+        self.assertIn("44444444-4444-4444-4444-444444444444", dry_run.stdout)
         self.assertNotIn("33333333-3333-3333-3333-333333333333", dry_run.stdout)
         self.assertEqual(json.loads(self.state_file.read_text())["writes"], 0)
         first = self.run_sweep("--mempool-genesis-apply")
@@ -1595,10 +1621,10 @@ class SweepCandidateTests(PackageFixture):
         self.assertEqual(json.loads(self.state_file.read_text())["writes"], 4)
         self.assertIn("planned=0 writes=0 already=4 blocked=0", second.stdout)
 
-    def test_owner_admin_role_is_not_owner_authority(self) -> None:
+    def test_non_owner_or_admin_role_blocks_owner_authority(self) -> None:
         value = json.loads(self.state_file.read_text())
         for members in value["channels"].values():
-            members[0]["role"] = "admin"
+            members[0]["role"] = "member"
         write_private_json(self.state_file, value)
         result = self.run_sweep("--dry-run")
         self.assertNotEqual(result.returncode, 0)

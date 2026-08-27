@@ -39,9 +39,9 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 BACKUP_ID = re.compile(
     r"^mempool-genesis-activation-20260825-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}\.[0-9]{6}Z$"
 )
-RUNTIME_TARGET_COUNT = 22
-TOTAL_PACKAGE_TARGET_COUNT = 23
-REVIEW_PATH_COUNT = 19
+RUNTIME_TARGET_COUNT = 24
+TOTAL_PACKAGE_TARGET_COUNT = 25
+REVIEW_PATH_COUNT = 21
 IDENTITY_STATE_MODES = {
     "mempool": {
         "/home/buzz-mempool": 0o700,
@@ -49,6 +49,7 @@ IDENTITY_STATE_MODES = {
         "/home/buzz-mempool/.config": 0o700,
         "/home/buzz-mempool/.cache": 0o700,
         "/home/buzz-mempool/.local/state": 0o700,
+        "/home/buzz-mempool/.local/state/buzz-acp": 0o700,
         "/home/buzz-mempool/.tmp": 0o700,
     },
     "genesis": {
@@ -57,6 +58,7 @@ IDENTITY_STATE_MODES = {
         "/home/buzz-genesis/.config": 0o700,
         "/home/buzz-genesis/.cache": 0o700,
         "/home/buzz-genesis/.local/state": 0o700,
+        "/home/buzz-genesis/.local/state/buzz-acp": 0o700,
         "/home/buzz-genesis/.tmp": 0o700,
     },
 }

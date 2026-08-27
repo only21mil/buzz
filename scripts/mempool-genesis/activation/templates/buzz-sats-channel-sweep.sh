@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Keep every Sats agent in every live open Buzz channel, maintain the named
 # channel admins, and add the full Sats set to Victor-visible private channels.
-# Mempool and Genesis are a fixed public-key roster. The owner adds them only to
-# open channels. Their private keys are never loaded here, and their kind:10100
+# Mempool and Genesis are a fixed public-key roster. Victor adds them to every
+# open and eligible Sats/Victor private channel where Codex-R is a member. Their
+# private keys are never loaded here, and their kind:10100
 # records remain self-published rather than owned by directory-sync automation.
 #
 # Keys and auth tags come only from the sanctioned secrets file and reach Buzz
@@ -146,10 +147,14 @@ owner_key=${BUZZ_OWNER_PRIVATE_KEY:-}
 [[ ${#owner_key} -ge 32 ]] || { echo "BUZZ_OWNER_PRIVATE_KEY is empty" >&2; exit 1; }
 owner_pubkey=$(derive_pubkey "$owner_key")
 expected_owner_pubkey=4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d
+rachel_pubkey=7806a7beb69ba4fd3b6e9b86d56931a446b62666e9794533f87fb2d1b956684f
 [[ $owner_pubkey == "$expected_owner_pubkey" ]] || {
   echo "BUZZ_OWNER_PRIVATE_KEY does not authenticate Victor" >&2
   exit 1
 }
+codexr_key=${BUZZ_SATS_CODEX_R_PRIVATE_KEY:-}
+[[ ${#codexr_key} -ge 32 ]] || { echo "BUZZ_SATS_CODEX_R_PRIVATE_KEY is empty" >&2; exit 1; }
+codexr_pubkey=$(derive_pubkey "$codexr_key")
 
 mg_labels=("Mempool" "Genesis")
 mg_pubkeys=(
@@ -191,6 +196,7 @@ validate_mg_roster() {
   local key reserved
   [[ ${#mg_pubkeys[@]} -eq 2 ]]
   [[ ${mg_pubkeys[0]} != "${mg_pubkeys[1]}" ]]
+  [[ $codexr_pubkey =~ ^[0-9a-f]{64}$ ]]
   for key in "${mg_pubkeys[@]}"; do
     [[ $key =~ ^[0-9a-f]{64}$ ]] || {
       statusline "Mempool/Genesis roster has an unresolved or invalid public key"
@@ -202,39 +208,60 @@ validate_mg_roster() {
         return 1
       }
     done
+    [[ $key != "$codexr_pubkey" ]] || {
+      statusline "Mempool/Genesis roster reuses the Codex-R reference identity"
+      return 1
+    }
   done
 }
 
-reconcile_mg_open_channels() {
-  local action=$1 cid members owner_role target label role out verified
+reconcile_mg_channels() {
+  local action=$1 visibility=$2 channel_rows=$3
+  local cid members owner_role rachel_role codexr_role target label role out verified
   validate_mg_roster || {
     mg_blocked=$((mg_blocked + 1))
     return 1
   }
   while IFS=$'\t' read -r cid _encoded_name; do
     [[ -n $cid ]] || continue
+    in_skips "$cid" && continue
     if ! members=$(buzz_as "$owner_key" "" channels members --channel "$cid" 2>/dev/null); then
       statusline "owner: Mempool/Genesis member read FAILED $cid"
       mg_blocked=$((mg_blocked + 1))
       continue
     fi
     owner_role=$(member_role "$expected_owner_pubkey" <<<"$members")
-    if [[ $owner_role != owner ]]; then
+    if [[ $owner_role != owner && $owner_role != admin ]]; then
       statusline "owner: Mempool/Genesis owner authority UNMET $cid"
       mg_blocked=$((mg_blocked + 1))
+      continue
+    fi
+    rachel_role=$(member_role "$rachel_pubkey" <<<"$members")
+    if [[ $visibility == private && $rachel_role == owner ]]; then
+      statusline "owner: Mempool/Genesis skipped Rachel/Archimedes private $cid"
+      continue
+    fi
+    codexr_role=$(member_role "$codexr_pubkey" <<<"$members")
+    if [[ -z $codexr_role ]]; then
+      statusline "owner: Mempool/Genesis skipped non-Codex-R channel $cid"
       continue
     fi
     for i in "${!mg_pubkeys[@]}"; do
       target=${mg_pubkeys[$i]}
       label=${mg_labels[$i]}
       role=$(member_role "$target" <<<"$members")
-      if [[ -n $role ]]; then
+      if [[ $role == member ]]; then
         mg_already=$((mg_already + 1))
+        continue
+      fi
+      if [[ -n $role ]]; then
+        statusline "$label role mismatch $cid expected=member"
+        mg_blocked=$((mg_blocked + 1))
         continue
       fi
       mg_planned=$((mg_planned + 1))
       if [[ $action == dry-run ]]; then
-        printf 'PLAN owner add-member channel=%s label=%s pubkey=%s role=member\n' "$cid" "$label" "$target"
+        printf 'PLAN owner add-member visibility=%s channel=%s label=%s pubkey=%s role=member\n' "$visibility" "$cid" "$label" "$target"
       fi
       [[ $action == apply ]] || continue
       if out=$(buzz_as "$owner_key" "" channels add-member --channel "$cid" --pubkey "$target" --role member 2>&1); then
@@ -254,7 +281,7 @@ reconcile_mg_open_channels() {
           failed=$((failed + 1))
           continue
         fi
-        statusline "$label joined open $cid by owner add-member"
+        statusline "$label joined $visibility $cid by owner add-member"
         mg_writes=$((mg_writes + 1))
       elif grep -qi 'archived' <<<"$out"; then
         statusline "$label owner add-member skipped archived $cid"
@@ -264,8 +291,8 @@ reconcile_mg_open_channels() {
         failed=$((failed + 1))
       fi
     done
-  done <<<"$open_channels"
-  statusline "Mempool/Genesis open-channel roster: planned=$mg_planned writes=$mg_writes already=$mg_already blocked=$mg_blocked"
+  done <<<"$channel_rows"
+  statusline "Mempool/Genesis $visibility roster: planned=$mg_planned writes=$mg_writes already=$mg_already blocked=$mg_blocked"
   [[ $mg_blocked -eq 0 && $failed -eq 0 ]]
 }
 
@@ -275,24 +302,35 @@ if ! open_channels=$(list_live_channels open "$owner_key" "" 2>/dev/null); then
   open_channels=
 fi
 [[ -n $open_channels ]] || { statusline "owner: live open channel list empty"; failed=$((failed + 1)); }
+if ! mg_private_channels=$(list_live_channels private "$owner_key" "" true 2>/dev/null); then
+  statusline "owner: private channel list failed or relay unreachable"
+  failed=$((failed + 1))
+  mg_private_channels=
+fi
+
+reconcile_mg_parity() {
+  local action=$1
+  reconcile_mg_channels "$action" open "$open_channels"
+  reconcile_mg_channels "$action" private "$mg_private_channels"
+}
 
 case $mg_mode in
   check)
-    reconcile_mg_open_channels check
+    reconcile_mg_parity check
     printf '%s\n' "PREFLIGHT OK: read-only Mempool/Genesis reconciliation can proceed"
     exit 0
     ;;
   dry-run)
-    reconcile_mg_open_channels dry-run
+    reconcile_mg_parity dry-run
     printf '%s\n' "DRY RUN OK: no channel writes performed"
     exit 0
     ;;
   apply)
-    reconcile_mg_open_channels apply
+    reconcile_mg_parity apply
     exit 0
     ;;
   full)
-    reconcile_mg_open_channels apply || failed=$((failed + 1))
+    reconcile_mg_parity apply || failed=$((failed + 1))
     ;;
 esac
 

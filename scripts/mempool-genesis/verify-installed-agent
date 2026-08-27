@@ -34,6 +34,8 @@ expected_paths=(
   /usr/local/libexec/buzz/buzz-acp
   /usr/local/libexec/buzz/buzz-dev-mcp
   /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+  /usr/local/libexec/buzz/verify-agent-capability-parity
+  /etc/buzz-agents/capability-parity-policy.json
 )
 
 unit="buzz-agent@$slug.service"
@@ -100,14 +102,23 @@ test "$(stat -c '%a' /usr/local/libexec/buzz/codex-code-mode-host)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-acp)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-dev-mcp)" = 755
 test "$(stat -c '%a' /usr/lib/systemd/system/service.d/10-timeout-abort.conf)" = 644
+test "$(stat -c '%a' /usr/local/libexec/buzz/verify-agent-capability-parity)" = 755
+test "$(stat -c '%a' /etc/buzz-agents/capability-parity-policy.json)" = 644
 
 expected_user="buzz-$slug"
+env_file="/etc/buzz-agents/$slug.env"
+grep -qx 'BUZZ_ACP_RESPOND_TO=owner-only' "$env_file"
+grep -qx 'BUZZ_ACP_ALLOWED_RESPOND_TO=owner-only' "$env_file"
+grep -qx "BUZZ_ACP_STATE_DIR=/home/$expected_user/.local/state/buzz-acp" "$env_file"
+! grep -q '^BUZZ_ACP_RESPOND_TO_ALLOWLIST=' "$env_file"
+
 state_paths=(
   "/home/$expected_user"
   "/home/$expected_user/.codex"
   "/home/$expected_user/.config"
   "/home/$expected_user/.cache"
   "/home/$expected_user/.local/state"
+  "/home/$expected_user/.local/state/buzz-acp"
   "/home/$expected_user/.tmp"
   "/run/buzz-agents-$slug"
 )
@@ -134,3 +145,13 @@ test -r "$credential"
 test ! -w "$credential"
 test "$(wc -c < "$credential")" = 65
 LC_ALL=C grep -Eq '^[0-9a-f]{64}$' "$credential"
+other_slug=genesis
+[[ $slug == genesis ]] && other_slug=mempool
+other_credential="/etc/buzz-agents/credentials/$other_slug.key"
+if [[ -e $other_credential || -L $other_credential ]]; then
+  test -f "$other_credential"
+  test ! -L "$other_credential"
+  test "$(stat -c '%h' "$other_credential")" = 1
+  test "$(stat -c '%d:%i' "$credential")" != "$(stat -c '%d:%i' "$other_credential")"
+  ! cmp -s "$credential" "$other_credential"
+fi

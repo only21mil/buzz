@@ -63,7 +63,17 @@ A complete package reports `input_status=complete`, `ready_for_parent_tier1=true
 - the exact SHA-256 of `/home/victor/.agents/skills/codex-review/scripts/tier2`;
 - candidate paths `bundle-manifest.json` and `metadata/review-files.json`.
 
-Each agent's installed closure inventory has exactly 19 paths, including its effective template fragment, manager drop-in, and per-instance drop-in. The prestart verifier compares systemd's actual `FragmentPath` and `DropInPaths` with that closed set and rejects any extra or missing path.
+Each agent's installed closure inventory has exactly 21 paths, including its effective template fragment, manager drop-in, per-instance drop-in, capability-parity comparator, and approved-differences policy. The prestart verifier compares systemd's actual `FragmentPath` and `DropInPaths` with that closed set and rejects any extra or missing path.
+
+The environment templates use `respond_to=owner-only`, permit only `owner-only`, carry no responder allowlist, and bind `BUZZ_ACP_STATE_DIR` to the identity-local persistent state path. The package removes the unproven `AF_NETLINK` exception.
+
+## Codex-R capability parity
+
+`capability-parity.py` builds redacted `reference`, `mempool`, and `genesis` manifests from secret-safe observations and compares the set against `capability-parity-policy.json`. The manifests contain only public identity fields, nonsecret configuration, file metadata, allowed truncated hashes, runtime closure hashes, channel roles, directory policy, and effective systemd properties. The builder rejects secret-bearing fields and secret-looking values.
+
+The comparator fails closed on a shared pubkey, auth-tag binding, secret path, inode, or secret digest; a non-owner response policy; runtime closure drift; missing open or eligible Sats/Victor private membership; admin elevation; a directory record not authored by that agent; stale directory `channel_ids`; weakened systemd hardening; unapproved `AF_NETLINK`; or broad Victor, Sats, family, vault, browser, or secret-store access. Mempool's six existing CI migration lanes are the only host-path exceptions in the policy. The receipt records every allowed identity difference, approved exception, manifest and policy digest, check result, and any unexplained diff.
+
+Capture the live Sats Codex-R observation immediately before freezing the source candidate. Build all three manifests with `build`, then run `compare-set`; activation requires `status=PASS` and empty `unexplained_differences` for both candidates. No comparator mode reads a credential value.
 
 ## Tier 1 receipt and Tier 2 evidence
 
@@ -140,7 +150,7 @@ The real-root gate also requires `framework-desktop`, root, and both `buzz-agent
 
 Parent symlinks are allowed only when the link owner is trusted, the resolved directory remains inside the install root and below the same already-validated parent tree, and the normal owner and non-writable-directory checks pass. Broken, escaping, cross-tree, writable, or wrong-owner links remain blocked.
 
-The staged sweep candidate has separate read-only modes. They need later approval to use Victor's sanctioned owner credential for relay reads. Mempool and Genesis remain a fixed public-key roster. The script covers every live open channel, uses Victor's owner authority, and never reads either managed agent's private key.
+The staged sweep candidate has separate read-only modes. They need later approval to use Victor's sanctioned owner credential for relay reads. Mempool and Genesis remain a fixed public-key roster. The script matches Codex-R's live open and eligible Sats/Victor private memberships, skips Rachel/Archimedes private channels, enforces member role, uses Victor's owner or admin authority, and never reads either managed agent's private key. Each managed agent remains the sole publisher of its kind-10100 record.
 
 ```sh
 "$STAGE/candidate-final/ops-root/home/victor/.agents/tools/buzz-sats-channel-sweep.sh" --check
