@@ -10,6 +10,11 @@ log_root=${BUZZ_DEPLOY_LOG_ROOT:-${HOME}/.local/state/buzz-relay/deploys}
 health_attempts=${BUZZ_DEPLOY_HEALTH_ATTEMPTS:-30}
 health_interval=${BUZZ_DEPLOY_HEALTH_INTERVAL:-2}
 probe_timeout=${BUZZ_DEPLOY_PROBE_TIMEOUT:-5}
+source_ref=${BUZZ_DEPLOY_SOURCE_REF:-refs/remotes/origin/main}
+pre_freeze_receipt=${BUZZ_PRE_FREEZE_RECEIPT:-${repo_root}/pre-freeze-receipt.json}
+protected_ci_receipt=${BUZZ_PROTECTED_CI_RECEIPT:-${repo_root}/protected-ci-receipt.json}
+receipt_max_age=${BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS:-86400}
+prior_migration_override=${BUZZ_PRIOR_MIGRATION_OVERRIDE-}
 
 usage() {
   printf 'Usage: %s <full-40-character-commit>\n' "${0##*/}" >&2
@@ -26,7 +31,8 @@ if [[ ! ${commit} =~ ^[0-9a-f]{40}$ ]]; then
 fi
 if [[ ! ${health_attempts} =~ ^[1-9][0-9]*$ ]] || \
   [[ ! ${health_interval} =~ ^[0-9]+([.][0-9]+)?$ ]] || \
-  [[ ! ${probe_timeout} =~ ^([1-9][0-9]*|0[.][0-9]*[1-9][0-9]*)$ ]]; then
+  [[ ! ${probe_timeout} =~ ^([1-9][0-9]*|0[.][0-9]*[1-9][0-9]*)$ ]] || \
+  [[ ! ${receipt_max_age} =~ ^[1-9][0-9]*$ ]]; then
   printf 'REFUSED: health attempts, interval, and probe timeout must be positive numbers\n' >&2
   exit 64
 fi
@@ -34,6 +40,125 @@ fi
   printf 'REFUSED: compose runner is not executable: %s\n' "${run_local}" >&2
   exit 1
 }
+
+validate_receipt() {
+  local receipt_path=$1 receipt_source=$2
+  [[ -f ${receipt_path} && ! -L ${receipt_path} ]] || {
+    printf 'REFUSED: %s receipt is missing or is not a regular file: %s\n' \
+      "${receipt_source}" "${receipt_path}" >&2
+    return 1
+  }
+  python3 - "${receipt_path}" "${receipt_source}" "${commit}" "${receipt_max_age}" <<'PY'
+import datetime
+import json
+import os
+import re
+import stat
+import sys
+
+path, expected_source, expected_commit, max_age_text = sys.argv[1:]
+
+def refuse(message):
+    print(f"REFUSED: {expected_source} receipt {message}: {path}", file=sys.stderr)
+    raise SystemExit(1)
+
+mode = os.stat(path, follow_symlinks=False).st_mode
+if mode & (stat.S_IWGRP | stat.S_IWOTH):
+    refuse("is group- or world-writable")
+
+try:
+    with open(path, encoding="utf-8") as receipt_file:
+        receipt = json.load(receipt_file)
+except (OSError, json.JSONDecodeError) as error:
+    refuse(f"is unreadable or invalid JSON ({error})")
+
+if receipt.get("schema_version") != 1:
+    refuse("has unsupported schema_version")
+if receipt.get("source") != expected_source:
+    refuse("has the wrong source")
+if receipt.get("repository") != "only21mil/buzz":
+    refuse("has the wrong repository")
+
+head_sha = receipt.get("head_sha")
+if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+    refuse("head_sha must be a full 40-character lowercase commit")
+if head_sha != expected_commit:
+    refuse("does not match the requested commit")
+if receipt.get("overall") != "PASS":
+    refuse("does not record overall PASS")
+
+timestamp = receipt.get("timestamp")
+if not isinstance(timestamp, str) or not timestamp.endswith("Z"):
+    refuse("timestamp must be UTC RFC3339")
+try:
+    recorded_at = datetime.datetime.fromisoformat(timestamp[:-1] + "+00:00")
+except ValueError:
+    refuse("timestamp is invalid")
+now = datetime.datetime.now(datetime.timezone.utc)
+age = (now - recorded_at).total_seconds()
+if age < -300:
+    refuse("timestamp is more than 300 seconds in the future")
+if age > int(max_age_text):
+    refuse("is stale")
+
+checks = receipt.get("checks")
+if not isinstance(checks, list) or not checks:
+    refuse("must contain at least one check")
+if any(not isinstance(check, dict) or check.get("status") != "PASS" for check in checks):
+    refuse("contains a check without PASS status")
+
+if expected_source == "pre-freeze":
+    base_sha = receipt.get("base_sha")
+    if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+        refuse("base_sha must be a full 40-character lowercase commit")
+    print(base_sha)
+elif expected_source == "protected-ci":
+    if receipt.get("protected") is not True:
+        refuse("does not attest protected CI")
+    if receipt.get("full_exact_head") is not True:
+        refuse("does not attest the full exact-head matrix")
+PY
+}
+
+git -C "${repo_root}" cat-file -e "${commit}^{commit}"
+resolved_commit=$(git -C "${repo_root}" rev-parse --verify "${commit}^{commit}")
+[[ ${resolved_commit} == "${commit}" ]] || {
+  printf 'REFUSED: requested commit resolves to %s\n' "${resolved_commit}" >&2
+  exit 1
+}
+checkout_head=$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')
+[[ ${checkout_head} == "${commit}" ]] || {
+  printf 'REFUSED: source checkout is at %s, expected %s\n' "${checkout_head}" "${commit}" >&2
+  exit 1
+}
+source_head=$(git -C "${repo_root}" rev-parse --verify "${source_ref}^{commit}")
+[[ ${source_head} == "${commit}" ]] || {
+  printf 'REFUSED: source ref %s is at %s, expected %s\n' \
+    "${source_ref}" "${source_head}" "${commit}" >&2
+  exit 1
+}
+dirty_status=$(git -C "${repo_root}" status --porcelain --untracked-files=all)
+filtered_dirty_status=
+while IFS= read -r status_entry; do
+  [[ -n ${status_entry} ]] || continue
+  case "${status_entry}" in
+    '?? pre-freeze-receipt.json'|'?? protected-ci-receipt.json') ;;
+    *) filtered_dirty_status+="${status_entry}"$'\n' ;;
+  esac
+done <<<"${dirty_status}"
+dirty_status=${filtered_dirty_status}
+[[ -z ${dirty_status} ]] || {
+  printf 'REFUSED: source checkout is dirty\n' >&2
+  exit 1
+}
+pre_freeze_base=$(validate_receipt "${pre_freeze_receipt}" pre-freeze)
+git -C "${repo_root}" cat-file -e "${pre_freeze_base}^{commit}"
+git -C "${repo_root}" merge-base --is-ancestor "${pre_freeze_base}" "${commit}" || {
+  printf 'REFUSED: pre-freeze receipt base %s is not an ancestor of %s\n' \
+    "${pre_freeze_base}" "${commit}" >&2
+  exit 1
+}
+validate_receipt "${protected_ci_receipt}" protected-ci
 
 mkdir -p "${build_root}" "${log_root}"
 chmod 700 "${build_root}" "${log_root}"
@@ -54,13 +179,48 @@ rollback_tag=
 dump_file=
 
 compose() {
-  "${run_local}" "$@"
+  env -u BUZZ_IMAGE -u BUZZ_EXPECTED_IMAGE "${run_local}" "$@"
 }
 
 compose_with_image() {
   local image=$1
   shift
-  BUZZ_IMAGE=${image} "${run_local}" "$@"
+  [[ -n ${image} ]] || {
+    printf 'REFUSED: deployment image is missing\n' >&2
+    return 1
+  }
+  BUZZ_IMAGE=${image} BUZZ_EXPECTED_IMAGE=${image} "${run_local}" "$@"
+}
+
+pg_boolean_true() {
+  local value=${1-}
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  [[ ${value} == t || ${value} == true ]]
+}
+
+image_ids() {
+  local image=$1 raw_ids raw_id seen=' '
+  raw_ids=$(docker image inspect "${image}" --format '{{.Id}}') || return 1
+  while IFS= read -r raw_id; do
+    [[ -n ${raw_id} ]] || continue
+    [[ ${raw_id} =~ ^sha256:[0-9a-f]{64}$ ]] || {
+      printf 'REFUSED: image %s returned invalid image ID: %s\n' "${image}" "${raw_id}" >&2
+      return 1
+    }
+    if [[ ${seen} != *" ${raw_id} "* ]]; then
+      printf '%s\n' "${raw_id}"
+      seen+="${raw_id} "
+    fi
+  done <<<"${raw_ids}"
+}
+
+image_ids_contain() {
+  local ids=$1 expected=$2 image_id
+  while IFS= read -r image_id; do
+    [[ ${image_id} == "${expected}" ]] && return 0
+  done <<<"${ids}"
+  return 1
 }
 
 container_image_id() {
@@ -84,11 +244,14 @@ container_binary_sha() {
 }
 
 image_required_migration() {
-  local required
+  local required quiet=${2-}
   required=$(docker inspect --format \
     '{{index .Config.Labels "org.block.buzz.required-migration"}}' "$1")
   [[ ${required} =~ ^[0-9]+$ ]] || {
-    printf 'REFUSED: image %s has no valid required-migration label: %s\n' "$1" "${required}" >&2
+    if [[ ${quiet} != quiet ]]; then
+      printf 'REFUSED: image %s has no valid required-migration label: %s\n' \
+        "$1" "${required}" >&2
+    fi
     return 1
   }
   printf '%d\n' "$((10#${required}))"
@@ -138,7 +301,7 @@ rollback() {
     return 1
   fi
   IFS='|' read -r rollback_db_migration rollback_db_success <<<"${rollback_db_state}"
-  if [[ ! ${rollback_db_migration} =~ ^[0-9]+$ ]] || [[ ${rollback_db_success} != t ]]; then
+  if [[ ! ${rollback_db_migration} =~ ^[0-9]+$ ]] || ! pg_boolean_true "${rollback_db_success}"; then
     printf 'AUTOMATIC ROLLBACK REFUSED: database migration state is %s. Prior image requires at most %d. Database dump: %s\n' \
       "${rollback_db_state}" "${prior_required_migration}" "${dump_file}" >&2
     return 1
@@ -196,12 +359,6 @@ on_exit() {
 trap on_exit EXIT
 
 printf 'Deploy candidate: %s\n' "${commit}"
-git -C "${repo_root}" cat-file -e "${commit}^{commit}"
-resolved_commit=$(git -C "${repo_root}" rev-parse --verify "${commit}^{commit}")
-[[ ${resolved_commit} == "${commit}" ]] || {
-  printf 'REFUSED: requested commit resolves to %s\n' "${resolved_commit}" >&2
-  exit 1
-}
 
 build_worktree=$(mktemp -d "${build_root}/buzz-relay-${commit:0:12}-XXXXXX")
 rmdir "${build_worktree}"
@@ -230,12 +387,13 @@ printf 'Building %s from clean commit worktree\n' "${new_image}"
 docker build --label "org.opencontainers.image.revision=${commit}" \
   --label "org.block.buzz.required-migration=${required_migration}" \
   -t "${new_image}" -f "${build_worktree}/Dockerfile" "${build_worktree}"
-new_image_id=$(docker image inspect "${new_image}" --format '{{.Id}}')
-[[ ${new_image_id} =~ ^sha256:[0-9a-f]{64}$ ]] || {
-  printf 'REFUSED: built image returned invalid image ID: %s\n' "${new_image_id}" >&2
+new_image_ids=$(image_ids "${new_image}")
+[[ -n ${new_image_ids} ]] || {
+  printf 'REFUSED: built image returned no image IDs\n' >&2
   exit 1
 }
-printf '%s\n' "${new_image_id}" >"${deploy_dir}/new-image-id.txt"
+printf '%s\n' "${new_image_ids}" >"${deploy_dir}/new-image-ids.txt"
+printf '%s\n' "${new_image_ids%%$'\n'*}" >"${deploy_dir}/new-image-id.txt"
 cleanup_build_worktree
 build_worktree=
 
@@ -246,19 +404,20 @@ prior_container=$(relay_container)
 }
 prior_image_id=$(container_image_id "${prior_container}")
 prior_image_ref=$(docker inspect --format '{{.Config.Image}}' "${prior_container}")
-prior_required_migration=$(image_required_migration "${prior_container}")
+if prior_required_migration_label=$(image_required_migration "${prior_container}" quiet); then
+  :
+else
+  prior_required_migration_label=
+fi
 prior_binary_sha=$(container_binary_sha "${prior_container}")
 printf '%s\n' "${prior_container}" >"${deploy_dir}/prior-container-id.txt"
 printf '%s\n' "${prior_image_id}" >"${deploy_dir}/prior-image-id.txt"
 printf '%s\n' "${prior_image_ref}" >"${deploy_dir}/prior-image-ref.txt"
-printf '%d\n' "${prior_required_migration}" >"${deploy_dir}/prior-required-migration.txt"
 printf '%s\n' "${prior_binary_sha}" >"${deploy_dir}/prior-binary-sha256.txt"
 rollback_tag=localhost/buzz-relay:rollback-${timestamp}-${prior_image_id#sha256:}
 rollback_tag=${rollback_tag:0:127}
 docker image tag "${prior_image_id}" "${rollback_tag}"
 printf '%s\n' "${rollback_tag}" >"${deploy_dir}/rollback-image-tag.txt"
-printf 'Prior image: %s, required migration: %d, binary: %s\n' \
-  "${prior_image_id}" "${prior_required_migration}" "${prior_binary_sha}"
 
 dump_file=${deploy_dir}/buzz-prod-before-${timestamp}.dump
 printf 'Writing Postgres custom-format dump: %s\n' "${dump_file}"
@@ -274,7 +433,7 @@ read_db_migration() {
   table_present=$(compose exec -T postgres sh -euc \
     'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "$1"' sh \
     "SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-  if [[ ${table_present} == t ]]; then
+  if pg_boolean_true "${table_present}"; then
     row=$(compose exec -T postgres sh -euc \
       'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "$1"' sh \
       "SELECT version || '|' || success FROM _sqlx_migrations ORDER BY version DESC LIMIT 1")
@@ -290,10 +449,32 @@ IFS='|' read -r db_migration db_success <<<"${db_state}"
   printf 'REFUSED: invalid migration version returned by database: %s\n' "${db_state}" >&2
   exit 1
 }
-if [[ ${db_success} != t ]]; then
+if ! pg_boolean_true "${db_success}"; then
   printf 'REFUSED: database migration %s is recorded with success=%s\n' "${db_migration}" "${db_success}" >&2
   exit 1
 fi
+
+expected_override=${prior_image_id}@${db_migration}
+if [[ -n ${prior_migration_override} ]]; then
+  [[ ${prior_migration_override} == "${expected_override}" ]] || {
+    printf 'REFUSED: BUZZ_PRIOR_MIGRATION_OVERRIDE must match the current prior-image/database binding %s\n' \
+      "${expected_override}" >&2
+    exit 1
+  }
+  prior_required_migration=${db_migration}
+  printf 'Prior-image migration override accepted for image %s at database migration %d\n' \
+    "${prior_image_id}" "${db_migration}"
+else
+  [[ -n ${prior_required_migration_label} ]] || {
+    printf 'REFUSED: prior image has no valid required-migration label; rerun with BUZZ_PRIOR_MIGRATION_OVERRIDE=%s only after verifying compatibility\n' \
+      "${expected_override}" >&2
+    exit 1
+  }
+  prior_required_migration=${prior_required_migration_label}
+fi
+printf '%d\n' "${prior_required_migration}" >"${deploy_dir}/prior-required-migration.txt"
+printf 'Prior image: %s, required migration: %d, binary: %s\n' \
+  "${prior_image_id}" "${prior_required_migration}" "${prior_binary_sha}"
 printf 'Migration gate: image requires %d, database is at %d success=%s\n' \
   "${required_migration}" "${db_migration}" "${db_success}"
 
@@ -310,8 +491,9 @@ if ((db_migration < required_migration)); then
   fi
   db_state=$(read_db_migration)
   IFS='|' read -r db_migration db_success <<<"${db_state}"
-  if [[ ! ${db_migration} =~ ^[0-9]+$ ]] || [[ ${db_success} != t ]] || ((db_migration != required_migration)); then
-    printf 'REFUSED: database state after migrate is %s, expected %d|t; relay image was not swapped\n' \
+  if [[ ! ${db_migration} =~ ^[0-9]+$ ]] || ! pg_boolean_true "${db_success}" || \
+    ((db_migration != required_migration)); then
+    printf 'REFUSED: database state after migrate is %s, expected %d with a true success value; relay image was not swapped\n' \
       "${db_state}" "${required_migration}" >&2
     exit 1
   fi
@@ -327,9 +509,9 @@ new_container=$(relay_container)
   exit 1
 }
 running_image_id=$(container_image_id "${new_container}")
-[[ ${running_image_id} == "${new_image_id}" ]] || {
-  printf 'Post-swap failure: running image %s does not match built image %s\n' \
-    "${running_image_id}" "${new_image_id}" >&2
+image_ids_contain "${new_image_ids}" "${running_image_id}" || {
+  printf 'Post-swap failure: running image %s is not one of the built image IDs: %s\n' \
+    "${running_image_id}" "${new_image_ids//$'\n'/,}" >&2
   exit 1
 }
 wait_for_relay "${new_container}"

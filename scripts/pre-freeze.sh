@@ -115,6 +115,8 @@ with open(records_path, encoding="utf-8") as records:
 
 receipt = {
     "schema_version": 1,
+    "source": "pre-freeze",
+    "repository": "only21mil/buzz",
     "head_sha": head_sha,
     "base_sha": base_sha,
     "timestamp": timestamp,

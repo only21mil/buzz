@@ -55,6 +55,8 @@ non-secret Compose settings file separately from the mode-`0600` secret file:
 ```bash
 export BUZZ_COMPOSE_ENV_FILE=/path/to/compose.env
 export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
+export BUZZ_PRE_FREEZE_RECEIPT=/path/to/pre-freeze-receipt.json
+export BUZZ_PROTECTED_CI_RECEIPT=/path/to/protected-ci-receipt.json
 ./deploy-local.sh 0123456789abcdef0123456789abcdef01234567
 ```
 
@@ -64,6 +66,27 @@ runs the new image's `buzz-admin migrate` before swapping only `relay`. It then
 checks readiness, NIP-11, the running image ID, and the relay binary hash. A
 failed post-swap check restores the prior image and verifies it before exiting
 nonzero. Deploy records default to `$HOME/.local/state/buzz-relay/deploys`.
+
+The checked-out `HEAD`, `BUZZ_DEPLOY_SOURCE_REF` (default
+`refs/remotes/origin/main`), pre-freeze receipt, and protected-CI receipt must
+all name the requested full commit. Both receipts must be mode-safe JSON from
+`only21mil/buzz`, record `overall: "PASS"`, contain at least one passing check,
+and be no older than `BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS` (default 86400).
+The pre-freeze receipt comes from `scripts/pre-freeze.sh`. The protected-CI
+receipt also requires `source: "protected-ci"`, `protected: true`, and
+`full_exact_head: true`.
+
+`run-local.sh` carries an expected deployment image through `sudo` with an
+explicit non-secret environment assignment, asks Compose for its resolved image
+list, and refuses missing, default, or mismatched images before a migration or
+swap. Secrets remain in inherited environment variables; their values are not
+placed in command arguments or logs.
+
+If the prior image lacks an accurate migration label, an operator may set
+`BUZZ_PRIOR_MIGRATION_OVERRIDE` only to the exact
+`<prior-image-id>@<current-database-migration>` binding printed by a refused
+run. The override never permits rollback after the database advances beyond
+that recorded migration.
 
 Do not use `run-local.sh up` as an upgrade command. Use `deploy-local.sh` so the
 backup, migration check, and rollback path cannot be skipped.
