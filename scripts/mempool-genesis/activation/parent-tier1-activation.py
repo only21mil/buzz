@@ -36,7 +36,7 @@ ACCEPTANCE = Path(
 )
 
 SCHEMA = "buzz-mempool-genesis-parent-tier1-acceptance-v1"
-INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-tier1-install-receipt-v1"
+INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-install-receipt-v3"
 SOURCE_COMMIT = "8cf1537b905a8bae5ae3aa7623b95c639a4402ee"
 SOURCE_TREE = "f8f06060d5cbf6c61d2e58ccf0dff0fb4aed7dba"
 SOURCE_PARENT = "02f24e7af165a414cb2fb09821ed44b5fe6760bf"
@@ -743,6 +743,18 @@ def acceptance_unchanged(acceptance: Acceptance) -> None:
         raise ValueError("acceptance mutated during validation")
 
 
+def installed_records(changed: list[object]) -> dict[str, dict[str, object]]:
+    return {
+        state.target.target: {
+            "sha256": state.target.sha256,
+            "mode": f"{state.target.mode:04o}",
+            "uid": state.target.uid,
+            "gid": state.target.gid,
+        }
+        for state in changed
+    }
+
+
 def install(
     root: Path,
     *,
@@ -797,6 +809,7 @@ def install(
             "state": "prepared",
             "changed_targets": [state.target.target for state in changed],
             "previous": previous,
+            "installed": installed_records(changed),
         }
         receipt_path = backup / "receipt.json"
         INSTALLER.write_receipt(receipt_path, install_receipt)

@@ -33,8 +33,8 @@ TIER2_REVIEW = {
 }
 TIER2_CANDIDATE_PATHS = ("bundle-manifest.json", "metadata/review-files.json")
 BUNDLE_ID = "mempool-genesis-activation-20260825"
-RUNTIME_TARGET_COUNT = 22
-REVIEW_PATH_COUNT = 19
+RUNTIME_TARGET_COUNT = 24
+REVIEW_PATH_COUNT = 21
 CODEX_CLI_PATH = "/usr/local/libexec/buzz/codex"
 CODEX_ACP_PATH = "/usr/local/libexec/buzz/codex-acp"
 NODE_PATH = "/usr/local/libexec/buzz/node"
@@ -50,14 +50,13 @@ CURRENT_REVIEW_POLICY = (
     "instruction. Luna is producer-only and never a reviewer."
 )
 OWNER_PUBKEY = "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d"
-ASSIGNER_PUBKEYS = (
+RESERVED_PUBKEYS = (
     OWNER_PUBKEY,
     "7806a7beb69ba4fd3b6e9b86d56931a446b62666e9794533f87fb2d1b956684f",
     "73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812",
     "aefa6783cdf2f33f9aa3705b41e5ae3ec214318c64db48f1410fc77db015f2ec",
     "db965b1f484ec4ebd3b0041091e890e2cd28e64732d9be53fd07ba640255af61",
 )
-ALLOWLIST = ",".join(ASSIGNER_PUBKEYS)
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PLACEHOLDERS = {
     "mempool": "DESKTOP_SAVE_REQUIRED_MEMPOOL_PUBKEY",
@@ -161,6 +160,18 @@ COMMON_TARGETS = (
         "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
         0o644,
     ),
+    TargetSpec(
+        "/usr/local/libexec/buzz/verify-agent-capability-parity",
+        "scripts/mempool-genesis/activation/capability-parity.py",
+        0o755,
+        source_kind="repo",
+    ),
+    TargetSpec(
+        "/etc/buzz-agents/capability-parity-policy.json",
+        "scripts/mempool-genesis/activation/capability-parity-policy.json",
+        0o644,
+        source_kind="repo",
+    ),
 )
 
 EXPECTED_PATHS = {
@@ -188,6 +199,8 @@ EXPECTED_PATHS = {
         "/usr/local/libexec/buzz/buzz-acp",
         "/usr/local/libexec/buzz/buzz-dev-mcp",
         "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "/usr/local/libexec/buzz/verify-agent-capability-parity",
+        "/etc/buzz-agents/capability-parity-policy.json",
     )
     for slug in ("mempool", "genesis")
 }
@@ -319,8 +332,8 @@ def load_inputs(path: Path, allow_placeholders: bool) -> tuple[dict[str, str], b
     if complete:
         if result["mempool"] == result["genesis"]:
             raise ValueError("Mempool and Genesis public keys must differ")
-        if result["mempool"] in ASSIGNER_PUBKEYS or result["genesis"] in ASSIGNER_PUBKEYS:
-            raise ValueError("new agent public keys must not reuse an assignment-roster identity")
+        if result["mempool"] in RESERVED_PUBKEYS or result["genesis"] in RESERVED_PUBKEYS:
+            raise ValueError("new agent public keys must not reuse a reserved responder identity")
     return result, complete
 
 
@@ -334,16 +347,18 @@ def validate_env(payload: bytes, slug: str) -> None:
     required = {
         "BUZZ_ACP_AGENT_COMMAND": CODEX_ACP_PATH,
         "BUZZ_ACP_MCP_COMMAND": "/usr/local/libexec/buzz/buzz-dev-mcp",
-        "BUZZ_ACP_RESPOND_TO": "allowlist",
-        "BUZZ_ACP_RESPOND_TO_ALLOWLIST": ALLOWLIST,
-        "BUZZ_ACP_ALLOWED_RESPOND_TO": "allowlist",
+        "BUZZ_ACP_RESPOND_TO": "owner-only",
+        "BUZZ_ACP_ALLOWED_RESPOND_TO": "owner-only",
         "BUZZ_ACP_AGENT_OWNER": OWNER_PUBKEY,
         "BUZZ_RELAY_URL": "wss://framework-desktop.tail69757d.ts.net:38443",
         "CODEX_PATH": CODEX_CLI_PATH,
+        "BUZZ_ACP_STATE_DIR": f"/home/buzz-{slug}/.local/state/buzz-acp",
     }
     for key, expected in required.items():
         if values.get(key) != expected:
             raise ValueError(f"{slug} env has wrong {key}")
+    if "BUZZ_ACP_RESPOND_TO_ALLOWLIST" in values:
+        raise ValueError(f"{slug} env must not carry a responder allowlist")
     if "PATH" in values:
         raise ValueError(f"{slug} env must not override the reviewed service PATH")
 
@@ -394,7 +409,10 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
         SCRIPT_DIR / "make-tier1-receipt.py",
         SCRIPT_DIR / "tier2-evidence-verifier.py",
         SCRIPT_DIR / "input.template.json",
+        SCRIPT_DIR / "capability-parity.py",
+        SCRIPT_DIR / "capability-parity-policy.json",
         SCRIPT_DIR / "tests/test_activation.py",
+        SCRIPT_DIR / "tests/test_capability_parity.py",
         TEMPLATE_DIR / "mempool.env",
         TEMPLATE_DIR / "genesis.env",
         TEMPLATE_DIR / "mempool.md",
@@ -608,7 +626,7 @@ def generate(
             "uid": 1000,
             "gid": 1000,
             "sha256": sha256_bytes(sweep_payload),
-            "scope": "Victor-owner-authenticated all-open-channel fixed public-key roster",
+            "scope": "Codex-R-matched open and eligible Sats/Victor private membership",
         }
 
         sources = source_inventory(repo_root)
@@ -627,6 +645,12 @@ def generate(
             "tier2_engine": engine_record,
             "tier2_evidence_schema": TIER2_EVIDENCE_SCHEMA,
             "tier2_candidate_paths": list(TIER2_CANDIDATE_PATHS),
+            "capability_parity": {
+                "manifest_schema": "buzz-agent-capability-manifest-v1",
+                "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
+                "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
+                "policy": "/etc/buzz-agents/capability-parity-policy.json",
+            },
         }
         package_digest = sha256_bytes(canonical_json(digest_input))
 
@@ -665,6 +689,7 @@ def generate(
             "tier2_engine": engine_record,
             "tier2_evidence_schema": TIER2_EVIDENCE_SCHEMA,
             "tier2_candidate_paths": list(TIER2_CANDIDATE_PATHS),
+            "capability_parity": digest_input["capability_parity"],
         }
         manifest_payload = canonical_json(manifest)
         write_bytes(temporary / "bundle-manifest.json", manifest_payload, 0o600)
@@ -680,7 +705,7 @@ def generate(
                 "OAuth or provider credentials",
                 "Desktop keyring files",
             ],
-            "must_not_reuse_assignment_roster": list(ASSIGNER_PUBKEYS),
+            "must_not_reuse_reserved_identity": list(RESERVED_PUBKEYS),
             "placeholder_generation_is_not_installable": True,
         }
         write_bytes(temporary / "input-contract.json", canonical_json(input_contract), 0o600)

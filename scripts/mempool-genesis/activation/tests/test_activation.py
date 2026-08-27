@@ -288,9 +288,9 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(tree_fingerprint(first), tree_fingerprint(second))
         self.assertTrue(manifest["ready_for_parent_tier1"])
         self.assertFalse(manifest["installable"])
-        self.assertEqual(len(manifest["runtime_targets"]), 22)
+        self.assertEqual(len(manifest["runtime_targets"]), 24)
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(manifest["review_files"][slug]), 19)
+            self.assertEqual(len(manifest["review_files"][slug]), 21)
             self.assertEqual(
                 [entry["path"] for entry in manifest["review_files"][slug]],
                 manifest["expected_closure_paths"][slug],
@@ -324,7 +324,16 @@ class ActivationBundleTests(PackageFixture):
             )
         self.assertEqual(
             manifest["ops_targets"][0]["scope"],
-            "Victor-owner-authenticated all-open-channel fixed public-key roster",
+            "Codex-R-matched open and eligible Sats/Victor private membership",
+        )
+        self.assertEqual(
+            manifest["capability_parity"],
+            {
+                "manifest_schema": "buzz-agent-capability-manifest-v1",
+                "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
+                "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
+                "policy": "/etc/buzz-agents/capability-parity-policy.json",
+            },
         )
         codex_acp = first / "install-root/usr/local/libexec/buzz/codex-acp"
         self.assertTrue(codex_acp.read_bytes().startswith(b"#!/usr/local/libexec/buzz/node\n"))
@@ -335,7 +344,7 @@ class ActivationBundleTests(PackageFixture):
             "uppercase": ("A" * 64, "2" * 64, "lowercase"),
             "short": ("1" * 63, "2" * 64, "64 lowercase"),
             "equal": ("1" * 64, "1" * 64, "must differ"),
-            "reserved": (GENERATOR.OWNER_PUBKEY, "2" * 64, "assignment-roster"),
+            "reserved": (GENERATOR.OWNER_PUBKEY, "2" * 64, "reserved responder"),
         }
         for name, (mempool, genesis, message) in cases.items():
             with self.subTest(name=name):
@@ -396,19 +405,26 @@ class ActivationBundleTests(PackageFixture):
                 REPO_ROOT,
             )
 
-    def test_templates_bind_exact_allowlist_host_and_memory_boundary(self) -> None:
+    def test_templates_bind_owner_only_host_state_and_memory_boundary(self) -> None:
         bundle, _manifest = self.generate()
         for slug in ("mempool", "genesis"):
             env = (bundle / f"install-root/etc/buzz-agents/{slug}.env").read_text()
             values = dict(line.split("=", 1) for line in env.splitlines())
-            self.assertEqual(values["BUZZ_ACP_RESPOND_TO"], "allowlist")
-            self.assertEqual(values["BUZZ_ACP_RESPOND_TO_ALLOWLIST"], GENERATOR.ALLOWLIST)
-            self.assertEqual(len(values["BUZZ_ACP_RESPOND_TO_ALLOWLIST"].split(",")), 5)
-            self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "allowlist")
+            self.assertEqual(values["BUZZ_ACP_RESPOND_TO"], "owner-only")
+            self.assertNotIn("BUZZ_ACP_RESPOND_TO_ALLOWLIST", values)
+            self.assertEqual(values["BUZZ_ACP_ALLOWED_RESPOND_TO"], "owner-only")
+            self.assertEqual(
+                values["BUZZ_ACP_STATE_DIR"],
+                f"/home/buzz-{slug}/.local/state/buzz-acp",
+            )
             self.assertEqual(values["BUZZ_RELAY_URL"], "wss://framework-desktop.tail69757d.ts.net:38443")
             self.assertEqual(values["BUZZ_ACP_AGENT_COMMAND"], "/usr/local/libexec/buzz/codex-acp")
             self.assertEqual(
                 values["BUZZ_ACP_MCP_COMMAND"], "/usr/local/libexec/buzz/buzz-dev-mcp"
+            )
+            self.assertEqual(
+                values["BUZZ_ACP_STATE_DIR"],
+                f"/home/buzz-{slug}/.local/state/buzz-acp",
             )
             self.assertEqual(values["CODEX_PATH"], "/usr/local/libexec/buzz/codex")
             self.assertNotIn("PATH", values)
@@ -447,6 +463,76 @@ class ActivationBundleTests(PackageFixture):
                 ).read_bytes()
                 + b"PATH=/home/buzz-genesis/.local/bin:/usr/bin\n",
                 "genesis",
+            )
+
+        expected = b"/home/buzz-genesis/.local/state/buzz-acp"
+        genesis_env = (ACTIVATION_DIR / "templates/genesis.env").read_bytes()
+        cases = {
+            "relative": b".buzz-acp/state",
+            "shared": b"/home/buzz-shared/.local/state/buzz-acp",
+            "wrong identity": b"/home/buzz-mempool/.local/state/buzz-acp",
+        }
+        for label, replacement in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ValueError, "wrong BUZZ_ACP_STATE_DIR"
+            ):
+                GENERATOR.validate_env(genesis_env.replace(expected, replacement), "genesis")
+
+        with self.assertRaisesRegex(ValueError, "invalid or duplicate env line"):
+            GENERATOR.validate_env(
+                genesis_env + b"BUZZ_ACP_STATE_DIR=/home/buzz-genesis/.local/state/buzz-acp\n",
+                "genesis",
+            )
+
+    def test_installer_revalidates_state_dir_before_building_closure(self) -> None:
+        targets = []
+        for slug in ("mempool", "genesis"):
+            source = self.root / f"installer-{slug}.env"
+            payload = f"BUZZ_ACP_STATE_DIR=/home/buzz-{slug}/.local/state/buzz-acp\n".encode()
+            write_file(source, payload, 0o600)
+            targets.append(
+                INSTALLER.Target(
+                    f"/etc/buzz-agents/{slug}.env",
+                    source,
+                    None,
+                    0o600,
+                    0,
+                    0,
+                    hashlib.sha256(payload).hexdigest(),
+                )
+            )
+        INSTALLER.validate_runtime_state_dirs(tuple(targets))
+
+        genesis = targets[1]
+        wrong = b"BUZZ_ACP_STATE_DIR=.buzz-acp/state\n"
+        write_file(genesis.source, wrong, 0o600)
+        with self.assertRaisesRegex(ValueError, "wrong BUZZ_ACP_STATE_DIR"):
+            INSTALLER.validate_runtime_state_dirs(tuple(targets))
+
+    def test_state_dir_override_survives_bridge_with_read_only_home(self) -> None:
+        write_file(
+            self.system_root / "usr/local/libexec/buzz/run-buzz-agent",
+            b"#!/usr/bin/env bash\nexec /usr/local/libexec/buzz/buzz-acp\n",
+            0o755,
+        )
+        bundle, _manifest = self.generate("state-dir-bridge")
+        service = (
+            bundle / "install-root/etc/systemd/system/buzz-agent@.service"
+        ).read_text()
+        bridge = (
+            bundle / "install-root/usr/local/libexec/buzz/run-buzz-agent"
+        ).read_text()
+
+        self.assertIn("ProtectHome=read-only\n", service)
+        self.assertIn(" /home/buzz-%i/.local/state ", service)
+        self.assertIn("exec /usr/local/libexec/buzz/buzz-acp\n", bridge)
+        self.assertNotIn("unset BUZZ_ACP_STATE_DIR", bridge)
+        for slug in ("mempool", "genesis"):
+            env = (bundle / f"install-root/etc/buzz-agents/{slug}.env").read_text()
+            values = dict(line.split("=", 1) for line in env.splitlines())
+            self.assertEqual(
+                values["BUZZ_ACP_STATE_DIR"],
+                f"/home/buzz-{slug}/.local/state/buzz-acp",
             )
 
     def test_instance_dropins_are_exact_and_fully_covered(self) -> None:
@@ -618,7 +704,7 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(value["candidate_fingerprint"], acceptance.candidate_fingerprint)
         self.assertEqual(value["bundle_digest"], manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(value["files"][slug]), 19)
+            self.assertEqual(len(value["files"][slug]), 21)
             self.assertEqual(value["files"][slug], manifest["review_files"][slug])
 
     def test_derived_closure_satisfies_the_installed_runtime_contract(self) -> None:
@@ -643,7 +729,7 @@ class ActivationBundleTests(PackageFixture):
 
         for slug in ("mempool", "genesis"):
             completed = subprocess.run(
-                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "19", contract],
+                ["jq", "-e", "--arg", "slug", slug, "--argjson", "count", "21", contract],
                 input=closure_text,
                 check=False,
                 stdout=subprocess.PIPE,
@@ -656,7 +742,7 @@ class ActivationBundleTests(PackageFixture):
         retired = json.loads(closure_text)
         retired["schema"] = "buzz-agent-review-closure-v1"
         rejected = subprocess.run(
-            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "19", contract],
+            ["jq", "-e", "--arg", "slug", "mempool", "--argjson", "count", "21", contract],
             input=json.dumps(retired),
             check=False,
             stdout=subprocess.PIPE,
@@ -1131,11 +1217,15 @@ class InstallerSafetyTests(PackageFixture):
         self.assertTrue(closure["accepted"])
         self.assertEqual(closure["bundle_digest"], self.manifest["package_digest"])
         for slug in ("mempool", "genesis"):
-            self.assertEqual(len(closure["files"][slug]), 19)
+            self.assertEqual(len(closure["files"][slug]), 21)
         first_snapshot = target_snapshot(self.install_root, targets)
         backup_root = self.install_root / "var/lib/buzz-mgact-backups"
         backup_ids = [path.name for path in backup_root.iterdir() if path.is_dir()]
         self.assertEqual(len(backup_ids), 1)
+        v3_receipt = json.loads((backup_root / backup_ids[0] / "receipt.json").read_text())
+        self.assertEqual(v3_receipt["schema"], INSTALLER.INSTALL_RECEIPT_SCHEMA)
+        self.assertEqual(set(v3_receipt["changed_targets"]), set(v3_receipt["previous"]))
+        self.assertEqual(set(v3_receipt["changed_targets"]), set(v3_receipt["installed"]))
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.install(), 0)
         self.assertIn("ALREADY_INSTALLED writes=0", output.getvalue())
@@ -1356,6 +1446,269 @@ class InstallerSafetyTests(PackageFixture):
                 INSTALLER.rollback(backup_id, self.install_root)
 
 
+class LegacyV1RollbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.addCleanup(self.temporary.cleanup)
+        self.installed_payloads: dict[str, bytes] = {}
+        self.previous_payloads: dict[str, bytes] = {}
+
+        previous: dict[str, dict[str, object]] = {}
+        installed: dict[str, dict[str, object]] = {}
+        for index, target_text in enumerate(INSTALLER.LEGACY_V1_CHANGED_TARGETS):
+            destination = self.root / target_text.lstrip("/")
+            self.ensure_directory(destination.parent, 0o755)
+            installed_payload = f"installed-{index}-{target_text}\n".encode()
+            previous_payload = f"previous-{index}-{target_text}\n".encode()
+            installed_mode = 0o755 if target_text.startswith("/usr/local/libexec/") else 0o644
+            if target_text.endswith(".env"):
+                installed_mode = 0o600
+            previous_mode = 0o755 if target_text.startswith("/usr/local/libexec/") else 0o644
+            write_file(destination, installed_payload, installed_mode)
+            backup_name = hashlib.sha256(target_text.encode()).hexdigest()
+            previous[target_text] = {
+                "exists": True,
+                "backup_name": backup_name,
+                "sha256": hashlib.sha256(previous_payload).hexdigest(),
+                "mode": f"{previous_mode:04o}",
+                "uid": 0,
+                "gid": 0,
+            }
+            installed[target_text] = {
+                "sha256": hashlib.sha256(installed_payload).hexdigest(),
+                "mode": f"{installed_mode:04o}",
+                "uid": 0,
+                "gid": 0,
+            }
+            self.installed_payloads[target_text] = installed_payload
+            self.previous_payloads[target_text] = previous_payload
+
+        self.stack.enter_context(mock.patch.object(INSTALLER, "LEGACY_V1_PREVIOUS", previous))
+        self.stack.enter_context(mock.patch.object(INSTALLER, "LEGACY_V1_INSTALLED", installed))
+        inventory_digest = INSTALLER.legacy_v1_inventory_digest()
+        self.stack.enter_context(
+            mock.patch.object(INSTALLER, "LEGACY_V1_INVENTORY_SHA256", inventory_digest)
+        )
+
+        self.backup = (
+            self.root
+            / "var/lib/buzz-mgact-backups"
+            / INSTALLER.LEGACY_V1_BACKUP_ID
+        )
+        self.ensure_directory(self.backup.parent, 0o700)
+        self.ensure_directory(self.backup, 0o700)
+        files = self.backup / "files"
+        self.ensure_directory(files, 0o700)
+        for target_text, payload in self.previous_payloads.items():
+            write_file(files / str(previous[target_text]["backup_name"]), payload, 0o600)
+
+        receipt_payload = INSTALLER.canonical_json(INSTALLER.legacy_v1_contract_receipt())
+        self.receipt = self.backup / "receipt.json"
+        write_file(self.receipt, receipt_payload, 0o600)
+        self.backup.parent.chmod(0o700)
+        self.backup.chmod(0o700)
+        files.chmod(0o700)
+        self.stack.enter_context(
+            mock.patch.object(
+                INSTALLER,
+                "LEGACY_V1_RECEIPT_SHA256",
+                hashlib.sha256(receipt_payload).hexdigest(),
+            )
+        )
+
+        self.claim_directory = self.root / INSTALLER.LEGACY_V1_RECOVERY_CLAIM_DIRECTORY.lstrip(
+            "/"
+        )
+        self.ensure_directory(self.claim_directory, 0o700)
+        acceptance_claim = self.root / INSTALLER.LEGACY_V1_CLAIM.lstrip("/")
+        write_file(
+            acceptance_claim,
+            INSTALLER.canonical_json(INSTALLER.legacy_v1_acceptance_claim()),
+            0o600,
+        )
+
+    def ensure_directory(self, path: Path, mode: int) -> None:
+        path.mkdir(mode=0o755, parents=True, exist_ok=True)
+        current = self.root
+        for part in path.relative_to(self.root).parts:
+            current = current / part
+            current.chmod(0o755)
+        path.chmod(mode)
+
+    def rollback(self, *, dry_run: bool = False) -> int:
+        with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
+            return INSTALLER.rollback(
+                INSTALLER.LEGACY_V1_BACKUP_ID,
+                self.root,
+                dry_run=dry_run,
+            )
+
+    def recovery_claim(self) -> Path:
+        return INSTALLER.legacy_v1_recovery_claim_path(self.root)
+
+    def test_dry_run_is_reachable_and_writes_nothing(self) -> None:
+        before = tree_fingerprint(self.root)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.rollback(dry_run=True), 0)
+        self.assertIn("targets=10 writes=0", output.getvalue())
+        self.assertEqual(tree_fingerprint(self.root), before)
+        self.assertFalse(self.recovery_claim().exists())
+        self.assertFalse((self.root / "run/lock/buzz-mgact-install.lock").exists())
+        argv = [
+            str(INSTALLER.__file__),
+            "rollback",
+            "--backup-id",
+            INSTALLER.LEGACY_V1_BACKUP_ID,
+            "--dry-run",
+            "--root",
+            str(self.root),
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            INSTALLER,
+            "rollback",
+            return_value=0,
+        ) as rollback:
+            with self.assertRaises(SystemExit) as exited:
+                INSTALLER.main()
+        self.assertEqual(exited.exception.code, 0)
+        rollback.assert_called_once_with(
+            INSTALLER.LEGACY_V1_BACKUP_ID,
+            self.root.absolute(),
+            dry_run=True,
+        )
+
+    def test_only_exact_legacy_backup_dispatches_to_the_v1_path(self) -> None:
+        wrong = INSTALLER.LEGACY_V1_BACKUP_ID[:-2] + "0Z"
+        before = tree_fingerprint(self.root)
+        with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
+            with self.assertRaisesRegex(ValueError, "only supports the exact legacy v1 backup"):
+                INSTALLER.rollback(wrong, self.root, dry_run=True)
+        self.assertEqual(tree_fingerprint(self.root), before)
+
+    def test_wrong_receipt_and_incomplete_backup_inventory_fail_closed(self) -> None:
+        original = self.receipt.read_bytes()
+        self.receipt.write_bytes(original + b" ")
+        self.receipt.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "receipt hash mismatch"):
+            self.rollback(dry_run=True)
+        self.receipt.write_bytes(original)
+        self.receipt.chmod(0o600)
+        extra = self.backup / "files/unexpected"
+        write_file(extra, b"unexpected\n", 0o600)
+        with self.assertRaisesRegex(ValueError, "backup file inventory mismatch"):
+            self.rollback(dry_run=True)
+        self.assertFalse(self.recovery_claim().exists())
+
+    def test_consumed_acceptance_claim_and_installed_drift_are_validated(self) -> None:
+        acceptance_claim = self.root / INSTALLER.LEGACY_V1_CLAIM.lstrip("/")
+        original_claim = acceptance_claim.read_bytes()
+        acceptance_claim.write_bytes(b"{}\n")
+        acceptance_claim.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "consumed acceptance claim mismatch"):
+            self.rollback(dry_run=True)
+        acceptance_claim.write_bytes(original_claim)
+        acceptance_claim.chmod(0o600)
+        drifted_target = INSTALLER.LEGACY_V1_CHANGED_TARGETS[0]
+        drifted = self.root / drifted_target.lstrip("/")
+        drifted.write_bytes(b"drift\n")
+        with self.assertRaisesRegex(ValueError, "installed target drift"):
+            self.rollback(dry_run=True)
+        installed_record = INSTALLER.LEGACY_V1_INSTALLED[drifted_target]
+        drifted.write_bytes(self.installed_payloads[drifted_target])
+        drifted.chmod(int(str(installed_record["mode"]), 8) ^ 0o040)
+        with self.assertRaisesRegex(ValueError, "installed target drift"):
+            self.rollback(dry_run=True)
+        drifted.chmod(int(str(installed_record["mode"]), 8))
+
+        original_require_regular = INSTALLER.require_regular
+
+        def require_with_owner_drift(path, **kwargs):
+            metadata = original_require_regular(path, **kwargs)
+            if Path(path) != drifted:
+                return metadata
+            changed = mock.Mock()
+            changed.st_mode = metadata.st_mode
+            changed.st_nlink = metadata.st_nlink
+            changed.st_uid = metadata.st_uid + 1
+            changed.st_gid = metadata.st_gid
+            return changed
+
+        with mock.patch.object(
+            INSTALLER,
+            "require_regular",
+            side_effect=require_with_owner_drift,
+        ):
+            with self.assertRaisesRegex(ValueError, "installed target drift"):
+                self.rollback(dry_run=True)
+        self.assertFalse(self.recovery_claim().exists())
+
+    def test_service_state_is_validated_before_legacy_recovery(self) -> None:
+        before = tree_fingerprint(self.root)
+        with mock.patch.object(
+            INSTALLER,
+            "service_blockers",
+            return_value=["service must be stopped", "service must be disabled"],
+        ):
+            with self.assertRaisesRegex(ValueError, "service must be stopped"):
+                self.rollback(dry_run=True)
+        self.assertEqual(tree_fingerprint(self.root), before)
+        self.assertFalse(self.recovery_claim().exists())
+
+    def test_success_restores_exactly_ten_targets_and_claim_blocks_reuse(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.rollback(), 0)
+        self.assertIn("LEGACY_V1_ROLLED_BACK", output.getvalue())
+        self.assertEqual(len(INSTALLER.LEGACY_V1_CHANGED_TARGETS), 10)
+        for target_text in INSTALLER.LEGACY_V1_CHANGED_TARGETS:
+            destination = self.root / target_text.lstrip("/")
+            self.assertEqual(destination.read_bytes(), self.previous_payloads[target_text])
+        self.assertTrue(self.recovery_claim().is_file())
+        with self.assertRaisesRegex(ValueError, "already claimed"):
+            self.rollback()
+
+    def test_partial_restore_is_detected_and_remains_single_use(self) -> None:
+        def restore_only_nine(changed, previous, backup, root):
+            for state in changed[:9]:
+                record = previous[state.target.target]
+                INSTALLER.atomic_restore(
+                    backup / "files" / str(record["backup_name"]),
+                    state,
+                    int(str(record["mode"]), 8),
+                    int(record["uid"]),
+                    int(record["gid"]),
+                    root,
+                )
+
+        with mock.patch.object(INSTALLER, "restore_targets", side_effect=restore_only_nine):
+            with self.assertRaisesRegex(ValueError, "restore verification failed"):
+                self.rollback()
+        self.assertTrue(self.recovery_claim().is_file())
+        last = INSTALLER.LEGACY_V1_CHANGED_TARGETS[-1]
+        self.assertEqual(
+            (self.root / last.lstrip("/")).read_bytes(),
+            self.installed_payloads[last],
+        )
+        with self.assertRaisesRegex(ValueError, "already claimed"):
+            self.rollback()
+
+    def test_atomic_restore_failure_claims_before_any_target_write(self) -> None:
+        with mock.patch.object(
+            INSTALLER,
+            "atomic_restore",
+            side_effect=OSError("injected atomic restore failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected atomic restore failure"):
+                self.rollback()
+        self.assertTrue(self.recovery_claim().is_file())
+        for target_text in INSTALLER.LEGACY_V1_CHANGED_TARGETS:
+            destination = self.root / target_text.lstrip("/")
+            self.assertEqual(destination.read_bytes(), self.installed_payloads[target_text])
+
+
 class ServiceGateTests(unittest.TestCase):
     def test_stopped_service_gate_requires_persistent_state_and_prestart_checks_runtime(
         self,
@@ -1372,6 +1725,7 @@ class ServiceGateTests(unittest.TestCase):
                         f"/home/{expected_user}/.config",
                         f"/home/{expected_user}/.cache",
                         f"/home/{expected_user}/.local/state",
+                        f"/home/{expected_user}/.local/state/buzz-acp",
                         f"/home/{expected_user}/.tmp",
                     ],
                 )
@@ -1380,6 +1734,17 @@ class ServiceGateTests(unittest.TestCase):
                 )
         self.assertIn('  "/run/buzz-agents-$slug"\n', verifier)
         self.assertIn('for state_path in "${state_paths[@]}"; do\n', verifier)
+        self.assertIn(
+            'expected_acp_state_dir="/home/$expected_user/.local/state/buzz-acp"\n',
+            verifier,
+        )
+        self.assertIn(
+            'test "$(grep -c \'^BUZZ_ACP_STATE_DIR=\' "$env_file")" = 1\n', verifier
+        )
+        self.assertIn(
+            'test "${BUZZ_ACP_STATE_DIR:?missing BUZZ_ACP_STATE_DIR}" = '
+            '"$expected_acp_state_dir"\n', verifier
+        )
 
     def test_identity_runtime_preflight_accepts_exact_metadata_access_and_tools(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
@@ -1486,8 +1851,9 @@ class SweepCandidateTests(PackageFixture):
         self.tools = self.root / "tools"
         self.tools.mkdir(mode=0o700)
         (self.tools / "nostr_min.py").write_text(
-            "def pubkey_xonly(_value):\n"
-            f"    return bytes.fromhex('{GENERATOR.OWNER_PUBKEY}')\n"
+            "def pubkey_xonly(value):\n"
+            "    return bytes.fromhex('9' * 64) if value == bytes.fromhex('d' * 64) "
+            f"else bytes.fromhex('{GENERATOR.OWNER_PUBKEY}')\n"
         )
         self.secret_dir = self.root / "secret"
         self.secret_dir.mkdir(mode=0o700)
@@ -1495,10 +1861,12 @@ class SweepCandidateTests(PackageFixture):
         self.owner_private = "a" * 64
         self.mempool_private = "b" * 64
         self.genesis_private = "c" * 64
+        self.codexr_private = "d" * 64
         self.secret_file.write_text(
             f"BUZZ_OWNER_PRIVATE_KEY={self.owner_private}\n"
             f"BUZZ_SATS_MEMPOOL_PRIVATE_KEY={self.mempool_private}\n"
             f"BUZZ_SATS_GENESIS_PRIVATE_KEY={self.genesis_private}\n"
+            f"BUZZ_SATS_CODEX_R_PRIVATE_KEY={self.codexr_private}\n"
         )
         self.secret_file.chmod(0o600)
         self.state_file = self.root / "state.json"
@@ -1509,10 +1877,16 @@ class SweepCandidateTests(PackageFixture):
                 "seen_private_keys": [],
                 "channels": {
                     "11111111-1111-1111-1111-111111111111": [
-                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"}
+                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"},
+                        {"pubkey": "9" * 64, "role": "member"}
                     ],
                     "22222222-2222-2222-2222-222222222222": [
-                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"}
+                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "owner"},
+                        {"pubkey": "9" * 64, "role": "member"}
+                    ],
+                    "44444444-4444-4444-4444-444444444444": [
+                        {"pubkey": GENERATOR.OWNER_PUBKEY, "role": "admin"},
+                        {"pubkey": "9" * 64, "role": "member"}
                     ],
                 },
             },
@@ -1534,6 +1908,8 @@ class SweepCandidateTests(PackageFixture):
             "  {'channel_id':'11111111-1111-1111-1111-111111111111','name':'one','archived':False},\n"
             "  {'channel_id':'22222222-2222-2222-2222-222222222222','name':'two','archived':False},\n"
             "  {'channel_id':'33333333-3333-3333-3333-333333333333','name':'old','archived':True}]))\n"
+            "elif args[:5] == ['channels','list','--visibility','private','--member']:\n"
+            " print(json.dumps([{'channel_id':'44444444-4444-4444-4444-444444444444','name':'private','archived':False}]))\n"
             "elif args[:2] == ['channels','members']:\n"
             " cid=args[args.index('--channel')+1]; print(json.dumps(state['channels'][cid]))\n"
             "elif args[:2] == ['channels','add-member']:\n"
@@ -1571,7 +1947,7 @@ class SweepCandidateTests(PackageFixture):
             timeout=60,
         )
 
-    def test_fixed_public_roster_covers_all_open_channels_and_is_idempotent(self) -> None:
+    def test_fixed_public_roster_matches_codexr_open_and_private_membership(self) -> None:
         before = self.state_file.read_bytes()
         check = self.run_sweep("--check")
         self.assertEqual(check.returncode, 0, check.stderr)
@@ -1581,7 +1957,9 @@ class SweepCandidateTests(PackageFixture):
         dry_run = self.run_sweep("--dry-run")
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
         self.assertEqual(dry_run.stdout.count("PLAN owner add-member"), 4)
-        self.assertIn("11111111-1111-1111-1111-111111111111", dry_run.stdout)
+        self.assertNotIn("11111111-1111-1111-1111-111111111111", dry_run.stdout)
+        self.assertIn("22222222-2222-2222-2222-222222222222", dry_run.stdout)
+        self.assertIn("44444444-4444-4444-4444-444444444444", dry_run.stdout)
         self.assertNotIn("33333333-3333-3333-3333-333333333333", dry_run.stdout)
         self.assertEqual(json.loads(self.state_file.read_text())["writes"], 0)
         first = self.run_sweep("--mempool-genesis-apply")
@@ -1595,10 +1973,10 @@ class SweepCandidateTests(PackageFixture):
         self.assertEqual(json.loads(self.state_file.read_text())["writes"], 4)
         self.assertIn("planned=0 writes=0 already=4 blocked=0", second.stdout)
 
-    def test_owner_admin_role_is_not_owner_authority(self) -> None:
+    def test_non_owner_or_admin_role_blocks_owner_authority(self) -> None:
         value = json.loads(self.state_file.read_text())
         for members in value["channels"].values():
-            members[0]["role"] = "admin"
+            members[0]["role"] = "member"
         write_private_json(self.state_file, value)
         result = self.run_sweep("--dry-run")
         self.assertNotEqual(result.returncode, 0)

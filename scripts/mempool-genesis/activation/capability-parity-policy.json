@@ -1,0 +1,63 @@
+{
+  "schema": "buzz-agent-capability-parity-policy-v1",
+  "owner_pubkey": "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d",
+  "reserved_pubkeys": [
+    "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d",
+    "7806a7beb69ba4fd3b6e9b86d56931a446b62666e9794533f87fb2d1b956684f",
+    "73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812",
+    "aefa6783cdf2f33f9aa3705b41e5ae3ec214318c64db48f1410fc77db015f2ec",
+    "db965b1f484ec4ebd3b0041091e890e2cd28e64732d9be53fd07ba640255af61"
+  ],
+  "allowed_identity_differences": [
+    "/captured_at",
+    "/slug",
+    "/display_name",
+    "/identity/pubkey",
+    "/identity/auth_tag/subject_pubkey",
+    "/identity/auth_tag/sha256_prefix",
+    "/identity/unix_user",
+    "/identity/unix_group",
+    "/identity/profile_author_pubkey",
+    "/roots/*",
+    "/secret_files/*/path",
+    "/secret_files/*/owner",
+    "/secret_files/*/group",
+    "/secret_files/*/device",
+    "/secret_files/*/inode",
+    "/secret_files/*/sha256_prefix",
+    "/prompt/sha256",
+    "/prompt/identity",
+    "/prompt/mission",
+    "/prompt/session_title",
+    "/directory/author_pubkey",
+    "/directory/auth_subject_pubkey",
+    "/directory/event_id",
+    "/receipts/*",
+    "/runtime/closure/service_unit/path",
+    "/runtime/closure/service_unit/sha256",
+    "/systemd/identity_paths"
+  ],
+  "approved_exceptions": {
+    "mempool": {
+      "host_access": [
+        {"path": "/home/victor/work/ci-mig/a1", "mode": "rw", "purpose": "bounded CI migration lane A1", "owner": "sats", "expires_at": "on-ci-migration-lane-retirement", "approval": "existing-reviewed-mgact-ci-migration"},
+        {"path": "/home/victor/work/ci-mig/a2", "mode": "rw", "purpose": "bounded CI migration lane A2", "owner": "sats", "expires_at": "on-ci-migration-lane-retirement", "approval": "existing-reviewed-mgact-ci-migration"},
+        {"path": "/home/victor/work/ci-mig/a3", "mode": "rw", "purpose": "bounded CI migration lane A3", "owner": "sats", "expires_at": "on-ci-migration-lane-retirement", "approval": "existing-reviewed-mgact-ci-migration"},
+        {"path": "/home/victor/work/ci-mig/a4", "mode": "rw", "purpose": "bounded CI migration lane A4", "owner": "sats", "expires_at": "on-ci-migration-lane-retirement", "approval": "existing-reviewed-mgact-ci-migration"},
+        {"path": "/home/victor/work/ci-mig/a5", "mode": "rw", "purpose": "bounded CI migration lane A5", "owner": "sats", "expires_at": "on-ci-migration-lane-retirement", "approval": "existing-reviewed-mgact-ci-migration"},
+        {"path": "/home/victor/work/ci-mig/a6", "mode": "rw", "purpose": "bounded CI migration lane A6", "owner": "sats", "expires_at": "on-ci-migration-lane-retirement", "approval": "existing-reviewed-mgact-ci-migration"}
+      ],
+      "address_families": []
+    },
+    "genesis": {"host_access": [], "address_families": []}
+  },
+  "forbidden_path_prefixes": [
+    "/home/victor/Obsidian",
+    "/home/victor/.config/sats",
+    "/home/victor/.codex",
+    "/home/sats",
+    "/root",
+    "/home/buzz-mempool/.config/sats",
+    "/home/buzz-genesis/.config/sats"
+  ]
+}

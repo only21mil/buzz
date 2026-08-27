@@ -32,6 +32,7 @@ SUDO_PATH = Path("/usr/bin/sudo")
 BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 PREFLIGHT_RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v3"
 INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-install-receipt-v3"
+LEGACY_TIER1_INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-tier1-install-receipt-v1"
 INSTALLED_CLOSURE_SCHEMA = "buzz-agent-review-closure-v2"
 BUNDLE_ID = "mempool-genesis-activation-20260825"
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
@@ -39,9 +40,188 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 BACKUP_ID = re.compile(
     r"^mempool-genesis-activation-20260825-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}\.[0-9]{6}Z$"
 )
-RUNTIME_TARGET_COUNT = 22
-TOTAL_PACKAGE_TARGET_COUNT = 23
-REVIEW_PATH_COUNT = 19
+RUNTIME_TARGET_COUNT = 24
+TOTAL_PACKAGE_TARGET_COUNT = 25
+REVIEW_PATH_COUNT = 21
+LEGACY_V1_BACKUP_ID = (
+    "mempool-genesis-activation-20260825-744b636de5ab-"
+    "20260827T042741.590691Z"
+)
+LEGACY_V1_RECEIPT_SHA256 = (
+    "78ca36ccaa053409348b44122f14ab42318e8f2901277458ce9f5f1d64d23040"
+)
+LEGACY_V1_ACCEPTANCE_SHA256 = (
+    "ad40f0c5e3d49573c6f5801d10062acb49d00351bb626896077a6a205c12c5fa"
+)
+LEGACY_V1_PACKAGE_DIGEST = (
+    "744b636de5ab1b4d76222d55df0275a75bc48ea092df478e058ea8ec18851cf7"
+)
+LEGACY_V1_CLAIM = (
+    "/var/lib/buzz-mgact-tier1-claims/"
+    f"{LEGACY_V1_ACCEPTANCE_SHA256}.claim"
+)
+LEGACY_V1_RECOVERY_CLAIM_DIRECTORY = "/var/lib/buzz-mgact-tier1-claims"
+LEGACY_V1_ACCEPTANCE_CLAIM_SCHEMA = "buzz-mempool-genesis-tier1-single-use-claim-v1"
+LEGACY_V1_RECOVERY_CLAIM_SCHEMA = "buzz-mempool-genesis-legacy-v1-rollback-claim-v1"
+LEGACY_V1_CHANGED_TARGETS = (
+    "/etc/buzz-agents/genesis.env",
+    "/etc/buzz-agents/mempool.env",
+    "/etc/buzz-agents/prompts/genesis.md",
+    "/etc/buzz-agents/prompts/mempool.md",
+    "/etc/systemd/system/buzz-agent@.service",
+    "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf",
+    "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf",
+    "/usr/local/libexec/buzz/codex-acp",
+    "/usr/local/libexec/buzz/verify-installed-agent",
+    "/etc/buzz-agents/review-closure.json",
+)
+LEGACY_V1_PREVIOUS = {
+    "/etc/buzz-agents/genesis.env": {
+        "exists": True,
+        "backup_name": "e034a2bd0170a616f053ccce21c83d571df0cc4d92c2ed542b20c2f9102e6824",
+        "sha256": "0078f63c977e632c462c198b360008d4dd07a4b51c9d79e7ca44991bf7b75005",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/mempool.env": {
+        "exists": True,
+        "backup_name": "f8f338fa4d8426da68c0d405a8845d726b414ed37f48d56134131273ef88bced",
+        "sha256": "77ad1d690558181603e59e5dfd1965a4adf5d7671b502f5416bb4b4b6c466493",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/genesis.md": {
+        "exists": True,
+        "backup_name": "19fc63fa9344ad675901c244655c9c2b603c1e96383c49d187040578f4e2c3c2",
+        "sha256": "8c5882d694949e71585a3ffc0e0103aa816d008d491d5d49d78403e0c7840724",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/mempool.md": {
+        "exists": True,
+        "backup_name": "b31e7f82abc6f9bfb27257ad0e04bc2a21bb5ec5ca56ffc741858cabfae308c1",
+        "sha256": "43709ef3a714d7efddb1c95968f141f9f67ee671070d6d2f928df9ea4eff1580",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@.service": {
+        "exists": True,
+        "backup_name": "37be6a42569e2baa34ff082b5bc4837ddceecdd037d1a70b5b8618e3040d5819",
+        "sha256": "2fb7c492c71fa3fa7e7684abcd55119039e7fd1718b09838499efb8bba03109d",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf": {
+        "exists": True,
+        "backup_name": "e8f803b9c8e0bffbfc86bf05af36c1d3fdac4ffd57a24f1154d78a7be43268f4",
+        "sha256": "bc3668a0069bfd217b5f8a7c11707e1fc31d3746bb248ec80c8fd51abf191f2f",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf": {
+        "exists": True,
+        "backup_name": "5b805da22858dc7cea26e8bad8039efa1d1e5dc5b8df3c9bc1652e2b2cd1e0ea",
+        "sha256": "6dfd0f69ce5631fe23fe6ddd2c672918f79b629855a78fd213ef72f09c0e48d3",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/codex-acp": {
+        "exists": True,
+        "backup_name": "ce19c817869694937b9eda9053269b0eb77ad86677a806785ccd0e2ae202c84b",
+        "sha256": "0deb6b820dfed8804cd76b16a50210fe12202e5e339b5edaa23f6987f1742e0a",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/verify-installed-agent": {
+        "exists": True,
+        "backup_name": "51808d377fb1cb4bee9c9e96b01259326e245bcdce91ce198472d53a943b7cf0",
+        "sha256": "6bd0fb980cb3acf782fad0b4eaf926a88bd0c11c2d85ff30e66879e21074fccf",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/review-closure.json": {
+        "exists": True,
+        "backup_name": "ce3a444727789109479d52a9376797614177682f18d9e1e61982bb1655b1ed4c",
+        "sha256": "8857916fbf12fe0d624a0b548eddc92d3faf721ed6955b533eb04e181d3d8f52",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+}
+LEGACY_V1_INSTALLED = {
+    "/etc/buzz-agents/genesis.env": {
+        "sha256": "0078f63c977e632c462c198b360008d4dd07a4b51c9d79e7ca44991bf7b75005",
+        "mode": "0600",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/mempool.env": {
+        "sha256": "77ad1d690558181603e59e5dfd1965a4adf5d7671b502f5416bb4b4b6c466493",
+        "mode": "0600",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/genesis.md": {
+        "sha256": "89d8afac710cf2c38f96d9a8d5d6e98971e88aa888d6b6d8cb30b56655960b88",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/mempool.md": {
+        "sha256": "94a6ca980717cb6def8979bc37991df2778326c6dce66c45afdd7c1f70126ddb",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@.service": {
+        "sha256": "24909a04037977702062f9b193ae32dd474fcba6f53b3d9b223fa8705a156b8d",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf": {
+        "sha256": "bf08b9c285c1005fcdc5bde376e51b3a2717487b560c95eb8377927e9663f287",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf": {
+        "sha256": "39d0205ed2b5c6a40d0ff5ab9b5d69b57843ca98252e4066d43100a8a17400a0",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/codex-acp": {
+        "sha256": "4ec50d320ddee4db8b59dc7ee1d6314c380ba9849d8f4cb1f43d3b2014a3f0bd",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/verify-installed-agent": {
+        "sha256": "5dde0a80d0a58883ea1065f267dcfdc051261e9a221e7ea6aadb4becc8479066",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/review-closure.json": {
+        "sha256": "f0f4616f3c294c8980529d03d74cbf08286514217bad7813d83ef7d9e9145c57",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+}
+LEGACY_V1_INVENTORY_SHA256 = (
+    "871518084ed95f78ac713d62ccb6af5739984aa0b6deb3767c3106e98e8c61b4"
+)
 IDENTITY_STATE_MODES = {
     "mempool": {
         "/home/buzz-mempool": 0o700,
@@ -49,6 +229,7 @@ IDENTITY_STATE_MODES = {
         "/home/buzz-mempool/.config": 0o700,
         "/home/buzz-mempool/.cache": 0o700,
         "/home/buzz-mempool/.local/state": 0o700,
+        "/home/buzz-mempool/.local/state/buzz-acp": 0o700,
         "/home/buzz-mempool/.tmp": 0o700,
     },
     "genesis": {
@@ -57,8 +238,13 @@ IDENTITY_STATE_MODES = {
         "/home/buzz-genesis/.config": 0o700,
         "/home/buzz-genesis/.cache": 0o700,
         "/home/buzz-genesis/.local/state": 0o700,
+        "/home/buzz-genesis/.local/state/buzz-acp": 0o700,
         "/home/buzz-genesis/.tmp": 0o700,
     },
+}
+ACP_STATE_DIRS = {
+    slug: f"/home/buzz-{slug}/.local/state/buzz-acp"
+    for slug in ("mempool", "genesis")
 }
 ROOT_TOOL_PATHS = (
     "/usr/local/libexec/buzz/codex-acp",
@@ -134,6 +320,15 @@ class Preflight:
     acceptance: Tier2Acceptance | None
     targets: tuple[TargetState, ...]
     blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LegacyV1Recovery:
+    backup: Path
+    receipt: Path
+    recovery_claim: Path
+    targets: tuple[TargetState, ...]
+    previous: dict[str, dict[str, object]]
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -695,6 +890,31 @@ def build_installed_closure(
     )
 
 
+def validate_runtime_state_dirs(runtime_targets: tuple[Target, ...]) -> None:
+    by_path = {target.target: target for target in runtime_targets}
+    for slug, expected in ACP_STATE_DIRS.items():
+        env_path = f"/etc/buzz-agents/{slug}.env"
+        target = by_path.get(env_path)
+        if target is None or target.source is None or target.payload is not None:
+            raise ValueError(f"{slug} runtime env target is absent")
+        values: dict[str, str] = {}
+        try:
+            lines = target.source.read_text().splitlines()
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{slug} runtime env is not UTF-8") from error
+        for line in lines:
+            key, separator, value = line.partition("=")
+            if not separator or key in values:
+                raise ValueError(f"invalid or duplicate runtime env line for {slug}: {line}")
+            values[key] = value
+        if values.get("BUZZ_ACP_STATE_DIR") != expected:
+            raise ValueError(f"{slug} runtime env has wrong BUZZ_ACP_STATE_DIR")
+        state_dir = Path(values["BUZZ_ACP_STATE_DIR"])
+        identity_home = Path(f"/home/buzz-{slug}")
+        if not state_dir.is_absolute() or identity_home not in state_dir.parents:
+            raise ValueError(f"{slug} runtime state directory escapes its identity home")
+
+
 def load_bundle(
     bundle: Path,
     receipt_path: Path,
@@ -734,6 +954,7 @@ def load_bundle(
         != TOTAL_PACKAGE_TARGET_COUNT
     ):
         raise ValueError("duplicate install target")
+    validate_runtime_state_dirs(runtime_targets)
     closure_payload = build_installed_closure(manifest, acceptance)
     closure_target = Target(
         CLOSURE_TARGET,
@@ -1193,6 +1414,18 @@ def metadata_matches(metadata: os.stat_result, mode: int, uid: int, gid: int) ->
     )
 
 
+def installed_records(changed: list[TargetState]) -> dict[str, dict[str, object]]:
+    return {
+        state.target.target: {
+            "sha256": state.target.sha256,
+            "mode": f"{state.target.mode:04o}",
+            "uid": state.target.uid,
+            "gid": state.target.gid,
+        }
+        for state in changed
+    }
+
+
 def restore_targets(
     changed: list[TargetState],
     previous: dict[str, dict[str, object]],
@@ -1335,15 +1568,7 @@ def install(
             "state": "prepared",
             "changed_targets": [target.target.target for target in changed],
             "previous": previous,
-            "installed": {
-                target.target.target: {
-                    "sha256": target.target.sha256,
-                    "mode": f"{target.target.mode:04o}",
-                    "uid": target.target.uid,
-                    "gid": target.target.gid,
-                }
-                for target in changed
-            },
+            "installed": installed_records(changed),
         }
         receipt_path = backup / "receipt.json"
         write_receipt(receipt_path, install_receipt)
@@ -1377,9 +1602,275 @@ def install(
         lock_handle.close()
 
 
-def rollback(backup_id: str, root: Path) -> int:
+def require_admin_tree(path: Path, root: Path, final_mode: int) -> os.stat_result:
+    uid, gid = admin_owner(root)
+    relative = path.relative_to(root)
+    current = root
+    root_metadata(root)
+    metadata = current.lstat()
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"unsafe admin directory: {current}")
+        if metadata.st_uid != uid or metadata.st_gid != gid:
+            raise ValueError(f"admin directory owner mismatch: {current}")
+        if index == len(relative.parts) - 1:
+            if stat.S_IMODE(metadata.st_mode) != final_mode:
+                raise ValueError(f"admin directory mode mismatch: {current}")
+        elif stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ValueError(f"admin directory is group/world-writable: {current}")
+    return metadata
+
+
+def legacy_v1_contract_receipt() -> dict[str, object]:
+    return {
+        "schema": LEGACY_TIER1_INSTALL_RECEIPT_SCHEMA,
+        "backup_id": LEGACY_V1_BACKUP_ID,
+        "acceptance_sha256": LEGACY_V1_ACCEPTANCE_SHA256,
+        "claim": LEGACY_V1_CLAIM,
+        "package_digest": LEGACY_V1_PACKAGE_DIGEST,
+        "state": "installed",
+        "changed_targets": list(LEGACY_V1_CHANGED_TARGETS),
+        "previous": LEGACY_V1_PREVIOUS,
+    }
+
+
+def legacy_v1_inventory_digest() -> str:
+    return sha256_bytes(
+        canonical_json(
+            {
+                "changed_targets": list(LEGACY_V1_CHANGED_TARGETS),
+                "previous": LEGACY_V1_PREVIOUS,
+                "installed": LEGACY_V1_INSTALLED,
+            }
+        )
+    )
+
+
+def legacy_v1_recovery_claim_path(root: Path) -> Path:
+    name = f"legacy-v1-rollback-{LEGACY_V1_RECEIPT_SHA256}.claim"
+    return rooted(root, LEGACY_V1_RECOVERY_CLAIM_DIRECTORY) / name
+
+
+def legacy_v1_acceptance_claim() -> dict[str, object]:
+    return {
+        "schema": LEGACY_V1_ACCEPTANCE_CLAIM_SCHEMA,
+        "acceptance_sha256": LEGACY_V1_ACCEPTANCE_SHA256,
+        "package_digest": LEGACY_V1_PACKAGE_DIGEST,
+    }
+
+
+def validate_legacy_v1_recovery(backup_id: str, root: Path) -> LegacyV1Recovery:
+    if backup_id != LEGACY_V1_BACKUP_ID or not BACKUP_ID.fullmatch(backup_id):
+        raise ValueError("legacy v1 backup ID mismatch")
+    blockers = service_blockers(root)
+    if blockers:
+        raise ValueError("LEGACY V1 ROLLBACK REFUSED: " + "; ".join(blockers))
+    if len(LEGACY_V1_CHANGED_TARGETS) != 10:
+        raise ValueError("legacy v1 target count mismatch")
+    if (
+        set(LEGACY_V1_CHANGED_TARGETS) != set(LEGACY_V1_PREVIOUS)
+        or set(LEGACY_V1_CHANGED_TARGETS) != set(LEGACY_V1_INSTALLED)
+    ):
+        raise ValueError("legacy v1 target inventory mismatch")
+    if legacy_v1_inventory_digest() != LEGACY_V1_INVENTORY_SHA256:
+        raise ValueError("legacy v1 inventory digest mismatch")
+
+    backup_root = backup_root_for(root)
+    require_admin_tree(backup_root, root, 0o700)
+    backup = backup_root / backup_id
+    require_admin_tree(backup, root, 0o700)
+    if {entry.name for entry in os.scandir(backup)} != {"files", "receipt.json"}:
+        raise ValueError("legacy v1 backup directory inventory mismatch")
+
+    receipt_path = backup / "receipt.json"
+    uid, gid = admin_owner(root)
+    receipt_metadata = require_regular(
+        receipt_path,
+        mode=0o600,
+        owner_uid=uid,
+        links=1,
+    )
+    if receipt_metadata.st_gid != gid:
+        raise ValueError("legacy v1 receipt group mismatch")
+    if sha256_file(receipt_path) != LEGACY_V1_RECEIPT_SHA256:
+        raise ValueError("legacy v1 receipt hash mismatch")
+    receipt = load_json(receipt_path, mode=0o600, owner_uid=uid)
+    if receipt != legacy_v1_contract_receipt():
+        raise ValueError("legacy v1 receipt contract mismatch")
+    if "installed" in receipt:
+        raise ValueError("legacy v1 receipt unexpectedly contains an installed map")
+
+    files = backup / "files"
+    require_admin_tree(files, root, 0o700)
+    expected_names = {
+        str(LEGACY_V1_PREVIOUS[target]["backup_name"])
+        for target in LEGACY_V1_CHANGED_TARGETS
+    }
+    if len(expected_names) != 10 or {entry.name for entry in os.scandir(files)} != expected_names:
+        raise ValueError("legacy v1 backup file inventory mismatch")
+    for target_text in LEGACY_V1_CHANGED_TARGETS:
+        record = LEGACY_V1_PREVIOUS[target_text]
+        backup_name = str(record.get("backup_name"))
+        digest = str(record.get("sha256"))
+        if (
+            record.get("exists") is not True
+            or not HEX64.fullmatch(backup_name)
+            or backup_name != hashlib.sha256(target_text.encode()).hexdigest()
+            or not HEX64.fullmatch(digest)
+        ):
+            raise ValueError(f"legacy v1 previous record mismatch: {target_text}")
+        item = files / backup_name
+        item_metadata = require_regular(item, mode=0o600, owner_uid=uid, links=1)
+        if item_metadata.st_gid != gid:
+            raise ValueError(f"legacy v1 backup group mismatch: {target_text}")
+        if sha256_file(item) != digest:
+            raise ValueError(f"legacy v1 backup hash mismatch: {target_text}")
+
+    claim_directory = rooted(root, LEGACY_V1_RECOVERY_CLAIM_DIRECTORY)
+    require_admin_tree(claim_directory, root, 0o700)
+    acceptance_claim_path = rooted(root, LEGACY_V1_CLAIM)
+    if acceptance_claim_path.parent != claim_directory:
+        raise ValueError("legacy v1 acceptance claim path mismatch")
+    claim_metadata = require_regular(
+        acceptance_claim_path,
+        mode=0o600,
+        owner_uid=uid,
+        links=1,
+    )
+    if claim_metadata.st_gid != gid:
+        raise ValueError("legacy v1 acceptance claim group mismatch")
+    expected_claim = legacy_v1_acceptance_claim()
+    if (
+        sha256_file(acceptance_claim_path) != sha256_bytes(canonical_json(expected_claim))
+        or load_json(acceptance_claim_path, mode=0o600, owner_uid=uid) != expected_claim
+    ):
+        raise ValueError("legacy v1 consumed acceptance claim mismatch")
+
+    recovery_claim = legacy_v1_recovery_claim_path(root)
+    if os.path.lexists(recovery_claim):
+        raise ValueError("legacy v1 rollback was already claimed")
+
+    states: list[TargetState] = []
+    for target_text in LEGACY_V1_CHANGED_TARGETS:
+        record = LEGACY_V1_INSTALLED[target_text]
+        digest = str(record.get("sha256"))
+        if not HEX64.fullmatch(digest):
+            raise ValueError(f"legacy v1 installed hash mismatch: {target_text}")
+        target = Target(
+            target_text,
+            None,
+            None,
+            parse_mode(record.get("mode")),
+            int(record.get("uid")),
+            int(record.get("gid")),
+            digest,
+        )
+        destination = rooted(root, target_text)
+        parent, blocker = walk_parent(root, target)
+        if parent is None:
+            raise ValueError(f"legacy v1 rollback parent blocked: {target_text}: {blocker}")
+        current = parent / destination.name
+        metadata = require_regular(current, links=1)
+        installed_uid, installed_gid = expected_owner(target, root)
+        if sha256_file(current) != digest or not metadata_matches(
+            metadata,
+            target.mode,
+            installed_uid,
+            installed_gid,
+        ):
+            raise ValueError(f"legacy v1 installed target drift: {target_text}")
+        states.append(TargetState(target, destination, parent, "replace", "legacy-v1-rollback"))
+    return LegacyV1Recovery(
+        backup,
+        receipt_path,
+        recovery_claim,
+        tuple(states),
+        {target: dict(LEGACY_V1_PREVIOUS[target]) for target in LEGACY_V1_CHANGED_TARGETS},
+    )
+
+
+def create_legacy_v1_recovery_claim(root: Path) -> Path:
+    directory = rooted(root, LEGACY_V1_RECOVERY_CLAIM_DIRECTORY)
+    require_admin_tree(directory, root, 0o700)
+    path = legacy_v1_recovery_claim_path(root)
+    uid, gid = admin_owner(root)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        if root == Path("/"):
+            os.fchown(descriptor, uid, gid)
+        payload = canonical_json(
+            {
+                "schema": LEGACY_V1_RECOVERY_CLAIM_SCHEMA,
+                "backup_id": LEGACY_V1_BACKUP_ID,
+                "receipt_sha256": LEGACY_V1_RECEIPT_SHA256,
+                "inventory_sha256": LEGACY_V1_INVENTORY_SHA256,
+            }
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write during legacy v1 rollback claim")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    sync_directory(directory)
+    return path
+
+
+def verify_legacy_v1_restored(value: LegacyV1Recovery, root: Path) -> None:
+    for state in value.targets:
+        target_text = state.target.target
+        record = value.previous[target_text]
+        destination = state.resolved_parent / state.destination.name
+        metadata = require_regular(destination, links=1)
+        expected_uid = int(record["uid"]) if root == Path("/") else admin_owner(root)[0]
+        expected_gid = int(record["gid"]) if root == Path("/") else admin_owner(root)[1]
+        if sha256_file(destination) != record["sha256"] or not metadata_matches(
+            metadata,
+            int(str(record["mode"]), 8),
+            expected_uid,
+            expected_gid,
+        ):
+            raise ValueError(f"legacy v1 restore verification failed: {target_text}")
+
+
+def rollback_legacy_v1(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
+    checked = validate_legacy_v1_recovery(backup_id, root)
+    if dry_run:
+        print(
+            "LEGACY_V1_ROLLBACK_DRY_RUN "
+            f"backup_id={backup_id} targets={len(checked.targets)} writes=0"
+        )
+        return 0
+    _backup_root, lock_handle = prepare_admin_paths(root)
+    try:
+        checked = validate_legacy_v1_recovery(backup_id, root)
+        claim = create_legacy_v1_recovery_claim(root)
+        restore_targets(list(checked.targets), checked.previous, checked.backup, root)
+        verify_legacy_v1_restored(checked, root)
+        if sha256_file(checked.receipt) != LEGACY_V1_RECEIPT_SHA256:
+            raise ValueError("legacy v1 receipt changed during rollback")
+        print(f"LEGACY_V1_ROLLED_BACK backup_id={backup_id} claim={claim}")
+        return 0
+    finally:
+        lock_handle.close()
+
+
+def rollback(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
     if not BACKUP_ID.fullmatch(backup_id):
         raise ValueError("invalid backup ID")
+    if backup_id == LEGACY_V1_BACKUP_ID:
+        return rollback_legacy_v1(backup_id, root, dry_run=dry_run)
+    if dry_run:
+        raise ValueError("rollback --dry-run only supports the exact legacy v1 backup")
     blockers = service_blockers(root)
     if blockers:
         raise ValueError("ROLLBACK REFUSED: " + "; ".join(blockers))
@@ -1466,11 +1957,12 @@ def main() -> None:
         child.add_argument("--repo-root", default=str(REPO_ROOT))
     child = children.add_parser("rollback")
     child.add_argument("--backup-id", required=True)
+    child.add_argument("--dry-run", action="store_true")
     child.add_argument("--root", default="/")
     args = parser.parse_args()
     root = Path(args.root).absolute()
     if args.command == "rollback":
-        raise SystemExit(rollback(args.backup_id, root))
+        raise SystemExit(rollback(args.backup_id, root, dry_run=args.dry_run))
     bundle = Path(args.bundle).resolve(strict=True)
     receipt = Path(args.receipt).resolve(strict=True)
     evidence = Path(args.tier2_evidence).resolve(strict=True)
