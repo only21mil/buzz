@@ -308,6 +308,40 @@ class ActivationBundleTests(PackageFixture):
         )
         self.assertEqual(manifest["tier2_evidence_schema"], "tier2-evidence-v2")
         self.assertEqual(
+            manifest["tier2_engine"],
+            {
+                "path": "/home/victor/.agents/skills/codex-review/scripts/tier2",
+                "mode": "0755",
+                "sha256": "8750c7c2ceced906f825052452aa8f60fe27fc953c801a27ad62053ec2c87242",
+                "source_commit": "4efbf03a5220b40984e339d88b649220bd235cd7",
+                "source_tree": "4e1a8d5859ad353225fa05f218b2f0d1950c56e9",
+            },
+        )
+        self.assertEqual(
+            PREFLIGHT.validate_tier2_engine(manifest["tier2_engine"]),
+            manifest["tier2_engine"],
+        )
+        self.assertEqual(
+            INSTALLER.tier2_engine_record(manifest),
+            manifest["tier2_engine"],
+        )
+        tampered_engine = dict(manifest["tier2_engine"])
+        tampered_engine["mode"] = "0750"
+        with self.assertRaisesRegex(ValueError, "mode mismatch"):
+            PREFLIGHT.validate_tier2_engine(tampered_engine)
+        tampered_engine = dict(manifest["tier2_engine"])
+        tampered_engine["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "reviewed fleet source"):
+            PREFLIGHT.validate_tier2_engine(tampered_engine)
+        tampered_engine = dict(manifest["tier2_engine"])
+        tampered_engine["source_commit"] = "0" * 40
+        with self.assertRaisesRegex(ValueError, "source commit mismatch"):
+            PREFLIGHT.validate_tier2_engine(tampered_engine)
+        tampered_engine = dict(manifest["tier2_engine"])
+        tampered_engine["source_tree"] = "0" * 40
+        with self.assertRaisesRegex(ValueError, "source tree mismatch"):
+            PREFLIGHT.validate_tier2_engine(tampered_engine)
+        self.assertEqual(
             manifest["tier2_candidate_paths"],
             ["bundle-manifest.json", "metadata/review-files.json"],
         )
@@ -333,8 +367,55 @@ class ActivationBundleTests(PackageFixture):
                 "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
                 "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
                 "policy": "/etc/buzz-agents/capability-parity-policy.json",
+                "receipt_binding": {
+                    "status": "pending-live-capture",
+                    "path": "metadata/capability-parity-receipt.json",
+                    "sha256": None,
+                    "required_before_activation": True,
+                },
             },
         )
+        self.assertEqual(
+            manifest["source_commit"],
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=REPO_ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip(),
+        )
+        self.assertEqual(
+            manifest["source_tree"],
+            subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"],
+                cwd=REPO_ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip(),
+        )
+        self.assertEqual(
+            manifest["acp_state_dirs"],
+            {
+                "mempool": "/home/buzz-mempool/.local/state/buzz-acp",
+                "genesis": "/home/buzz-genesis/.local/state/buzz-acp",
+            },
+        )
+        for slug, public_key in (("mempool", "1" * 64), ("genesis", "2" * 64)):
+            self.assertEqual(
+                manifest["identities"][slug],
+                {
+                    "public_key": public_key,
+                    "user": f"buzz-{slug}",
+                    "home": f"/home/buzz-{slug}",
+                    "credential_path": f"/etc/buzz-agents/credentials/{slug}.key",
+                    "environment_path": f"/etc/buzz-agents/{slug}.env",
+                    "prompt_path": f"/etc/buzz-agents/prompts/{slug}.md",
+                    "acp_state_dir": f"/home/buzz-{slug}/.local/state/buzz-acp",
+                    "systemd_unit": f"buzz-agent@{slug}.service",
+                },
+            )
         codex_acp = first / "install-root/usr/local/libexec/buzz/codex-acp"
         self.assertTrue(codex_acp.read_bytes().startswith(b"#!/usr/local/libexec/buzz/node\n"))
         self.assertNotIn(b"#!/usr/bin/env node", codex_acp.read_bytes())
@@ -703,6 +784,11 @@ class ActivationBundleTests(PackageFixture):
         self.assertEqual(value["verdict_digest"], acceptance.verdict_digest)
         self.assertEqual(value["candidate_fingerprint"], acceptance.candidate_fingerprint)
         self.assertEqual(value["bundle_digest"], manifest["package_digest"])
+        self.assertEqual(value["source_commit"], manifest["source_commit"])
+        self.assertEqual(value["source_tree"], manifest["source_tree"])
+        self.assertEqual(value["identities"], manifest["identities"])
+        self.assertEqual(value["acp_state_dirs"], manifest["acp_state_dirs"])
+        self.assertEqual(value["capability_parity"], manifest["capability_parity"])
         for slug in ("mempool", "genesis"):
             self.assertEqual(len(value["files"][slug]), 21)
             self.assertEqual(value["files"][slug], manifest["review_files"][slug])
@@ -1224,8 +1310,23 @@ class InstallerSafetyTests(PackageFixture):
         self.assertEqual(len(backup_ids), 1)
         v3_receipt = json.loads((backup_root / backup_ids[0] / "receipt.json").read_text())
         self.assertEqual(v3_receipt["schema"], INSTALLER.INSTALL_RECEIPT_SCHEMA)
+        self.assertEqual(v3_receipt["source_commit"], self.manifest["source_commit"])
+        self.assertEqual(v3_receipt["source_tree"], self.manifest["source_tree"])
+        self.assertEqual(
+            v3_receipt["manifest_sha256"],
+            INSTALLER.sha256_file(self.bundle / "bundle-manifest.json"),
+        )
+        self.assertEqual(v3_receipt["identities"], self.manifest["identities"])
+        self.assertEqual(v3_receipt["acp_state_dirs"], self.manifest["acp_state_dirs"])
+        self.assertEqual(v3_receipt["capability_parity"], self.manifest["capability_parity"])
         self.assertEqual(set(v3_receipt["changed_targets"]), set(v3_receipt["previous"]))
         self.assertEqual(set(v3_receipt["changed_targets"]), set(v3_receipt["installed"]))
+        backup_files = v3_receipt["backup_inventory"]["files"]
+        self.assertEqual([record["target"] for record in backup_files], [str(old_env).replace(str(self.install_root), "")])
+        self.assertEqual(
+            v3_receipt["backup_inventory"]["sha256"],
+            INSTALLER.sha256_bytes(INSTALLER.canonical_json(backup_files)),
+        )
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.install(), 0)
         self.assertIn("ALREADY_INSTALLED writes=0", output.getvalue())
@@ -1234,6 +1335,17 @@ class InstallerSafetyTests(PackageFixture):
             io.StringIO()
         ):
             self.assertEqual(INSTALLER.rollback(backup_ids[0], self.install_root), 0)
+        rollback_receipt = json.loads((backup_root / backup_ids[0] / "receipt.json").read_text())
+        self.assertEqual(rollback_receipt["state"], "rolled_back")
+        self.assertEqual(rollback_receipt["rollback"]["status"], "verified")
+        self.assertEqual(
+            rollback_receipt["rollback"]["restored_targets"],
+            rollback_receipt["changed_targets"],
+        )
+        self.assertEqual(
+            rollback_receipt["rollback"]["backup_inventory_sha256"],
+            rollback_receipt["backup_inventory"]["sha256"],
+        )
         self.assertEqual(old_env.read_bytes(), b"old env\n")
         for target in targets:
             if target == "/etc/buzz-agents/mempool.env":
@@ -1280,6 +1392,34 @@ class InstallerSafetyTests(PackageFixture):
             (self.install_root / "var/lib/buzz-mgact-backups").glob("*/receipt.json")
         )
         self.assertEqual(json.loads(receipt_path.read_text())["state"], "rolled_back")
+
+    def test_v3_rollback_rejects_wrong_identity_state_binding(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.install(), 0)
+        backup_id = self.only_backup_id()
+        receipt_path = (
+            self.install_root / "var/lib/buzz-mgact-backups" / backup_id / "receipt.json"
+        )
+        receipt = json.loads(receipt_path.read_text())
+        receipt["identities"]["genesis"]["acp_state_dir"] = (
+            "/home/buzz-mempool/.local/state/buzz-acp"
+        )
+        write_private_json(receipt_path, receipt)
+        with self.assertRaisesRegex(ValueError, "genesis identity descriptor mismatch"):
+            self.rollback(backup_id)
+
+    def test_v3_rollback_rejects_backup_inventory_tamper(self) -> None:
+        old_env = self.install_root / "etc/buzz-agents/mempool.env"
+        write_file(old_env, b"old env\n", 0o644)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.install(), 0)
+        backup_id = self.only_backup_id()
+        backup = self.install_root / "var/lib/buzz-mgact-backups" / backup_id
+        receipt = json.loads((backup / "receipt.json").read_text())
+        backup_name = receipt["previous"]["/etc/buzz-agents/mempool.env"]["backup_name"]
+        (backup / "files" / backup_name).write_bytes(b"tampered\n")
+        with self.assertRaisesRegex(ValueError, "backup inventory mismatch"):
+            self.rollback(backup_id)
 
     def test_manual_rollback_restores_matching_content_metadata(self) -> None:
         target_text = "/etc/buzz-agents/mempool.env"

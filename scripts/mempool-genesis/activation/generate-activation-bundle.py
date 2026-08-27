@@ -21,9 +21,18 @@ TEMPLATE_DIR = SCRIPT_DIR / "templates"
 INPUT_SCHEMA = "buzz-mempool-genesis-activation-input-v1"
 BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 REVIEW_FILES_SCHEMA = "buzz-agent-review-files-v1"
+PARITY_RECEIPT_BINDING = {
+    "status": "pending-live-capture",
+    "path": "metadata/capability-parity-receipt.json",
+    "sha256": None,
+    "required_before_activation": True,
+}
 TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
-TIER2_ENGINE_MODE = 0o750
+TIER2_ENGINE_MODE = 0o755
+TIER2_ENGINE_SHA256 = "8750c7c2ceced906f825052452aa8f60fe27fc953c801a27ad62053ec2c87242"
+TIER2_ENGINE_SOURCE_COMMIT = "4efbf03a5220b40984e339d88b649220bd235cd7"
+TIER2_ENGINE_SOURCE_TREE = "4e1a8d5859ad353225fa05f218b2f0d1950c56e9"
 TIER2_REVIEW = {
     "producer_provider": "gpt",
     "reviewer_provider": "claude",
@@ -441,10 +450,15 @@ def source_inventory(repo_root: Path) -> list[dict[str, str]]:
 def tier2_engine_record(path: Path) -> dict[str, str]:
     resolved = path.resolve(strict=True)
     metadata = require_regular(resolved, TIER2_ENGINE_MODE, owner_uid=os.getuid())
+    digest = sha256_file(resolved)
+    if digest != TIER2_ENGINE_SHA256:
+        raise ValueError("Tier 2 engine does not match reviewed fleet source")
     return {
         "path": str(resolved),
         "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
-        "sha256": sha256_file(resolved),
+        "sha256": digest,
+        "source_commit": TIER2_ENGINE_SOURCE_COMMIT,
+        "source_tree": TIER2_ENGINE_SOURCE_TREE,
     }
 
 
@@ -630,11 +644,34 @@ def generate(
         }
 
         sources = source_inventory(repo_root)
+        source_commit = git_value(repo_root, "rev-parse", "HEAD")
+        source_tree = git_value(repo_root, "rev-parse", "HEAD^{tree}")
+        identities = {
+            slug: {
+                "public_key": pubkeys[slug],
+                "user": f"buzz-{slug}",
+                "home": f"/home/buzz-{slug}",
+                "credential_path": f"/etc/buzz-agents/credentials/{slug}.key",
+                "environment_path": f"/etc/buzz-agents/{slug}.env",
+                "prompt_path": f"/etc/buzz-agents/prompts/{slug}.md",
+                "acp_state_dir": f"/home/buzz-{slug}/.local/state/buzz-acp",
+                "systemd_unit": f"buzz-agent@{slug}.service",
+            }
+            for slug in ("mempool", "genesis")
+        }
+        acp_state_dirs = {
+            slug: str(descriptor["acp_state_dir"])
+            for slug, descriptor in identities.items()
+        }
         runtime_fingerprint = artifact_fingerprint(records)
         digest_input = {
             "schema": BUNDLE_SCHEMA,
             "bundle_id": BUNDLE_ID,
+            "source_commit": source_commit,
+            "source_tree": source_tree,
             "inputs": pubkeys,
+            "identities": identities,
+            "acp_state_dirs": acp_state_dirs,
             "input_status": "complete" if complete else "desktop-save-required",
             "runtime_targets": sorted(records, key=lambda record: str(record["target"]).encode()),
             "ops_targets": [ops_record],
@@ -650,6 +687,7 @@ def generate(
                 "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
                 "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
                 "policy": "/etc/buzz-agents/capability-parity-policy.json",
+                "receipt_binding": PARITY_RECEIPT_BINDING,
             },
         }
         package_digest = sha256_bytes(canonical_json(digest_input))
@@ -668,10 +706,13 @@ def generate(
         manifest = {
             "schema": BUNDLE_SCHEMA,
             "bundle_id": BUNDLE_ID,
-            "source_commit": git_value(repo_root, "rev-parse", "HEAD"),
+            "source_commit": source_commit,
+            "source_tree": source_tree,
             "source_branch": git_value(repo_root, "branch", "--show-current"),
             "generator_sources": sources,
             "inputs": pubkeys,
+            "identities": identities,
+            "acp_state_dirs": acp_state_dirs,
             "input_status": "complete" if complete else "desktop-save-required",
             "ready_for_parent_tier1": complete,
             "installable": False,

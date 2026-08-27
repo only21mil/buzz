@@ -31,7 +31,7 @@ EXPECTED_ROUTE = {
     "model": "claude-opus-5",
     "effort": "high",
 }
-TIER2_ENGINE_MODE = 0o750
+TIER2_ENGINE_MODE = 0o755
 SEALED_ENGINE_LAUNCHER = """\
 import os
 import sys

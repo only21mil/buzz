@@ -5,7 +5,9 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 ACTIVATION_DIR = Path(__file__).resolve().parents[1]
 
@@ -29,10 +31,10 @@ POLICY = PARITY.validate_policy(
 
 def descriptor(path: str, owner: str, marker: int) -> dict[str, object]:
     return {
-        "path": path,
+        "path_class": path,
         "present": True,
         "file_type": "regular",
-        "character_class": "lowercase-hex-or-json",
+        "character_class": "utf8-json",
         "length": 64 + marker,
         "mode": "0600",
         "owner": owner,
@@ -100,7 +102,7 @@ def manifest(role: str) -> dict[str, object]:
     hardening = copy.deepcopy(PARITY.REQUIRED_HARDENING)
     hardening.update({"User": user, "Group": user, "WorkingDirectory": home})
     host_access = copy.deepcopy(POLICY["approved_exceptions"].get(slug, {"host_access": []})["host_access"])
-    private_descriptor = descriptor(roots["credential"], "root" if role != "reference" else user, marker)
+    private_descriptor = descriptor(f"{slug}:buzz-private-key", "root" if role != "reference" else user, marker)
     if role != "reference":
         private_descriptor.update(
             {"length": 64, "character_class": "lowercase-hex", "group": "root"}
@@ -155,6 +157,13 @@ def manifest(role: str) -> dict[str, object]:
         },
         "response_policy": {"respond_to": "owner-only", "allowed_respond_to": "owner-only", "responder_allowlist": [], "owner_pubkey": POLICY["owner_pubkey"]},
         "channels": channels,
+        "profile": {
+            "author_pubkey": pubkey,
+            "display_name": display,
+            "event_id": f"{marker + 1500:064x}",
+            "auth_owner_pubkey": POLICY["owner_pubkey"],
+            "auth_subject_pubkey": pubkey,
+        },
         "directory": {
             "self_published": True,
             "author_pubkey": pubkey,
@@ -177,7 +186,7 @@ def manifest(role: str) -> dict[str, object]:
         },
         "secret_files": {
             "buzz_private_key": private_descriptor,
-            "codex_auth": descriptor(f"{roots['codex_home']}/auth.json", user, marker + 1),
+            "codex_auth": descriptor(f"{slug}:codex-auth", user, marker + 1),
         },
         "prompt": {
             "sha256": f"{marker + 3000:064x}",
@@ -202,6 +211,102 @@ class CapabilityParityTests(unittest.TestCase):
     def compare(self):
         return PARITY.compare_set(self.reference, self.mempool, self.genesis, POLICY)
 
+    def capture_fixture(self, root: Path) -> tuple[dict[str, object], tuple[str, str, str]]:
+        reference = manifest("reference")
+        pubkey = reference["identity"]["pubkey"]
+        auth_tag = "owner1syntheticcaptureauth"
+        private_key = "a" * 64
+        codex_auth = '{"session":"synthetic-capture"}'
+        environment = {
+            "BUZZ_ACP_MODEL": "gpt-5.6-sol[high]",
+            "BUZZ_ACP_AGENT_COMMAND": "/usr/local/libexec/buzz/codex-acp",
+            "BUZZ_ACP_MCP_COMMAND": "/usr/local/libexec/buzz/buzz-dev-mcp",
+            "BUZZ_ACP_MEMORY": "true",
+            "BUZZ_ACP_AGENTS": "1",
+            "BUZZ_ACP_SUBSCRIBE": "mentions",
+            "BUZZ_ACP_MULTIPLE_EVENT_HANDLING": "steer",
+            "BUZZ_ACP_CONTEXT_MESSAGE_LIMIT": "12",
+            "BUZZ_ACP_IDLE_TIMEOUT": "620",
+            "BUZZ_ACP_MAX_TURN_DURATION": "7200",
+            "BUZZ_ACP_TURN_LIVENESS_SECS": "10",
+            "BUZZ_ACP_PERMISSION_MODE": "bypass-permissions",
+            "BUZZ_ACP_RESPOND_TO": "owner-only",
+            "BUZZ_ACP_ALLOWED_RESPOND_TO": "owner-only",
+            "BUZZ_ACP_RESPOND_TO_ALLOWLIST": "",
+            "BUZZ_ACP_AGENT_OWNER": POLICY["owner_pubkey"],
+            "BUZZ_ACP_AUTH_TAG": auth_tag,
+        }
+
+        def write(name: str, payload: str, mode: int = 0o600) -> Path:
+            path = root / name
+            path.write_text(payload)
+            path.chmod(mode)
+            return path
+
+        environment_path = write(
+            "reference.env", "".join(f"{key}={value}\n" for key, value in environment.items())
+        )
+        prompt_path = write("prompt.md", "Synthetic reference prompt\n")
+        prompt_policy_path = write("prompt-policy.md", "Owner-only response policy\n")
+        config_path = write("config.toml", 'model = "gpt-5.6-sol"\nreasoning_effort = "high"\n')
+        key_path = write("reference.key", private_key)
+        auth_path = write("auth.json", codex_auth)
+        channels_path = write("channels.json", json.dumps(reference["channels"]))
+        profile_path = write("profile.json", json.dumps(reference["profile"]))
+        directory_path = write("directory.json", json.dumps(reference["directory"]))
+        systemd_path = write(
+            "systemd.json",
+            json.dumps(
+                {
+                    key: reference["systemd"][key]
+                    for key in (
+                        "properties", "read_write_paths", "read_only_paths",
+                        "address_families", "executable_paths",
+                    )
+                }
+            ),
+        )
+        closure_paths = {
+            name: str(write(f"closure-{name}", name, 0o755 if name != "service_unit" else 0o644))
+            for name in PARITY.CLOSURE_KEYS
+        }
+        environment["BUZZ_ACP_AGENT_COMMAND"] = closure_paths["codex_acp"]
+        environment["BUZZ_ACP_MCP_COMMAND"] = closure_paths["mcp"]
+        environment_path.write_text(
+            "".join(f"{key}={value}\n" for key, value in environment.items())
+        )
+        spec = {
+            "schema": PARITY.CAPTURE_SCHEMA,
+            "role": "reference",
+            "captured_at": reference["captured_at"],
+            "slug": reference["slug"],
+            "display_name": reference["display_name"],
+            "identity": {
+                key: reference["identity"][key]
+                for key in ("pubkey", "owner_pubkey", "unix_user", "unix_group", "profile_author_pubkey")
+            },
+            "roots": reference["roots"],
+            "sources": {
+                "environment_file": str(environment_path),
+                "prompt_file": str(prompt_path),
+                "prompt_policy_file": str(prompt_policy_path),
+                "codex_config_file": str(config_path),
+                "buzz_private_key": {"path": str(key_path), "path_class": "codex-r:buzz-private-key"},
+                "codex_auth": {"path": str(auth_path), "path_class": "codex-r:codex-auth"},
+                "auth_tag": {"kind": "environment", "path": str(environment_path), "key": "BUZZ_ACP_AUTH_TAG"},
+                "systemd": {"kind": "file", "path": str(systemd_path)},
+                "channels": {"kind": "file", "path": str(channels_path)},
+                "profile": {"kind": "file", "path": str(profile_path)},
+                "directory": {"kind": "file", "path": str(directory_path)},
+                "closure": closure_paths,
+            },
+            "prompt": {
+                key: reference["prompt"][key] for key in ("identity", "mission", "session_title")
+            },
+            "receipts": reference["receipts"],
+        }
+        return spec, (auth_tag, private_key, codex_auth)
+
     def test_three_redacted_manifests_have_empty_unexplained_diff(self) -> None:
         receipt = self.compare()
         self.assertEqual(receipt["status"], "PASS")
@@ -219,7 +324,7 @@ class CapabilityParityTests(unittest.TestCase):
             ("pubkey", lambda: self.genesis["identity"].__setitem__("pubkey", self.mempool["identity"]["pubkey"])),
             ("auth tags", lambda: self.genesis["identity"]["auth_tag"].__setitem__("sha256_prefix", self.mempool["identity"]["auth_tag"]["sha256_prefix"])),
             ("inode", lambda: self.genesis["secret_files"]["codex_auth"].update({"device": self.mempool["secret_files"]["codex_auth"]["device"], "inode": self.mempool["secret_files"]["codex_auth"]["inode"]})),
-            ("descriptor mismatch", lambda: self.genesis["secret_files"]["codex_auth"].__setitem__("path", self.mempool["secret_files"]["codex_auth"]["path"])),
+            ("descriptor mismatch", lambda: self.genesis["secret_files"]["codex_auth"].__setitem__("path_class", self.mempool["secret_files"]["codex_auth"]["path_class"])),
             ("material", lambda: self.genesis["secret_files"]["codex_auth"].__setitem__("sha256_prefix", self.mempool["secret_files"]["codex_auth"]["sha256_prefix"])),
         )
         for expected, mutate in mutations:
@@ -243,6 +348,24 @@ class CapabilityParityTests(unittest.TestCase):
         with self.assertRaisesRegex(PARITY.ParityError, "directory channels"):
             self.compare()
 
+    def test_identity_local_state_prompt_and_events_are_unique(self) -> None:
+        mutations = (
+            ("Unix users", lambda: self.reference["identity"].__setitem__("unix_user", self.mempool["identity"]["unix_user"])),
+            ("homes", lambda: self.reference["roots"].__setitem__("home", self.mempool["roots"]["home"])),
+            ("state roots", lambda: self.reference["roots"].__setitem__("state", self.mempool["roots"]["state"])),
+            ("prompt paths", lambda: self.reference["roots"].__setitem__("prompt", self.mempool["roots"]["prompt"])),
+            ("prompts", lambda: self.reference["prompt"].__setitem__("sha256", self.mempool["prompt"]["sha256"])),
+            ("directory events", lambda: self.reference["directory"].__setitem__("event_id", self.mempool["directory"]["event_id"])),
+            ("profile events", lambda: self.reference["profile"].__setitem__("event_id", self.mempool["profile"]["event_id"])),
+            ("receipt", lambda: self.reference["receipts"].__setitem__(0, self.mempool["receipts"][0])),
+        )
+        for expected, mutate in mutations:
+            with self.subTest(expected=expected):
+                self.setUp()
+                mutate()
+                with self.assertRaisesRegex(PARITY.ParityError, expected):
+                    self.compare()
+
     def test_broad_host_access_and_unapproved_netlink_fail(self) -> None:
         self.genesis["systemd"]["read_write_paths"].append("/home/victor")
         with self.assertRaisesRegex(PARITY.ParityError, "unapproved writable path"):
@@ -258,6 +381,112 @@ class CapabilityParityTests(unittest.TestCase):
         observation["private_key"] = "1" * 64
         with self.assertRaisesRegex(PARITY.ParityError, "secret-bearing field"):
             PARITY.build_manifest(observation, "mempool", POLICY)
+
+    def test_capture_fixture_is_deterministic_and_secret_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, secret_values = self.capture_fixture(Path(temporary))
+            first = PARITY.capture_manifest(spec, POLICY)
+            second = PARITY.capture_manifest(spec, POLICY)
+        self.assertEqual(PARITY.canonical_json(first), PARITY.canonical_json(second))
+        serialized = PARITY.canonical_json(first).decode()
+        for secret in secret_values:
+            self.assertNotIn(secret, serialized)
+        self.assertEqual(first["secret_files"]["buzz_private_key"]["path_class"], "codex-r:buzz-private-key")
+        self.assertNotIn("path", first["secret_files"]["buzz_private_key"])
+        self.assertEqual(first["response_policy"]["responder_allowlist"], [])
+
+    def test_capture_rejects_archimedes_rachel_private_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, _secret_values = self.capture_fixture(Path(temporary))
+            channels_path = Path(spec["sources"]["channels"]["path"])
+            channels = json.loads(channels_path.read_text())
+            channels.append(
+                {
+                    "channel_id": "foreign-private",
+                    "visibility": "private",
+                    "scope": "archimedes-rachel-private",
+                    "role": "member",
+                    "archived": False,
+                    "eligible": True,
+                }
+            )
+            channels_path.write_text(json.dumps(channels))
+            with self.assertRaisesRegex(PARITY.ParityError, "ineligible private-channel"):
+                PARITY.capture_manifest(spec, POLICY)
+
+    def test_live_systemd_adapter_never_requests_environment(self) -> None:
+        calls: list[list[str]] = []
+
+        def observe(argv, _stdin_payload=None):
+            calls.append(argv)
+            property_name = next(item for item in argv if item.startswith("--property=")).removeprefix(
+                "--property="
+            )
+            values = {
+                "CapabilityBoundingSet": "",
+                "AmbientCapabilities": "",
+                "ReadWritePaths": "/run/fixture",
+                "ReadOnlyPaths": "/usr/local/libexec/buzz",
+                "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
+            }
+            return f"{values.get(property_name, 'yes')}\n".encode()
+
+        with mock.patch.object(PARITY, "safe_command", side_effect=observe):
+            result = PARITY.systemd_capture(
+                {
+                    "kind": "live", "scope": "system",
+                    "unit": "buzz-agent@mempool.service", "executable_paths": [],
+                }
+            )
+        self.assertEqual(result["address_families"], ["AF_UNIX", "AF_INET", "AF_INET6"])
+        self.assertTrue(calls)
+        self.assertNotIn("Environment", " ".join(argument for call in calls for argument in call))
+        calls.clear()
+        with mock.patch.object(PARITY, "safe_command", side_effect=observe):
+            PARITY.systemd_capture(
+                {
+                    "kind": "live", "scope": "user",
+                    "unit": "buzz-sats-agent@sats-codex-r.service", "executable_paths": [],
+                }
+            )
+        self.assertTrue(all("--user" in call for call in calls))
+
+    def test_command_json_adapter_and_signed_receipt_contract(self) -> None:
+        command_value = [{"channel_id": "open-a"}]
+        command = PARITY.json_source(
+            {"kind": "command", "argv": ["/usr/bin/printf", "%s", json.dumps(command_value)]},
+            "fixture command",
+        )
+        self.assertEqual(command, command_value)
+        receipt = self.compare()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            signer = root / "signer"
+            verifier = root / "verifier"
+            signer.write_text(
+                "#!/usr/bin/python3\n"
+                "import json,sys\n"
+                "value=sys.stdin.read().strip()\n"
+                f"print(json.dumps({{'schema':'{PARITY.SIGNATURE_SCHEMA}',"
+                "'algorithm':'schnorr-secp256k1',"
+                f"'signer_pubkey':'{POLICY['owner_pubkey']}',"
+                "'payload_sha256':value,'signature':'0'*128,'signed_at':'2026-08-27T00:00:00Z'}))\n"
+            )
+            verifier.write_text(
+                "#!/usr/bin/python3\n"
+                "import json,sys\n"
+                "value=json.load(sys.stdin)\n"
+                "raise SystemExit(0 if value['verified'] is False else 1)\n"
+            )
+            signer.chmod(0o700)
+            verifier.chmod(0o700)
+            sealed = PARITY.seal_receipt(receipt, POLICY, [str(signer)], [str(verifier)])
+        self.assertTrue(sealed["verified"])
+        self.assertRegex(sealed["sealed_sha256"], r"^[0-9a-f]{64}$")
+        tampered = copy.deepcopy(receipt)
+        tampered["checks"]["runtime_closure"] = False
+        with self.assertRaisesRegex(PARITY.ParityError, "digest mismatch"):
+            PARITY.validate_receipt_digest(tampered)
 
 
 if __name__ == "__main__":
