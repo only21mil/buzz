@@ -21,6 +21,12 @@ TEMPLATE_DIR = SCRIPT_DIR / "templates"
 INPUT_SCHEMA = "buzz-mempool-genesis-activation-input-v1"
 BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 REVIEW_FILES_SCHEMA = "buzz-agent-review-files-v1"
+PARITY_RECEIPT_BINDING = {
+    "status": "pending-live-capture",
+    "path": "metadata/capability-parity-receipt.json",
+    "sha256": None,
+    "required_before_activation": True,
+}
 TIER2_EVIDENCE_SCHEMA = "tier2-evidence-v2"
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
 TIER2_ENGINE_MODE = 0o750
@@ -630,11 +636,34 @@ def generate(
         }
 
         sources = source_inventory(repo_root)
+        source_commit = git_value(repo_root, "rev-parse", "HEAD")
+        source_tree = git_value(repo_root, "rev-parse", "HEAD^{tree}")
+        identities = {
+            slug: {
+                "public_key": pubkeys[slug],
+                "user": f"buzz-{slug}",
+                "home": f"/home/buzz-{slug}",
+                "credential_path": f"/etc/buzz-agents/credentials/{slug}.key",
+                "environment_path": f"/etc/buzz-agents/{slug}.env",
+                "prompt_path": f"/etc/buzz-agents/prompts/{slug}.md",
+                "acp_state_dir": f"/home/buzz-{slug}/.local/state/buzz-acp",
+                "systemd_unit": f"buzz-agent@{slug}.service",
+            }
+            for slug in ("mempool", "genesis")
+        }
+        acp_state_dirs = {
+            slug: str(descriptor["acp_state_dir"])
+            for slug, descriptor in identities.items()
+        }
         runtime_fingerprint = artifact_fingerprint(records)
         digest_input = {
             "schema": BUNDLE_SCHEMA,
             "bundle_id": BUNDLE_ID,
+            "source_commit": source_commit,
+            "source_tree": source_tree,
             "inputs": pubkeys,
+            "identities": identities,
+            "acp_state_dirs": acp_state_dirs,
             "input_status": "complete" if complete else "desktop-save-required",
             "runtime_targets": sorted(records, key=lambda record: str(record["target"]).encode()),
             "ops_targets": [ops_record],
@@ -650,6 +679,7 @@ def generate(
                 "receipt_schema": "buzz-agent-capability-parity-receipt-v1",
                 "tool": "/usr/local/libexec/buzz/verify-agent-capability-parity",
                 "policy": "/etc/buzz-agents/capability-parity-policy.json",
+                "receipt_binding": PARITY_RECEIPT_BINDING,
             },
         }
         package_digest = sha256_bytes(canonical_json(digest_input))
@@ -668,10 +698,13 @@ def generate(
         manifest = {
             "schema": BUNDLE_SCHEMA,
             "bundle_id": BUNDLE_ID,
-            "source_commit": git_value(repo_root, "rev-parse", "HEAD"),
+            "source_commit": source_commit,
+            "source_tree": source_tree,
             "source_branch": git_value(repo_root, "branch", "--show-current"),
             "generator_sources": sources,
             "inputs": pubkeys,
+            "identities": identities,
+            "acp_state_dirs": acp_state_dirs,
             "input_status": "complete" if complete else "desktop-save-required",
             "ready_for_parent_tier1": complete,
             "installable": False,
