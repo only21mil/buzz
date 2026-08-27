@@ -970,6 +970,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-ci-controld"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "hex",
+ "nix 0.31.3",
+ "nostr",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-ci-execd"
 version = "0.1.0"
 dependencies = [
@@ -1039,9 +1054,14 @@ name = "buzz-ci-runner"
 version = "0.1.0"
 dependencies = [
  "buzz-ci-broker-protocol",
+ "buzz-ci-controld",
  "buzz-core",
  "hex",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "uuid",
 ]
