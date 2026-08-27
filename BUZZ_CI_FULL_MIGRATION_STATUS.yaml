@@ -1,0 +1,563 @@
+schema_version: 1
+metadata:
+  title: Buzz CI full migration status
+  observed_at: '2026-08-27T12:04:51Z'
+  controller: Sats Codex parent lane
+  global_state: FROZEN_OWNER_STOP
+  stop:
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    thread_event: 76c91baf9383c1693d62701652cd4f61f786946615bb012e9b7a5aec68885d93
+    effect: No code, review, retry, push, PR, merge, CI trigger, service, deployment, activation, or canon work may resume without new scoped authority from Victor or Rachel.
+
+evidence_precedence:
+  - tier: 1
+    source: Current owner events and reconciled live Buzz readback
+  - tier: 2
+    source: Authoritative refs, source-bound deployment receipts, and immutable Tier 2 states
+  - tier: 3
+    source: Direct clean-worktree and artifact readback
+  - tier: 4
+    source: Lane STATUS.md evidence
+  - tier: 5
+    source: Reconciled recovery plan and this generated task board
+
+aliases:
+  legacy_b1:
+    P0-RELAY/B1: BCI-P0-RELAY-01
+    P1-EXEC/B1: BCI-P1-EXEC-01
+
+authoritative_truth:
+  main:
+    repository: only21mil/buzz
+    authoritative_sha: 148cad107f22f0b73aab23e559406beafaf57e64
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: framework-desktop:/home/victor/work/buzz-relay refs/remotes/buzz/main
+  deployment:
+    deployed_sha: 6ac00a946e06e3786491f2b213d35520c89d94e8
+    migration: 34
+    observed_at: '2026-08-26T18:30:00Z'
+    evidence_ref: framework-desktop:/home/victor/Obsidian/Victor/Agent-Shared/decisions-log.md#2026-08-26-mempool-and-genesis-live
+    receipt:
+      result: PASS
+      source_sha: 6ac00a946e06e3786491f2b213d35520c89d94e8
+      artifact_ref: production relay deployment recorded at 2026-08-26T18:30:00Z
+      observed_at: '2026-08-26T18:30:00Z'
+    superseded_evidence:
+      - ref: framework-desktop:/home/victor/work/prog-buzz/deploy/MERGE_SHA
+        claim_sha: 1543c1ffed7aa193e5cdcaf8560fa18ab8354103
+        reason: Older deploy marker is lower-precedence than the later source-bound deployment receipt.
+  mgact:
+    activation_state: INACTIVE
+    program_state: FROZEN
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: owner stop reconciliation recorded in recovery plan current truth
+    note: Mempool and Genesis are inactive and disabled after failed activation. Older active claims are superseded.
+
+work_items:
+  - id: BCI-GOV-DELIVERY-01
+    title: Delivery lifecycle
+    lane: GOVERNANCE
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: sats/delivery-lifecycle
+    candidate_sha: d24ab5b4dc6a28fe3c15dc19c9dfea0f47e35e1b
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Rebase onto current main, exact-head CI, fresh Tier 2, landing]
+    dependencies: []
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-delivery-lifecycle, claim: candidate d24ab5b4 is absent from main}
+    resolution: {selected_evidence_ref: recovery-plan-delivery-lifecycle}
+    contradictions: []
+
+  - id: BCI-P0-RELAY-A1
+    title: Relay proxy recovery
+    lane: P0-RELAY
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: direct detached candidate readback
+    branch: null
+    candidate_sha: 433e6d2e64108811df1dd33b642ec224556b530d
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Current-main integration and delivery gates]
+    dependencies: [BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 3, ref: framework-ci-mig-a1-controller-review-head, claim: detached candidate 433e6d2 is present}
+    resolution: {selected_evidence_ref: framework-ci-mig-a1-controller-review-head}
+    contradictions: []
+
+  - id: BCI-P0-RELAY-01
+    title: Relay preflight
+    lane: P0-RELAY
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: sats/relay-ci-preflight-rev2
+    candidate_sha: 3b7f068dc41a2f453a958cd94ce49f1dd64d3334
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Re-integrate onto current main]
+    dependencies: [BCI-P0-RELAY-A1, BCI-P0-RELAY-A4]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-relay-preflight, claim: candidate 3b7f068 requires current-main integration}
+    resolution: {selected_evidence_ref: recovery-plan-relay-preflight}
+    contradictions: []
+
+  - id: BCI-P0-RELAY-A4
+    title: Relay preflight policy fix
+    lane: P0-RELAY
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: framework-desktop:/home/victor/work/ci-mig/a4/STATUS.md
+    branch: sats/ci-mig/preflight-policy-fix
+    candidate_sha: 23a7de9967065d3fdeabf2b0786d7ca06b60b9e2
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Compile and targeted tests, live 503 and 200 proof, integration with relay preflight]
+    dependencies: [BCI-P0-RELAY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 4, ref: lane-a4-status, claim: candidate 23a7de9 is frozen with verification gaps}
+    resolution: {selected_evidence_ref: lane-a4-status}
+    contradictions: []
+
+  - id: BCI-P0-RELAY-A5
+    title: CI logs route
+    lane: P0-RELAY
+    program_state: UNKNOWN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: owner-only path unreadable in current evidence collection
+    branch: null
+    candidate_sha: null
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Owner-session readback required]
+    dependencies: [BCI-P0-RELAY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-a5-limit, claim: no readable current candidate}
+    resolution: {selected_evidence_ref: recovery-plan-a5-limit}
+    contradictions: []
+
+  - id: BCI-P0-RELAY-A6
+    title: Run request and immutable ref route
+    lane: P0-RELAY
+    program_state: UNKNOWN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: owner-only path unreadable in current evidence collection
+    branch: null
+    candidate_sha: null
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Owner-session readback required]
+    dependencies: [BCI-P0-RELAY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-a6-limit, claim: no readable current candidate}
+    resolution: {selected_evidence_ref: recovery-plan-a6-limit}
+    contradictions: []
+
+  - id: BCI-P1-EXEC-01
+    title: Git host observer
+    lane: P1-EXEC
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: framework-desktop:/home/victor/work/ci-mig/b1/STATUS.md
+    branch: sats/ci-mig/git-host-observer
+    candidate_sha: 064fb242d801dad63c3fe094420995396061d5be
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Fresh pre-freeze, exact-head CI, review, integration]
+    dependencies: [BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 4, ref: lane-p1-exec-observer-status, claim: revision 2 candidate 064fb24 is frozen}
+    resolution: {selected_evidence_ref: lane-p1-exec-observer-status}
+    contradictions: []
+
+  - id: BCI-P1-EXEC-B2
+    title: Cleanup proof producer
+    lane: P1-EXEC
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: sats/ci-mig/cleanup-proof-producer
+    candidate_sha: ba72e9c96874a8b08803de15f78087de5eca6a2b
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Determine current integrated coverage]
+    dependencies: [BCI-P1-EXEC-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-cleanup-proof, claim: candidate ba72e9c requires coverage reconciliation}
+    resolution: {selected_evidence_ref: recovery-plan-cleanup-proof}
+    contradictions: []
+
+  - id: BCI-P1-EXEC-B3
+    title: Job source installer
+    lane: P1-EXEC
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: framework-desktop:/home/victor/work/ci-mig/b3/STATUS.md
+    branch: sats/ci-mig/jobsource-installer
+    candidate_sha: da9ece0d9c999fa2171cda13565e8b71be498cc0
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Renderer and install integration, review]
+    dependencies: [BCI-P1-EXEC-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 4, ref: lane-jobsource-installer-status, claim: candidate da9ece0 is frozen}
+    resolution: {selected_evidence_ref: lane-jobsource-installer-status}
+    contradictions: []
+
+  - id: BCI-P1-EXEC-B4
+    title: Transient process handoff
+    lane: P1-EXEC
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: sats/ci-mig/transient-handoff
+    candidate_sha: 7acb7e4f7e64abd3d08b17008f2aea3a9b25e96c
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Same-lineage terminal review, integration]
+    dependencies: [BCI-P1-EXEC-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-transient-handoff, claim: candidate 7acb7e4 requires same-lineage closure}
+    resolution: {selected_evidence_ref: recovery-plan-transient-handoff}
+    contradictions: []
+
+  - id: BCI-P1-EXEC-B5
+    title: Normal qualification backend
+    lane: P1-EXEC
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: sats/ci-mig/qualification-backend
+    candidate_sha: 2d7688bd5571294cb9d90de00685acff2ce63318
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Production adapter implementation]
+    dependencies: [BCI-P1-EXEC-B2, BCI-P1-EXEC-B3, BCI-P1-EXEC-B4]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-qualification-backend, claim: candidate 2d7688b lacks production adapter}
+    resolution: {selected_evidence_ref: recovery-plan-qualification-backend}
+    contradictions: []
+
+  - id: BCI-P1-EXEC-B6
+    title: Normal execution composition
+    lane: P1-EXEC
+    program_state: SUPERSEDED
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: null
+    candidate_sha: 111e34cf476206cc280b72151d05b954cf155de8
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Withdrawn because it embeds pre-revision-2 archive mediation, unresolved seams, replacement required]
+    dependencies: [BCI-P1-EXEC-01, BCI-P1-EXEC-B4, BCI-P1-EXEC-B5, BCI-P1-HARD-C1, BCI-P1-HARD-C2]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: owner-thread-normal-execution-withdrawal, claim: candidate 111e34c is withdrawn}
+      - {tier: 5, ref: recovery-plan-normal-execution, claim: replacement required}
+    resolution: {selected_evidence_ref: owner-thread-normal-execution-withdrawal}
+    contradictions: []
+
+  - id: BCI-P1-HARD-C1
+    title: Archive mediator
+    lane: P1-HARD
+    program_state: BLOCKED
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: owner thread transport-exhaustion event and lane status
+    branch: sats/ci-mig/tar-mediator
+    candidate_sha: afe030a4b66b21bb8d3458acc32c29228316a733
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Exact revision-2 review state exhausted transport, no verdict or check, audited recovery required]
+    dependencies: [BCI-REVIEW-ENGINE-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: owner-thread-c1-transport-exhaustion, claim: candidate frozen with no verdict or check}
+      - {tier: 4, ref: lane-c1-status, claim: candidate afe030a is frozen}
+    resolution: {selected_evidence_ref: owner-thread-c1-transport-exhaustion}
+    contradictions: []
+
+  - id: BCI-P1-HARD-C2
+    title: Exec hijack mediator
+    lane: P1-HARD
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: framework-desktop:/home/victor/work/ci-mig/c2/STATUS.md
+    branch: sats/ci-mig/exec-hijack-mediator
+    candidate_sha: 2c4386f8ffa533424b40c66c4338da44d2a99d61
+    review_state: REVIEW_CLOSED
+    review_receipt:
+      terminal_state: PASS_WITH_RISKS
+      source_sha: 2c4386f8ffa533424b40c66c4338da44d2a99d61
+      evidence_ref: lane-c2-status-tier2-closure
+      check_receipt: {result: OK, source_sha: 2c4386f8ffa533424b40c66c4338da44d2a99d61}
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Integrate with accepted archive mediator into replacement normal execution composition]
+    dependencies: [BCI-P1-HARD-C1]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 4, ref: lane-c2-status-tier2-closure, claim: candidate has terminal review and promotion check}
+    resolution: {selected_evidence_ref: lane-c2-status-tier2-closure}
+    contradictions: []
+
+  - id: BCI-P1-HARD-C3
+    title: Control daemon contract
+    lane: P1-HARD
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: current owner thread records delivery bundling into runner promotion
+    branch: sats/ci-mig/controld-design
+    candidate_sha: 8eff0c7343470ad1a9ab03e6cae1ea511ca58352
+    review_state: REVIEW_CLOSED
+    review_receipt:
+      terminal_state: PASS_WITH_RISKS
+      source_sha: 8eff0c7343470ad1a9ab03e6cae1ea511ca58352
+      evidence_ref: owner-thread-c3-verdict
+      check_receipt: {result: OK, source_sha: 8eff0c7343470ad1a9ab03e6cae1ea511ca58352}
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Delivery-bundled into runner promotion, no standalone route]
+    dependencies: [BCI-P1-HARD-C4]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: owner-thread-c3-delivery-bundle, claim: exact reviewed boundary is bundled into runner promotion}
+      - {tier: 4, ref: lane-c3-status, claim: revision-2 candidate is frozen}
+    resolution: {selected_evidence_ref: owner-thread-c3-delivery-bundle}
+    contradictions: []
+
+  - id: BCI-P1-HARD-C4
+    title: Runner integration and promotion
+    lane: P1-HARD
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: direct promotion worktree readback and recovery plan
+    branch: sats/ci-mig/c4-promotion-20260827
+    candidate_sha: 0ace191c25e4b5680779f95965910712eee1dec1
+    review_state: UNKNOWN
+    promotion_sha: 88734811828458a10752c9179724cd2e0542aee1
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Current-schema helper repair, exact-head CI, fresh review, exact promotion]
+    dependencies: [BCI-P1-HARD-C3, BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 3, ref: framework-c4-promotion-worktree-head, claim: promotion 8873481 is locally present}
+      - {tier: 5, ref: recovery-plan-runner-integration, claim: promotion requires current readiness gates}
+    resolution: {selected_evidence_ref: framework-c4-promotion-worktree-head}
+    contradictions: []
+
+  - id: BCI-P1-HARD-C5
+    title: Production ready proof
+    lane: P1-HARD
+    program_state: UNKNOWN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: conflicting owner-thread, lane-status, and recovery-plan candidate identities
+    branch: null
+    candidate_sha: null
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Candidate identity contradiction requires owner reconciliation, explicit no-push override, dependency integration]
+    dependencies: [BCI-P1-EXEC-B6, BCI-P1-HARD-C4]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: owner-thread-ready-proof-verdict, claim: candidate 81fc41a97790b3dcd31799f8cdbde4996070cc1b}
+      - {tier: 4, ref: lane-c5-status, claim: candidate 7d657e9c9850321c250c268d40c095662966baff}
+      - {tier: 5, ref: recovery-plan-ready-proof, claim: candidate e13354dcf735a3204743f2347d06a1e414a4bae6}
+      - {tier: 5, ref: recovery-plan-ready-proof-promotion, claim: promotion 3b50934a094864eb26148e5c02a3e34e2f74de94}
+    resolution: {selected_evidence_ref: owner-thread-ready-proof-verdict}
+    contradictions:
+      - field: candidate_sha
+        claims: [81fc41a97790b3dcd31799f8cdbde4996070cc1b, 7d657e9c9850321c250c268d40c095662966baff, e13354dcf735a3204743f2347d06a1e414a4bae6]
+
+  - id: BCI-P1-HARD-C6
+    title: Shared workflow schema
+    lane: P1-HARD
+    program_state: UNKNOWN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: conflicting lane-status and recovery-plan candidate identities
+    branch: null
+    candidate_sha: null
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Candidate identity contradiction, current authorized review closure absent, integration and exact-head CI required]
+    dependencies: [BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 4, ref: lane-c6-status, claim: candidate 0a6d9541ba3aee1771442b93c7ef57e64fa0135f}
+      - {tier: 5, ref: recovery-plan-workflow-schema, claim: candidate 0e5b6ece65d416fde64c14acdd0750c66ce16148}
+      - {tier: 5, ref: recovery-plan-workflow-schema-promotion, claim: promotion ee90e1437652a0774b029559f0a2daaf7ed1d9ca}
+    resolution: {selected_evidence_ref: lane-c6-status}
+    contradictions:
+      - field: candidate_sha
+        claims: [0a6d9541ba3aee1771442b93c7ef57e64fa0135f, 0e5b6ece65d416fde64c14acdd0750c66ce16148]
+
+  - id: BCI-REVIEW-ENGINE-01
+    title: Portable 5400-second Tier 2 engine
+    lane: REVIEW-CONTROL
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: framework engine hash and owner 5400-second decision
+    branch: null
+    candidate_sha: null
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Portable reviewed successor required before fleet promotion]
+    dependencies: []
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 2, ref: framework-tier2-engine-sha256-e56b77f3, claim: framework engine uses the 5400-second window}
+      - {tier: 5, ref: recovery-plan-tier2-fleet, claim: portable successor is not yet reviewed}
+    resolution: {selected_evidence_ref: framework-tier2-engine-sha256-e56b77f3}
+    contradictions: []
+
+  - id: BCI-ECONOMICS-01
+    title: CI economics rebase
+    lane: PROMOTION
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: framework-desktop:/home/victor/work/ci-mig/a2/STATUS.md
+    branch: sats/ci-mig/economics-r1-rebased
+    candidate_sha: 99dc03cd123708d9bcd6468f595a15a30a9b1fdf
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Exact-head CI, current review and promotion receipt]
+    dependencies: [BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 4, ref: lane-economics-rebase-status, claim: candidate 99dc03c is frozen on current main}
+    resolution: {selected_evidence_ref: lane-economics-rebase-status}
+    contradictions: []
+
+  - id: BCI-BUDGET-R3-01
+    title: MasonsBudget native CI promotion
+    lane: PROMOTION
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: null
+    candidate_sha: ca670fde8399eadb21e3aa9e1a385e0a8b776f4a
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [MasonsBudget authority, nine CI contexts, fresh review]
+    dependencies: []
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-budget-r3, claim: candidate ca670fd requires authority and gates}
+    resolution: {selected_evidence_ref: recovery-plan-budget-r3}
+    contradictions: []
+
+  - id: BCI-PARITY-01
+    title: Native CI parity promotion
+    lane: PROMOTION
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan candidate ledger
+    branch: null
+    candidate_sha: 02f24e7af165a414cb2fb09821ed44b5fe6760bf
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [PR and CI, source landing only, no activation authority]
+    dependencies: [BCI-P1-HARD-C5]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 5, ref: recovery-plan-parity-promotion, claim: candidate 02f24e7 is source-only and not activation}
+    resolution: {selected_evidence_ref: recovery-plan-parity-promotion}
+    contradictions: []
+
+  - id: BCI-MGACT-01
+    title: Mempool and Genesis repair integration
+    lane: MGACT
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:04:51Z'
+    evidence_ref: recovery plan current truth and clean candidate directory inventory
+    branch: null
+    candidate_sha: null
+    review_state: UNKNOWN
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Inactive and disabled, clean persistence and rollback integration required, fresh package and v3 receipt required]
+    dependencies: [BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: owner-stop-mgact-reconciliation, claim: agents inactive and disabled after failed activation}
+      - {tier: 3, ref: framework-mgact-clean-candidate-directory-inventory, claim: persistence and rollback candidates exist separately}
+    resolution: {selected_evidence_ref: owner-stop-mgact-reconciliation}
+    contradictions: []

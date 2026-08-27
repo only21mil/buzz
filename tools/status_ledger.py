@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Validate the Buzz CI status ledger and render its frozen task board."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import Any, Iterable
+
+import yaml
+
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+EVENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+WORK_ID_RE = re.compile(r"^BCI-[A-Z0-9]+(?:-[A-Z0-9]+)+$")
+UNQUALIFIED_B1_RE = re.compile(r"(?<![A-Z0-9/-])B1(?![A-Z0-9/-])")
+ALLOWED_STATES = {
+    "FROZEN",
+    "INTEGRATING",
+    "READY_FOR_CI",
+    "CI_GREEN",
+    "REVIEWING",
+    "REVIEW_CLOSED",
+    "LANDED",
+    "DEPLOYED",
+    "BLOCKED",
+    "SUPERSEDED",
+    "UNKNOWN",
+}
+ACTIVE_STATES = {"INTEGRATING", "READY_FOR_CI", "CI_GREEN", "REVIEWING"}
+TERMINAL_REVIEW_STATES = {"PASS", "PASS_WITH_RISKS", "FAIL"}
+EXPECTED_ALIASES = {
+    "P0-RELAY/B1": "BCI-P0-RELAY-01",
+    "P1-EXEC/B1": "BCI-P1-EXEC-01",
+}
+REQUIRED_ITEM_FIELDS = {
+    "id",
+    "title",
+    "lane",
+    "program_state",
+    "owner_event",
+    "observed_at",
+    "evidence_ref",
+    "branch",
+    "candidate_sha",
+    "review_state",
+    "promotion_sha",
+    "landing_sha",
+    "deployed_sha",
+    "blockers",
+    "dependencies",
+    "verification_state",
+    "evidence",
+    "resolution",
+    "contradictions",
+}
+
+
+class LedgerError(ValueError):
+    pass
+
+
+def load_ledger(path: Path) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise LedgerError(f"cannot load ledger: {exc}") from exc
+    if not isinstance(data, dict):
+        raise LedgerError("ledger root must be a mapping")
+    return data
+
+
+def _require_mapping(value: Any, where: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise LedgerError(f"{where} must be a mapping")
+    return value
+
+
+def _require_full_sha(value: Any, where: str, *, nullable: bool = False) -> None:
+    if value is None and nullable:
+        return
+    if not isinstance(value, str) or SHA_RE.fullmatch(value) is None:
+        suffix = " or null" if nullable else ""
+        raise LedgerError(f"{where} must be exactly 40 lowercase hexadecimal characters{suffix}")
+
+
+def _require_event_id(value: Any, where: str) -> None:
+    if not isinstance(value, str) or EVENT_ID_RE.fullmatch(value) is None:
+        raise LedgerError(f"{where} must be exactly 64 lowercase hexadecimal characters")
+
+
+def _walk_sha_fields(value: Any, path: str = "ledger") -> Iterable[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key.endswith("_sha"):
+                yield child_path, child
+            yield from _walk_sha_fields(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_sha_fields(child, f"{path}[{index}]")
+
+
+def _walk_strings(value: Any, path: str = "ledger") -> Iterable[tuple[str, str]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if isinstance(key, str):
+                yield f"{path}.<key>", key
+            yield from _walk_strings(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_strings(child, f"{path}[{index}]")
+    elif isinstance(value, str):
+        yield path, value
+
+
+def _validate_deployment(deployment: dict[str, Any], where: str) -> None:
+    deployed_sha = deployment.get("deployed_sha")
+    _require_full_sha(deployed_sha, f"{where}.deployed_sha")
+    receipt = _require_mapping(deployment.get("receipt"), f"{where}.receipt")
+    if receipt.get("result") != "PASS":
+        raise LedgerError(f"{where}.receipt.result must be PASS")
+    _require_full_sha(receipt.get("source_sha"), f"{where}.receipt.source_sha")
+    if receipt.get("source_sha") != deployed_sha:
+        raise LedgerError(f"{where} deployment receipt is not bound to deployed_sha")
+    for field in ("artifact_ref", "observed_at"):
+        if not isinstance(receipt.get(field), str) or not receipt[field].strip():
+            raise LedgerError(f"{where}.receipt.{field} must be non-empty")
+
+
+def _validate_review(item: dict[str, Any], where: str) -> None:
+    if item["review_state"] != "REVIEW_CLOSED":
+        return
+    receipt = _require_mapping(item.get("review_receipt"), f"{where}.review_receipt")
+    if receipt.get("terminal_state") not in TERMINAL_REVIEW_STATES:
+        raise LedgerError(f"{where} review closure requires a terminal review state")
+    source_sha = receipt.get("source_sha")
+    _require_full_sha(source_sha, f"{where}.review_receipt.source_sha")
+    eligible = item.get("promotion_sha") or item.get("candidate_sha")
+    if source_sha != eligible:
+        raise LedgerError(f"{where} review receipt is not bound to the eligible candidate")
+    check = _require_mapping(receipt.get("check_receipt"), f"{where}.review_receipt.check_receipt")
+    if check.get("result") != "OK":
+        raise LedgerError(f"{where} review closure requires an OK check receipt")
+    _require_full_sha(check.get("source_sha"), f"{where}.review_receipt.check_receipt.source_sha")
+    if check.get("source_sha") != source_sha:
+        raise LedgerError(f"{where} check receipt is not bound to the reviewed candidate")
+
+
+def _validate_landing(item: dict[str, Any], where: str) -> None:
+    if item["program_state"] not in {"LANDED", "DEPLOYED"} and item.get("landing_sha") is None:
+        return
+    landing_sha = item.get("landing_sha")
+    _require_full_sha(landing_sha, f"{where}.landing_sha")
+    ancestry = _require_mapping(item.get("ancestry"), f"{where}.ancestry")
+    if ancestry.get("result") != "PASS":
+        raise LedgerError(f"{where} landed state requires PASS ancestry evidence")
+    expected_ancestor = item.get("promotion_sha") or item.get("candidate_sha")
+    _require_full_sha(ancestry.get("ancestor_sha"), f"{where}.ancestry.ancestor_sha")
+    _require_full_sha(ancestry.get("descendant_sha"), f"{where}.ancestry.descendant_sha")
+    if ancestry.get("ancestor_sha") != expected_ancestor or ancestry.get("descendant_sha") != landing_sha:
+        raise LedgerError(f"{where} ancestry evidence is not bound to candidate and landing SHAs")
+    if not isinstance(ancestry.get("evidence_ref"), str) or not ancestry["evidence_ref"].strip():
+        raise LedgerError(f"{where}.ancestry.evidence_ref must be non-empty")
+
+
+def _validate_item_deploy(item: dict[str, Any], where: str) -> None:
+    if item["program_state"] != "DEPLOYED" and item.get("deployed_sha") is None:
+        return
+    receipt = item.get("deployment_receipt")
+    _validate_deployment(
+        {"deployed_sha": item.get("deployed_sha"), "receipt": receipt},
+        f"{where}.deployment",
+    )
+
+
+def _validate_evidence(item: dict[str, Any], where: str) -> None:
+    evidence = item["evidence"]
+    if not isinstance(evidence, list) or not evidence:
+        raise LedgerError(f"{where}.evidence must be a non-empty list")
+    refs: set[str] = set()
+    tiers: dict[str, int] = {}
+    for index, entry in enumerate(evidence):
+        entry = _require_mapping(entry, f"{where}.evidence[{index}]")
+        tier = entry.get("tier")
+        ref = entry.get("ref")
+        if not isinstance(tier, int) or tier not in range(1, 6):
+            raise LedgerError(f"{where}.evidence[{index}].tier must be 1 through 5")
+        if not isinstance(ref, str) or not ref.strip() or ref in refs:
+            raise LedgerError(f"{where}.evidence[{index}].ref must be non-empty and unique")
+        if not isinstance(entry.get("claim"), str) or not entry["claim"].strip():
+            raise LedgerError(f"{where}.evidence[{index}].claim must be non-empty")
+        refs.add(ref)
+        tiers[ref] = tier
+    resolution = _require_mapping(item["resolution"], f"{where}.resolution")
+    selected = resolution.get("selected_evidence_ref")
+    if selected not in refs:
+        raise LedgerError(f"{where} resolution must select one listed evidence ref")
+    if tiers[selected] != min(tiers.values()):
+        raise LedgerError(f"{where} resolution violates evidence precedence")
+
+
+def validate_ledger(data: dict[str, Any]) -> None:
+    if data.get("schema_version") != 1:
+        raise LedgerError("schema_version must be 1")
+
+    metadata = _require_mapping(data.get("metadata"), "metadata")
+    global_state = metadata.get("global_state")
+    if global_state != "FROZEN_OWNER_STOP":
+        raise LedgerError("metadata.global_state must remain FROZEN_OWNER_STOP")
+    stop = _require_mapping(metadata.get("stop"), "metadata.stop")
+    _require_event_id(stop.get("owner_event"), "metadata.stop.owner_event")
+    _require_event_id(stop.get("thread_event"), "metadata.stop.thread_event")
+
+    precedence = data.get("evidence_precedence")
+    if not isinstance(precedence, list) or [entry.get("tier") for entry in precedence] != [1, 2, 3, 4, 5]:
+        raise LedgerError("evidence_precedence must define tiers 1 through 5 in order")
+
+    aliases = _require_mapping(data.get("aliases"), "aliases")
+    if aliases.get("legacy_b1") != EXPECTED_ALIASES:
+        raise LedgerError("aliases.legacy_b1 must contain exactly the two qualified aliases")
+
+    truth = _require_mapping(data.get("authoritative_truth"), "authoritative_truth")
+    main = _require_mapping(truth.get("main"), "authoritative_truth.main")
+    _require_full_sha(main.get("authoritative_sha"), "authoritative_truth.main.authoritative_sha")
+    _validate_deployment(
+        _require_mapping(truth.get("deployment"), "authoritative_truth.deployment"),
+        "authoritative_truth.deployment",
+    )
+    mgact = _require_mapping(truth.get("mgact"), "authoritative_truth.mgact")
+    if mgact.get("activation_state") != "INACTIVE" or mgact.get("program_state") != "FROZEN":
+        raise LedgerError("authoritative_truth.mgact must be INACTIVE and FROZEN")
+
+    for path, value in _walk_sha_fields(data):
+        _require_full_sha(value, path, nullable=True)
+
+    for path, value in _walk_strings({key: value for key, value in data.items() if key != "aliases"}):
+        if UNQUALIFIED_B1_RE.search(value):
+            raise LedgerError(f"unqualified B1 is forbidden at {path}")
+
+    items = data.get("work_items")
+    if not isinstance(items, list) or not items:
+        raise LedgerError("work_items must be a non-empty list")
+    ids: set[str] = set()
+    for index, raw_item in enumerate(items):
+        where = f"work_items[{index}]"
+        item = _require_mapping(raw_item, where)
+        missing = REQUIRED_ITEM_FIELDS - item.keys()
+        if missing:
+            raise LedgerError(f"{where} missing required fields: {', '.join(sorted(missing))}")
+        work_id = item["id"]
+        if not isinstance(work_id, str) or WORK_ID_RE.fullmatch(work_id) is None or work_id in ids:
+            raise LedgerError(f"{where}.id must be a unique stable work ID")
+        ids.add(work_id)
+        if item["program_state"] not in ALLOWED_STATES:
+            raise LedgerError(f"{where}.program_state is invalid")
+        if global_state == "FROZEN_OWNER_STOP" and item["program_state"] in ACTIVE_STATES:
+            raise LedgerError(f"{where} cannot be active under FROZEN_OWNER_STOP")
+        if item["review_state"] not in {"UNKNOWN", "REVIEWING", "REVIEW_CLOSED"}:
+            raise LedgerError(f"{where}.review_state is invalid")
+        if global_state == "FROZEN_OWNER_STOP" and item["review_state"] == "REVIEWING":
+            raise LedgerError(f"{where} cannot have an active review under FROZEN_OWNER_STOP")
+        _require_event_id(item["owner_event"], f"{where}.owner_event")
+        for field in ("title", "lane", "observed_at", "evidence_ref"):
+            if not isinstance(item[field], str) or not item[field].strip():
+                raise LedgerError(f"{where}.{field} must be non-empty")
+        for field in ("blockers", "dependencies"):
+            if not isinstance(item[field], list) or not all(
+                isinstance(entry, str) and entry.strip() for entry in item[field]
+            ):
+                raise LedgerError(f"{where}.{field} must be a list of non-empty strings")
+        if any(item[field] is None for field in ("candidate_sha", "promotion_sha", "landing_sha", "deployed_sha")):
+            if item["verification_state"] != "UNKNOWN":
+                raise LedgerError(f"{where} has null SHA fields and must be UNKNOWN")
+        contradictions = item["contradictions"]
+        if not isinstance(contradictions, list):
+            raise LedgerError(f"{where}.contradictions must be a list")
+        if contradictions and (item["program_state"] != "UNKNOWN" or item["verification_state"] != "UNKNOWN"):
+            raise LedgerError(f"{where} contradictions must resolve to UNKNOWN")
+        for contradiction_index, contradiction in enumerate(contradictions):
+            contradiction = _require_mapping(
+                contradiction,
+                f"{where}.contradictions[{contradiction_index}]",
+            )
+            if contradiction.get("field", "").endswith("_sha"):
+                claims = contradiction.get("claims")
+                if not isinstance(claims, list) or len(claims) < 2:
+                    raise LedgerError(f"{where} SHA contradiction requires at least two claims")
+                for claim_index, claim in enumerate(claims):
+                    _require_full_sha(
+                        claim,
+                        f"{where}.contradictions[{contradiction_index}].claims[{claim_index}]",
+                    )
+        _validate_evidence(item, where)
+        _validate_review(item, where)
+        _validate_landing(item, where)
+        _validate_item_deploy(item, where)
+
+    for index, item in enumerate(items):
+        unknown = sorted(set(item["dependencies"]) - ids)
+        if unknown:
+            raise LedgerError(f"work_items[{index}] has unknown dependencies: {', '.join(unknown)}")
+
+
+def _sha_display(value: Any) -> str:
+    if value is None:
+        return "UNKNOWN"
+    return str(value)
+
+
+def _cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_taskboard(data: dict[str, Any]) -> str:
+    validate_ledger(data)
+    metadata = data["metadata"]
+    truth = data["authoritative_truth"]
+    lines = [
+        "# Buzz CI migration task board",
+        "",
+        f"Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `{metadata['observed_at']}`.",
+        "",
+        "## Routing state",
+        "",
+        f"`{metadata['global_state']}`. {metadata['stop']['effect']}",
+        "",
+        "| Truth | Value | Evidence |",
+        "|---|---|---|",
+        f"| Authoritative main | `{truth['main']['authoritative_sha']}` | {_cell(truth['main']['evidence_ref'])} |",
+        f"| Last proven deployed source | `{truth['deployment']['deployed_sha']}` | {_cell(truth['deployment']['evidence_ref'])} |",
+        f"| Production migration | `{truth['deployment']['migration']}` | source-bound deployment receipt |",
+        f"| Mempool and Genesis | `{truth['mgact']['activation_state']}` | {_cell(truth['mgact']['note'])} |",
+        "",
+        "## Qualified legacy aliases",
+        "",
+        "| Alias | Stable work ID |",
+        "|---|---|",
+    ]
+    for alias, work_id in sorted(data["aliases"]["legacy_b1"].items()):
+        lines.append(f"| `{alias}` | `{work_id}` |")
+    lines.extend(
+        [
+            "",
+            "## Current candidates",
+            "",
+            "Every row is non-routable while the owner stop remains in force.",
+            "",
+            "| Stable work ID | Item | State | Candidate | Promotion | Review | Blockers |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+    for item in data["work_items"]:
+        blockers = "; ".join(item["blockers"]) or "None recorded"
+        if item["contradictions"]:
+            claims = ", ".join(item["contradictions"][0]["claims"])
+            blockers = f"CONTRADICTED candidate evidence: {claims}; {blockers}"
+        lines.append(
+            "| `{id}` | {title} | `{state}` | `{candidate}` | `{promotion}` | `{review}` | {blockers} |".format(
+                id=item["id"],
+                title=_cell(item["title"]),
+                state=item["program_state"],
+                candidate=_sha_display(item["candidate_sha"]),
+                promotion=_sha_display(item["promotion_sha"]),
+                review=item["review_state"],
+                blockers=_cell(blockers),
+            )
+        )
+    lines.extend(["", "## Evidence precedence", ""])
+    for entry in data["evidence_precedence"]:
+        lines.append(f"{entry['tier']}. {entry['source']}.")
+    lines.extend(
+        [
+            "",
+            "A lower-precedence source cannot override a higher one. Unresolved contradictions remain `UNKNOWN`.",
+            "",
+            "Regenerate and check with `python3 tools/status_ledger.py check`.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _default_paths() -> tuple[Path, Path]:
+    root = Path(__file__).resolve().parents[1]
+    return root / "BUZZ_CI_FULL_MIGRATION_STATUS.yaml", root / "TASKBOARD.md"
+
+
+def main(argv: list[str] | None = None) -> int:
+    default_ledger, default_board = _default_paths()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("validate", "render", "check"))
+    parser.add_argument("--ledger", type=Path, default=default_ledger)
+    parser.add_argument("--taskboard", type=Path, default=default_board)
+    args = parser.parse_args(argv)
+    try:
+        data = load_ledger(args.ledger)
+        rendered = render_taskboard(data)
+        if args.command == "render":
+            args.taskboard.write_text(rendered, encoding="utf-8")
+        elif args.command == "check":
+            try:
+                current = args.taskboard.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise LedgerError(f"cannot read generated task board: {exc}") from exc
+            if current != rendered:
+                raise LedgerError("TASKBOARD.md is stale; run the render command")
+    except LedgerError as exc:
+        print(f"status-ledger: ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"status-ledger: {args.command} OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
