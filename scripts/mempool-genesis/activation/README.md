@@ -25,10 +25,25 @@ Tier 2 v3 accepts only a Git-worktree root and binds its complete status invento
 ACT=/home/victor/work/prog-buzz/wave3/MGACT/.scratch/activation-wt-sats/scripts/mempool-genesis/activation
 STAGE=/home/victor/work/mgact-activation-staging
 PACKAGE_WT=/home/victor/work/mgact-activation-package-wt
+: "${FULL_REVIEWED_SOURCE_COMMIT:?set to the full reviewed source commit}"
+if [ "${#FULL_REVIEWED_SOURCE_COMMIT}" -ne 40 ]; then
+  echo "FULL_REVIEWED_SOURCE_COMMIT must be exactly 40 lowercase hex characters" >&2
+  exit 1
+fi
+case "$FULL_REVIEWED_SOURCE_COMMIT" in
+  *[!0-9a-f]*)
+    echo "FULL_REVIEWED_SOURCE_COMMIT must be exactly 40 lowercase hex characters" >&2
+    exit 1
+    ;;
+esac
+git -C /home/victor/work/buzz-relay cat-file -e "${FULL_REVIEWED_SOURCE_COMMIT}^{commit}"
 install -d -m 0700 "$STAGE"
 install -m 0600 "$ACT/input.template.json" "$STAGE/inputs.json"
-git -C /home/victor/work/buzz-relay worktree add --detach "$PACKAGE_WT" c672bb2dd4b7ca23fea8f1de8b66b7d36f1a483c
+git -C /home/victor/work/buzz-relay worktree add --detach "$PACKAGE_WT" "$FULL_REVIEWED_SOURCE_COMMIT"
+test "$(git -C "$PACKAGE_WT" rev-parse HEAD)" = "$FULL_REVIEWED_SOURCE_COMMIT"
 ```
+
+Set `FULL_REVIEWED_SOURCE_COMMIT` only to the final full commit ID whose exact source candidate received the terminal accepted review. Do not reuse an older source base or abbreviated ID.
 
 The template contains placeholders. After Desktop save, replace only these JSON values:
 

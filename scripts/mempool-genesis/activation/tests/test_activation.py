@@ -661,6 +661,7 @@ class ActivationBundleTests(PackageFixture):
                 "carriage return": payload.replace(b"\n", b"\r\n", 1),
                 "nul control": payload + b"UNRELATED=value\x00\n",
                 "delete control": payload + b"UNRELATED=value\x7f\n",
+                "non-ASCII byte": payload + b"UNRELATED=value\x80\n",
             }
             for label, invalid in cases.items():
                 with self.subTest(slug=slug, syntax=label), self.assertRaisesRegex(
@@ -732,6 +733,8 @@ class ActivationBundleTests(PackageFixture):
                 "single quoted value": payload + b"UNRELATED='unsupported'\n",
                 "escaped quote": payload + b'UNRELATED="escaped\\\"quote"\n',
                 "nul control": payload + b"UNRELATED=value\x00\n",
+                "delete control": payload + b"UNRELATED=value\x7f\n",
+                "non-ASCII byte": payload + b"UNRELATED=value\x80\n",
             }
             for label, drifted_payload in drift_cases.items():
                 with self.subTest(slug=slug, drift=label):
@@ -772,6 +775,26 @@ class ActivationBundleTests(PackageFixture):
                 env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
             )
             self.assertNotEqual(rejected.returncode, 0)
+
+    def test_package_worktree_requires_full_reviewed_source_commit(self) -> None:
+        readme = (ACTIVATION_DIR / "README.md").read_text()
+        self.assertNotRegex(readme, r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
+        self.assertIn(
+            ': "${FULL_REVIEWED_SOURCE_COMMIT:?set to the full reviewed source commit}"',
+            readme,
+        )
+        self.assertIn('if [ "${#FULL_REVIEWED_SOURCE_COMMIT}" -ne 40 ]', readme)
+        self.assertIn('*[!0-9a-f]*)', readme)
+        self.assertIn('"${FULL_REVIEWED_SOURCE_COMMIT}^{commit}"', readme)
+        self.assertIn(
+            'worktree add --detach "$PACKAGE_WT" "$FULL_REVIEWED_SOURCE_COMMIT"',
+            readme,
+        )
+        self.assertIn(
+            'test "$(git -C "$PACKAGE_WT" rev-parse HEAD)" = '
+            '"$FULL_REVIEWED_SOURCE_COMMIT"',
+            readme,
+        )
 
     def test_installer_revalidates_state_dir_before_building_closure(self) -> None:
         targets = []
