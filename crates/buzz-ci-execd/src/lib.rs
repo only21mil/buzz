@@ -27,6 +27,8 @@ pub mod evidence;
 pub mod git_host_observer;
 #[cfg(unix)]
 pub mod harness;
+#[cfg(target_os = "linux")]
+pub mod host_composition;
 #[cfg(unix)]
 pub mod materializer_evidence;
 #[cfg(target_os = "linux")]
@@ -37,6 +39,8 @@ pub mod normal_backend;
 pub mod normal_engine;
 #[cfg(target_os = "linux")]
 pub mod normal_qualification;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod normal_qualification_host;
 #[cfg(target_os = "linux")]
 pub mod normal_source;
 #[cfg(target_os = "linux")]

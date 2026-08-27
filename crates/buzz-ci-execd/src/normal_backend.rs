@@ -11,6 +11,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use buzz_ci_broker_protocol::{GitOid, QualificationRequest};
 use buzz_ci_isolation_contract::ValidatedAttemptLeaseBinding;
 use buzz_ci_materializer::{
     execute_materialization, CleanupProof, CommandExecution, CommandOutput, CommandSpec,
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::activation::{LeaseToken, OrdinaryAdmission};
+use crate::activation::{LeaseToken, OrdinaryAdmission, QualificationLease};
 use crate::dns_activation::DnsLeaseLifecycle;
 use crate::dns_exec::{MaterializerCommandPlan, MaterializerHandoffBinding, ProcessCommandRunner};
 use crate::durable_dispatch::{ExecutionUnavailable, OrdinaryStop};
@@ -35,6 +36,10 @@ use crate::normal_engine::{
     ActLaunchPlan, NormalExecutionBackend, NormalJobPlan, NormalReconcileEvidence,
     NormalTerminalEvidence,
 };
+use crate::normal_qualification::{
+    CrashFixture, NormalQualificationCase, NormalQualificationExpectedCode,
+    NormalQualificationLiveBinding, NormalQualificationSemantics, ResourceLimitFixture,
+};
 use crate::proxy_lease::{
     build_broker_proxy_lease, BrokerProxyLease, PodmanReconcileRunner, PrestartPersister,
     ProxyLeaseAuthority,
@@ -43,6 +48,277 @@ use crate::proxy_lease::{
 const MAX_CANONICAL_JOB_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const ACT_PROXY_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const ACT_PROXY_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Root-authored, sealed qualification identity validated before any host handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NormalQualificationPreflightPlan {
+    case: NormalQualificationCase,
+    request: QualificationRequest,
+    case_digest: [u8; 32],
+    run_identity: [u8; 32],
+}
+
+impl NormalQualificationPreflightPlan {
+    /// Close one reviewed case over every request coordinate used by the host.
+    pub fn from_sealed_case(
+        case: NormalQualificationCase,
+        request: QualificationRequest,
+    ) -> Result<Self, ExecutionUnavailable> {
+        if request.directive.is_some()
+            || request.not_before == 0
+            || request.not_before >= request.expires_at
+            || !safe_case_token(case.test_id)
+            || !safe_case_token(case.case_name)
+            || case.required_readbacks.is_empty()
+            || !case.required_readbacks.is_ascii()
+            || request_digests(request).contains(&[0; 32])
+            || oid_is_zero(request.integrated_candidate_sha)
+            || oid_is_zero(request.source_oid)
+            || oid_is_zero(request.base_oid)
+        {
+            return Err(ExecutionUnavailable);
+        }
+        let case_digest = qualification_case_digest(case);
+        let run_identity = qualification_run_identity(case_digest, request);
+        if case_digest == [0; 32] || run_identity == [0; 32] {
+            return Err(ExecutionUnavailable);
+        }
+        Ok(Self {
+            case,
+            request,
+            case_digest,
+            run_identity,
+        })
+    }
+
+    pub const fn case(self) -> NormalQualificationCase {
+        self.case
+    }
+
+    pub const fn request(self) -> QualificationRequest {
+        self.request
+    }
+
+    pub const fn case_digest(self) -> [u8; 32] {
+        self.case_digest
+    }
+
+    pub const fn run_identity(self) -> [u8; 32] {
+        self.run_identity
+    }
+}
+
+/// Exact admitted qualification lease paired with its closed normal host plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NormalQualificationHostPlan {
+    preflight: NormalQualificationPreflightPlan,
+    lease: QualificationLease,
+}
+
+impl NormalQualificationHostPlan {
+    /// Bind the sealed plan to the opaque lease issued for that exact fixture.
+    pub fn from_admitted(
+        preflight: NormalQualificationPreflightPlan,
+        lease: QualificationLease,
+    ) -> Result<Self, ExecutionUnavailable> {
+        let request = preflight.request;
+        let mut expected_lease_id = [0; 16];
+        expected_lease_id.copy_from_slice(&request.fixture_identity[..16]);
+        if lease.fixture_identity() != request.fixture_identity
+            || lease.lease_id() != expected_lease_id
+            || lease.generation() == 0
+            || lease.nonce() != request.nonce
+            || lease.directive().is_some()
+        {
+            return Err(ExecutionUnavailable);
+        }
+        Ok(Self { preflight, lease })
+    }
+
+    pub const fn preflight(self) -> NormalQualificationPreflightPlan {
+        self.preflight
+    }
+
+    pub const fn lease(self) -> QualificationLease {
+        self.lease
+    }
+
+    pub const fn owner(self) -> [u8; 32] {
+        self.preflight.request.fixture_signer
+    }
+
+    pub const fn expires_at(self) -> u64 {
+        self.preflight.request.expires_at
+    }
+}
+
+/// Bounded host result. Partial evidence never closes a qualification lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NormalQualificationHostProgress {
+    Passed { evidence_set_digest: [u8; 32] },
+    Failed,
+    Partial,
+}
+
+/// Injectable B6 normal-host-plan executor used by the B5 primitive bridge.
+///
+/// Canonical composition intentionally supplies no implementation yet. The
+/// bridge can therefore be tested without making production execution ready.
+pub trait NormalQualificationHostExecutor {
+    fn live_binding(
+        &mut self,
+        case: NormalQualificationCase,
+    ) -> Result<NormalQualificationLiveBinding, ExecutionUnavailable>;
+
+    fn preflight(
+        &mut self,
+        plan: NormalQualificationPreflightPlan,
+    ) -> Result<(), ExecutionUnavailable>;
+
+    /// Perform the sole executor handoff for a newly CAS-owned lease.
+    fn execute(
+        &mut self,
+        plan: NormalQualificationHostPlan,
+        now: u64,
+    ) -> Result<NormalQualificationHostProgress, ExecutionUnavailable>;
+
+    /// Read back a retained running lease after retry or process restart.
+    fn recover(
+        &mut self,
+        plan: NormalQualificationHostPlan,
+        now: u64,
+    ) -> Result<NormalQualificationHostProgress, ExecutionUnavailable>;
+}
+
+fn request_digests(request: QualificationRequest) -> [[u8; 32]; 9] {
+    [
+        request.broker_build_identity,
+        request.host_profile_digest,
+        request.suite_identity,
+        request.fixture_signer,
+        request.request_digest,
+        request.manifest_digest,
+        request.isolation_profile_digest,
+        request.job_identity,
+        request.fixture_identity,
+    ]
+}
+
+fn safe_case_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn oid_is_zero(oid: GitOid) -> bool {
+    match oid {
+        GitOid::Sha1(value) => value == [0; 20],
+        GitOid::Sha256(value) => value == [0; 32],
+    }
+}
+
+fn hash_oid(hasher: &mut Sha256, oid: GitOid) {
+    match oid {
+        GitOid::Sha1(value) => {
+            hasher.update([1]);
+            hasher.update(value);
+        }
+        GitOid::Sha256(value) => {
+            hasher.update([2]);
+            hasher.update(value);
+        }
+    }
+}
+
+fn semantics_tag(value: NormalQualificationSemantics) -> [u8; 2] {
+    match value {
+        NormalQualificationSemantics::ExclusiveCapacity => [1, 0],
+        NormalQualificationSemantics::SocketIsolation => [2, 0],
+        NormalQualificationSemantics::DnsReadback => [3, 0],
+        NormalQualificationSemantics::PrestartOci => [4, 0],
+        NormalQualificationSemantics::ResourceLimit(resource) => [
+            5,
+            match resource {
+                ResourceLimitFixture::CpuBurn => 1,
+                ResourceLimitFixture::MemoryBalloon => 2,
+                ResourceLimitFixture::PidForkStorm => 3,
+                ResourceLimitFixture::DiskFill => 4,
+                ResourceLimitFixture::LogFlood => 5,
+                ResourceLimitFixture::WallTimeOverrun => 6,
+                ResourceLimitFixture::ArtifactOverrun => 7,
+            },
+        ],
+        NormalQualificationSemantics::HostileArtifacts => [6, 0],
+        NormalQualificationSemantics::TerminalOrdering => [7, 0],
+        NormalQualificationSemantics::CrashRecovery(component) => [
+            8,
+            match component {
+                CrashFixture::Act => 1,
+                CrashFixture::Podman => 2,
+                CrashFixture::Proxy => 3,
+                CrashFixture::Materializer => 4,
+                CrashFixture::Broker => 5,
+                CrashFixture::SimulatedHost => 6,
+                CrashFixture::CleanupAdapter => 7,
+                CrashFixture::DnsAdapter => 8,
+            },
+        ],
+        NormalQualificationSemantics::ReuseAfterCrash(component) => [
+            9,
+            match component {
+                CrashFixture::Act => 1,
+                CrashFixture::Podman => 2,
+                CrashFixture::Proxy => 3,
+                CrashFixture::Materializer => 4,
+                CrashFixture::Broker => 5,
+                CrashFixture::SimulatedHost => 6,
+                CrashFixture::CleanupAdapter => 7,
+                CrashFixture::DnsAdapter => 8,
+            },
+        ],
+        NormalQualificationSemantics::RetryAttempt(attempt) => [10, attempt],
+        NormalQualificationSemantics::ExpiryRefusal => [11, 0],
+        NormalQualificationSemantics::ReplayRefusal => [12, 0],
+        NormalQualificationSemantics::RateLimitRefusal => [13, 0],
+        NormalQualificationSemantics::ConcurrencyPrimary => [14, 0],
+        NormalQualificationSemantics::ConcurrencyOverflowRefusal => [15, 0],
+    }
+}
+
+fn qualification_case_digest(case: NormalQualificationCase) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"buzzci-normal-qualification-case-v1\0");
+    for value in [case.test_id, case.case_name, case.required_readbacks] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(semantics_tag(case.semantics));
+    hasher.update([match case.expected_code {
+        NormalQualificationExpectedCode::Ok => 1,
+        NormalQualificationExpectedCode::PolicyDenied => 2,
+        NormalQualificationExpectedCode::ReplayConflict => 3,
+        NormalQualificationExpectedCode::NoCapacity => 4,
+    }]);
+    hasher.finalize().into()
+}
+
+fn qualification_run_identity(case_digest: [u8; 32], request: QualificationRequest) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"buzzci-normal-qualification-run-v1\0");
+    hasher.update(case_digest);
+    hash_oid(&mut hasher, request.integrated_candidate_sha);
+    for digest in request_digests(request) {
+        hasher.update(digest);
+    }
+    hasher.update(request.nonce);
+    hash_oid(&mut hasher, request.source_oid);
+    hash_oid(&mut hasher, request.base_oid);
+    hasher.update(request.not_before.to_be_bytes());
+    hasher.update(request.expires_at.to_be_bytes());
+    hasher.finalize().into()
+}
 
 /// Fixed attempt-scoped ceilings used by the integrated archive and hijack
 /// mediators. The broker input source cannot widen them.

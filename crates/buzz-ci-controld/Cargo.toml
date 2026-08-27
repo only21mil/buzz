@@ -12,14 +12,21 @@ name = "buzz_ci_controld"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = { workspace = true }
 buzz-core = { workspace = true }
 hex = { workspace = true }
 nostr = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"

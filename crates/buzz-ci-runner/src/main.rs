@@ -9,8 +9,11 @@ use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
 use buzz_ci_runner::config::RunnerConfig;
 #[cfg(target_os = "linux")]
+use buzz_ci_runner::host::ConfiguredRunner;
+#[cfg(target_os = "linux")]
 use buzz_ci_runner::service::{
-    serve_runner_connection, validate_systemd_environment, validate_systemd_listener,
+    serve_runner_connection, serve_runner_connection_with_handler, validate_systemd_environment,
+    validate_systemd_listener,
 };
 #[cfg(target_os = "linux")]
 use buzz_ci_runner::transport::SYSTEMD_LISTEN_FD;
@@ -46,7 +49,7 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Err(()) => {
+        Err(_) => {
             log(json!({"level": "error", "error": "invalid_arguments"}));
             ExitCode::from(1)
         }
@@ -74,6 +77,13 @@ fn run(config: RunnerConfig) -> ExitCode {
             return ExitCode::from(4);
         }
     };
+    let mut configured = match config.host.as_ref().map(ConfiguredRunner::new).transpose() {
+        Ok(configured) => configured,
+        Err(_) => {
+            log(json!({"level": "error", "error": "invalid_runner_host"}));
+            return ExitCode::from(1);
+        }
+    };
     log(json!({
         "level": "info",
         "event": "runner_ready",
@@ -91,7 +101,15 @@ fn run(config: RunnerConfig) -> ExitCode {
                 return ExitCode::from(4);
             }
         };
-        if let Err(error) = serve_runner_connection(stream, config.controld_uid) {
+        let result = match configured.as_mut() {
+            Some(handler) => serve_runner_connection_with_handler(
+                stream,
+                config.controld_uid,
+                &mut |request, writer| handler.handle(request, writer).map_err(|_| ()),
+            ),
+            None => serve_runner_connection(stream, config.controld_uid),
+        };
+        if let Err(error) = result {
             log(json!({
                 "level": "warn",
                 "event": "runner_connection_rejected",

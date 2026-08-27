@@ -19,11 +19,36 @@ use crate::{
     runtime::ReadyValidationTarget,
 };
 
+/// Lease-scoped host provider that is not yet linked into canonical startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostBackendSeam {
+    ExecutorUnitHandoff,
+    RuntimeDescriptorProvider,
+    MaterializationInputProvider,
+    ProxyInputAndLeaseProvider,
+    TerminalEvidenceCollector,
+    TeardownProvider,
+    CrashRecoveryCoordinator,
+}
+
+/// Exact ordinary provider inventory that canonical startup still requires.
+pub const MISSING_ORDINARY_HOST_SEAMS: [HostBackendSeam; 7] = [
+    HostBackendSeam::ExecutorUnitHandoff,
+    HostBackendSeam::RuntimeDescriptorProvider,
+    HostBackendSeam::MaterializationInputProvider,
+    HostBackendSeam::ProxyInputAndLeaseProvider,
+    HostBackendSeam::TerminalEvidenceCollector,
+    HostBackendSeam::TeardownProvider,
+    HostBackendSeam::CrashRecoveryCoordinator,
+];
+
 /// Why production remains closed before authority/state loading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProductionCompositionError {
-    /// One or more privileged proof, execution, or cleanup backends is absent.
-    HostBackendsMissing,
+    /// Root-authored host composition is absent, partial, or malformed.
+    HostContractUnavailable,
+    /// Lease-scoped providers are absent even though the static contract loaded.
+    HostBackendsMissing(&'static [HostBackendSeam]),
 }
 
 /// Fresh host proof adapter. The source must bind all facts to `target`.
@@ -162,7 +187,11 @@ impl ProductionAdapters {
     /// Discovery remains closed until every production proof source and host
     /// execution adapter is bound. It never assembles a partial host path.
     pub fn canonical() -> Result<Self, ProductionCompositionError> {
-        Err(ProductionCompositionError::HostBackendsMissing)
+        crate::host_composition::HostCompositionContract::canonical()
+            .map_err(|_| ProductionCompositionError::HostContractUnavailable)?;
+        Err(ProductionCompositionError::HostBackendsMissing(
+            &MISSING_ORDINARY_HOST_SEAMS,
+        ))
     }
 }
 
@@ -338,9 +367,19 @@ mod tests {
 
     #[test]
     fn canonical_composition_is_closed_until_every_backend_is_linked() {
+        assert!(ProductionAdapters::canonical().is_err());
+        assert_eq!(MISSING_ORDINARY_HOST_SEAMS.len(), 7);
         assert_eq!(
-            ProductionAdapters::canonical().err(),
-            Some(ProductionCompositionError::HostBackendsMissing)
+            MISSING_ORDINARY_HOST_SEAMS,
+            [
+                HostBackendSeam::ExecutorUnitHandoff,
+                HostBackendSeam::RuntimeDescriptorProvider,
+                HostBackendSeam::MaterializationInputProvider,
+                HostBackendSeam::ProxyInputAndLeaseProvider,
+                HostBackendSeam::TerminalEvidenceCollector,
+                HostBackendSeam::TeardownProvider,
+                HostBackendSeam::CrashRecoveryCoordinator,
+            ]
         );
         assert!(matches!(
             load_production_dispatch(1),

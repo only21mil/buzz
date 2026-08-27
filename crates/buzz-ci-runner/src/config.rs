@@ -1,12 +1,13 @@
 //! Secure loading for runner-owned configuration.
 //!
-//! The reviewed version-1 contract supplies only the peer UID. Socket and
-//! output paths remain fixed crate constants and cannot be selected here.
+//! The version-1 contract always supplies the peer UID. A complete optional
+//! host block selects the reviewed concrete adapters; omission stays closed.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -15,13 +16,34 @@ const CONFIG_MODE: u32 = 0o600;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 
 /// Contract-independent runner configuration.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
     /// Configuration schema. Version 1 is the only accepted value.
     pub schema_version: u32,
     /// Dedicated controld account accepted by `SO_PEERCRED`.
     pub controld_uid: u32,
+    /// Complete concrete host composition. Omission keeps the runner closed.
+    #[serde(default)]
+    pub host: Option<RunnerHostConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerHostConfig {
+    pub owner_pubkey: String,
+    pub manifest_verification_key: String,
+    pub relay_signer: String,
+    pub broker_socket: PathBuf,
+    pub broker_uid: u32,
+    pub executor_program: PathBuf,
+    pub evidence_directory: PathBuf,
+    pub journal_directory: PathBuf,
+    pub max_argv_items: usize,
+    pub max_argv_bytes: usize,
+    pub max_environment_items: usize,
+    pub max_environment_bytes: usize,
+    pub max_output_bytes: usize,
 }
 
 /// Fail-closed configuration loading failures.
@@ -31,8 +53,6 @@ pub enum ConfigError {
     Unavailable(#[source] io::Error),
     #[error("runner configuration must be a mode-0600 regular file")]
     InsecureFile,
-    #[error("runner configuration changed while it was opened")]
-    ReplacedFile,
     #[error("runner configuration exceeds the byte limit")]
     Oversized,
     #[error("runner configuration is invalid JSON")]
@@ -41,29 +61,39 @@ pub enum ConfigError {
     UnsupportedSchema,
     #[error("runner controld UID must be nonzero")]
     InvalidPeerUid,
+    #[error("runner host configuration is invalid")]
+    InvalidHost,
 }
 
 impl RunnerConfig {
-    /// Load a bounded JSON file after checking its type, mode, and stable inode.
+    /// Load a bounded JSON file descriptor-relative without following its final link.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let before = fs::symlink_metadata(path).map_err(ConfigError::Unavailable)?;
-        if !before.file_type().is_file()
-            || before.permissions().mode() & 0o7777 != CONFIG_MODE
-            || before.nlink() != 1
-        {
-            return Err(ConfigError::InsecureFile);
-        }
-
-        let file = File::open(path).map_err(ConfigError::Unavailable)?;
+        let parent = path.parent().ok_or(ConfigError::InsecureFile)?;
+        let name = path.file_name().ok_or(ConfigError::InsecureFile)?;
+        let directory = File::open(parent).map_err(ConfigError::Unavailable)?;
+        let opened: OwnedFd = nix::fcntl::openat(
+            &directory,
+            Path::new(name),
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NOFOLLOW,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(|error| {
+            if error == nix::errno::Errno::ELOOP {
+                ConfigError::InsecureFile
+            } else {
+                ConfigError::Unavailable(error.into())
+            }
+        })?;
+        let file = File::from(opened);
         let opened = file.metadata().map_err(ConfigError::Unavailable)?;
         if !opened.is_file()
             || opened.permissions().mode() & 0o7777 != CONFIG_MODE
             || opened.nlink() != 1
+            || opened.uid() != nix::unistd::Uid::effective().as_raw()
         {
             return Err(ConfigError::InsecureFile);
-        }
-        if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
-            return Err(ConfigError::ReplacedFile);
         }
         if opened.len() > MAX_CONFIG_BYTES {
             return Err(ConfigError::Oversized);
@@ -83,8 +113,36 @@ impl RunnerConfig {
         if config.controld_uid == 0 {
             return Err(ConfigError::InvalidPeerUid);
         }
+        if config.host.as_ref().is_some_and(|host| !host.is_valid()) {
+            return Err(ConfigError::InvalidHost);
+        }
         Ok(config)
     }
+}
+
+impl RunnerHostConfig {
+    fn is_valid(&self) -> bool {
+        is_lower_hex(&self.owner_pubkey, 64)
+            && is_lower_hex(&self.manifest_verification_key, 64)
+            && is_lower_hex(&self.relay_signer, 64)
+            && self.broker_uid != 0
+            && self.broker_socket.is_absolute()
+            && self.executor_program.is_absolute()
+            && self.evidence_directory.is_absolute()
+            && self.journal_directory.is_absolute()
+            && (1..=256).contains(&self.max_argv_items)
+            && (1..=65_536).contains(&self.max_argv_bytes)
+            && (1..=256).contains(&self.max_environment_items)
+            && (1..=65_536).contains(&self.max_environment_bytes)
+            && (1..=16_777_216).contains(&self.max_output_bytes)
+    }
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -112,8 +170,47 @@ mod tests {
             RunnerConfig {
                 schema_version: 1,
                 controld_uid: 962,
+                host: None,
             }
         );
+    }
+
+    #[test]
+    fn host_composition_is_all_or_nothing() {
+        let directory = tempdir().expect("tempdir");
+        let complete = directory.path().join("complete.json");
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "controld_uid": 962,
+            "host": {
+                "owner_pubkey": "11".repeat(32),
+                "manifest_verification_key": "22".repeat(32),
+                "relay_signer": "33".repeat(32),
+                "broker_socket": "/run/buzzci/execd.sock",
+                "broker_uid": 963,
+                "executor_program": "/usr/bin/buzz-ci-executor",
+                "evidence_directory": "/var/lib/buzz-ci-runner/evidence",
+                "journal_directory": "/var/lib/buzz-ci-runner/journal",
+                "max_argv_items": 32,
+                "max_argv_bytes": 8192,
+                "max_environment_items": 32,
+                "max_environment_bytes": 8192,
+                "max_output_bytes": 1048576
+            }
+        });
+        write_config(&complete, &serde_json::to_vec(&value).unwrap(), 0o600);
+        assert!(RunnerConfig::load(&complete).unwrap().host.is_some());
+
+        let partial = directory.path().join("partial.json");
+        write_config(
+            &partial,
+            br#"{"schema_version":1,"controld_uid":962,"host":{"owner_pubkey":"11"}}"#,
+            0o600,
+        );
+        assert!(matches!(
+            RunnerConfig::load(&partial),
+            Err(ConfigError::InvalidJson(_))
+        ));
     }
 
     #[test]

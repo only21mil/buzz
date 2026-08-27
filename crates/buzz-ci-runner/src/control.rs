@@ -5,6 +5,7 @@
 //! values from command-line strings.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use buzz_ci_broker_protocol::{
@@ -423,33 +424,72 @@ pub fn validate_completed_response(
     Ok(response)
 }
 
-/// Production fixed-socket Unix transport.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnixBrokerTransport;
+/// Production Unix transport bound to one configured socket and broker UID.
+#[derive(Clone, Debug)]
+pub struct UnixBrokerTransport {
+    socket_path: PathBuf,
+    expected_uid: u32,
+}
+
+impl UnixBrokerTransport {
+    pub fn new(socket_path: PathBuf, expected_uid: u32) -> Self {
+        Self {
+            socket_path,
+            expected_uid,
+        }
+    }
+}
+
+impl Default for UnixBrokerTransport {
+    fn default() -> Self {
+        Self::new(PathBuf::from(BROKER_SOCKET_PATH), 0)
+    }
+}
 
 impl BrokerTransport for UnixBrokerTransport {
     fn admit(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError> {
-        exchange_unix(Request::AdmitAttempt(request))
+        exchange_unix(
+            &self.socket_path,
+            self.expected_uid,
+            Request::AdmitAttempt(request),
+        )
     }
 
     fn get(&mut self, request: GetAttemptRequest) -> Result<BrokerResponse, ControlError> {
-        exchange_unix(Request::GetAttempt(request))
+        exchange_unix(
+            &self.socket_path,
+            self.expected_uid,
+            Request::GetAttempt(request),
+        )
     }
 
     fn complete(
         &mut self,
         request: CompleteAttemptRequest,
     ) -> Result<BrokerResponse, ControlError> {
-        exchange_unix(Request::CompleteAttempt(request))
+        exchange_unix(
+            &self.socket_path,
+            self.expected_uid,
+            Request::CompleteAttempt(request),
+        )
     }
 }
 
 #[cfg(unix)]
-fn exchange_unix(request: Request) -> Result<BrokerResponse, ControlError> {
+fn exchange_unix(
+    path: &Path,
+    expected_uid: u32,
+    request: Request,
+) -> Result<BrokerResponse, ControlError> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     use std::os::unix::net::UnixStream;
 
-    let mut stream =
-        UnixStream::connect(BROKER_SOCKET_PATH).map_err(|_| ControlError::BrokerUnavailable)?;
+    let mut stream = UnixStream::connect(path).map_err(|_| ControlError::BrokerUnavailable)?;
+    let credentials =
+        getsockopt(&stream, PeerCredentials).map_err(|_| ControlError::TransportFailure)?;
+    if expected_uid == 0 || credentials.uid() != expected_uid {
+        return Err(ControlError::BrokerRejected);
+    }
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
@@ -458,7 +498,11 @@ fn exchange_unix(request: Request) -> Result<BrokerResponse, ControlError> {
 }
 
 #[cfg(not(unix))]
-fn exchange_unix(_request: Request) -> Result<BrokerResponse, ControlError> {
+fn exchange_unix(
+    _path: &Path,
+    _expected_uid: u32,
+    _request: Request,
+) -> Result<BrokerResponse, ControlError> {
     Err(ControlError::BrokerUnavailable)
 }
 
@@ -539,6 +583,8 @@ fn request_id_for(request: Request) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
 
     use buzz_ci_broker_protocol::{
         decode_request, encode_response, BrokerState, Conclusion, GitOid, ResponseCode,
@@ -1178,6 +1224,51 @@ mod tests {
             exchange_stream(&mut stream, request),
             Err(ControlError::InvalidBrokerResponse)
         );
+    }
+
+    #[test]
+    fn unix_broker_transport_authenticates_peer_before_protocol_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        assert_eq!(
+            exchange_unix(
+                &path,
+                u32::MAX,
+                Request::GetAttempt(GetAttemptRequest {
+                    attempt_id: [7; 16]
+                }),
+            ),
+            Err(ControlError::BrokerRejected)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_broker_still_fails_closed_on_invalid_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        assert_eq!(
+            exchange_unix(
+                &path,
+                nix::unistd::Uid::effective().as_raw(),
+                Request::GetAttempt(GetAttemptRequest {
+                    attempt_id: [7; 16]
+                }),
+            ),
+            Err(ControlError::TransportFailure)
+        );
+        server.join().unwrap();
     }
 
     fn transport_request() -> AdmitAttemptRequest {

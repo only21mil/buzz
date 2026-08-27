@@ -758,6 +758,37 @@ mod tests {
     }
 
     #[test]
+    fn owner_refusal_precedes_broker_admission_and_execution() {
+        struct Deny;
+        impl RequestAuthorizer for Deny {
+            fn authorize(&self, _request: &CiRequestEnvelope) -> bool {
+                false
+            }
+        }
+        struct MustNotExecute;
+        impl JobExecutor for MustNotExecute {
+            fn execute(
+                &mut self,
+                _job: &ExecuteJob,
+                _lease: &AdmittedLease,
+            ) -> Result<JobExecution, ExecutionBackendError> {
+                panic!("executor called before owner authorization")
+            }
+        }
+        let mut handler = BrokerAttemptHandler::new(
+            Deny,
+            Verify,
+            Broker::default(),
+            MustNotExecute,
+            MemoryJournal::default(),
+        );
+        let mut bytes = Vec::new();
+        handler.handle(request(), &mut bytes).unwrap();
+        let (_, _, broker, _, _) = handler.into_parts();
+        assert!(broker.lease.is_none());
+    }
+
+    #[test]
     fn fixture_request_stays_transport_valid() {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request()).unwrap();

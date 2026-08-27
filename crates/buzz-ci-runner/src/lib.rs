@@ -15,6 +15,8 @@
 pub mod config;
 pub mod control;
 pub mod handler;
+pub mod host;
+pub mod journal;
 pub mod service;
 pub mod transport;
 

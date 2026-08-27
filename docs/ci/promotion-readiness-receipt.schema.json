@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/only21mil/buzz/docs/ci/promotion-readiness-receipt.schema.json",
+  "title": "Buzz promotion readiness receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "repository",
+    "candidate_sha",
+    "base_sha",
+    "tree_sha",
+    "generated_at",
+    "overall",
+    "identities",
+    "gates",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "buzz-promotion-readiness-receipt" },
+    "repository": { "const": "only21mil/buzz" },
+    "candidate_sha": { "$ref": "#/$defs/sha40" },
+    "base_sha": { "$ref": "#/$defs/sha40" },
+    "tree_sha": { "$ref": "#/$defs/sha40" },
+    "generated_at": { "type": "integer", "minimum": 0 },
+    "overall": { "const": "PASS" },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image_ref", "image_ids", "running_image_id", "binary_sha256",
+        "migration", "ci_contexts", "tier2", "relay_sha", "mirror_sha",
+        "merge_sha", "staging_signer", "canary_run_id", "deliberate_red_sha"
+      ],
+      "properties": {
+        "image_ref": { "type": "string", "pattern": "^localhost/buzz-relay:[0-9a-f]{40}$" },
+        "image_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/image_id" }
+        },
+        "running_image_id": { "$ref": "#/$defs/image_id" },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "migration": { "type": "integer", "minimum": 0 },
+        "ci_contexts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "tier2": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lineage", "state_sha256", "fingerprint", "reviewer", "verdict", "remaining_seconds"],
+          "properties": {
+            "lineage": { "type": "string", "minLength": 1 },
+            "state_sha256": { "$ref": "#/$defs/sha256" },
+            "fingerprint": { "$ref": "#/$defs/sha256" },
+            "reviewer": { "type": "string", "pattern": "^claude:" },
+            "verdict": { "enum": ["PASS", "PASS WITH RISKS"] },
+            "remaining_seconds": { "type": "integer", "minimum": 0, "maximum": 5400 }
+          }
+        },
+        "relay_sha": { "$ref": "#/$defs/sha40" },
+        "mirror_sha": { "$ref": "#/$defs/sha40" },
+        "merge_sha": { "$ref": "#/$defs/sha40" },
+        "staging_signer": { "$ref": "#/$defs/sha256" },
+        "canary_run_id": { "type": "string", "minLength": 1 },
+        "deliberate_red_sha": { "$ref": "#/$defs/sha40" }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source", "pre_freeze", "protected_ci", "tier2", "threat_model", "probes",
+        "staging", "production_canary", "accepted_and_unaccepted_paths",
+        "idempotent_retries", "deliberate_red_merge_block", "deploy_and_rollback",
+        "log_authentication"
+      ],
+      "properties": {
+        "source": { "const": "PASS" },
+        "pre_freeze": { "const": "PASS" },
+        "protected_ci": { "const": "PASS" },
+        "tier2": { "const": "PASS" },
+        "threat_model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "total"],
+          "properties": { "passed": { "const": 17 }, "total": { "const": 17 } }
+        },
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed_runs", "total_runs"],
+          "properties": { "passed_runs": { "const": 12 }, "total_runs": { "const": 12 } }
+        },
+        "staging": { "const": "PASS" },
+        "production_canary": { "const": "PASS" },
+        "accepted_and_unaccepted_paths": { "const": "PASS" },
+        "idempotent_retries": { "const": "PASS" },
+        "deliberate_red_merge_block": { "const": "PASS" },
+        "deploy_and_rollback": { "const": "PASS" },
+        "log_authentication": { "const": "PASS" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pre_freeze_sha256", "protected_ci_sha256", "acceptance_verdict_sha256",
+        "acceptance_records_sha256", "dump_sha256", "bundle_sha256"
+      ],
+      "properties": {
+        "pre_freeze_sha256": { "$ref": "#/$defs/sha256" },
+        "protected_ci_sha256": { "$ref": "#/$defs/sha256" },
+        "acceptance_verdict_sha256": { "$ref": "#/$defs/sha256" },
+        "acceptance_records_sha256": { "$ref": "#/$defs/sha256" },
+        "dump_sha256": { "$ref": "#/$defs/sha256" },
+        "bundle_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  },
+  "$defs": {
+    "sha40": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "image_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

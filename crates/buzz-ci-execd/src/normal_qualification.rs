@@ -13,11 +13,15 @@ use std::{
 };
 
 use buzz_ci_broker_protocol::{GitOid, QualificationDirective, QualificationRequest};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     activation::{QualificationLease, QualificationOutcome},
     durable_dispatch::ExecutionUnavailable,
+    normal_backend::{
+        NormalQualificationHostExecutor, NormalQualificationHostPlan,
+        NormalQualificationHostProgress, NormalQualificationPreflightPlan,
+    },
     normal_engine::NormalQualificationBackend,
 };
 
@@ -123,7 +127,7 @@ impl NormalQualificationLiveBinding {
 }
 
 /// Decisive result returned by the normal DNS/materializer/proxy/Act path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum NormalQualificationCaseResult {
     Passed { evidence_set_digest: [u8; 32] },
     Failed,
@@ -154,6 +158,208 @@ pub trait NormalQualificationPrimitiveSet {
         lease: QualificationLease,
         now: u64,
     ) -> Result<NormalQualificationCaseResult, ExecutionUnavailable>;
+}
+
+/// Durable phase of one exact normal qualification host handoff.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum NormalQualificationLeasePhase {
+    Running,
+    Completed(NormalQualificationCaseResult),
+}
+
+/// Exact CAS value retained across process restart.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalQualificationLeaseRecord {
+    pub case_digest: [u8; 32],
+    pub run_identity: [u8; 32],
+    pub owner: [u8; 32],
+    pub fixture_identity: [u8; 32],
+    pub job_identity: [u8; 32],
+    pub request_digest: [u8; 32],
+    pub lease_id: [u8; 16],
+    pub lease_generation: u64,
+    pub expires_at: u64,
+    pub revision: u64,
+    pub phase: NormalQualificationLeasePhase,
+}
+
+impl NormalQualificationLeaseRecord {
+    fn running(plan: NormalQualificationHostPlan) -> Self {
+        let preflight = plan.preflight();
+        let request = preflight.request();
+        Self {
+            case_digest: preflight.case_digest(),
+            run_identity: preflight.run_identity(),
+            owner: plan.owner(),
+            fixture_identity: request.fixture_identity,
+            job_identity: request.job_identity,
+            request_digest: request.request_digest,
+            lease_id: plan.lease().lease_id(),
+            lease_generation: plan.lease().generation(),
+            expires_at: plan.expires_at(),
+            revision: 1,
+            phase: NormalQualificationLeasePhase::Running,
+        }
+    }
+
+    fn matches_preflight(self, plan: NormalQualificationPreflightPlan) -> bool {
+        let request = plan.request();
+        let mut expected_lease_id = [0; 16];
+        expected_lease_id.copy_from_slice(&request.fixture_identity[..16]);
+        self.case_digest == plan.case_digest()
+            && self.run_identity == plan.run_identity()
+            && self.owner == request.fixture_signer
+            && self.fixture_identity == request.fixture_identity
+            && self.job_identity == request.job_identity
+            && self.request_digest == request.request_digest
+            && self.lease_id == expected_lease_id
+            && self.lease_generation != 0
+            && self.expires_at == request.expires_at
+            && self.revision != 0
+    }
+
+    fn matches_plan(self, plan: NormalQualificationHostPlan) -> bool {
+        self.matches_preflight(plan.preflight())
+            && self.lease_generation == plan.lease().generation()
+            && self.lease_id == plan.lease().lease_id()
+    }
+
+    fn completed(
+        self,
+        result: NormalQualificationCaseResult,
+    ) -> Result<Self, ExecutionUnavailable> {
+        let revision = self.revision.checked_add(1).ok_or(ExecutionUnavailable)?;
+        Ok(Self {
+            revision,
+            phase: NormalQualificationLeasePhase::Completed(result),
+            ..self
+        })
+    }
+}
+
+/// Root-owned compare-and-swap store for qualification lease ownership.
+pub trait NormalQualificationLeaseStore {
+    fn load(
+        &mut self,
+        lease_id: [u8; 16],
+    ) -> Result<Option<NormalQualificationLeaseRecord>, ExecutionUnavailable>;
+
+    fn compare_and_swap(
+        &mut self,
+        lease_id: [u8; 16],
+        expected: Option<NormalQualificationLeaseRecord>,
+        replacement: NormalQualificationLeaseRecord,
+    ) -> Result<bool, ExecutionUnavailable>;
+}
+
+/// Safe B5-to-B6 bridge. Canonical composition stays unavailable until an
+/// independently reviewed host executor and durable CAS store are injected.
+pub struct CasNormalQualificationPrimitiveSet<H, S> {
+    host: H,
+    leases: S,
+}
+
+impl<H, S> CasNormalQualificationPrimitiveSet<H, S> {
+    pub fn new(host: H, leases: S) -> Self {
+        Self { host, leases }
+    }
+
+    pub fn into_parts(self) -> (H, S) {
+        (self.host, self.leases)
+    }
+}
+
+impl<H, S> NormalQualificationPrimitiveSet for CasNormalQualificationPrimitiveSet<H, S>
+where
+    H: NormalQualificationHostExecutor,
+    S: NormalQualificationLeaseStore,
+{
+    fn live_binding(
+        &mut self,
+        case: NormalQualificationCase,
+    ) -> Result<NormalQualificationLiveBinding, ExecutionUnavailable> {
+        self.host.live_binding(case)
+    }
+
+    fn preflight_case(
+        &mut self,
+        case: NormalQualificationCase,
+        request: QualificationRequest,
+    ) -> Result<(), ExecutionUnavailable> {
+        let plan = NormalQualificationPreflightPlan::from_sealed_case(case, request)?;
+        let mut lease_id = [0; 16];
+        lease_id.copy_from_slice(&request.fixture_identity[..16]);
+        if let Some(record) = self.leases.load(lease_id)? {
+            if !record.matches_preflight(plan) {
+                return Err(ExecutionUnavailable);
+            }
+            return Ok(());
+        }
+        self.host.preflight(plan)
+    }
+
+    fn execute_case(
+        &mut self,
+        case: NormalQualificationCase,
+        request: QualificationRequest,
+        lease: QualificationLease,
+        now: u64,
+    ) -> Result<NormalQualificationCaseResult, ExecutionUnavailable> {
+        if now < request.not_before || now >= request.expires_at {
+            return Err(ExecutionUnavailable);
+        }
+        let preflight = NormalQualificationPreflightPlan::from_sealed_case(case, request)?;
+        let plan = NormalQualificationHostPlan::from_admitted(preflight, lease)?;
+        let lease_id = lease.lease_id();
+        let loaded = self.leases.load(lease_id)?;
+        let (running, progress) = match loaded {
+            None => {
+                let running = NormalQualificationLeaseRecord::running(plan);
+                if !self.leases.compare_and_swap(lease_id, None, running)? {
+                    return Err(ExecutionUnavailable);
+                }
+                (running, self.host.execute(plan, now)?)
+            }
+            Some(record) => {
+                if !record.matches_plan(plan) || now >= record.expires_at {
+                    return Err(ExecutionUnavailable);
+                }
+                match record.phase {
+                    NormalQualificationLeasePhase::Completed(result) => return Ok(result),
+                    NormalQualificationLeasePhase::Running => {
+                        (record, self.host.recover(plan, now)?)
+                    }
+                }
+            }
+        };
+
+        let result = match progress {
+            NormalQualificationHostProgress::Passed {
+                evidence_set_digest,
+            } if evidence_set_digest != [0; 32] => NormalQualificationCaseResult::Passed {
+                evidence_set_digest,
+            },
+            NormalQualificationHostProgress::Passed { .. }
+            | NormalQualificationHostProgress::Partial => return Err(ExecutionUnavailable),
+            NormalQualificationHostProgress::Failed => NormalQualificationCaseResult::Failed,
+        };
+        let completed = running.completed(result)?;
+        if self
+            .leases
+            .compare_and_swap(lease_id, Some(running), completed)?
+        {
+            return Ok(result);
+        }
+        let replay = self.leases.load(lease_id)?.ok_or(ExecutionUnavailable)?;
+        if replay.matches_plan(plan)
+            && replay.phase == NormalQualificationLeasePhase::Completed(result)
+        {
+            Ok(result)
+        } else {
+            Err(ExecutionUnavailable)
+        }
+    }
 }
 
 /// Production normal qualification backend backed by the sealed case store.
@@ -891,7 +1097,12 @@ const NORMAL_CASE_CATALOG: &[QualificationCaseSpec] = &[
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap, os::unix::fs::PermissionsExt, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeMap,
+        os::unix::fs::PermissionsExt,
+        rc::Rc,
+    };
 
     use super::*;
     use crate::{
@@ -1047,6 +1258,309 @@ mod tests {
             nonce: request.nonce,
             directive: request.directive,
         })
+    }
+
+    #[derive(Default)]
+    struct BridgeHostCalls {
+        live: usize,
+        preflight: usize,
+        execute: usize,
+        recover: usize,
+    }
+
+    struct FakeQualificationHost {
+        live: NormalQualificationLiveBinding,
+        calls: Rc<RefCell<BridgeHostCalls>>,
+        execute_progress: NormalQualificationHostProgress,
+        recover_progress: NormalQualificationHostProgress,
+    }
+
+    impl NormalQualificationHostExecutor for FakeQualificationHost {
+        fn live_binding(
+            &mut self,
+            _case: NormalQualificationCase,
+        ) -> Result<NormalQualificationLiveBinding, ExecutionUnavailable> {
+            self.calls.borrow_mut().live += 1;
+            Ok(self.live)
+        }
+
+        fn preflight(
+            &mut self,
+            _plan: NormalQualificationPreflightPlan,
+        ) -> Result<(), ExecutionUnavailable> {
+            self.calls.borrow_mut().preflight += 1;
+            Ok(())
+        }
+
+        fn execute(
+            &mut self,
+            _plan: NormalQualificationHostPlan,
+            _now: u64,
+        ) -> Result<NormalQualificationHostProgress, ExecutionUnavailable> {
+            self.calls.borrow_mut().execute += 1;
+            Ok(self.execute_progress)
+        }
+
+        fn recover(
+            &mut self,
+            _plan: NormalQualificationHostPlan,
+            _now: u64,
+        ) -> Result<NormalQualificationHostProgress, ExecutionUnavailable> {
+            self.calls.borrow_mut().recover += 1;
+            Ok(self.recover_progress)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLeaseStore {
+        record: Rc<RefCell<Option<NormalQualificationLeaseRecord>>>,
+        fail_next_cas: Rc<Cell<bool>>,
+    }
+
+    impl NormalQualificationLeaseStore for SharedLeaseStore {
+        fn load(
+            &mut self,
+            lease_id: [u8; 16],
+        ) -> Result<Option<NormalQualificationLeaseRecord>, ExecutionUnavailable> {
+            Ok(self
+                .record
+                .borrow()
+                .filter(|record| record.lease_id == lease_id))
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            lease_id: [u8; 16],
+            expected: Option<NormalQualificationLeaseRecord>,
+            replacement: NormalQualificationLeaseRecord,
+        ) -> Result<bool, ExecutionUnavailable> {
+            if self.fail_next_cas.replace(false) || replacement.lease_id != lease_id {
+                return Ok(false);
+            }
+            let mut record = self.record.borrow_mut();
+            if *record != expected {
+                return Ok(false);
+            }
+            *record = Some(replacement);
+            Ok(true)
+        }
+    }
+
+    fn bridge(
+        request: QualificationRequest,
+        store: SharedLeaseStore,
+        calls: Rc<RefCell<BridgeHostCalls>>,
+        execute_progress: NormalQualificationHostProgress,
+        recover_progress: NormalQualificationHostProgress,
+    ) -> CasNormalQualificationPrimitiveSet<FakeQualificationHost, SharedLeaseStore> {
+        CasNormalQualificationPrimitiveSet::new(
+            FakeQualificationHost {
+                live: live(request),
+                calls,
+                execute_progress,
+                recover_progress,
+            },
+            store,
+        )
+    }
+
+    #[test]
+    fn qualification_bridge_refuses_stale_lease_before_host_handoff() {
+        let fixture = Fixture::hostile("cross-candidate-sealed.json");
+        let case = fixture.store.specs[0].case;
+        let store = SharedLeaseStore::default();
+        let calls = Rc::new(RefCell::new(BridgeHostCalls::default()));
+        let mut primitives = bridge(
+            fixture.request,
+            store.clone(),
+            Rc::clone(&calls),
+            NormalQualificationHostProgress::Passed {
+                evidence_set_digest: [51; 32],
+            },
+            NormalQualificationHostProgress::Partial,
+        );
+
+        assert!(primitives
+            .execute_case(
+                case,
+                fixture.request,
+                lease(fixture.request),
+                fixture.request.expires_at,
+            )
+            .is_err());
+        assert!(store.record.borrow().is_none());
+        assert_eq!(calls.borrow().execute, 0);
+        assert_eq!(calls.borrow().recover, 0);
+    }
+
+    #[test]
+    fn qualification_bridge_replays_completed_result_without_duplicate_handoff() {
+        let fixture = Fixture::hostile("cross-candidate-sealed.json");
+        let case = fixture.store.specs[0].case;
+        let store = SharedLeaseStore::default();
+        let calls = Rc::new(RefCell::new(BridgeHostCalls::default()));
+        let mut primitives = bridge(
+            fixture.request,
+            store.clone(),
+            Rc::clone(&calls),
+            NormalQualificationHostProgress::Passed {
+                evidence_set_digest: [52; 32],
+            },
+            NormalQualificationHostProgress::Partial,
+        );
+
+        let expected = NormalQualificationCaseResult::Passed {
+            evidence_set_digest: [52; 32],
+        };
+        assert_eq!(
+            primitives
+                .execute_case(case, fixture.request, lease(fixture.request), 100)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            primitives
+                .execute_case(case, fixture.request, lease(fixture.request), 100)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(calls.borrow().execute, 1);
+        assert_eq!(calls.borrow().recover, 0);
+        assert!(matches!(
+            store.record.borrow().unwrap().phase,
+            NormalQualificationLeasePhase::Completed(result) if result == expected
+        ));
+    }
+
+    #[test]
+    fn qualification_bridge_refuses_wrong_run_and_wrong_case() {
+        let fixture = Fixture::hostile("cross-candidate-sealed.json");
+        let case = fixture.store.specs[0].case;
+        let store = SharedLeaseStore::default();
+        let calls = Rc::new(RefCell::new(BridgeHostCalls::default()));
+        let mut primitives = bridge(
+            fixture.request,
+            store,
+            Rc::clone(&calls),
+            NormalQualificationHostProgress::Partial,
+            NormalQualificationHostProgress::Partial,
+        );
+        assert!(primitives
+            .execute_case(case, fixture.request, lease(fixture.request), 100)
+            .is_err());
+
+        let mut wrong_run = fixture.request;
+        wrong_run.job_identity = [53; 32];
+        assert!(primitives
+            .execute_case(case, wrong_run, lease(wrong_run), 100)
+            .is_err());
+        let wrong_case = NormalQualificationCase {
+            case_name: "wrong-case",
+            ..case
+        };
+        assert!(primitives
+            .execute_case(wrong_case, fixture.request, lease(fixture.request), 100)
+            .is_err());
+        assert_eq!(calls.borrow().execute, 1);
+        assert_eq!(calls.borrow().recover, 0);
+    }
+
+    #[test]
+    fn partial_qualification_remains_running_and_cannot_close() {
+        let fixture = Fixture::hostile("cross-candidate-sealed.json");
+        let case = fixture.store.specs[0].case;
+        let store = SharedLeaseStore::default();
+        let calls = Rc::new(RefCell::new(BridgeHostCalls::default()));
+        let mut primitives = bridge(
+            fixture.request,
+            store.clone(),
+            Rc::clone(&calls),
+            NormalQualificationHostProgress::Partial,
+            NormalQualificationHostProgress::Partial,
+        );
+
+        assert!(primitives
+            .execute_case(case, fixture.request, lease(fixture.request), 100)
+            .is_err());
+        assert!(primitives
+            .execute_case(case, fixture.request, lease(fixture.request), 100)
+            .is_err());
+        assert!(matches!(
+            store.record.borrow().unwrap().phase,
+            NormalQualificationLeasePhase::Running
+        ));
+        assert_eq!(calls.borrow().execute, 1);
+        assert_eq!(calls.borrow().recover, 1);
+    }
+
+    #[test]
+    fn qualification_bridge_recovers_running_lease_after_restart() {
+        let fixture = Fixture::hostile("cross-candidate-sealed.json");
+        let case = fixture.store.specs[0].case;
+        let store = SharedLeaseStore::default();
+        let first_calls = Rc::new(RefCell::new(BridgeHostCalls::default()));
+        let mut first = bridge(
+            fixture.request,
+            store.clone(),
+            Rc::clone(&first_calls),
+            NormalQualificationHostProgress::Partial,
+            NormalQualificationHostProgress::Partial,
+        );
+        assert!(first
+            .execute_case(case, fixture.request, lease(fixture.request), 100)
+            .is_err());
+        drop(first);
+
+        let recovered_calls = Rc::new(RefCell::new(BridgeHostCalls::default()));
+        let mut recovered = bridge(
+            fixture.request,
+            store.clone(),
+            Rc::clone(&recovered_calls),
+            NormalQualificationHostProgress::Partial,
+            NormalQualificationHostProgress::Passed {
+                evidence_set_digest: [54; 32],
+            },
+        );
+        assert_eq!(
+            recovered
+                .execute_case(case, fixture.request, lease(fixture.request), 100)
+                .unwrap(),
+            NormalQualificationCaseResult::Passed {
+                evidence_set_digest: [54; 32]
+            }
+        );
+        assert_eq!(first_calls.borrow().execute, 1);
+        assert_eq!(recovered_calls.borrow().execute, 0);
+        assert_eq!(recovered_calls.borrow().recover, 1);
+        assert!(matches!(
+            store.record.borrow().unwrap().phase,
+            NormalQualificationLeasePhase::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn qualification_bridge_never_hands_off_before_cas_ownership() {
+        let fixture = Fixture::hostile("cross-candidate-sealed.json");
+        let case = fixture.store.specs[0].case;
+        let store = SharedLeaseStore::default();
+        store.fail_next_cas.set(true);
+        let calls = Rc::new(RefCell::new(BridgeHostCalls::default()));
+        let mut primitives = bridge(
+            fixture.request,
+            store.clone(),
+            Rc::clone(&calls),
+            NormalQualificationHostProgress::Passed {
+                evidence_set_digest: [55; 32],
+            },
+            NormalQualificationHostProgress::Partial,
+        );
+
+        assert!(primitives
+            .execute_case(case, fixture.request, lease(fixture.request), 100)
+            .is_err());
+        assert!(store.record.borrow().is_none());
+        assert_eq!(calls.borrow().execute, 0);
+        assert_eq!(calls.borrow().recover, 0);
     }
 
     #[test]

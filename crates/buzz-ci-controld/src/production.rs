@@ -93,7 +93,7 @@ pub struct SignedCiEvent {
     pub signed_event: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum StoredPublication {
     Pending(SignedCiEvent),
     Accepted {
@@ -845,11 +845,16 @@ impl EvidenceReader for DescriptorOutputReader {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::rc::Rc;
 
     use buzz_core::ci::{CiRequestType, CiTeardownLease};
 
     use super::*;
+    use crate::store::DurableControlStore;
 
     const CHANNEL: &str = "123e4567-e89b-12d3-a456-426614174099";
     const SIGNER: &str = "7777777777777777777777777777777777777777777777777777777777777777";
@@ -995,6 +1000,8 @@ mod tests {
     struct Relay {
         accepted: Option<AcceptedRequest>,
         published: Vec<u32>,
+        intent_signal: Option<Rc<Cell<bool>>>,
+        refuse_publication: bool,
     }
 
     impl RelayControl for Relay {
@@ -1013,6 +1020,12 @@ mod tests {
         }
 
         fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
+            if let Some(signal) = self.intent_signal.as_ref() {
+                assert!(signal.get(), "relay called before durable intent returned");
+            }
+            if self.refuse_publication {
+                return Err(());
+            }
             self.published.push(event.kind);
             Ok(event.event_id.clone())
         }
@@ -1136,6 +1149,8 @@ mod tests {
         let relay = Relay {
             accepted: Some(accepted()),
             published: Vec::new(),
+            intent_signal: None,
+            refuse_publication: false,
         };
         let mut handler = ProductionHandler::new(
             relay,
@@ -1156,6 +1171,107 @@ mod tests {
             handler.store.run.as_ref().unwrap().1.state(),
             RunState::Success
         );
+    }
+
+    #[test]
+    fn refused_publication_leaves_durable_intent_for_restart_replay() {
+        struct SignallingStore {
+            durable: DurableControlStore,
+            intent_signal: Rc<Cell<bool>>,
+        }
+
+        impl ControlStore for SignallingStore {
+            type Error = crate::store::StoreError;
+
+            fn cursor(&self, channel_id: &str) -> Result<u64, Self::Error> {
+                self.durable.cursor(channel_id)
+            }
+
+            fn advance_cursor(
+                &mut self,
+                channel_id: &str,
+                expected: u64,
+                next: u64,
+            ) -> Result<bool, Self::Error> {
+                self.durable.advance_cursor(channel_id, expected, next)
+            }
+
+            fn load_run(
+                &self,
+                identity: &RunIdentity,
+            ) -> Result<Option<(u64, RunRecord)>, Self::Error> {
+                self.durable.load_run(identity)
+            }
+
+            fn compare_and_swap_run(
+                &mut self,
+                identity: &RunIdentity,
+                expected_revision: Option<u64>,
+                next: &RunRecord,
+            ) -> Result<StoreWrite, Self::Error> {
+                self.durable
+                    .compare_and_swap_run(identity, expected_revision, next)
+            }
+
+            fn load_publication(
+                &self,
+                key: &str,
+            ) -> Result<Option<StoredPublication>, Self::Error> {
+                self.durable.load_publication(key)
+            }
+
+            fn record_publication_intent(
+                &mut self,
+                key: &str,
+                event: &SignedCiEvent,
+            ) -> Result<bool, Self::Error> {
+                let written = self.durable.record_publication_intent(key, event)?;
+                self.intent_signal.set(true);
+                Ok(written)
+            }
+
+            fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {
+                self.durable.accept_publication(key, event_id)
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+        let uid = fs::metadata(&root).expect("metadata").uid();
+        let signal = Rc::new(Cell::new(false));
+        let store = SignallingStore {
+            durable: DurableControlStore::open(root.clone(), uid).expect("store"),
+            intent_signal: Rc::clone(&signal),
+        };
+        let log = b"ok\n".to_vec();
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted()),
+                published: Vec::new(),
+                intent_signal: Some(Rc::clone(&signal)),
+                refuse_publication: true,
+            },
+            DeterministicSigner,
+            Executor(completion(&log)),
+            store,
+            MemoryOutput(log),
+        );
+
+        assert!(matches!(
+            handler.poll_once(CHANNEL),
+            Err(ProductionError::Relay)
+        ));
+        assert!(signal.get());
+        drop(handler);
+        let reopened = DurableControlStore::open(root, uid).expect("reopen");
+        assert!(matches!(
+            reopened
+                .load_publication(&format!("{}:run:queued", "11".repeat(32)))
+                .expect("load intent"),
+            Some(StoredPublication::Pending(_))
+        ));
+        assert_eq!(reopened.cursor(CHANNEL).expect("cursor"), 0);
     }
 
     #[cfg(target_os = "linux")]

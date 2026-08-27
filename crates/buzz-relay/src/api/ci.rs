@@ -54,7 +54,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::body::Body;
+use axum::extract::{OriginalUri, Path as AxumPath, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Json;
 use base64::Engine as _;
@@ -71,11 +72,16 @@ use crate::config::CiPolicyConfig;
 use crate::state::AppState;
 use crate::tenant::bind_community;
 use buzz_core::channel::MemberRole;
+use buzz_core::ci::CiRequestEnvelope;
 use buzz_core::kind::{KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST};
 #[cfg(test)]
 use buzz_core::CommunityId;
 use buzz_core::TenantContext;
 use buzz_db::EventQuery;
+
+const MAX_CI_CONTROL_BACKLOG: i64 = 1_001;
+/// Maximum bytes accepted by either CI evidence upload route.
+pub const MAX_CI_EVIDENCE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Deadline for one preflight git subprocess / hydration attempt.
 ///
@@ -1211,6 +1217,460 @@ struct PreflightReject {
     message: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Exact query contract for the controld accepted-request poll.
+pub struct AcceptedControlQuery {
+    channel_id: String,
+    after_cursor: u64,
+    limit: u32,
+}
+
+#[derive(Serialize)]
+struct AcceptedControlResponse {
+    accepted: Option<AcceptedControlEvent>,
+}
+
+#[derive(Serialize)]
+struct AcceptedControlEvent {
+    channel_id: String,
+    watch_cursor: u64,
+    event: nostr::Event,
+}
+
+/// Return the next durably stored kind-46100 request for one channel.
+pub async fn next_accepted_control(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<AcceptedControlQuery>,
+) -> Result<Json<Value>, PreflightApiError> {
+    let channel_id = uuid::Uuid::parse_str(&query.channel_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid channel ID"))?;
+    if query.limit != 1 || query.after_cursor > buzz_ci_controld_safe_cursor() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "invalid control cursor"));
+    }
+    let tenant = bind_request_tenant(&state, &headers).await?;
+    let raw_query = raw_query.ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "missing query"))?;
+    let path = format!("/ci/control/accepted?{raw_query}");
+    let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, &path);
+    let (caller, event_id) = super::bridge::verify_bridge_auth(&headers, "GET", &url, None, true)?;
+    super::bridge::check_nip98_replay(&state, &tenant, event_id).await?;
+
+    let events = state
+        .db
+        .query_events(&EventQuery {
+            channel_id: Some(channel_id),
+            kinds: Some(vec![buzz_core::kind::KIND_CI_REQUEST as i32]),
+            limit: Some(MAX_CI_CONTROL_BACKLOG),
+            max_limit: Some(MAX_CI_CONTROL_BACKLOG),
+            ..EventQuery::for_community(tenant.community())
+        })
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "control source unavailable",
+            )
+        })?;
+    if events.len() as i64 == MAX_CI_CONTROL_BACKLOG {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control backlog exceeds the bounded read window",
+        ));
+    }
+    let mut candidates = events
+        .into_iter()
+        .filter_map(|stored| {
+            let cursor = u64::try_from(stored.received_at.timestamp_micros()).ok()?;
+            (cursor > query.after_cursor).then_some((cursor, stored))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.event.id.cmp(&right.1.event.id))
+    });
+    if candidates
+        .windows(2)
+        .any(|window| window[0].0 == window[1].0)
+    {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control cursor collision",
+        ));
+    }
+    let accepted = if let Some((watch_cursor, stored)) = candidates.into_iter().next() {
+        let envelope = validate_control_request(&stored.event, channel_id)?;
+        authorize_ci_signer(
+            &state,
+            &tenant,
+            channel_id,
+            &envelope.target_repo_a,
+            &caller,
+        )
+        .await?;
+        Some(AcceptedControlEvent {
+            channel_id: channel_id.to_string(),
+            watch_cursor,
+            event: stored.event,
+        })
+    } else {
+        // No request facts are disclosed. Repository-scoped grant authority
+        // cannot be evaluated without a repository, so a valid NIP-98 caller
+        // receives the same empty result while every non-empty result remains
+        // gated against its exact stored request repository.
+        None
+    };
+    serde_json::to_value(AcceptedControlResponse { accepted })
+        .map(Json)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+#[derive(Serialize)]
+struct EvidencePutResponse {
+    url: String,
+    sha256: String,
+    byte_length: u64,
+}
+
+/// Store one authenticated, descriptor-bound job log.
+pub async fn put_ci_log(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, PreflightApiError> {
+    put_ci_evidence(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: None,
+            sha256,
+        },
+        uri.path(),
+        headers,
+        body,
+    )
+    .await
+}
+
+/// Store one authenticated, descriptor-bound job artifact.
+pub async fn put_ci_artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, artifact_id, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, PreflightApiError> {
+    put_ci_evidence(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: Some(artifact_id),
+            sha256,
+        },
+        uri.path(),
+        headers,
+        body,
+    )
+    .await
+}
+
+struct EvidencePath {
+    request_id: String,
+    run_id: String,
+    job_id: String,
+    attempt: u32,
+    object_id: Option<String>,
+    sha256: String,
+}
+
+async fn put_ci_evidence(
+    state: Arc<AppState>,
+    path: EvidencePath,
+    request_path: &str,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, PreflightApiError> {
+    validate_evidence_path(&path)?;
+    let tenant = bind_request_tenant(&state, &headers).await?;
+    let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, request_path);
+
+    // Validate signature, method, URL, and payload-tag presence before polling
+    // the body stream. The exact digest is verified after the bounded read.
+    let (caller, preauth_id) =
+        super::bridge::verify_bridge_auth_with_options(&headers, "PUT", &url, None, true, true)?;
+    let request_bytes = hex::decode(&path.request_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid request event ID"))?;
+    let stored = state
+        .db
+        .get_event_by_id(tenant.community(), &request_bytes)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI request unavailable"))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "CI request not found"))?;
+    let channel_id = stored
+        .channel_id
+        .ok_or_else(|| api_error(StatusCode::CONFLICT, "CI request is not channel-bound"))?;
+    let envelope = validate_control_request(&stored.event, channel_id)?;
+    if stored.event.id.to_hex() != path.request_id
+        || envelope.run_id != path.run_id
+        || envelope.attempt != path.attempt
+        || !envelope.job_ids.iter().any(|job| job == &path.job_id)
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "CI evidence identity mismatch",
+        ));
+    }
+    authorize_ci_signer(
+        &state,
+        &tenant,
+        channel_id,
+        &envelope.target_repo_a,
+        &caller,
+    )
+    .await?;
+
+    let declared = headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| api_error(StatusCode::LENGTH_REQUIRED, "content length required"))?;
+    if declared > MAX_CI_EVIDENCE_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "CI evidence exceeds byte limit",
+        ));
+    }
+    let bytes = axum::body::to_bytes(body, declared.saturating_add(1))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "CI evidence exceeds byte limit",
+            )
+        })?;
+    if bytes.len() != declared {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "CI evidence length mismatch",
+        ));
+    }
+    let (_, auth_id) = super::bridge::verify_bridge_auth_with_options(
+        &headers,
+        "PUT",
+        &url,
+        Some(&bytes),
+        true,
+        true,
+    )?;
+    if auth_id != preauth_id {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "NIP-98 identity changed",
+        ));
+    }
+    super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if actual != path.sha256 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "CI evidence digest mismatch",
+        ));
+    }
+
+    let object_key = evidence_object_key(
+        tenant.community(),
+        &envelope.target_repo_a,
+        &envelope.tip_oid,
+        &path,
+    );
+    match state.media_storage.head_with_metadata(&object_key).await {
+        Ok(Some(metadata)) if metadata.size != declared as u64 => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "stored CI evidence conflicts",
+            ));
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => state
+            .media_storage
+            .put(&object_key, &bytes, "application/octet-stream")
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CI evidence store unavailable",
+                )
+            })?,
+        Err(_) => {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CI evidence store unavailable",
+            ));
+        }
+    }
+    let response = EvidencePutResponse {
+        url,
+        sha256: path.sha256,
+        byte_length: declared as u64,
+    };
+    serde_json::to_value(response)
+        .map(Json)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+async fn bind_request_tenant(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<TenantContext, PreflightApiError> {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    bind_community(&state.db, host).await.map_err(|_| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "relay: no community is configured for this host",
+        )
+    })
+}
+
+fn validate_control_request(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+) -> Result<CiRequestEnvelope, PreflightApiError> {
+    match buzz_core::ci::validate_signed_ci_event(
+        event,
+        &channel_id.to_string(),
+        &std::collections::HashSet::new(),
+    )
+    .map_err(|_| api_error(StatusCode::CONFLICT, "stored CI request is invalid"))?
+    {
+        buzz_core::ci::ValidatedCiEnvelope::Request(envelope) => Ok(envelope),
+        _ => Err(api_error(
+            StatusCode::CONFLICT,
+            "stored CI request kind is invalid",
+        )),
+    }
+}
+
+async fn authorize_ci_signer(
+    state: &AppState,
+    tenant: &TenantContext,
+    channel_id: uuid::Uuid,
+    target_repo_a: &str,
+    caller: &nostr::PublicKey,
+) -> Result<(), PreflightApiError> {
+    let caller = caller.to_hex();
+    if state.config.ci_status_signer_pubkeys.contains(&caller) {
+        return Ok(());
+    }
+    let granted = state
+        .db
+        .get_active_ci_signers(
+            tenant.community(),
+            channel_id,
+            target_repo_a,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CI authorization unavailable",
+            )
+        })?;
+    if granted.iter().any(|signer| signer == &caller) {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            "CI signer is not authorized",
+        ))
+    }
+}
+
+fn validate_evidence_path(path: &EvidencePath) -> Result<(), PreflightApiError> {
+    let safe_component = |value: &str, max: usize| {
+        !value.is_empty()
+            && value.len() <= max
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    };
+    if !is_lower_hex_value(&path.request_id, 64)
+        || uuid::Uuid::parse_str(&path.run_id).is_err()
+        || !safe_component(&path.job_id, 64)
+        || path.attempt == 0
+        || !is_lower_hex_value(&path.sha256, 64)
+        || path
+            .object_id
+            .as_deref()
+            .is_some_and(|value| !safe_component(value, 128))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid CI evidence path",
+        ));
+    }
+    Ok(())
+}
+
+fn evidence_object_key(
+    community: buzz_core::CommunityId,
+    target_repo_a: &str,
+    tip_oid: &str,
+    path: &EvidencePath,
+) -> String {
+    let repo_binding = hex::encode(Sha256::digest(
+        format!("{target_repo_a}\0{tip_oid}").as_bytes(),
+    ));
+    format!(
+        "_ci/{}/{}/{}/{}/{}/{}/{}/{}",
+        community,
+        repo_binding,
+        path.request_id,
+        path.run_id,
+        path.job_id,
+        path.attempt,
+        path.object_id.as_deref().unwrap_or("log"),
+        path.sha256
+    )
+}
+
+fn is_lower_hex_value(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+const fn buzz_ci_controld_safe_cursor() -> u64 {
+    (1_u64 << 53) - 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,6 +1679,60 @@ mod tests {
     use nostr::EventBuilder;
     use sha2::Sha256;
     use tower::ServiceExt as _;
+
+    fn evidence_path() -> EvidencePath {
+        EvidencePath {
+            request_id: "11".repeat(32),
+            run_id: "123e4567-e89b-12d3-a456-426614174011".to_owned(),
+            job_id: "test_job".to_owned(),
+            attempt: 1,
+            object_id: Some("results".to_owned()),
+            sha256: "22".repeat(32),
+        }
+    }
+
+    #[test]
+    fn evidence_path_and_storage_key_bind_all_immutable_inputs() {
+        let path = evidence_path();
+        validate_evidence_path(&path).expect("valid path");
+        let community = CommunityId::from_uuid(
+            uuid::Uuid::parse_str("123e4567-e89b-12d3-a456-426614174099").expect("uuid"),
+        );
+        let first = evidence_object_key(
+            community,
+            &format!("30617:{}:buzz", "33".repeat(32)),
+            &"44".repeat(20),
+            &path,
+        );
+        let second = evidence_object_key(
+            community,
+            &format!("30617:{}:buzz", "33".repeat(32)),
+            &"55".repeat(20),
+            &path,
+        );
+        assert_ne!(first, second, "tip OID must change the storage key");
+        assert!(first.contains(&path.request_id));
+        assert!(first.contains(&path.run_id));
+        assert!(first.contains(&path.job_id));
+        assert!(first.ends_with(&path.sha256));
+
+        let mut unsafe_path = evidence_path();
+        unsafe_path.job_id = "../escape".to_owned();
+        assert!(validate_evidence_path(&unsafe_path).is_err());
+    }
+
+    #[test]
+    fn accepted_control_query_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_value::<AcceptedControlQuery>(serde_json::json!({
+                "channel_id": "123e4567-e89b-12d3-a456-426614174099",
+                "after_cursor": 0,
+                "limit": 1,
+                "repo": "not accepted"
+            }))
+            .is_err()
+        );
+    }
 
     // ── B1 rev-2 acceptance helpers ────────────────────────────────────────
 

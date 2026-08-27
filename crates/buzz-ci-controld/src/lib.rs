@@ -6,7 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod keyholder;
 pub mod production;
+pub mod source;
+pub mod store;
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};

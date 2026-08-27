@@ -21,13 +21,14 @@ buzz-ci-controld = { workspace = true }
 buzz-core = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+ed25519-dalek = "=3.0.0-rc.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["socket"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "socket", "user"] }
 
 [dev-dependencies]
 tempfile = "3"
