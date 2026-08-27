@@ -1136,6 +1136,10 @@ class InstallerSafetyTests(PackageFixture):
         backup_root = self.install_root / "var/lib/buzz-mgact-backups"
         backup_ids = [path.name for path in backup_root.iterdir() if path.is_dir()]
         self.assertEqual(len(backup_ids), 1)
+        v3_receipt = json.loads((backup_root / backup_ids[0] / "receipt.json").read_text())
+        self.assertEqual(v3_receipt["schema"], INSTALLER.INSTALL_RECEIPT_SCHEMA)
+        self.assertEqual(set(v3_receipt["changed_targets"]), set(v3_receipt["previous"]))
+        self.assertEqual(set(v3_receipt["changed_targets"]), set(v3_receipt["installed"]))
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.install(), 0)
         self.assertIn("ALREADY_INSTALLED writes=0", output.getvalue())
@@ -1354,6 +1358,269 @@ class InstallerSafetyTests(PackageFixture):
         with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
             with self.assertRaisesRegex(ValueError, "drift blocks rollback"):
                 INSTALLER.rollback(backup_id, self.install_root)
+
+
+class LegacyV1RollbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.addCleanup(self.temporary.cleanup)
+        self.installed_payloads: dict[str, bytes] = {}
+        self.previous_payloads: dict[str, bytes] = {}
+
+        previous: dict[str, dict[str, object]] = {}
+        installed: dict[str, dict[str, object]] = {}
+        for index, target_text in enumerate(INSTALLER.LEGACY_V1_CHANGED_TARGETS):
+            destination = self.root / target_text.lstrip("/")
+            self.ensure_directory(destination.parent, 0o755)
+            installed_payload = f"installed-{index}-{target_text}\n".encode()
+            previous_payload = f"previous-{index}-{target_text}\n".encode()
+            installed_mode = 0o755 if target_text.startswith("/usr/local/libexec/") else 0o644
+            if target_text.endswith(".env"):
+                installed_mode = 0o600
+            previous_mode = 0o755 if target_text.startswith("/usr/local/libexec/") else 0o644
+            write_file(destination, installed_payload, installed_mode)
+            backup_name = hashlib.sha256(target_text.encode()).hexdigest()
+            previous[target_text] = {
+                "exists": True,
+                "backup_name": backup_name,
+                "sha256": hashlib.sha256(previous_payload).hexdigest(),
+                "mode": f"{previous_mode:04o}",
+                "uid": 0,
+                "gid": 0,
+            }
+            installed[target_text] = {
+                "sha256": hashlib.sha256(installed_payload).hexdigest(),
+                "mode": f"{installed_mode:04o}",
+                "uid": 0,
+                "gid": 0,
+            }
+            self.installed_payloads[target_text] = installed_payload
+            self.previous_payloads[target_text] = previous_payload
+
+        self.stack.enter_context(mock.patch.object(INSTALLER, "LEGACY_V1_PREVIOUS", previous))
+        self.stack.enter_context(mock.patch.object(INSTALLER, "LEGACY_V1_INSTALLED", installed))
+        inventory_digest = INSTALLER.legacy_v1_inventory_digest()
+        self.stack.enter_context(
+            mock.patch.object(INSTALLER, "LEGACY_V1_INVENTORY_SHA256", inventory_digest)
+        )
+
+        self.backup = (
+            self.root
+            / "var/lib/buzz-mgact-backups"
+            / INSTALLER.LEGACY_V1_BACKUP_ID
+        )
+        self.ensure_directory(self.backup.parent, 0o700)
+        self.ensure_directory(self.backup, 0o700)
+        files = self.backup / "files"
+        self.ensure_directory(files, 0o700)
+        for target_text, payload in self.previous_payloads.items():
+            write_file(files / str(previous[target_text]["backup_name"]), payload, 0o600)
+
+        receipt_payload = INSTALLER.canonical_json(INSTALLER.legacy_v1_contract_receipt())
+        self.receipt = self.backup / "receipt.json"
+        write_file(self.receipt, receipt_payload, 0o600)
+        self.backup.parent.chmod(0o700)
+        self.backup.chmod(0o700)
+        files.chmod(0o700)
+        self.stack.enter_context(
+            mock.patch.object(
+                INSTALLER,
+                "LEGACY_V1_RECEIPT_SHA256",
+                hashlib.sha256(receipt_payload).hexdigest(),
+            )
+        )
+
+        self.claim_directory = self.root / INSTALLER.LEGACY_V1_RECOVERY_CLAIM_DIRECTORY.lstrip(
+            "/"
+        )
+        self.ensure_directory(self.claim_directory, 0o700)
+        acceptance_claim = self.root / INSTALLER.LEGACY_V1_CLAIM.lstrip("/")
+        write_file(
+            acceptance_claim,
+            INSTALLER.canonical_json(INSTALLER.legacy_v1_acceptance_claim()),
+            0o600,
+        )
+
+    def ensure_directory(self, path: Path, mode: int) -> None:
+        path.mkdir(mode=0o755, parents=True, exist_ok=True)
+        current = self.root
+        for part in path.relative_to(self.root).parts:
+            current = current / part
+            current.chmod(0o755)
+        path.chmod(mode)
+
+    def rollback(self, *, dry_run: bool = False) -> int:
+        with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
+            return INSTALLER.rollback(
+                INSTALLER.LEGACY_V1_BACKUP_ID,
+                self.root,
+                dry_run=dry_run,
+            )
+
+    def recovery_claim(self) -> Path:
+        return INSTALLER.legacy_v1_recovery_claim_path(self.root)
+
+    def test_dry_run_is_reachable_and_writes_nothing(self) -> None:
+        before = tree_fingerprint(self.root)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.rollback(dry_run=True), 0)
+        self.assertIn("targets=10 writes=0", output.getvalue())
+        self.assertEqual(tree_fingerprint(self.root), before)
+        self.assertFalse(self.recovery_claim().exists())
+        self.assertFalse((self.root / "run/lock/buzz-mgact-install.lock").exists())
+        argv = [
+            str(INSTALLER.__file__),
+            "rollback",
+            "--backup-id",
+            INSTALLER.LEGACY_V1_BACKUP_ID,
+            "--dry-run",
+            "--root",
+            str(self.root),
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            INSTALLER,
+            "rollback",
+            return_value=0,
+        ) as rollback:
+            with self.assertRaises(SystemExit) as exited:
+                INSTALLER.main()
+        self.assertEqual(exited.exception.code, 0)
+        rollback.assert_called_once_with(
+            INSTALLER.LEGACY_V1_BACKUP_ID,
+            self.root.absolute(),
+            dry_run=True,
+        )
+
+    def test_only_exact_legacy_backup_dispatches_to_the_v1_path(self) -> None:
+        wrong = INSTALLER.LEGACY_V1_BACKUP_ID[:-2] + "0Z"
+        before = tree_fingerprint(self.root)
+        with mock.patch.dict(os.environ, {"MGACT_TESTING": "1"}):
+            with self.assertRaisesRegex(ValueError, "only supports the exact legacy v1 backup"):
+                INSTALLER.rollback(wrong, self.root, dry_run=True)
+        self.assertEqual(tree_fingerprint(self.root), before)
+
+    def test_wrong_receipt_and_incomplete_backup_inventory_fail_closed(self) -> None:
+        original = self.receipt.read_bytes()
+        self.receipt.write_bytes(original + b" ")
+        self.receipt.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "receipt hash mismatch"):
+            self.rollback(dry_run=True)
+        self.receipt.write_bytes(original)
+        self.receipt.chmod(0o600)
+        extra = self.backup / "files/unexpected"
+        write_file(extra, b"unexpected\n", 0o600)
+        with self.assertRaisesRegex(ValueError, "backup file inventory mismatch"):
+            self.rollback(dry_run=True)
+        self.assertFalse(self.recovery_claim().exists())
+
+    def test_consumed_acceptance_claim_and_installed_drift_are_validated(self) -> None:
+        acceptance_claim = self.root / INSTALLER.LEGACY_V1_CLAIM.lstrip("/")
+        original_claim = acceptance_claim.read_bytes()
+        acceptance_claim.write_bytes(b"{}\n")
+        acceptance_claim.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "consumed acceptance claim mismatch"):
+            self.rollback(dry_run=True)
+        acceptance_claim.write_bytes(original_claim)
+        acceptance_claim.chmod(0o600)
+        drifted_target = INSTALLER.LEGACY_V1_CHANGED_TARGETS[0]
+        drifted = self.root / drifted_target.lstrip("/")
+        drifted.write_bytes(b"drift\n")
+        with self.assertRaisesRegex(ValueError, "installed target drift"):
+            self.rollback(dry_run=True)
+        installed_record = INSTALLER.LEGACY_V1_INSTALLED[drifted_target]
+        drifted.write_bytes(self.installed_payloads[drifted_target])
+        drifted.chmod(int(str(installed_record["mode"]), 8) ^ 0o040)
+        with self.assertRaisesRegex(ValueError, "installed target drift"):
+            self.rollback(dry_run=True)
+        drifted.chmod(int(str(installed_record["mode"]), 8))
+
+        original_require_regular = INSTALLER.require_regular
+
+        def require_with_owner_drift(path, **kwargs):
+            metadata = original_require_regular(path, **kwargs)
+            if Path(path) != drifted:
+                return metadata
+            changed = mock.Mock()
+            changed.st_mode = metadata.st_mode
+            changed.st_nlink = metadata.st_nlink
+            changed.st_uid = metadata.st_uid + 1
+            changed.st_gid = metadata.st_gid
+            return changed
+
+        with mock.patch.object(
+            INSTALLER,
+            "require_regular",
+            side_effect=require_with_owner_drift,
+        ):
+            with self.assertRaisesRegex(ValueError, "installed target drift"):
+                self.rollback(dry_run=True)
+        self.assertFalse(self.recovery_claim().exists())
+
+    def test_service_state_is_validated_before_legacy_recovery(self) -> None:
+        before = tree_fingerprint(self.root)
+        with mock.patch.object(
+            INSTALLER,
+            "service_blockers",
+            return_value=["service must be stopped", "service must be disabled"],
+        ):
+            with self.assertRaisesRegex(ValueError, "service must be stopped"):
+                self.rollback(dry_run=True)
+        self.assertEqual(tree_fingerprint(self.root), before)
+        self.assertFalse(self.recovery_claim().exists())
+
+    def test_success_restores_exactly_ten_targets_and_claim_blocks_reuse(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.rollback(), 0)
+        self.assertIn("LEGACY_V1_ROLLED_BACK", output.getvalue())
+        self.assertEqual(len(INSTALLER.LEGACY_V1_CHANGED_TARGETS), 10)
+        for target_text in INSTALLER.LEGACY_V1_CHANGED_TARGETS:
+            destination = self.root / target_text.lstrip("/")
+            self.assertEqual(destination.read_bytes(), self.previous_payloads[target_text])
+        self.assertTrue(self.recovery_claim().is_file())
+        with self.assertRaisesRegex(ValueError, "already claimed"):
+            self.rollback()
+
+    def test_partial_restore_is_detected_and_remains_single_use(self) -> None:
+        def restore_only_nine(changed, previous, backup, root):
+            for state in changed[:9]:
+                record = previous[state.target.target]
+                INSTALLER.atomic_restore(
+                    backup / "files" / str(record["backup_name"]),
+                    state,
+                    int(str(record["mode"]), 8),
+                    int(record["uid"]),
+                    int(record["gid"]),
+                    root,
+                )
+
+        with mock.patch.object(INSTALLER, "restore_targets", side_effect=restore_only_nine):
+            with self.assertRaisesRegex(ValueError, "restore verification failed"):
+                self.rollback()
+        self.assertTrue(self.recovery_claim().is_file())
+        last = INSTALLER.LEGACY_V1_CHANGED_TARGETS[-1]
+        self.assertEqual(
+            (self.root / last.lstrip("/")).read_bytes(),
+            self.installed_payloads[last],
+        )
+        with self.assertRaisesRegex(ValueError, "already claimed"):
+            self.rollback()
+
+    def test_atomic_restore_failure_claims_before_any_target_write(self) -> None:
+        with mock.patch.object(
+            INSTALLER,
+            "atomic_restore",
+            side_effect=OSError("injected atomic restore failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected atomic restore failure"):
+                self.rollback()
+        self.assertTrue(self.recovery_claim().is_file())
+        for target_text in INSTALLER.LEGACY_V1_CHANGED_TARGETS:
+            destination = self.root / target_text.lstrip("/")
+            self.assertEqual(destination.read_bytes(), self.installed_payloads[target_text])
 
 
 class ServiceGateTests(unittest.TestCase):

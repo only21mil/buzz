@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -288,6 +289,36 @@ class ParentTier1ActivationTests(unittest.TestCase):
             "ExecStartPre=+/bin/bash /usr/local/libexec/buzz/verify-installed-agent %i",
             unit,
         )
+
+    def test_next_parent_install_writes_complete_v3_installed_records(self) -> None:
+        changed = [
+            SimpleNamespace(
+                target=SimpleNamespace(
+                    target="/etc/one",
+                    sha256="1" * 64,
+                    mode=0o640,
+                    uid=0,
+                    gid=0,
+                )
+            ),
+            SimpleNamespace(
+                target=SimpleNamespace(
+                    target="/usr/local/bin/two",
+                    sha256="2" * 64,
+                    mode=0o755,
+                    uid=0,
+                    gid=0,
+                )
+            ),
+        ]
+        self.assertEqual(
+            BRIDGE.INSTALL_RECEIPT_SCHEMA,
+            "buzz-mempool-genesis-install-receipt-v3",
+        )
+        records = BRIDGE.installed_records(changed)
+        self.assertEqual(set(records), {state.target.target for state in changed})
+        self.assertEqual(records["/etc/one"]["mode"], "0640")
+        self.assertEqual(records["/usr/local/bin/two"]["sha256"], "2" * 64)
 
     def test_services_are_checked_before_and_again_under_the_one_install_lock(self) -> None:
         source = BRIDGE_PATH.read_text()
