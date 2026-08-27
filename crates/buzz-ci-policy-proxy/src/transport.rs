@@ -1911,7 +1911,7 @@ fn validate_response_framing(
         }
         return Ok(ResponseFraming::Chunked);
     }
-    validate_framing(headers, max_body, false).map(ResponseFraming::ContentLength)
+    validate_framing(headers, max_body, false, false).map(ResponseFraming::ContentLength)
 }
 
 fn read_chunked_body(

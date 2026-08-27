@@ -518,8 +518,10 @@ impl RetainedDnsLease {
 ///
 /// `dns_exec` starts the materializer unit with its fixed handoff shim. The
 /// executor and runtime units remain dormant placeholders until their reviewed
-/// handoffs land. This lifecycle retains all three units under the same cleanup
-/// token and lease slice.
+/// handoffs land. The normal backend rejects direct Act process creation during
+/// preflight because recreating the retained executor unit would collide. This
+/// lifecycle retains all three units under the same cleanup token and lease
+/// slice.
 pub struct DnsLeaseLifecycle<R> {
     builder: DnsLeaseBuilder,
     executor: DnsExecutor<R>,

@@ -82,3 +82,39 @@ This candidate adds the fixed unit, command-plan boundary, bounded transport,
 descriptor receipt, and persistent materializer service loop. Production
 composition remains closed; the later normal execution backend only needs to
 join this handoff result with its root-owned nft/cgroup observations.
+
+## Normal execution successor closure
+
+The normal backend does not recreate the DNS-owned executor unit. Its current
+direct `systemd-run --unit=<executor>` implementation now returns
+`ExecutorUnitHandoffRequired` from preflight and repeats that guard in `spawn`.
+This closes the collision before the DNS lifecycle creates a slice, service,
+namespace, socket, or proxy listener. A later executor shim must accept the
+pinned Act launch through an authenticated descriptor and command handoff inside
+the already read-back executor service.
+
+The runtime service remains a dormant DNS-owned placeholder too. An
+`ActRuntimeDescriptorSource` must now prove readiness for the exact launch plan
+and validated attempt binding before proxy inputs are opened, then return a
+fresh one-shot Podman descriptor for each exchange. The proxy path retains its
+4,096-exchange ceiling, fixed transport caps, signed expected-exec population,
+and C2 ledger ownership.
+
+Every injected source now participates in ordinary preflight before host
+mutation. The exact remaining construction seams are
+`NormalMaterializationSource`, `BrokerProxyInputSource`,
+`ActRuntimeDescriptorSource`, `NormalTerminalCollector`, and
+`NormalTeardownCollector` in `crates/buzz-ci-execd/src/normal_backend.rs`.
+The first two already had exact-plan preflights; the runtime, terminal, and
+teardown sources now have the same fail-closed requirement. No canonical
+provider exists for these seams, and `ProductionAdapters::canonical()` in
+`crates/buzz-ci-execd/src/production_composition.rs` continues to return
+`HostBackendsMissing`.
+
+The B4 revision-2 response deadline and typed command-planning behavior remain
+in `crates/buzz-ci-execd/src/materializer_handoff.rs` and `dns_exec.rs`. The B5
+qualification backend is still a separate dependency in
+`crates/buzz-ci-execd/src/normal_qualification.rs`; this successor does not copy
+that candidate or invent its `NormalQualificationPrimitiveSet` bridge. Final
+all-or-closed composition must add that bridge with the five host providers
+above before canonical discovery can change.

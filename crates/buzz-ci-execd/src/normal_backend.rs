@@ -545,12 +545,20 @@ pub enum ActProxyLaunchError {
     /// Proxy construction, supervision, or the child process failed closed.
     #[error("Act proxy launch failed closed")]
     Unavailable,
+    /// DNS already owns the exact executor unit, so direct `systemd-run` would
+    /// collide with the retained placeholder instead of entering its cgroup.
+    #[error("the executor unit requires an authenticated process handoff")]
+    ExecutorUnitHandoffRequired,
 }
 
 /// Concurrent supervisor for pinned Act and one broker proxy lease.
 pub trait ActThroughProxyLauncher<P: PrestartPersister> {
-    /// Fail before listener creation when the reviewed mediator set is absent.
-    fn readiness(&self) -> Result<(), ActProxyLaunchError>;
+    /// Fail before listener creation when any exact host seam is unavailable.
+    fn readiness(
+        &self,
+        plan: &ActLaunchPlan,
+        binding: &ValidatedAttemptLeaseBinding,
+    ) -> Result<(), ActProxyLaunchError>;
 
     /// Run Act with the exact launch plan while serving its proxy exchanges.
     fn launch(
@@ -564,6 +572,16 @@ pub trait ActThroughProxyLauncher<P: PrestartPersister> {
 
 /// Root-owned source of fresh one-shot Podman connections for Act exchanges.
 pub trait ActRuntimeDescriptorSource {
+    /// Prove that the DNS-owned runtime unit can supply fresh lease-bound
+    /// descriptors before any ordinary host mutation begins.
+    fn preflight(
+        &self,
+        _plan: &ActLaunchPlan,
+        _binding: &ValidatedAttemptLeaseBinding,
+    ) -> Result<(), ActProxyLaunchError> {
+        Err(ActProxyLaunchError::Unavailable)
+    }
+
     /// Open one exact lease-bound descriptor before the next upstream exchange.
     fn next_upstream(
         &mut self,
@@ -585,6 +603,16 @@ pub trait ActChild {
 pub trait ActProcessSpawner {
     /// Concrete child controller.
     type Child: ActChild;
+
+    /// Prove that the pinned Act process can enter the exact DNS-owned
+    /// executor unit without attempting to create a colliding unit.
+    fn preflight(
+        &self,
+        _plan: &ActLaunchPlan,
+        _binding: &ValidatedAttemptLeaseBinding,
+    ) -> Result<(), ActProxyLaunchError> {
+        Err(ActProxyLaunchError::Unavailable)
+    }
 
     /// Start the pinned plan as the validated executor principal.
     fn spawn(
@@ -636,11 +664,20 @@ impl ActChild for SystemdActChild {
 impl ActProcessSpawner for SystemdActProcessSpawner {
     type Child = SystemdActChild;
 
+    fn preflight(
+        &self,
+        _plan: &ActLaunchPlan,
+        _binding: &ValidatedAttemptLeaseBinding,
+    ) -> Result<(), ActProxyLaunchError> {
+        Err(ActProxyLaunchError::ExecutorUnitHandoffRequired)
+    }
+
     fn spawn(
         &mut self,
         plan: &ActLaunchPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<Self::Child, ActProxyLaunchError> {
+        self.preflight(plan, binding)?;
         verify_act_binary(plan)?;
         let argv = plan.argv().map_err(|_| ActProxyLaunchError::Unavailable)?;
         let environment = plan
@@ -709,12 +746,16 @@ where
     D: ActRuntimeDescriptorSource,
     S: ActProcessSpawner,
 {
-    fn readiness(&self) -> Result<(), ActProxyLaunchError> {
+    fn readiness(
+        &self,
+        plan: &ActLaunchPlan,
+        binding: &ValidatedAttemptLeaseBinding,
+    ) -> Result<(), ActProxyLaunchError> {
         if self.maximum_exchanges == 0 || self.poll_interval.is_zero() {
-            Err(ActProxyLaunchError::Unavailable)
-        } else {
-            Ok(())
+            return Err(ActProxyLaunchError::Unavailable);
         }
+        self.descriptors.preflight(plan, binding)?;
+        self.spawner.preflight(plan, binding)
     }
 
     fn launch(
@@ -724,7 +765,7 @@ where
         binding: &ValidatedAttemptLeaseBinding,
         proxy: &mut BrokerProxyLease<P>,
     ) -> Result<(), ActProxyLaunchError> {
-        <Self as ActThroughProxyLauncher<P>>::readiness(self)?;
+        <Self as ActThroughProxyLauncher<P>>::readiness(self, plan, binding)?;
         if proxy.listener_path() != plan.proxy_socket {
             return Err(ActProxyLaunchError::Unavailable);
         }
@@ -917,6 +958,9 @@ where
         if self.active.is_some() || plan.argv().is_err() || plan.environment().is_err() {
             return Err(ExecutionUnavailable);
         }
+        self.launcher
+            .readiness(plan, binding)
+            .map_err(|_| ExecutionUnavailable)?;
         self.source.preflight(plan, binding)
     }
 
@@ -931,7 +975,7 @@ where
             return Err(ExecutionUnavailable);
         }
         self.launcher
-            .readiness()
+            .readiness(plan, binding)
             .map_err(|_| ExecutionUnavailable)?;
         let inputs = self.source.prepare(admission, lease, plan, binding)?;
         let mut manifest = inputs.manifest;
@@ -984,6 +1028,15 @@ where
 
 /// Host terminal evidence collector used after Act exits.
 pub trait NormalTerminalCollector {
+    /// Validate the exact terminal-evidence source before DNS or unit creation.
+    fn preflight(
+        &mut self,
+        _plan: &NormalJobPlan,
+        _binding: &ValidatedAttemptLeaseBinding,
+    ) -> Result<(), ExecutionUnavailable> {
+        Err(ExecutionUnavailable)
+    }
+
     /// Collect terminal outcome and the strict stop-through-upload ordering.
     fn collect(
         &mut self,
@@ -993,6 +1046,15 @@ pub trait NormalTerminalCollector {
 
 /// Final host teardown and receipt builder.
 pub trait NormalTeardownCollector {
+    /// Validate the exact teardown and readback source before host mutation.
+    fn preflight(
+        &mut self,
+        _plan: &NormalJobPlan,
+        _binding: &ValidatedAttemptLeaseBinding,
+    ) -> Result<(), ExecutionUnavailable> {
+        Err(ExecutionUnavailable)
+    }
+
     /// Prove the unit, cgroup, mounts, directories, and lease resources empty.
     fn reconcile(
         &mut self,
@@ -1043,6 +1105,8 @@ where
         }
         self.dns.preflight()?;
         self.materializer.preflight(plan, binding)?;
+        self.terminal.preflight(plan, binding)?;
+        self.teardown.preflight(plan, binding)?;
         self.proxy.preflight(&plan.act, binding)
     }
 
@@ -1235,6 +1299,15 @@ mod tests {
     struct FakeTerminal(Calls);
 
     impl NormalTerminalCollector for FakeTerminal {
+        fn preflight(
+            &mut self,
+            _plan: &NormalJobPlan,
+            _binding: &ValidatedAttemptLeaseBinding,
+        ) -> Result<(), ExecutionUnavailable> {
+            self.0.borrow_mut().push("terminal-preflight");
+            Ok(())
+        }
+
         fn collect(
             &mut self,
             _lease: LeaseToken,
@@ -1251,6 +1324,15 @@ mod tests {
     struct FakeTeardown(Calls);
 
     impl NormalTeardownCollector for FakeTeardown {
+        fn preflight(
+            &mut self,
+            _plan: &NormalJobPlan,
+            _binding: &ValidatedAttemptLeaseBinding,
+        ) -> Result<(), ExecutionUnavailable> {
+            self.0.borrow_mut().push("teardown-preflight");
+            Ok(())
+        }
+
         fn reconcile(
             &mut self,
             _lease: LeaseToken,
@@ -1472,6 +1554,8 @@ mod tests {
             vec![
                 "dns-preflight",
                 "materializer-preflight",
+                "terminal-preflight",
+                "teardown-preflight",
                 "proxy-preflight",
                 "dns-apply",
                 "materialize",
@@ -1524,5 +1608,26 @@ mod tests {
         assert!(calls.borrow().contains(&"materializer-reconcile"));
         assert!(calls.borrow().contains(&"dns-reconcile"));
         assert!(calls.borrow().contains(&"teardown"));
+    }
+
+    #[test]
+    fn direct_systemd_act_spawn_is_closed_before_executor_unit_collision() {
+        let fixture = ordinary_fixture();
+        let binding = fixture
+            .plan
+            .binding
+            .clone()
+            .validate_phase1(&fixture.plan.validation.context())
+            .expect("fixture binding should validate");
+        let mut spawner = SystemdActProcessSpawner;
+
+        assert_eq!(
+            spawner.preflight(&fixture.plan.act, &binding),
+            Err(ActProxyLaunchError::ExecutorUnitHandoffRequired)
+        );
+        assert!(matches!(
+            spawner.spawn(&fixture.plan.act, &binding),
+            Err(ActProxyLaunchError::ExecutorUnitHandoffRequired)
+        ));
     }
 }
