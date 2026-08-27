@@ -1,6 +1,6 @@
 # Buzz CI migration task board
 
-Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `2026-08-27T12:04:51Z`.
+Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `2026-08-27T12:44:41Z`.
 
 ## Routing state
 
@@ -19,6 +19,34 @@ Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `2026-08-27T12:04:51Z`.
 |---|---|
 | `P0-RELAY/B1` | `BCI-P0-RELAY-01` |
 | `P1-EXEC/B1` | `BCI-P1-EXEC-01` |
+
+## Source-only execution checkpoint
+
+These candidates are frozen and locally checked. No downstream authority is implied.
+
+| Stable work ID | Source candidate | Verified scope | Includes |
+|---|---|---|---|
+| `BCI-REVIEW-ENGINE-01` | `e7023d766b09edca854130c810d2e000a3396174` | `VERIFIED_SOURCE_ONLY` | Portable 5400-second Tier 2 engine candidate |
+| `BCI-REVIEW-C1-RECOVERY-01` | `c9229b6e7202c22ea5bd4f99161aedef5bc68f1f` | `VERIFIED_SOURCE_ONLY` | Exact C1 exhausted-transport recovery candidate |
+| `BCI-MGACT-01` | `92b1639b99cc2ea5d1c35c569a44fe8c964f528a` | `VERIFIED_SOURCE_ONLY` | Integrated persistence and rollback source candidate |
+| `BCI-GOV-LANDING-FACADE-01` | `be50713557bdedb7fce94967116c6ef054e500b2` | `VERIFIED_SOURCE_ONLY` | Current-schema landing facade candidate |
+| `BCI-BUZZ-CUMULATIVE-01` | `d7677e177b9e3732bf92962e00b5d7ba161ce03c` | `VERIFIED_SOURCE_ONLY` | Cumulative Buzz source integrating relay, normal execution composition, control and runner, deploy hardening, and normal qualification |
+
+## Closed downstream gates
+
+| Gate | State | Approval required |
+|---|---|---|
+| `tier2_review` | `NOT_STARTED` | `yes` |
+| `install` | `NOT_STARTED` | `yes` |
+| `push` | `NOT_STARTED` | `yes` |
+| `pr` | `NOT_STARTED` | `yes` |
+| `ci` | `NOT_STARTED` | `yes` |
+| `merge` | `NOT_STARTED` | `yes` |
+| `credentials_and_signing` | `NOT_STARTED` | `yes` |
+| `docker_sudo_services` | `NOT_STARTED` | `yes` |
+| `deployment` | `NOT_STARTED` | `yes` |
+| `mgact_activation` | `NOT_STARTED` | `yes` |
+| `live_parity` | `NOT_STARTED` | `yes` |
 
 ## Current candidates
 
@@ -44,11 +72,14 @@ Every row is non-routable while the owner stop remains in force.
 | `BCI-P1-HARD-C4` | Runner integration and promotion | `FROZEN` | `0ace191c25e4b5680779f95965910712eee1dec1` | `88734811828458a10752c9179724cd2e0542aee1` | `UNKNOWN` | Current-schema helper repair; exact-head CI; fresh review; exact promotion |
 | `BCI-P1-HARD-C5` | Production ready proof | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | CONTRADICTED candidate evidence: 81fc41a97790b3dcd31799f8cdbde4996070cc1b, 7d657e9c9850321c250c268d40c095662966baff, e13354dcf735a3204743f2347d06a1e414a4bae6; Candidate identity contradiction requires owner reconciliation; explicit no-push override; dependency integration |
 | `BCI-P1-HARD-C6` | Shared workflow schema | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | CONTRADICTED candidate evidence: 0a6d9541ba3aee1771442b93c7ef57e64fa0135f, 0e5b6ece65d416fde64c14acdd0750c66ce16148; Candidate identity contradiction; current authorized review closure absent; integration and exact-head CI required |
-| `BCI-REVIEW-ENGINE-01` | Portable 5400-second Tier 2 engine | `FROZEN` | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | Portable reviewed successor required before fleet promotion |
+| `BCI-REVIEW-ENGINE-01` | Portable 5400-second Tier 2 engine | `FROZEN` | `e7023d766b09edca854130c810d2e000a3396174` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; reviewed installation receipt; matching Framework and Yoga hashes |
+| `BCI-REVIEW-C1-RECOVERY-01` | C1 exhausted-transport recovery tool | `FROZEN` | `c9229b6e7202c22ea5bd4f99161aedef5bc68f1f` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; reviewed tool installation; exact legacy-state recovery receipt |
+| `BCI-GOV-LANDING-FACADE-01` | Current-schema landing facade | `FROZEN` | `be50713557bdedb7fce94967116c6ef054e500b2` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; helper ownership decision; host installation and exact-head use |
+| `BCI-BUZZ-CUMULATIVE-01` | Cumulative Buzz integration | `FROZEN` | `d7677e177b9e3732bf92962e00b5d7ba161ce03c` | `UNKNOWN` | `NOT_STARTED` | Tier 2 review approval; exact-head CI authority; push and PR authority; merge authority; production configuration and host acceptance |
 | `BCI-ECONOMICS-01` | CI economics rebase | `FROZEN` | `99dc03cd123708d9bcd6468f595a15a30a9b1fdf` | `UNKNOWN` | `UNKNOWN` | Exact-head CI; current review and promotion receipt |
 | `BCI-BUDGET-R3-01` | MasonsBudget native CI promotion | `FROZEN` | `ca670fde8399eadb21e3aa9e1a385e0a8b776f4a` | `UNKNOWN` | `UNKNOWN` | MasonsBudget authority; nine CI contexts; fresh review |
 | `BCI-PARITY-01` | Native CI parity promotion | `FROZEN` | `02f24e7af165a414cb2fb09821ed44b5fe6760bf` | `UNKNOWN` | `UNKNOWN` | PR and CI; source landing only; no activation authority |
-| `BCI-MGACT-01` | Mempool and Genesis repair integration | `FROZEN` | `UNKNOWN` | `UNKNOWN` | `UNKNOWN` | Inactive and disabled; clean persistence and rollback integration required; fresh package and v3 receipt required |
+| `BCI-MGACT-01` | Mempool and Genesis repair integration | `FROZEN` | `92b1639b99cc2ea5d1c35c569a44fe8c964f528a` | `UNKNOWN` | `NOT_STARTED` | Inactive and uninstalled; Tier 2 review approval; real-host preflight; credentials and signing approval; fresh package and v3 receipt; install and activation authority; live parity |
 
 ## Evidence precedence
 

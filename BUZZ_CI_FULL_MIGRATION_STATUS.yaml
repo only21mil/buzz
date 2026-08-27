@@ -1,7 +1,7 @@
 schema_version: 1
 metadata:
   title: Buzz CI full migration status
-  observed_at: '2026-08-27T12:04:51Z'
+  observed_at: '2026-08-27T12:44:41Z'
   controller: Sats Codex parent lane
   global_state: FROZEN_OWNER_STOP
   stop:
@@ -52,6 +52,51 @@ authoritative_truth:
     observed_at: '2026-08-27T12:04:51Z'
     evidence_ref: owner stop reconciliation recorded in recovery plan current truth
     note: Mempool and Genesis are inactive and disabled after failed activation. Older active claims are superseded.
+
+execution_checkpoint:
+  date: '2026-08-27'
+  observed_at: '2026-08-27T12:44:41Z'
+  scope: SOURCE_ONLY
+  evidence_ref: controller final reconciliation handoff for buzz_exec_core
+  source_candidates:
+    - id: BCI-REVIEW-ENGINE-01
+      candidate_sha: e7023d766b09edca854130c810d2e000a3396174
+      verification: VERIFIED_SOURCE_ONLY
+      includes: Portable 5400-second Tier 2 engine candidate
+    - id: BCI-REVIEW-C1-RECOVERY-01
+      candidate_sha: c9229b6e7202c22ea5bd4f99161aedef5bc68f1f
+      verification: VERIFIED_SOURCE_ONLY
+      includes: Exact C1 exhausted-transport recovery candidate
+    - id: BCI-MGACT-01
+      candidate_sha: 92b1639b99cc2ea5d1c35c569a44fe8c964f528a
+      verification: VERIFIED_SOURCE_ONLY
+      includes: Integrated persistence and rollback source candidate
+    - id: BCI-GOV-LANDING-FACADE-01
+      candidate_sha: be50713557bdedb7fce94967116c6ef054e500b2
+      verification: VERIFIED_SOURCE_ONLY
+      includes: Current-schema landing facade candidate
+    - id: BCI-BUZZ-CUMULATIVE-01
+      candidate_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+      verification: VERIFIED_SOURCE_ONLY
+      includes: Cumulative Buzz source integrating relay, normal execution composition, control and runner, deploy hardening, and normal qualification
+  downstream_states:
+    tier2_review: {state: NOT_STARTED, approval_required: true}
+    install: {state: NOT_STARTED, approval_required: true}
+    push: {state: NOT_STARTED, approval_required: true}
+    pr: {state: NOT_STARTED, approval_required: true}
+    ci: {state: NOT_STARTED, approval_required: true}
+    merge: {state: NOT_STARTED, approval_required: true}
+    credentials_and_signing: {state: NOT_STARTED, approval_required: true}
+    docker_sudo_services: {state: NOT_STARTED, approval_required: true}
+    deployment: {state: NOT_STARTED, approval_required: true}
+    mgact_activation: {state: NOT_STARTED, approval_required: true}
+    live_parity: {state: NOT_STARTED, approval_required: true}
+  remaining_host_contracts:
+    - Reviewed engine installation receipts and matching Framework and Yoga hashes
+    - Exact C1 legacy-state binding, preserved lineage and reviewer, and audited recovery receipt
+    - Current-schema landing helper ownership and host installation path
+    - Cumulative Buzz production configuration, closed host backends, and exact-head acceptance inputs
+    - MGACT real-host preflight, Codex-R parity manifest, distinct identities, credential handoff, v3 rollback receipt, and live channel policy
 
 work_items:
   - id: BCI-GOV-DELIVERY-01
@@ -460,21 +505,84 @@ work_items:
     lane: REVIEW-CONTROL
     program_state: FROZEN
     owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
-    observed_at: '2026-08-27T12:04:51Z'
-    evidence_ref: framework engine hash and owner 5400-second decision
+    observed_at: '2026-08-27T12:44:41Z'
+    evidence_ref: controller final reconciliation handoff for portable engine source candidate
     branch: null
-    candidate_sha: null
-    review_state: UNKNOWN
+    candidate_sha: e7023d766b09edca854130c810d2e000a3396174
+    review_state: NOT_STARTED
     promotion_sha: null
     landing_sha: null
     deployed_sha: null
-    blockers: [Portable reviewed successor required before fleet promotion]
+    blockers: [Tier 2 review approval, reviewed installation receipt, matching Framework and Yoga hashes]
     dependencies: []
     verification_state: UNKNOWN
     evidence:
-      - {tier: 2, ref: framework-tier2-engine-sha256-e56b77f3, claim: framework engine uses the 5400-second window}
-      - {tier: 5, ref: recovery-plan-tier2-fleet, claim: portable successor is not yet reviewed}
-    resolution: {selected_evidence_ref: framework-tier2-engine-sha256-e56b77f3}
+      - {tier: 1, ref: controller-final-portable-engine-source, claim: source candidate e7023d766b09edca854130c810d2e000a3396174 is frozen and locally checked}
+      - {tier: 2, ref: framework-tier2-engine-sha256-e56b77f3, claim: installed Framework engine predates this candidate}
+    resolution: {selected_evidence_ref: controller-final-portable-engine-source}
+    contradictions: []
+
+  - id: BCI-REVIEW-C1-RECOVERY-01
+    title: C1 exhausted-transport recovery tool
+    lane: REVIEW-CONTROL
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:44:41Z'
+    evidence_ref: controller final reconciliation handoff for C1 recovery source candidate
+    branch: null
+    candidate_sha: c9229b6e7202c22ea5bd4f99161aedef5bc68f1f
+    review_state: NOT_STARTED
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Tier 2 review approval, reviewed tool installation, exact legacy-state recovery receipt]
+    dependencies: [BCI-REVIEW-ENGINE-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: controller-final-c1-recovery-source, claim: source candidate c9229b6e7202c22ea5bd4f99161aedef5bc68f1f is frozen and locally checked}
+    resolution: {selected_evidence_ref: controller-final-c1-recovery-source}
+    contradictions: []
+
+  - id: BCI-GOV-LANDING-FACADE-01
+    title: Current-schema landing facade
+    lane: GOVERNANCE
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:44:41Z'
+    evidence_ref: controller final reconciliation handoff for landing facade source candidate
+    branch: null
+    candidate_sha: be50713557bdedb7fce94967116c6ef054e500b2
+    review_state: NOT_STARTED
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Tier 2 review approval, helper ownership decision, host installation and exact-head use]
+    dependencies: [BCI-GOV-DELIVERY-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: controller-final-landing-facade-source, claim: source candidate be50713557bdedb7fce94967116c6ef054e500b2 is frozen and locally checked}
+    resolution: {selected_evidence_ref: controller-final-landing-facade-source}
+    contradictions: []
+
+  - id: BCI-BUZZ-CUMULATIVE-01
+    title: Cumulative Buzz integration
+    lane: INTEGRATION
+    program_state: FROZEN
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T12:44:41Z'
+    evidence_ref: controller final reconciliation handoff for cumulative Buzz source candidate
+    branch: null
+    candidate_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+    review_state: NOT_STARTED
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Tier 2 review approval, exact-head CI authority, push and PR authority, merge authority, production configuration and host acceptance]
+    dependencies: [BCI-P0-RELAY-01, BCI-P1-EXEC-B5, BCI-P1-EXEC-B6, BCI-P1-HARD-C3, BCI-P1-HARD-C4, BCI-GOV-LANDING-FACADE-01]
+    verification_state: UNKNOWN
+    evidence:
+      - {tier: 1, ref: controller-final-cumulative-buzz-source, claim: source candidate d7677e177b9e3732bf92962e00b5d7ba161ce03c is frozen and locally checked}
+    resolution: {selected_evidence_ref: controller-final-cumulative-buzz-source}
     contradictions: []
 
   - id: BCI-ECONOMICS-01
@@ -545,19 +653,20 @@ work_items:
     lane: MGACT
     program_state: FROZEN
     owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
-    observed_at: '2026-08-27T12:04:51Z'
-    evidence_ref: recovery plan current truth and clean candidate directory inventory
-    branch: null
-    candidate_sha: null
-    review_state: UNKNOWN
+    observed_at: '2026-08-27T12:44:41Z'
+    evidence_ref: controller final reconciliation handoff and direct clean-worktree object readback
+    branch: sats/mgact-integrated-clean-20260827
+    candidate_sha: 92b1639b99cc2ea5d1c35c569a44fe8c964f528a
+    review_state: NOT_STARTED
     promotion_sha: null
     landing_sha: null
     deployed_sha: null
-    blockers: [Inactive and disabled, clean persistence and rollback integration required, fresh package and v3 receipt required]
+    blockers: [Inactive and uninstalled, Tier 2 review approval, real-host preflight, credentials and signing approval, fresh package and v3 receipt, install and activation authority, live parity]
     dependencies: [BCI-GOV-DELIVERY-01]
     verification_state: UNKNOWN
     evidence:
       - {tier: 1, ref: owner-stop-mgact-reconciliation, claim: agents inactive and disabled after failed activation}
-      - {tier: 3, ref: framework-mgact-clean-candidate-directory-inventory, claim: persistence and rollback candidates exist separately}
+      - {tier: 1, ref: controller-final-mgact-source, claim: integrated source candidate 92b1639b99cc2ea5d1c35c569a44fe8c964f528a is frozen and locally checked}
+      - {tier: 3, ref: framework-mgact-integrated-worktree-head, claim: candidate object and clean integration worktree are present}
     resolution: {selected_evidence_ref: owner-stop-mgact-reconciliation}
     contradictions: []

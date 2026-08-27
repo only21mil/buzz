@@ -35,6 +35,19 @@ EXPECTED_ALIASES = {
     "P0-RELAY/B1": "BCI-P0-RELAY-01",
     "P1-EXEC/B1": "BCI-P1-EXEC-01",
 }
+REQUIRED_DOWNSTREAM_GATES = {
+    "tier2_review",
+    "install",
+    "push",
+    "pr",
+    "ci",
+    "merge",
+    "credentials_and_signing",
+    "docker_sudo_services",
+    "deployment",
+    "mgact_activation",
+    "live_parity",
+}
 REQUIRED_ITEM_FIELDS = {
     "id",
     "title",
@@ -234,6 +247,37 @@ def validate_ledger(data: dict[str, Any]) -> None:
     if mgact.get("activation_state") != "INACTIVE" or mgact.get("program_state") != "FROZEN":
         raise LedgerError("authoritative_truth.mgact must be INACTIVE and FROZEN")
 
+    checkpoint = _require_mapping(data.get("execution_checkpoint"), "execution_checkpoint")
+    if checkpoint.get("scope") != "SOURCE_ONLY":
+        raise LedgerError("execution_checkpoint.scope must be SOURCE_ONLY")
+    checkpoint_candidates = checkpoint.get("source_candidates")
+    if not isinstance(checkpoint_candidates, list) or not checkpoint_candidates:
+        raise LedgerError("execution_checkpoint.source_candidates must be a non-empty list")
+    checkpoint_ids: set[str] = set()
+    for index, candidate in enumerate(checkpoint_candidates):
+        candidate = _require_mapping(candidate, f"execution_checkpoint.source_candidates[{index}]")
+        candidate_id = candidate.get("id")
+        if not isinstance(candidate_id, str) or WORK_ID_RE.fullmatch(candidate_id) is None or candidate_id in checkpoint_ids:
+            raise LedgerError("execution checkpoint candidate IDs must be unique stable work IDs")
+        checkpoint_ids.add(candidate_id)
+        _require_full_sha(candidate.get("candidate_sha"), f"execution_checkpoint.source_candidates[{index}].candidate_sha")
+        if candidate.get("verification") != "VERIFIED_SOURCE_ONLY":
+            raise LedgerError("execution checkpoint candidates must be VERIFIED_SOURCE_ONLY")
+        if not isinstance(candidate.get("includes"), str) or not candidate["includes"].strip():
+            raise LedgerError("execution checkpoint candidate includes text must be non-empty")
+    downstream = _require_mapping(checkpoint.get("downstream_states"), "execution_checkpoint.downstream_states")
+    if set(downstream) != REQUIRED_DOWNSTREAM_GATES:
+        raise LedgerError("execution checkpoint must define every required downstream gate exactly once")
+    for gate, raw_state in downstream.items():
+        state = _require_mapping(raw_state, f"execution_checkpoint.downstream_states.{gate}")
+        if state != {"state": "NOT_STARTED", "approval_required": True}:
+            raise LedgerError(f"execution checkpoint gate {gate} must be NOT_STARTED and approval-gated")
+    host_contracts = checkpoint.get("remaining_host_contracts")
+    if not isinstance(host_contracts, list) or not host_contracts or not all(
+        isinstance(contract, str) and contract.strip() for contract in host_contracts
+    ):
+        raise LedgerError("execution_checkpoint.remaining_host_contracts must be non-empty strings")
+
     for path, value in _walk_sha_fields(data):
         _require_full_sha(value, path, nullable=True)
 
@@ -259,7 +303,7 @@ def validate_ledger(data: dict[str, Any]) -> None:
             raise LedgerError(f"{where}.program_state is invalid")
         if global_state == "FROZEN_OWNER_STOP" and item["program_state"] in ACTIVE_STATES:
             raise LedgerError(f"{where} cannot be active under FROZEN_OWNER_STOP")
-        if item["review_state"] not in {"UNKNOWN", "REVIEWING", "REVIEW_CLOSED"}:
+        if item["review_state"] not in {"NOT_STARTED", "UNKNOWN", "REVIEWING", "REVIEW_CLOSED"}:
             raise LedgerError(f"{where}.review_state is invalid")
         if global_state == "FROZEN_OWNER_STOP" and item["review_state"] == "REVIEWING":
             raise LedgerError(f"{where} cannot have an active review under FROZEN_OWNER_STOP")
@@ -303,6 +347,11 @@ def validate_ledger(data: dict[str, Any]) -> None:
         unknown = sorted(set(item["dependencies"]) - ids)
         if unknown:
             raise LedgerError(f"work_items[{index}] has unknown dependencies: {', '.join(unknown)}")
+    item_by_id = {item["id"]: item for item in items}
+    for index, candidate in enumerate(checkpoint_candidates):
+        item = item_by_id.get(candidate["id"])
+        if item is None or item.get("candidate_sha") != candidate["candidate_sha"]:
+            raise LedgerError(f"execution checkpoint candidate {index} does not match its work item")
 
 
 def _sha_display(value: Any) -> str:
@@ -342,6 +391,32 @@ def render_taskboard(data: dict[str, Any]) -> str:
     ]
     for alias, work_id in sorted(data["aliases"]["legacy_b1"].items()):
         lines.append(f"| `{alias}` | `{work_id}` |")
+    lines.extend(
+        [
+            "",
+            "## Source-only execution checkpoint",
+            "",
+            "These candidates are frozen and locally checked. No downstream authority is implied.",
+            "",
+            "| Stable work ID | Source candidate | Verified scope | Includes |",
+            "|---|---|---|---|",
+        ]
+    )
+    for candidate in data["execution_checkpoint"]["source_candidates"]:
+        lines.append(
+            f"| `{candidate['id']}` | `{candidate['candidate_sha']}` | `{candidate['verification']}` | {_cell(candidate['includes'])} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Closed downstream gates",
+            "",
+            "| Gate | State | Approval required |",
+            "|---|---|---|",
+        ]
+    )
+    for gate, state in data["execution_checkpoint"]["downstream_states"].items():
+        lines.append(f"| `{gate}` | `{state['state']}` | `yes` |")
     lines.extend(
         [
             "",

@@ -78,6 +78,16 @@ class StatusLedgerTests(unittest.TestCase):
         ledger["work_items"][0]["review_state"] = "REVIEWING"
         self.assert_rejected(ledger, "cannot have an active review under FROZEN_OWNER_STOP")
 
+    def test_rejects_started_downstream_gate(self) -> None:
+        ledger = copy.deepcopy(self.ledger)
+        ledger["execution_checkpoint"]["downstream_states"]["ci"]["state"] = "RUNNING"
+        self.assert_rejected(ledger, "must be NOT_STARTED and approval-gated")
+
+    def test_checkpoint_candidate_must_match_work_item(self) -> None:
+        ledger = copy.deepcopy(self.ledger)
+        ledger["execution_checkpoint"]["source_candidates"][0]["candidate_sha"] = "f" * 40
+        self.assert_rejected(ledger, "does not match its work item")
+
     def test_rejects_unqualified_legacy_label(self) -> None:
         ledger = copy.deepcopy(self.ledger)
         ledger["work_items"][0]["title"] = "Unqualified B1 work"
