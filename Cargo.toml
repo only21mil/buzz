@@ -33,6 +33,7 @@ members = [
     "crates/buzz-ci-broker-protocol",
     "crates/buzz-ci-execd",
     "crates/buzz-ci-runner",
+    "crates/buzz-ci-controld",
     "crates/buzz-ci-isolation-contract",
     "crates/buzz-ci-materializer",
     "crates/buzz-ci-policy-proxy",
@@ -153,6 +154,7 @@ buzz-sdk = { path = "crates/buzz-sdk" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }
 buzz-ci-broker-protocol = { path = "crates/buzz-ci-broker-protocol" }
+buzz-ci-controld = { path = "crates/buzz-ci-controld" }
 
 # CI profile — builds the relay for desktop e2e. Dependencies keep full
 # release optimization (warm from main's cache; they carry the runtime hot
