@@ -791,10 +791,104 @@ class ActivationBundleTests(PackageFixture):
             readme,
         )
         self.assertIn(
-            'test "$(git -C "$PACKAGE_WT" rev-parse HEAD)" = '
-            '"$FULL_REVIEWED_SOURCE_COMMIT"',
+            'echo "failed to create package worktree from '
+            'FULL_REVIEWED_SOURCE_COMMIT" >&2',
             readme,
         )
+        self.assertIn('if [ "$PACKAGE_HEAD" != "$FULL_REVIEWED_SOURCE_COMMIT" ]', readme)
+        self.assertIn(
+            'echo "package worktree HEAD mismatch; refusing to continue" >&2',
+            readme,
+        )
+
+    def test_package_worktree_runbook_block_fails_closed(self) -> None:
+        readme = (ACTIVATION_DIR / "README.md").read_text()
+        block = readme.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        mock_bin = self.root / "runbook-bin"
+        mock_bin.mkdir(mode=0o700)
+        write_file(
+            mock_bin / "git",
+            b"""#!/bin/sh
+case "$*" in
+  *" cat-file -e "*) exit 0 ;;
+  *" worktree add "*)
+    if [ "${RUNBOOK_GIT_MODE:-}" = add-fail ]; then exit 12; fi
+    exit 0
+    ;;
+  *" rev-parse HEAD")
+    if [ "${RUNBOOK_GIT_MODE:-}" = head-fail ]; then exit 13; fi
+    printf '%s\\n' "${RUNBOOK_HEAD:-}"
+    exit 0
+    ;;
+esac
+exit 14
+""",
+            0o755,
+        )
+        write_file(mock_bin / "install", b"#!/bin/sh\nexit 0\n", 0o755)
+        reviewed = "a" * 40
+
+        def run(mode: str, head: str) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                ["/bin/sh"],
+                input=block.encode(),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    "PATH": str(mock_bin),
+                    "FULL_REVIEWED_SOURCE_COMMIT": reviewed,
+                    "RUNBOOK_GIT_MODE": mode,
+                    "RUNBOOK_HEAD": head,
+                },
+            )
+
+        accepted = run("ok", reviewed)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr.decode())
+
+        add_failed = run("add-fail", reviewed)
+        self.assertNotEqual(add_failed.returncode, 0)
+        self.assertIn(b"failed to create package worktree", add_failed.stderr)
+
+        head_failed = run("head-fail", reviewed)
+        self.assertNotEqual(head_failed.returncode, 0)
+        self.assertIn(b"failed to read package worktree HEAD", head_failed.stderr)
+
+        mismatched = run("ok", "b" * 40)
+        self.assertNotEqual(mismatched.returncode, 0)
+        self.assertIn(b"package worktree HEAD mismatch", mismatched.stderr)
+
+    def test_runbook_shell_and_path_state_contract_is_consistent(self) -> None:
+        readme = (ACTIVATION_DIR / "README.md").read_text()
+        blocks = [part.split("\n```", 1)[0] for part in readme.split("```sh\n")[1:]]
+        syntax = subprocess.run(
+            ["/bin/sh", "-n"],
+            input="\n".join(blocks).encode(),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr.decode())
+
+        self.assertIn('PACKAGE_DIR="$PACKAGE_WT/candidate-final"', readme)
+        self.assertEqual(readme.count('$PACKAGE_WT/candidate-final'), 1)
+        self.assertNotIn('$STAGE/candidate-final', readme)
+        self.assertIn('--output "$PACKAGE_DIR"', readme)
+        self.assertIn('--bundle-manifest "$PACKAGE_DIR/bundle-manifest.json"', readme)
+        self.assertIn(
+            '"$PACKAGE_DIR/ops-root/home/victor/.agents/tools/'
+            'buzz-sats-channel-sweep.sh" --check',
+            readme,
+        )
+        self.assertEqual(readme.count('--bundle "$PACKAGE_DIR"'), 4)
+
+        self.assertIn('PARITY_DIR="$STAGE/capability-parity"', readme)
+        self.assertIn('TIER2_STATE_DIR="$STAGE/tier2-r1"', readme)
+        self.assertIn('TIER2_STATE_FILE=$("$TIER2" prepare', readme)
+        self.assertNotIn('$STATE/', readme)
+        self.assertNotIn('\nSTATE=$("$TIER2" prepare', readme)
+        self.assertNotIn('--tier2-state "$STATE"', readme)
+        self.assertNotIn('\nSTATE_DIR="$STAGE/tier2-r1"', readme)
 
     def test_installer_revalidates_state_dir_before_building_closure(self) -> None:
         targets = []
