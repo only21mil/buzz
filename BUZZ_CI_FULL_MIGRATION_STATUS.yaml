@@ -1,13 +1,13 @@
 schema_version: 1
 metadata:
   title: Buzz CI full migration status
-  observed_at: '2026-08-27T12:44:41Z'
+  observed_at: '2026-08-27T13:08:59Z'
   controller: Sats Codex parent lane
   global_state: FROZEN_OWNER_STOP
   stop:
     owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
     thread_event: 76c91baf9383c1693d62701652cd4f61f786946615bb012e9b7a5aec68885d93
-    effect: No code, review, retry, push, PR, merge, CI trigger, service, deployment, activation, or canon work may resume without new scoped authority from Victor or Rachel.
+    effect: The migration remains frozen except for the scoped repository-delivery actions and active web-app parity assignment recorded below. Merge, install, deployment, activation, service, and canon gates remain closed.
 
 evidence_precedence:
   - tier: 1
@@ -55,7 +55,7 @@ authoritative_truth:
 
 execution_checkpoint:
   date: '2026-08-27'
-  observed_at: '2026-08-27T12:44:41Z'
+  observed_at: '2026-08-27T13:08:59Z'
   scope: SOURCE_ONLY
   evidence_ref: controller final reconciliation handoff for buzz_exec_core
   source_candidates:
@@ -82,9 +82,9 @@ execution_checkpoint:
   downstream_states:
     tier2_review: {state: NOT_STARTED, approval_required: true}
     install: {state: NOT_STARTED, approval_required: true}
-    push: {state: NOT_STARTED, approval_required: true}
-    pr: {state: NOT_STARTED, approval_required: true}
-    ci: {state: NOT_STARTED, approval_required: true}
+    push: {state: COMPLETE, approval_required: true, authority: standing full repository-delivery authorization}
+    pr: {state: DRAFT_OPEN, approval_required: true, authority: standing full repository-delivery authorization}
+    ci: {state: RUNNING, approval_required: true, authority: draft PR exact-head tracking}
     merge: {state: NOT_STARTED, approval_required: true}
     credentials_and_signing: {state: NOT_STARTED, approval_required: true}
     docker_sudo_services: {state: NOT_STARTED, approval_required: true}
@@ -97,6 +97,52 @@ execution_checkpoint:
     - Current-schema landing helper ownership and host installation path
     - Cumulative Buzz production configuration, closed host backends, and exact-head acceptance inputs
     - MGACT real-host preflight, Codex-R parity manifest, distinct identities, credential handoff, v3 rollback receipt, and live channel policy
+
+repository_delivery:
+  observed_at: '2026-08-27T13:08:59Z'
+  source_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+  base_sha: 148cad107f22f0b73aab23e559406beafaf57e64
+  branch: sats/bci-p1-cumulative-successor-20260827
+  relay:
+    status: PUBLISHED
+    clone_url: https://framework-desktop.tail69757d.ts.net:38443/git/73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812/buzz
+    ref: refs/heads/sats/bci-p1-cumulative-successor-20260827
+    ref_url: https://framework-desktop.tail69757d.ts.net:38443/git/73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812/buzz#refs/heads/sats/bci-p1-cumulative-successor-20260827
+    ref_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+  github_mirror:
+    status: MIRRORED
+    ref: refs/heads/sats/bci-p1-cumulative-successor-20260827
+    ref_url: https://github.com/only21mil/buzz/tree/sats/bci-p1-cumulative-successor-20260827
+    ref_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+  buzz_issue:
+    status: OPEN
+    event_id: d3276e465093a35318ffda37f06346caa1ecf5412509ba2d5d33d9e7402648e2
+    external_id: buzz-recovery-native-ci-20260827
+    url: buzz://issue?id=d3276e465093a35318ffda37f06346caa1ecf5412509ba2d5d33d9e7402648e2&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz
+  buzz_pr:
+    status: DRAFT
+    event_id: 5e556209c04dd6bb6d9704a7f009710507290f7b66998e05f7fdf832aa3c6569
+    draft_status_event_id: bac8c4c943bbd7b82cfc9e32fa140e40c190839210850818d4264aaddc283a40
+    external_id: buzz-recovery-native-ci-cumulative-d7677e177b9e
+    url: buzz://pr?id=5e556209c04dd6bb6d9704a7f009710507290f7b66998e05f7fdf832aa3c6569&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz
+  github_pr:
+    status: OPEN
+    draft: true
+    number: 107
+    url: https://github.com/only21mil/buzz/pull/107
+    head_ref: sats/bci-p1-cumulative-successor-20260827
+    head_sha: d7677e177b9e3732bf92962e00b5d7ba161ce03c
+    base_ref: main
+    base_sha: 148cad107f22f0b73aab23e559406beafaf57e64
+    ci_state: RUNNING
+    check_snapshot: {total: 24, success: 8, skipped: 4, pending: 12, failed: 0}
+  required_workflows:
+    lifecycle_rule: Full exact-head matrix at the landing SHA plus Tier 2 at the same frozen SHA
+    ci_workflow: .github/workflows/ci.yml
+    ci_jobs: [changes, rust-lint, unit-tests, desktop-core, desktop-smoke-e2e, desktop, desktop-e2e-relay, desktop-e2e-integration-shard, desktop-e2e-integration, backend-integration, relay-e2e, web, mobile, security, dead-token-guard, server-cross-compile, desktop-build-macos]
+    applicable_pr_workflows: [.github/workflows/auto-tag-on-release-pr-merge.yml, .github/workflows/benchmark-harbor.yml, .github/workflows/ci.yml, .github/workflows/desktop-release-candidate.yml, .github/workflows/docker-pr.yml, .github/workflows/helm-chart.yml, .github/workflows/mesh-lifecycle.yml, .github/workflows/push-gateway-helm-chart.yml, .github/workflows/sprig-image.yml]
+    github_main_protection: UNPROTECTED
+  missing_gates: [Full exact-head CI closure, Tier 2 terminal verdict and commit check, production adapters, MGACT parity and host acceptance, deploy receipts, separate deployment authority, separate activation authority, web-app parity exact candidate and evidence]
 
 work_items:
   - id: BCI-GOV-DELIVERY-01
@@ -669,4 +715,43 @@ work_items:
       - {tier: 1, ref: controller-final-mgact-source, claim: integrated source candidate 92b1639b99cc2ea5d1c35c569a44fe8c964f528a is frozen and locally checked}
       - {tier: 3, ref: framework-mgact-integrated-worktree-head, claim: candidate object and clean integration worktree are present}
     resolution: {selected_evidence_ref: owner-stop-mgact-reconciliation}
+    contradictions: []
+
+  - id: BCI-WEB-PARITY-01
+    title: Browser and web-app native parity
+    lane: WEB-APP
+    program_state: INTEGRATING
+    owner_event: 34be6e954260edb1745448e89cc5a6484198fbbe4ae6abcda94f1a55a52d5f5f
+    observed_at: '2026-08-27T13:04:24Z'
+    evidence_ref: controller scoped assignment to /root/web_app_parity
+    branch: null
+    candidate_sha: null
+    review_state: NOT_STARTED
+    promotion_sha: null
+    landing_sha: null
+    deployed_sha: null
+    blockers: [Exact candidate evidence not yet received, tests and deployment evidence pending, do not mark complete]
+    dependencies: []
+    verification_state: UNKNOWN
+    scoped_active:
+      authority: controller assignment under standing full authorization
+      owner_agent: /root/web_app_parity
+      model: gpt-5.6-sol
+      effort: high
+    requirements:
+      - Native parity for authentication and authorization scopes
+      - Channels, direct messages, mentions, membership, roles, and privacy
+      - Identity handling for Mempool, Genesis, Sats Codex-R, and approved Sats identities
+      - Notifications, settings, and CI observability
+      - Current schemas and APIs
+      - Reconnect, retry, offline, stale-state, and cursor recovery
+      - Responsive desktop, phone, and unfolded Fold 852 by 883 dp layouts
+      - Keyboard, focus, semantic, contrast, zoom, and reduced-motion accessibility
+      - Chrome, Firefox, and WebKit coverage
+      - CSP, origin, storage, credential, cache, and browser security
+      - Focused unit, integration, end-to-end, and deliberate-failure tests
+      - Reviewed deployment and rollback plan
+    evidence:
+      - {tier: 1, ref: controller-web-app-parity-assignment, claim: workstream active under /root/web_app_parity with no exact candidate yet}
+    resolution: {selected_evidence_ref: controller-web-app-parity-assignment}
     contradictions: []

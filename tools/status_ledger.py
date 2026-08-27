@@ -48,6 +48,19 @@ REQUIRED_DOWNSTREAM_GATES = {
     "mgact_activation",
     "live_parity",
 }
+EXPECTED_DOWNSTREAM_STATES = {
+    "tier2_review": "NOT_STARTED",
+    "install": "NOT_STARTED",
+    "push": "COMPLETE",
+    "pr": "DRAFT_OPEN",
+    "ci": "RUNNING",
+    "merge": "NOT_STARTED",
+    "credentials_and_signing": "NOT_STARTED",
+    "docker_sudo_services": "NOT_STARTED",
+    "deployment": "NOT_STARTED",
+    "mgact_activation": "NOT_STARTED",
+    "live_parity": "NOT_STARTED",
+}
 REQUIRED_ITEM_FIELDS = {
     "id",
     "title",
@@ -102,6 +115,11 @@ def _require_full_sha(value: Any, where: str, *, nullable: bool = False) -> None
 def _require_event_id(value: Any, where: str) -> None:
     if not isinstance(value, str) or EVENT_ID_RE.fullmatch(value) is None:
         raise LedgerError(f"{where} must be exactly 64 lowercase hexadecimal characters")
+
+
+def _require_url(value: Any, where: str, schemes: tuple[str, ...]) -> None:
+    if not isinstance(value, str) or not value.startswith(schemes):
+        raise LedgerError(f"{where} must use one of these URL schemes: {', '.join(schemes)}")
 
 
 def _walk_sha_fields(value: Any, path: str = "ledger") -> Iterable[tuple[str, Any]]:
@@ -270,13 +288,92 @@ def validate_ledger(data: dict[str, Any]) -> None:
         raise LedgerError("execution checkpoint must define every required downstream gate exactly once")
     for gate, raw_state in downstream.items():
         state = _require_mapping(raw_state, f"execution_checkpoint.downstream_states.{gate}")
-        if state != {"state": "NOT_STARTED", "approval_required": True}:
-            raise LedgerError(f"execution checkpoint gate {gate} must be NOT_STARTED and approval-gated")
+        if state.get("state") != EXPECTED_DOWNSTREAM_STATES[gate] or state.get("approval_required") is not True:
+            raise LedgerError(f"execution checkpoint gate {gate} has an invalid state or approval record")
+        if state["state"] != "NOT_STARTED" and (
+            not isinstance(state.get("authority"), str) or not state["authority"].strip()
+        ):
+            raise LedgerError(f"execution checkpoint gate {gate} requires recorded authority")
     host_contracts = checkpoint.get("remaining_host_contracts")
     if not isinstance(host_contracts, list) or not host_contracts or not all(
         isinstance(contract, str) and contract.strip() for contract in host_contracts
     ):
         raise LedgerError("execution_checkpoint.remaining_host_contracts must be non-empty strings")
+
+    delivery = _require_mapping(data.get("repository_delivery"), "repository_delivery")
+    source_sha = delivery.get("source_sha")
+    base_sha = delivery.get("base_sha")
+    _require_full_sha(source_sha, "repository_delivery.source_sha")
+    _require_full_sha(base_sha, "repository_delivery.base_sha")
+    branch = delivery.get("branch")
+    if not isinstance(branch, str) or not branch.startswith("sats/"):
+        raise LedgerError("repository_delivery.branch must be a qualified sats branch")
+    expected_ref = f"refs/heads/{branch}"
+    for name, expected_status in (("relay", "PUBLISHED"), ("github_mirror", "MIRRORED")):
+        ref_record = _require_mapping(delivery.get(name), f"repository_delivery.{name}")
+        if ref_record.get("status") != expected_status or ref_record.get("ref") != expected_ref:
+            raise LedgerError(f"repository_delivery.{name} status or ref is invalid")
+        _require_full_sha(ref_record.get("ref_sha"), f"repository_delivery.{name}.ref_sha")
+        if ref_record["ref_sha"] != source_sha:
+            raise LedgerError(f"repository_delivery.{name} is not bound to source_sha")
+        _require_url(ref_record.get("ref_url"), f"repository_delivery.{name}.ref_url", ("https://",))
+    _require_url(delivery["relay"].get("clone_url"), "repository_delivery.relay.clone_url", ("https://",))
+
+    issue = _require_mapping(delivery.get("buzz_issue"), "repository_delivery.buzz_issue")
+    if issue.get("status") != "OPEN":
+        raise LedgerError("repository_delivery.buzz_issue.status must be OPEN")
+    _require_event_id(issue.get("event_id"), "repository_delivery.buzz_issue.event_id")
+    _require_url(issue.get("url"), "repository_delivery.buzz_issue.url", ("buzz://issue",))
+    if not isinstance(issue.get("external_id"), str) or not issue["external_id"].strip():
+        raise LedgerError("repository_delivery.buzz_issue.external_id must be non-empty")
+
+    buzz_pr = _require_mapping(delivery.get("buzz_pr"), "repository_delivery.buzz_pr")
+    if buzz_pr.get("status") != "DRAFT":
+        raise LedgerError("repository_delivery.buzz_pr.status must be DRAFT")
+    _require_event_id(buzz_pr.get("event_id"), "repository_delivery.buzz_pr.event_id")
+    _require_event_id(
+        buzz_pr.get("draft_status_event_id"),
+        "repository_delivery.buzz_pr.draft_status_event_id",
+    )
+    _require_url(buzz_pr.get("url"), "repository_delivery.buzz_pr.url", ("buzz://pr",))
+    if not isinstance(buzz_pr.get("external_id"), str) or not buzz_pr["external_id"].strip():
+        raise LedgerError("repository_delivery.buzz_pr.external_id must be non-empty")
+
+    github_pr = _require_mapping(delivery.get("github_pr"), "repository_delivery.github_pr")
+    if github_pr.get("status") != "OPEN" or github_pr.get("draft") is not True:
+        raise LedgerError("repository_delivery.github_pr must be an open draft")
+    if not isinstance(github_pr.get("number"), int) or github_pr["number"] <= 0:
+        raise LedgerError("repository_delivery.github_pr.number must be positive")
+    _require_url(github_pr.get("url"), "repository_delivery.github_pr.url", ("https://github.com/",))
+    _require_full_sha(github_pr.get("head_sha"), "repository_delivery.github_pr.head_sha")
+    _require_full_sha(github_pr.get("base_sha"), "repository_delivery.github_pr.base_sha")
+    if (
+        github_pr["head_sha"] != source_sha
+        or github_pr["base_sha"] != base_sha
+        or github_pr.get("head_ref") != branch
+        or github_pr.get("base_ref") != "main"
+        or github_pr.get("ci_state") != "RUNNING"
+    ):
+        raise LedgerError("repository_delivery.github_pr is not bound to the exact source/base state")
+    snapshot = _require_mapping(github_pr.get("check_snapshot"), "repository_delivery.github_pr.check_snapshot")
+    counts = [snapshot.get(key) for key in ("total", "success", "skipped", "pending", "failed")]
+    if not all(isinstance(value, int) and value >= 0 for value in counts):
+        raise LedgerError("repository_delivery.github_pr.check_snapshot counts must be nonnegative integers")
+    if snapshot["total"] != snapshot["success"] + snapshot["skipped"] + snapshot["pending"] + snapshot["failed"]:
+        raise LedgerError("repository_delivery.github_pr.check_snapshot counts do not sum to total")
+
+    workflows = _require_mapping(delivery.get("required_workflows"), "repository_delivery.required_workflows")
+    jobs = workflows.get("ci_jobs")
+    if not isinstance(jobs, list) or len(jobs) != 17 or len(set(jobs)) != 17:
+        raise LedgerError("repository_delivery.required_workflows.ci_jobs must contain 17 unique jobs")
+    pr_workflows = workflows.get("applicable_pr_workflows")
+    if not isinstance(pr_workflows, list) or not pr_workflows:
+        raise LedgerError("repository_delivery.required_workflows.applicable_pr_workflows must be non-empty")
+    if workflows.get("github_main_protection") != "UNPROTECTED":
+        raise LedgerError("repository_delivery.required_workflows.github_main_protection must match readback")
+    missing_gates = delivery.get("missing_gates")
+    if not isinstance(missing_gates, list) or not missing_gates:
+        raise LedgerError("repository_delivery.missing_gates must be non-empty")
 
     for path, value in _walk_sha_fields(data):
         _require_full_sha(value, path, nullable=True)
@@ -302,7 +399,21 @@ def validate_ledger(data: dict[str, Any]) -> None:
         if item["program_state"] not in ALLOWED_STATES:
             raise LedgerError(f"{where}.program_state is invalid")
         if global_state == "FROZEN_OWNER_STOP" and item["program_state"] in ACTIVE_STATES:
-            raise LedgerError(f"{where} cannot be active under FROZEN_OWNER_STOP")
+            scoped = item.get("scoped_active")
+            if scoped != {
+                "authority": "controller assignment under standing full authorization",
+                "owner_agent": "/root/web_app_parity",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+            }:
+                raise LedgerError(f"{where} cannot be active under FROZEN_OWNER_STOP without exact scoped authority")
+            if item.get("candidate_sha") is not None or item.get("verification_state") != "UNKNOWN":
+                raise LedgerError(f"{where} scoped active work must remain UNKNOWN until exact candidate evidence")
+            requirements = item.get("requirements")
+            if not isinstance(requirements, list) or not requirements or not all(
+                isinstance(requirement, str) and requirement.strip() for requirement in requirements
+            ):
+                raise LedgerError(f"{where}.requirements must be non-empty strings")
         if item["review_state"] not in {"NOT_STARTED", "UNKNOWN", "REVIEWING", "REVIEW_CLOSED"}:
             raise LedgerError(f"{where}.review_state is invalid")
         if global_state == "FROZEN_OWNER_STOP" and item["review_state"] == "REVIEWING":
@@ -352,6 +463,9 @@ def validate_ledger(data: dict[str, Any]) -> None:
         item = item_by_id.get(candidate["id"])
         if item is None or item.get("candidate_sha") != candidate["candidate_sha"]:
             raise LedgerError(f"execution checkpoint candidate {index} does not match its work item")
+    cumulative = item_by_id.get("BCI-BUZZ-CUMULATIVE-01")
+    if cumulative is None or cumulative.get("candidate_sha") != source_sha:
+        raise LedgerError("repository delivery source does not match the cumulative work item")
 
 
 def _sha_display(value: Any) -> str:
@@ -409,7 +523,7 @@ def render_taskboard(data: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## Closed downstream gates",
+            "## Downstream delivery states",
             "",
             "| Gate | State | Approval required |",
             "|---|---|---|",
@@ -417,6 +531,32 @@ def render_taskboard(data: dict[str, Any]) -> str:
     )
     for gate, state in data["execution_checkpoint"]["downstream_states"].items():
         lines.append(f"| `{gate}` | `{state['state']}` | `yes` |")
+    delivery = data["repository_delivery"]
+    lines.extend(
+        [
+            "",
+            "## Repository delivery tracking",
+            "",
+            "| Record | Status | Exact target |",
+            "|---|---|---|",
+            f"| Relay feature ref | `{delivery['relay']['status']}` | `{delivery['relay']['ref_url']}` at `{delivery['relay']['ref_sha']}` |",
+            f"| GitHub mirror ref | `{delivery['github_mirror']['status']}` | [{delivery['branch']}]({delivery['github_mirror']['ref_url']}) at `{delivery['github_mirror']['ref_sha']}` |",
+            f"| Buzz issue | `{delivery['buzz_issue']['status']}` | `{delivery['buzz_issue']['url']}` |",
+            f"| Buzz PR | `{delivery['buzz_pr']['status']}` | `{delivery['buzz_pr']['url']}` |",
+            f"| GitHub PR #{delivery['github_pr']['number']} | `DRAFT / {delivery['github_pr']['ci_state']}` | [PR #{delivery['github_pr']['number']}]({delivery['github_pr']['url']}) at `{delivery['github_pr']['head_sha']}` |",
+            "",
+            "## Active workstreams",
+            "",
+            "| Stable work ID | Owner | Profile | State | Candidate |",
+            "|---|---|---|---|---|",
+        ]
+    )
+    for item in data["work_items"]:
+        scoped = item.get("scoped_active")
+        if scoped:
+            lines.append(
+                f"| `{item['id']}` | `{scoped['owner_agent']}` | `{scoped['model']} · {scoped['effort']}` | `{item['program_state']}` | `{_sha_display(item['candidate_sha'])}` |"
+            )
     lines.extend(
         [
             "",

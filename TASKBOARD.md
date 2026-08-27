@@ -1,10 +1,10 @@
 # Buzz CI migration task board
 
-Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `2026-08-27T12:44:41Z`.
+Generated from `BUZZ_CI_FULL_MIGRATION_STATUS.yaml` at `2026-08-27T13:08:59Z`.
 
 ## Routing state
 
-`FROZEN_OWNER_STOP`. No code, review, retry, push, PR, merge, CI trigger, service, deployment, activation, or canon work may resume without new scoped authority from Victor or Rachel.
+`FROZEN_OWNER_STOP`. The migration remains frozen except for the scoped repository-delivery actions and active web-app parity assignment recorded below. Merge, install, deployment, activation, service, and canon gates remain closed.
 
 | Truth | Value | Evidence |
 |---|---|---|
@@ -32,21 +32,37 @@ These candidates are frozen and locally checked. No downstream authority is impl
 | `BCI-GOV-LANDING-FACADE-01` | `be50713557bdedb7fce94967116c6ef054e500b2` | `VERIFIED_SOURCE_ONLY` | Current-schema landing facade candidate |
 | `BCI-BUZZ-CUMULATIVE-01` | `d7677e177b9e3732bf92962e00b5d7ba161ce03c` | `VERIFIED_SOURCE_ONLY` | Cumulative Buzz source integrating relay, normal execution composition, control and runner, deploy hardening, and normal qualification |
 
-## Closed downstream gates
+## Downstream delivery states
 
 | Gate | State | Approval required |
 |---|---|---|
 | `tier2_review` | `NOT_STARTED` | `yes` |
 | `install` | `NOT_STARTED` | `yes` |
-| `push` | `NOT_STARTED` | `yes` |
-| `pr` | `NOT_STARTED` | `yes` |
-| `ci` | `NOT_STARTED` | `yes` |
+| `push` | `COMPLETE` | `yes` |
+| `pr` | `DRAFT_OPEN` | `yes` |
+| `ci` | `RUNNING` | `yes` |
 | `merge` | `NOT_STARTED` | `yes` |
 | `credentials_and_signing` | `NOT_STARTED` | `yes` |
 | `docker_sudo_services` | `NOT_STARTED` | `yes` |
 | `deployment` | `NOT_STARTED` | `yes` |
 | `mgact_activation` | `NOT_STARTED` | `yes` |
 | `live_parity` | `NOT_STARTED` | `yes` |
+
+## Repository delivery tracking
+
+| Record | Status | Exact target |
+|---|---|---|
+| Relay feature ref | `PUBLISHED` | `https://framework-desktop.tail69757d.ts.net:38443/git/73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812/buzz#refs/heads/sats/bci-p1-cumulative-successor-20260827` at `d7677e177b9e3732bf92962e00b5d7ba161ce03c` |
+| GitHub mirror ref | `MIRRORED` | [sats/bci-p1-cumulative-successor-20260827](https://github.com/only21mil/buzz/tree/sats/bci-p1-cumulative-successor-20260827) at `d7677e177b9e3732bf92962e00b5d7ba161ce03c` |
+| Buzz issue | `OPEN` | `buzz://issue?id=d3276e465093a35318ffda37f06346caa1ecf5412509ba2d5d33d9e7402648e2&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz` |
+| Buzz PR | `DRAFT` | `buzz://pr?id=5e556209c04dd6bb6d9704a7f009710507290f7b66998e05f7fdf832aa3c6569&owner=73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812&d=buzz` |
+| GitHub PR #107 | `DRAFT / RUNNING` | [PR #107](https://github.com/only21mil/buzz/pull/107) at `d7677e177b9e3732bf92962e00b5d7ba161ce03c` |
+
+## Active workstreams
+
+| Stable work ID | Owner | Profile | State | Candidate |
+|---|---|---|---|---|
+| `BCI-WEB-PARITY-01` | `/root/web_app_parity` | `gpt-5.6-sol · high` | `INTEGRATING` | `UNKNOWN` |
 
 ## Current candidates
 
@@ -80,6 +96,7 @@ Every row is non-routable while the owner stop remains in force.
 | `BCI-BUDGET-R3-01` | MasonsBudget native CI promotion | `FROZEN` | `ca670fde8399eadb21e3aa9e1a385e0a8b776f4a` | `UNKNOWN` | `UNKNOWN` | MasonsBudget authority; nine CI contexts; fresh review |
 | `BCI-PARITY-01` | Native CI parity promotion | `FROZEN` | `02f24e7af165a414cb2fb09821ed44b5fe6760bf` | `UNKNOWN` | `UNKNOWN` | PR and CI; source landing only; no activation authority |
 | `BCI-MGACT-01` | Mempool and Genesis repair integration | `FROZEN` | `92b1639b99cc2ea5d1c35c569a44fe8c964f528a` | `UNKNOWN` | `NOT_STARTED` | Inactive and uninstalled; Tier 2 review approval; real-host preflight; credentials and signing approval; fresh package and v3 receipt; install and activation authority; live parity |
+| `BCI-WEB-PARITY-01` | Browser and web-app native parity | `INTEGRATING` | `UNKNOWN` | `UNKNOWN` | `NOT_STARTED` | Exact candidate evidence not yet received; tests and deployment evidence pending; do not mark complete |
 
 ## Evidence precedence
 

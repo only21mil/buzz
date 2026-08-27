@@ -71,7 +71,7 @@ class StatusLedgerTests(unittest.TestCase):
     def test_rejects_active_work_under_owner_stop(self) -> None:
         ledger = copy.deepcopy(self.ledger)
         ledger["work_items"][0]["program_state"] = "INTEGRATING"
-        self.assert_rejected(ledger, "cannot be active under FROZEN_OWNER_STOP")
+        self.assert_rejected(ledger, "cannot be active under FROZEN_OWNER_STOP without exact scoped authority")
 
     def test_rejects_active_review_under_owner_stop(self) -> None:
         ledger = copy.deepcopy(self.ledger)
@@ -80,8 +80,19 @@ class StatusLedgerTests(unittest.TestCase):
 
     def test_rejects_started_downstream_gate(self) -> None:
         ledger = copy.deepcopy(self.ledger)
-        ledger["execution_checkpoint"]["downstream_states"]["ci"]["state"] = "RUNNING"
-        self.assert_rejected(ledger, "must be NOT_STARTED and approval-gated")
+        ledger["execution_checkpoint"]["downstream_states"]["merge"]["state"] = "RUNNING"
+        self.assert_rejected(ledger, "invalid state or approval record")
+
+    def test_rejects_active_web_work_without_exact_scope(self) -> None:
+        ledger = copy.deepcopy(self.ledger)
+        item = next(item for item in ledger["work_items"] if item["id"] == "BCI-WEB-PARITY-01")
+        item["scoped_active"]["owner_agent"] = "/root/someone_else"
+        self.assert_rejected(ledger, "without exact scoped authority")
+
+    def test_rejects_repository_ref_sha_drift(self) -> None:
+        ledger = copy.deepcopy(self.ledger)
+        ledger["repository_delivery"]["github_mirror"]["ref_sha"] = "f" * 40
+        self.assert_rejected(ledger, "not bound to source_sha")
 
     def test_checkpoint_candidate_must_match_work_item(self) -> None:
         ledger = copy.deepcopy(self.ledger)
