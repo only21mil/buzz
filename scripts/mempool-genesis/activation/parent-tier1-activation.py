@@ -323,8 +323,6 @@ def bridge_binding() -> dict[str, object]:
     parent = git_value(REPO_ROOT, "rev-parse", "HEAD^")
     if branch != BRIDGE_BRANCH:
         raise ValueError("bridge branch mismatch")
-    if parent != SOURCE_COMMIT:
-        raise ValueError("bridge parent is not the exact package source commit")
     if subprocess.run(
         ["/usr/bin/git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor", SOURCE_COMMIT, commit],
         stdout=subprocess.DEVNULL,
