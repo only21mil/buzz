@@ -561,7 +561,11 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 34);
+        assert_eq!(
+            migrations.len(),
+            35,
+            "embedded migration matrix must contain the canonical set through 0035_ci_grants"
+        );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1084,6 +1088,36 @@ mod tests {
         assert!(desired_schema.contains("CREATE TABLE ci_runs"));
         assert!(desired_schema.contains("CREATE TABLE ci_run_events"));
         assert!(desired_schema.contains("CREATE TRIGGER ci_run_identity_immutable"));
+
+        // CI grants (0035, index 34) carry per-repository CI endorsement
+        // approval for a run's signed events.
+        let ci_grants = migrations[34].sql.as_str();
+        assert_eq!(migrations[34].version, 35);
+        assert_eq!(&*migrations[34].description, "ci grants");
+        assert!(
+            ci_grants.contains("CREATE TABLE ci_grants"),
+            "0035 must create the ci_grants table"
+        );
+        assert!(
+            ci_grants.contains("signer_pubkey"),
+            "0035 ci_grants must carry the signer_pubkey authorization column"
+        );
+        assert!(
+            ci_grants.contains("target_repo"),
+            "0035 ci_grants must carry the target_repo grant target"
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE ci_grants"),
+            "desired-state schema must mirror the additive ci_grants table"
+        );
+        assert!(
+            desired_schema.contains("signer_pubkey"),
+            "desired-state schema must carry ci_grants.signer_pubkey"
+        );
+        assert!(
+            desired_schema.contains("target_repo"),
+            "desired-state schema must carry ci_grants.target_repo"
+        );
     }
 
     #[test]
@@ -1637,6 +1671,86 @@ mod tests {
         assert!(
             search_expression.contains("ELSE NULL::tsvector"),
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod b1_ci_grants_ordering {
+    //! A4 test-only hook for B1 lane objective 4: `0035_ci_grants` must run
+    //! only after 0029..0034.
+    //!
+    //! This module is additive-only (never edits or re-binds migration
+    //! indexes inside the main test module). It asserts the *semantic*
+    //! ordering: the workflow snapshot/state/approval/CI-event storage base
+    //! (0029-0034) must still occupy versions 29-34, and the CI-signer-grant
+    //! migration must be version 35 at the vector tail and must not have
+    //! displaced any of 0029-0034.
+    //!
+    //! The embedded migrator must contain exactly 35 migrations, with 0035
+    //! immediately after 0034.
+
+    use super::MIGRATOR;
+
+    #[test]
+    fn ci_grants_lands_only_after_workflow_and_ci_storage_base() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+
+        assert_eq!(migrations.len(), 35, "0035_ci_grants must be embedded");
+        let ci_grants = migrations
+            .iter()
+            .position(|migration| migration.description == "ci grants")
+            .expect("0035_ci_grants must be present");
+
+        // 0035_ci_grants.sql must have sqlx version 35.
+        assert_eq!(
+            migrations[ci_grants].version, 35,
+            "0035_ci_grants must be migration version 35"
+        );
+
+        // The base the workflow/CI ingestion depends on must remain in place
+        // (semantic index): index 28 is 0029_workflow_run_snapshots and the
+        // sequence 29-34 (vector indexes 28..=33) is unchanged. This is the
+        // "index 34 semantic vs index 28 workflow snapshots" binding: the tail
+        // migration is exactly one past 0034's vector slot, and 0029 has not
+        // been replaced or displaced.
+        let snapshot = &migrations[28];
+        assert_eq!(snapshot.version, 29, "index 28 must be 0029");
+        assert_eq!(
+            &*snapshot.description, "workflow run snapshots",
+            "index 28 must still be 0029_workflow_run_snapshots"
+        );
+
+        let tail_versions: Vec<i64> = migrations.iter().map(|m| m.version).collect();
+        let tail = &tail_versions[29..35];
+        assert_eq!(
+            tail,
+            &[30, 31, 32, 33, 34, 35],
+            "migration 0035 must land immediately after 0034 with no renumbering of 0030-0034"
+        );
+
+        // And `ci_grants` must sit at the final vector index (35 in 1-based
+        // terms, i.e. vector index 34 because 0001 occupies index 0).
+        assert_eq!(
+            ci_grants, 34,
+            "0035_ci_grants must be the last migration (vector index 34)"
+        );
+
+        // Fact-bound: the migration itself must create the grants table with
+        // the B1 authorizer's PK and window columns.
+        let sql = migrations[ci_grants].sql.as_str();
+        assert!(
+            sql.contains("CREATE TABLE ci_grants"),
+            "0035_ci_grants must create the ci_grants table"
+        );
+        assert!(
+            sql.contains("PRIMARY KEY (community_id, channel_id, target_repo_a, signer_pubkey)"),
+            "0035_ci_grants must key on the full (community, channel, repo, signer) tuple"
+        );
+        assert!(
+            sql.contains("valid_from") && sql.contains("valid_until"),
+            "0035_ci_grants must carry the validity window columns"
         );
     }
 }

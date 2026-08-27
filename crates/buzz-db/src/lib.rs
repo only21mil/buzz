@@ -19,6 +19,8 @@ pub mod archived_identities;
 pub mod channel;
 /// Durable Buzz-native CI ingest index and queries.
 pub mod ci;
+/// CI control-plane signer grants.
+pub mod ci_grants;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -2210,6 +2212,50 @@ impl Db {
         envelope: &buzz_core::ci::ValidatedCiEnvelope,
     ) -> Result<ci::StoreCiEventOutcome> {
         ci::store_ci_event(&self.pool, community_id, channel_id, event, envelope).await
+    }
+
+    /// Upsert a CI control-plane signer grant (kind 46107).
+    ///
+    /// Idempotent per `(community, channel, target_repo_a, signer)`: the
+    /// validity window and `granted_by` are updated, `created_at` is preserved.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_ci_grant(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        target_repo_a: &str,
+        signer_pubkey: &str,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+        granted_by: &str,
+    ) -> Result<()> {
+        ci_grants::upsert_ci_grant(
+            &self.pool,
+            community_id,
+            channel_id,
+            target_repo_a,
+            signer_pubkey,
+            valid_from,
+            valid_until,
+            granted_by,
+        )
+        .await
+    }
+
+    /// Return hex pubkeys of signers with an ACTIVE grant for
+    /// `(community, channel, target_repo_a)` at `now`.
+    ///
+    /// Consumed by the relay ingest gate as the grant half of the authorized
+    /// status-signer union (config signers ∪ grant signers).
+    pub async fn get_active_ci_signers(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        target_repo_a: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        ci_grants::get_active_ci_signers(&self.pool, community_id, channel_id, target_repo_a, now)
+            .await
     }
 
     /// Atomically insert a kind:7 reaction event and its reaction row.
