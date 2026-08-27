@@ -23,10 +23,16 @@ pub mod dns_isolation;
 pub mod durable_dispatch;
 #[cfg(unix)]
 pub mod evidence;
+#[cfg(target_os = "linux")]
+pub mod git_host_observer;
 #[cfg(unix)]
 pub mod harness;
 #[cfg(unix)]
 pub mod materializer_evidence;
+#[cfg(target_os = "linux")]
+pub mod materializer_handoff;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod normal_backend;
 #[cfg(target_os = "linux")]
 pub mod normal_engine;
 #[cfg(target_os = "linux")]

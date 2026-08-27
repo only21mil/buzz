@@ -8,8 +8,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     contract::{is_environment_name, is_socket_path, IsolationProfile},
-    AttemptPhase, DockerMethod, DockerRoute, ObjectLedger, PolicyManifest, ProxyError,
+    ArchiveDirection, ArchiveGrant, AttemptPhase, DockerMethod, DockerRoute, ExecExpectation,
+    ObjectLedger, PolicyManifest, ProxyError,
 };
+
+const MAX_ARCHIVE_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 4096;
+const MAX_ARCHIVE_DECOMPRESSION_RATIO: usize = 100;
 
 const RESERVED_ENVIRONMENT: [&str; 3] = ["BUZZ_CI_RUN_ID", "BUZZ_CI_SHA", "BUZZ_CI_ATTEMPT"];
 const FORBIDDEN_ENVIRONMENT: [&str; 8] = [
@@ -44,12 +49,22 @@ pub struct CanonicalExec {
     pub body: Vec<u8>,
     container_id: String,
     operation_id: u64,
+    allow_input: bool,
+    tty: bool,
 }
 
 impl CanonicalExec {
     /// Return the exact owned container this exec-create targets.
     pub fn container_id(&self) -> &str {
         &self.container_id
+    }
+
+    pub(crate) fn allow_input(&self) -> bool {
+        self.allow_input
+    }
+
+    pub(crate) fn tty(&self) -> bool {
+        self.tty
     }
 }
 
@@ -139,6 +154,17 @@ pub enum Admission {
     },
     /// Forward a rebuilt canonical exec-create request.
     ExecCreate(CanonicalExec),
+    /// Start one ledger-owned exec through the bounded hijack mediator.
+    ExecStart {
+        /// Canonical exec-start target.
+        target: String,
+        /// Full attempt-owned exec ID.
+        exec_id: String,
+        /// Rebuilt non-detached start body.
+        body: Vec<u8>,
+        /// Whether stdin bytes are allowed by the matching exec expectation.
+        allow_input: bool,
+    },
     /// A create request awaiting an upstream object ID.
     Create(CanonicalCreate),
     /// Start is permitted only after caller compares a fresh inspect result
@@ -165,6 +191,8 @@ pub enum Admission {
         /// Canonical wait target.
         target: String,
     },
+    /// Validate and canonically rebuild one owned-container tar transfer.
+    Archive(ArchiveGrant),
 }
 
 /// Closed policy engine used by the Unix-socket frontend.
@@ -176,6 +204,7 @@ pub struct ProxyPolicy {
     pending_creates: BTreeMap<u64, String>,
     created_requests: BTreeMap<String, CanonicalCreate>,
     pending_execs: BTreeMap<u64, String>,
+    created_execs: BTreeMap<String, CanonicalExec>,
     container_lifecycle: ContainerLifecycle,
     executor_uid: u32,
     runtime_uid: u32,
@@ -243,6 +272,7 @@ impl ProxyPolicy {
             pending_creates: BTreeMap::new(),
             created_requests: BTreeMap::new(),
             pending_execs: BTreeMap::new(),
+            created_execs: BTreeMap::new(),
             container_lifecycle: ContainerLifecycle::AwaitCreate,
             executor_uid,
             runtime_uid,
@@ -273,6 +303,10 @@ impl ProxyPolicy {
     /// Dedicated runtime UID that must own the inherited upstream peer.
     pub fn runtime_uid(&self) -> u32 {
         self.runtime_uid
+    }
+
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.manifest.lease_id
     }
 
     pub(crate) fn image_digest(&self) -> &str {
@@ -379,7 +413,7 @@ impl ProxyPolicy {
             }
             DockerRoute::ExecCreate { container_id } => {
                 self.ledger.require_started(&container_id)?;
-                let body = canonical_exec(body, &self.manifest)?;
+                let (body, expectation) = canonical_exec(body, &self.manifest)?;
                 let operation_id = self.allocate_operation()?;
                 self.pending_execs
                     .insert(operation_id, container_id.clone());
@@ -388,17 +422,62 @@ impl ProxyPolicy {
                     body,
                     container_id,
                     operation_id,
+                    allow_input: expectation.attach_stdin,
+                    tty: expectation.tty,
                 }))
             }
-            DockerRoute::ExecStart { exec_id } | DockerRoute::ExecInspect { exec_id } => {
+            DockerRoute::ExecStart { exec_id } => {
+                self.ledger.require_exec(&exec_id)?;
+                let (allow_input, tty) = {
+                    let created = self.created_exec(&exec_id)?;
+                    (created.allow_input(), created.tty())
+                };
+                let body = canonical_exec_start(body, tty)?;
+                self.ledger.begin_exec_start(&exec_id)?;
+                Ok(Admission::ExecStart {
+                    target: canonical_target,
+                    exec_id,
+                    body,
+                    allow_input,
+                })
+            }
+            DockerRoute::ExecInspect { exec_id } => {
                 self.ledger.require_exec(&exec_id)?;
                 Ok(Admission::Forward {
                     target: canonical_target,
                 })
             }
-            DockerRoute::Archive { .. } => Err(ProxyError::PolicyRefused(
-                "executor archive access is disabled in Phase 1".into(),
-            )),
+            DockerRoute::Archive { id, path } => {
+                self.ledger.require_started(&id)?;
+                let direction = match method {
+                    DockerMethod::Put => ArchiveDirection::Upload,
+                    DockerMethod::Get if body.is_empty() => ArchiveDirection::Download,
+                    DockerMethod::Get => {
+                        return Err(ProxyError::InvalidRequest(
+                            "archive download requests must have an empty body".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(ProxyError::PolicyRefused(
+                            "archive method is not mediated".into(),
+                        ));
+                    }
+                };
+                let disk_limit =
+                    usize::try_from(self.manifest.isolation_profile.limits.disk_max_bytes)
+                        .unwrap_or(usize::MAX);
+                let max_bytes = disk_limit.min(MAX_ARCHIVE_STREAM_BYTES);
+                Ok(Admission::Archive(ArchiveGrant {
+                    lease_id: self.manifest.lease_id.clone(),
+                    container_id: id,
+                    container_path: path,
+                    direction,
+                    max_bytes,
+                    max_entries: MAX_ARCHIVE_ENTRIES,
+                    max_total_bytes: max_bytes,
+                    max_decompression_ratio: MAX_ARCHIVE_DECOMPRESSION_RATIO,
+                }))
+            }
             DockerRoute::ImagePull => Err(ProxyError::PolicyRefused(
                 "runtime image pulls are disabled; preload is mandatory".into(),
             )),
@@ -644,7 +723,9 @@ impl ProxyPolicy {
                 "exec result has no matching pending request".into(),
             ));
         }
-        self.ledger.record_exec(exec_id, &approved.container_id)?;
+        self.ledger
+            .record_exec(exec_id.clone(), &approved.container_id)?;
+        self.created_execs.insert(exec_id.clone(), approved.clone());
         self.pending_execs.remove(&approved.operation_id);
         Ok(())
     }
@@ -657,6 +738,22 @@ impl ProxyPolicy {
                 "exec request is not pending".into(),
             )),
         }
+    }
+
+    /// Commit one successful exec-start upgrade.
+    pub fn commit_exec_started(&mut self, exec_id: &str) -> Result<(), ProxyError> {
+        self.ledger.commit_exec_started(exec_id)
+    }
+
+    /// Release an exec-start reservation after a definite runtime refusal.
+    pub fn abort_exec_start(&mut self, exec_id: &str) -> Result<(), ProxyError> {
+        self.ledger.abort_exec_start(exec_id)
+    }
+
+    fn created_exec(&self, exec_id: &str) -> Result<&CanonicalExec, ProxyError> {
+        self.created_execs
+            .get(exec_id)
+            .ok_or_else(|| ProxyError::StateRefused("exec has no matching canonical create".into()))
     }
 
     /// Start the terminal barrier. The frontend must drain active mutations
@@ -1039,7 +1136,10 @@ fn canonical_environment(
     Ok(values.into_values().map(Value::String).collect())
 }
 
-fn canonical_exec(body: &[u8], manifest: &PolicyManifest) -> Result<Vec<u8>, ProxyError> {
+fn canonical_exec(
+    body: &[u8],
+    manifest: &PolicyManifest,
+) -> Result<(Vec<u8>, ExecExpectation), ProxyError> {
     if body.len() > 1024 * 1024 {
         return Err(ProxyError::InvalidRequest("exec body exceeds 1 MiB".into()));
     }
@@ -1048,6 +1148,25 @@ fn canonical_exec(body: &[u8], manifest: &PolicyManifest) -> Result<Vec<u8>, Pro
     let object = input
         .as_object()
         .ok_or_else(|| ProxyError::InvalidRequest("exec body must be an object".into()))?;
+    const ALLOWED_FIELDS: [&str; 9] = [
+        "AttachStdin",
+        "AttachStdout",
+        "AttachStderr",
+        "Cmd",
+        "Env",
+        "Privileged",
+        "Tty",
+        "User",
+        "WorkingDir",
+    ];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ProxyError::InvalidRequest(format!(
+            "unknown exec field {field}"
+        )));
+    }
     if object.get("Privileged").and_then(Value::as_bool) == Some(true) {
         return Err(ProxyError::PolicyRefused(
             "privileged exec is forbidden".into(),
@@ -1056,6 +1175,56 @@ fn canonical_exec(body: &[u8], manifest: &PolicyManifest) -> Result<Vec<u8>, Pro
     if object.contains_key("SecurityOpt") {
         return Err(ProxyError::PolicyRefused(
             "caller may not set exec SecurityOpt".into(),
+        ));
+    }
+    let user = object
+        .get("User")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| ProxyError::InvalidRequest("exec User must be a string".into()))
+        })
+        .transpose()?
+        .unwrap_or(&manifest.container_user);
+    if user != manifest.container_user {
+        return Err(ProxyError::PolicyRefused(
+            "exec User does not match the manifest".into(),
+        ));
+    }
+    let argv = bounded_string_array(object, "Cmd")?;
+    if argv.is_empty() {
+        return Err(ProxyError::InvalidRequest(
+            "exec Cmd must be non-empty".into(),
+        ));
+    }
+    let working_dir = object
+        .get("WorkingDir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProxyError::InvalidRequest("exec WorkingDir must be an explicit string".into())
+        })?
+        .to_owned();
+    let environment = canonical_caller_environment(object.get("Env"), manifest)?;
+    let bool_field = |name: &str| -> Result<bool, ProxyError> {
+        object.get(name).map_or(Ok(false), |value| {
+            value
+                .as_bool()
+                .ok_or_else(|| ProxyError::InvalidRequest(format!("exec {name} must be a bool")))
+        })
+    };
+    let candidate = ExecExpectation {
+        argv,
+        environment,
+        user: user.to_owned(),
+        working_dir,
+        attach_stdin: bool_field("AttachStdin")?,
+        attach_stdout: bool_field("AttachStdout")?,
+        attach_stderr: bool_field("AttachStderr")?,
+        tty: bool_field("Tty")?,
+    };
+    if !manifest.expected_execs.contains(&candidate) {
+        return Err(ProxyError::PolicyRefused(
+            "exec argv, environment, user, workdir, or stream mode is not manifest-bound".into(),
         ));
     }
     let mut output = Map::new();
@@ -1068,15 +1237,96 @@ fn canonical_exec(body: &[u8], manifest: &PolicyManifest) -> Result<Vec<u8>, Pro
         "Env".into(),
         Value::Array(canonical_environment(object.get("Env"), manifest)?),
     );
-    copy_bounded_string_array(object, &mut output, "Cmd")?;
-    copy_safe_string(object, &mut output, "WorkingDir", 4096)?;
-    for field in ["AttachStdin", "AttachStdout", "AttachStderr", "Tty"] {
-        if let Some(value @ Value::Bool(_)) = object.get(field) {
-            output.insert(field.into(), value.clone());
-        }
+    output.insert(
+        "Cmd".into(),
+        Value::Array(candidate.argv.iter().cloned().map(Value::String).collect()),
+    );
+    output.insert(
+        "WorkingDir".into(),
+        Value::String(candidate.working_dir.clone()),
+    );
+    for (field, value) in [
+        ("AttachStdin", candidate.attach_stdin),
+        ("AttachStdout", candidate.attach_stdout),
+        ("AttachStderr", candidate.attach_stderr),
+        ("Tty", candidate.tty),
+    ] {
+        output.insert(field.into(), Value::Bool(value));
     }
-    serde_json::to_vec(&Value::Object(output))
+    let body = serde_json::to_vec(&Value::Object(output))
+        .map_err(|error| ProxyError::InvalidRequest(error.to_string()))?;
+    Ok((body, candidate))
+}
+
+fn canonical_exec_start(body: &[u8], expected_tty: bool) -> Result<Vec<u8>, ProxyError> {
+    if body.len() > 4096 {
+        return Err(ProxyError::InvalidRequest(
+            "exec-start body exceeds 4 KiB".into(),
+        ));
+    }
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| ProxyError::InvalidRequest(error.to_string()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProxyError::InvalidRequest("exec-start body must be an object".into()))?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "Detach" | "Tty"))
+        || object.get("Detach").and_then(Value::as_bool) != Some(false)
+        || object.get("Tty").and_then(Value::as_bool) != Some(expected_tty)
+    {
+        return Err(ProxyError::PolicyRefused(
+            "exec-start must be non-detached and match the manifest-bound TTY mode".into(),
+        ));
+    }
+    serde_json::to_vec(&serde_json::json!({"Detach": false, "Tty": expected_tty}))
         .map_err(|error| ProxyError::InvalidRequest(error.to_string()))
+}
+
+fn bounded_string_array(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Vec<String>, ProxyError> {
+    let values = object
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProxyError::InvalidRequest(format!("{field} must be an array")))?;
+    if values.len() > 256 {
+        return Err(ProxyError::InvalidRequest(format!(
+            "{field} has too many values"
+        )));
+    }
+    values
+        .iter()
+        .map(|value| {
+            let value = value.as_str().ok_or_else(|| {
+                ProxyError::InvalidRequest(format!("{field} contains a non-string"))
+            })?;
+            if value.len() > 8192 || value.bytes().any(|byte| byte == 0) {
+                return Err(ProxyError::InvalidRequest(format!(
+                    "{field} contains an oversized or NUL-bearing value"
+                )));
+            }
+            Ok(value.to_owned())
+        })
+        .collect()
+}
+
+fn canonical_caller_environment(
+    input: Option<&Value>,
+    manifest: &PolicyManifest,
+) -> Result<Vec<String>, ProxyError> {
+    let canonical = canonical_environment(input, manifest)?;
+    Ok(canonical
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .filter(|value| {
+            let name = value
+                .split_once('=')
+                .map_or(value.as_str(), |(name, _)| name);
+            !RESERVED_ENVIRONMENT.contains(&name)
+        })
+        .collect())
 }
 
 fn reject_conflicting_host_config(host_config: Option<&Value>) -> Result<(), ProxyError> {
@@ -1263,6 +1513,16 @@ mod tests {
                 read_only: true,
             }],
             allowed_environment: vec!["CI".into()],
+            expected_execs: vec![ExecExpectation {
+                argv: vec!["true".into()],
+                environment: Vec::new(),
+                user: "65534:65534".into(),
+                working_dir: "/workspace".into(),
+                attach_stdin: false,
+                attach_stdout: false,
+                attach_stderr: false,
+                tty: false,
+            }],
         }
     }
 
@@ -1519,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_build_network_and_archive_are_explicitly_denied() {
+    fn pull_build_network_and_unowned_archive_are_explicitly_denied() {
         let cases = [
             (DockerMethod::Post, "/images/create"),
             (DockerMethod::Post, "/build"),
@@ -1607,14 +1867,39 @@ mod tests {
         for security_opt in ["seccomp=unconfined", "unknown-security-option"] {
             let body = serde_json::to_vec(&serde_json::json!({
                 "Cmd": ["true"],
+                "WorkingDir": "/workspace",
                 "SecurityOpt": [security_opt]
             }))
             .unwrap();
+            assert!(policy
+                .admit(DockerMethod::Post, "/containers/container-1/exec", &body)
+                .is_err());
+        }
+        for body in [
+            br#"{"Cmd":["unexpected"],"WorkingDir":"/workspace"}"#.as_slice(),
+            br#"{"Cmd":["true"],"Env":["GITHUB_TOKEN=secret"],"WorkingDir":"/workspace"}"#
+                .as_slice(),
+            br#"{"Cmd":["true"],"WorkingDir":"/tmp"}"#.as_slice(),
+        ] {
             assert!(matches!(
-                policy.admit(DockerMethod::Post, "/containers/container-1/exec", &body),
+                policy.admit(DockerMethod::Post, "/containers/container-1/exec", body),
                 Err(ProxyError::PolicyRefused(_))
             ));
         }
+        let Admission::ExecCreate(exec) = policy
+            .admit(
+                DockerMethod::Post,
+                "/containers/container-1/exec",
+                br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#,
+            )
+            .unwrap()
+        else {
+            panic!("manifest-bound exec must be admitted");
+        };
+        let canonical: Value = serde_json::from_slice(&exec.body).unwrap();
+        assert_eq!(canonical["User"], "65534:65534");
+        assert_eq!(canonical["WorkingDir"], "/workspace");
+        assert_eq!(canonical["Privileged"], false);
     }
 
     #[test]
@@ -1675,7 +1960,7 @@ mod tests {
             policy.admit(
                 DockerMethod::Post,
                 "/containers/container-1/exec",
-                br#"{"Cmd":["true"]}"#
+                br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#
             ),
             Err(ProxyError::StateRefused(_))
         ));

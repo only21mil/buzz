@@ -494,6 +494,22 @@ impl<P: PrestartPersister> BrokerProxyLease<P> {
         self.proxy.serve_once()
     }
 
+    /// Poll a nonblocking listener once. `false` means no Act connection was
+    /// ready and does not consume the installed upstream descriptor.
+    pub fn try_serve_once(&mut self) -> Result<bool, ProxyError> {
+        self.proxy.try_serve_once()
+    }
+
+    /// Select listener blocking mode for a controller-owned bounded poll loop.
+    pub fn set_listener_nonblocking(&self, nonblocking: bool) -> Result<(), ProxyError> {
+        self.proxy.set_listener_nonblocking(nonblocking)
+    }
+
+    /// Report whether the next upstream exchange has a broker descriptor.
+    pub fn has_upstream(&self) -> bool {
+        self.proxy.has_inherited_upstream()
+    }
+
     /// Report whether ambiguous upstream state requires reconciliation.
     pub fn is_poisoned(&self) -> bool {
         self.proxy.is_poisoned()
@@ -1403,6 +1419,7 @@ mod tests {
                 read_only: true,
             }],
             allowed_environment: Vec::new(),
+            expected_execs: Vec::new(),
         };
         (admission, lease, validated, manifest)
     }

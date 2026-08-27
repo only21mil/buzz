@@ -37,10 +37,11 @@ owned container inspect, and owned exec inspect responses through fixed JSON
 projections. Create and other already-admitted non-streaming operations also
 receive fixed projections.
 
-Archive transfer and exec hijack remain disabled. Their typed grants only state
-what a future mediator must bind. They do not authorize forwarding. Because
-both operations are mandatory in the sequence above, this crate is not yet
-compatible with `act`.
+Archive transfer is mediated through typed, owned-container grants and bounded
+canonical tar reconstruction. Exec-create is reconstructed from an exact
+manifest expectation, and exec-start has a ledger-owned, byte-capped,
+deadline-bounded upgrade relay. These are the only archive and hijack routes
+admitted for the pinned sequence above.
 
 ## Pinned source paths
 

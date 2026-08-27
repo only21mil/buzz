@@ -516,10 +516,10 @@ impl RetainedDnsLease {
 
 /// Single-slot owner of DNS apply, retained receipt state, and reconciliation.
 ///
-/// `dns_exec` still starts all three principal units with `/usr/bin/sleep
-/// infinity`. Candidates C5 and C6 replace those placeholders with the policy
-/// proxy, runtime, materializer, and executor handoff. This adapter deliberately
-/// preserves the current command grammar until that reviewed integration lands.
+/// `dns_exec` starts the materializer unit with its fixed handoff shim. The
+/// executor and runtime units remain dormant placeholders until their reviewed
+/// handoffs land. This lifecycle retains all three units under the same cleanup
+/// token and lease slice.
 pub struct DnsLeaseLifecycle<R> {
     builder: DnsLeaseBuilder,
     executor: DnsExecutor<R>,

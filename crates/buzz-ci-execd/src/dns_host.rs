@@ -29,6 +29,9 @@ pub const MATERIALIZER_NFT_FAMILY: &str = "inet";
 /// Fixed chain within each per-lease nftables table.
 pub const MATERIALIZER_NFT_CHAIN: &str = "materializer_output";
 
+/// Named byte counter shared by every materializer rule in one lease table.
+pub const MATERIALIZER_NFT_COUNTER: &str = "materializer_git_bytes";
+
 const LEASE_FILE_ROOT: &str = "/var/lib/buzzci/leases";
 const MATERIALIZER_NFT_PRIORITY: i32 = 0;
 const EXPECTED_SLICE_PROPERTIES: [&str; 6] = [
@@ -157,6 +160,7 @@ pub struct MaterializerNftPlan {
     family: String,
     table: String,
     chain: String,
+    counter: String,
     hook: NftHook,
     priority: i32,
     principal_uid: u32,
@@ -175,6 +179,10 @@ impl MaterializerNftPlan {
 
     pub fn chain(&self) -> &str {
         &self.chain
+    }
+
+    pub fn counter(&self) -> &str {
+        &self.counter
     }
 
     pub const fn hook(&self) -> NftHook {
@@ -269,6 +277,7 @@ pub struct MaterializerNftReadback {
     pub family: String,
     pub table: String,
     pub chain: String,
+    pub counter: String,
     pub hook: NftHook,
     pub priority: i32,
     pub principal_uid: u32,
@@ -319,6 +328,7 @@ impl DnsHostPlan {
             family: MATERIALIZER_NFT_FAMILY.to_owned(),
             table: identifiers.nft_table.clone(),
             chain: identifiers.nft_chain.clone(),
+            counter: MATERIALIZER_NFT_COUNTER.to_owned(),
             hook: NftHook::Output,
             priority: MATERIALIZER_NFT_PRIORITY,
             principal_uid: materializer.uid,
@@ -655,8 +665,15 @@ fn validate_principal_properties(
 
     match (&unit.role, &unit.network_mode) {
         (PrincipalRole::Materializer, UnitNetworkMode::HostTupleAllowlist { tuples })
-            if unit.properties.len() == 5
+            if unit.properties.len() == 7
                 && unit.properties.get("PrivateNetwork").map(String::as_str) == Some("no")
+                && unit.properties.get("RuntimeDirectory").map(String::as_str)
+                    == unit.unit_name.strip_suffix(".service")
+                && unit
+                    .properties
+                    .get("RuntimeDirectoryMode")
+                    .map(String::as_str)
+                    == Some("0700")
                 && tuples == &plan.materializer_allowlist =>
         {
             Ok(())
@@ -957,6 +974,7 @@ mod tests {
                 family: plan.materializer_policy.family.clone(),
                 table: plan.materializer_policy.table.clone(),
                 chain: plan.materializer_policy.chain.clone(),
+                counter: plan.materializer_policy.counter.clone(),
                 hook: NftHook::Output,
                 priority: MATERIALIZER_NFT_PRIORITY,
                 principal_uid: plan.materializer_policy.principal_uid,

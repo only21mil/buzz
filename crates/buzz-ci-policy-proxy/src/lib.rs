@@ -4,12 +4,14 @@
 //! descriptor Unix transport. A trusted broker must still pass the already-open
 //! executor listener and rootless-runtime connection, bind both to the validated
 //! lease, and terminate/reconcile the attempt whenever the transport reports an
-//! ambiguous post-upstream failure. Unsupported Docker framing and streaming
-//! routes fail closed.
+//! ambiguous post-upstream failure. Unsupported Docker framing and unmediated
+//! streaming routes fail closed; archive transfers pass through bounded tar
+//! validation and canonical reconstruction.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod archive;
 mod contract;
 mod policy;
 mod route;
@@ -17,7 +19,8 @@ mod state;
 mod transport;
 
 pub use contract::{
-    AllowedMount, EngineKind, IsolationLimits, IsolationProfile, NetworkPolicy, PolicyManifest,
+    AllowedMount, EngineKind, ExecExpectation, IsolationLimits, IsolationProfile, NetworkPolicy,
+    PolicyManifest,
 };
 pub use policy::{
     Admission, CanonicalCreate, CanonicalExec, EffectiveContainerSpec, ProxyPolicy, VerifiedStart,

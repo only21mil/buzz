@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::MaterializeError;
@@ -27,6 +28,11 @@ impl Sha256Digest {
     /// Return the canonical lowercase hexadecimal value.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Hash bounded bytes into the canonical lowercase representation.
+    pub fn digest(bytes: &[u8]) -> Self {
+        Self(hex::encode(Sha256::digest(bytes)))
     }
 
     pub(crate) fn from_sha256_bytes(bytes: [u8; 32]) -> Self {

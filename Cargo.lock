@@ -979,6 +979,7 @@ dependencies = [
  "buzz-ci-policy-proxy",
  "hex",
  "nix 0.31.3",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1020,12 +1021,14 @@ name = "buzz-ci-policy-proxy"
 version = "0.1.0"
 dependencies = [
  "buzz-ci-isolation-contract",
+ "flate2",
  "hex",
  "nix 0.31.3",
  "proptest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "thiserror 2.0.18",
  "url",
 ]

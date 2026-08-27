@@ -96,10 +96,12 @@ pub enum DockerRoute {
         /// Requested exec identifier.
         exec_id: String,
     },
-    /// Archive upload/download. Executor-facing Phase 1 denies this route.
+    /// Bounded archive upload/download for an owned container.
     Archive {
         /// Requested container identifier.
         id: String,
+        /// Exact normalized absolute path inside the container.
+        path: String,
     },
     /// Runtime image pull. Phase 1 denies it.
     ImagePull,
@@ -148,7 +150,7 @@ impl DockerRoute {
         }
         let path = strip_version(raw_path)?;
         let segments = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
-        let route = match (method, segments.as_slice()) {
+        let mut route = match (method, segments.as_slice()) {
             (DockerMethod::Get | DockerMethod::Head, ["_ping"]) => Self::Ping,
             (DockerMethod::Get, ["version"]) => Self::Version,
             (DockerMethod::Get, ["info"]) => Self::Info,
@@ -185,12 +187,12 @@ impl DockerRoute {
             (DockerMethod::Get, ["exec", id, "json"]) => Self::ExecInspect {
                 exec_id: validate_id(id)?,
             },
-            (
-                DockerMethod::Get | DockerMethod::Head | DockerMethod::Put,
-                ["containers", id, "archive"],
-            ) => Self::Archive {
-                id: validate_id(id)?,
-            },
+            (DockerMethod::Get | DockerMethod::Put, ["containers", id, "archive"]) => {
+                Self::Archive {
+                    id: validate_id(id)?,
+                    path: String::new(),
+                }
+            }
             (DockerMethod::Post, ["images", "create"]) => Self::ImagePull,
             (DockerMethod::Post, ["build"]) => Self::Build,
             (_, [family, ..])
@@ -219,6 +221,11 @@ impl DockerRoute {
             }
         };
         let canonical_query = canonical_query(&route, query)?;
+        if let DockerRoute::Archive { path, .. } = &mut route {
+            *path = url::form_urlencoded::parse(canonical_query.as_bytes())
+                .find_map(|(key, value)| (key == "path").then(|| value.into_owned()))
+                .ok_or_else(|| ProxyError::RouteRefused("archive path is required".into()))?;
+        }
         let canonical_path = match &route {
             DockerRoute::ImageInspect { image } => {
                 format!("/images/{}/json", image.replace(':', "%3A"))
@@ -313,6 +320,17 @@ fn canonical_query(route: &DockerRoute, query: &str) -> Result<String, ProxyErro
             "query field is not admitted for this route".into(),
         ));
     }
+    if matches!(route, DockerRoute::Archive { .. }) {
+        if values.len() != 1 {
+            return Err(ProxyError::RouteRefused(
+                "archive requests require exactly one path".into(),
+            ));
+        }
+        let path = values
+            .get_mut("path")
+            .ok_or_else(|| ProxyError::RouteRefused("archive path is required".into()))?;
+        *path = normalize_archive_path(path)?;
+    }
     for (key, value) in &values {
         match key.as_str() {
             "all" | "force" | "link" | "logs" | "size" | "stderr" | "stdin" | "stdout"
@@ -354,6 +372,45 @@ fn canonical_query(route: &DockerRoute, query: &str) -> Result<String, ProxyErro
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.extend_pairs(values.iter());
     Ok(serializer.finish())
+}
+
+fn normalize_archive_path(value: &str) -> Result<String, ProxyError> {
+    use std::path::Component;
+
+    if value.len() > 4096
+        || value.contains('\\')
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(ProxyError::RouteRefused(
+            "archive path is oversized or contains unsafe bytes".into(),
+        ));
+    }
+    let path = std::path::Path::new(value);
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(ProxyError::RouteRefused(
+            "archive path must be absolute".into(),
+        ));
+    }
+    let mut normalized = String::new();
+    for component in components {
+        let Component::Normal(component) = component else {
+            return Err(ProxyError::RouteRefused(
+                "archive path must be canonical".into(),
+            ));
+        };
+        let component = component
+            .to_str()
+            .ok_or_else(|| ProxyError::RouteRefused("archive path must be valid UTF-8".into()))?;
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    if normalized.is_empty() {
+        normalized.push('/');
+    }
+    Ok(normalized)
 }
 
 fn validate_id(value: &str) -> Result<String, ProxyError> {

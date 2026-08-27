@@ -9,10 +9,12 @@ repository.workspace = true
 
 [dependencies]
 buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }
+flate2 = "1.1.9"
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tar = "0.4.46"
 thiserror = { workspace = true }
 url = { workspace = true }
 

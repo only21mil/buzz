@@ -77,6 +77,35 @@ pub struct GitCommandLog {
     pub finished_at_unix_ns: u64,
 }
 
+/// Bounded process result returned by an already-confined Git shim.
+///
+/// Root-owned network and cgroup observations intentionally remain outside
+/// this result and must be joined by the broker before it can form cleanup
+/// evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfinedGitProcessResult {
+    /// Normal child exit code, or `None` when no code was available.
+    pub exit_code: Option<i32>,
+    /// Whether the hard command deadline fired.
+    pub timed_out: bool,
+    /// Retained bounded stdout.
+    pub stdout: Vec<u8>,
+    /// Retained bounded stderr.
+    pub stderr: Vec<u8>,
+    /// Total stdout bytes observed, including overflow.
+    pub stdout_observed_bytes: u64,
+    /// Total stderr bytes observed, including overflow.
+    pub stderr_observed_bytes: u64,
+    /// Whether stdout exceeded its retained-byte ceiling.
+    pub stdout_truncated: bool,
+    /// Whether stderr exceeded its retained-byte ceiling.
+    pub stderr_truncated: bool,
+    /// Observed command wall time.
+    pub elapsed_millis: u64,
+    /// Whether the spawned process group was empty after cleanup.
+    pub process_group_empty: bool,
+}
+
 /// Concrete no-shell Git runner for one already-isolated materializer lease.
 pub struct ProcessGitBackend<O> {
     program: PathBuf,
@@ -126,6 +155,32 @@ impl<O> ProcessGitBackend<O> {
     /// Consume the backend and return its host observer and command records.
     pub fn into_parts(self) -> (O, Vec<GitCommandLog>) {
         (self.observer, self.command_logs)
+    }
+
+    /// Validate and execute one command inside an already-confined process.
+    ///
+    /// This reuses the exact argv/environment/cwd validation and bounded
+    /// process runner used by [`GitBackend`]. It does not fabricate the
+    /// root-owned network or cgroup observations required for final evidence.
+    pub fn run_confined_command(
+        &self,
+        command: &CommandSpec,
+        workspace_directory: &File,
+    ) -> Result<ConfinedGitProcessResult, String> {
+        self.validate_command(command, workspace_directory)?;
+        let process = run_process(command, workspace_directory);
+        Ok(ConfinedGitProcessResult {
+            exit_code: process.exit_code,
+            timed_out: process.timed_out,
+            stdout: process.stdout.retained,
+            stderr: process.stderr.retained,
+            stdout_observed_bytes: process.stdout.observed_bytes,
+            stderr_observed_bytes: process.stderr.observed_bytes,
+            stdout_truncated: process.stdout.truncated,
+            stderr_truncated: process.stderr.truncated,
+            elapsed_millis: process.elapsed_millis,
+            process_group_empty: process.process_group_empty,
+        })
     }
 }
 
@@ -207,7 +262,9 @@ fn failed_cleanup(command: &CommandSpec) -> CleanupProof {
 }
 
 impl<O> ProcessGitBackend<O> {
-    fn validate_command(
+    /// Validate one command against this backend's exact program, principal,
+    /// lease capabilities, descriptor-backed cwd, environment, and Git argv.
+    pub fn validate_command(
         &self,
         command: &CommandSpec,
         workspace_directory: &File,
