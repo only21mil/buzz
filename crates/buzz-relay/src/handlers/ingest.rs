@@ -14,29 +14,29 @@ use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
     KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
-    KIND_CANVAS, KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
-    KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
-    KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
-    KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER, KIND_FOLLOW_SET, KIND_FORUM_COMMENT,
-    KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-    KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE,
-    KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
-    KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
-    KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
-    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
-    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
-    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
-    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT, KIND_REACTION,
-    KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
-    KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
-    KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
-    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
-    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
-    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_CANVAS, KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_GRANT,
+    KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS,
+    KIND_CI_TEARDOWN_ATTESTATION, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER,
+    KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER,
+    KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
+    KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+    KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+    KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES,
+    KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED,
+    KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
+    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
+    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
+    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
+    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
+    KIND_PRESENCE_UPDATE, KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE,
+    KIND_PROJECT, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
+    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
+    KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -64,7 +64,138 @@ fn is_ci_event_kind(kind: u32) -> bool {
             | KIND_CI_ARTIFACT_REFERENCE
             | KIND_CI_EVIDENCE_FINALIZED
             | KIND_CI_TEARDOWN_ATTESTATION
+            | KIND_CI_GRANT
     )
+}
+
+/// A validated kind-46107 CI signer grant.
+///
+/// Wire contract (JSON in `event.content`): every field is required except
+/// `valid_until`, which is `null` or absent for an open-ended grant. Times are
+/// accepted as integer Unix seconds or RFC3339 strings. Any parse failure,
+/// unknown field, malformed coordinate/signer/key, or inverted validity window
+/// rejects the whole event (fail-closed) — nothing is silently persisted.
+#[derive(Debug, Clone)]
+struct ValidatedCiGrant {
+    /// NIP-34 repository coordinate `30617:<64hex-owner>:<repo-id>` scoping the grant.
+    target_repo_a: String,
+    /// 64-char lowercase-hex signer pubkey being granted status-signer authority.
+    signer_pubkey: String,
+    /// Grant window start (inclusive).
+    valid_from: chrono::DateTime<Utc>,
+    /// Optional grant window end (exclusive); `None` is open-ended.
+    valid_until: Option<chrono::DateTime<Utc>>,
+}
+
+/// Kind-46107 grant content schema version. Must match the signed CI schema
+/// family (`buzz_core::ci::CI_SCHEMA_VERSION`) so grant events carry the same
+/// protocol versioning discipline as run envelopes.
+const CI_GRANT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CiGrantContent {
+    schema_version: u32,
+    target_repo_a: String,
+    signer_pubkey: String,
+    valid_from: CiGrantTime,
+    #[serde(default)]
+    valid_until: Option<CiGrantTime>,
+}
+
+/// A CI grant window bound: either integer Unix seconds or an RFC3339 string.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CiGrantTime {
+    Seconds(i64),
+    Rfc3339(String),
+}
+
+fn grant_time_to_utc(value: &CiGrantTime) -> Result<chrono::DateTime<Utc>, &'static str> {
+    match value {
+        CiGrantTime::Seconds(secs) => {
+            chrono::DateTime::from_timestamp(*secs, 0).ok_or("CI grant timestamp is out of range")
+        }
+        CiGrantTime::Rfc3339(raw) => chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|_| "CI grant timestamp is not a valid RFC3339 string"),
+    }
+}
+
+/// Validate a 64-char lowercase-hex pubkey (the wire form used everywhere the
+/// relay fingerprints signers; mirrors `buzz-relay/src/config.rs` signer parsing).
+fn is_lower_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Validate a NIP-34 repository coordinate `30617:<64hex-owner>:<repo-id>`
+/// (mirrors `buzz_core::ci::validate_repository_coordinate`, which is private).
+fn is_valid_repository_coordinate(value: &str) -> bool {
+    let mut parts = value.splitn(3, ':');
+    if parts.next() != Some("30617") {
+        return false;
+    }
+    let owner = match parts.next() {
+        Some(owner) if is_lower_hex64(owner) => owner,
+        _ => return false,
+    };
+    let repo_id = match parts.next() {
+        Some(repo_id) => repo_id,
+        None => return false,
+    };
+    is_lower_hex64(owner) && !repo_id.is_empty()
+}
+
+/// Parse and fail-closed validate a kind-46107 CI signer grant event.
+fn validate_ci_grant_event(event: &Event) -> Result<ValidatedCiGrant, IngestError> {
+    let content: CiGrantContent = serde_json::from_str(&event.content).map_err(|error| {
+        IngestError::Rejected(format!(
+            "invalid: CI grant content is not valid JSON: {error}"
+        ))
+    })?;
+
+    if content.schema_version != CI_GRANT_SCHEMA_VERSION {
+        return Err(IngestError::Rejected(format!(
+            "invalid: unsupported CI grant schema_version (expected {CI_GRANT_SCHEMA_VERSION}, got {})",
+            content.schema_version
+        )));
+    }
+    if !is_valid_repository_coordinate(&content.target_repo_a) {
+        return Err(IngestError::Rejected(
+            "invalid: CI grant target_repo_a must be 30617:<64hex owner>:<repo id>".into(),
+        ));
+    }
+    if !is_lower_hex64(&content.signer_pubkey) {
+        return Err(IngestError::Rejected(
+            "invalid: CI grant signer_pubkey must be a 64-character lowercase hex pubkey".into(),
+        ));
+    }
+
+    let valid_from = grant_time_to_utc(&content.valid_from)
+        .map_err(|message| IngestError::Rejected(format!("invalid: {message}")))?;
+    let valid_until = match &content.valid_until {
+        Some(bound) => Some(
+            grant_time_to_utc(bound)
+                .map_err(|message| IngestError::Rejected(format!("invalid: {message}")))?,
+        ),
+        None => None,
+    };
+
+    if valid_until.is_some_and(|until| until <= valid_from) {
+        return Err(IngestError::Rejected(
+            "invalid: CI grant valid_until must be strictly after valid_from".into(),
+        ));
+    }
+
+    Ok(ValidatedCiGrant {
+        target_repo_a: content.target_repo_a,
+        signer_pubkey: content.signer_pubkey,
+        valid_from,
+        valid_until,
+    })
 }
 
 fn validate_custom_emoji_tags(event: &Event) -> Result<(), IngestError> {
@@ -490,16 +621,18 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
         KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
         KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
-        // CI requests and control-plane facts use the existing background-job
-        // capability. Repository membership and signer authority are enforced
-        // independently after the channel is resolved.
+        // CI requests, control-plane facts, and CI signer grants use the
+        // existing background-job capability. Repository membership, signer
+        // authority, and grant-issuer authority are enforced independently
+        // after the channel is resolved.
         KIND_CI_REQUEST
         | KIND_CI_RUN_STATUS
         | KIND_CI_JOB_STATUS
         | KIND_CI_LOG_REFERENCE
         | KIND_CI_ARTIFACT_REFERENCE
         | KIND_CI_EVIDENCE_FINALIZED
-        | KIND_CI_TEARDOWN_ATTESTATION => Ok(Scope::JobsWrite),
+        | KIND_CI_TEARDOWN_ATTESTATION
+        | KIND_CI_GRANT => Ok(Scope::JobsWrite),
         _ => Err("restricted: unknown event kind"),
     }
 }
@@ -2515,17 +2648,112 @@ async fn ingest_event_inner(
         }
     }
 
-    let validated_ci_event = if is_ci_event_kind(kind_u32) {
+    // A validated kind-46107 CI signer grant, parsed from `event.content` and
+    // authorized against the channel/community role of the event signer. It is
+    // persisted to `ci_grants` via `Db::upsert_ci_grant` after the canonical
+    // event row is stored (see the grant storage branch below). `None` for
+    // every non-grant kind.
+    let mut validated_ci_grant: Option<ValidatedCiGrant> = None;
+
+    let validated_ci_event = if kind_u32 == KIND_CI_GRANT {
+        // Kind 46107 is admitted to the CI ingest gate (see `is_ci_event_kind`)
+        // but is NOT a run-event envelope: it does NOT round-trip through
+        // `validate_signed_ci_event`/`store_ci_event`. Instead the grant
+        // contract is validated fail-closed, the issuer is authorized, the
+        // grant event is stored as a canonical event, and the `ci_grants` row
+        // is upserted. The signer-union gate for 46101-46106 is deliberately
+        // untouched: a grant only ADDS a durable row that later feeds
+        // `get_active_ci_signers`.
+        let ch_id = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: CI grant events require a channel h tag".into())
+        })?;
+
+        let grant = validate_ci_grant_event(&event)?;
+
+        // Authorization (fail-closed): a CI signer grant may be issued only by
+        // a channel owner/admin, or by a community owner/admin acting on any
+        // channel of the community — the repository's authorization model (see
+        // `moderation_authz::authorize_moderation_action`).
+        let channel_role = state
+            .db
+            .get_member_role(tenant.community(), ch_id, &pubkey_bytes)
+            .await
+            .map_err(|e| {
+                IngestError::Internal(format!("error: ci grant issuer role check: {e}"))
+            })?;
+        if !matches!(channel_role.as_deref(), Some("owner") | Some("admin")) {
+            let community_role = state
+                .db
+                .get_relay_member(tenant.community(), &event.pubkey.to_hex())
+                .await
+                .map_err(|e| {
+                    IngestError::Internal(format!("error: ci grant issuer role check: {e}"))
+                })?
+                .map(|member| member.role);
+            if !matches!(community_role.as_deref(), Some("owner") | Some("admin")) {
+                return Err(IngestError::AuthFailed(
+                    "restricted: only a channel owner or admin may issue a CI signer grant".into(),
+                ));
+            }
+        }
+
+        validated_ci_grant = Some(grant);
+        // No run-event envelope for a grant: leave `validated_ci_event` None so
+        // the event falls through to canonical storage + grant persistence.
+        None
+    } else if is_ci_event_kind(kind_u32) {
         let ch_id = channel_id.ok_or_else(|| {
             IngestError::Rejected("invalid: CI events require a channel h tag".into())
         })?;
+
+        // B1 authorized-signer composition.
+        //
+        // ORDERING (fail-closed):
+        // 1. Kind 46100 (CI_REQUEST): the actor IS the requester — the signer
+        //    set is DEFINED as empty, so validate_signed_ci_event checks the
+        //    envelope + tags + actor==signer and never consults the signer set.
+        // 2. Kinds 46101-46106: signers must be authorized. The granted set is
+        //    the UNION of canonical's owner-configured static signers
+        //    `config.ci_status_signer_pubkeys` AND the active `ci_grants` rows
+        //    for (community, channel, target_repo_a) now resolved via
+        //    Db::get_active_ci_signers. The union is taken here so neither the
+        //    config-based set nor the grant set can ever be silently dropped:
+        //    if BOTH are empty, validate_signed_ci_event rejects the event
+        //    (unauthorized signer).
+        // Canonical's static validation is retained verbatim on the union below,
+        // not replaced. Kind 46107 is NOT part of this union — the grant event
+        // authorizes, it is never authorized by the status-signer set.
+        let signers: std::collections::HashSet<String> = if kind_u32 == KIND_CI_REQUEST {
+            std::collections::HashSet::new()
+        } else {
+            // Every 46101-46106 envelope carries the immutable NIP-34 repository
+            // coordinate `target_repo_a` as a top-level JSON field; it scopes the
+            // grant lookup to the exact repository the event is about.
+            let parsed: serde_json::Value = serde_json::from_str(&event.content).map_err(|_| {
+                IngestError::Rejected("invalid: CI event content is not valid JSON".into())
+            })?;
+            let target_repo_a = parsed
+                .get("target_repo_a")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    IngestError::Rejected("invalid: CI event missing target_repo_a".into())
+                })?;
+
+            let now = chrono::Utc::now();
+            let mut signers: std::collections::HashSet<String> =
+                state.config.ci_status_signer_pubkeys.clone();
+            let grant_signers = state
+                .db
+                .get_active_ci_signers(tenant.community(), ch_id, target_repo_a, now)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: ci grant lookup: {e}")))?;
+            signers.extend(grant_signers);
+            signers
+        };
+
         Some(
-            buzz_core::ci::validate_signed_ci_event(
-                &event,
-                &ch_id.to_string(),
-                &state.config.ci_status_signer_pubkeys,
-            )
-            .map_err(|error| IngestError::Rejected(error.to_string()))?,
+            buzz_core::ci::validate_signed_ci_event(&event, &ch_id.to_string(), &signers)
+                .map_err(|error| IngestError::Rejected(error.to_string()))?,
         )
     } else {
         None
@@ -3042,6 +3270,42 @@ async fn ingest_event_inner(
                 )));
             }
         }
+    } else if kind_u32 == KIND_CI_GRANT {
+        // Kind 46107 storage is authority-gated and validated earlier in the
+        // pipeline; here the channel is required (the grant is channel-scoped).
+        let ch_id = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: CI grant event requires a channel".into())
+        })?;
+        let grant = validated_ci_grant.take().ok_or_else(|| {
+            IngestError::Rejected("invalid: CI grant event was not validated".into())
+        })?;
+        let result = state
+            .db
+            .insert_event_with_thread_metadata(tenant.community(), &event, Some(ch_id), None)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
+        // Persist the durable grant row. This is idempotent (ON CONFLICT DO
+        // UPDATE), so a duplicate replay re-applies the same window and a
+        // re-published grant with an updated window supersedes the old one.
+        // `granted_by` is the signer of the grant event — the authenticated
+        // channel/community owner or admin (grant-issuer authority above).
+        let granted_by = event.pubkey.to_hex();
+        state
+            .db
+            .upsert_ci_grant(
+                tenant.community(),
+                ch_id,
+                &grant.target_repo_a,
+                &grant.signer_pubkey,
+                grant.valid_from,
+                grant.valid_until,
+                &granted_by,
+            )
+            .await
+            .map_err(|e| {
+                IngestError::Internal(format!("error: persisting CI signer grant: {e}"))
+            })?;
+        result
     } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
@@ -3637,6 +3901,7 @@ mod tests {
             KIND_CI_ARTIFACT_REFERENCE,
             KIND_CI_EVIDENCE_FINALIZED,
             KIND_CI_TEARDOWN_ATTESTATION,
+            KIND_CI_GRANT,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &event).expect("known CI kind"),
@@ -3652,6 +3917,144 @@ mod tests {
                     if message == "restricted: insufficient scope (need jobs:write)"
             ));
         }
+    }
+
+    #[test]
+    fn ci_grant_kind_is_admitted_to_the_ci_gate() {
+        for kind in [
+            KIND_CI_REQUEST,
+            KIND_CI_RUN_STATUS,
+            KIND_CI_JOB_STATUS,
+            KIND_CI_LOG_REFERENCE,
+            KIND_CI_ARTIFACT_REFERENCE,
+            KIND_CI_EVIDENCE_FINALIZED,
+            KIND_CI_TEARDOWN_ATTESTATION,
+            KIND_CI_GRANT,
+        ] {
+            assert!(
+                is_ci_event_kind(kind),
+                "kind {kind} must be a CI event kind"
+            );
+        }
+        assert!(
+            !is_ci_event_kind(KIND_APPROVAL_GRANT),
+            "non-CI kind must not be admitted to the CI gate"
+        );
+    }
+
+    fn valid_grant_content() -> serde_json::Value {
+        let owner = "a".repeat(64);
+        let signer = "b".repeat(64);
+        serde_json::json!({
+            "schema_version": CI_GRANT_SCHEMA_VERSION,
+            "target_repo_a": format!("30617:{owner}:buzz"),
+            "signer_pubkey": signer,
+            "valid_from": (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+            "valid_until": null,
+        })
+    }
+
+    fn grant_event_with_content(content: &serde_json::Value) -> Event {
+        let keys = nostr::Keys::generate();
+        nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_CI_GRANT as u16),
+            content.to_string(),
+        )
+        .tags([nostr::Tag::parse(["h", "46bba699-8251-43c7-943e-66be58376585"]).unwrap()])
+        .sign_with_keys(&keys)
+        .unwrap()
+    }
+
+    #[test]
+    fn grant_validation_accepts_a_valid_open_ended_grant() {
+        let event = grant_event_with_content(&valid_grant_content());
+        let grant = validate_ci_grant_event(&event).expect("valid grant must validate");
+        assert_eq!(
+            grant.target_repo_a,
+            format!("30617:{}:buzz", "a".repeat(64))
+        );
+        assert_eq!(grant.signer_pubkey, "b".repeat(64));
+        assert!(grant.valid_until.is_none(), "open-ended grant");
+        assert!(grant.valid_from <= chrono::Utc::now());
+    }
+
+    #[test]
+    fn grant_validation_accepts_unix_second_bounds_and_windows() {
+        let now = chrono::Utc::now();
+        let owner = "c".repeat(64);
+        let signer = "d".repeat(64);
+        let content = serde_json::json!({
+            "schema_version": CI_GRANT_SCHEMA_VERSION,
+            "target_repo_a": format!("30617:{owner}:ci"),
+            "signer_pubkey": signer,
+            "valid_from": now.timestamp(),
+            "valid_until": (now + chrono::Duration::hours(4)).timestamp(),
+        });
+        let event = grant_event_with_content(&content);
+        let grant = validate_ci_grant_event(&event).expect("windowed grant must validate");
+        let until = grant.valid_until.expect("valid_until present");
+        assert!(
+            until > grant.valid_from,
+            "valid_until must be strictly after valid_from"
+        );
+    }
+
+    #[test]
+    fn grant_validation_rejects_each_invalid_contract() {
+        let now = chrono::Utc::now();
+
+        let mut bad = valid_grant_content();
+        bad["schema_version"] = serde_json::json!(99);
+        let event = grant_event_with_content(&bad);
+        assert!(matches!(
+            validate_ci_grant_event(&event),
+            Err(IngestError::Rejected(ref m)) if m.contains("schema_version")
+        ));
+
+        let mut bad = valid_grant_content();
+        bad["target_repo_a"] = serde_json::json!("30617:short:buzz");
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
+
+        let mut bad = valid_grant_content();
+        bad["target_repo_a"] = serde_json::json!("30100:not-a-ci-repo");
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
+
+        let mut bad = valid_grant_content();
+        bad["signer_pubkey"] = serde_json::json!("not-hex");
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
+
+        let mut bad = valid_grant_content();
+        bad["signer_pubkey"] = serde_json::json!("Z".repeat(64));
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
+
+        // Inverted window: valid_until strictly before valid_from.
+        let mut bad = valid_grant_content();
+        bad["valid_from"] = serde_json::json!((now + chrono::Duration::hours(2)).timestamp());
+        bad["valid_until"] = serde_json::json!((now + chrono::Duration::hours(1)).timestamp());
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
+
+        // Missing required field.
+        let mut bad = valid_grant_content();
+        bad.as_object_mut().unwrap().remove("signer_pubkey");
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
+
+        // Unknown field is fail-closed.
+        let mut bad = valid_grant_content();
+        bad["extra"] = serde_json::json!("sneaky");
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
+
+        // Malformed timestamp.
+        let mut bad = valid_grant_content();
+        bad["valid_from"] = serde_json::json!("not-a-timestamp");
+        let event = grant_event_with_content(&bad);
+        assert!(validate_ci_grant_event(&event).is_err());
     }
 
     #[test]

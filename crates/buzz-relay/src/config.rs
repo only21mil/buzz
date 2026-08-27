@@ -46,6 +46,46 @@ pub struct JoinPolicyConfig {
     pub version: String,
 }
 
+/// Relay-side CI configuration.
+#[derive(Debug, Clone, Default)]
+pub struct CiConfig {
+    /// Root/operator-owned bounds returned by `POST /ci/preflight`.
+    ///
+    /// `None` keeps preflight fail-closed. The policy is present only when all
+    /// five `BUZZ_CI_*` policy variables pass validation together.
+    pub policy: Option<CiPolicyConfig>,
+}
+
+/// Validated CI request and acknowledgement bounds advertised by preflight.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CiPolicyConfig {
+    /// Minimum accepted job timeout in seconds.
+    pub min_timeout_seconds: u64,
+    /// Maximum accepted job timeout in seconds.
+    pub max_timeout_seconds: u64,
+    /// Maximum request lifetime in seconds.
+    pub max_expiry_seconds: u64,
+    /// Maximum time to wait for a broker acknowledgement in seconds.
+    pub acknowledgement_timeout_seconds: u64,
+    /// Maximum attempt number accepted for one job lineage.
+    pub max_attempts: u64,
+}
+
+const CI_POLICY_ENV_NAMES: [&str; 5] = [
+    "BUZZ_CI_MIN_TIMEOUT_SECONDS",
+    "BUZZ_CI_MAX_TIMEOUT_SECONDS",
+    "BUZZ_CI_MAX_EXPIRY_SECONDS",
+    "BUZZ_CI_ACKNOWLEDGEMENT_TIMEOUT_SECONDS",
+    "BUZZ_CI_MAX_ATTEMPTS",
+];
+
+// Operational ceilings keep an operator typo from advertising request bounds
+// that the u32 broker protocol could technically encode but cannot safely run.
+const CI_MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const CI_MAX_EXPIRY_SECONDS: u64 = 60 * 60;
+const CI_MAX_ACKNOWLEDGEMENT_TIMEOUT_SECONDS: u64 = 5 * 60;
+const CI_MAX_ATTEMPTS: u64 = 10;
+
 /// Maximum configured jitter, leaving ten seconds of the hard-drain budget for
 /// WebSocket close-frame delivery after the final delayed cancellation.
 pub const MAX_DRAIN_JITTER_MS: u64 = 20_000;
@@ -212,6 +252,9 @@ pub struct Config {
     /// 64-character lowercase hexadecimal pubkeys.
     pub ci_status_signer_pubkeys: std::collections::HashSet<String>,
 
+    /// CI preflight policy configuration. Absent by default (fail closed).
+    pub ci: CiConfig,
+
     /// Allow NIP-OA owner attestation for relay membership.
     ///
     /// When `true` and `require_relay_membership` is also `true`, agents
@@ -354,6 +397,101 @@ fn parse_pubkey_set_env(name: &str) -> Result<std::collections::HashSet<String>,
             Ok(entry)
         })
         .collect()
+}
+
+fn ci_policy_config_from_env() -> Result<Option<CiPolicyConfig>, ConfigError> {
+    let mut raw_values: [Option<String>; 5] = Default::default();
+    for (index, name) in CI_POLICY_ENV_NAMES.into_iter().enumerate() {
+        match std::env::var(name) {
+            Ok(raw) => raw_values[index] = Some(raw),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidValue(format!(
+                    "{name} must be valid Unicode"
+                )))
+            }
+        }
+    }
+    parse_ci_policy_config(&raw_values)
+}
+
+fn parse_ci_policy_config(
+    raw_values: &[Option<String>; 5],
+) -> Result<Option<CiPolicyConfig>, ConfigError> {
+    if raw_values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+
+    let missing: Vec<_> = CI_POLICY_ENV_NAMES
+        .iter()
+        .zip(raw_values)
+        .filter_map(|(name, value)| value.is_none().then_some(*name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(ConfigError::InvalidValue(format!(
+            "CI policy must configure all five bounds together; missing {}",
+            missing.join(", ")
+        )));
+    }
+
+    let mut values = [0_u64; 5];
+    for (index, (name, raw)) in CI_POLICY_ENV_NAMES.iter().zip(raw_values).enumerate() {
+        let raw = raw
+            .as_deref()
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "CI policy must configure all five bounds together; missing {name}"
+                ))
+            })?
+            .trim();
+        values[index] = raw
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(format!("{name} must be a positive integer"))
+            })?;
+    }
+
+    let policy = CiPolicyConfig {
+        min_timeout_seconds: values[0],
+        max_timeout_seconds: values[1],
+        max_expiry_seconds: values[2],
+        acknowledgement_timeout_seconds: values[3],
+        max_attempts: values[4],
+    };
+    if policy.min_timeout_seconds >= policy.max_timeout_seconds {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_CI_MIN_TIMEOUT_SECONDS must be less than BUZZ_CI_MAX_TIMEOUT_SECONDS".into(),
+        ));
+    }
+    if policy.max_timeout_seconds > CI_MAX_TIMEOUT_SECONDS {
+        return Err(ConfigError::InvalidValue(format!(
+            "BUZZ_CI_MAX_TIMEOUT_SECONDS must not exceed {CI_MAX_TIMEOUT_SECONDS}"
+        )));
+    }
+    if policy.max_expiry_seconds > CI_MAX_EXPIRY_SECONDS {
+        return Err(ConfigError::InvalidValue(format!(
+            "BUZZ_CI_MAX_EXPIRY_SECONDS must not exceed {CI_MAX_EXPIRY_SECONDS}"
+        )));
+    }
+    if policy.acknowledgement_timeout_seconds > CI_MAX_ACKNOWLEDGEMENT_TIMEOUT_SECONDS {
+        return Err(ConfigError::InvalidValue(format!(
+            "BUZZ_CI_ACKNOWLEDGEMENT_TIMEOUT_SECONDS must not exceed {CI_MAX_ACKNOWLEDGEMENT_TIMEOUT_SECONDS}"
+        )));
+    }
+    if policy.acknowledgement_timeout_seconds > policy.max_expiry_seconds {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_CI_ACKNOWLEDGEMENT_TIMEOUT_SECONDS must not exceed BUZZ_CI_MAX_EXPIRY_SECONDS"
+                .into(),
+        ));
+    }
+    if policy.max_attempts > CI_MAX_ATTEMPTS {
+        return Err(ConfigError::InvalidValue(format!(
+            "BUZZ_CI_MAX_ATTEMPTS must not exceed {CI_MAX_ATTEMPTS}"
+        )));
+    }
+    Ok(Some(policy))
 }
 
 fn rate_limit_config_from_env() -> Result<buzz_auth::RateLimitConfig, ConfigError> {
@@ -733,6 +871,9 @@ impl Config {
         }
 
         let ci_status_signer_pubkeys = parse_pubkey_set_env("BUZZ_CI_STATUS_SIGNER_PUBKEYS")?;
+        let ci = CiConfig {
+            policy: ci_policy_config_from_env()?,
+        };
 
         let auth = buzz_auth::AuthConfig {
             rate_limits: rate_limit_config_from_env()?,
@@ -1074,6 +1215,7 @@ impl Config {
             relay_operator_api_origin,
             relay_operator_pubkeys,
             ci_status_signer_pubkeys,
+            ci,
             allow_nip_oa_auth,
             media,
             media_max_concurrent_uploads,
@@ -1202,6 +1344,10 @@ mod tests {
         assert!(
             config.ci_status_signer_pubkeys.is_empty(),
             "CI status signer authority should default empty"
+        );
+        assert!(
+            config.ci.policy.is_none(),
+            "CI preflight policy should default absent"
         );
         assert!(
             !config.allow_nip_oa_auth,
@@ -1644,6 +1790,96 @@ mod tests {
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_CI_STATUS_SIGNER_PUBKEYS")
         ));
+    }
+
+    fn ci_policy_values(values: [&str; 5]) -> [Option<String>; 5] {
+        values.map(|value| Some(value.to_string()))
+    }
+
+    #[test]
+    fn ci_policy_absent_fails_closed() {
+        let values = [None, None, None, None, None];
+        assert_eq!(parse_ci_policy_config(&values).expect("parse policy"), None);
+    }
+
+    #[test]
+    fn ci_policy_parses_complete_valid_bounds() {
+        let values = ci_policy_values(["60", "1800", "300", "5", "3"]);
+        assert_eq!(
+            parse_ci_policy_config(&values).expect("parse policy"),
+            Some(CiPolicyConfig {
+                min_timeout_seconds: 60,
+                max_timeout_seconds: 1800,
+                max_expiry_seconds: 300,
+                acknowledgement_timeout_seconds: 5,
+                max_attempts: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn ci_policy_env_parser_reads_all_five_bounds() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous: Vec<_> = CI_POLICY_ENV_NAMES
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in CI_POLICY_ENV_NAMES
+            .iter()
+            .zip(["60", "1800", "300", "5", "3"])
+        {
+            std::env::set_var(name, value);
+        }
+
+        let policy = ci_policy_config_from_env().expect("parse policy environment");
+
+        for (name, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        assert_eq!(
+            policy,
+            Some(CiPolicyConfig {
+                min_timeout_seconds: 60,
+                max_timeout_seconds: 1800,
+                max_expiry_seconds: 300,
+                acknowledgement_timeout_seconds: 5,
+                max_attempts: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn ci_policy_rejects_partial_configuration() {
+        let values = [Some("60".into()), None, None, None, None];
+        let result = parse_ci_policy_config(&values);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("all five bounds")
+                    && message.contains("BUZZ_CI_MAX_TIMEOUT_SECONDS")
+        ));
+    }
+
+    #[test]
+    fn ci_policy_rejects_zero_inverted_and_excessive_bounds() {
+        for values in [
+            ci_policy_values(["0", "1800", "300", "5", "3"]),
+            ci_policy_values(["1800", "1800", "300", "5", "3"]),
+            ci_policy_values(["60", "86401", "300", "5", "3"]),
+            ci_policy_values(["60", "1800", "3601", "5", "3"]),
+            ci_policy_values(["60", "1800", "300", "301", "3"]),
+            ci_policy_values(["60", "1800", "4", "5", "3"]),
+            ci_policy_values(["60", "1800", "300", "5", "11"]),
+        ] {
+            assert!(
+                parse_ci_policy_config(&values).is_err(),
+                "invalid CI policy must fail startup: {values:?}"
+            );
+        }
     }
 
     #[test]
