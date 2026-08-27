@@ -600,6 +600,101 @@ class CapabilityParityTests(unittest.TestCase):
         with self.assertRaisesRegex(PARITY.ParityError, "digest mismatch"):
             PARITY.validate_receipt_digest(tampered)
 
+    def test_open_sealed_runtime_verifier_rejects_drift_and_freezes_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            verifier = root / PARITY.ROOT_VERIFIER_TARGET.lstrip("/")
+            verifier.parent.mkdir(parents=True)
+            original = b"#!/bin/sh\nexit 0\n"
+            verifier.write_bytes(original)
+            verifier.chmod(0o755)
+            sha256, _metadata = PARITY.regular_sha256(verifier)
+            record = {
+                "target": PARITY.ROOT_VERIFIER_TARGET,
+                "source": "install-root/usr/local/libexec/buzz/buzz-agent-key-handoff",
+                "mode": "0755",
+                "uid": 0,
+                "gid": 0,
+                "sha256": sha256,
+            }
+            manifest = {"runtime_targets": [record]}
+            real_fstat = PARITY.os.fstat
+
+            def metadata(*, uid=0, gid=0):
+                def observe(descriptor):
+                    fields = list(real_fstat(descriptor))
+                    fields[4] = uid
+                    fields[5] = gid
+                    return os.stat_result(fields)
+
+                return observe
+
+            with mock.patch.object(PARITY.os, "fstat", side_effect=metadata()):
+                descriptor = PARITY.open_sealed_runtime_verifier(verifier, manifest, root)
+            try:
+                verifier.write_bytes(b"mutated after freeze\n")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                self.assertEqual(os.read(descriptor, len(original) + 32), original)
+                with self.assertRaises(OSError):
+                    os.write(descriptor, b"x")
+            finally:
+                os.close(descriptor)
+            verifier.write_bytes(original)
+            verifier.chmod(0o755)
+
+            with self.assertRaisesRegex(PARITY.ParityError, "reviewed runtime target"):
+                PARITY.open_sealed_runtime_verifier(root / "wrong", manifest, root)
+            with self.assertRaisesRegex(PARITY.ParityError, "inventory is absent"):
+                PARITY.open_sealed_runtime_verifier(verifier, {}, root)
+            with self.assertRaisesRegex(PARITY.ParityError, "no unique"):
+                PARITY.open_sealed_runtime_verifier(verifier, {"runtime_targets": []}, root)
+            wrong_target = copy.deepcopy(record)
+            wrong_target["target"] = f"{PARITY.ROOT_VERIFIER_TARGET}.other"
+            with self.assertRaisesRegex(PARITY.ParityError, "no unique"):
+                PARITY.open_sealed_runtime_verifier(
+                    verifier, {"runtime_targets": [wrong_target]}, root
+                )
+            with self.assertRaisesRegex(PARITY.ParityError, "no unique"):
+                PARITY.open_sealed_runtime_verifier(
+                    verifier, {"runtime_targets": [record, copy.deepcopy(record)]}, root
+                )
+
+            for field, value in (("mode", "0700"), ("uid", 1000), ("gid", 1000)):
+                drifted = copy.deepcopy(record)
+                drifted[field] = value
+                with self.subTest(record_field=field), self.assertRaisesRegex(
+                    PARITY.ParityError, "manifest ownership, mode, or digest is unsafe"
+                ):
+                    PARITY.open_sealed_runtime_verifier(
+                        verifier, {"runtime_targets": [drifted]}, root
+                    )
+
+            with mock.patch.object(PARITY.os, "fstat", side_effect=metadata(uid=1000)):
+                with self.assertRaisesRegex(PARITY.ParityError, "metadata is unsafe"):
+                    PARITY.open_sealed_runtime_verifier(verifier, manifest, root)
+            with mock.patch.object(PARITY.os, "fstat", side_effect=metadata(gid=1000)):
+                with self.assertRaisesRegex(PARITY.ParityError, "metadata is unsafe"):
+                    PARITY.open_sealed_runtime_verifier(verifier, manifest, root)
+            verifier.chmod(0o700)
+            with mock.patch.object(PARITY.os, "fstat", side_effect=metadata()):
+                with self.assertRaisesRegex(PARITY.ParityError, "metadata is unsafe"):
+                    PARITY.open_sealed_runtime_verifier(verifier, manifest, root)
+            verifier.chmod(0o755)
+            hardlink = root / "runtime-verifier-hardlink"
+            os.link(verifier, hardlink)
+            with mock.patch.object(PARITY.os, "fstat", side_effect=metadata()):
+                with self.assertRaisesRegex(PARITY.ParityError, "metadata is unsafe"):
+                    PARITY.open_sealed_runtime_verifier(verifier, manifest, root)
+            hardlink.unlink()
+
+            wrong_digest = copy.deepcopy(record)
+            wrong_digest["sha256"] = "f" * 64
+            with mock.patch.object(PARITY.os, "fstat", side_effect=metadata()):
+                with self.assertRaisesRegex(PARITY.ParityError, "digest is not manifest-bound"):
+                    PARITY.open_sealed_runtime_verifier(
+                        verifier, {"runtime_targets": [wrong_digest]}, root
+                    )
+
     def test_maintained_owner_tools_seal_synthetic_private_safe_receipt(self) -> None:
         synthetic_owner = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
         synthetic_secret = "0" * 63 + "1"

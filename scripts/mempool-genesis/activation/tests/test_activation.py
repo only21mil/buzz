@@ -639,6 +639,35 @@ class ActivationBundleTests(PackageFixture):
                     "genesis",
                 )
 
+    def test_simple_env_grammar_rejects_systemd_quoting_and_continuations(self) -> None:
+        response_line = b"BUZZ_ACP_RESPOND_TO=allowlist\n"
+        for slug in ("mempool", "genesis"):
+            payload = (ACTIVATION_DIR / f"templates/{slug}.env").read_bytes()
+            cases = {
+                "multiline double quote": payload.replace(
+                    response_line,
+                    b'UNRELATED="open\n' + response_line + b'CLOSE=value"\n',
+                    1,
+                ),
+                "backslash continuation": payload.replace(
+                    response_line,
+                    b"UNRELATED=continued\\\n" + response_line,
+                    1,
+                ),
+                "unbalanced double quote": payload + b'UNRELATED="unterminated\n',
+                "single quoted value": payload + b"UNRELATED='unsupported'\n",
+                "escaped quote": payload + b'UNRELATED="escaped\\\"quote"\n',
+                "embedded unquoted whitespace": payload + b"UNRELATED=two words\n",
+                "carriage return": payload.replace(b"\n", b"\r\n", 1),
+                "nul control": payload + b"UNRELATED=value\x00\n",
+                "delete control": payload + b"UNRELATED=value\x7f\n",
+            }
+            for label, invalid in cases.items():
+                with self.subTest(slug=slug, syntax=label), self.assertRaisesRegex(
+                    ValueError, "unsupported|reviewed ASCII grammar|control syntax"
+                ):
+                    GENERATOR.validate_env(invalid, slug)
+
     def test_prestart_response_contract_matches_both_envs_and_rejects_drift(self) -> None:
         verifier = REPO_ROOT / "scripts/mempool-genesis/verify-installed-agent"
         policy = ACTIVATION_DIR / "capability-parity-policy.json"
@@ -689,6 +718,20 @@ class ActivationBundleTests(PackageFixture):
                 + b" BUZZ_ACP_RESPOND_TO=everyone\n",
                 "tab-prefixed duplicate allowed-respond-to": payload
                 + b"\tBUZZ_ACP_ALLOWED_RESPOND_TO=everyone\n",
+                "multiline double quote": payload.replace(
+                    b"BUZZ_ACP_RESPOND_TO=allowlist\n",
+                    b'UNRELATED="open\nBUZZ_ACP_RESPOND_TO=allowlist\nCLOSE=value"\n',
+                    1,
+                ),
+                "backslash continuation": payload.replace(
+                    b"BUZZ_ACP_RESPOND_TO=allowlist\n",
+                    b"UNRELATED=continued\\\nBUZZ_ACP_RESPOND_TO=allowlist\n",
+                    1,
+                ),
+                "unbalanced double quote": payload + b'UNRELATED="unterminated\n',
+                "single quoted value": payload + b"UNRELATED='unsupported'\n",
+                "escaped quote": payload + b'UNRELATED="escaped\\\"quote"\n',
+                "nul control": payload + b"UNRELATED=value\x00\n",
             }
             for label, drifted_payload in drift_cases.items():
                 with self.subTest(slug=slug, drift=label):
@@ -1011,6 +1054,24 @@ class ActivationBundleTests(PackageFixture):
             timeout=30,
         )
         self.assertNotEqual(rejected.returncode, 0)
+
+    def test_shell_expected_paths_match_generator_element_for_element(self) -> None:
+        verifier = REPO_ROOT / "scripts/mempool-genesis/verify-installed-agent"
+        for slug in ("mempool", "genesis"):
+            completed = subprocess.run(
+                ["/usr/bin/bash", str(verifier), "--print-expected-paths", slug],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            fields = completed.stdout.split(b"\0")
+            self.assertEqual(fields.pop(), b"")
+            self.assertEqual(
+                [field.decode() for field in fields],
+                list(GENERATOR.EXPECTED_PATHS[slug]),
+            )
 
     def test_tier2_v3_pass_with_risks_is_terminal_and_accepted(self) -> None:
         bundle, manifest = self.generate("accepted-risks")

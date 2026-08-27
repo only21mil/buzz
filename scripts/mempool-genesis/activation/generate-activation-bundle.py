@@ -368,17 +368,44 @@ def load_inputs(path: Path, allow_placeholders: bool) -> tuple[dict[str, str], b
     return result, complete
 
 
-def validate_env(payload: bytes, slug: str) -> None:
+def parse_simple_env(payload: bytes, slug: str) -> dict[str, str]:
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{slug} env must use the reviewed ASCII grammar") from error
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines or any(not line for line in lines):
+        raise ValueError(f"{slug} env contains a blank or missing assignment")
     values: dict[str, str] = {}
-    for line in payload.decode().splitlines():
+    for line in lines:
         if line[:1].isspace():
             raise ValueError(
                 f"systemd-equivalent leading whitespace is forbidden for {slug}: {line}"
             )
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in line):
+            raise ValueError(f"{slug} env contains unsupported control syntax")
         key, separator, value = line.partition("=")
-        if not separator or key in values:
+        if (
+            not separator
+            or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
+            or key in values
+        ):
             raise ValueError(f"invalid or duplicate env line for {slug}: {line}")
+        if "\\" in value or "'" in value:
+            raise ValueError(f"unsupported quoting or continuation syntax for {slug}: {line}")
+        if value.startswith('"'):
+            if len(value) < 2 or not value.endswith('"') or '"' in value[1:-1]:
+                raise ValueError(f"unsupported quoting or continuation syntax for {slug}: {line}")
+        elif '"' in value or any(character.isspace() for character in value):
+            raise ValueError(f"unsupported quoting or whitespace syntax for {slug}: {line}")
         values[key] = value
+    return values
+
+
+def validate_env(payload: bytes, slug: str) -> None:
+    values = parse_simple_env(payload, slug)
     required = {
         "BUZZ_ACP_AGENT_COMMAND": CODEX_ACP_PATH,
         "BUZZ_ACP_MCP_COMMAND": "/usr/local/libexec/buzz/buzz-dev-mcp",

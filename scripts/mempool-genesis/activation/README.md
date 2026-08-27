@@ -67,7 +67,7 @@ A complete package reports `input_status=complete`, `ready_for_parent_tier1=true
 
 Each agent's installed closure inventory has exactly 22 paths, including its effective template fragment, manager drop-in, per-instance drop-in, capability-parity comparator, activation transaction tool, and approved-differences policy. The prestart verifier compares systemd's actual `FragmentPath` and `DropInPaths` with that closed set and rejects any extra or missing path.
 
-The environment templates match Codex-R's reviewed response policy: `respond_to=allowlist`, `allowed_respond_to=allowlist`, and the sole responder is Victor's owner pubkey. They bind `BUZZ_ACP_STATE_DIR` to the identity-local persistent state path. The package removes the unproven `AF_NETLINK` exception and binds the template and both drop-in hashes that prove it remains absent.
+The environment templates match Codex-R's reviewed response policy: `respond_to=allowlist`, `allowed_respond_to=allowlist`, and the sole responder is Victor's owner pubkey. They bind `BUZZ_ACP_STATE_DIR` to the identity-local persistent state path. Generation and prestart accept only the reviewed ASCII `KEY=VALUE` grammar: an unquoted whitespace-free value or one completely balanced double-quoted value without escapes. Blank lines, comments, leading whitespace, single quotes, embedded unquoted whitespace, control bytes, backslashes, continuations, and multiline or unbalanced quotes fail closed. The package removes the unproven `AF_NETLINK` exception and binds the template and both drop-in hashes that prove it remains absent.
 
 ## Codex-R capability parity
 
