@@ -760,8 +760,10 @@ class ActivationBundleTests(PackageFixture):
 
     def test_expired_tier2_v2_state_is_rejected(self) -> None:
         bundle, _manifest, receipt, evidence, state = self.closed_package("expired")
-        os.utime(state, (1, 1))
-        with self.assertRaisesRegex(ValueError, "closure rejected"):
+        value = json.loads(state.read_text())
+        value["prepared_at_ns"] = 1
+        write_private_json(state, value)
+        with self.assertRaisesRegex(ValueError, "closed review state is stale"):
             INSTALLER.load_bundle(bundle, receipt, evidence, state, REPO_ROOT)
 
 
