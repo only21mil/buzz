@@ -82,32 +82,106 @@ set -euo pipefail
 printf 'docker BUZZ_IMAGE=%s %s\n' "${BUZZ_IMAGE:-}" "$*" >>"${TEST_COMMAND_LOG}"
 args=" $* "
 state=$(cat "${TEST_CONTAINER_STATE}")
+prior_id=sha256:1111111111111111111111111111111111111111111111111111111111111111
+new_id=sha256:2222222222222222222222222222222222222222222222222222222222222222
+mismatch_id=sha256:9999999999999999999999999999999999999999999999999999999999999999
 
 case "${args}" in
   *" build "*) exit 0 ;;
-  *" image inspect "*)
+  *" image inspect localhost/buzz-relay:${TEST_COMMIT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa} "*)
     if [[ ${TEST_SCENARIO} == manifest_list ]]; then
       printf 'sha256:3333333333333333333333333333333333333333333333333333333333333333\n'
     fi
     printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n'
     ;;
+  *" image inspect ${prior_id} "*)
+    case "${TEST_SCENARIO}" in
+      prior_child_uninspectable_valid_ref|prior_ref_platform_mismatch|prior_ref_revision_mismatch|prior_image_unavailable)
+        exit 1
+        ;;
+    esac
+    printf '%s\n' "${prior_id}"
+    ;;
   *" image tag "*) exit 0 ;;
-  *"org.block.buzz.required-migration"*) printf '%s\n' "${TEST_PRIOR_REQUIRED_MIGRATION}" ;;
+  *"org.opencontainers.image.revision"*)
+    target=${!#}
+    if [[ ${TEST_SCENARIO} == prior_ref_revision_mismatch && ${target} != relay-old ]]; then
+      printf 'dddddddddddddddddddddddddddddddddddddddd\n'
+    else
+      printf 'cccccccccccccccccccccccccccccccccccccccc\n'
+    fi
+    ;;
+  *"org.block.buzz.required-migration"*)
+    if [[ ${TEST_SCENARIO} == prior_label_inspect_failure* ]]; then
+      exit 26
+    fi
+    printf '%s\n' "${TEST_PRIOR_REQUIRED_MIGRATION}"
+    ;;
   *" inspect --format {{.Image}} "*)
-    case "${state}" in
-      old|rollback) printf 'sha256:1111111111111111111111111111111111111111111111111111111111111111\n' ;;
-      new) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;;
+    target=${!#}
+    case "${target}" in
+      relay-old|relay-rollback) printf '%s\n' "${prior_id}" ;;
+      relay-new) printf '%s\n' "${new_id}" ;;
+      *)
+        create_count=$(cat "${TEST_VERIFY_CREATE_COUNT}")
+        case "${TEST_SCENARIO}:${create_count}" in
+          prior_ref_platform_mismatch:*|explicit_platform_mismatch:*|post_create_validation_failure:*|rollback_revalidation_mismatch:2)
+            printf '%s\n' "${mismatch_id}"
+            ;;
+          *) printf '%s\n' "${prior_id}" ;;
+        esac
+        ;;
     esac
     ;;
-  *" inspect --format {{.Config.Image}} "*) printf 'localhost/buzz-relay:old\n' ;;
-  *" exec "*" sha256sum /usr/local/bin/buzz-relay "*)
-    case "${state}" in
-      old|rollback) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /usr/local/bin/buzz-relay\n' ;;
-      new) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  /usr/local/bin/buzz-relay\n' ;;
+  *" inspect --format {{.Config.Image}} "*)
+    case "${TEST_SCENARIO}" in
+      prior_ref_bare) printf 'localhost/buzz-relay\n' ;;
+      prior_ref_main) printf 'localhost/buzz-relay:main\n' ;;
+      prior_ref_latest) printf 'localhost/buzz-relay:latest\n' ;;
+      prior_ref_leading_option) printf '%s\n' '--pull=always' ;;
+      prior_ref_malformed) printf 'localhost//buzz-relay:old\n' ;;
+      *) printf 'localhost/buzz-relay:old\n' ;;
     esac
+    ;;
+  *" create --pull=never "*)
+    if [[ ${TEST_SCENARIO} == prior_image_unavailable ]]; then
+      exit 1
+    fi
+    create_count=$(( $(cat "${TEST_VERIFY_CREATE_COUNT}") + 1 ))
+    printf '%d\n' "${create_count}" >"${TEST_VERIFY_CREATE_COUNT}"
+    case "${TEST_SCENARIO}" in
+      create_stdout_empty) ;;
+      create_stdout_contaminated)
+        printf 'unexpected create output\n%064x\n' "${create_count}"
+        ;;
+      *) printf '%064x\n' "${create_count}" ;;
+    esac
+    ;;
+  *" cp "*)
+    source=$2
+    destination=$3
+    if [[ ${TEST_SCENARIO} == verification_copy_failure && ${source} != relay-old:* ]]; then
+      exit 23
+    fi
+    case "${source}" in
+      relay-new:*) printf 'new relay binary\n' >"${destination}" ;;
+      *) printf 'prior relay binary\n' >"${destination}" ;;
+    esac
+    ;;
+  *" rm -v "*)
+    remove_count=$(( $(cat "${TEST_VERIFY_REMOVE_COUNT}") + 1 ))
+    printf '%d\n' "${remove_count}" >"${TEST_VERIFY_REMOVE_COUNT}"
+    if [[ (${TEST_SCENARIO} == verification_remove_failure && ${remove_count} -eq 1) || \
+      (${TEST_SCENARIO} == rollback_verification_remove_failure && ${remove_count} -eq 2) ]]; then
+      exit 24
+    fi
+    printf '%s\n' "${!#}"
     ;;
   *" exec "*" bash -ec "*)
-    if [[ ${TEST_SCENARIO} == post_swap_failure* && ${state} == new ]]; then
+    if [[ (${TEST_SCENARIO} == post_swap_failure* || \
+      ${TEST_SCENARIO} == rollback_revalidation_mismatch || \
+      ${TEST_SCENARIO} == rollback_db_read_* || \
+      ${TEST_SCENARIO} == rollback_verification_remove_failure) && ${state} == new ]]; then
       exit 1
     fi
     if [[ ${TEST_SCENARIO} == stalled_probe && ${state} == new ]]; then
@@ -122,6 +196,17 @@ case "${args}" in
       rollback) printf 'relay-rollback\n' ;;
     esac
     ;;
+  *" compose "*" config --format json "*)
+    case "${TEST_SCENARIO}" in
+      explicit_platform|explicit_platform_mismatch)
+        printf '{"services":{"relay":{"platform":"linux/amd64"}}}\n'
+        ;;
+      malformed_platform)
+        printf '{"services":{"relay":{"platform":"linux/amd64;bad"}}}\n'
+        ;;
+      *) printf '{"services":{"relay":{}}}\n' ;;
+    esac
+    ;;
   *" compose "*" config --images "*)
     if [[ ${TEST_SCENARIO} == wrong_resolved_image ]]; then
       printf 'ghcr.io/block/buzz:main\n'
@@ -132,13 +217,19 @@ case "${args}" in
   *" compose "*" exec -T postgres sh -euc "*"pg_dump"*) printf 'stub custom dump\n' ;;
   *" compose "*" exec -T postgres sh -euc "*"psql"*)
     if [[ ${args} == *"to_regclass"* ]]; then
-      if [[ ${TEST_SCENARIO} == boolean_true ]]; then
-        printf '  true  \n'
-      else
-        printf 't\n'
-      fi
+      db_read_count=$(( $(cat "${TEST_DB_READ_COUNT}") + 1 ))
+      printf '%d\n' "${db_read_count}" >"${TEST_DB_READ_COUNT}"
+      case "${TEST_SCENARIO}:${db_read_count}" in
+        rollback_db_read_failure:2) exit 25 ;;
+        rollback_db_read_empty:2|db_marker_empty:*) ;;
+        rollback_db_read_malformed:2|db_marker_malformed:*) printf 'unknown\n' ;;
+        boolean_true:*) printf '  true  \n' ;;
+        *) printf 't\n' ;;
+      esac
     else
       case "${TEST_SCENARIO}" in
+        db_row_empty) ;;
+        db_row_malformed) printf '31|t|extra\n' ;;
         rollback_refusal) printf '32|t\n' ;;
         boolean_false) printf '%s|false\n' "$(cat "${TEST_DB_STATE}")" ;;
         boolean_true) printf '%s|true\n' "$(cat "${TEST_DB_STATE}")" ;;
@@ -174,8 +265,10 @@ run_case() {
   local initial_db=28 prior_required_migration=28
   local checkout_head=${test_commit} source_head=${test_commit} dirty_checkout=0
   local pre_freeze_head=${test_commit} protected_ci_head=${test_commit}
-  local receipt_timestamp prior_migration_override=
-  if [[ ${scenario} == post_swap_failure_unadvanced || ${scenario} == stalled_probe ]]; then
+  local receipt_timestamp prior_migration_override='' docker_default_platform=''
+  if [[ ${scenario} == post_swap_failure_unadvanced || ${scenario} == stalled_probe || \
+    ${scenario} == rollback_revalidation_mismatch || ${scenario} == rollback_db_read_* || \
+    ${scenario} == rollback_verification_remove_failure ]]; then
     initial_db=31
     prior_required_migration=31
   fi
@@ -199,6 +292,16 @@ run_case() {
       prior_required_migration=invalid
       prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@30
       ;;
+    prior_override_with_valid_label)
+      initial_db=31
+      prior_required_migration=28
+      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@31
+      ;;
+    prior_label_inspect_failure_override)
+      initial_db=31
+      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@31
+      ;;
+    docker_default_platform) docker_default_platform=linux/amd64 ;;
   esac
   receipt_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   [[ ${scenario} == stale_receipt ]] && receipt_timestamp=2000-01-01T00:00:00Z
@@ -208,6 +311,9 @@ run_case() {
   make_stubs "${case_dir}/bin"
   printf 'old\n' >"${case_dir}/container-state"
   printf '%d\n' "${initial_db}" >"${case_dir}/db-state"
+  printf '0\n' >"${case_dir}/verify-create-count"
+  printf '0\n' >"${case_dir}/verify-remove-count"
+  printf '0\n' >"${case_dir}/db-read-count"
   : >"${case_dir}/commands.log"
   : >"${case_dir}/compose.env"
   cat >"${case_dir}/pre-freeze-receipt.json" <<JSON
@@ -255,6 +361,9 @@ ENV
     TEST_COMMAND_LOG="${case_dir}/commands.log" \
     TEST_CONTAINER_STATE="${case_dir}/container-state" \
     TEST_DB_STATE="${case_dir}/db-state" \
+    TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
+    TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
+    TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
     TEST_PRIOR_REQUIRED_MIGRATION="${prior_required_migration}" \
     TEST_REPO_ROOT="${case_dir}/repo" \
     TEST_COMMIT=${test_commit} \
@@ -266,6 +375,7 @@ ENV
     BUZZ_PRE_FREEZE_RECEIPT="${case_dir}/pre-freeze-receipt.json" \
     BUZZ_PROTECTED_CI_RECEIPT="${case_dir}/protected-ci-receipt.json" \
     BUZZ_PRIOR_MIGRATION_OVERRIDE="${prior_migration_override}" \
+    DOCKER_DEFAULT_PLATFORM="${docker_default_platform}" \
     BUZZ_DEPLOY_LOG_ROOT="${case_dir}/logs" \
     BUZZ_DEPLOY_BUILD_ROOT="${case_dir}/build" \
     BUZZ_DEPLOY_HEALTH_ATTEMPTS=1 \
@@ -292,6 +402,9 @@ run_local_image_case() {
   make_stubs "${case_dir}/bin"
   printf 'old\n' >"${case_dir}/container-state"
   printf '31\n' >"${case_dir}/db-state"
+  printf '0\n' >"${case_dir}/verify-create-count"
+  printf '0\n' >"${case_dir}/verify-remove-count"
+  printf '0\n' >"${case_dir}/db-read-count"
   : >"${case_dir}/commands.log"
   : >"${case_dir}/compose.env"
   cat >"${case_dir}/secrets.env" <<'ENV'
@@ -313,6 +426,9 @@ ENV
       TEST_COMMAND_LOG="${case_dir}/commands.log" \
       TEST_CONTAINER_STATE="${case_dir}/container-state" \
       TEST_DB_STATE="${case_dir}/db-state" \
+      TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
+      TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
+      TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
       TEST_PRIOR_REQUIRED_MIGRATION=31 \
       BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
       BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
@@ -324,6 +440,9 @@ ENV
       TEST_COMMAND_LOG="${case_dir}/commands.log" \
       TEST_CONTAINER_STATE="${case_dir}/container-state" \
       TEST_DB_STATE="${case_dir}/db-state" \
+      TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
+      TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
+      TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
       TEST_PRIOR_REQUIRED_MIGRATION=31 \
       BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
       BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
@@ -392,6 +511,21 @@ assert_not_contains "${scratch}/boolean_false/commands.log" ' up -d --no-deps --
 run_case boolean_true success
 assert_contains "${scratch}/boolean_true/output" 'DEPLOY SUCCEEDED'
 
+for invalid_db_read in db_marker_empty db_marker_malformed db_row_empty db_row_malformed; do
+  run_case "${invalid_db_read}" failure
+  assert_not_contains "${scratch}/${invalid_db_read}/commands.log" ' run --rm --no-deps '
+  assert_not_contains "${scratch}/${invalid_db_read}/commands.log" \
+    ' up -d --no-deps --force-recreate relay'
+done
+assert_contains "${scratch}/db_marker_empty/output" \
+  'database migration table marker is empty or malformed: <empty>'
+assert_contains "${scratch}/db_marker_malformed/output" \
+  'database migration table marker is empty or malformed: unknown'
+assert_contains "${scratch}/db_row_empty/output" \
+  'database latest-migration row is empty or malformed: <empty>'
+assert_contains "${scratch}/db_row_malformed/output" \
+  'database latest-migration row is empty or malformed: 31\|t\|extra'
+
 run_case manifest_list success
 assert_contains "${scratch}/manifest_list/output" 'DEPLOY SUCCEEDED'
 
@@ -409,6 +543,136 @@ assert_contains "${scratch}/prior_override_mismatch/output" \
   'BUZZ_PRIOR_MIGRATION_OVERRIDE must match'
 assert_not_contains "${scratch}/prior_override_mismatch/commands.log" \
   ' up -d --no-deps --force-recreate relay'
+
+run_case prior_override_with_valid_label failure
+assert_contains "${scratch}/prior_override_with_valid_label/output" \
+  'BUZZ_PRIOR_MIGRATION_OVERRIDE is not permitted because the prior image has valid required-migration label 28'
+assert_not_contains "${scratch}/prior_override_with_valid_label/output" \
+  'migration override accepted'
+assert_not_contains "${scratch}/prior_override_with_valid_label/commands.log" \
+  ' up -d --no-deps --force-recreate relay'
+
+for label_inspect_failure in prior_label_inspect_failure \
+  prior_label_inspect_failure_override; do
+  run_case "${label_inspect_failure}" failure
+  assert_contains "${scratch}/${label_inspect_failure}/output" \
+    'prior image required-migration label could not be inspected; rollback compatibility is unreadable and BUZZ_PRIOR_MIGRATION_OVERRIDE is not permitted'
+  assert_not_contains "${scratch}/${label_inspect_failure}/commands.log" \
+    'exec -T postgres sh -euc.*pg_dump'
+  assert_not_contains "${scratch}/${label_inspect_failure}/commands.log" \
+    ' run --rm --no-deps '
+  assert_not_contains "${scratch}/${label_inspect_failure}/commands.log" \
+    ' up -d --no-deps --force-recreate relay'
+done
+assert_not_contains "${scratch}/prior_label_inspect_failure_override/output" \
+  'migration override accepted'
+
+run_case prior_child_inspectable success
+assert_contains "${scratch}/prior_child_inspectable/commands.log" \
+  'image tag sha256:1111111111111111111111111111111111111111111111111111111111111111 localhost/buzz-relay:rollback-'
+assert_contains "${scratch}/prior_child_inspectable/commands.log" \
+  'create --pull=never --name buzz-rollback-verify-.* localhost/buzz-relay:rollback-'
+assert_contains "${scratch}/prior_child_inspectable/commands.log" \
+  'rm -v buzz-rollback-verify-.*-1'
+assert_not_contains "${scratch}/prior_child_inspectable/commands.log" \
+  'create --pull=never .* --platform '
+inspectable_source=$(rg --files "${scratch}/prior_child_inspectable/logs" | \
+  grep '/rollback-source[.]txt$')
+assert_contains "${inspectable_source}" \
+  '^sha256:1111111111111111111111111111111111111111111111111111111111111111$'
+assert_contains "${scratch}/prior_child_inspectable/output" 'DEPLOY SUCCEEDED'
+
+run_case prior_child_uninspectable_valid_ref success
+assert_contains "${scratch}/prior_child_uninspectable_valid_ref/output" \
+  'is not directly inspectable; binding configured image localhost/buzz-relay:old to its platform ID'
+assert_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log" \
+  'create --pull=never --name buzz-rollback-verify-.* localhost/buzz-relay:old'
+assert_not_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log" \
+  'image inspect localhost/buzz-relay:old'
+assert_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log" \
+  'image tag localhost/buzz-relay:old localhost/buzz-relay:rollback-'
+fallback_source=$(rg --files "${scratch}/prior_child_uninspectable_valid_ref/logs" | \
+  grep '/rollback-source[.]txt$')
+fallback_source_id=$(rg --files "${scratch}/prior_child_uninspectable_valid_ref/logs" | \
+  grep '/rollback-source-image-id[.]txt$')
+assert_contains "${fallback_source}" '^localhost/buzz-relay:old$'
+assert_contains "${fallback_source_id}" \
+  '^sha256:1111111111111111111111111111111111111111111111111111111111111111$'
+[[ $(cat "${scratch}/prior_child_uninspectable_valid_ref/verify-create-count") -eq 2 ]] || \
+  fail 'valid configured ref did not create both source and retained-tag verification containers'
+[[ $(cat "${scratch}/prior_child_uninspectable_valid_ref/verify-remove-count") -eq 2 ]] || \
+  fail 'valid configured ref did not remove both stopped containers with their volumes'
+assert_contains "${scratch}/prior_child_uninspectable_valid_ref/output" 'DEPLOY SUCCEEDED'
+
+for bad_prior in prior_ref_platform_mismatch prior_ref_revision_mismatch prior_image_unavailable; do
+  run_case "${bad_prior}" failure
+  assert_not_contains "${scratch}/${bad_prior}/commands.log" 'exec -T postgres sh -euc.*pg_dump'
+  assert_not_contains "${scratch}/${bad_prior}/commands.log" \
+    ' up -d --no-deps --force-recreate relay'
+done
+assert_contains "${scratch}/prior_ref_platform_mismatch/output" \
+  'resolves to platform image sha256:999999.*expected running image sha256:111111'
+assert_contains "${scratch}/prior_ref_revision_mismatch/output" \
+  'revision dddddddd.*does not match running container revision cccccccc'
+assert_contains "${scratch}/prior_image_unavailable/output" \
+  'is not directly inspectable; binding configured image'
+
+for invalid_ref in prior_ref_bare prior_ref_main prior_ref_latest \
+  prior_ref_leading_option prior_ref_malformed; do
+  run_case "${invalid_ref}" failure
+  assert_not_contains "${scratch}/${invalid_ref}/commands.log" ' create --pull=never '
+  assert_not_contains "${scratch}/${invalid_ref}/commands.log" 'exec -T postgres sh -euc.*pg_dump'
+done
+assert_contains "${scratch}/prior_ref_bare/output" 'uses implicit latest'
+assert_contains "${scratch}/prior_ref_main/output" 'forbidden mutable tag main'
+assert_contains "${scratch}/prior_ref_latest/output" 'forbidden mutable tag latest'
+assert_contains "${scratch}/prior_ref_leading_option/output" 'unsafe or empty configured image reference'
+assert_contains "${scratch}/prior_ref_malformed/output" 'malformed configured image reference'
+
+run_case verification_copy_failure failure
+assert_contains "${scratch}/verification_copy_failure/commands.log" ' cp 0000000000000000000000000000000000000000000000000000000000000001:'
+assert_contains "${scratch}/verification_copy_failure/commands.log" ' rm -v buzz-rollback-verify-.*-1'
+assert_not_contains "${scratch}/verification_copy_failure/commands.log" 'exec -T postgres sh -euc.*pg_dump'
+
+for create_failure in create_stdout_empty create_stdout_contaminated \
+  post_create_validation_failure; do
+  run_case "${create_failure}" failure
+  assert_contains "${scratch}/${create_failure}/commands.log" \
+    ' create --pull=never --name buzz-rollback-verify-.*-1 localhost/buzz-relay:rollback-'
+  assert_contains "${scratch}/${create_failure}/commands.log" \
+    ' rm -v buzz-rollback-verify-.*-1'
+  assert_not_contains "${scratch}/${create_failure}/commands.log" \
+    'exec -T postgres sh -euc.*pg_dump'
+  assert_not_contains "${scratch}/${create_failure}/commands.log" \
+    ' run --rm --no-deps '
+  assert_not_contains "${scratch}/${create_failure}/commands.log" \
+    ' up -d --no-deps --force-recreate relay'
+done
+assert_contains "${scratch}/create_stdout_empty/output" \
+  'docker create returned an invalid verification container ID:'
+assert_contains "${scratch}/create_stdout_contaminated/output" \
+  'docker create returned an invalid verification container ID: unexpected create output'
+assert_contains "${scratch}/post_create_validation_failure/output" \
+  'resolves to platform image sha256:999999.*expected running image sha256:111111'
+
+run_case verification_remove_failure failure
+[[ $(cat "${scratch}/verification_remove_failure/verify-remove-count") -eq 2 ]] || \
+  fail 'failed immediate verification cleanup was not retried by EXIT cleanup'
+assert_contains "${scratch}/verification_remove_failure/output" \
+  'could not remove stopped verification container'
+assert_not_contains "${scratch}/verification_remove_failure/commands.log" 'exec -T postgres sh -euc.*pg_dump'
+
+run_case explicit_platform success
+assert_contains "${scratch}/explicit_platform/commands.log" \
+  'create --pull=never --name buzz-rollback-verify-.* --platform linux/amd64 localhost/buzz-relay:rollback-'
+
+for bad_platform in explicit_platform_mismatch malformed_platform docker_default_platform; do
+  run_case "${bad_platform}" failure
+  assert_not_contains "${scratch}/${bad_platform}/commands.log" 'exec -T postgres sh -euc.*pg_dump'
+done
+assert_contains "${scratch}/explicit_platform_mismatch/output" 'resolves to platform image sha256:999999'
+assert_contains "${scratch}/malformed_platform/output" 'invalid relay service platform'
+assert_contains "${scratch}/docker_default_platform/output" 'DOCKER_DEFAULT_PLATFORM is set'
 
 run_case healthy success
 healthy_log=${scratch}/healthy/commands.log
@@ -433,6 +697,59 @@ assert_contains "${scratch}/post_swap_failure_unadvanced/output" 'prior service 
 unadvanced_swap_count=$(grep -c '^docker .*up -d --no-deps --force-recreate relay' "${scratch}/post_swap_failure_unadvanced/commands.log")
 [[ ${unadvanced_swap_count} -eq 2 ]] || fail "unadvanced post-swap failure made ${unadvanced_swap_count} recreate calls, expected 2"
 assert_contains "${scratch}/post_swap_failure_unadvanced/commands.log" 'BUZZ_IMAGE=localhost/buzz-relay:rollback-'
+[[ $(cat "${scratch}/post_swap_failure_unadvanced/verify-create-count") -eq 2 ]] || \
+  fail 'rollback path did not re-create a stopped container for retained-tag revalidation'
+revalidate_line=$(grep -n 'create --pull=never .*localhost/buzz-relay:rollback-' \
+  "${scratch}/post_swap_failure_unadvanced/commands.log" | tail -1 | cut -d: -f1)
+rollback_swap_line=$(grep -n 'BUZZ_IMAGE=localhost/buzz-relay:rollback-.* up -d --no-deps --force-recreate relay' \
+  "${scratch}/post_swap_failure_unadvanced/commands.log" | head -1 | cut -d: -f1)
+[[ -n ${revalidate_line} && -n ${rollback_swap_line} && ${revalidate_line} -lt ${rollback_swap_line} ]] || \
+  fail 'retained rollback tag was not revalidated immediately before Compose rollback'
+
+run_case rollback_revalidation_mismatch failure
+assert_contains "${scratch}/rollback_revalidation_mismatch/output" \
+  'AUTOMATIC ROLLBACK REFUSED: retained rollback image identity could not be verified'
+rollback_mismatch_swap_count=$(grep -c '^docker .*up -d --no-deps --force-recreate relay' \
+  "${scratch}/rollback_revalidation_mismatch/commands.log")
+[[ ${rollback_mismatch_swap_count} -eq 1 ]] || \
+  fail "rollback revalidation mismatch made ${rollback_mismatch_swap_count} recreate calls, expected 1"
+assert_not_contains "${scratch}/rollback_revalidation_mismatch/commands.log" \
+  'BUZZ_IMAGE=localhost/buzz-relay:rollback-.* up -d'
+
+for rollback_db_failure in rollback_db_read_failure rollback_db_read_empty \
+  rollback_db_read_malformed; do
+  run_case "${rollback_db_failure}" failure
+  assert_contains "${scratch}/${rollback_db_failure}/output" \
+    'AUTOMATIC ROLLBACK REFUSED: could not read the database migration state'
+  assert_contains "${scratch}/${rollback_db_failure}/output" \
+    'LOUD FAILURE: deploy failed and automatic rollback did not recover service'
+  rollback_db_swap_count=$(grep -c '^docker .*up -d --no-deps --force-recreate relay' \
+    "${scratch}/${rollback_db_failure}/commands.log")
+  [[ ${rollback_db_swap_count} -eq 1 ]] || \
+    fail "${rollback_db_failure} made ${rollback_db_swap_count} recreate calls, expected 1"
+  assert_not_contains "${scratch}/${rollback_db_failure}/commands.log" \
+    'BUZZ_IMAGE=localhost/buzz-relay:rollback-.* up -d'
+done
+assert_contains "${scratch}/rollback_db_read_failure/output" \
+  'database migration table-marker query failed'
+assert_contains "${scratch}/rollback_db_read_empty/output" \
+  'database migration table marker is empty or malformed: <empty>'
+assert_contains "${scratch}/rollback_db_read_malformed/output" \
+  'database migration table marker is empty or malformed: unknown'
+
+run_case rollback_verification_remove_failure failure
+assert_contains "${scratch}/rollback_verification_remove_failure/output" \
+  'AUTOMATIC ROLLBACK REFUSED: rollback image identity passed, but its stopped verification container and anonymous volumes could not be removed'
+assert_not_contains "${scratch}/rollback_verification_remove_failure/output" \
+  'retained rollback image identity could not be verified'
+rollback_cleanup_swap_count=$(grep -c '^docker .*up -d --no-deps --force-recreate relay' \
+  "${scratch}/rollback_verification_remove_failure/commands.log")
+[[ ${rollback_cleanup_swap_count} -eq 1 ]] || \
+  fail "rollback cleanup failure made ${rollback_cleanup_swap_count} recreate calls, expected 1"
+[[ $(cat "${scratch}/rollback_verification_remove_failure/verify-remove-count") -eq 3 ]] || \
+  fail 'rollback verification cleanup failure was not retried during EXIT cleanup'
+assert_not_contains "${scratch}/rollback_verification_remove_failure/commands.log" \
+  'BUZZ_IMAGE=localhost/buzz-relay:rollback-.* up -d'
 
 run_case stalled_probe failure
 assert_contains "${scratch}/stalled_probe/output" 'ROLLBACK SUCCEEDED'
@@ -440,6 +757,15 @@ assert_contains "${scratch}/stalled_probe/output" 'prior service was restored'
 stalled_swap_count=$(grep -c '^docker .*up -d --no-deps --force-recreate relay' "${scratch}/stalled_probe/commands.log")
 [[ ${stalled_swap_count} -eq 2 ]] || fail "stalled probe made ${stalled_swap_count} recreate calls, expected 2"
 assert_contains "${scratch}/stalled_probe/commands.log" 'BUZZ_IMAGE=localhost/buzz-relay:rollback-'
+
+assert_not_contains <(find "${scratch}" -name commands.log -type f -exec cat {} +) \
+  'docker .* (exec|run).*sha256sum'
+assert_not_contains <(find "${scratch}" -name commands.log -type f -exec cat {} +) \
+  'docker .* start '
+
+if find "${scratch}" -name '.relay-binary.*' -type f -print -quit | grep -q .; then
+  fail 'temporary relay binary copy leaked into deployment evidence'
+fi
 
 for secret_value in test-relay-key test-hook-secret test-postgres-password \
   test-redis-password test-s3-access test-s3-secret test-owner-pubkey; do
