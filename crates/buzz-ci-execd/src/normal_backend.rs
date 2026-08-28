@@ -1984,7 +1984,10 @@ mod tests {
                 "/var/lib/buzzci/invocations/normal/other/secrets",
             ),
             ("vars", "/var/lib/buzzci/invocations/normal/other/vars"),
-            ("environment", "/var/lib/buzzci/invocations/normal/other/env"),
+            (
+                "environment",
+                "/var/lib/buzzci/invocations/normal/other/env",
+            ),
             ("inputs", "/var/lib/buzzci/invocations/normal/other/inputs"),
         ] {
             let mut plan = fixture.plan.act.clone();
@@ -2021,10 +2024,9 @@ mod tests {
             "/var/lib/buzzci/workspaces/normal/source/.github/workflows/other.yml".into();
         mismatch.proxy_socket = "/run/buzzci/other-proxy.sock".into();
 
-        let mismatch_identity = handoff_descriptor::HandoffIdentity::from_validated(
-            &mismatch, &binding, &contract,
-        )
-        .unwrap();
+        let mismatch_identity =
+            handoff_descriptor::HandoffIdentity::from_validated(&mismatch, &binding, &contract)
+                .unwrap();
         let rebound = handoff_descriptor::HandoffDescriptor::issue(
             mismatch_identity,
             handoff_descriptor::HandoffRole::Executor,
