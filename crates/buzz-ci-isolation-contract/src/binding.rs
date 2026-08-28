@@ -651,7 +651,10 @@ mod tests {
         for invalid in ["0linux", "-linux", "linux.job", "linux/job", "linux job"] {
             let mut job = binding();
             job.job_id = invalid.into();
-            assert!(job.validate_phase1(&context()).is_err(), "accepted {invalid:?}");
+            assert!(
+                job.validate_phase1(&context()).is_err(),
+                "accepted {invalid:?}"
+            );
         }
     }
 

@@ -284,9 +284,7 @@ async fn preflight_configured_policy_returns_complete_section_2_response() {
             bytes.next(),
             Some(first) if first.is_ascii_alphabetic() || first == b'_'
         ));
-        assert!(bytes.all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
-        }));
+        assert!(bytes.all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') }));
         assert!(job_ids.insert(job_id), "job IDs must be unique");
         required_non_empty_string(job, "name");
         assert!(job["required"].is_boolean());

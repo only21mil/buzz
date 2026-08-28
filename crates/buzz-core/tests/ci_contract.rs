@@ -528,9 +528,9 @@ fn request_rejects_malformed_coordinates_sources_jobs_triggers_and_numbers() {
     for job_id in ["rust-lint", "desktop-smoke-e2e", "_internal-job"] {
         let mut accepted = valid.clone();
         accepted.job_ids = vec![job_id.to_string()];
-        accepted.validate().unwrap_or_else(|error| {
-            panic!("valid GitHub job ID rejected: {job_id}: {error}")
-        });
+        accepted
+            .validate()
+            .unwrap_or_else(|error| panic!("valid GitHub job ID rejected: {job_id}: {error}"));
     }
 
     let mut bad = valid.clone();
