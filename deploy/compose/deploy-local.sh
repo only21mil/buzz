@@ -18,6 +18,10 @@ if [[ ! ${commit} =~ ^[0-9a-f]{40}$ ]]; then
   printf 'REFUSED: commit must be exactly 40 lowercase hexadecimal characters\n' >&2
   exit 64
 fi
+if ((check_only == 1)) && [[ -z ${BUZZ_COMPOSE_ENV_FILE:-} ]]; then
+  printf 'REFUSED: --check requires an explicit BUZZ_COMPOSE_ENV_FILE path\n' >&2
+  exit 64
+fi
 
 repo_root=$(git -C "${script_dir}" rev-parse --show-toplevel)
 canonical_run_local=${script_dir}/run-local.sh
@@ -145,6 +149,7 @@ db_success=
 prior_required_migration_label=
 prior_descriptor_digest=
 prior_platform=
+prior_platform_image_id=
 relay_network_ip=
 postgres_network_ip=
 preflight_active=0
@@ -640,6 +645,17 @@ container_image_id() {
   printf '%s\n' "${image_id}"
 }
 
+platform_image_id() {
+  local image=$1 platform=$2 image_id
+  image_id=$(docker_state image inspect --platform "${platform}" --format '{{.Id}}' "${image}") || return 1
+  [[ ${image_id} =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf 'REFUSED: image %s returned invalid platform image ID for %s: %s\n' \
+      "${image}" "${platform}" "${image_id}" >&2
+    return 1
+  }
+  printf '%s\n' "${image_id}"
+}
+
 validate_image_ref() {
   local image_ref=$1 name tag at_suffix name_component registry_component
   local registry_host registry_port
@@ -992,9 +1008,9 @@ verify_image_platform_binding() {
   container=${verification_container}
   cleanup_target=${verification_cleanup_target}
   actual_id=$(container_image_id "${container}") || return 1
-  [[ ${actual_id} == "${prior_image_id}" ]] || {
-    printf 'REFUSED: image %s resolves to platform image %s, expected running image %s\n' \
-      "${image}" "${actual_id}" "${prior_image_id}" >&2
+  [[ ${actual_id} == "${prior_platform_image_id}" ]] || {
+    printf 'REFUSED: image %s resolves to platform image %s, expected prior platform image %s\n' \
+      "${image}" "${actual_id}" "${prior_platform_image_id}" >&2
     return 1
   }
   revision=$(object_revision "${container}") || return 1
@@ -1023,21 +1039,12 @@ verify_image_platform_binding() {
 }
 
 capture_rollback_reference() {
-  local direct_ids
-  if direct_ids=$(image_ids "${prior_image_id}" 2>/dev/null); then
-    [[ ${direct_ids} == "${prior_image_id}" ]] || {
-      printf 'REFUSED: running container image ID %s resolves to mismatched or ambiguous IDs: %s\n' \
-        "${prior_image_id}" "${direct_ids//$'\n'/,}" >&2
-      return 1
-    }
-    rollback_source=${prior_image_id}
-  else
-    printf 'Prior container image ID %s is not directly inspectable; binding configured image %s to its platform ID\n' \
-      "${prior_image_id}" "${prior_image_ref}"
-    verify_image_platform_binding "${prior_image_ref}" || return 1
-    rollback_source=${prior_image_ref}
+  rollback_source=${prior_platform_image_id}
+  rollback_source_image_id=${prior_platform_image_id}
+  if [[ ${prior_image_id} != "${prior_platform_image_id}" ]]; then
+    printf 'Prior container image index %s differs from runnable platform image %s; preserving the index as evidence and retaining the platform image\n' \
+      "${prior_image_id}" "${prior_platform_image_id}"
   fi
-  rollback_source_image_id=${prior_image_id}
   docker image tag "${rollback_source}" "${rollback_tag}"
   verify_image_platform_binding "${rollback_tag}"
 }
@@ -1129,9 +1136,9 @@ rollback() {
     fi
     return 1
   fi
-  printf '\nDEPLOY FAILED AFTER SWAP. ROLLING BACK TO %s\n' "${prior_image_id}" >&2
+  printf '\nDEPLOY FAILED AFTER SWAP. ROLLING BACK TO %s\n' "${prior_platform_image_id}" >&2
   if ! compose_with_image "${rollback_tag}" up -d --no-deps --force-recreate relay; then
-    printf 'ROLLBACK FAILED: compose could not recreate relay with %s\n' "${prior_image_id}" >&2
+    printf 'ROLLBACK FAILED: compose could not recreate relay with %s\n' "${prior_platform_image_id}" >&2
     return 1
   fi
   rollback_container=$(relay_container)
@@ -1140,8 +1147,9 @@ rollback() {
     return 1
   }
   rollback_image=$(container_image_id "${rollback_container}")
-  [[ ${rollback_image} == "${prior_image_id}" ]] || {
-    printf 'ROLLBACK FAILED: running image %s does not match prior %s\n' "${rollback_image}" "${prior_image_id}" >&2
+  [[ ${rollback_image} == "${prior_platform_image_id}" ]] || {
+    printf 'ROLLBACK FAILED: running image %s does not match prior platform image %s\n' \
+      "${rollback_image}" "${prior_platform_image_id}" >&2
     return 1
   }
   if ! wait_for_relay "${rollback_container}"; then
@@ -1154,7 +1162,8 @@ rollback() {
     return 1
   }
   printf '%s\n' "${rollback_sha}" >"${deploy_dir}/rollback-binary-sha256.txt"
-  printf 'ROLLBACK SUCCEEDED: restored image %s with binary %s\n' "${prior_image_id}" "${rollback_sha}" >&2
+  printf 'ROLLBACK SUCCEEDED: restored platform image %s with binary %s\n' \
+    "${prior_platform_image_id}" "${rollback_sha}" >&2
 }
 
 collect_static_preflight_blockers() {
@@ -1472,6 +1481,7 @@ print(image)
       "${image_descriptor_platform}" "${prior_platform}" >&2
     return 1
   fi
+  prior_platform_image_id=$(platform_image_id "${prior_image_ref}" "${prior_platform}")
 
   prior_required_migration_label=$(image_required_migration "${prior_container}" quiet) || \
     prior_required_migration_status=$?
@@ -1611,10 +1621,11 @@ build_worktree=
 deployment_preflight
 printf '%s\n' "${prior_container}" >"${deploy_dir}/prior-container-id.txt"
 printf '%s\n' "${prior_image_id}" >"${deploy_dir}/prior-image-id.txt"
+printf '%s\n' "${prior_platform_image_id}" >"${deploy_dir}/prior-platform-image-id.txt"
 printf '%s\n' "${prior_image_ref}" >"${deploy_dir}/prior-image-ref.txt"
 printf '%s\n' "${prior_revision}" >"${deploy_dir}/prior-revision.txt"
 printf '%s\n' "${prior_binary_sha}" >"${deploy_dir}/prior-binary-sha256.txt"
-rollback_tag=localhost/buzz-relay:rollback-${timestamp}-${prior_image_id#sha256:}
+rollback_tag=localhost/buzz-relay:rollback-${timestamp}-${prior_platform_image_id#sha256:}
 rollback_tag=${rollback_tag:0:127}
 capture_rollback_reference
 printf '%s\n' "${rollback_source}" >"${deploy_dir}/rollback-source.txt"
