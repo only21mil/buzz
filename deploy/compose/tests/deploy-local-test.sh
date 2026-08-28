@@ -27,6 +27,45 @@ assert_not_contains() {
   fi
 }
 
+assert_check_runtime_readonly() {
+  local case_dir=$1 line
+  while IFS= read -r line; do
+    case "${line}" in
+      docker\ *)
+        [[ ${line} == *" DOCKER_HOST=unix://${case_dir}/docker.sock "* ]] || \
+          fail "check Docker command was not bound to the validated socket: ${line}"
+        case "${line}" in
+          *" info --format {{.ServerVersion}}"|*" compose version --short"|\
+          *" compose "*" ps -q relay"|*" compose "*" ps -q postgres"|\
+          *" compose "*" config --format json"|\
+          *" compose "*" ps --all --format json"|\
+          *" inspect --format {{.Image}} "*|*" inspect --format {{.Config.Image}} "*|\
+          *" inspect --format {{json .NetworkSettings.Networks}} "*|\
+          *" inspect --format {{index .Config.Labels \"org.opencontainers.image.revision\"}} "*|\
+          *" inspect --format {{json .ImageManifestDescriptor}} "*|\
+          *" image inspect --platform linux/amd64 --format {{json .Descriptor}} "*|\
+          *" inspect --format {{index .Config.Labels \"org.block.buzz.required-migration\"}} "*) ;;
+          *) fail "check used unapproved Docker argv: ${line}" ;;
+        esac
+        ;;
+      curl\ *)
+        case "${line}" in
+          "curl --disable --noproxy * --fail --silent --show-error --unix-socket ${case_dir}/docker.sock --get --data-urlencode path=/usr/local/bin/buzz-relay http://localhost/containers/relay-old/archive"|\
+          "curl --disable --noproxy * --fail --silent --show-error --max-time 0.1 http://172.30.0.2:8080/_readiness"|\
+          "curl --disable --noproxy * --fail --silent --show-error --max-time 0.1 --header Accept: application/nostr+json http://172.30.0.2:3000/") ;;
+          *) fail "check used unapproved host/archive curl argv: ${line}" ;;
+        esac
+        ;;
+      psql\ *)
+        [[ ${line} == *"PGCONNECT_TIMEOUT=5 PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=5000 -c lock_timeout=1000"* ]] || \
+          fail "check psql did not force a read-only bounded session: ${line}"
+        [[ ${line} == *"--host 172.30.0.3 --port 5432 --username buzz --dbname buzz --command BEGIN TRANSACTION READ ONLY;"*"; ROLLBACK;" ]] || \
+          fail "check used unapproved psql argv: ${line}"
+        ;;
+    esac
+  done <"${case_dir}/commands.log"
+}
+
 make_stubs() {
   local bin_dir=$1
   mkdir -p "${bin_dir}"
@@ -45,6 +84,10 @@ STUB
   cat >"${bin_dir}/git" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ ${GIT_OPTIONAL_LOCKS:-} == 0 ]] || {
+  printf 'git invocation did not disable optional index locks\n' >&2
+  exit 91
+}
 printf 'git %s\n' "$*" >>"${TEST_COMMAND_LOG}"
 args=" $* "
 case "${args}" in
@@ -54,6 +97,9 @@ case "${args}" in
   *" rev-parse --verify HEAD"*) printf '%s\n' "${TEST_CHECKOUT_HEAD}" ;;
   *" rev-parse --verify "*|*" rev-parse HEAD "*) printf '%s\n' "${TEST_COMMIT}" ;;
   *" merge-base --is-ancestor "*) exit 0 ;;
+  *" check-ref-format "*) exit 0 ;;
+  *" diff --quiet "*) exit 0 ;;
+  *" ls-tree -r --name-only "*) printf 'migrations/0031_workflow_approval_foundations.sql\n' ;;
   *" status --porcelain "*)
     [[ ${TEST_DIRTY_CHECKOUT} == 1 ]] && printf ' M deploy/compose/deploy-local.sh\n'
     exit 0
@@ -76,10 +122,117 @@ case "${args}" in
 esac
 STUB
 
+  cat >"${bin_dir}/stat" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+format=$2
+target=$3
+if [[ -n ${TEST_DOCKER_SOCKET:-} && ${target} == "${TEST_DOCKER_SOCKET}" ]]; then
+  case "${format}" in
+    %u) printf '0\n' ;;
+    %G) printf 'docker\n' ;;
+    %a) printf '660\n' ;;
+    *) exit 92 ;;
+  esac
+  exit 0
+fi
+if [[ ${TEST_SCENARIO} == check_bad_owner && ${target} == "${BUZZ_COMPOSE_ENV_FILE}" && ${format} == %u ]]; then
+  printf '99999\n'
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+STUB
+
+  local fs_command
+  for fs_command in mkdir chmod mktemp rmdir rm tee; do
+    cat >"${bin_dir}/${fs_command}" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+command_name=${0##*/}
+printf 'fs %s %s\n' "${command_name}" "$*" >>"${TEST_COMMAND_LOG}"
+exec "/usr/bin/${command_name}" "$@"
+STUB
+  done
+
+  cat >"${bin_dir}/run-local-sentinel" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'run-local %s\n' "$*" >>"${TEST_COMMAND_LOG}"
+exit 99
+STUB
+
+  cat >"${bin_dir}/curl" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\n' "$*" >>"${TEST_COMMAND_LOG}"
+if [[ -n ${CURL_HOME:-} && -f ${CURL_HOME}/.curlrc && ${1:-} != --disable ]]; then
+  : >"${TEST_CURL_POISON_OUTPUT}"
+fi
+[[ ${1:-} == --disable ]] || exit 92
+[[ -z ${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-} ]] || {
+  printf 'curl inherited a proxy environment\n' >&2
+  exit 93
+}
+[[ " $* " == *" --noproxy * "* ]] || exit 94
+case " $* " in
+  *"/containers/relay-old/archive "*)
+    if [[ ${TEST_SCENARIO} == check_binary_archive_invalid ]]; then
+      printf 'not a tar stream\n'
+      exit 0
+    fi
+    python3 - <<'PY'
+import io
+import sys
+import tarfile
+
+data = b"prior relay binary\n"
+member = tarfile.TarInfo("buzz-relay")
+member.mode = 0o755
+member.size = len(data)
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+    archive.addfile(member, io.BytesIO(data))
+PY
+    ;;
+  *" http://172.30.0.2:8080/_readiness "*) printf '{"ready":true}\n' ;;
+  *" http://172.30.0.2:3000/ "*) printf '{"supported_nips":[1,11]}\n' ;;
+  *) printf 'unexpected curl invocation: %s\n' "$*" >&2; exit 92 ;;
+esac
+STUB
+
+  cat >"${bin_dir}/psql" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'psql PGCONNECT_TIMEOUT=%s PGOPTIONS=%s %s\n' \
+  "${PGCONNECT_TIMEOUT:-}" "${PGOPTIONS:-}" "$*" >>"${TEST_COMMAND_LOG}"
+[[ ${PGCONNECT_TIMEOUT:-} == 5 ]] || exit 92
+[[ ${PGOPTIONS:-} == *default_transaction_read_only=on* ]] || exit 93
+[[ -z ${PGHOSTADDR:-} ]] || exit 95
+[[ " $* " == *" BEGIN TRANSACTION READ ONLY; "*"; ROLLBACK; "* ]] || exit 94
+[[ ${TEST_SCENARIO} != check_db_unreachable ]] || exec sleep 60
+if [[ " $* " == *"to_regclass"* ]]; then
+  db_read_count=$(( $(cat "${TEST_DB_READ_COUNT}") + 1 ))
+  printf '%d\n' "${db_read_count}" >"${TEST_DB_READ_COUNT}"
+  case "${TEST_SCENARIO}:${db_read_count}" in
+    check_db_read_failure:*) exit 25 ;;
+    *) printf 't\n' ;;
+  esac
+elif [[ " $* " == *"SELECT count"* ]]; then
+  [[ ${TEST_SCENARIO} == check_db_failed_rows ]] && printf '1\n' || printf '0\n'
+else
+  [[ ${TEST_SCENARIO} == check_db_malformed ]] && printf '31|t|extra\n' || \
+    printf '%s|t\n' "$(cat "${TEST_DB_STATE}")"
+fi
+STUB
+
   cat >"${bin_dir}/docker" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'docker BUZZ_IMAGE=%s %s\n' "${BUZZ_IMAGE:-}" "$*" >>"${TEST_COMMAND_LOG}"
+if [[ -n ${DOCKER_HOST:-} ]]; then
+  printf 'docker BUZZ_IMAGE=%s DOCKER_HOST=%s %s\n' \
+    "${BUZZ_IMAGE:-}" "${DOCKER_HOST}" "$*" >>"${TEST_COMMAND_LOG}"
+else
+  printf 'docker BUZZ_IMAGE=%s %s\n' "${BUZZ_IMAGE:-}" "$*" >>"${TEST_COMMAND_LOG}"
+fi
 args=" $* "
 state=$(cat "${TEST_CONTAINER_STATE}")
 prior_id=sha256:1111111111111111111111111111111111111111111111111111111111111111
@@ -87,7 +240,26 @@ new_id=sha256:2222222222222222222222222222222222222222222222222222222222222222
 mismatch_id=sha256:9999999999999999999999999999999999999999999999999999999999999999
 
 case "${args}" in
+  *" info --format "*) printf '29.7.2\n' ;;
+  *" compose version --short "*) printf '5.4.0\n' ;;
   *" build "*) exit 0 ;;
+  *" inspect --format {{json .NetworkSettings.Networks}} relay-old "*)
+    printf '{"buzz-prod_buzz-net":{"IPAddress":"172.30.0.2"}}\n'
+    ;;
+  *" inspect --format {{json .NetworkSettings.Networks}} postgres-old "*)
+    printf '{"buzz-prod_buzz-net":{"IPAddress":"172.30.0.3"}}\n'
+    ;;
+  *" inspect --format {{json .ImageManifestDescriptor}} "*)
+    if [[ ${TEST_SCENARIO} == check_descriptor_mismatch ]]; then
+      digest=sha256:8888888888888888888888888888888888888888888888888888888888888888
+    else
+      digest=sha256:7777777777777777777777777777777777777777777777777777777777777777
+    fi
+    printf '{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}}\n' "${digest}"
+    ;;
+  *" image inspect --platform linux/amd64 --format {{json .Descriptor}} "*)
+    printf '{"digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777"}\n'
+    ;;
   *" image inspect localhost/buzz-relay:${TEST_COMMIT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa} "*)
     if [[ ${TEST_SCENARIO} == manifest_list ]]; then
       printf 'sha256:3333333333333333333333333333333333333333333333333333333333333333\n'
@@ -196,15 +368,30 @@ case "${args}" in
       rollback) printf 'relay-rollback\n' ;;
     esac
     ;;
+  *" compose "*" ps -q postgres "*) printf 'postgres-old\n' ;;
+  *" compose "*" ps --all --format json "*)
+    if [[ ${TEST_SCENARIO} == check_service_unhealthy ]]; then
+      relay_health=unhealthy
+    else
+      relay_health=healthy
+    fi
+    printf '[{"Service":"relay","State":"running","Health":"%s"},{"Service":"pair-relay","State":"running","Health":"healthy"},{"Service":"postgres","State":"running","Health":"healthy"},{"Service":"redis","State":"running","Health":"healthy"},{"Service":"minio","State":"running","Health":"healthy"},{"Service":"minio-init","State":"exited","ExitCode":0}]\n' "${relay_health}"
+    ;;
   *" compose "*" config --format json "*)
     case "${TEST_SCENARIO}" in
       explicit_platform|explicit_platform_mismatch)
-        printf '{"services":{"relay":{"platform":"linux/amd64"}}}\n'
+        printf '{"services":{"relay":{"image":"%s","platform":"linux/amd64"}}}\n' "${BUZZ_IMAGE:-ghcr.io/block/buzz:main}"
+        ;;
+      check_platform_mismatch)
+        printf '{"services":{"relay":{"image":"%s","platform":"linux/arm64"}}}\n' "${BUZZ_IMAGE:-ghcr.io/block/buzz:main}"
+        ;;
+      check_compose_image_mismatch)
+        printf '{"services":{"relay":{"image":"localhost/buzz-relay:other"}}}\n'
         ;;
       malformed_platform)
         printf '{"services":{"relay":{"platform":"linux/amd64;bad"}}}\n'
         ;;
-      *) printf '{"services":{"relay":{}}}\n' ;;
+      *) printf '{"services":{"relay":{"image":"%s"}}}\n' "${BUZZ_IMAGE:-ghcr.io/block/buzz:main}" ;;
     esac
     ;;
   *" compose "*" config --images "*)
@@ -220,14 +407,22 @@ case "${args}" in
       db_read_count=$(( $(cat "${TEST_DB_READ_COUNT}") + 1 ))
       printf '%d\n' "${db_read_count}" >"${TEST_DB_READ_COUNT}"
       case "${TEST_SCENARIO}:${db_read_count}" in
-        rollback_db_read_failure:2) exit 25 ;;
-        rollback_db_read_empty:2|db_marker_empty:*) ;;
-        rollback_db_read_malformed:2|db_marker_malformed:*) printf 'unknown\n' ;;
+        check_db_read_failure:*) exit 25 ;;
+        rollback_db_read_failure:4) exit 25 ;;
+        rollback_db_read_empty:4|db_marker_empty:*) ;;
+        rollback_db_read_malformed:4|db_marker_malformed:*) printf 'unknown\n' ;;
         boolean_true:*) printf '  true  \n' ;;
         *) printf 't\n' ;;
       esac
+    elif [[ ${args} == *"SELECT count"* ]]; then
+      if [[ ${TEST_SCENARIO} == check_db_failed_rows ]]; then
+        printf '1\n'
+      else
+        printf '0\n'
+      fi
     else
       case "${TEST_SCENARIO}" in
+        check_db_malformed) printf '31|t|extra\n' ;;
         db_row_empty) ;;
         db_row_malformed) printf '31|t|extra\n' ;;
         rollback_refusal) printf '32|t\n' ;;
@@ -256,16 +451,31 @@ case "${args}" in
 esac
 STUB
 
-  chmod 755 "${bin_dir}/sudo" "${bin_dir}/git" "${bin_dir}/docker"
+  chmod 755 "${bin_dir}/sudo" "${bin_dir}/git" "${bin_dir}/docker" "${bin_dir}/stat" \
+    "${bin_dir}/mkdir" "${bin_dir}/chmod" "${bin_dir}/mktemp" "${bin_dir}/rmdir" \
+    "${bin_dir}/rm" "${bin_dir}/tee" "${bin_dir}/run-local-sentinel" \
+    "${bin_dir}/curl" "${bin_dir}/psql"
 }
 
 run_case() {
   local scenario=$1 expected=$2
+  local invocation_mode=${3:-deploy}
   local case_dir=${scratch}/${scenario}
   local initial_db=28 prior_required_migration=28
   local checkout_head=${test_commit} source_head=${test_commit} dirty_checkout=0
   local pre_freeze_head=${test_commit} protected_ci_head=${test_commit}
   local receipt_timestamp prior_migration_override='' docker_default_platform=''
+  local deploy_log_root=${case_dir}/logs deploy_build_root=${case_dir}/build
+  local run_local_override=${compose_dir}/run-local.sh deploy_source_ref=refs/remotes/origin/main
+  local docker_host='' docker_context=''
+  local proxy_url=''
+  local curl_home='' curl_poison_output=${case_dir}/curl-config-output pg_hostaddr=''
+  local -a deploy_args=("${test_commit}")
+  if [[ ${invocation_mode} == check ]]; then
+    deploy_args=(--check "${test_commit}")
+    deploy_log_root=${case_dir}/check-logs
+    deploy_build_root=${case_dir}/check-build
+  fi
   if [[ ${scenario} == post_swap_failure_unadvanced || ${scenario} == stalled_probe || \
     ${scenario} == rollback_revalidation_mismatch || ${scenario} == rollback_db_read_* || \
     ${scenario} == rollback_verification_remove_failure ]]; then
@@ -278,11 +488,25 @@ run_case() {
     prior_required_migration=31
   fi
   case "${scenario}" in
-    stale_checkout) checkout_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
-    stale_source) source_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
-    dirty_checkout) dirty_checkout=1 ;;
+    stale_checkout|check_stale_checkout) checkout_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    stale_source|check_stale_source) source_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    dirty_checkout|check_dirty_checkout) dirty_checkout=1 ;;
+    check_raw_source_ref) deploy_source_ref=${test_commit} ;;
+    check_runner_override) run_local_override=${case_dir}/bin/run-local-sentinel ;;
+    check_docker_host) docker_host=tcp://127.0.0.1:2375 ;;
+    check_docker_context) docker_context=unexpected ;;
+    check_proxy_env) proxy_url=http://127.0.0.1:9 ;;
+    check_curl_config) curl_home=${case_dir}/curl-home ;;
+    check_pg_hostaddr) pg_hostaddr=203.0.113.1 ;;
+    check_root_slash) deploy_build_root=/ ;;
+    check_root_relative) deploy_build_root=relative/build ;;
+    check_root_noncanonical) deploy_build_root=${case_dir}/../${scenario}/check-build ;;
+    check_root_overlap) deploy_log_root=${deploy_build_root} ;;
+    check_root_repo) deploy_build_root=${case_dir}/repo ;;
+    check_root_symlink) deploy_build_root=${case_dir}/check-build ;;
+    check_root_unsafe_parent) deploy_build_root=${case_dir}/unsafe/new ;;
     short_receipt) pre_freeze_head=aaaaaaaaaaaa ;;
-    mismatched_receipt) protected_ci_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    mismatched_receipt|check_bad_receipt) protected_ci_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
     prior_override_required) prior_required_migration=invalid ;;
     prior_override_success)
       prior_required_migration=invalid
@@ -307,7 +531,7 @@ run_case() {
   [[ ${scenario} == stale_receipt ]] && receipt_timestamp=2000-01-01T00:00:00Z
 
   mkdir -p "${case_dir}/bin" "${case_dir}/logs" "${case_dir}/build" "${case_dir}/repo"
-  chmod 700 "${case_dir}"
+  chmod 700 "${case_dir}" "${case_dir}/logs" "${case_dir}/build"
   make_stubs "${case_dir}/bin"
   printf 'old\n' >"${case_dir}/container-state"
   printf '%d\n' "${initial_db}" >"${case_dir}/db-state"
@@ -316,6 +540,14 @@ run_case() {
   printf '0\n' >"${case_dir}/db-read-count"
   : >"${case_dir}/commands.log"
   : >"${case_dir}/compose.env"
+  chmod 640 "${case_dir}/compose.env"
+  python3 - "${case_dir}/docker.sock" <<'PY'
+import socket
+import sys
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
   cat >"${case_dir}/pre-freeze-receipt.json" <<JSON
 {
   "schema_version": 1,
@@ -354,36 +586,93 @@ BUZZ_S3_SECRET_KEY=test-s3-secret
 BUZZ_RELAY_OWNER_PUBKEY=test-owner-pubkey
 ENV
   chmod 600 "${case_dir}/secrets.env"
+  case "${scenario}" in
+    check_bad_mode) chmod 600 "${case_dir}/compose.env" ;;
+    check_symlink)
+      mv "${case_dir}/compose.env" "${case_dir}/compose.env.target"
+      ln -s "${case_dir}/compose.env.target" "${case_dir}/compose.env"
+      ;;
+    check_missing_secret) sed -i '/^BUZZ_RELAY_OWNER_PUBKEY=/d' "${case_dir}/secrets.env" ;;
+    check_root_symlink)
+      mkdir "${case_dir}/safe-root"
+      chmod 700 "${case_dir}/safe-root"
+      ln -s "${case_dir}/safe-root" "${case_dir}/check-build"
+      ;;
+    check_root_unsafe_parent)
+      mkdir "${case_dir}/unsafe"
+      chmod 777 "${case_dir}/unsafe"
+      ;;
+    check_curl_config)
+      mkdir "${curl_home}"
+      printf 'output = "%s"\n' "${curl_poison_output}" >"${curl_home}/.curlrc"
+      ;;
+  esac
 
+  local repetitions=1 iteration rc=0 inventory_before='' inventory_after=''
+  local started_ms=0 elapsed_ms=0
+  [[ ${scenario} == check_success ]] && repetitions=2
+  : >"${case_dir}/output"
+  if [[ ${invocation_mode} == check ]]; then
+    inventory_before=$(find "${case_dir}" -mindepth 1 -printf '%P|%y|%m\n' | sort)
+  fi
   set +e
-  PATH="${case_dir}/bin:${PATH}" \
-    TEST_SCENARIO=${scenario} \
-    TEST_COMMAND_LOG="${case_dir}/commands.log" \
-    TEST_CONTAINER_STATE="${case_dir}/container-state" \
-    TEST_DB_STATE="${case_dir}/db-state" \
-    TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
-    TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
-    TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
-    TEST_PRIOR_REQUIRED_MIGRATION="${prior_required_migration}" \
-    TEST_REPO_ROOT="${case_dir}/repo" \
-    TEST_COMMIT=${test_commit} \
-    TEST_CHECKOUT_HEAD="${checkout_head}" \
-    TEST_SOURCE_HEAD="${source_head}" \
-    TEST_DIRTY_CHECKOUT="${dirty_checkout}" \
-    BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
-    BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
-    BUZZ_PRE_FREEZE_RECEIPT="${case_dir}/pre-freeze-receipt.json" \
-    BUZZ_PROTECTED_CI_RECEIPT="${case_dir}/protected-ci-receipt.json" \
-    BUZZ_PRIOR_MIGRATION_OVERRIDE="${prior_migration_override}" \
-    DOCKER_DEFAULT_PLATFORM="${docker_default_platform}" \
-    BUZZ_DEPLOY_LOG_ROOT="${case_dir}/logs" \
-    BUZZ_DEPLOY_BUILD_ROOT="${case_dir}/build" \
-    BUZZ_DEPLOY_HEALTH_ATTEMPTS=1 \
-    BUZZ_DEPLOY_HEALTH_INTERVAL=0 \
-    BUZZ_DEPLOY_PROBE_TIMEOUT=0.1 \
-    "${deploy_script}" "${test_commit}" >"${case_dir}/output" 2>&1
-  rc=$?
+  [[ ${scenario} != check_db_unreachable ]] || started_ms=$(date +%s%3N)
+  for ((iteration = 1; iteration <= repetitions; iteration++)); do
+    env -u EGID \
+      PATH="${case_dir}/bin:${PATH}" \
+      TEST_SCENARIO=${scenario} \
+      TEST_COMMAND_LOG="${case_dir}/commands.log" \
+      TEST_CONTAINER_STATE="${case_dir}/container-state" \
+      TEST_DB_STATE="${case_dir}/db-state" \
+      TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
+      TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
+      TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
+      TEST_DOCKER_SOCKET="${case_dir}/docker.sock" \
+      TEST_PRIOR_REQUIRED_MIGRATION="${prior_required_migration}" \
+      TEST_REPO_ROOT="${case_dir}/repo" \
+      TEST_COMMIT=${test_commit} \
+      TEST_CHECKOUT_HEAD="${checkout_head}" \
+      TEST_SOURCE_HEAD="${source_head}" \
+      TEST_DIRTY_CHECKOUT="${dirty_checkout}" \
+      BUZZ_RUN_LOCAL="${run_local_override}" \
+      BUZZ_DEPLOY_SOURCE_REF="${deploy_source_ref}" \
+      BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
+      BUZZ_DOCKER_SOCKET="${case_dir}/docker.sock" \
+      BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
+      BUZZ_PRE_FREEZE_RECEIPT="${case_dir}/pre-freeze-receipt.json" \
+      BUZZ_PROTECTED_CI_RECEIPT="${case_dir}/protected-ci-receipt.json" \
+      BUZZ_PRIOR_MIGRATION_OVERRIDE="${prior_migration_override}" \
+      DOCKER_HOST="${docker_host}" \
+      DOCKER_CONTEXT="${docker_context}" \
+      http_proxy="${proxy_url}" \
+      HTTP_PROXY="${proxy_url}" \
+      https_proxy="${proxy_url}" \
+      HTTPS_PROXY="${proxy_url}" \
+      all_proxy="${proxy_url}" \
+      ALL_PROXY="${proxy_url}" \
+      CURL_HOME="${curl_home}" \
+      TEST_CURL_POISON_OUTPUT="${curl_poison_output}" \
+      PGHOSTADDR="${pg_hostaddr}" \
+      DOCKER_DEFAULT_PLATFORM="${docker_default_platform}" \
+      BUZZ_DEPLOY_LOG_ROOT="${deploy_log_root}" \
+      BUZZ_DEPLOY_BUILD_ROOT="${deploy_build_root}" \
+      BUZZ_DEPLOY_HEALTH_ATTEMPTS=1 \
+      BUZZ_DEPLOY_HEALTH_INTERVAL=0 \
+      BUZZ_DEPLOY_PROBE_TIMEOUT=0.1 \
+      "${deploy_script}" "${deploy_args[@]}" >>"${case_dir}/output" 2>&1
+    rc=$?
+    ((rc == 0)) || break
+  done
   set -e
+  if [[ ${scenario} == check_db_unreachable ]]; then
+    elapsed_ms=$(( $(date +%s%3N) - started_ms ))
+    ((elapsed_ms < 5000)) || fail "${scenario} exceeded its 5-second outer deadline (${elapsed_ms} ms)"
+  fi
+  if [[ ${invocation_mode} == check ]]; then
+    inventory_after=$(find "${case_dir}" -mindepth 1 -printf '%P|%y|%m\n' | sort)
+    [[ ${inventory_after} == "${inventory_before}" ]] || \
+      fail "${scenario} changed the fixture path inventory"
+  fi
 
   if [[ ${expected} == success && ${rc} -ne 0 ]]; then
     sed -n '1,240p' "${case_dir}/output" >&2
@@ -473,6 +762,117 @@ assert_contains "${scratch}/dirty_receipt/output" 'group- or world-writable'
 assert_contains "${scratch}/short_receipt/output" 'head_sha must be a full 40-character'
 assert_contains "${scratch}/mismatched_receipt/output" 'does not match the requested commit'
 assert_contains "${scratch}/stale_receipt/output" 'receipt is stale'
+
+set +e
+"${deploy_script}" --check abc >"${scratch}/check-invalid-sha.output" 2>&1
+invalid_sha_rc=$?
+set -e
+[[ ${invalid_sha_rc} -ne 0 ]] || fail 'check mode accepted a short commit'
+assert_contains "${scratch}/check-invalid-sha.output" \
+  'commit must be exactly 40 lowercase hexadecimal characters'
+
+run_case check_success success check
+assert_contains "${scratch}/check_success/output" '^PREFLIGHT PASSED:'
+assert_contains "${scratch}/check_success/output" '^CHECK PASSED: no files, images, containers, services, or database state were changed$'
+[[ ! -e ${scratch}/check_success/check-logs ]] || fail 'check mode created its log root'
+[[ ! -e ${scratch}/check_success/check-build ]] || fail 'check mode created its build root'
+assert_not_contains "${scratch}/check_success/commands.log" '^sudo '
+assert_not_contains "${scratch}/check_success/commands.log" '^fs '
+assert_not_contains "${scratch}/check_success/commands.log" 'worktree add'
+assert_not_contains "${scratch}/check_success/commands.log" \
+  '^docker .* (build|create|run|tag|cp|rm) '
+assert_not_contains "${scratch}/check_success/commands.log" \
+  ' compose .* (run|up) '
+assert_not_contains "${scratch}/check_success/commands.log" 'pg_dump'
+assert_not_contains "${scratch}/check_success/commands.log" '^docker .* exec '
+assert_not_contains "${scratch}/check_success/commands.log" ' compose .* exec '
+
+run_case check_proxy_env success check
+assert_contains "${scratch}/check_proxy_env/output" '^CHECK PASSED:'
+assert_check_runtime_readonly "${scratch}/check_proxy_env"
+
+run_case check_curl_config success check
+assert_contains "${scratch}/check_curl_config/output" '^CHECK PASSED:'
+[[ ! -e ${scratch}/check_curl_config/curl-config-output ]] || \
+  fail 'check mode honored a poisoned curl config'
+assert_check_runtime_readonly "${scratch}/check_curl_config"
+
+run_case check_pg_hostaddr success check
+assert_contains "${scratch}/check_pg_hostaddr/output" '^CHECK PASSED:'
+assert_check_runtime_readonly "${scratch}/check_pg_hostaddr"
+
+run_case check_concurrent_a success check &
+concurrent_a=$!
+run_case check_concurrent_b success check &
+concurrent_b=$!
+wait "${concurrent_a}"
+wait "${concurrent_b}"
+assert_check_runtime_readonly "${scratch}/check_concurrent_a"
+assert_check_runtime_readonly "${scratch}/check_concurrent_b"
+
+for check_early_failure in check_stale_checkout check_stale_source \
+  check_dirty_checkout check_raw_source_ref check_runner_override check_bad_receipt \
+  check_bad_owner check_bad_mode check_symlink check_missing_secret check_docker_host \
+  check_docker_context check_root_slash check_root_relative check_root_noncanonical \
+  check_root_overlap check_root_repo check_root_symlink check_root_unsafe_parent; do
+  run_case "${check_early_failure}" failure check
+  assert_not_contains "${scratch}/${check_early_failure}/commands.log" '^docker '
+  assert_not_contains "${scratch}/${check_early_failure}/commands.log" '^fs '
+  [[ ! -e ${scratch}/${check_early_failure}/check-logs ]] || \
+    fail "${check_early_failure} created its log root"
+  if [[ ${check_early_failure} != check_root_symlink ]]; then
+    [[ ! -e ${scratch}/${check_early_failure}/check-build ]] || \
+      fail "${check_early_failure} created its build root"
+  fi
+done
+assert_contains "${scratch}/check_bad_owner/output" 'Compose environment file must be owned'
+assert_contains "${scratch}/check_bad_mode/output" 'Compose environment file must have mode 640'
+assert_contains "${scratch}/check_symlink/output" 'Compose environment file is missing, is not a regular file, or is a symlink'
+assert_contains "${scratch}/check_missing_secret/output" 'required secret name is missing: BUZZ_RELAY_OWNER_PUBKEY'
+assert_contains "${scratch}/check_raw_source_ref/output" \
+  'deployment source ref must be a remote-tracking branch, not a raw commit'
+assert_contains "${scratch}/check_runner_override/output" \
+  'BUZZ_RUN_LOCAL may not replace the commit-bound Compose runner'
+assert_contains "${scratch}/check_docker_host/output" \
+  'DOCKER_HOST and DOCKER_CONTEXT must be unset'
+assert_contains "${scratch}/check_docker_context/output" \
+  'DOCKER_HOST and DOCKER_CONTEXT must be unset'
+assert_contains "${scratch}/check_root_slash/output" 'build root must be an absolute canonical non-root path'
+assert_contains "${scratch}/check_root_relative/output" 'build root must be an absolute canonical non-root path'
+assert_contains "${scratch}/check_root_noncanonical/output" 'build root must be an absolute canonical non-root path'
+assert_contains "${scratch}/check_root_overlap/output" 'build and log roots overlap'
+assert_contains "${scratch}/check_root_repo/output" 'build root overlaps the repository root'
+assert_contains "${scratch}/check_root_symlink/output" 'build root has a symlinked existing ancestor'
+assert_contains "${scratch}/check_root_unsafe_parent/output" \
+  'build root has a group- or world-writable existing ancestor'
+assert_not_contains "${scratch}/check_success/commands.log" '^run-local '
+assert_check_runtime_readonly "${scratch}/check_success"
+
+for check_runtime_failure in check_compose_image_mismatch check_descriptor_mismatch \
+  check_platform_mismatch check_service_unhealthy check_binary_archive_invalid \
+  check_db_read_failure check_db_unreachable check_db_malformed \
+  check_db_failed_rows; do
+  run_case "${check_runtime_failure}" failure check
+  assert_not_contains "${scratch}/${check_runtime_failure}/commands.log" '^sudo '
+  assert_not_contains "${scratch}/${check_runtime_failure}/commands.log" '^fs '
+  assert_not_contains "${scratch}/${check_runtime_failure}/commands.log" 'worktree add'
+  assert_not_contains "${scratch}/${check_runtime_failure}/commands.log" \
+    '^docker .* (build|create|run|tag|cp|rm) '
+  assert_not_contains "${scratch}/${check_runtime_failure}/commands.log" \
+    ' compose .* (run|up) '
+  assert_not_contains "${scratch}/${check_runtime_failure}/commands.log" 'pg_dump'
+  assert_check_runtime_readonly "${scratch}/${check_runtime_failure}"
+done
+assert_contains "${scratch}/check_descriptor_mismatch/output" 'running container descriptor .* does not match configured ref descriptor'
+assert_contains "${scratch}/check_compose_image_mismatch/output" \
+  'Compose relay image localhost/buzz-relay:other does not match running configured ref localhost/buzz-relay:old'
+assert_contains "${scratch}/check_platform_mismatch/output" 'Compose relay platform linux/arm64 does not match running descriptor platform linux/amd64'
+assert_contains "${scratch}/check_service_unhealthy/output" 'Compose service relay is not running and healthy'
+assert_contains "${scratch}/check_binary_archive_invalid/output" 'relay binary archive stream is invalid'
+assert_contains "${scratch}/check_db_read_failure/output" 'database migration table-marker query failed'
+assert_contains "${scratch}/check_db_unreachable/output" 'database migration table-marker query failed'
+assert_contains "${scratch}/check_db_malformed/output" 'database latest-migration row is empty or malformed'
+assert_contains "${scratch}/check_db_failed_rows/output" 'database contains 1 failed migration rows'
 
 run_local_image_case missing __unset__ localhost/buzz-relay:${test_commit} failure
 assert_contains "${scratch}/run-local-missing/output" 'BUZZ_IMAGE is required'

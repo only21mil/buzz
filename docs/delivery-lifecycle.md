@@ -73,6 +73,7 @@ export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
 export BUZZ_PRE_FREEZE_RECEIPT=/absolute/path/to/pre-freeze-receipt.json
 export BUZZ_PROTECTED_CI_RECEIPT=/absolute/path/to/protected-ci-receipt.json
 export BUZZ_DEPLOY_SOURCE_REF=refs/remotes/buzz/main
+deploy/compose/deploy-local.sh --check FULL_40_CHARACTER_LANDED_COMMIT
 deploy/compose/deploy-local.sh FULL_40_CHARACTER_LANDED_COMMIT
 ```
 
@@ -89,10 +90,65 @@ set it to a raw commit merely to bypass the branch readback.
   `only21mil/buzz`, and the pre-freeze base is an ancestor;
 - the operator-supplied protected-CI receipt is schema-valid, fresh, and states
   that protected full exact-head CI passed;
-- `deploy/compose/run-local.sh` is executable and resolves the exact pinned
-  candidate image through Compose; and
+- the Compose runner, both Compose files, the non-secret settings file, the
+  secret file, and their relevant parent directories have the required regular
+  file or directory type, ownership, mode, and no-symlink state. The non-secret
+  Compose settings file is owner-writable mode `0640`; the secret file is mode
+  `0600` under its mode-`0700` parent. The secret
+  file contains every required variable name with a nonempty assignment, but
+  the preflight never prints or passes secret values in command arguments;
+- the deployment tools, minimum free disk, root-owned `docker` group socket,
+  direct Docker access, and Compose plugin are available. `DOCKER_HOST` and
+  `DOCKER_CONTEXT` must be unset; every preflight Docker call is explicitly
+  bound to the validated Unix socket;
+- build and receipt/log roots are absolute canonical non-root paths with no
+  symlinked existing ancestor, safe deployment-user ownership and modes, and a
+  safe writable nearest parent. Neither root may overlap the other or be an
+  ancestor or descendant of the source repository. These gates bind every
+  later `mkdir`, `chmod`, log, temporary worktree, and receipt write to an
+  approved descendant;
+- Compose resolves exactly one healthy production relay, healthy PostgreSQL,
+  Redis, and MinIO services, and a successfully completed MinIO initializer;
+- the running relay's configured image ref, manifest descriptor digest,
+  platform, OCI revision, required-migration label, and streamed relay-binary
+  SHA-256 are readable and mutually consistent; and
 - the running relay, prior image evidence, database state, and required
-  migration labels are readable and internally consistent.
+  migration labels are readable and internally consistent. The database read
+  also requires zero failed migration rows. The candidate migration is derived
+  directly from the requested commit's Git tree, not from a temporary checkout
+  or a newly built image.
+
+`--check` and the real deploy call the same fail-closed preflight function. Run
+the check immediately before requesting the production action. Check mode is
+strictly read-only: it creates no directory, log, temporary file, worktree,
+image, container, tag, dump, or receipt; it does not invoke `sudo`, build or
+copy an image, run a one-shot container, migrate the database, recreate a
+service, or change service state. Its Docker operations are limited to daemon,
+Compose, container, descriptor, network, and binary-stream metadata readbacks;
+it never uses `docker exec` or Compose `exec`. It never sources the secret file.
+Compose schema resolution uses fixed non-secret sentinels. Relay readiness and
+NIP-11 are fetched by trusted host `curl` from the inspected container network
+endpoint with all ambient HTTP(S)/all-proxy variables cleared and
+curl startup configuration disabled before any other option, with
+`--noproxy '*'` enforced. Database checks use trusted host `psql` against the inspected
+PostgreSQL endpoint with `default_transaction_read_only=on`, bounded timeouts,
+including both libpq `connect_timeout` and an outer process deadline, and an
+explicit `BEGIN TRANSACTION READ ONLY`/`ROLLBACK` envelope. A strict
+non-evaluating parser supplies the database password only through `PGPASSWORD`;
+all ambient `PG*` variables are removed before the script installs only
+`PGPASSWORD`, `PGOPTIONS`, and `PGCONNECT_TIMEOUT`, and the value is never
+printed or placed in command arguments. If host `psql`, the
+network endpoint, or the strictly parseable connection inputs are unavailable,
+preflight refuses. A Docker Engine archive stream carries the running relay
+binary directly to trusted host Python for exact tar-shape validation and
+SHA-256; neither container code nor `docker cp` is a hash trust anchor. The
+runner is always the clean commit-bound `deploy/compose/run-local.sh`—an
+operator path override is refused. Independent static blockers are reported
+together; identity-dependent live checks stop at the first broken prerequisite
+instead of guessing through missing or ambiguous state.
+The real deploy completes this same preflight before its first filesystem write
+and repeats it after the candidate build before rollback capture or backup, so
+live-state drift during the build fails closed.
 
 Receipt validation is not provider authentication. `deploy-local.sh` checks the
 supplied JSON's mode, schema, freshness, commit binding, and asserted result; it
