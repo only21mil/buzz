@@ -2259,7 +2259,10 @@ jobs:
     fn static_job_id_grammar_matches_github_and_rejects_ambiguous_separators() {
         let max = format!("a{}", "-".repeat(63));
         for value in ["a", "_", "A-0_x", "desktop-smoke-e2e", max.as_str()] {
-            assert!(is_valid_static_job_id(value), "rejected valid job ID {value:?}");
+            assert!(
+                is_valid_static_job_id(value),
+                "rejected valid job ID {value:?}"
+            );
         }
 
         let too_long = format!("a{}", "-".repeat(64));
@@ -2275,7 +2278,10 @@ jobs:
             "é",
             too_long.as_str(),
         ] {
-            assert!(!is_valid_static_job_id(value), "accepted unsafe job ID {value:?}");
+            assert!(
+                !is_valid_static_job_id(value),
+                "accepted unsafe job ID {value:?}"
+            );
         }
     }
 
