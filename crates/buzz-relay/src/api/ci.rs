@@ -1680,12 +1680,7 @@ fn map_log_read_authorization(
 fn validate_log_read_path(path: &EvidencePath) -> Result<(), PreflightApiError> {
     if !is_lower_hex_value(&path.request_id, 64)
         || uuid::Uuid::parse_str(&path.run_id).is_err()
-        || path.job_id.is_empty()
-        || path.job_id.len() > 64
-        || !path
-            .job_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || !is_valid_static_job_id(&path.job_id)
         || path.attempt == 0
         || !is_lower_hex_value(&path.sha256, 64)
         || path.object_id.is_some()
@@ -2088,12 +2083,13 @@ mod tests {
     }
 
     #[test]
-    fn log_read_path_uses_the_closed_job_grammar() {
+    fn log_read_path_uses_the_static_job_grammar() {
         let mut path = evidence_path();
         path.object_id = None;
+        path.job_id = "desktop-smoke-e2e".to_owned();
         validate_log_read_path(&path).expect("valid log path");
 
-        for hostile in ["..", ".hidden", "job-name", "job/name", "job%2fescape"] {
+        for hostile in ["..", ".hidden", "0job", "job/name", "job%2fescape"] {
             path.job_id = hostile.to_owned();
             assert!(
                 validate_log_read_path(&path).is_err(),
