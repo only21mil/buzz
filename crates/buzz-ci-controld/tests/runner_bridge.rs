@@ -1,22 +1,21 @@
-#[path = "../src/manifest.rs"]
-mod manifest;
-#[path = "../src/runner_client.rs"]
-mod runner_client;
-
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::rc::Rc;
 
-use buzz_core::ci::{CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
-use manifest::{
+use buzz_ci_controld::manifest::{
     compile_job_manifest, Ed25519ManifestSigner, JobManifestInput, ManifestCompileError,
     ManifestSigningError, WorkspaceIdentity, MANIFEST_SIGNATURE_DOMAIN,
 };
-use runner_client::{
+use buzz_ci_controld::production::{
+    AcceptedRequest, AttemptExecutor, JobMetadata, PreparedRunnerAttempt, RunnerAttemptExecutor,
+    RunnerAttemptPreparer,
+};
+use buzz_ci_controld::runner_client::{
     prepare_runner_request, AttemptOutcome, FailureClass, PreparedRunnerRequest, RunnerClient,
     RunnerClientError, RunnerConnector, ValidatedRunnerResult, RECEIPT_SET_DIGEST_DOMAIN,
 };
+use buzz_core::ci::{CiRequestEnvelope, CiRequestType, CiSkipPolicy, CI_SCHEMA_VERSION};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -480,6 +479,7 @@ type WrittenFrames = Rc<RefCell<Vec<Vec<u8>>>>;
 
 impl RunnerConnector for ScriptedConnector {
     type Connection = ScriptedConnection;
+    type Error = ();
     fn connect(&mut self) -> Result<Self::Connection, ()> {
         let input = self.responses.pop_front().ok_or(())?;
         let write_index = self.writes.borrow().len();
@@ -505,6 +505,53 @@ fn client(
         RunnerClient::new(connector, attempts).expect("client"),
         writes,
     )
+}
+
+struct FixturePreparer(PreparedRunnerRequest);
+
+impl RunnerAttemptPreparer for FixturePreparer {
+    type Error = ();
+
+    fn prepare(
+        &mut self,
+        _accepted: &AcceptedRequest,
+    ) -> Result<PreparedRunnerAttempt, Self::Error> {
+        PreparedRunnerAttempt::new(
+            self.0.clone(),
+            vec![JobMetadata {
+                job_id: "test".into(),
+                name: "Test".into(),
+                required: true,
+                skip_policy: CiSkipPolicy::Forbid,
+                selected_job_instance: "test".into(),
+                also_reruns: Vec::new(),
+            }],
+        )
+        .map_err(|_| ())
+    }
+}
+
+#[test]
+fn production_attempt_executor_invokes_the_public_runner_bridge() {
+    let prepared = prepared();
+    let expected_frame = prepared.frame().to_vec();
+    let (client, writes) = client(vec![completed_stream(11)], 1);
+    let mut executor = RunnerAttemptExecutor::new(client, FixturePreparer(prepared));
+    let accepted = AcceptedRequest {
+        channel_id: "native-ci".into(),
+        watch_cursor: 1,
+        event_id: "ab".repeat(32),
+        envelope: request(),
+    };
+
+    let completion = executor.execute(&accepted).expect("runner completion");
+
+    assert_eq!(writes.borrow().as_slice(), &[expected_frame]);
+    assert_eq!(completion.finished_at, 13);
+    assert_eq!(completion.jobs.len(), 1);
+    assert_eq!(completion.jobs[0].metadata.job_id, "test");
+    assert_eq!(completion.jobs[0].log_cap_bytes, 4096);
+    assert_eq!(completion.teardown.request_event_id, accepted.event_id);
 }
 
 #[test]

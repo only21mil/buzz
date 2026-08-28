@@ -77,6 +77,18 @@ impl PreparedRunnerRequest {
     pub fn frame_digest(&self) -> &str {
         &self.frame_digest
     }
+
+    pub(crate) fn matches_request(
+        &self,
+        request_event_id: &str,
+        request: &CiRequestEnvelope,
+    ) -> bool {
+        self.request_event_id == request_event_id && self.request == *request
+    }
+
+    pub(crate) fn job_ids(&self) -> impl Iterator<Item = &str> {
+        self.jobs.keys().map(String::as_str)
+    }
 }
 
 /// Errors produced before any runner connection is opened.
@@ -525,8 +537,10 @@ impl RunnerClientError {
 pub trait RunnerConnector {
     /// Fresh readable and writable connection type.
     type Connection: Read + Write;
+    /// Connector-specific transport error.
+    type Error;
     /// Open one fresh connection to the configured runner endpoint.
-    fn connect(&mut self) -> Result<Self::Connection, ()>;
+    fn connect(&mut self) -> Result<Self::Connection, Self::Error>;
 }
 
 #[derive(Clone)]
@@ -571,7 +585,7 @@ impl<C: RunnerConnector> RunnerClient<C> {
         for _ in 0..self.max_transport_attempts {
             let mut connection = match self.connector.connect() {
                 Ok(connection) => connection,
-                Err(()) => continue,
+                Err(_) => continue,
             };
             if connection.write_all(request.frame()).is_err() || connection.flush().is_err() {
                 continue;
