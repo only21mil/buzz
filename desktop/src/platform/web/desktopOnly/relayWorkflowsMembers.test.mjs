@@ -424,6 +424,29 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
   assert.equal(getUnregisteredCommandMissCount(), 0);
 });
 
+test("list_relay_agents preserves named fleet identities without an allowlist", async () => {
+  const names = ["Mempool", "Genesis", "Codex-R"];
+  const client = clientFixture({
+    events: names.map((name, index) =>
+      event({
+        id: `agent-${index}`,
+        kind: 10100,
+        createdAt: 30 + index,
+        pubkey: index.toString(16).padStart(64, "0"),
+        content: JSON.stringify({ name, status: "online" }),
+      }),
+    ),
+  });
+  registerRelayWorkflowsMembersCommands(identity, client);
+
+  const result = await dispatch("list_relay_agents");
+  assert.deepEqual(
+    result.map((agent) => agent.name),
+    names,
+  );
+  assert.deepEqual(client.calls.fetchEvents, [{ kinds: [10100] }]);
+});
+
 test("update_profile_at_relay compare-writes through the explicit relay seam", async () => {
   const priorCreatedAt = Math.floor(Date.now() / 1000) + 10;
   let scopedProfile = event({

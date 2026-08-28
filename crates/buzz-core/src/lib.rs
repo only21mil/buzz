@@ -11,6 +11,8 @@ pub mod agent_turn_metric;
 pub mod channel;
 /// Typed signed envelopes for Buzz-native CI events.
 pub mod ci;
+/// Pure reduction of validated CI envelopes into status and verdict state.
+pub mod ci_reducer;
 /// NIP-AE Agent Engrams — slug grammar, conversation key, d-tag derivation,
 /// body parse/serialize, envelope build/validate, head selection.
 pub mod engram;

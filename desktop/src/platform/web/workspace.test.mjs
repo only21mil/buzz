@@ -9,7 +9,7 @@ afterEach(() => resetRegistryForTests());
 const identity = { pubkey: () => "a".repeat(64) };
 
 test("workspace installs and returns a validated relay context", async () => {
-  const workspace = new BrowserWorkspace();
+  const workspace = new BrowserWorkspace("https://relay.example/app/");
   registerWorkspaceCommands(workspace, identity);
   await dispatch("apply_workspace", {
     relayUrl: "wss://relay.example/",
@@ -23,8 +23,25 @@ test("workspace installs and returns a validated relay context", async () => {
   });
 });
 
+test("workspace rejects a relay outside the hosted application origin", async () => {
+  registerWorkspaceCommands(
+    new BrowserWorkspace("https://relay.example/app/"),
+    identity,
+  );
+  await assert.rejects(
+    dispatch("apply_workspace", {
+      relayUrl: "wss://other.example",
+      reposDir: null,
+    }),
+    /must match the application origin/,
+  );
+});
+
 test("workspace rejects filesystem-only repository configuration", async () => {
-  registerWorkspaceCommands(new BrowserWorkspace(), identity);
+  registerWorkspaceCommands(
+    new BrowserWorkspace("https://relay.example/app/"),
+    identity,
+  );
   await assert.rejects(
     dispatch("apply_workspace", {
       relayUrl: "wss://relay.example",

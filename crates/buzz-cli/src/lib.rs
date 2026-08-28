@@ -11,6 +11,11 @@ use error::CliError;
 use nostr::Keys;
 use uuid::Uuid;
 
+/// Shared pure CI status reducer used by authenticated relay read surfaces.
+pub mod ci_reducer {
+    pub use crate::commands::ci::reducer::*;
+}
+
 /// Run the Buzz CLI from raw arguments (including `argv[0]`).
 ///
 /// Returns a process exit code (0 = success).

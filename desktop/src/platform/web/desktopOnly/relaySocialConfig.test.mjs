@@ -37,7 +37,6 @@ const THROW_COMMANDS = [
 ];
 
 const READ_COMMANDS = [
-  ["get_workflow_runs", []],
   ["list_channel_templates", []],
   ["list_personas", []],
   ["list_save_subscriptions", []],
