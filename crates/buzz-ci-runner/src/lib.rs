@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 pub const BINDING_PROTOCOL_CONTRACT_SHA256: &str = CI_PROTOCOL_CONTRACT_SHA256;
 pub const BINDING_RELAY_API_CONTRACT_SHA256: &str =
-    "9e4727a55599150de762d26ec04186ca6a002ee79a9cf6d8a8dcd072fa7960f3";
+    "48b7eee19c63f219e3d0016d48745d5cd3f71962dae0c1209ec7a66adaf3dc56";
 
 pub trait RequestAuthorizer {
     fn authorize(&self, request: &CiRequestEnvelope) -> bool;
@@ -442,11 +442,11 @@ mod tests {
     fn contract_hashes_bind_to_reviewed_v1_4_anchor() {
         assert_eq!(
             BINDING_PROTOCOL_CONTRACT_SHA256,
-            "8b9715d719b057d5d297074c3d019e40d1d2104eeafa2b6033f17b465e7d5a1c"
+            "ac335626526aba0a0c429e6fbbe387600155d539f456075375cb6f11fb0a18d1"
         );
         assert_eq!(
             BINDING_RELAY_API_CONTRACT_SHA256,
-            "9e4727a55599150de762d26ec04186ca6a002ee79a9cf6d8a8dcd072fa7960f3"
+            "48b7eee19c63f219e3d0016d48745d5cd3f71962dae0c1209ec7a66adaf3dc56"
         );
     }
 

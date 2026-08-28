@@ -6,7 +6,7 @@ Inputs:
 
 - `PLANS/BUZZ_CI_DESIGN.md` v1.2, SHA-256 `094b9a66036d9763bdb433942fca21a78a3bb7619c5285271ee2d68be596c8ab`
 - `PLANS/BUZZ_CI_AGENT_LOOP.md` v1.6, SHA-256 `306a9631a374ce4fe3d326311aecc48abe35feacd07c84c8dc07bd2852e2a4d2`
-- `docs/ci/BUZZ_CI_RELAY_API_CONTRACT.md` v1.1, SHA-256 `9e4727a55599150de762d26ec04186ca6a002ee79a9cf6d8a8dcd072fa7960f3`
+- `docs/ci/BUZZ_CI_RELAY_API_CONTRACT.md` v1.1, SHA-256 `48b7eee19c63f219e3d0016d48745d5cd3f71962dae0c1209ec7a66adaf3dc56`
 - `/home/victor/work/alpheus/Agent-Shared/PLANS/BUZZ_CI_THREAT_MODEL.md`, SHA-256 `2f127ef24dfe4b89a88e5b1d406287d7fb4e3de64c029c0c5aa127ce55a118be`
 - product source baseline `660f83c55de5190b0ec2fcb3d6bca43715c8cdbf`
 
@@ -190,7 +190,9 @@ queued | running | success | failure | cancelled | timed_out | skipped
 
 Exactly one of `url` or `inline` is present. `inline` is canonical padded RFC 4648 base64 using the standard alphabet. `byte_length` and `log_sha256` are computed over the decoded scrubbed bytes, never the base64 text. Non-canonical base64, decoded length/hash mismatch, `byte_length > cap_bytes`, or `truncated=true` is a refusal. Identity binds the scrubbed bytes to `{request_event_id, run_id, tip_oid, job_id, attempt, byte_length, truncated}`. Scrub/encode/truncate occurs before hashing and before durable or channel-member-readable persistence. Overflow terminates the job; silent truncation is forbidden.
 
-A `url` is accepted only when it has the HTTP(S) origin corresponding to the active relay (`wss` maps to `https`, `ws` maps to `http`), contains no credentials/query/fragment, and its exact path is `/ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{log_sha256}`. Retrieval is authenticated and path-bound, follows zero redirects, and never forwards authorization off-origin. `logs --raw` buffers the complete bounded response and verifies authorized signer, exactly one location, canonical decoding when inline, cap, exact decoded byte length, SHA-256, and `truncated=false` before writing any byte to stdout.
+A `url` is accepted only when it has the HTTP(S) origin corresponding to the active relay (`wss` maps to `https`, `ws` maps to `http`), contains no credentials/query/fragment, and its exact path is `/ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{log_sha256}`. `GET` and `HEAD` require fresh NIP-98 authentication for the exact method and URL before the relay performs any request, event, or object lookup. A caller must be a current member of the repository's bound channel. Missing evidence and evidence requested by a non-member have the same response, so the route does not expose an existence oracle. The relay requires one authorized log-reference event and a terminal job-status event that names it, with exact repository, channel, request, run, workflow, tip, job, attempt, URL, byte length, cap, and digest bindings. It then verifies stored size and SHA-256 before responding. The decoded-byte ceiling is 32 MiB. The route supports one RFC 9110 byte range and returns `Accept-Ranges`, `Content-Range`, `Content-Length`, and `Digest`; `HEAD` returns the corresponding verified headers with no body. It never redirects and storage keys are built only from validated, fixed-grammar coordinates.
+
+The CLI uses a redirect-disabled client, buffers no more than the signed `cap_bytes`, and rejects a changed final URL. `logs --raw` verifies authorized signer, exactly one location, canonical decoding when inline, cap, exact decoded byte length, SHA-256, and `truncated=false` before writing any byte to stdout.
 
 ### Artifact reference — kind 46104
 
