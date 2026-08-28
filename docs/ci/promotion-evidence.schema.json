@@ -121,8 +121,7 @@
       "required": [
         "candidate_sha", "absent_policy_status", "configured_policy_status", "root_executor_handoff",
         "advertised_bounds_sha256", "enforced_bounds_sha256", "scenarios",
-        "immutable_request_sha", "records", "signer", "job_set_sha256",
-        "evidence_sha256", "teardown_sha256", "conclusion", "log"
+        "event_evidence", "log"
       ],
       "properties": {
         "candidate_sha": {"$ref": "#/$defs/sha40"},
@@ -143,13 +142,7 @@
             "unaccepted_refusal": {"const": "PASS"}
           }
         },
-        "immutable_request_sha": {"$ref": "#/$defs/sha40"},
-        "records": {"$ref": "#/$defs/record_kinds"},
-        "signer": {"$ref": "#/$defs/sha256"},
-        "job_set_sha256": {"$ref": "#/$defs/sha256"},
-        "evidence_sha256": {"$ref": "#/$defs/sha256"},
-        "teardown_sha256": {"$ref": "#/$defs/sha256"},
-        "conclusion": {"const": "success"},
+        "event_evidence": {"$ref": "#/$defs/signed_ci_event_evidence"},
         "log": {"$ref": "#/$defs/log_auth"}
       }
     },
@@ -157,26 +150,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "candidate_sha", "initial_concurrency", "enabled_concurrency",
-        "accepted_executed", "unaccepted_refused", "signed", "allowed_kinds_only", "records",
-        "run_id", "signer", "conclusion", "log_sha256", "evidence_sha256",
-        "teardown_sha256", "retry"
+        "candidate_sha", "accepted_executed", "unaccepted_refused", "event_evidence", "retry"
       ],
       "properties": {
         "candidate_sha": {"$ref": "#/$defs/sha40"},
-        "initial_concurrency": {"const": 0},
-        "enabled_concurrency": {"const": 1},
         "accepted_executed": {"const": true},
         "unaccepted_refused": {"const": true},
-        "signed": {"const": true},
-        "allowed_kinds_only": {"const": true},
-        "records": {"$ref": "#/$defs/record_kinds"},
-        "run_id": {"type": "string", "minLength": 1},
-        "signer": {"$ref": "#/$defs/sha256"},
-        "conclusion": {"const": "success"},
-        "log_sha256": {"$ref": "#/$defs/sha256"},
-        "evidence_sha256": {"$ref": "#/$defs/sha256"},
-        "teardown_sha256": {"$ref": "#/$defs/sha256"},
+        "event_evidence": {"$ref": "#/$defs/signed_ci_event_evidence"},
         "retry": {"$ref": "#/$defs/retry"}
       }
     },
@@ -186,7 +166,7 @@
       "required": [
         "system_sha", "red_sha", "accepted_commit", "required_check",
         "conclusion", "merge_allowed", "protected_rule", "terminal_events",
-        "first_run_id", "duplicate_run_id"
+        "first_run_id", "duplicate_run_id", "parity", "event_evidence"
       ],
       "properties": {
         "system_sha": {"$ref": "#/$defs/sha40"},
@@ -198,7 +178,9 @@
         "protected_rule": {"const": true},
         "terminal_events": {"const": 1},
         "first_run_id": {"type": "string", "minLength": 1},
-        "duplicate_run_id": {"type": "string", "minLength": 1}
+        "duplicate_run_id": {"type": "string", "minLength": 1},
+        "parity": {"$ref": "#/$defs/ci_parity"},
+        "event_evidence": {"$ref": "#/$defs/signed_ci_event_evidence"}
       }
     },
     "deployment": {
@@ -249,6 +231,9 @@
   "$defs": {
     "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sig128": {"type": "string", "pattern": "^[0-9a-f]{128}$"},
+    "uuid": {"type": "string", "format": "uuid"},
+    "job_id": {"type": "string", "pattern": "^[A-Za-z0-9_]{1,64}$"},
     "image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
     "file_descriptor": {
       "type": "object",
@@ -259,15 +244,274 @@
         "sha256": {"$ref": "#/$defs/sha256"}
       }
     },
-    "record_kinds": {
-      "type": "array",
-      "prefixItems": [
-        {"const": 46101}, {"const": 46102}, {"const": 46103},
-        {"const": 46104}, {"const": 46105}, {"const": 46106}
+    "ci_parity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_repo_a", "workflow_id", "workflow_digest", "job_ids", "relay_signer"],
+      "properties": {
+        "target_repo_a": {"type": "string", "minLength": 1},
+        "workflow_id": {"type": "string", "minLength": 1},
+        "workflow_digest": {"$ref": "#/$defs/sha256"},
+        "job_ids": {"type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/job_id"}},
+        "relay_signer": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "signed_ci_event_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "channel_id", "relay_url", "authorized_relay_signers", "requests", "events", "decoded_logs"
       ],
-      "items": false,
-      "minItems": 6,
-      "maxItems": 6
+      "properties": {
+        "channel_id": {"$ref": "#/$defs/uuid"},
+        "relay_url": {"type": "string", "pattern": "^https?://[^/?#]+$"},
+        "authorized_relay_signers": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sha256"}
+        },
+        "requests": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/signed_ci_request"}
+        },
+        "events": {
+          "type": "array", "minItems": 10,
+          "items": {"$ref": "#/$defs/signed_ci_event"}
+        },
+        "decoded_logs": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/sha256"},
+          "additionalProperties": {"type": "string", "contentEncoding": "base64"}
+        }
+      }
+    },
+    "signed_ci_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pubkey", "created_at", "kind", "tags", "content", "sig", "stored"],
+      "properties": {
+        "kind": {"const": 46100},
+        "id": {"$ref": "#/$defs/sha256"},
+        "pubkey": {"$ref": "#/$defs/sha256"},
+        "created_at": {"type": "integer", "minimum": 0},
+        "tags": {"$ref": "#/$defs/nostr_tags"},
+        "sig": {"$ref": "#/$defs/sig128"},
+        "stored": {"const": true},
+        "content": {"type": "string", "minLength": 1}
+      }
+    },
+    "signed_ci_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "pubkey", "created_at", "kind", "tags", "content", "sig", "stored", "watch_cursor"
+      ],
+      "properties": {
+        "kind": {"enum": [46101, 46102, 46103, 46104, 46105, 46106]},
+        "id": {"$ref": "#/$defs/sha256"},
+        "pubkey": {"$ref": "#/$defs/sha256"},
+        "created_at": {"type": "integer", "minimum": 0},
+        "tags": {"$ref": "#/$defs/nostr_tags"},
+        "sig": {"$ref": "#/$defs/sig128"},
+        "stored": {"const": true},
+        "watch_cursor": {"type": "integer", "minimum": 1},
+        "content": {"type": "string", "minLength": 1}
+      }
+    },
+    "nostr_tags": {
+      "type": "array",
+      "items": {
+        "type": "array", "minItems": 1,
+        "items": {"type": "string"}
+      }
+    },
+    "ci_request_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "request_type", "target_repo_a", "pr_root_event_id",
+        "source_clone_url", "immutable_source_ref", "tip_oid", "source_branch", "base_ref",
+        "base_oid", "workflow_id", "workflow_digest", "job_ids", "run_id", "attempt",
+        "trigger_event_id", "actor", "timeout_seconds", "idempotency_key", "issued_at", "expires_at"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "request_type": {"const": "run"},
+        "target_repo_a": {"type": "string", "minLength": 1},
+        "pr_root_event_id": {"$ref": "#/$defs/sha256"},
+        "pr_update_event_id": {"$ref": "#/$defs/sha256"},
+        "source_clone_url": {"type": "string", "minLength": 1},
+        "immutable_source_ref": {"type": "string", "minLength": 1},
+        "tip_oid": {"$ref": "#/$defs/sha40"},
+        "source_branch": {"type": "string", "minLength": 1},
+        "base_ref": {"type": "string", "minLength": 1},
+        "base_oid": {"$ref": "#/$defs/sha40"},
+        "workflow_id": {"type": "string", "minLength": 1},
+        "workflow_digest": {"$ref": "#/$defs/sha256"},
+        "job_ids": {"type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/job_id"}},
+        "run_id": {"$ref": "#/$defs/uuid"},
+        "attempt": {"const": 1},
+        "trigger_event_id": {"$ref": "#/$defs/sha256"},
+        "actor": {"$ref": "#/$defs/sha256"},
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "idempotency_key": {"type": "string", "minLength": 1},
+        "issued_at": {"type": "integer", "minimum": 0},
+        "expires_at": {"type": "integer", "minimum": 1}
+      }
+    },
+    "run_status_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "request_event_id", "run_id", "workflow_id", "target_repo_a",
+        "tip_oid", "base_oid", "attempt", "sequence", "state", "job_ids", "relay_signer"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "request_event_id": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "minLength": 1},
+        "workflow_id": {"type": "string", "minLength": 1},
+        "target_repo_a": {"type": "string", "minLength": 1},
+        "tip_oid": {"$ref": "#/$defs/sha40"},
+        "base_oid": {"$ref": "#/$defs/sha40"},
+        "attempt": {"type": "integer", "minimum": 1},
+        "sequence": {"type": "integer", "minimum": 1},
+        "state": {"enum": ["queued", "running", "success", "failure", "cancelled", "timed_out", "infrastructure_failure"]},
+        "conclusion": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "started_at": {"type": "integer", "minimum": 0},
+        "finished_at": {"type": "integer", "minimum": 0},
+        "job_ids": {"type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/job_id"}},
+        "relay_signer": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "job_status_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "request_event_id", "run_id", "workflow_id", "target_repo_a",
+        "tip_oid", "base_oid", "job_id", "name", "attempt", "sequence", "state",
+        "required", "skip_policy", "selected_job_instance", "also_reruns", "artifact_refs", "relay_signer"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "request_event_id": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "minLength": 1},
+        "workflow_id": {"type": "string", "minLength": 1},
+        "target_repo_a": {"type": "string", "minLength": 1},
+        "tip_oid": {"$ref": "#/$defs/sha40"},
+        "base_oid": {"$ref": "#/$defs/sha40"},
+        "job_id": {"$ref": "#/$defs/job_id"},
+        "name": {"type": "string", "minLength": 1},
+        "attempt": {"type": "integer", "minimum": 1},
+        "parent_attempt": {"type": "integer", "minimum": 1},
+        "sequence": {"type": "integer", "minimum": 1},
+        "state": {"enum": ["queued", "running", "success", "failure", "cancelled", "timed_out", "skipped"]},
+        "conclusion": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "required": {"type": "boolean"},
+        "skip_policy": {"enum": ["allow", "forbid"]},
+        "selected_job_instance": {},
+        "also_reruns": {"type": "array"},
+        "started_at": {"type": "integer", "minimum": 0},
+        "finished_at": {"type": "integer", "minimum": 0},
+        "log_ref": {"$ref": "#/$defs/sha256"},
+        "artifact_refs": {"type": "array", "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sha256"}},
+        "relay_signer": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "log_reference_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "request_event_id", "run_id", "workflow_id", "target_repo_a",
+        "tip_oid", "job_id", "attempt", "log_sha256", "byte_length", "cap_bytes",
+        "truncated", "created_at", "relay_signer"
+      ],
+      "properties": {
+        "schema_version": {"const": 1}, "request_event_id": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "minLength": 1}, "workflow_id": {"type": "string", "minLength": 1},
+        "target_repo_a": {"type": "string", "minLength": 1}, "tip_oid": {"$ref": "#/$defs/sha40"},
+        "job_id": {"$ref": "#/$defs/job_id"}, "attempt": {"type": "integer", "minimum": 1},
+        "log_sha256": {"$ref": "#/$defs/sha256"}, "byte_length": {"type": "integer", "minimum": 1},
+        "cap_bytes": {"type": "integer", "minimum": 1}, "truncated": {"const": false},
+        "url": {"type": "string", "pattern": "^https?://"}, "inline": {"type": "string", "minLength": 1},
+        "created_at": {"type": "integer", "minimum": 0}, "relay_signer": {"$ref": "#/$defs/sha256"}
+      },
+      "oneOf": [{"required": ["url"]}, {"required": ["inline"]}]
+    },
+    "artifact_reference_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "request_event_id", "run_id", "workflow_id", "target_repo_a", "tip_oid",
+        "job_id", "attempt", "artifact_id", "name", "media_type", "sha256", "byte_length", "url",
+        "created_at", "relay_signer"
+      ],
+      "properties": {
+        "schema_version": {"const": 1}, "request_event_id": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "minLength": 1}, "workflow_id": {"type": "string", "minLength": 1},
+        "target_repo_a": {"type": "string", "minLength": 1}, "tip_oid": {"$ref": "#/$defs/sha40"},
+        "job_id": {"$ref": "#/$defs/job_id"}, "attempt": {"type": "integer", "minimum": 1},
+        "artifact_id": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1},
+        "media_type": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"},
+        "byte_length": {"type": "integer", "minimum": 1}, "url": {"type": "string", "pattern": "^https?://"},
+        "created_at": {"type": "integer", "minimum": 0}, "relay_signer": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "evidence_finalized_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "request_event_id", "run_id", "workflow_id", "target_repo_a", "tip_oid",
+        "attempt", "finalized_job_attempts", "finalized_at", "relay_signer"
+      ],
+      "properties": {
+        "schema_version": {"const": 1}, "request_event_id": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "minLength": 1}, "workflow_id": {"type": "string", "minLength": 1},
+        "target_repo_a": {"type": "string", "minLength": 1}, "tip_oid": {"$ref": "#/$defs/sha40"},
+        "attempt": {"type": "integer", "minimum": 1},
+        "finalized_job_attempts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/finalized_job_attempt"}},
+        "finalized_at": {"type": "integer", "minimum": 0}, "relay_signer": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "finalized_job_attempt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["job_id", "attempt", "log_ref", "artifact_refs"],
+      "properties": {
+        "job_id": {"$ref": "#/$defs/job_id"}, "attempt": {"type": "integer", "minimum": 1},
+        "log_ref": {"$ref": "#/$defs/sha256"},
+        "artifact_refs": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/sha256"}}
+      }
+    },
+    "teardown_attestation_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "request_event_id", "run_id", "workflow_id", "target_repo_a", "tip_oid",
+        "base_oid", "workflow_digest", "attempt", "leases", "lease_empty", "teardown_at", "relay_signer"
+      ],
+      "properties": {
+        "schema_version": {"const": 1}, "request_event_id": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "minLength": 1}, "workflow_id": {"type": "string", "minLength": 1},
+        "target_repo_a": {"type": "string", "minLength": 1}, "tip_oid": {"$ref": "#/$defs/sha40"},
+        "base_oid": {"$ref": "#/$defs/sha40"}, "workflow_digest": {"$ref": "#/$defs/sha256"},
+        "attempt": {"type": "integer", "minimum": 1},
+        "leases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/lease"}},
+        "lease_empty": {"const": true}, "teardown_at": {"type": "integer", "minimum": 0},
+        "relay_signer": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "lease": {
+      "type": "object", "additionalProperties": false,
+      "required": ["job_id", "attempt", "lease_id"],
+      "properties": {
+        "job_id": {"$ref": "#/$defs/job_id"}, "attempt": {"type": "integer", "minimum": 1},
+        "lease_id": {"type": "string", "minLength": 1}
+      }
     },
     "log_auth": {
       "type": "object",
@@ -290,13 +534,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "request_id", "first_run_id", "duplicate_run_id", "attempts",
+        "request_id", "rerun_request_id", "first_run_id", "duplicate_run_id", "attempts",
         "workspaces", "terminal_events"
       ],
       "properties": {
         "request_id": {"type": "string", "minLength": 1},
-        "first_run_id": {"type": "string", "minLength": 1},
-        "duplicate_run_id": {"type": "string", "minLength": 1},
+        "rerun_request_id": {"$ref": "#/$defs/sha256"},
+        "first_run_id": {"$ref": "#/$defs/uuid"},
+        "duplicate_run_id": {"$ref": "#/$defs/uuid"},
         "attempts": {"const": [1, 2]},
         "workspaces": {"type": "array", "minItems": 2, "maxItems": 2,
           "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
