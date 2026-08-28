@@ -192,30 +192,21 @@ pub(super) async fn cmd_logs(
         return output_log(inline.as_bytes(), raw, selected.result());
     }
 
-    // URL-backed log: the relay does not serve /ci/logs yet, so this will 404.
     if let Some(plan) = selected.fetch_plan() {
-        match client.get_authed(plan.url()).await {
-            Ok(body) => {
-                let bytes = body.into_bytes();
-                let response = ev::BufferedLogResponse {
-                    requested_url: plan.url().to_owned(),
-                    final_url: plan.url().to_owned(),
-                    redirects_followed: 0,
-                    authenticated: true,
-                    content_length: Some(bytes.len() as u64),
-                    body: bytes,
-                };
-                let verified = ev::verify_fetched_log(plan, response)
-                    .map_err(|e| CliError::Other(format!("CI log evidence mismatch: {e}")))?;
-                output_log(verified.as_bytes(), raw, selected.result())
-            }
-            Err(CliError::Relay { status: 404, .. }) => Err(CliError::Other(
-                "CI log retrieval unavailable: the relay does not serve the /ci/logs endpoint yet. \
-                 The signed log reference points to a URL the relay has not implemented."
-                    .into(),
-            )),
-            Err(e) => Err(e),
-        }
+        let fetched = client
+            .get_authed_bytes_bounded(plan.url(), plan.cap_bytes())
+            .await?;
+        let response = ev::BufferedLogResponse {
+            requested_url: plan.url().to_owned(),
+            final_url: fetched.final_url,
+            redirects_followed: 0,
+            authenticated: true,
+            content_length: fetched.content_length,
+            body: fetched.body,
+        };
+        let verified = ev::verify_fetched_log(plan, response)
+            .map_err(|e| CliError::Other(format!("CI log evidence mismatch: {e}")))?;
+        output_log(verified.as_bytes(), raw, selected.result())
     } else {
         Err(CliError::Other(
             "internal error: selected log has neither inline nor URL source".into(),
