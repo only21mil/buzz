@@ -25,18 +25,28 @@ The bundle must bind all of these identities exactly:
 - staging signer, production canary run, relay landing, authoritative mirror,
   merge commit and deliberate-red commit.
 
-Staging and canary evidence retain the signed kind-46100 request plus the
-ordered stored kind-46101 through kind-46106 facts. Each retained event names
-its event ID, pubkey, verified signature result, storage result and watch
-cursor. The verifier binds every event to the request event, run, repository,
-workflow, tip, base where present, attempt and authorized relay signer.
+Staging, canary and deliberate-red evidence retain canonical Nostr wire events:
+`id`, `pubkey`, `created_at`, `kind`, `tags`, raw `content` and `sig`. The
+verifier recomputes every event ID and verifies every BIP-340 Schnorr signature.
+It rejects caller-supplied verification claims. It also checks the repository
+CI tag contract before it binds each stored status event to its signed request,
+canonical run UUID, repository, workflow, tip, top-level base SHA, attempt and
+authorized relay signer.
 
 Kind coverage is deduplicated. It must equal 46101 through 46106, but the
 event list must contain every transition. A successful initial run therefore
 has ordered `queued`, `running` and terminal `success` kind-46101 facts and the
 same ordered kind-46102 history for every selected job. Sequences begin at one
 and have no gaps per run-attempt or job-attempt stream. Unknown kinds, states,
-fields, illegal transitions, cursor gaps and equivocation fail closed.
+fields, illegal transitions, cursor gaps and equivocation fail closed. Job
+name, required status, skip policy and selected matrix instance stay immutable
+through the lifecycle. Terminal state and conclusion must agree.
+
+Every rerun has its own signed kind-46100 request. Its stable run UUID, selected
+job, parent run, parent attempt and next attempt must form a contiguous lineage.
+Signed kind-46102 histories must match that request exactly, including the
+selected job instance and dependency fanout. The verifier decodes every retained
+log body, then checks its signed byte length, cap and SHA-256.
 
 Kind 46105 must name every selected job attempt exactly once and bind each log
 and artifact event ID to the same job and attempt. Kind 46106 must carry
@@ -71,12 +81,14 @@ receipt is written.
    retries. Mock-suite evidence proves the harness only; live staging evidence
    remains mandatory.
 5. With production-canary approval, run one accepted signed job, refuse an
-   unaccepted job, retain the complete signed event history, and prove
-   idempotent retry results with a fresh workspace per attempt. The verifier
-   checks staging/canary contract parity from the retained event facts.
+   unaccepted job, retain the initial and rerun requests plus the complete
+   signed event history, and prove idempotent retry results with a fresh
+   workspace per attempt. The verifier checks request lineage and
+   staging/canary contract parity from the retained event facts.
 6. Run the deliberate-red candidate. The protected check must conclude
    failure, the merge must remain blocked, and a duplicate request must return
-   the same single terminal run.
+   the same single terminal run. Retain its canonical signed request, full
+   status history, finalization, teardown and decoded log evidence.
 7. After explicit deployment approval, record dump completion before swap,
    exact image/binary/revision/migration identities, readiness, NIP-11 and
    authenticated log results. Rehearse both rollback cases: a compatible

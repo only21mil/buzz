@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import copy
+import base64
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,10 @@ import unittest
 
 SCRIPT = Path(__file__).with_name("ci-promotion-readiness.py")
 REPO_ROOT = SCRIPT.parent.parent
+SPEC = importlib.util.spec_from_file_location("ci_promotion_readiness", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+READINESS = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(READINESS)
 NOW = 1_787_832_000
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
@@ -24,6 +30,42 @@ DIGEST_C = "c" * 64
 IMAGE_A = f"sha256:{'1' * 64}"
 IMAGE_B = f"sha256:{'2' * 64}"
 PRIOR_IMAGE = f"sha256:{'3' * 64}"
+LOG_BYTES = b"canonical native CI log\n"
+LOG_DIGEST = hashlib.sha256(LOG_BYTES).hexdigest()
+ACTOR_SECRET = 3
+SIGNER_SECRET = 5
+
+
+def xonly_pubkey(secret: int) -> str:
+    point = READINESS.point_multiply(secret, READINESS.SECP256K1_G)
+    assert point is not None
+    return point[0].to_bytes(32, "big").hex()
+
+
+def schnorr_sign(secret: int, message: bytes) -> str:
+    point = READINESS.point_multiply(secret, READINESS.SECP256K1_G)
+    assert point is not None
+    adjusted = secret if point[1] % 2 == 0 else READINESS.SECP256K1_N - secret
+    pubkey = point[0].to_bytes(32, "big")
+    aux = b"\x00" * 32
+    mask = READINESS.tagged_hash("BIP0340/aux", aux)
+    nonce_input = bytes(a ^ b for a, b in zip(adjusted.to_bytes(32, "big"), mask))
+    nonce = int.from_bytes(
+        READINESS.tagged_hash("BIP0340/nonce", nonce_input + pubkey + message), "big"
+    ) % READINESS.SECP256K1_N
+    assert nonce != 0
+    nonce_point = READINESS.point_multiply(nonce, READINESS.SECP256K1_G)
+    assert nonce_point is not None
+    if nonce_point[1] % 2:
+        nonce = READINESS.SECP256K1_N - nonce
+        nonce_point = READINESS.point_multiply(nonce, READINESS.SECP256K1_G)
+        assert nonce_point is not None
+    r = nonce_point[0].to_bytes(32, "big")
+    challenge = int.from_bytes(
+        READINESS.tagged_hash("BIP0340/challenge", r + pubkey + message), "big"
+    ) % READINESS.SECP256K1_N
+    signature = r + ((nonce + challenge * adjusted) % READINESS.SECP256K1_N).to_bytes(32, "big")
+    return signature.hex()
 
 
 def run(command: list[str], cwd: Path) -> str:
@@ -132,156 +174,74 @@ class PromotionReadinessTest(unittest.TestCase):
             record["run"] = run
         return record
 
-    def signed_event_evidence(self, run_id: str) -> dict:
+    def signed_event_evidence(
+        self, run_id: str, *, tip_oid: str | None = None, retry: bool = False,
+        terminal_state: str = "success",
+    ) -> dict:
         def fixed_id(label: str) -> str:
             return hashlib.sha256(f"{run_id}:{label}".encode()).hexdigest()
 
-        actor = DIGEST_A
-        signer = DIGEST_B
-        request_event_id = fixed_id("request")
+        actor = xonly_pubkey(ACTOR_SECRET)
+        signer = xonly_pubkey(SIGNER_SECRET)
+        candidate = tip_oid or self.candidate
         job_id = "build"
-        target_repo_a = f"30617:{DIGEST_A}:buzz"
+        target_repo_a = f"30617:{actor}:buzz"
         workflow_id = "ci"
         workflow_digest = DIGEST_C
-        base_content = {
-            "schema_version": 1,
-            "request_event_id": request_event_id,
-            "run_id": run_id,
-            "workflow_id": workflow_id,
-            "target_repo_a": target_repo_a,
-            "tip_oid": self.candidate,
-        }
+        channel_id = "46bba699-8251-43c7-943e-66be58376585"
+        creation_counter = 0
 
-        def signed_event(kind: int, cursor: int, content: dict) -> dict:
-            return {
+        def tags_for(kind: int, content: dict) -> list[list[str]]:
+            tags = [
+                ["h", channel_id], ["a", content["target_repo_a"]], ["run", content["run_id"]],
+                ["workflow", content["workflow_id"]], ["c", content["tip_oid"]],
+                ["attempt", str(content["attempt"])],
+            ]
+            if kind in (46102, 46103, 46104):
+                tags.append(["job", content["job_id"]])
+            if kind != 46100:
+                tags.append(["e", content["request_event_id"], "", "request"])
+            if kind == 46103:
+                tags.append(["x", content["log_sha256"]])
+            elif kind == 46104:
+                tags.append(["x", content["sha256"]])
+            return tags
+
+        def wire_event(kind: int, content: dict, secret: int, *, cursor: int | None = None) -> dict:
+            nonlocal creation_counter
+            creation_counter += 1
+            pubkey = xonly_pubkey(secret)
+            created_at = NOW - 500 + creation_counter
+            raw_content = json.dumps(content, sort_keys=True, separators=(",", ":"))
+            tags = tags_for(kind, content)
+            serialized = json.dumps(
+                [0, pubkey, created_at, kind, tags, raw_content], separators=(",", ":")
+            ).encode()
+            identifier = hashlib.sha256(serialized).hexdigest()
+            event = {
+                "id": identifier,
+                "pubkey": pubkey,
+                "created_at": created_at,
                 "kind": kind,
-                "event_id": fixed_id(f"event-{cursor}"),
-                "pubkey": signer,
-                "signature": "d" * 128,
-                "signature_verified": True,
+                "tags": tags,
+                "content": raw_content,
+                "sig": schnorr_sign(secret, bytes.fromhex(identifier)),
                 "stored": True,
-                "watch_cursor": cursor,
-                "content": content,
             }
+            if cursor is not None:
+                event["watch_cursor"] = cursor
+            return event
 
-        def run_status(cursor: int, sequence: int, state: str) -> dict:
+        def request_content(attempt: int) -> dict:
             content = {
-                **base_content,
-                "base_oid": self.base,
-                "attempt": 1,
-                "sequence": sequence,
-                "state": state,
-                "job_ids": [job_id],
-                "relay_signer": signer,
-            }
-            if state != "queued":
-                content["started_at"] = NOW - 30
-            if state == "success":
-                content["conclusion"] = "success"
-                content["finished_at"] = NOW - 1
-            return signed_event(46101, cursor, content)
-
-        log_event_id = fixed_id("event-5")
-        artifact_event_id = fixed_id("event-6")
-
-        def job_status(cursor: int, sequence: int, state: str) -> dict:
-            content = {
-                **base_content,
-                "base_oid": self.base,
-                "job_id": job_id,
-                "name": "Build",
-                "attempt": 1,
-                "sequence": sequence,
-                "state": state,
-                "required": True,
-                "skip_policy": "forbid",
-                "selected_job_instance": job_id,
-                "also_reruns": [],
-                "artifact_refs": [],
-                "relay_signer": signer,
-            }
-            if state != "queued":
-                content["started_at"] = NOW - 25
-            if state == "success":
-                content["conclusion"] = "success"
-                content["finished_at"] = NOW - 10
-                content["log_ref"] = log_event_id
-                content["artifact_refs"] = [artifact_event_id]
-            return signed_event(46102, cursor, content)
-
-        events = [
-            run_status(1, 1, "queued"),
-            run_status(2, 2, "running"),
-            job_status(3, 1, "queued"),
-            job_status(4, 2, "running"),
-            signed_event(46103, 5, {
-                **base_content,
-                "job_id": job_id,
-                "attempt": 1,
-                "log_sha256": DIGEST_A,
-                "byte_length": 128,
-                "cap_bytes": 1024,
-                "truncated": False,
-                "url": f"https://relay.example.invalid/ci/logs/{request_event_id}/{run_id}/{job_id}/1/{DIGEST_A}",
-                "created_at": NOW - 15,
-                "relay_signer": signer,
-            }),
-            signed_event(46104, 6, {
-                **base_content,
-                "job_id": job_id,
-                "attempt": 1,
-                "artifact_id": "artifact-1",
-                "name": "result.json",
-                "media_type": "application/json",
-                "sha256": DIGEST_B,
-                "byte_length": 64,
-                "url": "https://relay.example.invalid/ci/artifacts/artifact-1",
-                "created_at": NOW - 14,
-                "relay_signer": signer,
-            }),
-            job_status(7, 3, "success"),
-            signed_event(46105, 8, {
-                **base_content,
-                "attempt": 1,
-                "finalized_job_attempts": [{
-                    "job_id": job_id,
-                    "attempt": 1,
-                    "log_ref": log_event_id,
-                    "artifact_refs": [artifact_event_id],
-                }],
-                "finalized_at": NOW - 8,
-                "relay_signer": signer,
-            }),
-            signed_event(46106, 9, {
-                **base_content,
-                "base_oid": self.base,
-                "workflow_digest": workflow_digest,
-                "attempt": 1,
-                "leases": [{"job_id": job_id, "attempt": 1, "lease_id": "lease-1"}],
-                "lease_empty": True,
-                "teardown_at": NOW - 5,
-                "relay_signer": signer,
-            }),
-            run_status(10, 3, "success"),
-        ]
-        return {
-            "authorized_relay_signers": [signer],
-            "request": {
-                "kind": 46100,
-                "event_id": request_event_id,
-                "pubkey": actor,
-                "signature": "c" * 128,
-                "signature_verified": True,
-                "stored": True,
-                "content": {
                     "schema_version": 1,
-                    "request_type": "run",
+                    "request_type": "run" if attempt == 1 else "rerun",
                     "target_repo_a": target_repo_a,
                     "pr_root_event_id": fixed_id("pr-root"),
                     "pr_update_event_id": fixed_id("pr-update"),
                     "source_clone_url": "https://example.invalid/only21mil/buzz.git",
-                    "immutable_source_ref": f"refs/buzz/{self.candidate}",
-                    "tip_oid": self.candidate,
+                    "immutable_source_ref": f"refs/buzz/{candidate}",
+                    "tip_oid": candidate,
                     "source_branch": "sats/test",
                     "base_ref": "refs/heads/main",
                     "base_oid": self.base,
@@ -289,26 +249,135 @@ class PromotionReadinessTest(unittest.TestCase):
                     "workflow_digest": workflow_digest,
                     "job_ids": [job_id],
                     "run_id": run_id,
-                    "attempt": 1,
+                    "attempt": attempt,
                     "trigger_event_id": fixed_id("pr-update"),
                     "actor": actor,
                     "timeout_seconds": 600,
-                    "idempotency_key": f"idempotency-{run_id}",
+                    "idempotency_key": f"idempotency-{run_id}-{attempt}",
                     "issued_at": NOW - 120,
                     "expires_at": NOW + 480,
-                },
-            },
+            }
+            if attempt > 1:
+                content["parent_attempt"] = attempt - 1
+                content["parent_run_id"] = run_id
+            return content
+
+        request_attempts = [1, 2] if retry else [1]
+        requests = [wire_event(46100, request_content(attempt), ACTOR_SECRET)
+                    for attempt in request_attempts]
+        request_ids = {attempt: requests[attempt - 1]["id"] for attempt in request_attempts}
+        events: list[dict] = []
+        decoded_logs: dict[str, str] = {}
+        cursor = 0
+
+        def append(kind: int, content: dict) -> dict:
+            nonlocal cursor
+            cursor += 1
+            event = wire_event(kind, content, SIGNER_SECRET, cursor=cursor)
+            events.append(event)
+            return event
+
+        for attempt in request_attempts:
+            request_event_id = request_ids[attempt]
+            base_content = {
+                "schema_version": 1, "request_event_id": request_event_id, "run_id": run_id,
+                "workflow_id": workflow_id, "target_repo_a": target_repo_a, "tip_oid": candidate,
+            }
+            final_attempt = attempt == request_attempts[-1]
+            state = terminal_state if final_attempt else "failure"
+
+            def run_status(sequence: int, status: str) -> dict:
+                content = {
+                    **base_content, "base_oid": self.base, "attempt": attempt, "sequence": sequence,
+                    "state": status, "job_ids": [job_id], "relay_signer": signer,
+                }
+                if status != "queued":
+                    content["started_at"] = NOW - 30
+                if status not in ("queued", "running"):
+                    content["conclusion"] = status
+                    content["finished_at"] = NOW - 1
+                return content
+
+            def job_status(sequence: int, status: str) -> dict:
+                content = {
+                    **base_content, "base_oid": self.base, "job_id": job_id, "name": "Build",
+                    "attempt": attempt, "sequence": sequence, "state": status, "required": True,
+                    "skip_policy": "forbid", "selected_job_instance": job_id, "also_reruns": [],
+                    "artifact_refs": [], "relay_signer": signer,
+                }
+                if attempt > 1:
+                    content["parent_attempt"] = attempt - 1
+                if status != "queued":
+                    content["started_at"] = NOW - 25
+                if status not in ("queued", "running"):
+                    content["conclusion"] = status
+                    content["finished_at"] = NOW - 10
+                return content
+
+            append(46101, run_status(1, "queued"))
+            append(46101, run_status(2, "running"))
+            append(46102, job_status(1, "queued"))
+            append(46102, job_status(2, "running"))
+            if final_attempt:
+                log = append(46103, {
+                    **base_content, "job_id": job_id, "attempt": attempt, "log_sha256": LOG_DIGEST,
+                    "byte_length": len(LOG_BYTES), "cap_bytes": 1024, "truncated": False,
+                    "url": f"https://relay.example.invalid/ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{LOG_DIGEST}",
+                    "created_at": NOW - 15, "relay_signer": signer,
+                })
+                decoded_logs[log["id"]] = base64.b64encode(LOG_BYTES).decode()
+                artifact = append(46104, {
+                    **base_content, "job_id": job_id, "attempt": attempt, "artifact_id": "artifact-1",
+                    "name": "result.json", "media_type": "application/json", "sha256": DIGEST_B,
+                    "byte_length": 64, "url": "https://relay.example.invalid/ci/artifacts/artifact-1",
+                    "created_at": NOW - 14, "relay_signer": signer,
+                })
+                terminal_job = job_status(3, state)
+                terminal_job["log_ref"] = log["id"]
+                terminal_job["artifact_refs"] = [artifact["id"]]
+                append(46102, terminal_job)
+                append(46105, {
+                    **base_content, "attempt": attempt, "finalized_job_attempts": [{
+                        "job_id": job_id, "attempt": attempt, "log_ref": log["id"],
+                        "artifact_refs": [artifact["id"]],
+                    }], "finalized_at": NOW - 8, "relay_signer": signer,
+                })
+                append(46106, {
+                    **base_content, "base_oid": self.base, "workflow_digest": workflow_digest,
+                    "attempt": attempt, "leases": [{"job_id": job_id, "attempt": attempt,
+                                                       "lease_id": f"lease-{attempt}"}],
+                    "lease_empty": True, "teardown_at": NOW - 5, "relay_signer": signer,
+                })
+            else:
+                append(46102, job_status(3, "failure"))
+            append(46101, run_status(3, state))
+
+        return {
+            "channel_id": channel_id,
+            "authorized_relay_signers": [signer],
+            "requests": requests,
             "events": events,
+            "decoded_logs": decoded_logs,
         }
 
     def valid_bundle(self) -> dict:
+        staging_run_id = "11111111-1111-4111-8111-111111111111"
+        canary_run_id = "22222222-2222-4222-8222-222222222222"
+        red_run_id = "33333333-3333-4333-8333-333333333333"
+        staging_evidence = self.signed_event_evidence(staging_run_id)
+        canary_evidence = self.signed_event_evidence(canary_run_id, retry=True)
+        red_evidence = self.signed_event_evidence(
+            red_run_id, tip_oid=self.red_sha, terminal_state="failure"
+        )
+        actor = xonly_pubkey(ACTOR_SECRET)
+        signer = xonly_pubkey(SIGNER_SECRET)
         log = {
             "authorized_status": 200,
             "unauthorized_status": 403,
             "redirects": 0,
-            "sha256": DIGEST_A,
-            "computed_sha256": DIGEST_A,
-            "byte_count": 128,
+            "sha256": LOG_DIGEST,
+            "computed_sha256": LOG_DIGEST,
+            "byte_count": len(LOG_BYTES),
             "byte_cap": 1024,
         }
         return {
@@ -376,18 +445,19 @@ class PromotionReadinessTest(unittest.TestCase):
                     "restart_recovery": "PASS",
                     "unaccepted_refusal": "PASS",
                 },
-                "event_evidence": self.signed_event_evidence("run-1"),
+                "event_evidence": staging_evidence,
                 "log": copy.deepcopy(log),
             },
             "production_canary": {
                 "candidate_sha": self.candidate,
                 "accepted_executed": True,
                 "unaccepted_refused": True,
-                "event_evidence": self.signed_event_evidence("run-1"),
+                "event_evidence": canary_evidence,
                 "retry": {
-                    "request_id": "request-1",
-                    "first_run_id": "run-1",
-                    "duplicate_run_id": "run-1",
+                    "request_id": canary_evidence["requests"][0]["id"],
+                    "rerun_request_id": canary_evidence["requests"][1]["id"],
+                    "first_run_id": canary_run_id,
+                    "duplicate_run_id": canary_run_id,
                     "attempts": [1, 2],
                     "workspaces": ["workspace-1", "workspace-2"],
                     "terminal_events": 1,
@@ -402,15 +472,16 @@ class PromotionReadinessTest(unittest.TestCase):
                 "merge_allowed": False,
                 "protected_rule": True,
                 "terminal_events": 1,
-                "first_run_id": "red-run-1",
-                "duplicate_run_id": "red-run-1",
+                "first_run_id": red_run_id,
+                "duplicate_run_id": red_run_id,
                 "parity": {
-                    "target_repo_a": f"30617:{DIGEST_A}:buzz",
+                    "target_repo_a": f"30617:{actor}:buzz",
                     "workflow_id": "ci",
                     "workflow_digest": DIGEST_C,
                     "job_ids": ["build"],
-                    "relay_signer": DIGEST_B,
+                    "relay_signer": signer,
                 },
+                "event_evidence": red_evidence,
             },
             "deployment": {
                 "commit_sha": self.candidate,
@@ -457,6 +528,20 @@ class PromotionReadinessTest(unittest.TestCase):
                 "merge_sha": self.candidate,
             },
         }
+
+    @staticmethod
+    def event_content(event: dict) -> dict:
+        return json.loads(event["content"])
+
+    @staticmethod
+    def resign_event(event: dict, content: dict, *, secret: int = SIGNER_SECRET) -> None:
+        event["content"] = json.dumps(content, sort_keys=True, separators=(",", ":"))
+        serialized = json.dumps(
+            [0, event["pubkey"], event["created_at"], event["kind"], event["tags"], event["content"]],
+            separators=(",", ":"),
+        ).encode()
+        event["id"] = hashlib.sha256(serialized).hexdigest()
+        event["sig"] = schnorr_sign(secret, bytes.fromhex(event["id"]))
 
     def invoke(self, bundle: dict, *, now: int = NOW) -> subprocess.CompletedProcess[str]:
         bundle_path = self.evidence_dir / "bundle.json"
@@ -548,72 +633,196 @@ class PromotionReadinessTest(unittest.TestCase):
         bundle = copy.deepcopy(self.bundle)
         event = bundle["staging"]["event_evidence"]["events"][0]
         event["pubkey"] = DIGEST_C
-        self.assert_refused(bundle, "signer is not authorized")
+        self.assert_refused(bundle, "canonical event ID mismatch")
 
     def test_status_sequence_must_be_gap_free(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = bundle["staging"]["event_evidence"]["events"][1]
-        event["content"]["sequence"] = 3
+        content = self.event_content(event)
+        content["sequence"] = 3
+        self.resign_event(event, content)
         self.assert_refused(bundle, "sequence is not gap-free")
 
     def test_attempt_binding_is_required(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = next(item for item in bundle["staging"]["event_evidence"]["events"]
                      if item["kind"] == 46103)
-        event["content"]["attempt"] = 2
-        self.assert_refused(bundle, "log_ref is not bound to the selected job attempt")
+        content = self.event_content(event)
+        content["attempt"] = 2
+        self.resign_event(event, content)
+        self.assert_refused(bundle, "attempt does not match signed request")
 
     def test_immutable_coordinate_binding_is_required(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = next(item for item in bundle["staging"]["event_evidence"]["events"]
                      if item["kind"] == 46106)
-        event["content"]["tip_oid"] = self.red_sha
+        content = self.event_content(event)
+        content["tip_oid"] = self.red_sha
+        self.resign_event(event, content)
         self.assert_refused(bundle, "tip_oid mismatch")
 
     def test_evidence_finalization_must_bind_durable_refs(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = next(item for item in bundle["staging"]["event_evidence"]["events"]
                      if item["kind"] == 46105)
-        event["content"]["finalized_job_attempts"][0]["log_ref"] = DIGEST_C
+        content = self.event_content(event)
+        content["finalized_job_attempts"][0]["log_ref"] = DIGEST_C
+        self.resign_event(event, content)
         self.assert_refused(bundle, "log_ref is not bound")
 
     def test_teardown_must_bind_exact_selected_graph(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = next(item for item in bundle["staging"]["event_evidence"]["events"]
                      if item["kind"] == 46106)
-        event["content"]["leases"][0]["attempt"] = 2
+        content = self.event_content(event)
+        content["leases"][0]["attempt"] = 2
+        self.resign_event(event, content)
         self.assert_refused(bundle, "lease graph does not match")
 
     def test_terminal_success_must_follow_evidence_and_teardown(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         events = bundle["staging"]["event_evidence"]["events"]
         terminal = next(item for item in events
-                        if item["kind"] == 46101 and item["content"]["state"] == "success")
+                        if item["kind"] == 46101 and self.event_content(item)["state"] == "success")
         finalized = next(item for item in events if item["kind"] == 46105)
         teardown = next(item for item in events if item["kind"] == 46106)
         terminal["watch_cursor"], finalized["watch_cursor"], teardown["watch_cursor"] = 8, 9, 10
         events.sort(key=lambda item: item["watch_cursor"])
-        self.assert_refused(bundle, "terminal success was stored before")
+        self.assert_refused(bundle, "terminal run was stored before")
 
     def test_unknown_event_kind_fails_closed(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = next(item for item in bundle["staging"]["event_evidence"]["events"]
                      if item["kind"] == 46104)
+        event["kind"] = 46999
+        self.resign_event(event, self.event_content(event))
+        self.assert_refused(bundle, "not a promotion history kind")
+
+    def test_ci_grant_kind_cannot_masquerade_as_run_history(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46104)
         event["kind"] = 46107
-        self.assert_refused(bundle, "kind is unknown")
+        self.resign_event(event, self.event_content(event))
+        self.assert_refused(bundle, "not a promotion history kind")
 
     def test_unknown_signed_field_fails_closed(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = next(item for item in bundle["staging"]["event_evidence"]["events"]
                      if item["kind"] == 46105)
-        event["content"]["tombstone"] = True
+        content = self.event_content(event)
+        content["tombstone"] = True
+        self.resign_event(event, content)
         self.assert_refused(bundle, "unknown fields")
 
     def test_unknown_status_state_fails_closed(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = bundle["staging"]["event_evidence"]["events"][0]
-        event["content"]["state"] = "activated"
+        content = self.event_content(event)
+        content["state"] = "activated"
+        self.resign_event(event, content)
         self.assert_refused(bundle, "state is unknown")
+
+    def test_caller_signature_verified_claim_is_rejected(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["staging"]["event_evidence"]["requests"][0]["signature_verified"] = True
+        self.assert_refused(bundle, "unknown fields")
+
+    def test_canonical_event_id_is_recomputed(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["staging"]["event_evidence"]["events"][0]["id"] = DIGEST_A
+        self.assert_refused(bundle, "canonical event ID mismatch")
+
+    def test_schnorr_signature_is_verified(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["staging"]["event_evidence"]["events"][0]["sig"] = "0" * 128
+        self.assert_refused(bundle, "Schnorr signature is invalid")
+
+    def test_signed_tags_are_bound_to_content(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = bundle["staging"]["event_evidence"]["events"][0]
+        event["tags"][0][1] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.resign_event(event, self.event_content(event))
+        self.assert_refused(bundle, "h tag does not match signed content")
+
+    def test_every_history_base_oid_is_top_level_bound(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = bundle["staging"]["event_evidence"]["events"][0]
+        content = self.event_content(event)
+        content["base_oid"] = self.red_sha
+        self.resign_event(event, content)
+        self.assert_refused(bundle, "base_oid mismatch")
+
+    def test_skip_policy_cannot_change_inside_job_history(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46102 and self.event_content(item)["sequence"] == 2)
+        content = self.event_content(event)
+        content["skip_policy"] = "allow"
+        self.resign_event(event, content)
+        self.assert_refused(bundle, "changed its immutable job manifest")
+
+    def test_terminal_outcome_cannot_equivocate_with_state(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46102 and self.event_content(item)["state"] == "success")
+        content = self.event_content(event)
+        content["conclusion"] = "failure"
+        self.resign_event(event, content)
+        self.assert_refused(bundle, "terminal outcome does not match state")
+
+    def test_run_id_must_be_a_canonical_uuid(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = bundle["staging"]["event_evidence"]["requests"][0]
+        content = self.event_content(event)
+        content["run_id"] = "caller-chosen-run"
+        self.resign_event(event, content, secret=ACTOR_SECRET)
+        self.assert_refused(bundle, "must be a canonical UUID")
+
+    def test_rerun_parent_attempt_is_signed_and_contiguous(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = bundle["production_canary"]["event_evidence"]["requests"][1]
+        content = self.event_content(event)
+        content["parent_attempt"] = 2
+        self.resign_event(event, content, secret=ACTOR_SECRET)
+        self.assert_refused(bundle, "parent_attempt is not contiguous")
+
+    def test_selected_job_instance_is_immutable(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46102 and self.event_content(item)["sequence"] == 2)
+        content = self.event_content(event)
+        content["selected_job_instance"] = "build_matrix_alt"
+        self.resign_event(event, content)
+        self.assert_refused(bundle, "changed its immutable job manifest")
+
+    def test_signed_rerun_fanout_rejects_unknown_jobs(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["production_canary"]["event_evidence"]["events"]
+                     if item["kind"] == 46102 and self.event_content(item)["attempt"] == 2)
+        content = self.event_content(event)
+        content["also_reruns"] = ["ghost"]
+        self.resign_event(event, content)
+        self.assert_refused(bundle, "also_reruns contains an unknown job")
+
+    def test_decoded_log_bytes_must_match_signed_digest(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        logs = bundle["staging"]["event_evidence"]["decoded_logs"]
+        log_id = next(iter(logs))
+        logs[log_id] = base64.b64encode(b"x" * len(LOG_BYTES)).decode()
+        self.assert_refused(bundle, "decoded log digest mismatch")
+
+    def test_retry_section_binds_the_signed_rerun_request(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["production_canary"]["retry"]["rerun_request_id"] = DIGEST_A
+        self.assert_refused(bundle, "canonical signed rerun request")
+
+    def test_deliberate_red_is_bound_to_its_signed_red_history(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["deliberate_red"]["event_evidence"] = copy.deepcopy(
+            bundle["staging"]["event_evidence"]
+        )
+        self.assert_refused(bundle, "tip_oid does not match candidate")
 
     def test_log_authentication_is_required(self) -> None:
         bundle = copy.deepcopy(self.bundle)
@@ -622,7 +831,8 @@ class PromotionReadinessTest(unittest.TestCase):
 
     def test_duplicate_request_must_be_idempotent(self) -> None:
         bundle = copy.deepcopy(self.bundle)
-        bundle["production_canary"]["retry"]["duplicate_run_id"] = "run-2"
+        bundle["production_canary"]["retry"]["duplicate_run_id"] = \
+            "44444444-4444-4444-8444-444444444444"
         self.assert_refused(bundle, "created a second run")
 
     def test_accepted_and_unaccepted_paths_are_required(self) -> None:
