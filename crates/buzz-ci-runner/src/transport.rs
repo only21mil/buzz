@@ -364,6 +364,31 @@ pub fn read_request_frame(reader: &mut impl Read) -> Result<RunnerRequest, Frame
     Ok(request)
 }
 
+/// Read one request and return SHA-256 of the exact length-prefixed frame bytes.
+pub fn read_request_frame_with_digest(
+    reader: &mut impl Read,
+) -> Result<(RunnerRequest, [u8; 32]), FrameError> {
+    let mut reader = DigestReader {
+        inner: reader,
+        hasher: Sha256::new(),
+    };
+    let request = read_request_frame(&mut reader)?;
+    Ok((request, reader.hasher.finalize().into()))
+}
+
+struct DigestReader<'a, R> {
+    inner: &'a mut R,
+    hasher: Sha256,
+}
+
+impl<R: Read> Read for DigestReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
 pub fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, FrameError> {
     let body = serde_json::to_vec(value).map_err(FrameError::InvalidJson)?;
     if body.len() > MAX_FRAME_BODY_BYTES {
