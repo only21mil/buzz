@@ -45,6 +45,9 @@ use crate::proxy_lease::{
     ProxyLeaseAuthority,
 };
 
+pub mod materialization_input;
+pub mod proxy_input;
+
 const MAX_CANONICAL_JOB_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const ACT_PROXY_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const ACT_PROXY_IO_TIMEOUT: Duration = Duration::from_secs(30);
