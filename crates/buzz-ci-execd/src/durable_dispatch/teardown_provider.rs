@@ -38,6 +38,9 @@ pub struct TeardownReadbackReceipt {
     pub cgroup_procs_empty: bool,
     pub mounts_removed: bool,
     pub dirs_removed: bool,
+    pub network_namespace_removed: Option<bool>,
+    pub runtime_socket_removed: Option<bool>,
+    pub proxy_object_state_removed: Option<bool>,
     pub teardown_at_unix_ns: u64,
     pub published_at_unix_ns: u64,
     pub readback_at_unix_ns: u64,
@@ -181,7 +184,7 @@ impl<H: TeardownHost, J: RecoveryJournal> NormalTeardownCollector
                 teardown_digest: receipt.teardown_digest,
             },
         })?;
-        Ok(reconcile_evidence(prepared, receipt))
+        reconcile_evidence(prepared, receipt)
     }
 }
 
@@ -201,6 +204,9 @@ fn validate_receipt(
         || !receipt.cgroup_procs_empty
         || !receipt.mounts_removed
         || !receipt.dirs_removed
+        || receipt.network_namespace_removed != Some(true)
+        || receipt.runtime_socket_removed != Some(true)
+        || receipt.proxy_object_state_removed != Some(true)
         || receipt.teardown_at_unix_ns == 0
         || receipt.published_at_unix_ns <= receipt.teardown_at_unix_ns
         || receipt.readback_at_unix_ns <= receipt.published_at_unix_ns
@@ -222,16 +228,17 @@ fn event_id(value: &str) -> bool {
 fn reconcile_evidence(
     prepared: &PreparedTeardown,
     receipt: TeardownReadbackReceipt,
-) -> NormalReconcileEvidence {
+) -> Result<NormalReconcileEvidence, ExecutionUnavailable> {
+    let emptied_resources = clean_resources(&receipt).ok_or(ExecutionUnavailable)?;
     let teardown = TeardownRecord {
         lease_id: prepared.host_lease_id.clone(),
         event_binding: prepared.event_binding,
         lease_unit: prepared.lease_unit.clone(),
         cgroup_path: prepared.cgroup_path.clone(),
-        unit_inactive: true,
-        cgroup_procs_empty: true,
-        mounts_removed: true,
-        dirs_removed: true,
+        unit_inactive: receipt.unit_inactive,
+        cgroup_procs_empty: receipt.cgroup_procs_empty,
+        mounts_removed: receipt.mounts_removed,
+        dirs_removed: receipt.dirs_removed,
         teardown_sha256: Digest32(receipt.teardown_digest),
         completed_at_unix_ns: receipt.teardown_at_unix_ns,
     };
@@ -243,14 +250,7 @@ fn reconcile_evidence(
         emptied: true,
         quarantined: false,
         before_reuse: true,
-        emptied_resources: vec![
-            ReconciledResource::LeaseUnit,
-            ReconciledResource::Cgroup,
-            ReconciledResource::Workspace,
-            ReconciledResource::NetworkNamespace,
-            ReconciledResource::RuntimeSocket,
-            ReconciledResource::ProxyObjectState,
-        ],
+        emptied_resources,
         quarantined_resources: Vec::new(),
         reuse_allowed: true,
         observed_at_unix_ns: receipt.readback_at_unix_ns,
@@ -290,11 +290,31 @@ fn reconcile_evidence(
         },
     )
     .collect();
-    NormalReconcileEvidence {
+    Ok(NormalReconcileEvidence {
         teardown,
         reconcile,
         ordering,
-    }
+    })
+}
+
+fn clean_resources(receipt: &TeardownReadbackReceipt) -> Option<Vec<ReconciledResource>> {
+    (receipt.unit_inactive
+        && receipt.cgroup_procs_empty
+        && receipt.mounts_removed
+        && receipt.dirs_removed
+        && receipt.network_namespace_removed == Some(true)
+        && receipt.runtime_socket_removed == Some(true)
+        && receipt.proxy_object_state_removed == Some(true))
+    .then(|| {
+        vec![
+            ReconciledResource::LeaseUnit,
+            ReconciledResource::Cgroup,
+            ReconciledResource::Workspace,
+            ReconciledResource::NetworkNamespace,
+            ReconciledResource::RuntimeSocket,
+            ReconciledResource::ProxyObjectState,
+        ]
+    })
 }
 
 #[cfg(test)]
@@ -322,6 +342,110 @@ mod tests {
             self.teardown_calls.set(self.teardown_calls.get() + 1);
             Ok(())
         }
+    }
+
+    fn validation_fixture() -> (TeardownRequest, PreparedTeardown, TeardownReadbackReceipt) {
+        let mut binding = AttemptEvidenceBinding {
+            run_id: [1; 16],
+            job_id: "job".into(),
+            attempt: 1,
+            controller_lease_id: [2; 16],
+            lease_generation: 1,
+            lease_deadline_at: 10,
+            host_lease_id: "lease".into(),
+            workspace_sha256: [3; 32],
+            binding_sha256: [0; 32],
+        };
+        binding.binding_sha256 = binding.digest();
+        let prepared = PreparedTeardown {
+            run_id: binding.run_id,
+            job_id: binding.job_id.clone(),
+            attempt: binding.attempt,
+            host_lease_id: binding.host_lease_id.clone(),
+            workspace_sha256: binding.workspace_sha256,
+            event_binding: CiEventBinding {
+                request_event_id_46105: [4; 32],
+                teardown_event_id_46106: [5; 32],
+            },
+            lease_unit: "lease.service".into(),
+            cgroup_path: "/sys/fs/cgroup/lease".into(),
+        };
+        let request = TeardownRequest {
+            binding,
+            evidence_set_digest: [7; 32],
+            stop: OrdinaryStop::Recovery,
+        };
+        let receipt = TeardownReadbackReceipt {
+            binding_sha256: request.binding.binding_sha256,
+            evidence_set_digest: request.evidence_set_digest,
+            teardown_digest: [8; 32],
+            lease_unit: prepared.lease_unit.clone(),
+            cgroup_path: prepared.cgroup_path.clone(),
+            unit_inactive: true,
+            cgroup_procs_empty: true,
+            mounts_removed: true,
+            dirs_removed: true,
+            network_namespace_removed: Some(true),
+            runtime_socket_removed: Some(true),
+            proxy_object_state_removed: Some(true),
+            teardown_at_unix_ns: 1,
+            published_at_unix_ns: 2,
+            readback_at_unix_ns: 3,
+            status_event_id: "a".repeat(64),
+            verdict_event_id: "b".repeat(64),
+        };
+        (request, prepared, receipt)
+    }
+
+    fn assert_readback_rejected(
+        network_namespace_removed: Option<bool>,
+        runtime_socket_removed: Option<bool>,
+        proxy_object_state_removed: Option<bool>,
+    ) {
+        let (request, prepared, mut receipt) = validation_fixture();
+        receipt.network_namespace_removed = network_namespace_removed;
+        receipt.runtime_socket_removed = runtime_socket_removed;
+        receipt.proxy_object_state_removed = proxy_object_state_removed;
+        assert!(validate_receipt(&receipt, &request, &prepared, None).is_err());
+        assert!(clean_resources(&receipt).is_none());
+    }
+
+    #[test]
+    fn network_namespace_requires_present_clean_readback() {
+        assert_readback_rejected(None, Some(true), Some(true));
+        assert_readback_rejected(Some(false), Some(true), Some(true));
+    }
+
+    #[test]
+    fn runtime_socket_requires_present_clean_readback() {
+        assert_readback_rejected(Some(true), None, Some(true));
+        assert_readback_rejected(Some(true), Some(false), Some(true));
+    }
+
+    #[test]
+    fn proxy_object_state_requires_present_clean_readback() {
+        assert_readback_rejected(Some(true), Some(true), None);
+        assert_readback_rejected(Some(true), Some(true), Some(false));
+    }
+
+    #[test]
+    fn complete_authoritative_readback_allows_reuse() {
+        let (request, prepared, receipt) = validation_fixture();
+        validate_receipt(&receipt, &request, &prepared, None).expect("readback");
+        let evidence = reconcile_evidence(&prepared, receipt).expect("reconcile");
+
+        assert_eq!(
+            evidence.reconcile.emptied_resources,
+            vec![
+                ReconciledResource::LeaseUnit,
+                ReconciledResource::Cgroup,
+                ReconciledResource::Workspace,
+                ReconciledResource::NetworkNamespace,
+                ReconciledResource::RuntimeSocket,
+                ReconciledResource::ProxyObjectState,
+            ]
+        );
+        assert!(evidence.reconcile.reuse_allowed);
     }
 
     #[test]
