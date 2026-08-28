@@ -82,15 +82,13 @@ impl<P: BoundPrestartPersister> ProductionInputProviders<P> {
         persister: P,
     ) -> Result<Self, ExecutionUnavailable> {
         let materialization = MaterializationInputProvider::from_contract(contract)?;
-        let descriptors = RuntimeDescriptorProvider::new(contract.clone())
-            .map_err(|_| ExecutionUnavailable)?;
+        let descriptors =
+            RuntimeDescriptorProvider::new(contract.clone()).map_err(|_| ExecutionUnavailable)?;
         let proxy_source =
             ProxyInputProvider::from_contract(contract, descriptors.clone(), persister)?;
-        let proxy_launcher = MediatedActThroughProxyLauncher::production(
-            descriptors,
-            contract.clone(),
-        )
-        .map_err(|_| ExecutionUnavailable)?;
+        let proxy_launcher =
+            MediatedActThroughProxyLauncher::production(descriptors, contract.clone())
+                .map_err(|_| ExecutionUnavailable)?;
         Ok(Self {
             materialization,
             proxy_source,
