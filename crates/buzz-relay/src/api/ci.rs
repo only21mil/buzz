@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path as AxumPath, Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Json;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Json, Response};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,9 +73,10 @@ use crate::config::CiPolicyConfig;
 use crate::state::AppState;
 use crate::tenant::bind_community;
 use buzz_core::channel::MemberRole;
-use buzz_core::ci::CiRequestEnvelope;
-use buzz_core::ci::{validate_signed_ci_event, ValidatedCiEnvelope};
-use buzz_core::kind::{KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST};
+use buzz_core::ci::{validate_signed_ci_event, CiRequestEnvelope, ValidatedCiEnvelope};
+use buzz_core::kind::{
+    KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+};
 #[cfg(test)]
 use buzz_core::CommunityId;
 use buzz_core::TenantContext;
@@ -138,7 +139,7 @@ pub struct PreflightRequest {
 /// Job definition in the preflight response.
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightJob {
-    /// Static job ID matching `^[A-Za-z0-9_]{1,64}$`.
+    /// Static job ID matching `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`.
     pub job_id: String,
     /// Human-readable workflow job name.
     pub name: String,
@@ -1063,7 +1064,8 @@ struct ParsedJob {
 /// may ignore unknown fields within a known schema version).
 ///
 /// Derivation (all from the workflow bytes, never the client):
-/// - `job_id` — the `jobs:` map key, validated against `^[A-Za-z0-9_]{1,64}$`.
+/// - `job_id` — the `jobs:` map key, validated against
+///   `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`.
 /// - `name` — the job's `name:` when present, else the job id.
 /// - `required` — the job's explicit `required:` bool, else `true` (the probe
 ///   fixture marks optional jobs `required: false`).
@@ -1087,12 +1089,7 @@ fn parse_workflow_jobs(bytes: &[u8]) -> Result<Vec<ParsedJob>, String> {
     let mut parsed = Vec::new();
     for (key, job_value) in jobs {
         let job_id = key.as_str().ok_or("job id must be a string")?.to_string();
-        if job_id.is_empty()
-            || job_id.len() > 64
-            || !job_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
+        if !is_valid_static_job_id(&job_id) {
             return Err(format!("invalid static job id {job_id:?}"));
         }
         let job = job_value.as_mapping().ok_or("job must be a mapping")?;
@@ -1133,10 +1130,7 @@ fn parse_workflow_jobs(bytes: &[u8]) -> Result<Vec<ParsedJob>, String> {
                 if need == &job_id {
                     return Err(format!("job {job_id} depends on itself"));
                 }
-                if need.is_empty()
-                    || need.len() > 64
-                    || !need.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
+                if !is_valid_static_job_id(need) {
                     return Err(format!("invalid needs id {need:?} in job {job_id}"));
                 }
             }
@@ -1151,6 +1145,15 @@ fn parse_workflow_jobs(bytes: &[u8]) -> Result<Vec<ParsedJob>, String> {
         });
     }
     Ok(parsed)
+}
+
+fn is_valid_static_job_id(value: &str) -> bool {
+    if value.len() > 64 {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Select the static job set and the selected job ids per protocol §9.5.
@@ -1595,6 +1598,363 @@ pub async fn put_ci_log(
     .await
 }
 
+/// Read one authenticated, signed-reference-bound job log.
+pub async fn get_ci_log(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response<Body>, PreflightApiError> {
+    read_ci_log(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: None,
+            sha256,
+        },
+        uri.path(),
+        headers,
+        "GET",
+        false,
+    )
+    .await
+}
+
+/// Return verified metadata for one authenticated job log without a body.
+pub async fn head_ci_log(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response<Body>, PreflightApiError> {
+    read_ci_log(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: None,
+            sha256,
+        },
+        uri.path(),
+        headers,
+        "HEAD",
+        true,
+    )
+    .await
+}
+
+async fn read_ci_log(
+    state: Arc<AppState>,
+    path: EvidencePath,
+    request_path: &str,
+    headers: HeaderMap,
+    method: &'static str,
+    head_only: bool,
+) -> Result<Response<Body>, PreflightApiError> {
+    let tenant = bind_request_tenant(&state, &headers).await?;
+    let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, request_path);
+
+    // Authenticate the exact method and URL before any request, repository,
+    // event, or object lookup. A valid non-member receives the same 404 as a
+    // missing object, so this endpoint is not an existence oracle.
+    let (caller, auth_id) = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
+    super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
+    validate_log_read_path(&path)?;
+
+    let hidden = || api_error(StatusCode::NOT_FOUND, "CI log not found");
+    let request_bytes = hex::decode(&path.request_id).map_err(|_| hidden())?;
+    let stored = state
+        .db
+        .get_event_by_id(tenant.community(), &request_bytes)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?
+        .ok_or_else(hidden)?;
+    let channel_id = stored.channel_id.ok_or_else(hidden)?;
+    let request = validate_control_request(&stored.event, channel_id).map_err(|_| hidden())?;
+    if stored.event.id.to_hex() != path.request_id
+        || request.run_id != path.run_id
+        || request.attempt != path.attempt
+        || !request.job_ids.iter().any(|job| job == &path.job_id)
+    {
+        return Err(hidden());
+    }
+
+    let (owner, repo) = parse_repo_coordinate(&request.target_repo_a).ok_or_else(hidden)?;
+    let authorized_channel =
+        map_log_read_authorization(authorize_ci_read(&state, &tenant, &caller, owner, repo).await)?;
+    if authorized_channel != channel_id {
+        return Err(hidden());
+    }
+
+    let mut signers = state.config.ci_status_signer_pubkeys.clone();
+    signers.extend(
+        state
+            .db
+            .get_active_ci_signers(
+                tenant.community(),
+                channel_id,
+                &request.target_repo_a,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?,
+    );
+    if signers.is_empty() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+    let events = state
+        .db
+        .query_events(&EventQuery {
+            channel_id: Some(channel_id),
+            kinds: Some(vec![
+                KIND_CI_JOB_STATUS as i32,
+                KIND_CI_LOG_REFERENCE as i32,
+            ]),
+            e_tags: Some(vec![path.request_id.clone()]),
+            limit: Some(MAX_CI_CONTROL_BACKLOG),
+            max_limit: Some(MAX_CI_CONTROL_BACKLOG),
+            ..EventQuery::for_community(tenant.community())
+        })
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?;
+    if events.len() as i64 == MAX_CI_CONTROL_BACKLOG {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+
+    let mut logs = Vec::new();
+    let mut statuses = Vec::new();
+    for stored_event in events {
+        let event_id = stored_event.event.id.to_hex();
+        match buzz_core::ci::validate_signed_ci_event(
+            &stored_event.event,
+            &channel_id.to_string(),
+            &signers,
+        ) {
+            Ok(ValidatedCiEnvelope::LogReference(log))
+                if log.request_event_id == path.request_id
+                    && log.run_id == path.run_id
+                    && log.workflow_id == request.workflow_id
+                    && log.target_repo_a == request.target_repo_a
+                    && log.tip_oid == request.tip_oid
+                    && log.job_id == path.job_id
+                    && log.attempt == path.attempt
+                    && log.log_sha256 == path.sha256
+                    && log.url.as_deref() == Some(url.as_str())
+                    && log.validate_url_for_relay(&state.config.relay_url).is_ok() =>
+            {
+                logs.push((event_id, log));
+            }
+            Ok(ValidatedCiEnvelope::JobStatus(status))
+                if status.request_event_id == path.request_id
+                    && status.run_id == path.run_id
+                    && status.workflow_id == request.workflow_id
+                    && status.target_repo_a == request.target_repo_a
+                    && status.tip_oid == request.tip_oid
+                    && status.base_oid == request.base_oid
+                    && status.job_id == path.job_id
+                    && status.attempt == path.attempt
+                    && status.state.is_terminal() =>
+            {
+                statuses.push(status);
+            }
+            _ => {}
+        }
+    }
+    if logs.len() != 1 {
+        return Err(hidden());
+    }
+    let (log_event_id, log) = logs.pop().ok_or_else(hidden)?;
+    if !statuses
+        .iter()
+        .any(|status| status.log_ref.as_deref() == Some(log_event_id.as_str()))
+        || log.truncated
+        || log.byte_length > log.cap_bytes
+        || log.cap_bytes > MAX_CI_EVIDENCE_BYTES as u64
+    {
+        return Err(hidden());
+    }
+
+    let object_key = evidence_object_key(
+        tenant.community(),
+        &request.target_repo_a,
+        &request.tip_oid,
+        &path,
+    );
+    let metadata = state
+        .media_storage
+        .head_with_metadata(&object_key)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?
+        .ok_or_else(hidden)?;
+    if metadata.size != log.byte_length || metadata.size > log.cap_bytes {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+    let bytes = state
+        .media_storage
+        .get(&object_key)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?;
+    if bytes.len() as u64 != log.byte_length || hex::encode(Sha256::digest(&bytes)) != path.sha256 {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+
+    let selected = match select_log_range(headers.get(header::RANGE), log.byte_length) {
+        Ok(selected) => selected,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes */{}", log.byte_length),
+                )
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::empty())
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"));
+        }
+    };
+    let (status, body, content_length, content_range) = match selected {
+        Some((start, end)) => {
+            let range = start as usize..=end as usize;
+            let body = if head_only {
+                Body::empty()
+            } else {
+                Body::from(bytes[range].to_vec())
+            };
+            (
+                StatusCode::PARTIAL_CONTENT,
+                body,
+                end - start + 1,
+                Some(format!("bytes {start}-{end}/{}", log.byte_length)),
+            )
+        }
+        None => (
+            StatusCode::OK,
+            if head_only {
+                Body::empty()
+            } else {
+                Body::from(bytes)
+            },
+            log.byte_length,
+            None,
+        ),
+    };
+    let digest = base64::engine::general_purpose::STANDARD
+        .encode(hex::decode(&path.sha256).map_err(|_| hidden())?);
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header("digest", format!("sha-256={digest}"));
+    if let Some(value) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, value);
+    }
+    builder
+        .body(body)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+fn parse_repo_coordinate(target_repo_a: &str) -> Option<(&str, &str)> {
+    let mut parts = target_repo_a.splitn(3, ':');
+    (parts.next()? == "30617").then_some((parts.next()?, parts.next()?))
+}
+
+fn map_log_read_authorization(
+    result: Result<uuid::Uuid, PreflightReject>,
+) -> Result<uuid::Uuid, PreflightApiError> {
+    match result {
+        Ok(channel_id) => Ok(channel_id),
+        Err(reject) if matches!(reject.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {
+            Err(api_error(StatusCode::NOT_FOUND, "CI log not found"))
+        }
+        Err(_) => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        )),
+    }
+}
+
+fn validate_log_read_path(path: &EvidencePath) -> Result<(), PreflightApiError> {
+    if !is_lower_hex_value(&path.request_id, 64)
+        || uuid::Uuid::parse_str(&path.run_id).is_err()
+        || !is_valid_static_job_id(&path.job_id)
+        || path.attempt == 0
+        || !is_lower_hex_value(&path.sha256, 64)
+        || path.object_id.is_some()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "CI log not found"));
+    }
+    Ok(())
+}
+
+fn select_log_range(
+    range: Option<&axum::http::HeaderValue>,
+    total: u64,
+) -> Result<Option<(u64, u64)>, PreflightApiError> {
+    let Some(range) = range else { return Ok(None) };
+    let range = range
+        .to_str()
+        .ok()
+        .filter(|value| !value.contains(','))
+        .and_then(|value| parse_log_byte_range(value, total))
+        .ok_or_else(|| api_error(StatusCode::RANGE_NOT_SATISFIABLE, "invalid byte range"))?;
+    Ok(Some(range))
+}
+
+fn parse_log_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    let value = value.strip_prefix("bytes=")?;
+    if let Some(suffix) = value.strip_prefix('-') {
+        let length = suffix.parse::<u64>().ok()?;
+        if length == 0 || total == 0 {
+            return None;
+        }
+        return Some((total.saturating_sub(length), total - 1));
+    }
+    let (start, end) = value.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<u64>().ok()?.min(total - 1)
+    };
+    (start <= end).then_some((start, end))
+}
+
 /// Store one authenticated, descriptor-bound job artifact.
 pub async fn put_ci_artifact(
     State(state): State<Arc<AppState>>,
@@ -1949,6 +2309,83 @@ mod tests {
         let mut unsafe_path = evidence_path();
         unsafe_path.job_id = "../escape".to_owned();
         assert!(validate_evidence_path(&unsafe_path).is_err());
+    }
+
+    #[test]
+    fn log_read_path_uses_the_static_job_grammar() {
+        let mut path = evidence_path();
+        path.object_id = None;
+        path.job_id = "desktop-smoke-e2e".to_owned();
+        validate_log_read_path(&path).expect("valid log path");
+
+        for hostile in ["..", ".hidden", "0job", "job/name", "job%2fescape"] {
+            path.job_id = hostile.to_owned();
+            assert!(
+                validate_log_read_path(&path).is_err(),
+                "hostile job component must fail: {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_ranges_are_single_bounded_and_deterministic() {
+        assert_eq!(parse_log_byte_range("bytes=0-3", 10), Some((0, 3)));
+        assert_eq!(parse_log_byte_range("bytes=4-", 10), Some((4, 9)));
+        assert_eq!(parse_log_byte_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_log_byte_range("bytes=8-99", 10), Some((8, 9)));
+        for invalid in [
+            "items=0-1",
+            "bytes=10-11",
+            "bytes=5-4",
+            "bytes=-0",
+            "bytes=0-1,3-4",
+        ] {
+            let parsed = if invalid.contains(',') {
+                None
+            } else {
+                parse_log_byte_range(invalid, 10)
+            };
+            assert_eq!(parsed, None, "invalid range must fail: {invalid}");
+        }
+    }
+
+    #[test]
+    fn log_read_authorization_hides_denials_but_preserves_outages() {
+        let reject = |status, message: &str| PreflightReject {
+            status,
+            message: message.to_owned(),
+        };
+        let forbidden = map_log_read_authorization(Err(reject(
+            StatusCode::FORBIDDEN,
+            "private membership detail",
+        )))
+        .expect_err("forbidden read must fail");
+        let missing = map_log_read_authorization(Err(reject(
+            StatusCode::NOT_FOUND,
+            "private repository detail",
+        )))
+        .expect_err("missing read must fail");
+        assert_eq!(forbidden.0, StatusCode::NOT_FOUND);
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            forbidden.1 .0, missing.1 .0,
+            "denial and absence must be indistinguishable"
+        );
+        assert_eq!(
+            forbidden.1 .0,
+            serde_json::json!({"error": "CI log not found"})
+        );
+
+        let outage = map_log_read_authorization(Err(reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "private database detail",
+        )))
+        .expect_err("authorization outage must fail");
+        assert_eq!(outage.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            outage.1 .0,
+            serde_json::json!({"error": "CI log unavailable"})
+        );
     }
 
     #[test]
@@ -2416,13 +2853,13 @@ mod tests {
     fn workflow_jobs_parse_derives_semantics_from_bytes_only() {
         let workflow = br#"name: build-ci
 jobs:
-  lint:
+  rust-lint:
     runs-on: linux
     steps:
       - run: cargo fmt --check
-  test:
+  desktop-smoke-e2e:
     runs-on: linux
-    needs: lint
+    needs: rust-lint
     if: github.event_name == 'push'
     steps:
       - run: cargo test
@@ -2437,17 +2874,20 @@ jobs:
         let by_id: std::collections::HashMap<_, _> =
             jobs.iter().map(|job| (job.job_id.as_str(), job)).collect();
 
-        // lint: default required=true, no `if:` → forbid (a skipped required
+        // rust-lint: default required=true, no `if:` → forbid (a skipped required
         // job is a violation).
-        assert_eq!(by_id["lint"].name, "lint");
-        assert!(by_id["lint"].required);
-        assert_eq!(by_id["lint"].skip_policy, "forbid");
-        assert!(by_id["lint"].needs.is_empty());
+        assert_eq!(by_id["rust-lint"].name, "rust-lint");
+        assert!(by_id["rust-lint"].required);
+        assert_eq!(by_id["rust-lint"].skip_policy, "forbid");
+        assert!(by_id["rust-lint"].needs.is_empty());
 
-        // test: `if:` condition → skippable → allow; needs for the dependency.
-        assert!(by_id["test"].required);
-        assert_eq!(by_id["test"].skip_policy, "allow");
-        assert_eq!(by_id["test"].needs, vec!["lint".to_string()]);
+        // desktop-smoke-e2e: `if:` condition → skippable → allow; needs for the dependency.
+        assert!(by_id["desktop-smoke-e2e"].required);
+        assert_eq!(by_id["desktop-smoke-e2e"].skip_policy, "allow");
+        assert_eq!(
+            by_id["desktop-smoke-e2e"].needs,
+            vec!["rust-lint".to_string()]
+        );
 
         // optional: explicit required=false → allow.
         assert!(!by_id["optional"].required);
@@ -2465,6 +2905,49 @@ jobs:
         assert!(jobs[0].required);
         assert_eq!(jobs[0].skip_policy, "forbid");
         assert_eq!(workflow_id(workflow), DEFAULT_WORKFLOW_ID);
+    }
+
+    #[test]
+    fn workflow_jobs_parse_accepts_current_github_workflow_job_ids() {
+        let workflow = include_bytes!("../../../../.github/workflows/ci.yml");
+        let jobs = parse_workflow_jobs(workflow).expect("parse current GitHub workflow");
+        let ids: std::collections::HashSet<_> =
+            jobs.iter().map(|job| job.job_id.as_str()).collect();
+
+        assert_eq!(jobs.len(), 17);
+        for expected in ["rust-lint", "desktop-smoke-e2e", "desktop-build-macos"] {
+            assert!(ids.contains(expected), "missing current job ID {expected}");
+        }
+    }
+
+    #[test]
+    fn static_job_id_grammar_matches_github_and_rejects_ambiguous_separators() {
+        let max = format!("a{}", "-".repeat(63));
+        for value in ["a", "_", "A-0_x", "desktop-smoke-e2e", max.as_str()] {
+            assert!(
+                is_valid_static_job_id(value),
+                "rejected valid job ID {value:?}"
+            );
+        }
+
+        let too_long = format!("a{}", "-".repeat(64));
+        for value in [
+            "",
+            "0job",
+            "-job",
+            ".job",
+            "job.name",
+            "job/name",
+            "job:name",
+            "job name",
+            "é",
+            too_long.as_str(),
+        ] {
+            assert!(
+                !is_valid_static_job_id(value),
+                "accepted unsafe job ID {value:?}"
+            );
+        }
     }
 
     #[test]
@@ -2763,13 +3246,7 @@ jobs:
         for job in &response.jobs {
             assert!(!job.name.is_empty(), "job name must be non-empty");
             assert!(
-                !job.job_id.is_empty() && job.job_id.len() <= 64,
-                "job_id must satisfy the static job grammar"
-            );
-            assert!(
-                job.job_id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                is_valid_static_job_id(&job.job_id),
                 "job_id must satisfy the static job grammar"
             );
             let _required_flag = job.required; // presence locked; semantics are broker-manifest state
