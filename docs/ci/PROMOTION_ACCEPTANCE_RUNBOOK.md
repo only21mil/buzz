@@ -32,6 +32,10 @@ It rejects caller-supplied verification claims. It also checks the repository
 CI tag contract before it binds each stored status event to its signed request,
 canonical run UUID, repository, workflow, tip, top-level base SHA, attempt and
 authorized relay signer.
+Each `event_evidence` object also retains the canonical HTTP(S) origin derived
+from the same trusted `BUZZ_RELAY_URL` or `--relay-url` configuration used to
+collect that run. Collection refuses missing configuration and never supplies a
+fallback relay.
 
 Kind coverage is deduplicated. It must equal 46101 through 46106, but the
 event list must contain every transition. A successful initial run therefore
@@ -101,6 +105,18 @@ receipt is written.
 
 Choose a fixed UTC epoch for `--now`; it is part of the receipt so identical
 inputs and the same epoch produce identical bytes.
+
+Populate all three signed-event sections from the relay configuration used by
+the collection commands. The utility maps `ws` to `http` and `wss` to `https`,
+removes a trailing slash and default port, and refuses credentials, paths,
+queries, fragments or an origin that conflicts with retained evidence.
+
+```bash
+: "${BUZZ_RELAY_URL:?set the trusted relay used to collect this evidence}"
+python3 scripts/populate-ci-promotion-relay-origin.py \
+  --input "$HOME/work/buzz-promotion-evidence/promotion-evidence.unpopulated.json" \
+  --output "$HOME/work/buzz-promotion-evidence/promotion-evidence.json"
+```
 
 ```bash
 now=$(date -u +%s)

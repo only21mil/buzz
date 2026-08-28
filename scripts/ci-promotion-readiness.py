@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
 import uuid
 
 
@@ -119,6 +120,55 @@ def job_ids(value: Any, path: str) -> list[str]:
     expect(all(JOB_ID.fullmatch(item) is not None for item in result),
            f"{path} contains an invalid static job ID")
     return result
+
+
+def relay_http_origin(value: Any, path: str) -> tuple[str, str, int]:
+    raw = text(value, path)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        refuse(f"{path} is not a valid relay URL")
+    scheme = parsed.scheme
+    expect(scheme in ("http", "https") and parsed.hostname is not None,
+           f"{path} must use http or https")
+    expect(parsed.username is None and parsed.password is None and "@" not in parsed.netloc,
+           f"{path} must not contain credentials")
+    expect("?" not in raw and "#" not in raw and parsed.path in ("", "/"),
+           f"{path} must be an origin without path, query, or fragment")
+    assert parsed.hostname is not None
+    default_port = 443 if scheme == "https" else 80
+    hostname = parsed.hostname.lower()
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and port != default_port:
+        authority = f"{authority}:{port}"
+    expect(raw == f"{scheme}://{authority}", f"{path} must be a canonical relay origin")
+    return scheme, hostname, port or default_port
+
+
+def validate_relay_evidence_url(
+    value: Any, relay_origin: tuple[str, str, int], expected_path: str, path: str
+) -> str:
+    raw = text(value, path)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        refuse(f"{path} is not a valid evidence URL")
+    expect(parsed.scheme in ("http", "https") and parsed.hostname is not None,
+           f"{path} must use http or https")
+    expect(parsed.username is None and parsed.password is None and "@" not in parsed.netloc,
+           f"{path} has forbidden credentials")
+    expect("?" not in raw and "#" not in raw,
+           f"{path} has a forbidden query or fragment")
+    candidate_origin = (
+        parsed.scheme,
+        parsed.hostname,
+        port or (443 if parsed.scheme == "https" else 80),
+    )
+    expect(candidate_origin == relay_origin, f"{path} is off relay origin")
+    expect(parsed.path == expected_path, f"{path} does not match the exact evidence path")
+    return raw
 
 
 def event_id(value: Any, path: str) -> str:
@@ -637,11 +687,12 @@ def validate_ci_event_evidence(
 ) -> dict[str, Any]:
     exact_fields(
         section,
-        {"channel_id", "authorized_relay_signers", "requests", "events", "decoded_logs"},
+        {"channel_id", "relay_url", "authorized_relay_signers", "requests", "events", "decoded_logs"},
         set(),
         path,
     )
     channel_id = run_uuid(field(section, "channel_id", path), f"{path}.channel_id")
+    relay_origin = relay_http_origin(field(section, "relay_url", path), f"{path}.relay_url")
     authorized = [sha256(value, f"{path}.authorized_relay_signers[]")
                   for value in array(field(section, "authorized_relay_signers", path),
                                      f"{path}.authorized_relay_signers")]
@@ -655,7 +706,7 @@ def validate_ci_event_evidence(
         "trigger_event_id", "actor", "timeout_seconds", "idempotency_key", "issued_at", "expires_at",
     }
     requests: dict[str, dict[str, Any]] = {}
-    request_ids_by_attempt: dict[int, str] = {}
+    request_order: list[str] = []
     initial_request_id = ""
     initial_content: dict[str, Any] | None = None
     raw_requests = array(field(section, "requests", path), f"{path}.requests")
@@ -684,7 +735,6 @@ def validate_ci_event_evidence(
         expect(base_oid == base, f"{request_path}.content base_oid does not match top-level base_sha")
         run_id = run_uuid(request_content["run_id"], f"{request_path}.content.run_id")
         attempt = positive_integer(request_content["attempt"], f"{request_path}.content.attempt")
-        expect(attempt not in request_ids_by_attempt, f"{path} has duplicate request attempt {attempt}")
         selected = job_ids(request_content["job_ids"], f"{request_path}.content.job_ids")
         for name in ("pr_root_event_id", "trigger_event_id"):
             event_id(request_content[name], f"{request_path}.content.{name}")
@@ -720,16 +770,15 @@ def validate_ci_event_evidence(
                    f"{request_path}.content rerun parent_run_id mismatch")
         expect(request_id not in requests, f"{request_path}.id is duplicated")
         requests[request_id] = request_content
-        request_ids_by_attempt[attempt] = request_id
+        request_order.append(request_id)
 
     expect(initial_content is not None, f"{path} has no initial run request")
-    request_attempts = sorted(request_ids_by_attempt)
-    expect(request_attempts == list(range(1, request_attempts[-1] + 1)),
-           f"{path} request attempts are not contiguous")
+    expect(requests[request_order[0]]["request_type"] == "run",
+           f"{path} initial run request must be first")
     immutable_request_fields = (
         "target_repo_a", "pr_root_event_id", "pr_update_event_id", "source_clone_url",
         "immutable_source_ref", "tip_oid", "source_branch", "base_ref", "base_oid",
-        "workflow_id", "workflow_digest", "run_id", "trigger_event_id", "actor",
+        "workflow_id", "workflow_digest", "run_id", "trigger_event_id",
     )
     for request_content in requests.values():
         for name in immutable_request_fields:
@@ -744,8 +793,8 @@ def validate_ci_event_evidence(
     selected_jobs = initial_content["job_ids"]
     run_id = initial_content["run_id"]
     actor = initial_content["actor"]
-    for attempt, request_id_value in request_ids_by_attempt.items():
-        if attempt > 1:
+    for request_id_value in request_order[1:]:
+        if requests[request_id_value]["request_type"] == "rerun":
             expect(requests[request_id_value]["job_ids"][0] in selected_jobs,
                    f"{path} rerun request selected an unknown initial job")
 
@@ -755,7 +804,7 @@ def validate_ci_event_evidence(
     observed_kinds: set[int] = set()
     observed_signers: set[str] = set()
     cursors: list[int] = []
-    run_histories: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+    run_histories: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     job_histories: dict[tuple[str, int], list[tuple[int, dict[str, Any]]]] = {}
     log_events: dict[str, tuple[str, int, int]] = {}
     artifact_events: dict[str, tuple[str, int, int]] = {}
@@ -843,7 +892,7 @@ def validate_ci_event_evidence(
             job_ids(content["job_ids"], f"{content_path}.job_ids")
             state = text(content["state"], f"{content_path}.state")
             expect(state in RUN_STATES, f"{content_path}.state is unknown")
-            run_histories.setdefault(attempt, []).append((cursor, content))
+            run_histories.setdefault(request_event_id, []).append((cursor, content))
         elif kind == 46102:
             job_id_value = text(content["job_id"], f"{content_path}.job_id")
             expect(job_id_value in selected_jobs, f"{content_path}.job_id was not requested")
@@ -866,6 +915,14 @@ def validate_ci_event_evidence(
             expect(job_id_value in selected_jobs, f"{content_path}.job_id was not requested")
             expect(("url" in content) != ("inline" in content),
                    f"{content_path} must contain exactly one of url or inline")
+            if "url" in content:
+                expected_path = (
+                    f"/ci/logs/{request_event_id}/{run_id}/{job_id_value}/{attempt}/"
+                    f"{content['log_sha256']}"
+                )
+                validate_relay_evidence_url(
+                    content["url"], relay_origin, expected_path, f"{content_path}.url"
+                )
             expect(field(content, "truncated", content_path) is False, f"{content_path} is truncated")
             byte_length = positive_integer(content["byte_length"], f"{content_path}.byte_length")
             expect(byte_length <= positive_integer(content["cap_bytes"], f"{content_path}.cap_bytes"),
@@ -888,10 +945,17 @@ def validate_ci_event_evidence(
         elif kind == 46104:
             job_id_value = text(content["job_id"], f"{content_path}.job_id")
             expect(job_id_value in selected_jobs, f"{content_path}.job_id was not requested")
-            sha256(content["sha256"], f"{content_path}.sha256")
+            artifact_digest = sha256(content["sha256"], f"{content_path}.sha256")
             positive_integer(content["byte_length"], f"{content_path}.byte_length")
-            for name in ("artifact_id", "name", "media_type", "url"):
+            for name in ("artifact_id", "name", "media_type"):
                 text(content[name], f"{content_path}.{name}")
+            expected_path = (
+                f"/ci/artifacts/{request_event_id}/{run_id}/{job_id_value}/{attempt}/"
+                f"{content['artifact_id']}/{artifact_digest}"
+            )
+            validate_relay_evidence_url(
+                content["url"], relay_origin, expected_path, f"{content_path}.url"
+            )
             artifact_events[current_id] = (job_id_value, attempt, integer(content["created_at"],
                                                                           f"{content_path}.created_at"))
         elif kind == 46105:
@@ -913,6 +977,8 @@ def validate_ci_event_evidence(
 
     selected_attempts: dict[str, int] = {}
     job_attempt_ranges: dict[str, list[int]] = {}
+    job_request_ids: dict[tuple[str, int], str] = {}
+    job_terminals: dict[tuple[str, int], dict[str, Any]] = {}
     immutable_manifests: dict[str, tuple[Any, ...]] = {}
     for job_id_value in selected_jobs:
         job_attempts = sorted(attempt for job, attempt in job_histories if job == job_id_value)
@@ -950,56 +1016,77 @@ def validate_ci_event_evidence(
             terminal_content = ordered_history[-1][1]
             expect(terminal_content.get("conclusion") == terminal,
                    f"{history_path} terminal outcome does not match state")
+            request_ids = {item[1]["request_event_id"] for item in ordered_history}
+            expect(len(request_ids) == 1,
+                   f"{history_path} is not bound to one signed request")
+            job_request_ids[(job_id_value, attempt)] = next(iter(request_ids))
+            job_terminals[(job_id_value, attempt)] = terminal_content
             if attempt < job_attempts[-1]:
                 expect(terminal == "failure", f"{history_path} must fail before a rerun")
 
-    for attempt in request_attempts:
-        request_id_for_attempt = request_ids_by_attempt[attempt]
-        request_for_attempt = requests[request_id_for_attempt]
-        observed_jobs = {job for job, job_attempt in job_histories if job_attempt == attempt}
-        if attempt == 1:
+    evolving_attempts = {job: 1 for job in selected_jobs}
+    for request_index, request_id_value in enumerate(request_order):
+        request_content = requests[request_id_value]
+        attempt = request_content["attempt"]
+        observed_jobs = {
+            job for (job, _), request_id_for_job in job_request_ids.items()
+            if request_id_for_job == request_id_value
+        }
+        if request_index == 0:
             expect(observed_jobs == set(selected_jobs), f"{path} attempt one job graph mismatch")
         else:
-            selected_job = request_for_attempt["job_ids"][0]
+            selected_job = request_content["job_ids"][0]
+            parent_attempt = request_content["parent_attempt"]
+            expect(evolving_attempts[selected_job] == parent_attempt,
+                   f"{path} rerun parent_attempt is stale for selected job")
             expect((selected_job, attempt) in job_histories,
                    f"{path} rerun request has no selected job history")
             selected_history = sorted(job_histories[(selected_job, attempt)])
             fanout = set(selected_history[0][1]["also_reruns"])
             expect(observed_jobs == {selected_job} | fanout,
                    f"{path} rerun fanout does not match signed selected job history")
-            expect((selected_job, attempt - 1) in job_histories,
+            expect((selected_job, parent_attempt) in job_terminals,
                    f"{path} rerun request has no parent job history")
-            prior = sorted(job_histories[(selected_job, attempt - 1)])[-1][1]
+            prior = job_terminals[(selected_job, parent_attempt)]
             expect(prior["state"] == "failure",
                    f"{path} rerun parent job is not a terminal failure")
+            for job in observed_jobs:
+                expect(evolving_attempts[job] == attempt - 1,
+                       f"{path} rerun fanout does not advance each job contiguously")
+                evolving_attempts[job] = attempt
         for job in observed_jobs:
             history = job_histories[(job, attempt)]
-            expect(all(item[1]["request_event_id"] == request_id_for_attempt for item in history),
+            expect(all(item[1]["request_event_id"] == request_id_value for item in history),
                    f"{path} job history is not bound to its signed request")
-        run_jobs = [job_ids(item[1]["job_ids"], f"{path} run attempt {attempt}.job_ids")
-                    for item in run_histories.get(attempt, [])]
+        run_jobs = [job_ids(item[1]["job_ids"], f"{path} run request {request_index}.job_ids")
+                    for item in run_histories.get(request_id_value, [])]
         expect(bool(run_jobs) and all(set(value) == observed_jobs for value in run_jobs),
                f"{path} run job manifest does not match the selected attempt graph")
-        expect(all(item[1]["request_event_id"] == request_id_for_attempt
-                   for item in run_histories[attempt]),
+        expect(all(item[1]["request_event_id"] == request_id_value
+                   for item in run_histories[request_id_value]),
                f"{path} run history is not bound to its signed request")
+    expect(evolving_attempts == selected_attempts,
+           f"{path} request lineage does not select the final per-job attempt graph")
 
     maximum_attempt = max(selected_attempts.values())
-    expect(sorted(run_histories) == list(range(1, maximum_attempt + 1)),
-           f"{path} run attempt lineage is not contiguous")
+    expect(set(run_histories) == set(request_order),
+           f"{path} run history does not exactly match signed requests")
     terminal_run: tuple[int, dict[str, Any]] | None = None
-    for attempt in sorted(run_histories):
-        history_path = f"{path} run attempt {attempt}"
-        terminal_state = validate_status_history(run_histories[attempt], RUN_TRANSITIONS, history_path)
-        terminal_content_for_attempt = sorted(run_histories[attempt])[-1][1]
+    for request_index, request_id_value in enumerate(request_order):
+        attempt = requests[request_id_value]["attempt"]
+        history_path = f"{path} run request {request_index} attempt {attempt}"
+        terminal_state = validate_status_history(
+            run_histories[request_id_value], RUN_TRANSITIONS, history_path
+        )
+        terminal_content_for_attempt = sorted(run_histories[request_id_value])[-1][1]
         expect(terminal_content_for_attempt.get("conclusion") == terminal_state,
                f"{history_path} terminal outcome does not match state")
-        if attempt < maximum_attempt:
+        if request_index < len(request_order) - 1:
             expect(terminal_state == "failure", f"{history_path} must fail before a rerun")
         else:
             expect(terminal_state == expected_run_state,
                    f"{history_path} must conclude {expected_run_state}")
-            terminal_run = sorted(run_histories[attempt])[-1]
+            terminal_run = sorted(run_histories[request_id_value])[-1]
     expect(terminal_run is not None, f"{path} has no final terminal run")
 
     final_job_states = {
@@ -1017,6 +1104,8 @@ def validate_ci_event_evidence(
                f"{path} deliberate-red evidence has no failed final job")
 
     finalized_cursor, finalized_content = finalized
+    expect(finalized_content["request_event_id"] == request_order[-1],
+           f"{path} kind 46105 is not bound to the final signed request")
     expect(positive_integer(finalized_content["attempt"], f"{path}.kind46105.attempt") == maximum_attempt,
            f"{path} kind 46105 top-level attempt mismatch")
     finalized_entries = array(finalized_content["finalized_job_attempts"],
@@ -1055,6 +1144,8 @@ def validate_ci_event_evidence(
            f"{path} kind 46105 does not bind every artifact event exactly once")
 
     teardown_cursor, teardown_content = teardown
+    expect(teardown_content["request_event_id"] == request_order[-1],
+           f"{path} kind 46106 is not bound to the final signed request")
     expect(positive_integer(teardown_content["attempt"], f"{path}.kind46106.attempt") == maximum_attempt,
            f"{path} kind 46106 top-level attempt mismatch")
     expect(teardown_content["lease_empty"] is True, f"{path} kind 46106 lease_empty must be true")
@@ -1085,7 +1176,8 @@ def validate_ci_event_evidence(
     return {
         "request_event_id": request_event_id,
         "initial_request_event_id": initial_request_id,
-        "request_event_ids": request_ids_by_attempt,
+        "request_event_ids": request_order,
+        "rerun_request_event_ids": request_order[1:],
         "run_id": run_id,
         "actor": actor,
         "relay_signer": relay_signer,
@@ -1096,7 +1188,7 @@ def validate_ci_event_evidence(
         "selected_job_attempts": selected_attempts,
         "tip_oid": tip_oid,
         "base_oid": base_oid,
-        "attempts": request_attempts,
+        "attempts": sorted({requests[request_id]["attempt"] for request_id in request_order}),
         "job_attempts": {
             job: job_attempt_ranges[job] for job in sorted(job_attempt_ranges)
         },
@@ -1154,7 +1246,7 @@ def validate_retry(section: dict[str, Any], event_evidence: dict[str, Any], path
     expect(request_id == event_evidence["initial_request_event_id"],
            f"{path} request_id is not the canonical signed initial request")
     rerun_request_id = event_id(field(section, "rerun_request_id", path), f"{path}.rerun_request_id")
-    expect(rerun_request_id == event_evidence["request_event_ids"].get(2),
+    expect(event_evidence["rerun_request_event_ids"] == [rerun_request_id],
            f"{path} rerun_request_id is not the canonical signed rerun request")
     first = run_uuid(field(section, "first_run_id", path), f"{path}.first_run_id")
     duplicate = run_uuid(field(section, "duplicate_run_id", path), f"{path}.duplicate_run_id")

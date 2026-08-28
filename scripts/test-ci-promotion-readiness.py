@@ -18,11 +18,16 @@ import unittest
 
 
 SCRIPT = Path(__file__).with_name("ci-promotion-readiness.py")
+PRODUCER_SCRIPT = Path(__file__).with_name("populate-ci-promotion-relay-origin.py")
 REPO_ROOT = SCRIPT.parent.parent
 SPEC = importlib.util.spec_from_file_location("ci_promotion_readiness", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 READINESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(READINESS)
+PRODUCER_SPEC = importlib.util.spec_from_file_location("ci_promotion_relay_origin", PRODUCER_SCRIPT)
+assert PRODUCER_SPEC is not None and PRODUCER_SPEC.loader is not None
+PRODUCER = importlib.util.module_from_spec(PRODUCER_SPEC)
+PRODUCER_SPEC.loader.exec_module(PRODUCER)
 NOW = 1_787_832_000
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
@@ -33,6 +38,7 @@ PRIOR_IMAGE = f"sha256:{'3' * 64}"
 LOG_BYTES = b"canonical native CI log\n"
 LOG_DIGEST = hashlib.sha256(LOG_BYTES).hexdigest()
 ACTOR_SECRET = 3
+RERUN_ACTOR_SECRET = 7
 SIGNER_SECRET = 5
 
 
@@ -178,6 +184,8 @@ class PromotionReadinessTest(unittest.TestCase):
         self, run_id: str, *, tip_oid: str | None = None, retry: bool = False,
         terminal_state: str = "success", jobs: tuple[str, ...] = ("build",),
         rerun_job: str = "build", also_reruns: tuple[str, ...] = (),
+        reruns: tuple[tuple[str, tuple[str, ...]], ...] | None = None,
+        rerun_actor_secret: int = ACTOR_SECRET,
     ) -> dict:
         def fixed_id(label: str) -> str:
             return hashlib.sha256(f"{run_id}:{label}".encode()).hexdigest()
@@ -233,10 +241,30 @@ class PromotionReadinessTest(unittest.TestCase):
                 event["watch_cursor"] = cursor
             return event
 
-        def request_content(attempt: int) -> dict:
+        rerun_specs = reruns if reruns is not None else (
+            ((rerun_job, also_reruns),) if retry else ()
+        )
+        selected_attempts = {job_id: 1 for job_id in jobs}
+        request_specs: list[tuple[int, list[str], int | None, int]] = [
+            (1, list(jobs), None, ACTOR_SECRET)
+        ]
+        for selected_job, fanout in rerun_specs:
+            assert selected_job in jobs and set(fanout) <= set(jobs) - {selected_job}
+            parent_attempt = selected_attempts[selected_job]
+            attempt = parent_attempt + 1
+            assert all(selected_attempts[job_id] == parent_attempt for job_id in fanout)
+            request_specs.append((attempt, [selected_job, *fanout], parent_attempt,
+                                  rerun_actor_secret))
+            for job_id in (selected_job, *fanout):
+                selected_attempts[job_id] = attempt
+
+        def request_content(
+            request_index: int, attempt: int, active_jobs: list[str],
+            parent_attempt: int | None, request_actor: str,
+        ) -> dict:
             content = {
                     "schema_version": 1,
-                    "request_type": "run" if attempt == 1 else "rerun",
+                    "request_type": "run" if request_index == 0 else "rerun",
                     "target_repo_a": target_repo_a,
                     "pr_root_event_id": fixed_id("pr-root"),
                     "pr_update_event_id": fixed_id("pr-update"),
@@ -248,25 +276,29 @@ class PromotionReadinessTest(unittest.TestCase):
                     "base_oid": self.base,
                     "workflow_id": workflow_id,
                     "workflow_digest": workflow_digest,
-                    "job_ids": list(jobs) if attempt == 1 else [rerun_job],
+                    "job_ids": list(jobs) if request_index == 0 else [active_jobs[0]],
                     "run_id": run_id,
                     "attempt": attempt,
                     "trigger_event_id": fixed_id("pr-update"),
-                    "actor": actor,
+                    "actor": request_actor,
                     "timeout_seconds": 600,
-                    "idempotency_key": f"idempotency-{run_id}-{attempt}",
+                    "idempotency_key": f"idempotency-{run_id}-{request_index}-{attempt}",
                     "issued_at": NOW - 120,
                     "expires_at": NOW + 480,
             }
-            if attempt > 1:
-                content["parent_attempt"] = attempt - 1
+            if parent_attempt is not None:
+                content["parent_attempt"] = parent_attempt
                 content["parent_run_id"] = run_id
             return content
 
-        request_attempts = [1, 2] if retry else [1]
-        requests = [wire_event(46100, request_content(attempt), ACTOR_SECRET)
-                    for attempt in request_attempts]
-        request_ids = {attempt: requests[attempt - 1]["id"] for attempt in request_attempts}
+        requests = []
+        for request_index, (attempt, active_jobs, parent_attempt, secret) in enumerate(request_specs):
+            request_actor = xonly_pubkey(secret)
+            requests.append(wire_event(
+                46100,
+                request_content(request_index, attempt, active_jobs, parent_attempt, request_actor),
+                secret,
+            ))
         events: list[dict] = []
         decoded_logs: dict[str, str] = {}
         final_refs: dict[str, tuple[int, str, str]] = {}
@@ -279,15 +311,16 @@ class PromotionReadinessTest(unittest.TestCase):
             events.append(event)
             return event
 
-        for attempt in request_attempts:
-            request_event_id = request_ids[attempt]
+        for request_index, ((attempt, active_jobs, parent_attempt, _), request) in enumerate(
+            zip(request_specs, requests)
+        ):
+            request_event_id = request["id"]
             base_content = {
                 "schema_version": 1, "request_event_id": request_event_id, "run_id": run_id,
                 "workflow_id": workflow_id, "target_repo_a": target_repo_a, "tip_oid": candidate,
             }
-            final_attempt = attempt == request_attempts[-1]
-            run_state = terminal_state if final_attempt else "failure"
-            active_jobs = list(jobs) if attempt == 1 else [rerun_job, *also_reruns]
+            final_request = request_index == len(request_specs) - 1
+            run_state = terminal_state if final_request else "failure"
 
             def run_status(sequence: int, status: str) -> dict:
                 content = {
@@ -302,7 +335,7 @@ class PromotionReadinessTest(unittest.TestCase):
                 return content
 
             def job_status(job_id: str, sequence: int, status: str) -> dict:
-                fanout = list(also_reruns) if attempt > 1 and job_id == rerun_job else []
+                fanout = active_jobs[1:] if request_index > 0 and job_id == active_jobs[0] else []
                 content = {
                     **base_content, "base_oid": self.base, "job_id": job_id,
                     "name": job_id.replace("_", " ").title(),
@@ -311,8 +344,8 @@ class PromotionReadinessTest(unittest.TestCase):
                     "also_reruns": fanout,
                     "artifact_refs": [], "relay_signer": signer,
                 }
-                if attempt > 1:
-                    content["parent_attempt"] = attempt - 1
+                if parent_attempt is not None:
+                    content["parent_attempt"] = parent_attempt
                 if status != "queued":
                     content["started_at"] = NOW - 25
                 if status not in ("queued", "running"):
@@ -325,12 +358,10 @@ class PromotionReadinessTest(unittest.TestCase):
             for job_id in active_jobs:
                 append(46102, job_status(job_id, 1, "queued"))
                 append(46102, job_status(job_id, 2, "running"))
-                job_state = (
-                    terminal_state if final_attempt and job_id == rerun_job
-                    else "failure" if not final_attempt and job_id in {rerun_job, *also_reruns}
-                    else "success"
+                selected_final = selected_attempts[job_id] == attempt
+                job_state = terminal_state if selected_final and final_request else (
+                    "success" if selected_final else "failure"
                 )
-                selected_final = final_attempt or job_id not in {rerun_job, *also_reruns}
                 terminal_job = job_status(job_id, 3, job_state)
                 if selected_final:
                     log = append(46103, {
@@ -345,14 +376,17 @@ class PromotionReadinessTest(unittest.TestCase):
                         **base_content, "job_id": job_id, "attempt": attempt,
                         "artifact_id": f"artifact-{job_id}-{attempt}", "name": "result.json",
                         "media_type": "application/json", "sha256": DIGEST_B, "byte_length": 64,
-                        "url": f"https://relay.example.invalid/ci/artifacts/{job_id}/{attempt}",
+                        "url": (
+                            f"https://relay.example.invalid/ci/artifacts/{request_event_id}/"
+                            f"{run_id}/{job_id}/{attempt}/artifact-{job_id}-{attempt}/{DIGEST_B}"
+                        ),
                         "created_at": NOW - 14, "relay_signer": signer,
                     })
                     terminal_job["log_ref"] = log["id"]
                     terminal_job["artifact_refs"] = [artifact["id"]]
                     final_refs[job_id] = (attempt, log["id"], artifact["id"])
                 append(46102, terminal_job)
-            if final_attempt:
+            if final_request:
                 assert set(final_refs) == set(jobs)
                 append(46105, {
                     **base_content, "attempt": attempt, "finalized_job_attempts": [
@@ -373,13 +407,18 @@ class PromotionReadinessTest(unittest.TestCase):
                 })
             append(46101, run_status(3, run_state))
 
-        return {
+        evidence = {
             "channel_id": channel_id,
             "authorized_relay_signers": [signer],
             "requests": requests,
             "events": events,
             "decoded_logs": decoded_logs,
         }
+        return PRODUCER.populate_event_evidence(
+            evidence,
+            PRODUCER.canonical_relay_origin("wss://relay.example.invalid/"),
+            "fixture.event_evidence",
+        )
 
     def valid_bundle(self) -> dict:
         staging_run_id = "11111111-1111-4111-8111-111111111111"
@@ -619,6 +658,90 @@ class PromotionReadinessTest(unittest.TestCase):
         canary_properties = evidence_schema["properties"]["production_canary"]["properties"]
         self.assertNotIn("initial_concurrency", canary_properties)
         self.assertNotIn("enabled_concurrency", canary_properties)
+        relay_schema = evidence_schema["$defs"]["signed_ci_event_evidence"]["properties"][
+            "relay_url"
+        ]
+        self.assertEqual(relay_schema["pattern"], "^https?://[^/?#]+$")
+
+    def test_relay_origin_producer_populates_every_live_evidence_section(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        for section in PRODUCER.SECTIONS:
+            bundle[section]["event_evidence"].pop("relay_url")
+        populated = PRODUCER.populate_promotion_evidence(
+            bundle, "wss://Relay.Example.Invalid:443/"
+        )
+        for section in PRODUCER.SECTIONS:
+            self.assertEqual(
+                populated[section]["event_evidence"]["relay_url"],
+                "https://relay.example.invalid",
+            )
+        result = self.invoke(populated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_relay_origin_producer_cli_uses_config_and_writes_private_output(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        for section in PRODUCER.SECTIONS:
+            bundle[section]["event_evidence"].pop("relay_url")
+        source = self.evidence_dir / "unpopulated.json"
+        output = self.evidence_dir / "populated.json"
+        write_json(source, bundle)
+        environment = os.environ.copy()
+        environment["BUZZ_RELAY_URL"] = "ws://127.0.0.1:3000/"
+        result = subprocess.run(
+            [sys.executable, str(PRODUCER_SCRIPT), "--input", str(source), "--output", str(output)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        populated = json.loads(output.read_text(encoding="utf-8"))
+        self.assertTrue(all(
+            populated[section]["event_evidence"]["relay_url"] == "http://127.0.0.1:3000"
+            for section in PRODUCER.SECTIONS
+        ))
+        missing_environment = os.environ.copy()
+        missing_environment.pop("BUZZ_RELAY_URL", None)
+        missing = subprocess.run(
+            [sys.executable, str(PRODUCER_SCRIPT), "--input", str(source),
+             "--output", str(self.evidence_dir / "missing-config.json")],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=missing_environment,
+        )
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("no relay fallback", missing.stderr)
+
+    def test_relay_origin_producer_refuses_missing_or_hostile_config(self) -> None:
+        with self.assertRaisesRegex(PRODUCER.EvidenceError, "no relay fallback"):
+            PRODUCER.configured_relay_origin(None, {})
+        hostile = (
+            "https://user@relay.example.invalid",
+            "https://relay.example.invalid?token=secret",
+            "https://relay.example.invalid#secret",
+            "https://relay.example.invalid/path",
+            "ftp://relay.example.invalid",
+            " https://relay.example.invalid",
+            "https://relay..example.invalid",
+        )
+        for value in hostile:
+            with self.subTest(value=value):
+                with self.assertRaises(PRODUCER.EvidenceError):
+                    PRODUCER.canonical_relay_origin(value)
+
+    def test_relay_origin_producer_refuses_conflicting_evidence(self) -> None:
+        with self.assertRaisesRegex(PRODUCER.EvidenceError, "conflicts"):
+            PRODUCER.populate_promotion_evidence(
+                self.bundle, "https://other-relay.example.invalid"
+            )
+
+    def test_verifier_requires_the_canonical_relay_origin(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["staging"]["event_evidence"]["relay_url"] = \
+            "https://relay.example.invalid:443"
+        self.assert_refused(bundle, "canonical relay origin")
 
     def test_wrong_sha_is_refused(self) -> None:
         bundle = copy.deepcopy(self.bundle)
@@ -869,6 +992,64 @@ class PromotionReadinessTest(unittest.TestCase):
         )
         self.assertEqual(result["job_attempts"], {"build": [1, 2], "lint": [1, 2]})
         self.assertEqual(result["selected_job_attempts"], {"build": 2, "lint": 2})
+
+    def test_distinct_jobs_may_each_have_attempt_two_requests(self) -> None:
+        evidence = self.signed_event_evidence(
+            "88888888-8888-4888-8888-888888888888",
+            jobs=("build", "lint"),
+            reruns=(("build", ()), ("lint", ())),
+        )
+        result = READINESS.validate_ci_event_evidence(
+            evidence, self.candidate, self.base, "per-job", "success"
+        )
+        self.assertEqual(
+            [self.event_content(request)["attempt"] for request in evidence["requests"]],
+            [1, 2, 2],
+        )
+        self.assertEqual(result["job_attempts"], {"build": [1, 2], "lint": [1, 2]})
+        self.assertEqual(result["selected_job_attempts"], {"build": 2, "lint": 2})
+
+    def test_rerun_actor_may_differ_from_initial_actor(self) -> None:
+        evidence = self.signed_event_evidence(
+            "99999999-9999-4999-8999-999999999999",
+            retry=True,
+            rerun_actor_secret=RERUN_ACTOR_SECRET,
+        )
+        result = READINESS.validate_ci_event_evidence(
+            evidence, self.candidate, self.base, "rerun-actor", "success"
+        )
+        actors = [self.event_content(request)["actor"] for request in evidence["requests"]]
+        self.assertEqual(actors, [xonly_pubkey(ACTOR_SECRET), xonly_pubkey(RERUN_ACTOR_SECRET)])
+        self.assertEqual(result["actor"], actors[0])
+
+    def test_log_and_artifact_urls_reject_unsafe_or_unbound_locations(self) -> None:
+        cases = {
+            "off relay origin": ("off relay origin", lambda url: url.replace(
+                "relay.example.invalid", "attacker.example.invalid"
+            )),
+            "forbidden credentials": (
+                "forbidden credentials", lambda url: url.replace("https://", "https://user@")
+            ),
+            "forbidden query": ("forbidden query or fragment", lambda url: f"{url}?token=secret"),
+            "forbidden fragment": ("forbidden query or fragment", lambda url: f"{url}#secret"),
+            "wrong exact path": (
+                "exact evidence path", lambda url: url.replace("/ci/", "/ci/wrong/", 1)
+            ),
+        }
+        for kind, label in ((46103, "log"), (46104, "artifact")):
+            for case, (expected_error, mutate) in cases.items():
+                with self.subTest(kind=kind, case=case):
+                    evidence = self.signed_event_evidence(
+                        f"aaaaaaaa-aaaa-4aaa-8aaa-{kind:012d}"
+                    )
+                    event = next(item for item in evidence["events"] if item["kind"] == kind)
+                    content = self.event_content(event)
+                    content["url"] = mutate(content["url"])
+                    self.resign_event(event, content)
+                    with self.assertRaisesRegex(READINESS.GateError, expected_error):
+                        READINESS.validate_ci_event_evidence(
+                            evidence, self.candidate, self.base, label, "success"
+                        )
 
     def test_decoded_log_bytes_must_match_signed_digest(self) -> None:
         bundle = copy.deepcopy(self.bundle)
