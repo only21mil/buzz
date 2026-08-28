@@ -365,6 +365,7 @@ export function MachineOnboardingFlow({
                     <Button
                       className={`${ONBOARDING_SECONDARY_CTA_CLASS} mt-2 px-5`}
                       onClick={() => void replaceLostIdentity()}
+                      tabIndex={0}
                       type="button"
                       variant="ghost"
                     >
