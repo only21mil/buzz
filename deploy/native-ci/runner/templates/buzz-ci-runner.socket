@@ -1,0 +1,17 @@
+[Unit]
+Description=Buzz CI runner control socket
+Documentation=file:/usr/share/doc/buzz-ci-runner/README.md
+
+[Socket]
+ListenStream=/run/buzzci/runner-control.sock
+FileDescriptorName=buzz-ci-runner-control
+Accept=no
+SocketUser=buzzci-runner
+SocketGroup=buzzci-controld
+SocketMode=0620
+DirectoryMode=0711
+RemoveOnStop=yes
+Service=buzz-ci-runner.service
+
+[Install]
+WantedBy=sockets.target
