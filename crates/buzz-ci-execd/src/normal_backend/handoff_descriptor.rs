@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -60,6 +62,29 @@ pub(super) struct PlatformIdentity {
     act_binary_sha256: [u8; 32],
 }
 
+#[derive(Serialize)]
+struct CanonicalActPlanBinding<'a> {
+    binary: &'a Path,
+    binary_sha256: [u8; 32],
+    working_directory: &'a Path,
+    home_directory: &'a Path,
+    workflow_path: &'a Path,
+    job_id: &'a str,
+    image: &'a str,
+    secrets_path: &'a Path,
+    vars_path: &'a Path,
+    env_path: &'a Path,
+    inputs_path: &'a Path,
+    proxy_socket: &'a Path,
+    executor_unit: &'a str,
+    runtime_unit: &'a str,
+    lease_slice: &'a str,
+    workspace_path: &'a str,
+    workspace_device: u64,
+    workspace_inode: u64,
+    workspace_owner_uid: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct UnitIdentity {
@@ -89,6 +114,7 @@ pub(super) struct HandoffIdentity {
     lease_expires_at_unix_seconds: u64,
     workspace: WorkspaceIdentity,
     platform: PlatformIdentity,
+    act_plan_sha256: [u8; 32],
     units: UnitIdentity,
     runtime_endpoint_token_sha256: [u8; 32],
     runtime_endpoint_device: Option<u64>,
@@ -126,6 +152,15 @@ impl HandoffIdentity {
                 } => (Some(*device), Some(*inode), token.as_str()),
                 RuntimeEndpointIdentity::InheritedFd { token, .. } => (None, None, token.as_str()),
             };
+        let workspace = WorkspaceIdentity {
+            path: binding.workspace.path.clone(),
+            device: binding.workspace.object.device,
+            inode: binding.workspace.object.inode,
+            owner_uid: binding.workspace.owner_uid,
+            object_token_sha256: digest(binding.workspace.object.token.as_bytes()),
+            quota_token_sha256: digest(binding.workspace.quota_token.as_bytes()),
+        };
+        let act_plan_sha256 = canonical_act_plan_digest(plan, &workspace)?;
         Ok(Self {
             schema_version: FRAME_VERSION,
             run_id: binding.run_id.clone(),
@@ -133,14 +168,7 @@ impl HandoffIdentity {
             attempt: binding.attempt,
             lease_id: binding.lease_id.clone(),
             lease_expires_at_unix_seconds: binding.expires_at_unix_seconds,
-            workspace: WorkspaceIdentity {
-                path: binding.workspace.path.clone(),
-                device: binding.workspace.object.device,
-                inode: binding.workspace.object.inode,
-                owner_uid: binding.workspace.owner_uid,
-                object_token_sha256: digest(binding.workspace.object.token.as_bytes()),
-                quota_token_sha256: digest(binding.workspace.quota_token.as_bytes()),
-            },
+            workspace,
             platform: PlatformIdentity {
                 source_sha: binding.source_sha.clone(),
                 base_oid: binding.base_oid.clone(),
@@ -151,6 +179,7 @@ impl HandoffIdentity {
                 architecture: binding.isolation_profile.arch.clone(),
                 act_binary_sha256: plan.binary_sha256,
             },
+            act_plan_sha256,
             units: UnitIdentity {
                 host_contract_revision: contract.revision,
                 executor_uid: contract.executor_uid,
@@ -207,8 +236,43 @@ impl HandoffIdentity {
             || plan.job_id != self.job_id
             || plan.image != self.platform.image_digest
             || plan.binary_sha256 != self.platform.act_binary_sha256
+            || canonical_act_plan_digest(plan, &self.workspace)? != self.act_plan_sha256
             || plan.argv().is_err()
             || plan.environment().is_err()
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_live_service(
+        &self,
+        role: HandoffRole,
+        socket_path: &Path,
+        effective_uid: u32,
+    ) -> Result<(), ()> {
+        ProductionLiveIdentityVerifier.verify(self, role, socket_path, effective_uid)
+    }
+
+    pub(super) fn validate_observed_service(
+        &self,
+        role: HandoffRole,
+        observed: &ObservedServiceIdentity,
+    ) -> Result<(), ()> {
+        let expected_unit = match role {
+            HandoffRole::Executor => &self.units.executor_unit,
+            HandoffRole::Runtime => &self.units.runtime_unit,
+        };
+        if observed.role != role
+            || observed.uid != self.expected_uid(role)
+            || observed.socket_path != self.socket(role)
+            || &observed.unit_name != expected_unit
+            || observed.lease_slice != self.units.lease_slice
+            || observed.cgroup_device != self.units.cgroup_device
+            || observed.cgroup_inode != self.units.cgroup_inode
+            || observed.netns_device != self.units.netns_device
+            || observed.netns_inode != self.units.netns_inode
+            || observed.netns_name != self.units.netns_name
         {
             return Err(());
         }
@@ -235,6 +299,150 @@ impl HandoffIdentity {
             .any(|value| json.contains(value))
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn expected_live_service(&self, role: HandoffRole) -> ObservedServiceIdentity {
+        ObservedServiceIdentity {
+            role,
+            uid: self.expected_uid(role),
+            socket_path: self.socket(role).to_path_buf(),
+            unit_name: match role {
+                HandoffRole::Executor => self.units.executor_unit.clone(),
+                HandoffRole::Runtime => self.units.runtime_unit.clone(),
+            },
+            lease_slice: self.units.lease_slice.clone(),
+            cgroup_device: self.units.cgroup_device,
+            cgroup_inode: self.units.cgroup_inode,
+            netns_device: self.units.netns_device,
+            netns_inode: self.units.netns_inode,
+            netns_name: self.units.netns_name.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ObservedServiceIdentity {
+    pub(super) role: HandoffRole,
+    pub(super) uid: u32,
+    pub(super) socket_path: PathBuf,
+    pub(super) unit_name: String,
+    pub(super) lease_slice: String,
+    pub(super) cgroup_device: u64,
+    pub(super) cgroup_inode: u64,
+    pub(super) netns_device: u64,
+    pub(super) netns_inode: u64,
+    pub(super) netns_name: String,
+}
+
+struct ProductionLiveIdentityVerifier;
+
+impl ProductionLiveIdentityVerifier {
+    fn verify(
+        &self,
+        identity: &HandoffIdentity,
+        role: HandoffRole,
+        socket_path: &Path,
+        effective_uid: u32,
+    ) -> Result<(), ()> {
+        if socket_path != identity.socket(role) || effective_uid != identity.expected_uid(role) {
+            return Err(());
+        }
+        let cgroup_text = fs::read_to_string("/proc/self/cgroup").map_err(|_| ())?;
+        let cgroup_path = cgroup_text
+            .lines()
+            .filter_map(|line| line.strip_prefix("0::"))
+            .collect::<Vec<_>>();
+        if cgroup_path.len() != 1 {
+            return Err(());
+        }
+        let cgroup_path = Path::new(cgroup_path[0]);
+        let unit_name = cgroup_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or(())?;
+        let mut slice_path = PathBuf::from("/sys/fs/cgroup");
+        let mut found_slice = false;
+        for component in cgroup_path.components() {
+            let Component::Normal(component) = component else {
+                continue;
+            };
+            slice_path.push(component);
+            if component.to_str() == Some(identity.units.lease_slice.as_str()) {
+                found_slice = true;
+                break;
+            }
+        }
+        if !found_slice {
+            return Err(());
+        }
+        let cgroup = fs::metadata(slice_path).map_err(|_| ())?;
+        let process_netns = fs::metadata("/proc/self/ns/net").map_err(|_| ())?;
+        let named_netns = fs::metadata(Path::new("/run/netns").join(&identity.units.netns_name))
+            .map_err(|_| ())?;
+        if process_netns.dev() != named_netns.dev() || process_netns.ino() != named_netns.ino() {
+            return Err(());
+        }
+        identity.validate_observed_service(
+            role,
+            &ObservedServiceIdentity {
+                role,
+                uid: effective_uid,
+                socket_path: socket_path.to_path_buf(),
+                unit_name,
+                lease_slice: identity.units.lease_slice.clone(),
+                cgroup_device: cgroup.dev(),
+                cgroup_inode: cgroup.ino(),
+                netns_device: process_netns.dev(),
+                netns_inode: process_netns.ino(),
+                netns_name: identity.units.netns_name.clone(),
+            },
+        )
+    }
+}
+
+fn canonical_act_plan_digest(
+    plan: &ActLaunchPlan,
+    workspace: &WorkspaceIdentity,
+) -> Result<[u8; 32], ()> {
+    let workspace_path = Path::new(&workspace.path);
+    if !plan.workflow_path.starts_with(workspace_path)
+        || !plan.home_directory.starts_with(&plan.working_directory)
+        || [
+            &plan.secrets_path,
+            &plan.vars_path,
+            &plan.env_path,
+            &plan.inputs_path,
+        ]
+        .iter()
+        .any(|path| !path.starts_with(&plan.working_directory))
+    {
+        return Err(());
+    }
+    let binding = CanonicalActPlanBinding {
+        binary: &plan.binary,
+        binary_sha256: plan.binary_sha256,
+        working_directory: &plan.working_directory,
+        home_directory: &plan.home_directory,
+        workflow_path: &plan.workflow_path,
+        job_id: &plan.job_id,
+        image: &plan.image,
+        secrets_path: &plan.secrets_path,
+        vars_path: &plan.vars_path,
+        env_path: &plan.env_path,
+        inputs_path: &plan.inputs_path,
+        proxy_socket: &plan.proxy_socket,
+        executor_unit: &plan.executor_unit,
+        runtime_unit: &plan.runtime_unit,
+        lease_slice: &plan.lease_slice,
+        workspace_path: &workspace.path,
+        workspace_device: workspace.device,
+        workspace_inode: workspace.inode,
+        workspace_owner_uid: workspace.owner_uid,
+    };
+    serde_json::to_vec(&binding)
+        .map(|bytes| digest(&bytes))
+        .map_err(|_| ())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -266,12 +474,21 @@ impl ControllerLeaseIdentity {
         identity: &HandoffIdentity,
         now: u64,
     ) -> Result<(), ()> {
-        let run_id = uuid::Uuid::parse_str(&identity.run_id).map_err(|_| ())?;
         if self != &Self::from_lease(lease)
-            || run_id.as_bytes() != &self.run_id
+            || self.validate_identity(identity, now).is_err()
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn validate_identity(&self, identity: &HandoffIdentity, now: u64) -> Result<(), ()> {
+        let run_id = uuid::Uuid::parse_str(&identity.run_id).map_err(|_| ())?;
+        if run_id.as_bytes() != &self.run_id
             || identity.attempt != self.attempt
-            || self.validate_live(now).is_err()
             || identity.lease_expires_at_unix_seconds <= now
+            || self.deadline_at > identity.lease_expires_at_unix_seconds
+            || self.validate_live(now).is_err()
         {
             return Err(());
         }
@@ -289,6 +506,20 @@ impl ControllerLeaseIdentity {
             return Err(());
         }
         Ok(())
+    }
+
+    pub(super) fn monotonic_budget(
+        &self,
+        identity: &HandoffIdentity,
+        now: u64,
+    ) -> Result<Duration, ()> {
+        self.validate_identity(identity, now)?;
+        self.deadline_at
+            .min(identity.lease_expiry())
+            .checked_sub(now)
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .ok_or(())
     }
 }
 
@@ -342,7 +573,7 @@ impl HandoffDescriptor {
             (HandoffRole::Executor | HandoffRole::Runtime, HandoffOperation::Probe, None) => true,
             (HandoffRole::Executor, HandoffOperation::Launch, Some(controller))
             | (HandoffRole::Runtime, HandoffOperation::AcquireRuntime, Some(controller)) => {
-                controller.validate_live(now).is_ok()
+                controller.validate_identity(&self.identity, now).is_ok()
             }
             _ => false,
         };

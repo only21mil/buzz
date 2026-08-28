@@ -302,7 +302,15 @@ pub fn run_runtime_descriptor_service<O: RuntimeDescriptorOpener>(
         if peer.uid() != ROOT_BROKER_UID {
             continue;
         }
-        if serve_request(&mut stream, effective_uid, &mut replay, opener).is_err() {
+        if serve_request(
+            &mut stream,
+            socket_path,
+            effective_uid,
+            &mut replay,
+            opener,
+        )
+        .is_err()
+        {
             continue;
         }
     }
@@ -311,6 +319,7 @@ pub fn run_runtime_descriptor_service<O: RuntimeDescriptorOpener>(
 
 fn serve_request<O: RuntimeDescriptorOpener>(
     stream: &mut UnixStream,
+    socket_path: &Path,
     effective_uid: u32,
     replay: &mut DescriptorReplayGuard,
     opener: &mut O,
@@ -330,6 +339,11 @@ fn serve_request<O: RuntimeDescriptorOpener>(
     {
         return Err(ActProxyLaunchError::Unavailable);
     }
+    request
+        .descriptor
+        .identity
+        .validate_live_service(HandoffRole::Runtime, socket_path, effective_uid)
+        .map_err(|_| ActProxyLaunchError::Unavailable)?;
     replay
         .accept(&request.descriptor, now)
         .map_err(|_| ActProxyLaunchError::Unavailable)?;
