@@ -176,16 +176,18 @@ migration. Before any migration or relay swap, it:
    and matches its revision, migration evidence, and binary; and
 4. writes a non-empty Postgres custom-format dump.
 
-Some Docker image stores keep a running container's platform image ID after
-that ID stops being directly inspectable or taggable, while the configured
-manifest-list or tagged reference remains local. In that case the script may
-use the container's configured image reference only as a currently resolved
-source. It creates, but never starts, a temporary container with `--pull=never`;
-the temporary container's `.Image` must equal the running container's exact
-platform image ID. The script copies `/usr/local/bin/buzz-relay` out of that
-stopped container and hashes it with the trusted host `sha256sum`, then checks
-the OCI revision and available migration label. It removes the stopped
-container and its anonymous volumes on success and during exit cleanup.
+Some Docker image stores expose a running container's manifest-list or index ID
+separately from its runnable platform image ID. The script resolves and records
+the configured image reference's exact platform image ID, preserves the
+historical container image ID as evidence, and tags the exact platform image ID
+as the rollback source. Missing platform resolution or a failed exact-ID tag
+stops the deployment. It creates, but never starts, a temporary container from
+the retained tag with `--pull=never`; the temporary container's `.Image` must
+equal the recorded platform image ID. The script copies
+`/usr/local/bin/buzz-relay` out of that stopped container and hashes it with the
+trusted host `sha256sum`, then checks the OCI revision and available migration
+label. It removes the stopped container and its anonymous volumes on success
+and during exit cleanup.
 
 The current Compose files do not set a relay platform, so verification uses
 Docker's same no-platform default with `DOCKER_DEFAULT_PLATFORM` unset. If a
