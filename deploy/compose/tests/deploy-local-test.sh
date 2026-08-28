@@ -44,6 +44,7 @@ assert_check_runtime_readonly() {
           *" inspect --format {{index .Config.Labels \"org.opencontainers.image.revision\"}} "*|\
           *" inspect --format {{json .ImageManifestDescriptor}} "*|\
           *" image inspect --platform linux/amd64 --format {{json .Descriptor}} "*|\
+          *" image inspect --platform linux/amd64 --format {{.Id}} "*|\
           *" inspect --format {{index .Config.Labels \"org.block.buzz.required-migration\"}} "*) ;;
           *) fail "check used unapproved Docker argv: ${line}" ;;
         esac
@@ -236,8 +237,15 @@ fi
 args=" $* "
 state=$(cat "${TEST_CONTAINER_STATE}")
 prior_id=sha256:1111111111111111111111111111111111111111111111111111111111111111
+platform_id=${prior_id}
 new_id=sha256:2222222222222222222222222222222222222222222222222222222222222222
 mismatch_id=sha256:9999999999999999999999999999999999999999999999999999999999999999
+case "${TEST_SCENARIO}" in
+  prior_index_platform_survives|post_swap_failure_idxplat)
+    prior_id=sha256:4444444444444444444444444444444444444444444444444444444444444444
+    platform_id=sha256:5555555555555555555555555555555555555555555555555555555555555555
+    ;;
+esac
 
 case "${args}" in
   *" info --format "*) printf '29.7.2\n' ;;
@@ -260,6 +268,9 @@ case "${args}" in
   *" image inspect --platform linux/amd64 --format {{json .Descriptor}} "*)
     printf '{"digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777"}\n'
     ;;
+  *" image inspect --platform linux/amd64 --format {{.Id}} "*)
+    printf '%s\n' "${platform_id}"
+    ;;
   *" image inspect localhost/buzz-relay:${TEST_COMMIT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa} "*)
     if [[ ${TEST_SCENARIO} == manifest_list ]]; then
       printf 'sha256:3333333333333333333333333333333333333333333333333333333333333333\n'
@@ -268,7 +279,8 @@ case "${args}" in
     ;;
   *" image inspect ${prior_id} "*)
     case "${TEST_SCENARIO}" in
-      prior_child_uninspectable_valid_ref|prior_ref_platform_mismatch|prior_ref_revision_mismatch|prior_image_unavailable)
+      prior_child_uninspectable_valid_ref|prior_ref_platform_mismatch|prior_ref_revision_mismatch|\
+        prior_image_unavailable|prior_index_platform_survives|post_swap_failure_idxplat)
         exit 1
         ;;
     esac
@@ -292,7 +304,8 @@ case "${args}" in
   *" inspect --format {{.Image}} "*)
     target=${!#}
     case "${target}" in
-      relay-old|relay-rollback) printf '%s\n' "${prior_id}" ;;
+      relay-old) printf '%s\n' "${prior_id}" ;;
+      relay-rollback) printf '%s\n' "${platform_id}" ;;
       relay-new) printf '%s\n' "${new_id}" ;;
       *)
         create_count=$(cat "${TEST_VERIFY_CREATE_COUNT}")
@@ -300,7 +313,7 @@ case "${args}" in
           prior_ref_platform_mismatch:*|explicit_platform_mismatch:*|post_create_validation_failure:*|rollback_revalidation_mismatch:2)
             printf '%s\n' "${mismatch_id}"
             ;;
-          *) printf '%s\n' "${prior_id}" ;;
+          *) printf '%s\n' "${platform_id}" ;;
         esac
         ;;
     esac
@@ -471,12 +484,14 @@ run_case() {
   local proxy_url=''
   local curl_home='' curl_poison_output=${case_dir}/curl-config-output pg_hostaddr=''
   local -a deploy_args=("${test_commit}")
+  local -a compose_env_args=(BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env")
   if [[ ${invocation_mode} == check ]]; then
     deploy_args=(--check "${test_commit}")
     deploy_log_root=${case_dir}/check-logs
     deploy_build_root=${case_dir}/check-build
   fi
   if [[ ${scenario} == post_swap_failure_unadvanced || ${scenario} == stalled_probe || \
+    ${scenario} == post_swap_failure_idxplat || \
     ${scenario} == rollback_revalidation_mismatch || ${scenario} == rollback_db_read_* || \
     ${scenario} == rollback_verification_remove_failure ]]; then
     initial_db=31
@@ -498,6 +513,7 @@ run_case() {
     check_proxy_env) proxy_url=http://127.0.0.1:9 ;;
     check_curl_config) curl_home=${case_dir}/curl-home ;;
     check_pg_hostaddr) pg_hostaddr=203.0.113.1 ;;
+    check_compose_env_required) compose_env_args=() ;;
     check_root_slash) deploy_build_root=/ ;;
     check_root_relative) deploy_build_root=relative/build ;;
     check_root_noncanonical) deploy_build_root=${case_dir}/../${scenario}/check-build ;;
@@ -618,7 +634,8 @@ ENV
   set +e
   [[ ${scenario} != check_db_unreachable ]] || started_ms=$(date +%s%3N)
   for ((iteration = 1; iteration <= repetitions; iteration++)); do
-    env -u EGID \
+    env -u EGID -u BUZZ_COMPOSE_ENV_FILE \
+      "${compose_env_args[@]}" \
       PATH="${case_dir}/bin:${PATH}" \
       TEST_SCENARIO=${scenario} \
       TEST_COMMAND_LOG="${case_dir}/commands.log" \
@@ -638,7 +655,6 @@ ENV
       BUZZ_DEPLOY_SOURCE_REF="${deploy_source_ref}" \
       BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
       BUZZ_DOCKER_SOCKET="${case_dir}/docker.sock" \
-      BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
       BUZZ_PRE_FREEZE_RECEIPT="${case_dir}/pre-freeze-receipt.json" \
       BUZZ_PROTECTED_CI_RECEIPT="${case_dir}/protected-ci-receipt.json" \
       BUZZ_PRIOR_MIGRATION_OVERRIDE="${prior_migration_override}" \
@@ -786,6 +802,20 @@ assert_not_contains "${scratch}/check_success/commands.log" \
 assert_not_contains "${scratch}/check_success/commands.log" 'pg_dump'
 assert_not_contains "${scratch}/check_success/commands.log" '^docker .* exec '
 assert_not_contains "${scratch}/check_success/commands.log" ' compose .* exec '
+
+run_case check_compose_env_required failure check
+assert_contains "${scratch}/check_compose_env_required/output" \
+  '^REFUSED: --check requires an explicit BUZZ_COMPOSE_ENV_FILE path$'
+assert_not_contains "${scratch}/check_compose_env_required/commands.log" '^git '
+assert_not_contains "${scratch}/check_compose_env_required/commands.log" '^docker '
+
+run_case check_external_compose_env success check
+assert_contains "${scratch}/check_external_compose_env/output" '^CHECK PASSED:'
+assert_contains "${scratch}/check_external_compose_env/commands.log" \
+  " compose --env-file ${scratch}/check_external_compose_env/compose.env "
+[[ ! -e ${scratch}/check_external_compose_env/repo/deploy/compose/.env ]] || \
+  fail 'explicit external Compose env check required a checkout-local .env'
+assert_check_runtime_readonly "${scratch}/check_external_compose_env"
 
 run_case check_proxy_env success check
 assert_contains "${scratch}/check_proxy_env/output" '^CHECK PASSED:'
@@ -983,26 +1013,42 @@ assert_contains "${inspectable_source}" \
 assert_contains "${scratch}/prior_child_inspectable/output" 'DEPLOY SUCCEEDED'
 
 run_case prior_child_uninspectable_valid_ref success
-assert_contains "${scratch}/prior_child_uninspectable_valid_ref/output" \
-  'is not directly inspectable; binding configured image localhost/buzz-relay:old to its platform ID'
 assert_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log" \
-  'create --pull=never --name buzz-rollback-verify-.* localhost/buzz-relay:old'
+  'image inspect --platform linux/amd64 --format {{.Id}} localhost/buzz-relay:old'
 assert_not_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log" \
   'image inspect localhost/buzz-relay:old'
 assert_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log" \
-  'image tag localhost/buzz-relay:old localhost/buzz-relay:rollback-'
+  'image tag sha256:1111111111111111111111111111111111111111111111111111111111111111 localhost/buzz-relay:rollback-'
 fallback_source=$(rg --files "${scratch}/prior_child_uninspectable_valid_ref/logs" | \
   grep '/rollback-source[.]txt$')
 fallback_source_id=$(rg --files "${scratch}/prior_child_uninspectable_valid_ref/logs" | \
   grep '/rollback-source-image-id[.]txt$')
-assert_contains "${fallback_source}" '^localhost/buzz-relay:old$'
+assert_contains "${fallback_source}" \
+  '^sha256:1111111111111111111111111111111111111111111111111111111111111111$'
 assert_contains "${fallback_source_id}" \
   '^sha256:1111111111111111111111111111111111111111111111111111111111111111$'
-[[ $(cat "${scratch}/prior_child_uninspectable_valid_ref/verify-create-count") -eq 2 ]] || \
-  fail 'valid configured ref did not create both source and retained-tag verification containers'
-[[ $(cat "${scratch}/prior_child_uninspectable_valid_ref/verify-remove-count") -eq 2 ]] || \
-  fail 'valid configured ref did not remove both stopped containers with their volumes'
+[[ $(cat "${scratch}/prior_child_uninspectable_valid_ref/verify-create-count") -eq 1 ]] || \
+  fail 'valid platform image did not create one retained-tag verification container'
+[[ $(cat "${scratch}/prior_child_uninspectable_valid_ref/verify-remove-count") -eq 1 ]] || \
+  fail 'valid platform image did not remove its stopped verification container and volumes'
 assert_contains "${scratch}/prior_child_uninspectable_valid_ref/output" 'DEPLOY SUCCEEDED'
+
+run_case prior_index_platform_survives success
+assert_contains "${scratch}/prior_index_platform_survives/output" \
+  'Prior container image index sha256:444444.*differs from runnable platform image sha256:555555'
+assert_contains "${scratch}/prior_index_platform_survives/commands.log" \
+  'image tag sha256:5555555555555555555555555555555555555555555555555555555555555555 localhost/buzz-relay:rollback-'
+assert_not_contains "${scratch}/prior_index_platform_survives/commands.log" \
+  'image inspect sha256:4444444444444444444444444444444444444444444444444444444444444444'
+index_evidence=$(rg --files "${scratch}/prior_index_platform_survives/logs" | \
+  grep '/prior-image-id[.]txt$')
+platform_evidence=$(rg --files "${scratch}/prior_index_platform_survives/logs" | \
+  grep '/prior-platform-image-id[.]txt$')
+assert_contains "${index_evidence}" \
+  '^sha256:4444444444444444444444444444444444444444444444444444444444444444$'
+assert_contains "${platform_evidence}" \
+  '^sha256:5555555555555555555555555555555555555555555555555555555555555555$'
+assert_contains "${scratch}/prior_index_platform_survives/output" 'DEPLOY SUCCEEDED'
 
 for bad_prior in prior_ref_platform_mismatch prior_ref_revision_mismatch prior_image_unavailable; do
   run_case "${bad_prior}" failure
@@ -1011,11 +1057,11 @@ for bad_prior in prior_ref_platform_mismatch prior_ref_revision_mismatch prior_i
     ' up -d --no-deps --force-recreate relay'
 done
 assert_contains "${scratch}/prior_ref_platform_mismatch/output" \
-  'resolves to platform image sha256:999999.*expected running image sha256:111111'
+  'resolves to platform image sha256:999999.*expected prior platform image sha256:111111'
 assert_contains "${scratch}/prior_ref_revision_mismatch/output" \
   'revision dddddddd.*does not match running container revision cccccccc'
-assert_contains "${scratch}/prior_image_unavailable/output" \
-  'is not directly inspectable; binding configured image'
+assert_contains "${scratch}/prior_image_unavailable/commands.log" \
+  'create --pull=never --name buzz-rollback-verify-.* localhost/buzz-relay:rollback-'
 
 for invalid_ref in prior_ref_bare prior_ref_main prior_ref_latest \
   prior_ref_leading_option prior_ref_malformed; do
@@ -1053,7 +1099,7 @@ assert_contains "${scratch}/create_stdout_empty/output" \
 assert_contains "${scratch}/create_stdout_contaminated/output" \
   'docker create returned an invalid verification container ID: unexpected create output'
 assert_contains "${scratch}/post_create_validation_failure/output" \
-  'resolves to platform image sha256:999999.*expected running image sha256:111111'
+  'resolves to platform image sha256:999999.*expected prior platform image sha256:111111'
 
 run_case verification_remove_failure failure
 [[ $(cat "${scratch}/verification_remove_failure/verify-remove-count") -eq 2 ]] || \
@@ -1105,6 +1151,20 @@ rollback_swap_line=$(grep -n 'BUZZ_IMAGE=localhost/buzz-relay:rollback-.* up -d 
   "${scratch}/post_swap_failure_unadvanced/commands.log" | head -1 | cut -d: -f1)
 [[ -n ${revalidate_line} && -n ${rollback_swap_line} && ${revalidate_line} -lt ${rollback_swap_line} ]] || \
   fail 'retained rollback tag was not revalidated immediately before Compose rollback'
+
+run_case post_swap_failure_idxplat failure
+assert_contains "${scratch}/post_swap_failure_idxplat/output" \
+  'ROLLBACK SUCCEEDED: restored platform image sha256:555555'
+assert_contains "${scratch}/post_swap_failure_idxplat/commands.log" \
+  'image tag sha256:5555555555555555555555555555555555555555555555555555555555555555 localhost/buzz-relay:rollback-'
+assert_not_contains "${scratch}/post_swap_failure_idxplat/commands.log" \
+  'image inspect sha256:4444444444444444444444444444444444444444444444444444444444444444'
+assert_contains "${scratch}/post_swap_failure_idxplat/commands.log" \
+  'BUZZ_IMAGE=localhost/buzz-relay:rollback-.* up -d --no-deps --force-recreate relay'
+index_rollback_swap_count=$(grep -c '^docker .*up -d --no-deps --force-recreate relay' \
+  "${scratch}/post_swap_failure_idxplat/commands.log")
+[[ ${index_rollback_swap_count} -eq 2 ]] || \
+  fail "index/platform rollback made ${index_rollback_swap_count} recreate calls, expected 2"
 
 run_case rollback_revalidation_mismatch failure
 assert_contains "${scratch}/rollback_revalidation_mismatch/output" \
