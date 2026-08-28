@@ -1421,6 +1421,7 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
 
         // Validate oa[0] is a valid BIP-340 x-only public key (not just hex)
         PublicKey::from_hex(owner)
+            .and_then(|public_key| public_key.xonly().map(|_| ()))
             .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?;
 
         // Self-attestation is meaningless — owner must differ from signer
