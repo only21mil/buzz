@@ -723,8 +723,9 @@ def validate_ci_event_evidence(
         request_ids_by_attempt[attempt] = request_id
 
     expect(initial_content is not None, f"{path} has no initial run request")
-    attempts = sorted(request_ids_by_attempt)
-    expect(attempts == list(range(1, attempts[-1] + 1)), f"{path} request attempts are not contiguous")
+    request_attempts = sorted(request_ids_by_attempt)
+    expect(request_attempts == list(range(1, request_attempts[-1] + 1)),
+           f"{path} request attempts are not contiguous")
     immutable_request_fields = (
         "target_repo_a", "pr_root_event_id", "pr_update_event_id", "source_clone_url",
         "immutable_source_ref", "tip_oid", "source_branch", "base_ref", "base_oid",
@@ -911,14 +912,16 @@ def validate_ci_event_evidence(
            f"{path}.events must contain one kind 46105 and one kind 46106 fact")
 
     selected_attempts: dict[str, int] = {}
+    job_attempt_ranges: dict[str, list[int]] = {}
     immutable_manifests: dict[str, tuple[Any, ...]] = {}
     for job_id_value in selected_jobs:
-        attempts = sorted(attempt for job, attempt in job_histories if job == job_id_value)
-        expect(bool(attempts), f"{path} has no status stream for job {job_id_value}")
-        expect(attempts == list(range(1, attempts[-1] + 1)),
+        job_attempts = sorted(attempt for job, attempt in job_histories if job == job_id_value)
+        expect(bool(job_attempts), f"{path} has no status stream for job {job_id_value}")
+        expect(job_attempts == list(range(1, job_attempts[-1] + 1)),
                f"{path} job {job_id_value} attempt lineage is not contiguous")
-        selected_attempts[job_id_value] = attempts[-1]
-        for attempt in attempts:
+        job_attempt_ranges[job_id_value] = job_attempts
+        selected_attempts[job_id_value] = job_attempts[-1]
+        for attempt in job_attempts:
             history_path = f"{path} job {job_id_value} attempt {attempt}"
             ordered_history = sorted(job_histories[(job_id_value, attempt)])
             manifest_fields = ("name", "required", "skip_policy", "selected_job_instance",
@@ -947,10 +950,10 @@ def validate_ci_event_evidence(
             terminal_content = ordered_history[-1][1]
             expect(terminal_content.get("conclusion") == terminal,
                    f"{history_path} terminal outcome does not match state")
-            if attempt < attempts[-1]:
+            if attempt < job_attempts[-1]:
                 expect(terminal == "failure", f"{history_path} must fail before a rerun")
 
-    for attempt in attempts:
+    for attempt in request_attempts:
         request_id_for_attempt = request_ids_by_attempt[attempt]
         request_for_attempt = requests[request_id_for_attempt]
         observed_jobs = {job for job, job_attempt in job_histories if job_attempt == attempt}
@@ -1093,7 +1096,10 @@ def validate_ci_event_evidence(
         "selected_job_attempts": selected_attempts,
         "tip_oid": tip_oid,
         "base_oid": base_oid,
-        "attempts": attempts,
+        "attempts": request_attempts,
+        "job_attempts": {
+            job: job_attempt_ranges[job] for job in sorted(job_attempt_ranges)
+        },
         "terminal_events": 1,
         "log_digests": sorted(
             sha256(json.loads(event["content"])["log_sha256"], f"{path}.log_digest")

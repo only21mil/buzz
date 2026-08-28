@@ -176,7 +176,8 @@ class PromotionReadinessTest(unittest.TestCase):
 
     def signed_event_evidence(
         self, run_id: str, *, tip_oid: str | None = None, retry: bool = False,
-        terminal_state: str = "success",
+        terminal_state: str = "success", jobs: tuple[str, ...] = ("build",),
+        rerun_job: str = "build", also_reruns: tuple[str, ...] = (),
     ) -> dict:
         def fixed_id(label: str) -> str:
             return hashlib.sha256(f"{run_id}:{label}".encode()).hexdigest()
@@ -184,7 +185,7 @@ class PromotionReadinessTest(unittest.TestCase):
         actor = xonly_pubkey(ACTOR_SECRET)
         signer = xonly_pubkey(SIGNER_SECRET)
         candidate = tip_oid or self.candidate
-        job_id = "build"
+        assert jobs and rerun_job in jobs and set(also_reruns) <= set(jobs) - {rerun_job}
         target_repo_a = f"30617:{actor}:buzz"
         workflow_id = "ci"
         workflow_digest = DIGEST_C
@@ -247,7 +248,7 @@ class PromotionReadinessTest(unittest.TestCase):
                     "base_oid": self.base,
                     "workflow_id": workflow_id,
                     "workflow_digest": workflow_digest,
-                    "job_ids": [job_id],
+                    "job_ids": list(jobs) if attempt == 1 else [rerun_job],
                     "run_id": run_id,
                     "attempt": attempt,
                     "trigger_event_id": fixed_id("pr-update"),
@@ -268,6 +269,7 @@ class PromotionReadinessTest(unittest.TestCase):
         request_ids = {attempt: requests[attempt - 1]["id"] for attempt in request_attempts}
         events: list[dict] = []
         decoded_logs: dict[str, str] = {}
+        final_refs: dict[str, tuple[int, str, str]] = {}
         cursor = 0
 
         def append(kind: int, content: dict) -> dict:
@@ -284,12 +286,13 @@ class PromotionReadinessTest(unittest.TestCase):
                 "workflow_id": workflow_id, "target_repo_a": target_repo_a, "tip_oid": candidate,
             }
             final_attempt = attempt == request_attempts[-1]
-            state = terminal_state if final_attempt else "failure"
+            run_state = terminal_state if final_attempt else "failure"
+            active_jobs = list(jobs) if attempt == 1 else [rerun_job, *also_reruns]
 
             def run_status(sequence: int, status: str) -> dict:
                 content = {
                     **base_content, "base_oid": self.base, "attempt": attempt, "sequence": sequence,
-                    "state": status, "job_ids": [job_id], "relay_signer": signer,
+                    "state": status, "job_ids": active_jobs, "relay_signer": signer,
                 }
                 if status != "queued":
                     content["started_at"] = NOW - 30
@@ -298,11 +301,14 @@ class PromotionReadinessTest(unittest.TestCase):
                     content["finished_at"] = NOW - 1
                 return content
 
-            def job_status(sequence: int, status: str) -> dict:
+            def job_status(job_id: str, sequence: int, status: str) -> dict:
+                fanout = list(also_reruns) if attempt > 1 and job_id == rerun_job else []
                 content = {
-                    **base_content, "base_oid": self.base, "job_id": job_id, "name": "Build",
+                    **base_content, "base_oid": self.base, "job_id": job_id,
+                    "name": job_id.replace("_", " ").title(),
                     "attempt": attempt, "sequence": sequence, "state": status, "required": True,
-                    "skip_policy": "forbid", "selected_job_instance": job_id, "also_reruns": [],
+                    "skip_policy": "forbid", "selected_job_instance": job_id,
+                    "also_reruns": fanout,
                     "artifact_refs": [], "relay_signer": signer,
                 }
                 if attempt > 1:
@@ -316,41 +322,56 @@ class PromotionReadinessTest(unittest.TestCase):
 
             append(46101, run_status(1, "queued"))
             append(46101, run_status(2, "running"))
-            append(46102, job_status(1, "queued"))
-            append(46102, job_status(2, "running"))
-            if final_attempt:
-                log = append(46103, {
-                    **base_content, "job_id": job_id, "attempt": attempt, "log_sha256": LOG_DIGEST,
-                    "byte_length": len(LOG_BYTES), "cap_bytes": 1024, "truncated": False,
-                    "url": f"https://relay.example.invalid/ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{LOG_DIGEST}",
-                    "created_at": NOW - 15, "relay_signer": signer,
-                })
-                decoded_logs[log["id"]] = base64.b64encode(LOG_BYTES).decode()
-                artifact = append(46104, {
-                    **base_content, "job_id": job_id, "attempt": attempt, "artifact_id": "artifact-1",
-                    "name": "result.json", "media_type": "application/json", "sha256": DIGEST_B,
-                    "byte_length": 64, "url": "https://relay.example.invalid/ci/artifacts/artifact-1",
-                    "created_at": NOW - 14, "relay_signer": signer,
-                })
-                terminal_job = job_status(3, state)
-                terminal_job["log_ref"] = log["id"]
-                terminal_job["artifact_refs"] = [artifact["id"]]
+            for job_id in active_jobs:
+                append(46102, job_status(job_id, 1, "queued"))
+                append(46102, job_status(job_id, 2, "running"))
+                job_state = (
+                    terminal_state if final_attempt and job_id == rerun_job
+                    else "failure" if not final_attempt and job_id in {rerun_job, *also_reruns}
+                    else "success"
+                )
+                selected_final = final_attempt or job_id not in {rerun_job, *also_reruns}
+                terminal_job = job_status(job_id, 3, job_state)
+                if selected_final:
+                    log = append(46103, {
+                        **base_content, "job_id": job_id, "attempt": attempt,
+                        "log_sha256": LOG_DIGEST, "byte_length": len(LOG_BYTES),
+                        "cap_bytes": 1024, "truncated": False,
+                        "url": f"https://relay.example.invalid/ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{LOG_DIGEST}",
+                        "created_at": NOW - 15, "relay_signer": signer,
+                    })
+                    decoded_logs[log["id"]] = base64.b64encode(LOG_BYTES).decode()
+                    artifact = append(46104, {
+                        **base_content, "job_id": job_id, "attempt": attempt,
+                        "artifact_id": f"artifact-{job_id}-{attempt}", "name": "result.json",
+                        "media_type": "application/json", "sha256": DIGEST_B, "byte_length": 64,
+                        "url": f"https://relay.example.invalid/ci/artifacts/{job_id}/{attempt}",
+                        "created_at": NOW - 14, "relay_signer": signer,
+                    })
+                    terminal_job["log_ref"] = log["id"]
+                    terminal_job["artifact_refs"] = [artifact["id"]]
+                    final_refs[job_id] = (attempt, log["id"], artifact["id"])
                 append(46102, terminal_job)
+            if final_attempt:
+                assert set(final_refs) == set(jobs)
                 append(46105, {
-                    **base_content, "attempt": attempt, "finalized_job_attempts": [{
-                        "job_id": job_id, "attempt": attempt, "log_ref": log["id"],
-                        "artifact_refs": [artifact["id"]],
-                    }], "finalized_at": NOW - 8, "relay_signer": signer,
+                    **base_content, "attempt": attempt, "finalized_job_attempts": [
+                        {"job_id": job_id, "attempt": final_refs[job_id][0],
+                         "log_ref": final_refs[job_id][1],
+                         "artifact_refs": [final_refs[job_id][2]]}
+                        for job_id in jobs
+                    ], "finalized_at": NOW - 8, "relay_signer": signer,
                 })
                 append(46106, {
                     **base_content, "base_oid": self.base, "workflow_digest": workflow_digest,
-                    "attempt": attempt, "leases": [{"job_id": job_id, "attempt": attempt,
-                                                       "lease_id": f"lease-{attempt}"}],
+                    "attempt": attempt, "leases": [
+                        {"job_id": job_id, "attempt": final_refs[job_id][0],
+                         "lease_id": f"lease-{job_id}-{final_refs[job_id][0]}"}
+                        for job_id in sorted(jobs)
+                    ],
                     "lease_empty": True, "teardown_at": NOW - 5, "relay_signer": signer,
                 })
-            else:
-                append(46102, job_status(3, "failure"))
-            append(46101, run_status(3, state))
+            append(46101, run_status(3, run_state))
 
         return {
             "channel_id": channel_id,
@@ -804,6 +825,50 @@ class PromotionReadinessTest(unittest.TestCase):
         content["also_reruns"] = ["ghost"]
         self.resign_event(event, content)
         self.assert_refused(bundle, "also_reruns contains an unknown job")
+
+    def test_mixed_job_attempt_ranges_are_returned_per_job(self) -> None:
+        evidence = self.signed_event_evidence(
+            "55555555-5555-4555-8555-555555555555",
+            retry=True,
+            jobs=("build", "lint"),
+        )
+        result = READINESS.validate_ci_event_evidence(
+            evidence, self.candidate, self.base, "mixed", "success"
+        )
+        self.assertEqual(result["attempts"], [1, 2])
+        self.assertEqual(result["job_attempts"], {"build": [1, 2], "lint": [1]})
+        self.assertEqual(result["selected_job_attempts"], {"build": 2, "lint": 1})
+
+    def test_signed_fanout_requires_the_fanout_jobs_correct_attempt(self) -> None:
+        evidence = self.signed_event_evidence(
+            "66666666-6666-4666-8666-666666666666",
+            retry=True,
+            jobs=("build", "lint"),
+        )
+        for event in evidence["events"]:
+            if event["kind"] != 46102:
+                continue
+            content = self.event_content(event)
+            if content["job_id"] == "build" and content["attempt"] == 2:
+                content["also_reruns"] = ["lint"]
+                self.resign_event(event, content)
+        with self.assertRaisesRegex(READINESS.GateError, "rerun fanout"):
+            READINESS.validate_ci_event_evidence(
+                evidence, self.candidate, self.base, "mixed", "success"
+            )
+
+    def test_signed_fanout_accepts_all_jobs_at_the_rerun_attempt(self) -> None:
+        evidence = self.signed_event_evidence(
+            "77777777-7777-4777-8777-777777777777",
+            retry=True,
+            jobs=("build", "lint"),
+            also_reruns=("lint",),
+        )
+        result = READINESS.validate_ci_event_evidence(
+            evidence, self.candidate, self.base, "mixed", "success"
+        )
+        self.assertEqual(result["job_attempts"], {"build": [1, 2], "lint": [1, 2]})
+        self.assertEqual(result["selected_job_attempts"], {"build": 2, "lint": 2})
 
     def test_decoded_log_bytes_must_match_signed_digest(self) -> None:
         bundle = copy.deepcopy(self.bundle)
