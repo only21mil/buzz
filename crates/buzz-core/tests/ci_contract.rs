@@ -193,7 +193,7 @@ fn valid_teardown_attestation() -> CiTeardownAttestationEnvelope {
 fn ci_kinds_are_dedicated_and_outside_workflow_lifecycle() {
     assert_eq!(
         CI_PROTOCOL_CONTRACT_SHA256,
-        "8b9715d719b057d5d297074c3d019e40d1d2104eeafa2b6033f17b465e7d5a1c"
+        "ac335626526aba0a0c429e6fbbe387600155d539f456075375cb6f11fb0a18d1"
     );
     assert_eq!(KIND_CI_REQUEST, 46100);
     assert_eq!(KIND_CI_RUN_STATUS, 46101);
@@ -509,10 +509,28 @@ fn request_rejects_malformed_coordinates_sources_jobs_triggers_and_numbers() {
         assert!(bad.validate().is_err(), "empty {field} accepted");
     }
 
-    for job_id in ["bad-job", "has space", "", &"a".repeat(65)] {
+    for job_id in [
+        "0bad-job",
+        "-bad-job",
+        "bad.job",
+        "bad/job",
+        "bad:job",
+        "has space",
+        "é",
+        "",
+        &"a".repeat(65),
+    ] {
         let mut bad = valid.clone();
         bad.job_ids = vec![job_id.to_string()];
         assert!(bad.validate().is_err(), "invalid job ID accepted: {job_id}");
+    }
+
+    for job_id in ["rust-lint", "desktop-smoke-e2e", "_internal-job"] {
+        let mut accepted = valid.clone();
+        accepted.job_ids = vec![job_id.to_string()];
+        accepted
+            .validate()
+            .unwrap_or_else(|error| panic!("valid GitHub job ID rejected: {job_id}: {error}"));
     }
 
     let mut bad = valid.clone();
@@ -571,7 +589,7 @@ fn absent_optionals_are_omitted_and_inline_size_is_bounded_before_decode() {
 #[test]
 fn every_reference_kind_validates_coordinates_and_static_job_ids() {
     let mut log = valid_log_reference();
-    log.job_id = "bad-job".into();
+    log.job_id = "bad.job".into();
     assert!(log.validate().is_err());
 
     let mut artifact = valid_artifact_reference();
@@ -679,7 +697,7 @@ fn explicit_terminal_facts_are_nonempty_unique_tag_bound_and_signer_authorized()
     duplicate_lease.leases[1].lease_id = duplicate_lease.leases[0].lease_id.clone();
     assert!(duplicate_lease.validate().is_err());
     let mut invalid_job = teardown.clone();
-    invalid_job.leases[0].job_id = "bad-job".into();
+    invalid_job.leases[0].job_id = "bad.job".into();
     assert!(invalid_job.validate().is_err());
     let mut zero_attempt = teardown.clone();
     zero_attempt.leases[0].attempt = 0;
