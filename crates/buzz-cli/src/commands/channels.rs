@@ -402,10 +402,7 @@ pub async fn cmd_list_channel_members(
         serde_json::from_str(&member_resp).unwrap_or_default();
     let admin_events: Vec<serde_json::Value> =
         serde_json::from_str(&admin_resp).unwrap_or_default();
-    let members = channel_members_with_authority(
-        member_events.first(),
-        admin_events.first(),
-    );
+    let members = channel_members_with_authority(member_events.first(), admin_events.first());
     let output = serde_json::to_string(&members).unwrap_or_default();
     println!("{output}");
     Ok(())
@@ -1480,11 +1477,11 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        apply_cardinality_rule, build_template_report, cmd_set_add_policy,
-        channel_members_with_authority, extract_channel_metadata, finalize_roster_resolution,
-        include_channel, is_channel_archived, merge_agent_profile_policy, name_matches,
-        query_list_channel_events, resolve_roster_with_archive_filter, validate_ttl_seconds,
-        ArchivedExclusion, ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
+        apply_cardinality_rule, build_template_report, channel_members_with_authority,
+        cmd_set_add_policy, extract_channel_metadata, finalize_roster_resolution, include_channel,
+        is_channel_archived, merge_agent_profile_policy, name_matches, query_list_channel_events,
+        resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion,
+        ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
     };
     use crate::client::BuzzClient;
     use crate::CliError;
@@ -1503,10 +1500,7 @@ mod tests {
             ["p", agent, "", "bot"],
             ["p", human, "", "member"]
         ]));
-        let admin_event = event(json!([
-            ["d", "channel"],
-            ["p", "a".repeat(64), "admin"]
-        ]));
+        let admin_event = event(json!([["d", "channel"], ["p", "a".repeat(64), "admin"]]));
 
         let members = channel_members_with_authority(Some(&member_event), Some(&admin_event));
 

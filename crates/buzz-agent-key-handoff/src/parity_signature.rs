@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use nostr::secp256k1::{
-    schnorr::Signature, Keypair, Message, Secp256k1, SecretKey as SecpSecretKey,
-    XOnlyPublicKey,
+    schnorr::Signature, Keypair, Message, Secp256k1, SecretKey as SecpSecretKey, XOnlyPublicKey,
 };
 use rustix::fs::{open, Mode, OFlags};
 use serde::{Deserialize, Serialize};
@@ -56,7 +55,10 @@ fn lowercase_hex_64(value: &str) -> bool {
 }
 
 fn printable_ascii(value: &str) -> bool {
-    value.as_bytes().iter().all(|byte| (0x20..=0x7e).contains(byte))
+    value
+        .as_bytes()
+        .iter()
+        .all(|byte| (0x20..=0x7e).contains(byte))
 }
 
 fn append_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<()> {
@@ -202,10 +204,9 @@ pub fn sign_payload(
         || timestamp[13] != b':'
         || timestamp[16] != b':'
         || timestamp[19] != b'Z'
-        || timestamp
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit())
+        || timestamp.iter().enumerate().any(|(index, byte)| {
+            !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
+        })
     {
         bail!("signed-at must be a UTC second timestamp");
     }
@@ -213,9 +214,8 @@ pub fn sign_payload(
     if actual_owner != expected_owner {
         bail!("owner secret does not match reviewed owner public key");
     }
-    let secret_bytes = Zeroizing::new(
-        hex::decode(secret_hex.as_str()).context("decode owner secret")?,
-    );
+    let secret_bytes =
+        Zeroizing::new(hex::decode(secret_hex.as_str()).context("decode owner secret")?);
     let secret = SecpSecretKey::from_slice(&secret_bytes).context("parse owner secret")?;
     let secp = Secp256k1::new();
     let keypair = Keypair::from_secret_key(&secp, &secret);
@@ -261,8 +261,13 @@ pub fn verify_envelope(input: &[u8], expected_owner: &str) -> Result<()> {
     if !envelope.signer.is_object() || !envelope.verifier.is_object() {
         bail!("verification command provenance is invalid");
     }
-    let receipt = envelope.receipt.as_object().context("receipt must be an object")?;
-    if receipt.get("canonical_json_contract").and_then(Value::as_str)
+    let receipt = envelope
+        .receipt
+        .as_object()
+        .context("receipt must be an object")?;
+    if receipt
+        .get("canonical_json_contract")
+        .and_then(Value::as_str)
         != Some(CANONICAL_JSON_CONTRACT)
     {
         bail!("receipt canonical JSON contract mismatch");

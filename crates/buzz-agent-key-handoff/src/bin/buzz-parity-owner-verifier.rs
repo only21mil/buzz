@@ -17,6 +17,8 @@ fn main() -> Result<()> {
     }
     require_anonymous_pipe(io::stdin().as_fd())?;
     let mut envelope = Vec::new();
-    io::stdin().take(512 * 1024 + 1).read_to_end(&mut envelope)?;
+    io::stdin()
+        .take(512 * 1024 + 1)
+        .read_to_end(&mut envelope)?;
     parity_signature::verify_envelope(&envelope, &owner_pubkey)
 }

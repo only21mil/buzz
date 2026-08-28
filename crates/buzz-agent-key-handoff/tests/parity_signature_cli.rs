@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use buzz_agent_key_handoff::parity_signature::{canonical_json_ascii, CANONICAL_JSON_CONTRACT};
 use nostr::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -48,8 +48,12 @@ fn signer_and_verifier_are_deterministic_and_fail_closed() {
     unsigned["payload_sha256"] = Value::String(digest.clone());
 
     let signer_args = [
-        "--secrets-file", secrets.to_str().unwrap(), "--owner-pubkey", PK1,
-        "--signed-at", "2026-08-27T00:00:00Z",
+        "--secrets-file",
+        secrets.to_str().unwrap(),
+        "--owner-pubkey",
+        PK1,
+        "--signed-at",
+        "2026-08-27T00:00:00Z",
     ];
     let sign = || {
         pipe_command(
@@ -59,7 +63,11 @@ fn signer_and_verifier_are_deterministic_and_fail_closed() {
     };
     let first = sign();
     let second = sign();
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     assert_eq!(first.stdout, second.stdout);
     assert!(!String::from_utf8_lossy(&first.stdout).contains(SK1));
     assert!(!String::from_utf8_lossy(&first.stderr).contains(SK1));
@@ -104,8 +112,7 @@ fn signer_and_verifier_are_deterministic_and_fail_closed() {
     let mut persisted = envelope.clone();
     persisted["verified"] = Value::Bool(true);
     let persisted_canonical = canonical_json_ascii(&persisted).unwrap();
-    persisted["sealed_sha256"] =
-        Value::String(hex::encode(Sha256::digest(persisted_canonical)));
+    persisted["sealed_sha256"] = Value::String(hex::encode(Sha256::digest(persisted_canonical)));
     assert!(verify(&persisted, PK1).status.success());
     assert!(verify_root_owned(&persisted, PK1).status.success());
 
@@ -122,10 +129,8 @@ fn signer_and_verifier_are_deterministic_and_fail_closed() {
 
 #[test]
 fn shared_canonical_json_contract_vectors() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "fixtures/parity-canonical-json-v1.json"
-    ))
-    .unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/parity-canonical-json-v1.json")).unwrap();
     assert_eq!(fixture["contract"], CANONICAL_JSON_CONTRACT);
     for case in fixture["positive"].as_array().unwrap() {
         let observed = canonical_json_ascii(&case["value"]).unwrap();
@@ -150,8 +155,12 @@ fn signer_rejects_relative_or_weak_private_input() {
     fs::set_permissions(&secrets, fs::Permissions::from_mode(0o644)).unwrap();
     let output = pipe_command(
         Command::new(env!("CARGO_BIN_EXE_buzz-parity-owner-signer")).args([
-            "--secrets-file", secrets.to_str().unwrap(), "--owner-pubkey", PK1,
-            "--signed-at", "2026-08-27T00:00:00Z",
+            "--secrets-file",
+            secrets.to_str().unwrap(),
+            "--owner-pubkey",
+            PK1,
+            "--signed-at",
+            "2026-08-27T00:00:00Z",
         ]),
         format!("{}\n", "a".repeat(64)).as_bytes(),
     );

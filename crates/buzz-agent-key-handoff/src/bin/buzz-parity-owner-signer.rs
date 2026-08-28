@@ -30,7 +30,9 @@ fn main() -> Result<()> {
     require_anonymous_pipe(io::stdin().as_fd())?;
     let mut payload = String::new();
     io::stdin().take(66).read_to_string(&mut payload)?;
-    let payload = payload.strip_suffix('\n').context("payload must end with newline")?;
+    let payload = payload
+        .strip_suffix('\n')
+        .context("payload must end with newline")?;
     if payload.contains('\n') {
         bail!("payload must contain exactly one line");
     }
