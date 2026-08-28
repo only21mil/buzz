@@ -175,7 +175,11 @@ function getAuthorAvatarUrl(input: {
   const { authorPubkey, currentPubkey, currentUserAvatarUrl, profiles } = input;
 
   if (currentPubkey === authorPubkey) {
-    return currentUserAvatarUrl ?? null;
+    return (
+      currentUserAvatarUrl ??
+      profiles?.[authorPubkey.toLowerCase()]?.avatarUrl ??
+      null
+    );
   }
 
   return profiles?.[authorPubkey.toLowerCase()]?.avatarUrl ?? null;

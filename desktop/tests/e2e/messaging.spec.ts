@@ -1301,25 +1301,69 @@ test("shows your avatar on your own message when profile avatar is set", async (
   page,
 }) => {
   const message = `Avatar message ${Date.now()}`;
-  const avatarUrl =
-    'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"%3E%3Crect width="16" height="16" rx="4" fill="%2300a36c"/%3E%3C/svg%3E';
+  const separator = `Avatar separator ${Date.now()}`;
 
   await page.goto("/");
+  const avatarUrl = new URL("/app-icon@2x.png", page.url()).href;
   await openSettings(page, "profile");
   await page.getByTestId("profile-avatar-edit").click();
-  await page.getByTestId("profile-avatar-url").fill(avatarUrl);
+  const avatarEditor = page.getByTestId("profile-avatar-editor-shell");
+  await expect(avatarEditor).not.toHaveAttribute("inert", "");
+  const avatarUrlInput = page.getByTestId("profile-avatar-url");
+  await avatarUrlInput.fill(avatarUrl);
+  await avatarUrlInput.blur();
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }),
+  );
   await page.getByTestId("profile-avatar-done").click();
+  await expect(page.getByTestId("profile-avatar-editor-shell")).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const update = window.__BUZZ_E2E_COMMAND_LOG__?.findLast(
+          (entry) => entry.command === "update_profile",
+        );
+        return (update?.payload as { avatarUrl?: string } | undefined)
+          ?.avatarUrl;
+      }),
+    )
+    .toBe(avatarUrl);
   await page.getByTestId("settings-back-to-app").click();
 
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await page.waitForFunction(
+    () => typeof window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ === "function",
+  );
+  await page.evaluate(
+    ({ content, createdAt, pubkey }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content,
+        createdAt,
+        pubkey,
+      });
+    },
+    {
+      content: separator,
+      createdAt: Math.floor(Date.now() / 1000) - 1,
+      pubkey: TEST_IDENTITIES.alice.pubkey,
+    },
+  );
+  await expect(page.getByTestId("message-timeline")).toContainText(separator);
 
   await page.getByTestId("message-input").fill(message);
   await page.getByTestId("send-message").click();
 
-  const lastMessage = page.getByTestId("message-row").last();
-  await expect(lastMessage).toContainText(message);
-  await expect(lastMessage.getByTestId("message-avatar-image")).toHaveAttribute(
+  const ownMessage = page
+    .getByTestId("message-row")
+    .filter({ hasText: message })
+    .last();
+  await expect(ownMessage).toContainText(message);
+  await expect(ownMessage.getByTestId("message-avatar-image")).toHaveAttribute(
     "src",
     avatarUrl,
   );

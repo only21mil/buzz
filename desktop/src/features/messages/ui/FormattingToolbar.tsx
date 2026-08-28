@@ -152,15 +152,22 @@ export const FormattingToolbar = React.memo(function FormattingToolbar({
     };
   }, [editor]);
 
-  const captureSelection = React.useCallback(() => {
-    if (!editor || editor.state.selection.empty) {
-      pendingSelectionRef.current = null;
-      return;
-    }
+  const captureSelection = React.useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      // Keep the editor's DOM selection intact while the toolbar button is
+      // pressed. This matters for collapsed carets, which otherwise move as
+      // focus leaves the contenteditable before the click handler runs.
+      event.preventDefault();
+      if (!editor) {
+        pendingSelectionRef.current = null;
+        return;
+      }
 
-    const { anchor, head } = editor.state.selection;
-    pendingSelectionRef.current = { anchor, head };
-  }, [editor]);
+      const { anchor, head } = editor.state.selection;
+      pendingSelectionRef.current = { anchor, head };
+    },
+    [editor],
+  );
 
   const formattingChain = React.useCallback(() => {
     if (!editor) return null;
@@ -171,7 +178,6 @@ export const FormattingToolbar = React.memo(function FormattingToolbar({
 
     if (
       range &&
-      range.anchor !== range.head &&
       range.anchor <= editor.state.doc.content.size &&
       range.head <= editor.state.doc.content.size
     ) {

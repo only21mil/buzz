@@ -1,8 +1,10 @@
 import * as React from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { useIsMutating } from "@tanstack/react-query";
 import { AlertCircle, ArrowLeft, LoaderCircle, RefreshCw } from "lucide-react";
 
 import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
+import { updateProfileMutationKey } from "@/features/profile/hooks";
 import {
   canManageCommunityMembers,
   shouldWarnMissingMembershipSnapshot,
@@ -77,10 +79,12 @@ const settingsNavGroups: Array<{
 
 function SettingsSectionButton({
   active,
+  disabled,
   onSelect,
   section,
 }: {
   active: boolean;
+  disabled: boolean;
   onSelect: (section: SettingsSection) => void;
   section: (typeof settingsSections)[number];
 }) {
@@ -91,6 +95,7 @@ function SettingsSectionButton({
       <SidebarMenuButton
         aria-pressed={active}
         data-testid={`settings-nav-${section.value}`}
+        disabled={disabled}
         isActive={active}
         onClick={() => onSelect(section.value)}
         tooltip={section.label}
@@ -129,6 +134,8 @@ export function SettingsView({
 }: SettingsViewProps) {
   const { isMobile, open: sidebarOpen, setOpen: setSidebarOpen } = useSidebar();
   const myMembershipQuery = useMyRelayMembershipLookupQuery();
+  const isUpdatingProfile =
+    useIsMutating({ mutationKey: updateProfileMutationKey }) > 0;
   const featureState = useFeatureSnapshot();
   const visibleSections = React.useMemo(() => {
     return settingsSections.filter((s) => {
@@ -176,7 +183,11 @@ export function SettingsView({
 
   React.useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !event.defaultPrevented) {
+      if (
+        event.key === "Escape" &&
+        !event.defaultPrevented &&
+        !isUpdatingProfile
+      ) {
         event.preventDefault();
         event.stopPropagation();
         onClose();
@@ -184,7 +195,7 @@ export function SettingsView({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [isUpdatingProfile, onClose]);
 
   const visibleSectionByValue = React.useMemo(
     () => new Map(visibleSections.map((entry) => [entry.value, entry])),
@@ -225,7 +236,9 @@ export function SettingsView({
           <SidebarMenu>
             <SidebarMenuItem>
               <SidebarMenuButton
+                aria-busy={isUpdatingProfile || undefined}
                 data-testid="settings-back-to-app"
+                disabled={isUpdatingProfile}
                 onClick={onClose}
                 tooltip="Back to app"
                 type="button"
@@ -284,6 +297,7 @@ export function SettingsView({
                   {group.sections.map((entry) => (
                     <SettingsSectionButton
                       active={entry.value === section}
+                      disabled={isUpdatingProfile}
                       key={entry.value}
                       onSelect={onSectionChange}
                       section={entry}

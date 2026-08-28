@@ -52,6 +52,7 @@ import {
 } from "@/features/profile/lib/profileBatchCoalescer";
 
 export const profileQueryKey = ["profile"] as const;
+export const updateProfileMutationKey = ["update-profile"] as const;
 export const contactListQueryKey = (pubkey: string) =>
   ["contact-list", pubkey] as const;
 export const allPulseTimelinesQueryKey = ["pulse-timeline"] as const;
@@ -520,6 +521,7 @@ export function useUpdateProfileMutation() {
   const identityQuery = useIdentityQuery();
 
   return useMutation({
+    mutationKey: updateProfileMutationKey,
     mutationFn: (input: UpdateProfileInput) => updateProfile(input),
     onMutate: async () => {
       // Discard any in-flight profile fetch: a background refetch started

@@ -43,7 +43,7 @@ export const MessageComposerToolbar = React.memo(
     isFormattingOpen: boolean;
     isSending: boolean;
     isUploading: boolean;
-    onCaptureSelection: () => void;
+    onCaptureSelection: (event?: React.MouseEvent<HTMLButtonElement>) => void;
     onEmojiPickerOpenChange: (open: boolean) => void;
     onEmojiSelect: (emoji: string) => void;
     onFormattingToggle: (pressed: boolean) => void;

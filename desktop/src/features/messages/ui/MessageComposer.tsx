@@ -819,7 +819,15 @@ function MessageComposerImpl({
       media.queuedAttachments.length,
     ],
   );
-  const handleCaptureSelection = React.useCallback(() => {}, []);
+  const handleCaptureSelection = React.useCallback(
+    (event?: React.MouseEvent<HTMLButtonElement>) => {
+      // The formatting toolbar is mounted only after this button is pressed.
+      // Preventing its mouse-down focus keeps the editor's current selection,
+      // including a collapsed caret, available to the toolbar action.
+      event?.preventDefault();
+    },
+    [],
+  );
 
   const handlePaperclipClick = React.useCallback(() => {
     void media.handlePaperclip();

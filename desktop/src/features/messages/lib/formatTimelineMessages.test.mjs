@@ -88,6 +88,25 @@ function huddleStarted(overrides = {}) {
   };
 }
 
+test("own messages use the batch avatar while the current profile refreshes", () => {
+  const [message] = formatTimelineMessages(
+    [streamMessage()],
+    null,
+    PUBKEY_A,
+    null,
+    {
+      [PUBKEY_A]: {
+        displayName: "Current user",
+        avatarUrl: "https://example.test/current.png",
+        nip05Handle: null,
+        ownerPubkey: null,
+      },
+    },
+  );
+
+  assert.equal(message.avatarUrl, "https://example.test/current.png");
+});
+
 // ---------------------------------------------------------------------------
 // Keystone regression: aux events (edits/deletions) apply by `#e` reference,
 // NOT by time-window overlap. This is the invariant the split-query +
