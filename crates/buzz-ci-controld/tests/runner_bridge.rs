@@ -228,6 +228,62 @@ fn manifest_compiler_rejects_mismatch_traversal_and_secret_bearing_inputs() {
         compile(reserved),
         Err(ManifestCompileError::InvalidEnvironment)
     );
+
+    for key in ["NOSTR_NSEC", "GITHUB_TOKEN", "GIT_CREDENTIAL"] {
+        let mut secret = manifest_input();
+        secret.environment.insert(key.into(), "redacted".into());
+        assert_eq!(
+            compile(secret),
+            Err(ManifestCompileError::InvalidEnvironment)
+        );
+    }
+    for value in [
+        format!("nsec1{}", "q".repeat(58)),
+        "wrapped=ghp_0123456789abcdefghijklmnopqrstuvwxyz".into(),
+        "github_pat_0123456789abcdefghijklmnopqrstuvwxyz".into(),
+        "glpat-0123456789abcdefghijklmnopqrstuvwxyz".into(),
+        "-----BEGIN OPENSSH PRIVATE KEY-----payload".into(),
+    ] {
+        let mut secret = manifest_input();
+        secret.environment.insert("DESCRIPTION".into(), value);
+        assert_eq!(
+            compile(secret),
+            Err(ManifestCompileError::InvalidEnvironment)
+        );
+    }
+
+    let mut safe_text = manifest_input();
+    safe_text.environment.insert(
+        "MONKEY_BUSINESS".into(),
+        "documentation mentions token, nsec1, ghp_, and private key labels".into(),
+    );
+    assert!(compile(safe_text).is_ok());
+
+    for path in [
+        "./.github/workflows/ci.yml",
+        ".github//workflows/ci.yml",
+        ".github/./workflows/ci.yml",
+        ".github/workflows/ci.yml/",
+    ] {
+        let mut noncanonical = manifest_input();
+        noncanonical.workflow_path = path.into();
+        assert_eq!(
+            compile(noncanonical),
+            Err(ManifestCompileError::InvalidWorkflowPath)
+        );
+    }
+    for path in [
+        "/var/lib/buzzci//workspaces/test",
+        "/var/lib/buzzci/./workspaces/test",
+        "/var/lib/buzzci/workspaces/test/",
+    ] {
+        let mut noncanonical = manifest_input();
+        noncanonical.workspace.path = path.into();
+        assert_eq!(
+            compile(noncanonical),
+            Err(ManifestCompileError::InvalidWorkspace)
+        );
+    }
 }
 
 #[test]

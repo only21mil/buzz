@@ -5,7 +5,7 @@
 //! command line, environment, log descriptor, or runner receipt.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use buzz_core::ci::CiRequestEnvelope;
 use serde::Serialize;
@@ -391,6 +391,7 @@ fn validate_environment(
             !valid_env_key(key)
                 || sensitive_environment_key(key)
                 || value.contains(['\0', '\r', '\n'])
+                || contains_secret_material(value)
         })
     {
         return Err(ManifestCompileError::InvalidEnvironment);
@@ -422,9 +423,69 @@ fn valid_env_key(key: &str) -> bool {
 }
 
 fn sensitive_environment_key(key: &str) -> bool {
-    ["KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "AUTH"]
+    [
+        "KEY",
+        "NSEC",
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "AUTH",
+    ]
+    .iter()
+    .any(|word| key.split('_').any(|part| part == *word))
+}
+
+fn contains_secret_material(value: &str) -> bool {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    contains_nostr_nsec(&lower)
+        || [
+            ("ghp_", 36),
+            ("gho_", 36),
+            ("ghu_", 36),
+            ("ghs_", 36),
+            ("ghr_", 36),
+            ("github_pat_", 20),
+            ("glpat-", 20),
+        ]
         .iter()
-        .any(|word| key.split('_').any(|part| part == *word))
+        .any(|(prefix, minimum_suffix_length)| {
+            contains_prefixed_secret(&lower, prefix, *minimum_suffix_length)
+        })
+        || (lower.contains("-----begin ") && lower.contains(" private key-----"))
+}
+
+fn contains_nostr_nsec(value: &str) -> bool {
+    value.match_indices("nsec1").any(|(index, prefix)| {
+        value[index + prefix.len()..]
+            .chars()
+            .take_while(|character| {
+                matches!(
+                    character,
+                    '0' | '2'..='9'
+                        | 'a'
+                        | 'c'..='h'
+                        | 'j'..='n'
+                        | 'p'..='z'
+                )
+            })
+            .count()
+            >= 58
+    })
+}
+
+fn contains_prefixed_secret(value: &str, prefix: &str, minimum_suffix_length: usize) -> bool {
+    value.match_indices(prefix).any(|(index, prefix)| {
+        value[index + prefix.len()..]
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+            .count()
+            >= minimum_suffix_length
+    })
 }
 
 fn sensitive_argument(value: &str) -> bool {
@@ -451,18 +512,21 @@ fn safe_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !value.contains(['\0', '\r', '\n', '\\'])
         && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn safe_absolute_path(value: &str) -> bool {
     let path = Path::new(value);
     path.is_absolute()
         && !value.contains(['\0', '\r', '\n', '\\'])
-        && path
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+        && value.strip_prefix('/').is_some_and(|relative| {
+            !relative.is_empty()
+                && relative
+                    .split('/')
+                    .all(|component| !component.is_empty() && component != "." && component != "..")
+        })
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
