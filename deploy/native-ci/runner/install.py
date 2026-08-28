@@ -459,6 +459,20 @@ def ensure_private_tree(root: Path, path: Path) -> None:
     require_directory(path, root_uid, root_gid, 0o700)
 
 
+def check(package: Path, root: Path) -> dict[str, object]:
+    package = Path(os.path.abspath(package))
+    manifest, entries = parse_manifest(package, package)
+    validate_host_identities(root, manifest)
+    planned = changes(package, root, entries)
+    return {
+        "status": "checked",
+        "package_id": manifest["package_id"],
+        "package_digest": manifest["package_digest"],
+        "changed_targets": [entry.target for entry in planned],
+        **DEFAULT_STATE,
+    }
+
+
 def install(package: Path, root: Path, backup_root: Path, *, dry_run: bool = False) -> dict[str, object]:
     manifest, entries = parse_manifest(package, root)
     validate_host_identities(root, manifest)
@@ -672,8 +686,7 @@ def main() -> int:
     try:
         root = Path(os.path.abspath(arguments.root))
         if arguments.action == "check":
-            manifest, _ = parse_manifest(arguments.package, root)
-            result = {"status": "checked", "package_id": manifest["package_id"], "package_digest": manifest["package_digest"], **DEFAULT_STATE}
+            result = check(arguments.package, root)
         elif arguments.action == "dry-run":
             result = install(arguments.package, root, arguments.backup_root, dry_run=True)
         elif arguments.action == "install":

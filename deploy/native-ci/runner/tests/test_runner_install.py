@@ -207,6 +207,64 @@ class RunnerInstallTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "provenance digest"):
             INSTALLER.parse_manifest(self.package, self.base)
 
+    def test_check_validates_host_plan_without_mutation(self) -> None:
+        self.freeze()
+        root = self.make_root()
+
+        def snapshot() -> dict[str, tuple[int, int, int, bytes | None]]:
+            result: dict[str, tuple[int, int, int, bytes | None]] = {}
+            for path in sorted(root.rglob("*")):
+                metadata = path.lstat()
+                payload = path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None
+                result[str(path.relative_to(root))] = (
+                    metadata.st_mode,
+                    metadata.st_uid,
+                    metadata.st_gid,
+                    payload,
+                )
+            return result
+
+        before = snapshot()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER_DIR / "install.py"),
+                "check",
+                "--package",
+                str(self.package),
+                "--root",
+                str(root),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["status"], "checked")
+        self.assertEqual(result["changed_targets"], sorted(INSTALLER.EXPECTED_TARGETS.values()))
+        self.assertEqual(snapshot(), before)
+
+        INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        before = snapshot()
+        self.assertEqual(INSTALLER.check(self.package, root)["changed_targets"], [])
+        self.assertEqual(snapshot(), before)
+
+    def test_check_rejects_host_identity_and_target_path_drift(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        (root / "etc/group").write_text(f"buzzci-runner:x:{self.runner_gid}:\n")
+        with self.assertRaisesRegex(ValueError, "controld identity"):
+            INSTALLER.check(self.package, root)
+
+        root = self.make_root("target-root")
+        outside = self.base / "outside-check"
+        outside.write_text("do not touch\n")
+        (root / "usr/libexec/buzz-ci-runner").symlink_to(outside)
+        with self.assertRaises(OSError):
+            INSTALLER.check(self.package, root)
+        self.assertEqual(outside.read_text(), "do not touch\n")
+
     def test_dry_run_install_idempotency_and_exact_rollback(self) -> None:
         self.freeze()
         root = self.make_root()

@@ -95,8 +95,9 @@ deploy/native-ci/runner/install.py rollback \
   --backup-id EXACT_BACKUP_ID
 ```
 
-`check` validates the sealed package only. `dry-run` also validates target
-parents and reports the exact changed paths without writing. `install` uses
+`check` validates an operator-owned sealed package, host identities, target
+parents, and exact changed paths without writing or requiring root. `dry-run`
+revalidates installation ownership before reporting the same plan. `install` uses
 descriptor-verified sources, atomic replacements, exact metadata readback, and
 a root-private backup receipt. Reinstalling the same package returns
 `unchanged`. Rollback requires the same package and backup ID and refuses any
