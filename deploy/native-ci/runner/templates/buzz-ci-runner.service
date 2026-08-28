@@ -1,0 +1,25 @@
+[Unit]
+Description=Buzz CI unprivileged runner
+Documentation=file:/usr/share/doc/buzz-ci-runner/README.md
+Requires=buzz-ci-runner.socket systemd-tmpfiles-setup.service
+After=local-fs.target buzz-ci-runner.socket systemd-tmpfiles-setup.service
+
+[Service]
+Type=exec
+User=buzzci-runner
+Group=buzzci-runner
+UMask=0077
+ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v1.json
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/buzzci/runner-v1.json /run/buzzci
+ReadWritePaths=/var/lib/buzzci/runner
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+Restart=no
