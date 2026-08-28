@@ -474,9 +474,7 @@ impl ControllerLeaseIdentity {
         identity: &HandoffIdentity,
         now: u64,
     ) -> Result<(), ()> {
-        if self != &Self::from_lease(lease)
-            || self.validate_identity(identity, now).is_err()
-        {
+        if self != &Self::from_lease(lease) || self.validate_identity(identity, now).is_err() {
             return Err(());
         }
         Ok(())

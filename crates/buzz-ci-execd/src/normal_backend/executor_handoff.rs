@@ -498,9 +498,7 @@ fn serve_request(
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            let mut child = command
-                .spawn()
-                .map_err(|_| ServiceRequestError::Rejected)?;
+            let mut child = command.spawn().map_err(|_| ServiceRequestError::Rejected)?;
             supervise_launched_child(
                 stream,
                 &request.descriptor,
@@ -577,9 +575,8 @@ fn supervise_launched_child<C: ManagedChild, G: ProcessGroupControl>(
     lease_deadline: Instant,
     cleanup_policy: CleanupPolicy,
 ) -> Result<(), ServiceRequestError> {
-    let started = ExecutorResponse::started(descriptor).map_err(|_| {
-        cleanup_after_failure(child, process_group, cleanup_policy)
-    })?;
+    let started = ExecutorResponse::started(descriptor)
+        .map_err(|_| cleanup_after_failure(child, process_group, cleanup_policy))?;
     if write_frame(stream, EXECUTOR_RESPONSE_KIND, &started).is_err() {
         return Err(cleanup_after_failure(child, process_group, cleanup_policy));
     }
@@ -590,13 +587,8 @@ fn supervise_launched_child<C: ManagedChild, G: ProcessGroupControl>(
     let status = loop {
         match child.try_wait_managed() {
             Ok(Some(status)) => {
-                break cleanup_process_group(
-                    child,
-                    process_group,
-                    Some(status),
-                    cleanup_policy,
-                )
-                .map_err(|_| ServiceRequestError::CleanupUnproven)?;
+                break cleanup_process_group(child, process_group, Some(status), cleanup_policy)
+                    .map_err(|_| ServiceRequestError::CleanupUnproven)?;
             }
             Ok(None) => {}
             Err(_) => {
@@ -609,12 +601,9 @@ fn supervise_launched_child<C: ManagedChild, G: ProcessGroupControl>(
         }
         match cancel_reader.try_read(stream) {
             Ok(Some(cancel)) => {
-                let valid = descriptor
-                    .identity_digest()
-                    .is_ok_and(|digest| {
-                        cancel.request_id == descriptor.request_id
-                            && cancel.identity_digest == digest
-                    });
+                let valid = descriptor.identity_digest().is_ok_and(|digest| {
+                    cancel.request_id == descriptor.request_id && cancel.identity_digest == digest
+                });
                 if !valid {
                     return Err(cleanup_after_failure(child, process_group, cleanup_policy));
                 }
@@ -631,10 +620,9 @@ fn supervise_launched_child<C: ManagedChild, G: ProcessGroupControl>(
     if stream.set_nonblocking(false).is_err() {
         return Err(ServiceRequestError::Rejected);
     }
-    let exited = ExecutorResponse::exited(descriptor, status)
-        .map_err(|_| ServiceRequestError::Rejected)?;
-    write_frame(stream, EXECUTOR_RESPONSE_KIND, &exited)
-        .map_err(|_| ServiceRequestError::Rejected)
+    let exited =
+        ExecutorResponse::exited(descriptor, status).map_err(|_| ServiceRequestError::Rejected)?;
+    write_frame(stream, EXECUTOR_RESPONSE_KIND, &exited).map_err(|_| ServiceRequestError::Rejected)
 }
 
 fn cleanup_after_failure<C: ManagedChild, G: ProcessGroupControl>(
@@ -659,8 +647,7 @@ fn cleanup_process_group<C: ManagedChild, G: ProcessGroupControl>(
         return Err(());
     }
     let process_group_id = Pid::from_raw(raw_pid);
-    if let Ok(Some(status)) =
-        observe_cleanup(child, process_group, process_group_id, &mut terminal)
+    if let Ok(Some(status)) = observe_cleanup(child, process_group, process_group_id, &mut terminal)
     {
         return Ok(status);
     }
@@ -866,7 +853,9 @@ mod tests {
         }
     }
 
-    fn fake_process(fail_signals: bool) -> (FakeChild, FakeProcessGroup, Arc<Mutex<FakeProcessState>>) {
+    fn fake_process(
+        fail_signals: bool,
+    ) -> (FakeChild, FakeProcessGroup, Arc<Mutex<FakeProcessState>>) {
         let state = Arc::new(Mutex::new(FakeProcessState {
             group_alive: true,
             fail_signals,
@@ -948,8 +937,9 @@ mod tests {
         fixture: &crate::normal_engine::tests::OrdinaryFixture,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> HandoffDescriptor {
-        let identity = HandoffIdentity::from_validated(&fixture.plan.act, binding, &contract(binding))
-            .unwrap();
+        let identity =
+            HandoffIdentity::from_validated(&fixture.plan.act, binding, &contract(binding))
+                .unwrap();
         HandoffDescriptor::issue(
             identity,
             HandoffRole::Executor,

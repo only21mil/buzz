@@ -302,15 +302,7 @@ pub fn run_runtime_descriptor_service<O: RuntimeDescriptorOpener>(
         if peer.uid() != ROOT_BROKER_UID {
             continue;
         }
-        if serve_request(
-            &mut stream,
-            socket_path,
-            effective_uid,
-            &mut replay,
-            opener,
-        )
-        .is_err()
-        {
+        if serve_request(&mut stream, socket_path, effective_uid, &mut replay, opener).is_err() {
             continue;
         }
     }
