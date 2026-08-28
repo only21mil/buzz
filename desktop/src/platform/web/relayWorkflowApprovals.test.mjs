@@ -14,12 +14,13 @@ const RUN_ID = "123e4567-e89b-42d3-a456-426614174001";
 const APPROVAL_ID = "123e4567-e89b-42d3-a456-426614174002";
 const COMMUNITY_ID = "123e4567-e89b-42d3-a456-426614174003";
 const CHANNEL_ID = "123e4567-e89b-42d3-a456-426614174004";
+const SECOND_APPROVAL_ID = "123e4567-e89b-42d3-a456-426614174005";
 const REQUEST_SECRET = Uint8Array.from(
   { length: 32 },
   (_, index) => index + 65,
 );
 
-function requestEvent(overrides = {}) {
+function requestEvent(overrides = {}, contentOverrides = {}) {
   const tags = [
     ["h", CHANNEL_ID],
     ["p", PUBKEY],
@@ -45,6 +46,7 @@ function requestEvent(overrides = {}) {
           action_summary: "Promote the reviewed candidate",
           expires_at: "2026-08-28T00:00:00Z",
           tags,
+          ...contentOverrides,
         }),
       },
       REQUEST_SECRET,
@@ -66,6 +68,7 @@ test("approval requests map to the existing native client wire schema", () => {
         step_id: "release",
         step_index: 2,
         approver_spec: "Current channel approval policy",
+        action_summary: "Promote the reviewed candidate",
         status: "pending",
         approver_pubkey: null,
         note: null,
@@ -96,6 +99,60 @@ test("approval parsing isolates schema drift and wrong recipients", () => {
       RUN_ID,
     ).map((approval) => approval.token),
     [APPROVAL_ID],
+  );
+});
+
+test("a slower fetch cannot replace the latest active approval scope", async () => {
+  const pendingFetches = [];
+  const identity = {
+    pubkey: () => PUBKEY,
+    sign: (request) =>
+      JSON.stringify({
+        ...request,
+        id: "1".repeat(64),
+        pubkey: PUBKEY,
+        created_at: 1_700_000_100,
+        sig: "2".repeat(128),
+      }),
+  };
+  const client = {
+    fetchEvents: () =>
+      new Promise((resolve) => {
+        pendingFetches.push(resolve);
+      }),
+    publishEvent: async (event) => event,
+  };
+  registerWorkflowApprovalCommands(identity, client);
+
+  const older = dispatch("get_run_approvals", {
+    workflowId: WORKFLOW_ID,
+    runId: RUN_ID,
+  });
+  const latest = dispatch("get_run_approvals", {
+    workflowId: WORKFLOW_ID,
+    runId: RUN_ID,
+  });
+  assert.equal(pendingFetches.length, 2);
+
+  pendingFetches[1]([requestEvent({}, { approval_id: SECOND_APPROVAL_ID })]);
+  assert.deepEqual(
+    (await latest).map((approval) => approval.token),
+    [SECOND_APPROVAL_ID],
+  );
+
+  pendingFetches[0]([requestEvent()]);
+  assert.deepEqual(await older, []);
+  assert.deepEqual(
+    await dispatch("grant_approval", {
+      token: SECOND_APPROVAL_ID,
+      note: null,
+    }),
+    {
+      token: SECOND_APPROVAL_ID,
+      status: "granted",
+      run_id: RUN_ID,
+      workflow_id: WORKFLOW_ID,
+    },
   );
 });
 

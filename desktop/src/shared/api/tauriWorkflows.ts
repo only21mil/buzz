@@ -54,6 +54,7 @@ type RawWorkflowApproval = {
   step_id: string;
   step_index: number;
   approver_spec: string;
+  action_summary?: string | null;
   status: WorkflowApproval["status"];
   approver_pubkey: string | null;
   note: string | null;
@@ -179,6 +180,7 @@ export function fromRawApproval(raw: RawWorkflowApproval): WorkflowApproval {
     stepId: raw.step_id,
     stepIndex: raw.step_index,
     approverSpec: raw.approver_spec,
+    actionSummary: raw.action_summary ?? null,
     status: raw.status,
     approverPubkey: raw.approver_pubkey,
     note: raw.note,

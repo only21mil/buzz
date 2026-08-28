@@ -29,6 +29,14 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
       <p className="mb-2 text-xs text-muted-foreground">
         Approver: {approval.approverSpec}
       </p>
+      {approval.actionSummary ? (
+        <p
+          className="mb-2 text-sm"
+          data-testid="workflow-approval-action-summary"
+        >
+          Action: {approval.actionSummary}
+        </p>
+      ) : null}
       <p className="mb-2 text-xs text-muted-foreground">
         Expires: {new Date(approval.expiresAt).toLocaleString()}
       </p>

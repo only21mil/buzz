@@ -40,6 +40,7 @@ type ApprovalWire = {
   step_id: string;
   step_index: number;
   approver_spec: string;
+  action_summary: string;
   status: "pending";
   approver_pubkey: null;
   note: null;
@@ -153,6 +154,7 @@ function parseRequestContent(
     step_id: stepId,
     step_index: Number(stepIndex),
     approver_spec: "Current channel approval policy",
+    action_summary: value.action_summary,
     status: "pending",
     approver_pubkey: null,
     note: null,
@@ -203,6 +205,7 @@ export function registerWorkflowApprovalCommands(
 ): void {
   const active = new Map<string, ApprovalWire>();
   const decided = new Set<string>();
+  let fetchGeneration = 0;
 
   register("get_run_approvals", async (body) => {
     const input = objectBody(body, "get_run_approvals");
@@ -211,6 +214,7 @@ export function registerWorkflowApprovalCommands(
     if (!UUID.test(workflowId) || !UUID.test(runId)) {
       throw new TypeError("workflowId and runId must be canonical UUIDs");
     }
+    const generation = ++fetchGeneration;
     const pubkey = identity.pubkey();
     const approvals = parseApprovalRequests(
       await client.fetchEvents({
@@ -222,6 +226,7 @@ export function registerWorkflowApprovalCommands(
       workflowId,
       runId,
     ).filter((approval) => !decided.has(approval.token));
+    if (generation !== fetchGeneration) return [];
     active.clear();
     for (const approval of approvals) active.set(approval.token, approval);
     return approvals;

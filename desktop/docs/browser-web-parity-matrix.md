@@ -1,8 +1,10 @@
 # Browser client parity matrix
 
-Base audited: `d7677e177b9e3732bf92962e00b5d7ba161ce03c`; this
-successor continues from browser-parity commit
-`e627ff05edc57990982687669e3e47326857d1ab` on 2026-08-27.
+Build-ahead base audited: `02d443fa8450393520f2e9cdd581d6f269ae3830`.
+This replay preserves the reviewed browser series through
+`f43f8af216ce7b9670f68681e932fc3cd0d2970e` plus smoke correction
+`a36cd7d602449c1062ec83ad49535425c0950c19` on 2026-08-28. Final promotion
+still requires replay onto the post-PR109/MGACT main lineage.
 
 This matrix covers the hosted build of the full React client, produced by
 `pnpm -C desktop build:web`. It also records the other browser bundles so the
