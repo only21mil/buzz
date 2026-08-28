@@ -132,6 +132,175 @@ class PromotionReadinessTest(unittest.TestCase):
             record["run"] = run
         return record
 
+    def signed_event_evidence(self, run_id: str) -> dict:
+        def fixed_id(label: str) -> str:
+            return hashlib.sha256(f"{run_id}:{label}".encode()).hexdigest()
+
+        actor = DIGEST_A
+        signer = DIGEST_B
+        request_event_id = fixed_id("request")
+        job_id = "build"
+        target_repo_a = f"30617:{DIGEST_A}:buzz"
+        workflow_id = "ci"
+        workflow_digest = DIGEST_C
+        base_content = {
+            "schema_version": 1,
+            "request_event_id": request_event_id,
+            "run_id": run_id,
+            "workflow_id": workflow_id,
+            "target_repo_a": target_repo_a,
+            "tip_oid": self.candidate,
+        }
+
+        def signed_event(kind: int, cursor: int, content: dict) -> dict:
+            return {
+                "kind": kind,
+                "event_id": fixed_id(f"event-{cursor}"),
+                "pubkey": signer,
+                "signature": "d" * 128,
+                "signature_verified": True,
+                "stored": True,
+                "watch_cursor": cursor,
+                "content": content,
+            }
+
+        def run_status(cursor: int, sequence: int, state: str) -> dict:
+            content = {
+                **base_content,
+                "base_oid": self.base,
+                "attempt": 1,
+                "sequence": sequence,
+                "state": state,
+                "job_ids": [job_id],
+                "relay_signer": signer,
+            }
+            if state != "queued":
+                content["started_at"] = NOW - 30
+            if state == "success":
+                content["conclusion"] = "success"
+                content["finished_at"] = NOW - 1
+            return signed_event(46101, cursor, content)
+
+        log_event_id = fixed_id("event-5")
+        artifact_event_id = fixed_id("event-6")
+
+        def job_status(cursor: int, sequence: int, state: str) -> dict:
+            content = {
+                **base_content,
+                "base_oid": self.base,
+                "job_id": job_id,
+                "name": "Build",
+                "attempt": 1,
+                "sequence": sequence,
+                "state": state,
+                "required": True,
+                "skip_policy": "forbid",
+                "selected_job_instance": job_id,
+                "also_reruns": [],
+                "artifact_refs": [],
+                "relay_signer": signer,
+            }
+            if state != "queued":
+                content["started_at"] = NOW - 25
+            if state == "success":
+                content["conclusion"] = "success"
+                content["finished_at"] = NOW - 10
+                content["log_ref"] = log_event_id
+                content["artifact_refs"] = [artifact_event_id]
+            return signed_event(46102, cursor, content)
+
+        events = [
+            run_status(1, 1, "queued"),
+            run_status(2, 2, "running"),
+            job_status(3, 1, "queued"),
+            job_status(4, 2, "running"),
+            signed_event(46103, 5, {
+                **base_content,
+                "job_id": job_id,
+                "attempt": 1,
+                "log_sha256": DIGEST_A,
+                "byte_length": 128,
+                "cap_bytes": 1024,
+                "truncated": False,
+                "url": f"https://relay.example.invalid/ci/logs/{request_event_id}/{run_id}/{job_id}/1/{DIGEST_A}",
+                "created_at": NOW - 15,
+                "relay_signer": signer,
+            }),
+            signed_event(46104, 6, {
+                **base_content,
+                "job_id": job_id,
+                "attempt": 1,
+                "artifact_id": "artifact-1",
+                "name": "result.json",
+                "media_type": "application/json",
+                "sha256": DIGEST_B,
+                "byte_length": 64,
+                "url": "https://relay.example.invalid/ci/artifacts/artifact-1",
+                "created_at": NOW - 14,
+                "relay_signer": signer,
+            }),
+            job_status(7, 3, "success"),
+            signed_event(46105, 8, {
+                **base_content,
+                "attempt": 1,
+                "finalized_job_attempts": [{
+                    "job_id": job_id,
+                    "attempt": 1,
+                    "log_ref": log_event_id,
+                    "artifact_refs": [artifact_event_id],
+                }],
+                "finalized_at": NOW - 8,
+                "relay_signer": signer,
+            }),
+            signed_event(46106, 9, {
+                **base_content,
+                "base_oid": self.base,
+                "workflow_digest": workflow_digest,
+                "attempt": 1,
+                "leases": [{"job_id": job_id, "attempt": 1, "lease_id": "lease-1"}],
+                "lease_empty": True,
+                "teardown_at": NOW - 5,
+                "relay_signer": signer,
+            }),
+            run_status(10, 3, "success"),
+        ]
+        return {
+            "authorized_relay_signers": [signer],
+            "request": {
+                "kind": 46100,
+                "event_id": request_event_id,
+                "pubkey": actor,
+                "signature": "c" * 128,
+                "signature_verified": True,
+                "stored": True,
+                "content": {
+                    "schema_version": 1,
+                    "request_type": "run",
+                    "target_repo_a": target_repo_a,
+                    "pr_root_event_id": fixed_id("pr-root"),
+                    "pr_update_event_id": fixed_id("pr-update"),
+                    "source_clone_url": "https://example.invalid/only21mil/buzz.git",
+                    "immutable_source_ref": f"refs/buzz/{self.candidate}",
+                    "tip_oid": self.candidate,
+                    "source_branch": "sats/test",
+                    "base_ref": "refs/heads/main",
+                    "base_oid": self.base,
+                    "workflow_id": workflow_id,
+                    "workflow_digest": workflow_digest,
+                    "job_ids": [job_id],
+                    "run_id": run_id,
+                    "attempt": 1,
+                    "trigger_event_id": fixed_id("pr-update"),
+                    "actor": actor,
+                    "timeout_seconds": 600,
+                    "idempotency_key": f"idempotency-{run_id}",
+                    "issued_at": NOW - 120,
+                    "expires_at": NOW + 480,
+                },
+            },
+            "events": events,
+        }
+
     def valid_bundle(self) -> dict:
         log = {
             "authorized_status": 200,
@@ -161,6 +330,8 @@ class PromotionReadinessTest(unittest.TestCase):
                 "protected": True,
                 "conclusion": "success",
                 "contexts": [
+                    {"name": "buzz-native-ci", "head_sha": self.candidate, "conclusion": "success",
+                     "run_url": "https://ci.example.invalid/run/0"},
                     {"name": "build", "head_sha": self.candidate, "conclusion": "success",
                      "run_url": "https://ci.example.invalid/run/1"},
                     {"name": "test", "head_sha": self.candidate, "conclusion": "success",
@@ -205,30 +376,14 @@ class PromotionReadinessTest(unittest.TestCase):
                     "restart_recovery": "PASS",
                     "unaccepted_refusal": "PASS",
                 },
-                "immutable_request_sha": self.candidate,
-                "records": [46101, 46102, 46103, 46104, 46105, 46106],
-                "signer": DIGEST_B,
-                "job_set_sha256": DIGEST_A,
-                "evidence_sha256": DIGEST_B,
-                "teardown_sha256": DIGEST_C,
-                "conclusion": "success",
+                "event_evidence": self.signed_event_evidence("run-1"),
                 "log": copy.deepcopy(log),
             },
             "production_canary": {
                 "candidate_sha": self.candidate,
-                "initial_concurrency": 0,
-                "enabled_concurrency": 1,
                 "accepted_executed": True,
                 "unaccepted_refused": True,
-                "signed": True,
-                "allowed_kinds_only": True,
-                "records": [46101, 46102, 46103, 46104, 46105, 46106],
-                "run_id": "run-1",
-                "signer": DIGEST_B,
-                "conclusion": "success",
-                "log_sha256": DIGEST_A,
-                "evidence_sha256": DIGEST_B,
-                "teardown_sha256": DIGEST_C,
+                "event_evidence": self.signed_event_evidence("run-1"),
                 "retry": {
                     "request_id": "request-1",
                     "first_run_id": "run-1",
@@ -249,6 +404,13 @@ class PromotionReadinessTest(unittest.TestCase):
                 "terminal_events": 1,
                 "first_run_id": "red-run-1",
                 "duplicate_run_id": "red-run-1",
+                "parity": {
+                    "target_repo_a": f"30617:{DIGEST_A}:buzz",
+                    "workflow_id": "ci",
+                    "workflow_digest": DIGEST_C,
+                    "job_ids": ["build"],
+                    "relay_signer": DIGEST_B,
+                },
             },
             "deployment": {
                 "commit_sha": self.candidate,
@@ -327,13 +489,30 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assertEqual(receipt["overall"], "PASS")
         self.assertEqual(receipt["gates"]["threat_model"], {"passed": 17, "total": 17})
         self.assertEqual(receipt["gates"]["probes"], {"passed_runs": 12, "total_runs": 12})
+        self.assertEqual(receipt["gates"]["staging_canary_parity"], "PASS")
         self.assertEqual(receipt["identities"]["relay_sha"], self.candidate)
         self.assertEqual(receipt["identities"]["mirror_sha"], self.candidate)
+        kinds = [event["kind"] for event in self.bundle["staging"]["event_evidence"]["events"]]
+        self.assertEqual(kinds.count(46101), 3)
+        self.assertEqual(kinds.count(46102), 3)
+        self.assertEqual(set(kinds), {46101, 46102, 46103, 46104, 46105, 46106})
 
     def test_json_schemas_are_parseable(self) -> None:
         for name in ("promotion-evidence.schema.json", "promotion-readiness-receipt.schema.json"):
             schema = json.loads((REPO_ROOT / "docs" / "ci" / name).read_text(encoding="utf-8"))
             self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        evidence_schema = json.loads(
+            (REPO_ROOT / "docs" / "ci" / "promotion-evidence.schema.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("signed_ci_event_evidence", evidence_schema["$defs"])
+        self.assertEqual(
+            evidence_schema["$defs"]["signed_ci_event"]["properties"]["kind"]["enum"],
+            [46101, 46102, 46103, 46104, 46105, 46106],
+        )
+        self.assertNotIn("record_kinds", evidence_schema["$defs"])
+        canary_properties = evidence_schema["properties"]["production_canary"]["properties"]
+        self.assertNotIn("initial_concurrency", canary_properties)
+        self.assertNotIn("enabled_concurrency", canary_properties)
 
     def test_wrong_sha_is_refused(self) -> None:
         bundle = copy.deepcopy(self.bundle)
@@ -359,6 +538,82 @@ class PromotionReadinessTest(unittest.TestCase):
         bundle = copy.deepcopy(self.bundle)
         bundle["deliberate_red"]["merge_allowed"] = True
         self.assert_refused(bundle, "did not block merge")
+
+    def test_deliberate_red_must_match_canary_parity(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["deliberate_red"]["parity"]["workflow_digest"] = DIGEST_A
+        self.assert_refused(bundle, "deliberate-red parity")
+
+    def test_signed_event_signer_binding_is_required(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = bundle["staging"]["event_evidence"]["events"][0]
+        event["pubkey"] = DIGEST_C
+        self.assert_refused(bundle, "signer is not authorized")
+
+    def test_status_sequence_must_be_gap_free(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = bundle["staging"]["event_evidence"]["events"][1]
+        event["content"]["sequence"] = 3
+        self.assert_refused(bundle, "sequence is not gap-free")
+
+    def test_attempt_binding_is_required(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46103)
+        event["content"]["attempt"] = 2
+        self.assert_refused(bundle, "log_ref is not bound to the selected job attempt")
+
+    def test_immutable_coordinate_binding_is_required(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46106)
+        event["content"]["tip_oid"] = self.red_sha
+        self.assert_refused(bundle, "tip_oid mismatch")
+
+    def test_evidence_finalization_must_bind_durable_refs(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46105)
+        event["content"]["finalized_job_attempts"][0]["log_ref"] = DIGEST_C
+        self.assert_refused(bundle, "log_ref is not bound")
+
+    def test_teardown_must_bind_exact_selected_graph(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46106)
+        event["content"]["leases"][0]["attempt"] = 2
+        self.assert_refused(bundle, "lease graph does not match")
+
+    def test_terminal_success_must_follow_evidence_and_teardown(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        events = bundle["staging"]["event_evidence"]["events"]
+        terminal = next(item for item in events
+                        if item["kind"] == 46101 and item["content"]["state"] == "success")
+        finalized = next(item for item in events if item["kind"] == 46105)
+        teardown = next(item for item in events if item["kind"] == 46106)
+        terminal["watch_cursor"], finalized["watch_cursor"], teardown["watch_cursor"] = 8, 9, 10
+        events.sort(key=lambda item: item["watch_cursor"])
+        self.assert_refused(bundle, "terminal success was stored before")
+
+    def test_unknown_event_kind_fails_closed(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46104)
+        event["kind"] = 46107
+        self.assert_refused(bundle, "kind is unknown")
+
+    def test_unknown_signed_field_fails_closed(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = next(item for item in bundle["staging"]["event_evidence"]["events"]
+                     if item["kind"] == 46105)
+        event["content"]["tombstone"] = True
+        self.assert_refused(bundle, "unknown fields")
+
+    def test_unknown_status_state_fails_closed(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        event = bundle["staging"]["event_evidence"]["events"][0]
+        event["content"]["state"] = "activated"
+        self.assert_refused(bundle, "state is unknown")
 
     def test_log_authentication_is_required(self) -> None:
         bundle = copy.deepcopy(self.bundle)

@@ -25,6 +25,28 @@ The bundle must bind all of these identities exactly:
 - staging signer, production canary run, relay landing, authoritative mirror,
   merge commit and deliberate-red commit.
 
+Staging and canary evidence retain the signed kind-46100 request plus the
+ordered stored kind-46101 through kind-46106 facts. Each retained event names
+its event ID, pubkey, verified signature result, storage result and watch
+cursor. The verifier binds every event to the request event, run, repository,
+workflow, tip, base where present, attempt and authorized relay signer.
+
+Kind coverage is deduplicated. It must equal 46101 through 46106, but the
+event list must contain every transition. A successful initial run therefore
+has ordered `queued`, `running` and terminal `success` kind-46101 facts and the
+same ordered kind-46102 history for every selected job. Sequences begin at one
+and have no gaps per run-attempt or job-attempt stream. Unknown kinds, states,
+fields, illegal transitions, cursor gaps and equivocation fail closed.
+
+Kind 46105 must name every selected job attempt exactly once and bind each log
+and artifact event ID to the same job and attempt. Kind 46106 must carry
+`lease_empty=true` and a strictly ordered lease set that exactly equals the
+selected job-attempt graph. The verifier accepts terminal run success only
+when both facts were stored first. Staging, canary and deliberate-red evidence
+must use the same repository coordinate, workflow ID and digest, selected job
+set and relay signer. These event contracts have no activation or tombstone
+fact, so this runbook makes no claim about either one.
+
 Missing evidence, a short or wrong SHA, a mismatched image or binary, a stale
 review, a dirty checkout, or an unapproved rollback fails closed before the
 receipt is written.
@@ -38,19 +60,20 @@ receipt is written.
    may not exceed 5,400 seconds or be expired at verification time.
 3. On approved staging infrastructure, capture the absent-policy 503 and
    configured-policy 200 paths; success, refusal, teardown, restart and
-   unaccepted paths; immutable request; root-executor handoff; records
-   46101–46106; signer; job set and conclusions; authenticated log denial;
-   bounded log response; and log digest.
+   unaccepted paths; the signed kind-46100 request; every ordered 46101 and
+   46102 transition; durable 46103 and 46104 references; exact 46105 evidence
+   finalization; exact 46106 lease-empty teardown; root-executor handoff;
+   authenticated log denial; bounded log response; and log digest.
 4. Run the 17 threat-model checks and all six named probes twice at the same
    full SHA. Retain both the canonical JSONL records and aggregate suite
    verdict. The six probes are trigger,
    assignment monitor, headless logs, bounded rerun, dropped run and bounded
    retries. Mock-suite evidence proves the harness only; live staging evidence
    remains mandatory.
-5. With explicit activation approval, prove production starts at concurrency
-   zero, transitions to one accepted signed job, refuses an unaccepted job,
-   accepts only signed allowed kinds, and gives idempotent retry results with a
-   fresh workspace per attempt.
+5. With production-canary approval, run one accepted signed job, refuse an
+   unaccepted job, retain the complete signed event history, and prove
+   idempotent retry results with a fresh workspace per attempt. The verifier
+   checks staging/canary contract parity from the retained event facts.
 6. Run the deliberate-red candidate. The protected check must conclude
    failure, the merge must remain blocked, and a duplicate request must return
    the same single terminal run.
@@ -92,7 +115,7 @@ deploy, migrate, use sudo, start services, or invoke Docker.
 
 ## Live work still requiring approval
 
-The source harness cannot perform or authorize activation, GitHub settings or
+The source harness cannot perform or authorize GitHub settings or
 merges, production canary traffic, live log collection, database dump or
 migration, deployment, rollback, relay checkout changes, or authoritative
 mirror updates. Those steps stay blocked until their named operator approvals
