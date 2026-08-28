@@ -22,6 +22,8 @@
     "test:e2e": "pnpm build:e2e && playwright test",
     "test:e2e:smoke": "pnpm build:e2e && playwright test --project=smoke",
     "test:e2e:integration": "pnpm build:e2e && playwright test --project=integration",
+    "test:web:e2e": "pnpm build:web && playwright test --config playwright.web.config.ts",
+    "test:web:e2e:chromium": "pnpm build:web && playwright test --config playwright.web.config.ts --project=chromium",
     "test:e2e:report": "playwright show-report",
     "tauri:build": "tauri build"
   },
@@ -89,6 +91,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
     "@noble/hashes": "^2.0.1",
     "@playwright/test": "^1.58.2",
     "@tailwindcss/postcss": "^4.3.0",

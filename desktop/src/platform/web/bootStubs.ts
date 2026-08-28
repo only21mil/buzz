@@ -1,4 +1,5 @@
 import { relayClient } from "@/shared/api/relayClient";
+import { toast } from "sonner";
 import { registerNoopCommands } from "./noops";
 import { registerAgentsRuntimeBuilderlabCommands } from "./desktopOnly/agentsRuntimeBuilderlab";
 import { registerHuddleVoiceTtsCommands } from "./desktopOnly/huddleVoiceTts";
@@ -15,8 +16,16 @@ import { registerRelayMembershipCommands } from "./relayMembership";
 import { registerRelayMembershipStatusCommands } from "./relayMembershipStatus";
 import { registerRelayMessageReadCommands } from "./relayMessageReads";
 import { registerRelayQueryCommands } from "./relayQueries";
+import { registerWorkflowRunCommands } from "./relayWorkflowRuns";
+import { registerWorkflowApprovalCommands } from "./relayWorkflowApprovals";
 import { installMediaAuthServiceWorker } from "./mediaAuth";
 import { registerMediaCommands } from "./mediaUpload";
+import {
+  createOfflineMessagePublisher,
+  OFFLINE_MESSAGE_STATUS_EVENT,
+  type OfflineMessageDeliveryStatus,
+  OfflineMessageRetryDriver,
+} from "./offlineMessageOutbox";
 import { registerOnboardingCommands } from "./onboarding";
 import { registerRelayCanvasCommands } from "./relayCanvas";
 import { registerRelayDmCommands } from "./relayDms";
@@ -74,7 +83,53 @@ export async function installBrowserPal(): Promise<void> {
   registerIdentityCommands(identity);
   const workspace = new BrowserWorkspace();
   registerWorkspaceCommands(workspace, identity);
-  registerRelayQueryCommands(identity);
+  let wakeMessageOutbox = () => {};
+  const messagePublisher = createOfflineMessagePublisher(
+    () => ({ relayUrl: workspace.wsUrl(), pubkey: identity.pubkey() }),
+    relayClient,
+    undefined,
+    () => wakeMessageOutbox(),
+  );
+  window.addEventListener(OFFLINE_MESSAGE_STATUS_EVENT, (rawEvent) => {
+    const status = (rawEvent as CustomEvent<OfflineMessageDeliveryStatus>)
+      .detail;
+    if (
+      !status ||
+      status.pubkey !== identity.pubkey() ||
+      status.relayUrl !== workspace.wsUrl()
+    ) {
+      return;
+    }
+    const id = `offline-message:${status.eventId}`;
+    if (status.state === "queued") {
+      toast.info("Message queued for delivery", { id });
+    } else if (status.state === "delivered") {
+      toast.success("Queued message delivered", { id });
+    } else if (status.state === "expired") {
+      toast.error("Queued message expired before delivery", { id });
+    } else {
+      toast.error("Queued message could not be delivered", { id });
+    }
+  });
+  registerRelayQueryCommands(identity, relayClient, messagePublisher);
+  const messageOutboxRetryDriver = new OfflineMessageRetryDriver(
+    () => messagePublisher.flush(),
+    {
+      onError: (error) => {
+        console.warn("Unable to flush the offline message outbox", error);
+      },
+    },
+  );
+  wakeMessageOutbox = () => messageOutboxRetryDriver.wake();
+  const flushMessageOutbox = () => messageOutboxRetryDriver.wake();
+  const flushVisibleMessageOutbox = () => {
+    if (document.visibilityState === "visible") flushMessageOutbox();
+  };
+  window.addEventListener("online", flushMessageOutbox);
+  window.addEventListener("focus", flushMessageOutbox);
+  document.addEventListener("visibilitychange", flushVisibleMessageOutbox);
+  relayClient.subscribeToReconnects(flushMessageOutbox);
+  flushMessageOutbox();
   registerMessageMutationCommands(identity);
   registerRelayChannelAdminCommands(identity);
   registerRelayDiscoveryCommands();
@@ -90,8 +145,10 @@ export async function installBrowserPal(): Promise<void> {
   registerRepoSnapshotCommands(identity);
   registerHuddleVoiceTtsCommands();
   registerAgentsRuntimeBuilderlabCommands();
+  registerWorkflowApprovalCommands(identity, relayClient);
   registerRelaySocialConfigCommands(identity);
   registerRelayWorkflowsMembersCommands(identity);
+  registerWorkflowRunCommands();
   registerRelayCryptoSocialCommands(identity);
   registerWebMediaTransferCommands(workspace);
   registerLinkPreviewCommands();

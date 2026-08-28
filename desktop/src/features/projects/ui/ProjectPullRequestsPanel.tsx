@@ -52,6 +52,7 @@ import {
 import { ProjectRichContent } from "./ProjectRichContent";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 import { PullRequestReviewCard } from "./PullRequestReviewCard";
+import { PullRequestCiChecks } from "./PullRequestCiChecks";
 
 function profileForPubkey(pubkey: string, profiles?: UserProfileLookup) {
   return profiles?.[normalizePubkey(pubkey)] ?? null;
@@ -588,11 +589,7 @@ export function ProjectPullRequestDetail({
   }
 
   if (mode === "checks") {
-    return (
-      <p className="p-4 text-sm text-muted-foreground">
-        No checks have been reported for this pull request yet.
-      </p>
-    );
+    return <PullRequestCiChecks project={project} pullRequest={pullRequest} />;
   }
 
   const reviewHistory = pullRequest.comments

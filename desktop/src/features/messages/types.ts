@@ -44,6 +44,7 @@ export type TimelineMessage = {
   depth: number;
   accent?: boolean;
   pending?: boolean;
+  deliveryStatus?: "queued" | "failed" | "expired";
   edited?: boolean;
   highlighted?: boolean;
   kind?: number;

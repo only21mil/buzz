@@ -1,4 +1,5 @@
 import type * as React from "react";
+import { AppRouteAccessibility } from "@/app/AppRouteAccessibility";
 import * as BuzzTheme from "@/app/BuzzThemeSurfaces";
 import { HuddleRoomHeader, HuddleStartingView } from "@/features/huddle";
 import { MainInsetProvider } from "@/shared/layout/MainInsetContext";
@@ -23,8 +24,10 @@ export function AppShellChannelSurface({
 }: AppShellChannelSurfaceProps) {
   return (
     <MainInsetProvider mainInsetRef={mainInsetRef}>
+      <AppRouteAccessibility />
       <SidebarInset
         ref={mainInsetRef}
+        aria-label="Main content"
         className={cn(
           "isolate z-0 min-h-0 min-w-0 overflow-hidden",
           isHuddleRoom ? "bg-background" : "bg-sidebar",
@@ -33,7 +36,9 @@ export function AppShellChannelSurface({
         data-buzz-content-unframed={isHuddleRoom ? true : undefined}
         data-buzz-glass-inset
         data-buzz-shadow-viewport
+        id="main-content"
         style={chromeCssVarDefaults as React.CSSProperties}
+        tabIndex={-1}
       >
         {isHuddleRoom && !isHuddleRoomStarting ? <HuddleRoomHeader /> : null}
         <BuzzTheme.ContentSurface terminal={terminal} unframed={isHuddleRoom}>

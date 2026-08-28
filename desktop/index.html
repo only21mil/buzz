@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/buzz.svg?v=20260610" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title></title>
+    <title>Buzz</title>
     <!--
       Boot background: the document must be painted before the app bundle (and
       its stylesheets) load so cold boot never flashes ahead of the loading
@@ -16,7 +16,7 @@
       Kept as a <link> rather than an inline <style> to avoid Tauri's nonce
       injection for style-src (see boot.css for the full rationale).
 
-      The inline script below reads the cached theme background (same
+      The linked boot script below reads the cached theme background (same
       `buzz-theme-cache` entry ThemeProvider writes) and applies it synchronously
       so the boot color matches the themed loading gate — no black flash on light
       themes. On the first-ever launch (no cache yet) it seeds the light/dark
@@ -25,35 +25,7 @@
       it loads.
     -->
     <link rel="stylesheet" href="/boot.css" />
-    <script>
-      (() => {
-        var cached, bg, parsed;
-        try {
-          cached = window.localStorage.getItem("buzz-theme-cache");
-          if (!cached) {
-            // No stored theme: the default is Buzz following the OS scheme,
-            // so seed the matching class (and backdrop) now. Otherwise the
-            // setup gate would paint the wrong scheme until ThemeProvider
-            // loads asynchronously.
-            if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
-              document.documentElement.classList.add("dark");
-            } else {
-              document.documentElement.classList.add("light");
-              document.documentElement.style.backgroundColor = "#fff";
-            }
-            return;
-          }
-          parsed = JSON.parse(cached);
-          bg = parsed.vars["--background"];
-          if (bg) document.documentElement.style.backgroundColor = `hsl(${bg})`;
-          // Match the cached light/dark class so themed vars resolve correctly
-          // before ThemeProvider mounts.
-          document.documentElement.classList.add(parsed.isDark ? "dark" : "light");
-        } catch {
-          /* fall back to the black default above */
-        }
-      })();
-    </script>
+    <script src="/boot.js"></script>
   </head>
 
   <body>

@@ -7,6 +7,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { isTauri } from "@tauri-apps/api/core";
 
 import {
   channelMessagesKey,
@@ -80,6 +81,7 @@ import {
 } from "@/features/messages/lib/messageSnapshot";
 import { parseChannelWindowResponse } from "@/features/messages/lib/channelWindowResponse";
 import { KIND_STREAM_MESSAGE } from "@/shared/constants/kinds";
+import { subscribeOfflineMessageDeliveryStatuses } from "@/features/messages/lib/offlineMessageDelivery";
 
 type MessageQueryContext = {
   optimisticId: string;
@@ -606,6 +608,14 @@ export function useSendMessageMutation(
 ) {
   const queryClient = useQueryClient();
 
+  useEffect(() => {
+    if (isTauri() || !identity) return;
+    return subscribeOfflineMessageDeliveryStatuses(
+      queryClient,
+      identity.pubkey,
+    );
+  }, [identity, queryClient]);
+
   return useMutation<
     RelayEvent,
     Error,
@@ -669,10 +679,11 @@ export function useSendMessageMutation(
         mentionPubkeys,
       );
 
-      // Messages carrying media OR custom-emoji tags MUST go through REST so
-      // the relay's tag validation runs. The WebSocket path emits no extra
-      // tags, so emoji-only messages would otherwise lose their emoji tag.
+      // Browser sends always use the web PAL so a fully signed message can be
+      // queued while the user agent is explicitly offline. Desktop keeps its
+      // direct WebSocket path for simple messages.
       if (
+        !isTauri() ||
         parentEventId ||
         imetaTags.length > 0 ||
         emojiTags.length > 0 ||
@@ -733,6 +744,9 @@ export function useSendMessageMutation(
           ],
           content: content.trim(),
           sig: "",
+          pending: result.deliveryStatus === "queued",
+          deliveryStatus:
+            result.deliveryStatus === "queued" ? "queued" : undefined,
         };
       }
 
