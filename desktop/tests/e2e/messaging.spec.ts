@@ -249,7 +249,11 @@ test.beforeEach(async ({ page }, testInfo) => {
                     : undefined;
   const mock = testInfo.title.includes("unresolvable preview")
     ? { linkPreviewMetadata: null, linkPreviewMetadataDelayMs: 150 }
-    : baseMock;
+    : testInfo.title.includes(
+          "shows your avatar on your own message when profile avatar is set",
+        )
+      ? { ...baseMock, profileUpdateDelayMs: 2_000 }
+      : baseMock;
   await installMockBridge(page, mock);
 });
 
@@ -1319,6 +1323,15 @@ test("shows your avatar on your own message when profile avatar is set", async (
       }),
   );
   await page.getByTestId("profile-avatar-done").click();
+  const backToApp = page.getByTestId("settings-back-to-app");
+  await expect(backToApp).toBeDisabled();
+  await expect(backToApp).toHaveAttribute("aria-busy", "true");
+  const settingsUrl = page.url();
+  await backToApp.evaluate((button) => {
+    (button as HTMLButtonElement).click();
+  });
+  await expect(page.getByTestId("settings-profile")).toBeVisible();
+  expect(page.url()).toBe(settingsUrl);
   await expect(page.getByTestId("profile-avatar-editor-shell")).toHaveCount(0);
   await expect
     .poll(() =>
@@ -1331,13 +1344,24 @@ test("shows your avatar on your own message when profile avatar is set", async (
       }),
     )
     .toBe(avatarUrl);
-  await page.getByTestId("settings-back-to-app").click();
+  await expect(backToApp).toBeEnabled();
+  await backToApp.click();
 
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await page.waitForFunction(
     () => typeof window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ === "function",
   );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+            channelName: "general",
+          }) ?? false,
+      ),
+    )
+    .toBe(true);
   await page.evaluate(
     ({ content, createdAt, pubkey }) => {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({

@@ -338,6 +338,7 @@ type E2eConfig = {
     profileReadError?: string;
     /** Override whether get_profile reports a real kind:0 event. */
     profileHasEvent?: boolean;
+    profileUpdateDelayMs?: number;
     profileUpdateError?: string;
     profileUpdateErrors?: string[];
     linkPreviewMetadata?: {
@@ -5865,6 +5866,13 @@ async function handleUpdateProfile(
 ) {
   const identity = getIdentity(config);
   if (!identity) {
+    const profileUpdateDelayMs = config?.mock?.profileUpdateDelayMs ?? 0;
+    if (profileUpdateDelayMs > 0) {
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, profileUpdateDelayMs);
+      });
+    }
+
     const profileUpdateError = config?.mock?.profileUpdateError;
     const profileUpdateErrors = config?.mock?.profileUpdateErrors;
     const nextProfileUpdateError = profileUpdateErrors?.shift();

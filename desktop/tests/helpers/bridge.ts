@@ -293,6 +293,7 @@ type MockBridgeOptions = {
   profileReadError?: string;
   /** Override whether get_profile reports a real kind:0 event. */
   profileHasEvent?: boolean;
+  profileUpdateDelayMs?: number;
   profileUpdateError?: string;
   profileUpdateErrors?: string[];
   linkPreviewMetadata?: {
