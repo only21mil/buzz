@@ -52,6 +52,7 @@ pub(crate) struct NormalJobInputs {
     pub(crate) evidence_root: PathBuf,
     pub(crate) lease_record: LeaseRecord,
     pub(crate) event_binding: CiEventBinding,
+    pub(crate) job_manifest_digest: [u8; 32],
     pub(crate) act: ActLaunchPlan,
 }
 
@@ -177,6 +178,7 @@ impl ProductionNormalJobSource {
             evidence_root: inputs.evidence_root,
             lease_record: inputs.lease_record,
             event_binding: inputs.event_binding,
+            job_manifest_digest: inputs.job_manifest_digest,
             act: inputs.act,
         };
         plan.validate_identity(runtime.request, runtime.admission)?;
@@ -528,6 +530,10 @@ mod tests {
         let mut source = fixture.source();
         let plan = source.prepare(fixture.request, fixture.admission).unwrap();
 
+        assert_eq!(
+            plan.job_manifest_digest,
+            fixture.request.job_manifest_digest
+        );
         assert_eq!(
             plan.binding.run_id,
             uuid::Uuid::from_bytes(fixture.request.run_id).to_string()
@@ -933,6 +939,7 @@ mod tests {
                 request_event_id_46105: [31; 32],
                 teardown_event_id_46106: [32; 32],
             },
+            job_manifest_digest: request.job_manifest_digest,
             act,
         }
     }

@@ -1,7 +1,7 @@
 //! Root-owned proxy authority and one-shot runtime descriptors.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use buzz_ci_broker_protocol::GitOid;
@@ -17,7 +17,7 @@ use crate::host_composition::HostCompositionContract;
 use crate::normal_backend::{
     populate_expected_execs, ActRuntimeDescriptorSource, BrokerProxyInputSource, BrokerProxyInputs,
 };
-use crate::normal_engine::ActLaunchPlan;
+use crate::normal_engine::NormalJobPlan;
 use crate::proxy_lease::{PrestartPersister, ProxyLeaseAuthority};
 use crate::seccomp_activation::SeccompInstallCapability;
 
@@ -98,11 +98,14 @@ impl ProxyInputRecord {
     fn validate<P: BoundPrestartPersister>(
         &self,
         now: u64,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
+        contract: &HostCompositionContract,
+        owner: ExpectedOwner,
         persister: &P,
     ) -> Result<(), ExecutionUnavailable> {
         let expected = binding.as_binding();
+        let act = &plan.act;
         let derived_socket = self.authority.listener_root.join(format!(
             "proxy-{}-{}.sock",
             self.controller_lease_id, self.lease_generation
@@ -140,12 +143,21 @@ impl ProxyInputRecord {
                 != expected.isolation_profile.limits.mem_max_bytes
             || self.manifest.isolation_profile.limits.pids_max
                 != u64::from(expected.isolation_profile.limits.pids_max)
-            || self.authority.exec_argv != plan.argv()?
-            || self.authority.exec_working_directory != plan.working_directory
+            || self.authority.event_binding != plan.event_binding
+            || self.authority.evidence_root != plan.evidence_root
+            || self.authority.exec_argv != act.argv()?
+            || self.authority.exec_working_directory != act.working_directory
             || self.authority.exec_uid != expected.principals.executor
+            || self.authority.exec_uid != contract.executor_uid
+            || expected.principals.runtime != contract.runtime_uid
+            || self.authority.exec_gid != contract.executor_uid
+            || self.authority.listener_gid != contract.executor_uid
             || self.authority.listener_root
-                != plan.proxy_socket.parent().ok_or(ExecutionUnavailable)?
-            || derived_socket != plan.proxy_socket
+                != act.proxy_socket.parent().ok_or(ExecutionUnavailable)?
+            || self.authority.bundle != self.authority.listener_root.join("bundle")
+            || self.authority.pid_file != self.authority.listener_root.join("pid")
+            || derived_socket != act.proxy_socket
+            || Sha256::digest(&self.canonical_job_manifest).as_slice() != plan.job_manifest_digest
             || self.seccomp_profile_path != persister.profile_path()
             || self.seccomp_profile_path != expected.isolation_profile.seccomp_profile_path
             || self.seccomp_receipt_sha256 != persister.receipt_digest()
@@ -153,6 +165,8 @@ impl ProxyInputRecord {
         {
             return Err(ExecutionUnavailable);
         }
+        DescriptorRoot::open(&self.authority.listener_root, owner)?;
+        DescriptorRoot::open(&self.authority.evidence_root, owner)?;
         let canonical_json: serde_json::Value =
             serde_json::from_slice(&self.canonical_job_manifest)
                 .map_err(|_| ExecutionUnavailable)?;
@@ -170,6 +184,8 @@ impl ProxyInputRecord {
 /// Root-owned proxy input source that consumes one exact lease generation.
 pub struct ProxyInputProvider<D, P = SeccompInstallCapability> {
     root: DescriptorRoot,
+    contract: HostCompositionContract,
+    owner: ExpectedOwner,
     descriptors: D,
     persister: P,
     consumed: BTreeSet<(String, u64)>,
@@ -187,26 +203,22 @@ where
         descriptors: D,
         persister: P,
     ) -> Result<Self, ExecutionUnavailable> {
-        Self::open_for_owner(
-            &contract.proxy_authority_root,
-            0,
-            0,
-            descriptors,
-            persister,
-            system_now,
-        )
+        Self::open_for_owner(contract.clone(), 0, 0, descriptors, persister, system_now)
     }
 
     fn open_for_owner(
-        path: &Path,
+        contract: HostCompositionContract,
         uid: u32,
         gid: u32,
         descriptors: D,
         persister: P,
         now: fn() -> Result<u64, ExecutionUnavailable>,
     ) -> Result<Self, ExecutionUnavailable> {
+        let owner = ExpectedOwner { uid, gid };
         Ok(Self {
-            root: DescriptorRoot::open(path, ExpectedOwner { uid, gid })?,
+            root: DescriptorRoot::open(&contract.proxy_authority_root, owner)?,
+            contract,
+            owner,
             descriptors,
             persister,
             consumed: BTreeSet::new(),
@@ -216,13 +228,24 @@ where
 
     fn record(
         &self,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<ProxyInputRecord, ExecutionUnavailable> {
         let name = format!("{}.json", binding.as_binding().lease_id);
         let record: ProxyInputRecord = self.root.read(&name)?;
-        record.validate((self.now)()?, plan, binding, &self.persister)?;
+        record.validate(
+            (self.now)()?,
+            plan,
+            binding,
+            &self.contract,
+            self.owner,
+            &self.persister,
+        )?;
         Ok(record)
+    }
+
+    fn claim_name(record: &ProxyInputRecord) -> String {
+        format!("{}_{}_proxy.used", record.lease_id, record.lease_generation)
     }
 }
 
@@ -235,7 +258,7 @@ where
 
     fn preflight(
         &mut self,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<(), ExecutionUnavailable> {
         let record = self.record(plan, binding)?;
@@ -245,8 +268,9 @@ where
         {
             return Err(ExecutionUnavailable);
         }
+        self.root.ensure_unclaimed(&Self::claim_name(&record))?;
         self.descriptors
-            .preflight(plan, binding)
+            .preflight(&plan.act, binding)
             .map_err(|_| ExecutionUnavailable)
     }
 
@@ -254,7 +278,7 @@ where
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<BrokerProxyInputs<Self::Persister>, ExecutionUnavailable> {
         self.preflight(plan, binding)?;
@@ -285,6 +309,7 @@ where
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(remaining))
             .ok_or(ExecutionUnavailable)?;
+        self.root.claim(&Self::claim_name(&record))?;
         let upstream = self
             .descriptors
             .next_upstream(lease, deadline)
@@ -353,15 +378,16 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
 
     use buzz_ci_policy_proxy::{
         AllowedMount, CanonicalCreate, EffectiveContainerSpec, EngineKind, ExecExpectation,
         IsolationLimits, IsolationProfile, NetworkPolicy, VerifiedStart,
     };
-    use nix::unistd::getegid;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::normal_engine::ActLaunchPlan;
 
     #[derive(Clone)]
     struct FakePersister;
@@ -417,7 +443,7 @@ mod tests {
     }
 
     fn proxy_record(
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
         lease: LeaseToken,
         authority_root: &Path,
@@ -513,20 +539,40 @@ mod tests {
             authority: ProxyAuthorityRecord {
                 listener_root: authority_root.into(),
                 evidence_root: evidence_root.into(),
-                event_binding: CiEventBinding {
-                    request_event_id_46105: [31; 32],
-                    teardown_event_id_46106: [32; 32],
-                },
+                event_binding: plan.event_binding,
                 bundle: authority_root.join("bundle"),
                 pid_file: authority_root.join("pid"),
-                exec_argv: plan.argv().unwrap(),
-                exec_working_directory: plan.working_directory.clone(),
+                exec_argv: plan.act.argv().unwrap(),
+                exec_working_directory: plan.act.working_directory.clone(),
                 exec_uid: expected.principals.executor,
-                exec_gid: getegid().as_raw(),
-                listener_gid: getegid().as_raw(),
+                exec_gid: expected.principals.executor,
+                listener_gid: expected.principals.executor,
             },
             seccomp_profile_path: buzz_ci_isolation_contract::PHASE1_SECCOMP_PROFILE_PATH.into(),
             seccomp_receipt_sha256: "d".repeat(64),
+        }
+    }
+
+    fn contract(authority_root: &Path, plan: &NormalJobPlan) -> HostCompositionContract {
+        HostCompositionContract {
+            schema_version: 1,
+            revision: 1,
+            executor_uid: plan.binding.principals.executor,
+            runtime_uid: plan.binding.principals.runtime,
+            executor_socket_template: "/run/buzzci/executor/{lease_id}/executor.sock".into(),
+            runtime_socket_template: "/run/buzzci/runtime/{lease_id}/runtime.sock".into(),
+            materialization_authority_root: "/var/lib/buzzci/materialization".into(),
+            proxy_authority_root: authority_root.into(),
+            terminal_evidence_root: "/var/lib/buzzci/terminal".into(),
+            teardown_authority_root: "/var/lib/buzzci/teardown".into(),
+            qualification_lease_root: "/var/lib/buzzci/qualification/lease".into(),
+            qualification_binding_root: "/var/lib/buzzci/qualification/binding".into(),
+            qualification_handoff_root: "/var/lib/buzzci/qualification/handoff".into(),
+            qualification_readback_root: "/var/lib/buzzci/qualification/readback".into(),
+            proved_invariants: crate::host_composition::REQUIRED_HOST_INVARIANTS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
         }
     }
 
@@ -558,6 +604,8 @@ mod tests {
         fs::set_permissions(authority.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let listener = TempDir::new().unwrap();
         let evidence = TempDir::new().unwrap();
+        fs::set_permissions(listener.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(evidence.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let fixture = crate::normal_engine::tests::ordinary_fixture();
         let binding = fixture
             .plan
@@ -565,8 +613,9 @@ mod tests {
             .clone()
             .validate_phase1(&fixture.plan.validation.context())
             .unwrap();
-        let mut plan = fixture.plan.act;
-        plan.proxy_socket = listener.path().join(format!(
+        let mut plan = fixture.plan;
+        plan.evidence_root = evidence.path().into();
+        plan.act.proxy_socket = listener.path().join(format!(
             "proxy-{}-{}.sock",
             hex::encode(fixture.lease.lease_id()),
             fixture.lease.generation()
@@ -578,14 +627,16 @@ mod tests {
             listener.path(),
             evidence.path(),
         );
+        plan.job_manifest_digest = Sha256::digest(&record.canonical_job_manifest).into();
         write_record(
             authority.path(),
             &format!("{}.json", binding.as_binding().lease_id),
             &record,
         );
         let owner = fs::metadata(authority.path()).unwrap();
+        let host_contract = contract(authority.path(), &plan);
         let mut provider = ProxyInputProvider::open_for_owner(
-            authority.path(),
+            host_contract.clone(),
             owner.uid(),
             owner.gid(),
             FakeDescriptors,
@@ -601,9 +652,103 @@ mod tests {
             populate_expected_execs(&mut populated, &record.canonical_job_manifest),
             Ok(())
         );
+        assert_eq!(record.authority.event_binding, plan.event_binding);
+        assert_eq!(record.authority.evidence_root, plan.evidence_root);
+        assert_eq!(record.authority.exec_argv, plan.act.argv().unwrap());
+        assert_eq!(
+            record.authority.exec_working_directory,
+            plan.act.working_directory
+        );
+        assert_eq!(record.authority.exec_uid, host_contract.executor_uid);
+        assert_eq!(
+            binding.as_binding().principals.runtime,
+            host_contract.runtime_uid
+        );
+        assert_eq!(record.authority.exec_gid, host_contract.executor_uid);
+        assert_eq!(record.authority.listener_gid, host_contract.executor_uid);
+        assert_eq!(
+            record.authority.listener_root,
+            plan.act.proxy_socket.parent().unwrap()
+        );
+        assert_eq!(
+            Sha256::digest(&record.canonical_job_manifest).as_slice(),
+            plan.job_manifest_digest
+        );
+        DescriptorRoot::open(
+            &record.authority.listener_root,
+            ExpectedOwner {
+                uid: owner.uid(),
+                gid: owner.gid(),
+            },
+        )
+        .unwrap();
+        DescriptorRoot::open(
+            &record.authority.evidence_root,
+            ExpectedOwner {
+                uid: owner.uid(),
+                gid: owner.gid(),
+            },
+        )
+        .unwrap();
         record
-            .validate(20, &plan, &binding, &FakePersister)
+            .validate(
+                20,
+                &plan,
+                &binding,
+                &host_contract,
+                ExpectedOwner {
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                },
+                &FakePersister,
+            )
             .unwrap();
+        for tampered in [
+            {
+                let mut value = record.clone();
+                value.authority.event_binding.request_event_id_46105 = [99; 32];
+                value
+            },
+            {
+                let mut value = record.clone();
+                value.authority.evidence_root = listener.path().into();
+                value
+            },
+            {
+                let mut value = record.clone();
+                value.authority.bundle = listener.path().join("other-bundle");
+                value
+            },
+            {
+                let mut value = record.clone();
+                value.authority.pid_file = listener.path().join("other-pid");
+                value
+            },
+            {
+                let mut value = record.clone();
+                value.authority.exec_gid += 1;
+                value
+            },
+            {
+                let mut value = record.clone();
+                value.authority.listener_gid += 1;
+                value
+            },
+        ] {
+            assert!(tampered
+                .validate(
+                    20,
+                    &plan,
+                    &binding,
+                    &host_contract,
+                    ExpectedOwner {
+                        uid: owner.uid(),
+                        gid: owner.gid(),
+                    },
+                    &FakePersister,
+                )
+                .is_err());
+        }
         provider.preflight(&plan, &binding).unwrap();
         let mut admission = fixture.admission;
         admission.job.manifest_digest = Sha256::digest(&record.canonical_job_manifest).into();
@@ -615,6 +760,16 @@ mod tests {
         assert!(provider
             .prepare(admission, fixture.lease, &plan, &binding)
             .is_err());
+        let mut restarted = ProxyInputProvider::open_for_owner(
+            host_contract.clone(),
+            owner.uid(),
+            owner.gid(),
+            FakeDescriptors,
+            FakePersister,
+            fixed_now,
+        )
+        .unwrap();
+        assert!(restarted.preflight(&plan, &binding).is_err());
 
         let hostile = TempDir::new().unwrap();
         fs::set_permissions(hostile.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -626,8 +781,9 @@ mod tests {
             &tampered,
         );
         let owner = fs::metadata(hostile.path()).unwrap();
+        let hostile_contract = contract(hostile.path(), &plan);
         let mut hostile_provider = ProxyInputProvider::open_for_owner(
-            hostile.path(),
+            hostile_contract,
             owner.uid(),
             owner.gid(),
             FakeDescriptors,

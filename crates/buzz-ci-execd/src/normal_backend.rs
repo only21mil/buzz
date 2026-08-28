@@ -1160,7 +1160,7 @@ pub trait BrokerProxyInputSource {
     /// Validate availability without opening or mutating the proxy listener.
     fn preflight(
         &mut self,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<(), ExecutionUnavailable>;
 
@@ -1169,7 +1169,7 @@ pub trait BrokerProxyInputSource {
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<BrokerProxyInputs<Self::Persister>, ExecutionUnavailable>;
 }
@@ -1179,7 +1179,7 @@ pub trait NormalActProxy {
     /// Validate root-owned proxy inputs before lease commitment.
     fn preflight(
         &mut self,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<(), ExecutionUnavailable>;
 
@@ -1188,7 +1188,7 @@ pub trait NormalActProxy {
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<(), ExecutionUnavailable>;
 
@@ -1231,14 +1231,15 @@ where
 {
     fn preflight(
         &mut self,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<(), ExecutionUnavailable> {
-        if self.active.is_some() || plan.argv().is_err() || plan.environment().is_err() {
+        let act = &plan.act;
+        if self.active.is_some() || act.argv().is_err() || act.environment().is_err() {
             return Err(ExecutionUnavailable);
         }
         self.launcher
-            .readiness(plan, binding)
+            .readiness(act, binding)
             .map_err(|_| ExecutionUnavailable)?;
         self.source.preflight(plan, binding)
     }
@@ -1247,14 +1248,15 @@ where
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<(), ExecutionUnavailable> {
         if self.active.is_some() {
             return Err(ExecutionUnavailable);
         }
+        let act = &plan.act;
         self.launcher
-            .readiness(plan, binding)
+            .readiness(act, binding)
             .map_err(|_| ExecutionUnavailable)?;
         let inputs = self.source.prepare(admission, lease, plan, binding)?;
         let mut manifest = inputs.manifest;
@@ -1275,14 +1277,14 @@ where
         if self
             .active
             .as_ref()
-            .is_none_or(|proxy| proxy.listener_path() != plan.proxy_socket)
+            .is_none_or(|proxy| proxy.listener_path() != act.proxy_socket)
         {
             return Err(ExecutionUnavailable);
         }
         self.launcher
             .launch(
                 lease,
-                plan,
+                act,
                 binding,
                 self.active.as_mut().ok_or(ExecutionUnavailable)?,
             )
@@ -1386,7 +1388,7 @@ where
         self.materializer.preflight(plan, binding)?;
         self.terminal.preflight(plan, binding)?;
         self.teardown.preflight(plan, binding)?;
-        self.proxy.preflight(&plan.act, binding)
+        self.proxy.preflight(plan, binding)
     }
 
     fn apply_dns(
@@ -1419,7 +1421,7 @@ where
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
         _store: &EvidenceStore,
     ) -> Result<(), ExecutionUnavailable> {
@@ -1547,7 +1549,7 @@ mod tests {
     impl NormalActProxy for FakeProxy {
         fn preflight(
             &mut self,
-            _plan: &ActLaunchPlan,
+            _plan: &NormalJobPlan,
             _binding: &ValidatedAttemptLeaseBinding,
         ) -> Result<(), ExecutionUnavailable> {
             self.calls.borrow_mut().push("proxy-preflight");
@@ -1558,7 +1560,7 @@ mod tests {
             &mut self,
             _admission: OrdinaryAdmission,
             _lease: LeaseToken,
-            _plan: &ActLaunchPlan,
+            _plan: &NormalJobPlan,
             _binding: &ValidatedAttemptLeaseBinding,
         ) -> Result<(), ExecutionUnavailable> {
             self.calls.borrow_mut().push("act");
@@ -1812,7 +1814,7 @@ mod tests {
             .run_act_through_proxy(
                 fixture.admission,
                 fixture.lease,
-                &fixture.plan.act,
+                &fixture.plan,
                 &binding,
                 &store,
             )
@@ -1875,7 +1877,7 @@ mod tests {
             .run_act_through_proxy(
                 fixture.admission,
                 fixture.lease,
-                &fixture.plan.act,
+                &fixture.plan,
                 &binding,
                 &store,
             )

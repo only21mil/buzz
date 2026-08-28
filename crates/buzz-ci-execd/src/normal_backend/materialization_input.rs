@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_ci_isolation_contract::ValidatedAttemptLeaseBinding;
@@ -15,6 +15,7 @@ use buzz_ci_materializer::{
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, OFlag};
 use nix::sys::stat::{fstat, Mode, SFlag};
+use nix::unistd::fsync;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::activation::LeaseToken;
@@ -99,6 +100,41 @@ impl DescriptorRoot {
         }
         Ok(value)
     }
+
+    pub(super) fn ensure_unclaimed(&self, name: &str) -> Result<(), ExecutionUnavailable> {
+        if !safe_claim_name(name) {
+            return Err(ExecutionUnavailable);
+        }
+        match openat(
+            &self.descriptor,
+            name,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        ) {
+            Err(Errno::ENOENT) => Ok(()),
+            _ => Err(ExecutionUnavailable),
+        }
+    }
+
+    pub(super) fn claim(&self, name: &str) -> Result<(), ExecutionUnavailable> {
+        if !safe_claim_name(name) {
+            return Err(ExecutionUnavailable);
+        }
+        let descriptor = openat(
+            &self.descriptor,
+            name,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(FILE_MODE),
+        )
+        .map_err(|_| ExecutionUnavailable)?;
+        let mut file = File::from(descriptor);
+        file.write_all(b"claimed\n")
+            .map_err(|_| ExecutionUnavailable)?;
+        file.sync_all().map_err(|_| ExecutionUnavailable)?;
+        validate_regular(&file, self.owner)?;
+        fsync(&self.descriptor).map_err(|_| ExecutionUnavailable)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +198,15 @@ fn safe_record_name(name: &str) -> bool {
     name.len() > 5
         && name.len() <= 128
         && name.ends_with(".json")
+        && name[..name.len() - 5]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn safe_claim_name(name: &str) -> bool {
+    name.len() > 5
+        && name.len() <= 160
+        && name.ends_with(".used")
         && name[..name.len() - 5]
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -245,6 +290,7 @@ impl MaterializationAuthorityRecord {
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<RootOwnedPolicy, ExecutionUnavailable> {
         let expected = binding.as_binding();
+        let workflow_path = trusted_workflow_path(expected, &self.manifest.workflow_path)?;
         if self.schema_version != SCHEMA_VERSION
             || self.lease_id != expected.lease_id
             || self.issued_at_unix_seconds == 0
@@ -263,13 +309,14 @@ impl MaterializationAuthorityRecord {
             || self.manifest.trusted_base_sha != expected.base_oid
             || self.manifest.repo_coordinate != expected.target_repo_a
             || self.manifest.workflow_id != expected.workflow_id
+            || workflow_path != plan.act.workflow_path
             || self.manifest.workflow_sha256.as_str() != expected.workflow_digest
             || self.manifest.job_id != expected.job_id
             || self.manifest.attempt != expected.attempt
             || self.manifest.lease_id != expected.lease_id
             || self.materializer_unit.role != PrincipalRole::Materializer
             || self.materializer_unit.uid != expected.principals.materializer
-            || self.manifest_sha256.0 == [0; 32]
+            || self.manifest_sha256.0 != plan.job_manifest_digest
             || self.input_digests.len() > 127
             || self.canonical_inputs.is_empty()
             || self.canonical_inputs.len() > MAX_RECORD_BYTES / 2
@@ -299,18 +346,98 @@ pub(super) fn canonical_non_secret_inputs(bytes: &[u8]) -> bool {
 pub(super) fn non_secret_json(value: &serde_json::Value) -> bool {
     fn safe(value: &serde_json::Value) -> bool {
         match value {
-            serde_json::Value::Object(map) => map.iter().all(|(name, value)| {
-                let name = name.to_ascii_lowercase();
-                !["credential", "password", "private_key", "secret", "token"]
-                    .iter()
-                    .any(|word| name.contains(word))
-                    && safe(value)
-            }),
+            serde_json::Value::Object(map) => map
+                .iter()
+                .all(|(name, value)| !sensitive_name(name) && safe(value)),
             serde_json::Value::Array(values) => values.iter().all(safe),
+            serde_json::Value::String(value) => safe_string(value),
             _ => true,
         }
     }
     safe(value)
+}
+
+fn trusted_workflow_path(
+    binding: &buzz_ci_isolation_contract::AttemptLeaseBinding,
+    workflow_path: &str,
+) -> Result<PathBuf, ExecutionUnavailable> {
+    let relative = Path::new(workflow_path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(ExecutionUnavailable);
+    }
+    Ok(Path::new(&binding.workspace.path)
+        .join("source")
+        .join(relative))
+}
+
+fn sensitive_name(name: &str) -> bool {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prior_lower = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase() && prior_lower && !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            current.push(character.to_ascii_uppercase());
+            prior_lower = character.is_ascii_lowercase();
+        } else {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prior_lower = false;
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "SECRET" | "TOKEN" | "PASSWORD" | "CREDENTIAL" | "CREDENTIALS"
+        )
+    }) || words
+        .windows(2)
+        .any(|words| words[0] == "PRIVATE" && words[1] == "KEY")
+}
+
+fn safe_string(value: &str) -> bool {
+    let trimmed = value.trim();
+    if sensitive_name(trimmed)
+        || trimmed
+            .split_once('=')
+            .is_some_and(|(name, _)| valid_env_name(name) && sensitive_name(name))
+    {
+        return false;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    !upper.contains("-----BEGIN PRIVATE KEY-----")
+        && !upper.starts_with("BEARER ")
+        && !looks_like_aws_access_key(trimmed)
+        && !["ghp_", "github_pat_", "glpat-"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn looks_like_aws_access_key(value: &str) -> bool {
+    value.len() == 20
+        && (value.starts_with("AKIA") || value.starts_with("ASIA"))
+        && value[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 /// Descriptor-relative source for broker-authored materialization records.
@@ -348,6 +475,10 @@ impl MaterializationInputProvider {
         let record: MaterializationAuthorityRecord = self.root.read(&name)?;
         let policy = record.validate((self.now)()?, plan, binding)?;
         Ok((record, policy))
+    }
+
+    fn claim_name(binding: &ValidatedAttemptLeaseBinding) -> String {
+        format!("{}_materialization.used", binding.as_binding().lease_id)
     }
 
     fn workspace(binding: &ValidatedAttemptLeaseBinding) -> Result<File, ExecutionUnavailable> {
@@ -395,6 +526,7 @@ impl NormalMaterializationSource for MaterializationInputProvider {
         if self.consumed.contains(lease_id) {
             return Err(ExecutionUnavailable);
         }
+        self.root.ensure_unclaimed(&Self::claim_name(binding))?;
         self.record(plan, binding)?;
         Self::workspace(binding)?;
         Ok(())
@@ -413,6 +545,7 @@ impl NormalMaterializationSource for MaterializationInputProvider {
             binding,
         )
         .map_err(|_| ExecutionUnavailable)?;
+        self.root.claim(&Self::claim_name(binding))?;
         self.consumed.insert(record.lease_id.clone());
         Ok(NormalMaterializationInputs {
             manifest: record.manifest,
@@ -526,6 +659,15 @@ mod tests {
         };
         assert!(policy.build().is_err());
         assert!(!canonical_non_secret_inputs(br#"{"secret":"value"}"#));
+        assert!(!canonical_non_secret_inputs(
+            br#"{"values":["AWS_SECRET_ACCESS_KEY"]}"#
+        ));
+        assert!(!canonical_non_secret_inputs(
+            br#"{"env":["MY_TOKEN=value"]}"#
+        ));
+        assert!(canonical_non_secret_inputs(
+            br#"{"note":"tokenize source","secretary":"public"}"#
+        ));
         assert!(!canonical_non_secret_inputs(br#"{ "safe":1}"#));
         assert!(canonical_non_secret_inputs(br#"{"safe":1}"#));
     }
@@ -564,6 +706,7 @@ mod tests {
             owner_uid: materializer_uid + 2,
         };
         plan.lease_record.workspace_dir = workspace.clone();
+        plan.act.workflow_path = workspace.join("source/.github/workflows/ci.yml");
         let binding = plan
             .binding
             .clone()
@@ -630,7 +773,7 @@ mod tests {
             canonical_inputs: inputs,
             policy: policy_record,
             materializer_unit: unit,
-            manifest_sha256: Digest32([9; 32]),
+            manifest_sha256: Digest32(plan.job_manifest_digest),
             input_digests: Vec::new(),
         };
         write_record(
@@ -654,6 +797,58 @@ mod tests {
         );
         assert_eq!(prepared.policy.digest(), &record.manifest.policy_sha256);
         assert!(provider.prepare(&plan, &binding).is_err());
+        let mut restarted = MaterializationInputProvider::open_for_owner(
+            authority.path(),
+            geteuid().as_raw(),
+            getegid().as_raw(),
+            fixed_now,
+        )
+        .unwrap();
+        assert!(restarted.preflight(&plan, &binding).is_err());
+
+        let mut wrong_workflow = record.clone();
+        wrong_workflow.manifest.workflow_path = ".github/workflows/other.yml".into();
+        let wrong_workflow_root = TempDir::new().unwrap();
+        fs::set_permissions(
+            wrong_workflow_root.path(),
+            fs::Permissions::from_mode(DIRECTORY_MODE),
+        )
+        .unwrap();
+        write_record(
+            wrong_workflow_root.path(),
+            &format!("{}.json", expected.lease_id),
+            &wrong_workflow,
+        );
+        let mut wrong_workflow_provider = MaterializationInputProvider::open_for_owner(
+            wrong_workflow_root.path(),
+            geteuid().as_raw(),
+            getegid().as_raw(),
+            fixed_now,
+        )
+        .unwrap();
+        assert!(wrong_workflow_provider.preflight(&plan, &binding).is_err());
+
+        let mut wrong_digest = record.clone();
+        wrong_digest.manifest_sha256 = Digest32([42; 32]);
+        let wrong_digest_root = TempDir::new().unwrap();
+        fs::set_permissions(
+            wrong_digest_root.path(),
+            fs::Permissions::from_mode(DIRECTORY_MODE),
+        )
+        .unwrap();
+        write_record(
+            wrong_digest_root.path(),
+            &format!("{}.json", expected.lease_id),
+            &wrong_digest,
+        );
+        let mut wrong_digest_provider = MaterializationInputProvider::open_for_owner(
+            wrong_digest_root.path(),
+            geteuid().as_raw(),
+            getegid().as_raw(),
+            fixed_now,
+        )
+        .unwrap();
+        assert!(wrong_digest_provider.preflight(&plan, &binding).is_err());
 
         let mut stale = record;
         stale.expires_at_unix_seconds -= 1;
