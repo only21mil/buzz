@@ -445,6 +445,9 @@ mod tests {
     use nostr::{EventBuilder, Keys, Tag};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     fn signed_event(keys: &Keys, channel_id: Uuid, created_at: u64, content: &str) -> Event {
         EventBuilder::new(Kind::TextNote, content)
             .tags([
@@ -454,6 +457,60 @@ mod tests {
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn cursor_path_is_scoped_to_the_configured_state_directory() {
+        let state_dir = Path::new("/home/buzz-mempool/.local/state/buzz-acp");
+        let pubkey = "11".repeat(32);
+        let store = InboxCursorStore::load(state_dir, &pubkey, 95, 10);
+
+        assert_eq!(
+            store.path(),
+            state_dir.join(format!("{pubkey}.inbox-cursor.json"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_state_dirs_persist_cursor_across_restart_without_replay() {
+        for slug in ["mempool", "genesis"] {
+            let root = std::env::temp_dir()
+                .join(format!("buzz-acp-{slug}-read-only-home-{}", Uuid::new_v4()));
+            let home = root.join("home").join(format!("buzz-{slug}"));
+            let state_dir = home.join(".local/state/buzz-acp");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let keys = Keys::generate();
+            let channel_id = Uuid::new_v4();
+            let event = signed_event(&keys, channel_id, 100, slug);
+            let pubkey = keys.public_key().to_hex();
+
+            let mut first = InboxCursorStore::load(&state_dir, &pubkey, 95, 10);
+            first.mark_processed_at([&event], 110);
+            drop(first);
+
+            let cursor_path = state_dir.join(format!("{pubkey}.inbox-cursor.json"));
+            assert!(cursor_path.is_file(), "{slug} cursor was not persisted");
+            assert_eq!(
+                std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+
+            let mut restarted = InboxCursorStore::load(&state_dir, &pubkey, 95, 10);
+            assert_eq!(restarted.load_status(), CursorLoadStatus::Loaded);
+            assert!(restarted.has_durable_cursor());
+            assert_eq!(restarted.catchup_since(110, 1_000).since, 90);
+            assert!(
+                !restarted.begin_event(&event),
+                "{slug} replay was not deduplicated"
+            );
+
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     async fn mock_query_rest(keys: Keys, response: Vec<Event>) -> RestClient {

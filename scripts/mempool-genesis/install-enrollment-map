@@ -9,9 +9,49 @@ set -euo pipefail
 
 mempool="$2"
 genesis="$4"
-[[ $mempool =~ ^[0-9a-f]{64}$ ]]
-[[ $genesis =~ ^[0-9a-f]{64}$ ]]
-[[ $mempool != "$genesis" ]]
+reserved_pubkeys=(
+  "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d"
+  "7806a7beb69ba4fd3b6e9b86d56931a446b62666e9794533f87fb2d1b956684f"
+  "73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812"
+  "aefa6783cdf2f33f9aa3705b41e5ae3ec214318c64db48f1410fc77db015f2ec"
+  "db965b1f484ec4ebd3b0041091e890e2cd28e64732d9be53fd07ba640255af61"
+)
+validate_pubkey() {
+  local label=$1 key=$2 reserved stripped
+  [[ $key =~ ^[0-9a-f]{64}$ ]] || {
+    printf '%s public key must be 64 lowercase hex characters\n' "$label" >&2
+    return 1
+  }
+  stripped=${key//${key:0:1}/}
+  [[ -n $stripped ]] || {
+    printf '%s public key is a repeated-nibble placeholder\n' "$label" >&2
+    return 1
+  }
+  PUBKEY=$key /usr/bin/python3 -c '
+import os
+p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+x = int(os.environ["PUBKEY"], 16)
+if x >= p:
+    raise SystemExit(1)
+value = (pow(x, 3, p) + 7) % p
+raise SystemExit(0 if pow(value, (p - 1) // 2, p) == 1 else 1)
+' || {
+    printf '%s public key is not a valid secp256k1 x-only public key\n' "$label" >&2
+    return 1
+  }
+  for reserved in "${reserved_pubkeys[@]}"; do
+    [[ $key != "$reserved" ]] || {
+      printf '%s public key reuses a reserved responder identity\n' "$label" >&2
+      return 1
+    }
+  done
+}
+validate_pubkey mempool "$mempool" || exit 65
+validate_pubkey genesis "$genesis" || exit 65
+[[ $mempool != "$genesis" ]] || {
+  printf '%s\n' 'Mempool and Genesis public keys must differ' >&2
+  exit 65
+}
 
 dir=/etc/buzz-agents
 target=$dir/enrollment-keys.json
@@ -22,7 +62,7 @@ if [[ -e $dir || -L $dir ]]; then
 else
   install -d -o root -g root -m 0755 "$dir"
 fi
-expected="$(printf '{"schema":"buzz-agent-enrollment-keys-v1","keys":{"mempool":"%s","genesis":"%s"}}' "$mempool" "$genesis")"
+expected="$(printf '{"keys":{"genesis":"%s","mempool":"%s"},"schema":"buzz-agent-enrollment-keys-v1"}' "$genesis" "$mempool")"
 temporary="$(mktemp "$dir/.enrollment-keys.XXXXXX")"
 trap 'test ! -e "$temporary" || unlink "$temporary"' EXIT
 chmod 0600 "$temporary"
@@ -34,7 +74,10 @@ if [[ -e $target || -L $target ]]; then
   test -f "$target"
   test ! -L "$target"
   test "$(stat -c '%U:%G:%a:%h' "$target")" = root:root:600:1
-  cmp -s "$temporary" "$target"
+  if ! cmp -s "$temporary" "$target"; then
+    printf '%s\n' 'existing enrollment map does not match canonical expected bytes' >&2
+    exit 1
+  fi
   printf '%s\n' ALREADY_PRESENT
   exit 0
 fi

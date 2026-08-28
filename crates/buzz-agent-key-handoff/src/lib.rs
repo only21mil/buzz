@@ -10,6 +10,8 @@ use std::fs;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod parity_signature;
+
 /// Versioned schema identifier for the root-owned public enrollment map.
 pub const ENROLLMENT_SCHEMA: &str = "buzz-agent-enrollment-keys-v1";
 pub const MAX_KEYRING_BLOB_BYTES: usize = 1024 * 1024;

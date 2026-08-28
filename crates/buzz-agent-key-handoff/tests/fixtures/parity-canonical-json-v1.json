@@ -1,0 +1,32 @@
+{
+  "schema": "buzz-canonical-json-ascii-v1-fixture",
+  "contract": "buzz-canonical-json-ascii-v1",
+  "positive": [
+    {
+      "name": "byte-sorted-object",
+      "value": {"z": null, "A": false, "a": true},
+      "canonical": "{\"A\":false,\"a\":true,\"z\":null}\n"
+    },
+    {
+      "name": "nesting-escaping-and-integer-bounds",
+      "value": {
+        "outer": [false, {"b": "quote\"backslash\\tilde~", "a": -9223372036854775808}],
+        "max": 9223372036854775807
+      },
+      "canonical": "{\"max\":9223372036854775807,\"outer\":[false,{\"a\":-9223372036854775808,\"b\":\"quote\\\"backslash\\\\tilde~\"}]}\n"
+    }
+  ],
+  "negative": [
+    {"name": "non-ascii-letter", "json": "\"\\u00e9\""},
+    {"name": "emoji", "json": "\"\\ud83d\\ude00\""},
+    {"name": "control", "json": "\"line\\nfeed\""},
+    {"name": "delete", "json": "\"\\u007f\""},
+    {"name": "float", "json": "1.0"},
+    {"name": "negative-zero", "json": "-0.0"},
+    {"name": "exponent", "json": "1e0"},
+    {"name": "nan", "json": "NaN"},
+    {"name": "infinity", "json": "Infinity"},
+    {"name": "positive-overflow", "json": "9223372036854775808"},
+    {"name": "negative-overflow", "json": "-9223372036854775809"}
+  ]
+}

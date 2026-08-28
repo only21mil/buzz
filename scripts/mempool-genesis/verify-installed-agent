@@ -1,18 +1,143 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-slug="${1:-}"
+readonly owner_pubkey=4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d
+
+validate_simple_env_file() {
+  local env_path="$1"
+  if ! LC_ALL=C od -An -v -tu1 "$env_path" | awk '
+    {
+      for (field_index = 1; field_index <= NF; field_index += 1) {
+        byte = $field_index
+        if ((byte < 32 && byte != 10) || byte > 126) {
+          exit 1
+        }
+      }
+    }
+  '; then
+    return 1
+  fi
+  LC_ALL=C awk '
+    {
+      line = $0
+      if (line == "" || line ~ /^[[:space:]]/) {
+        exit 1
+      }
+      separator = index(line, "=")
+      if (separator == 0) {
+        exit 1
+      }
+      key = substr(line, 1, separator - 1)
+      value = substr(line, separator + 1)
+      if (key !~ /^[A-Z][A-Z0-9_]*$/ || seen[key]++) {
+        exit 1
+      }
+      if (index(value, "\\") || index(value, "\047")) {
+        exit 1
+      }
+      if (substr(value, 1, 1) == "\"") {
+        closing_quote = substr(value, length(value), 1)
+        inner_quote = index(substr(value, 2, length(value) - 2), "\"")
+        if (length(value) < 2 || closing_quote != "\"" || inner_quote) {
+          exit 1
+        }
+      } else if (index(value, "\"") || value ~ /[[:space:]]/) {
+        exit 1
+      }
+    }
+    END { if (NR == 0) exit 1 }
+  ' "$env_path"
+}
+
+require_exact_env_value() {
+  local env_path="$1"
+  local key="$2"
+  local expected="$3"
+  local count
+  count="$(awk -v key="$key" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      separator = index(line, "=")
+      if (separator > 0 && substr(line, 1, separator - 1) == key) {
+        count += 1
+      }
+    }
+    END { print count + 0 }
+  ' "$env_path")"
+  test "$count" = 1
+  grep -Fxq "$key=$expected" "$env_path"
+}
+
+verify_response_contract() {
+  local env_path="$1"
+  local policy_path="$2"
+  test -f "$env_path"
+  test ! -L "$env_path"
+  test -f "$policy_path"
+  test ! -L "$policy_path"
+  validate_simple_env_file "$env_path"
+  jq -e --arg owner "$owner_pubkey" '
+    .schema == "buzz-agent-capability-parity-policy-v2" and
+    .canonical_json_contract == "buzz-canonical-json-ascii-v1" and
+    (.reference_channels | length) == 26 and
+    (.eligible_channels | length) == 25 and
+    (.authority_exclusions | length) == 1 and
+    ([.reference_channels[].channel_id] | unique | length) == 26 and
+    ([.eligible_channels[].channel_id] | unique | length) == 25 and
+    ([.authority_exclusions[].channel_id] | unique | length) == 1 and
+    ([.reference_channels[].channel_id] | sort) ==
+      (([.eligible_channels[].channel_id] + [.authority_exclusions[].channel_id]) | sort) and
+    .owner_pubkey == $owner and
+    .response_policy == {
+      "respond_to": "allowlist",
+      "allowed_respond_to": "allowlist",
+      "responder_allowlist": [$owner],
+      "owner_pubkey": $owner
+    }
+  ' "$policy_path" >/dev/null
+  require_exact_env_value "$env_path" BUZZ_ACP_RESPOND_TO allowlist
+  require_exact_env_value "$env_path" BUZZ_ACP_ALLOWED_RESPOND_TO allowlist
+  require_exact_env_value "$env_path" BUZZ_ACP_RESPOND_TO_ALLOWLIST "$owner_pubkey"
+}
+
+if [[ "${1:-}" == --verify-response-contract ]]; then
+  test "$#" = 3 || exit 64
+  verify_response_contract "$2" "$3"
+  exit 0
+fi
+
+print_expected_paths=false
+if [[ "${1:-}" == --print-expected-paths ]]; then
+  test "$#" = 2 || exit 64
+  slug="$2"
+  print_expected_paths=true
+else
+  test "$#" = 1 || exit 64
+  slug="${1:-}"
+fi
 case "$slug" in
-  mempool|genesis) ;;
+  mempool)
+    expected_instance_dropin=/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf
+    ;;
+  genesis)
+    expected_instance_dropin=/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf
+    ;;
   *) printf '%s\n' "unsupported agent slug" >&2; exit 64 ;;
 esac
 
 closure=/etc/buzz-agents/review-closure.json
-credential="${CREDENTIALS_DIRECTORY:?missing CREDENTIALS_DIRECTORY}/buzz-private-key"
+activation_state=/var/lib/buzz-agent-activation/current
+activation_manifest="$activation_state/bundle-manifest.json"
+parity_receipt="$activation_state/capability-parity-receipt.json"
+env_file="/etc/buzz-agents/$slug.env"
+expected_user="buzz-$slug"
+expected_acp_state_dir="/home/$expected_user/.local/state/buzz-acp"
 expected_paths=(
-  "/etc/buzz-agents/$slug.env"
+  "$env_file"
   "/etc/buzz-agents/prompts/$slug.md"
   /etc/systemd/system/buzz-agent@.service
+  "$expected_instance_dropin"
   /usr/local/libexec/buzz/run-buzz-agent
   /usr/local/libexec/buzz/verify-installed-agent
   /usr/local/libexec/buzz/buzz-agent-key-handoff
@@ -28,7 +153,26 @@ expected_paths=(
   /usr/local/libexec/buzz/buzz-acp
   /usr/local/libexec/buzz/buzz-dev-mcp
   /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+  /usr/local/libexec/buzz/verify-agent-capability-parity
+  /usr/local/libexec/buzz/mempool-genesis-activation-transaction
+  /etc/buzz-agents/capability-parity-policy.json
 )
+
+if "$print_expected_paths"; then
+  printf '%s\0' "${expected_paths[@]}"
+  exit 0
+fi
+
+credential="${CREDENTIALS_DIRECTORY:?missing CREDENTIALS_DIRECTORY}/buzz-private-key"
+
+unit="buzz-agent@$slug.service"
+effective_fragment="$(/usr/bin/systemctl show --no-pager --property=FragmentPath --value "$unit")"
+effective_dropins_text="$(/usr/bin/systemctl show --no-pager --property=DropInPaths --value "$unit")"
+read -r -a effective_dropins <<<"$effective_dropins_text"
+test "$effective_fragment" = /etc/systemd/system/buzz-agent@.service
+test "${#effective_dropins[@]}" = 2
+test "${effective_dropins[0]}" = /usr/lib/systemd/system/service.d/10-timeout-abort.conf
+test "${effective_dropins[1]}" = "$expected_instance_dropin"
 
 test -f "$closure"
 test ! -L "$closure"
@@ -66,9 +210,21 @@ test "$(stat -c '%U:%G:%a' /etc/buzz-agents/prompts)" = root:root:755
 test "$(stat -c '%U:%G:%a' /etc/buzz-agents/credentials)" = root:root:700
 test "$(stat -c '%U:%G:%a' /usr/local/libexec/buzz)" = root:root:755
 
-test "$(stat -c '%a' "/etc/buzz-agents/$slug.env")" = 644
+for activation_artifact in "$activation_manifest" "$parity_receipt"; do
+  test -f "$activation_artifact"
+  test ! -L "$activation_artifact"
+  test "$(stat -c '%U:%G:%a:%h' "$activation_artifact")" = root:root:600:1
+done
+/usr/local/libexec/buzz/verify-agent-capability-parity verify-sealed \
+  --receipt "$parity_receipt" \
+  --policy /etc/buzz-agents/capability-parity-policy.json \
+  --bundle-manifest "$activation_manifest" \
+  --runtime-verifier /usr/local/libexec/buzz/buzz-agent-key-handoff >/dev/null
+
+test "$(stat -c '%a' "$env_file")" = 600
 test "$(stat -c '%a' "/etc/buzz-agents/prompts/$slug.md")" = 644
 test "$(stat -c '%a' /etc/systemd/system/buzz-agent@.service)" = 644
+test "$(stat -c '%a' "$expected_instance_dropin")" = 644
 test "$(stat -c '%a' /usr/local/libexec/buzz/run-buzz-agent)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/verify-installed-agent)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-agent-key-handoff)" = 755
@@ -84,6 +240,40 @@ test "$(stat -c '%a' /usr/local/libexec/buzz/codex-code-mode-host)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-acp)" = 755
 test "$(stat -c '%a' /usr/local/libexec/buzz/buzz-dev-mcp)" = 755
 test "$(stat -c '%a' /usr/lib/systemd/system/service.d/10-timeout-abort.conf)" = 644
+test "$(stat -c '%a' /usr/local/libexec/buzz/verify-agent-capability-parity)" = 755
+test "$(stat -c '%a' /usr/local/libexec/buzz/mempool-genesis-activation-transaction)" = 755
+test "$(stat -c '%a' /etc/buzz-agents/capability-parity-policy.json)" = 644
+
+verify_response_contract "$env_file" /etc/buzz-agents/capability-parity-policy.json
+test "$(grep -c '^BUZZ_ACP_STATE_DIR=' "$env_file")" = 1
+grep -Fxq "BUZZ_ACP_STATE_DIR=$expected_acp_state_dir" "$env_file"
+test "${BUZZ_ACP_STATE_DIR:?missing BUZZ_ACP_STATE_DIR}" = "$expected_acp_state_dir"
+
+state_paths=(
+  "/home/$expected_user"
+  "/home/$expected_user/.codex"
+  "/home/$expected_user/.config"
+  "/home/$expected_user/.cache"
+  "/home/$expected_user/.local/state"
+  "/home/$expected_user/.local/state/buzz-acp"
+  "/home/$expected_user/.tmp"
+  "/run/buzz-agents-$slug"
+)
+for state_path in "${state_paths[@]}"; do
+  test -d "$state_path"
+  test ! -L "$state_path"
+  test "$(stat -c '%U:%G:%a' "$state_path")" = "$expected_user:$expected_user:700"
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -r "$state_path"
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -w "$state_path"
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -x "$state_path"
+done
+for tool_path in \
+  /usr/local/libexec/buzz/codex-acp \
+  /usr/local/libexec/buzz/codex \
+  /usr/local/libexec/buzz/node; do
+  /usr/sbin/runuser -u "$expected_user" -- /usr/bin/test -x "$tool_path"
+  test "$(/usr/sbin/runuser -u "$expected_user" -- /usr/bin/readlink -e "$tool_path")" = "$tool_path"
+done
 
 test -f "$credential"
 test ! -L "$credential"
@@ -92,3 +282,15 @@ test -r "$credential"
 test ! -w "$credential"
 test "$(wc -c < "$credential")" = 65
 LC_ALL=C grep -Eq '^[0-9a-f]{64}$' "$credential"
+other_slug=genesis
+[[ $slug == genesis ]] && other_slug=mempool
+other_credential="/etc/buzz-agents/credentials/$other_slug.key"
+if [[ -e $other_credential || -L $other_credential ]]; then
+  test -f "$other_credential"
+  test ! -L "$other_credential"
+  test "$(stat -c '%h' "$other_credential")" = 1
+  test "$(stat -c '%d:%i' "$credential")" != "$(stat -c '%d:%i' "$other_credential")"
+  if cmp -s "$credential" "$other_credential"; then
+    exit 1
+  fi
+fi

@@ -1444,6 +1444,35 @@ pub fn extract_p_tags(event: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// Extract relay-signed kind:39001 p-tags into [{pubkey, role}].
+///
+/// Kind:39001 uses `["p", pubkey, role]`, unlike kind:39002's
+/// `["p", pubkey, relay, discovery_role]`. The relay deliberately labels
+/// agents as `bot` in 39002 for client discovery while retaining their
+/// administrative authority in 39001.
+pub fn extract_admin_p_tags(event: &serde_json::Value) -> Vec<serde_json::Value> {
+    event
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| {
+                    let values = tag.as_array()?;
+                    if values.first().and_then(|value| value.as_str()) != Some("p") {
+                        return None;
+                    }
+                    let pubkey = values.get(1).and_then(|value| value.as_str())?;
+                    let role = values.get(2).and_then(|value| value.as_str())?;
+                    if !matches!(role, "owner" | "admin") {
+                        return None;
+                    }
+                    Some(serde_json::json!({"pubkey": pubkey, "role": role}))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Return a create-command response, injecting the entity ID **only** when the
 /// relay accepted the event (`"accepted": true`). When the relay rejected the
 /// event, emitting the locally-computed link would be misleading — callers

@@ -1,12 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use buzz_core::kind::{KIND_AGENT_PROFILE, KIND_MANAGED_AGENT, KIND_TEAM};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::client::{
-    extract_d_tag, extract_p_tags, extract_tag_value, normalize_write_response,
-    print_create_response, BuzzClient,
+    extract_admin_p_tags, extract_d_tag, extract_p_tags, extract_tag_value,
+    normalize_write_response, print_create_response, BuzzClient,
 };
 use crate::commands::agents::fetch_archived_snapshot;
 use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAgentRoster};
@@ -386,17 +386,56 @@ pub async fn cmd_list_channel_members(
     channel_id: &str,
 ) -> Result<(), CliError> {
     validate_uuid(channel_id)?;
-    let filter = serde_json::json!({
+    let member_filter = serde_json::json!({
         "kinds": [39002],
         "#d": [channel_id],
         "limit": 1
     });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let members = events.first().map(extract_p_tags).unwrap_or_default();
+    let admin_filter = serde_json::json!({
+        "kinds": [39001],
+        "#d": [channel_id],
+        "limit": 1
+    });
+    let member_resp = client.query(&member_filter).await?;
+    let admin_resp = client.query(&admin_filter).await?;
+    let member_events: Vec<serde_json::Value> =
+        serde_json::from_str(&member_resp).unwrap_or_default();
+    let admin_events: Vec<serde_json::Value> =
+        serde_json::from_str(&admin_resp).unwrap_or_default();
+    let members = channel_members_with_authority(
+        member_events.first(),
+        admin_events.first(),
+    );
     let output = serde_json::to_string(&members).unwrap_or_default();
     println!("{output}");
     Ok(())
+}
+
+fn channel_members_with_authority(
+    member_event: Option<&serde_json::Value>,
+    admin_event: Option<&serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut members = member_event.map(extract_p_tags).unwrap_or_default();
+    let authority = admin_event
+        .map(extract_admin_p_tags)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|member| {
+            Some((
+                member.get("pubkey")?.as_str()?.to_string(),
+                member.get("role")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    for member in &mut members {
+        let Some(pubkey) = member.get("pubkey").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if let Some(role) = authority.get(pubkey) {
+            member["role"] = serde_json::Value::String(role.clone());
+        }
+    }
+    members
 }
 
 pub async fn cmd_get_canvas(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
@@ -1442,10 +1481,10 @@ mod tests {
 
     use super::{
         apply_cardinality_rule, build_template_report, cmd_set_add_policy,
-        extract_channel_metadata, finalize_roster_resolution, include_channel, is_channel_archived,
-        merge_agent_profile_policy, name_matches, query_list_channel_events,
-        resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion,
-        ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
+        channel_members_with_authority, extract_channel_metadata, finalize_roster_resolution,
+        include_channel, is_channel_archived, merge_agent_profile_policy, name_matches,
+        query_list_channel_events, resolve_roster_with_archive_filter, validate_ttl_seconds,
+        ArchivedExclusion, ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
     };
     use crate::client::BuzzClient;
     use crate::CliError;
@@ -1453,6 +1492,32 @@ mod tests {
 
     fn event(tags: serde_json::Value) -> serde_json::Value {
         json!({ "tags": tags })
+    }
+
+    #[test]
+    fn channel_members_overlay_authoritative_admin_roles_on_bot_discovery_roles() {
+        let agent = "a".repeat(64);
+        let human = "b".repeat(64);
+        let member_event = event(json!([
+            ["d", "channel"],
+            ["p", agent, "", "bot"],
+            ["p", human, "", "member"]
+        ]));
+        let admin_event = event(json!([
+            ["d", "channel"],
+            ["p", "a".repeat(64), "admin"]
+        ]));
+
+        let members = channel_members_with_authority(Some(&member_event), Some(&admin_event));
+
+        assert_eq!(
+            members,
+            vec![
+                json!({"pubkey": "a".repeat(64), "role": "admin"}),
+                json!({"pubkey": "b".repeat(64), "role": "member"}),
+            ]
+        );
+        assert_eq!(member_event["tags"][1][3], "bot");
     }
 
     #[derive(Clone)]

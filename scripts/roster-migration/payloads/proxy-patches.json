@@ -1,0 +1,8 @@
+{
+  "preserve": ["api-keys", "api-key-entries", "remote-management.secret-key", "host", "port", "auth-dir", "unknown_fields"],
+  "targets": {
+    "sats-dsv4f": {"model": "qwen/qwen3.8-flash", "alias": "qwen38-flash", "reasoning": {"enabled": true}, "remove_named_effort_filter": true, "port": 8328},
+    "sats-glm": {"model": "z-ai/glm-5.3-flash", "alias": "glm53-flash-max", "reasoning": {"effort": "max"}, "port": 8327},
+    "sats-glm52": {"model": "z-ai/glm-5.3-flash", "alias": "glm53-flash-max", "reasoning": {"effort": "max"}, "port": 8329}
+  }
+}

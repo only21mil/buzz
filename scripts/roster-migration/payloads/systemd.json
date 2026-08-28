@@ -1,0 +1,35 @@
+{
+  "install_template": {
+    "path": "/home/victor/.config/systemd/user/buzz-sats-agent@.service",
+    "exec_start": "/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1/launch-buzz-agent %i",
+    "working_directory": "/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1"
+  },
+  "disable_stop_exact": [
+    "buzz-sats-agent@sats-hermes.service",
+    "agent-child-reaper@sats-hermes.timer"
+  ],
+  "pause_restore_exact": [
+    "buzz-sats-channel-sweep.timer",
+    "buzz-sats-channel-sweep.service"
+  ],
+  "restart_exact": [
+    "sats-dsv4f-proxy.service",
+    "sats-glm-proxy.service",
+    "sats-glm52-proxy.service",
+    "buzz-sats-agent@sats-codex.service",
+    "buzz-sats-agent@sats-codex-2.service",
+    "buzz-sats-agent@sats-codex-r.service",
+    "buzz-sats-agent@sats-glm.service",
+    "buzz-sats-agent@sats-dsv4f.service",
+    "buzz-sats-agent@sats-glm52.service",
+    "buzz-sats-agent@alpheus-claude-code.service",
+    "buzz-sats-agent@alpheus-codex.service"
+  ],
+  "preserve_exact": [
+    "buzz-sats-agent@.service",
+    "agent-child-reaper@.timer",
+    "hermes-gateway.service",
+    "buzz-agent@mempool.service",
+    "buzz-agent@genesis.service"
+  ]
+}

@@ -409,7 +409,7 @@ def accepted_bundle(
     if hashlib.sha256(raw).hexdigest() != bundle_digest:
         raise ValueError("accepted evidence bundle digest mismatch")
     if (
-        bundle.get("schema") != "tier2-evidence-v2"
+        bundle.get("schema") != "tier2-evidence-v3"
         or bundle.get("revision") != revision
         or bundle.get("artifact_fingerprint") != artifact_fingerprint
         or bundle.get("candidate") != {"mode": "files"}

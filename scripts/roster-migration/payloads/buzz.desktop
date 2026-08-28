@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Buzz
+Comment=Buzz desktop app
+Exec=/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1/launch-buzz-desktop %U
+Icon=/home/victor/work/buzz-client/buzz.png
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+StartupWMClass=buzz-desktop
+MimeType=x-scheme-handler/buzz;
+X-AppImage-Version=0.5.9-test.11

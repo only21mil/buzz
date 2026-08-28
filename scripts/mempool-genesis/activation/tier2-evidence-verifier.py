@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate one MGACT package against the current Tier 2 v2 engine state."""
+"""Validate one MGACT package against the current Tier 2 v3 engine state."""
 
 from __future__ import annotations
 
@@ -30,7 +30,26 @@ EXPECTED_ROUTE = {
     "provider": "claude",
     "model": "claude-opus-5",
     "effort": "high",
+    "auth_source": "profile",
 }
+TIER2_ENGINE_MODE = 0o755
+SEALED_ENGINE_LAUNCHER = """\
+import os
+import sys
+
+engine_path = sys.argv[1]
+sealed_path = sys.argv[2]
+with open(sealed_path, "rb", buffering=0) as source:
+    payload = source.read()
+sys.argv = [engine_path, *sys.argv[3:]]
+namespace = {
+    "__name__": "__main__",
+    "__file__": engine_path,
+    "__package__": None,
+    "__cached__": None,
+}
+exec(compile(payload, engine_path, "exec"), namespace)
+"""
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -112,8 +131,8 @@ def validate_relative_path(value: object) -> str:
 
 
 def validate_evidence(value: dict[str, object], candidate_root: Path) -> tuple[str, ...]:
-    if set(value) != EVIDENCE_KEYS or value.get("schema") != "tier2-evidence-v2":
-        raise ValueError("Tier 2 evidence must use the current tier2-evidence-v2 schema")
+    if set(value) != EVIDENCE_KEYS or value.get("schema") != "tier2-evidence-v3":
+        raise ValueError("Tier 2 evidence must use the current tier2-evidence-v3 schema")
     if value.get("candidate_root") != str(candidate_root):
         raise ValueError("Tier 2 evidence is bound to a different candidate root")
     if not isinstance(value.get("summary"), str) or not str(value["summary"]).strip():
@@ -134,8 +153,15 @@ def validate_evidence(value: dict[str, object], candidate_root: Path) -> tuple[s
     if not isinstance(commands, list) or len(commands) > 20:
         raise ValueError("Tier 2 evidence commands exceed the engine bound")
     for command in commands:
-        if not isinstance(command, dict) or set(command) != {"argv", "exit_code", "output"}:
+        if not isinstance(command, dict) or set(command) != {
+            "kind",
+            "argv",
+            "exit_code",
+            "output",
+        }:
             raise ValueError("Tier 2 evidence command fields mismatch")
+        if command.get("kind") != "result":
+            raise ValueError("Tier 2 evidence command kind is invalid")
         argv = command.get("argv")
         if not isinstance(argv, list) or not argv or any(
             not isinstance(argument, str) or not argument for argument in argv
@@ -148,30 +174,6 @@ def validate_evidence(value: dict[str, object], candidate_root: Path) -> tuple[s
     return paths
 
 
-def expected_fingerprint(candidate_root: Path, paths: tuple[str, ...]) -> dict[str, object]:
-    artifacts: list[dict[str, object]] = []
-    for relative in paths:
-        target = candidate_root.joinpath(*PurePosixPath(relative).parts)
-        resolved = target.resolve(strict=False)
-        if resolved != candidate_root and candidate_root not in resolved.parents:
-            raise ValueError(f"Tier 2 artifact escapes candidate root: {relative}")
-        try:
-            metadata = target.lstat()
-        except FileNotFoundError:
-            artifacts.append({"path": relative, "kind": "absent", "sha256": None, "size": 0})
-            continue
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"Tier 2 artifact is not a regular file: {relative}")
-        descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        try:
-            digest = hash_fd(descriptor)
-            size = os.fstat(descriptor).st_size
-        finally:
-            os.close(descriptor)
-        artifacts.append({"path": relative, "kind": "file", "sha256": digest, "size": size})
-    return {"candidate_root": str(candidate_root), "artifacts": artifacts, "git": None}
-
-
 def validate_state(
     state: dict[str, object],
     state_raw: bytes,
@@ -180,17 +182,16 @@ def validate_state(
     candidate_root: Path,
     paths: tuple[str, ...],
 ) -> dict[str, object]:
-    if state.get("state_schema") != "tier2-state-v2":
-        raise ValueError("Tier 2 state does not use the current tier2-state-v2 schema")
-    if state.get("producer_provider") != "gpt" or state.get("escalate") is not False:
-        raise ValueError(
-            "Tier 2 state does not record the GPT producer and activation-specific non-escalated route"
-        )
+    if state.get("state_schema") != "tier2-state-v3":
+        raise ValueError("Tier 2 state does not use the current tier2-state-v3 schema")
+    if state.get("producer_provider") != "gpt" or "escalate" in state:
+        raise ValueError("Tier 2 state does not record the current GPT producer route")
     route = state.get("route")
     if not isinstance(route, dict) or set(route) != {
         "provider",
         "model",
         "effort",
+        "auth_source",
         "reviewer_identity",
     }:
         raise ValueError("Tier 2 state review route is invalid")
@@ -227,9 +228,25 @@ def validate_state(
     if state.get("bundle_sha256") != sha256_bytes(evidence_raw):
         raise ValueError("Tier 2 state evidence digest mismatch")
     frozen = state.get("fingerprint")
-    expected = expected_fingerprint(candidate_root, paths)
-    if frozen != expected:
+    if (
+        not isinstance(frozen, dict)
+        or frozen.get("candidate_root") != str(candidate_root)
+        or frozen.get("changed_paths") != sorted(paths)
+        or not isinstance(frozen.get("base_commit"), str)
+        or not HEX64.fullmatch(str(frozen.get("status_sha256", "")))
+        or not HEX64.fullmatch(str(frozen.get("diff_sha256", "")))
+        or not isinstance(frozen.get("untracked_files"), list)
+    ):
         raise ValueError("Tier 2 state candidate fingerprint mismatch")
+    scope_id = state.get("scope_id")
+    ledger_path = state.get("ledger_path")
+    if (
+        not isinstance(scope_id, str)
+        or not scope_id.strip()
+        or not isinstance(ledger_path, str)
+        or not Path(ledger_path).is_absolute()
+    ):
+        raise ValueError("Tier 2 state scope or ledger binding is absent")
     verdict = state.get("verdict")
     if not isinstance(verdict, dict) or set(verdict) != {
         "verdict",
@@ -275,7 +292,7 @@ def validate_state(
         "reviewer_identity": reviewer_identity,
         "evidence_digest": sha256_bytes(evidence_raw),
         "state_digest": sha256_bytes(state_raw),
-        "candidate_fingerprint": sha256_bytes(canonical_json(expected)),
+        "candidate_fingerprint": sha256_bytes(canonical_json(frozen)),
         "verdict_digest": sha256_bytes(canonical_json(verdict)),
     }
 
@@ -290,10 +307,10 @@ def open_sealed_engine(path: Path, expected_digest: str) -> int:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or stat.S_IMODE(metadata.st_mode) != TIER2_ENGINE_MODE
         ):
             raise ValueError("unsafe installed Tier 2 engine")
-        sealed = os.memfd_create("mgact-tier2-v2-engine", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        sealed = os.memfd_create("mgact-tier2-v3-engine", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         digest = hashlib.sha256()
         while chunk := os.read(source, 1024 * 1024):
             digest.update(chunk)
@@ -323,7 +340,17 @@ def run_engine_check(engine: Path, engine_digest: str, state_path: Path) -> None
     descriptor = open_sealed_engine(engine, engine_digest)
     try:
         completed = subprocess.run(
-            [sys.executable, f"/proc/self/fd/{descriptor}", "check", "--state", str(state_path)],
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                SEALED_ENGINE_LAUNCHER,
+                str(engine),
+                f"/proc/self/fd/{descriptor}",
+                "check",
+                "--state",
+                str(state_path),
+            ],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -341,9 +368,9 @@ def run_engine_check(engine: Path, engine_digest: str, state_path: Path) -> None
         os.close(descriptor)
     if completed.returncode != 0:
         detail = completed.stderr.strip()
-        raise ValueError(f"Tier 2 v2 check rejected closure: {detail or completed.returncode}")
+        raise ValueError(f"Tier 2 v3 check rejected closure: {detail or completed.returncode}")
     if completed.stdout.splitlines() != ["OK"]:
-        raise ValueError("Tier 2 v2 check returned an invalid response")
+        raise ValueError("Tier 2 v3 check returned an invalid response")
 
 
 def check(
@@ -377,9 +404,8 @@ def check(
     return {
         "ok": True,
         "subcommand": "check",
-        "state_schema": "tier2-state-v2",
+        "state_schema": "tier2-state-v3",
         "producer_provider": "gpt",
-        "escalated": False,
         "route": EXPECTED_ROUTE,
         **acceptance,
     }
@@ -410,5 +436,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(f"mgact-tier2-v2: {error}", file=sys.stderr)
+        print(f"mgact-tier2-v3: {error}", file=sys.stderr)
         raise SystemExit(1)

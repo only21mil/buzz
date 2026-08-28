@@ -1,0 +1,24 @@
+[Unit]
+Description=Buzz Sats agent (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1
+ExecStart=/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1/launch-buzz-agent %i
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=20s
+KillMode=control-group
+NoNewPrivileges=no
+RestrictSUIDSGID=no
+LockPersonality=no
+UMask=0077
+TasksMax=256
+MemoryMax=12G
+MemorySwapMax=0
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target

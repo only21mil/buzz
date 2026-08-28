@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "base_commit": "5ac44f9ff2d16d61f562e4de16f012ae0be9fd47",
+  "relay_url": "wss://framework-desktop.tail69757d.ts.net:38443",
+  "owner_pubkey": "4a34c131ec5cb5dd9a200bac619bbd103c0793e068fad278d1de59203d05b97d",
+  "install_root": "/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1",
+  "config_root": "/home/victor/.config/buzz/agents",
+  "standing_sweep_timer": "buzz-sats-channel-sweep.timer",
+  "standing_sweep_service": "buzz-sats-channel-sweep.service",
+  "owner_private_key_var": "BUZZ_OWNER_PRIVATE_KEY",
+  "retained_agents": [
+    "sats-codex",
+    "sats-codex-2",
+    "sats-codex-r",
+    "sats-glm",
+    "sats-dsv4f",
+    "sats-glm52",
+    "alpheus-claude-code",
+    "alpheus-codex"
+  ],
+  "preserve_units": [
+    "hermes-gateway.service",
+    "buzz-agent@mempool.service",
+    "buzz-agent@genesis.service"
+  ],
+  "targets": [
+    {
+      "slug": "sats-dsv4f",
+      "display_name": "Knots",
+      "previous_display_name": "Sats DSV4F",
+      "pubkey": "3b1293bdf1f3885417eb1df302b5f31401fb740ad6e25b83a7aab210abc549bb",
+      "agent_type": "qwen",
+      "model": "qwen/qwen3.8-flash",
+      "alias": "qwen38-flash",
+      "reasoning": {"enabled": true, "effort": null},
+      "context_tokens": 1000000,
+      "compact_tokens": 950000,
+      "port": 8328,
+      "home": "/home/victor/work/buzz-agents/sats-dsv4f/home",
+      "prompt": "/home/victor/.config/buzz/agents/sats-dsv4f-system.md",
+      "proxy_config": "/home/victor/.config/sats-dsv4f/cliproxyapi.yaml",
+      "proxy_unit": "sats-dsv4f-proxy.service",
+      "private_key_var": "BUZZ_SATS_DSV4F_PRIVATE_KEY",
+      "auth_tag_var": "BUZZ_SATS_DSV4F_AUTH_TAG",
+      "proxy_token_var": "BUZZ_SATS_DSV4F_PROXY_TOKEN"
+    },
+    {
+      "slug": "sats-glm",
+      "display_name": "Segwit",
+      "previous_display_name": "Sats GLM5.2.1",
+      "pubkey": "b7d2ebed4d4f15a28c71b8a83f3a717770a37bd65bd29e95aea4faa6106c445a",
+      "agent_type": "glm",
+      "model": "z-ai/glm-5.3-flash",
+      "alias": "glm53-flash-max",
+      "reasoning": {"enabled": true, "effort": "max"},
+      "context_tokens": 1048576,
+      "compact_tokens": 1000000,
+      "port": 8327,
+      "home": "/home/victor/work/buzz-agents/sats-glm/home",
+      "prompt": "/home/victor/.config/buzz/agents/sats-glm-system.md",
+      "proxy_config": "/home/victor/.config/sats-glm/cliproxyapi.yaml",
+      "proxy_unit": "sats-glm-proxy.service",
+      "private_key_var": "BUZZ_SATS_GLM_PRIVATE_KEY",
+      "auth_tag_var": "BUZZ_SATS_GLM_AUTH_TAG",
+      "proxy_token_var": "BUZZ_SATS_GLM_PROXY_TOKEN"
+    },
+    {
+      "slug": "sats-glm52",
+      "display_name": "Ledger",
+      "previous_display_name": "Sats GLM5.2",
+      "pubkey": "d0abfb7c343012552a44009b2f33bb6a6ada54b4e6d408fffeed58d388d1f2af",
+      "agent_type": "glm",
+      "model": "z-ai/glm-5.3-flash",
+      "alias": "glm53-flash-max",
+      "reasoning": {"enabled": true, "effort": "max"},
+      "context_tokens": 1048576,
+      "compact_tokens": 1000000,
+      "port": 8329,
+      "home": "/home/victor/work/buzz-agents/sats-glm52/home",
+      "prompt": "/home/victor/.config/buzz/agents/sats-glm52-system.md",
+      "proxy_config": "/home/victor/.config/sats-glm52/cliproxyapi.yaml",
+      "proxy_unit": "sats-glm52-proxy.service",
+      "private_key_var": "BUZZ_SATS_GLM52_PRIVATE_KEY",
+      "auth_tag_var": "BUZZ_SATS_GLM52_AUTH_TAG",
+      "proxy_token_var": "BUZZ_SATS_GLM52_PROXY_TOKEN"
+    },
+    {
+      "slug": "sats-codex-2",
+      "display_name": "UTXO",
+      "previous_display_name": "Sats Codex-2",
+      "pubkey": "aefa6783cdf2f33f9aa3705b41e5ae3ec214318c64db48f1410fc77db015f2ec",
+      "agent_type": "codex",
+      "model": "gpt-5.6-sol",
+      "reasoning": {"enabled": true, "effort": "high"},
+      "home": "/home/victor/work/buzz-agents/sats-codex-2/home",
+      "prompt": "/home/victor/.config/buzz/agents/sats-codex-2-system.md",
+      "private_key_var": "BUZZ_SATS_CODEX2_PRIVATE_KEY",
+      "auth_tag_var": "BUZZ_SATS_CODEX2_AUTH_TAG"
+    }
+  ],
+  "hermes_retirement": {
+    "slug": "sats-hermes",
+    "pubkey": "fc2cd7a09dfebfc20cd9ee4cc9ec03536d7ad4ef5d0e2d961e9fdb064511e6ba",
+    "secret_variables": ["BUZZ_SATS_HERMES_PRIVATE_KEY", "BUZZ_SATS_HERMES_AUTH_TAG"],
+    "agent_unit": "buzz-sats-agent@sats-hermes.service",
+    "reaper_timer": "agent-child-reaper@sats-hermes.timer",
+    "launcher_prompt": "/home/victor/.config/buzz/agents/sats-hermes-system.md",
+    "memberships": [
+      "9ae3b00b-d064-4182-9ba1-4a947205b084", "46bba699-8251-43c7-943e-66be58376585", "6fb4c4d1-0c7c-4f2b-95ce-49c1971d10cc", "ff7700bd-d8bf-415f-a9cb-efd4b466a10a", "9f7d9f1d-df0f-490f-8e32-1e3dbf261f1f", "c3faa255-1f1d-4a54-8f7d-77d4d5182458", "1ec68cd0-3051-45cd-8297-76803e34add0", "8663825d-9b6c-4aba-8595-bbb500b36d4f", "03f28d12-d392-4147-a9d6-9f23426dcde0", "ffd6f3aa-014d-4879-8983-ee29986824b2", "9c4331e6-3c1a-5eb2-a67c-f290232ea4c1", "746a87fe-6565-44db-adc9-3ba7a7dfde97", "8bec55c2-4ea5-4e26-bd3a-31c07bf2fab0", "e0633ce4-ddc4-4fb7-9487-57ded8fec949", "26faf8b2-dfce-4f35-9665-f5f33318d9ad", "0ed53b38-d6f7-44ba-a2b4-1e685d1fbb1e", "f153323f-c5ed-4597-9023-676dffe55dab", "ec1d8df0-678d-4d48-9158-57e0d0579682", "4d559c69-8f5c-4e76-8a4d-41700e959f93", "7921fa97-167f-42e3-aab1-a2137ecd7db6", "631597a2-1104-4b90-a0f4-9018810be096", "b6291e68-a928-4719-8419-347246bc5794", "52cf47f6-ce33-491e-b8a7-07c412992b82", "7a334e7d-bb6a-4ace-8414-b75e8bcf2efc", "93d0eab0-207d-4343-903f-3016944ee711", "490d6860-9bd9-483b-985d-6a40e984c687", "f38ead3d-9129-4b9c-9f25-f2e9845f9079"
+    ]
+  },
+  "fleet_prompts": [
+    {"name": "sats-codex-system.md", "path": "/home/victor/.config/buzz/agents/sats-codex-system.md", "sha256": "0a8ed14ed7fb15d832ca9c20486af8493c516d7ba51559bd27d89bce065bce21"},
+    {"name": "sats-codex-2-system.md", "path": "/home/victor/.config/buzz/agents/sats-codex-2-system.md", "sha256": "62cbb90fb39e95eaa8cbc6008e117c9cc76fbed98955c75ef153d12c117fbd28"},
+    {"name": "sats-codex-r-system.md", "path": "/home/victor/.config/buzz/agents/sats-codex-r-system.md", "sha256": "0a69ecc6359270f1c95a460c75566a76834a616e4dd65a491c3b259748da04a8"},
+    {"name": "sats-glm-system.md", "path": "/home/victor/.config/buzz/agents/sats-glm-system.md", "sha256": "c7177f33e2b6f1a05f98478c40cffce9d1b258fd224ac39ee8eb37f8d69f054f"},
+    {"name": "sats-dsv4f-system.md", "path": "/home/victor/.config/buzz/agents/sats-dsv4f-system.md", "sha256": "356283c2760baba950654ef92e483cc87c86c97c7c2b42d7deef9a2c1f60c36f"},
+    {"name": "sats-glm52-system.md", "path": "/home/victor/.config/buzz/agents/sats-glm52-system.md", "sha256": "73a0a6bcc3597f6a3157d9cab9fbcae126fe449bc7c6cf48262d9361cba87959"},
+    {"name": "alpheus-claude-code-system.md", "path": "/home/victor/.config/buzz/agents/alpheus-claude-code-system.md", "sha256": "e7df68e8b0bbfca5a6dc29267c6495ceca4c0b290b1f2269396f3b944a7eae33"},
+    {"name": "alpheus-codex-system.md", "path": "/home/victor/.config/buzz/agents/alpheus-codex-system.md", "sha256": "184427261b7822eab5242b816176eb79ae3bc618b2b2755b88f9b8258aa986c4"}
+  ],
+  "live_files": {
+    "launcher": "/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1/launch-buzz-agent",
+    "desktop_launcher": "/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1/launch-buzz-desktop",
+    "desktop_entry": "/home/victor/.local/share/applications/buzz.desktop",
+    "directory_sync": "/home/victor/.local/libexec/buzz/fleet/roster-5ac44f9f-v1/buzz-sats-directory-sync.py",
+    "directory_sync_compat": "/home/victor/.agents/tools/buzz-sats-directory-sync.py",
+    "membership_sweep": "/home/victor/.local/libexec/buzz/buzz-sats-channel-sweep",
+    "membership_sweep_service": "/home/victor/.config/systemd/user/buzz-sats-channel-sweep.service",
+    "agent_service": "/home/victor/.config/systemd/user/buzz-sats-agent@.service",
+    "secrets": "/home/victor/.config/sats/secrets.env"
+  },
+  "desktop": {
+    "appimage": "/home/victor/work/buzz-client/Buzz_0.5.9-test.11_amd64.AppImage",
+    "appimage_sha256": "404829a7fba15a9887e847c3b0fbf5b208f6759e097367bba51ca044437f2009",
+    "manifest": "/home/victor/work/buzz-client/Buzz_0.5.9-test.11_amd64.AppImage.manifest.json",
+    "manifest_sha256": "b18b3b5185da563a267df2f31336ac26138d39b6808616c6735bf76d6f611168",
+    "source_sha": "1543c1ffed7aa193e5cdcaf8560fa18ab8354103",
+    "icon": "/home/victor/work/buzz-client/buzz.png",
+    "icon_sha256": "c401bb5c0783e37275d811d87af46f4f5246dff40b1a85b4a8fc771f065cb51e"
+  },
+  "membership_sweep_dependency": {
+    "activation_manifest_schema": "buzz-mempool-genesis-activation-bundle-v3",
+    "source_commit": "5ac44f9ff2d16d61f562e4de16f012ae0be9fd47",
+    "source_tree": "191cc2831e94c9aa60a2dd91ff67aedb280c2155",
+    "staged_diff_sha256": "107c26530f020af6d9bafa46db79012f7afc134d50bbd043bccc1daa545ca1d2",
+    "generator_sources": {
+      "scripts/mempool-genesis/activation/templates/buzz-sats-channel-sweep.sh": "2d3af932d6706adc7e93b726b3d0b32bcb230e5418f64a944c09fc0e0b5b91e3",
+      "scripts/mempool-genesis/activation/templates/buzz-sats-channel-sweep.service": "564ff73439a7ad919d9ca292a6df8b52473ae32b3314832db11a16becb46f9d0"
+    },
+    "ops_targets": {
+      "membership_sweep": {
+        "target": "/home/victor/.local/libexec/buzz/buzz-sats-channel-sweep",
+        "source": "ops-root/home/victor/.local/libexec/buzz/buzz-sats-channel-sweep",
+        "mode": "0700",
+        "uid": 1000
+      },
+      "membership_sweep_service": {
+        "target": "/home/victor/.config/systemd/user/buzz-sats-channel-sweep.service",
+        "source": "ops-root/home/victor/.config/systemd/user/buzz-sats-channel-sweep.service",
+        "mode": "0600",
+        "uid": 1000,
+        "gid": 1000,
+        "sha256": "564ff73439a7ad919d9ca292a6df8b52473ae32b3314832db11a16becb46f9d0"
+      }
+    }
+  },
+  "publish_kinds": [0, 10100]
+}
