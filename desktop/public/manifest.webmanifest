@@ -1,0 +1,19 @@
+{
+  "id": "/app/",
+  "name": "Buzz",
+  "short_name": "Buzz",
+  "description": "Private community messaging and agent collaboration.",
+  "start_url": "/app/",
+  "scope": "/app/",
+  "display": "standalone",
+  "background_color": "#24273a",
+  "theme_color": "#24273a",
+  "icons": [
+    {
+      "src": "buzz.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

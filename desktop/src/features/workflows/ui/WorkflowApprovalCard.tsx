@@ -59,7 +59,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
         </Button>
         <Button
           className="flex-1"
-          disabled={approvalMutation.isPending}
+          disabled={approvalMutation.isPending || note.trim().length === 0}
           onClick={() =>
             approvalMutation.mutate({
               token: approval.token,

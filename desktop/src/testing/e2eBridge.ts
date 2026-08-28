@@ -11,6 +11,7 @@ import {
 } from "./e2eBridgeCustomHarnesses.ts";
 
 import { relayClient } from "@/shared/api/relayClient";
+import { register as registerWebCommand } from "@/platform/web/registry";
 import { activateRateLimit } from "@/shared/api/relayRateLimitGate";
 import { resolveAgentParallelism } from "@/features/agents/lib/agentParallelism";
 import type { ConnectionState } from "@/shared/api/relayClientShared";
@@ -5338,6 +5339,7 @@ const MOCK_PROJECT_KINDS = new Set<number>([
   KIND_GIT_STATUS_MERGED,
   KIND_GIT_STATUS_CLOSED,
   KIND_GIT_STATUS_DRAFT,
+  46_100,
 ]);
 
 function mulberry32(seed: number) {
@@ -13065,6 +13067,9 @@ export function maybeInstallE2eTauriMocks() {
   };
   window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__ = (command, payload) =>
     handleMockCommand(command, payload ?? null);
+  registerWebCommand("sign_event", (body) =>
+    handleMockCommand("sign_event", body ?? null),
+  );
   window.__BUZZ_E2E_EMIT_TAURI_EVENT__ = (event, payload) =>
     emit(event, payload);
   mockIPC(handleMockCommand, { shouldMockEvents: true });

@@ -38,6 +38,7 @@ import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
+import { messageDeliveryLabel } from "@/features/messages/lib/messageDeliveryStatus";
 import { Markdown } from "@/shared/ui/markdown";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
 import { useOpenVideoReviewAt } from "@/shared/ui/VideoReviewNavigation";
@@ -576,15 +577,25 @@ export const MessageRow = React.memo(
       </div>
     );
 
+    const deliveryLabel = messageDeliveryLabel(
+      message.deliveryStatus,
+      message.pending,
+    );
     const statusMetadataNode =
-      message.pending || message.edited ? (
+      deliveryLabel || message.edited ? (
         <>
-          {message.pending ? (
+          {deliveryLabel ? (
             <p
               className="font-normal text-muted-foreground/70"
               data-testid="message-send-status"
+              role={
+                message.deliveryStatus === "failed" ||
+                message.deliveryStatus === "expired"
+                  ? "alert"
+                  : "status"
+              }
             >
-              Sending…
+              {deliveryLabel}
             </p>
           ) : null}
           {message.edited ? (

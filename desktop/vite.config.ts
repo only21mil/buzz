@@ -5,9 +5,65 @@ import { tanstackRouter } from "@tanstack/router-plugin/vite";
 
 const host = process.env.TAURI_DEV_HOST;
 
+const WEB_CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "form-action 'self'",
+  "frame-src 'none'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' data: blob:",
+  "connect-src 'self'",
+  "worker-src 'self'",
+  "manifest-src 'self'",
+].join("; ");
+
+function browserDocumentMetadata() {
+  return {
+    name: "buzz-browser-document-metadata",
+    transformIndexHtml: {
+      order: "pre" as const,
+      handler: () => [
+        {
+          tag: "meta",
+          attrs: {
+            "http-equiv": "Content-Security-Policy",
+            content: WEB_CONTENT_SECURITY_POLICY,
+          },
+          injectTo: "head-prepend" as const,
+        },
+        {
+          tag: "meta",
+          attrs: { name: "theme-color", content: "#24273a" },
+          injectTo: "head" as const,
+        },
+        {
+          tag: "meta",
+          attrs: { name: "apple-mobile-web-app-capable", content: "yes" },
+          injectTo: "head" as const,
+        },
+        {
+          tag: "meta",
+          attrs: { name: "apple-mobile-web-app-title", content: "Buzz" },
+          injectTo: "head" as const,
+        },
+        {
+          tag: "link",
+          attrs: { rel: "manifest", href: "/app/manifest.webmanifest" },
+          injectTo: "head" as const,
+        },
+      ],
+    },
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig(async ({ mode }) => ({
   plugins: [
+    ...(mode === "web" ? [browserDocumentMetadata()] : []),
     tanstackRouter({
       target: "react",
       routesDirectory: "./src/app/routes",
