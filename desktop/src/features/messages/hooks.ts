@@ -609,7 +609,11 @@ export function useSendMessageMutation(
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    if (isTauri() || !identity) return;
+    // The desktop E2E harness runs in a browser but mocks the packaged Tauri
+    // command path. Keep browser-only delivery events out of that harness.
+    if (isTauri() || import.meta.env.MODE === "e2e" || !identity) {
+      return;
+    }
     return subscribeOfflineMessageDeliveryStatuses(
       queryClient,
       identity.pubkey,
@@ -683,7 +687,7 @@ export function useSendMessageMutation(
       // queued while the user agent is explicitly offline. Desktop keeps its
       // direct WebSocket path for simple messages.
       if (
-        !isTauri() ||
+        (!isTauri() && import.meta.env.MODE !== "e2e") ||
         parentEventId ||
         imetaTags.length > 0 ||
         emojiTags.length > 0 ||

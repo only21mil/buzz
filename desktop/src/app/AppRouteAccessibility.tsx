@@ -20,19 +20,45 @@ export function focusMainContent(): void {
   document.getElementById("main-content")?.focus({ preventScroll: true });
 }
 
+export function focusMainContentAfterRouteChange(
+  activeAtRouteChange: Element | null,
+): void {
+  const main = document.getElementById("main-content");
+  const activeNow = document.activeElement;
+
+  // Destination routes can intentionally autofocus their own controls. Keep
+  // that focus when it landed inside the main region after the route changed.
+  if (
+    main &&
+    activeNow !== activeAtRouteChange &&
+    activeNow &&
+    main.contains(activeNow)
+  ) {
+    return;
+  }
+  main?.focus({ preventScroll: true });
+}
+
 /** Keyboard and screen-reader support for client-side route changes. */
 export function AppRouteAccessibility() {
   const location = useLocation();
   const previousPath = React.useRef(location.pathname);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pathname is the invalidation key for the pre-commit focus snapshot
+  const activeBeforeRouteCommit = React.useMemo(
+    () => document.activeElement,
+    [location.pathname],
+  );
   const [announcement, setAnnouncement] = React.useState("");
 
   React.useEffect(() => {
     if (previousPath.current === location.pathname) return;
     previousPath.current = location.pathname;
     setAnnouncement(routeAnnouncement(location.pathname));
-    const frame = window.requestAnimationFrame(focusMainContent);
+    const frame = window.requestAnimationFrame(() => {
+      focusMainContentAfterRouteChange(activeBeforeRouteCommit);
+    });
     return () => window.cancelAnimationFrame(frame);
-  }, [location.pathname]);
+  }, [activeBeforeRouteCommit, location.pathname]);
 
   const handleSkipLink = React.useCallback(
     (event: React.MouseEvent<HTMLAnchorElement>) => {
