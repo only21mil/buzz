@@ -1468,9 +1468,8 @@ async fn read_ci_log(
     }
 
     let (owner, repo) = parse_repo_coordinate(&request.target_repo_a).ok_or_else(hidden)?;
-    let authorized_channel = authorize_ci_read(&state, &tenant, &caller, owner, repo)
-        .await
-        .map_err(|_| hidden())?;
+    let authorized_channel =
+        map_log_read_authorization(authorize_ci_read(&state, &tenant, &caller, owner, repo).await)?;
     if authorized_channel != channel_id {
         return Err(hidden());
     }
@@ -1661,6 +1660,21 @@ async fn read_ci_log(
 fn parse_repo_coordinate(target_repo_a: &str) -> Option<(&str, &str)> {
     let mut parts = target_repo_a.splitn(3, ':');
     (parts.next()? == "30617").then_some((parts.next()?, parts.next()?))
+}
+
+fn map_log_read_authorization(
+    result: Result<uuid::Uuid, PreflightReject>,
+) -> Result<uuid::Uuid, PreflightApiError> {
+    match result {
+        Ok(channel_id) => Ok(channel_id),
+        Err(reject) if matches!(reject.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {
+            Err(api_error(StatusCode::NOT_FOUND, "CI log not found"))
+        }
+        Err(_) => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        )),
+    }
 }
 
 fn validate_log_read_path(path: &EvidencePath) -> Result<(), PreflightApiError> {
@@ -2108,6 +2122,45 @@ mod tests {
             };
             assert_eq!(parsed, None, "invalid range must fail: {invalid}");
         }
+    }
+
+    #[test]
+    fn log_read_authorization_hides_denials_but_preserves_outages() {
+        let reject = |status, message: &str| PreflightReject {
+            status,
+            message: message.to_owned(),
+        };
+        let forbidden = map_log_read_authorization(Err(reject(
+            StatusCode::FORBIDDEN,
+            "private membership detail",
+        )))
+        .expect_err("forbidden read must fail");
+        let missing = map_log_read_authorization(Err(reject(
+            StatusCode::NOT_FOUND,
+            "private repository detail",
+        )))
+        .expect_err("missing read must fail");
+        assert_eq!(forbidden.0, StatusCode::NOT_FOUND);
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            forbidden.1 .0, missing.1 .0,
+            "denial and absence must be indistinguishable"
+        );
+        assert_eq!(
+            forbidden.1 .0,
+            serde_json::json!({"error": "CI log not found"})
+        );
+
+        let outage = map_log_read_authorization(Err(reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "private database detail",
+        )))
+        .expect_err("authorization outage must fail");
+        assert_eq!(outage.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            outage.1 .0,
+            serde_json::json!({"error": "CI log unavailable"})
+        );
     }
 
     #[test]
