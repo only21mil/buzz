@@ -137,7 +137,7 @@ class StaticManifestTests(unittest.TestCase):
         if fingerprints is not None:
             package_fingerprints.update(fingerprints)
         bundle = {
-            "schema": "tier2-evidence-v2",
+            "schema": "tier2-evidence-v3",
             "revision": 1,
             "candidate": {"mode": "files"},
             "changed_paths": changed_paths,

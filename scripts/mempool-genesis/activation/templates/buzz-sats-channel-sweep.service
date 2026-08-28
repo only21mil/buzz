@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile Sats agents and authority in Buzz channels
+
+[Service]
+Type=oneshot
+ExecStart=/home/victor/.local/libexec/buzz/buzz-sats-channel-sweep --check
+
+[Install]
+WantedBy=default.target

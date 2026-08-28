@@ -13,7 +13,7 @@ ID/digest, job, attempt, or lease ID. The shared lease emits the exact
 `{job_id,attempt,lease_id}` tuple used by kind 46106.
 
 Pulls, builds, networks, volume mutation, Libpod endpoints, service containers,
-archive access, runtime or proxy socket mounts, secret-bearing environment,
+runtime or proxy socket mounts, secret-bearing environment,
 privileged configuration, and unknown routes are denied for the Phase-1
 offline slice.
 
@@ -31,9 +31,16 @@ locally. It filters manifest-pinned image inspect, owned container inspect, and
 owned exec inspect responses. The runtime never controls executor-visible
 headers or exposes extra inspect fields.
 
-Archive and exec-hijack grants are types only. The transport refuses those
-routes until bounded tar and hijack mediators exist. Pinned `act` 0.2.89 needs
-both routes, so this crate is not act-compatible.
+PUT/GET container archives are mediated for owned, started containers. The
+proxy validates the complete bounded tar stream before forwarding or returning
+any archive bytes, rejects unsafe entry types and paths, and rebuilds normalized
+ustar output. Archive downloads accept bounded chunked daemon framing and keep
+only the required validated path-stat response header. Exec-create requires an
+exact manifest-bound argv, environment, user, workdir, and stream-mode
+expectation. Only the resulting ledger-owned exec ID may use the bounded
+exec-start hijack relay. The relay requires the exact Docker upgrade, caps both
+byte directions, enforces one deadline, and closes both sockets when either side
+closes. Other archive, attach, log, and hijack routes remain denied.
 
 The root-owned broker must still deliver one-shot descriptors over an
 authenticated capability channel. It must also persist poison and

@@ -891,6 +891,7 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "zeroize",
 ]
@@ -970,6 +971,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-ci-controld"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "buzz-core",
+ "hex",
+ "nix 0.31.3",
+ "nostr",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "buzz-ci-execd"
 version = "0.1.0"
 dependencies = [
@@ -979,6 +1000,7 @@ dependencies = [
  "buzz-ci-policy-proxy",
  "hex",
  "nix 0.31.3",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1019,13 +1041,16 @@ dependencies = [
 name = "buzz-ci-policy-proxy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "buzz-ci-isolation-contract",
+ "flate2",
  "hex",
  "nix 0.31.3",
  "proptest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "thiserror 2.0.18",
  "url",
 ]
@@ -1035,9 +1060,15 @@ name = "buzz-ci-runner"
 version = "0.1.0"
 dependencies = [
  "buzz-ci-broker-protocol",
+ "buzz-ci-controld",
  "buzz-core",
+ "ed25519-dalek",
  "hex",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -7940,6 +7971,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

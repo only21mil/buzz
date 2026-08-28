@@ -17,8 +17,8 @@ The machine-readable copy is
 6. `POST /containers/{id}/start`
 7. `POST /containers/{id}/exec` and hijacked `POST /exec/{id}/start` for
    user and group probes
-8. `PUT /containers/{id}/archive?path=...` for event, environment, command,
-   and script files
+8. `PUT /containers/{id}/archive?noOverwriteDirNonDir=true&path=...` for
+   event, environment, command, and script files
 9. `POST /containers/{id}/exec`, hijacked `POST /exec/{id}/start`, then
    `GET /exec/{id}/json` for each shell step
 10. `GET /containers/{id}/archive?path=...` for command files and step output
@@ -37,10 +37,17 @@ owned container inspect, and owned exec inspect responses through fixed JSON
 projections. Create and other already-admitted non-streaming operations also
 receive fixed projections.
 
-Archive transfer and exec hijack remain disabled. Their typed grants only state
-what a future mediator must bind. They do not authorize forwarding. Because
-both operations are mandatory in the sequence above, this crate is not yet
-compatible with `act`.
+Archive transfer is mediated through typed, owned-container grants and bounded
+canonical tar reconstruction. Exec-create is reconstructed from an exact
+manifest expectation, and exec-start has a ledger-owned, byte-capped,
+deadline-bounded upgrade relay. These are the only archive and hijack routes
+admitted for the pinned sequence above.
+
+Moby's default `CopyToContainer` query sets `noOverwriteDirNonDir=true` before
+the required `path`. `CopyFromContainer` requires the daemon's
+`X-Docker-Container-Path-Stat` response header. The daemon streams successful
+GET archives without a known length, which Go's HTTP/1.1 server frames as
+`Transfer-Encoding: chunked`.
 
 ## Pinned source paths
 

@@ -5,6 +5,18 @@ use std::{collections::BTreeSet, path::Component};
 
 use crate::ProxyError;
 
+const RESERVED_ENVIRONMENT: [&str; 3] = ["BUZZ_CI_RUN_ID", "BUZZ_CI_SHA", "BUZZ_CI_ATTEMPT"];
+const FORBIDDEN_ENVIRONMENT: [&str; 8] = [
+    "BUZZ_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
+    "NOSTR_PRIVATE_KEY",
+    "GITHUB_TOKEN",
+    "SSH_AUTH_SOCK",
+    "DOCKER_HOST",
+    "CONTAINER_HOST",
+    "XDG_RUNTIME_DIR",
+];
+
 /// Runtime implementation frozen by the signed isolation profile.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +147,33 @@ impl IsolationProfile {
     }
 }
 
+/// One manifest-bound class of Docker exec-create request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecExpectation {
+    /// Exact non-empty argument vector.
+    pub argv: Vec<String>,
+    /// Exact non-secret caller environment before proxy identity injection.
+    #[serde(default)]
+    pub environment: Vec<String>,
+    /// Exact numeric non-root UID:GID.
+    pub user: String,
+    /// Exact canonical absolute working directory.
+    pub working_dir: String,
+    /// Whether the executor may send stdin bytes after hijack.
+    #[serde(default)]
+    pub attach_stdin: bool,
+    /// Whether stdout is attached.
+    #[serde(default)]
+    pub attach_stdout: bool,
+    /// Whether stderr is attached.
+    #[serde(default)]
+    pub attach_stderr: bool,
+    /// Whether Docker multiplexing is disabled for a TTY stream.
+    #[serde(default)]
+    pub tty: bool,
+}
+
 /// Immutable policy installed by the trusted broker for one attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -175,6 +214,11 @@ pub struct PolicyManifest {
     /// identity variables reach the container.
     #[serde(default)]
     pub allowed_environment: Vec<String>,
+    /// Exact exec-create classes derived from the signed job manifest.
+    ///
+    /// An empty list keeps exec creation closed.
+    #[serde(default)]
+    pub expected_execs: Vec<ExecExpectation>,
 }
 
 impl PolicyManifest {
@@ -263,6 +307,52 @@ impl PolicyManifest {
             return Err(ProxyError::InvalidManifest(
                 "allowed_environment contains an invalid or duplicate name".into(),
             ));
+        }
+        if self.expected_execs.len() > 4096 {
+            return Err(ProxyError::InvalidManifest(
+                "expected_execs exceeds the manifest limit".into(),
+            ));
+        }
+        for expectation in &self.expected_execs {
+            if expectation.argv.is_empty()
+                || expectation.argv.len() > 256
+                || expectation
+                    .argv
+                    .iter()
+                    .any(|value| value.len() > 8192 || value.bytes().any(|byte| byte == 0))
+                || expectation.user != self.container_user
+                || !is_normal_absolute_path(&expectation.working_dir)
+                || !self.mounts.iter().any(|mount| {
+                    std::path::Path::new(&expectation.working_dir).starts_with(&mount.destination)
+                })
+            {
+                return Err(ProxyError::InvalidManifest(
+                    "expected exec argv, user, or working directory is invalid".into(),
+                ));
+            }
+            let mut names = BTreeSet::new();
+            if expectation.environment.len() > 256
+                || expectation.environment.iter().any(|entry| {
+                    let Some((name, _)) = entry.split_once('=') else {
+                        return true;
+                    };
+                    entry.len() > 8192
+                        || entry.bytes().any(|byte| byte == 0)
+                        || !is_environment_name(name)
+                        || RESERVED_ENVIRONMENT.contains(&name)
+                        || FORBIDDEN_ENVIRONMENT.contains(&name)
+                        || !self
+                            .allowed_environment
+                            .iter()
+                            .any(|allowed| allowed == name)
+                        || !names.insert(name)
+                })
+            {
+                return Err(ProxyError::InvalidManifest(
+                    "expected exec environment is invalid, secret-bearing, or not allowlisted"
+                        .into(),
+                ));
+            }
         }
         self.isolation_profile.validate()
     }

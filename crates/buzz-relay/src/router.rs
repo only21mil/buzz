@@ -46,6 +46,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(RequestBodyLimitLayer::new(media_body_limit))
         .with_state(state.clone());
 
+    let ci_evidence_router = Router::new()
+        .route(
+            "/ci/logs/{request_id}/{run_id}/{job_id}/{attempt}/{sha256}",
+            put(api::ci::put_ci_log),
+        )
+        .route(
+            "/ci/artifacts/{request_id}/{run_id}/{job_id}/{attempt}/{artifact_id}/{sha256}",
+            put(api::ci::put_ci_artifact),
+        )
+        .layer(RequestBodyLimitLayer::new(api::ci::MAX_CI_EVIDENCE_BYTES))
+        .with_state(state.clone());
+
     let git_router = api::git::git_router(state.clone());
 
     let git_policy_router = api::git::git_policy_router(state.clone());
@@ -72,6 +84,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", post(api::bridge::submit_event))
         .route("/query", post(api::bridge::query_events))
         .route("/count", post(api::bridge::count_events))
+        // CI preflight (NIP-98 auth)
+        .route("/ci/preflight", post(api::ci::ci_preflight))
+        .route("/ci/control/accepted", get(api::ci::next_accepted_control))
         .route(
             "/workflows/{workflow_id}/runs",
             get(api::bridge::workflow_runs),
@@ -139,6 +154,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Metrics → Trace → CORS applied once over the combined router.
     let mut merged = api_router
         .merge(media_router)
+        .merge(ci_evidence_router)
         .merge(git_router)
         .merge(git_policy_router);
     if let Some(admin_router) = admin_router {

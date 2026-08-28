@@ -1,0 +1,10 @@
+{
+  "replaceable_event_policy": "self-authored-only",
+  "events": [
+    {"slug": "sats-dsv4f", "pubkey": "3b1293bdf1f3885417eb1df302b5f31401fb740ad6e25b83a7aab210abc549bb", "kind_0": {"preserve": ["name"], "display_name": "Knots"}, "kind_10100": {"name": "Knots", "display_name": "Knots", "agent_type": "qwen"}},
+    {"slug": "sats-glm", "pubkey": "b7d2ebed4d4f15a28c71b8a83f3a717770a37bd65bd29e95aea4faa6106c445a", "kind_0": {"preserve": ["name"], "display_name": "Segwit"}, "kind_10100": {"name": "Segwit", "display_name": "Segwit", "agent_type": "glm"}},
+    {"slug": "sats-glm52", "pubkey": "d0abfb7c343012552a44009b2f33bb6a6ada54b4e6d408fffeed58d388d1f2af", "kind_0": {"preserve": ["name"], "display_name": "Ledger"}, "kind_10100": {"name": "Ledger", "display_name": "Ledger", "agent_type": "glm"}},
+    {"slug": "sats-codex-2", "pubkey": "aefa6783cdf2f33f9aa3705b41e5ae3ec214318c64db48f1410fc77db015f2ec", "kind_0": {"preserve": ["name"], "display_name": "UTXO"}, "kind_10100": {"name": "UTXO", "display_name": "UTXO", "agent_type": "codex"}}
+  ],
+  "preserve_from_current_kind_10100": ["auth", "channel_ids", "channels", "channel_add_policy", "respond_to", "respond_to_allowlist", "status", "unknown_fields"]
+}

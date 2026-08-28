@@ -1443,6 +1443,7 @@ async fn handle_put_user(
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
     let target_pubkey = extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
+    let members = state.db.get_members(tenant.community(), channel_id).await?;
     // No role tag = no role change: preserve an existing member's current role and
     // fall back to Member only for a new member. Unconditionally defaulting to
     // Member let a bare PUT_USER silently demote an existing owner/admin.
@@ -1450,15 +1451,17 @@ async fn handle_put_user(
         Some(role_str) => role_str
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid role: {role_str}"))?,
-        None => state
-            .db
-            .get_members(tenant.community(), channel_id)
-            .await?
+        None => members
             .iter()
             .find(|m| m.pubkey == target_pubkey)
             .and_then(|m| m.role.parse().ok())
             .unwrap_or(MemberRole::Member),
     };
+
+    if !put_user_role_change_required(&members, &target_pubkey, role) {
+        info!(channel = %channel_id, target = %hex::encode(&target_pubkey), "NIP-29 PUT_USER already has requested role, skipping");
+        return Ok(());
+    }
 
     let actor_bytes = event.pubkey.to_bytes().to_vec();
 
@@ -1507,6 +1510,18 @@ async fn handle_put_user(
 
     info!(channel = %channel_id, target = %target_hex, "NIP-29 PUT_USER processed");
     Ok(())
+}
+
+fn put_user_role_change_required(
+    members: &[MemberRecord],
+    target_pubkey: &[u8],
+    requested_role: MemberRole,
+) -> bool {
+    !members.iter().any(|member| {
+        member.pubkey == target_pubkey
+            && member.removed_at.is_none()
+            && member.role.parse::<MemberRole>().ok() == Some(requested_role)
+    })
 }
 
 async fn handle_remove_user(
@@ -3583,6 +3598,28 @@ mod tests {
             invited_by: None,
             removed_at: None,
         }
+    }
+
+    #[test]
+    fn put_user_same_role_is_a_noop_before_write_and_event_side_effects() {
+        let channel_id = Uuid::new_v4();
+        let members = vec![member(channel_id, 1, "admin")];
+
+        assert!(!put_user_role_change_required(
+            &members,
+            &[1; 32],
+            MemberRole::Admin
+        ));
+        assert!(put_user_role_change_required(
+            &members,
+            &[1; 32],
+            MemberRole::Owner
+        ));
+        assert!(put_user_role_change_required(
+            &members,
+            &[2; 32],
+            MemberRole::Admin
+        ));
     }
 
     fn deletion_event(tags: impl IntoIterator<Item = Tag>) -> Event {

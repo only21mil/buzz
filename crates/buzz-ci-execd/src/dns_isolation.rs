@@ -46,11 +46,13 @@ const LEASE_SLICE_RESOURCE_PROPERTY_NAMES: [&str; 6] = [
     "MemorySwapMax",
     "TasksMax",
 ];
-const PRINCIPAL_PROPERTY_NAMES: [&str; 6] = [
+const PRINCIPAL_PROPERTY_NAMES: [&str; 8] = [
     "BindReadOnlyPaths",
     "InaccessiblePaths",
     "NetworkNamespacePath",
     "PrivateNetwork",
+    "RuntimeDirectory",
+    "RuntimeDirectoryMode",
     "Slice",
     "User",
 ];
@@ -508,6 +510,11 @@ pub fn build_lease_isolation_plan(
         ]);
         let network_mode = if unit.role == PrincipalRole::Materializer {
             properties.insert("PrivateNetwork".to_owned(), "no".to_owned());
+            properties.insert(
+                "RuntimeDirectory".to_owned(),
+                unit.unit_name.trim_end_matches(".service").to_owned(),
+            );
+            properties.insert("RuntimeDirectoryMode".to_owned(), "0700".to_owned());
             UnitNetworkMode::HostTupleAllowlist {
                 tuples: allowlist.clone(),
             }

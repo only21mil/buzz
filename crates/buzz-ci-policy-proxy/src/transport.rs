@@ -9,24 +9,32 @@
 
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
+    net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
-    time::Duration,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use buzz_ci_isolation_contract::{RuntimeEndpointIdentity, ValidatedAttemptLeaseBinding};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use serde_json::Value;
 
 use crate::{
-    Admission, CanonicalCreate, CanonicalExec, DockerMethod, DockerRoute, EffectiveContainerSpec,
-    ProxyError, ProxyPolicy, VerifiedStart,
+    archive::mediate_archive, Admission, CanonicalCreate, CanonicalExec, DockerMethod, DockerRoute,
+    EffectiveContainerSpec, ProxyError, ProxyPolicy, VerifiedStart,
 };
 
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_STATUS_LINE_BYTES: usize = 4 * 1024;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_HEADER_COUNT: usize = 64;
+const MAX_CHUNK_LINE_BYTES: usize = 128;
+const MAX_CHUNK_COUNT: usize = 4096;
+const MAX_CHUNK_FRAMING_BYTES: usize = 64 * 1024;
+const CHUNK_INPUT_BUFFER_BYTES: usize = 8 * 1024;
+const MAX_PATH_STAT_HEADER_BYTES: usize = 8 * 1024;
 
 /// Broker capability authorizing one connection to a lease's raw runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,7 +126,7 @@ impl OneShotUpstreamConnector for InheritedOneShotConnector {
     }
 }
 
-/// Direction of a future manifest-bound archive mediation grant.
+/// Direction of a manifest-bound archive mediation grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveDirection {
     /// Bounded tar bytes from the executor to an owned container.
@@ -127,7 +135,7 @@ pub enum ArchiveDirection {
     Download,
 }
 
-/// Typed grant required before archive mediation can be enabled.
+/// Typed grant for one bounded owned-container archive transfer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveGrant {
     /// Attempt lease identifier.
@@ -140,6 +148,12 @@ pub struct ArchiveGrant {
     pub direction: ArchiveDirection,
     /// Hard tar-stream byte ceiling.
     pub max_bytes: usize,
+    /// Hard count of regular-file and directory entries.
+    pub max_entries: usize,
+    /// Hard sum of declared regular-file payload bytes.
+    pub max_total_bytes: usize,
+    /// Maximum decoded tar bytes per encoded gzip byte.
+    pub max_decompression_ratio: usize,
 }
 
 /// Typed grant required before Docker hijack mediation can be enabled.
@@ -369,25 +383,51 @@ impl<C: OneShotUpstreamConnector, O: LifecycleObserver> InheritedProxy<C, O> {
             .listener
             .accept()
             .map_err(|error| ProxyError::Transport(format!("accept failed: {error}")))?;
-        configure_stream(&executor, self.limits.io_timeout)?;
-        let executor_peer_uid = peer_uid(&executor)?;
+        self.serve_executor(&mut executor)
+    }
+
+    /// Poll a nonblocking listener once, returning `false` when no executor is
+    /// waiting. The caller owns the bounded poll loop and child deadline.
+    pub fn try_serve_once(&mut self) -> Result<bool, ProxyError> {
+        if self.poisoned {
+            return Err(ProxyError::Transport(
+                "proxy is poisoned and requires broker reconciliation".into(),
+            ));
+        }
+        let (mut executor, _) = match self.listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(ProxyError::Transport(format!("accept failed: {error}"))),
+        };
+        self.serve_executor(&mut executor)?;
+        Ok(true)
+    }
+
+    /// Select blocking or nonblocking acceptance without changing either
+    /// connected stream's read/write deadlines.
+    pub fn set_listener_nonblocking(&self, nonblocking: bool) -> Result<(), ProxyError> {
+        self.listener
+            .set_nonblocking(nonblocking)
+            .map_err(|error| ProxyError::Transport(format!("listener mode failed: {error}")))
+    }
+
+    fn serve_executor(&mut self, executor: &mut UnixStream) -> Result<(), ProxyError> {
+        configure_stream(executor, self.limits.io_timeout)?;
+        let executor_peer_uid = peer_uid(executor)?;
         if executor_peer_uid != self.expected_executor_uid {
-            let _ = write_error_response(&mut executor, 403, "executor peer refused");
+            let _ = write_error_response(executor, 403, "executor peer refused");
             return Err(ProxyError::Transport(
                 "executor peer UID does not match the broker manifest".into(),
             ));
         }
-        let prepared = match prepare_request(
-            &mut executor,
-            &mut self.policy,
-            self.limits.request_body_bytes,
-        ) {
-            Ok(prepared) => prepared,
-            Err(failure) => {
-                let _ = write_error_response(&mut executor, failure.status, failure.public_message);
-                return Err(failure.error);
-            }
-        };
+        let prepared =
+            match prepare_request(executor, &mut self.policy, self.limits.request_body_bytes) {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    let _ = write_error_response(executor, failure.status, failure.public_message);
+                    return Err(failure.error);
+                }
+            };
         let mut upstream = if prepared.requires_upstream() {
             let acquired = self
                 .upstream_connector
@@ -405,7 +445,7 @@ impl<C: OneShotUpstreamConnector, O: LifecycleObserver> InheritedProxy<C, O> {
                 Ok(stream) => Some(stream),
                 Err(error) => {
                     let rollback = prepared.abort_before_upstream(&mut self.policy);
-                    let _ = write_error_response(&mut executor, 502, "runtime capability refused");
+                    let _ = write_error_response(executor, 502, "runtime capability refused");
                     rollback?;
                     return Err(error);
                 }
@@ -414,12 +454,12 @@ impl<C: OneShotUpstreamConnector, O: LifecycleObserver> InheritedProxy<C, O> {
             None
         };
         match serve_prepared(
-            &mut executor,
+            executor,
             upstream.as_mut(),
             &mut self.policy,
             &mut self.observer,
             prepared,
-            self.limits.response_body_bytes,
+            self.limits,
         ) {
             Ok(outcome) => {
                 if outcome.upstream_closed && outcome.mutated {
@@ -429,7 +469,7 @@ impl<C: OneShotUpstreamConnector, O: LifecycleObserver> InheritedProxy<C, O> {
             }
             Err(failure) => {
                 let poison = failure.poison.then(|| self.poison()).transpose();
-                let _ = write_error_response(&mut executor, failure.status, failure.public_message);
+                let _ = write_error_response(executor, failure.status, failure.public_message);
                 poison?;
                 Err(failure.error)
             }
@@ -467,6 +507,12 @@ impl<O: LifecycleObserver> InheritedProxy<InheritedOneShotConnector, O> {
         self.upstream_connector =
             InheritedOneShotConnector::new(stream, self.upstream_capability.clone())?;
         Ok(())
+    }
+
+    /// Report whether the next admitted upstream exchange already has its
+    /// one-shot descriptor installed.
+    pub fn has_inherited_upstream(&self) -> bool {
+        self.upstream_connector.stream.is_some()
     }
 }
 
@@ -535,6 +581,7 @@ impl PreparedRequest {
         match &self.admission {
             Admission::Create(approved) => policy.abort_create(approved),
             Admission::ExecCreate(approved) => policy.abort_exec(approved),
+            Admission::ExecStart { exec_id, .. } => policy.abort_exec_start(exec_id),
             Admission::Delete { container_id, .. } => policy.abort_delete(container_id),
             _ => Ok(()),
         }
@@ -557,10 +604,7 @@ fn prepare_request(
         .map_err(ConnectionFailure::before_upstream)?;
     if matches!(
         &route,
-        DockerRoute::ContainerAttach { .. }
-            | DockerRoute::ContainerLogs { .. }
-            | DockerRoute::ExecStart { .. }
-            | DockerRoute::Archive { .. }
+        DockerRoute::ContainerAttach { .. } | DockerRoute::ContainerLogs { .. }
     ) {
         return Err(ConnectionFailure::before_upstream(ProxyError::Transport(
             "Docker stream/archive routes are disabled until bounded mediation is proven".into(),
@@ -585,15 +629,8 @@ fn serve_connection(
     limits: TransportLimits,
 ) -> Result<bool, ConnectionFailure> {
     let prepared = prepare_request(executor, policy, limits.request_body_bytes)?;
-    serve_prepared(
-        executor,
-        Some(upstream),
-        policy,
-        observer,
-        prepared,
-        limits.response_body_bytes,
-    )
-    .map(|outcome| outcome.upstream_closed)
+    serve_prepared(executor, Some(upstream), policy, observer, prepared, limits)
+        .map(|outcome| outcome.upstream_closed)
 }
 
 fn serve_prepared(
@@ -602,13 +639,62 @@ fn serve_prepared(
     policy: &mut ProxyPolicy,
     observer: &mut impl LifecycleObserver,
     prepared: PreparedRequest,
-    max_response: usize,
+    limits: TransportLimits,
 ) -> Result<ServeOutcome, ConnectionFailure> {
     let PreparedRequest {
         request,
         route,
         admission,
     } = prepared;
+    let max_request = limits.request_body_bytes;
+    let max_response = limits.response_body_bytes;
+    let admission = match admission {
+        Admission::Archive(grant) => {
+            Admission::Archive(limit_archive_grant_for_transport(grant, limits))
+        }
+        other => other,
+    };
+    if let Admission::ExecStart {
+        target,
+        exec_id,
+        body,
+        allow_input,
+    } = &admission
+    {
+        if !request.upgrade {
+            return Err(ConnectionFailure::before_upstream(ProxyError::Transport(
+                "exec-start did not carry the required upgrade".into(),
+            )));
+        }
+        let grant = HijackGrant {
+            lease_id: policy.lease_id().to_owned(),
+            exec_id: exec_id.clone(),
+            max_output_bytes: limits.response_body_bytes,
+            max_input_bytes: if *allow_input {
+                limits.request_body_bytes
+            } else {
+                0
+            },
+            allow_input: *allow_input,
+        };
+        let started = handle_exec_start(
+            executor,
+            upstream.as_deref_mut().ok_or_else(|| {
+                ConnectionFailure::before_upstream(ProxyError::Transport(
+                    "exec-start lacks a runtime descriptor".into(),
+                ))
+            })?,
+            policy,
+            target,
+            body,
+            &grant,
+            limits.io_timeout,
+        )?;
+        return Ok(ServeOutcome {
+            upstream_closed: false,
+            mutated: started,
+        });
+    }
     let mut mutated = false;
     let mut upstream_used = false;
     let response = match admission {
@@ -659,6 +745,11 @@ fn serve_prepared(
             )?;
             mutated = response.is_success();
             response
+        }
+        Admission::ExecStart { .. } => {
+            return Err(ConnectionFailure::before_upstream(ProxyError::Transport(
+                "exec-start bypassed its bounded mediator".into(),
+            )));
         }
         Admission::NeedsPreStartProof {
             container_id,
@@ -726,6 +817,82 @@ fn serve_prepared(
             }
             response
         }
+        Admission::Archive(grant) => {
+            let upstream = upstream.ok_or_else(|| {
+                ConnectionFailure::before_upstream(ProxyError::Transport(
+                    "archive transfer lacks a runtime descriptor".into(),
+                ))
+            })?;
+            let no_overwrite_dir_non_dir = match &route {
+                DockerRoute::Archive {
+                    no_overwrite_dir_non_dir,
+                    ..
+                } => *no_overwrite_dir_non_dir,
+                _ => {
+                    return Err(ConnectionFailure::before_upstream(ProxyError::Transport(
+                        "archive grant is not paired with an archive route".into(),
+                    )));
+                }
+            };
+            let target = archive_target(&grant, no_overwrite_dir_non_dir);
+            match grant.direction {
+                ArchiveDirection::Upload => {
+                    let body = mediate_archive(&grant, &request.body, max_request)
+                        .map_err(ConnectionFailure::before_upstream)?;
+                    let response = exchange_with_content_type(
+                        upstream,
+                        DockerMethod::Put,
+                        &target,
+                        &body,
+                        "application/x-tar",
+                        max_response,
+                    )
+                    .map_err(ConnectionFailure::after_upstream)?;
+                    if !response.is_success() {
+                        return Err(ConnectionFailure::after_upstream(ProxyError::Transport(
+                            "archive upload response does not prove atomic extraction".into(),
+                        )));
+                    }
+                    validate_empty_ack(&response.body)
+                        .map_err(ConnectionFailure::after_upstream)?;
+                    mutated = true;
+                    projected_empty(response)
+                }
+                ArchiveDirection::Download => {
+                    let mut response = exchange_archive_download(
+                        upstream,
+                        DockerMethod::Get,
+                        &target,
+                        &[],
+                        max_response,
+                    )
+                    .map_err(ConnectionFailure::after_upstream)?;
+                    if response.is_success() {
+                        response.body = mediate_archive(&grant, &response.body, max_response)
+                            .map_err(ConnectionFailure::resolved_upstream)?;
+                        response.content_type = Some("application/x-tar".into());
+                        let path_stat = response
+                            .safe_headers
+                            .remove("X-Docker-Container-Path-Stat")
+                            .ok_or_else(|| {
+                                ConnectionFailure::resolved_upstream(ProxyError::Transport(
+                                    "archive download response lacks required path stat".into(),
+                                ))
+                            })?;
+                        validate_path_stat_header(&path_stat)
+                            .map_err(ConnectionFailure::resolved_upstream)?;
+                        response.safe_headers.clear();
+                        response
+                            .safe_headers
+                            .insert("X-Docker-Container-Path-Stat".into(), path_stat);
+                        response
+                    } else {
+                        project_error_response(response)
+                            .map_err(ConnectionFailure::resolved_upstream)?
+                    }
+                }
+            }
+        }
     };
     let response = if upstream_used {
         project_upstream_response(&route, response, policy).map_err(|error| {
@@ -750,6 +917,29 @@ fn serve_prepared(
         upstream_closed,
         mutated,
     })
+}
+
+fn limit_archive_grant_for_transport(
+    mut grant: ArchiveGrant,
+    limits: TransportLimits,
+) -> ArchiveGrant {
+    let body_limit = match grant.direction {
+        ArchiveDirection::Upload => limits.request_body_bytes,
+        ArchiveDirection::Download => limits.response_body_bytes,
+    };
+    grant.max_bytes = grant.max_bytes.min(body_limit);
+    grant.max_total_bytes = grant.max_total_bytes.min(body_limit);
+    grant
+}
+
+fn archive_target(grant: &ArchiveGrant, no_overwrite_dir_non_dir: bool) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    if grant.direction == ArchiveDirection::Upload && no_overwrite_dir_non_dir {
+        serializer.append_pair("noOverwriteDirNonDir", "true");
+    }
+    serializer.append_pair("path", &grant.container_path);
+    let query = serializer.finish();
+    format!("/containers/{}/archive?{query}", grant.container_id)
 }
 
 fn validate_wait_response(body: &[u8]) -> Result<(), ProxyError> {
@@ -873,6 +1063,253 @@ fn handle_exec_create(
         )));
     }
     Ok(response)
+}
+
+fn handle_exec_start(
+    executor: &mut UnixStream,
+    upstream: &mut UnixStream,
+    policy: &mut ProxyPolicy,
+    target: &str,
+    body: &[u8],
+    grant: &HijackGrant,
+    timeout: Duration,
+) -> Result<bool, ConnectionFailure> {
+    write_upgrade_request(upstream, target, body).map_err(ConnectionFailure::after_upstream)?;
+    match read_upgrade_response(upstream, grant.max_output_bytes)
+        .map_err(ConnectionFailure::after_upstream)?
+    {
+        UpgradeResponse::Rejected(response) => {
+            if !is_definite_mutation_rejection(response.status) {
+                return Err(ConnectionFailure::after_upstream(ProxyError::Transport(
+                    "exec-start response does not prove that no runtime mutation occurred".into(),
+                )));
+            }
+            policy
+                .abort_exec_start(&grant.exec_id)
+                .map_err(ConnectionFailure::after_upstream)?;
+            let response =
+                project_error_response(response).map_err(ConnectionFailure::resolved_upstream)?;
+            write_filtered_response(executor, &response)
+                .map_err(ConnectionFailure::resolved_upstream)?;
+            Ok(false)
+        }
+        UpgradeResponse::Accepted(initial) => {
+            policy
+                .commit_exec_started(&grant.exec_id)
+                .map_err(ConnectionFailure::after_upstream)?;
+            executor
+                .write_all(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+                .and_then(|()| executor.flush())
+                .map_err(|error| {
+                    ConnectionFailure::after_upstream(ProxyError::Transport(format!(
+                        "executor upgrade response failed: {error}"
+                    )))
+                })?;
+            relay_hijack(executor, upstream, &initial, grant, timeout)
+                .map_err(ConnectionFailure::after_upstream)?;
+            Ok(true)
+        }
+    }
+}
+
+enum UpgradeResponse {
+    Accepted(Vec<u8>),
+    Rejected(HttpResponse),
+}
+
+fn write_upgrade_request(
+    stream: &mut UnixStream,
+    target: &str,
+    body: &[u8],
+) -> Result<(), ProxyError> {
+    let head = format!(
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .and_then(|()| stream.flush())
+        .map_err(|error| ProxyError::Transport(format!("upstream upgrade write failed: {error}")))
+}
+
+fn read_upgrade_response(
+    stream: &mut UnixStream,
+    max_body: usize,
+) -> Result<UpgradeResponse, ProxyError> {
+    let head = read_head(stream, MAX_STATUS_LINE_BYTES)?;
+    let parsed = parse_head(&head, false)?;
+    let mut status_line = parsed.start_line.splitn(3, ' ');
+    if status_line.next() != Some("HTTP/1.1") {
+        return Err(ProxyError::Transport(
+            "upstream upgrade status line is not HTTP/1.1".into(),
+        ));
+    }
+    let status = status_line
+        .next()
+        .ok_or_else(|| ProxyError::Transport("upstream upgrade status is missing".into()))?
+        .parse::<u16>()
+        .map_err(|_| ProxyError::Transport("upstream upgrade status is invalid".into()))?;
+    let reason = status_line.next().unwrap_or("");
+    if status == 101 {
+        let content_type_ok = parsed
+            .headers
+            .get("content-type")
+            .is_none_or(|value| value.eq_ignore_ascii_case("application/vnd.docker.raw-stream"));
+        if parsed
+            .headers
+            .keys()
+            .any(|name| !matches!(name.as_str(), "connection" | "upgrade" | "content-type"))
+            || !parsed
+                .headers
+                .get("connection")
+                .is_some_and(|value| value.eq_ignore_ascii_case("upgrade"))
+            || !parsed
+                .headers
+                .get("upgrade")
+                .is_some_and(|value| value.eq_ignore_ascii_case("tcp"))
+            || !content_type_ok
+            || parsed.trailing.len() > max_body
+        {
+            return Err(ProxyError::Transport(
+                "upstream exec-start upgrade headers or initial bytes are invalid".into(),
+            ));
+        }
+        return Ok(UpgradeResponse::Accepted(parsed.trailing));
+    }
+    if !(400..600).contains(&status) {
+        return Err(ProxyError::Transport(
+            "upstream exec-start returned an ambiguous status".into(),
+        ));
+    }
+    let content_length = validate_framing(&parsed.headers, max_body, false, false)?;
+    let content_type = parsed.headers.get("content-type").cloned();
+    let body = read_exact_body(stream, parsed.trailing, content_length, max_body)?;
+    Ok(UpgradeResponse::Rejected(HttpResponse {
+        status,
+        reason: reason.into(),
+        content_type,
+        safe_headers: BTreeMap::new(),
+        body,
+        connection_close: true,
+    }))
+}
+
+fn relay_hijack(
+    executor: &mut UnixStream,
+    upstream: &mut UnixStream,
+    initial_output: &[u8],
+    grant: &HijackGrant,
+    timeout: Duration,
+) -> Result<(), ProxyError> {
+    if initial_output.len() > grant.max_output_bytes
+        || (grant.allow_input && grant.max_input_bytes == 0)
+        || (!grant.allow_input && grant.max_input_bytes != 0)
+    {
+        return Err(ProxyError::Transport(
+            "hijack grant has inconsistent byte limits".into(),
+        ));
+    }
+    executor
+        .write_all(initial_output)
+        .and_then(|()| executor.flush())
+        .map_err(|error| ProxyError::Transport(format!("initial hijack write failed: {error}")))?;
+
+    let deadline = Instant::now() + timeout;
+    let stopped = AtomicBool::new(false);
+    let mut executor_read = executor
+        .try_clone()
+        .map_err(|error| ProxyError::Transport(format!("executor clone failed: {error}")))?;
+    let mut upstream_write = upstream
+        .try_clone()
+        .map_err(|error| ProxyError::Transport(format!("upstream clone failed: {error}")))?;
+    let input_limit = grant.max_input_bytes;
+    let allow_input = grant.allow_input;
+    let output_limit = grant.max_output_bytes - initial_output.len();
+
+    let result = std::thread::scope(|scope| {
+        let input = allow_input.then(|| {
+            scope.spawn(|| {
+                copy_hijack_direction(
+                    &mut executor_read,
+                    &mut upstream_write,
+                    input_limit,
+                    deadline,
+                    &stopped,
+                    "executor-to-runtime",
+                )
+            })
+        });
+        let output = copy_hijack_direction(
+            upstream,
+            executor,
+            output_limit,
+            deadline,
+            &stopped,
+            "runtime-to-executor",
+        );
+        stopped.store(true, Ordering::Release);
+        let _ = executor.shutdown(Shutdown::Both);
+        let _ = upstream.shutdown(Shutdown::Both);
+        let input = input.map(|handle| {
+            handle.join().unwrap_or_else(|_| {
+                Err(ProxyError::Transport("hijack input relay panicked".into()))
+            })
+        });
+        output.and(input.unwrap_or(Ok(())))
+    });
+    result
+}
+
+fn copy_hijack_direction(
+    reader: &mut UnixStream,
+    writer: &mut UnixStream,
+    limit: usize,
+    deadline: Instant,
+    stopped: &AtomicBool,
+    direction: &str,
+) -> Result<(), ProxyError> {
+    let mut copied = 0_usize;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        if stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ProxyError::Transport(format!(
+                "{direction} hijack deadline exceeded"
+            )));
+        }
+        let slice = (deadline - now).min(Duration::from_millis(100));
+        reader
+            .set_read_timeout(Some(slice))
+            .map_err(|error| ProxyError::Transport(format!("hijack timeout failed: {error}")))?;
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                stopped.store(true, Ordering::Release);
+                let _ = writer.shutdown(Shutdown::Both);
+                return Ok(());
+            }
+            Ok(count) => {
+                if count > limit.saturating_sub(copied) {
+                    return Err(ProxyError::Transport(format!(
+                        "{direction} hijack byte cap exceeded"
+                    )));
+                }
+                writer.write_all(&buffer[..count]).map_err(|error| {
+                    ProxyError::Transport(format!("{direction} hijack write failed: {error}"))
+                })?;
+                copied += count;
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => {
+                return Err(ProxyError::Transport(format!(
+                    "{direction} hijack read failed: {error}"
+                )));
+            }
+        }
+    }
 }
 
 fn handle_delete(
@@ -1009,7 +1446,30 @@ fn exchange(
     max_response: usize,
 ) -> Result<HttpResponse, ProxyError> {
     write_upstream_request(upstream, method, target, body)?;
-    read_response(upstream, method, max_response)
+    read_response(upstream, method, max_response, false)
+}
+
+fn exchange_archive_download(
+    upstream: &mut UnixStream,
+    method: DockerMethod,
+    target: &str,
+    body: &[u8],
+    max_response: usize,
+) -> Result<HttpResponse, ProxyError> {
+    write_upstream_request(upstream, method, target, body)?;
+    read_response(upstream, method, max_response, true)
+}
+
+fn exchange_with_content_type(
+    upstream: &mut UnixStream,
+    method: DockerMethod,
+    target: &str,
+    body: &[u8],
+    content_type: &str,
+    max_response: usize,
+) -> Result<HttpResponse, ProxyError> {
+    write_upstream_request_with_content_type(upstream, method, target, body, content_type)?;
+    read_response(upstream, method, max_response, false)
 }
 
 #[derive(Debug)]
@@ -1017,6 +1477,7 @@ struct HttpRequest {
     method: DockerMethod,
     target: String,
     body: Vec<u8>,
+    upgrade: bool,
 }
 
 #[derive(Debug)]
@@ -1335,12 +1796,18 @@ fn read_request(stream: &mut UnixStream, max_body: usize) -> Result<HttpRequest,
         ));
     }
     let method = DockerMethod::parse(request_line[0])?;
-    let content_length = validate_framing(&parsed.headers, max_body, true)?;
+    let target = request_line[1];
+    let allow_upgrade = matches!(
+        DockerRoute::parse(method, target)?,
+        DockerRoute::ExecStart { .. }
+    );
+    let content_length = validate_framing(&parsed.headers, max_body, true, allow_upgrade)?;
     let body = read_exact_body(stream, parsed.trailing, content_length, max_body)?;
     Ok(HttpRequest {
         method,
-        target: request_line[1].into(),
+        target: target.into(),
         body,
+        upgrade: allow_upgrade,
     })
 }
 
@@ -1348,6 +1815,7 @@ fn read_response(
     stream: &mut UnixStream,
     request_method: DockerMethod,
     max_body: usize,
+    allow_chunked: bool,
 ) -> Result<HttpResponse, ProxyError> {
     let head = read_head(stream, MAX_STATUS_LINE_BYTES)?;
     let parsed = parse_head(&head, false)?;
@@ -1391,8 +1859,13 @@ fn read_response(
             }
         }
     }
-    let content_length = validate_framing(&headers, max_body, false)?;
-    let body = read_exact_body(stream, parsed.trailing, content_length, max_body)?;
+    let framing = validate_response_framing(&headers, max_body, body_forbidden, allow_chunked)?;
+    let body = match framing {
+        ResponseFraming::ContentLength(content_length) => {
+            read_exact_body(stream, parsed.trailing, content_length, max_body)?
+        }
+        ResponseFraming::Chunked => read_chunked_body(stream, parsed.trailing, max_body)?,
+    };
     let content_type = headers.get("content-type").cloned().filter(|value| {
         value.len() <= 128
             && value
@@ -1404,14 +1877,239 @@ fn read_response(
         .map(|value| connection_has_token(value, "close"))
         .transpose()?
         .unwrap_or(false);
+    let mut safe_headers = BTreeMap::new();
+    if let Some(value) = headers.get("x-docker-container-path-stat") {
+        safe_headers.insert("X-Docker-Container-Path-Stat".into(), value.clone());
+    }
     Ok(HttpResponse {
         status,
         reason: reason.into(),
         content_type,
-        safe_headers: BTreeMap::new(),
+        safe_headers,
         body,
         connection_close,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseFraming {
+    ContentLength(usize),
+    Chunked,
+}
+
+fn validate_response_framing(
+    headers: &BTreeMap<String, String>,
+    max_body: usize,
+    body_forbidden: bool,
+    allow_chunked: bool,
+) -> Result<ResponseFraming, ProxyError> {
+    if let Some(transfer_encoding) = headers.get("transfer-encoding") {
+        if body_forbidden
+            || !allow_chunked
+            || headers.contains_key("content-length")
+            || !transfer_encoding.eq_ignore_ascii_case("chunked")
+        {
+            return Err(ProxyError::Transport(
+                "unsupported or conflicting upstream Transfer-Encoding".into(),
+            ));
+        }
+        for forbidden in ["upgrade", "proxy-connection", "trailer", "expect"] {
+            if headers.contains_key(forbidden) {
+                return Err(ProxyError::Transport(format!(
+                    "unsupported HTTP framing header: {forbidden}"
+                )));
+            }
+        }
+        if headers
+            .get("connection")
+            .map(|value| connection_has_token(value, "upgrade"))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(ProxyError::Transport("HTTP upgrade is refused".into()));
+        }
+        return Ok(ResponseFraming::Chunked);
+    }
+    validate_framing(headers, max_body, false, false).map(ResponseFraming::ContentLength)
+}
+
+fn read_chunked_body(
+    stream: &mut UnixStream,
+    initial: Vec<u8>,
+    max_body: usize,
+) -> Result<Vec<u8>, ProxyError> {
+    let mut input = ChunkInput::new(stream, initial);
+    let mut body = Vec::new();
+    let mut chunks = 0_usize;
+    let mut framing_bytes = 0_usize;
+    loop {
+        let line = input.read_line(MAX_CHUNK_LINE_BYTES)?;
+        framing_bytes = framing_bytes
+            .checked_add(line.len() + 2)
+            .ok_or_else(|| ProxyError::Transport("chunk framing size overflowed".into()))?;
+        if framing_bytes > MAX_CHUNK_FRAMING_BYTES {
+            return Err(ProxyError::Transport(
+                "chunk framing exceeds its byte cap".into(),
+            ));
+        }
+        if line.is_empty()
+            || line.len() > 16
+            || !line.iter().all(u8::is_ascii_hexdigit)
+            || (line.len() > 1 && line[0] == b'0')
+        {
+            return Err(ProxyError::Transport(
+                "chunk size line is not canonical hexadecimal".into(),
+            ));
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| ProxyError::Transport("chunk size line is not ASCII".into()))?;
+        let chunk_size = usize::from_str_radix(line, 16)
+            .map_err(|_| ProxyError::Transport("chunk size overflows".into()))?;
+        if chunk_size == 0 {
+            let final_line = input.read_line(MAX_CHUNK_LINE_BYTES)?;
+            framing_bytes = framing_bytes
+                .checked_add(final_line.len() + 2)
+                .ok_or_else(|| ProxyError::Transport("chunk framing size overflowed".into()))?;
+            if framing_bytes > MAX_CHUNK_FRAMING_BYTES
+                || !final_line.is_empty()
+                || input.has_buffered_bytes()
+            {
+                return Err(ProxyError::Transport(
+                    "chunk trailers or pipelined bytes are refused".into(),
+                ));
+            }
+            return Ok(body);
+        }
+        chunks = chunks
+            .checked_add(1)
+            .ok_or_else(|| ProxyError::Transport("chunk count overflowed".into()))?;
+        if chunks > MAX_CHUNK_COUNT {
+            return Err(ProxyError::Transport("chunk count exceeds its cap".into()));
+        }
+        let new_len = body
+            .len()
+            .checked_add(chunk_size)
+            .ok_or_else(|| ProxyError::Transport("chunked body size overflowed".into()))?;
+        if new_len > max_body {
+            return Err(ProxyError::Transport("HTTP body exceeds limit".into()));
+        }
+        input.read_exact_into(&mut body, chunk_size)?;
+        if input.read_byte()? != b'\r' || input.read_byte()? != b'\n' {
+            return Err(ProxyError::Transport(
+                "chunk payload lacks its CRLF terminator".into(),
+            ));
+        }
+        framing_bytes = framing_bytes
+            .checked_add(2)
+            .ok_or_else(|| ProxyError::Transport("chunk framing size overflowed".into()))?;
+    }
+}
+
+struct ChunkInput<'a> {
+    stream: &'a mut UnixStream,
+    buffer: Vec<u8>,
+    offset: usize,
+}
+
+impl<'a> ChunkInput<'a> {
+    fn new(stream: &'a mut UnixStream, initial: Vec<u8>) -> Self {
+        Self {
+            stream,
+            buffer: initial,
+            offset: 0,
+        }
+    }
+
+    fn read_byte(&mut self) -> Result<u8, ProxyError> {
+        self.fill()?;
+        let byte = self.buffer[self.offset];
+        self.offset += 1;
+        Ok(byte)
+    }
+
+    fn read_line(&mut self, max_bytes: usize) -> Result<Vec<u8>, ProxyError> {
+        let mut line = Vec::new();
+        loop {
+            let byte = self.read_byte()?;
+            if byte == b'\r' {
+                if self.read_byte()? != b'\n' {
+                    return Err(ProxyError::Transport(
+                        "chunk framing contains a bare carriage return".into(),
+                    ));
+                }
+                return Ok(line);
+            }
+            if byte == b'\n' || line.len() == max_bytes {
+                return Err(ProxyError::Transport(
+                    "chunk line is malformed or exceeds its cap".into(),
+                ));
+            }
+            line.push(byte);
+        }
+    }
+
+    fn read_exact_into(&mut self, output: &mut Vec<u8>, length: usize) -> Result<(), ProxyError> {
+        output
+            .try_reserve_exact(length)
+            .map_err(|_| ProxyError::Transport("chunk allocation was refused".into()))?;
+        let mut remaining = length;
+        while remaining != 0 {
+            self.fill()?;
+            let available = self.buffer.len() - self.offset;
+            let take = available.min(remaining);
+            output.extend_from_slice(&self.buffer[self.offset..self.offset + take]);
+            self.offset += take;
+            remaining -= take;
+        }
+        Ok(())
+    }
+
+    fn has_buffered_bytes(&self) -> bool {
+        self.offset < self.buffer.len()
+    }
+
+    fn fill(&mut self) -> Result<(), ProxyError> {
+        if self.has_buffered_bytes() {
+            return Ok(());
+        }
+        self.buffer.resize(CHUNK_INPUT_BUFFER_BYTES, 0);
+        let count = self
+            .stream
+            .read(&mut self.buffer)
+            .map_err(|error| ProxyError::Transport(format!("chunked body read failed: {error}")))?;
+        if count == 0 {
+            return Err(ProxyError::Transport(
+                "connection closed before complete chunked body".into(),
+            ));
+        }
+        self.buffer.truncate(count);
+        self.offset = 0;
+        Ok(())
+    }
+}
+
+fn validate_path_stat_header(value: &str) -> Result<(), ProxyError> {
+    if value.is_empty()
+        || value.len() > MAX_PATH_STAT_HEADER_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return Err(ProxyError::Transport(
+            "archive path stat header is malformed or oversized".into(),
+        ));
+    }
+    let decoded = BASE64_STANDARD
+        .decode(value)
+        .map_err(|_| ProxyError::Transport("archive path stat header is not base64".into()))?;
+    if decoded.len() > MAX_PATH_STAT_HEADER_BYTES
+        || !serde_json::from_slice::<Value>(&decoded).is_ok_and(|value| value.is_object())
+    {
+        return Err(ProxyError::Transport(
+            "archive path stat header is not a bounded JSON object".into(),
+        ));
+    }
+    Ok(())
 }
 
 struct ParsedHead {
@@ -1519,26 +2217,39 @@ fn validate_framing(
     headers: &BTreeMap<String, String>,
     max_body: usize,
     request: bool,
+    allow_upgrade: bool,
 ) -> Result<usize, ProxyError> {
-    for forbidden in [
-        "transfer-encoding",
-        "upgrade",
-        "proxy-connection",
-        "trailer",
-        "expect",
-    ] {
+    for forbidden in ["transfer-encoding", "proxy-connection", "trailer", "expect"] {
         if headers.contains_key(forbidden) {
             return Err(ProxyError::Transport(format!(
                 "unsupported HTTP framing header: {forbidden}"
             )));
         }
     }
-    if headers
+    let requests_upgrade = headers
         .get("connection")
         .map(|value| connection_has_token(value, "upgrade"))
         .transpose()?
         .unwrap_or(false)
-    {
+        || headers.contains_key("upgrade");
+    if allow_upgrade {
+        if !headers
+            .get("connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("upgrade"))
+        {
+            return Err(ProxyError::Transport(
+                "exec-start requires an exact Connection: Upgrade header".into(),
+            ));
+        }
+        if !headers
+            .get("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("tcp"))
+        {
+            return Err(ProxyError::Transport(
+                "exec-start requires Upgrade: tcp".into(),
+            ));
+        }
+    } else if requests_upgrade {
         return Err(ProxyError::Transport("HTTP upgrade is refused".into()));
     }
     let content_length = match headers.get("content-length") {
@@ -1597,9 +2308,19 @@ fn write_upstream_request(
     target: &str,
     body: &[u8],
 ) -> Result<(), ProxyError> {
+    write_upstream_request_with_content_type(stream, method, target, body, "application/json")
+}
+
+fn write_upstream_request_with_content_type(
+    stream: &mut UnixStream,
+    method: DockerMethod,
+    target: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Result<(), ProxyError> {
     let method = method_name(method);
     let head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         body.len()
     );
     stream
@@ -1624,12 +2345,17 @@ fn write_filtered_response(
         response.body.len()
     );
     for (name, value) in &response.safe_headers {
-        if name != "API-Version"
-            || value.len() > 32
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'.')
-        {
+        let valid = match name.as_str() {
+            "API-Version" => {
+                value.len() <= 32
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            }
+            "X-Docker-Container-Path-Stat" => validate_path_stat_header(value).is_ok(),
+            _ => false,
+        };
+        if !valid {
             return Err(ProxyError::Transport(
                 "response projector produced an unsafe header".into(),
             ));
@@ -1886,6 +2612,7 @@ mod tests {
         os::linux::net::SocketAddrExt,
         os::unix::net::SocketAddr,
         os::unix::net::UnixStream,
+        path::Path,
         sync::atomic::{AtomicU64, Ordering},
         sync::{Arc, Mutex},
         thread,
@@ -1893,8 +2620,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        AllowedMount, EngineKind, IsolationLimits, IsolationProfile, NetworkPolicy, PolicyManifest,
+        AllowedMount, EngineKind, ExecExpectation, IsolationLimits, IsolationProfile,
+        NetworkPolicy, PolicyManifest,
     };
+    use tar::EntryType;
 
     fn manifest() -> PolicyManifest {
         PolicyManifest {
@@ -1939,7 +2668,50 @@ mod tests {
                 read_only: true,
             }],
             allowed_environment: Vec::new(),
+            expected_execs: vec![ExecExpectation {
+                argv: vec!["true".into()],
+                environment: Vec::new(),
+                user: "10001:10001".into(),
+                working_dir: "/workspace".into(),
+                attach_stdin: false,
+                attach_stdout: false,
+                attach_stderr: false,
+                tty: false,
+            }],
         }
+    }
+
+    fn test_tar(path: &str, entry_type: EntryType, data: &[u8], mode: u32) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(entry_type);
+        header.set_mode(mode);
+        header.set_uid(1234);
+        header.set_gid(5678);
+        header.set_mtime(1_700_000_000);
+        header.set_size(data.len() as u64);
+        header.set_cksum();
+        builder.append(&header, data).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn path_stat_header() -> String {
+        base64::Engine::encode(
+            &BASE64_STANDARD,
+            br#"{"name":"output.txt","size":4,"mode":420,"mtime":"2026-08-26T00:00:00Z","linkTarget":""}"#,
+        )
+    }
+
+    fn chunked_body(body: &[u8], chunk_bytes: usize) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for chunk in body.chunks(chunk_bytes) {
+            encoded.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            encoded.extend_from_slice(chunk);
+            encoded.extend_from_slice(b"\r\n");
+        }
+        encoded.extend_from_slice(b"0\r\n\r\n");
+        encoded
     }
 
     fn policy() -> ProxyPolicy {
@@ -2217,7 +2989,7 @@ mod tests {
             .admit(
                 DockerMethod::Post,
                 "/containers/owned/exec",
-                br#"{"Cmd":["true"]}"#,
+                br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#,
             )
             .unwrap()
         else {
@@ -2271,7 +3043,7 @@ mod tests {
             .unwrap();
             runtime.write_all(body).unwrap();
         });
-        let body = br#"{"Cmd":["true"]}"#;
+        let body = br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#;
         let executor = executor_exchange(
             &listener_address,
             format!(
@@ -2587,7 +3359,7 @@ mod tests {
                 .admit(
                     DockerMethod::Post,
                     "/containers/owned/exec",
-                    br#"{"Cmd":["true"]}"#,
+                    br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#,
                 )
                 .unwrap()
             else {
@@ -2624,7 +3396,7 @@ mod tests {
             .admit(
                 DockerMethod::Post,
                 "/containers/owned/exec",
-                br#"{"Cmd":["true"]}"#,
+                br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#,
             )
             .unwrap()
         else {
@@ -2722,7 +3494,7 @@ mod tests {
                 .admit(
                     DockerMethod::Post,
                     "/containers/owned/exec",
-                    br#"{"Cmd":["true"]}"#,
+                    br#"{"Cmd":["true"],"WorkingDir":"/workspace"}"#,
                 )
                 .unwrap()
             else {
@@ -3694,14 +4466,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_and_hijack_grants_do_not_enable_forwarding() {
-        let archive = ArchiveGrant {
-            lease_id: "lease".into(),
-            container_id: "owned".into(),
-            container_path: "/workspace/file".into(),
-            direction: ArchiveDirection::Upload,
-            max_bytes: 1024,
-        };
+    fn hijack_grants_do_not_enable_forwarding() {
         let hijack = HijackGrant {
             lease_id: "lease".into(),
             exec_id: "owned-exec".into(),
@@ -3709,24 +4474,337 @@ mod tests {
             max_input_bytes: 0,
             allow_input: false,
         };
-        assert_eq!(archive.direction, ArchiveDirection::Upload);
         assert!(!hijack.allow_input);
 
-        for request in [
-            b"PUT /containers/owned/archive?path=%2Fworkspace HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n".as_slice(),
-            b"POST /exec/owned-exec/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
-        ] {
-            let (mut executor_client, executor_server) = UnixStream::pair().unwrap();
-            let (mut upstream_server, upstream_client) = UnixStream::pair().unwrap();
+        let request = b"POST /exec/owned-exec/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+        let (mut executor_client, executor_server) = UnixStream::pair().unwrap();
+        let (mut upstream_server, upstream_client) = UnixStream::pair().unwrap();
+        upstream_server
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let handle = serve_pair(executor_server, upstream_client, TransportLimits::default());
+        executor_client.write_all(request).unwrap();
+        drop(executor_client);
+        assert!(handle.join().unwrap().is_err());
+        assert_no_upstream_bytes(&mut upstream_server);
+    }
+
+    #[test]
+    fn owned_archive_upload_is_validated_and_rebuilt_before_forwarding() {
+        let input = test_tar("script.sh", EntryType::Regular, b"echo ok", 0o6777);
+        let request = format!(
+            "PUT /v1.47/containers/owned/archive?noOverwriteDirNonDir=true&path=%2Fworkspace HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            input.len()
+        );
+        let (mut executor_client, mut executor_server) = UnixStream::pair().unwrap();
+        let (mut upstream_server, mut upstream_client) = UnixStream::pair().unwrap();
+        let runtime = thread::spawn(move || {
+            let request = read_test_http(&mut upstream_server);
             upstream_server
-                .set_read_timeout(Some(Duration::from_millis(100)))
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
-            let handle = serve_pair(executor_server, upstream_client, TransportLimits::default());
-            executor_client.write_all(request).unwrap();
-            drop(executor_client);
-            assert!(handle.join().unwrap().is_err());
-            assert_no_upstream_bytes(&mut upstream_server);
+            request
+        });
+        executor_client.write_all(request.as_bytes()).unwrap();
+        executor_client.write_all(&input).unwrap();
+
+        let mut policy = transport_policy_with_started_container();
+        let mut observer = NoopLifecycleObserver;
+        assert!(serve_connection(
+            &mut executor_server,
+            &mut upstream_client,
+            &mut policy,
+            &mut observer,
+            TransportLimits::default(),
+        )
+        .is_ok());
+        drop(executor_server);
+        let response = read_to_end(&mut executor_client);
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        let forwarded = runtime.join().unwrap();
+        let split = find_subsequence(&forwarded, b"\r\n\r\n").unwrap() + 4;
+        assert!(forwarded[..split].starts_with(
+            b"PUT /containers/owned/archive?noOverwriteDirNonDir=true&path=%2Fworkspace HTTP/1.1\r\n"
+        ));
+        assert!(forwarded[..split]
+            .windows(b"Content-Type: application/x-tar".len())
+            .any(|window| window == b"Content-Type: application/x-tar"));
+        let mut archive = tar::Archive::new(&forwarded[split..]);
+        let entry = archive.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap(), Path::new("script.sh"));
+        assert_eq!(entry.header().mode().unwrap(), 0o755);
+        assert_eq!(entry.header().uid().unwrap(), 0);
+        assert_eq!(entry.header().gid().unwrap(), 0);
+    }
+
+    #[test]
+    fn owned_archive_download_is_rebuilt_before_executor_visibility() {
+        let input = test_tar("output.txt", EntryType::Regular, b"done", 0o6666);
+        let path_stat = path_stat_header();
+        let expected_path_stat = path_stat.clone();
+        let (mut executor_client, mut executor_server) = UnixStream::pair().unwrap();
+        let (mut upstream_server, mut upstream_client) = UnixStream::pair().unwrap();
+        let runtime = thread::spawn(move || {
+            let request = read_test_http(&mut upstream_server);
+            assert!(request.starts_with(
+                b"GET /containers/owned/archive?path=%2Fworkspace%2Foutput.txt HTTP/1.1\r\n"
+            ));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\nX-Docker-Container-Path-Stat: {path_stat}\r\nX-Runtime-Path: /host/private\r\n\r\n",
+                input.len(),
+            );
+            upstream_server.write_all(head.as_bytes()).unwrap();
+            upstream_server.write_all(&input).unwrap();
+        });
+        executor_client
+            .write_all(b"GET /containers/owned/archive?path=%2Fworkspace%2Foutput.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+
+        let mut policy = transport_policy_with_started_container();
+        let mut observer = NoopLifecycleObserver;
+        assert!(serve_connection(
+            &mut executor_server,
+            &mut upstream_client,
+            &mut policy,
+            &mut observer,
+            TransportLimits::default(),
+        )
+        .is_ok());
+        drop(executor_server);
+        runtime.join().unwrap();
+
+        let response = read_to_end(&mut executor_client);
+        let split = find_subsequence(&response, b"\r\n\r\n").unwrap() + 4;
+        assert!(response[..split]
+            .windows(b"Content-Type: application/x-tar".len())
+            .any(|window| window == b"Content-Type: application/x-tar"));
+        assert!(response[..split]
+            .windows(expected_path_stat.len())
+            .any(|window| { window == expected_path_stat.as_bytes() }));
+        assert!(!response[..split]
+            .windows(b"X-Runtime-Path".len())
+            .any(|window| window == b"X-Runtime-Path"));
+        let mut archive = tar::Archive::new(&response[split..]);
+        let entry = archive.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap(), Path::new("output.txt"));
+        assert_eq!(entry.header().mode().unwrap(), 0o644);
+        assert_eq!(entry.header().uid().unwrap(), 0);
+    }
+
+    #[test]
+    fn chunked_archive_download_is_bounded_decoded_and_rebuilt() {
+        let input = test_tar("output.txt", EntryType::Regular, b"done", 0o6666);
+        let chunked = chunked_body(&input, 37);
+        let path_stat = path_stat_header();
+        let expected_path_stat = path_stat.clone();
+        let (mut executor_client, mut executor_server) = UnixStream::pair().unwrap();
+        let (mut upstream_server, mut upstream_client) = UnixStream::pair().unwrap();
+        let runtime = thread::spawn(move || {
+            let request = read_test_http(&mut upstream_server);
+            assert!(request.starts_with(
+                b"GET /containers/owned/archive?path=%2Fworkspace%2Foutput.txt HTTP/1.1\r\n"
+            ));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nTransfer-Encoding: chunked\r\nX-Docker-Container-Path-Stat: {path_stat}\r\nX-Unsafe-Runtime-Header: private\r\n\r\n"
+            );
+            upstream_server.write_all(head.as_bytes()).unwrap();
+            upstream_server.write_all(&chunked).unwrap();
+        });
+        executor_client
+            .write_all(b"GET /containers/owned/archive?path=%2Fworkspace%2Foutput.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+
+        let mut policy = transport_policy_with_started_container();
+        let mut observer = NoopLifecycleObserver;
+        assert!(serve_connection(
+            &mut executor_server,
+            &mut upstream_client,
+            &mut policy,
+            &mut observer,
+            TransportLimits::default(),
+        )
+        .is_ok());
+        drop(executor_server);
+        runtime.join().unwrap();
+
+        let response = read_to_end(&mut executor_client);
+        let split = find_subsequence(&response, b"\r\n\r\n").unwrap() + 4;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response[..split]
+            .windows(b"Content-Length:".len())
+            .any(|window| window == b"Content-Length:"));
+        assert!(!response[..split]
+            .windows(b"Transfer-Encoding".len())
+            .any(|window| window == b"Transfer-Encoding"));
+        assert!(!response[..split]
+            .windows(b"X-Unsafe-Runtime-Header".len())
+            .any(|window| window == b"X-Unsafe-Runtime-Header"));
+        assert!(response[..split]
+            .windows(expected_path_stat.len())
+            .any(|window| { window == expected_path_stat.as_bytes() }));
+        let mut archive = tar::Archive::new(&response[split..]);
+        let mut entries = archive.entries().unwrap();
+        let entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap(), Path::new("output.txt"));
+        assert_eq!(entry.header().mode().unwrap(), 0o644);
+        assert_eq!(entry.header().uid().unwrap(), 0);
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
+    fn hostile_archive_download_framing_and_headers_refuse_before_visibility() {
+        let valid_tar = test_tar("secret.txt", EntryType::Regular, b"unsafe", 0o644);
+        let valid_chunks = chunked_body(&valid_tar, 64);
+        let path_stat = path_stat_header();
+        let mut responses = vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\nX-Docker-Container-Path-Stat: {path_stat}\r\n\r\n0\r\n\r\n"
+            )
+            .into_bytes(),
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nX-Docker-Container-Path-Stat: {path_stat}\r\n\r\n0\r\n\r\n"
+            )
+            .into_bytes(),
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Docker-Container-Path-Stat: {path_stat}\r\n\r\n400001\r\n"
+            )
+            .into_bytes(),
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Docker-Container-Path-Stat: {path_stat}\r\n\r\n1;extension=x\r\na\r\n0\r\n\r\n"
+            )
+            .into_bytes(),
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Docker-Container-Path-Stat: {path_stat}\r\n\r\n0\r\nX-Trailer: refused\r\n\r\n"
+            )
+            .into_bytes(),
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Docker-Container-Path-Stat: {path_stat}\r\n\r\n0\r\n\r\nunsafe-pipeline"
+            )
+            .into_bytes(),
+            {
+                let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_vec();
+                response.extend_from_slice(&valid_chunks);
+                response
+            },
+            {
+                let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Docker-Container-Path-Stat: !!!\r\n\r\n"
+                    .to_vec();
+                response.extend_from_slice(&valid_chunks);
+                response
+            },
+        ];
+        let mut too_many_chunks = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Docker-Container-Path-Stat: {path_stat}\r\n\r\n"
+        )
+        .into_bytes();
+        for _ in 0..=MAX_CHUNK_COUNT {
+            too_many_chunks.extend_from_slice(b"1\r\na\r\n");
         }
+        too_many_chunks.extend_from_slice(b"0\r\n\r\n");
+        responses.push(too_many_chunks);
+
+        for response in responses {
+            let (mut executor_client, mut executor_server) = UnixStream::pair().unwrap();
+            let (mut upstream_server, mut upstream_client) = UnixStream::pair().unwrap();
+            let runtime = thread::spawn(move || {
+                let _request = read_test_http(&mut upstream_server);
+                upstream_server.write_all(&response).unwrap();
+            });
+            executor_client
+                .write_all(b"GET /containers/owned/archive?path=%2Fworkspace%2Fsecret.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            let mut policy = transport_policy_with_started_container();
+            let mut observer = NoopLifecycleObserver;
+            assert!(serve_connection(
+                &mut executor_server,
+                &mut upstream_client,
+                &mut policy,
+                &mut observer,
+                TransportLimits::default(),
+            )
+            .is_err());
+            drop(executor_server);
+            runtime.join().unwrap();
+            assert!(read_to_end(&mut executor_client).is_empty());
+        }
+    }
+
+    #[test]
+    fn chunked_upstream_responses_remain_closed_outside_archive_downloads() {
+        let (mut runtime, mut proxy) = UnixStream::pair().unwrap();
+        runtime
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n")
+            .unwrap();
+        assert!(read_response(
+            &mut proxy,
+            DockerMethod::Get,
+            TransportLimits::default().response_body_bytes,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn archive_grants_do_not_exceed_directional_transport_body_caps() {
+        let grant = ArchiveGrant {
+            lease_id: "lease".into(),
+            container_id: "container".into(),
+            container_path: "/workspace".into(),
+            direction: ArchiveDirection::Download,
+            max_bytes: 64 * 1024 * 1024,
+            max_entries: 4096,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_decompression_ratio: 100,
+        };
+        let limits = TransportLimits {
+            request_body_bytes: 2 * 1024 * 1024,
+            response_body_bytes: 4 * 1024 * 1024,
+            io_timeout: Duration::from_secs(30),
+        };
+
+        let download = limit_archive_grant_for_transport(grant.clone(), limits);
+        assert_eq!(download.max_bytes, limits.response_body_bytes);
+        assert_eq!(download.max_total_bytes, limits.response_body_bytes);
+
+        let upload = limit_archive_grant_for_transport(
+            ArchiveGrant {
+                direction: ArchiveDirection::Upload,
+                ..grant
+            },
+            limits,
+        );
+        assert_eq!(upload.max_bytes, limits.request_body_bytes);
+        assert_eq!(upload.max_total_bytes, limits.request_body_bytes);
+    }
+
+    #[test]
+    fn hostile_archive_upload_refuses_before_any_upstream_byte() {
+        let input = test_tar("escape", EntryType::Symlink, b"", 0o777);
+        let request = format!(
+            "PUT /containers/owned/archive?path=%2Fworkspace HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            input.len()
+        );
+        let (mut executor_client, mut executor_server) = UnixStream::pair().unwrap();
+        let (mut upstream_server, mut upstream_client) = UnixStream::pair().unwrap();
+        upstream_server
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        executor_client.write_all(request.as_bytes()).unwrap();
+        executor_client.write_all(&input).unwrap();
+
+        let mut policy = transport_policy_with_started_container();
+        let mut observer = NoopLifecycleObserver;
+        assert!(serve_connection(
+            &mut executor_server,
+            &mut upstream_client,
+            &mut policy,
+            &mut observer,
+            TransportLimits::default(),
+        )
+        .is_err());
+        assert_no_upstream_bytes(&mut upstream_server);
     }
 
     #[test]
@@ -3803,6 +4881,106 @@ mod tests {
             assert!(handle.join().unwrap().is_err());
             assert_no_upstream_bytes(&mut upstream_server);
         }
+    }
+
+    #[test]
+    fn foreign_exec_hijack_is_refused_before_upstream() {
+        let (mut executor_client, mut executor_server) = UnixStream::pair().unwrap();
+        let body = br#"{"Detach":false,"Tty":false}"#;
+        write!(
+            executor_client,
+            "POST /exec/foreign/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        executor_client.write_all(body).unwrap();
+        let failure = match prepare_request(&mut executor_server, &mut policy(), 1024 * 1024) {
+            Ok(_) => panic!("foreign exec must fail closed"),
+            Err(failure) => failure,
+        };
+        assert!(!failure.poison);
+        assert!(matches!(failure.error, ProxyError::StateRefused(_)));
+    }
+
+    #[test]
+    fn hijack_relay_copies_both_directions_and_closes_the_pair() {
+        let (mut executor_client, mut executor_proxy) = UnixStream::pair().unwrap();
+        let (mut runtime_client, mut runtime_proxy) = UnixStream::pair().unwrap();
+        let grant = HijackGrant {
+            lease_id: "lease".into(),
+            exec_id: "exec".into(),
+            max_output_bytes: 64,
+            max_input_bytes: 64,
+            allow_input: true,
+        };
+        let relay = thread::spawn(move || {
+            relay_hijack(
+                &mut executor_proxy,
+                &mut runtime_proxy,
+                b"prefix",
+                &grant,
+                Duration::from_secs(1),
+            )
+        });
+
+        let mut prefix = [0_u8; 6];
+        executor_client.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"prefix");
+        executor_client.write_all(b"stdin").unwrap();
+        let mut stdin = [0_u8; 5];
+        runtime_client.read_exact(&mut stdin).unwrap();
+        assert_eq!(&stdin, b"stdin");
+        runtime_client.write_all(b"stdout").unwrap();
+        let mut stdout = [0_u8; 6];
+        executor_client.read_exact(&mut stdout).unwrap();
+        assert_eq!(&stdout, b"stdout");
+        runtime_client.shutdown(Shutdown::Both).unwrap();
+        assert!(relay.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn hijack_relay_enforces_output_cap_and_deadline() {
+        let (mut executor_client, mut executor_proxy) = UnixStream::pair().unwrap();
+        let (mut runtime_client, mut runtime_proxy) = UnixStream::pair().unwrap();
+        let cap = HijackGrant {
+            lease_id: "lease".into(),
+            exec_id: "exec".into(),
+            max_output_bytes: 3,
+            max_input_bytes: 0,
+            allow_input: false,
+        };
+        let capped = thread::spawn(move || {
+            relay_hijack(
+                &mut executor_proxy,
+                &mut runtime_proxy,
+                b"",
+                &cap,
+                Duration::from_secs(1),
+            )
+        });
+        runtime_client.write_all(b"four").unwrap();
+        assert!(capped.join().unwrap().is_err());
+        let _ = executor_client.read(&mut [0_u8; 1]);
+
+        let (_executor_client, mut executor_proxy) = UnixStream::pair().unwrap();
+        let (_runtime_client, mut runtime_proxy) = UnixStream::pair().unwrap();
+        let deadline = HijackGrant {
+            lease_id: "lease".into(),
+            exec_id: "exec".into(),
+            max_output_bytes: 8,
+            max_input_bytes: 0,
+            allow_input: false,
+        };
+        let result = relay_hijack(
+            &mut executor_proxy,
+            &mut runtime_proxy,
+            b"",
+            &deadline,
+            Duration::from_millis(25),
+        );
+        assert!(
+            matches!(result, Err(ProxyError::Transport(message)) if message.contains("deadline"))
+        );
     }
 
     #[test]
@@ -3887,7 +5065,7 @@ mod tests {
     fn read_test_http(stream: &mut UnixStream) -> Vec<u8> {
         let head = read_head(stream, MAX_REQUEST_LINE_BYTES).unwrap();
         let parsed = parse_head(&head, true).unwrap();
-        let length = validate_framing(&parsed.headers, 1024 * 1024, true).unwrap();
+        let length = validate_framing(&parsed.headers, 1024 * 1024, true, false).unwrap();
         let body = read_exact_body(stream, parsed.trailing, length, 1024 * 1024).unwrap();
         let mut all = head;
         all.extend_from_slice(&body);

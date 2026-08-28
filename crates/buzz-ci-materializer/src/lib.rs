@@ -58,5 +58,6 @@ pub enum MaterializeError {
     Io(#[from] std::io::Error),
 }
 pub use backend::{
-    GitCommandLog, GitCommandResultLog, GitHostObservation, GitHostObserver, ProcessGitBackend,
+    ConfinedGitProcessResult, GitCommandLog, GitCommandResultLog, GitHostObservation,
+    GitHostObserver, ProcessGitBackend,
 };

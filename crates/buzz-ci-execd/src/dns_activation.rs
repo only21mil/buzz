@@ -516,10 +516,12 @@ impl RetainedDnsLease {
 
 /// Single-slot owner of DNS apply, retained receipt state, and reconciliation.
 ///
-/// `dns_exec` still starts all three principal units with `/usr/bin/sleep
-/// infinity`. Candidates C5 and C6 replace those placeholders with the policy
-/// proxy, runtime, materializer, and executor handoff. This adapter deliberately
-/// preserves the current command grammar until that reviewed integration lands.
+/// `dns_exec` starts the materializer unit with its fixed handoff shim. The
+/// executor and runtime units remain dormant placeholders until their reviewed
+/// handoffs land. The normal backend rejects direct Act process creation during
+/// preflight because recreating the retained executor unit would collide. This
+/// lifecycle retains all three units under the same cleanup token and lease
+/// slice.
 pub struct DnsLeaseLifecycle<R> {
     builder: DnsLeaseBuilder,
     executor: DnsExecutor<R>,
@@ -1355,6 +1357,10 @@ mod tests {
                     "type": "filter", "hook": "output", "prio": policy.priority(),
                     "policy": "accept"
                 }}),
+                json!({"counter": {
+                    "family": policy.family(), "table": policy.table(),
+                    "name": policy.counter(), "handle": 3, "packets": 0, "bytes": 0
+                }}),
             ];
             for tuple in policy.allowed_tcp_tuples() {
                 objects.push(json!({"rule": {
@@ -1363,6 +1369,7 @@ mod tests {
                         {"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": policy.principal_uid()}},
                         {"match": {"op": "==", "left": {"payload": {"protocol": if tuple.address.is_ipv4() { "ip" } else { "ip6" }, "field": "daddr"}}, "right": tuple.address.to_string()}},
                         {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": tuple.port}},
+                        {"counter": policy.counter()},
                         {"accept": null}
                     ]
                 }}));
@@ -1371,6 +1378,7 @@ mod tests {
                 "family": policy.family(), "table": policy.table(), "chain": policy.chain(),
                 "expr": [
                     {"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": policy.principal_uid()}},
+                    {"counter": policy.counter()},
                     {"drop": null}
                 ]
             }}));

@@ -11,7 +11,7 @@
     {"method": "POST", "target": "/containers/{container_id}/start", "required": true},
     {"method": "POST", "target": "/containers/{container_id}/exec", "required": true},
     {"method": "POST", "target": "/exec/{exec_id}/start", "required": true, "stream": "hijack"},
-    {"method": "PUT", "target": "/containers/{container_id}/archive?path={path}", "required": true, "stream": "archive"},
+    {"method": "PUT", "target": "/containers/{container_id}/archive?noOverwriteDirNonDir=true&path={path}", "required": true, "stream": "archive"},
     {"method": "GET", "target": "/exec/{exec_id}/json", "required": true},
     {"method": "GET", "target": "/containers/{container_id}/archive?path={path}", "required": true, "stream": "archive"},
     {"method": "DELETE", "target": "/containers/{container_id}?force=true&v=true", "required": true},

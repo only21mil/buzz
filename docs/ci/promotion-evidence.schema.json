@@ -1,0 +1,342 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/only21mil/buzz/docs/ci/promotion-evidence.schema.json",
+  "title": "Buzz promotion acceptance evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "repository",
+    "candidate_sha",
+    "base_sha",
+    "tree_sha",
+    "source",
+    "evidence_files",
+    "protected_ci",
+    "tier2",
+    "artifacts",
+    "staging",
+    "production_canary",
+    "deliberate_red",
+    "deployment",
+    "rollback",
+    "landing"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repository": {"const": "only21mil/buzz"},
+    "candidate_sha": {"$ref": "#/$defs/sha40"},
+    "base_sha": {"$ref": "#/$defs/sha40"},
+    "tree_sha": {"$ref": "#/$defs/sha40"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkout_sha", "clean"],
+      "properties": {
+        "checkout_sha": {"$ref": "#/$defs/sha40"},
+        "clean": {"const": true}
+      }
+    },
+    "evidence_files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pre_freeze", "protected_ci", "acceptance_verdict", "acceptance_records"],
+      "properties": {
+        "pre_freeze": {"$ref": "#/$defs/file_descriptor"},
+        "protected_ci": {"$ref": "#/$defs/file_descriptor"},
+        "acceptance_verdict": {"$ref": "#/$defs/file_descriptor"},
+        "acceptance_records": {"$ref": "#/$defs/file_descriptor"}
+      }
+    },
+    "protected_ci": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["head_sha", "protected", "conclusion", "contexts"],
+      "properties": {
+        "head_sha": {"$ref": "#/$defs/sha40"},
+        "protected": {"const": true},
+        "conclusion": {"const": "success"},
+        "contexts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "head_sha", "conclusion", "run_url"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "head_sha": {"$ref": "#/$defs/sha40"},
+              "conclusion": {"const": "success"},
+              "run_url": {"type": "string", "pattern": "^https://"}
+            }
+          }
+        }
+      }
+    },
+    "tier2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "eligible_commit", "checked_commit", "check_exit_code", "verdict",
+        "reviewer", "model", "effort", "lineage", "state_sha256",
+        "fingerprint", "prepared_at", "reviewed_at", "expires_at"
+      ],
+      "properties": {
+        "eligible_commit": {"$ref": "#/$defs/sha40"},
+        "checked_commit": {"$ref": "#/$defs/sha40"},
+        "check_exit_code": {"const": 0},
+        "verdict": {"enum": ["PASS", "PASS WITH RISKS"]},
+        "reviewer": {"type": "string", "pattern": "^claude:"},
+        "model": {"const": "claude-opus-5"},
+        "effort": {"const": "high"},
+        "lineage": {"type": "string", "minLength": 1},
+        "state_sha256": {"$ref": "#/$defs/sha256"},
+        "fingerprint": {"$ref": "#/$defs/sha256"},
+        "prepared_at": {"type": "integer", "minimum": 0},
+        "reviewed_at": {"type": "integer", "minimum": 0},
+        "expires_at": {"type": "integer", "minimum": 0}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image_ref", "image_ids", "running_image_id", "binary_sha256",
+        "oci_revision", "required_migration", "database_migration"
+      ],
+      "properties": {
+        "image_ref": {"type": "string", "minLength": 1},
+        "image_ids": {"type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/image_id"}},
+        "running_image_id": {"$ref": "#/$defs/image_id"},
+        "binary_sha256": {"$ref": "#/$defs/sha256"},
+        "oci_revision": {"$ref": "#/$defs/sha40"},
+        "required_migration": {"type": "integer", "minimum": 0},
+        "database_migration": {"type": "integer", "minimum": 0}
+      }
+    },
+    "staging": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_sha", "absent_policy_status", "configured_policy_status", "root_executor_handoff",
+        "advertised_bounds_sha256", "enforced_bounds_sha256", "scenarios",
+        "immutable_request_sha", "records", "signer", "job_set_sha256",
+        "evidence_sha256", "teardown_sha256", "conclusion", "log"
+      ],
+      "properties": {
+        "candidate_sha": {"$ref": "#/$defs/sha40"},
+        "absent_policy_status": {"const": 503},
+        "configured_policy_status": {"const": 200},
+        "root_executor_handoff": {"const": true},
+        "advertised_bounds_sha256": {"$ref": "#/$defs/sha256"},
+        "enforced_bounds_sha256": {"$ref": "#/$defs/sha256"},
+        "scenarios": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["success", "policy_refusal", "teardown_failure", "restart_recovery", "unaccepted_refusal"],
+          "properties": {
+            "success": {"const": "PASS"},
+            "policy_refusal": {"const": "PASS"},
+            "teardown_failure": {"const": "PASS"},
+            "restart_recovery": {"const": "PASS"},
+            "unaccepted_refusal": {"const": "PASS"}
+          }
+        },
+        "immutable_request_sha": {"$ref": "#/$defs/sha40"},
+        "records": {"$ref": "#/$defs/record_kinds"},
+        "signer": {"$ref": "#/$defs/sha256"},
+        "job_set_sha256": {"$ref": "#/$defs/sha256"},
+        "evidence_sha256": {"$ref": "#/$defs/sha256"},
+        "teardown_sha256": {"$ref": "#/$defs/sha256"},
+        "conclusion": {"const": "success"},
+        "log": {"$ref": "#/$defs/log_auth"}
+      }
+    },
+    "production_canary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_sha", "initial_concurrency", "enabled_concurrency",
+        "accepted_executed", "unaccepted_refused", "signed", "allowed_kinds_only", "records",
+        "run_id", "signer", "conclusion", "log_sha256", "evidence_sha256",
+        "teardown_sha256", "retry"
+      ],
+      "properties": {
+        "candidate_sha": {"$ref": "#/$defs/sha40"},
+        "initial_concurrency": {"const": 0},
+        "enabled_concurrency": {"const": 1},
+        "accepted_executed": {"const": true},
+        "unaccepted_refused": {"const": true},
+        "signed": {"const": true},
+        "allowed_kinds_only": {"const": true},
+        "records": {"$ref": "#/$defs/record_kinds"},
+        "run_id": {"type": "string", "minLength": 1},
+        "signer": {"$ref": "#/$defs/sha256"},
+        "conclusion": {"const": "success"},
+        "log_sha256": {"$ref": "#/$defs/sha256"},
+        "evidence_sha256": {"$ref": "#/$defs/sha256"},
+        "teardown_sha256": {"$ref": "#/$defs/sha256"},
+        "retry": {"$ref": "#/$defs/retry"}
+      }
+    },
+    "deliberate_red": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "system_sha", "red_sha", "accepted_commit", "required_check",
+        "conclusion", "merge_allowed", "protected_rule", "terminal_events",
+        "first_run_id", "duplicate_run_id"
+      ],
+      "properties": {
+        "system_sha": {"$ref": "#/$defs/sha40"},
+        "red_sha": {"$ref": "#/$defs/sha40"},
+        "accepted_commit": {"const": true},
+        "required_check": {"type": "string", "minLength": 1},
+        "conclusion": {"const": "failure"},
+        "merge_allowed": {"const": false},
+        "protected_rule": {"const": true},
+        "terminal_events": {"const": 1},
+        "first_run_id": {"type": "string", "minLength": 1},
+        "duplicate_run_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit_sha", "image_ref", "running_image_id", "binary_sha256",
+        "oci_revision", "database_migration", "dump_before_swap", "dump_sha256",
+        "readiness", "nip11", "started_at", "swapped_at", "finished_at", "log"
+      ],
+      "properties": {
+        "commit_sha": {"$ref": "#/$defs/sha40"},
+        "image_ref": {"type": "string", "minLength": 1},
+        "running_image_id": {"$ref": "#/$defs/image_id"},
+        "binary_sha256": {"$ref": "#/$defs/sha256"},
+        "oci_revision": {"$ref": "#/$defs/sha40"},
+        "database_migration": {"type": "integer", "minimum": 0},
+        "dump_before_swap": {"const": true},
+        "dump_sha256": {"$ref": "#/$defs/sha256"},
+        "readiness": {"const": true},
+        "nip11": {"const": true},
+        "started_at": {"type": "integer", "minimum": 0},
+        "swapped_at": {"type": "integer", "minimum": 0},
+        "finished_at": {"type": "integer", "minimum": 0},
+        "log": {"$ref": "#/$defs/log_auth"}
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["compatible", "advanced"],
+      "properties": {
+        "compatible": {"$ref": "#/$defs/compatible_rollback"},
+        "advanced": {"$ref": "#/$defs/advanced_rollback"}
+      }
+    },
+    "landing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relay_sha", "mirror_sha", "merge_sha"],
+      "properties": {
+        "relay_sha": {"$ref": "#/$defs/sha40"},
+        "mirror_sha": {"$ref": "#/$defs/sha40"},
+        "merge_sha": {"$ref": "#/$defs/sha40"}
+      }
+    }
+  },
+  "$defs": {
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "file_descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^/"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "record_kinds": {
+      "type": "array",
+      "prefixItems": [
+        {"const": 46101}, {"const": 46102}, {"const": 46103},
+        {"const": 46104}, {"const": 46105}, {"const": 46106}
+      ],
+      "items": false,
+      "minItems": 6,
+      "maxItems": 6
+    },
+    "log_auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorized_status", "unauthorized_status", "redirects", "sha256",
+        "computed_sha256", "byte_count", "byte_cap"
+      ],
+      "properties": {
+        "authorized_status": {"const": 200},
+        "unauthorized_status": {"enum": [401, 403]},
+        "redirects": {"const": 0},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "computed_sha256": {"$ref": "#/$defs/sha256"},
+        "byte_count": {"type": "integer", "minimum": 1},
+        "byte_cap": {"type": "integer", "minimum": 1}
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id", "first_run_id", "duplicate_run_id", "attempts",
+        "workspaces", "terminal_events"
+      ],
+      "properties": {
+        "request_id": {"type": "string", "minLength": 1},
+        "first_run_id": {"type": "string", "minLength": 1},
+        "duplicate_run_id": {"type": "string", "minLength": 1},
+        "attempts": {"const": [1, 2]},
+        "workspaces": {"type": "array", "minItems": 2, "maxItems": 2,
+          "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "terminal_events": {"const": 1}
+      }
+    },
+    "compatible_rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "current_migration", "prior_required_migration", "prior_image_id",
+        "prior_binary_sha256", "prior_dump_sha256", "restore_attempted", "restored_image_id",
+        "restored_binary_sha256", "restored_dump_sha256", "readiness", "nip11"
+      ],
+      "properties": {
+        "mode": {"const": "restored"},
+        "current_migration": {"type": "integer", "minimum": 0},
+        "prior_required_migration": {"type": "integer", "minimum": 0},
+        "prior_image_id": {"$ref": "#/$defs/image_id"},
+        "prior_binary_sha256": {"$ref": "#/$defs/sha256"},
+        "prior_dump_sha256": {"$ref": "#/$defs/sha256"},
+        "restore_attempted": {"const": true},
+        "restored_image_id": {"$ref": "#/$defs/image_id"},
+        "restored_binary_sha256": {"$ref": "#/$defs/sha256"},
+        "restored_dump_sha256": {"$ref": "#/$defs/sha256"},
+        "readiness": {"const": true},
+        "nip11": {"const": true}
+      }
+    },
+    "advanced_rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "current_migration", "prior_required_migration", "restore_attempted", "reason"],
+      "properties": {
+        "mode": {"const": "refused"},
+        "current_migration": {"type": "integer", "minimum": 0},
+        "prior_required_migration": {"type": "integer", "minimum": 0},
+        "restore_attempted": {"const": false},
+        "reason": {"const": "migration_advanced"}
+      }
+    }
+  }
+}

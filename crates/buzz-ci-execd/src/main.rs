@@ -17,6 +17,8 @@ use buzz_ci_execd::control::{
     ControlServer,
 };
 #[cfg(target_os = "linux")]
+use buzz_ci_execd::materializer_handoff::run_materializer_handoff_service;
+#[cfg(target_os = "linux")]
 use buzz_ci_execd::production_composition::load_production_dispatch;
 
 #[cfg(target_os = "linux")]
@@ -34,12 +36,13 @@ fn adopt_systemd_listener() -> UnixListener {
 fn main() -> ExitCode {
     let mut args = std::env::args_os();
     let _program = args.next();
-    match (args.next().as_deref(), args.next()) {
-        (Some(arg), None) if arg == "--version" => {
+    let args = args.collect::<Vec<_>>();
+    match args.as_slice() {
+        [arg] if arg == "--version" => {
             println!("buzz-ci-execd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        (Some(arg), None) if arg == "--self-check" => match buzz_ci_execd::self_check() {
+        [arg] if arg == "--self-check" => match buzz_ci_execd::self_check() {
             Ok(()) => {
                 println!(r#"{{"status":"not_provisioned","capacity":0}}"#);
                 ExitCode::SUCCESS
@@ -49,7 +52,7 @@ fn main() -> ExitCode {
                 ExitCode::from(4)
             }
         },
-        (Some(arg), None) if arg == "--socket-activation" => {
+        [arg] if arg == "--socket-activation" => {
             let forbidden = buzz_ci_execd::FORBIDDEN_ENVIRONMENT_KEYS
                 .iter()
                 .copied()
@@ -120,9 +123,28 @@ fn main() -> ExitCode {
                 ExitCode::from(4)
             }
         }
+        #[cfg(target_os = "linux")]
+        [mode, socket] if mode == "--materializer-handoff" => {
+            let Some(socket) = socket
+                .to_str()
+                .and_then(|value| value.strip_prefix("--socket="))
+            else {
+                eprintln!(
+                    r#"{{"error":"usage","expected":"--materializer-handoff --socket=/run/<unit>/materializer.sock"}}"#
+                );
+                return ExitCode::from(1);
+            };
+            match run_materializer_handoff_service(std::path::Path::new(socket)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!(r#"{{"error":"materializer_handoff","reason":"{error}"}}"#);
+                    ExitCode::from(4)
+                }
+            }
+        }
         _ => {
             eprintln!(
-                r#"{{"error":"usage","expected":"--version|--self-check|--socket-activation"}}"#
+                r#"{{"error":"usage","expected":"--version|--self-check|--socket-activation|--materializer-handoff --socket=/run/<unit>/materializer.sock"}}"#
             );
             ExitCode::from(1)
         }

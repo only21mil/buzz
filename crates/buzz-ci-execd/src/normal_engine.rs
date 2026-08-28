@@ -1234,7 +1234,7 @@ fn oid_hex(oid: GitOid) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{cell::RefCell, fs, os::unix::fs::symlink, rc::Rc};
 
     use buzz_ci_broker_protocol::{Operation, TrustClass};
@@ -1532,17 +1532,17 @@ mod tests {
             .collect()
     }
 
-    struct OrdinaryFixture {
-        _root: TempDir,
-        request: AdmitAttemptRequest,
-        admission: OrdinaryAdmission,
-        lease: LeaseToken,
-        plan: NormalJobPlan,
-        event_binding: CiEventBinding,
-        lease_id: String,
+    pub(crate) struct OrdinaryFixture {
+        pub(crate) _root: TempDir,
+        pub(crate) request: AdmitAttemptRequest,
+        pub(crate) admission: OrdinaryAdmission,
+        pub(crate) lease: LeaseToken,
+        pub(crate) plan: NormalJobPlan,
+        pub(crate) event_binding: CiEventBinding,
+        pub(crate) lease_id: String,
     }
 
-    fn ordinary_fixture() -> OrdinaryFixture {
+    pub(crate) fn ordinary_fixture() -> OrdinaryFixture {
         let root = tempfile::tempdir().unwrap();
         let request = AdmitAttemptRequest {
             signed_request_digest: [6; 32],

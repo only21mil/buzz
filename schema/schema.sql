@@ -1539,3 +1539,23 @@ $$;
 CREATE TRIGGER ci_run_identity_immutable
 BEFORE UPDATE ON ci_runs
 FOR EACH ROW EXECUTE FUNCTION enforce_ci_run_identity();
+
+-- ── CI control-plane signer grants (0035_ci_grants) ─────────────────────────
+-- Owner/admin-upserted authorizations: which pubkeys may sign status/control
+-- events (kinds 46101-46106) for a (community, channel, target_repo_a).
+CREATE TABLE ci_grants (
+    community_id    UUID        NOT NULL REFERENCES communities(id),
+    channel_id      UUID        NOT NULL,
+    target_repo_a   TEXT        NOT NULL,
+    signer_pubkey   TEXT        NOT NULL,
+    valid_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_until     TIMESTAMPTZ,
+    granted_by      TEXT        NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, channel_id, target_repo_a, signer_pubkey),
+    FOREIGN KEY (community_id, channel_id)
+        REFERENCES channels (community_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX ci_grants_channel_repo_idx
+    ON ci_grants (community_id, channel_id, target_repo_a);

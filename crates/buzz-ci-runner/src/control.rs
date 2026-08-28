@@ -5,12 +5,13 @@
 //! values from command-line strings.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use buzz_ci_broker_protocol::{
     decode_response, encode_request, AdmitAttemptRequest, BrokerResponse, BrokerState,
-    CompleteAttemptRequest, Conclusion, FrameHeader, GitOid, Request, ResponseCode, TrustClass,
-    HEADER_SIZE, MAX_SAFE_INTEGER, RESPONSE_BODY_SIZE,
+    CompleteAttemptRequest, Conclusion, FrameHeader, GetAttemptRequest, GitOid, Request,
+    ResponseCode, TrustClass, HEADER_SIZE, MAX_SAFE_INTEGER, RESPONSE_BODY_SIZE,
 };
 use buzz_core::ci::CiRequestEnvelope;
 use sha2::{Digest, Sha256};
@@ -26,6 +27,7 @@ pub const BROKER_SOCKET_PATH: &str = "/run/buzzci/execd.sock";
 const RESPONSE_FRAME_SIZE: usize = HEADER_SIZE + RESPONSE_BODY_SIZE;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const ADMIT_REQUEST_ID_DOMAIN: &[u8] = b"buzz-ci-runner:admit-request-id:v1\0";
+const GET_REQUEST_ID_DOMAIN: &[u8] = b"buzz-ci-runner:get-request-id:v1\0";
 const COMPLETE_REQUEST_ID_DOMAIN: &[u8] = b"buzz-ci-runner:complete-request-id:v1\0";
 
 /// Reviewed workflow facts supplied by the trusted integration layer.
@@ -221,9 +223,81 @@ pub trait BrokerTransport {
     /// Send one normalized admission request.
     fn admit(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError>;
 
+    /// Read the broker-owned state for one opaque admitted lease.
+    fn get(&mut self, request: GetAttemptRequest) -> Result<BrokerResponse, ControlError>;
+
     /// Send one completion bound to the admitted lease.
     fn complete(&mut self, request: CompleteAttemptRequest)
         -> Result<BrokerResponse, ControlError>;
+}
+
+/// Execution backend that obtains the broker's bounded terminal evidence.
+///
+/// Version 1 performs one broker read. The contract does not define a runner
+/// retry schedule, so callers reconcile a nonterminal response through
+/// controld instead of spinning or inventing backoff rules here.
+pub struct BrokerExecutionBackend<T> {
+    transport: T,
+}
+
+impl<T> BrokerExecutionBackend<T> {
+    pub const fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.transport
+    }
+}
+
+impl<T: BrokerTransport> ExecutionBackend<()> for BrokerExecutionBackend<T> {
+    fn execute(
+        &mut self,
+        _inputs: AuthorizedWorkflowInputs<()>,
+        lease: &AdmittedLease,
+    ) -> Result<BoundedExecutionEvidence, ExecutionBackendError> {
+        let response = self
+            .transport
+            .get(GetAttemptRequest {
+                attempt_id: lease.lease_id,
+            })
+            .map_err(|_| ExecutionBackendError::Unavailable)?;
+        validate_execution_response(*lease, response)
+            .map_err(|_| ExecutionBackendError::MissingEvidence)
+    }
+}
+
+fn validate_execution_response(
+    lease: AdmittedLease,
+    response: BrokerResponse,
+) -> Result<BoundedExecutionEvidence, ControlError> {
+    if !matches!(response.code, ResponseCode::Ok | ResponseCode::Existing)
+        || response.retry_after_millis != 0
+        || response.attempt_id != lease.lease_id
+        || response.run_id != lease.run_id
+        || response.accepted_request_digest != lease.signed_request_digest
+        || response.job_manifest_digest != lease.job_manifest_digest
+        || response.tip_oid != Some(lease.tip_oid)
+        || !matches!(
+            response.broker_state,
+            BrokerState::Ready | BrokerState::Quarantined | BrokerState::Terminal
+        )
+        || response.conclusion == Conclusion::None
+        || response.generation == 0
+        || response.accepted_at != lease.accepted_at
+        || response.updated_at < response.accepted_at
+        || response.updated_at > MAX_SAFE_INTEGER
+        || response.lease_generation != lease.lease_generation
+        || response.evidence_set_digest == [0; 32]
+        || response.attempt != lease.attempt
+    {
+        return Err(ControlError::InvalidBrokerResponse);
+    }
+    BoundedExecutionEvidence::new(
+        response.conclusion,
+        response.evidence_set_digest,
+        response.updated_at,
+    )
 }
 
 /// Authorize, reject expired input, normalize, and only then contact the broker.
@@ -350,29 +424,72 @@ pub fn validate_completed_response(
     Ok(response)
 }
 
-/// Production fixed-socket Unix transport.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnixBrokerTransport;
+/// Production Unix transport bound to one configured socket and broker UID.
+#[derive(Clone, Debug)]
+pub struct UnixBrokerTransport {
+    socket_path: PathBuf,
+    expected_uid: u32,
+}
+
+impl UnixBrokerTransport {
+    pub fn new(socket_path: PathBuf, expected_uid: u32) -> Self {
+        Self {
+            socket_path,
+            expected_uid,
+        }
+    }
+}
+
+impl Default for UnixBrokerTransport {
+    fn default() -> Self {
+        Self::new(PathBuf::from(BROKER_SOCKET_PATH), 0)
+    }
+}
 
 impl BrokerTransport for UnixBrokerTransport {
     fn admit(&mut self, request: AdmitAttemptRequest) -> Result<BrokerResponse, ControlError> {
-        exchange_unix(Request::AdmitAttempt(request))
+        exchange_unix(
+            &self.socket_path,
+            self.expected_uid,
+            Request::AdmitAttempt(request),
+        )
+    }
+
+    fn get(&mut self, request: GetAttemptRequest) -> Result<BrokerResponse, ControlError> {
+        exchange_unix(
+            &self.socket_path,
+            self.expected_uid,
+            Request::GetAttempt(request),
+        )
     }
 
     fn complete(
         &mut self,
         request: CompleteAttemptRequest,
     ) -> Result<BrokerResponse, ControlError> {
-        exchange_unix(Request::CompleteAttempt(request))
+        exchange_unix(
+            &self.socket_path,
+            self.expected_uid,
+            Request::CompleteAttempt(request),
+        )
     }
 }
 
 #[cfg(unix)]
-fn exchange_unix(request: Request) -> Result<BrokerResponse, ControlError> {
+fn exchange_unix(
+    path: &Path,
+    expected_uid: u32,
+    request: Request,
+) -> Result<BrokerResponse, ControlError> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     use std::os::unix::net::UnixStream;
 
-    let mut stream =
-        UnixStream::connect(BROKER_SOCKET_PATH).map_err(|_| ControlError::BrokerUnavailable)?;
+    let mut stream = UnixStream::connect(path).map_err(|_| ControlError::BrokerUnavailable)?;
+    let credentials =
+        getsockopt(&stream, PeerCredentials).map_err(|_| ControlError::TransportFailure)?;
+    if expected_uid == 0 || credentials.uid() != expected_uid {
+        return Err(ControlError::BrokerRejected);
+    }
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
@@ -381,7 +498,11 @@ fn exchange_unix(request: Request) -> Result<BrokerResponse, ControlError> {
 }
 
 #[cfg(not(unix))]
-fn exchange_unix(_request: Request) -> Result<BrokerResponse, ControlError> {
+fn exchange_unix(
+    _path: &Path,
+    _expected_uid: u32,
+    _request: Request,
+) -> Result<BrokerResponse, ControlError> {
     Err(ControlError::BrokerUnavailable)
 }
 
@@ -434,6 +555,10 @@ fn request_id_for(request: Request) -> [u8; 16] {
             .chain_update(ADMIT_REQUEST_ID_DOMAIN)
             .chain_update(request.signed_request_digest)
             .finalize(),
+        Request::GetAttempt(request) => Sha256::new()
+            .chain_update(GET_REQUEST_ID_DOMAIN)
+            .chain_update(request.attempt_id)
+            .finalize(),
         Request::CompleteAttempt(request) => Sha256::new()
             .chain_update(COMPLETE_REQUEST_ID_DOMAIN)
             .chain_update(request.signer_pubkey)
@@ -446,11 +571,8 @@ fn request_id_for(request: Request) -> [u8; 16] {
             .chain_update(request.evidence_set_digest)
             .chain_update(request.terminal_at.to_be_bytes())
             .finalize(),
-        Request::Hello(_)
-        | Request::CancelAttempt(_)
-        | Request::GetAttempt(_)
-        | Request::AdmitQualification(_) => {
-            unreachable!("runner transport exposes only admit and complete")
+        Request::Hello(_) | Request::CancelAttempt(_) | Request::AdmitQualification(_) => {
+            unreachable!("runner transport exposes only admit, get, and complete")
         }
     };
     let mut request_id = [0; 16];
@@ -461,6 +583,8 @@ fn request_id_for(request: Request) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
 
     use buzz_ci_broker_protocol::{
         decode_request, encode_response, BrokerState, Conclusion, GitOid, ResponseCode,
@@ -481,10 +605,13 @@ mod tests {
     #[derive(Default)]
     struct SpyTransport {
         admissions: Vec<AdmitAttemptRequest>,
+        gets: Vec<GetAttemptRequest>,
         completions: Vec<CompleteAttemptRequest>,
         frames: Vec<Vec<u8>>,
         admit_response: Option<BrokerResponse>,
+        get_response: Option<BrokerResponse>,
         fail_admit: bool,
+        fail_get: bool,
         fail_complete: bool,
     }
 
@@ -503,6 +630,20 @@ mod tests {
             Ok(self
                 .admit_response
                 .unwrap_or_else(|| response_for(self.admissions[0])))
+        }
+
+        fn get(&mut self, request: GetAttemptRequest) -> Result<BrokerResponse, ControlError> {
+            self.gets.push(request);
+            let request = Request::GetAttempt(request);
+            self.frames.push(
+                encode_request(request_id_for(request), request)
+                    .as_bytes()
+                    .to_vec(),
+            );
+            if self.fail_get {
+                return Err(ControlError::TransportFailure);
+            }
+            self.get_response.ok_or(ControlError::InvalidBrokerResponse)
         }
 
         fn complete(
@@ -773,6 +914,39 @@ mod tests {
             validate_admitted_response(normalized, generation_mismatch),
             Err(ControlError::InvalidBrokerResponse)
         );
+    }
+
+    #[test]
+    fn broker_execution_backend_maps_one_bound_terminal_poll() {
+        let normalized = transport_request();
+        let lease =
+            validate_admitted_response(normalized, response_for(normalized)).expect("bound lease");
+        let mut terminal = response_for(normalized);
+        terminal.broker_state = BrokerState::Terminal;
+        terminal.conclusion = Conclusion::Success;
+        terminal.updated_at = 21;
+        terminal.evidence_set_digest = [7; 32];
+        terminal.teardown_digest = [8; 32];
+        let transport = SpyTransport {
+            get_response: Some(terminal),
+            ..SpyTransport::default()
+        };
+        let mut backend = BrokerExecutionBackend::new(transport);
+
+        let evidence = backend
+            .execute(AuthorizedWorkflowInputs::new(()), &lease)
+            .expect("bounded terminal evidence");
+        assert_eq!(evidence.advisory_conclusion, Conclusion::Success);
+        assert_eq!(evidence.evidence_set_digest, [7; 32]);
+        assert_eq!(evidence.terminal_at, 21);
+        let transport = backend.into_inner();
+        assert_eq!(
+            transport.gets,
+            vec![GetAttemptRequest {
+                attempt_id: lease.lease_id(),
+            }]
+        );
+        assert_eq!(transport.frames.len(), 1);
     }
 
     #[test]
@@ -1050,6 +1224,51 @@ mod tests {
             exchange_stream(&mut stream, request),
             Err(ControlError::InvalidBrokerResponse)
         );
+    }
+
+    #[test]
+    fn unix_broker_transport_authenticates_peer_before_protocol_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        assert_eq!(
+            exchange_unix(
+                &path,
+                u32::MAX,
+                Request::GetAttempt(GetAttemptRequest {
+                    attempt_id: [7; 16]
+                }),
+            ),
+            Err(ControlError::BrokerRejected)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_broker_still_fails_closed_on_invalid_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        assert_eq!(
+            exchange_unix(
+                &path,
+                nix::unistd::Uid::effective().as_raw(),
+                Request::GetAttempt(GetAttemptRequest {
+                    attempt_id: [7; 16]
+                }),
+            ),
+            Err(ControlError::TransportFailure)
+        );
+        server.join().unwrap();
     }
 
     fn transport_request() -> AdmitAttemptRequest {

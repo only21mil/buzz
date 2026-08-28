@@ -96,10 +96,14 @@ pub enum DockerRoute {
         /// Requested exec identifier.
         exec_id: String,
     },
-    /// Archive upload/download. Executor-facing Phase 1 denies this route.
+    /// Bounded archive upload/download for an owned container.
     Archive {
         /// Requested container identifier.
         id: String,
+        /// Exact normalized absolute path inside the container.
+        path: String,
+        /// Refuse file/directory replacement conflicts during upload.
+        no_overwrite_dir_non_dir: bool,
     },
     /// Runtime image pull. Phase 1 denies it.
     ImagePull,
@@ -148,7 +152,7 @@ impl DockerRoute {
         }
         let path = strip_version(raw_path)?;
         let segments = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
-        let route = match (method, segments.as_slice()) {
+        let mut route = match (method, segments.as_slice()) {
             (DockerMethod::Get | DockerMethod::Head, ["_ping"]) => Self::Ping,
             (DockerMethod::Get, ["version"]) => Self::Version,
             (DockerMethod::Get, ["info"]) => Self::Info,
@@ -185,12 +189,13 @@ impl DockerRoute {
             (DockerMethod::Get, ["exec", id, "json"]) => Self::ExecInspect {
                 exec_id: validate_id(id)?,
             },
-            (
-                DockerMethod::Get | DockerMethod::Head | DockerMethod::Put,
-                ["containers", id, "archive"],
-            ) => Self::Archive {
-                id: validate_id(id)?,
-            },
+            (DockerMethod::Get | DockerMethod::Put, ["containers", id, "archive"]) => {
+                Self::Archive {
+                    id: validate_id(id)?,
+                    path: String::new(),
+                    no_overwrite_dir_non_dir: false,
+                }
+            }
             (DockerMethod::Post, ["images", "create"]) => Self::ImagePull,
             (DockerMethod::Post, ["build"]) => Self::Build,
             (_, [family, ..])
@@ -218,7 +223,28 @@ impl DockerRoute {
                 ));
             }
         };
-        let canonical_query = canonical_query(&route, query)?;
+        let canonical_query = canonical_query(method, &route, query)?;
+        if let DockerRoute::Archive {
+            path,
+            no_overwrite_dir_non_dir,
+            ..
+        } = &mut route
+        {
+            for (key, value) in url::form_urlencoded::parse(canonical_query.as_bytes()) {
+                match key.as_ref() {
+                    "path" => *path = value.into_owned(),
+                    "noOverwriteDirNonDir" => *no_overwrite_dir_non_dir = true,
+                    _ => {
+                        return Err(ProxyError::RouteRefused(
+                            "canonical archive query contains an unadmitted field".into(),
+                        ));
+                    }
+                }
+            }
+            if path.is_empty() {
+                return Err(ProxyError::RouteRefused("archive path is required".into()));
+            }
+        }
         let canonical_path = match &route {
             DockerRoute::ImageInspect { image } => {
                 format!("/images/{}/json", image.replace(':', "%3A"))
@@ -262,7 +288,11 @@ fn strip_version(path: &str) -> Result<&str, ProxyError> {
     Ok(&path[path.len() - remainder.len() - 1..])
 }
 
-fn canonical_query(route: &DockerRoute, query: &str) -> Result<String, ProxyError> {
+fn canonical_query(
+    method: DockerMethod,
+    route: &DockerRoute,
+    query: &str,
+) -> Result<String, ProxyError> {
     let mut values = BTreeMap::new();
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         if key.is_empty()
@@ -301,6 +331,9 @@ fn canonical_query(route: &DockerRoute, query: &str) -> Result<String, ProxyErro
         DockerRoute::ContainerDelete { .. } => &["force", "link", "v"],
         DockerRoute::ExecCreate { .. } | DockerRoute::ExecStart { .. } => &["detachKeys"],
         DockerRoute::ExecInspect { .. } => &[],
+        DockerRoute::Archive { .. } if method == DockerMethod::Put => {
+            &["noOverwriteDirNonDir", "path"]
+        }
         DockerRoute::Archive { .. } => &["path"],
         // These operations are always denied by policy. Parse their queries
         // only for duplicate/bounds safety so the denial is explicit.
@@ -312,6 +345,25 @@ fn canonical_query(route: &DockerRoute, query: &str) -> Result<String, ProxyErro
         return Err(ProxyError::RouteRefused(
             "query field is not admitted for this route".into(),
         ));
+    }
+    if matches!(route, DockerRoute::Archive { .. }) {
+        if !matches!(values.len(), 1 | 2) {
+            return Err(ProxyError::RouteRefused(
+                "archive requests require one path and at most one upload option".into(),
+            ));
+        }
+        let path = values
+            .get_mut("path")
+            .ok_or_else(|| ProxyError::RouteRefused("archive path is required".into()))?;
+        *path = normalize_archive_path(path)?;
+        if values
+            .get("noOverwriteDirNonDir")
+            .is_some_and(|value| value != "true")
+        {
+            return Err(ProxyError::RouteRefused(
+                "archive upload conflict protection must be true".into(),
+            ));
+        }
     }
     for (key, value) in &values {
         match key.as_str() {
@@ -354,6 +406,45 @@ fn canonical_query(route: &DockerRoute, query: &str) -> Result<String, ProxyErro
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.extend_pairs(values.iter());
     Ok(serializer.finish())
+}
+
+fn normalize_archive_path(value: &str) -> Result<String, ProxyError> {
+    use std::path::Component;
+
+    if value.len() > 4096
+        || value.contains('\\')
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(ProxyError::RouteRefused(
+            "archive path is oversized or contains unsafe bytes".into(),
+        ));
+    }
+    let path = std::path::Path::new(value);
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(ProxyError::RouteRefused(
+            "archive path must be absolute".into(),
+        ));
+    }
+    let mut normalized = String::new();
+    for component in components {
+        let Component::Normal(component) = component else {
+            return Err(ProxyError::RouteRefused(
+                "archive path must be canonical".into(),
+            ));
+        };
+        let component = component
+            .to_str()
+            .ok_or_else(|| ProxyError::RouteRefused("archive path must be valid UTF-8".into()))?;
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    if normalized.is_empty() {
+        normalized.push('/');
+    }
+    Ok(normalized)
 }
 
 fn validate_id(value: &str) -> Result<String, ProxyError> {
@@ -414,6 +505,45 @@ mod tests {
         assert!(DockerRoute::parse(
             DockerMethod::Get,
             "/containers/id/logs?follow=false&tail=all"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn archive_upload_accepts_only_the_moby_default_option_shape() {
+        let parsed = DockerRoute::parse_canonical(
+            DockerMethod::Put,
+            "/v1.47/containers/id/archive?path=%2Fworkspace&noOverwriteDirNonDir=true",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.target,
+            "/containers/id/archive?noOverwriteDirNonDir=true&path=%2Fworkspace"
+        );
+        assert_eq!(
+            parsed.route,
+            DockerRoute::Archive {
+                id: "id".into(),
+                path: "/workspace".into(),
+                no_overwrite_dir_non_dir: true,
+            }
+        );
+
+        for target in [
+            "/containers/id/archive?path=%2Fworkspace&unknown=true",
+            "/containers/id/archive?path=%2Fworkspace&path=%2Fother",
+            "/containers/id/archive?path=%2Fworkspace&noOverwriteDirNonDir=false",
+            "/containers/id/archive?path=%2Fworkspace&noOverwriteDirNonDir=1",
+            "/containers/id/archive?path=%2Fworkspace&noOverwriteDirNonDir=true&noOverwriteDirNonDir=true",
+        ] {
+            assert!(
+                DockerRoute::parse(DockerMethod::Put, target).is_err(),
+                "accepted hostile upload query {target}"
+            );
+        }
+        assert!(DockerRoute::parse(
+            DockerMethod::Get,
+            "/containers/id/archive?path=%2Fworkspace&noOverwriteDirNonDir=true"
         )
         .is_err());
     }

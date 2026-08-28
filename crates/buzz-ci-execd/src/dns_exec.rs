@@ -30,6 +30,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use buzz_ci_isolation_contract::ValidatedAttemptLeaseBinding;
+use buzz_ci_materializer::CommandSpec;
+
 use crate::dns_host::{
     DnsHostAction, DnsHostAdapter, DnsHostApplyError, DnsHostApplyResult, DnsHostBackend,
     DnsHostObservation, DnsHostPlan, DnsHostPlanError, DnsHostReadbackTarget, LeaseSliceQuarantine,
@@ -70,6 +73,7 @@ pub enum AllowedBinary {
     Stat,
     Ncat,
     Sleep,
+    BuzzCiExecd,
 }
 
 impl AllowedBinary {
@@ -84,8 +88,178 @@ impl AllowedBinary {
             Self::Stat => "/usr/bin/stat",
             Self::Ncat => "/usr/bin/ncat",
             Self::Sleep => "/usr/bin/sleep",
+            Self::BuzzCiExecd => "/usr/libexec/buzz-ci-execd",
         }
     }
+}
+
+const MATERIALIZER_HANDOFF_MODE: &str = "--materializer-handoff";
+const MATERIALIZER_SOCKET_NAME: &str = "materializer.sock";
+const MATERIALIZER_GIT_PROGRAM: &str = "/usr/bin/git";
+
+/// Root-owned binding between a retained materializer unit and Git commands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializerHandoffBinding {
+    unit: TransientUnitPlan,
+    lease_id: String,
+    cgroup_token: String,
+    netns_token: String,
+    socket_path: PathBuf,
+}
+
+impl MaterializerHandoffBinding {
+    /// Derive the command capability tuple from one validated attempt lease.
+    pub fn from_lease(
+        unit: TransientUnitPlan,
+        lease: &ValidatedAttemptLeaseBinding,
+    ) -> Result<Self, MaterializerHandoffError> {
+        let binding = lease.as_binding();
+        Self::new(
+            unit,
+            binding.lease_id.clone(),
+            binding.cgroup.object.token.clone(),
+            binding.netns.object.token.clone(),
+        )
+    }
+
+    /// Bind the materializer service to the exact capability tuple copied into
+    /// every materializer `CommandSpec`.
+    fn new(
+        unit: TransientUnitPlan,
+        lease_id: String,
+        cgroup_token: String,
+        netns_token: String,
+    ) -> Result<Self, MaterializerHandoffError> {
+        if unit.role != PrincipalRole::Materializer
+            || unit.uid == 0
+            || lease_id.is_empty()
+            || cgroup_token.is_empty()
+            || netns_token.is_empty()
+        {
+            return Err(MaterializerHandoffError::InvalidBinding);
+        }
+        let runtime_directory = unit
+            .properties
+            .get("RuntimeDirectory")
+            .filter(|value| safe_runtime_directory(value))
+            .ok_or(MaterializerHandoffError::InvalidBinding)?;
+        if unit
+            .properties
+            .get("RuntimeDirectoryMode")
+            .map(String::as_str)
+            != Some("0700")
+        {
+            return Err(MaterializerHandoffError::InvalidBinding);
+        }
+        let socket_path = Path::new("/run")
+            .join(runtime_directory)
+            .join(MATERIALIZER_SOCKET_NAME);
+        Ok(Self {
+            unit,
+            lease_id,
+            cgroup_token,
+            netns_token,
+            socket_path,
+        })
+    }
+
+    /// Validate and retain one exact materializer command before socket handoff.
+    pub fn command_plan(
+        &self,
+        command: &CommandSpec,
+    ) -> Result<MaterializerCommandPlan, MaterializerHandoffError> {
+        if command.required_uid != self.unit.uid
+            || command.lease_id != self.lease_id
+            || command.cgroup_token != self.cgroup_token
+            || command.netns_token != self.netns_token
+        {
+            return Err(MaterializerHandoffError::CapabilityMismatch);
+        }
+        if command.program != Path::new(MATERIALIZER_GIT_PROGRAM)
+            || !command.clear_environment
+            || command.deadline_millis == 0
+            || command.maximum_stdout_bytes == 0
+            || command.maximum_stderr_bytes == 0
+            || command.maximum_processes == 0
+        {
+            return Err(MaterializerHandoffError::InvalidCommand);
+        }
+        let workspace_fd = command
+            .current_dir
+            .to_str()
+            .and_then(|value| value.strip_prefix("/proc/self/fd/"))
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value >= 0)
+            .ok_or(MaterializerHandoffError::InvalidWorkspaceDescriptor)?;
+        Ok(MaterializerCommandPlan {
+            socket_path: self.socket_path.clone(),
+            workspace_fd,
+            command: command.clone(),
+        })
+    }
+
+    /// Exact private socket exposed by the confined materializer shim.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+/// Validated materializer command ready for bounded framing and descriptor transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializerCommandPlan {
+    socket_path: PathBuf,
+    workspace_fd: i32,
+    command: CommandSpec,
+}
+
+impl MaterializerCommandPlan {
+    /// Private Unix socket owned by the retained materializer unit.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Sender-side workspace descriptor that the transport must pass, not reopen.
+    pub const fn workspace_fd(&self) -> i32 {
+        self.workspace_fd
+    }
+
+    /// Exact validated command payload for the confined shim.
+    pub const fn command(&self) -> &CommandSpec {
+        &self.command
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_new(socket_path: PathBuf, workspace_fd: i32, command: CommandSpec) -> Self {
+        Self {
+            socket_path,
+            workspace_fd,
+            command,
+        }
+    }
+}
+
+/// Fail-closed rejection while binding or planning a materializer handoff.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MaterializerHandoffError {
+    /// Unit identity or its private runtime directory is incomplete.
+    #[error("materializer handoff binding is incomplete or malformed")]
+    InvalidBinding,
+    /// A `CommandSpec` names a different UID or lease capability.
+    #[error("materializer command does not match the retained lease capabilities")]
+    CapabilityMismatch,
+    /// The command is not the fixed bounded Git form accepted by the shim.
+    #[error("materializer command is outside the fixed Git execution contract")]
+    InvalidCommand,
+    /// The command describes a pathname instead of an already-open directory.
+    #[error("materializer command lacks a transferable workspace descriptor")]
+    InvalidWorkspaceDescriptor,
+}
+
+fn safe_runtime_directory(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 /// Private-construction command with bounded execution metadata.
@@ -684,13 +858,24 @@ pub enum DnsExecBackendError<E: std::error::Error + 'static> {
     ResourceCollision,
     #[error("lease quarantine cleanup failed")]
     Quarantine,
+    /// A required property was absent while deriving an allowlisted command.
+    #[error("allowlisted command planning failed")]
+    CommandPlan(#[source] CommandPlanningError),
+}
+
+/// Fail-closed rejection while deriving exact host commands from a service plan.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum CommandPlanningError {
+    /// A property required to construct fixed `systemd-run` arguments was absent.
+    #[error("principal service is missing required property {0}")]
+    MissingServiceProperty(&'static str),
 }
 
 impl<R: ExactCommandRunner> DnsHostBackend for DnsExecBackend<'_, R> {
     type Error = DnsExecBackendError<R::Error>;
 
     fn apply(&mut self, action: &DnsHostAction) -> Result<(), Self::Error> {
-        let commands = commands_for_action(action);
+        let commands = commands_for_action(action).map_err(DnsExecBackendError::CommandPlan)?;
         match action {
             DnsHostAction::EnsureLeaseSlice { slice } => {
                 require_slice_absent(self.runner, &slice.unit_name)?;
@@ -831,8 +1016,8 @@ fn quarantine_identifiers(target: &LeaseSliceQuarantine) -> Option<QuarantineIde
     })
 }
 
-fn commands_for_action(action: &DnsHostAction) -> Vec<ExactCommand> {
-    match action {
+fn commands_for_action(action: &DnsHostAction) -> Result<Vec<ExactCommand>, CommandPlanningError> {
+    Ok(match action {
         DnsHostAction::EnsureLeaseSlice { slice } => {
             let mut argv = vec![os("set-property"), os("--runtime"), os(&slice.unit_name)];
             argv.extend(
@@ -868,23 +1053,23 @@ fn commands_for_action(action: &DnsHostAction) -> Vec<ExactCommand> {
         ],
         DnsHostAction::InstallMaterializerPolicy { policy } => nft_apply_commands(policy),
         DnsHostAction::EnsurePrincipalService { service } => {
-            vec![service_apply_command(service)]
+            vec![service_apply_command(service)?]
         }
-    }
+    })
 }
 
-fn service_apply_command(service: &TransientUnitPlan) -> ExactCommand {
+fn service_apply_command(
+    service: &TransientUnitPlan,
+) -> Result<ExactCommand, CommandPlanningError> {
+    let slice = service
+        .properties
+        .get("Slice")
+        .ok_or(CommandPlanningError::MissingServiceProperty("Slice"))?;
     let mut argv = vec![
         os("--quiet"),
         os("--collect"),
         os(format!("--unit={}", service.unit_name)),
-        os(format!(
-            "--slice={}",
-            service
-                .properties
-                .get("Slice")
-                .expect("closed plan has Slice")
-        )),
+        os(format!("--slice={slice}")),
         os(format!("--uid={}", service.uid)),
     ];
     argv.extend(
@@ -894,8 +1079,26 @@ fn service_apply_command(service: &TransientUnitPlan) -> ExactCommand {
             .filter(|(name, _)| name.as_str() != "Slice" && name.as_str() != "User")
             .map(|(name, value)| os(format!("--property={name}={value}"))),
     );
-    argv.extend([os(AllowedBinary::Sleep.path()), os("infinity")]);
-    ExactCommand::new(AllowedBinary::SystemdRun, argv, COMMAND_TIMEOUT)
+    if service.role == PrincipalRole::Materializer {
+        let runtime_directory = service.properties.get("RuntimeDirectory").ok_or(
+            CommandPlanningError::MissingServiceProperty("RuntimeDirectory"),
+        )?;
+        let socket_path = Path::new("/run")
+            .join(runtime_directory)
+            .join(MATERIALIZER_SOCKET_NAME);
+        argv.extend([
+            os(AllowedBinary::BuzzCiExecd.path()),
+            os(MATERIALIZER_HANDOFF_MODE),
+            os(format!("--socket={}", socket_path.display())),
+        ]);
+    } else {
+        argv.extend([os(AllowedBinary::Sleep.path()), os("infinity")]);
+    }
+    Ok(ExactCommand::new(
+        AllowedBinary::SystemdRun,
+        argv,
+        COMMAND_TIMEOUT,
+    ))
 }
 
 fn nft_apply_commands(policy: &MaterializerNftPlan) -> Vec<ExactCommand> {
@@ -905,6 +1108,13 @@ fn nft_apply_commands(policy: &MaterializerNftPlan) -> Vec<ExactCommand> {
             os("table"),
             os(policy.family()),
             os(policy.table()),
+        ]),
+        nft(vec![
+            os("add"),
+            os("counter"),
+            os(policy.family()),
+            os(policy.table()),
+            os(policy.counter()),
         ]),
         nft(vec![
             os("add"),
@@ -943,6 +1153,9 @@ fn nft_apply_commands(policy: &MaterializerNftPlan) -> Vec<ExactCommand> {
             os("tcp"),
             os("dport"),
             os(tuple.port.to_string()),
+            os("counter"),
+            os("name"),
+            os(policy.counter()),
             os("accept"),
         ]));
     }
@@ -955,6 +1168,9 @@ fn nft_apply_commands(policy: &MaterializerNftPlan) -> Vec<ExactCommand> {
         os("meta"),
         os("skuid"),
         os(policy.principal_uid().to_string()),
+        os("counter"),
+        os("name"),
+        os(policy.counter()),
         os("drop"),
     ]));
     commands
@@ -1157,6 +1373,8 @@ fn read_unit<R: ExactCommandRunner>(
         "InaccessiblePaths",
         "NetworkNamespacePath",
         "PrivateNetwork",
+        "RuntimeDirectory",
+        "RuntimeDirectoryMode",
         "Slice",
         "User",
     ];
@@ -1282,6 +1500,7 @@ fn read_nft<R: ExactCommandRunner>(
             family: expected.family().to_owned(),
             table: expected.table().to_owned(),
             chain: expected.chain().to_owned(),
+            counter: expected.counter().to_owned(),
             hook: NftHook::Output,
             priority: expected.priority(),
             principal_uid: expected.principal_uid(),
@@ -1323,6 +1542,22 @@ fn nft_json_matches(value: &Value, expected: &MaterializerNftPlan) -> bool {
         return false;
     }
 
+    let counters = objects
+        .iter()
+        .filter_map(|object| object.get("counter"))
+        .filter(|counter| {
+            counter.get("family").and_then(Value::as_str) == Some(expected.family())
+                && counter.get("table").and_then(Value::as_str) == Some(expected.table())
+        })
+        .collect::<Vec<_>>();
+    if counters.len() != 1
+        || counters[0].get("name").and_then(Value::as_str) != Some(expected.counter())
+        || counters[0].get("packets").and_then(Value::as_u64).is_none()
+        || counters[0].get("bytes").and_then(Value::as_u64).is_none()
+    {
+        return false;
+    }
+
     let rules = objects
         .iter()
         .filter_map(|object| object.get("rule"))
@@ -1342,7 +1577,7 @@ fn nft_json_matches(value: &Value, expected: &MaterializerNftPlan) -> bool {
     let mut allows = BTreeSet::new();
     let mut drops = 0_usize;
     for rule in rules {
-        match parse_nft_rule(rule, expected.principal_uid()) {
+        match parse_nft_rule(rule, expected.principal_uid(), expected.counter()) {
             Some(ParsedNftRule::Allow(tuple)) if allows.insert(tuple) => {}
             Some(ParsedNftRule::Drop) => drops += 1,
             _ => return false,
@@ -1356,23 +1591,37 @@ enum ParsedNftRule {
     Drop,
 }
 
-fn parse_nft_rule(rule: &Value, expected_uid: u32) -> Option<ParsedNftRule> {
+fn parse_nft_rule(
+    rule: &Value,
+    expected_uid: u32,
+    expected_counter: &str,
+) -> Option<ParsedNftRule> {
     let expressions = rule.get("expr")?.as_array()?;
-    if expressions.len() == 2
+    if expressions.len() == 3
         && parse_uid_match(&expressions[0]) == Some(expected_uid)
-        && exact_verdict(&expressions[1], "drop")
+        && exact_named_counter(&expressions[1], expected_counter)
+        && exact_verdict(&expressions[2], "drop")
     {
         return Some(ParsedNftRule::Drop);
     }
-    if expressions.len() != 4 || parse_uid_match(&expressions[0]) != Some(expected_uid) {
+    if expressions.len() != 5
+        || parse_uid_match(&expressions[0]) != Some(expected_uid)
+        || !exact_named_counter(&expressions[3], expected_counter)
+    {
         return None;
     }
     let address = parse_address_match(&expressions[1])?;
     let port = parse_port_match(&expressions[2])?;
-    if !exact_verdict(&expressions[3], "accept") {
+    if !exact_verdict(&expressions[4], "accept") {
         return None;
     }
     Some(ParsedNftRule::Allow(TcpServiceTuple { address, port }))
+}
+
+fn exact_named_counter(value: &Value, expected: &str) -> bool {
+    value.as_object().is_some_and(|expression| {
+        expression.len() == 1 && expression.get("counter").and_then(Value::as_str) == Some(expected)
+    })
 }
 
 fn parse_uid_match(value: &Value) -> Option<u32> {
@@ -2148,12 +2397,14 @@ fn existing_file_identity(
 mod tests {
     use super::*;
     use crate::dns_host::DnsHostDisposition;
+    use crate::dns_host::MATERIALIZER_NFT_COUNTER;
     use crate::dns_isolation::{
         build_lease_isolation_plan, BrokerApprovedMaterializerNetwork, BrokerPinnedFile,
         DelegationCanaryReadback, DnsFiles, LeaseIsolationRequest, LeaseSliceIdentity,
         NetworkNamespaceProperty, PinnedServiceKind, PrincipalUnitIdentity, SniHostPin,
         UnitResources, EMPTY_FILE_SHA256,
     };
+    use buzz_ci_materializer::{GitOperation, NetworkScope};
     use serde_json::json;
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
@@ -2359,6 +2610,16 @@ mod tests {
                         "policy": "accept"
                     }
                 }),
+                json!({
+                    "counter": {
+                        "family": policy.family(),
+                        "table": policy.table(),
+                        "name": policy.counter(),
+                        "handle": 3,
+                        "packets": 0,
+                        "bytes": 0
+                    }
+                }),
             ];
             for tuple in policy.allowed_tcp_tuples() {
                 objects.push(json!({
@@ -2370,6 +2631,7 @@ mod tests {
                             {"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": policy.principal_uid()}},
                             {"match": {"op": "==", "left": {"payload": {"protocol": if tuple.address.is_ipv4() { "ip" } else { "ip6" }, "field": "daddr"}}, "right": tuple.address.to_string()}},
                             {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": tuple.port}},
+                            {"counter": policy.counter()},
                             {"accept": null}
                         ]
                     }
@@ -2382,6 +2644,7 @@ mod tests {
                         "chain": policy.chain(),
                         "expr": [
                             {"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": policy.principal_uid()}},
+                            {"counter": policy.counter()},
                             {"drop": null}
                         ]
                 }
@@ -2559,9 +2822,9 @@ mod tests {
             .host
             .actions()
             .iter()
-            .flat_map(commands_for_action)
+            .flat_map(|action| commands_for_action(action).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(commands.len(), 12);
+        assert_eq!(commands.len(), 13);
         assert!(commands.iter().all(|command| {
             command.binary().path().starts_with('/')
                 && command.timeout() == COMMAND_TIMEOUT
@@ -2573,10 +2836,149 @@ mod tests {
         assert_eq!(commands[0].binary(), AllowedBinary::Systemctl);
         assert_eq!(commands[1].binary(), AllowedBinary::Ip);
         assert_eq!(commands[3].binary(), AllowedBinary::Nft);
-        assert_eq!(commands[9].binary(), AllowedBinary::SystemdRun);
-        assert!(ScriptedRunner::args(&commands[9])
+        assert_eq!(
+            ScriptedRunner::args(&commands[4]),
+            [
+                "add",
+                "counter",
+                "inet",
+                "buzzci_lease01",
+                MATERIALIZER_NFT_COUNTER,
+            ]
+        );
+        assert!(commands[6..10].iter().all(|command| {
+            ScriptedRunner::args(command)
+                .windows(3)
+                .any(|words| words == ["counter", "name", MATERIALIZER_NFT_COUNTER])
+        }));
+        assert_eq!(commands[10].binary(), AllowedBinary::SystemdRun);
+        assert!(ScriptedRunner::args(&commands[10])
             .iter()
             .any(|arg| arg == "--property=PrivateNetwork=no"));
+        assert!(ScriptedRunner::args(&commands[10]).ends_with(&[
+            AllowedBinary::BuzzCiExecd.path().to_owned(),
+            MATERIALIZER_HANDOFF_MODE.to_owned(),
+            "--socket=/run/buzzci-lease01-mat/materializer.sock".to_owned(),
+        ]));
+        assert!(!ScriptedRunner::args(&commands[10])
+            .windows(2)
+            .any(|args| args == [AllowedBinary::Sleep.path(), "infinity"]));
+    }
+
+    #[test]
+    fn missing_materializer_service_properties_return_typed_errors() {
+        for property in ["Slice", "RuntimeDirectory"] {
+            let mut materializer = isolation_plan()
+                .units
+                .into_iter()
+                .find(|unit| unit.role == PrincipalRole::Materializer)
+                .unwrap();
+            materializer.properties.remove(property);
+
+            assert_eq!(
+                service_apply_command(&materializer),
+                Err(CommandPlanningError::MissingServiceProperty(property))
+            );
+        }
+    }
+
+    fn materializer_command() -> CommandSpec {
+        CommandSpec {
+            operation: GitOperation::Init,
+            program: PathBuf::from(MATERIALIZER_GIT_PROGRAM),
+            arguments: vec![
+                "--git-dir=objects.git".to_owned(),
+                "init".to_owned(),
+                "--bare".to_owned(),
+            ],
+            current_dir: PathBuf::from("/proc/self/fd/17"),
+            clear_environment: true,
+            environment: BTreeMap::new(),
+            required_uid: 966,
+            lease_id: "lease-capability".to_owned(),
+            cgroup_token: "cgroup-capability".to_owned(),
+            netns_token: "netns-capability".to_owned(),
+            lease_expires_at_unix_seconds: 10_000,
+            maximum_stdout_bytes: 4_096,
+            maximum_stderr_bytes: 4_096,
+            deadline_millis: 1_000,
+            network: NetworkScope::None,
+            maximum_network_bytes: 0,
+            maximum_processes: 32,
+        }
+    }
+
+    fn materializer_handoff() -> MaterializerHandoffBinding {
+        let unit = isolation_plan()
+            .units
+            .into_iter()
+            .find(|unit| unit.role == PrincipalRole::Materializer)
+            .unwrap();
+        MaterializerHandoffBinding::new(
+            unit,
+            "lease-capability".to_owned(),
+            "cgroup-capability".to_owned(),
+            "netns-capability".to_owned(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn materializer_command_plan_binds_uid_capabilities_and_workspace_fd() {
+        let binding = materializer_handoff();
+        let command = materializer_command();
+        let plan = binding.command_plan(&command).unwrap();
+
+        assert_eq!(plan.workspace_fd(), 17);
+        assert_eq!(plan.command(), &command);
+        assert_eq!(
+            plan.socket_path(),
+            Path::new("/run/buzzci-lease01-mat/materializer.sock")
+        );
+    }
+
+    #[test]
+    fn materializer_command_plan_rejects_each_drifting_capability() {
+        let binding = materializer_handoff();
+        for (index, mut command) in [
+            materializer_command(),
+            materializer_command(),
+            materializer_command(),
+            materializer_command(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match index {
+                0 => command.required_uid += 1,
+                1 => command.lease_id.push_str("-other"),
+                2 => command.cgroup_token.push_str("-other"),
+                _ => command.netns_token.push_str("-other"),
+            }
+            command.arguments.push("marker".to_owned());
+            assert_eq!(
+                binding.command_plan(&command),
+                Err(MaterializerHandoffError::CapabilityMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn materializer_command_plan_rejects_path_reopen_and_nonfixed_program() {
+        let binding = materializer_handoff();
+        let mut path = materializer_command();
+        path.current_dir = PathBuf::from("/var/lib/buzzci/leases/lease01/workspace");
+        assert_eq!(
+            binding.command_plan(&path),
+            Err(MaterializerHandoffError::InvalidWorkspaceDescriptor)
+        );
+
+        let mut program = materializer_command();
+        program.program = PathBuf::from("/tmp/git");
+        assert_eq!(
+            binding.command_plan(&program),
+            Err(MaterializerHandoffError::InvalidCommand)
+        );
     }
 
     #[test]
@@ -2755,8 +3157,15 @@ mod tests {
         let valid: Value = serde_json::from_slice(&runner.nft_readback()).unwrap();
         assert!(nft_json_matches(&valid, policy));
 
+        let mut missing_counter = valid.clone();
+        missing_counter["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .remove(2);
+        assert!(!nft_json_matches(&missing_counter, policy));
+
         let mut comment_forgery = valid.clone();
-        let rule = comment_forgery["nftables"][2]["rule"]
+        let rule = comment_forgery["nftables"][3]["rule"]
             .as_object_mut()
             .unwrap();
         rule.insert(
@@ -2767,15 +3176,39 @@ mod tests {
         assert!(!nft_json_matches(&comment_forgery, policy));
 
         let mut extra_expression = valid.clone();
-        extra_expression["nftables"][2]["rule"]["expr"]
+        extra_expression["nftables"][3]["rule"]["expr"]
             .as_array_mut()
             .unwrap()
             .push(json!({"counter": {"packets": 0, "bytes": 0}}));
         assert!(!nft_json_matches(&extra_expression, policy));
 
         let mut duplicate = valid.clone();
-        duplicate["nftables"][3] = duplicate["nftables"][2].clone();
+        duplicate["nftables"][4] = duplicate["nftables"][3].clone();
         assert!(!nft_json_matches(&duplicate, policy));
+    }
+
+    #[test]
+    fn named_counter_rule_reference_requires_exact_string_shape() {
+        assert!(exact_named_counter(
+            &json!({"counter": MATERIALIZER_NFT_COUNTER}),
+            MATERIALIZER_NFT_COUNTER
+        ));
+        assert!(!exact_named_counter(
+            &json!({"counter": {"name": MATERIALIZER_NFT_COUNTER}}),
+            MATERIALIZER_NFT_COUNTER
+        ));
+        assert!(!exact_named_counter(
+            &json!({"counter": MATERIALIZER_NFT_COUNTER, "accept": null}),
+            MATERIALIZER_NFT_COUNTER
+        ));
+        assert!(!exact_named_counter(
+            &json!({"counter": null}),
+            MATERIALIZER_NFT_COUNTER
+        ));
+        assert!(!exact_named_counter(
+            &json!({"counter": "unexpected"}),
+            MATERIALIZER_NFT_COUNTER
+        ));
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct ObjectLedger {
     containers: BTreeMap<String, String>,
     started: BTreeSet<String>,
     execs: BTreeMap<String, String>,
+    starting_execs: BTreeSet<String>,
+    started_execs: BTreeSet<String>,
 }
 
 impl ObjectLedger {
@@ -109,12 +111,51 @@ impl ObjectLedger {
         }
     }
 
+    /// Reserve one owned exec for its single start/hijack operation.
+    pub fn begin_exec_start(&mut self, id: &str) -> Result<(), ProxyError> {
+        self.require_exec(id)?;
+        if self.started_execs.contains(id) || !self.starting_execs.insert(id.into()) {
+            return Err(ProxyError::StateRefused(
+                "exec has already started or is starting".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Commit a successful exec-start upgrade.
+    pub fn commit_exec_started(&mut self, id: &str) -> Result<(), ProxyError> {
+        self.require_exec(id)?;
+        if !self.starting_execs.remove(id) {
+            return Err(ProxyError::StateRefused(
+                "exec start was not pending".into(),
+            ));
+        }
+        self.started_execs.insert(id.into());
+        Ok(())
+    }
+
+    /// Release an exec-start reservation after a definite pre-start refusal.
+    pub fn abort_exec_start(&mut self, id: &str) -> Result<(), ProxyError> {
+        self.require_exec(id)?;
+        if self.starting_execs.remove(id) {
+            Ok(())
+        } else {
+            Err(ProxyError::StateRefused(
+                "exec start was not pending".into(),
+            ))
+        }
+    }
+
     /// Remove a container from the attempt ledger during bounded cleanup.
     pub fn remove_container(&mut self, id: &str) -> Result<(), ProxyError> {
         self.container_fingerprint(id)?;
         self.containers.remove(id);
         self.started.remove(id);
         self.execs.retain(|_, container| container != id);
+        self.starting_execs
+            .retain(|exec_id| self.execs.contains_key(exec_id));
+        self.started_execs
+            .retain(|exec_id| self.execs.contains_key(exec_id));
         Ok(())
     }
 }
@@ -138,5 +179,12 @@ mod tests {
         ledger.record_exec("exec".into(), "container").unwrap();
         assert!(ledger.record_exec("exec".into(), "container").is_err());
         assert!(ledger.require_exec("exec").is_ok());
+        ledger.begin_exec_start("exec").unwrap();
+        assert!(ledger.begin_exec_start("exec").is_err());
+        ledger.abort_exec_start("exec").unwrap();
+        ledger.begin_exec_start("exec").unwrap();
+        ledger.commit_exec_started("exec").unwrap();
+        assert!(ledger.begin_exec_start("exec").is_err());
+        assert!(ledger.begin_exec_start("foreign").is_err());
     }
 }

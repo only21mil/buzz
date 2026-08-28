@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight, install, or roll back one Tier 2 v2-reviewed MGACT package."""
+"""Preflight, install, or roll back one Tier 2 v3-reviewed MGACT package."""
 
 from __future__ import annotations
 
@@ -26,18 +26,243 @@ TIER2_VERIFIER_RELATIVE = Path(
     "scripts/mempool-genesis/activation/tier2-evidence-verifier.py"
 )
 TIER2_ENGINE_PATH = Path("/home/victor/.agents/skills/codex-review/scripts/tier2")
+TIER2_ENGINE_MODE = 0o755
+TIER2_ENGINE_SHA256 = "10222c7a28c71232d65695562d28f68b158307bbac0e6f0c0e67bd8c57a08ef0"
+TIER2_ENGINE_SOURCE_COMMIT = "8614f91296a8258ddba1c37d6ad0fd72b172619f"
+TIER2_ENGINE_SOURCE_TREE = "d7ab1633c3bcf1e64b1725e82fd84470ceafe3c6"
 TIER2_VERIFIER_MODE = 0o755
 SUDO_PATH = Path("/usr/bin/sudo")
 BUNDLE_SCHEMA = "buzz-mempool-genesis-activation-bundle-v3"
 PREFLIGHT_RECEIPT_SCHEMA = "buzz-mempool-genesis-preflight-receipt-v3"
 INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-install-receipt-v3"
+LEGACY_TIER1_INSTALL_RECEIPT_SCHEMA = "buzz-mempool-genesis-tier1-install-receipt-v1"
 INSTALLED_CLOSURE_SCHEMA = "buzz-agent-review-closure-v2"
 BUNDLE_ID = "mempool-genesis-activation-20260825"
 CLOSURE_TARGET = "/etc/buzz-agents/review-closure.json"
+ACTIVATION_TRANSACTION_DIR = "/var/lib/buzz-agent-activation/current"
+ACTIVATION_TRANSACTION_SCHEMA = "buzz-mempool-genesis-activation-transaction-v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
 BACKUP_ID = re.compile(
     r"^mempool-genesis-activation-20260825-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}\.[0-9]{6}Z$"
 )
+RUNTIME_TARGET_COUNT = 25
+OPS_TARGET_COUNT = 4
+TOTAL_PACKAGE_TARGET_COUNT = 29
+REVIEW_PATH_COUNT = 22
+LEGACY_V1_BACKUP_ID = (
+    "mempool-genesis-activation-20260825-744b636de5ab-"
+    "20260827T042741.590691Z"
+)
+LEGACY_V1_RECEIPT_SHA256 = (
+    "78ca36ccaa053409348b44122f14ab42318e8f2901277458ce9f5f1d64d23040"
+)
+LEGACY_V1_ACCEPTANCE_SHA256 = (
+    "ad40f0c5e3d49573c6f5801d10062acb49d00351bb626896077a6a205c12c5fa"
+)
+LEGACY_V1_PACKAGE_DIGEST = (
+    "744b636de5ab1b4d76222d55df0275a75bc48ea092df478e058ea8ec18851cf7"
+)
+LEGACY_V1_CLAIM = (
+    "/var/lib/buzz-mgact-tier1-claims/"
+    f"{LEGACY_V1_ACCEPTANCE_SHA256}.claim"
+)
+LEGACY_V1_RECOVERY_CLAIM_DIRECTORY = "/var/lib/buzz-mgact-tier1-claims"
+LEGACY_V1_ACCEPTANCE_CLAIM_SCHEMA = "buzz-mempool-genesis-tier1-single-use-claim-v1"
+LEGACY_V1_RECOVERY_CLAIM_SCHEMA = "buzz-mempool-genesis-legacy-v1-rollback-claim-v1"
+LEGACY_V1_CHANGED_TARGETS = (
+    "/etc/buzz-agents/genesis.env",
+    "/etc/buzz-agents/mempool.env",
+    "/etc/buzz-agents/prompts/genesis.md",
+    "/etc/buzz-agents/prompts/mempool.md",
+    "/etc/systemd/system/buzz-agent@.service",
+    "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf",
+    "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf",
+    "/usr/local/libexec/buzz/codex-acp",
+    "/usr/local/libexec/buzz/verify-installed-agent",
+    "/etc/buzz-agents/review-closure.json",
+)
+LEGACY_V1_PREVIOUS = {
+    "/etc/buzz-agents/genesis.env": {
+        "exists": True,
+        "backup_name": "e034a2bd0170a616f053ccce21c83d571df0cc4d92c2ed542b20c2f9102e6824",
+        "sha256": "0078f63c977e632c462c198b360008d4dd07a4b51c9d79e7ca44991bf7b75005",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/mempool.env": {
+        "exists": True,
+        "backup_name": "f8f338fa4d8426da68c0d405a8845d726b414ed37f48d56134131273ef88bced",
+        "sha256": "77ad1d690558181603e59e5dfd1965a4adf5d7671b502f5416bb4b4b6c466493",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/genesis.md": {
+        "exists": True,
+        "backup_name": "19fc63fa9344ad675901c244655c9c2b603c1e96383c49d187040578f4e2c3c2",
+        "sha256": "8c5882d694949e71585a3ffc0e0103aa816d008d491d5d49d78403e0c7840724",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/mempool.md": {
+        "exists": True,
+        "backup_name": "b31e7f82abc6f9bfb27257ad0e04bc2a21bb5ec5ca56ffc741858cabfae308c1",
+        "sha256": "43709ef3a714d7efddb1c95968f141f9f67ee671070d6d2f928df9ea4eff1580",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@.service": {
+        "exists": True,
+        "backup_name": "37be6a42569e2baa34ff082b5bc4837ddceecdd037d1a70b5b8618e3040d5819",
+        "sha256": "2fb7c492c71fa3fa7e7684abcd55119039e7fd1718b09838499efb8bba03109d",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf": {
+        "exists": True,
+        "backup_name": "e8f803b9c8e0bffbfc86bf05af36c1d3fdac4ffd57a24f1154d78a7be43268f4",
+        "sha256": "bc3668a0069bfd217b5f8a7c11707e1fc31d3746bb248ec80c8fd51abf191f2f",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf": {
+        "exists": True,
+        "backup_name": "5b805da22858dc7cea26e8bad8039efa1d1e5dc5b8df3c9bc1652e2b2cd1e0ea",
+        "sha256": "6dfd0f69ce5631fe23fe6ddd2c672918f79b629855a78fd213ef72f09c0e48d3",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/codex-acp": {
+        "exists": True,
+        "backup_name": "ce19c817869694937b9eda9053269b0eb77ad86677a806785ccd0e2ae202c84b",
+        "sha256": "0deb6b820dfed8804cd76b16a50210fe12202e5e339b5edaa23f6987f1742e0a",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/verify-installed-agent": {
+        "exists": True,
+        "backup_name": "51808d377fb1cb4bee9c9e96b01259326e245bcdce91ce198472d53a943b7cf0",
+        "sha256": "6bd0fb980cb3acf782fad0b4eaf926a88bd0c11c2d85ff30e66879e21074fccf",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/review-closure.json": {
+        "exists": True,
+        "backup_name": "ce3a444727789109479d52a9376797614177682f18d9e1e61982bb1655b1ed4c",
+        "sha256": "8857916fbf12fe0d624a0b548eddc92d3faf721ed6955b533eb04e181d3d8f52",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+}
+LEGACY_V1_INSTALLED = {
+    "/etc/buzz-agents/genesis.env": {
+        "sha256": "0078f63c977e632c462c198b360008d4dd07a4b51c9d79e7ca44991bf7b75005",
+        "mode": "0600",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/mempool.env": {
+        "sha256": "77ad1d690558181603e59e5dfd1965a4adf5d7671b502f5416bb4b4b6c466493",
+        "mode": "0600",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/genesis.md": {
+        "sha256": "89d8afac710cf2c38f96d9a8d5d6e98971e88aa888d6b6d8cb30b56655960b88",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/prompts/mempool.md": {
+        "sha256": "94a6ca980717cb6def8979bc37991df2778326c6dce66c45afdd7c1f70126ddb",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@.service": {
+        "sha256": "24909a04037977702062f9b193ae32dd474fcba6f53b3d9b223fa8705a156b8d",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@genesis.service.d/capability-parity.conf": {
+        "sha256": "bf08b9c285c1005fcdc5bde376e51b3a2717487b560c95eb8377927e9663f287",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/systemd/system/buzz-agent@mempool.service.d/ci-migration.conf": {
+        "sha256": "39d0205ed2b5c6a40d0ff5ab9b5d69b57843ca98252e4066d43100a8a17400a0",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/codex-acp": {
+        "sha256": "4ec50d320ddee4db8b59dc7ee1d6314c380ba9849d8f4cb1f43d3b2014a3f0bd",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/usr/local/libexec/buzz/verify-installed-agent": {
+        "sha256": "5dde0a80d0a58883ea1065f267dcfdc051261e9a221e7ea6aadb4becc8479066",
+        "mode": "0755",
+        "uid": 0,
+        "gid": 0,
+    },
+    "/etc/buzz-agents/review-closure.json": {
+        "sha256": "f0f4616f3c294c8980529d03d74cbf08286514217bad7813d83ef7d9e9145c57",
+        "mode": "0644",
+        "uid": 0,
+        "gid": 0,
+    },
+}
+LEGACY_V1_INVENTORY_SHA256 = (
+    "871518084ed95f78ac713d62ccb6af5739984aa0b6deb3767c3106e98e8c61b4"
+)
+IDENTITY_STATE_MODES = {
+    "mempool": {
+        "/home/buzz-mempool": 0o700,
+        "/home/buzz-mempool/.codex": 0o700,
+        "/home/buzz-mempool/.config": 0o700,
+        "/home/buzz-mempool/.cache": 0o700,
+        "/home/buzz-mempool/.local/state": 0o700,
+        "/home/buzz-mempool/.local/state/buzz-acp": 0o700,
+        "/home/buzz-mempool/.tmp": 0o700,
+    },
+    "genesis": {
+        "/home/buzz-genesis": 0o700,
+        "/home/buzz-genesis/.codex": 0o700,
+        "/home/buzz-genesis/.config": 0o700,
+        "/home/buzz-genesis/.cache": 0o700,
+        "/home/buzz-genesis/.local/state": 0o700,
+        "/home/buzz-genesis/.local/state/buzz-acp": 0o700,
+        "/home/buzz-genesis/.tmp": 0o700,
+    },
+}
+ACP_STATE_DIRS = {
+    slug: f"/home/buzz-{slug}/.local/state/buzz-acp"
+    for slug in ("mempool", "genesis")
+}
+ROOT_TOOL_PATHS = (
+    "/usr/local/libexec/buzz/codex-acp",
+    "/usr/local/libexec/buzz/codex",
+    "/usr/local/libexec/buzz/node",
+)
+ROOT_PATH_COMMANDS = (
+    ("codex", "/usr/local/libexec/buzz/codex"),
+    ("node", "/usr/local/libexec/buzz/node"),
+)
+WHICH_PROGRAM = "import shutil,sys; print(shutil.which(sys.argv[1]) or '')"
 sys.dont_write_bytecode = True
 
 
@@ -52,6 +277,7 @@ def load_module(name: str, path: Path):
 
 
 PREFLIGHT_SUPPORT = load_module("mgact_preflight_support", SCRIPT_DIR / "make-tier1-receipt.py")
+PARITY_SUPPORT = load_module("mgact_installer_parity_support", SCRIPT_DIR / "capability-parity.py")
 
 
 @dataclass(frozen=True)
@@ -102,6 +328,15 @@ class Preflight:
     acceptance: Tier2Acceptance | None
     targets: tuple[TargetState, ...]
     blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LegacyV1Recovery:
+    backup: Path
+    receipt: Path
+    recovery_claim: Path
+    targets: tuple[TargetState, ...]
+    previous: dict[str, dict[str, object]]
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -256,6 +491,51 @@ def load_json(
     return value
 
 
+def require_activation_transaction_rolled_back(
+    root: Path, install_receipt: dict[str, object]
+) -> None:
+    transaction_dir = rooted(root, ACTIVATION_TRANSACTION_DIR)
+    if not os.path.lexists(transaction_dir):
+        return
+    metadata = transaction_dir.lstat()
+    expected_uid = 0 if root == Path("/") else admin_owner(root)[0]
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != expected_uid
+    ):
+        raise ValueError("activation transaction directory is unsafe")
+    state = load_json(
+        transaction_dir / "state.json", mode=0o600, owner_uid=expected_uid
+    )
+    if (
+        state.get("schema") != ACTIVATION_TRANSACTION_SCHEMA
+        or state.get("state") != "rolled_back"
+        or state.get("claim_used") is not True
+    ):
+        raise ValueError("activation transaction must be rolled back before package rollback")
+    binding = state.get("binding")
+    if not isinstance(binding, dict) or any(
+        binding.get(field) != install_receipt.get(field)
+        for field in ("source_commit", "source_tree", "package_digest")
+    ):
+        raise ValueError("activation transaction does not match the installed package")
+    memberships = state.get("memberships")
+    credentials = state.get("credentials")
+    if (
+        not isinstance(memberships, list)
+        or any(not isinstance(item, dict) or item.get("rolled_back") is not True for item in memberships)
+        or not isinstance(credentials, dict)
+        or set(credentials) != {"mempool", "genesis"}
+        or any(
+            not isinstance(credentials[slug], dict)
+            or credentials[slug].get("restored") is not True
+            for slug in ("mempool", "genesis")
+        )
+    ):
+        raise ValueError("activation transaction rollback receipt is incomplete")
+
+
 def parse_mode(value: object) -> int:
     if not isinstance(value, str) or not re.fullmatch(r"0[0-7]{3}", value):
         raise ValueError("invalid target mode")
@@ -327,12 +607,17 @@ def validate_preflight_receipt(
     expected = {
         "manifest_sha256": sha256_file(bundle / "bundle-manifest.json"),
         "bundle_id": manifest["bundle_id"],
+        "source_commit": manifest["source_commit"],
+        "source_tree": manifest["source_tree"],
         "package_digest": manifest["package_digest"],
         "input_status": manifest["input_status"],
         "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
         "review_files_sha256": manifest["review_files_record"]["sha256"],
         "tier2_review": manifest["tier2_review"],
         "tier2_engine_sha256": manifest["tier2_engine"]["sha256"],
+        "identities": manifest["identities"],
+        "acp_state_dirs": manifest["acp_state_dirs"],
+        "capability_parity": manifest["capability_parity"],
     }
     if bundle_record.get("path") != str(bundle):
         raise ValueError("preflight receipt package path mismatch")
@@ -340,11 +625,17 @@ def validate_preflight_receipt(
         if bundle_record.get(key) != value:
             raise ValueError(f"preflight receipt package mismatch: {key}")
     tier2_record = receipt.get("tier2_bundle")
+    evidence_value = load_json(
+        evidence_path,
+        max_bytes=64 * 1024,
+        mode=0o600,
+        owner_uid=owner.uid,
+    )
     expected_tier2_record = {
         "path": str(evidence_path),
         "sha256": sha256_file(evidence_path),
-        "schema": "tier2-evidence-v2",
-        "candidate_root": str(bundle),
+        "schema": "tier2-evidence-v3",
+        "candidate_root": evidence_value.get("candidate_root"),
     }
     if tier2_record != expected_tier2_record:
         raise ValueError("preflight receipt Tier 2 evidence binding mismatch")
@@ -400,16 +691,32 @@ def verifier_source_record(manifest: dict[str, object]) -> dict[str, object]:
 
 def tier2_engine_record(manifest: dict[str, object]) -> dict[str, str]:
     record = manifest.get("tier2_engine")
-    if not isinstance(record, dict) or set(record) != {"path", "mode", "sha256"}:
+    if not isinstance(record, dict) or set(record) != {
+        "path",
+        "mode",
+        "sha256",
+        "source_commit",
+        "source_tree",
+    }:
         raise ValueError("package-bound Tier 2 engine record is invalid")
     path_raw, mode_raw, digest = record.get("path"), record.get("mode"), record.get("sha256")
     if path_raw != str(TIER2_ENGINE_PATH):
         raise ValueError("package-bound Tier 2 engine path is invalid")
-    if parse_mode(mode_raw) != 0o700:
+    if parse_mode(mode_raw) != TIER2_ENGINE_MODE:
         raise ValueError("package-bound Tier 2 engine mode mismatch")
-    if not isinstance(digest, str) or not HEX64.fullmatch(digest):
-        raise ValueError("package-bound Tier 2 engine digest is invalid")
-    return {"path": path_raw, "mode": str(mode_raw), "sha256": digest}
+    if digest != TIER2_ENGINE_SHA256:
+        raise ValueError("package-bound Tier 2 engine digest mismatch")
+    if record.get("source_commit") != TIER2_ENGINE_SOURCE_COMMIT:
+        raise ValueError("package-bound Tier 2 engine source commit mismatch")
+    if record.get("source_tree") != TIER2_ENGINE_SOURCE_TREE:
+        raise ValueError("package-bound Tier 2 engine source tree mismatch")
+    return {
+        "path": path_raw,
+        "mode": str(mode_raw),
+        "sha256": digest,
+        "source_commit": TIER2_ENGINE_SOURCE_COMMIT,
+        "source_tree": TIER2_ENGINE_SOURCE_TREE,
+    }
 
 
 def open_bound_tier2_verifier(
@@ -469,7 +776,7 @@ def drop_to_artifact_owner(owner: ArtifactOwner) -> None:
 def run_tier2_check(
     state_path: Path,
     evidence_path: Path,
-    bundle: Path,
+    candidate_root: Path,
     manifest: dict[str, object],
     repo_root: Path,
     owner: ArtifactOwner,
@@ -494,7 +801,7 @@ def run_tier2_check(
                 "--evidence",
                 str(evidence_path),
                 "--candidate-root",
-                str(bundle),
+                str(candidate_root),
                 "--engine",
                 engine["path"],
                 "--engine-sha256",
@@ -518,12 +825,12 @@ def run_tier2_check(
     lines = [line for line in completed.stdout.splitlines() if line]
     if completed.returncode != 0:
         detail = completed.stderr.strip()
-        raise ValueError(f"Tier 2 v2 closure rejected: {detail or completed.returncode}")
+        raise ValueError(f"Tier 2 v3 closure rejected: {detail or completed.returncode}")
     if len(lines) != 1:
-        raise ValueError("Tier 2 v2 closure check returned an invalid response count")
+        raise ValueError("Tier 2 v3 closure check returned an invalid response count")
     value = json.loads(lines[0], object_pairs_hook=reject_duplicates)
     if not isinstance(value, dict):
-        raise ValueError("Tier 2 v2 closure check did not return an object")
+        raise ValueError("Tier 2 v3 closure check did not return an object")
     return value
 
 
@@ -545,7 +852,7 @@ def validate_tier2_acceptance(
             if path.lstat().st_size > limit:
                 raise ValueError(f"file exceeds {limit} bytes")
         except Exception as error:
-            raise ValueError(f"unsafe Tier 2 v2 {label}: {error}") from error
+            raise ValueError(f"unsafe Tier 2 v3 {label}: {error}") from error
 
     evidence_raw = load_json(
         evidence_path,
@@ -558,13 +865,13 @@ def validate_tier2_acceptance(
         raise ValueError("preflight receipt commands are absent")
     expected_evidence = PREFLIGHT_SUPPORT.expected_tier2_bundle(bundle, manifest, commands)
     if evidence_raw != expected_evidence:
-        raise ValueError("Tier 2 v2 evidence does not bind the exact package and Tier 1 results")
+        raise ValueError("Tier 2 v3 evidence does not bind the exact package and Tier 1 results")
     evidence_digest = sha256_file(evidence_path)
 
     check = run_tier2_check(
         state_path,
         evidence_path,
-        bundle,
+        Path(str(evidence_raw["candidate_root"])).resolve(strict=True),
         manifest,
         repo_root,
         owner,
@@ -574,7 +881,6 @@ def validate_tier2_acceptance(
         "subcommand",
         "state_schema",
         "producer_provider",
-        "escalated",
         "route",
         "lineage_id",
         "state_id",
@@ -587,26 +893,27 @@ def validate_tier2_acceptance(
         "verdict_digest",
     }
     if set(check) != expected_keys or check.get("ok") is not True:
-        raise ValueError("Tier 2 v2 closure response fields mismatch")
-    if check.get("subcommand") != "check" or check.get("state_schema") != "tier2-state-v2":
-        raise ValueError("Tier 2 v2 closure response type mismatch")
-    if check.get("producer_provider") != "gpt" or check.get("escalated") is not False:
-        raise ValueError("Tier 2 v2 closure producer or activation override mismatch")
+        raise ValueError("Tier 2 v3 closure response fields mismatch")
+    if check.get("subcommand") != "check" or check.get("state_schema") != "tier2-state-v3":
+        raise ValueError("Tier 2 v3 closure response type mismatch")
+    if check.get("producer_provider") != "gpt":
+        raise ValueError("Tier 2 v3 closure producer mismatch")
     if check.get("route") != {
         "provider": "claude",
         "model": "claude-opus-5",
         "effort": "high",
+        "auth_source": "profile",
     }:
-        raise ValueError("Tier 2 v2 closure review route mismatch")
+        raise ValueError("Tier 2 v3 closure review route mismatch")
     if check.get("evidence_digest") != evidence_digest:
-        raise ValueError("Tier 2 v2 closure evidence digest mismatch")
+        raise ValueError("Tier 2 v3 closure evidence digest mismatch")
     if check.get("state_digest") != sha256_file(state_path):
-        raise ValueError("Tier 2 v2 state changed during validation")
+        raise ValueError("Tier 2 v3 state changed during validation")
     revision = check.get("revision")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision not in (1, 2):
-        raise ValueError("Tier 2 v2 closure revision is invalid")
+        raise ValueError("Tier 2 v3 closure revision is invalid")
     if check.get("verdict") not in ("PASS", "PASS WITH RISKS"):
-        raise ValueError("Tier 2 v2 closure verdict is not accepted")
+        raise ValueError("Tier 2 v3 closure verdict is not accepted")
     for key in (
         "lineage_id",
         "state_id",
@@ -616,10 +923,10 @@ def validate_tier2_acceptance(
     ):
         value = check.get(key)
         if not isinstance(value, str) or not value:
-            raise ValueError(f"Tier 2 v2 closure {key} is absent")
+            raise ValueError(f"Tier 2 v3 closure {key} is absent")
     for key in ("candidate_fingerprint", "verdict_digest", "state_digest"):
         if not HEX64.fullmatch(str(check[key])):
-            raise ValueError(f"Tier 2 v2 closure {key} is invalid")
+            raise ValueError(f"Tier 2 v3 closure {key} is invalid")
 
     return Tier2Acceptance(
         lineage_id=str(check["lineage_id"]),
@@ -643,23 +950,93 @@ def build_installed_closure(
         raise ValueError("review file map is absent")
     for slug in ("mempool", "genesis"):
         values = files.get(slug)
-        if not isinstance(values, list) or len(values) != 18:
-            raise ValueError(f"{slug} installed closure must contain exactly 18 paths")
+        if not isinstance(values, list) or len(values) != REVIEW_PATH_COUNT:
+            raise ValueError(
+                f"{slug} installed closure must contain exactly {REVIEW_PATH_COUNT} paths"
+            )
     return canonical_json(
         {
             "schema": INSTALLED_CLOSURE_SCHEMA,
             "accepted": True,
             "lineage_id": acceptance.lineage_id,
             "state_id": acceptance.state_id,
+            "source_commit": manifest["source_commit"],
+            "source_tree": manifest["source_tree"],
             "runtime_artifact_fingerprint": manifest["runtime_artifact_fingerprint"],
             "candidate_fingerprint": acceptance.candidate_fingerprint,
             "bundle_digest": manifest["package_digest"],
             "state_digest": acceptance.state_digest,
             "verdict_digest": acceptance.verdict_digest,
             "verdict": acceptance.verdict,
+            "identities": manifest["identities"],
+            "acp_state_dirs": manifest["acp_state_dirs"],
+            "capability_parity": manifest["capability_parity"],
             "files": files,
         }
     )
+
+
+def validate_runtime_state_dirs(runtime_targets: tuple[Target, ...]) -> None:
+    by_path = {target.target: target for target in runtime_targets}
+    for slug, expected in ACP_STATE_DIRS.items():
+        env_path = f"/etc/buzz-agents/{slug}.env"
+        target = by_path.get(env_path)
+        if target is None or target.source is None or target.payload is not None:
+            raise ValueError(f"{slug} runtime env target is absent")
+        values: dict[str, str] = {}
+        try:
+            lines = target.source.read_text().splitlines()
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{slug} runtime env is not UTF-8") from error
+        for line in lines:
+            key, separator, value = line.partition("=")
+            if not separator or key in values:
+                raise ValueError(f"invalid or duplicate runtime env line for {slug}: {line}")
+            values[key] = value
+        if values.get("BUZZ_ACP_STATE_DIR") != expected:
+            raise ValueError(f"{slug} runtime env has wrong BUZZ_ACP_STATE_DIR")
+        state_dir = Path(values["BUZZ_ACP_STATE_DIR"])
+        identity_home = Path(f"/home/buzz-{slug}")
+        if not state_dir.is_absolute() or identity_home not in state_dir.parents:
+            raise ValueError(f"{slug} runtime state directory escapes its identity home")
+
+
+def validate_capability_parity_contract(manifest: dict[str, object]) -> None:
+    parity = manifest.get("capability_parity")
+    if not isinstance(parity, dict):
+        raise ValueError("capability parity contract is absent")
+    if (
+        parity.get("receipt_schema") != "buzz-agent-capability-parity-receipt-v2"
+        or parity.get("authority_receipt_schema")
+        != "buzz-agent-capability-authority-receipt-v1"
+        or parity.get("canonical_json_contract") != "buzz-canonical-json-ascii-v1"
+    ):
+        raise ValueError("capability parity authority contract version mismatch")
+    for field, count in (
+        ("reference_channels", 26),
+        ("eligible_channels", 25),
+        ("authority_exclusions", 1),
+    ):
+        value = parity.get(field)
+        if not isinstance(value, list) or len(value) != count:
+            raise ValueError(f"capability parity {field} inventory mismatch")
+        try:
+            canonical = PARITY_SUPPORT.canonical_json(value)
+        except PARITY_SUPPORT.ParityError as error:
+            raise ValueError(f"capability parity {field} is outside canonical JSON contract") from error
+        if parity.get(f"{field}_sha256") != sha256_bytes(canonical):
+            raise ValueError(f"capability parity {field} digest mismatch")
+    reference_ids = {item.get("channel_id") for item in parity["reference_channels"]}
+    eligible_ids = {item.get("channel_id") for item in parity["eligible_channels"]}
+    exclusion_ids = {item.get("channel_id") for item in parity["authority_exclusions"]}
+    if eligible_ids & exclusion_ids or reference_ids != eligible_ids | exclusion_ids:
+        raise ValueError("capability parity channel partition mismatch")
+    if parity.get("authority_receipt_binding") != {
+        "path": "metadata/live-authority-receipt.json",
+        "required": True,
+        "max_age_seconds": 300,
+    }:
+        raise ValueError("capability parity live authority receipt binding mismatch")
 
 
 def load_bundle(
@@ -679,6 +1056,7 @@ def load_bundle(
         raise ValueError("package public-key inputs are incomplete")
     if manifest.get("installable") is not False:
         raise ValueError("producer package must remain non-installable")
+    validate_capability_parity_contract(manifest)
     receipt = validate_preflight_receipt(receipt_path, bundle, manifest, evidence_path, owner)
     acceptance = validate_tier2_acceptance(
         bundle,
@@ -690,14 +1068,18 @@ def load_bundle(
         owner,
     )
     runtime_raw, ops_raw = manifest.get("runtime_targets"), manifest.get("ops_targets")
-    if not isinstance(runtime_raw, list) or len(runtime_raw) != 20:
-        raise ValueError("runtime target count must be 20")
-    if not isinstance(ops_raw, list) or len(ops_raw) != 1:
-        raise ValueError("ops target count must be one")
+    if not isinstance(runtime_raw, list) or len(runtime_raw) != RUNTIME_TARGET_COUNT:
+        raise ValueError(f"runtime target count must be {RUNTIME_TARGET_COUNT}")
+    if not isinstance(ops_raw, list) or len(ops_raw) != OPS_TARGET_COUNT:
+        raise ValueError(f"ops target count must be {OPS_TARGET_COUNT}")
     runtime_targets = tuple(parse_target(bundle, raw) for raw in runtime_raw)
     ops_targets = tuple(parse_target(bundle, raw) for raw in ops_raw)
-    if len({target.target for target in runtime_targets + ops_targets}) != 21:
+    if (
+        len({target.target for target in runtime_targets + ops_targets})
+        != TOTAL_PACKAGE_TARGET_COUNT
+    ):
         raise ValueError("duplicate install target")
+    validate_runtime_state_dirs(runtime_targets)
     closure_payload = build_installed_closure(manifest, acceptance)
     closure_target = Target(
         CLOSURE_TARGET,
@@ -817,6 +1199,75 @@ def systemctl_readback(action: str, unit: str) -> tuple[int, str]:
     return completed.returncode, completed.stdout.strip()
 
 
+def identity_command(user: str, *command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/usr/sbin/runuser", "-u", user, "--", *command],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        env={
+            "LC_ALL": "C",
+            "PATH": "/usr/local/libexec/buzz:/usr/local/bin:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    )
+
+
+def identity_runtime_blockers() -> list[str]:
+    blockers: list[str] = []
+    for slug, paths in IDENTITY_STATE_MODES.items():
+        user = f"buzz-{slug}"
+        try:
+            account = pwd.getpwnam(user)
+        except KeyError:
+            blockers.append(f"service identity absent: {user}")
+            continue
+        if account.pw_dir != f"/home/{user}":
+            blockers.append(f"service identity HOME mismatch: {user}")
+        for raw, expected_mode in paths.items():
+            path = Path(raw)
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                blockers.append(f"identity state path unreadable: {raw}: {type(error).__name__}")
+                continue
+            if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+                blockers.append(f"identity state path is not a real directory: {raw}")
+                continue
+            if metadata.st_uid != account.pw_uid or metadata.st_gid != account.pw_gid:
+                blockers.append(f"identity state path owner mismatch: {raw}")
+            if stat.S_IMODE(metadata.st_mode) != expected_mode:
+                blockers.append(f"identity state path mode mismatch: {raw}")
+            for flag, label in (("-r", "read"), ("-w", "write"), ("-x", "search")):
+                result = identity_command(user, "/usr/bin/test", flag, raw)
+                if result.returncode != 0:
+                    blockers.append(f"service identity lacks {label} access: {user}: {raw}")
+        for raw in ROOT_TOOL_PATHS:
+            executable = identity_command(user, "/usr/bin/test", "-x", raw)
+            if executable.returncode != 0:
+                blockers.append(f"service identity cannot execute root tool: {user}: {raw}")
+                continue
+            resolved = identity_command(user, "/usr/bin/readlink", "-e", raw)
+            if resolved.returncode != 0 or resolved.stdout.strip() != raw:
+                blockers.append(f"service identity root tool resolution mismatch: {user}: {raw}")
+        for command_name, expected_path in ROOT_PATH_COMMANDS:
+            resolved = identity_command(
+                user,
+                "/usr/bin/python3",
+                "-I",
+                "-c",
+                WHICH_PROGRAM,
+                command_name,
+            )
+            if resolved.returncode != 0 or resolved.stdout.strip() != expected_path:
+                blockers.append(
+                    f"service identity PATH resolution mismatch: {user}: {command_name}"
+                )
+    return blockers
+
+
 def service_blockers(root: Path) -> list[str]:
     if root != Path("/"):
         return []
@@ -837,6 +1288,8 @@ def service_blockers(root: Path) -> list[str]:
             blockers.append(f"service must be stopped: {unit} state={active_state or active_code}")
         if enabled_code != 1 or enabled_state != "disabled":
             blockers.append(f"service must be disabled: {unit} state={enabled_state or enabled_code}")
+    if not blockers:
+        blockers.extend(identity_runtime_blockers())
     return blockers
 
 
@@ -1086,6 +1539,84 @@ def metadata_matches(metadata: os.stat_result, mode: int, uid: int, gid: int) ->
     )
 
 
+def installed_records(changed: list[TargetState]) -> dict[str, dict[str, object]]:
+    return {
+        state.target.target: {
+            "sha256": state.target.sha256,
+            "mode": f"{state.target.mode:04o}",
+            "uid": state.target.uid,
+            "gid": state.target.gid,
+        }
+        for state in changed
+    }
+
+
+def backup_inventory(
+    previous: dict[str, dict[str, object]], backup: Path, root: Path
+) -> dict[str, object]:
+    uid, gid = admin_owner(root)
+    records: list[dict[str, object]] = []
+    for target_text in sorted(previous, key=str.encode):
+        record = previous[target_text]
+        if (
+            not isinstance(record, dict)
+            or (record.get("exists") is not True and record.get("exists") is not False)
+        ):
+            raise ValueError(f"invalid previous record: {target_text}")
+        if record["exists"] is False:
+            if set(record) != {"exists"}:
+                raise ValueError(f"invalid absent previous record: {target_text}")
+            continue
+        if set(record) != {"exists", "backup_name", "sha256", "mode", "uid", "gid"}:
+            raise ValueError(f"invalid present previous record: {target_text}")
+        backup_name = record.get("backup_name")
+        digest = record.get("sha256")
+        if not isinstance(backup_name, str) or not HEX64.fullmatch(backup_name):
+            raise ValueError(f"invalid backup name: {target_text}")
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            raise ValueError(f"invalid previous digest: {target_text}")
+        parse_mode(record.get("mode"))
+        if not isinstance(record.get("uid"), int) or not isinstance(record.get("gid"), int):
+            raise ValueError(f"invalid previous ownership: {target_text}")
+        source = backup / "files" / backup_name
+        metadata = require_regular(source, mode=0o600, owner_uid=uid, links=1)
+        if metadata.st_gid != gid or sha256_file(source) != digest:
+            raise ValueError(f"backup inventory mismatch: {target_text}")
+        records.append(
+            {
+                "target": target_text,
+                "backup_name": backup_name,
+                "sha256": digest,
+                "mode": "0600",
+                "uid": uid,
+                "gid": gid,
+            }
+        )
+    return {"files": records, "sha256": sha256_bytes(canonical_json(records))}
+
+
+def rollback_record(
+    changed: list[TargetState],
+    previous: dict[str, dict[str, object]],
+    installed: dict[str, dict[str, object]],
+    inventory: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "status": "verified",
+        "restored_targets": [state.target.target for state in changed],
+        "previous_sha256": sha256_bytes(canonical_json(previous)),
+        "installed_sha256": sha256_bytes(canonical_json(installed)),
+        "backup_inventory_sha256": inventory["sha256"],
+    }
+
+
+def verify_restored_targets(
+    changed: list[TargetState], previous: dict[str, dict[str, object]]
+) -> None:
+    for state in changed:
+        verify_previous_state(state, previous[state.target.target])
+
+
 def restore_targets(
     changed: list[TargetState],
     previous: dict[str, dict[str, object]],
@@ -1210,12 +1741,20 @@ def install(
                 }
             else:
                 previous[target.target.target] = {"exists": False}
+        inventory = backup_inventory(previous, backup, root)
+        installed = installed_records(changed)
         acceptance = checked.acceptance
         install_receipt: dict[str, object] = {
             "schema": INSTALL_RECEIPT_SCHEMA,
             "backup_id": backup_id,
             "bundle_id": checked.manifest["bundle_id"],
+            "source_commit": checked.manifest["source_commit"],
+            "source_tree": checked.manifest["source_tree"],
+            "manifest_sha256": sha256_file(bundle / "bundle-manifest.json"),
             "package_digest": checked.manifest["package_digest"],
+            "identities": checked.manifest["identities"],
+            "acp_state_dirs": checked.manifest["acp_state_dirs"],
+            "capability_parity": checked.manifest["capability_parity"],
             "preflight_receipt_sha256": sha256_file(receipt),
             "tier2_evidence_sha256": acceptance.evidence_digest,
             "tier2_state_sha256": acceptance.state_digest,
@@ -1228,15 +1767,8 @@ def install(
             "state": "prepared",
             "changed_targets": [target.target.target for target in changed],
             "previous": previous,
-            "installed": {
-                target.target.target: {
-                    "sha256": target.target.sha256,
-                    "mode": f"{target.target.mode:04o}",
-                    "uid": target.target.uid,
-                    "gid": target.target.gid,
-                }
-                for target in changed
-            },
+            "installed": installed,
+            "backup_inventory": inventory,
         }
         receipt_path = backup / "receipt.json"
         write_receipt(receipt_path, install_receipt)
@@ -1254,6 +1786,10 @@ def install(
         except Exception:
             try:
                 restore_targets(applied, previous, backup, root)
+                verify_restored_targets(changed, previous)
+                install_receipt["rollback"] = rollback_record(
+                    changed, previous, installed, inventory
+                )
                 install_receipt["state"] = "rolled_back"
                 write_receipt(receipt_path, install_receipt)
             except Exception as rollback_error:
@@ -1270,9 +1806,275 @@ def install(
         lock_handle.close()
 
 
-def rollback(backup_id: str, root: Path) -> int:
+def require_admin_tree(path: Path, root: Path, final_mode: int) -> os.stat_result:
+    uid, gid = admin_owner(root)
+    relative = path.relative_to(root)
+    current = root
+    root_metadata(root)
+    metadata = current.lstat()
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"unsafe admin directory: {current}")
+        if metadata.st_uid != uid or metadata.st_gid != gid:
+            raise ValueError(f"admin directory owner mismatch: {current}")
+        if index == len(relative.parts) - 1:
+            if stat.S_IMODE(metadata.st_mode) != final_mode:
+                raise ValueError(f"admin directory mode mismatch: {current}")
+        elif stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ValueError(f"admin directory is group/world-writable: {current}")
+    return metadata
+
+
+def legacy_v1_contract_receipt() -> dict[str, object]:
+    return {
+        "schema": LEGACY_TIER1_INSTALL_RECEIPT_SCHEMA,
+        "backup_id": LEGACY_V1_BACKUP_ID,
+        "acceptance_sha256": LEGACY_V1_ACCEPTANCE_SHA256,
+        "claim": LEGACY_V1_CLAIM,
+        "package_digest": LEGACY_V1_PACKAGE_DIGEST,
+        "state": "installed",
+        "changed_targets": list(LEGACY_V1_CHANGED_TARGETS),
+        "previous": LEGACY_V1_PREVIOUS,
+    }
+
+
+def legacy_v1_inventory_digest() -> str:
+    return sha256_bytes(
+        canonical_json(
+            {
+                "changed_targets": list(LEGACY_V1_CHANGED_TARGETS),
+                "previous": LEGACY_V1_PREVIOUS,
+                "installed": LEGACY_V1_INSTALLED,
+            }
+        )
+    )
+
+
+def legacy_v1_recovery_claim_path(root: Path) -> Path:
+    name = f"legacy-v1-rollback-{LEGACY_V1_RECEIPT_SHA256}.claim"
+    return rooted(root, LEGACY_V1_RECOVERY_CLAIM_DIRECTORY) / name
+
+
+def legacy_v1_acceptance_claim() -> dict[str, object]:
+    return {
+        "schema": LEGACY_V1_ACCEPTANCE_CLAIM_SCHEMA,
+        "acceptance_sha256": LEGACY_V1_ACCEPTANCE_SHA256,
+        "package_digest": LEGACY_V1_PACKAGE_DIGEST,
+    }
+
+
+def validate_legacy_v1_recovery(backup_id: str, root: Path) -> LegacyV1Recovery:
+    if backup_id != LEGACY_V1_BACKUP_ID or not BACKUP_ID.fullmatch(backup_id):
+        raise ValueError("legacy v1 backup ID mismatch")
+    blockers = service_blockers(root)
+    if blockers:
+        raise ValueError("LEGACY V1 ROLLBACK REFUSED: " + "; ".join(blockers))
+    if len(LEGACY_V1_CHANGED_TARGETS) != 10:
+        raise ValueError("legacy v1 target count mismatch")
+    if (
+        set(LEGACY_V1_CHANGED_TARGETS) != set(LEGACY_V1_PREVIOUS)
+        or set(LEGACY_V1_CHANGED_TARGETS) != set(LEGACY_V1_INSTALLED)
+    ):
+        raise ValueError("legacy v1 target inventory mismatch")
+    if legacy_v1_inventory_digest() != LEGACY_V1_INVENTORY_SHA256:
+        raise ValueError("legacy v1 inventory digest mismatch")
+
+    backup_root = backup_root_for(root)
+    require_admin_tree(backup_root, root, 0o700)
+    backup = backup_root / backup_id
+    require_admin_tree(backup, root, 0o700)
+    if {entry.name for entry in os.scandir(backup)} != {"files", "receipt.json"}:
+        raise ValueError("legacy v1 backup directory inventory mismatch")
+
+    receipt_path = backup / "receipt.json"
+    uid, gid = admin_owner(root)
+    receipt_metadata = require_regular(
+        receipt_path,
+        mode=0o600,
+        owner_uid=uid,
+        links=1,
+    )
+    if receipt_metadata.st_gid != gid:
+        raise ValueError("legacy v1 receipt group mismatch")
+    if sha256_file(receipt_path) != LEGACY_V1_RECEIPT_SHA256:
+        raise ValueError("legacy v1 receipt hash mismatch")
+    receipt = load_json(receipt_path, mode=0o600, owner_uid=uid)
+    if receipt != legacy_v1_contract_receipt():
+        raise ValueError("legacy v1 receipt contract mismatch")
+    if "installed" in receipt:
+        raise ValueError("legacy v1 receipt unexpectedly contains an installed map")
+
+    files = backup / "files"
+    require_admin_tree(files, root, 0o700)
+    expected_names = {
+        str(LEGACY_V1_PREVIOUS[target]["backup_name"])
+        for target in LEGACY_V1_CHANGED_TARGETS
+    }
+    if len(expected_names) != 10 or {entry.name for entry in os.scandir(files)} != expected_names:
+        raise ValueError("legacy v1 backup file inventory mismatch")
+    for target_text in LEGACY_V1_CHANGED_TARGETS:
+        record = LEGACY_V1_PREVIOUS[target_text]
+        backup_name = str(record.get("backup_name"))
+        digest = str(record.get("sha256"))
+        if (
+            record.get("exists") is not True
+            or not HEX64.fullmatch(backup_name)
+            or backup_name != hashlib.sha256(target_text.encode()).hexdigest()
+            or not HEX64.fullmatch(digest)
+        ):
+            raise ValueError(f"legacy v1 previous record mismatch: {target_text}")
+        item = files / backup_name
+        item_metadata = require_regular(item, mode=0o600, owner_uid=uid, links=1)
+        if item_metadata.st_gid != gid:
+            raise ValueError(f"legacy v1 backup group mismatch: {target_text}")
+        if sha256_file(item) != digest:
+            raise ValueError(f"legacy v1 backup hash mismatch: {target_text}")
+
+    claim_directory = rooted(root, LEGACY_V1_RECOVERY_CLAIM_DIRECTORY)
+    require_admin_tree(claim_directory, root, 0o700)
+    acceptance_claim_path = rooted(root, LEGACY_V1_CLAIM)
+    if acceptance_claim_path.parent != claim_directory:
+        raise ValueError("legacy v1 acceptance claim path mismatch")
+    claim_metadata = require_regular(
+        acceptance_claim_path,
+        mode=0o600,
+        owner_uid=uid,
+        links=1,
+    )
+    if claim_metadata.st_gid != gid:
+        raise ValueError("legacy v1 acceptance claim group mismatch")
+    expected_claim = legacy_v1_acceptance_claim()
+    if (
+        sha256_file(acceptance_claim_path) != sha256_bytes(canonical_json(expected_claim))
+        or load_json(acceptance_claim_path, mode=0o600, owner_uid=uid) != expected_claim
+    ):
+        raise ValueError("legacy v1 consumed acceptance claim mismatch")
+
+    recovery_claim = legacy_v1_recovery_claim_path(root)
+    if os.path.lexists(recovery_claim):
+        raise ValueError("legacy v1 rollback was already claimed")
+
+    states: list[TargetState] = []
+    for target_text in LEGACY_V1_CHANGED_TARGETS:
+        record = LEGACY_V1_INSTALLED[target_text]
+        digest = str(record.get("sha256"))
+        if not HEX64.fullmatch(digest):
+            raise ValueError(f"legacy v1 installed hash mismatch: {target_text}")
+        target = Target(
+            target_text,
+            None,
+            None,
+            parse_mode(record.get("mode")),
+            int(record.get("uid")),
+            int(record.get("gid")),
+            digest,
+        )
+        destination = rooted(root, target_text)
+        parent, blocker = walk_parent(root, target)
+        if parent is None:
+            raise ValueError(f"legacy v1 rollback parent blocked: {target_text}: {blocker}")
+        current = parent / destination.name
+        metadata = require_regular(current, links=1)
+        installed_uid, installed_gid = expected_owner(target, root)
+        if sha256_file(current) != digest or not metadata_matches(
+            metadata,
+            target.mode,
+            installed_uid,
+            installed_gid,
+        ):
+            raise ValueError(f"legacy v1 installed target drift: {target_text}")
+        states.append(TargetState(target, destination, parent, "replace", "legacy-v1-rollback"))
+    return LegacyV1Recovery(
+        backup,
+        receipt_path,
+        recovery_claim,
+        tuple(states),
+        {target: dict(LEGACY_V1_PREVIOUS[target]) for target in LEGACY_V1_CHANGED_TARGETS},
+    )
+
+
+def create_legacy_v1_recovery_claim(root: Path) -> Path:
+    directory = rooted(root, LEGACY_V1_RECOVERY_CLAIM_DIRECTORY)
+    require_admin_tree(directory, root, 0o700)
+    path = legacy_v1_recovery_claim_path(root)
+    uid, gid = admin_owner(root)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        if root == Path("/"):
+            os.fchown(descriptor, uid, gid)
+        payload = canonical_json(
+            {
+                "schema": LEGACY_V1_RECOVERY_CLAIM_SCHEMA,
+                "backup_id": LEGACY_V1_BACKUP_ID,
+                "receipt_sha256": LEGACY_V1_RECEIPT_SHA256,
+                "inventory_sha256": LEGACY_V1_INVENTORY_SHA256,
+            }
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write during legacy v1 rollback claim")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    sync_directory(directory)
+    return path
+
+
+def verify_legacy_v1_restored(value: LegacyV1Recovery, root: Path) -> None:
+    for state in value.targets:
+        target_text = state.target.target
+        record = value.previous[target_text]
+        destination = state.resolved_parent / state.destination.name
+        metadata = require_regular(destination, links=1)
+        expected_uid = int(record["uid"]) if root == Path("/") else admin_owner(root)[0]
+        expected_gid = int(record["gid"]) if root == Path("/") else admin_owner(root)[1]
+        if sha256_file(destination) != record["sha256"] or not metadata_matches(
+            metadata,
+            int(str(record["mode"]), 8),
+            expected_uid,
+            expected_gid,
+        ):
+            raise ValueError(f"legacy v1 restore verification failed: {target_text}")
+
+
+def rollback_legacy_v1(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
+    checked = validate_legacy_v1_recovery(backup_id, root)
+    if dry_run:
+        print(
+            "LEGACY_V1_ROLLBACK_DRY_RUN "
+            f"backup_id={backup_id} targets={len(checked.targets)} writes=0"
+        )
+        return 0
+    _backup_root, lock_handle = prepare_admin_paths(root)
+    try:
+        checked = validate_legacy_v1_recovery(backup_id, root)
+        claim = create_legacy_v1_recovery_claim(root)
+        restore_targets(list(checked.targets), checked.previous, checked.backup, root)
+        verify_legacy_v1_restored(checked, root)
+        if sha256_file(checked.receipt) != LEGACY_V1_RECEIPT_SHA256:
+            raise ValueError("legacy v1 receipt changed during rollback")
+        print(f"LEGACY_V1_ROLLED_BACK backup_id={backup_id} claim={claim}")
+        return 0
+    finally:
+        lock_handle.close()
+
+
+def rollback(backup_id: str, root: Path, *, dry_run: bool = False) -> int:
     if not BACKUP_ID.fullmatch(backup_id):
         raise ValueError("invalid backup ID")
+    if backup_id == LEGACY_V1_BACKUP_ID:
+        return rollback_legacy_v1(backup_id, root, dry_run=dry_run)
+    if dry_run:
+        raise ValueError("rollback --dry-run only supports the exact legacy v1 backup")
     blockers = service_blockers(root)
     if blockers:
         raise ValueError("ROLLBACK REFUSED: " + "; ".join(blockers))
@@ -1282,12 +2084,90 @@ def rollback(backup_id: str, root: Path) -> int:
         receipt_path = backup / "receipt.json"
         require_regular(receipt_path, mode=0o600)
         receipt = load_json(receipt_path)
+        required_receipt_fields = {
+            "schema",
+            "backup_id",
+            "bundle_id",
+            "source_commit",
+            "source_tree",
+            "manifest_sha256",
+            "package_digest",
+            "identities",
+            "acp_state_dirs",
+            "capability_parity",
+            "preflight_receipt_sha256",
+            "tier2_evidence_sha256",
+            "tier2_state_sha256",
+            "tier2_verdict_sha256",
+            "tier2_candidate_fingerprint",
+            "review_lineage_id",
+            "review_state_id",
+            "review_revision",
+            "review_verdict",
+            "state",
+            "changed_targets",
+            "previous",
+            "installed",
+            "backup_inventory",
+        }
         if (
-            receipt.get("schema") != INSTALL_RECEIPT_SCHEMA
+            set(receipt) != required_receipt_fields
+            or not isinstance(receipt.get("source_commit"), str)
+            or not HEX40.fullmatch(str(receipt["source_commit"]))
+            or not isinstance(receipt.get("source_tree"), str)
+            or not HEX40.fullmatch(str(receipt["source_tree"]))
+            or receipt.get("schema") != INSTALL_RECEIPT_SCHEMA
             or receipt.get("backup_id") != backup_id
             or receipt.get("state") != "installed"
         ):
             raise ValueError("backup receipt is not rollback-ready")
+        for name in (
+            "manifest_sha256",
+            "package_digest",
+            "preflight_receipt_sha256",
+            "tier2_evidence_sha256",
+            "tier2_state_sha256",
+            "tier2_verdict_sha256",
+            "tier2_candidate_fingerprint",
+        ):
+            if not isinstance(receipt.get(name), str) or not HEX64.fullmatch(str(receipt[name])):
+                raise ValueError(f"invalid rollback receipt digest: {name}")
+        require_activation_transaction_rolled_back(root, receipt)
+        identities = receipt.get("identities")
+        if not isinstance(identities, dict) or set(identities) != {"mempool", "genesis"}:
+            raise ValueError("rollback identity descriptor map mismatch")
+        if receipt.get("acp_state_dirs") != ACP_STATE_DIRS:
+            raise ValueError("rollback ACP state directory map mismatch")
+        for slug in ("mempool", "genesis"):
+            descriptor = identities.get(slug)
+            expected = {
+                "public_key",
+                "user",
+                "home",
+                "credential_path",
+                "environment_path",
+                "prompt_path",
+                "acp_state_dir",
+                "systemd_unit",
+            }
+            if not isinstance(descriptor, dict) or set(descriptor) != expected:
+                raise ValueError(f"rollback {slug} identity descriptor mismatch")
+            public_key = descriptor.get("public_key")
+            if not isinstance(public_key, str) or not HEX64.fullmatch(public_key):
+                raise ValueError(f"rollback {slug} public key mismatch")
+            if descriptor != {
+                "public_key": public_key,
+                "user": f"buzz-{slug}",
+                "home": f"/home/buzz-{slug}",
+                "credential_path": f"/etc/buzz-agents/credentials/{slug}.key",
+                "environment_path": f"/etc/buzz-agents/{slug}.env",
+                "prompt_path": f"/etc/buzz-agents/prompts/{slug}.md",
+                "acp_state_dir": ACP_STATE_DIRS[slug],
+                "systemd_unit": f"buzz-agent@{slug}.service",
+            }:
+                raise ValueError(f"rollback {slug} identity descriptor mismatch")
+        if identities["mempool"]["public_key"] == identities["genesis"]["public_key"]:
+            raise ValueError("rollback identity public keys are not unique")
         changed = receipt.get("changed_targets")
         previous = receipt.get("previous")
         installed = receipt.get("installed")
@@ -1295,18 +2175,33 @@ def rollback(backup_id: str, root: Path) -> int:
             not isinstance(changed, list)
             or not isinstance(previous, dict)
             or not isinstance(installed, dict)
+            or len(changed) != len(set(changed))
             or set(changed) != set(previous)
             or set(changed) != set(installed)
         ):
             raise ValueError("backup receipt target set mismatch")
+        inventory = backup_inventory(previous, backup, root)
+        if receipt.get("backup_inventory") != inventory:
+            raise ValueError("backup receipt inventory mismatch")
         states: list[TargetState] = []
         for target_text in changed:
             if not isinstance(target_text, str) or not Path(target_text).is_absolute():
                 raise ValueError("invalid rollback target")
             destination = rooted(root, target_text)
             record = installed[target_text]
-            if not isinstance(record, dict):
+            if not isinstance(record, dict) or set(record) != {"sha256", "mode", "uid", "gid"}:
                 raise ValueError("invalid installed record")
+            if not isinstance(record.get("sha256"), str) or not HEX64.fullmatch(
+                str(record["sha256"])
+            ):
+                raise ValueError("invalid installed digest")
+            if (
+                not isinstance(record.get("uid"), int)
+                or isinstance(record.get("uid"), bool)
+                or not isinstance(record.get("gid"), int)
+                or isinstance(record.get("gid"), bool)
+            ):
+                raise ValueError("invalid installed ownership")
             target = Target(
                 target_text,
                 destination,
@@ -1338,6 +2233,8 @@ def rollback(backup_id: str, root: Path) -> int:
         receipt["state"] = "rollback_started"
         write_receipt(receipt_path, receipt)
         restore_targets(states, previous, backup, root)
+        verify_restored_targets(states, previous)
+        receipt["rollback"] = rollback_record(states, previous, installed, inventory)
         receipt["state"] = "rolled_back"
         write_receipt(receipt_path, receipt)
         print(f"ROLLED_BACK backup_id={backup_id}")
@@ -1359,11 +2256,12 @@ def main() -> None:
         child.add_argument("--repo-root", default=str(REPO_ROOT))
     child = children.add_parser("rollback")
     child.add_argument("--backup-id", required=True)
+    child.add_argument("--dry-run", action="store_true")
     child.add_argument("--root", default="/")
     args = parser.parse_args()
     root = Path(args.root).absolute()
     if args.command == "rollback":
-        raise SystemExit(rollback(args.backup_id, root))
+        raise SystemExit(rollback(args.backup_id, root, dry_run=args.dry_run))
     bundle = Path(args.bundle).resolve(strict=True)
     receipt = Path(args.receipt).resolve(strict=True)
     evidence = Path(args.tier2_evidence).resolve(strict=True)

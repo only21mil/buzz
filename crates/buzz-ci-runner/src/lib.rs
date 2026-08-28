@@ -4,10 +4,21 @@
 //! the content-blind broker protocol, drives a separately supplied unprivileged
 //! execution backend, and constructs teardown attestations only from terminal
 //! broker receipts. It does not own privileged resources.
+//!
+//! The daemon's controld-facing transport is limited to the frozen socket,
+//! framing, dispatch, and receipt fields in [`transport`]. Authentication,
+//! execution dispatch, evidence validation, and reconciliation remain outside
+//! the transport layer.
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod control;
+pub mod handler;
+pub mod host;
+pub mod journal;
+pub mod service;
+pub mod transport;
 
 use std::collections::HashSet;
 
@@ -203,8 +214,11 @@ pub fn build_teardown_attestation(
     let mut teardown_at = 0;
     for proof in lease_receipts {
         let receipt = proof.receipt;
-        if receipt.code != buzz_ci_broker_protocol::ResponseCode::Ok
-            || receipt.broker_state != BrokerState::Terminal
+        if !matches!(
+            receipt.code,
+            buzz_ci_broker_protocol::ResponseCode::Ok
+                | buzz_ci_broker_protocol::ResponseCode::Existing
+        ) || receipt.broker_state != BrokerState::Terminal
             || receipt.attempt_id == [0; 16]
             || receipt.teardown_digest == [0; 32]
             || matches!(receipt.conclusion, Conclusion::None)

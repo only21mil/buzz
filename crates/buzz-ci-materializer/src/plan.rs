@@ -5,6 +5,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 use buzz_ci_isolation_contract::ValidatedAttemptLeaseBinding;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -272,7 +273,8 @@ impl MaterializationSlot {
 }
 
 /// One operation in the frozen raw-object Git protocol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GitOperation {
     /// Create one private bare object database.
     Init,
@@ -291,7 +293,8 @@ pub enum GitOperation {
 /// A command whose executable, arguments, environment, and cwd are completely
 /// broker-derived. The executor must honor `clear_environment` before applying
 /// `environment`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandSpec {
     /// Frozen operation class used by the backend and evidence translator.
     pub operation: GitOperation,
@@ -330,7 +333,8 @@ pub struct CommandSpec {
 }
 
 /// Network grant associated with one exact command.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum NetworkScope {
     /// No network access is permitted.
     None,

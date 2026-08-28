@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sats roster migration private receipt",
+  "type": "object",
+  "required": ["schema_version", "status", "manifest_sha256", "root", "files", "operations"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["backup_complete", "complete", "apply_recovery_in_progress", "apply_failed_partial", "apply_failed_rolled_back", "rollback_in_progress", "rollback_failed", "rolled_back"]},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "root": {"type": "string"},
+    "files": {"type": "object"},
+    "operations": {"type": "array"},
+    "pre_service_state": {"type": "object"},
+    "pre_kind0_names": {"type": "object"},
+    "pre_memberships": {"type": "object"},
+    "dependency_state": {"type": "object"},
+    "public_preflight_state": {"type": "object"},
+    "preflight_operations": {"type": "array"},
+    "post_files": {"type": "object"},
+    "rollback_commands": {"type": "array", "items": {"type": "string"}},
+    "rollback_operations": {"type": "array"},
+    "rollback_dependency_state": {"type": "object"},
+    "rollback_pre_memberships": {"type": "object"},
+    "rollback_preflight_operations": {"type": "array"},
+    "relay_memberships": {"type": "object"},
+    "rollback_error_type": {"type": "string"},
+    "apply_error_type": {"type": "string"},
+    "recovery_operations": {"type": "array"},
+    "recovery_error_type": {"type": "string"}
+  },
+  "additionalProperties": false
+}
