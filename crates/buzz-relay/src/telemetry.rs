@@ -479,6 +479,18 @@ mod tests {
                 .clone()
                 .with_filter(tracing_subscriber::filter::LevelFilter::OFF),
         );
+        // Query this subscriber directly. `enabled!` also consults the
+        // process-global callsite cache, which parallel tests rebuild.
+        use tracing::callsite::Callsite as _;
+        let callsite = tracing::callsite!(
+            name: "trace_context_lookup_filter_test",
+            kind: tracing::metadata::Kind::EVENT,
+            target: "trace_context_lookup_filter_test",
+            level: tracing::Level::ERROR,
+            fields:
+        );
+        let interest = tracing::Subscriber::register_callsite(&subscriber, callsite.metadata());
+        assert!(interest.is_never());
 
         tracing::subscriber::with_default(subscriber, || {
             assert!(context_lookup
@@ -486,10 +498,6 @@ mod tests {
                 .get()
                 .and_then(tracing::dispatcher::WeakDispatch::upgrade)
                 .is_some());
-            assert!(!tracing::enabled!(
-                target: "trace_context_lookup_filter_test",
-                tracing::Level::ERROR
-            ));
         });
     }
 
