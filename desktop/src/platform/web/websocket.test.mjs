@@ -55,7 +55,7 @@ class FakeWebSocket {
 
 async function install() {
   globalThis.WebSocket = FakeWebSocket;
-  registerWebSocketCommands();
+  registerWebSocketCommands("https://relay.example.test/app/");
 }
 
 afterEach(async () => {
@@ -128,6 +128,18 @@ test("connect blocks encrypted key backups in the URL", async () => {
       onMessage: new Channel(),
     }),
     /local key backup must never be transmitted/,
+  );
+  assert.equal(FakeWebSocket.instances.length, 0);
+});
+
+test("connect rejects cross-origin relay sockets before construction", async () => {
+  await install();
+  await assert.rejects(
+    dispatch("plugin:websocket|connect", {
+      url: "wss://other.example.test",
+      onMessage: new Channel(),
+    }),
+    /must match the application origin/,
   );
   assert.equal(FakeWebSocket.instances.length, 0);
 });

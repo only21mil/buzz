@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade},
-    http::{HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Json},
     routing::{get, post, put},
@@ -87,6 +87,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // CI preflight (NIP-98 auth)
         .route("/ci/preflight", post(api::ci::ci_preflight))
         .route("/ci/control/accepted", get(api::ci::next_accepted_control))
+        .route("/ci/runs/{run_id}/status", get(api::ci::ci_status))
         .route(
             "/workflows/{workflow_id}/runs",
             get(api::bridge::workflow_runs),
@@ -164,18 +165,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Serve both bundles from one fallback. The admin host is checked first so
     // it can never fall through to the public web bundle.
     let web_dir = state.config.web_dir.clone();
-    if admin_web_dir.is_some() || web_dir.is_some() {
+    let app_web_dir = state.config.app_web_dir.clone();
+    if admin_web_dir.is_some() || web_dir.is_some() || app_web_dir.is_some() {
         let admin_index = admin_web_dir.as_ref().map(|dir| dir.join("index.html"));
         let admin_files = admin_web_dir.map(ServeDir::new);
         let web_index = web_dir.as_ref().map(|dir| dir.join("index.html"));
         let web_files = web_dir.map(ServeDir::new);
+        let app_index = app_web_dir.as_ref().map(|dir| dir.join("index.html"));
+        let app_files = app_web_dir.map(ServeDir::new);
         let serve_git_web_gui = state.config.serve_git_web_gui;
         let fallback_state = state.clone();
-        let spa_fallback = tower::service_fn(move |req: axum::extract::Request| {
+        let spa_fallback = tower::service_fn(move |mut req: axum::extract::Request| {
             let admin_index = admin_index.clone();
             let admin_files = admin_files.clone();
             let web_index = web_index.clone();
             let web_files = web_files.clone();
+            let app_index = app_index.clone();
+            let app_files = app_files.clone();
             let state = fallback_state.clone();
             async move {
                 let path = req.uri().path();
@@ -190,6 +196,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                         }
                     }
                     return Ok(StatusCode::NOT_FOUND.into_response());
+                }
+
+                if let (Some(index), Some(files), Some(relative_uri)) =
+                    (app_index, app_files, app_relative_uri(req.uri()))
+                {
+                    let relative_path = relative_uri.path().to_owned();
+                    let mut response = if is_app_spa_path(&relative_path) {
+                        read_spa_index(&index).await
+                    } else {
+                        *req.uri_mut() = relative_uri;
+                        files.oneshot(req).await.map(IntoResponse::into_response)?
+                    };
+                    harden_hosted_app_response(&mut response);
+                    return Ok(response);
                 }
 
                 if let (Some(index), Some(files)) = (web_index, web_files) {
@@ -231,6 +251,47 @@ fn is_admin_spa_path(path: &str) -> bool {
         || path.starts_with("/reports/")
         || path == "/feedback"
         || path.starts_with("/feedback/")
+}
+
+const HOSTED_APP_CSP: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'";
+
+fn app_relative_uri(uri: &Uri) -> Option<Uri> {
+    let relative_path = match uri.path() {
+        "/app" | "/app/" => "/".to_owned(),
+        path => format!("/{}", path.strip_prefix("/app/")?),
+    };
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{relative_path}?{query}"),
+        None => relative_path,
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().ok()?);
+    Uri::from_parts(parts).ok()
+}
+
+fn is_app_spa_path(path: &str) -> bool {
+    path == "/"
+        || path
+            .rsplit('/')
+            .next()
+            .is_some_and(|segment| !segment.contains('.'))
+}
+
+fn harden_hosted_app_response(response: &mut axum::response::Response) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(HOSTED_APP_CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
 }
 
 fn is_invite_landing_path(path: &str) -> bool {
@@ -467,6 +528,9 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use axum::body::to_bytes;
     use axum::{routing::get, Router};
     use futures_util::SinkExt;
     use opentelemetry::trace::TracerProvider as _;
@@ -480,6 +544,47 @@ mod tests {
 
     use super::*;
 
+    async fn hosted_app_test_state(app_web_dir: PathBuf) -> Arc<AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.admin = None;
+        config.web_dir = None;
+        config.app_web_dir = Some(app_web_dir);
+        config.serve_git_web_gui = false;
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
     #[test]
     fn invite_landing_path_requires_exactly_one_nonempty_code_segment() {
         assert!(is_invite_landing_path("/invite/payload.mac"));
@@ -487,6 +592,85 @@ mod tests {
         assert!(!is_invite_landing_path("/invite/code/extra"));
         assert!(!is_invite_landing_path("/repos"));
         assert!(!is_invite_landing_path("/"));
+    }
+
+    #[test]
+    fn hosted_app_paths_are_prefix_bounded_and_keep_queries() {
+        assert_eq!(
+            app_relative_uri(&"/app/".parse().unwrap()).unwrap(),
+            "/".parse::<Uri>().unwrap()
+        );
+        assert_eq!(
+            app_relative_uri(&"/app/assets/main.js?v=1".parse().unwrap()).unwrap(),
+            "/assets/main.js?v=1".parse::<Uri>().unwrap()
+        );
+        assert!(app_relative_uri(&"/application".parse().unwrap()).is_none());
+        assert!(is_app_spa_path("/"));
+        assert!(is_app_spa_path("/channels/example"));
+        assert!(!is_app_spa_path("/assets/main.js"));
+    }
+
+    #[test]
+    fn hosted_app_headers_pin_browser_security_boundaries() {
+        let mut response = StatusCode::OK.into_response();
+        harden_hosted_app_response(&mut response);
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            HOSTED_APP_CSP
+        );
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "DENY");
+        assert!(HOSTED_APP_CSP.contains("frame-ancestors 'none'"));
+    }
+
+    #[tokio::test]
+    async fn hosted_app_router_serves_spa_and_assets_under_app_with_headers() {
+        let app_dir = tempfile::tempdir().expect("app tempdir");
+        std::fs::create_dir(app_dir.path().join("assets")).expect("asset directory");
+        std::fs::write(
+            app_dir.path().join("index.html"),
+            r#"<!doctype html><base href="/app/"><main>hosted app</main>"#,
+        )
+        .expect("write app index");
+        std::fs::write(
+            app_dir.path().join("assets/main.js"),
+            "globalThis.__hostedApp = true;",
+        )
+        .expect("write app asset");
+        let router = build_router(hosted_app_test_state(app_dir.path().to_path_buf()).await);
+
+        for (uri, expected_body) in [
+            ("/app/channels/general", "<base href=\"/app/\">"),
+            ("/app/assets/main.js?v=1", "globalThis.__hostedApp = true;"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(uri)
+                        .body(Body::empty())
+                        .expect("hosted app request"),
+                )
+                .await
+                .expect("hosted app response");
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                response.headers()[header::CONTENT_SECURITY_POLICY],
+                HOSTED_APP_CSP,
+                "{uri}"
+            );
+            assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "DENY", "{uri}");
+            let body = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("read hosted app body");
+            assert!(
+                String::from_utf8_lossy(&body).contains(expected_body),
+                "{uri}"
+            );
+        }
     }
 
     #[test]

@@ -91,6 +91,7 @@ test("NIP-98 fetch hashes and sends the same body bytes", async () => {
   assert.equal(observed.url, "https://relay.example.test/events");
   assert.equal(observed.init.body, body);
   assert.equal(observed.init.method, "POST");
+  assert.equal(observed.init.credentials, "omit");
   assert.match(observed.init.headers.get("Authorization"), /^Nostr /);
   assert.equal(observed.init.headers.get("Content-Type"), "application/json");
 });

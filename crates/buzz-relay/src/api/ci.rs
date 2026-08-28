@@ -68,11 +68,13 @@ use crate::api::git::binding::{resolve_repo_binding, RepoBinding};
 use crate::api::git::hydrate::{hydrate_for_read, load_manifest_for_read, HydrationOptions};
 use crate::api::git::manifest::is_hex_oid;
 use crate::api::git::transport::{harden_git_env, validate_repo_id};
+use crate::api::internal_error;
 use crate::config::CiPolicyConfig;
 use crate::state::AppState;
 use crate::tenant::bind_community;
 use buzz_core::channel::MemberRole;
 use buzz_core::ci::CiRequestEnvelope;
+use buzz_core::ci::{validate_signed_ci_event, ValidatedCiEnvelope};
 use buzz_core::kind::{KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST};
 #[cfg(test)]
 use buzz_core::CommunityId;
@@ -207,6 +209,234 @@ pub struct PreflightResponse {
 
 type PreflightApiError = (StatusCode, Json<Value>);
 type SelectedJobs = (Vec<PreflightJob>, Vec<String>);
+
+const STATUS_EVENT_LIMIT: u32 = 1_000;
+const REJECTED_SIGNER_PROVENANCE_LIMIT: usize = 20;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Tenant-local channel coordinate required for a CI run status read.
+pub struct CiStatusQuery {
+    /// Repository-bound channel whose current membership authorizes the read.
+    channel_id: uuid::Uuid,
+}
+
+fn reduce_ci_status_events(
+    run_id: uuid::Uuid,
+    channel_id: uuid::Uuid,
+    trusted_signers: &std::collections::HashSet<String>,
+    initial_event: &nostr::Event,
+    stored_events: Vec<(i64, nostr::Event)>,
+) -> Result<Value, &'static str> {
+    let initial_id = initial_event.id.to_hex();
+    let initial_envelope =
+        match validate_signed_ci_event(initial_event, &channel_id.to_string(), trusted_signers) {
+            Ok(ValidatedCiEnvelope::Request(request)) if request.run_id == run_id.to_string() => {
+                request
+            }
+            _ => return Err("stored CI request failed schema validation"),
+        };
+    let mut accepted = Vec::new();
+    let mut malformed_count = 0_u32;
+    let mut unexpected_request_count = 0_u32;
+    let mut untrusted_count = 0_u32;
+    let mut untrusted_signers = std::collections::BTreeSet::new();
+    for (watch_cursor, event) in stored_events {
+        let event_id = event.id.to_hex();
+        let kind = event.kind.as_u16() as u32;
+        if watch_cursor < 0 {
+            malformed_count = malformed_count.saturating_add(1).min(STATUS_EVENT_LIMIT);
+            continue;
+        }
+
+        if kind == buzz_core::kind::KIND_CI_REQUEST {
+            match validate_signed_ci_event(&event, &channel_id.to_string(), trusted_signers) {
+                Ok(ValidatedCiEnvelope::Request(envelope)) if event_id == initial_id => {
+                    accepted.push(buzz_core::ci_reducer::AcceptedCiEnvelope {
+                        event_id,
+                        watch_cursor: watch_cursor as u64,
+                        envelope: ValidatedCiEnvelope::Request(envelope),
+                    });
+                }
+                Ok(ValidatedCiEnvelope::Request(_)) => {
+                    unexpected_request_count = unexpected_request_count
+                        .saturating_add(1)
+                        .min(STATUS_EVENT_LIMIT);
+                }
+                _ => {
+                    malformed_count = malformed_count.saturating_add(1).min(STATUS_EVENT_LIMIT);
+                }
+            }
+            continue;
+        }
+
+        let signer = event.pubkey.to_hex();
+        if !trusted_signers.contains(&signer) {
+            let signer_only = std::collections::HashSet::from([signer.clone()]);
+            match validate_signed_ci_event(&event, &channel_id.to_string(), &signer_only) {
+                Ok(_) => {
+                    untrusted_count = untrusted_count.saturating_add(1).min(STATUS_EVENT_LIMIT);
+                    untrusted_signers.insert(signer);
+                }
+                Err(_) => {
+                    malformed_count = malformed_count.saturating_add(1).min(STATUS_EVENT_LIMIT);
+                }
+            }
+            continue;
+        }
+
+        if event.verify().is_err() {
+            malformed_count = malformed_count.saturating_add(1).min(STATUS_EVENT_LIMIT);
+            continue;
+        }
+        let envelope = validate_signed_ci_event(&event, &channel_id.to_string(), trusted_signers)
+            .map_err(|_| "trusted signed CI event is structurally ambiguous")?;
+        accepted.push(buzz_core::ci_reducer::AcceptedCiEnvelope {
+            event_id,
+            watch_cursor: watch_cursor as u64,
+            envelope,
+        });
+    }
+    let reduction =
+        buzz_core::ci_reducer::reduce_status(&initial_id, &initial_envelope, &accepted, false);
+    let state_label = match reduction.state {
+        buzz_core::ci_reducer::CiReducedState::Pending => "pending",
+        buzz_core::ci_reducer::CiReducedState::Green => "green",
+        buzz_core::ci_reducer::CiReducedState::Red => "red",
+        buzz_core::ci_reducer::CiReducedState::InfrastructureFailure => "infrastructure_failure",
+    };
+    let mut signer_pubkeys: Vec<&str> = trusted_signers.iter().map(String::as_str).collect();
+    signer_pubkeys.sort_unstable();
+    let provenance_truncated = untrusted_signers.len() > REJECTED_SIGNER_PROVENANCE_LIMIT;
+    let untrusted_status_signer_pubkeys: Vec<&str> = untrusted_signers
+        .iter()
+        .take(REJECTED_SIGNER_PROVENANCE_LIMIT)
+        .map(String::as_str)
+        .collect();
+    let rejected_count = malformed_count
+        .saturating_add(unexpected_request_count)
+        .saturating_add(untrusted_count)
+        .min(STATUS_EVENT_LIMIT);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "authority": {
+            "source": "relay_startup_config",
+            "status_signer_pubkeys": signer_pubkeys,
+        },
+        "rejected": {
+            "count": rejected_count,
+            "malformed_count": malformed_count,
+            "unexpected_request_count": unexpected_request_count,
+            "untrusted_count": untrusted_count,
+            "untrusted_status_signer_pubkeys": untrusted_status_signer_pubkeys,
+            "provenance_truncated": provenance_truncated,
+        },
+        "status": {
+            "run_id": run_id,
+            "state": state_label,
+            "reduction": reduction,
+        },
+    }))
+}
+
+/// Read-only browser status surface using the same pure reducer and response
+/// schema as `buzz ci status`. Signer authority comes only from relay startup
+/// configuration; neither request parameters nor stored relay events can add a
+/// trusted signer.
+pub async fn ci_status(
+    State(state): State<Arc<AppState>>,
+    AxumPath(run_id): AxumPath<uuid::Uuid>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    Query(query): Query<CiStatusQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let tenant = bind_community(&state.db, raw_host).await.map_err(|_| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "relay: no community is configured for this host",
+        )
+    })?;
+    let path_with_query = original_uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| original_uri.path());
+    let expected_url =
+        super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, path_with_query);
+    let (pubkey, event_id_bytes) = super::bridge::verify_bridge_auth(
+        &headers,
+        "GET",
+        &expected_url,
+        None,
+        state.config.require_auth_token,
+    )?;
+    super::bridge::enforce_http_admission(&state, &tenant, &pubkey).await?;
+    super::bridge::check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+    super::relay_members::enforce_relay_membership(
+        &state,
+        tenant.community(),
+        &pubkey.to_bytes(),
+        headers
+            .get("x-auth-tag")
+            .and_then(|value| value.to_str().ok()),
+    )
+    .await?;
+    let is_channel_member = state
+        .db
+        .is_member(tenant.community(), query.channel_id, &pubkey.to_bytes())
+        .await
+        .map_err(|error| internal_error(&format!("check CI status membership: {error}")))?;
+    if !is_channel_member {
+        return Err(api_error(StatusCode::NOT_FOUND, "CI run not found"));
+    }
+
+    let trusted_signers = &state.config.ci_status_signer_pubkeys;
+    if trusted_signers.is_empty() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI status signer authority is unavailable",
+        ));
+    }
+    let initial = state
+        .db
+        .get_ci_run_request(tenant.community(), query.channel_id, run_id)
+        .await
+        .map_err(|error| internal_error(&format!("load CI request: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "CI run not found"))?;
+    let stored_events = state
+        .db
+        .list_ci_run_events(
+            tenant.community(),
+            query.channel_id,
+            run_id,
+            0,
+            STATUS_EVENT_LIMIT,
+        )
+        .await
+        .map_err(|error| internal_error(&format!("list CI status events: {error}")))?;
+    if stored_events.len() == STATUS_EVENT_LIMIT as usize {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI status event bound exceeded",
+        ));
+    }
+
+    let response = reduce_ci_status_events(
+        run_id,
+        query.channel_id,
+        trusted_signers,
+        &initial.stored_event.event,
+        stored_events
+            .into_iter()
+            .map(|stored| (stored.watch_cursor, stored.stored_event.event))
+            .collect(),
+    )
+    .map_err(|message| api_error(StatusCode::CONFLICT, message))?;
+    Ok(Json(response))
+}
 
 /// Standard error envelope.
 fn api_error(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
@@ -2932,6 +3162,262 @@ jobs:
             git_rev_parse_commit(&bare, &format!("{ghost}^{{commit}}"), deadline)
                 .await
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn browser_status_uses_sorted_startup_signer_provenance_and_native_shape() {
+        use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
+        use nostr::{Keys, Kind};
+
+        let channel_id = uuid::Uuid::parse_str(TEST_CHANNEL).expect("channel UUID");
+        let run_id =
+            uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").expect("run UUID");
+        let actor = Keys::generate();
+        let request = CiRequestEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_type: CiRequestType::Run,
+            target_repo_a: format!("30617:{}:buzz", "1".repeat(64)),
+            pr_root_event_id: "2".repeat(64),
+            pr_update_event_id: None,
+            source_clone_url: "https://relay.example/git/repo".to_owned(),
+            immutable_source_ref: "refs/nostr/source".to_owned(),
+            tip_oid: "3".repeat(40),
+            source_branch: "feature".to_owned(),
+            base_ref: "refs/heads/main".to_owned(),
+            base_oid: "4".repeat(40),
+            workflow_id: "ci".to_owned(),
+            workflow_digest: "5".repeat(64),
+            job_ids: vec!["test".to_owned()],
+            run_id: run_id.to_string(),
+            attempt: 1,
+            parent_attempt: None,
+            parent_run_id: None,
+            trigger_event_id: "2".repeat(64),
+            actor: actor.public_key().to_hex(),
+            timeout_seconds: 300,
+            idempotency_key: "status-test".to_owned(),
+            issued_at: 10,
+            expires_at: 20,
+        };
+        let event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CI_REQUEST as u16),
+            serde_json::to_string(&request).expect("serialize request"),
+        )
+        .tags(request_tags(TEST_CHANNEL, &request).expect("request tags"))
+        .sign_with_keys(&actor)
+        .expect("sign request");
+        let trusted = std::collections::HashSet::from(["b".repeat(64), "a".repeat(64)]);
+
+        let response = reduce_ci_status_events(
+            run_id,
+            channel_id,
+            &trusted,
+            &event,
+            vec![(1, event.clone())],
+        )
+        .expect("reduce pending status");
+
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["authority"]["source"], "relay_startup_config");
+        assert_eq!(
+            response["authority"]["status_signer_pubkeys"],
+            serde_json::json!(["a".repeat(64), "b".repeat(64)])
+        );
+        assert_eq!(response["status"]["run_id"], run_id.to_string());
+        assert_eq!(response["status"]["state"], "pending");
+        assert_eq!(response["status"]["reduction"]["jobs_total"], 1);
+        assert_eq!(
+            response["rejected"],
+            serde_json::json!({
+                "count": 0,
+                "malformed_count": 0,
+                "unexpected_request_count": 0,
+                "untrusted_count": 0,
+                "untrusted_status_signer_pubkeys": [],
+                "provenance_truncated": false,
+            })
+        );
+    }
+
+    #[test]
+    fn browser_status_isolates_untrusted_malformed_and_unexpected_linked_events() {
+        use buzz_core::ci::{
+            request_tags, run_status_tags, CiRequestEnvelope, CiRequestType, CiRunState,
+            CiRunStatusEnvelope, CI_SCHEMA_VERSION,
+        };
+        use nostr::{Keys, Kind};
+
+        let channel_id = uuid::Uuid::parse_str(TEST_CHANNEL).expect("channel UUID");
+        let run_id =
+            uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").expect("run UUID");
+        let actor = Keys::generate();
+        let request = CiRequestEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_type: CiRequestType::Run,
+            target_repo_a: format!("30617:{}:buzz", "1".repeat(64)),
+            pr_root_event_id: "2".repeat(64),
+            pr_update_event_id: None,
+            source_clone_url: "https://relay.example/git/repo".to_owned(),
+            immutable_source_ref: "refs/nostr/source".to_owned(),
+            tip_oid: "3".repeat(40),
+            source_branch: "feature".to_owned(),
+            base_ref: "refs/heads/main".to_owned(),
+            base_oid: "4".repeat(40),
+            workflow_id: "ci".to_owned(),
+            workflow_digest: "5".repeat(64),
+            job_ids: vec!["test".to_owned()],
+            run_id: run_id.to_string(),
+            attempt: 1,
+            parent_attempt: None,
+            parent_run_id: None,
+            trigger_event_id: "2".repeat(64),
+            actor: actor.public_key().to_hex(),
+            timeout_seconds: 300,
+            idempotency_key: "status-isolation".to_owned(),
+            issued_at: 10,
+            expires_at: 20,
+        };
+        let request_event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CI_REQUEST as u16),
+            serde_json::to_string(&request).expect("serialize request"),
+        )
+        .tags(request_tags(TEST_CHANNEL, &request).expect("request tags"))
+        .sign_with_keys(&actor)
+        .expect("sign request");
+
+        let untrusted = Keys::generate();
+        let status = CiRunStatusEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_event_id: request_event.id.to_hex(),
+            run_id: run_id.to_string(),
+            workflow_id: request.workflow_id.clone(),
+            target_repo_a: request.target_repo_a.clone(),
+            tip_oid: request.tip_oid.clone(),
+            base_oid: request.base_oid.clone(),
+            attempt: 1,
+            sequence: 1,
+            state: CiRunState::Success,
+            conclusion: Some("success".to_owned()),
+            reason: None,
+            started_at: Some(11),
+            finished_at: Some(12),
+            job_ids: request.job_ids.clone(),
+            relay_signer: untrusted.public_key().to_hex(),
+        };
+        let untrusted_event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CI_RUN_STATUS as u16),
+            serde_json::to_string(&status).expect("serialize run status"),
+        )
+        .tags(run_status_tags(TEST_CHANNEL, &status).expect("run status tags"))
+        .sign_with_keys(&untrusted)
+        .expect("sign run status");
+        let malformed_event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CI_RUN_STATUS as u16),
+            "{}",
+        )
+        .sign_with_keys(&untrusted)
+        .expect("sign malformed status");
+
+        let other_actor = Keys::generate();
+        let mut other_request = request.clone();
+        other_request.actor = other_actor.public_key().to_hex();
+        other_request.idempotency_key = "unexpected-request".to_owned();
+        let other_request_event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CI_REQUEST as u16),
+            serde_json::to_string(&other_request).expect("serialize second request"),
+        )
+        .tags(request_tags(TEST_CHANNEL, &other_request).expect("second request tags"))
+        .sign_with_keys(&other_actor)
+        .expect("sign second request");
+
+        let trusted_key = Keys::generate();
+        let trusted = std::collections::HashSet::from([trusted_key.public_key().to_hex()]);
+        let response = reduce_ci_status_events(
+            run_id,
+            channel_id,
+            &trusted,
+            &request_event,
+            vec![
+                (1, request_event.clone()),
+                (2, untrusted_event),
+                (3, malformed_event),
+                (4, other_request_event),
+            ],
+        )
+        .expect("isolate non-authoritative linked events");
+
+        assert_eq!(response["status"]["state"], "pending");
+        assert_eq!(response["rejected"]["count"], 3);
+        assert_eq!(response["rejected"]["malformed_count"], 1);
+        assert_eq!(response["rejected"]["unexpected_request_count"], 1);
+        assert_eq!(response["rejected"]["untrusted_count"], 1);
+        assert_eq!(
+            response["rejected"]["untrusted_status_signer_pubkeys"],
+            serde_json::json!([untrusted.public_key().to_hex()])
+        );
+    }
+
+    #[test]
+    fn browser_status_rejects_structurally_ambiguous_trusted_signed_event() {
+        use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
+        use nostr::{Keys, Kind};
+
+        let channel_id = uuid::Uuid::parse_str(TEST_CHANNEL).expect("channel UUID");
+        let run_id =
+            uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").expect("run UUID");
+        let actor = Keys::generate();
+        let request = CiRequestEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_type: CiRequestType::Run,
+            target_repo_a: format!("30617:{}:buzz", "1".repeat(64)),
+            pr_root_event_id: "2".repeat(64),
+            pr_update_event_id: None,
+            source_clone_url: "https://relay.example/git/repo".to_owned(),
+            immutable_source_ref: "refs/nostr/source".to_owned(),
+            tip_oid: "3".repeat(40),
+            source_branch: "feature".to_owned(),
+            base_ref: "refs/heads/main".to_owned(),
+            base_oid: "4".repeat(40),
+            workflow_id: "ci".to_owned(),
+            workflow_digest: "5".repeat(64),
+            job_ids: vec!["test".to_owned()],
+            run_id: run_id.to_string(),
+            attempt: 1,
+            parent_attempt: None,
+            parent_run_id: None,
+            trigger_event_id: "2".repeat(64),
+            actor: actor.public_key().to_hex(),
+            timeout_seconds: 300,
+            idempotency_key: "trusted-ambiguity".to_owned(),
+            issued_at: 10,
+            expires_at: 20,
+        };
+        let request_event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CI_REQUEST as u16),
+            serde_json::to_string(&request).expect("serialize request"),
+        )
+        .tags(request_tags(TEST_CHANNEL, &request).expect("request tags"))
+        .sign_with_keys(&actor)
+        .expect("sign request");
+        let trusted_key = Keys::generate();
+        let malformed_trusted_event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CI_RUN_STATUS as u16),
+            "{}",
+        )
+        .sign_with_keys(&trusted_key)
+        .expect("sign malformed trusted status");
+        let trusted = std::collections::HashSet::from([trusted_key.public_key().to_hex()]);
+
+        assert_eq!(
+            reduce_ci_status_events(
+                run_id,
+                channel_id,
+                &trusted,
+                &request_event,
+                vec![(1, request_event.clone()), (2, malformed_trusted_event)],
+            ),
+            Err("trusted signed CI event is structurally ambiguous")
         );
     }
 }

@@ -1,5 +1,6 @@
 import { assertNoIdentityKeyEgress } from "@/shared/lib/keyBackupEgress";
 
+import { normalizeBrowserRelayUrl } from "./originPolicy";
 import { register, type InvokeBody } from "./registry";
 
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -89,14 +90,21 @@ function terminateRemote(
   connection.handler(message);
 }
 
-async function connect(body: InvokeBody): Promise<number> {
+async function connect(
+  body: InvokeBody,
+  pageUrl?: string | URL,
+): Promise<number> {
   const payload = commandBody(body, "plugin:websocket|connect");
   if (typeof payload.url !== "string" || payload.url.length === 0) {
     throw new TypeError("plugin:websocket|connect requires a url");
   }
   assertNoIdentityKeyEgress(payload.url, "websocket URL");
+  const normalizedUrl = normalizeBrowserRelayUrl(
+    payload.url,
+    pageUrl ? new URL(pageUrl) : undefined,
+  );
   const handler = resolveHandler(payload.onMessage);
-  const socket = new WebSocket(payload.url);
+  const socket = new WebSocket(normalizedUrl);
   socket.binaryType = "arraybuffer";
 
   return new Promise<number>((resolve, reject) => {
@@ -288,8 +296,8 @@ function disconnectAll(): void {
   connections.clear();
 }
 
-export function registerWebSocketCommands(): void {
-  register("plugin:websocket|connect", connect);
+export function registerWebSocketCommands(pageUrl?: string | URL): void {
+  register("plugin:websocket|connect", (body) => connect(body, pageUrl));
   register("plugin:websocket|send", send);
   register("plugin:websocket|disconnect", disconnect);
   register("plugin:websocket|disconnect_all", disconnectAll);

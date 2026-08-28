@@ -710,6 +710,7 @@ test("send_channel_message resolves NIP-10 roots, signs, publishes, and returns 
       root_event_id: rootId,
       depth: 2,
       created_at: 100,
+      delivery_status: "delivered",
     },
   );
   assert.equal(published.kind, 9);
@@ -724,6 +725,42 @@ test("send_channel_message resolves NIP-10 roots, signs, publishes, and returns 
     ["emoji", "wave", "https://example.test/wave.png"],
     ["link-preview", "none"],
   ]);
+});
+
+test("send_channel_message returns an explicit queued delivery status", async () => {
+  const client = {
+    async fetchFirstEvent() {
+      return null;
+    },
+    async fetchEvents() {
+      return [];
+    },
+    async publishEvent() {
+      throw new Error("queued sends must not report a relay publish");
+    },
+  };
+  const offlinePublisher = {
+    async publishOrQueue(signed) {
+      return { event: signed, deliveryStatus: "queued" };
+    },
+    async flush() {},
+  };
+  registerRelayQueryCommands(identity, client, offlinePublisher);
+
+  assert.deepEqual(
+    await dispatch("send_channel_message", {
+      channelId: "11111111-1111-4111-8111-111111111111",
+      content: "queued",
+    }),
+    {
+      event_id: "signed-event",
+      parent_event_id: null,
+      root_event_id: null,
+      depth: 0,
+      created_at: 100,
+      delivery_status: "queued",
+    },
+  );
 });
 
 test("search_messages forwards prefix search and maps raw relay events", async () => {

@@ -103,8 +103,8 @@ type RawSendChannelMessageResult = {
   root_event_id: string | null;
   depth: number;
   created_at: number;
+  delivery_status?: "delivered" | "queued";
 };
-
 type RawRelayAgent = {
   pubkey: string;
   name: string;
@@ -565,13 +565,13 @@ export async function sendChannelMessage(
       kind: kind ?? null,
     },
   );
-
   return {
     eventId: response.event_id,
     parentEventId: response.parent_event_id,
     rootEventId: response.root_event_id,
     depth: response.depth,
     createdAt: response.created_at,
+    deliveryStatus: response.delivery_status ?? "delivered",
   };
 }
 

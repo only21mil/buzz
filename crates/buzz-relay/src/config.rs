@@ -346,6 +346,9 @@ pub struct Config {
     /// When set, the relay serves the invite landing page and its static assets.
     /// When unset, no static file serving happens (relay behaves as before).
     pub web_dir: Option<std::path::PathBuf>,
+    /// Optional path to the full hosted client bundle served below `/app/`.
+    /// This surface remains same-origin with the relay by construction.
+    pub app_web_dir: Option<std::path::PathBuf>,
     /// Whether the configured web bundle serves Git browser routes in addition
     /// to the public invite landing page. Defaults to false.
     pub serve_git_web_gui: bool,
@@ -1149,6 +1152,11 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from);
+        let app_web_dir = std::env::var("BUZZ_APP_WEB_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
         let serve_git_web_gui = std::env::var("BUZZ_SERVE_GIT_WEB_GUI")
             .map(|value| value == "true" || value == "1")
             .unwrap_or(false);
@@ -1170,6 +1178,18 @@ impl Config {
                 )));
             }
             tracing::info!("BUZZ_WEB_DIR={} — serving web UI from relay", dir.display());
+        }
+        if let Some(ref dir) = app_web_dir {
+            if !dir.join("index.html").is_file() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "BUZZ_APP_WEB_DIR={} does not contain index.html",
+                    dir.display()
+                )));
+            }
+            tracing::info!(
+                "BUZZ_APP_WEB_DIR={} — serving hosted client at /app/",
+                dir.display()
+            );
         }
 
         // Reject explicitly-configured secrets that are too short.
@@ -1240,6 +1260,7 @@ impl Config {
             join_policy,
             admin,
             web_dir,
+            app_web_dir,
             serve_git_web_gui,
         })
     }
@@ -1356,6 +1377,10 @@ mod tests {
         assert!(
             !config.serve_git_web_gui,
             "serve_git_web_gui should default to false"
+        );
+        assert!(
+            config.app_web_dir.is_none(),
+            "app_web_dir should default to None"
         );
         assert_eq!(
             config.media.s3_addressing_style,

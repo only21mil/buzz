@@ -162,6 +162,7 @@ export async function nip98Fetch(
     method: prepared.method,
     headers,
     body: prepared.body,
+    credentials: "omit",
     signal: request.signal,
   });
 }

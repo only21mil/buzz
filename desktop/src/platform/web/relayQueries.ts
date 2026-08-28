@@ -2,6 +2,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { nip98Fetch } from "./nip98";
+import type { OfflineMessagePublisher } from "./offlineMessageOutbox";
 import { dispatch, register } from "./registry";
 
 export type QueryBridgeClient = {
@@ -875,6 +876,7 @@ async function sendChannelMessage(
   body: unknown,
   identity: BrowserIdentityManager,
   client: RelayQueryClient,
+  offlinePublisher?: OfflineMessagePublisher,
 ) {
   const input = objectBody(body, "send_channel_message");
   const channelId = requiredString(input, "channelId");
@@ -932,12 +934,18 @@ async function sendChannelMessage(
   tags.push(...mediaTags, ...mentionTags);
   if (kind === 9) tags.push(...emojiTags, ...linkPreviewTags);
 
-  const published = await publishSignedEvent(
-    identity,
-    client,
-    { kind, content, tags },
-    "sending the message",
-  );
+  const signed = parseSignedEvent(identity.sign({ kind, content, tags }));
+  const outcome = offlinePublisher
+    ? await offlinePublisher.publishOrQueue(signed)
+    : {
+        event: await client.publishEvent(
+          signed,
+          "Timed out while sending the message.",
+          "Failed while sending the message.",
+        ),
+        deliveryStatus: "delivered" as const,
+      };
+  const published = outcome.event;
   const depth = !parentEventId ? 0 : parentEventId === rootEventId ? 1 : 2;
   return {
     event_id: published.id,
@@ -945,6 +953,7 @@ async function sendChannelMessage(
     root_event_id: rootEventId,
     depth,
     created_at: published.created_at,
+    delivery_status: outcome.deliveryStatus,
   };
 }
 
@@ -990,6 +999,7 @@ async function searchMessages(body: unknown, client: RelayQueryClient) {
 export function registerRelayQueryCommands(
   identity: BrowserIdentityManager,
   client: RelayQueryClient = relayClient,
+  offlinePublisher?: OfflineMessagePublisher,
 ): void {
   register("get_profile", () => getProfile(identity, client));
   register("get_user_profile", (body) =>
@@ -1009,7 +1019,7 @@ export function registerRelayQueryCommands(
   );
   register("get_channel_window", (body) => getChannelWindow(body, client));
   register("send_channel_message", (body) =>
-    sendChannelMessage(body, identity, client),
+    sendChannelMessage(body, identity, client, offlinePublisher),
   );
   register("search_messages", (body) => searchMessages(body, client));
 }

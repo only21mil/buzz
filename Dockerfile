@@ -2,8 +2,9 @@
 #
 # Public Buzz relay image — published as ghcr.io/block/buzz:<tag>.
 #
-# Builds the `buzz-relay` binary (Rust 1.95) and the `buzz-web` static bundle
-# (pnpm + vite), then assembles them into a small debian-slim runtime with
+# Builds the `buzz-relay` binary (Rust 1.95), the public repository/invite UI,
+# the admin UI, and the full hosted client at `/app/`, then assembles them into
+# a small debian-slim runtime with
 # `git` available (the relay shells out to git for repo hydrate / receive-pack
 # / upload-pack — see crates/buzz-relay/src/api/git).
 #
@@ -113,10 +114,13 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY patches/ patches/
 COPY web/package.json web/
 COPY admin-web/package.json admin-web/
-RUN pnpm install --frozen-lockfile --filter buzz-web --filter buzz-admin-web
+COPY desktop/package.json desktop/
+COPY preview-features.json ./
+RUN pnpm install --frozen-lockfile --filter buzz-web --filter buzz-admin-web --filter buzz
 COPY web/ web/
 COPY admin-web/ admin-web/
-RUN pnpm -C web build && pnpm -C admin-web build
+COPY desktop/ desktop/
+RUN pnpm -C web build && pnpm -C admin-web build && pnpm -C desktop build:web
 
 # ─── Stage 5: shared runtime ────────────────────────────────────────────────
 FROM debian:${DEBIAN_VERSION}-slim AS runtime-base
@@ -144,12 +148,14 @@ RUN apt-get update \
 
 COPY --from=web-builder /build/web/dist                 /srv/buzz/web
 COPY --from=web-builder /build/admin-web/dist           /srv/buzz/admin-web
+COPY --from=web-builder /build/desktop/dist              /srv/buzz/app
 
 # The invite landing page is always served from the bundled web UI. Repository
 # browser routes require the separate BUZZ_SERVE_GIT_WEB_GUI=true opt-in. The
 # admin bundle is inert until BUZZ_ADMIN_HOST is configured.
 ENV BUZZ_WEB_DIR=/srv/buzz/web \
-    BUZZ_ADMIN_WEB_DIR=/srv/buzz/admin-web
+    BUZZ_ADMIN_WEB_DIR=/srv/buzz/admin-web \
+    BUZZ_APP_WEB_DIR=/srv/buzz/app
 
 # 3000: app (WS + REST)  ·  8080: /_liveness, /_readiness  ·  9102: /metrics
 EXPOSE 3000 8080 9102

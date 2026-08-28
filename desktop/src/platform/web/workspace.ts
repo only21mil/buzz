@@ -1,4 +1,8 @@
 import type { BrowserIdentityManager } from "./identity";
+import {
+  normalizeBrowserRelayUrl,
+  relayHttpUrlFromBrowserRelay,
+} from "./originPolicy";
 import { register, type InvokeBody } from "./registry";
 
 function objectBody(body: InvokeBody): Record<string, unknown> {
@@ -13,9 +17,9 @@ function objectBody(body: InvokeBody): Record<string, unknown> {
   return body;
 }
 
-function defaultRelayUrl(): string {
-  if (typeof window === "undefined") return "ws://localhost:3000";
-  const url = new URL(window.location.href);
+function defaultRelayUrl(pageUrl?: string | URL): string {
+  if (!pageUrl && typeof window === "undefined") return "ws://localhost:3000";
+  const url = new URL(pageUrl ?? window.location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = "/";
   url.search = "";
@@ -23,17 +27,14 @@ function defaultRelayUrl(): string {
   return url.toString().replace(/\/$/, "");
 }
 
-function relayHttpUrl(relayUrl: string): string {
-  const url = new URL(relayUrl);
-  if (url.protocol !== "ws:" && url.protocol !== "wss:") {
-    throw new Error("Relay URL must use ws:// or wss://");
-  }
-  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  return url.toString().replace(/\/$/, "");
-}
-
 export class BrowserWorkspace {
-  private relayUrl = defaultRelayUrl();
+  private readonly pageUrl?: URL;
+  private relayUrl: string;
+
+  constructor(pageUrl?: string | URL) {
+    this.pageUrl = pageUrl ? new URL(pageUrl) : undefined;
+    this.relayUrl = defaultRelayUrl(this.pageUrl);
+  }
 
   apply(body: InvokeBody): void {
     const record = objectBody(body);
@@ -46,9 +47,13 @@ export class BrowserWorkspace {
         "Browser workspaces do not support a local repositories directory",
       );
     }
-    // Parse and validate before publishing the new active context.
-    relayHttpUrl(record.relayUrl);
-    this.relayUrl = record.relayUrl.trim().replace(/\/$/, "");
+    // Parse and validate before publishing the new active context. The hosted
+    // renderer has no cross-community browser capability, so fail closed on
+    // cross-origin, credential-bearing, or path-scoped relay URLs.
+    this.relayUrl = normalizeBrowserRelayUrl(
+      record.relayUrl.trim(),
+      this.pageUrl,
+    );
   }
 
   wsUrl(): string {
@@ -56,7 +61,7 @@ export class BrowserWorkspace {
   }
 
   httpUrl(): string {
-    return relayHttpUrl(this.relayUrl);
+    return relayHttpUrlFromBrowserRelay(this.relayUrl);
   }
 }
 
@@ -64,7 +69,7 @@ export function registerWorkspaceCommands(
   workspace: BrowserWorkspace,
   identity: BrowserIdentityManager,
 ): void {
-  register("get_default_relay_url", () => defaultRelayUrl());
+  register("get_default_relay_url", () => workspace.wsUrl());
   register("auto_connect_default_relay_enabled", () => false);
   register("get_relay_ws_url", () => workspace.wsUrl());
   register("get_relay_http_url", () => workspace.httpUrl());

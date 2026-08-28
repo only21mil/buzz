@@ -3,8 +3,8 @@ target/
 **/target/
 desktop/src-tauri/target/
 
-# Native non-relay UI builds (not part of the public image)
-desktop/
+# Native/mobile build outputs are not part of the public image. The desktop
+# source tree is included because its Vite web mode now produces `/app/`.
 mobile/
 
 # Node artifacts (built inside the image; host outputs would invalidate cache)

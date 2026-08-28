@@ -197,16 +197,16 @@ export type RelayEvent = {
   content: string;
   sig: string;
   pending?: boolean;
+  deliveryStatus?: "queued" | "failed" | "expired";
 };
-
 export type SendChannelMessageResult = {
   eventId: string;
   parentEventId: string | null;
   rootEventId: string | null;
   depth: number;
   createdAt: number;
+  deliveryStatus?: "delivered" | "queued";
 };
-
 export type FeedItemCategory =
   | "mention"
   | "needs_action"
