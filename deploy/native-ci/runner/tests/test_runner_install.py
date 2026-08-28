@@ -87,8 +87,8 @@ class RunnerInstallTests(unittest.TestCase):
             self.runner_gid,
         )
 
-    def make_root(self) -> Path:
-        root = self.base / "root"
+    def make_root(self, name: str = "root") -> Path:
+        root = self.base / name
         root.mkdir(mode=0o700)
         for relative in (
             "etc/systemd/system",
@@ -112,6 +112,54 @@ class RunnerInstallTests(unittest.TestCase):
         (root / "etc/passwd").chmod(0o644)
         (root / "etc/group").chmod(0o644)
         return root
+
+    def target_receipt_snapshot(self, root: Path, transaction: Path) -> dict[str, object]:
+        targets: dict[str, tuple[bytes, int, int, int]] = {}
+        for target in INSTALLER.EXPECTED_TARGETS.values():
+            path = INSTALLER.rooted(root, target)
+            if path.exists():
+                payload, metadata = INSTALLER.read_fd(path)
+                targets[target] = (
+                    payload,
+                    stat.S_IMODE(metadata.st_mode),
+                    metadata.st_uid,
+                    metadata.st_gid,
+                )
+        receipt, receipt_meta = INSTALLER.read_fd(transaction / "receipt.json")
+        directories = {
+            directory: (
+                stat.S_IMODE(INSTALLER.rooted(root, directory).lstat().st_mode),
+                tuple(sorted(path.name for path in INSTALLER.rooted(root, directory).iterdir())),
+            )
+            for directory in INSTALLER.EXPECTED_DIRECTORIES
+            if INSTALLER.rooted(root, directory).exists()
+        }
+        return {
+            "targets": targets,
+            "receipt": (
+                receipt,
+                stat.S_IMODE(receipt_meta.st_mode),
+                receipt_meta.st_uid,
+                receipt_meta.st_gid,
+            ),
+            "directories": directories,
+        }
+
+    def install_with_prior_tmpfiles(self, root_name: str) -> tuple[Path, dict[str, object], Path, dict[str, object]]:
+        root = self.make_root(root_name)
+        tmpfiles = root / "usr/lib/tmpfiles.d/buzzci-runner.conf"
+        tmpfiles.write_bytes(b"prior tmpfiles payload\n")
+        tmpfiles.chmod(0o644)
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        transaction = INSTALLER.backup_root_path(root, INSTALLER.DEFAULT_BACKUP_ROOT) / str(installed["backup_id"])
+        receipt = json.loads((transaction / "receipt.json").read_text())
+        record = next(
+            item
+            for item in receipt["inventory"]
+            if item["target"] == "/usr/lib/tmpfiles.d/buzzci-runner.conf"
+        )
+        self.assertTrue(record["existed"])
+        return root, installed, transaction, record
 
     def test_config_renderer_is_canonical_closed_and_nofollow(self) -> None:
         output = self.base / "runner-v1.json"
@@ -218,6 +266,80 @@ class RunnerInstallTests(unittest.TestCase):
                 INSTALLER.DEFAULT_BACKUP_ROOT,
                 str(installed["backup_id"]),
             )
+
+    def test_late_corrupt_backup_refuses_before_any_rollback_mutation(self) -> None:
+        self.freeze()
+        root, installed, transaction, record = self.install_with_prior_tmpfiles("root-corrupt")
+        before = self.target_receipt_snapshot(root, transaction)
+        backup = transaction / str(record["backup"])
+        backup.write_bytes(b"corrupt late backup\n")
+        backup.chmod(0o600)
+
+        with self.assertRaisesRegex(ValueError, "backup file digest drift"):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            )
+
+        self.assertEqual(self.target_receipt_snapshot(root, transaction), before)
+        self.assertEqual(json.loads((transaction / "receipt.json").read_text())["state"], "installed")
+
+    def test_backup_preflight_blocks_missing_wrong_mode_and_symlink_without_mutation(self) -> None:
+        self.freeze()
+        cases = ("missing", "mode", "symlink")
+        for case in cases:
+            with self.subTest(case=case):
+                root, installed, transaction, record = self.install_with_prior_tmpfiles(f"root-{case}")
+                before = self.target_receipt_snapshot(root, transaction)
+                backup = transaction / str(record["backup"])
+                if case == "missing":
+                    backup.unlink()
+                elif case == "mode":
+                    backup.chmod(0o644)
+                else:
+                    original = backup.with_name(f"{backup.name}.original")
+                    backup.rename(original)
+                    backup.symlink_to(original)
+
+                with self.assertRaises((OSError, ValueError)):
+                    INSTALLER.rollback(
+                        self.package,
+                        root,
+                        INSTALLER.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    )
+
+                self.assertEqual(self.target_receipt_snapshot(root, transaction), before)
+                self.assertEqual(json.loads((transaction / "receipt.json").read_text())["state"], "installed")
+
+    def test_directory_removal_preflight_blocks_content_and_metadata_drift_without_mutation(self) -> None:
+        self.freeze()
+        for case in ("content", "mode"):
+            with self.subTest(case=case):
+                root = self.make_root(f"root-directory-{case}")
+                installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                transaction = INSTALLER.backup_root_path(root, INSTALLER.DEFAULT_BACKUP_ROOT) / str(installed["backup_id"])
+                directory = root / "usr/share/doc/buzz-ci-runner"
+                if case == "content":
+                    blocker = directory / "operator-note"
+                    blocker.write_text("keep\n")
+                    blocker.chmod(0o600)
+                else:
+                    directory.chmod(0o700)
+                before = self.target_receipt_snapshot(root, transaction)
+
+                with self.assertRaisesRegex(ValueError, "rollback directory"):
+                    INSTALLER.rollback(
+                        self.package,
+                        root,
+                        INSTALLER.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    )
+
+                self.assertEqual(self.target_receipt_snapshot(root, transaction), before)
+                self.assertEqual(json.loads((transaction / "receipt.json").read_text())["state"], "installed")
 
     def test_templates_keep_runner_and_control_resources_separate(self) -> None:
         service = (RUNNER_DIR / "templates/buzz-ci-runner.service").read_text()

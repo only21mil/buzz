@@ -566,7 +566,7 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
         or any(directory not in EXPECTED_DIRECTORIES for directory in created_directories)
     ):
         raise ValueError("backup receipt inventory is invalid")
-    for target, record in zip(changed_targets, inventory, strict=True):
+    for index, (target, record) in enumerate(zip(changed_targets, inventory, strict=True)):
         if not isinstance(record, dict) or record.get("target") != target or not isinstance(record.get("existed"), bool):
             raise ValueError("backup receipt entry is invalid")
         expected_record_keys = {"target", "existed"}
@@ -575,7 +575,7 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
             if (
                 set(record) != expected_record_keys
                 or not isinstance(record["backup"], str)
-                or not re.fullmatch(r"files/[0-9]+", record["backup"])
+                or record["backup"] != f"files/{index}"
                 or isinstance(record["mode"], bool)
                 or not isinstance(record["mode"], int)
                 or not 0 <= record["mode"] <= 0o777
@@ -591,32 +591,70 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
                 raise ValueError("backup receipt prior-state binding is invalid")
         elif set(record) != expected_record_keys:
             raise ValueError("backup receipt new-target binding is invalid")
-    for target in changed_targets:
-        entry = by_target[str(target)]
+
+    if any(record["existed"] for record in inventory):
+        require_directory(
+            transaction / "files",
+            mapped_id(0, root),
+            mapped_id(0, root, group=True),
+            0o700,
+        )
+
+    rollback_plan: list[tuple[dict[str, object], Path, bytes | None]] = []
+    for target, record in zip(changed_targets, inventory, strict=True):
+        entry = by_target[target]
         state = target_state(root, entry)
         uid, gid, install_mode = desired_metadata(root, entry)
         if state is None or (state["sha256"], state["mode"], state["uid"], state["gid"]) != (entry.sha256, install_mode, uid, gid):
             raise ValueError(f"installed target drift blocks rollback: {target}")
-    result = {"status": "rollback_dry_run" if dry_run else "rolled_back", "package_id": manifest["package_id"], "backup_id": backup_id, "restored_targets": receipt["changed_targets"]}
-    if dry_run:
-        return result
-    for record in reversed(inventory):
-        target = rooted(root, str(record["target"]))
+        prior_payload: bytes | None = None
         if record["existed"]:
-            payload, backup_meta = read_fd(transaction / str(record["backup"]))
+            prior_payload, backup_meta = read_fd(transaction / str(record["backup"]))
             if (
                 backup_meta.st_uid != mapped_id(0, root)
                 or backup_meta.st_gid != mapped_id(0, root, group=True)
                 or stat.S_IMODE(backup_meta.st_mode) != 0o600
             ):
                 raise ValueError("backup file mode drift")
-            if sha256(payload) != record["sha256"]:
+            if sha256(prior_payload) != record["sha256"]:
                 raise ValueError("backup file digest drift")
-            atomic_write(target, payload, int(record["mode"]), int(record["uid"]), int(record["gid"]))
+        rollback_plan.append((record, rooted(root, target), prior_payload))
+
+    removal_plan: list[Path] = []
+    for directory in created_directories:
+        path = rooted(root, directory)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            directory_meta = os.fstat(fd)
+            if (
+                not stat.S_ISDIR(directory_meta.st_mode)
+                or directory_meta.st_uid != mapped_id(0, root)
+                or directory_meta.st_gid != mapped_id(0, root, group=True)
+                or stat.S_IMODE(directory_meta.st_mode) != 0o755
+            ):
+                raise ValueError(f"rollback directory metadata drift: {directory}")
+            present = set(os.listdir(fd))
+        finally:
+            os.close(fd)
+        removable = {
+            step_target.name
+            for record, step_target, _prior_payload in rollback_plan
+            if not record["existed"] and step_target.parent == path
+        }
+        if present != removable:
+            raise ValueError(f"rollback directory removal is blocked: {directory}")
+        removal_plan.append(path)
+
+    result = {"status": "rollback_dry_run" if dry_run else "rolled_back", "package_id": manifest["package_id"], "backup_id": backup_id, "restored_targets": receipt["changed_targets"]}
+    if dry_run:
+        return result
+    for record, target, prior_payload in reversed(rollback_plan):
+        if prior_payload is not None:
+            atomic_write(target, prior_payload, int(record["mode"]), int(record["uid"]), int(record["gid"]))
         else:
             target.unlink()
-    for directory in reversed(created_directories):
-        rooted(root, str(directory)).rmdir()
+    for directory in reversed(removal_plan):
+        directory.rmdir()
     receipt["state"] = "rolled_back"
     atomic_write(transaction / "receipt.json", canonical_json(receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
     return result
