@@ -22,7 +22,10 @@ pub const MAX_SCENARIO_BYTES: usize = 128 * 1024;
 const MAX_DRIVER_OUTPUT_BYTES: usize = 1024 * 1024;
 const SCENARIO_VERSION: &str = "buzz-ci-capacity-one-scenario/v1";
 pub const DRIVER_VERSION: &str = "buzz-ci-capacity-one-driver/v1";
-const RECEIPT_VERSION: &str = "buzz-ci-capacity-one-acceptance-receipt/v1";
+const RECEIPT_VERSION: &str = "buzz-ci-capacity-one-acceptance-receipt/v2";
+pub const ZERO_REQUEST_VERSION: &str = "buzz-ci-capacity-one-zero-request/v1";
+pub const ZERO_PROOF_VERSION: &str = "buzz-ci-capacity-one-zero-proof/v1";
+pub const ZERO_TRANSITION_VERSION: &str = "buzz-ci-capacity-one-zero-transition/v1";
 
 /// One executable endpoint. The harness never invokes a shell.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -255,6 +258,100 @@ pub struct DriverResponse {
     pub export: Option<ExportSnapshot>,
 }
 
+/// Root-only compensating request. It never uses the controld adapter socket.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroRequest {
+    pub schema_version: String,
+    pub scenario_sha256: String,
+    pub activation_id: String,
+    pub activation_package_digest: String,
+    pub integrated_candidate_sha: String,
+    pub run_id: String,
+    pub failed_stage: Stage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_controller_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_runner_generation: Option<u64>,
+}
+
+/// Independent root readback after the controld acceptance socket is stopped.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroProof {
+    pub schema_version: String,
+    pub scenario_sha256: String,
+    pub activation_id: String,
+    pub activation_package_digest: String,
+    pub integrated_candidate_sha: String,
+    pub capacity: u32,
+    pub admission: AdmissionState,
+    pub controller_generation: u64,
+    pub runner_generation: u64,
+    pub controld_service_active: bool,
+    pub controld_acceptance_socket_active: bool,
+    pub controld_acceptance_socket_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroOperation {
+    FinalizeCapacityZero,
+    ProveCapacityZero,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroPhaseRequest {
+    pub sequence: u32,
+    pub operation: ZeroOperation,
+    pub operation_id: String,
+    pub scenario_sha256: String,
+    pub activation_id: String,
+    pub activation_package_digest: String,
+    pub integrated_candidate_sha: String,
+    pub failed_stage: Stage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_controller_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_runner_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroPhaseResponse {
+    pub operation_id: String,
+    pub controller_receipt_sha256: String,
+    pub proof: ZeroProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroPhaseReceipt {
+    pub sequence: u32,
+    pub operation: ZeroOperation,
+    pub outcome: Outcome,
+    pub attempts: u32,
+    pub request_sha256: String,
+    pub response_sha256: String,
+    pub request: ZeroPhaseRequest,
+    pub response: ZeroPhaseResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroTransition {
+    pub schema_version: String,
+    pub outcome: Outcome,
+    pub attempts: u32,
+    pub phases: Vec<ZeroPhaseReceipt>,
+    pub zero_proof: ZeroProof,
+}
+
 /// Stable acceptance check names recorded in order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -271,7 +368,7 @@ pub enum Stage {
     TombstoneFolding,
     ControllerRestartRecovery,
     RunnerRestartRecovery,
-    ReturnCapacityZero,
+    PrepareCapacityZero,
 }
 
 /// Pass or fail result for the whole receipt.
@@ -290,6 +387,9 @@ pub struct StageReceipt {
     pub stage: Stage,
     pub outcome: Outcome,
     pub evidence_sha256: String,
+    pub snapshot: SystemSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<ExportSnapshot>,
 }
 
 /// Stable failure detail without raw driver output.
@@ -311,6 +411,8 @@ pub struct AcceptanceReceipt {
     pub integrated_candidate_sha: String,
     pub run_id: String,
     pub checks: Vec<StageReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_transition: Option<ZeroTransition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureReceipt>,
 }
@@ -379,6 +481,9 @@ pub trait AcceptanceDriver {
 
     /// Perform exactly one requested operation and return its observation.
     fn execute(&mut self, request: &DriverRequest<'_>) -> Result<DriverResponse, Self::Error>;
+
+    /// Finalize capacity zero and return an independent root readback.
+    fn return_to_zero(&mut self, request: &ZeroRequest) -> Result<ZeroTransition, Self::Error>;
 }
 
 /// Parse and validate one complete scenario without invoking a driver.
@@ -407,6 +512,7 @@ pub fn run_acceptance<D: AcceptanceDriver>(
                 integrated_candidate_sha: scenario.fixture.integrated_candidate_sha.clone(),
                 run_id: scenario.fixture.run_id.clone(),
                 checks: Vec::new(),
+                zero_transition: None,
                 failure: Some(FailureReceipt {
                     stage: Stage::CapacityZeroClosed,
                     code: "integrity_mismatch".to_owned(),
@@ -422,15 +528,21 @@ pub fn run_acceptance<D: AcceptanceDriver>(
         integrated_candidate_sha: scenario.fixture.integrated_candidate_sha.clone(),
         run_id: scenario.fixture.run_id.clone(),
         checks: Vec::new(),
+        zero_transition: None,
         failure: None,
     };
 
-    if let Err((stage, error)) = run_sequence(
+    let result = run_sequence(
         scenario,
         &receipt.scenario_sha256,
         driver,
         &mut receipt.checks,
-    ) {
+    );
+    let failed_stage = result
+        .as_ref()
+        .err()
+        .map_or(Stage::PrepareCapacityZero, |v| v.0);
+    if let Err((stage, error)) = result {
         receipt.outcome = Outcome::Fail;
         receipt.failure = Some(FailureReceipt {
             stage,
@@ -438,7 +550,244 @@ pub fn run_acceptance<D: AcceptanceDriver>(
             message: error.to_string(),
         });
     }
+    if failed_stage != Stage::CapacityZeroClosed {
+        let last = receipt.checks.last();
+        let last_trusted = receipt
+            .checks
+            .iter()
+            .rev()
+            .find(|check| check.outcome == Outcome::Pass);
+        let zero_request = ZeroRequest {
+            schema_version: ZERO_REQUEST_VERSION.to_owned(),
+            scenario_sha256: receipt.scenario_sha256.clone(),
+            activation_id: scenario.fixture.activation_id.clone(),
+            activation_package_digest: scenario.fixture.activation_package_digest.clone(),
+            integrated_candidate_sha: scenario.fixture.integrated_candidate_sha.clone(),
+            run_id: scenario.fixture.run_id.clone(),
+            failed_stage,
+            final_response_sha256: (receipt.outcome == Outcome::Pass)
+                .then(|| last.map(|check| check.evidence_sha256.clone()))
+                .flatten(),
+            expected_controller_generation: (failed_stage != Stage::ControllerRestartRecovery)
+                .then(|| {
+                    last_trusted.map_or(scenario.fixture.controller_generation, |check| {
+                        check.snapshot.controller_generation
+                    })
+                }),
+            expected_runner_generation: (failed_stage != Stage::RunnerRestartRecovery).then(|| {
+                last_trusted.map_or(scenario.fixture.runner_generation, |check| {
+                    check.snapshot.runner_generation
+                })
+            }),
+        };
+        let mut zero_error = None;
+        let mut zero_attempts = 0;
+        for _ in 0..2 {
+            zero_attempts += 1;
+            match driver.return_to_zero(&zero_request) {
+                Ok(mut transition) => match validate_zero_transition(&transition, &zero_request) {
+                    Ok(()) => {
+                        transition.attempts = zero_attempts;
+                        receipt.zero_transition = Some(transition);
+                        zero_error = None;
+                        break;
+                    }
+                    Err(error) => zero_error = Some(error),
+                },
+                Err(error) => zero_error = Some(AcceptanceError::Driver(error.to_string())),
+            }
+        }
+        if let Some(error) = zero_error {
+            receipt.outcome = Outcome::Fail;
+            receipt.failure = Some(FailureReceipt {
+                stage: failed_stage,
+                code: error.code().to_owned(),
+                message: format!("capacity-zero compensation failed: {error}"),
+            });
+        }
+    }
     receipt
+}
+
+fn validate_zero_proof(proof: &ZeroProof, request: &ZeroRequest) -> Result<(), AcceptanceError> {
+    require(
+        proof.schema_version == ZERO_PROOF_VERSION
+            && proof.scenario_sha256 == request.scenario_sha256
+            && proof.activation_id == request.activation_id
+            && proof.activation_package_digest == request.activation_package_digest
+            && proof.integrated_candidate_sha == request.integrated_candidate_sha,
+        "capacity-zero proof binding mismatch",
+    )?;
+    require(
+        proof.capacity == 0 && proof.admission == AdmissionState::Closed,
+        "capacity-zero proof is not closed",
+    )?;
+    require(
+        proof.controller_generation > 0
+            && proof.runner_generation > 0
+            && request
+                .expected_controller_generation
+                .is_none_or(|expected| proof.controller_generation == expected)
+            && request
+                .expected_runner_generation
+                .is_none_or(|expected| proof.runner_generation == expected),
+        "capacity-zero proof generation mismatch",
+    )?;
+    require(
+        !proof.controld_service_active
+            && !proof.controld_acceptance_socket_active
+            && !proof.controld_acceptance_socket_present,
+        "controld acceptance transport remains active",
+    )
+}
+
+fn validate_zero_transition(
+    transition: &ZeroTransition,
+    request: &ZeroRequest,
+) -> Result<(), AcceptanceError> {
+    if transition.schema_version != ZERO_TRANSITION_VERSION
+        || transition.outcome != Outcome::Pass
+        || !(1..=2).contains(&transition.attempts)
+        || transition.phases.len() != 2
+    {
+        return Err(AcceptanceError::IntegrityMismatch("zero transition shape"));
+    }
+    for (index, phase) in transition.phases.iter().enumerate() {
+        let (sequence, operation) = if index == 0 {
+            (14, ZeroOperation::FinalizeCapacityZero)
+        } else {
+            (15, ZeroOperation::ProveCapacityZero)
+        };
+        if phase.sequence != sequence
+            || phase.operation != operation
+            || phase.outcome != Outcome::Pass
+            || !(1..=2).contains(&phase.attempts)
+            || phase.request.sequence != sequence
+            || phase.request.operation != operation
+            || phase.request.operation_id != phase.response.operation_id
+            || phase.request.scenario_sha256 != request.scenario_sha256
+            || phase.request.activation_id != request.activation_id
+            || phase.request.activation_package_digest != request.activation_package_digest
+            || phase.request.integrated_candidate_sha != request.integrated_candidate_sha
+            || phase.request.failed_stage != request.failed_stage
+            || phase.request.final_response_sha256 != request.final_response_sha256
+            || phase.request.expected_controller_generation
+                != request.expected_controller_generation
+            || phase.request.expected_runner_generation != request.expected_runner_generation
+            || digest_json(&phase.request).as_deref() != Some(&phase.request_sha256)
+            || digest_json(&phase.response).as_deref() != Some(&phase.response_sha256)
+        {
+            return Err(AcceptanceError::IntegrityMismatch("zero transition phase"));
+        }
+        require_hex(
+            &phase.response.controller_receipt_sha256,
+            64,
+            "controller zero receipt digest",
+        )?;
+        validate_zero_proof(&phase.response.proof, request)?;
+    }
+    require(
+        transition.zero_proof == transition.phases[1].response.proof,
+        "final zero proof is not the independent prove response",
+    )
+}
+
+/// Reconstruct and validate all evidence required for a passing receipt.
+pub fn validate_receipt(receipt: &AcceptanceReceipt) -> Result<(), AcceptanceError> {
+    if receipt.schema_version != RECEIPT_VERSION
+        || receipt.outcome != Outcome::Pass
+        || receipt.failure.is_some()
+        || receipt.checks.len() != 13
+    {
+        return Err(AcceptanceError::IntegrityMismatch("receipt shape"));
+    }
+    let expected = [
+        Stage::CapacityZeroClosed,
+        Stage::CapacityOneOpen,
+        Stage::ManifestIdentity,
+        Stage::ApprovalGrant,
+        Stage::GrantResume,
+        Stage::FirstAttemptTerminal,
+        Stage::AuthenticatedExport,
+        Stage::RerunSeparation,
+        Stage::CancellationTerminal,
+        Stage::TombstoneFolding,
+        Stage::ControllerRestartRecovery,
+        Stage::RunnerRestartRecovery,
+        Stage::PrepareCapacityZero,
+    ];
+    for (index, check) in receipt.checks.iter().enumerate() {
+        let sequence = u32::try_from(index + 1)
+            .map_err(|_| AcceptanceError::IntegrityMismatch("receipt sequence"))?;
+        if check.sequence != sequence
+            || check.stage != expected[index]
+            || check.outcome != Outcome::Pass
+        {
+            return Err(AcceptanceError::IntegrityMismatch("receipt stage ordering"));
+        }
+        let response = DriverResponse {
+            schema_version: DRIVER_VERSION.to_owned(),
+            sequence,
+            operation: expected_operation_for_stage(check.stage),
+            snapshot: check.snapshot.clone(),
+            export: check.export.clone(),
+        };
+        if digest_json(&response).as_deref() != Some(&check.evidence_sha256) {
+            return Err(AcceptanceError::IntegrityMismatch(
+                "receipt evidence digest",
+            ));
+        }
+    }
+    let transition = receipt
+        .zero_transition
+        .as_ref()
+        .ok_or(AcceptanceError::MissingEvidence("capacity-zero transition"))?;
+    let proof = &transition.zero_proof;
+    if proof.scenario_sha256 != receipt.scenario_sha256
+        || proof.integrated_candidate_sha != receipt.integrated_candidate_sha
+        || proof.capacity != 0
+        || proof.admission != AdmissionState::Closed
+        || proof.controld_service_active
+        || proof.controld_acceptance_socket_active
+        || proof.controld_acceptance_socket_present
+    {
+        return Err(AcceptanceError::IntegrityMismatch("capacity-zero proof"));
+    }
+    let request = ZeroRequest {
+        schema_version: ZERO_REQUEST_VERSION.to_owned(),
+        scenario_sha256: receipt.scenario_sha256.clone(),
+        activation_id: proof.activation_id.clone(),
+        activation_package_digest: proof.activation_package_digest.clone(),
+        integrated_candidate_sha: receipt.integrated_candidate_sha.clone(),
+        run_id: receipt.run_id.clone(),
+        failed_stage: Stage::PrepareCapacityZero,
+        final_response_sha256: receipt
+            .checks
+            .last()
+            .map(|check| check.evidence_sha256.clone()),
+        expected_controller_generation: Some(proof.controller_generation),
+        expected_runner_generation: Some(proof.runner_generation),
+    };
+    validate_zero_transition(transition, &request)?;
+    Ok(())
+}
+
+const fn expected_operation_for_stage(stage: Stage) -> Operation {
+    match stage {
+        Stage::CapacityZeroClosed => Operation::ObserveInitial,
+        Stage::CapacityOneOpen => Operation::SetCapacityOne,
+        Stage::ManifestIdentity => Operation::SubmitManifest,
+        Stage::ApprovalGrant => Operation::ApproveGrant,
+        Stage::GrantResume => Operation::ResumeGrant,
+        Stage::FirstAttemptTerminal => Operation::AwaitFirstTerminal,
+        Stage::AuthenticatedExport => Operation::ExportFirstEvidence,
+        Stage::RerunSeparation => Operation::Rerun,
+        Stage::CancellationTerminal => Operation::CancelRerun,
+        Stage::TombstoneFolding => Operation::TombstoneRerun,
+        Stage::ControllerRestartRecovery => Operation::RestartController,
+        Stage::RunnerRestartRecovery => Operation::RestartRunner,
+        Stage::PrepareCapacityZero => Operation::SetCapacityZero,
+    }
 }
 
 fn run_sequence<D: AcceptanceDriver>(
@@ -625,7 +974,7 @@ fn run_sequence<D: AcceptanceDriver>(
         checks,
         13,
         Operation::SetCapacityZero,
-        Stage::ReturnCapacityZero,
+        Stage::PrepareCapacityZero,
         None,
         Some(&runner_recovered),
         |response| validate_final_zero(&response.snapshot, &runner_recovered),
@@ -679,6 +1028,8 @@ where
             stage,
             outcome: Outcome::Fail,
             evidence_sha256,
+            snapshot: response.snapshot,
+            export: response.export,
         });
         return Err((
             stage,
@@ -692,6 +1043,8 @@ where
                 stage,
                 outcome: Outcome::Pass,
                 evidence_sha256,
+                snapshot: response.snapshot.clone(),
+                export: response.export.clone(),
             });
             Ok(response.snapshot)
         }
@@ -701,6 +1054,8 @@ where
                 stage,
                 outcome: Outcome::Fail,
                 evidence_sha256,
+                snapshot: response.snapshot.clone(),
+                export: response.export.clone(),
             });
             Err((stage, error))
         }
@@ -1638,32 +1993,12 @@ impl CommandAcceptanceDriver {
             | Operation::SetCapacityZero => &self.endpoints.control,
         }
     }
-}
 
-/// Stable subprocess adapter failure. Raw output is never copied into receipts.
-#[derive(Debug, Error)]
-pub enum CommandDriverError {
-    #[error("could not start driver endpoint")]
-    Spawn,
-    #[error("could not write driver request")]
-    RequestWrite,
-    #[error("driver endpoint timed out")]
-    Timeout,
-    #[error("driver endpoint output exceeded the limit")]
-    OutputTooLarge,
-    #[error("driver endpoint exited unsuccessfully")]
-    Unsuccessful,
-    #[error("driver endpoint returned malformed JSON")]
-    MalformedResponse,
-    #[error("could not collect driver endpoint output")]
-    OutputRead,
-}
-
-impl AcceptanceDriver for CommandAcceptanceDriver {
-    type Error = CommandDriverError;
-
-    fn execute(&mut self, request: &DriverRequest<'_>) -> Result<DriverResponse, Self::Error> {
-        let endpoint = self.endpoint(request.operation);
+    fn invoke<I: Serialize, O: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &ProcessEndpoint,
+        request: &I,
+    ) -> Result<O, CommandDriverError> {
         let mut child = Command::new(&endpoint.program)
             .args(&endpoint.args)
             .stdin(Stdio::piped())
@@ -1723,6 +2058,38 @@ impl AcceptanceDriver for CommandAcceptanceDriver {
     }
 }
 
+/// Stable subprocess adapter failure. Raw output is never copied into receipts.
+#[derive(Debug, Error)]
+pub enum CommandDriverError {
+    #[error("could not start driver endpoint")]
+    Spawn,
+    #[error("could not write driver request")]
+    RequestWrite,
+    #[error("driver endpoint timed out")]
+    Timeout,
+    #[error("driver endpoint output exceeded the limit")]
+    OutputTooLarge,
+    #[error("driver endpoint exited unsuccessfully")]
+    Unsuccessful,
+    #[error("driver endpoint returned malformed JSON")]
+    MalformedResponse,
+    #[error("could not collect driver endpoint output")]
+    OutputRead,
+}
+
+impl AcceptanceDriver for CommandAcceptanceDriver {
+    type Error = CommandDriverError;
+
+    fn execute(&mut self, request: &DriverRequest<'_>) -> Result<DriverResponse, Self::Error> {
+        let endpoint = self.endpoint(request.operation);
+        self.invoke(endpoint, request)
+    }
+
+    fn return_to_zero(&mut self, request: &ZeroRequest) -> Result<ZeroTransition, Self::Error> {
+        self.invoke(&self.endpoints.control, request)
+    }
+}
+
 fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>, CommandDriverError> {
     let mut output = Vec::new();
     reader
@@ -1751,6 +2118,106 @@ mod tests {
             let response = self.responses[self.index].clone();
             self.index += 1;
             Ok(response)
+        }
+
+        fn return_to_zero(&mut self, request: &ZeroRequest) -> Result<ZeroTransition, Self::Error> {
+            Ok(zero_transition_for(request, false))
+        }
+    }
+
+    struct FaultDriver {
+        responses: Vec<DriverResponse>,
+        fail_sequence: u32,
+        zero_failures: usize,
+        zero_requests: Vec<ZeroRequest>,
+        wrong_zero: bool,
+    }
+
+    impl AcceptanceDriver for FaultDriver {
+        type Error = &'static str;
+
+        fn execute(&mut self, request: &DriverRequest<'_>) -> Result<DriverResponse, Self::Error> {
+            if request.sequence == self.fail_sequence {
+                Err("transport unavailable or timed out")
+            } else {
+                Ok(self.responses[request.sequence as usize - 1].clone())
+            }
+        }
+
+        fn return_to_zero(&mut self, request: &ZeroRequest) -> Result<ZeroTransition, Self::Error> {
+            self.zero_requests.push(request.clone());
+            if self.zero_failures > 0 {
+                self.zero_failures -= 1;
+                return Err("transport unavailable or timed out");
+            }
+            Ok(zero_transition_for(request, self.wrong_zero))
+        }
+    }
+
+    fn zero_proof_for(request: &ZeroRequest) -> ZeroProof {
+        ZeroProof {
+            schema_version: ZERO_PROOF_VERSION.to_owned(),
+            scenario_sha256: request.scenario_sha256.clone(),
+            activation_id: request.activation_id.clone(),
+            activation_package_digest: request.activation_package_digest.clone(),
+            integrated_candidate_sha: request.integrated_candidate_sha.clone(),
+            capacity: 0,
+            admission: AdmissionState::Closed,
+            controller_generation: request.expected_controller_generation.unwrap_or(2),
+            runner_generation: request.expected_runner_generation.unwrap_or(2),
+            controld_service_active: false,
+            controld_acceptance_socket_active: false,
+            controld_acceptance_socket_present: false,
+        }
+    }
+
+    fn zero_transition_for(request: &ZeroRequest, wrong: bool) -> ZeroTransition {
+        let mut proof = zero_proof_for(request);
+        if wrong {
+            proof.controld_acceptance_socket_present = true;
+        }
+        let phases = [
+            (14, ZeroOperation::FinalizeCapacityZero),
+            (15, ZeroOperation::ProveCapacityZero),
+        ]
+        .into_iter()
+        .map(|(sequence, operation)| {
+            let phase_request = ZeroPhaseRequest {
+                sequence,
+                operation,
+                operation_id: digest_bytes(format!("zero-{sequence}").as_bytes()),
+                scenario_sha256: request.scenario_sha256.clone(),
+                activation_id: request.activation_id.clone(),
+                activation_package_digest: request.activation_package_digest.clone(),
+                integrated_candidate_sha: request.integrated_candidate_sha.clone(),
+                failed_stage: request.failed_stage,
+                final_response_sha256: request.final_response_sha256.clone(),
+                expected_controller_generation: request.expected_controller_generation,
+                expected_runner_generation: request.expected_runner_generation,
+            };
+            let phase_response = ZeroPhaseResponse {
+                operation_id: phase_request.operation_id.clone(),
+                controller_receipt_sha256: digest_bytes(b"controller-zero-receipt"),
+                proof: proof.clone(),
+            };
+            ZeroPhaseReceipt {
+                sequence,
+                operation,
+                outcome: Outcome::Pass,
+                attempts: 1,
+                request_sha256: digest_json(&phase_request).unwrap(),
+                response_sha256: digest_json(&phase_response).unwrap(),
+                request: phase_request,
+                response: phase_response,
+            }
+        })
+        .collect();
+        ZeroTransition {
+            schema_version: ZERO_TRANSITION_VERSION.to_owned(),
+            outcome: Outcome::Pass,
+            attempts: 1,
+            phases,
+            zero_proof: proof,
         }
     }
 
@@ -2107,7 +2574,88 @@ mod tests {
         assert_eq!(receipt.outcome, Outcome::Pass);
         assert_eq!(receipt.checks.len(), 13);
         assert!(receipt.failure.is_none());
+        validate_receipt(&receipt).unwrap();
         assert_eq!(driver.index, 13);
+    }
+
+    #[test]
+    fn every_error_after_capacity_one_compensates_and_proves_zero() {
+        let scenario = scenario();
+        for sequence in 2..=13 {
+            let mut driver = FaultDriver {
+                responses: passing_responses(&scenario),
+                fail_sequence: sequence,
+                zero_failures: 0,
+                zero_requests: Vec::new(),
+                wrong_zero: false,
+            };
+            let receipt = run_acceptance(&scenario, &mut driver);
+            assert_eq!(receipt.outcome, Outcome::Fail, "sequence {sequence}");
+            assert_eq!(receipt.zero_transition.as_ref().unwrap().attempts, 1);
+            let request = &driver.zero_requests[0];
+            assert_eq!(
+                request.expected_controller_generation.is_none(),
+                sequence == 11
+            );
+            assert_eq!(request.expected_runner_generation.is_none(), sequence == 12);
+            assert_eq!(driver.zero_requests.len(), 1, "sequence {sequence}");
+        }
+    }
+
+    #[test]
+    fn compensation_retries_identical_request_after_transport_loss() {
+        let scenario = scenario();
+        let mut driver = FaultDriver {
+            responses: passing_responses(&scenario),
+            fail_sequence: 4,
+            zero_failures: 1,
+            zero_requests: Vec::new(),
+            wrong_zero: false,
+        };
+        let receipt = run_acceptance(&scenario, &mut driver);
+        assert_eq!(receipt.outcome, Outcome::Fail);
+        assert_eq!(receipt.zero_transition.as_ref().unwrap().attempts, 2);
+        assert_eq!(driver.zero_requests.len(), 2);
+        assert_eq!(driver.zero_requests[0], driver.zero_requests[1]);
+    }
+
+    #[test]
+    fn ambiguous_zero_readback_fails_closed_after_bounded_retry() {
+        let scenario = scenario();
+        let mut driver = FaultDriver {
+            responses: passing_responses(&scenario),
+            fail_sequence: 5,
+            zero_failures: 0,
+            zero_requests: Vec::new(),
+            wrong_zero: true,
+        };
+        let receipt = run_acceptance(&scenario, &mut driver);
+        assert_eq!(receipt.outcome, Outcome::Fail);
+        assert!(receipt.zero_transition.is_none());
+        assert!(receipt
+            .failure
+            .unwrap()
+            .message
+            .starts_with("capacity-zero compensation failed:"));
+    }
+
+    #[test]
+    fn pass_receipt_verifier_rejects_reordering_and_digest_tampering() {
+        let scenario = scenario();
+        let mut driver = ScriptedDriver {
+            responses: passing_responses(&scenario),
+            index: 0,
+        };
+        let receipt = run_acceptance(&scenario, &mut driver);
+        validate_receipt(&receipt).unwrap();
+
+        let mut reordered = receipt.clone();
+        reordered.checks.swap(5, 6);
+        assert!(validate_receipt(&reordered).is_err());
+
+        let mut tampered = receipt;
+        tampered.checks[6].export.as_mut().unwrap().authenticated = false;
+        assert!(validate_receipt(&tampered).is_err());
     }
 
     #[test]

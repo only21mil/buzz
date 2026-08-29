@@ -24,7 +24,9 @@ use thiserror::Error;
 
 use crate::acceptance::{
     AcceptanceDriver, AdmissionState, DriverRequest, DriverResponse, FixtureSpec, Operation,
-    DRIVER_VERSION,
+    Outcome, Stage, ZeroOperation, ZeroPhaseReceipt, ZeroPhaseRequest, ZeroPhaseResponse,
+    ZeroProof, ZeroRequest, ZeroTransition, DRIVER_VERSION, ZERO_PROOF_VERSION,
+    ZERO_REQUEST_VERSION, ZERO_TRANSITION_VERSION,
 };
 
 /// Installed unprivileged adapter binary.
@@ -37,6 +39,10 @@ pub const CONTROL_SOCKET_PATH: &str = "/run/buzzci/acceptance-control.sock";
 pub const CONTROLD_SOCKET_PATH: &str = "/run/buzzci/controld-acceptance.sock";
 /// Root helper executable.
 pub const CONTROL_PROGRAM: &str = "/usr/libexec/buzz-ci-acceptance-control";
+/// Fixed activation controller installed by the package lane.
+pub const ACTIVATION_CONTROLLER_PROGRAM: &str = "/usr/libexec/buzz-ci-activation-controller";
+/// Immutable active activation package used by the fixed controller.
+pub const ACTIVATION_PACKAGE_PATH: &str = "/var/lib/buzzci/activation-controller/package";
 /// Root helper configuration.
 pub const CONTROL_CONFIG_PATH: &str = "/etc/buzzci/acceptance-control-v1.json";
 /// Root activation receipt bound to each helper request.
@@ -46,10 +52,13 @@ pub const CONTROL_LEDGER_PATH: &str = "/var/lib/buzzci/acceptance-control/operat
 
 const CONFIG_SCHEMA: &str = "buzz-ci-capacity-one-driver-config/v1";
 const CONTROL_CONFIG_SCHEMA: &str = "buzz-ci-acceptance-control-config/v1";
+const QUALIFICATION_ZERO_REQUEST_SCHEMA: &str = "buzz-ci-activation-qualification-zero-request/v1";
+const QUALIFICATION_ZERO_RESPONSE_SCHEMA: &str =
+    "buzz-ci-activation-qualification-zero-response/v1";
 pub const ADAPTER_REQUEST_SCHEMA: &str = "buzz-ci-capacity-one-adapter-request/v1";
 pub const ADAPTER_RESPONSE_SCHEMA: &str = "buzz-ci-capacity-one-adapter-response/v1";
-pub const CONTROL_REQUEST_SCHEMA: &str = "buzz-ci-acceptance-control-request/v1";
-pub const CONTROL_RESPONSE_SCHEMA: &str = "buzz-ci-acceptance-control-response/v1";
+pub const CONTROL_REQUEST_SCHEMA: &str = "buzz-ci-acceptance-control-request/v2";
+pub const CONTROL_RESPONSE_SCHEMA: &str = "buzz-ci-acceptance-control-response/v2";
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
 /// Maximum request or response frame.
 pub const MAX_ADAPTER_FRAME_BYTES: usize = 1024 * 1024;
@@ -135,6 +144,25 @@ impl ProductionDriverConfig {
             && request.fixture.approval_id == self.approval_id
             && request.fixture.grant_event_id == self.grant_event_id
             && request.fixture.grant_digest == self.grant_digest
+    }
+
+    fn binds_zero(&self, request: &ZeroRequest) -> bool {
+        request.schema_version == ZERO_REQUEST_VERSION
+            && request.scenario_sha256 == self.scenario_sha256
+            && request.activation_id == self.activation_id
+            && request.activation_package_digest == self.activation_package_digest
+            && request.integrated_candidate_sha == self.integrated_candidate_sha
+            && request.run_id == self.run_id
+            && request
+                .expected_controller_generation
+                .is_none_or(|value| value > 0)
+            && request
+                .expected_runner_generation
+                .is_none_or(|value| value > 0)
+            && request
+                .final_response_sha256
+                .as_deref()
+                .is_none_or(|value| lower_hex(value, &[64]))
     }
 }
 
@@ -287,6 +315,10 @@ pub struct ControlRequest {
     pub expected_controller_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_runner_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_stage: Option<Stage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response_sha256: Option<String>,
 }
 
 /// Only actions accepted by the root helper.
@@ -297,7 +329,62 @@ pub enum ControlOperation {
     SetCapacityOne,
     RestartController,
     RestartRunner,
-    SetCapacityZero,
+    PrepareCapacityZero,
+    FinalizeCapacityZero,
+    ProveCapacityZero,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+enum QualificationZeroAction {
+    #[serde(rename = "prepare_qualification_zero")]
+    Prepare,
+    #[serde(rename = "finalize_qualification_zero")]
+    Finalize,
+    #[serde(rename = "prove_qualification_zero")]
+    Prove,
+}
+
+impl QualificationZeroAction {
+    const fn argument(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare-qualification-zero",
+            Self::Finalize => "finalize-qualification-zero",
+            Self::Prove => "prove-qualification-zero",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct QualificationZeroRequest<'a> {
+    schema_version: &'static str,
+    action: QualificationZeroAction,
+    activation_id: &'a str,
+    activation_package_digest: &'a str,
+    scenario_sha256: &'a str,
+    initial_controller_generation: u64,
+    initial_runner_generation: u64,
+    operation_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_stage: Option<Stage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_response_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_controller_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_runner_generation: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationZeroResponse {
+    schema_version: String,
+    action: QualificationZeroAction,
+    activation_id: String,
+    activation_package_digest: String,
+    scenario_sha256: String,
+    operation_id: String,
+    state: String,
+    receipt_sha256: String,
 }
 
 /// Bound root helper response.
@@ -310,6 +397,15 @@ pub struct ControlResponse {
     pub scenario_sha256: String,
     pub operation_id: String,
     pub readback: ControlReadback,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_proof: Option<ZeroProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_receipt_sha256: Option<String>,
+}
+
+pub struct HostZeroResult {
+    pub proof: ZeroProof,
+    pub controller_receipt_sha256: String,
 }
 
 /// One bounded socket exchange, injectable in tests.
@@ -345,6 +441,31 @@ impl<T> ProductionDriver<T> {
 
     pub fn into_transport(self) -> T {
         self.transport
+    }
+}
+
+impl<T: AdapterTransport> ProductionDriver<T> {
+    fn exchange_control_retry(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<(ControlResponse, u32), DriverError> {
+        let bytes = canonical_json(request)?;
+        let timeout = Duration::from_millis(self.config.timeout_millis);
+        let mut last = DriverError::Transport;
+        for attempt in 1..=2 {
+            match self
+                .transport
+                .exchange(AdapterEndpoint::Control, &bytes, timeout)
+            {
+                Ok(response) => {
+                    let response: ControlResponse = parse_bounded(&response)?;
+                    validate_control_response(request, &response)?;
+                    return Ok((response, attempt));
+                }
+                Err(_) => last = DriverError::Transport,
+            }
+        }
+        Err(last)
     }
 }
 
@@ -402,6 +523,79 @@ where
         validate_snapshot_host(&response.response, &adapter.host)?;
         Ok(response.response)
     }
+
+    fn return_to_zero(&mut self, request: &ZeroRequest) -> Result<ZeroTransition, Self::Error> {
+        if !self.config.binds_zero(request) {
+            return Err(DriverError::BindingMismatch);
+        }
+        let finalize = zero_control_request(request, 14, ControlOperation::FinalizeCapacityZero)?;
+        let (finalized, finalize_attempts) = self.exchange_control_retry(&finalize)?;
+        let finalize_phase = zero_phase_receipt(
+            request,
+            &finalize,
+            finalized,
+            ZeroOperation::FinalizeCapacityZero,
+            finalize_attempts,
+        )?;
+
+        let prove = zero_control_request(request, 15, ControlOperation::ProveCapacityZero)?;
+        let (proved, prove_attempts) = self.exchange_control_retry(&prove)?;
+        let prove_phase = zero_phase_receipt(
+            request,
+            &prove,
+            proved,
+            ZeroOperation::ProveCapacityZero,
+            prove_attempts,
+        )?;
+        Ok(ZeroTransition {
+            schema_version: ZERO_TRANSITION_VERSION.to_owned(),
+            outcome: Outcome::Pass,
+            attempts: 1,
+            zero_proof: prove_phase.response.proof.clone(),
+            phases: vec![finalize_phase, prove_phase],
+        })
+    }
+}
+
+fn zero_phase_receipt(
+    zero: &ZeroRequest,
+    control: &ControlRequest,
+    response: ControlResponse,
+    operation: ZeroOperation,
+    attempts: u32,
+) -> Result<ZeroPhaseReceipt, DriverError> {
+    let proof = response.zero_proof.ok_or(DriverError::BindingMismatch)?;
+    validate_zero_response(zero, &proof)?;
+    let request = ZeroPhaseRequest {
+        sequence: control.sequence,
+        operation,
+        operation_id: control.operation_id.clone(),
+        scenario_sha256: zero.scenario_sha256.clone(),
+        activation_id: zero.activation_id.clone(),
+        activation_package_digest: zero.activation_package_digest.clone(),
+        integrated_candidate_sha: zero.integrated_candidate_sha.clone(),
+        failed_stage: zero.failed_stage,
+        final_response_sha256: zero.final_response_sha256.clone(),
+        expected_controller_generation: zero.expected_controller_generation,
+        expected_runner_generation: zero.expected_runner_generation,
+    };
+    let response = ZeroPhaseResponse {
+        operation_id: control.operation_id.clone(),
+        controller_receipt_sha256: response
+            .controller_receipt_sha256
+            .ok_or(DriverError::BindingMismatch)?,
+        proof,
+    };
+    Ok(ZeroPhaseReceipt {
+        sequence: control.sequence,
+        operation,
+        outcome: Outcome::Pass,
+        attempts,
+        request_sha256: hex::encode(Sha256::digest(canonical_json(&request)?)),
+        response_sha256: hex::encode(Sha256::digest(canonical_json(&response)?)),
+        request,
+        response,
+    })
 }
 
 fn control_request(request: &DriverRequest<'_>, operation_id: &str) -> ControlRequest {
@@ -412,7 +606,7 @@ fn control_request(request: &DriverRequest<'_>, operation_id: &str) -> ControlRe
             Operation::SetCapacityOne => ControlOperation::SetCapacityOne,
             Operation::RestartController => ControlOperation::RestartController,
             Operation::RestartRunner => ControlOperation::RestartRunner,
-            Operation::SetCapacityZero => ControlOperation::SetCapacityZero,
+            Operation::SetCapacityZero => ControlOperation::PrepareCapacityZero,
             _ => ControlOperation::Observe,
         },
         scenario_sha256: request.scenario_sha256.to_owned(),
@@ -430,7 +624,69 @@ fn control_request(request: &DriverRequest<'_>, operation_id: &str) -> ControlRe
         attempt_id: request.attempt_id.map(str::to_owned),
         expected_controller_generation: request.expected_controller_generation,
         expected_runner_generation: request.expected_runner_generation,
+        failed_stage: None,
+        final_response_sha256: None,
     }
+}
+
+fn zero_control_request(
+    request: &ZeroRequest,
+    sequence: u32,
+    operation: ControlOperation,
+) -> Result<ControlRequest, DriverError> {
+    let mut control = ControlRequest {
+        schema_version: CONTROL_REQUEST_SCHEMA.to_owned(),
+        sequence,
+        operation,
+        scenario_sha256: request.scenario_sha256.clone(),
+        operation_id: String::new(),
+        activation_id: request.activation_id.clone(),
+        activation_package_digest: request.activation_package_digest.clone(),
+        integrated_candidate_sha: request.integrated_candidate_sha.clone(),
+        run_id: request.run_id.clone(),
+        job_id: "qualification-zero".to_owned(),
+        request_digest: self_digest(&request.run_id),
+        manifest_digest: self_digest(&request.scenario_sha256),
+        approval_id: self_digest(&request.activation_id)[..32].to_owned(),
+        grant_event_id: self_digest(&request.activation_package_digest),
+        grant_digest: self_digest(&request.integrated_candidate_sha),
+        attempt_id: None,
+        expected_controller_generation: request.expected_controller_generation,
+        expected_runner_generation: request.expected_runner_generation,
+        failed_stage: Some(request.failed_stage),
+        final_response_sha256: request.final_response_sha256.clone(),
+    };
+    control.operation_id = zero_control_operation_id(&control)?;
+    Ok(control)
+}
+
+fn self_digest(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn validate_zero_response(request: &ZeroRequest, proof: &ZeroProof) -> Result<(), DriverError> {
+    if proof.schema_version != ZERO_PROOF_VERSION
+        || proof.scenario_sha256 != request.scenario_sha256
+        || proof.activation_id != request.activation_id
+        || proof.activation_package_digest != request.activation_package_digest
+        || proof.integrated_candidate_sha != request.integrated_candidate_sha
+        || proof.capacity != 0
+        || proof.admission != AdmissionState::Closed
+        || proof.controller_generation == 0
+        || proof.runner_generation == 0
+        || request
+            .expected_controller_generation
+            .is_some_and(|expected| proof.controller_generation != expected)
+        || request
+            .expected_runner_generation
+            .is_some_and(|expected| proof.runner_generation != expected)
+        || proof.controld_service_active
+        || proof.controld_acceptance_socket_active
+        || proof.controld_acceptance_socket_present
+    {
+        return Err(DriverError::BindingMismatch);
+    }
+    Ok(())
 }
 
 fn validate_control_response(
@@ -474,6 +730,18 @@ fn validate_control_response(
         {
             return Err(DriverError::StaleGeneration);
         }
+    }
+    if matches!(
+        request.operation,
+        ControlOperation::FinalizeCapacityZero | ControlOperation::ProveCapacityZero
+    ) != response.zero_proof.is_some()
+        || response.zero_proof.is_some() != response.controller_receipt_sha256.is_some()
+        || response
+            .controller_receipt_sha256
+            .as_deref()
+            .is_some_and(|digest| !lower_hex(digest, &[64]))
+    {
+        return Err(DriverError::BindingMismatch);
     }
     Ok(())
 }
@@ -595,6 +863,9 @@ fn digest_operation_id(
 }
 
 fn control_operation_id(request: &ControlRequest) -> Result<String, ControlError> {
+    if request.sequence >= 14 {
+        return zero_control_operation_id(request).map_err(|_| ControlError::BindingMismatch);
+    }
     let operation = expected_operation(request.sequence).ok_or(ControlError::BindingMismatch)?;
     let mut digest = Sha256::new();
     digest.update(b"buzz-ci-capacity-one-operation-v1\0");
@@ -606,6 +877,37 @@ fn control_operation_id(request: &ControlRequest) -> Result<String, ControlError
     if let Some(attempt_id) = &request.attempt_id {
         digest.update(attempt_id.as_bytes());
     }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn zero_control_operation_id(request: &ControlRequest) -> Result<String, DriverError> {
+    let mut digest = Sha256::new();
+    digest.update(b"buzz-ci-capacity-one-zero-operation-v1\0");
+    digest.update(request.scenario_sha256.as_bytes());
+    digest.update(request.sequence.to_be_bytes());
+    digest.update(canonical_json(&request.operation)?);
+    digest.update(request.activation_id.as_bytes());
+    digest.update(request.activation_package_digest.as_bytes());
+    digest.update(request.integrated_candidate_sha.as_bytes());
+    digest.update(request.run_id.as_bytes());
+    if let Some(stage) = request.failed_stage {
+        digest.update(canonical_json(&stage)?);
+    }
+    if let Some(response) = &request.final_response_sha256 {
+        digest.update(response.as_bytes());
+    }
+    digest.update(
+        request
+            .expected_controller_generation
+            .unwrap_or_default()
+            .to_be_bytes(),
+    );
+    digest.update(
+        request
+            .expected_runner_generation
+            .unwrap_or_default()
+            .to_be_bytes(),
+    );
     Ok(hex::encode(digest.finalize()))
 }
 
@@ -891,21 +1193,31 @@ impl AcceptanceControlConfig {
     }
 
     pub fn binds(&self, request: &ControlRequest) -> bool {
-        request.schema_version == CONTROL_REQUEST_SCHEMA
+        let core = request.schema_version == CONTROL_REQUEST_SCHEMA
             && request.scenario_sha256 == self.scenario_sha256
             && request.activation_id == self.activation_id
             && request.activation_package_digest == self.activation_package_digest
             && request.integrated_candidate_sha == self.integrated_candidate_sha
-            && request.run_id == self.run_id
-            && request.job_id == self.job_id
-            && request.request_digest == self.request_digest
-            && request.manifest_digest == self.manifest_digest
-            && request.approval_id == self.approval_id
-            && request.grant_event_id == self.grant_event_id
-            && request.grant_digest == self.grant_digest
+            && request.run_id == self.run_id;
+        core && if request.sequence >= 14 {
+            true
+        } else {
+            request.job_id == self.job_id
+                && request.request_digest == self.request_digest
+                && request.manifest_digest == self.manifest_digest
+                && request.approval_id == self.approval_id
+                && request.grant_event_id == self.grant_event_id
+                && request.grant_digest == self.grant_digest
+        }
     }
 
-    pub fn response(&self, request: &ControlRequest, readback: ControlReadback) -> ControlResponse {
+    pub fn response(
+        &self,
+        request: &ControlRequest,
+        readback: ControlReadback,
+        zero_proof: Option<ZeroProof>,
+        controller_receipt_sha256: Option<String>,
+    ) -> ControlResponse {
         ControlResponse {
             schema_version: CONTROL_RESPONSE_SCHEMA.to_owned(),
             sequence: request.sequence,
@@ -913,6 +1225,8 @@ impl AcceptanceControlConfig {
             scenario_sha256: request.scenario_sha256.clone(),
             operation_id: request.operation_id.clone(),
             readback,
+            zero_proof,
+            controller_receipt_sha256,
         }
     }
 }
@@ -925,7 +1239,19 @@ pub trait HostControl {
     fn set_capacity_one(&mut self) -> Result<ControlReadback, Self::Error>;
     fn restart_controller(&mut self) -> Result<ControlReadback, Self::Error>;
     fn restart_runner(&mut self) -> Result<ControlReadback, Self::Error>;
-    fn set_capacity_zero(&mut self) -> Result<ControlReadback, Self::Error>;
+    fn prepare_capacity_zero(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<ControlReadback, Self::Error>;
+    fn finalize_capacity_zero(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<HostZeroResult, Self::Error>;
+    fn prove_capacity_zero(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<HostZeroResult, Self::Error>;
+    fn emergency_capacity_zero(&mut self) -> Result<ZeroProof, Self::Error>;
 }
 
 /// Fixed systemd-backed host control. Unit names and the executable are not configurable.
@@ -993,7 +1319,6 @@ impl SystemdHostControl {
     fn close_capacity(&self) -> Result<(), ControlError> {
         for unit in [
             "buzz-ci-capacity-one.target",
-            "buzz-ci-controld.service",
             "buzz-ci-runner.service",
             "buzz-ci-runner.socket",
             "buzz-ci-execd.service",
@@ -1004,6 +1329,68 @@ impl SystemdHostControl {
             self.systemctl("stop", unit)?;
         }
         Ok(())
+    }
+
+    fn zero_proof(&self) -> Result<ZeroProof, ControlError> {
+        let readback = self.readback()?;
+        let socket_active = unit_active("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        let service_active = unit_active("buzz-ci-controld.service", self.timeout)?;
+        let socket_present = match fs::symlink_metadata(CONTROLD_SOCKET_PATH) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(ControlError::ReadbackMismatch),
+        };
+        Ok(ZeroProof {
+            schema_version: ZERO_PROOF_VERSION.to_owned(),
+            scenario_sha256: self.config.scenario_sha256.clone(),
+            activation_id: self.config.activation_id.clone(),
+            activation_package_digest: self.config.activation_package_digest.clone(),
+            integrated_candidate_sha: self.config.integrated_candidate_sha.clone(),
+            capacity: readback.capacity,
+            admission: readback.admission,
+            controller_generation: readback.controller_generation,
+            runner_generation: readback.runner_generation,
+            controld_service_active: service_active,
+            controld_acceptance_socket_active: socket_active,
+            controld_acceptance_socket_present: socket_present,
+        })
+    }
+
+    fn controller_zero_action(
+        &self,
+        action: QualificationZeroAction,
+        request: &ControlRequest,
+    ) -> Result<String, ControlError> {
+        let body = QualificationZeroRequest {
+            schema_version: QUALIFICATION_ZERO_REQUEST_SCHEMA,
+            action,
+            activation_id: &request.activation_id,
+            activation_package_digest: &request.activation_package_digest,
+            scenario_sha256: &request.scenario_sha256,
+            initial_controller_generation: self.config.controller_generation,
+            initial_runner_generation: self.config.runner_generation,
+            operation_id: &request.operation_id,
+            failed_stage: request.failed_stage,
+            final_response_sha256: request.final_response_sha256.as_deref(),
+            expected_controller_generation: request.expected_controller_generation,
+            expected_runner_generation: request.expected_runner_generation,
+        };
+        let input = serde_json::to_vec(&body).map_err(|_| ControlError::HostAction)?;
+        let output = run_bounded_controller(action.argument(), &input, self.timeout)?;
+        let response: QualificationZeroResponse =
+            serde_json::from_slice(&output).map_err(|_| ControlError::HostAction)?;
+        if response.schema_version != QUALIFICATION_ZERO_RESPONSE_SCHEMA
+            || response.action != action
+            || response.activation_id != request.activation_id
+            || response.activation_package_digest != request.activation_package_digest
+            || response.scenario_sha256 != request.scenario_sha256
+            || response.operation_id != request.operation_id
+            || response.state != "staged_zero"
+            || !lower_hex(&response.receipt_sha256, &[64])
+        {
+            return Err(ControlError::BindingMismatch);
+        }
+        Ok(response.receipt_sha256)
     }
 }
 
@@ -1060,13 +1447,53 @@ impl HostControl for SystemdHostControl {
         self.readback()
     }
 
-    fn set_capacity_zero(&mut self) -> Result<ControlReadback, Self::Error> {
+    fn prepare_capacity_zero(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<ControlReadback, Self::Error> {
+        let _ = self.controller_zero_action(QualificationZeroAction::Prepare, request)?;
         self.close_capacity()?;
+        self.systemctl("start", "buzz-ci-controld-acceptance.socket")?;
+        self.systemctl("start", "buzz-ci-controld.service")?;
         let readback = self.readback()?;
         if readback.capacity != 0 || readback.admission != AdmissionState::Closed {
             return Err(ControlError::ReadbackMismatch);
         }
         Ok(readback)
+    }
+
+    fn finalize_capacity_zero(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<HostZeroResult, Self::Error> {
+        self.close_capacity()?;
+        self.systemctl("stop", "buzz-ci-controld-acceptance.socket")?;
+        self.systemctl("stop", "buzz-ci-controld.service")?;
+        let controller_receipt_sha256 =
+            self.controller_zero_action(QualificationZeroAction::Finalize, request)?;
+        Ok(HostZeroResult {
+            proof: self.zero_proof()?,
+            controller_receipt_sha256,
+        })
+    }
+
+    fn prove_capacity_zero(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<HostZeroResult, Self::Error> {
+        let controller_receipt_sha256 =
+            self.controller_zero_action(QualificationZeroAction::Prove, request)?;
+        Ok(HostZeroResult {
+            proof: self.zero_proof()?,
+            controller_receipt_sha256,
+        })
+    }
+
+    fn emergency_capacity_zero(&mut self) -> Result<ZeroProof, Self::Error> {
+        self.close_capacity()?;
+        self.systemctl("stop", "buzz-ci-controld-acceptance.socket")?;
+        self.systemctl("stop", "buzz-ci-controld.service")?;
+        self.zero_proof()
     }
 }
 
@@ -1182,6 +1609,63 @@ fn run_bounded_command(
     Ok(stdout)
 }
 
+fn run_bounded_controller(
+    action: &'static str,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, ControlError> {
+    const MAX_OUTPUT: usize = 64 * 1024;
+    if input.is_empty() || input.len() > MAX_OUTPUT {
+        return Err(ControlError::HostAction);
+    }
+    let mut child = Command::new(ACTIVATION_CONTROLLER_PROGRAM)
+        .arg(action)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| ControlError::HostAction)?;
+    let mut stdin = child.stdin.take().ok_or(ControlError::HostAction)?;
+    let write_result = stdin
+        .write_all(input)
+        .and_then(|()| stdin.write_all(b"\n"))
+        .map_err(|_| ControlError::HostAction);
+    drop(stdin);
+    if write_result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ControlError::HostAction);
+    }
+    let stdout = child.stdout.take().ok_or(ControlError::HostAction)?;
+    let stderr = child.stderr.take().ok_or(ControlError::HostAction)?;
+    let stdout_reader = thread::spawn(move || read_process_output(stdout, MAX_OUTPUT));
+    let stderr_reader = thread::spawn(move || read_process_output(stderr, MAX_OUTPUT));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|_| ControlError::HostAction)? {
+            Some(value) => break value,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(ControlError::HostAction);
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| ControlError::HostAction)??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| ControlError::HostAction)??;
+    if !status.success() || !stderr.is_empty() || stdout.is_empty() {
+        return Err(ControlError::HostAction);
+    }
+    Ok(stdout)
+}
+
 fn read_process_output(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>, ControlError> {
     let mut bytes = Vec::new();
     reader
@@ -1204,7 +1688,7 @@ pub fn handle_control<H: HostControl>(
     config.validate()?;
     let bound_operation_id = control_operation_id(request)?;
     if !config.binds(request)
-        || !(1..=13).contains(&request.sequence)
+        || !(1..=15).contains(&request.sequence)
         || expected_control_operation(request.sequence) != Some(request.operation)
         || bound_operation_id != request.operation_id
         || !lower_hex(&request.operation_id, &[64])
@@ -1219,17 +1703,70 @@ pub fn handle_control<H: HostControl>(
             .attempt_id
             .as_deref()
             .is_some_and(|value| !lower_hex(value, &[32]))
+        || (request.sequence >= 14) != request.failed_stage.is_some()
+        || (request.sequence <= 13
+            && (request.failed_stage.is_some() || request.final_response_sha256.is_some()))
+        || request
+            .final_response_sha256
+            .as_deref()
+            .is_some_and(|value| !lower_hex(value, &[64]))
+        || (request.final_response_sha256.is_some()
+            && request.failed_stage != Some(Stage::PrepareCapacityZero))
+        || (request.sequence >= 14 && request.attempt_id.is_some())
     {
         return Err(ControlError::BindingMismatch);
     }
-    let readback = match request.operation {
-        ControlOperation::Observe => host.observe(),
-        ControlOperation::SetCapacityOne => host.set_capacity_one(),
-        ControlOperation::RestartController => host.restart_controller(),
-        ControlOperation::RestartRunner => host.restart_runner(),
-        ControlOperation::SetCapacityZero => host.set_capacity_zero(),
-    }
-    .map_err(|_| ControlError::HostAction)?;
+    let (readback, zero_proof, controller_receipt_sha256) = match request.operation {
+        ControlOperation::Observe => (
+            host.observe().map_err(|_| ControlError::HostAction)?,
+            None,
+            None,
+        ),
+        ControlOperation::SetCapacityOne => (
+            host.set_capacity_one()
+                .map_err(|_| ControlError::HostAction)?,
+            None,
+            None,
+        ),
+        ControlOperation::RestartController => (
+            host.restart_controller()
+                .map_err(|_| ControlError::HostAction)?,
+            None,
+            None,
+        ),
+        ControlOperation::RestartRunner => (
+            host.restart_runner()
+                .map_err(|_| ControlError::HostAction)?,
+            None,
+            None,
+        ),
+        ControlOperation::PrepareCapacityZero => (
+            host.prepare_capacity_zero(request)
+                .map_err(|_| ControlError::HostAction)?,
+            None,
+            None,
+        ),
+        ControlOperation::FinalizeCapacityZero => {
+            let result = host
+                .finalize_capacity_zero(request)
+                .map_err(|_| ControlError::HostAction)?;
+            (
+                proof_readback(&result.proof),
+                Some(result.proof),
+                Some(result.controller_receipt_sha256),
+            )
+        }
+        ControlOperation::ProveCapacityZero => {
+            let result = host
+                .prove_capacity_zero(request)
+                .map_err(|_| ControlError::HostAction)?;
+            (
+                proof_readback(&result.proof),
+                Some(result.proof),
+                Some(result.controller_receipt_sha256),
+            )
+        }
+    };
     if readback.activation_id != config.activation_id
         || readback.activation_package_digest != config.activation_package_digest
         || readback.integrated_candidate_sha != config.integrated_candidate_sha
@@ -1259,7 +1796,29 @@ pub fn handle_control<H: HostControl>(
             return Err(ControlError::StaleGeneration);
         }
     }
-    Ok(config.response(request, readback))
+    if let Some(proof) = &zero_proof {
+        if proof.capacity != 0
+            || proof.admission != AdmissionState::Closed
+            || proof.controld_service_active
+            || proof.controld_acceptance_socket_active
+            || proof.controld_acceptance_socket_present
+        {
+            return Err(ControlError::ReadbackMismatch);
+        }
+    }
+    Ok(config.response(request, readback, zero_proof, controller_receipt_sha256))
+}
+
+fn proof_readback(proof: &ZeroProof) -> ControlReadback {
+    ControlReadback {
+        activation_id: proof.activation_id.clone(),
+        activation_package_digest: proof.activation_package_digest.clone(),
+        integrated_candidate_sha: proof.integrated_candidate_sha.clone(),
+        capacity: proof.capacity,
+        admission: proof.admission,
+        controller_generation: proof.controller_generation,
+        runner_generation: proof.runner_generation,
+    }
 }
 
 fn expected_control_operation(sequence: u32) -> Option<ControlOperation> {
@@ -1267,7 +1826,9 @@ fn expected_control_operation(sequence: u32) -> Option<ControlOperation> {
         2 => ControlOperation::SetCapacityOne,
         11 => ControlOperation::RestartController,
         12 => ControlOperation::RestartRunner,
-        13 => ControlOperation::SetCapacityZero,
+        13 => ControlOperation::PrepareCapacityZero,
+        14 => ControlOperation::FinalizeCapacityZero,
+        15 => ControlOperation::ProveCapacityZero,
         1 | 3..=10 => ControlOperation::Observe,
         _ => return None,
     })
@@ -1277,6 +1838,11 @@ fn expected_control_operation(sequence: u32) -> Option<ControlOperation> {
 #[serde(deny_unknown_fields)]
 struct ControlLedger {
     schema_version: String,
+    activation_id: String,
+    activation_package_digest: String,
+    scenario_sha256: String,
+    controller_generation: u64,
+    runner_generation: u64,
     entries: BTreeMap<String, ControlLedgerEntry>,
 }
 
@@ -1299,7 +1865,7 @@ pub fn handle_control_durable<H: HostControl>(
     let request: ControlRequest =
         serde_json::from_slice(request_bytes).map_err(|_| ControlError::BindingMismatch)?;
     let request_sha256 = hex::encode(Sha256::digest(request_bytes));
-    let mut ledger = load_control_ledger()?;
+    let mut ledger = load_control_ledger(config)?;
     if let Some(existing) = ledger.entries.get(&request.operation_id) {
         return if existing.request_sha256 == request_sha256 {
             Ok(existing.response.clone())
@@ -1319,20 +1885,47 @@ pub fn handle_control_durable<H: HostControl>(
     Ok(response)
 }
 
-fn load_control_ledger() -> Result<ControlLedger, ControlError> {
+fn new_control_ledger(config: &AcceptanceControlConfig) -> ControlLedger {
+    ControlLedger {
+        schema_version: "buzz-ci-acceptance-control-ledger/v2".into(),
+        activation_id: config.activation_id.clone(),
+        activation_package_digest: config.activation_package_digest.clone(),
+        scenario_sha256: config.scenario_sha256.clone(),
+        controller_generation: config.controller_generation,
+        runner_generation: config.runner_generation,
+        entries: BTreeMap::new(),
+    }
+}
+
+fn ledger_matches_config(ledger: &ControlLedger, config: &AcceptanceControlConfig) -> bool {
+    ledger.activation_id == config.activation_id
+        && ledger.activation_package_digest == config.activation_package_digest
+        && ledger.scenario_sha256 == config.scenario_sha256
+        && ledger.controller_generation == config.controller_generation
+        && ledger.runner_generation == config.runner_generation
+}
+
+fn load_control_ledger(config: &AcceptanceControlConfig) -> Result<ControlLedger, ControlError> {
     let path = Path::new(CONTROL_LEDGER_PATH);
     if !path.exists() {
-        return Ok(ControlLedger {
-            schema_version: "buzz-ci-acceptance-control-ledger/v1".into(),
-            entries: BTreeMap::new(),
-        });
+        return Ok(new_control_ledger(config));
     }
     let bytes =
         read_secure_file(path, 0, 0, 0o600, MAX_CONFIG_BYTES).map_err(|_| ControlError::Ledger)?;
-    let ledger: ControlLedger = serde_json::from_slice(&bytes).map_err(|_| ControlError::Ledger)?;
-    if ledger.schema_version != "buzz-ci-acceptance-control-ledger/v1" || ledger.entries.len() > 13
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ControlError::Ledger)?;
+    if value.get("schema_version").and_then(|item| item.as_str())
+        != Some("buzz-ci-acceptance-control-ledger/v2")
+    {
+        return Ok(new_control_ledger(config));
+    }
+    let ledger: ControlLedger = serde_json::from_value(value).map_err(|_| ControlError::Ledger)?;
+    if ledger.schema_version != "buzz-ci-acceptance-control-ledger/v2" || ledger.entries.len() > 15
     {
         return Err(ControlError::Ledger);
+    }
+    if !ledger_matches_config(&ledger, config) {
+        return Ok(new_control_ledger(config));
     }
     Ok(ledger)
 }
@@ -1340,7 +1933,7 @@ fn load_control_ledger() -> Result<ControlLedger, ControlError> {
 fn persist_control_ledger(ledger: &ControlLedger) -> Result<(), ControlError> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    if ledger.entries.len() > 13 {
+    if ledger.entries.len() > 15 {
         return Err(ControlError::Ledger);
     }
     let bytes = serde_json::to_vec(ledger).map_err(|_| ControlError::Ledger)?;
@@ -1472,6 +2065,30 @@ mod tests {
         }
     }
 
+    fn fake_zero_proof(readback: &ControlReadback) -> ZeroProof {
+        ZeroProof {
+            schema_version: ZERO_PROOF_VERSION.into(),
+            scenario_sha256: hex('9', 64),
+            activation_id: readback.activation_id.clone(),
+            activation_package_digest: readback.activation_package_digest.clone(),
+            integrated_candidate_sha: readback.integrated_candidate_sha.clone(),
+            capacity: 0,
+            admission: AdmissionState::Closed,
+            controller_generation: readback.controller_generation,
+            runner_generation: readback.runner_generation,
+            controld_service_active: false,
+            controld_acceptance_socket_active: false,
+            controld_acceptance_socket_present: false,
+        }
+    }
+
+    fn fake_host_zero(readback: &ControlReadback) -> HostZeroResult {
+        HostZeroResult {
+            proof: fake_zero_proof(readback),
+            controller_receipt_sha256: hex('7', 64),
+        }
+    }
+
     fn request<'a>(fixture: &'a FixtureSpec, scenario_sha256: &'a str) -> DriverRequest<'a> {
         DriverRequest {
             schema_version: DRIVER_VERSION,
@@ -1539,6 +2156,8 @@ mod tests {
             scenario_sha256: request.scenario_sha256.into(),
             operation_id: operation_id.clone(),
             readback: host.clone(),
+            zero_proof: None,
+            controller_receipt_sha256: None,
         };
         let driver_response = DriverResponse {
             schema_version: DRIVER_VERSION.into(),
@@ -1579,6 +2198,39 @@ mod tests {
     }
 
     #[test]
+    fn durable_ledger_scope_is_activation_scenario_and_generation_bound() {
+        let driver = config();
+        let control = AcceptanceControlConfig {
+            schema_version: CONTROL_CONFIG_SCHEMA.into(),
+            activation_id: driver.activation_id,
+            activation_package_digest: driver.activation_package_digest,
+            integrated_candidate_sha: driver.integrated_candidate_sha,
+            scenario_sha256: driver.scenario_sha256,
+            run_id: driver.run_id,
+            job_id: driver.job_id,
+            request_digest: driver.request_digest,
+            manifest_digest: driver.manifest_digest,
+            approval_id: driver.approval_id,
+            grant_event_id: driver.grant_event_id,
+            grant_digest: driver.grant_digest,
+            qualification_uid: driver.qualification_uid,
+            qualification_gid: driver.qualification_gid,
+            controller_generation: 7,
+            runner_generation: 9,
+        };
+        let ledger = new_control_ledger(&control);
+        assert!(ledger_matches_config(&ledger, &control));
+
+        let mut next = control.clone();
+        next.scenario_sha256 = hex('a', 64);
+        assert!(!ledger_matches_config(&ledger, &next));
+        next = control.clone();
+        next.controller_generation += 1;
+        assert!(!ledger_matches_config(&ledger, &next));
+        assert_eq!(ledger.entries.len(), 0);
+    }
+
+    #[test]
     fn driver_rejects_wrong_attempt_auth_digest_restart_and_capacity() {
         let fixture = fixture();
         let driver_config = config();
@@ -1612,6 +2264,8 @@ mod tests {
                 controller_generation: 7,
                 runner_generation: 9,
             },
+            zero_proof: None,
+            controller_receipt_sha256: None,
         };
         let transport = FakeTransport {
             replies: VecDeque::from([serde_json::to_vec(&wrong_capacity).unwrap()]),
@@ -1638,8 +2292,26 @@ mod tests {
             fn restart_runner(&mut self) -> Result<ControlReadback, Self::Error> {
                 Ok(self.0.clone())
             }
-            fn set_capacity_zero(&mut self) -> Result<ControlReadback, Self::Error> {
+            fn prepare_capacity_zero(
+                &mut self,
+                _request: &ControlRequest,
+            ) -> Result<ControlReadback, Self::Error> {
                 Ok(self.0.clone())
+            }
+            fn finalize_capacity_zero(
+                &mut self,
+                _request: &ControlRequest,
+            ) -> Result<HostZeroResult, Self::Error> {
+                Ok(fake_host_zero(&self.0))
+            }
+            fn prove_capacity_zero(
+                &mut self,
+                _request: &ControlRequest,
+            ) -> Result<HostZeroResult, Self::Error> {
+                Ok(fake_host_zero(&self.0))
+            }
+            fn emergency_capacity_zero(&mut self) -> Result<ZeroProof, Self::Error> {
+                Ok(fake_zero_proof(&self.0))
             }
         }
         let fixture = fixture();
@@ -1713,10 +2385,13 @@ mod tests {
 
     struct ScenarioTransport {
         fault: Fault,
+        trace: Vec<(AdapterEndpoint, u32)>,
+        control_frames: Vec<(u32, Vec<u8>)>,
+        finalize_failures: usize,
     }
 
     impl AdapterTransport for ScenarioTransport {
-        type Error = Infallible;
+        type Error = &'static str;
 
         fn exchange(
             &mut self,
@@ -1724,6 +2399,26 @@ mod tests {
             request: &[u8],
             _timeout: Duration,
         ) -> Result<Vec<u8>, Self::Error> {
+            let sequence = match endpoint {
+                AdapterEndpoint::Control => {
+                    serde_json::from_slice::<ControlRequest>(request)
+                        .unwrap()
+                        .sequence
+                }
+                AdapterEndpoint::Controld => {
+                    serde_json::from_slice::<AdapterRequest>(request)
+                        .unwrap()
+                        .sequence
+                }
+            };
+            self.trace.push((endpoint, sequence));
+            if endpoint == AdapterEndpoint::Control {
+                self.control_frames.push((sequence, request.to_vec()));
+                if sequence == 14 && self.finalize_failures > 0 {
+                    self.finalize_failures -= 1;
+                    return Err("transport lost after durable finalize");
+                }
+            }
             Ok(match endpoint {
                 AdapterEndpoint::Control => {
                     let request: ControlRequest = serde_json::from_slice(request).unwrap();
@@ -1733,6 +2428,7 @@ mod tests {
                         11 => (1, 8, 9),
                         12 => (1, 8, 10),
                         13 => (0, 8, 10),
+                        14 | 15 => (0, 8, 10),
                         _ => unreachable!(),
                     };
                     if self.fault == Fault::StaleRestart && request.sequence == 11 {
@@ -1741,6 +2437,20 @@ mod tests {
                     if self.fault == Fault::BadCapacity && request.sequence == 2 {
                         capacity = 2;
                     }
+                    let zero_proof = (request.sequence >= 14).then(|| ZeroProof {
+                        schema_version: ZERO_PROOF_VERSION.into(),
+                        scenario_sha256: request.scenario_sha256.clone(),
+                        activation_id: request.activation_id.clone(),
+                        activation_package_digest: request.activation_package_digest.clone(),
+                        integrated_candidate_sha: request.integrated_candidate_sha.clone(),
+                        capacity: 0,
+                        admission: AdmissionState::Closed,
+                        controller_generation: controller,
+                        runner_generation: runner,
+                        controld_service_active: false,
+                        controld_acceptance_socket_active: false,
+                        controld_acceptance_socket_present: false,
+                    });
                     let response = ControlResponse {
                         schema_version: CONTROL_RESPONSE_SCHEMA.into(),
                         sequence: request.sequence,
@@ -1760,6 +2470,8 @@ mod tests {
                             controller_generation: controller,
                             runner_generation: runner,
                         },
+                        zero_proof,
+                        controller_receipt_sha256: (request.sequence >= 14).then(|| hex('7', 64)),
                     };
                     serde_json::to_vec(&response).unwrap()
                 }
@@ -2006,16 +2718,71 @@ mod tests {
         let scenario_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&scenario).unwrap()));
         let mut config = config();
         config.scenario_sha256 = scenario_sha256;
-        let transport = ScenarioTransport { fault };
+        let transport = ScenarioTransport {
+            fault,
+            trace: Vec::new(),
+            control_frames: Vec::new(),
+            finalize_failures: 0,
+        };
         let mut driver = ProductionDriver::new(config, transport).unwrap();
         run_acceptance(&scenario, &mut driver)
     }
 
+    fn run_simulation_with_transport(
+        finalize_failures: usize,
+    ) -> (crate::acceptance::AcceptanceReceipt, ScenarioTransport) {
+        let scenario = scenario();
+        let scenario_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&scenario).unwrap()));
+        let mut config = config();
+        config.scenario_sha256 = scenario_sha256;
+        let transport = ScenarioTransport {
+            fault: Fault::None,
+            trace: Vec::new(),
+            control_frames: Vec::new(),
+            finalize_failures,
+        };
+        let mut driver = ProductionDriver::new(config, transport).unwrap();
+        let receipt = run_acceptance(&scenario, &mut driver);
+        (receipt, driver.into_transport())
+    }
+
     #[test]
     fn full_production_adapter_simulation_passes_all_thirteen_stages() {
-        let receipt = run_simulation(Fault::None);
+        let (receipt, transport) = run_simulation_with_transport(0);
         assert_eq!(receipt.outcome, Outcome::Pass);
         assert_eq!(receipt.checks.len(), 13);
+        assert_eq!(
+            &transport.trace[transport.trace.len() - 4..],
+            &[
+                (AdapterEndpoint::Control, 13),
+                (AdapterEndpoint::Controld, 13),
+                (AdapterEndpoint::Control, 14),
+                (AdapterEndpoint::Control, 15),
+            ]
+        );
+    }
+
+    #[test]
+    fn lost_finalize_response_retries_byte_identically_without_controld_reactivation() {
+        let (receipt, transport) = run_simulation_with_transport(1);
+        assert_eq!(receipt.outcome, Outcome::Pass);
+        let finalize: Vec<_> = transport
+            .control_frames
+            .iter()
+            .filter(|(sequence, _)| *sequence == 14)
+            .collect();
+        assert_eq!(finalize.len(), 2);
+        assert_eq!(finalize[0].1, finalize[1].1);
+        assert_eq!(
+            &transport.trace[transport.trace.len() - 5..],
+            &[
+                (AdapterEndpoint::Control, 13),
+                (AdapterEndpoint::Controld, 13),
+                (AdapterEndpoint::Control, 14),
+                (AdapterEndpoint::Control, 14),
+                (AdapterEndpoint::Control, 15),
+            ]
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@ fn run() -> Result<(), ControlError> {
     loop {
         let (stream, _) = listener.accept().map_err(|_| ControlError::HostAction)?;
         if serve_connection(stream, &config, &mut host).is_err() {
-            let _ = host.set_capacity_zero();
+            let _ = host.emergency_capacity_zero();
         }
     }
 }
