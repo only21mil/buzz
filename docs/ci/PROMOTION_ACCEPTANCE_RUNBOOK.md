@@ -25,6 +25,42 @@ The bundle must bind all of these identities exactly:
 - staging signer, production canary run, relay landing, authoritative mirror,
   merge commit and deliberate-red commit.
 
+Staging, canary and deliberate-red evidence retain canonical Nostr wire events:
+`id`, `pubkey`, `created_at`, `kind`, `tags`, raw `content` and `sig`. The
+verifier recomputes every event ID and verifies every BIP-340 Schnorr signature.
+It rejects caller-supplied verification claims. It also checks the repository
+CI tag contract before it binds each stored status event to its signed request,
+canonical run UUID, repository, workflow, tip, top-level base SHA, attempt and
+authorized relay signer.
+Each `event_evidence` object also retains the canonical HTTP(S) origin derived
+from the same trusted `BUZZ_RELAY_URL` or `--relay-url` configuration used to
+collect that run. Collection refuses missing configuration and never supplies a
+fallback relay.
+
+Kind coverage is deduplicated. It must equal 46101 through 46106, but the
+event list must contain every transition. A successful initial run therefore
+has ordered `queued`, `running` and terminal `success` kind-46101 facts and the
+same ordered kind-46102 history for every selected job. Sequences begin at one
+and have no gaps per run-attempt or job-attempt stream. Unknown kinds, states,
+fields, illegal transitions, cursor gaps and equivocation fail closed. Job
+name, required status, skip policy and selected matrix instance stay immutable
+through the lifecycle. Terminal state and conclusion must agree.
+
+Every rerun has its own signed kind-46100 request. Its stable run UUID, selected
+job, parent run, parent attempt and next attempt must form a contiguous lineage.
+Signed kind-46102 histories must match that request exactly, including the
+selected job instance and dependency fanout. The verifier decodes every retained
+log body, then checks its signed byte length, cap and SHA-256.
+
+Kind 46105 must name every selected job attempt exactly once and bind each log
+and artifact event ID to the same job and attempt. Kind 46106 must carry
+`lease_empty=true` and a strictly ordered lease set that exactly equals the
+selected job-attempt graph. The verifier accepts terminal run success only
+when both facts were stored first. Staging, canary and deliberate-red evidence
+must use the same repository coordinate, workflow ID and digest, selected job
+set and relay signer. These event contracts have no activation or tombstone
+fact, so this runbook makes no claim about either one.
+
 Missing evidence, a short or wrong SHA, a mismatched image or binary, a stale
 review, a dirty checkout, or an unapproved rollback fails closed before the
 receipt is written.
@@ -38,22 +74,25 @@ receipt is written.
    may not exceed 5,400 seconds or be expired at verification time.
 3. On approved staging infrastructure, capture the absent-policy 503 and
    configured-policy 200 paths; success, refusal, teardown, restart and
-   unaccepted paths; immutable request; root-executor handoff; records
-   46101–46106; signer; job set and conclusions; authenticated log denial;
-   bounded log response; and log digest.
+   unaccepted paths; the signed kind-46100 request; every ordered 46101 and
+   46102 transition; durable 46103 and 46104 references; exact 46105 evidence
+   finalization; exact 46106 lease-empty teardown; root-executor handoff;
+   authenticated log denial; bounded log response; and log digest.
 4. Run the 17 threat-model checks and all six named probes twice at the same
    full SHA. Retain both the canonical JSONL records and aggregate suite
    verdict. The six probes are trigger,
    assignment monitor, headless logs, bounded rerun, dropped run and bounded
    retries. Mock-suite evidence proves the harness only; live staging evidence
    remains mandatory.
-5. With explicit activation approval, prove production starts at concurrency
-   zero, transitions to one accepted signed job, refuses an unaccepted job,
-   accepts only signed allowed kinds, and gives idempotent retry results with a
-   fresh workspace per attempt.
+5. With production-canary approval, run one accepted signed job, refuse an
+   unaccepted job, retain the initial and rerun requests plus the complete
+   signed event history, and prove idempotent retry results with a fresh
+   workspace per attempt. The verifier checks request lineage and
+   staging/canary contract parity from the retained event facts.
 6. Run the deliberate-red candidate. The protected check must conclude
    failure, the merge must remain blocked, and a duplicate request must return
-   the same single terminal run.
+   the same single terminal run. Retain its canonical signed request, full
+   status history, finalization, teardown and decoded log evidence.
 7. After explicit deployment approval, record dump completion before swap,
    exact image/binary/revision/migration identities, readiness, NIP-11 and
    authenticated log results. Rehearse both rollback cases: a compatible
@@ -66,6 +105,18 @@ receipt is written.
 
 Choose a fixed UTC epoch for `--now`; it is part of the receipt so identical
 inputs and the same epoch produce identical bytes.
+
+Populate all three signed-event sections from the relay configuration used by
+the collection commands. The utility maps `ws` to `http` and `wss` to `https`,
+removes a trailing slash and default port, and refuses credentials, paths,
+queries, fragments or an origin that conflicts with retained evidence.
+
+```bash
+: "${BUZZ_RELAY_URL:?set the trusted relay used to collect this evidence}"
+python3 scripts/populate-ci-promotion-relay-origin.py \
+  --input "$HOME/work/buzz-promotion-evidence/promotion-evidence.unpopulated.json" \
+  --output "$HOME/work/buzz-promotion-evidence/promotion-evidence.json"
+```
 
 ```bash
 now=$(date -u +%s)
@@ -92,7 +143,7 @@ deploy, migrate, use sudo, start services, or invoke Docker.
 
 ## Live work still requiring approval
 
-The source harness cannot perform or authorize activation, GitHub settings or
+The source harness cannot perform or authorize GitHub settings or
 merges, production canary traffic, live log collection, database dump or
 migration, deployment, rollback, relay checkout changes, or authoritative
 mirror updates. Those steps stay blocked until their named operator approvals
