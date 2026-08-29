@@ -71,19 +71,22 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertNotIn("sudo", service)
 
     def test_fresh_umask_copy_keeps_declared_package_modes(self) -> None:
-        prior = os.umask(0)
+        prior = os.umask(0o077)
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 destinations = {
-                    "buzz-ci-acceptance-control.socket": 0o644,
-                    "buzz-ci-acceptance-control.service": 0o644,
-                    "buzz-ci-controld-acceptance.socket": 0o644,
-                    "buzzci-acceptance.tmpfiles": 0o644,
+                    "buzz-ci-acceptance-control.socket": (ACCEPTANCE / "templates" / "buzz-ci-acceptance-control.socket", 0o644),
+                    "buzz-ci-acceptance-control.service": (ACCEPTANCE / "templates" / "buzz-ci-acceptance-control.service", 0o644),
+                    "buzz-ci-controld-acceptance.socket": (ACCEPTANCE / "templates" / "buzz-ci-controld-acceptance.socket", 0o644),
+                    "buzzci-acceptance.tmpfiles": (ACCEPTANCE / "templates" / "buzzci-acceptance.tmpfiles", 0o644),
+                    "verify-receipt.py": (ACCEPTANCE / "verify-receipt.py", 0o755),
                 }
-                for name, mode in destinations.items():
+                for name, (source, mode) in destinations.items():
+                    if name == "verify-receipt.py":
+                        self.assertEqual(stat.S_IMODE(source.stat().st_mode), mode)
                     target = root / name
-                    shutil.copyfile(ACCEPTANCE / "templates" / name, target)
+                    shutil.copyfile(source, target)
                     os.chmod(target, mode)
                     self.assertEqual(stat.S_IMODE(target.stat().st_mode), mode)
         finally:
@@ -92,6 +95,7 @@ class AcceptancePackageTests(unittest.TestCase):
     def test_no_placeholder_or_ambient_credential_channel(self) -> None:
         checked = [
             ACCEPTANCE / "scenario.template.json",
+            ACCEPTANCE / "verify-receipt.py",
             *sorted((ACCEPTANCE / "templates").iterdir()),
         ]
         for path in checked:
