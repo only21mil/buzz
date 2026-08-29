@@ -136,7 +136,7 @@ pub struct PreflightRequest {
 /// Job definition in the preflight response.
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightJob {
-    /// Static job ID matching `^[A-Za-z0-9_]{1,64}$`.
+    /// Static job ID matching `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`.
     pub job_id: String,
     /// Human-readable workflow job name.
     pub name: String,
@@ -833,7 +833,8 @@ struct ParsedJob {
 /// may ignore unknown fields within a known schema version).
 ///
 /// Derivation (all from the workflow bytes, never the client):
-/// - `job_id` — the `jobs:` map key, validated against `^[A-Za-z0-9_]{1,64}$`.
+/// - `job_id` — the `jobs:` map key, validated against
+///   `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`.
 /// - `name` — the job's `name:` when present, else the job id.
 /// - `required` — the job's explicit `required:` bool, else `true` (the probe
 ///   fixture marks optional jobs `required: false`).
@@ -857,12 +858,7 @@ fn parse_workflow_jobs(bytes: &[u8]) -> Result<Vec<ParsedJob>, String> {
     let mut parsed = Vec::new();
     for (key, job_value) in jobs {
         let job_id = key.as_str().ok_or("job id must be a string")?.to_string();
-        if job_id.is_empty()
-            || job_id.len() > 64
-            || !job_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
+        if !is_valid_static_job_id(&job_id) {
             return Err(format!("invalid static job id {job_id:?}"));
         }
         let job = job_value.as_mapping().ok_or("job must be a mapping")?;
@@ -903,10 +899,7 @@ fn parse_workflow_jobs(bytes: &[u8]) -> Result<Vec<ParsedJob>, String> {
                 if need == &job_id {
                     return Err(format!("job {job_id} depends on itself"));
                 }
-                if need.is_empty()
-                    || need.len() > 64
-                    || !need.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
+                if !is_valid_static_job_id(need) {
                     return Err(format!("invalid needs id {need:?} in job {job_id}"));
                 }
             }
@@ -921,6 +914,15 @@ fn parse_workflow_jobs(bytes: &[u8]) -> Result<Vec<ParsedJob>, String> {
         });
     }
     Ok(parsed)
+}
+
+fn is_valid_static_job_id(value: &str) -> bool {
+    if value.len() > 64 {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Select the static job set and the selected job ids per protocol §9.5.
@@ -2186,13 +2188,13 @@ mod tests {
     fn workflow_jobs_parse_derives_semantics_from_bytes_only() {
         let workflow = br#"name: build-ci
 jobs:
-  lint:
+  rust-lint:
     runs-on: linux
     steps:
       - run: cargo fmt --check
-  test:
+  desktop-smoke-e2e:
     runs-on: linux
-    needs: lint
+    needs: rust-lint
     if: github.event_name == 'push'
     steps:
       - run: cargo test
@@ -2207,17 +2209,20 @@ jobs:
         let by_id: std::collections::HashMap<_, _> =
             jobs.iter().map(|job| (job.job_id.as_str(), job)).collect();
 
-        // lint: default required=true, no `if:` → forbid (a skipped required
+        // rust-lint: default required=true, no `if:` → forbid (a skipped required
         // job is a violation).
-        assert_eq!(by_id["lint"].name, "lint");
-        assert!(by_id["lint"].required);
-        assert_eq!(by_id["lint"].skip_policy, "forbid");
-        assert!(by_id["lint"].needs.is_empty());
+        assert_eq!(by_id["rust-lint"].name, "rust-lint");
+        assert!(by_id["rust-lint"].required);
+        assert_eq!(by_id["rust-lint"].skip_policy, "forbid");
+        assert!(by_id["rust-lint"].needs.is_empty());
 
-        // test: `if:` condition → skippable → allow; needs for the dependency.
-        assert!(by_id["test"].required);
-        assert_eq!(by_id["test"].skip_policy, "allow");
-        assert_eq!(by_id["test"].needs, vec!["lint".to_string()]);
+        // desktop-smoke-e2e: `if:` condition → skippable → allow; needs for the dependency.
+        assert!(by_id["desktop-smoke-e2e"].required);
+        assert_eq!(by_id["desktop-smoke-e2e"].skip_policy, "allow");
+        assert_eq!(
+            by_id["desktop-smoke-e2e"].needs,
+            vec!["rust-lint".to_string()]
+        );
 
         // optional: explicit required=false → allow.
         assert!(!by_id["optional"].required);
@@ -2235,6 +2240,49 @@ jobs:
         assert!(jobs[0].required);
         assert_eq!(jobs[0].skip_policy, "forbid");
         assert_eq!(workflow_id(workflow), DEFAULT_WORKFLOW_ID);
+    }
+
+    #[test]
+    fn workflow_jobs_parse_accepts_current_github_workflow_job_ids() {
+        let workflow = include_bytes!("../../../../.github/workflows/ci.yml");
+        let jobs = parse_workflow_jobs(workflow).expect("parse current GitHub workflow");
+        let ids: std::collections::HashSet<_> =
+            jobs.iter().map(|job| job.job_id.as_str()).collect();
+
+        assert_eq!(jobs.len(), 17);
+        for expected in ["rust-lint", "desktop-smoke-e2e", "desktop-build-macos"] {
+            assert!(ids.contains(expected), "missing current job ID {expected}");
+        }
+    }
+
+    #[test]
+    fn static_job_id_grammar_matches_github_and_rejects_ambiguous_separators() {
+        let max = format!("a{}", "-".repeat(63));
+        for value in ["a", "_", "A-0_x", "desktop-smoke-e2e", max.as_str()] {
+            assert!(
+                is_valid_static_job_id(value),
+                "rejected valid job ID {value:?}"
+            );
+        }
+
+        let too_long = format!("a{}", "-".repeat(64));
+        for value in [
+            "",
+            "0job",
+            "-job",
+            ".job",
+            "job.name",
+            "job/name",
+            "job:name",
+            "job name",
+            "é",
+            too_long.as_str(),
+        ] {
+            assert!(
+                !is_valid_static_job_id(value),
+                "accepted unsafe job ID {value:?}"
+            );
+        }
     }
 
     #[test]
@@ -2533,13 +2581,7 @@ jobs:
         for job in &response.jobs {
             assert!(!job.name.is_empty(), "job name must be non-empty");
             assert!(
-                !job.job_id.is_empty() && job.job_id.len() <= 64,
-                "job_id must satisfy the static job grammar"
-            );
-            assert!(
-                job.job_id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                is_valid_static_job_id(&job.job_id),
                 "job_id must satisfy the static job grammar"
             );
             let _required_flag = job.required; // presence locked; semantics are broker-manifest state

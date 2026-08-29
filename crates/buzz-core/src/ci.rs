@@ -19,7 +19,7 @@ pub const CI_SCHEMA_VERSION: u32 = 1;
 pub const CI_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// SHA-256 of `BUZZ_CI_PROTOCOL_CONTRACT.md` v1.4 implemented by this module.
 pub const CI_PROTOCOL_CONTRACT_SHA256: &str =
-    "8b9715d719b057d5d297074c3d019e40d1d2104eeafa2b6033f17b465e7d5a1c";
+    "ac335626526aba0a0c429e6fbbe387600155d539f456075375cb6f11fb0a18d1";
 
 /// Validation failure for a CI envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -1406,11 +1406,12 @@ fn validate_non_empty(value: &str, message: &'static str) -> Result<(), CiValida
 }
 
 fn validate_job_id(value: &str) -> Result<(), CiValidationError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    if value.len() > 64 {
+        return Err(CiValidationError("invalid static job ID"));
+    }
+    let mut bytes = value.bytes();
+    if !matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(CiValidationError("invalid static job ID"));
     }

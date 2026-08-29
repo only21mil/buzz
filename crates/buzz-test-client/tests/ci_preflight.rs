@@ -279,9 +279,12 @@ async fn preflight_configured_policy_returns_complete_section_2_response() {
     for job in jobs {
         let job_id = required_non_empty_string(job, "job_id");
         assert!(job_id.len() <= 64);
-        assert!(job_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
+        let mut bytes = job_id.bytes();
+        assert!(matches!(
+            bytes.next(),
+            Some(first) if first.is_ascii_alphabetic() || first == b'_'
+        ));
+        assert!(bytes.all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') }));
         assert!(job_ids.insert(job_id), "job IDs must be unique");
         required_non_empty_string(job, "name");
         assert!(job["required"].is_boolean());

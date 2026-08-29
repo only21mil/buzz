@@ -288,11 +288,14 @@ fn validate_lower_hex(name: &str, value: &str, length: usize) -> Result<(), Mate
 }
 
 fn validate_job_id(value: &str) -> Result<(), MaterializeError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    if value.len() > 64 {
+        return Err(MaterializeError::InvalidManifest(
+            "job_id does not match the protocol static job grammar".into(),
+        ));
+    }
+    let mut bytes = value.bytes();
+    if !matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(MaterializeError::InvalidManifest(
             "job_id does not match the protocol static job grammar".into(),
@@ -364,6 +367,29 @@ mod tests {
         assert!(Sha256Digest::parse("a".repeat(64)).is_ok());
         assert!(Sha256Digest::parse("A".repeat(64)).is_err());
         assert!(Sha256Digest::parse("a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn static_job_id_grammar_accepts_hyphens_and_rejects_unsafe_forms() {
+        let max = format!("a{}", "-".repeat(63));
+        for value in ["a", "_", "A-0_x", "desktop-smoke-e2e", max.as_str()] {
+            assert!(validate_job_id(value).is_ok(), "rejected {value:?}");
+        }
+
+        let too_long = format!("a{}", "-".repeat(64));
+        for value in [
+            "",
+            "0job",
+            "-job",
+            "job.name",
+            "job/name",
+            "job:name",
+            "job name",
+            "é",
+            too_long.as_str(),
+        ] {
+            assert!(validate_job_id(value).is_err(), "accepted {value:?}");
+        }
     }
 
     #[test]

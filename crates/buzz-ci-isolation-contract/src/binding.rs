@@ -286,11 +286,15 @@ fn validate_repository_coordinate(value: &str) -> Result<(), ContractError> {
 }
 
 fn validate_job_id(value: &str) -> Result<(), ContractError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    if value.len() > 64 {
+        return Err(ContractError::invalid(
+            "job_id",
+            "must match the protocol static job grammar",
+        ));
+    }
+    let mut bytes = value.bytes();
+    if !matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(ContractError::invalid(
             "job_id",
@@ -642,14 +646,23 @@ mod tests {
 
         let mut job = binding();
         job.job_id = "linux-job".into();
-        assert!(job.validate_phase1(&context()).is_err());
+        assert!(job.validate_phase1(&context()).is_ok());
+
+        for invalid in ["0linux", "-linux", "linux.job", "linux/job", "linux job"] {
+            let mut job = binding();
+            job.job_id = invalid.into();
+            assert!(
+                job.validate_phase1(&context()).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]
     fn teardown_tuple_serializes_exactly_like_protocol_v14() {
         assert_eq!(
             buzz_core::ci::CI_PROTOCOL_CONTRACT_SHA256,
-            "8b9715d719b057d5d297074c3d019e40d1d2104eeafa2b6033f17b465e7d5a1c"
+            "ac335626526aba0a0c429e6fbbe387600155d539f456075375cb6f11fb0a18d1"
         );
         let validated = binding().validate_phase1(&context()).unwrap();
         let local = serde_json::to_vec(&validated.teardown_identity()).unwrap();

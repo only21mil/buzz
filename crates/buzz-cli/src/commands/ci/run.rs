@@ -654,14 +654,17 @@ fn validate_unique_job_ids(values: &[String], field: &str) -> Result<(), CliErro
 }
 
 fn validate_job_id(value: &str, field: &str) -> Result<(), CliError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    if value.len() > 64 {
+        return Err(CliError::Usage(format!(
+            "{field} must start with [A-Za-z_], use [A-Za-z0-9_-], and contain 1 to 64 bytes"
+        )));
+    }
+    let mut bytes = value.bytes();
+    if !matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(CliError::Usage(format!(
-            "{field} must use [A-Za-z0-9_] and contain 1 to 64 bytes"
+            "{field} must start with [A-Za-z_], use [A-Za-z0-9_-], and contain 1 to 64 bytes"
         )));
     }
     Ok(())
@@ -797,6 +800,29 @@ mod tests {
         let validated =
             validate_preflight(preflight(), &preflight_request(), "https://relay.example").unwrap();
         assert_eq!(validated.selected_jobs[0].job_id, "test");
+    }
+
+    #[test]
+    fn static_job_id_grammar_accepts_hyphens_and_rejects_unsafe_forms() {
+        let max = format!("a{}", "-".repeat(63));
+        for value in ["a", "_", "A-0_x", "desktop-smoke-e2e", max.as_str()] {
+            assert!(validate_job_id(value, "job").is_ok(), "rejected {value:?}");
+        }
+
+        let too_long = format!("a{}", "-".repeat(64));
+        for value in [
+            "",
+            "0job",
+            "-job",
+            "job.name",
+            "job/name",
+            "job:name",
+            "job name",
+            "é",
+            too_long.as_str(),
+        ] {
+            assert!(validate_job_id(value, "job").is_err(), "accepted {value:?}");
+        }
     }
 
     #[test]

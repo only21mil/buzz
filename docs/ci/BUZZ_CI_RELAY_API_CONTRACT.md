@@ -53,7 +53,9 @@ Response:
 }
 ```
 
-The relay resolves exactly one authorized effective PR snapshot whose full `tip_oid` equals `requested_tip_oid`; `trigger_event_id` equals `pr_update_event_id` when present and otherwise `pr_root_event_id`. The workflow is resolved only from canonical bytes at the trusted full `base_oid`. Jobs are static IDs using `^[A-Za-z0-9_]{1,64}$`, non-empty and unique.
+The relay resolves exactly one authorized effective PR snapshot whose full `tip_oid` equals `requested_tip_oid`; `trigger_event_id` equals `pr_update_event_id` when present and otherwise `pr_root_event_id`. The workflow is resolved only from canonical bytes at the trusted full `base_oid`. Jobs are static IDs using `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`, non-empty and unique. This follows the GitHub Actions job identifier contract while preserving Buzz's 64-byte bound; IDs that begin with a digit or contain whitespace, dots, slashes, colons, or non-ASCII bytes fail closed.
+
+This source contract does not activate Buzz-native CI. Native CI remains unavailable until the separate production adapter seams, maintained control service, owner-configured status signers and policy, and required service credentials are completed, reviewed, and deployed. GitHub's protected checks remain the delivery authority until that activation work is complete.
 
 Before signing kind 46100, the CLI independently requires: exact repository/tip equality; exact effective-trigger equality; a safe credential-free clone URL; a non-empty advertised immutable ref; SHA-256 of decoded `canonical_workflow_base64` equals `workflow_digest`; and selected jobs are a non-empty unique subset of the returned static set. Preflight fields never supply or extend the authorized signer set.
 
