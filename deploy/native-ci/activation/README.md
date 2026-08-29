@@ -9,8 +9,10 @@ qualification, and runner-executor binaries. It also installs the three frozen
 capacity-one acceptance binaries and the tracked receipt verifier because no
 other package owns them. Every
 binary has a full source commit, binary digest, and copied mode-`0400`
-provenance record. The staged and active runner and controld configs have
-separate digests. The separate keyholder package solely owns
+provenance record. The staged and active runner, execd-template, and controld
+configs have separate digests. Execd's exact live configs are rendered only
+after the package digest and acceptance scenario are known. The separate
+keyholder package solely owns
 `/etc/buzzci/keyholder-v1.json`; activation validates its exact public receipt
 reference, peer operations, selectors, origin, owner, and mode but never writes
 the file.
@@ -62,28 +64,38 @@ already exist with their frozen staged bytes and metadata.
 1. `stage --scenario` validates the exact scenario, installs the generated
    sysusers, tmpfiles, acceptance binaries and units, target, drop-ins, and
    capacity-zero configs. After the package digest is known, it atomically
-   writes the shared acceptance binding receipt and the two acceptance adapter
-   configs.
+   writes the shared acceptance binding receipt, the two acceptance adapter
+   configs, and the rendered capacity-zero execd-v2 config. It persists the
+   truthful `staged_zero` receipt before starting any receipt-consuming staged
+   service. A startup/readback failure triggers complete compensation and
+   independent prior-state readback.
    It also installs the controller and its package module, then copies the
    validated package to the fixed root-owned mode-`0700`
    `/var/lib/buzzci/activation-controller/package`. Only the two acceptance
    sockets and their services remain active. Ordinary CI units and the
    capacity-one target remain inactive and disabled.
-2. `activate` replaces only the runner and controld configs with their frozen
-   active variants. It starts keyholder, execd, runner, and controld in the
-   manifest's fixed order. Socket ownership and mode readback must pass.
-3. The controller sends one bounded, frozen request on stdin to the
-   descriptor-opened `/usr/libexec/buzz-ci-acceptance-ctl`. It passes no
-   arguments, clears the environment, applies `no_new_privs` where supported,
-   and runs as the manifest-bound `buzzci-ctl` UID, primary GID, and sole
-   supplementary group. Timeout cleanup sends TERM and then KILL to the whole
-   new process group. The exact response digest and a second health readback
-   must pass before the controller enables `buzz-ci-capacity-one.target`.
-4. Any failed activation attempts every stop, disable, config-restage, reload,
+2. `activate` first starts execd with its rendered capacity-zero config while
+   admission and the capacity-one target remain closed. It constructs a closed
+   production-v2 qualification request from exact package, scenario, principal,
+   lane, seccomp, executor, and generation bindings. Random request ID, nonce,
+   time bounds, and complete compact bytes are persisted before execution and
+   reused byte-for-byte on retry.
+3. The descriptor-opened `/usr/libexec/buzz-ci-production-qualification`
+   receives that request with no arguments. The controller clears the
+   environment, applies `no_new_privs`, and runs it as the manifest-bound
+   `buzzci-ctl` identity with sole `buzzci-execd` supplementary membership.
+   Timeout cleanup TERM/KILLs and reaps the whole new process group. Only an
+   exact `qualified_closed` production-v2 response passes. The client is frozen
+   at source commit `a86023a797aa6251001829aefcc30698b3580bc0`; neither the
+   legacy v1 client nor the full live canary is used for this gate.
+4. Activation then stops execd, installs active runner, rendered execd, and
+   controld configs, starts the fixed dependency order, and enables the target
+   only after socket and health readback.
+5. Any failed activation attempts every stop, disable, config-restage, reload,
    and independent readback. It records `rollback_failed` unless both staged
    configs and inactive units are proven; it never labels an unproven host
    `staged_zero`.
-5. `rollback` first validates every managed target against its prior, staged,
+6. `rollback` first validates every managed target against its prior, staged,
    or active digest. Unknown drift stops rollback before systemd or file
    mutation. A valid rollback stops and disables the activation, restores exact
    prior bytes, metadata, and exact unit active/enable state. It restores or
@@ -96,7 +108,7 @@ its fixed hyphenated action and a compact JSON request on stdin. It accepts no
 package or root path from the caller.
 
 - `prepare-qualification-zero` verifies the immutable fixed package, restores
-  and reads back the staged runner and controld configs, and keeps controld plus
+  and reads back the staged runner, rendered execd, and controld configs, and keeps controld plus
   both acceptance services available for the stage-13 durable snapshot.
 - `finalize-qualification-zero` stops the controld acceptance socket first and
   controld second, closes the remaining capacity-one units, keeps the root
@@ -138,18 +150,26 @@ canary, not the input file's whitespace or key order.
 Create a private mode-`0600` draft that follows
 `activation-manifest.schema.json`, except use schema
 `buzz-ci-capacity-one-activation-draft-v1` and omit `activation_id` and
-`package_digest`. Asset names are flat `assets/...` names. Put config,
-provenance, and qualification request inputs in a private asset directory with
-the exact source modes declared by the draft.
+`package_digest`. Asset names are flat `assets/...` names. Put config and
+provenance inputs in a private asset directory with the exact source modes
+declared by the draft. Qualification requests are never frozen assets because
+they bind the final package digest and runtime validity interval.
 
 The runner staged config is the exact runner-v2 `dormant` shape at
 `/etc/buzzci/runner-v2.json`. Its active config selects `mode=v2_proxy`, binds
 the root execd peer at `/run/buzzci/execd.sock`, and carries the frozen lane
-authority. The root-owned `/etc/buzzci/execd-v2.json` binds protocol v2,
+authority. The package freezes closed capacity-zero and capacity-one execd-v2
+templates with zero dynamic placeholders. After freezing, the controller
+injects only the final package digest, canonical scenario digest, and initial
+controller/runner generations, atomically installs the rendered
+`/etc/buzzci/execd-v2.json`, and receipt-binds both rendered digests. The config binds protocol v2,
 `RegisterJobIntent` operation 9, exact runner and qualification peers, the
 `buzzci-job` executor principal, retained intent/state roots, the executor
 socket, lane manifest digest, and packaged `/usr/libexec/buzz-ci-executor`
-provenance. Dynamic accepted-request intent files are runtime state and are
+provenance. It also binds the exact `buzzci-ctl` name, manifest-selected UID and
+GID, `/var/lib/buzzci/ctl` home, `/usr/sbin/nologin` shell, sole
+`buzzci-execd` supplementary group, and private qualification root. Dynamic
+accepted-request intent files are runtime state and are
 never frozen into the activation package.
 
 The package also freezes the tracked Git-`100755` receipt verifier from
@@ -161,6 +181,10 @@ Git executable class and writes the package asset and installed target at their
 declared exact modes. The settled source contract is commit
 `84698212017eb20891c931c645024c0e7de265f8`, SHA-256
 `2d95e2a97655e40ef779804065f68450dd6745ba2b499e4ecf9218f25540c6fd`.
+Its Git-`100644` expected-stage table is separately frozen at package mode
+`0400` and installed root:root mode `0644` only at
+`/usr/libexec/buzz-ci-acceptance-expected-stages.json`; the verifier has no
+argument or environment override for that path.
 
 The activation tmpfiles entry creates retained execd and seccomp parent
 directories only. The execd composition package owns the immutable seccomp

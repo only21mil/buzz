@@ -44,6 +44,11 @@ SYSUSERS = "/usr/bin/systemd-sysusers"
 TMPFILES = "/usr/bin/systemd-tmpfiles"
 MAX_COMMAND_OUTPUT = 256 * 1024
 MAX_BINARY_BYTES = 128 * 1024 * 1024
+QUALIFICATION_REQUEST_SCHEMA = "buzz-ci-production-qualification-request/v2"
+QUALIFICATION_RESPONSE_SCHEMA = "buzz-ci-production-qualification-response/v2"
+QUALIFICATION_STATE_SCHEMA = "buzz-ci-production-qualification-state/v2"
+QUALIFICATION_PRINCIPAL_DOMAIN = b"buzz-ci-execd:production-qualification-principal:v1\0"
+QUALIFICATION_EXECUTOR_DOMAIN = b"buzz-ci-execd:production-qualification-executor-provenance:v1\0"
 
 
 def utc_now() -> str:
@@ -364,7 +369,9 @@ def load_acceptance_scenario(path: Path, manifest: dict[str, Any], *, live: bool
     return _acceptance_binding(manifest, scenario)
 
 
-def _generated_acceptance_files(manifest: dict[str, Any], binding: dict[str, object]) -> list[dict[str, object]]:
+def _generated_acceptance_files(
+    manifest: dict[str, Any], payloads: dict[str, bytes], binding: dict[str, object],
+) -> list[dict[str, object]]:
     fixture = binding["fixture"]
     qualification = manifest["identities"]["qualification"]
     controld = manifest["identities"]["controld"]
@@ -398,6 +405,9 @@ def _generated_acceptance_files(manifest: dict[str, Any], binding: dict[str, obj
         "controld_socket": activation_package.SOCKET_POLICY["controld_acceptance"]["path"],
         "timeout_millis": binding["timeout_millis"],
     }
+    execd_entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+    execd_staged = _render_execd_config(manifest, payloads, execd_entry, binding, capacity=0)
+    execd_active = _render_execd_config(manifest, payloads, execd_entry, binding, capacity=1)
     return [
         {
             "role": "controld_acceptance_binding", "target": ACCEPTANCE_BINDING_PATH,
@@ -412,7 +422,42 @@ def _generated_acceptance_files(manifest: dict[str, Any], binding: dict[str, obj
             "payload": activation_package.canonical_json(driver), "mode": 0o440, "uid": 0,
             "gid": qualification["gid"],
         },
+        {
+            "role": "execd_config", "target": activation_package.CONFIG_TARGETS["execd_config"],
+            "payload": execd_staged, "active_payload": execd_active,
+            "mode": 0o600, "uid": 0, "gid": 0,
+        },
     ]
+
+
+def _render_execd_config(
+    manifest: dict[str, Any], payloads: dict[str, bytes], entry: dict[str, object],
+    binding: dict[str, object], *, capacity: int,
+) -> bytes:
+    source_field = "source" if capacity == 0 else "active_source"
+    source = entry.get(source_field)
+    if not isinstance(source, str):
+        raise ValueError("execd configuration template phase is absent")
+    fixture = binding.get("fixture")
+    if not isinstance(fixture, dict):
+        raise ValueError("execd qualification fixture is absent")
+    template = payloads.get(source)
+    if template is None:
+        raise ValueError("execd configuration template payload is unavailable")
+    try:
+        rendered = json.loads(template, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("execd configuration template is invalid JSON") from error
+    qualification = rendered.get("qualification")
+    if not isinstance(qualification, dict) or rendered.get("capacity") != capacity:
+        raise ValueError("execd configuration template phase differs")
+    qualification.update({
+        "activation_package_digest": manifest["package_digest"],
+        "fixture_digest": binding["scenario_sha256"],
+        "controller_generation": fixture["controller_generation"],
+        "runner_generation": fixture["runner_generation"],
+    })
+    return activation_package.canonical_json(rendered)
 
 
 def _capture_prior(root: Path, target: str) -> dict[str, object]:
@@ -493,15 +538,21 @@ def _acceptance_ledger_prior_readback(receipt: dict[str, Any], root: Path) -> st
 
 
 def _generated_records(root: Path, generated: list[dict[str, object]]) -> list[dict[str, object]]:
-    return [
-        {
+    records: list[dict[str, object]] = []
+    for item in generated:
+        record: dict[str, object] = {
             "role": item["role"], "target": item["target"], "sha256": activation_package.digest(item["payload"]),
             "mode": item["mode"], "uid": item["uid"], "gid": item["gid"],
             "payload_base64": base64.b64encode(item["payload"]).decode("ascii"),
             "prior": _capture_prior(root, item["target"]),
         }
-        for item in generated
-    ]
+        if "active_payload" in item:
+            record.update({
+                "active_sha256": activation_package.digest(item["active_payload"]),
+                "active_payload_base64": base64.b64encode(item["active_payload"]).decode("ascii"),
+            })
+        records.append(record)
+    return records
 
 
 def _bind_generated_plan(records: object, generated: list[dict[str, object]]) -> None:
@@ -517,23 +568,37 @@ def _bind_generated_plan(records: object, generated: list[dict[str, object]]) ->
             "mode": item["mode"], "uid": item["uid"], "gid": item["gid"],
             "payload_base64": base64.b64encode(item["payload"]).decode("ascii"),
         }
+        if "active_payload" in item:
+            expected.update({
+                "active_sha256": activation_package.digest(item["active_payload"]),
+                "active_payload_base64": base64.b64encode(item["active_payload"]).decode("ascii"),
+            })
         if record is None or any(record.get(key) != value for key, value in expected.items()):
             raise ValueError("acceptance scenario differs from the staged receipt")
 
 
-def _apply_generated(root: Path, records: list[dict[str, object]]) -> None:
+def _apply_generated(root: Path, records: list[dict[str, object]], *, phase: str = "staged") -> None:
     for record in records:
-        payload = base64.b64decode(record["payload_base64"], validate=True)
-        if activation_package.digest(payload) != record["sha256"]:
+        active = phase == "active" and "active_payload_base64" in record
+        payload_key = "active_payload_base64" if active else "payload_base64"
+        digest_key = "active_sha256" if active else "sha256"
+        payload = base64.b64decode(record[payload_key], validate=True)
+        if activation_package.digest(payload) != record[digest_key]:
             raise ValueError(f"generated acceptance payload digest differs: {record['role']}")
         _atomic_write(root, record["target"], payload, record["mode"], record["uid"], record["gid"])
 
 
-def _verify_generated(root: Path, records: list[dict[str, object]]) -> dict[str, str]:
+def _verify_generated(
+    root: Path, records: list[dict[str, object]], *, phase: str = "staged",
+) -> dict[str, str]:
     result: dict[str, str] = {}
     for record in records:
-        _verify_target_digest(root, record["target"], record, MAX_SCENARIO_BYTES)
-        result[record["role"]] = "exact"
+        active = phase == "active" and "active_sha256" in record
+        expected = dict(record)
+        if active:
+            expected["sha256"] = record["active_sha256"]
+        _verify_target_digest(root, record["target"], expected, MAX_SCENARIO_BYTES)
+        result[record["role"]] = "active" if active else "exact"
     return result
 
 
@@ -573,7 +638,6 @@ def load_package(package: Path, *, live: bool) -> tuple[dict[str, Any], dict[str
             references[entry["active_source"]] = (activation_package.parse_mode(entry["active_source_mode"]), entry["active_sha256"])
     for component in manifest["components"]:
         references[component["provenance_source"]] = (0o400, component["provenance_sha256"])
-    references[manifest["qualification"]["request_source"]] = (0o400, manifest["qualification"]["request_sha256"])
     actual_assets = {f"assets/{item.name}" for item in (package / "assets").iterdir()}
     if actual_assets != set(references):
         raise ValueError("activation package has missing or extra assets")
@@ -603,7 +667,6 @@ def _package_references(manifest: dict[str, Any]) -> dict[str, int]:
             references[entry["active_source"]] = activation_package.parse_mode(entry["active_source_mode"])
     for component in manifest["components"]:
         references[component["provenance_source"]] = 0o400
-    references[manifest["qualification"]["request_source"]] = 0o400
     return references
 
 
@@ -914,6 +977,7 @@ class FakeSystemd:
             (activation_package.EXECD_EVIDENCE_ROOT, 0o700),
             (activation_package.EXECD_TEARDOWN_ROOT, 0o700),
             (activation_package.EXECD_ATTEMPT_ROOT, 0o711),
+            (activation_package.EXECD_QUALIFICATION_ROOT, 0o700),
         ):
             directory = activation_package.rooted(self.root, target)
             directory.mkdir(parents=True, mode=mode, exist_ok=True)
@@ -1111,6 +1175,8 @@ def _entry_state(root: Path, entry: dict[str, object], opened: tuple[bytes, os.s
         return "staged"
     if observed_digest == entry.get("active_sha256"):
         return "active"
+    if entry["role"] == "execd_config":
+        return "prior"
     return "drift"
 
 
@@ -1189,7 +1255,7 @@ def preflight(
     components = _component_readback(manifest, root, allow_installable_absent=True)
     principals = _identity_readback(driver, manifest["identities"], allow_absent=True)
     access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=True)
-    managed = _managed_readback(manifest, root, {"absent", "staged"})
+    managed = _managed_readback(manifest, root, {"absent", "staged", "prior"})
     for role in ("runner_config", "controld_config"):
         if managed[role] != "staged":
             raise ValueError(f"frozen component config is absent before activation: {role}")
@@ -1220,7 +1286,7 @@ def _new_receipt(
             prior: dict[str, object] = {"exists": False}
         else:
             payload, metadata = opened
-            if _entry_state(root, entry, opened) != "staged":
+            if entry["role"] != "execd_config" and _entry_state(root, entry, opened) != "staged":
                 raise ValueError(f"staging refuses existing target drift: {entry['target']}")
             prior = {
                 "exists": True,
@@ -1278,7 +1344,7 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
         raise ValueError("receipt belongs to a different activation package")
     records = receipt["acceptance_generated"]
     if not isinstance(records, list) or {record.get("role") for record in records if isinstance(record, dict)} != {
-        "controld_acceptance_binding", "acceptance_control_config", "acceptance_driver_config",
+        "controld_acceptance_binding", "acceptance_control_config", "acceptance_driver_config", "execd_config",
     }:
         raise ValueError("receipt acceptance generated targets differ")
     if receipt["fixed_package"] != {
@@ -1286,7 +1352,40 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
         "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest)),
     }:
         raise ValueError("receipt fixed activation package binding differs")
+    _validate_qualification_state(receipt["qualification"], receipt)
     _validate_qualification_zero_state(receipt["qualification_zero"], receipt)
+
+
+def _validate_qualification_state(value: object, receipt: dict[str, Any]) -> None:
+    if value is None:
+        return
+    required = {
+        "schema", "status", "request_sha256", "request_base64",
+        "response_sha256", "response_base64", "completed_at",
+    }
+    if not isinstance(value, dict) or set(value) != required or value.get("schema") != QUALIFICATION_STATE_SCHEMA:
+        raise ValueError("production qualification receipt state differs")
+    if value["status"] not in {"pending", "passed"}:
+        raise ValueError("production qualification status differs")
+    try:
+        request = base64.b64decode(value["request_base64"], validate=True)
+        parsed = json.loads(request, object_pairs_hook=activation_package.reject_duplicates)
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("production qualification request receipt is invalid") from error
+    if activation_package.digest(request) != value["request_sha256"] or request != _wire_qualification_json(parsed):
+        raise ValueError("production qualification request receipt bytes differ")
+    if parsed.get("schema_version") != QUALIFICATION_REQUEST_SCHEMA or parsed.get("activation_package_digest") != receipt["package_digest"]:
+        raise ValueError("production qualification request belongs to a different package")
+    if value["status"] == "pending":
+        if any(value[field] is not None for field in ("response_sha256", "response_base64", "completed_at")):
+            raise ValueError("pending production qualification contains response state")
+        return
+    if not all(isinstance(value[field], str) and value[field] for field in ("response_sha256", "response_base64", "completed_at")):
+        raise ValueError("passed production qualification response state is incomplete")
+    response = base64.b64decode(value["response_base64"], validate=True)
+    if activation_package.digest(response) != value["response_sha256"]:
+        raise ValueError("passed production qualification response digest differs")
+    _validate_qualification_response(request, response)
 
 
 def _validate_qualification_zero_state(value: object, receipt: dict[str, Any]) -> None:
@@ -1329,6 +1428,8 @@ def _apply_phase(
     phase: str,
 ) -> None:
     for entry in manifest["entries"]:
+        if entry["role"] == "execd_config":
+            continue
         if phase == "active" and "active_source" in entry:
             source = entry["active_source"]
         else:
@@ -1347,6 +1448,8 @@ def _verify_phase(manifest: dict[str, Any], root: Path, phase: str) -> dict[str,
     expected_state = "active" if phase == "active" else "staged"
     result: dict[str, str] = {}
     for entry in manifest["entries"]:
+        if entry["role"] == "execd_config":
+            continue
         observed = _entry_state(root, entry, _read_target(root, entry["target"]))
         wanted = expected_state if "active_source" in entry else "staged"
         if observed != wanted:
@@ -1449,6 +1552,31 @@ def _staged_zero_readback(
     sockets = _socket_readback(
         manifest, driver, names={"acceptance_control", "controld_acceptance"},
     )
+    return {"units": units, "sockets": sockets}
+
+
+def _staged_zero_convergence_readback(
+    manifest: dict[str, Any], driver: LiveSystemd | FakeSystemd,
+) -> dict[str, object]:
+    names = sorted(set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT]))
+    units = _unit_readback(driver, names)
+    staged = set(activation_package.STAGED_ZERO_UNITS)
+    for name, state in units.items():
+        if name in staged:
+            if state["ActiveState"] not in {"active", "inactive"}:
+                raise ValueError(f"staged-zero convergence found unsupported unit state: {name}")
+        elif state["ActiveState"] != "inactive":
+            raise ValueError(f"staged-zero convergence found active capacity-one unit: {name}")
+    target = units[activation_package.PERSISTENT_UNIT]
+    if target["LoadState"] != "not-found" and target["UnitFileState"] not in {"disabled", "static"}:
+        raise ValueError("capacity-one target remains enabled during staged-zero convergence")
+    sockets: dict[str, object] = {}
+    for name in ("acceptance_control", "controld_acceptance"):
+        policy = manifest["socket_policy"][name]
+        if units[policy["unit"]]["ActiveState"] == "active":
+            sockets.update(_socket_readback(manifest, driver, names={name}))
+        else:
+            driver.socket_absent(policy)
     return {"units": units, "sockets": sockets}
 
 
@@ -1787,6 +1915,7 @@ def _finalize_qualification_zero(
     errors = _qualification_finalize_stop_errors(driver)
     try:
         _apply_staged_configs(manifest, payloads, root)
+        _apply_generated(root, receipt["acceptance_generated"], phase="staged")
     except BaseException as error:
         errors.append(f"restage capacity-zero configs: {error}")
     controld_stopped = True
@@ -1841,6 +1970,40 @@ def _prove_qualification_zero(
     return _zero_response(request, root)
 
 
+def _compensate_failed_stage(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+) -> list[str]:
+    errors = _stop_zero_errors(driver)
+    _restored, restore_errors = _restore_prior_best_effort(receipt, manifest, root)
+    errors.extend(restore_errors)
+    _generated, generated_errors = _restore_generated_prior_best_effort(receipt, root)
+    errors.extend(generated_errors)
+    try:
+        _remove_fixed_package(manifest, root)
+    except BaseException as error:
+        errors.append(f"remove fixed activation package: {error}")
+    try:
+        _restore_acceptance_ledger(receipt, manifest, root)
+    except BaseException as error:
+        errors.append(f"restore controld acceptance ledger: {error}")
+    try:
+        driver.daemon_reload()
+    except BaseException as error:
+        errors.append(f"daemon-reload: {error}")
+    errors.extend(_restore_systemd_prior_errors(receipt, driver))
+    for label, readback in (
+        ("prior target readback", lambda: _prior_readback(receipt, manifest, root)),
+        ("acceptance prior readback", lambda: _generated_prior_readback(receipt, root)),
+        ("acceptance ledger prior readback", lambda: _acceptance_ledger_prior_readback(receipt, root)),
+        ("systemd prior readback", lambda: _systemd_prior_readback(receipt, driver)),
+    ):
+        try:
+            readback()
+        except BaseException as error:
+            errors.append(f"{label}: {error}")
+    return errors
+
+
 def stage(
     manifest: dict[str, Any],
     payloads: dict[str, bytes],
@@ -1848,7 +2011,7 @@ def stage(
     driver: LiveSystemd | FakeSystemd,
     binding: dict[str, object],
 ) -> dict[str, object]:
-    generated = _generated_acceptance_files(manifest, binding)
+    generated = _generated_acceptance_files(manifest, payloads, binding)
     existing = _read_receipt(root)
     if existing is not None:
         if existing.get("state") == "rolled_back":
@@ -1857,17 +2020,41 @@ def stage(
             _bind_receipt(existing, manifest)
             if existing["state"] == "staged_zero":
                 _bind_generated_plan(existing["acceptance_generated"], generated)
-                return {
-                    "status": "unchanged",
-                    "state": "staged_zero",
-                    "capacity": 0,
-                    "managed_targets": _verify_phase(manifest, root, "staged"),
-                    "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
-                    "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
-                    "acceptance_generated": _verify_generated(root, existing["acceptance_generated"]),
-                    "fixed_package": _verify_fixed_package(manifest, root),
-                    "staged_zero": _staged_zero_readback(manifest, driver),
-                }
+                if existing["qualification_zero"] is not None:
+                    raise ValueError("finalized qualification zero requires rollback before staging")
+                try:
+                    managed_targets = _verify_phase(manifest, root, "staged")
+                    principals = _identity_readback(driver, manifest["identities"], allow_absent=False)
+                    access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=False)
+                    generated_readback = _verify_generated(root, existing["acceptance_generated"])
+                    fixed_package = _verify_fixed_package(manifest, root)
+                    _staged_zero_convergence_readback(manifest, driver)
+                    for unit in activation_package.STAGED_ZERO_UNITS:
+                        driver.start(unit)
+                    staged_zero = _staged_zero_readback(manifest, driver)
+                    return {
+                        "status": "unchanged",
+                        "state": "staged_zero",
+                        "capacity": 0,
+                        "managed_targets": managed_targets,
+                        "principals": principals,
+                        "access_group": access_group,
+                        "acceptance_generated": generated_readback,
+                        "fixed_package": fixed_package,
+                        "staged_zero": staged_zero,
+                    }
+                except BaseException as error:
+                    compensation_errors = _compensate_failed_stage(existing, manifest, root, driver)
+                    last_error = str(error)
+                    state = "stage_failed"
+                    if compensation_errors:
+                        last_error = f"stage={error}; compensation=" + "; ".join(compensation_errors)
+                        state = "rollback_failed"
+                    existing.update({"state": state, "updated_at": utc_now(), "last_error": last_error})
+                    _write_receipt(root, existing, manifest["identities"]["controld"]["gid"])
+                    if compensation_errors:
+                        raise ValueError(last_error) from error
+                    raise
             raise ValueError(f"activation receipt requires rollback from {existing['state']}")
     report = preflight(manifest, root, driver, require_dormant=True, payloads=payloads)
     receipt = _new_receipt(manifest, root, driver, generated)
@@ -1880,16 +2067,17 @@ def stage(
         _apply_generated(root, receipt["acceptance_generated"])
         driver.daemon_reload()
         _stop_to_zero(driver)
+        _zero_readback(driver)
         _remove_captured_ledger(root, receipt["acceptance_ledger_prior"])
-        for unit in activation_package.STAGED_ZERO_UNITS:
-            driver.start(unit)
         principals = _identity_readback(driver, manifest["identities"], allow_absent=False)
         access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=False)
         targets = _verify_phase(manifest, root, "staged")
         generated_readback = _verify_generated(root, receipt["acceptance_generated"])
-        staged_zero = _staged_zero_readback(manifest, driver)
-        receipt.update({"state": "staged_zero", "updated_at": utc_now()})
+        receipt.update({"state": "staged_zero", "updated_at": utc_now(), "last_error": None})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        for unit in activation_package.STAGED_ZERO_UNITS:
+            driver.start(unit)
+        staged_zero = _staged_zero_readback(manifest, driver)
         return {
             "status": "staged",
             "state": "staged_zero",
@@ -1904,8 +2092,16 @@ def stage(
             "staged_zero": staged_zero,
         }
     except BaseException as error:
-        receipt.update({"state": "stage_failed", "updated_at": utc_now(), "last_error": str(error)})
+        compensation_errors = _compensate_failed_stage(receipt, manifest, root, driver)
+        last_error = str(error)
+        state = "stage_failed"
+        if compensation_errors:
+            last_error = f"stage={error}; compensation=" + "; ".join(compensation_errors)
+            state = "rollback_failed"
+        receipt.update({"state": state, "updated_at": utc_now(), "last_error": last_error})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        if compensation_errors:
+            raise ValueError(last_error) from error
         raise
 
 
@@ -2003,7 +2199,144 @@ def _qualification_credentials(manifest: dict[str, Any], root: Path) -> dict[str
     }
 
 
-def _run_qualification(manifest: dict[str, Any], payloads: dict[str, bytes], root: Path) -> dict[str, object]:
+def _length_prefixed(value: str) -> bytes:
+    encoded = value.encode("ascii")
+    if not encoded or len(encoded) > 0xFFFF:
+        raise ValueError("qualification digest string is outside its fixed bound")
+    return len(encoded).to_bytes(2, "big") + encoded
+
+
+def _qualification_principal_digest(manifest: dict[str, Any]) -> str:
+    principal = manifest["identities"][manifest["qualification"]["principal"]]
+    groups = principal["supplementary_groups"]
+    hasher = hashlib.sha256(QUALIFICATION_PRINCIPAL_DOMAIN)
+    hasher.update(_length_prefixed(principal["user"]))
+    hasher.update(_length_prefixed(principal["group"]))
+    hasher.update(principal["uid"].to_bytes(4, "big"))
+    hasher.update(principal["gid"].to_bytes(4, "big"))
+    hasher.update(_length_prefixed(principal["home"]))
+    hasher.update(_length_prefixed(principal["shell"]))
+    hasher.update(len(groups).to_bytes(2, "big"))
+    for group in groups:
+        hasher.update(_length_prefixed(group))
+    return hasher.hexdigest()
+
+
+def _executor_provenance_digest(executor: dict[str, Any]) -> str:
+    source_commit = executor["source_commit"]
+    encoded_source = bytes([20 if len(source_commit) == 40 else 32]) + bytes.fromhex(source_commit)
+    hasher = hashlib.sha256(QUALIFICATION_EXECUTOR_DOMAIN)
+    hasher.update(_length_prefixed(executor["path"]))
+    hasher.update(bytes.fromhex(executor["sha256"]))
+    hasher.update(encoded_source)
+    hasher.update(executor["uid"].to_bytes(4, "big"))
+    hasher.update(executor["gid"].to_bytes(4, "big"))
+    hasher.update(executor["mode"].to_bytes(4, "big"))
+    return hasher.hexdigest()
+
+
+def _wire_qualification_json(value: dict[str, object]) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+
+
+def _new_qualification_request(manifest: dict[str, Any], receipt: dict[str, Any]) -> bytes:
+    record = next(item for item in receipt["acceptance_generated"] if item["role"] == "execd_config")
+    config = json.loads(base64.b64decode(record["payload_base64"], validate=True), object_pairs_hook=activation_package.reject_duplicates)
+    lane = config["lane_manifest"]
+    executor = config["executor"]
+    qualification = config["qualification"]
+    issued_at = int(time.time())
+    if issued_at <= 0:
+        raise ValueError("qualification clock is invalid")
+    request_id = os.urandom(16)
+    nonce = os.urandom(32)
+    if not any(request_id) or not any(nonce):
+        raise ValueError("qualification randomness is zero")
+    request: dict[str, object] = {
+        "schema_version": QUALIFICATION_REQUEST_SCHEMA,
+        "request_id": request_id.hex(),
+        "integrated_candidate_sha": qualification["integrated_candidate_sha"],
+        "activation_package_digest": qualification["activation_package_digest"],
+        "fixture_digest": qualification["fixture_digest"],
+        "principal_digest": _qualification_principal_digest(manifest),
+        "lane_manifest_digest": config["lane_manifest_digest"],
+        "broker_build_identity_digest": lane["broker_build_identity"],
+        "host_profile_digest": lane["host_profile_digest"],
+        "suite_digest": lane["suite_identity"],
+        "isolation_profile_digest": lane["isolation_profile_digest"],
+        "seccomp_profile_digest": activation_package.SECCOMP_PROFILE_DIGEST,
+        "executor_program_digest": executor["sha256"],
+        "executor_provenance_digest": _executor_provenance_digest(executor),
+        "nonce": nonce.hex(),
+        "controller_generation": qualification["controller_generation"],
+        "runner_generation": qualification["runner_generation"],
+        "lane_epoch": lane["lane_epoch"],
+        "admission_key_generation": lane["admission_key_generation"],
+        "issued_at": issued_at,
+        "expires_at": issued_at + manifest["qualification"]["request_validity_seconds"],
+    }
+    return _wire_qualification_json(request)
+
+
+def _qualification_request(manifest: dict[str, Any], receipt: dict[str, Any], root: Path) -> bytes:
+    state = receipt["qualification"]
+    if state is None:
+        request = _new_qualification_request(manifest, receipt)
+        receipt["qualification"] = {
+            "schema": QUALIFICATION_STATE_SCHEMA,
+            "status": "pending",
+            "request_sha256": activation_package.digest(request),
+            "request_base64": base64.b64encode(request).decode("ascii"),
+            "response_sha256": None,
+            "response_base64": None,
+            "completed_at": None,
+        }
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        return request
+    _validate_qualification_state(state, receipt)
+    request = base64.b64decode(state["request_base64"], validate=True)
+    if activation_package.digest(request) != state["request_sha256"]:
+        raise ValueError("persisted qualification request digest differs")
+    return request
+
+
+def _validate_qualification_response(request_raw: bytes, response: bytes) -> dict[str, Any]:
+    try:
+        request = json.loads(request_raw, object_pairs_hook=activation_package.reject_duplicates)
+        value = json.loads(response, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("qualification response is not valid closed JSON") from error
+    expected_order = [
+        "schema_version", "status", "disposition", "request_id", "request_frame_digest",
+        "qualification_receipt_digest", "integrated_candidate_sha", "activation_package_digest",
+        "fixture_digest", "principal_digest", "lane_manifest_digest", "broker_build_identity_digest",
+        "host_profile_digest", "suite_digest", "isolation_profile_digest", "seccomp_profile_digest",
+        "seccomp_install_receipt_digest", "executor_program_digest", "executor_provenance_digest",
+        "controller_generation", "runner_generation", "lane_epoch", "admission_key_generation",
+        "qualified_at", "request_expires_at",
+    ]
+    if not isinstance(value, dict) or list(value) != expected_order or response != _wire_qualification_json(value):
+        raise ValueError("qualification response shape or canonical bytes differ")
+    if value["schema_version"] != QUALIFICATION_RESPONSE_SCHEMA or value["status"] != "qualified_closed" or value["disposition"] not in {"created", "existing"}:
+        raise ValueError("qualification response did not prove closed production-v2 qualification")
+    echoed = [
+        "request_id", "integrated_candidate_sha", "activation_package_digest", "fixture_digest",
+        "principal_digest", "lane_manifest_digest", "broker_build_identity_digest", "host_profile_digest",
+        "suite_digest", "isolation_profile_digest", "seccomp_profile_digest", "executor_program_digest",
+        "executor_provenance_digest", "controller_generation", "runner_generation", "lane_epoch",
+        "admission_key_generation",
+    ]
+    if any(value[field] != request[field] for field in echoed) or value["request_expires_at"] != request["expires_at"]:
+        raise ValueError("qualification response binding differs from the exact request")
+    for field in ("request_frame_digest", "qualification_receipt_digest", "seccomp_install_receipt_digest"):
+        _scenario_hex(value[field], {64}, f"qualification {field}")
+    qualified_at = value["qualified_at"]
+    if isinstance(qualified_at, bool) or not isinstance(qualified_at, int) or not request["issued_at"] <= qualified_at <= request["expires_at"]:
+        raise ValueError("qualification response timestamp differs")
+    return value
+
+
+def _run_qualification(manifest: dict[str, Any], root: Path, receipt: dict[str, Any]) -> dict[str, object]:
     qualification = manifest["qualification"]
     component = next(item for item in manifest["components"] if item["name"] == "qualification")
     parent_fd, name = activation_package.open_parent_fd(root, qualification["program"])
@@ -2035,7 +2368,13 @@ def _run_qualification(manifest: dict[str, Any], payloads: dict[str, bytes], roo
         os.close(program_fd)
         raise ValueError("qualification executable digest differs")
     os.lseek(program_fd, 0, os.SEEK_SET)
-    request = payloads[qualification["request_source"]]
+    request = _qualification_request(manifest, receipt, root)
+    state = receipt["qualification"]
+    if state["status"] == "passed":
+        os.close(program_fd)
+        response = base64.b64decode(state["response_base64"], validate=True)
+        parsed = _validate_qualification_response(request, response)
+        return {"controller_status": "passed", **parsed, "request_sha256": state["request_sha256"], "response_sha256": state["response_sha256"]}
     credential_options = _qualification_credentials(manifest, root)
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -2067,15 +2406,17 @@ def _run_qualification(manifest: dict[str, Any], payloads: dict[str, bytes], roo
         raise ValueError("qualification output exceeded its fixed bound")
     if process.returncode != 0:
         raise ValueError(f"qualification command failed with status {process.returncode}")
+    if error_output:
+        raise ValueError("qualification command wrote stderr on success")
     response_digest = activation_package.digest(response)
-    if response_digest != qualification["expected_response_sha256"]:
-        raise ValueError("qualification response digest differs")
-    return {
-        "status": "passed",
-        "request_sha256": qualification["request_sha256"],
-        "response_sha256": response_digest,
-        "completed_at": utc_now(),
-    }
+    parsed = _validate_qualification_response(request, response)
+    state = receipt["qualification"]
+    state.update({
+        "status": "passed", "response_sha256": response_digest,
+        "response_base64": base64.b64encode(response).decode("ascii"), "completed_at": utc_now(),
+    })
+    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    return {"status": "passed", **parsed, "request_sha256": state["request_sha256"], "response_sha256": response_digest}
 
 
 def _return_to_staged_zero(
@@ -2084,6 +2425,8 @@ def _return_to_staged_zero(
 ) -> dict[str, object]:
     errors = _stop_zero_errors(driver)
     for entry in manifest["entries"]:
+        if entry["role"] == "execd_config":
+            continue
         try:
             _atomic_write(
                 root,
@@ -2095,6 +2438,10 @@ def _return_to_staged_zero(
             )
         except BaseException as error:
             errors.append(f"restage {entry['role']}: {error}")
+    try:
+        _apply_generated(root, generated, phase="staged")
+    except BaseException as error:
+        errors.append(f"restage generated configuration: {error}")
     try:
         driver.daemon_reload()
     except BaseException as error:
@@ -2135,30 +2482,37 @@ def activate(
             "status": "unchanged",
             "state": "active_one",
             "managed_targets": _verify_phase(manifest, root, "active"),
+            "generated_targets": _verify_generated(root, receipt["acceptance_generated"], phase="active"),
             "health": _active_health(manifest, driver, require_enabled=True),
         }
     if receipt["state"] != "staged_zero":
         raise ValueError(f"activation cannot start from receipt state {receipt['state']}")
     _verify_phase(manifest, root, "staged")
-    _verify_generated(root, receipt["acceptance_generated"])
+    _verify_generated(root, receipt["acceptance_generated"], phase="staged")
     _keyholder_config_readback(manifest, root, payloads)
     _staged_zero_readback(manifest, driver)
     receipt.update({"state": "activating", "updated_at": utc_now(), "last_error": None})
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     try:
+        driver.start("buzz-ci-execd.socket")
+        driver.start("buzz-ci-execd.service")
+        qualification = _run_qualification(manifest, root, receipt)
+        driver.stop("buzz-ci-execd.service")
+        driver.stop("buzz-ci-execd.socket")
         driver.stop("buzz-ci-controld.service")
         _apply_phase(manifest, payloads, root, "active")
+        _apply_generated(root, receipt["acceptance_generated"], phase="active")
         _verify_phase(manifest, root, "active")
+        _verify_generated(root, receipt["acceptance_generated"], phase="active")
         driver.daemon_reload()
         for unit in manifest["systemd"]["start_order"]:
             driver.start(unit)
         driver.start(manifest["systemd"]["persistent_unit"])
         prequalification = _active_health(manifest, driver, require_enabled=False)
-        qualification = _run_qualification(manifest, payloads, root)
         postqualification = _active_health(manifest, driver, require_enabled=False)
         driver.enable(manifest["systemd"]["persistent_unit"])
         final_health = _active_health(manifest, driver, require_enabled=True)
-        receipt.update({"state": "active_one", "updated_at": utc_now(), "qualification": qualification})
+        receipt.update({"state": "active_one", "updated_at": utc_now()})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         return {
             "status": "activated",
@@ -2197,11 +2551,12 @@ def qualify(
     if receipt["state"] != "active_one":
         raise ValueError("qualification requires active capacity one")
     _verify_phase(manifest, root, "active")
+    _verify_generated(root, receipt["acceptance_generated"], phase="active")
     try:
         before = _active_health(manifest, driver, require_enabled=True)
-        result = _run_qualification(manifest, payloads, root)
+        result = _run_qualification(manifest, root, receipt)
         after = _active_health(manifest, driver, require_enabled=True)
-        receipt.update({"qualification": result, "updated_at": utc_now()})
+        receipt.update({"updated_at": utc_now()})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         return {"status": "qualified", "state": "active_one", "before": before, "qualification": result, "after": after}
     except BaseException as error:
@@ -2264,12 +2619,14 @@ def _validate_receipt_targets(receipt: dict[str, Any], manifest: dict[str, Any])
 
 def _validate_generated_records(receipt: dict[str, Any], root: Path, *, apply: bool) -> list[dict[str, Any]]:
     records = receipt.get("acceptance_generated")
-    expected_roles = {"controld_acceptance_binding", "acceptance_control_config", "acceptance_driver_config"}
+    expected_roles = {"controld_acceptance_binding", "acceptance_control_config", "acceptance_driver_config", "execd_config"}
     if not isinstance(records, list) or len(records) != len(expected_roles):
         raise ValueError("acceptance generated receipt records are invalid")
     seen: set[str] = set()
     for record in records:
         required = {"role", "target", "sha256", "mode", "uid", "gid", "payload_base64", "prior"}
+        if isinstance(record, dict) and record.get("role") == "execd_config":
+            required |= {"active_sha256", "active_payload_base64"}
         if not isinstance(record, dict) or set(record) != required or record["role"] in seen or record["role"] not in expected_roles:
             raise ValueError("acceptance generated receipt record differs")
         seen.add(record["role"])
@@ -2286,7 +2643,13 @@ def _validate_generated_records(receipt: dict[str, Any], root: Path, *, apply: b
         observed = activation_package.digest(current)
         expected_metadata = {"mode": record["mode"], "uid": expected_uid, "gid": expected_gid}
         prior = record["prior"]
-        current_is_generated = observed == record["sha256"] and _metadata_dict(metadata) == expected_metadata
+        generated_digests = {record["sha256"]}
+        if "active_sha256" in record:
+            active_payload = base64.b64decode(record["active_payload_base64"], validate=True)
+            if activation_package.digest(active_payload) != record["active_sha256"]:
+                raise ValueError(f"acceptance generated active payload differs: {record['role']}")
+            generated_digests.add(record["active_sha256"])
+        current_is_generated = observed in generated_digests and _metadata_dict(metadata) == expected_metadata
         current_is_prior = prior["exists"] and observed == prior["sha256"] and _metadata_dict(metadata) == {
             "mode": prior["mode"], "uid": prior["uid"], "gid": prior["gid"],
         }
@@ -2340,6 +2703,8 @@ def _restore_prior(receipt: dict[str, Any], manifest: dict[str, Any], root: Path
     entries = {entry["role"]: entry for entry in manifest["entries"]}
     plans: list[tuple[dict[str, Any], dict[str, Any], tuple[bytes, os.stat_result] | None]] = []
     for role, entry in entries.items():
+        if role == "execd_config":
+            continue
         record = records[role]
         opened = _read_target(root, entry["target"])
         if opened is None and record["prior"]["exists"]:
@@ -2381,6 +2746,8 @@ def _restore_prior_best_effort(receipt: dict[str, Any], manifest: dict[str, Any]
     restored: list[str] = []
     errors: list[str] = []
     for entry in reversed(manifest["entries"]):
+        if entry["role"] == "execd_config":
+            continue
         record = records[entry["role"]]
         prior = record["prior"]
         try:
@@ -2400,6 +2767,8 @@ def _prior_readback(receipt: dict[str, Any], manifest: dict[str, Any], root: Pat
     records = _validate_receipt_targets(receipt, manifest)
     result: dict[str, str] = {}
     for entry in manifest["entries"]:
+        if entry["role"] == "execd_config":
+            continue
         prior = records[entry["role"]]["prior"]
         opened = _read_target(root, entry["target"])
         if not prior["exists"]:
@@ -2432,7 +2801,7 @@ def rollback(
             "status": "unchanged",
             "state": "rolled_back",
             "capacity": 0,
-            "managed_targets": _managed_readback(manifest, root, {"absent", "staged"}),
+            "managed_targets": _managed_readback(manifest, root, {"absent", "staged", "prior"}),
             "acceptance_generated": _generated_prior_readback(receipt, root),
             "acceptance_ledger": _acceptance_ledger_prior_readback(receipt, root),
             "fixed_package": "absent",
@@ -2523,7 +2892,7 @@ def check_current(
         if isinstance(qualification_zero, dict) and qualification_zero["phase"] == "finalized":
             return {
                 "status": "qualification_zero_finalized", "state": "staged_zero", "capacity": 0,
-                "managed_targets": _managed_readback(manifest, root, {"staged", "active"}),
+                "managed_targets": _managed_readback(manifest, root, {"staged", "active", "prior"}),
                 "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
                 "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
                 "fixed_package": _verify_fixed_package(manifest, root),
@@ -2541,6 +2910,7 @@ def check_current(
         return {
             "status": "healthy", "state": "active_one", "capacity": 1,
             "managed_targets": _verify_phase(manifest, root, "active"),
+            "generated_targets": _verify_generated(root, receipt["acceptance_generated"], phase="active"),
             "health": _active_health(manifest, driver, require_enabled=True),
             "qualification": receipt.get("qualification"),
         }

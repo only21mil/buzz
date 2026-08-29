@@ -39,6 +39,12 @@ TRACKED_REPO_SOURCES = {
         0o100755,
         0o500,
     ),
+    "receipt_verifier_expected_stages": (
+        Path("deploy/native-ci/acceptance/expected-stages.json"),
+        "assets/buzz-ci-acceptance-expected-stages.json",
+        0o100644,
+        0o400,
+    ),
 }
 TRACKED_COMPONENT_PROVENANCE = {
     "receipt_verifier": "assets/receipt-verifier-provenance.json",
@@ -283,12 +289,6 @@ def freeze_package(
             raise ValueError(f"component provenance digest differs: {component['name']}")
         payloads[source] = (raw, 0o400)
 
-    qualification = draft["qualification"]
-    request = _external_payload(asset_root, qualification["request_source"], 0o400)
-    if activation_package.digest(request) != qualification["request_sha256"]:
-        raise ValueError("qualification request digest differs")
-    payloads[qualification["request_source"]] = (request, 0o400)
-
     activation_package.validate_payloads(
         draft,
         {source: payload for source, (payload, _mode) in payloads.items()},
@@ -300,7 +300,7 @@ def freeze_package(
         entry["active_source"] for entry in draft["entries"] if "active_source" in entry
     } | {
         component["provenance_source"] for component in draft["components"]
-    } | {qualification["request_source"]}
+    }
     if set(payloads) != referenced_sources:
         raise ValueError("package assets collide")
 

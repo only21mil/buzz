@@ -67,8 +67,8 @@
     },
     "entries": {
       "type": "array",
-      "minItems": 20,
-      "maxItems": 20,
+      "minItems": 22,
+      "maxItems": 22,
       "items": { "$ref": "#/$defs/entry" }
     },
     "systemd": {
@@ -151,18 +151,14 @@
       "required": [
         "program",
         "principal",
-        "request_source",
-        "request_sha256",
-        "expected_response_sha256",
+        "request_validity_seconds",
         "timeout_seconds",
         "terminate_grace_seconds"
       ],
       "properties": {
-        "program": { "const": "/usr/libexec/buzz-ci-acceptance-ctl" },
+        "program": { "const": "/usr/libexec/buzz-ci-production-qualification" },
         "principal": { "const": "qualification" },
-        "request_source": { "$ref": "#/$defs/asset" },
-        "request_sha256": { "$ref": "#/$defs/sha256" },
-        "expected_response_sha256": { "$ref": "#/$defs/sha256" },
+        "request_validity_seconds": { "const": 60 },
         "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
         "terminate_grace_seconds": { "const": 2 }
       }
@@ -339,7 +335,7 @@
             "/usr/libexec/buzz-ci-controld",
             "/usr/libexec/buzz-ci-execd",
             "/usr/libexec/buzz-ci-keyholder",
-            "/usr/libexec/buzz-ci-acceptance-ctl",
+            "/usr/libexec/buzz-ci-production-qualification",
             "/usr/libexec/buzz-ci-executor",
             "/usr/libexec/buzz-ci-capacity-one-canary",
             "/usr/libexec/buzz-ci-capacity-one-driver",
@@ -390,6 +386,8 @@
             "acceptance_driver_binary",
             "acceptance_control_binary",
             "receipt_verifier_binary",
+            "receipt_verifier_expected_stages",
+            "qualification_binary",
             "activation_controller",
             "activation_package_module",
             "execd_socket_dropin",
@@ -417,6 +415,8 @@
             "/usr/libexec/buzz-ci-capacity-one-driver",
             "/usr/libexec/buzz-ci-acceptance-control",
             "/usr/libexec/buzz-ci-verify-acceptance-receipt",
+            "/usr/libexec/buzz-ci-acceptance-expected-stages.json",
+            "/usr/libexec/buzz-ci-production-qualification",
             "/usr/libexec/buzz-ci-activation-controller",
             "/usr/libexec/buzz_ci_activation_package.py",
             "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",
