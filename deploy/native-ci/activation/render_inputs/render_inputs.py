@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -20,6 +21,8 @@ MAX_JSON = 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
 MAX_TREE_FILES = 1024
 MAX_TREE_BYTES = 64 * 1024 * 1024
+TEMP_CREATE_ATTEMPTS = 32
+TEMP_CLEANUP_ATTEMPTS = 3
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MODE = re.compile(r"^[0-7]{4}$")
@@ -815,23 +818,87 @@ def render(action: str, root: DescriptorRoot) -> dict[str, Any]:
     }[action](root, descriptor)
 
 
+def remove_output_temporary(parent: int, temporary: str) -> None:
+    failure: OSError | None = None
+    for _ in range(TEMP_CLEANUP_ATTEMPTS):
+        try:
+            os.unlink(temporary, dir_fd=parent)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            failure = error
+    if failure is not None:
+        raise failure
+
+
 def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
     output = normalized(relative, "output")
     parent, name = root._open_parent(output)
+    fd: int | None = None
+    temporary: str | None = None
     try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=parent)
-    finally:
-        os.close(parent)
-    try:
+        for _ in range(TEMP_CREATE_ATTEMPTS):
+            candidate = f".render-inputs-{secrets.token_hex(16)}.tmp"
+            try:
+                fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=parent,
+                )
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if fd is None or temporary is None:
+            raise RenderError("could not create a unique output temporary")
+
         os.fchmod(fd, 0o600)
         view = memoryview(payload)
         while view:
-            view = view[os.write(fd, view):]
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("output write made no progress")
+            view = view[written:]
         os.fsync(fd)
         if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
             raise RenderError("output mode differs")
+        closed = fd
+        fd = None
+        os.close(closed)
+
+        os.link(
+            temporary,
+            name,
+            src_dir_fd=parent,
+            dst_dir_fd=parent,
+            follow_symlinks=False,
+        )
+        remove_output_temporary(parent, temporary)
+        temporary = None
+        os.fsync(parent)
     finally:
-        os.close(fd)
+        primary_failure = sys.exc_info()[0] is not None
+        cleanup_failure: OSError | None = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as error:
+                cleanup_failure = error
+        if temporary is not None:
+            try:
+                remove_output_temporary(parent, temporary)
+            except OSError as error:
+                if cleanup_failure is None:
+                    cleanup_failure = error
+        try:
+            os.close(parent)
+        except OSError as error:
+            if cleanup_failure is None:
+                cleanup_failure = error
+        if cleanup_failure is not None and not primary_failure:
+            raise cleanup_failure
 
 
 def main() -> int:
