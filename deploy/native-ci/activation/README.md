@@ -95,14 +95,26 @@ already exist with their frozen staged bytes and metadata.
    last transport error, returns to proven capacity zero, and permits only
    rollback. Restaging must change the package, fixture, controller generation,
    or runner generation before the controller creates a new request identity.
-4. Activation then stops execd, installs active runner, rendered execd, and
-   controld configs, starts the fixed dependency order, and enables the target
-   only after socket and health readback.
-5. Any failed activation attempts every stop, disable, config-restage, reload,
+4. A passing qualification stops the temporary execd service and records
+   `qualified_closed` only after the staged configs, capacity-zero units, and
+   closed admission are read back. Capacity remains zero until the root helper
+   invokes the separate fixed `set-capacity-one` action.
+5. `set-capacity-one` verifies the immutable package, private receipt, shared
+   acceptance binding, passed qualification, exact principal, candidate,
+   scenario, and initial generation bindings. It stops the staged controld
+   acceptance socket before controld, atomically swaps the active runner,
+   rendered execd, and controld configs, reloads systemd, starts the exact
+   keyholder/execd/runner/controld dependency order, and enables the target only
+   after config, FragmentPath, socket, process InvocationID, capacity-one, and
+   open-admission readback. Acceptance-control remains alive throughout and the
+   controld acceptance socket is active when the action returns for canary
+   sequence 2.
+6. Any failed capacity-one action attempts every stop, disable, config-restage, reload,
    and independent readback. It records `rollback_failed` unless both staged
-   configs and inactive units are proven; it never labels an unproven host
-   `staged_zero`.
-6. `rollback` first validates every managed target against its prior, staged,
+   configs and capacity zero are proven. A proven compensation returns to
+   `qualified_closed` and permits only the same request bytes and operation ID,
+   at most three attempts; it never labels an unproven host safe.
+7. `rollback` first validates every managed target against its prior, staged,
    or active digest. Unknown drift stops rollback before systemd or file
    mutation. A valid rollback stops and disables the activation, restores exact
    prior bytes, metadata, and exact unit active/enable state. It restores or
@@ -133,6 +145,25 @@ and `buzz-ci-acceptance-control-response/v2`. Finalize and prove return the
 SHA-256 of the existing private activation receipt. The caller combines that
 digest with its own fresh systemd `zero_proof`; the controller does not create
 a second evidence file.
+
+The production canary opens capacity through one separate root-only fixed call:
+
+```text
+/usr/libexec/buzz-ci-activation-controller set-capacity-one
+```
+
+It accepts no package, root, scenario, or fake-state path. Stdin is one compact
+JSON object plus LF, with declaration-order fields
+`schema_version,action,activation_id,activation_package_digest,scenario_sha256,initial_controller_generation,initial_runner_generation,operation_id`.
+The schema is `buzz-ci-activation-capacity-one-request/v1`, the action is
+`set_capacity_one`, and every value is checked against the fixed package,
+private activation receipt, and shared binding. Stdout on success is one compact
+JSON object plus LF with declaration-order fields
+`schema_version,action,activation_id,activation_package_digest,scenario_sha256,operation_id,state,receipt_sha256`.
+The response schema is `buzz-ci-activation-capacity-one-response/v1`, state is
+`active_one`, and `receipt_sha256` hashes the exact bytes of the final private
+receipt including its LF. Exact replay is read-only and idempotent; a different
+request or operation ID is rejected.
 
 The root-owned receipt at
 `/var/lib/buzzci/activation-controller/receipt-v1.json` binds the activation ID,
