@@ -1,59 +1,83 @@
-# Disposable clean-host activation acceptance
+# Isolated clean-host activation acceptance
 
-This harness runs the capacity-one acceptance path only inside a disposable,
-privileged systemd container. It never invokes host `systemctl`, never reads the
-host credential store, and never accepts an unpinned candidate, image, package,
-scenario, or fixture.
+This harness runs candidate code only inside a disposable KVM guest. Privileged
+containers are rejected: they are not a security boundary. QEMU runs beneath
+Bubblewrap with a private mount namespace, no host home, no network namespace,
+no NIC, no shared filesystem, no USB, and only `/dev/kvm`. The guest receives
+immutable read-only ISO media and writes only its ephemeral qcow2 overlay plus
+one bounded virtio-serial evidence channel.
 
-The workflow has two phases because the keyholder package and activation
-package bind public keys, while the corresponding test credentials must be
-fresh for every run:
+The flow has two user-visible phases and three isolated boots:
+
+1. `prepare` copies and hashes a pinned cloud image into a private state
+   directory, boots a key-ceremony guest, generates four signing keys and a
+   loopback-relay TLS identity, encrypts the runtime keys with guest-local
+   `systemd-creds`, destroys every raw key, proves their absence, and exports
+   only a challenge-bound public binding.
+2. External package freezers consume `public-binding.json`. They never receive
+   the state directory or any credential bytes.
+3. The candidate boot snapshots the exact Git commit with `git archive`, copies and rehashes
+   the five frozen packages and scenario into a private ISO, and resumes the
+   same guest. The guest rehashes every input, validates candidate/package/
+   scenario/public-key cross-bindings, installs the packages, and runs real
+   systemd principals through staged-zero, closed qualification, fixed
+   capacity-one, the frozen fixture, all 13 acceptance stages, finalize/prove
+   zero, strict installed verification, and rollback.
+4. A fresh verifier boot, with no candidate staging and the only evidence
+   device in the flow, reruns the installed strict verifier over the pending
+   receipt and dormant proof. Only then does it emit a bounded digest-framed
+   receipt. The host revalidates the frame and writes the receipt, verifier
+   output, and exact input/evidence manifest. The VM overlay, encrypted test
+   credentials, staging media, and QEMU process are then destroyed and their
+   absence is checked.
+
+The relay is guest-loopback only. It verifies the complete NIP-98 event ID,
+BIP-340 signature, public key, method, exact URL, payload digest, and timestamp.
+Published Nostr events receive the same event-ID and signature verification.
+
+## Commands
+
+First bind an immutable, locally present qcow2 cloud image and the exact QEMU
+tools. The image must boot systemd/cloud-init and contain Python 3, OpenSSL,
+systemd credential/account/tmpfiles tools, CA trust tooling, `pgrep`, and
+`swapoff`. Every guest phase disables swap and reads `/proc/swaps` back before
+handling key or credential material; command capture files live on `/run`.
 
 ```bash
 HARNESS=deploy/native-ci/activation/tests/clean_host_e2e/harness.py
-STATE="$PWD/.clean-host-e2e-state"
-RESULTS="$PWD/.clean-host-e2e-results"
+STATE="$PWD/.clean-host-vm-state"
 
-python3 "$HARNESS" prepare --state "$STATE" \
+python3 "$HARNESS" capabilities
+
+python3 "$HARNESS" prepare \
+  --state "$STATE" \
+  --image /protected/systemd-cloud.qcow2 \
+  --image-sha256 FULL64 \
+  --qemu-sha256 FULL64 \
+  --qemu-img-sha256 FULL64 \
   --controld-uid 1201 --controld-gid 1201
-# Freeze the component and activation packages using only
-# $STATE/public-binding.json. Never read $STATE/private/.
 
+# Freeze packages against $STATE/public-binding.json.
 python3 "$HARNESS" preflight --contract /protected/e2e-contract.json
-python3 "$HARNESS" run --contract /protected/e2e-contract.json --results "$RESULTS"
+python3 "$HARNESS" run \
+  --contract /protected/e2e-contract.json \
+  --results /protected/e2e-results
 ```
 
-`prepare` creates four independent raw secp256k1 test keys, a private local CA,
-and a server certificate for `relay.test.invalid`. Private files are mode
-`0400` below a mode-`0700` directory. `run` encrypts the keys with the
-container's `systemd-creds`, installs only the public CA, and removes the raw
-key files during cleanup. No key bytes, credential paths, request bodies, or
-authorization headers are printed.
+The run contract also supplies the external `/usr/share/containers/seccomp.json`
+source with the fixed SHA-256
+`2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4`.
+The host copies those exact bytes into the immutable ISO; the guest rehashes
+them before provisioning the clean host and the sealed execd installer checks
+the resulting root-owned mode-`0644` source independently.
 
-The supplied image must already exist locally and its image ID must equal the
-contract. It must boot `/sbin/init` and provide Python 3, OpenSSL,
-`systemd-creds`, `systemd-sysusers`, `systemd-tmpfiles`, `systemctl`, and
-`update-ca-certificates`. The harness does not pull images or use a network
-relay. The loopback TLS relay implements only `POST /events`,
-`GET /ci/control/accepted`, and bounded `PUT /ci/logs/...` and
-`PUT /ci/artifacts/...` object storage.
+`capabilities` is read-only. `prepare`, `preflight`, and `run` fail before any
+candidate execution when KVM, Bubblewrap, offline QEMU arguments, image/tool
+digests, guest prerequisites, package bindings, or immutable staging differ.
+All subprocesses have fixed time and output bounds. QEMU is killed as a process
+group on timeout and the private state is removed on every terminal `run` path.
 
-The in-container order is:
-
-1. boot real systemd and install the generated test CA;
-2. encrypt the four ephemeral credentials and start the relay as a real unit;
-3. create the package-declared principals and install exact component packages;
-4. snapshot the dormant config/unit state;
-5. controller `check`, `stage`, and `activate` (qualified closed);
-6. invoke the installed canary with the exact scenario;
-7. invoke the installed strict receipt verifier and retain its JSON line;
-8. controller `rollback`, stop the relay, and compare the independent dormant
-   snapshot, unit states, processes, sockets, and activation-managed paths.
-
-Every failure takes the same cleanup path. A run is a pass only if the canary,
-installed verifier, rollback, and independent residue proof all pass.
-
-Current integration dependency: the candidate must provide
-`deploy/native-ci/execd/install.py` and a frozen execd package. The authoritative
-base `c37841169fa3b7b84dc6475cbf97b06b2d9282d1` does not, so `preflight` is
-expected to fail closed until the concurrent execd/package work lands.
+The authoritative base `d9360cc3203681797902cb0cf48bba6a152a0e82` does not
+yet contain the sealed execd installer. A runnable final candidate must include
+`deploy/native-ci/execd/install.py` with the agreed
+`install --package PACKAGE` ABI and a matching frozen execd package.
