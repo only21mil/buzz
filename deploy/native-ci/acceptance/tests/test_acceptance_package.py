@@ -124,9 +124,12 @@ class AcceptancePackageTests(unittest.TestCase):
             seed = root / "seed"
             checkout = root / "checkout"
             source = seed / VERIFIER_SOURCE.SOURCE_RELATIVE
+            stages_source = seed / VERIFIER_SOURCE.STAGES_SOURCE_RELATIVE
             source.parent.mkdir(parents=True)
             shutil.copyfile(ACCEPTANCE / "verify-receipt.py", source)
+            shutil.copyfile(ACCEPTANCE / "expected-stages.json", stages_source)
             os.chmod(source, 0o755)
+            os.chmod(stages_source, 0o644)
             subprocess.run(["git", "init", "-q", str(seed)], check=True)
             subprocess.run(
                 ["git", "-C", str(seed), "config", "user.name", "Acceptance Tests"],
@@ -148,7 +151,14 @@ class AcceptancePackageTests(unittest.TestCase):
                 check=True,
             )
             subprocess.run(
-                ["git", "-C", str(seed), "add", str(VERIFIER_SOURCE.SOURCE_RELATIVE)],
+                [
+                    "git",
+                    "-C",
+                    str(seed),
+                    "add",
+                    str(VERIFIER_SOURCE.SOURCE_RELATIVE),
+                    str(VERIFIER_SOURCE.STAGES_SOURCE_RELATIVE),
+                ],
                 check=True,
             )
             subprocess.run(
@@ -182,6 +192,18 @@ class AcceptancePackageTests(unittest.TestCase):
             self.assertEqual(contract["materialized_source_mode"], "0700")
             self.assertEqual(contract["install_path"], VERIFIER_INSTALL)
             self.assertEqual(contract["install_mode"], "0755")
+            stages_contract = VERIFIER_SOURCE.expected_stages_contract(checkout)
+            self.assertEqual(stages_contract["source_git_mode"], "100644")
+            self.assertEqual(stages_contract["materialized_source_mode"], "0600")
+            self.assertEqual(
+                stages_contract["install_path"],
+                "/usr/libexec/buzz-ci-acceptance-expected-stages.json",
+            )
+            self.assertEqual(stages_contract["install_mode"], "0644")
+            self.assertEqual(stages_contract["package_mode"], "0400")
+            self.assertEqual(stages_contract["install_owner"], "root")
+            self.assertEqual(stages_contract["install_group"], "root")
+            self.assertEqual(stages_contract["type"], "static_entry")
 
     def test_verifier_source_contract_rejects_unsafe_modes_and_links(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

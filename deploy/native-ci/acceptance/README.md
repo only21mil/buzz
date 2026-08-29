@@ -107,6 +107,12 @@ materialize it as `0700`. Packaging must validate the tracked execute intent
 and hardened file metadata through `verifier_source.py`, then install and read
 back the declared `0755` mode.
 
+The verifier reads its fixed 13-stage vector only from
+`/usr/libexec/buzz-ci-acceptance-expected-stages.json`. The activation package
+installs that tracked data asset as `root:root` mode `0644`; the verifier rejects
+missing, linked, multiply linked, ownership- or mode-drifted, noncanonical, or
+digest-drifted data. There is no argument or environment override for the path.
+
 The verifier rejects reordered, duplicate, partial, or hash-only stage records.
 It recomputes every retained driver-response and root-phase digest; binds the
 scenario, activation package, candidate, run, evidence, and service generations;

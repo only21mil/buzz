@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import importlib.machinery
 import importlib.util
+import io
 import json
-from pathlib import Path
-import subprocess
+import os
+import shutil
+import stat
 import tempfile
 import unittest
-
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 ACCEPTANCE = ROOT / "deploy/native-ci/acceptance"
@@ -15,6 +20,38 @@ SPEC = importlib.util.spec_from_file_location("receipt_verifier", ACCEPTANCE / "
 assert SPEC is not None and SPEC.loader is not None
 VERIFIER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VERIFIER)
+
+
+def _install_verifier(root: Path):
+    libexec = root / "usr/libexec"
+    libexec.mkdir(parents=True)
+    verifier_path = libexec / "buzz-ci-verify-acceptance-receipt"
+    stages_path = libexec / "buzz-ci-acceptance-expected-stages.json"
+    shutil.copyfile(ACCEPTANCE / "verify-receipt.py", verifier_path)
+    shutil.copyfile(ACCEPTANCE / "expected-stages.json", stages_path)
+    os.chmod(verifier_path, 0o755)
+    os.chmod(stages_path, 0o644)
+    loader = importlib.machinery.SourceFileLoader(
+        "installed_receipt_verifier", str(verifier_path)
+    )
+    spec = importlib.util.spec_from_loader("installed_receipt_verifier", loader)
+    assert spec is not None and spec.loader is not None
+    installed = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installed)
+    return installed, verifier_path, stages_path
+
+
+def _invoke(installed, stages_path: Path, scenario_path: Path, receipt_path: Path, uid=None, gid=None):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        return_code = installed._run(
+            [str(scenario_path), str(receipt_path)],
+            stages_path,
+            os.getuid() if uid is None else uid,
+            os.getgid() if gid is None else gid,
+        )
+    return return_code, stdout.getvalue(), stderr.getvalue()
 
 
 def _h(character: str, length: int) -> str:
@@ -229,55 +266,133 @@ class ReceiptVerifierTests(unittest.TestCase):
         value = copy.deepcopy(receipt); value["zero_transition"]["phases"][1]["response"]["proof"]["controld_service_active"] = True; mutations.append(value)
         value = copy.deepcopy(receipt); value["zero_transition"]["zero_proof"]["controller_generation"] = 3; mutations.append(value)
         for candidate in mutations:
-            with self.subTest(candidate=mutations.index(candidate)):
-                with self.assertRaises(VERIFIER.ReceiptError):
-                    VERIFIER.verify(candidate, scenario, stages)
+            with self.subTest(candidate=mutations.index(candidate)), self.assertRaises(
+                VERIFIER.ReceiptError
+            ):
+                VERIFIER.verify(candidate, scenario, stages)
 
-    def test_cli_rejects_duplicate_fields_and_accepts_exact_pass(self):
+    def test_installed_layout_accepts_exact_pass_and_rejects_bad_receipts(self):
         scenario, _stages, receipt = valid_receipt()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            prior = os.umask(0o077)
+            try:
+                installed, verifier_path, stages_path = _install_verifier(root)
+            finally:
+                os.umask(prior)
+            self.assertEqual(stat.S_IMODE(verifier_path.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(stages_path.stat().st_mode), 0o644)
+            self.assertEqual(
+                installed.EXPECTED_STAGES_PATH,
+                Path("/usr/libexec/buzz-ci-acceptance-expected-stages.json"),
+            )
             scenario_path = root / "scenario.json"
             receipt_path = root / "receipt.json"
             scenario_path.write_text(json.dumps(scenario, separators=(",", ":")))
             receipt_path.write_text(json.dumps(receipt, separators=(",", ":")))
-            result = subprocess.run(
-                [str(ACCEPTANCE / "verify-receipt.py"), str(scenario_path), str(receipt_path)],
-                check=False, capture_output=True, text=True,
+            return_code, stdout, stderr = _invoke(
+                installed, stages_path, scenario_path, receipt_path
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"outcome": "pass", "status": "verified"})
+            self.assertEqual(return_code, 0, stderr)
+            self.assertEqual(json.loads(stdout), {"outcome": "pass", "status": "verified"})
             receipt_path.write_text('{"schema_version":"x","schema_version":"y"}')
-            result = subprocess.run(
-                [str(ACCEPTANCE / "verify-receipt.py"), str(scenario_path), str(receipt_path)],
-                check=False, capture_output=True, text=True,
+            return_code, stdout, stderr = _invoke(
+                installed, stages_path, scenario_path, receipt_path
             )
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(result.stdout, "")
-            self.assertNotIn("scenario", result.stderr)
+            self.assertEqual(return_code, 1)
+            self.assertEqual(stdout, "")
+            self.assertNotIn("scenario", stderr)
 
             oversized = root / "oversized.json"
             oversized.write_bytes(b"{" + b" " * VERIFIER.MAX_JSON_BYTES + b"}")
-            result = subprocess.run(
-                [str(ACCEPTANCE / "verify-receipt.py"), str(scenario_path), str(oversized)],
-                check=False, capture_output=True, text=True,
+            return_code, _stdout, stderr = _invoke(
+                installed, stages_path, scenario_path, oversized
             )
-            self.assertEqual(result.returncode, 1)
-            self.assertLess(len(result.stderr), 128)
+            self.assertEqual(return_code, 1)
+            self.assertLess(len(stderr), 128)
 
             linked = root / "linked.json"
             linked.symlink_to(receipt_path)
-            result = subprocess.run(
-                [str(ACCEPTANCE / "verify-receipt.py"), str(scenario_path), str(linked)],
-                check=False, capture_output=True, text=True,
+            return_code, stdout, _stderr = _invoke(
+                installed, stages_path, scenario_path, linked
             )
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(result.stdout, "")
+            self.assertEqual(return_code, 1)
+            self.assertEqual(stdout, "")
+
+    def test_installed_stage_data_rejects_absence_tamper_and_path_attacks(self):
+        scenario, _stages, receipt = valid_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            installed, _verifier_path, stages_path = _install_verifier(root)
+            scenario_path = root / "scenario.json"
+            receipt_path = root / "receipt.json"
+            scenario_path.write_text(json.dumps(scenario, separators=(",", ":")))
+            receipt_path.write_text(json.dumps(receipt, separators=(",", ":")))
+            expected = (ACCEPTANCE / "expected-stages.json").read_bytes()
+
+            def rejected(uid=None, gid=None):
+                return_code, stdout, stderr = _invoke(
+                    installed,
+                    stages_path,
+                    scenario_path,
+                    receipt_path,
+                    uid=uid,
+                    gid=gid,
+                )
+                self.assertEqual(return_code, 1)
+                self.assertEqual(stdout, "")
+                self.assertLess(len(stderr), 128)
+
+            stages_path.unlink()
+            rejected()
+
+            stages_path.write_bytes(expected + b" ")
+            os.chmod(stages_path, 0o644)
+            rejected()
+
+            stages_path.write_text(json.dumps(list(VERIFIER.EXPECTED_STAGES), separators=(",", ":")))
+            os.chmod(stages_path, 0o644)
+            rejected()
+
+            stages_path.write_bytes(expected)
+            os.chmod(stages_path, 0o600)
+            rejected()
+
+            os.chmod(stages_path, 0o644)
+            rejected(uid=os.getuid() + 1)
+
+            outside = root / "outside-stages.json"
+            outside.write_bytes(expected)
+            os.chmod(outside, 0o644)
+            stages_path.unlink()
+            stages_path.symlink_to(outside)
+            rejected()
+
+            stages_path.unlink()
+            os.link(outside, stages_path)
+            rejected()
+
+            stages_path.unlink()
+            shutil.copyfile(ACCEPTANCE / "expected-stages.json", stages_path)
+            os.chmod(stages_path, 0o644)
+            real_usr = root / "real-usr"
+            (root / "usr").rename(real_usr)
+            (root / "usr").symlink_to(real_usr, target_is_directory=True)
+            rejected()
 
     def test_schema_and_upstream_stage_fixture_are_exactly_aligned(self):
         schema = json.loads((ACCEPTANCE / "receipt.schema.json").read_text())
-        stages = json.loads((ACCEPTANCE / "expected-stages.json").read_text())
+        stages_raw = (ACCEPTANCE / "expected-stages.json").read_bytes()
+        stages = json.loads(stages_raw)
         self.assertEqual(schema["$defs"]["stage"]["enum"], stages)
+        self.assertEqual(tuple(stages), VERIFIER.EXPECTED_STAGES)
+        self.assertEqual(
+            hashlib.sha256(stages_raw).hexdigest(), VERIFIER.EXPECTED_STAGES_SHA256
+        )
+        self.assertEqual(
+            hashlib.sha256(VERIFIER._canonical(stages)).hexdigest(),
+            VERIFIER.EXPECTED_STAGES_CANONICAL_SHA256,
+        )
         self.assertEqual(schema["properties"]["schema_version"]["const"], VERIFIER.RECEIPT_VERSION)
         self.assertEqual(schema["properties"]["checks"]["maxItems"], 13)
         self.assertEqual(len(schema["properties"]["checks"]["prefixItems"]), 13)

@@ -6,17 +6,36 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import stat
 import sys
+from pathlib import Path
 from typing import Any
 
-
 MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_STAGES_BYTES = 4096
 DRIVER_VERSION = "buzz-ci-capacity-one-driver/v1"
 RECEIPT_VERSION = "buzz-ci-capacity-one-acceptance-receipt/v2"
 ZERO_TRANSITION_VERSION = "buzz-ci-capacity-one-zero-transition/v1"
 ZERO_PROOF_VERSION = "buzz-ci-capacity-one-zero-proof/v1"
+EXPECTED_STAGES_PATH = Path("/usr/libexec/buzz-ci-acceptance-expected-stages.json")
+EXPECTED_STAGES_MODE = 0o644
+EXPECTED_STAGES_SHA256 = "c8addbb42bace522e99fc8fe00603c9245db61ac8a599ef5762c2744267189cd"
+EXPECTED_STAGES_CANONICAL_SHA256 = "24e57234328b8d994c90ba3f47e42f7b29ca580c7a3ab036a981839c1537ba68"
+EXPECTED_STAGES = (
+    "capacity_zero_closed",
+    "capacity_one_open",
+    "manifest_identity",
+    "approval_grant",
+    "grant_resume",
+    "first_attempt_terminal",
+    "authenticated_export",
+    "rerun_separation",
+    "cancellation_terminal",
+    "tombstone_folding",
+    "controller_restart_recovery",
+    "runner_restart_recovery",
+    "prepare_capacity_zero",
+)
 OPERATIONS = [
     "observe_initial",
     "set_capacity_one",
@@ -105,6 +124,71 @@ def _canonical(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _open_absolute_nofollow(path: Path) -> int:
+    if not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts[1:]):
+        raise ReceiptError("stage fixture path rejected")
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = child
+        return os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+    except OSError as error:
+        raise ReceiptError("stage fixture unavailable") from error
+    finally:
+        os.close(directory)
+
+
+def load_expected_stages(path: Path, expected_uid: int, expected_gid: int) -> list[str]:
+    descriptor = -1
+    try:
+        descriptor = _open_absolute_nofollow(path)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or stat.S_IMODE(metadata.st_mode) != EXPECTED_STAGES_MODE
+            or not 0 < metadata.st_size <= MAX_STAGES_BYTES
+        ):
+            raise ReceiptError("stage fixture metadata rejected")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(descriptor, MAX_STAGES_BYTES + 1 - size):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_STAGES_BYTES:
+                raise ReceiptError("stage fixture size rejected")
+        raw = b"".join(chunks)
+    except OSError as error:
+        raise ReceiptError("stage fixture unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) != metadata.st_size or hashlib.sha256(raw).hexdigest() != EXPECTED_STAGES_SHA256:
+        raise ReceiptError("stage fixture integrity rejected")
+    try:
+        value = json.loads(raw, object_pairs_hook=_reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReceiptError("stage fixture JSON rejected") from error
+    _require(value == list(EXPECTED_STAGES), "stage fixture schema rejected")
+    _require(
+        hashlib.sha256(_canonical(value)).hexdigest() == EXPECTED_STAGES_CANONICAL_SHA256,
+        "stage fixture canonical vector rejected",
+    )
+    return value
 
 
 def _ordered_evidence(value: Any) -> dict[str, Any]:
@@ -431,8 +515,7 @@ def _zero_operation_id(request: dict[str, Any], run_id: str) -> str:
 def verify(receipt: Any, scenario: Any, expected_stages: Any) -> None:
     scenario = _ordered_scenario(scenario)
     fixture = scenario["fixture"]
-    _require(isinstance(expected_stages, list) and len(expected_stages) == 13 and all(isinstance(stage, str) for stage in expected_stages), "stage fixture rejected")
-    _require(expected_stages == list(dict.fromkeys(expected_stages)), "stage fixture rejected")
+    _require(expected_stages == list(EXPECTED_STAGES), "stage fixture rejected")
     receipt = _exact(receipt, ["schema_version", "outcome", "scenario_sha256", "integrated_candidate_sha", "run_id", "checks", "zero_transition"], ["failure"])
     _require(receipt["schema_version"] == RECEIPT_VERSION and receipt["outcome"] == "pass" and "failure" not in receipt, "pass receipt shape rejected")
     scenario_sha256 = _digest(scenario)
@@ -496,18 +579,31 @@ def verify(receipt: Any, scenario: Any, expected_stages: Any) -> None:
     _require(final_proof == phase_proofs[1], "independent final zero proof rejected")
 
 
-def main(argv: list[str]) -> int:
+def _run(
+    argv: list[str],
+    expected_stages_path: Path,
+    expected_stages_uid: int,
+    expected_stages_gid: int,
+) -> int:
     if len(argv) != 2:
-        print("usage: verify-receipt.py SCENARIO RECEIPT", file=sys.stderr)
+        print("usage: buzz-ci-verify-acceptance-receipt SCENARIO RECEIPT", file=sys.stderr)
         return 2
-    root = Path(__file__).resolve().parent
     try:
-        verify(load_json(Path(argv[1])), load_json(Path(argv[0])), load_json(root / "expected-stages.json"))
+        stages = load_expected_stages(
+            expected_stages_path,
+            expected_stages_uid,
+            expected_stages_gid,
+        )
+        verify(load_json(Path(argv[1])), load_json(Path(argv[0])), stages)
     except ReceiptError as error:
         print(f"receipt rejected: {error}", file=sys.stderr)
         return 1
     print(json.dumps({"outcome": "pass", "status": "verified"}, separators=(",", ":")))
     return 0
+
+
+def main(argv: list[str]) -> int:
+    return _run(argv, EXPECTED_STAGES_PATH, 0, 0)
 
 
 if __name__ == "__main__":
