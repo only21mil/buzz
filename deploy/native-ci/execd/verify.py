@@ -17,7 +17,8 @@ EXPECTED = {
     ),
     "templates/buzz-ci-execd.service": (
         "ExecStart=/usr/libexec/buzz-ci-execd --socket-activation",
-        "ReadWritePaths=/var/lib/buzzci/execd-v2",
+        "ReadOnlyPaths=/etc/buzzci/execd-v2.json /usr/libexec/buzz-ci-executor /usr/share/containers/seccomp.json",
+        "ReadWritePaths=/var/lib/buzzci/execd-v2 /var/lib/buzzci/seccomp /var/lib/buzzci/activation/receipts",
         "RestrictAddressFamilies=AF_UNIX",
     ),
     "templates/buzz-ci-executor.service": (
@@ -60,9 +61,15 @@ def verify(source_root: Path) -> None:
         if missing:
             raise ValueError(f"{relative} misses {missing}")
     tmpfiles = (root / "templates/buzzci-execd.tmpfiles").read_text().splitlines()
-    if len(tmpfiles) != 6 or any(" 0700 root root " not in line for line in tmpfiles[:5]):
+    retained = [
+        "d /var/lib/buzzci 0700 root root - -",
+        "d /var/lib/buzzci/seccomp 0700 root root - -",
+        "d /var/lib/buzzci/activation 0700 root root - -",
+        "d /var/lib/buzzci/activation/receipts 0700 root root - -",
+    ]
+    if tmpfiles[:4] != retained or len(tmpfiles) != 10 or any(" 0700 root root " not in line for line in tmpfiles[:9]):
         raise ValueError("execd state roots are not exact root-owned 0700 directories")
-    if tmpfiles[5] != "d /var/lib/buzzci/execd-v2/attempts 0711 root root - -":
+    if tmpfiles[9] != "d /var/lib/buzzci/execd-v2/attempts 0711 root root - -":
         raise ValueError("attempt root drift")
 
 

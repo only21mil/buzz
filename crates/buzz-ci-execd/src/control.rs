@@ -27,6 +27,7 @@ use nix::{
     },
     unistd::write,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::activation::{
@@ -48,6 +49,10 @@ pub const EXECD_SOCKET_PATH: &str = "/run/buzzci/execd.sock";
 const PASSWD_PATH: &str = "/etc/passwd";
 const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn sha256_v2_admission(request: v2::AdmitAttemptRequest) -> [u8; 32] {
+    Sha256::digest(v2::admission_signature_message(&request)).into()
+}
 
 /// A refused or failed control connection.
 #[derive(Debug, Error)]
@@ -145,6 +150,7 @@ impl PeerRole {
                     | Operation::CompleteAttempt
                     | Operation::DescribeAttemptEvidence
                     | Operation::ReadAttemptEvidence
+                    | Operation::RegisterJobIntent
             ),
         }
     }
@@ -287,6 +293,28 @@ pub trait ControlDispatch {
                     attempt: value.coordinates.attempt,
                 },
             ),
+            v2::Request::RegisterJobIntent(value) => {
+                let admission = value.admission;
+                v2::encode_intent_registration_response(
+                    header,
+                    v2::IntentRegistrationResponse {
+                        code: ResponseCode::NotProvisioned,
+                        retry_after_millis: 0,
+                        signed_request_digest: admission.signed_request_digest,
+                        job_intent_digest: admission.job_intent_digest,
+                        request_frame_digest: value.request_frame_digest,
+                        admission_message_digest: sha256_v2_admission(admission),
+                        registration_key_digest: v2::intent_registration_key_digest(&value),
+                        lane_manifest_digest: admission.lane_manifest_digest,
+                        run_id: admission.run_id,
+                        lane_epoch: admission.lane_epoch,
+                        admission_key_generation: admission.admission_key_generation,
+                        issued_at: admission.issued_at,
+                        expires_at: admission.expires_at,
+                        attempt: admission.attempt,
+                    },
+                )
+            }
             _ => {
                 let response = self.dispatch_v2(header, request, now);
                 v2::encode_response(header, response)
@@ -1210,6 +1238,7 @@ mod tests {
             Operation::CompleteAttempt,
             Operation::DescribeAttemptEvidence,
             Operation::ReadAttemptEvidence,
+            Operation::RegisterJobIntent,
         ] {
             assert!(PeerRole::Runner.permits(operation));
             assert!(!PeerRole::Control.permits(operation));
