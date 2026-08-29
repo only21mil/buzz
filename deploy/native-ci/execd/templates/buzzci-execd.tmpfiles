@@ -1,3 +1,7 @@
+d /var/lib/buzzci 0700 root root - -
+d /var/lib/buzzci/seccomp 0700 root root - -
+d /var/lib/buzzci/activation 0700 root root - -
+d /var/lib/buzzci/activation/receipts 0700 root root - -
 d /var/lib/buzzci/execd-v2 0700 root root - -
 d /var/lib/buzzci/execd-v2/intents 0700 root root - -
 d /var/lib/buzzci/execd-v2/bindings 0700 root root - -

@@ -7,13 +7,15 @@
 use std::collections::BTreeMap;
 
 use buzz_ci_broker_protocol::v2::{
-    admission_signature_message, evidence_request_frame_digest, AdmissionSignatureAlgorithm,
-    AdmitAttemptRequest, AttemptEvidenceCoordinates, BrokerResponse, CancelAttemptRequest,
-    CompleteAttemptRequest, DescribeAttemptEvidenceRequest, EvidenceChunkResponse,
-    EvidenceDescriptionResponse, EvidenceDescriptor, FrameHeader, GetAttemptRequest,
-    ReadAttemptEvidenceRequest, Request, WireText64, EXECUTION_BINDING_DIGEST_DOMAIN,
-    JOB_INTENT_DIGEST_DOMAIN, LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN, MAX_EVIDENCE_CHUNK_SIZE,
-    MAX_EVIDENCE_ITEMS,
+    admission_signature_message, evidence_request_frame_digest,
+    intent_registration_key_digest_for_admission, intent_registration_key_digest_parts,
+    intent_registration_request_frame_digest, AdmissionSignatureAlgorithm, AdmitAttemptRequest,
+    AttemptEvidenceCoordinates, BrokerResponse, CancelAttemptRequest, CompleteAttemptRequest,
+    DescribeAttemptEvidenceRequest, EvidenceChunkResponse, EvidenceDescriptionResponse,
+    EvidenceDescriptor, FrameHeader, GetAttemptRequest, IntentRegistrationResponse,
+    ReadAttemptEvidenceRequest, RegisterJobIntentRequest, Request, WireText64,
+    EXECUTION_BINDING_DIGEST_DOMAIN, JOB_INTENT_DIGEST_DOMAIN,
+    LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN, MAX_EVIDENCE_CHUNK_SIZE, MAX_EVIDENCE_ITEMS,
 };
 use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, ResponseCode, TrustClass};
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
@@ -181,6 +183,46 @@ pub struct JobIntentV2 {
 }
 
 impl JobIntentV2 {
+    pub(crate) fn from_registration(value: RegisterJobIntentRequest) -> Self {
+        let admission = value.admission;
+        Self {
+            schema_version: JOB_INTENT_SCHEMA_V2,
+            signed_request_digest: admission.signed_request_digest,
+            actor_pubkey: admission.actor_pubkey,
+            audience_digest: admission.audience_digest,
+            idempotency_digest: admission.idempotency_digest,
+            source_pin_event_id: admission.source_pin_event_id,
+            workflow_digest: admission.workflow_digest,
+            isolation_profile_digest: admission.isolation_profile_digest,
+            lane_manifest_digest: admission.lane_manifest_digest,
+            lane_epoch: admission.lane_epoch,
+            admission_signature_algorithm: admission.admission_signature_algorithm,
+            admission_key_generation: admission.admission_key_generation,
+            run_id: admission.run_id,
+            tip_oid: admission.tip_oid,
+            base_oid: admission.base_oid,
+            issued_at: admission.issued_at,
+            expires_at: admission.expires_at,
+            wall_timeout_seconds: admission.wall_timeout_seconds,
+            attempt: admission.attempt,
+            parent_attempt: admission.parent_attempt,
+            trust_class: admission.trust_class,
+            request_event_id: value.request_event_id,
+            workflow_id: value.workflow_id,
+            job_id: value.job_id,
+            artifact_count: value.artifact_count,
+            artifacts: value.artifacts.map(|artifact| {
+                artifact.map(|artifact| ArtifactDeclarationV1 {
+                    artifact_id: artifact.artifact_id,
+                    name: artifact.name,
+                    media_type: artifact.media_type,
+                    relative_name: artifact.relative_name,
+                    max_bytes: artifact.max_bytes,
+                })
+            }),
+        }
+    }
+
     /// Return the canonical domain-separated intent digest.
     pub fn digest(self) -> [u8; 32] {
         let mut bytes = Vec::with_capacity(360);
@@ -249,7 +291,7 @@ impl JobIntentV2 {
             || self.attempt != request.attempt
             || self.parent_attempt != request.parent_attempt
             || self.trust_class != request.trust_class
-            || self.request_event_id == [0; 32]
+            || self.request_event_id != request.signed_request_digest
             || self.workflow_id.as_str().is_err()
             || !self.job_id.as_str().is_ok_and(safe_artifact_name)
             || usize::from(self.artifact_count) > MAX_DECLARED_ARTIFACTS
@@ -270,6 +312,31 @@ impl JobIntentV2 {
     }
 }
 
+pub(crate) fn registration_from_intent(
+    admission: AdmitAttemptRequest,
+    intent: JobIntentV2,
+) -> RegisterJobIntentRequest {
+    RegisterJobIntentRequest {
+        admission,
+        request_event_id: intent.request_event_id,
+        workflow_id: intent.workflow_id,
+        job_id: intent.job_id,
+        artifact_count: intent.artifact_count,
+        artifacts: intent.artifacts.map(|artifact| {
+            artifact.map(
+                |artifact| buzz_ci_broker_protocol::v2::JobArtifactDeclaration {
+                    artifact_id: artifact.artifact_id,
+                    name: artifact.name,
+                    media_type: artifact.media_type,
+                    relative_name: artifact.relative_name,
+                    max_bytes: artifact.max_bytes,
+                },
+            )
+        }),
+        request_frame_digest: [1; 32],
+    }
+}
+
 /// Static lane-manifest lookup used by production composition.
 pub trait LaneManifestSource {
     fn load(
@@ -279,9 +346,34 @@ pub trait LaneManifestSource {
     ) -> Result<LaneActivationManifestV1, BindingError>;
 }
 
-/// Digest-addressed job-intent lookup. Implementations must return exact bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentRegistrationWrite {
+    Written,
+    Existing,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegisteredJobIntent {
+    pub admission: AdmitAttemptRequest,
+    pub intent: JobIntentV2,
+}
+
+/// Execd-owned create-once intent registry. The key binds one logical attempt;
+/// implementations must persist exact canonical bytes and reject drift.
 pub trait JobIntentSource {
-    fn load(&mut self, digest: [u8; 32]) -> Result<JobIntentV2, BindingError>;
+    fn register(
+        &mut self,
+        header: FrameHeader,
+        request: RegisterJobIntentRequest,
+        intent: JobIntentV2,
+    ) -> Result<IntentRegistrationWrite, BindingError>;
+
+    fn load(
+        &mut self,
+        registration_key_digest: [u8; 32],
+        job_intent_digest: [u8; 32],
+    ) -> Result<RegisteredJobIntent, BindingError>;
 }
 
 /// One immutable manifest. A digest or epoch mismatch never falls back.
@@ -311,13 +403,43 @@ impl LaneManifestSource for StaticLaneManifest {
 /// In-memory exact-intent source useful for startup assembly and tests.
 #[derive(Default)]
 pub struct StaticJobIntents {
-    intents: BTreeMap<[u8; 32], JobIntentV2>,
+    intents: BTreeMap<[u8; 32], MemoryIntentEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MemoryIntentEntry {
+    header: FrameHeader,
+    request: RegisterJobIntentRequest,
+    registered: RegisteredJobIntent,
 }
 
 impl StaticJobIntents {
-    pub fn insert(&mut self, intent: JobIntentV2) -> Result<(), BindingError> {
-        let digest = intent.digest();
-        if digest == [0; 32] || self.intents.insert(digest, intent).is_some() {
+    pub fn insert(
+        &mut self,
+        admission: AdmitAttemptRequest,
+        intent: JobIntentV2,
+    ) -> Result<(), BindingError> {
+        let key = intent_registration_key_digest_parts(
+            intent.lane_manifest_digest,
+            intent.idempotency_digest,
+            intent.run_id,
+            intent.attempt,
+        );
+        let header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::RegisterJobIntent,
+            request_id: [0xff; 16],
+        };
+        let mut request = registration_from_intent(admission, intent);
+        request.request_frame_digest = intent_registration_request_frame_digest(header, &request)
+            .ok_or(BindingError::IntentRefused)?;
+        let entry = MemoryIntentEntry {
+            header,
+            request,
+            registered: RegisteredJobIntent { admission, intent },
+        };
+        if intent.digest() != admission.job_intent_digest
+            || self.intents.insert(key, entry).is_some()
+        {
             return Err(BindingError::IntentRefused);
         }
         Ok(())
@@ -325,10 +447,43 @@ impl StaticJobIntents {
 }
 
 impl JobIntentSource for StaticJobIntents {
-    fn load(&mut self, digest: [u8; 32]) -> Result<JobIntentV2, BindingError> {
+    fn register(
+        &mut self,
+        header: FrameHeader,
+        request: RegisterJobIntentRequest,
+        intent: JobIntentV2,
+    ) -> Result<IntentRegistrationWrite, BindingError> {
+        let registration_key_digest =
+            intent_registration_key_digest_for_admission(request.admission);
+        let entry = MemoryIntentEntry {
+            header,
+            request,
+            registered: RegisteredJobIntent {
+                admission: request.admission,
+                intent,
+            },
+        };
+        match self.intents.get(&registration_key_digest) {
+            Some(existing) if *existing == entry => Ok(IntentRegistrationWrite::Existing),
+            Some(_) => Ok(IntentRegistrationWrite::Conflict),
+            None => {
+                self.intents.insert(registration_key_digest, entry);
+                Ok(IntentRegistrationWrite::Written)
+            }
+        }
+    }
+
+    fn load(
+        &mut self,
+        registration_key_digest: [u8; 32],
+        job_intent_digest: [u8; 32],
+    ) -> Result<RegisteredJobIntent, BindingError> {
         self.intents
-            .get(&digest)
-            .copied()
+            .get(&registration_key_digest)
+            .map(|entry| entry.registered)
+            .and_then(|registered| {
+                (registered.intent.digest() == job_intent_digest).then_some(registered)
+            })
             .ok_or(BindingError::IntentRefused)
     }
 }
@@ -865,6 +1020,7 @@ where
             Request::DescribeAttemptEvidence(_) | Request::ReadAttemptEvidence(_) => {
                 empty_response(ResponseCode::BadFrame, now)
             }
+            Request::RegisterJobIntent(_) => empty_response(ResponseCode::BadFrame, now),
             Request::Hello(_) | Request::AdmitQualification(_) => {
                 empty_response(ResponseCode::NotProvisioned, now)
             }
@@ -878,7 +1034,16 @@ where
     ) -> Result<ExecutionBindingRecord, BindingError> {
         let record =
             self.load_bound(coordinates.attempt_id, coordinates.execution_binding_digest)?;
-        let intent = self.intents.load(record.binding.job_intent_digest)?;
+        let registration_key = intent_registration_key_digest_parts(
+            record.binding.lane_manifest_digest,
+            record.binding.idempotency_digest,
+            record.binding.run_id,
+            record.binding.attempt,
+        );
+        let intent = self
+            .intents
+            .load(registration_key, record.binding.job_intent_digest)?
+            .intent;
         if record.phase != BindingPhase::CapacityReturned
             || record.generation != coordinates.expected_generation
             || record.evidence_set_digest == [0; 32]
@@ -1021,16 +1186,39 @@ where
         Ok(())
     }
 
+    fn register_intent(
+        &mut self,
+        header: FrameHeader,
+        request: RegisterJobIntentRequest,
+        now: u64,
+    ) -> Result<ResponseCode, BindingError> {
+        let admission = request.admission;
+        let manifest = self
+            .manifests
+            .load(admission.lane_manifest_digest, admission.lane_epoch)?;
+        let measured = self.host.identity()?;
+        manifest.validate(admission, measured, now)?;
+        verify_admission_signature(manifest, admission)?;
+        let intent = JobIntentV2::from_registration(request);
+        intent.validate(admission, now)?;
+
+        let attempt_id = attempt_id_for_admission(admission);
+        let admitted = match self.journal.load(attempt_id)? {
+            Some(record) if record.binding.matches_request(admission) => true,
+            Some(_) => return Err(BindingError::ReplayConflict),
+            None => false,
+        };
+
+        match self.intents.register(header, request, intent)? {
+            IntentRegistrationWrite::Written if admitted => Ok(ResponseCode::Existing),
+            IntentRegistrationWrite::Written => Ok(ResponseCode::Ok),
+            IntentRegistrationWrite::Existing => Ok(ResponseCode::Existing),
+            IntentRegistrationWrite::Conflict => Err(BindingError::ReplayConflict),
+        }
+    }
+
     fn admit(&mut self, request: AdmitAttemptRequest, now: u64) -> BrokerResponse {
-        let attempt_id = derive_id(
-            b"buzz-ci-execd:attempt-id:v1\0",
-            &[
-                &request.lane_manifest_digest,
-                &request.idempotency_digest,
-                &request.run_id,
-                &request.attempt.to_be_bytes(),
-            ],
-        );
+        let attempt_id = attempt_id_for_admission(request);
         match self.journal.load(attempt_id) {
             Ok(Some(record)) if record.binding.matches_request(request) => {
                 return record_response(ResponseCode::Existing, record, now)
@@ -1056,10 +1244,17 @@ where
         if verify_admission_signature(manifest, request).is_err() {
             return empty_response(ResponseCode::PolicyDenied, now);
         }
-        let intent = match self.intents.load(request.job_intent_digest) {
-            Ok(intent) => intent,
+        let registered = match self.intents.load(
+            intent_registration_key_digest_for_admission(request),
+            request.job_intent_digest,
+        ) {
+            Ok(registered) => registered,
             Err(error) => return error_response(error, now),
         };
+        if registered.admission != request {
+            return empty_response(ResponseCode::ReplayConflict, now);
+        }
+        let intent = registered.intent;
         if let Err(error) = intent.validate(request, now) {
             return error_response(error, now);
         }
@@ -1332,6 +1527,23 @@ where
         now: u64,
     ) -> buzz_ci_broker_protocol::v2::EncodedFrame {
         match request {
+            Request::RegisterJobIntent(value) => {
+                let code = if header.operation != request.operation()
+                    || intent_registration_request_frame_digest(header, &value)
+                        != Some(value.request_frame_digest)
+                {
+                    ResponseCode::BadFrame
+                } else if !self.recovery_complete {
+                    ResponseCode::Reconciling
+                } else {
+                    self.register_intent(header, value, now)
+                        .unwrap_or_else(error_code)
+                };
+                buzz_ci_broker_protocol::v2::encode_intent_registration_response(
+                    header,
+                    intent_registration_response(code, value),
+                )
+            }
             Request::DescribeAttemptEvidence(value) => {
                 let response = if header.operation != request.operation() || !self.recovery_complete
                 {
@@ -1423,6 +1635,29 @@ fn evidence_description_error(
         workflow_digest: request.coordinates.workflow_digest,
         job_id: request.coordinates.job_id,
         attempt: request.coordinates.attempt,
+    }
+}
+
+fn intent_registration_response(
+    code: ResponseCode,
+    request: RegisterJobIntentRequest,
+) -> IntentRegistrationResponse {
+    let admission = request.admission;
+    IntentRegistrationResponse {
+        code,
+        retry_after_millis: 0,
+        signed_request_digest: admission.signed_request_digest,
+        job_intent_digest: admission.job_intent_digest,
+        request_frame_digest: request.request_frame_digest,
+        admission_message_digest: sha256(&admission_signature_message(&admission)),
+        registration_key_digest: intent_registration_key_digest_for_admission(admission),
+        lane_manifest_digest: admission.lane_manifest_digest,
+        run_id: admission.run_id,
+        lane_epoch: admission.lane_epoch,
+        admission_key_generation: admission.admission_key_generation,
+        issued_at: admission.issued_at,
+        expires_at: admission.expires_at,
+        attempt: admission.attempt,
     }
 }
 
@@ -1580,6 +1815,18 @@ fn derive_id(domain: &[u8], fields: &[&[u8]]) -> [u8; 16] {
     let mut id = [0; 16];
     id.copy_from_slice(&digest[..16]);
     id
+}
+
+fn attempt_id_for_admission(request: AdmitAttemptRequest) -> [u8; 16] {
+    derive_id(
+        b"buzz-ci-execd:attempt-id:v1\0",
+        &[
+            &request.lane_manifest_digest,
+            &request.idempotency_digest,
+            &request.run_id,
+            &request.attempt.to_be_bytes(),
+        ],
+    )
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -1789,7 +2036,7 @@ mod tests {
             attempt: 1,
             parent_attempt: 0,
             trust_class: TrustClass::AcceptedReviewed,
-            request_event_id: [19; 32],
+            request_event_id: [10; 32],
             workflow_id: WireText64::from_ascii("workflow").unwrap(),
             job_id: WireText64::from_ascii("job").unwrap(),
             artifact_count: 0,
@@ -1836,6 +2083,39 @@ mod tests {
     fn request_for(key: &Keypair) -> AdmitAttemptRequest {
         let lane = manifest(key);
         request(key, lane, intent_for(lane))
+    }
+
+    fn registration(
+        admission: AdmitAttemptRequest,
+        intent: JobIntentV2,
+        request_id: [u8; 16],
+    ) -> (FrameHeader, RegisterJobIntentRequest) {
+        let header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::RegisterJobIntent,
+            request_id,
+        };
+        let mut value = RegisterJobIntentRequest {
+            admission,
+            request_event_id: intent.request_event_id,
+            workflow_id: intent.workflow_id,
+            job_id: intent.job_id,
+            artifact_count: intent.artifact_count,
+            artifacts: intent.artifacts.map(|artifact| {
+                artifact.map(
+                    |artifact| buzz_ci_broker_protocol::v2::JobArtifactDeclaration {
+                        artifact_id: artifact.artifact_id,
+                        name: artifact.name,
+                        media_type: artifact.media_type,
+                        relative_name: artifact.relative_name,
+                        max_bytes: artifact.max_bytes,
+                    },
+                )
+            }),
+            request_frame_digest: [1; 32],
+        };
+        value.request_frame_digest =
+            intent_registration_request_frame_digest(header, &value).unwrap();
+        (header, value)
     }
 
     #[test]
@@ -1903,7 +2183,7 @@ mod tests {
             },
         };
         let mut intents = StaticJobIntents::default();
-        intents.insert(intent).unwrap();
+        intents.insert(request(&key, lane, intent), intent).unwrap();
         let mut journal = MemoryExecutionBindingJournal::default();
         let record = ExecutionBindingRecord {
             binding,
@@ -2075,11 +2355,17 @@ mod tests {
     >;
 
     fn controller() -> (Controller, Keypair, Rc<RefCell<HostState>>) {
+        controller_with_preseed(true)
+    }
+
+    fn controller_with_preseed(preseed: bool) -> (Controller, Keypair, Rc<RefCell<HostState>>) {
         let key = signing_key();
         let manifest = manifest(&key);
         let job = intent_for(manifest);
         let mut intents = StaticJobIntents::default();
-        intents.insert(job).unwrap();
+        if preseed {
+            intents.insert(request(&key, manifest, job), job).unwrap();
+        }
         let state = Rc::new(RefCell::new(HostState::default()));
         let host = FakeHost {
             state: Rc::clone(&state),
@@ -2128,12 +2414,118 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_registration_is_create_once_replay_bound_and_required_for_admission() {
+        use buzz_ci_broker_protocol::v2::decode_intent_registration_response;
+
+        let (mut controller, key, state) = controller_with_preseed(false);
+        let lane = manifest(&key);
+        let intent = intent_for(lane);
+        let admission = request(&key, lane, intent);
+
+        let absent = controller.dispatch(
+            header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
+            Request::AdmitAttempt(admission),
+            20,
+        );
+        assert_eq!(absent.code, ResponseCode::PolicyDenied);
+        assert_eq!(state.borrow().calls, ["identity"]);
+
+        let (register_header, register) = registration(admission, intent, [41; 16]);
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            register_header,
+            Request::RegisterJobIntent(register),
+            20,
+        );
+        let written =
+            decode_intent_registration_response(register_header, encoded.as_bytes()).unwrap();
+        assert_eq!(written.code, ResponseCode::Ok);
+        assert_eq!(written.job_intent_digest, admission.job_intent_digest);
+        assert_eq!(written.request_frame_digest, register.request_frame_digest);
+        assert_eq!(
+            written.admission_message_digest,
+            sha256(&admission_signature_message(&admission))
+        );
+        assert_eq!(
+            written.registration_key_digest,
+            intent_registration_key_digest_for_admission(admission)
+        );
+
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            register_header,
+            Request::RegisterJobIntent(register),
+            20,
+        );
+        assert_eq!(
+            decode_intent_registration_response(register_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::Existing
+        );
+
+        let (new_frame_header, new_frame) = registration(admission, intent, [44; 16]);
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            new_frame_header,
+            Request::RegisterJobIntent(new_frame),
+            20,
+        );
+        assert_eq!(
+            decode_intent_registration_response(new_frame_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::ReplayConflict
+        );
+
+        let mut bad_frame = register;
+        bad_frame.request_frame_digest[0] ^= 1;
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            register_header,
+            Request::RegisterJobIntent(bad_frame),
+            20,
+        );
+        assert_eq!(
+            decode_intent_registration_response(register_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::BadFrame
+        );
+
+        let mut other_intent = intent;
+        other_intent.job_id = WireText64::from_ascii("other-job").unwrap();
+        let other_admission = request(&key, lane, other_intent);
+        let (other_header, other_register) = registration(other_admission, other_intent, [42; 16]);
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            other_header,
+            Request::RegisterJobIntent(other_register),
+            20,
+        );
+        assert_eq!(
+            decode_intent_registration_response(other_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::ReplayConflict
+        );
+
+        let admitted = controller.dispatch(
+            header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
+            Request::AdmitAttempt(admission),
+            20,
+        );
+        assert_eq!(admitted.code, ResponseCode::Ok);
+        assert_eq!(admitted.job_intent_digest, intent.digest());
+    }
+
+    #[test]
     fn fresh_controller_stays_reconciling_until_startup_recovery_completes() {
         let key = signing_key();
         let manifest = manifest(&key);
         let job = intent_for(manifest);
         let mut intents = StaticJobIntents::default();
-        intents.insert(job).unwrap();
+        intents.insert(request(&key, manifest, job), job).unwrap();
         let state = Rc::new(RefCell::new(HostState::default()));
         let host = FakeHost {
             state: Rc::clone(&state),
@@ -2250,7 +2642,10 @@ mod tests {
         let mut second_intent = intent_for(lane);
         second_intent.idempotency_digest = [71; 32];
         second_intent.run_id = [72; 16];
-        controller.intents.insert(second_intent).unwrap();
+        controller
+            .intents
+            .insert(request(&key, manifest(&key), second_intent), second_intent)
+            .unwrap();
         let second = controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
             Request::AdmitAttempt(request(&key, manifest(&key), second_intent)),

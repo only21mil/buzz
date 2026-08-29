@@ -38,6 +38,8 @@ pub const COMPLETE_ATTEMPT_BODY_SIZE: usize = 192;
 pub const DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 416;
 /// Version 2 evidence chunk request length.
 pub const READ_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 448;
+/// Version 2 dynamic JobIntent registration body length.
+pub const REGISTER_JOB_INTENT_BODY_SIZE: usize = 960;
 /// Version 2 response body length.
 pub const RESPONSE_BODY_SIZE: usize = 288;
 /// Maximum number of sealed evidence items returned for one attempt.
@@ -48,10 +50,20 @@ pub const MAX_EVIDENCE_CHUNK_SIZE: usize = 4096;
 pub const EVIDENCE_DESCRIPTION_BODY_SIZE: usize = 1888;
 /// Fixed evidence chunk response length.
 pub const EVIDENCE_CHUNK_BODY_SIZE: usize = 4448;
+/// Fixed JobIntent registration response length.
+pub const INTENT_REGISTRATION_RESPONSE_BODY_SIZE: usize = 288;
 /// Largest version 2 request or response body.
 pub const MAX_BODY_SIZE: usize = EVIDENCE_CHUNK_BODY_SIZE;
 /// Largest complete version 2 frame.
 pub const MAX_FRAME_SIZE: usize = HEADER_SIZE + MAX_BODY_SIZE;
+/// Maximum declared artifacts in one registered JobIntent.
+pub const MAX_JOB_INTENT_ARTIFACTS: usize = 1;
+/// Maximum bytes accepted for one declared artifact.
+pub const MAX_JOB_INTENT_ARTIFACT_BYTES: u32 = 32 * 1024;
+
+const INTENT_REGISTRATION_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"buzz-ci-execd:intent-registration-request:v1\0";
+const INTENT_REGISTRATION_KEY_DIGEST_DOMAIN: &[u8] = b"buzz-ci-execd:intent-registration-key:v1\0";
 
 const ADMISSION_SIGNATURE_START: usize = 288;
 const ADMISSION_SIGNATURE_END: usize = 352;
@@ -261,6 +273,52 @@ impl WireText64 {
     }
 }
 
+/// One path-free artifact declaration in a registered JobIntentV2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobArtifactDeclaration {
+    pub artifact_id: WireText64,
+    pub name: WireText64,
+    pub media_type: WireText64,
+    pub relative_name: WireText64,
+    pub max_bytes: u32,
+}
+
+/// Authenticated create-once registration of the exact existing JobIntentV2
+/// preimage. The embedded admission signature binds `job_intent_digest`, and
+/// the request-frame digest binds the signature and every literal preimage
+/// field to one byte-identical transport retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegisterJobIntentRequest {
+    pub admission: AdmitAttemptRequest,
+    pub request_event_id: [u8; 32],
+    pub workflow_id: WireText64,
+    pub job_id: WireText64,
+    pub artifact_count: u8,
+    pub artifacts: [Option<JobArtifactDeclaration>; MAX_JOB_INTENT_ARTIFACTS],
+    pub request_frame_digest: [u8; 32],
+}
+
+/// Result of create-once JobIntent registration. This response exposes no
+/// execution binding or lease; it only echoes authenticated registration
+/// coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntentRegistrationResponse {
+    pub code: ResponseCode,
+    pub retry_after_millis: u32,
+    pub signed_request_digest: [u8; 32],
+    pub job_intent_digest: [u8; 32],
+    pub request_frame_digest: [u8; 32],
+    pub admission_message_digest: [u8; 32],
+    pub registration_key_digest: [u8; 32],
+    pub lane_manifest_digest: [u8; 32],
+    pub run_id: [u8; 16],
+    pub lane_epoch: u64,
+    pub admission_key_generation: u64,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub attempt: u32,
+}
+
 /// Describe all sealed evidence owned by execd for one exact attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DescribeAttemptEvidenceRequest {
@@ -380,6 +438,7 @@ pub enum Request {
     CompleteAttempt(CompleteAttemptRequest),
     DescribeAttemptEvidence(DescribeAttemptEvidenceRequest),
     ReadAttemptEvidence(ReadAttemptEvidenceRequest),
+    RegisterJobIntent(RegisterJobIntentRequest),
 }
 
 impl Request {
@@ -394,6 +453,7 @@ impl Request {
             Self::CompleteAttempt(_) => Operation::CompleteAttempt,
             Self::DescribeAttemptEvidence(_) => Operation::DescribeAttemptEvidence,
             Self::ReadAttemptEvidence(_) => Operation::ReadAttemptEvidence,
+            Self::RegisterJobIntent(_) => Operation::RegisterJobIntent,
         }
     }
 }
@@ -548,6 +608,7 @@ pub fn encode_request(request_id: [u8; 16], request: Request) -> EncodedFrame {
         Request::CompleteAttempt(value) => encode_complete(body, value),
         Request::DescribeAttemptEvidence(value) => encode_describe_evidence(body, value),
         Request::ReadAttemptEvidence(value) => encode_read_evidence(body, value),
+        Request::RegisterJobIntent(value) => encode_register_job_intent(body, value),
     }
     encoded
 }
@@ -579,6 +640,9 @@ pub fn decode_request(frame: &[u8]) -> Result<(FrameHeader, Request), DecodeErro
             Request::DescribeAttemptEvidence(decode_describe_evidence(body)?)
         }
         Operation::ReadAttemptEvidence => Request::ReadAttemptEvidence(decode_read_evidence(body)?),
+        Operation::RegisterJobIntent => {
+            Request::RegisterJobIntent(decode_register_job_intent(body)?)
+        }
     };
     Ok((header, request))
 }
@@ -654,6 +718,87 @@ pub fn decode_response(expected: FrameHeader, frame: &[u8]) -> Result<BrokerResp
     Ok(response)
 }
 
+/// Encode an operation-specific response to RegisterJobIntent.
+pub fn encode_intent_registration_response(
+    request_header: FrameHeader,
+    response: IntentRegistrationResponse,
+) -> EncodedFrame {
+    assert_eq!(request_header.operation, Operation::RegisterJobIntent);
+    let mut encoded = EncodedFrame {
+        bytes: [0_u8; MAX_FRAME_SIZE],
+        len: HEADER_SIZE + INTENT_REGISTRATION_RESPONSE_BODY_SIZE,
+    };
+    encode_header(
+        &mut encoded.bytes[..HEADER_SIZE],
+        (request_header.operation as u16) | OP_RESPONSE_BIT,
+        INTENT_REGISTRATION_RESPONSE_BODY_SIZE,
+        request_header.request_id,
+    );
+    let body = &mut encoded.bytes[HEADER_SIZE..encoded.len];
+    put_u16(body, 0, response.code as u16);
+    put_u32(body, 2, response.retry_after_millis);
+    body[6..38].copy_from_slice(&response.signed_request_digest);
+    body[38..70].copy_from_slice(&response.job_intent_digest);
+    body[70..102].copy_from_slice(&response.request_frame_digest);
+    body[102..134].copy_from_slice(&response.admission_message_digest);
+    body[134..166].copy_from_slice(&response.registration_key_digest);
+    body[166..198].copy_from_slice(&response.lane_manifest_digest);
+    body[198..214].copy_from_slice(&response.run_id);
+    put_u64(body, 214, response.lane_epoch);
+    put_u64(body, 222, response.admission_key_generation);
+    put_u64(body, 230, response.issued_at);
+    put_u64(body, 238, response.expires_at);
+    put_u32(body, 246, response.attempt);
+    encoded
+}
+
+/// Decode an operation-specific response bound to RegisterJobIntent.
+pub fn decode_intent_registration_response(
+    expected: FrameHeader,
+    frame: &[u8],
+) -> Result<IntentRegistrationResponse, DecodeError> {
+    if expected.operation != Operation::RegisterJobIntent {
+        return Err(DecodeError::UnknownOperation);
+    }
+    let (operation, request_id, body) = decode_header(frame, true)?;
+    if operation != (Operation::RegisterJobIntent as u16) | OP_RESPONSE_BIT
+        || request_id != expected.request_id
+        || body.len() != INTENT_REGISTRATION_RESPONSE_BODY_SIZE
+    {
+        return Err(DecodeError::UnknownOperation);
+    }
+    require_zero(&body[250..])?;
+    let response = IntentRegistrationResponse {
+        code: ResponseCode::try_from(get_u16(body, 0))?,
+        retry_after_millis: get_u32(body, 2),
+        signed_request_digest: nonzero_array(&body[6..38])?,
+        job_intent_digest: nonzero_array(&body[38..70])?,
+        request_frame_digest: nonzero_array(&body[70..102])?,
+        admission_message_digest: nonzero_array(&body[102..134])?,
+        registration_key_digest: nonzero_array(&body[134..166])?,
+        lane_manifest_digest: nonzero_array(&body[166..198])?,
+        run_id: nonzero_array(&body[198..214])?,
+        lane_epoch: get_u64(body, 214),
+        admission_key_generation: get_u64(body, 222),
+        issued_at: get_u64(body, 230),
+        expires_at: get_u64(body, 238),
+        attempt: get_u32(body, 246),
+    };
+    validate_safe(response.lane_epoch)?;
+    validate_safe(response.admission_key_generation)?;
+    validate_safe(response.issued_at)?;
+    validate_safe(response.expires_at)?;
+    if response.lane_epoch == 0
+        || response.admission_key_generation == 0
+        || response.issued_at == 0
+        || response.expires_at <= response.issued_at
+        || response.attempt == 0
+    {
+        return Err(DecodeError::ZeroField);
+    }
+    Ok(response)
+}
+
 const fn body_size(operation: Operation) -> usize {
     match operation {
         Operation::Hello => super::HELLO_BODY_SIZE,
@@ -664,6 +809,7 @@ const fn body_size(operation: Operation) -> usize {
         Operation::CompleteAttempt => COMPLETE_ATTEMPT_BODY_SIZE,
         Operation::DescribeAttemptEvidence => DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE,
         Operation::ReadAttemptEvidence => READ_ATTEMPT_EVIDENCE_BODY_SIZE,
+        Operation::RegisterJobIntent => REGISTER_JOB_INTENT_BODY_SIZE,
     }
 }
 
@@ -783,6 +929,109 @@ fn decode_admit(body: &[u8]) -> Result<AdmitAttemptRequest, DecodeError> {
         return Err(DecodeError::InvalidAttemptLineage);
     }
     Ok(value)
+}
+
+fn encode_register_job_intent(body: &mut [u8], value: RegisterJobIntentRequest) {
+    encode_admit(&mut body[..ADMIT_ATTEMPT_BODY_SIZE], value.admission);
+    body[480..512].copy_from_slice(&value.request_event_id);
+    encode_text(&mut body[512..577], value.workflow_id);
+    encode_text(&mut body[577..642], value.job_id);
+    body[642] = value.artifact_count;
+    if let Some(artifact) = value.artifacts[0] {
+        body[643] = 1;
+        encode_text(&mut body[644..709], artifact.artifact_id);
+        encode_text(&mut body[709..774], artifact.name);
+        encode_text(&mut body[774..839], artifact.media_type);
+        encode_text(&mut body[839..904], artifact.relative_name);
+        put_u32(body, 904, artifact.max_bytes);
+    }
+    body[908..940].copy_from_slice(&value.request_frame_digest);
+}
+
+fn decode_register_job_intent(body: &[u8]) -> Result<RegisterJobIntentRequest, DecodeError> {
+    let artifact_count = body[642];
+    let artifact = match (artifact_count, body[643]) {
+        (0, 0) => {
+            require_zero(&body[644..908])?;
+            None
+        }
+        (1, 1) => {
+            let artifact = JobArtifactDeclaration {
+                artifact_id: decode_text(&body[644..709], false)?,
+                name: decode_text(&body[709..774], false)?,
+                media_type: decode_text(&body[774..839], false)?,
+                relative_name: decode_text(&body[839..904], false)?,
+                max_bytes: get_u32(body, 904),
+            };
+            if artifact.max_bytes == 0 || artifact.max_bytes > MAX_JOB_INTENT_ARTIFACT_BYTES {
+                return Err(DecodeError::WrongBodyLength);
+            }
+            Some(artifact)
+        }
+        _ => return Err(DecodeError::WrongBodyLength),
+    };
+    require_zero(&body[940..])?;
+    Ok(RegisterJobIntentRequest {
+        admission: decode_admit(&body[..ADMIT_ATTEMPT_BODY_SIZE])?,
+        request_event_id: nonzero_array(&body[480..512])?,
+        workflow_id: decode_text(&body[512..577], false)?,
+        job_id: decode_text(&body[577..642], false)?,
+        artifact_count,
+        artifacts: [artifact],
+        request_frame_digest: nonzero_array(&body[908..940])?,
+    })
+}
+
+/// Digest the complete canonical registration frame except its self-digest.
+pub fn intent_registration_request_frame_digest(
+    header: FrameHeader,
+    value: &RegisterJobIntentRequest,
+) -> Option<[u8; 32]> {
+    if header.operation != Operation::RegisterJobIntent {
+        return None;
+    }
+    let mut canonical = *value;
+    canonical.request_frame_digest = [0; 32];
+    let mut body = [0; REGISTER_JOB_INTENT_BODY_SIZE];
+    encode_register_job_intent(&mut body, canonical);
+    let mut hasher = Sha256::new();
+    hasher.update(INTENT_REGISTRATION_REQUEST_DIGEST_DOMAIN);
+    hasher.update(PROTOCOL_VERSION.to_be_bytes());
+    hasher.update((Operation::RegisterJobIntent as u16).to_be_bytes());
+    hasher.update(header.request_id);
+    hasher.update(body);
+    Some(hasher.finalize().into())
+}
+
+/// Durable pre-admission replay coordinate for one exact logical attempt.
+pub fn intent_registration_key_digest(value: &RegisterJobIntentRequest) -> [u8; 32] {
+    intent_registration_key_digest_for_admission(value.admission)
+}
+
+/// Durable pre-admission replay coordinate derived from the signed admission.
+pub fn intent_registration_key_digest_for_admission(admission: AdmitAttemptRequest) -> [u8; 32] {
+    intent_registration_key_digest_parts(
+        admission.lane_manifest_digest,
+        admission.idempotency_digest,
+        admission.run_id,
+        admission.attempt,
+    )
+}
+
+/// Durable pre-admission replay coordinate from its canonical components.
+pub fn intent_registration_key_digest_parts(
+    lane_manifest_digest: [u8; 32],
+    idempotency_digest: [u8; 32],
+    run_id: [u8; 16],
+    attempt: u32,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(INTENT_REGISTRATION_KEY_DIGEST_DOMAIN);
+    hasher.update(lane_manifest_digest);
+    hasher.update(idempotency_digest);
+    hasher.update(run_id);
+    hasher.update(attempt.to_be_bytes());
+    hasher.finalize().into()
 }
 
 fn encode_cancel(body: &mut [u8], value: CancelAttemptRequest) {
@@ -1365,6 +1614,53 @@ mod tests {
         value
     }
 
+    fn register() -> RegisterJobIntentRequest {
+        let header = FrameHeader {
+            operation: Operation::RegisterJobIntent,
+            request_id: [9; 16],
+        };
+        let mut value = RegisterJobIntentRequest {
+            admission: admit(),
+            request_event_id: digest(1),
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            job_id: WireText64::from_ascii("job").unwrap(),
+            artifact_count: 1,
+            artifacts: [Some(JobArtifactDeclaration {
+                artifact_id: WireText64::from_ascii("report").unwrap(),
+                name: WireText64::from_ascii("report.txt").unwrap(),
+                media_type: WireText64::from_ascii("text/plain").unwrap(),
+                relative_name: WireText64::from_ascii("report.txt").unwrap(),
+                max_bytes: 4096,
+            })],
+            request_frame_digest: digest(20),
+        };
+        value.request_frame_digest =
+            intent_registration_request_frame_digest(header, &value).unwrap();
+        value
+    }
+
+    fn registration_response(request: RegisterJobIntentRequest) -> IntentRegistrationResponse {
+        IntentRegistrationResponse {
+            code: ResponseCode::Ok,
+            retry_after_millis: 0,
+            signed_request_digest: request.admission.signed_request_digest,
+            job_intent_digest: request.admission.job_intent_digest,
+            request_frame_digest: request.request_frame_digest,
+            admission_message_digest: Sha256::digest(admission_signature_message(
+                &request.admission,
+            ))
+            .into(),
+            registration_key_digest: intent_registration_key_digest(&request),
+            lane_manifest_digest: request.admission.lane_manifest_digest,
+            run_id: request.admission.run_id,
+            lane_epoch: request.admission.lane_epoch,
+            admission_key_generation: request.admission.admission_key_generation,
+            issued_at: request.admission.issued_at,
+            expires_at: request.admission.expires_at,
+            attempt: request.admission.attempt,
+        }
+    }
+
     fn response() -> BrokerResponse {
         BrokerResponse {
             code: ResponseCode::Ok,
@@ -1402,6 +1698,7 @@ mod tests {
             Request::CompleteAttempt(complete()),
             Request::DescribeAttemptEvidence(describe()),
             Request::ReadAttemptEvidence(read()),
+            Request::RegisterJobIntent(register()),
         ];
         for request in requests {
             let encoded = encode_request([42; 16], request);
@@ -1416,6 +1713,18 @@ mod tests {
         };
         let encoded = encode_response(header, response());
         assert_eq!(decode_response(header, encoded.as_bytes()), Ok(response()));
+
+        let header = FrameHeader {
+            operation: Operation::RegisterJobIntent,
+            request_id: [9; 16],
+        };
+        let request = register();
+        let response = registration_response(request);
+        let encoded = encode_intent_registration_response(header, response);
+        assert_eq!(
+            decode_intent_registration_response(header, encoded.as_bytes()),
+            Ok(response)
+        );
     }
 
     #[test]
@@ -1499,7 +1808,9 @@ mod tests {
         assert_eq!(COMPLETE_ATTEMPT_BODY_SIZE, 192);
         assert_eq!(DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE, 416);
         assert_eq!(READ_ATTEMPT_EVIDENCE_BODY_SIZE, 448);
+        assert_eq!(REGISTER_JOB_INTENT_BODY_SIZE, 960);
         assert_eq!(RESPONSE_BODY_SIZE, 288);
+        assert_eq!(INTENT_REGISTRATION_RESPONSE_BODY_SIZE, 288);
         assert_eq!(MAX_FRAME_SIZE, 4480);
         assert!(!std::mem::needs_drop::<AdmitAttemptRequest>());
         assert!(!std::mem::needs_drop::<CompleteAttemptRequest>());
@@ -1514,6 +1825,38 @@ mod tests {
             get_u32(encoded.as_bytes(), 12),
             ADMIT_ATTEMPT_BODY_SIZE as u32
         );
+    }
+
+    #[test]
+    fn registration_frame_binds_exact_literals_and_rejects_hostile_shapes() {
+        let header = FrameHeader {
+            operation: Operation::RegisterJobIntent,
+            request_id: [9; 16],
+        };
+        let request = register();
+        assert_eq!(
+            intent_registration_request_frame_digest(header, &request),
+            Some(request.request_frame_digest)
+        );
+        let mut changed = request;
+        changed.artifacts[0].as_mut().unwrap().name = WireText64::from_ascii("other.txt").unwrap();
+        assert_ne!(
+            intent_registration_request_frame_digest(header, &changed),
+            Some(request.request_frame_digest)
+        );
+
+        let encoded = encode_request([9; 16], Request::RegisterJobIntent(request));
+        let mut zero_digest = encoded.as_bytes().to_vec();
+        zero_digest[HEADER_SIZE + 908..HEADER_SIZE + 940].fill(0);
+        assert_eq!(decode_request(&zero_digest), Err(DecodeError::ZeroField));
+
+        let mut extra_artifact = encoded.as_bytes().to_vec();
+        extra_artifact[HEADER_SIZE + 642] = 2;
+        assert!(decode_request(&extra_artifact).is_err());
+
+        let mut padding = encoded.as_bytes().to_vec();
+        padding[HEADER_SIZE + 940] = 1;
+        assert_eq!(decode_request(&padding), Err(DecodeError::NonZeroReserved));
     }
 
     #[test]
@@ -1663,6 +2006,24 @@ mod tests {
         assert_eq!(
             hex_digest(response.as_bytes()),
             "c1ac6e82fd54e57102c453aa9de6284f71cfd74092108b7f985d153fe1f772c9"
+        );
+        let registration_request = register();
+        let registration_frame =
+            encode_request([9; 16], Request::RegisterJobIntent(registration_request));
+        let registration_response = encode_intent_registration_response(
+            FrameHeader {
+                operation: Operation::RegisterJobIntent,
+                request_id: [9; 16],
+            },
+            registration_response(registration_request),
+        );
+        assert_eq!(
+            hex_digest(registration_frame.as_bytes()),
+            "06e022cdde38b2e575e275de8f06a98422873f58d2c3f2d3c004fcce2ba36ce3"
+        );
+        assert_eq!(
+            hex_digest(registration_response.as_bytes()),
+            "2b1a30e1a1e48e8062233838dc63e78face60d7c266c1ad4a0b01b2272889d16"
         );
     }
 

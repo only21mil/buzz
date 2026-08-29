@@ -17,9 +17,14 @@ use std::{
 };
 
 use buzz_ci_broker_protocol::{
-    v2::{AdmissionSignatureAlgorithm, EvidenceDescriptor, EvidenceKind, WireText64},
-    Conclusion, GitOid, TrustClass,
+    v2::{
+        decode_request, encode_request, intent_registration_key_digest_for_admission,
+        intent_registration_request_frame_digest, AdmissionSignatureAlgorithm, EvidenceDescriptor,
+        EvidenceKind, FrameHeader, RegisterJobIntentRequest, Request, WireText64,
+    },
+    Conclusion, GitOid,
 };
+use buzz_ci_isolation_contract::{PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,10 +34,12 @@ use crate::{
     production_binding::{
         ArtifactDeclarationV1, BindingError, BindingPhase, ExecutionBindingJournal,
         ExecutionBindingRecord, ExecutionBindingV1, HostEvidenceItem, HostIdentity,
-        HostRecoveryReceipt, HostStepReceipt, HostStopReason, HostTerminalReceipt, JobIntentSource,
-        JobIntentV2, JournalWrite, LaneActivationManifestV1, PrivilegedHostSystem,
-        ProductionBindingController, StaticLaneManifest, EXECUTION_BINDING_SCHEMA_V1,
+        HostRecoveryReceipt, HostStepReceipt, HostStopReason, HostTerminalReceipt,
+        IntentRegistrationWrite, JobIntentSource, JobIntentV2, JournalWrite,
+        LaneActivationManifestV1, PrivilegedHostSystem, ProductionBindingController,
+        RegisteredJobIntent, StaticLaneManifest, EXECUTION_BINDING_SCHEMA_V1,
     },
+    seccomp_activation::{SeccompActivationAdapter, SeccompStartupProof},
 };
 
 pub const CONFIG_PATH: &str = "/etc/buzzci/execd-v2.json";
@@ -52,6 +59,48 @@ const MAX_INTENT: u64 = 32 * 1024;
 const MAX_RECORD: u64 = 32 * 1024;
 const MAX_RPC: usize = 64 * 1024;
 const MAX_RAW_OUTPUT: usize = 32 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SeccompRuntimeBinding {
+    profile_path: String,
+    profile_digest: String,
+    install_receipt_digest: String,
+}
+
+impl SeccompRuntimeBinding {
+    fn from_proof(proof: SeccompStartupProof) -> Result<Self, ProductionV2Error> {
+        let evidence = proof.seccomp_evidence();
+        let capability = proof.install_capability();
+        let binding = Self {
+            profile_path: evidence.path().into(),
+            profile_digest: evidence.digest().into(),
+            install_receipt_digest: capability.receipt_digest(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), ProductionV2Error> {
+        if self.profile_path != PHASE1_SECCOMP_PROFILE_PATH
+            || self.profile_digest != PHASE1_SECCOMP_PROFILE_DIGEST
+            || self.install_receipt_digest.len() != 64
+            || !lower_hex(&self.install_receipt_digest)
+            || self.install_receipt_digest.bytes().all(|byte| byte == b'0')
+        {
+            return Err(ProductionV2Error::Closed);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fixture() -> Self {
+        Self {
+            profile_path: PHASE1_SECCOMP_PROFILE_PATH.into(),
+            profile_digest: PHASE1_SECCOMP_PROFILE_DIGEST.into(),
+            install_receipt_digest: "11".repeat(32),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ProductionV2Error {
@@ -128,31 +177,10 @@ struct ManifestDocument {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct IntentDocument {
+struct RegisteredIntentDocument {
     schema_version: u16,
-    signed_request_digest: String,
-    actor_pubkey: String,
-    audience_digest: String,
-    idempotency_digest: String,
-    source_pin_event_id: String,
-    workflow_digest: String,
-    isolation_profile_digest: String,
-    lane_manifest_digest: String,
-    lane_epoch: u64,
-    admission_key_generation: u64,
-    run_id: String,
-    tip_oid: OidDocument,
-    base_oid: OidDocument,
-    issued_at: u64,
-    expires_at: u64,
-    wall_timeout_seconds: u32,
-    attempt: u32,
-    parent_attempt: u32,
-    trust_class: String,
-    request_event_id: String,
-    workflow_id: String,
-    job_id: String,
-    artifacts: Vec<ArtifactDocument>,
+    registration_key_digest: String,
+    request_frame_hex: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +246,9 @@ struct ExecutorRequest {
     phase: Option<String>,
     stop_reason: Option<String>,
     executor_program_sha256: String,
+    seccomp_profile_path: String,
+    seccomp_profile_sha256: String,
+    seccomp_install_receipt_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -403,17 +434,123 @@ struct StaticIntentFiles {
     root: SafeDirectory,
 }
 
+impl RegisteredIntentDocument {
+    fn decode(
+        self,
+    ) -> Result<(FrameHeader, RegisterJobIntentRequest, RegisteredJobIntent), ProductionV2Error>
+    {
+        if self.schema_version != 1 {
+            return Err(ProductionV2Error::Closed);
+        }
+        let registration_key_digest = decode_hex::<32>(&self.registration_key_digest)?;
+        if self.request_frame_hex.len() > MAX_INTENT as usize * 2
+            || !lower_hex(&self.request_frame_hex)
+        {
+            return Err(ProductionV2Error::Closed);
+        }
+        let frame = hex::decode(&self.request_frame_hex).map_err(|_| ProductionV2Error::Closed)?;
+        let (header, decoded) = decode_request(&frame).map_err(|_| ProductionV2Error::Closed)?;
+        let Request::RegisterJobIntent(request) = decoded else {
+            return Err(ProductionV2Error::Closed);
+        };
+        if intent_registration_request_frame_digest(header, &request)
+            != Some(request.request_frame_digest)
+            || intent_registration_key_digest_for_admission(request.admission)
+                != registration_key_digest
+        {
+            return Err(ProductionV2Error::Closed);
+        }
+        let intent = JobIntentV2::from_registration(request);
+        if intent.digest() != request.admission.job_intent_digest {
+            return Err(ProductionV2Error::Closed);
+        }
+        Ok((
+            header,
+            request,
+            RegisteredJobIntent {
+                admission: request.admission,
+                intent,
+            },
+        ))
+    }
+}
+
+impl StaticIntentFiles {
+    fn open(root: SafeDirectory) -> Result<Self, ProductionV2Error> {
+        for entry in fs::read_dir(root.descriptor_path()).map_err(|_| ProductionV2Error::Closed)? {
+            let entry = entry.map_err(|_| ProductionV2Error::Closed)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ProductionV2Error::Closed)?;
+            let Some(hex_key) = name.strip_suffix(".json") else {
+                return Err(ProductionV2Error::Closed);
+            };
+            if hex_key.len() != 64 || !lower_hex(hex_key) {
+                return Err(ProductionV2Error::Closed);
+            }
+            let bytes = root.read(&name, 0o400, MAX_INTENT)?;
+            let (_, _, registered) =
+                canonical_parse::<RegisteredIntentDocument>(&bytes)?.decode()?;
+            let expected = intent_registration_key_digest_for_admission(registered.admission);
+            if hex::encode(expected) != hex_key {
+                return Err(ProductionV2Error::Closed);
+            }
+        }
+        Ok(Self { root })
+    }
+}
+
 impl JobIntentSource for StaticIntentFiles {
-    fn load(&mut self, digest: [u8; 32]) -> Result<JobIntentV2, BindingError> {
-        let name = format!("{}.json", hex::encode(digest));
+    fn register(
+        &mut self,
+        header: FrameHeader,
+        request: RegisterJobIntentRequest,
+        intent: JobIntentV2,
+    ) -> Result<IntentRegistrationWrite, BindingError> {
+        if header.operation != Request::RegisterJobIntent(request).operation()
+            || intent_registration_request_frame_digest(header, &request)
+                != Some(request.request_frame_digest)
+            || JobIntentV2::from_registration(request) != intent
+            || intent.digest() != request.admission.job_intent_digest
+        {
+            return Err(BindingError::IntentRefused);
+        }
+        let registration_key_digest =
+            intent_registration_key_digest_for_admission(request.admission);
+        let name = format!("{}.json", hex::encode(registration_key_digest));
+        let frame = encode_request(header.request_id, Request::RegisterJobIntent(request));
+        let document = RegisteredIntentDocument {
+            schema_version: 1,
+            registration_key_digest: hex::encode(registration_key_digest),
+            request_frame_hex: hex::encode(frame.as_bytes()),
+        };
+        let bytes = canonical_bytes(&document).map_err(binding_error)?;
+        match self.root.write_once(&name, &bytes, 0o400) {
+            Ok(()) => Ok(IntentRegistrationWrite::Written),
+            Err(_) => match self.root.read(&name, 0o400, MAX_INTENT) {
+                Ok(existing) if existing == bytes => Ok(IntentRegistrationWrite::Existing),
+                Ok(_) => Ok(IntentRegistrationWrite::Conflict),
+                Err(_) => Err(BindingError::StorageUnavailable),
+            },
+        }
+    }
+
+    fn load(
+        &mut self,
+        registration_key: [u8; 32],
+        job_intent_digest: [u8; 32],
+    ) -> Result<RegisteredJobIntent, BindingError> {
+        let name = format!("{}.json", hex::encode(registration_key));
         let bytes = self
             .root
             .read(&name, 0o400, MAX_INTENT)
             .map_err(binding_error)?;
-        let document: IntentDocument = canonical_parse(&bytes).map_err(binding_error)?;
-        let intent = document.into_intent().map_err(binding_error)?;
-        (intent.digest() == digest)
-            .then_some(intent)
+        let document: RegisteredIntentDocument = canonical_parse(&bytes).map_err(binding_error)?;
+        let (_, _, registered) = document.decode().map_err(binding_error)?;
+        (intent_registration_key_digest_for_admission(registered.admission) == registration_key
+            && registered.intent.digest() == job_intent_digest)
+            .then_some(registered)
             .ok_or(BindingError::IntentRefused)
     }
 }
@@ -512,6 +649,7 @@ struct LocalHostSystem {
     executor_uid: u32,
     executor_gid: u32,
     executor: ProgramProvenance,
+    seccomp: SeccompRuntimeBinding,
     evidence: SafeDirectory,
     teardown: SafeDirectory,
     evidence_by_binding: BTreeMap<[u8; 32], [u8; 32]>,
@@ -530,6 +668,7 @@ impl LocalHostSystem {
         reason: Option<HostStopReason>,
     ) -> Result<ExecutorResponse, BindingError> {
         verify_program(&self.executor).map_err(binding_error)?;
+        self.seccomp.validate().map_err(binding_error)?;
         let mut stream =
             UnixStream::connect(&self.socket).map_err(|_| BindingError::HostRefused)?;
         stream
@@ -552,6 +691,9 @@ impl LocalHostSystem {
             phase: phase.map(phase_name).map(str::to_owned),
             stop_reason: reason.map(stop_name).map(str::to_owned),
             executor_program_sha256: self.executor.sha256.clone(),
+            seccomp_profile_path: self.seccomp.profile_path.clone(),
+            seccomp_profile_sha256: self.seccomp.profile_digest.clone(),
+            seccomp_install_receipt_sha256: self.seccomp.install_receipt_digest.clone(),
         };
         let body = canonical_bytes(&request).map_err(binding_error)?;
         if body.len() > MAX_RPC {
@@ -1164,27 +1306,40 @@ impl PrivilegedHostSystem for LocalHostSystem {
 
 /// Open exact capacity-one production state. Any ambiguity returns a closed dispatcher.
 pub fn load_canonical(now: u64) -> Result<Box<dyn ControlDispatch>, ProductionV2Error> {
-    load_from(RuntimePaths::canonical(), 0, now, true)
+    load_from(RuntimePaths::canonical(), 0, now, true, || {
+        SeccompActivationAdapter::production()
+            .activate()
+            .map_err(|_| ProductionV2Error::Closed)
+            .and_then(SeccompRuntimeBinding::from_proof)
+    })
 }
 
-fn load_from(
+fn load_from<F>(
     paths: RuntimePaths,
     owner: u32,
     now: u64,
     validate_group: bool,
-) -> Result<Box<dyn ControlDispatch>, ProductionV2Error> {
+    activate_seccomp: F,
+) -> Result<Box<dyn ControlDispatch>, ProductionV2Error>
+where
+    F: FnOnce() -> Result<SeccompRuntimeBinding, ProductionV2Error>,
+{
     let config_path = paths.resolve(CONFIG_PATH)?;
     let config = read_document::<ProductionConfig>(&config_path, owner, 0o600, MAX_CONFIG)?;
     validate_config(&config, &paths, owner, validate_group)?;
+    let seccomp = activate_seccomp()?;
+    seccomp.validate()?;
     let manifest = config.lane_manifest.clone().into_manifest()?;
     let identity = HostIdentity {
         broker_build_identity: manifest.broker_build_identity,
         host_profile_digest: manifest.host_profile_digest,
         suite_identity: manifest.suite_identity,
     };
-    let intents = StaticIntentFiles {
-        root: SafeDirectory::open(paths.resolve(INTENT_ROOT)?, owner, 0o700)?,
-    };
+    let intents = StaticIntentFiles::open(SafeDirectory::open(
+        paths.resolve(INTENT_ROOT)?,
+        owner,
+        0o700,
+    )?)?;
     let journal = DurableBindingFiles {
         root: SafeDirectory::open(paths.resolve(BINDING_ROOT)?, owner, 0o700)?,
     };
@@ -1194,6 +1349,7 @@ fn load_from(
         executor_uid: config.identities.job_uid,
         executor_gid: config.identities.job_gid,
         executor: mapped_program(&config.executor, &paths)?,
+        seccomp,
         evidence: SafeDirectory::open(paths.resolve(EVIDENCE_ROOT)?, owner, 0o700)?,
         teardown: SafeDirectory::open(paths.resolve(TEARDOWN_ROOT)?, owner, 0o700)?,
         evidence_by_binding: BTreeMap::new(),
@@ -1396,43 +1552,6 @@ impl ManifestDocument {
             not_before: self.not_before,
             expires_at: self.expires_at,
             max_wall_timeout_seconds: self.max_wall_timeout_seconds,
-        })
-    }
-}
-
-impl IntentDocument {
-    fn into_intent(self) -> Result<JobIntentV2, ProductionV2Error> {
-        let artifacts = artifact_array(&self.artifacts)?;
-        Ok(JobIntentV2 {
-            schema_version: self.schema_version,
-            signed_request_digest: decode_hex(&self.signed_request_digest)?,
-            actor_pubkey: decode_hex(&self.actor_pubkey)?,
-            audience_digest: decode_hex(&self.audience_digest)?,
-            idempotency_digest: decode_hex(&self.idempotency_digest)?,
-            source_pin_event_id: decode_hex(&self.source_pin_event_id)?,
-            workflow_digest: decode_hex(&self.workflow_digest)?,
-            isolation_profile_digest: decode_hex(&self.isolation_profile_digest)?,
-            lane_manifest_digest: decode_hex(&self.lane_manifest_digest)?,
-            lane_epoch: self.lane_epoch,
-            admission_signature_algorithm: AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
-            admission_key_generation: self.admission_key_generation,
-            run_id: decode_hex(&self.run_id)?,
-            tip_oid: self.tip_oid.into_oid()?,
-            base_oid: self.base_oid.into_oid()?,
-            issued_at: self.issued_at,
-            expires_at: self.expires_at,
-            wall_timeout_seconds: self.wall_timeout_seconds,
-            attempt: self.attempt,
-            parent_attempt: self.parent_attempt,
-            trust_class: match self.trust_class.as_str() {
-                "accepted_reviewed" => TrustClass::AcceptedReviewed,
-                _ => return Err(ProductionV2Error::Closed),
-            },
-            request_event_id: decode_hex(&self.request_event_id)?,
-            workflow_id: wire_text(&self.workflow_id)?,
-            job_id: wire_text(&self.job_id)?,
-            artifact_count: self.artifacts.len() as u8,
-            artifacts,
         })
     }
 }
@@ -1792,6 +1911,7 @@ fn serve_executor_stream(
     if request.schema_version != RPC_SCHEMA
         || binding == [0; 32]
         || request.executor_program_sha256 != executable_sha256
+        || !valid_executor_seccomp(&request)
         || active.len() > 1
     {
         return Err(std::io::ErrorKind::InvalidData.into());
@@ -1808,6 +1928,9 @@ fn executor_transition(
     request: ExecutorRequest,
     active: &mut BTreeMap<String, ExecutorStage>,
 ) -> Result<ExecutorResponse, ProductionV2Error> {
+    if !valid_executor_seccomp(&request) {
+        return Err(ProductionV2Error::Closed);
+    }
     let binding = request.execution_binding_digest.clone();
     let operation = request.operation.clone();
     let receipt = |name: &str| {
@@ -1815,6 +1938,8 @@ fn executor_transition(
         digest.update(b"buzz-ci-executor:receipt:v1\0");
         digest.update(name.as_bytes());
         digest.update(binding.as_bytes());
+        digest.update(request.seccomp_profile_sha256.as_bytes());
+        digest.update(request.seccomp_install_receipt_sha256.as_bytes());
         hex::encode(digest.finalize())
     };
     let mut response = ExecutorResponse {
@@ -1904,6 +2029,17 @@ fn executor_transition(
     Ok(response)
 }
 
+fn valid_executor_seccomp(request: &ExecutorRequest) -> bool {
+    request.seccomp_profile_path == PHASE1_SECCOMP_PROFILE_PATH
+        && request.seccomp_profile_sha256 == PHASE1_SECCOMP_PROFILE_DIGEST
+        && request.seccomp_install_receipt_sha256.len() == 64
+        && lower_hex(&request.seccomp_install_receipt_sha256)
+        && !request
+            .seccomp_install_receipt_sha256
+            .bytes()
+            .all(|byte| byte == b'0')
+}
+
 fn transition(
     active: &mut BTreeMap<String, ExecutorStage>,
     binding: &str,
@@ -1940,7 +2076,10 @@ fn executable_sha256() -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::{
+        cell::Cell,
+        os::unix::fs::{symlink, PermissionsExt},
+    };
 
     fn valid_record() -> ExecutionBindingRecord {
         let mut binding = ExecutionBindingV1 {
@@ -1980,6 +2119,75 @@ mod tests {
             evidence_set_digest: [0; 32],
             teardown_digest: [0; 32],
         }
+    }
+
+    fn valid_intent() -> JobIntentV2 {
+        JobIntentV2 {
+            schema_version: 2,
+            signed_request_digest: [4; 32],
+            actor_pubkey: [5; 32],
+            audience_digest: [6; 32],
+            idempotency_digest: [7; 32],
+            source_pin_event_id: [8; 32],
+            workflow_digest: [9; 32],
+            isolation_profile_digest: [10; 32],
+            lane_manifest_digest: [11; 32],
+            lane_epoch: 1,
+            admission_signature_algorithm: AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
+            admission_key_generation: 1,
+            run_id: [12; 16],
+            tip_oid: GitOid::Sha256([13; 32]),
+            base_oid: GitOid::Sha256([14; 32]),
+            issued_at: 1,
+            expires_at: 100,
+            wall_timeout_seconds: 30,
+            attempt: 1,
+            parent_attempt: 0,
+            trust_class: buzz_ci_broker_protocol::TrustClass::AcceptedReviewed,
+            request_event_id: [4; 32],
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            job_id: WireText64::from_ascii("job").unwrap(),
+            artifact_count: 0,
+            artifacts: [None],
+        }
+    }
+
+    fn valid_registration(
+        intent: JobIntentV2,
+        request_id: [u8; 16],
+    ) -> (FrameHeader, RegisterJobIntentRequest) {
+        let admission = buzz_ci_broker_protocol::v2::AdmitAttemptRequest {
+            signed_request_digest: intent.signed_request_digest,
+            actor_pubkey: intent.actor_pubkey,
+            audience_digest: intent.audience_digest,
+            idempotency_digest: intent.idempotency_digest,
+            source_pin_event_id: intent.source_pin_event_id,
+            workflow_digest: intent.workflow_digest,
+            job_intent_digest: intent.digest(),
+            isolation_profile_digest: intent.isolation_profile_digest,
+            lane_manifest_digest: intent.lane_manifest_digest,
+            admission_signature: [1; 64],
+            run_id: intent.run_id,
+            tip_oid: intent.tip_oid,
+            base_oid: intent.base_oid,
+            issued_at: intent.issued_at,
+            expires_at: intent.expires_at,
+            lane_epoch: intent.lane_epoch,
+            admission_key_generation: intent.admission_key_generation,
+            wall_timeout_seconds: intent.wall_timeout_seconds,
+            attempt: intent.attempt,
+            parent_attempt: intent.parent_attempt,
+            trust_class: intent.trust_class,
+            admission_signature_algorithm: intent.admission_signature_algorithm,
+        };
+        let header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::RegisterJobIntent,
+            request_id,
+        };
+        let mut request = crate::production_binding::registration_from_intent(admission, intent);
+        request.request_frame_digest =
+            intent_registration_request_frame_digest(header, &request).unwrap();
+        (header, request)
     }
 
     #[test]
@@ -2023,6 +2231,7 @@ mod tests {
                 gid: 0,
                 mode: 0o755,
             },
+            seccomp: SeccompRuntimeBinding::fixture(),
             evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
             teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
             evidence_by_binding: BTreeMap::new(),
@@ -2185,6 +2394,61 @@ mod tests {
     }
 
     #[test]
+    fn intent_registry_is_mode_0400_create_once_restartable_and_tamper_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = fs::metadata(temporary.path()).unwrap().uid();
+        let intent = valid_intent();
+        let (header, request) = valid_registration(intent, [21; 16]);
+        let key = intent_registration_key_digest_for_admission(request.admission);
+        let root = SafeDirectory::open(temporary.path().to_owned(), owner, 0o700).unwrap();
+        let mut registry = StaticIntentFiles { root };
+        assert_eq!(
+            registry.register(header, request, intent).unwrap(),
+            IntentRegistrationWrite::Written
+        );
+        let path = temporary.path().join(format!("{}.json", hex::encode(key)));
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o400);
+        assert_eq!(metadata.nlink(), 1);
+        drop(registry);
+
+        let root = SafeDirectory::open(temporary.path().to_owned(), owner, 0o700).unwrap();
+        let mut restarted = StaticIntentFiles { root };
+        assert_eq!(
+            restarted.load(key, intent.digest()).unwrap(),
+            RegisteredJobIntent {
+                admission: request.admission,
+                intent,
+            }
+        );
+        assert_eq!(
+            restarted.register(header, request, intent).unwrap(),
+            IntentRegistrationWrite::Existing
+        );
+
+        let mut mismatch = intent;
+        mismatch.job_id = WireText64::from_ascii("other-job").unwrap();
+        let (mismatch_header, mismatch_request) = valid_registration(mismatch, [22; 16]);
+        assert_eq!(
+            restarted
+                .register(mismatch_header, mismatch_request, mismatch)
+                .unwrap(),
+            IntentRegistrationWrite::Conflict
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            restarted.load(key, intent.digest()),
+            Err(BindingError::StorageUnavailable)
+        );
+        assert_eq!(
+            restarted.register(header, request, intent),
+            Err(BindingError::StorageUnavailable)
+        );
+    }
+
+    #[test]
     fn executor_partial_start_and_restart_recovery_are_fail_closed() {
         let binding = hex::encode([42; 32]);
         let request = |operation: &str| ExecutorRequest {
@@ -2196,6 +2460,9 @@ mod tests {
             phase: None,
             stop_reason: None,
             executor_program_sha256: hex::encode([9; 32]),
+            seccomp_profile_path: PHASE1_SECCOMP_PROFILE_PATH.into(),
+            seccomp_profile_sha256: PHASE1_SECCOMP_PROFILE_DIGEST.into(),
+            seccomp_install_receipt_sha256: "11".repeat(32),
         };
         let mut active = BTreeMap::new();
         executor_transition(request("executor_handoff"), &mut active).unwrap();
@@ -2207,6 +2474,16 @@ mod tests {
         let response = executor_transition(recovery, &mut active).unwrap();
         assert_eq!(response.capacity_returned, Some(true));
         assert!(active.is_empty());
+
+        let mut wrong_path = request("executor_handoff");
+        wrong_path.seccomp_profile_path = "/tmp/unconfined.json".into();
+        assert!(executor_transition(wrong_path, &mut BTreeMap::new()).is_err());
+        let mut wrong_digest = request("executor_handoff");
+        wrong_digest.seccomp_profile_sha256 = "22".repeat(32);
+        assert!(executor_transition(wrong_digest, &mut BTreeMap::new()).is_err());
+        let mut missing_receipt = request("executor_handoff");
+        missing_receipt.seccomp_install_receipt_sha256 = "0".repeat(64);
+        assert!(executor_transition(missing_receipt, &mut BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -2253,6 +2530,7 @@ mod tests {
                 gid: 0,
                 mode: 0o755,
             },
+            seccomp: SeccompRuntimeBinding::fixture(),
             evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
             teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
             evidence_by_binding: BTreeMap::new(),
@@ -2422,6 +2700,7 @@ mod tests {
         fs::write(&config_path, canonical_bytes(&config).unwrap()).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
 
+        let activated = Cell::new(false);
         assert!(load_from(
             RuntimePaths {
                 prefix: prefix.to_owned(),
@@ -2429,13 +2708,35 @@ mod tests {
             owner,
             2,
             false,
+            || {
+                activated.set(true);
+                Ok(SeccompRuntimeBinding::fixture())
+            },
         )
         .is_ok());
+        assert!(activated.get());
+
+        let refused = Cell::new(false);
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            owner,
+            2,
+            false,
+            || {
+                refused.set(true);
+                Err(ProductionV2Error::Closed)
+            },
+        )
+        .is_err());
+        assert!(refused.get());
 
         let mut drifted = config;
         drifted.capacity = 2;
         fs::write(&config_path, canonical_bytes(&drifted).unwrap()).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let invalid_called = Cell::new(false);
         assert!(load_from(
             RuntimePaths {
                 prefix: prefix.to_owned(),
@@ -2443,7 +2744,12 @@ mod tests {
             owner,
             2,
             false,
+            || {
+                invalid_called.set(true);
+                Ok(SeccompRuntimeBinding::fixture())
+            },
         )
         .is_err());
+        assert!(!invalid_called.get());
     }
 }
