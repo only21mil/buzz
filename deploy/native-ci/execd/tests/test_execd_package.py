@@ -30,6 +30,7 @@ ACTIVATION_DIRECTORY_PLAN = (
     "d /var/lib/buzzci/execd-v2/evidence 0700 root root - -",
     "d /var/lib/buzzci/execd-v2/teardown 0700 root root - -",
     "d /var/lib/buzzci/execd-v2/attempts 0711 root root - -",
+    "d /var/lib/buzzci/execd-v2/qualification 0700 root root - -",
 )
 
 
@@ -108,6 +109,7 @@ class ExecdPackageTests(unittest.TestCase):
                             "execd-v2/bindings",
                             "execd-v2/evidence",
                             "execd-v2/teardown",
+                            "execd-v2/qualification",
                         ):
                             self.assertEqual(_mode(state / private), 0o700, private)
 

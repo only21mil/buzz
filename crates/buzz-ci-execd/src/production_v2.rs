@@ -18,11 +18,16 @@ use std::{
 
 use buzz_ci_broker_protocol::{
     v2::{
-        decode_request, encode_request, intent_registration_key_digest_for_admission,
-        intent_registration_request_frame_digest, AdmissionSignatureAlgorithm, EvidenceDescriptor,
-        EvidenceKind, FrameHeader, RegisterJobIntentRequest, Request, WireText64,
+        decode_production_qualification_response, decode_request,
+        encode_production_qualification_response, encode_request,
+        intent_registration_key_digest_for_admission, intent_registration_request_frame_digest,
+        production_qualification_executor_provenance_digest, production_qualification_key_digest,
+        production_qualification_principal_digest, production_qualification_receipt_digest,
+        production_qualification_request_frame_digest, AdmissionSignatureAlgorithm,
+        EvidenceDescriptor, EvidenceKind, FrameHeader, ProductionQualificationRequest,
+        ProductionQualificationResponse, RegisterJobIntentRequest, Request, WireText64,
     },
-    Conclusion, GitOid,
+    Conclusion, GitOid, ResponseCode, MAX_SAFE_INTEGER,
 };
 use buzz_ci_isolation_contract::{PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -30,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    control::ControlDispatch,
+    control::{ControlDispatch, PeerUidPolicy},
     production_binding::{
         ArtifactDeclarationV1, BindingError, BindingPhase, ExecutionBindingJournal,
         ExecutionBindingRecord, ExecutionBindingV1, HostEvidenceItem, HostIdentity,
@@ -48,6 +53,7 @@ pub const BINDING_ROOT: &str = "/var/lib/buzzci/execd-v2/bindings";
 pub const EVIDENCE_ROOT: &str = "/var/lib/buzzci/execd-v2/evidence";
 pub const TEARDOWN_ROOT: &str = "/var/lib/buzzci/execd-v2/teardown";
 pub const ATTEMPT_ROOT: &str = "/var/lib/buzzci/execd-v2/attempts";
+pub const QUALIFICATION_ROOT: &str = "/var/lib/buzzci/execd-v2/qualification";
 pub const EXECUTOR_SOCKET: &str = "/run/buzzci/executor.sock";
 pub const EXECUTOR_PROGRAM: &str = "/usr/libexec/buzz-ci-executor";
 pub const ACCESS_GROUP: &str = "buzzci-execd";
@@ -59,6 +65,7 @@ const MAX_INTENT: u64 = 32 * 1024;
 const MAX_RECORD: u64 = 32 * 1024;
 const MAX_RPC: usize = 64 * 1024;
 const MAX_RAW_OUTPUT: usize = 32 * 1024;
+const MAX_QUALIFICATION_RECEIPTS: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SeccompRuntimeBinding {
@@ -118,6 +125,7 @@ struct ProductionConfig {
     lane_manifest: ManifestDocument,
     lane_manifest_digest: String,
     executor: ProgramProvenance,
+    qualification: QualificationConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -134,6 +142,11 @@ struct IdentityConfig {
     access_group: String,
     access_group_gid: u32,
     access_group_members: Vec<String>,
+    control_user: String,
+    control_group: String,
+    control_home: String,
+    control_shell: String,
+    control_supplementary_groups: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -145,6 +158,7 @@ struct PathConfig {
     teardown_root: String,
     executor_socket: String,
     attempt_root: String,
+    qualification_root: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -156,6 +170,25 @@ struct ProgramProvenance {
     uid: u32,
     gid: u32,
     mode: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationConfig {
+    integrated_candidate_sha: String,
+    activation_package_digest: String,
+    fixture_digest: String,
+    controller_generation: u64,
+    runner_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationReceiptDocument {
+    schema_version: u16,
+    qualification_key_digest: String,
+    request_frame_hex: String,
+    response_frame_hex: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1304,8 +1337,287 @@ impl PrivilegedHostSystem for LocalHostSystem {
     }
 }
 
-/// Open exact capacity-one production state. Any ambiguity returns a closed dispatcher.
-pub fn load_canonical(now: u64) -> Result<Box<dyn ControlDispatch>, ProductionV2Error> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProductionQualificationContract {
+    integrated_candidate_sha: GitOid,
+    activation_package_digest: [u8; 32],
+    fixture_digest: [u8; 32],
+    principal_digest: [u8; 32],
+    lane_manifest_digest: [u8; 32],
+    broker_build_identity: [u8; 32],
+    host_profile_digest: [u8; 32],
+    suite_identity: [u8; 32],
+    isolation_profile_digest: [u8; 32],
+    seccomp_profile_digest: [u8; 32],
+    seccomp_install_receipt_digest: [u8; 32],
+    executor_program_digest: [u8; 32],
+    executor_provenance_digest: [u8; 32],
+    controller_generation: u64,
+    runner_generation: u64,
+    lane_epoch: u64,
+    admission_key_generation: u64,
+}
+
+impl ProductionQualificationContract {
+    fn matches(self, request: ProductionQualificationRequest) -> bool {
+        request.integrated_candidate_sha == self.integrated_candidate_sha
+            && request.activation_package_digest == self.activation_package_digest
+            && request.fixture_digest == self.fixture_digest
+            && request.principal_digest == self.principal_digest
+            && request.lane_manifest_digest == self.lane_manifest_digest
+            && request.broker_build_identity == self.broker_build_identity
+            && request.host_profile_digest == self.host_profile_digest
+            && request.suite_identity == self.suite_identity
+            && request.isolation_profile_digest == self.isolation_profile_digest
+            && request.seccomp_profile_digest == self.seccomp_profile_digest
+            && request.executor_program_digest == self.executor_program_digest
+            && request.executor_provenance_digest == self.executor_provenance_digest
+            && request.controller_generation == self.controller_generation
+            && request.runner_generation == self.runner_generation
+            && request.lane_epoch == self.lane_epoch
+            && request.admission_key_generation == self.admission_key_generation
+    }
+
+    fn response(
+        self,
+        request: ProductionQualificationRequest,
+        code: ResponseCode,
+        now: u64,
+    ) -> ProductionQualificationResponse {
+        let qualified_at = now.clamp(request.issued_at, request.expires_at);
+        let mut response = ProductionQualificationResponse {
+            code,
+            retry_after_millis: 0,
+            request_frame_digest: request.request_frame_digest,
+            qualification_receipt_digest: [0; 32],
+            integrated_candidate_sha: request.integrated_candidate_sha,
+            activation_package_digest: request.activation_package_digest,
+            fixture_digest: request.fixture_digest,
+            principal_digest: request.principal_digest,
+            lane_manifest_digest: request.lane_manifest_digest,
+            broker_build_identity: request.broker_build_identity,
+            host_profile_digest: request.host_profile_digest,
+            suite_identity: request.suite_identity,
+            isolation_profile_digest: request.isolation_profile_digest,
+            seccomp_profile_digest: request.seccomp_profile_digest,
+            seccomp_install_receipt_digest: self.seccomp_install_receipt_digest,
+            executor_program_digest: request.executor_program_digest,
+            executor_provenance_digest: request.executor_provenance_digest,
+            controller_generation: request.controller_generation,
+            runner_generation: request.runner_generation,
+            lane_epoch: request.lane_epoch,
+            admission_key_generation: request.admission_key_generation,
+            qualified_at,
+            request_expires_at: request.expires_at,
+        };
+        response.qualification_receipt_digest = production_qualification_receipt_digest(&response);
+        response
+    }
+}
+
+struct DurableQualificationFiles {
+    root: SafeDirectory,
+}
+
+impl DurableQualificationFiles {
+    fn open(
+        root: SafeDirectory,
+        contract: ProductionQualificationContract,
+    ) -> Result<Self, ProductionV2Error> {
+        let mut count = 0;
+        for entry in fs::read_dir(root.descriptor_path()).map_err(|_| ProductionV2Error::Closed)? {
+            let entry = entry.map_err(|_| ProductionV2Error::Closed)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ProductionV2Error::Closed)?;
+            if name.len() != 69 || !name.ends_with(".json") || !lower_hex(&name[..64]) {
+                return Err(ProductionV2Error::Closed);
+            }
+            count += 1;
+            if count > MAX_QUALIFICATION_RECEIPTS {
+                return Err(ProductionV2Error::Closed);
+            }
+            let bytes = root.read(&name, 0o600, MAX_RECORD)?;
+            let document: QualificationReceiptDocument = canonical_parse(&bytes)?;
+            let (header, request, response) = document.decode()?;
+            if hex::encode(production_qualification_key_digest(&request)) != name[..64]
+                || response.code != ResponseCode::Ok
+                || !contract.matches(request)
+                || response.seccomp_install_receipt_digest
+                    != contract.seccomp_install_receipt_digest
+                || response.request_frame_digest != request.request_frame_digest
+                || production_qualification_request_frame_digest(header, &request)
+                    != Some(request.request_frame_digest)
+                || production_qualification_receipt_digest(&response)
+                    != response.qualification_receipt_digest
+            {
+                return Err(ProductionV2Error::Closed);
+            }
+        }
+        Ok(Self { root })
+    }
+
+    fn qualify(
+        &self,
+        header: FrameHeader,
+        request: ProductionQualificationRequest,
+        response: ProductionQualificationResponse,
+    ) -> Result<ProductionQualificationResponse, ResponseCode> {
+        let key = production_qualification_key_digest(&request);
+        let name = format!("{}.json", hex::encode(key));
+        if !self.root.descriptor_path().join(&name).exists()
+            && fs::read_dir(self.root.descriptor_path())
+                .map_err(|_| ResponseCode::StorageUnavailable)?
+                .take(MAX_QUALIFICATION_RECEIPTS)
+                .count()
+                >= MAX_QUALIFICATION_RECEIPTS
+        {
+            return Err(ResponseCode::StorageUnavailable);
+        }
+        let request_frame = encode_request(header.request_id, Request::AdmitQualification(request));
+        let response_frame = encode_production_qualification_response(header, response);
+        let document = QualificationReceiptDocument {
+            schema_version: 1,
+            qualification_key_digest: hex::encode(key),
+            request_frame_hex: hex::encode(request_frame.as_bytes()),
+            response_frame_hex: hex::encode(response_frame.as_bytes()),
+        };
+        let bytes = canonical_bytes(&document).map_err(|_| ResponseCode::StorageUnavailable)?;
+        match self.root.write_once(&name, &bytes, 0o600) {
+            Ok(()) => Ok(response),
+            Err(_) => {
+                let existing = self
+                    .root
+                    .read(&name, 0o600, MAX_RECORD)
+                    .map_err(|_| ResponseCode::StorageUnavailable)?;
+                let stored: QualificationReceiptDocument =
+                    canonical_parse(&existing).map_err(|_| ResponseCode::StorageUnavailable)?;
+                let (stored_header, stored_request, stored_response) = stored
+                    .decode()
+                    .map_err(|_| ResponseCode::StorageUnavailable)?;
+                if stored_header == header && stored_request == request {
+                    let mut replay = stored_response;
+                    replay.code = ResponseCode::Existing;
+                    Ok(replay)
+                } else {
+                    Err(ResponseCode::ReplayConflict)
+                }
+            }
+        }
+    }
+}
+
+impl QualificationReceiptDocument {
+    fn decode(
+        self,
+    ) -> Result<
+        (
+            FrameHeader,
+            ProductionQualificationRequest,
+            ProductionQualificationResponse,
+        ),
+        ProductionV2Error,
+    > {
+        if self.schema_version != 1
+            || self.qualification_key_digest.len() != 64
+            || !lower_hex(&self.qualification_key_digest)
+            || self.request_frame_hex.len() > MAX_RECORD as usize * 2
+            || self.response_frame_hex.len() > MAX_RECORD as usize * 2
+            || !lower_hex(&self.request_frame_hex)
+            || !lower_hex(&self.response_frame_hex)
+        {
+            return Err(ProductionV2Error::Closed);
+        }
+        let request_bytes =
+            hex::decode(self.request_frame_hex).map_err(|_| ProductionV2Error::Closed)?;
+        let (header, decoded) =
+            decode_request(&request_bytes).map_err(|_| ProductionV2Error::Closed)?;
+        let Request::AdmitQualification(request) = decoded else {
+            return Err(ProductionV2Error::Closed);
+        };
+        let response_bytes =
+            hex::decode(self.response_frame_hex).map_err(|_| ProductionV2Error::Closed)?;
+        let response = decode_production_qualification_response(header, &response_bytes)
+            .map_err(|_| ProductionV2Error::Closed)?;
+        if decode_hex::<32>(&self.qualification_key_digest)?
+            != production_qualification_key_digest(&request)
+        {
+            return Err(ProductionV2Error::Closed);
+        }
+        Ok((header, request, response))
+    }
+}
+
+struct ProductionV2Dispatch {
+    ordinary: Option<Box<dyn ControlDispatch>>,
+    qualification: DurableQualificationFiles,
+    contract: ProductionQualificationContract,
+}
+
+impl ControlDispatch for ProductionV2Dispatch {
+    fn dispatch(
+        &mut self,
+        header: buzz_ci_broker_protocol::FrameHeader,
+        request: buzz_ci_broker_protocol::Request,
+        now: u64,
+    ) -> buzz_ci_broker_protocol::BrokerResponse {
+        crate::control::ClosedDispatch::new().dispatch(header, request, now)
+    }
+
+    fn dispatch_v2_encoded(
+        &mut self,
+        header: FrameHeader,
+        request: Request,
+        now: u64,
+    ) -> buzz_ci_broker_protocol::v2::EncodedFrame {
+        let Request::AdmitQualification(qualification) = request else {
+            return match self.ordinary.as_mut() {
+                Some(dispatch) => dispatch.dispatch_v2_encoded(header, request, now),
+                None => crate::control::encode_not_provisioned_v2(header, request, now),
+            };
+        };
+        let error = if production_qualification_request_frame_digest(header, &qualification)
+            != Some(qualification.request_frame_digest)
+        {
+            Some(ResponseCode::BadFrame)
+        } else if now < qualification.issued_at
+            || now >= qualification.expires_at
+            || !self.contract.matches(qualification)
+        {
+            Some(ResponseCode::PolicyDenied)
+        } else {
+            let response = self.contract.response(qualification, ResponseCode::Ok, now);
+            match self.qualification.qualify(header, qualification, response) {
+                Ok(response) => {
+                    return encode_production_qualification_response(header, response);
+                }
+                Err(code) => Some(code),
+            }
+        };
+        let response = self.contract.response(
+            qualification,
+            error.expect("qualification error path always returns a code"),
+            now,
+        );
+        encode_production_qualification_response(header, response)
+    }
+
+    fn maintenance(&mut self, now: u64) {
+        if let Some(dispatch) = self.ordinary.as_mut() {
+            dispatch.maintenance(now);
+        }
+    }
+}
+
+/// Fully validated production dispatch and socket peer policy.
+pub struct ProductionRuntime {
+    pub dispatch: Box<dyn ControlDispatch>,
+    pub peer_policy: PeerUidPolicy,
+}
+
+/// Open exact production-v2 state. Any ambiguity prevents the socket from serving.
+pub fn load_canonical(now: u64) -> Result<ProductionRuntime, ProductionV2Error> {
     load_from(RuntimePaths::canonical(), 0, now, true, || {
         SeccompActivationAdapter::production()
             .activate()
@@ -1320,7 +1632,7 @@ fn load_from<F>(
     now: u64,
     validate_group: bool,
     activate_seccomp: F,
-) -> Result<Box<dyn ControlDispatch>, ProductionV2Error>
+) -> Result<ProductionRuntime, ProductionV2Error>
 where
     F: FnOnce() -> Result<SeccompRuntimeBinding, ProductionV2Error>,
 {
@@ -1330,38 +1642,66 @@ where
     let seccomp = activate_seccomp()?;
     seccomp.validate()?;
     let manifest = config.lane_manifest.clone().into_manifest()?;
+    let contract = qualification_contract(&config, &manifest, &seccomp)?;
+    let qualification = DurableQualificationFiles::open(
+        SafeDirectory::open(paths.resolve(QUALIFICATION_ROOT)?, owner, 0o700)?,
+        contract,
+    )?;
+    let peer_policy = PeerUidPolicy::new_with_gids(
+        config.identities.control_uid,
+        config.identities.control_gid,
+        config.identities.runner_uid,
+        config.identities.runner_gid,
+    )
+    .map_err(|_| ProductionV2Error::Closed)?;
     let identity = HostIdentity {
         broker_build_identity: manifest.broker_build_identity,
         host_profile_digest: manifest.host_profile_digest,
         suite_identity: manifest.suite_identity,
     };
-    let intents = StaticIntentFiles::open(SafeDirectory::open(
-        paths.resolve(INTENT_ROOT)?,
-        owner,
-        0o700,
-    )?)?;
-    let journal = DurableBindingFiles {
-        root: SafeDirectory::open(paths.resolve(BINDING_ROOT)?, owner, 0o700)?,
+    let ordinary: Option<Box<dyn ControlDispatch>> = if config.capacity == 1 {
+        let intents = StaticIntentFiles::open(SafeDirectory::open(
+            paths.resolve(INTENT_ROOT)?,
+            owner,
+            0o700,
+        )?)?;
+        let journal = DurableBindingFiles {
+            root: SafeDirectory::open(paths.resolve(BINDING_ROOT)?, owner, 0o700)?,
+        };
+        let host = LocalHostSystem {
+            identity,
+            socket: paths.resolve(EXECUTOR_SOCKET)?,
+            executor_uid: config.identities.job_uid,
+            executor_gid: config.identities.job_gid,
+            executor: mapped_program(&config.executor, &paths)?,
+            seccomp,
+            evidence: SafeDirectory::open(paths.resolve(EVIDENCE_ROOT)?, owner, 0o700)?,
+            teardown: SafeDirectory::open(paths.resolve(TEARDOWN_ROOT)?, owner, 0o700)?,
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(paths.resolve(ATTEMPT_ROOT)?, owner, 0o711)?,
+            job_uid: config.identities.job_uid,
+        };
+        let mut controller = ProductionBindingController::new(
+            StaticLaneManifest::new(manifest),
+            intents,
+            journal,
+            host,
+        );
+        controller
+            .recover_open(now)
+            .map_err(|_| ProductionV2Error::Closed)?;
+        Some(Box::new(controller))
+    } else {
+        None
     };
-    let host = LocalHostSystem {
-        identity,
-        socket: paths.resolve(EXECUTOR_SOCKET)?,
-        executor_uid: config.identities.job_uid,
-        executor_gid: config.identities.job_gid,
-        executor: mapped_program(&config.executor, &paths)?,
-        seccomp,
-        evidence: SafeDirectory::open(paths.resolve(EVIDENCE_ROOT)?, owner, 0o700)?,
-        teardown: SafeDirectory::open(paths.resolve(TEARDOWN_ROOT)?, owner, 0o700)?,
-        evidence_by_binding: BTreeMap::new(),
-        attempts: SafeDirectory::open(paths.resolve(ATTEMPT_ROOT)?, owner, 0o711)?,
-        job_uid: config.identities.job_uid,
-    };
-    let mut controller =
-        ProductionBindingController::new(StaticLaneManifest::new(manifest), intents, journal, host);
-    controller
-        .recover_open(now)
-        .map_err(|_| ProductionV2Error::Closed)?;
-    Ok(Box::new(controller))
+    Ok(ProductionRuntime {
+        dispatch: Box::new(ProductionV2Dispatch {
+            ordinary,
+            qualification,
+            contract,
+        }),
+        peer_policy,
+    })
 }
 
 fn validate_config(
@@ -1373,35 +1713,68 @@ fn validate_config(
     let identities = &config.identities;
     if config.schema_version != CONFIG_SCHEMA
         || config.enabled_protocol != 2
-        || config.capacity != 1
+        || !matches!(config.capacity, 0 | 1)
         || identities.execd_uid != owner
         || identities.execd_uid == identities.runner_uid
         || identities.execd_uid == identities.control_uid
-        || identities.job_uid == 0
-        || identities.job_gid == 0
         || [
             identities.runner_uid,
+            identities.runner_gid,
             identities.control_uid,
+            identities.control_gid,
             identities.job_uid,
+            identities.job_gid,
+            identities.access_group_gid,
         ]
         .contains(&0)
         || identities.runner_uid == identities.control_uid
         || identities.runner_uid == identities.job_uid
         || identities.control_uid == identities.job_uid
+        || identities.control_gid == identities.access_group_gid
         || identities.access_group != ACCESS_GROUP
         || identities.access_group_members != ["buzzci-ctl", "buzzci-runner"]
+        || identities.control_user != "buzzci-ctl"
+        || identities.control_group != "buzzci-ctl"
+        || identities.control_home != "/var/lib/buzzci/ctl"
+        || identities.control_shell != "/usr/sbin/nologin"
+        || identities.control_supplementary_groups != [ACCESS_GROUP]
         || config.paths.intent_root != INTENT_ROOT
         || config.paths.binding_root != BINDING_ROOT
         || config.paths.evidence_root != EVIDENCE_ROOT
         || config.paths.teardown_root != TEARDOWN_ROOT
         || config.paths.attempt_root != ATTEMPT_ROOT
+        || config.paths.qualification_root != QUALIFICATION_ROOT
         || config.paths.executor_socket != EXECUTOR_SOCKET
         || config.executor.path != EXECUTOR_PROGRAM
         || config.executor.source_commit.len() != 40
         || !lower_hex(&config.executor.source_commit)
+        || config
+            .executor
+            .source_commit
+            .bytes()
+            .all(|byte| byte == b'0')
         || config.executor.uid != owner
         || config.executor.gid != identities.execd_gid
         || config.executor.mode != 0o755
+        || config.qualification.integrated_candidate_sha != config.executor.source_commit
+        || config.qualification.activation_package_digest.len() != 64
+        || !lower_hex(&config.qualification.activation_package_digest)
+        || config
+            .qualification
+            .activation_package_digest
+            .bytes()
+            .all(|byte| byte == b'0')
+        || config.qualification.fixture_digest.len() != 64
+        || !lower_hex(&config.qualification.fixture_digest)
+        || config
+            .qualification
+            .fixture_digest
+            .bytes()
+            .all(|byte| byte == b'0')
+        || config.qualification.controller_generation == 0
+        || config.qualification.runner_generation == 0
+        || config.qualification.controller_generation > MAX_SAFE_INTEGER
+        || config.qualification.runner_generation > MAX_SAFE_INTEGER
     {
         return Err(ProductionV2Error::Closed);
     }
@@ -1412,27 +1785,83 @@ fn validate_config(
     let program = mapped_program(&config.executor, paths)?;
     verify_program(&program)?;
     if validate_group {
-        validate_access_group(identities)?;
+        validate_access_group(identities, paths)?;
+        validate_named_group(&identities.control_group, identities.control_gid, paths)?;
         validate_principal(
             "buzzci-runner",
             identities.runner_uid,
             identities.runner_gid,
+            None,
             "/usr/sbin/nologin",
+            paths,
         )?;
         validate_principal(
-            "buzzci-ctl",
+            &identities.control_user,
             identities.control_uid,
             identities.control_gid,
-            "/usr/sbin/nologin",
+            Some(&identities.control_home),
+            &identities.control_shell,
+            paths,
         )?;
         validate_principal(
             JOB_USER,
             identities.job_uid,
             identities.job_gid,
+            None,
             "/usr/sbin/nologin",
+            paths,
         )?;
     }
     Ok(())
+}
+
+fn qualification_contract(
+    config: &ProductionConfig,
+    manifest: &LaneActivationManifestV1,
+    seccomp: &SeccompRuntimeBinding,
+) -> Result<ProductionQualificationContract, ProductionV2Error> {
+    let integrated_candidate_sha = GitOid::Sha1(decode_hex::<20>(
+        &config.qualification.integrated_candidate_sha,
+    )?);
+    let executor_program_digest = decode_hex::<32>(&config.executor.sha256)?;
+    let executor_provenance_digest = production_qualification_executor_provenance_digest(
+        &config.executor.path,
+        executor_program_digest,
+        integrated_candidate_sha,
+        config.executor.uid,
+        config.executor.gid,
+        config.executor.mode,
+    )
+    .ok_or(ProductionV2Error::Closed)?;
+    let principal_digest = production_qualification_principal_digest(
+        &config.identities.control_user,
+        &config.identities.control_group,
+        config.identities.control_uid,
+        config.identities.control_gid,
+        &config.identities.control_home,
+        &config.identities.control_shell,
+        &config.identities.control_supplementary_groups,
+    )
+    .ok_or(ProductionV2Error::Closed)?;
+    Ok(ProductionQualificationContract {
+        integrated_candidate_sha,
+        activation_package_digest: decode_hex(&config.qualification.activation_package_digest)?,
+        fixture_digest: decode_hex(&config.qualification.fixture_digest)?,
+        principal_digest,
+        lane_manifest_digest: manifest.digest(),
+        broker_build_identity: manifest.broker_build_identity,
+        host_profile_digest: manifest.host_profile_digest,
+        suite_identity: manifest.suite_identity,
+        isolation_profile_digest: manifest.isolation_profile_digest,
+        seccomp_profile_digest: decode_hex(&seccomp.profile_digest)?,
+        seccomp_install_receipt_digest: decode_hex(&seccomp.install_receipt_digest)?,
+        executor_program_digest,
+        executor_provenance_digest,
+        controller_generation: config.qualification.controller_generation,
+        runner_generation: config.qualification.runner_generation,
+        lane_epoch: manifest.lane_epoch,
+        admission_key_generation: manifest.admission_key_generation,
+    })
 }
 
 fn mapped_program(
@@ -1478,8 +1907,11 @@ fn verify_program(value: &ProgramProvenance) -> Result<(), ProductionV2Error> {
     Ok(())
 }
 
-fn validate_access_group(config: &IdentityConfig) -> Result<(), ProductionV2Error> {
-    let bytes = fs::read("/etc/group").map_err(|_| ProductionV2Error::Closed)?;
+fn validate_access_group(
+    config: &IdentityConfig,
+    paths: &RuntimePaths,
+) -> Result<(), ProductionV2Error> {
+    let bytes = fs::read(paths.resolve("/etc/group")?).map_err(|_| ProductionV2Error::Closed)?;
     if bytes.len() > 1024 * 1024 {
         return Err(ProductionV2Error::Closed);
     }
@@ -1507,13 +1939,39 @@ fn validate_access_group(config: &IdentityConfig) -> Result<(), ProductionV2Erro
     Ok(())
 }
 
+fn validate_named_group(
+    name: &str,
+    gid: u32,
+    paths: &RuntimePaths,
+) -> Result<(), ProductionV2Error> {
+    let bytes = fs::read(paths.resolve("/etc/group")?).map_err(|_| ProductionV2Error::Closed)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(ProductionV2Error::Closed);
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| ProductionV2Error::Closed)?;
+    let mut matches = text
+        .lines()
+        .filter(|line| line.split(':').next() == Some(name));
+    let line = matches.next().ok_or(ProductionV2Error::Closed)?;
+    if matches.next().is_some() {
+        return Err(ProductionV2Error::Closed);
+    }
+    let fields: Vec<_> = line.split(':').collect();
+    if fields.len() != 4 || fields[2].parse::<u32>().ok() != Some(gid) {
+        return Err(ProductionV2Error::Closed);
+    }
+    Ok(())
+}
+
 fn validate_principal(
     name: &str,
     uid: u32,
     gid: u32,
+    home: Option<&str>,
     shell: &str,
+    paths: &RuntimePaths,
 ) -> Result<(), ProductionV2Error> {
-    let bytes = fs::read("/etc/passwd").map_err(|_| ProductionV2Error::Closed)?;
+    let bytes = fs::read(paths.resolve("/etc/passwd")?).map_err(|_| ProductionV2Error::Closed)?;
     if bytes.len() > 1024 * 1024 {
         return Err(ProductionV2Error::Closed);
     }
@@ -1529,6 +1987,7 @@ fn validate_principal(
     if fields.len() != 7
         || fields[2].parse::<u32>().ok() != Some(uid)
         || fields[3].parse::<u32>().ok() != Some(gid)
+        || home.is_some_and(|expected| fields[5] != expected)
         || fields[6] != shell
     {
         return Err(ProductionV2Error::Closed);
@@ -1845,19 +2304,82 @@ fn scrub(raw: &[u8]) -> Result<Vec<u8>, BindingError> {
         return Err(BindingError::HostRefused);
     }
     let mut output = String::with_capacity(text.len());
+    let mut private_key_block = false;
     for line in text.lines() {
-        if line.contains("PRIVATE_KEY=")
-            || line.contains("TOKEN=")
-            || line.contains("PASSWORD=")
-            || line.contains("AUTHORIZATION:")
-        {
-            output.push_str("[redacted]\n");
-        } else {
-            output.push_str(line);
-            output.push('\n');
+        let lower = line.to_ascii_lowercase();
+        if private_key_block {
+            if lower.contains("-----end ") && lower.contains(" private key-----") {
+                private_key_block = false;
+            }
+            continue;
         }
+        if lower.contains("-----begin ") && lower.contains(" private key-----") {
+            output.push_str("[REDACTED]\n");
+            private_key_block = true;
+            continue;
+        }
+        if sensitive_assignment(&lower) || sensitive_authorization(&lower) {
+            output.push_str("[REDACTED]\n");
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
     }
     Ok(output.into_bytes())
+}
+
+fn sensitive_assignment(lower: &str) -> bool {
+    const KEYS: [&str; 10] = [
+        "aws_secret_access_key",
+        "buzz_s3_secret_key",
+        "access_token",
+        "private_key",
+        "api_key",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "private key",
+    ];
+    lower
+        .char_indices()
+        .filter(|(_, character)| matches!(character, '=' | ':'))
+        .any(|(separator, _)| {
+            let left = lower[..separator].trim_end().trim_end_matches(['"', '\'']);
+            let start = left
+                .char_indices()
+                .rev()
+                .find(|(_, character)| {
+                    !character.is_ascii_alphanumeric()
+                        && !matches!(character, '_' | '-' | '.' | ' ')
+                })
+                .map_or(0, |(index, character)| index + character.len_utf8());
+            let key = left[start..].trim();
+            KEYS.iter().any(|suffix| {
+                key == *suffix
+                    || key.strip_suffix(suffix).is_some_and(|prefix| {
+                        prefix
+                            .chars()
+                            .last()
+                            .is_some_and(|character| !character.is_ascii_alphanumeric())
+                    })
+            })
+        })
+}
+
+fn sensitive_authorization(lower: &str) -> bool {
+    let Some((name, value)) = lower.split_once(':') else {
+        return false;
+    };
+    name.trim().trim_matches('"').ends_with("authorization")
+        && matches!(
+            value
+                .trim_start()
+                .trim_matches('"')
+                .split_ascii_whitespace()
+                .next(),
+            Some("bearer" | "basic")
+        )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2194,7 +2716,29 @@ mod tests {
     fn scrub_is_bounded_and_removes_secret_shaped_lines() {
         assert_eq!(
             scrub(b"ok\nTOKEN=secret\ndone\n").unwrap(),
-            b"ok\n[redacted]\ndone\n"
+            b"ok\n[REDACTED]\ndone\n"
+        );
+        let hostile = b"safe\naws_secret_access_key = abc\nDb_Password: nope\nauthorization: Bearer abc\nAUTHORIZATION: basic Zm9v\n{\"private_key\":\"raw\"}\n{\"safe\":1,\"password\":\"jsonsecret\"}\n-----BEGIN PRIVATE KEY-----\nsecret pem bytes\n-----END PRIVATE KEY-----\nafter\n";
+        let scrubbed = scrub(hostile).unwrap();
+        assert_eq!(
+            scrubbed,
+            b"safe\n[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED]\nafter\n"
+        );
+        let lower = String::from_utf8(scrubbed).unwrap().to_ascii_lowercase();
+        for secret in [
+            "abc",
+            "nope",
+            "bearer",
+            "basic",
+            "private_key",
+            "jsonsecret",
+            "pem bytes",
+        ] {
+            assert!(!lower.contains(secret), "secret escaped scrub: {secret}");
+        }
+        assert_eq!(
+            scrub(b"before\n-----BEGIN RSA PRIVATE KEY-----\nunterminated\nraw\n").unwrap(),
+            b"before\n[REDACTED]\n"
         );
         assert!(scrub(&vec![b'x'; MAX_RAW_OUTPUT + 1]).is_err());
     }
@@ -2269,7 +2813,7 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].descriptor.kind, EvidenceKind::Artifact);
         assert_eq!(captured[0].descriptor.artifact_id, declaration.artifact_id);
-        assert_eq!(captured[0].bytes, b"ok\n[redacted]\n");
+        assert_eq!(captured[0].bytes, b"ok\n[REDACTED]\n");
         fs::remove_file(&artifact_path).unwrap();
         fs::remove_dir(&attempt_path).unwrap();
         assert_eq!(make_system().sealed_artifacts(binding).unwrap().0, captured);
@@ -2625,6 +3169,7 @@ mod tests {
             "var/lib/buzzci/execd-v2/evidence",
             "var/lib/buzzci/execd-v2/teardown",
             "var/lib/buzzci/execd-v2/attempts",
+            "var/lib/buzzci/execd-v2/qualification",
             "usr/libexec",
             "run/buzzci",
         ] {
@@ -2671,6 +3216,11 @@ mod tests {
                 runner_gid: group + 1,
                 control_uid: owner + 2,
                 control_gid: group + 2,
+                control_user: "buzzci-ctl".into(),
+                control_group: "buzzci-ctl".into(),
+                control_home: "/var/lib/buzzci/ctl".into(),
+                control_shell: "/usr/sbin/nologin".into(),
+                control_supplementary_groups: vec![ACCESS_GROUP.into()],
                 job_uid: owner + 3,
                 job_gid: group + 3,
                 access_group: ACCESS_GROUP.into(),
@@ -2684,6 +3234,7 @@ mod tests {
                 teardown_root: TEARDOWN_ROOT.into(),
                 executor_socket: EXECUTOR_SOCKET.into(),
                 attempt_root: ATTEMPT_ROOT.into(),
+                qualification_root: QUALIFICATION_ROOT.into(),
             },
             lane_manifest: manifest_document,
             lane_manifest_digest: manifest_digest,
@@ -2695,10 +3246,37 @@ mod tests {
                 gid: group,
                 mode: 0o755,
             },
+            qualification: QualificationConfig {
+                integrated_candidate_sha: "1".repeat(40),
+                activation_package_digest: "22".repeat(32),
+                fixture_digest: "33".repeat(32),
+                controller_generation: 1,
+                runner_generation: 1,
+            },
         };
         let config_path = prefix.join("etc/buzzci/execd-v2.json");
         fs::write(&config_path, canonical_bytes(&config).unwrap()).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let passwd_path = prefix.join("etc/passwd");
+        let passwd = format!(
+            "buzzci-runner:x:{}:{}::/var/lib/buzzci/runner:/usr/sbin/nologin\nbuzzci-ctl:x:{}:{}::/var/lib/buzzci/ctl:/usr/sbin/nologin\nbuzzci-job:x:{}:{}::/var/empty:/usr/sbin/nologin\n",
+            owner + 1,
+            group + 1,
+            owner + 2,
+            group + 2,
+            owner + 3,
+            group + 3,
+        );
+        fs::write(&passwd_path, &passwd).unwrap();
+        fs::write(
+            prefix.join("etc/group"),
+            format!(
+                "buzzci-execd:x:{}:buzzci-ctl,buzzci-runner\nbuzzci-ctl:x:{}:\n",
+                group + 4,
+                group + 2
+            ),
+        )
+        .unwrap();
 
         let activated = Cell::new(false);
         assert!(load_from(
@@ -2707,7 +3285,7 @@ mod tests {
             },
             owner,
             2,
-            false,
+            true,
             || {
                 activated.set(true);
                 Ok(SeccompRuntimeBinding::fixture())
@@ -2715,6 +3293,219 @@ mod tests {
         )
         .is_ok());
         assert!(activated.get());
+
+        fs::write(
+            &passwd_path,
+            passwd.replace("/var/lib/buzzci/ctl", "/var/lib/buzzci/principals/ctl"),
+        )
+        .unwrap();
+        let drift_activation = Cell::new(false);
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            owner,
+            2,
+            true,
+            || {
+                drift_activation.set(true);
+                Ok(SeccompRuntimeBinding::fixture())
+            },
+        )
+        .is_err());
+        assert!(!drift_activation.get());
+        fs::write(&passwd_path, &passwd).unwrap();
+
+        let mut capacity_zero = config.clone();
+        capacity_zero.capacity = 0;
+        fs::write(&config_path, canonical_bytes(&capacity_zero).unwrap()).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut runtime = load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            owner,
+            2,
+            false,
+            || Ok(SeccompRuntimeBinding::fixture()),
+        )
+        .unwrap();
+        let header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::AdmitQualification,
+            request_id: [9; 16],
+        };
+        let seccomp = SeccompRuntimeBinding::fixture();
+        let mut qualification = ProductionQualificationRequest {
+            integrated_candidate_sha: GitOid::Sha1([0x11; 20]),
+            activation_package_digest: [0x22; 32],
+            fixture_digest: [0x33; 32],
+            principal_digest: production_qualification_principal_digest(
+                "buzzci-ctl",
+                "buzzci-ctl",
+                owner + 2,
+                group + 2,
+                "/var/lib/buzzci/ctl",
+                "/usr/sbin/nologin",
+                &[ACCESS_GROUP.into()],
+            )
+            .unwrap(),
+            lane_manifest_digest: decode_hex(&capacity_zero.lane_manifest_digest).unwrap(),
+            broker_build_identity: [3; 32],
+            host_profile_digest: [4; 32],
+            suite_identity: [5; 32],
+            isolation_profile_digest: [6; 32],
+            seccomp_profile_digest: decode_hex(&seccomp.profile_digest).unwrap(),
+            executor_program_digest: decode_hex(&capacity_zero.executor.sha256).unwrap(),
+            executor_provenance_digest: production_qualification_executor_provenance_digest(
+                EXECUTOR_PROGRAM,
+                decode_hex(&capacity_zero.executor.sha256).unwrap(),
+                GitOid::Sha1([0x11; 20]),
+                owner,
+                group,
+                0o755,
+            )
+            .unwrap(),
+            nonce: [7; 32],
+            controller_generation: 1,
+            runner_generation: 1,
+            lane_epoch: 1,
+            admission_key_generation: 1,
+            issued_at: 1,
+            expires_at: 60,
+            request_frame_digest: [0; 32],
+        };
+        qualification.request_frame_digest =
+            production_qualification_request_frame_digest(header, &qualification).unwrap();
+        let first = runtime.dispatch.dispatch_v2_encoded(
+            header,
+            Request::AdmitQualification(qualification),
+            2,
+        );
+        assert_eq!(
+            decode_production_qualification_response(header, first.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::Ok
+        );
+        let replay = runtime.dispatch.dispatch_v2_encoded(
+            header,
+            Request::AdmitQualification(qualification),
+            2,
+        );
+        assert_eq!(
+            decode_production_qualification_response(header, replay.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::Existing
+        );
+        let mut drift = qualification;
+        drift.nonce = [8; 32];
+        drift.request_frame_digest = [0; 32];
+        drift.request_frame_digest =
+            production_qualification_request_frame_digest(header, &drift).unwrap();
+        let conflict =
+            runtime
+                .dispatch
+                .dispatch_v2_encoded(header, Request::AdmitQualification(drift), 2);
+        assert_eq!(
+            decode_production_qualification_response(header, conflict.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::ReplayConflict
+        );
+        let mut wrong_principal = qualification;
+        wrong_principal.principal_digest[0] ^= 1;
+        let mut wrong_package = qualification;
+        wrong_package.activation_package_digest[0] ^= 1;
+        let mut wrong_fixture = qualification;
+        wrong_fixture.fixture_digest[0] ^= 1;
+        let mut wrong_generation = qualification;
+        wrong_generation.controller_generation += 1;
+        for mut mismatch in [
+            wrong_principal,
+            wrong_package,
+            wrong_fixture,
+            wrong_generation,
+        ] {
+            mismatch.request_frame_digest = [0; 32];
+            mismatch.request_frame_digest =
+                production_qualification_request_frame_digest(header, &mismatch).unwrap();
+            let denied = runtime.dispatch.dispatch_v2_encoded(
+                header,
+                Request::AdmitQualification(mismatch),
+                2,
+            );
+            assert_eq!(
+                decode_production_qualification_response(header, denied.as_bytes())
+                    .unwrap()
+                    .code,
+                ResponseCode::PolicyDenied
+            );
+        }
+        let hello_header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::Hello,
+            request_id: [10; 16],
+        };
+        let ordinary = runtime.dispatch.dispatch_v2_encoded(
+            hello_header,
+            Request::Hello(buzz_ci_broker_protocol::HelloRequest {
+                controller_instance: [1; 32],
+                nonce: [2; 32],
+            }),
+            2,
+        );
+        assert_eq!(
+            buzz_ci_broker_protocol::v2::decode_response(hello_header, ordinary.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::NotProvisioned
+        );
+        drop(runtime);
+        let mut restarted = load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            owner,
+            2,
+            false,
+            || Ok(SeccompRuntimeBinding::fixture()),
+        )
+        .unwrap();
+        let replay = restarted.dispatch.dispatch_v2_encoded(
+            header,
+            Request::AdmitQualification(qualification),
+            3,
+        );
+        assert_eq!(
+            decode_production_qualification_response(header, replay.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::Existing
+        );
+        drop(restarted);
+        let receipt_path = fs::read_dir(prefix.join("var/lib/buzzci/execd-v2/qualification"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let mut tampered = receipt_bytes.clone();
+        tampered[0] ^= 1;
+        fs::write(&receipt_path, tampered).unwrap();
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            owner,
+            2,
+            false,
+            || Ok(SeccompRuntimeBinding::fixture()),
+        )
+        .is_err());
+        fs::write(&receipt_path, receipt_bytes).unwrap();
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let refused = Cell::new(false);
         assert!(load_from(

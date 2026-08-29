@@ -1,8 +1,15 @@
-# Execd capacity-one package contract
+# Execd production-v2 package contract
 
 This directory packages the still-dormant broker v2 composition. Activation is
 possible only when `/etc/buzzci/execd-v2.json` selects protocol 2 and capacity
-exactly 1, and every identity, digest, path, mode, and group membership matches.
+0 or 1, and every identity, digest, path, mode, and group membership matches.
+
+At capacity zero, the production socket accepts only the fixed version-2
+production qualification operation from the exact configured `buzzci-ctl` UID
+and primary GID. Every ordinary operation returns `NotProvisioned`, and every
+version-1 frame is rejected before its body is read. Qualification carries no
+command, path, environment, artifact, or job input and never invokes the
+executor.
 
 `buzz-ci-execd` stays root-owned and is the only process that admits work,
 persists bindings, collects terminal output, scrubs it, or writes evidence.
@@ -28,6 +35,15 @@ The activation access group is `buzzci-execd`, with exactly `buzzci-runner` and
 `0620`. Execd still authorizes the peer by exact `SO_PEERCRED` UID and primary
 GID. Supplementary group membership grants filesystem access only.
 
+The config freezes the control account name `buzzci-ctl`, primary group
+`buzzci-ctl`, home `/var/lib/buzzci/ctl`, nologin shell, and sole supplementary
+group `buzzci-execd` together with the manifest-selected positive UID and GID.
+Execd validates `/etc/passwd` and `/etc/group` before serving. It stores at most
+16 create-once qualification receipts under
+`/var/lib/buzzci/execd-v2/qualification`, root-owned mode `0600` inside a
+root-owned mode-`0700` directory. Exact retries return `Existing`; frame drift
+under the same package, fixture, and generation key returns `ReplayConflict`.
+
 Package generation must replace the sysusers UID/GID placeholders, install the
 two release binaries, and write canonical compact JSON. The execd config binds
 the executor's full source commit, SHA-256, owner, group, mode, and fixed path.
@@ -41,6 +57,13 @@ installs or reuses the root-owned content-addressed profile under
 install receipt. The package creates only the retained state directories; it
 does not bundle, replace, or remove the immutable profile bytes during package
 rollback.
+
+The root execd service retains no Linux capabilities. OCI process execution
+runs only in the separate unprivileged `buzzci-job` executor service. The execd
+unit blocks device access, namespace creation, kernel mutation, mounts, raw I/O,
+debug syscalls, reboot, and swap while retaining Unix-socket and descriptor-safe
+file operations for seccomp installation, durable bindings, sealed evidence,
+and executor handoff.
 
 The shared `/var/lib/buzzci` ancestor is root:root mode `0711`: service
 principals may traverse an already-known child name but cannot list the

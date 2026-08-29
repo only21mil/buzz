@@ -10,7 +10,7 @@
 use super::{
     array, get_u16, get_u32, get_u64, nonzero_array, put_u16, put_u32, put_u64, require_zero,
     validate_safe, BrokerState, CancelReason, Conclusion, DecodeError, GitOid, HelloRequest,
-    Operation, QualificationRequest, ResponseCode, TrustClass, HEADER_SIZE, MAGIC, OP_RESPONSE_BIT,
+    Operation, ResponseCode, TrustClass, HEADER_SIZE, MAGIC, OP_RESPONSE_BIT,
 };
 use sha2::{Digest, Sha256};
 
@@ -40,6 +40,8 @@ pub const DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 416;
 pub const READ_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 448;
 /// Version 2 dynamic JobIntent registration body length.
 pub const REGISTER_JOB_INTENT_BODY_SIZE: usize = 960;
+/// Closed production qualification request length.
+pub const PRODUCTION_QUALIFICATION_BODY_SIZE: usize = 640;
 /// Version 2 response body length.
 pub const RESPONSE_BODY_SIZE: usize = 288;
 /// Maximum number of sealed evidence items returned for one attempt.
@@ -52,6 +54,8 @@ pub const EVIDENCE_DESCRIPTION_BODY_SIZE: usize = 1888;
 pub const EVIDENCE_CHUNK_BODY_SIZE: usize = 4448;
 /// Fixed JobIntent registration response length.
 pub const INTENT_REGISTRATION_RESPONSE_BODY_SIZE: usize = 288;
+/// Closed production qualification response length.
+pub const PRODUCTION_QUALIFICATION_RESPONSE_BODY_SIZE: usize = 576;
 /// Largest version 2 request or response body.
 pub const MAX_BODY_SIZE: usize = EVIDENCE_CHUNK_BODY_SIZE;
 /// Largest complete version 2 frame.
@@ -60,10 +64,22 @@ pub const MAX_FRAME_SIZE: usize = HEADER_SIZE + MAX_BODY_SIZE;
 pub const MAX_JOB_INTENT_ARTIFACTS: usize = 1;
 /// Maximum bytes accepted for one declared artifact.
 pub const MAX_JOB_INTENT_ARTIFACT_BYTES: u32 = 32 * 1024;
+/// Maximum lifetime of one production qualification frame.
+pub const MAX_PRODUCTION_QUALIFICATION_LIFETIME_SECONDS: u64 = 300;
 
 const INTENT_REGISTRATION_REQUEST_DIGEST_DOMAIN: &[u8] =
     b"buzz-ci-execd:intent-registration-request:v1\0";
 const INTENT_REGISTRATION_KEY_DIGEST_DOMAIN: &[u8] = b"buzz-ci-execd:intent-registration-key:v1\0";
+const PRODUCTION_QUALIFICATION_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"buzz-ci-execd:production-qualification-request:v1\0";
+const PRODUCTION_QUALIFICATION_KEY_DIGEST_DOMAIN: &[u8] =
+    b"buzz-ci-execd:production-qualification-key:v1\0";
+const PRODUCTION_QUALIFICATION_RECEIPT_DIGEST_DOMAIN: &[u8] =
+    b"buzz-ci-execd:production-qualification-receipt:v1\0";
+const PRODUCTION_QUALIFICATION_PRINCIPAL_DIGEST_DOMAIN: &[u8] =
+    b"buzz-ci-execd:production-qualification-principal:v1\0";
+const PRODUCTION_QUALIFICATION_EXECUTOR_PROVENANCE_DIGEST_DOMAIN: &[u8] =
+    b"buzz-ci-execd:production-qualification-executor-provenance:v1\0";
 
 const ADMISSION_SIGNATURE_START: usize = 288;
 const ADMISSION_SIGNATURE_END: usize = 352;
@@ -319,6 +335,60 @@ pub struct IntentRegistrationResponse {
     pub attempt: u32,
 }
 
+/// One closed production qualification request. It carries no command, job,
+/// path, environment, or execution directive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductionQualificationRequest {
+    pub integrated_candidate_sha: GitOid,
+    pub activation_package_digest: [u8; 32],
+    pub fixture_digest: [u8; 32],
+    pub principal_digest: [u8; 32],
+    pub lane_manifest_digest: [u8; 32],
+    pub broker_build_identity: [u8; 32],
+    pub host_profile_digest: [u8; 32],
+    pub suite_identity: [u8; 32],
+    pub isolation_profile_digest: [u8; 32],
+    pub seccomp_profile_digest: [u8; 32],
+    pub executor_program_digest: [u8; 32],
+    pub executor_provenance_digest: [u8; 32],
+    pub nonce: [u8; 32],
+    pub controller_generation: u64,
+    pub runner_generation: u64,
+    pub lane_epoch: u64,
+    pub admission_key_generation: u64,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub request_frame_digest: [u8; 32],
+}
+
+/// Execd-owned proof of one create-once closed production qualification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductionQualificationResponse {
+    pub code: ResponseCode,
+    pub retry_after_millis: u32,
+    pub request_frame_digest: [u8; 32],
+    pub qualification_receipt_digest: [u8; 32],
+    pub integrated_candidate_sha: GitOid,
+    pub activation_package_digest: [u8; 32],
+    pub fixture_digest: [u8; 32],
+    pub principal_digest: [u8; 32],
+    pub lane_manifest_digest: [u8; 32],
+    pub broker_build_identity: [u8; 32],
+    pub host_profile_digest: [u8; 32],
+    pub suite_identity: [u8; 32],
+    pub isolation_profile_digest: [u8; 32],
+    pub seccomp_profile_digest: [u8; 32],
+    pub seccomp_install_receipt_digest: [u8; 32],
+    pub executor_program_digest: [u8; 32],
+    pub executor_provenance_digest: [u8; 32],
+    pub controller_generation: u64,
+    pub runner_generation: u64,
+    pub lane_epoch: u64,
+    pub admission_key_generation: u64,
+    pub qualified_at: u64,
+    pub request_expires_at: u64,
+}
+
 /// Describe all sealed evidence owned by execd for one exact attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DescribeAttemptEvidenceRequest {
@@ -432,8 +502,8 @@ pub enum Request {
     CancelAttempt(CancelAttemptRequest),
     /// Bound state read.
     GetAttempt(GetAttemptRequest),
-    /// Existing fixed qualification request under a version 2 frame.
-    AdmitQualification(QualificationRequest),
+    /// Closed production qualification request under a version 2 frame.
+    AdmitQualification(ProductionQualificationRequest),
     /// Bound completion request.
     CompleteAttempt(CompleteAttemptRequest),
     DescribeAttemptEvidence(DescribeAttemptEvidenceRequest),
@@ -604,7 +674,7 @@ pub fn encode_request(request_id: [u8; 16], request: Request) -> EncodedFrame {
         Request::AdmitAttempt(value) => encode_admit(body, value),
         Request::CancelAttempt(value) => encode_cancel(body, value),
         Request::GetAttempt(value) => encode_get(body, value),
-        Request::AdmitQualification(value) => super::encode_qualification(body, value),
+        Request::AdmitQualification(value) => encode_production_qualification(body, value),
         Request::CompleteAttempt(value) => encode_complete(body, value),
         Request::DescribeAttemptEvidence(value) => encode_describe_evidence(body, value),
         Request::ReadAttemptEvidence(value) => encode_read_evidence(body, value),
@@ -633,7 +703,7 @@ pub fn decode_request(frame: &[u8]) -> Result<(FrameHeader, Request), DecodeErro
         Operation::CancelAttempt => Request::CancelAttempt(decode_cancel(body)?),
         Operation::GetAttempt => Request::GetAttempt(decode_get(body)?),
         Operation::AdmitQualification => {
-            Request::AdmitQualification(super::decode_qualification(body)?)
+            Request::AdmitQualification(decode_production_qualification(body)?)
         }
         Operation::CompleteAttempt => Request::CompleteAttempt(decode_complete(body)?),
         Operation::DescribeAttemptEvidence => {
@@ -799,13 +869,145 @@ pub fn decode_intent_registration_response(
     Ok(response)
 }
 
+/// Encode the operation-specific response to one closed production qualification.
+pub fn encode_production_qualification_response(
+    request_header: FrameHeader,
+    response: ProductionQualificationResponse,
+) -> EncodedFrame {
+    assert_eq!(request_header.operation, Operation::AdmitQualification);
+    let mut encoded = EncodedFrame {
+        bytes: [0_u8; MAX_FRAME_SIZE],
+        len: HEADER_SIZE + PRODUCTION_QUALIFICATION_RESPONSE_BODY_SIZE,
+    };
+    encode_header(
+        &mut encoded.bytes[..HEADER_SIZE],
+        (request_header.operation as u16) | OP_RESPONSE_BIT,
+        PRODUCTION_QUALIFICATION_RESPONSE_BODY_SIZE,
+        request_header.request_id,
+    );
+    let body = &mut encoded.bytes[HEADER_SIZE..encoded.len];
+    put_u16(body, 0, response.code as u16);
+    put_u32(body, 2, response.retry_after_millis);
+    body[6..38].copy_from_slice(&response.request_frame_digest);
+    body[38..70].copy_from_slice(&response.qualification_receipt_digest);
+    response
+        .integrated_candidate_sha
+        .encode_into(&mut body[70..103]);
+    body[103..135].copy_from_slice(&response.activation_package_digest);
+    body[135..167].copy_from_slice(&response.fixture_digest);
+    body[167..199].copy_from_slice(&response.principal_digest);
+    body[199..231].copy_from_slice(&response.lane_manifest_digest);
+    body[231..263].copy_from_slice(&response.broker_build_identity);
+    body[263..295].copy_from_slice(&response.host_profile_digest);
+    body[295..327].copy_from_slice(&response.suite_identity);
+    body[327..359].copy_from_slice(&response.isolation_profile_digest);
+    body[359..391].copy_from_slice(&response.seccomp_profile_digest);
+    body[391..423].copy_from_slice(&response.seccomp_install_receipt_digest);
+    body[423..455].copy_from_slice(&response.executor_program_digest);
+    body[455..487].copy_from_slice(&response.executor_provenance_digest);
+    put_u64(body, 487, response.controller_generation);
+    put_u64(body, 495, response.runner_generation);
+    put_u64(body, 503, response.lane_epoch);
+    put_u64(body, 511, response.admission_key_generation);
+    put_u64(body, 519, response.qualified_at);
+    put_u64(body, 527, response.request_expires_at);
+    encoded
+}
+
+/// Decode a closed production qualification response bound to its request.
+pub fn decode_production_qualification_response(
+    expected: FrameHeader,
+    frame: &[u8],
+) -> Result<ProductionQualificationResponse, DecodeError> {
+    if expected.operation != Operation::AdmitQualification {
+        return Err(DecodeError::UnknownOperation);
+    }
+    let (operation, request_id, body) = decode_header(frame, true)?;
+    if operation != (Operation::AdmitQualification as u16) | OP_RESPONSE_BIT
+        || request_id != expected.request_id
+        || body.len() != PRODUCTION_QUALIFICATION_RESPONSE_BODY_SIZE
+    {
+        return Err(DecodeError::UnknownOperation);
+    }
+    require_zero(&body[535..])?;
+    let response = ProductionQualificationResponse {
+        code: ResponseCode::try_from(get_u16(body, 0))?,
+        retry_after_millis: get_u32(body, 2),
+        request_frame_digest: nonzero_array(&body[6..38])?,
+        qualification_receipt_digest: nonzero_array(&body[38..70])?,
+        integrated_candidate_sha: GitOid::decode(&body[70..103])?,
+        activation_package_digest: nonzero_array(&body[103..135])?,
+        fixture_digest: nonzero_array(&body[135..167])?,
+        principal_digest: nonzero_array(&body[167..199])?,
+        lane_manifest_digest: nonzero_array(&body[199..231])?,
+        broker_build_identity: nonzero_array(&body[231..263])?,
+        host_profile_digest: nonzero_array(&body[263..295])?,
+        suite_identity: nonzero_array(&body[295..327])?,
+        isolation_profile_digest: nonzero_array(&body[327..359])?,
+        seccomp_profile_digest: nonzero_array(&body[359..391])?,
+        seccomp_install_receipt_digest: nonzero_array(&body[391..423])?,
+        executor_program_digest: nonzero_array(&body[423..455])?,
+        executor_provenance_digest: nonzero_array(&body[455..487])?,
+        controller_generation: get_u64(body, 487),
+        runner_generation: get_u64(body, 495),
+        lane_epoch: get_u64(body, 503),
+        admission_key_generation: get_u64(body, 511),
+        qualified_at: get_u64(body, 519),
+        request_expires_at: get_u64(body, 527),
+    };
+    for value in [
+        response.controller_generation,
+        response.runner_generation,
+        response.lane_epoch,
+        response.admission_key_generation,
+        response.qualified_at,
+        response.request_expires_at,
+    ] {
+        validate_safe(value)?;
+    }
+    if response.controller_generation == 0
+        || response.runner_generation == 0
+        || response.lane_epoch == 0
+        || response.admission_key_generation == 0
+        || response.qualified_at == 0
+        || response.request_expires_at < response.qualified_at
+        || response.request_expires_at - response.qualified_at
+            > MAX_PRODUCTION_QUALIFICATION_LIFETIME_SECONDS
+    {
+        return Err(DecodeError::InvalidDeadline);
+    }
+    Ok(response)
+}
+
+/// Digest the immutable success receipt. `Ok` and `Existing` share this digest.
+pub fn production_qualification_receipt_digest(
+    response: &ProductionQualificationResponse,
+) -> [u8; 32] {
+    let mut canonical = *response;
+    canonical.code = ResponseCode::Ok;
+    canonical.retry_after_millis = 0;
+    canonical.qualification_receipt_digest = [0; 32];
+    let frame = encode_production_qualification_response(
+        FrameHeader {
+            operation: Operation::AdmitQualification,
+            request_id: [0; 16],
+        },
+        canonical,
+    );
+    let body = &frame.bytes[HEADER_SIZE..frame.len];
+    let mut hasher = Sha256::new();
+    hasher.update(PRODUCTION_QUALIFICATION_RECEIPT_DIGEST_DOMAIN);
+    hasher.update(body);
+    hasher.finalize().into()
+}
+
 const fn body_size(operation: Operation) -> usize {
     match operation {
         Operation::Hello => super::HELLO_BODY_SIZE,
         Operation::AdmitAttempt => ADMIT_ATTEMPT_BODY_SIZE,
         Operation::CancelAttempt => CANCEL_ATTEMPT_BODY_SIZE,
         Operation::GetAttempt => GET_ATTEMPT_BODY_SIZE,
-        Operation::AdmitQualification => super::ADMIT_QUALIFICATION_BODY_SIZE,
+        Operation::AdmitQualification => PRODUCTION_QUALIFICATION_BODY_SIZE,
         Operation::CompleteAttempt => COMPLETE_ATTEMPT_BODY_SIZE,
         Operation::DescribeAttemptEvidence => DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE,
         Operation::ReadAttemptEvidence => READ_ATTEMPT_EVIDENCE_BODY_SIZE,
@@ -1032,6 +1234,186 @@ pub fn intent_registration_key_digest_parts(
     hasher.update(run_id);
     hasher.update(attempt.to_be_bytes());
     hasher.finalize().into()
+}
+
+fn encode_production_qualification(body: &mut [u8], value: ProductionQualificationRequest) {
+    value.integrated_candidate_sha.encode_into(&mut body[0..33]);
+    body[33..65].copy_from_slice(&value.activation_package_digest);
+    body[65..97].copy_from_slice(&value.fixture_digest);
+    body[97..129].copy_from_slice(&value.principal_digest);
+    body[129..161].copy_from_slice(&value.lane_manifest_digest);
+    body[161..193].copy_from_slice(&value.broker_build_identity);
+    body[193..225].copy_from_slice(&value.host_profile_digest);
+    body[225..257].copy_from_slice(&value.suite_identity);
+    body[257..289].copy_from_slice(&value.isolation_profile_digest);
+    body[289..321].copy_from_slice(&value.seccomp_profile_digest);
+    body[321..353].copy_from_slice(&value.executor_program_digest);
+    body[353..385].copy_from_slice(&value.executor_provenance_digest);
+    body[385..417].copy_from_slice(&value.nonce);
+    put_u64(body, 417, value.controller_generation);
+    put_u64(body, 425, value.runner_generation);
+    put_u64(body, 433, value.lane_epoch);
+    put_u64(body, 441, value.admission_key_generation);
+    put_u64(body, 449, value.issued_at);
+    put_u64(body, 457, value.expires_at);
+    body[465..497].copy_from_slice(&value.request_frame_digest);
+}
+
+fn decode_production_qualification(
+    body: &[u8],
+) -> Result<ProductionQualificationRequest, DecodeError> {
+    require_zero(&body[497..])?;
+    let value = ProductionQualificationRequest {
+        integrated_candidate_sha: GitOid::decode(&body[0..33])?,
+        activation_package_digest: nonzero_array(&body[33..65])?,
+        fixture_digest: nonzero_array(&body[65..97])?,
+        principal_digest: nonzero_array(&body[97..129])?,
+        lane_manifest_digest: nonzero_array(&body[129..161])?,
+        broker_build_identity: nonzero_array(&body[161..193])?,
+        host_profile_digest: nonzero_array(&body[193..225])?,
+        suite_identity: nonzero_array(&body[225..257])?,
+        isolation_profile_digest: nonzero_array(&body[257..289])?,
+        seccomp_profile_digest: nonzero_array(&body[289..321])?,
+        executor_program_digest: nonzero_array(&body[321..353])?,
+        executor_provenance_digest: nonzero_array(&body[353..385])?,
+        nonce: nonzero_array(&body[385..417])?,
+        controller_generation: get_u64(body, 417),
+        runner_generation: get_u64(body, 425),
+        lane_epoch: get_u64(body, 433),
+        admission_key_generation: get_u64(body, 441),
+        issued_at: get_u64(body, 449),
+        expires_at: get_u64(body, 457),
+        request_frame_digest: nonzero_array(&body[465..497])?,
+    };
+    for generation in [
+        value.controller_generation,
+        value.runner_generation,
+        value.lane_epoch,
+        value.admission_key_generation,
+        value.issued_at,
+        value.expires_at,
+    ] {
+        validate_safe(generation)?;
+    }
+    if value.controller_generation == 0
+        || value.runner_generation == 0
+        || value.lane_epoch == 0
+        || value.admission_key_generation == 0
+        || value.issued_at == 0
+        || value.expires_at <= value.issued_at
+        || value.expires_at - value.issued_at > MAX_PRODUCTION_QUALIFICATION_LIFETIME_SECONDS
+    {
+        return Err(DecodeError::InvalidDeadline);
+    }
+    Ok(value)
+}
+
+/// Digest the complete canonical qualification frame except its self-digest.
+pub fn production_qualification_request_frame_digest(
+    header: FrameHeader,
+    value: &ProductionQualificationRequest,
+) -> Option<[u8; 32]> {
+    if header.operation != Operation::AdmitQualification {
+        return None;
+    }
+    let mut canonical = *value;
+    canonical.request_frame_digest = [0; 32];
+    let mut body = [0; PRODUCTION_QUALIFICATION_BODY_SIZE];
+    encode_production_qualification(&mut body, canonical);
+    let mut hasher = Sha256::new();
+    hasher.update(PRODUCTION_QUALIFICATION_REQUEST_DIGEST_DOMAIN);
+    hasher.update(PROTOCOL_VERSION.to_be_bytes());
+    hasher.update((Operation::AdmitQualification as u16).to_be_bytes());
+    hasher.update(header.request_id);
+    hasher.update(body);
+    Some(hasher.finalize().into())
+}
+
+/// Durable create-once key for one package fixture and generation pair.
+pub fn production_qualification_key_digest(value: &ProductionQualificationRequest) -> [u8; 32] {
+    let mut candidate = [0; 33];
+    value.integrated_candidate_sha.encode_into(&mut candidate);
+    let mut hasher = Sha256::new();
+    hasher.update(PRODUCTION_QUALIFICATION_KEY_DIGEST_DOMAIN);
+    hasher.update(candidate);
+    hasher.update(value.activation_package_digest);
+    hasher.update(value.fixture_digest);
+    hasher.update(value.controller_generation.to_be_bytes());
+    hasher.update(value.runner_generation.to_be_bytes());
+    hasher.finalize().into()
+}
+
+/// Digest the exact configured qualification account contract.
+pub fn production_qualification_principal_digest(
+    user: &str,
+    group: &str,
+    uid: u32,
+    gid: u32,
+    home: &str,
+    shell: &str,
+    supplementary_groups: &[String],
+) -> Option<[u8; 32]> {
+    if uid == 0
+        || gid == 0
+        || supplementary_groups.is_empty()
+        || [user, group, home, shell]
+            .iter()
+            .any(|value| value.is_empty() || value.len() > u16::MAX as usize || !value.is_ascii())
+        || supplementary_groups
+            .iter()
+            .any(|value| value.is_empty() || value.len() > u16::MAX as usize || !value.is_ascii())
+    {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(PRODUCTION_QUALIFICATION_PRINCIPAL_DIGEST_DOMAIN);
+    for value in [user, group] {
+        hasher.update((value.len() as u16).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(uid.to_be_bytes());
+    hasher.update(gid.to_be_bytes());
+    for value in [home, shell] {
+        hasher.update((value.len() as u16).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update((supplementary_groups.len() as u16).to_be_bytes());
+    for value in supplementary_groups {
+        hasher.update((value.len() as u16).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Some(hasher.finalize().into())
+}
+
+/// Digest the package-bound executor program provenance.
+pub fn production_qualification_executor_provenance_digest(
+    path: &str,
+    program_digest: [u8; 32],
+    source_commit: GitOid,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> Option<[u8; 32]> {
+    if path.is_empty()
+        || path.len() > u16::MAX as usize
+        || !path.is_ascii()
+        || program_digest == [0; 32]
+        || mode == 0
+    {
+        return None;
+    }
+    let mut encoded_source = [0; 33];
+    source_commit.encode_into(&mut encoded_source);
+    let mut hasher = Sha256::new();
+    hasher.update(PRODUCTION_QUALIFICATION_EXECUTOR_PROVENANCE_DIGEST_DOMAIN);
+    hasher.update((path.len() as u16).to_be_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update(program_digest);
+    hasher.update(encoded_source);
+    hasher.update(uid.to_be_bytes());
+    hasher.update(gid.to_be_bytes());
+    hasher.update(mode.to_be_bytes());
+    Some(hasher.finalize().into())
 }
 
 fn encode_cancel(body: &mut [u8], value: CancelAttemptRequest) {
@@ -1475,6 +1857,14 @@ mod tests {
         [byte; 32]
     }
 
+    fn lowercase_hex(bytes: impl AsRef<[u8]>) -> String {
+        bytes
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     fn oid() -> GitOid {
         GitOid::Sha1([21; 20])
     }
@@ -1506,25 +1896,38 @@ mod tests {
         }
     }
 
-    fn qualification() -> QualificationRequest {
-        QualificationRequest {
+    fn qualification(request_id: [u8; 16]) -> ProductionQualificationRequest {
+        let mut value = ProductionQualificationRequest {
             integrated_candidate_sha: oid(),
-            broker_build_identity: digest(12),
-            host_profile_digest: digest(13),
-            suite_identity: digest(14),
-            fixture_signer: digest(15),
-            request_digest: digest(16),
-            manifest_digest: digest(17),
-            isolation_profile_digest: digest(18),
-            source_oid: GitOid::Sha256(digest(19)),
-            base_oid: oid(),
-            job_identity: digest(20),
-            fixture_identity: digest(21),
-            nonce: digest(22),
-            not_before: 100,
-            expires_at: 200,
-            directive: None,
-        }
+            activation_package_digest: digest(12),
+            fixture_digest: digest(13),
+            principal_digest: digest(14),
+            lane_manifest_digest: digest(15),
+            broker_build_identity: digest(16),
+            host_profile_digest: digest(17),
+            suite_identity: digest(18),
+            isolation_profile_digest: digest(19),
+            seccomp_profile_digest: digest(20),
+            executor_program_digest: digest(21),
+            executor_provenance_digest: digest(22),
+            nonce: digest(23),
+            controller_generation: 1,
+            runner_generation: 2,
+            lane_epoch: 3,
+            admission_key_generation: 4,
+            issued_at: 100,
+            expires_at: 160,
+            request_frame_digest: [0; 32],
+        };
+        value.request_frame_digest = production_qualification_request_frame_digest(
+            FrameHeader {
+                operation: Operation::AdmitQualification,
+                request_id,
+            },
+            &value,
+        )
+        .unwrap();
+        value
     }
 
     fn cancel() -> CancelAttemptRequest {
@@ -1684,6 +2087,36 @@ mod tests {
         }
     }
 
+    fn qualification_response(
+        request: ProductionQualificationRequest,
+    ) -> ProductionQualificationResponse {
+        ProductionQualificationResponse {
+            code: ResponseCode::Ok,
+            retry_after_millis: 0,
+            request_frame_digest: request.request_frame_digest,
+            qualification_receipt_digest: digest(31),
+            integrated_candidate_sha: request.integrated_candidate_sha,
+            activation_package_digest: request.activation_package_digest,
+            fixture_digest: request.fixture_digest,
+            principal_digest: request.principal_digest,
+            lane_manifest_digest: request.lane_manifest_digest,
+            broker_build_identity: request.broker_build_identity,
+            host_profile_digest: request.host_profile_digest,
+            suite_identity: request.suite_identity,
+            isolation_profile_digest: request.isolation_profile_digest,
+            seccomp_profile_digest: request.seccomp_profile_digest,
+            seccomp_install_receipt_digest: digest(32),
+            executor_program_digest: request.executor_program_digest,
+            executor_provenance_digest: request.executor_provenance_digest,
+            controller_generation: request.controller_generation,
+            runner_generation: request.runner_generation,
+            lane_epoch: request.lane_epoch,
+            admission_key_generation: request.admission_key_generation,
+            qualified_at: 150,
+            request_expires_at: request.expires_at,
+        }
+    }
+
     #[test]
     fn version_two_round_trips_every_request_and_response() {
         let requests = [
@@ -1694,7 +2127,7 @@ mod tests {
             Request::AdmitAttempt(admit()),
             Request::CancelAttempt(cancel()),
             Request::GetAttempt(get()),
-            Request::AdmitQualification(qualification()),
+            Request::AdmitQualification(qualification([42; 16])),
             Request::CompleteAttempt(complete()),
             Request::DescribeAttemptEvidence(describe()),
             Request::ReadAttemptEvidence(read()),
@@ -1714,6 +2147,18 @@ mod tests {
         let encoded = encode_response(header, response());
         assert_eq!(decode_response(header, encoded.as_bytes()), Ok(response()));
 
+        let qualification_header = FrameHeader {
+            operation: Operation::AdmitQualification,
+            request_id: [42; 16],
+        };
+        let qualification = qualification([42; 16]);
+        let response = qualification_response(qualification);
+        let encoded = encode_production_qualification_response(qualification_header, response);
+        assert_eq!(
+            decode_production_qualification_response(qualification_header, encoded.as_bytes()),
+            Ok(response)
+        );
+
         let header = FrameHeader {
             operation: Operation::RegisterJobIntent,
             request_id: [9; 16],
@@ -1723,6 +2168,58 @@ mod tests {
         let encoded = encode_intent_registration_response(header, response);
         assert_eq!(
             decode_intent_registration_response(header, encoded.as_bytes()),
+            Ok(response)
+        );
+    }
+
+    #[test]
+    fn production_qualification_matches_acceptance_client_compatibility_fixture() {
+        let header = FrameHeader {
+            operation: Operation::AdmitQualification,
+            request_id: [0x10; 16],
+        };
+        let mut request = ProductionQualificationRequest {
+            integrated_candidate_sha: GitOid::Sha1([0x11; 20]),
+            activation_package_digest: [0x12; 32],
+            fixture_digest: [0x13; 32],
+            principal_digest: [0x14; 32],
+            lane_manifest_digest: [0x15; 32],
+            broker_build_identity: [0x16; 32],
+            host_profile_digest: [0x17; 32],
+            suite_identity: [0x18; 32],
+            isolation_profile_digest: [0x19; 32],
+            seccomp_profile_digest: [0x1a; 32],
+            executor_program_digest: [0x1b; 32],
+            executor_provenance_digest: [0x1c; 32],
+            nonce: [0x1d; 32],
+            controller_generation: 21,
+            runner_generation: 22,
+            lane_epoch: 23,
+            admission_key_generation: 24,
+            issued_at: 100,
+            expires_at: 160,
+            request_frame_digest: [0; 32],
+        };
+        request.request_frame_digest =
+            production_qualification_request_frame_digest(header, &request).unwrap();
+        assert_eq!(
+            lowercase_hex(request.request_frame_digest),
+            "17b4b3615a49c9a62270f97d96fa95223743b36df5bbc3245b00017ec2b485f3"
+        );
+        let frame = encode_request(header.request_id, Request::AdmitQualification(request));
+        assert_eq!(frame.as_bytes().len(), 672);
+        assert_eq!(
+            lowercase_hex(Sha256::digest(frame.as_bytes())),
+            "5b7966fdb0dcc635d7315f1ea92401975e6c4e63da2713e8a0e0fb99ba5a5c8d"
+        );
+
+        let mut response = qualification_response(request);
+        response.qualification_receipt_digest = [0x71; 32];
+        response.seccomp_install_receipt_digest = [0x72; 32];
+        let frame = encode_production_qualification_response(header, response);
+        assert_eq!(frame.as_bytes().len(), 608);
+        assert_eq!(
+            decode_production_qualification_response(header, frame.as_bytes()),
             Ok(response)
         );
     }
