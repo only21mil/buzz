@@ -44,6 +44,10 @@ PEER_POLICY = {
     "broker_socket": {
         "path": "/run/buzzci/execd.sock",
         "expected_uid": 0,
+        "owner": "root",
+        "group": "buzzci-execd",
+        "mode": "0620",
+        "supplementary_members": ["buzzci-runner", "buzzci-ctl"],
         "managed_by_package": False,
     },
 }
@@ -291,10 +295,22 @@ def validate_assets(package: Path, entries: list[Entry], identities: dict[str, o
     tmpfiles = payloads["tmpfiles"].decode()
     required_service = {
         "ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v1.json",
+        "SupplementaryGroups=buzzci-execd",
+        "UMask=0077",
         "ReadWritePaths=/var/lib/buzzci/runner",
         "RestrictAddressFamilies=AF_UNIX",
     }
-    if not all(line in service.splitlines() for line in required_service) or "/var/lib/buzzci/runner-output" in service:
+    forbidden_service = {
+        "User=root",
+        "AmbientCapabilities=",
+        "CapabilityBoundingSet=",
+        "buzz-ci-executor",
+    }
+    if (
+        not all(line in service.splitlines() for line in required_service)
+        or any(token in service for token in forbidden_service)
+        or "/var/lib/buzzci/runner-output" in service
+    ):
         raise ValueError("runner service path contract mismatch")
     required_socket = {
         "ListenStream=/run/buzzci/runner-control.sock",
@@ -309,8 +325,8 @@ def validate_assets(package: Path, entries: list[Entry], identities: dict[str, o
         raise ValueError("runner and broker socket contracts overlap")
     for required in (
         "d /var/lib/buzzci/runner 0700 buzzci-runner buzzci-runner -",
-        "d /var/lib/buzzci/runner/evidence 0700 buzzci-runner buzzci-runner -",
-        "d /var/lib/buzzci/runner/journal 0700 buzzci-runner buzzci-runner -",
+        "d /var/lib/buzzci/runner/evidence 0700 buzzci-runner buzzci-runner 7d",
+        "d /var/lib/buzzci/runner/journal 0700 buzzci-runner buzzci-runner 30d",
     ):
         if required not in tmpfiles.splitlines():
             raise ValueError("runner tmpfiles contract mismatch")

@@ -1,13 +1,15 @@
 //! Secure loading for runner-owned configuration.
 //!
-//! The version-1 contract always supplies the peer UID. A complete optional
-//! host block selects the reviewed concrete adapters; omission stays closed.
+//! The version-1 contract supplies only the peer UID. Legacy host composition
+//! is rejected so production cannot fall back from broker v2 to local execution.
 
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -23,13 +25,12 @@ pub struct RunnerConfig {
     pub schema_version: u32,
     /// Dedicated controld account accepted by `SO_PEERCRED`.
     pub controld_uid: u32,
-    /// Complete concrete host composition. Omission keeps the runner closed.
-    #[serde(default)]
-    pub host: Option<RunnerHostConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// Test-only shape retained for the closed legacy host unit tests. Production
+/// configuration cannot deserialize this shape and the binary cannot compose it.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunnerHostConfig {
     pub owner_pubkey: String,
     pub manifest_verification_key: String,
@@ -61,8 +62,6 @@ pub enum ConfigError {
     UnsupportedSchema,
     #[error("runner controld UID must be nonzero")]
     InvalidPeerUid,
-    #[error("runner host configuration is invalid")]
-    InvalidHost,
 }
 
 impl RunnerConfig {
@@ -113,35 +112,20 @@ impl RunnerConfig {
         if config.controld_uid == 0 {
             return Err(ConfigError::InvalidPeerUid);
         }
-        if config.host.as_ref().is_some_and(|host| !host.is_valid()) {
-            return Err(ConfigError::InvalidHost);
-        }
         Ok(config)
     }
 }
 
-impl RunnerHostConfig {
-    fn is_valid(&self) -> bool {
-        is_lower_hex(&self.owner_pubkey, 64)
-            && is_lower_hex(&self.manifest_verification_key, 64)
-            && is_lower_hex(&self.relay_signer, 64)
-            && self.broker_socket.is_absolute()
-            && self.executor_program.is_absolute()
-            && self.evidence_directory.is_absolute()
-            && self.journal_directory.is_absolute()
-            && (1..=256).contains(&self.max_argv_items)
-            && (1..=65_536).contains(&self.max_argv_bytes)
-            && (1..=256).contains(&self.max_environment_items)
-            && (1..=65_536).contains(&self.max_environment_bytes)
-            && (1..=16_777_216).contains(&self.max_output_bytes)
+pub(crate) fn validate_private_directory(path: &Path) -> Result<(), ()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+    {
+        return Err(());
     }
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -169,13 +153,12 @@ mod tests {
             RunnerConfig {
                 schema_version: 1,
                 controld_uid: 962,
-                host: None,
             }
         );
     }
 
     #[test]
-    fn host_composition_is_all_or_nothing() {
+    fn legacy_host_composition_is_rejected() {
         let directory = tempdir().expect("tempdir");
         let complete = directory.path().join("complete.json");
         let value = serde_json::json!({
@@ -198,8 +181,10 @@ mod tests {
             }
         });
         write_config(&complete, &serde_json::to_vec(&value).unwrap(), 0o600);
-        let loaded = RunnerConfig::load(&complete).unwrap();
-        assert_eq!(loaded.host.as_ref().unwrap().broker_uid, 0);
+        assert!(matches!(
+            RunnerConfig::load(&complete),
+            Err(ConfigError::InvalidJson(_))
+        ));
 
         let partial = directory.path().join("partial.json");
         write_config(

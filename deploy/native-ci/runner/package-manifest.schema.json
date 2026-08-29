@@ -45,6 +45,10 @@
         "broker_socket": {
           "path": "/run/buzzci/execd.sock",
           "expected_uid": 0,
+          "owner": "root",
+          "group": "buzzci-execd",
+          "mode": "0620",
+          "supplementary_members": ["buzzci-runner", "buzzci-ctl"],
           "managed_by_package": false
         }
       }
