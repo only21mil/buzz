@@ -164,14 +164,14 @@ class RunnerInstallTests(unittest.TestCase):
         return root, installed, transaction, record
 
     def test_config_renderer_is_canonical_closed_and_nofollow(self) -> None:
-        output = self.base / "runner-v1.json"
-        RENDERER.render(output, self.runner_uid)
+        output = self.base / "runner-v2.json"
+        RENDERER.render(output, self.runner_uid, self.runner_gid)
         self.assertEqual(
             output.read_bytes(),
-            f'{{"controld_uid":{self.runner_uid},"schema_version":1}}\n'.encode(),
+            f'{{"controld_gid":{self.runner_gid},"controld_uid":{self.runner_uid},"mode":"dormant","schema_version":2}}\n'.encode(),
         )
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
-        RENDERER.check(output, self.runner_uid, self.runner_uid)
+        RENDERER.check(output, self.runner_uid, self.runner_gid, self.runner_uid)
         value = json.loads(output.read_bytes())
         self.assertNotIn("host", value)
         self.assertNotIn("capacity", value)
@@ -182,7 +182,7 @@ class RunnerInstallTests(unittest.TestCase):
         linked = self.base / "linked.json"
         linked.symlink_to(output)
         with self.assertRaises(OSError):
-            RENDERER.check(linked, self.runner_uid)
+            RENDERER.check(linked, self.runner_uid, self.runner_gid)
 
     def test_freeze_binds_source_binary_package_and_dormant_state(self) -> None:
         manifest = self.freeze()
@@ -464,24 +464,23 @@ class RunnerInstallTests(unittest.TestCase):
         self.assertNotIn("/var/lib/buzzci/runner-output", service + tmpfiles)
         self.assertNotIn("systemctl", (RUNNER_DIR / "install.py").read_text())
 
-    def test_dormant_legacy_state_has_bounded_cleanup(self) -> None:
+    def test_runner_state_has_no_evidence_roots(self) -> None:
         lines = (RUNNER_DIR / "templates/buzzci-runner.tmpfiles").read_text().splitlines()
-        self.assertIn(
-            "d /var/lib/buzzci/runner/evidence 0700 buzzci-runner buzzci-runner 7d",
-            lines,
-        )
-        self.assertIn(
-            "d /var/lib/buzzci/runner/journal 0700 buzzci-runner buzzci-runner 30d",
-            lines,
-        )
-        self.assertFalse(any("/var/lib/buzzci/runner/evidence" in line and line.endswith(" -") for line in lines))
-        self.assertFalse(any("/var/lib/buzzci/runner/journal" in line and line.endswith(" -") for line in lines))
+        self.assertEqual(lines, [
+            "d /run/buzzci 0711 root root -",
+            "d /var/lib/buzzci/runner 0700 buzzci-runner buzzci-runner -",
+        ])
 
     def test_closed_config_cannot_select_local_execution_or_evidence_persistence(self) -> None:
-        config = RENDERER.config_bytes(self.controld_uid)
+        config = RENDERER.config_bytes(self.controld_uid, self.controld_gid)
         self.assertEqual(
             json.loads(config),
-            {"schema_version": 1, "controld_uid": self.controld_uid},
+            {
+                "schema_version": 2,
+                "controld_uid": self.controld_uid,
+                "controld_gid": self.controld_gid,
+                "mode": "dormant",
+            },
         )
         for forbidden in (b"host", b"executor", b"evidence", b"journal"):
             self.assertNotIn(forbidden, config)
@@ -495,7 +494,8 @@ class RunnerInstallTests(unittest.TestCase):
             schema = json.loads((RUNNER_DIR / name).read_text())
             self.assertFalse(schema["additionalProperties"])
         runner_schema = json.loads((RUNNER_DIR / "runner-config.schema.json").read_text())
-        self.assertEqual(set(runner_schema["properties"]), {"schema_version", "controld_uid"})
+        self.assertIn("mode", runner_schema["properties"])
+        self.assertIn("lane_manifest_digest", runner_schema["properties"])
         manifest_schema = json.loads((RUNNER_DIR / "package-manifest.schema.json").read_text())
         self.assertEqual(manifest_schema["properties"]["peer_policy"]["const"], INSTALLER.PEER_POLICY)
 

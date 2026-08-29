@@ -7,7 +7,9 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
-use buzz_ci_runner::config::RunnerConfig;
+use buzz_ci_runner::config::{RunnerConfig, RunnerMode};
+#[cfg(target_os = "linux")]
+use buzz_ci_runner::proxy_v2::RunnerV2Proxy;
 #[cfg(target_os = "linux")]
 use buzz_ci_runner::service::{
     serve_runner_connection, validate_systemd_environment, validate_systemd_listener,
@@ -79,6 +81,20 @@ fn run(config: RunnerConfig) -> ExitCode {
         "event": "runner_ready",
         "schema_version": config.schema_version,
     }));
+    let mut proxy = match &config.mode {
+        RunnerMode::Dormant => None,
+        RunnerMode::V2Proxy { .. } => match RunnerV2Proxy::open(&config) {
+            Ok(proxy) => Some(proxy),
+            Err(error) => {
+                log(json!({
+                    "level": "error",
+                    "error": "v2_proxy_startup",
+                    "message": error.to_string(),
+                }));
+                return ExitCode::from(4);
+            }
+        },
+    };
     loop {
         let (stream, _) = match listener.accept() {
             Ok(connection) => connection,
@@ -91,14 +107,19 @@ fn run(config: RunnerConfig) -> ExitCode {
                 return ExitCode::from(4);
             }
         };
-        // The runner never executes jobs. Broker v2 reaches the root execd
-        // boundary through its distinct transport; legacy v1 stays closed.
-        let result = serve_runner_connection(stream, config.controld_uid);
+        // The runner never executes jobs. Dormant remains closed; v2 forwards
+        // only canonical broker frames to authenticated root execd.
+        let result = if let Some(proxy) = &mut proxy {
+            proxy.serve(stream).map_err(|error| error.to_string())
+        } else {
+            serve_runner_connection(stream, config.controld_uid, config.controld_gid)
+                .map_err(|error| error.to_string())
+        };
         if let Err(error) = result {
             log(json!({
                 "level": "warn",
                 "event": "runner_connection_rejected",
-                "message": error.to_string(),
+                "message": error,
             }));
         }
     }

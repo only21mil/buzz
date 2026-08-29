@@ -53,7 +53,7 @@ PEER_POLICY = {
 }
 EXPECTED_TARGETS = {
     "binary": "/usr/libexec/buzz-ci-runner",
-    "config": "/etc/buzzci/runner-v1.json",
+    "config": "/etc/buzzci/runner-v2.json",
     "service": "/etc/systemd/system/buzz-ci-runner.service",
     "socket": "/etc/systemd/system/buzz-ci-runner.socket",
     "tmpfiles": "/usr/lib/tmpfiles.d/buzzci-runner.conf",
@@ -286,15 +286,22 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
 def validate_assets(package: Path, entries: list[Entry], identities: dict[str, object]) -> None:
     payloads = {entry.role: read_fd(package / entry.source)[0] for entry in entries}
     config = json.loads(payloads["config"], object_pairs_hook=reject_duplicates)
-    if not isinstance(config, dict) or set(config) != {"schema_version", "controld_uid"} or config["schema_version"] != 1:
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"schema_version", "controld_uid", "controld_gid", "mode"}
+        or config["schema_version"] != 2
+        or config["mode"] != "dormant"
+    ):
         raise ValueError("runner config is not canonical and closed")
     if u32(config["controld_uid"], nonzero=True) != identities["controld"]["uid"]:
         raise ValueError("runner config controld UID binding mismatch")
+    if u32(config["controld_gid"], nonzero=True) != identities["controld"]["gid"]:
+        raise ValueError("runner config controld GID binding mismatch")
     service = payloads["service"].decode()
     socket = payloads["socket"].decode()
     tmpfiles = payloads["tmpfiles"].decode()
     required_service = {
-        "ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v1.json",
+        "ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v2.json",
         "SupplementaryGroups=buzzci-execd",
         "UMask=0077",
         "ReadWritePaths=/var/lib/buzzci/runner",
@@ -325,8 +332,6 @@ def validate_assets(package: Path, entries: list[Entry], identities: dict[str, o
         raise ValueError("runner and broker socket contracts overlap")
     for required in (
         "d /var/lib/buzzci/runner 0700 buzzci-runner buzzci-runner -",
-        "d /var/lib/buzzci/runner/evidence 0700 buzzci-runner buzzci-runner 7d",
-        "d /var/lib/buzzci/runner/journal 0700 buzzci-runner buzzci-runner 30d",
     ):
         if required not in tmpfiles.splitlines():
             raise ValueError("runner tmpfiles contract mismatch")
