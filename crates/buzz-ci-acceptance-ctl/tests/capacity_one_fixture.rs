@@ -31,9 +31,10 @@ fn checked_in_scenario_and_fixture_bytes_match() {
         let bytes = fs::read(acceptance.join(schema)).unwrap();
         let _: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     }
-    let receipt_schema: serde_json::Value =
-        serde_json::from_slice(&fs::read(acceptance.join("receipt.schema.json")).unwrap()).unwrap();
-    let schema_stages = receipt_schema["$defs"]["stage"]["enum"].as_array().unwrap();
+    let expected_stages: serde_json::Value =
+        serde_json::from_slice(&fs::read(acceptance.join("expected-stages.json")).unwrap())
+            .unwrap();
+    let schema_stages = expected_stages.as_array().unwrap();
     let rust_stages = [
         Stage::CapacityZeroClosed,
         Stage::CapacityOneOpen,
@@ -47,7 +48,7 @@ fn checked_in_scenario_and_fixture_bytes_match() {
         Stage::TombstoneFolding,
         Stage::ControllerRestartRecovery,
         Stage::RunnerRestartRecovery,
-        Stage::ReturnCapacityZero,
+        Stage::PrepareCapacityZero,
     ]
     .map(|stage| serde_json::to_value(stage).unwrap());
     assert_eq!(schema_stages.as_slice(), rust_stages.as_slice());

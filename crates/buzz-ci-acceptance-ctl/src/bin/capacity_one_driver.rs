@@ -6,7 +6,7 @@ use std::{
 };
 
 use buzz_ci_acceptance_ctl::{
-    acceptance::AcceptanceDriver,
+    acceptance::{AcceptanceDriver, ZeroRequest, ZERO_REQUEST_VERSION},
     production::{
         DriverError, OwnedDriverRequest, ProductionDriver, ProductionDriverConfig,
         UnixAdapterTransport, DRIVER_CONFIG_PATH, MAX_ADAPTER_FRAME_BYTES,
@@ -34,13 +34,10 @@ fn main() {
     {
         fail(DriverError::FrameTooLarge, 2);
     }
-    let owned: OwnedDriverRequest = match serde_json::from_slice(&input) {
-        Ok(value) => value,
-        Err(_) => fail(DriverError::Protocol, 2),
-    };
-    if let Err(error) = owned.validate_version() {
-        fail(error, 2);
-    }
+    let schema_version = serde_json::from_slice::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|value| value.get("schema_version")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| fail(DriverError::Protocol, 2));
     let (uid, gid) = effective_ids();
     let config = match ProductionDriverConfig::load(Path::new(DRIVER_CONFIG_PATH), gid) {
         Ok(value) if value.qualification_uid == uid && value.qualification_gid == gid => value,
@@ -52,9 +49,27 @@ fn main() {
         Ok(value) => value,
         Err(error) => fail(error, 3),
     };
-    let response = match driver.execute(&owned.borrowed()) {
-        Ok(value) => value,
-        Err(error) => fail(error, 4),
+    let response = if schema_version == ZERO_REQUEST_VERSION {
+        let request: ZeroRequest =
+            serde_json::from_slice(&input).unwrap_or_else(|_| fail(DriverError::Protocol, 2));
+        serde_json::to_value(
+            driver
+                .return_to_zero(&request)
+                .unwrap_or_else(|error| fail(error, 4)),
+        )
+        .unwrap_or_else(|_| fail(DriverError::Protocol, 4))
+    } else {
+        let owned: OwnedDriverRequest =
+            serde_json::from_slice(&input).unwrap_or_else(|_| fail(DriverError::Protocol, 2));
+        if let Err(error) = owned.validate_version() {
+            fail(error, 2);
+        }
+        serde_json::to_value(
+            driver
+                .execute(&owned.borrowed())
+                .unwrap_or_else(|error| fail(error, 4)),
+        )
+        .unwrap_or_else(|_| fail(DriverError::Protocol, 4))
     };
     if serde_json::to_writer(io::stdout().lock(), &response).is_err() {
         fail(DriverError::Protocol, 4);
