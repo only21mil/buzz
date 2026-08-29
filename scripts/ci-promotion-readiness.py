@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -15,15 +16,38 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
+import uuid
 
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SIGNATURE = re.compile(r"^[0-9a-f]{128}$")
+JOB_ID = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
-RECORD_KINDS = [46101, 46102, 46103, 46104, 46105, 46106]
+CI_EVENT_KINDS = {46101, 46102, 46103, 46104, 46105, 46106}
+RUN_STATES = {
+    "queued", "running", "success", "failure", "cancelled", "timed_out",
+    "infrastructure_failure",
+}
+JOB_STATES = {"queued", "running", "success", "failure", "cancelled", "timed_out", "skipped"}
+RUN_TRANSITIONS = {
+    "queued": {"running", "cancelled", "infrastructure_failure"},
+    "running": {"success", "failure", "cancelled", "timed_out", "infrastructure_failure"},
+}
+JOB_TRANSITIONS = {
+    "queued": {"running", "cancelled"},
+    "running": {"success", "failure", "cancelled", "timed_out", "skipped"},
+}
 TM_IDS = [f"TM-{number:02d}" for number in range(1, 18)]
 PROBE_IDS = ["P-i", "P-ii", "P-iii", "P-iv", "P-v", "P-vi"]
 REPOSITORY = "only21mil/buzz"
+SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+SECP256K1_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
 
 
 class GateError(Exception):
@@ -67,6 +91,281 @@ def integer(value: Any, path: str) -> int:
 def boolean(value: Any, path: str) -> bool:
     expect(isinstance(value, bool), f"{path} must be a boolean")
     return value
+
+
+def positive_integer(value: Any, path: str) -> int:
+    result = integer(value, path)
+    expect(result >= 1, f"{path} must be a positive integer")
+    return result
+
+
+def exact_fields(
+    container: dict[str, Any], required: set[str], optional: set[str], path: str
+) -> None:
+    missing = required - set(container)
+    unknown = set(container) - required - optional
+    expect(not missing, f"{path} is missing fields: {sorted(missing)}")
+    expect(not unknown, f"{path} has unknown fields: {sorted(unknown)}")
+
+
+def nonempty_unique_strings(value: Any, path: str) -> list[str]:
+    result = [text(item, f"{path}[]") for item in array(value, path)]
+    expect(bool(result), f"{path} must not be empty")
+    expect(len(result) == len(set(result)), f"{path} must be unique")
+    return result
+
+
+def job_ids(value: Any, path: str) -> list[str]:
+    result = nonempty_unique_strings(value, path)
+    expect(all(JOB_ID.fullmatch(item) is not None for item in result),
+           f"{path} contains an invalid static job ID")
+    return result
+
+
+def relay_http_origin(value: Any, path: str) -> tuple[str, str, int]:
+    raw = text(value, path)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        refuse(f"{path} is not a valid relay URL")
+    scheme = parsed.scheme
+    expect(scheme in ("http", "https") and parsed.hostname is not None,
+           f"{path} must use http or https")
+    expect(parsed.username is None and parsed.password is None and "@" not in parsed.netloc,
+           f"{path} must not contain credentials")
+    expect("?" not in raw and "#" not in raw and parsed.path in ("", "/"),
+           f"{path} must be an origin without path, query, or fragment")
+    assert parsed.hostname is not None
+    default_port = 443 if scheme == "https" else 80
+    hostname = parsed.hostname.lower()
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and port != default_port:
+        authority = f"{authority}:{port}"
+    expect(raw == f"{scheme}://{authority}", f"{path} must be a canonical relay origin")
+    return scheme, hostname, port or default_port
+
+
+def validate_relay_evidence_url(
+    value: Any, relay_origin: tuple[str, str, int], expected_path: str, path: str
+) -> str:
+    raw = text(value, path)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        refuse(f"{path} is not a valid evidence URL")
+    expect(parsed.scheme in ("http", "https") and parsed.hostname is not None,
+           f"{path} must use http or https")
+    expect(parsed.username is None and parsed.password is None and "@" not in parsed.netloc,
+           f"{path} has forbidden credentials")
+    expect("?" not in raw and "#" not in raw,
+           f"{path} has a forbidden query or fragment")
+    candidate_origin = (
+        parsed.scheme,
+        parsed.hostname,
+        port or (443 if parsed.scheme == "https" else 80),
+    )
+    expect(candidate_origin == relay_origin, f"{path} is off relay origin")
+    expect(parsed.path == expected_path, f"{path} does not match the exact evidence path")
+    return raw
+
+
+def event_id(value: Any, path: str) -> str:
+    return sha256(value, path)
+
+
+def signature(value: Any, path: str) -> str:
+    result = text(value, path)
+    expect(SIGNATURE.fullmatch(result) is not None, f"{path} must be a lowercase Schnorr signature")
+    return result
+
+
+def run_uuid(value: Any, path: str) -> str:
+    result = text(value, path)
+    try:
+        parsed = uuid.UUID(result)
+    except ValueError:
+        refuse(f"{path} must be a canonical UUID")
+    expect(str(parsed) == result, f"{path} must be a canonical UUID")
+    return result
+
+
+def point_add(
+    left: tuple[int, int] | None, right: tuple[int, int] | None
+) -> tuple[int, int] | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    x1, y1 = left
+    x2, y2 = right
+    if x1 == x2 and (y1 != y2 or y1 == 0):
+        return None
+    if left == right:
+        slope = (3 * x1 * x1) * pow(2 * y1, SECP256K1_P - 2, SECP256K1_P)
+    else:
+        slope = (y2 - y1) * pow(x2 - x1, SECP256K1_P - 2, SECP256K1_P)
+    slope %= SECP256K1_P
+    x3 = (slope * slope - x1 - x2) % SECP256K1_P
+    return x3, (slope * (x1 - x3) - y1) % SECP256K1_P
+
+
+def point_multiply(scalar: int, point: tuple[int, int]) -> tuple[int, int] | None:
+    def double(value: tuple[int, int, int]) -> tuple[int, int, int]:
+        x, y, z = value
+        if y == 0 or z == 0:
+            return 0, 1, 0
+        y2 = y * y % SECP256K1_P
+        s = 4 * x * y2 % SECP256K1_P
+        m = 3 * x * x % SECP256K1_P
+        x3 = (m * m - 2 * s) % SECP256K1_P
+        y3 = (m * (s - x3) - 8 * y2 * y2) % SECP256K1_P
+        return x3, y3, 2 * y * z % SECP256K1_P
+
+    def add(left: tuple[int, int, int], right: tuple[int, int, int]) -> tuple[int, int, int]:
+        x1, y1, z1 = left
+        x2, y2, z2 = right
+        if z1 == 0:
+            return right
+        if z2 == 0:
+            return left
+        z1_squared = z1 * z1 % SECP256K1_P
+        z2_squared = z2 * z2 % SECP256K1_P
+        u1 = x1 * z2_squared % SECP256K1_P
+        u2 = x2 * z1_squared % SECP256K1_P
+        s1 = y1 * z2 * z2_squared % SECP256K1_P
+        s2 = y2 * z1 * z1_squared % SECP256K1_P
+        if u1 == u2:
+            return double(left) if s1 == s2 else (0, 1, 0)
+        h = (u2 - u1) % SECP256K1_P
+        r = (s2 - s1) % SECP256K1_P
+        h2 = h * h % SECP256K1_P
+        h3 = h2 * h % SECP256K1_P
+        u1_h2 = u1 * h2 % SECP256K1_P
+        x3 = (r * r - h3 - 2 * u1_h2) % SECP256K1_P
+        y3 = (r * (u1_h2 - x3) - s1 * h3) % SECP256K1_P
+        return x3, y3, h * z1 * z2 % SECP256K1_P
+
+    result = (0, 1, 0)
+    addend = (point[0], point[1], 1)
+    while scalar:
+        if scalar & 1:
+            result = add(result, addend)
+        addend = double(addend)
+        scalar >>= 1
+    if result[2] == 0:
+        return None
+    inverse = pow(result[2], SECP256K1_P - 2, SECP256K1_P)
+    inverse_squared = inverse * inverse % SECP256K1_P
+    return (result[0] * inverse_squared % SECP256K1_P,
+            result[1] * inverse_squared * inverse % SECP256K1_P)
+
+
+def tagged_hash(tag: str, payload: bytes) -> bytes:
+    tag_digest = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_digest + tag_digest + payload).digest()
+
+
+def verify_schnorr(pubkey_hex: str, message: bytes, signature_hex: str) -> bool:
+    pubkey_x = int(pubkey_hex, 16)
+    if pubkey_x >= SECP256K1_P:
+        return False
+    y_squared = (pow(pubkey_x, 3, SECP256K1_P) + 7) % SECP256K1_P
+    pubkey_y = pow(y_squared, (SECP256K1_P + 1) // 4, SECP256K1_P)
+    if pow(pubkey_y, 2, SECP256K1_P) != y_squared:
+        return False
+    if pubkey_y & 1:
+        pubkey_y = SECP256K1_P - pubkey_y
+    raw_signature = bytes.fromhex(signature_hex)
+    r = int.from_bytes(raw_signature[:32], "big")
+    s = int.from_bytes(raw_signature[32:], "big")
+    if r >= SECP256K1_P or s >= SECP256K1_N:
+        return False
+    challenge = int.from_bytes(
+        tagged_hash("BIP0340/challenge", raw_signature[:32] + bytes.fromhex(pubkey_hex) + message),
+        "big",
+    ) % SECP256K1_N
+    public_point = (pubkey_x, pubkey_y)
+    negated = (public_point[0], (-public_point[1]) % SECP256K1_P)
+    recovered = point_add(point_multiply(s, SECP256K1_G), point_multiply(challenge, negated))
+    return recovered is not None and recovered[1] % 2 == 0 and recovered[0] == r
+
+
+def canonical_tags(value: Any, path: str) -> list[list[str]]:
+    result: list[list[str]] = []
+    for index, raw_tag in enumerate(array(value, path)):
+        tag_path = f"{path}[{index}]"
+        tag = array(raw_tag, tag_path)
+        expect(bool(tag) and all(isinstance(part, str) for part in tag),
+               f"{tag_path} must contain strings and a non-empty tag name")
+        expect(bool(tag[0]), f"{tag_path} must contain strings and a non-empty tag name")
+        result.append(tag)
+    return result
+
+
+def validate_wire_event(
+    raw_event: Any, path: str, *, require_cursor: bool
+) -> tuple[dict[str, Any], int, str, str, int | None, list[list[str]]]:
+    event = obj(raw_event, path)
+    required = {"id", "pubkey", "created_at", "kind", "tags", "content", "sig", "stored"}
+    if require_cursor:
+        required.add("watch_cursor")
+    exact_fields(event, required, set(), path)
+    event_id_value = event_id(field(event, "id", path), f"{path}.id")
+    pubkey = sha256(field(event, "pubkey", path), f"{path}.pubkey")
+    created_at = integer(field(event, "created_at", path), f"{path}.created_at")
+    expect(created_at >= 0, f"{path}.created_at must be non-negative")
+    kind = integer(field(event, "kind", path), f"{path}.kind")
+    tags = canonical_tags(field(event, "tags", path), f"{path}.tags")
+    raw_content = text(field(event, "content", path), f"{path}.content")
+    signature_value = signature(field(event, "sig", path), f"{path}.sig")
+    expect(field(event, "stored", path) is True, f"{path} was not stored")
+    serialized = json.dumps(
+        [0, pubkey, created_at, kind, tags, raw_content],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    computed_id = hashlib.sha256(serialized).hexdigest()
+    expect(computed_id == event_id_value, f"{path} canonical event ID mismatch")
+    expect(verify_schnorr(pubkey, bytes.fromhex(event_id_value), signature_value),
+           f"{path} Schnorr signature is invalid")
+    try:
+        content = obj(json.loads(raw_content), f"{path}.content")
+    except json.JSONDecodeError as error:
+        refuse(f"{path}.content is invalid JSON: {error}")
+    cursor = positive_integer(field(event, "watch_cursor", path), f"{path}.watch_cursor") \
+        if require_cursor else None
+    return content, kind, event_id_value, pubkey, cursor, tags
+
+
+def validate_ci_tags(
+    tags: list[list[str]], channel_id: str, content: dict[str, Any], kind: int, path: str
+) -> None:
+    expected: dict[str, list[str]] = {
+        "h": ["h", channel_id],
+        "a": ["a", text(content["target_repo_a"], f"{path}.target_repo_a")],
+        "run": ["run", run_uuid(content["run_id"], f"{path}.run_id")],
+        "workflow": ["workflow", text(content["workflow_id"], f"{path}.workflow_id")],
+        "c": ["c", sha40(content["tip_oid"], f"{path}.tip_oid")],
+        "attempt": ["attempt", str(positive_integer(content["attempt"], f"{path}.attempt"))],
+    }
+    if kind in (46102, 46103, 46104):
+        expected["job"] = ["job", text(content["job_id"], f"{path}.job_id")]
+    if kind != 46100:
+        expected["e"] = ["e", event_id(content["request_event_id"],
+                                               f"{path}.request_event_id"), "", "request"]
+    if kind == 46103:
+        expected["x"] = ["x", sha256(content["log_sha256"], f"{path}.log_sha256")]
+    elif kind == 46104:
+        expected["x"] = ["x", sha256(content["sha256"], f"{path}.sha256")]
+    reserved = {"h", "a", "run", "workflow", "c", "attempt", "job", "e", "x"}
+    for name in reserved:
+        matching = [tag for tag in tags if tag[0] == name]
+        if name in expected:
+            expect(matching == [expected[name]], f"{path} {name} tag does not match signed content")
+        else:
+            expect(not matching, f"{path} has forbidden reserved {name} tag")
 
 
 def sha40(value: Any, path: str) -> str:
@@ -368,8 +667,545 @@ def validate_log_auth(section: dict[str, Any], path: str) -> dict[str, Any]:
     return {"sha256": digest, "byte_count": byte_count}
 
 
-def validate_staging(section: dict[str, Any], candidate: str) -> dict[str, Any]:
+def validate_status_history(
+    history: list[tuple[int, dict[str, Any]]], transitions: dict[str, set[str]], path: str
+) -> str:
+    ordered = sorted(history)
+    sequences = [positive_integer(item[1]["sequence"], f"{path}.sequence") for item in ordered]
+    expect(sequences == list(range(1, len(sequences) + 1)), f"{path} sequence is not gap-free")
+    states = [text(item[1]["state"], f"{path}.state") for item in ordered]
+    expect(states[0] == "queued", f"{path} must begin queued")
+    for previous, current in zip(states, states[1:]):
+        expect(current in transitions.get(previous, set()),
+               f"{path} has illegal transition {previous}->{current}")
+    expect(states[-1] not in transitions, f"{path} is not terminal")
+    return states[-1]
+
+
+def validate_ci_event_evidence(
+    section: dict[str, Any], candidate: str, base: str, path: str, expected_run_state: str
+) -> dict[str, Any]:
+    exact_fields(
+        section,
+        {"channel_id", "relay_url", "authorized_relay_signers", "requests", "events", "decoded_logs"},
+        set(),
+        path,
+    )
+    channel_id = run_uuid(field(section, "channel_id", path), f"{path}.channel_id")
+    relay_origin = relay_http_origin(field(section, "relay_url", path), f"{path}.relay_url")
+    authorized = [sha256(value, f"{path}.authorized_relay_signers[]")
+                  for value in array(field(section, "authorized_relay_signers", path),
+                                     f"{path}.authorized_relay_signers")]
+    expect(bool(authorized) and len(authorized) == len(set(authorized)),
+           f"{path}.authorized_relay_signers must be non-empty and unique")
+
+    request_required = {
+        "schema_version", "request_type", "target_repo_a", "pr_root_event_id",
+        "source_clone_url", "immutable_source_ref", "tip_oid", "source_branch", "base_ref",
+        "base_oid", "workflow_id", "workflow_digest", "job_ids", "run_id", "attempt",
+        "trigger_event_id", "actor", "timeout_seconds", "idempotency_key", "issued_at", "expires_at",
+    }
+    requests: dict[str, dict[str, Any]] = {}
+    request_order: list[str] = []
+    initial_request_id = ""
+    initial_content: dict[str, Any] | None = None
+    raw_requests = array(field(section, "requests", path), f"{path}.requests")
+    expect(bool(raw_requests), f"{path}.requests must not be empty")
+    for index, raw_request in enumerate(raw_requests):
+        request_path = f"{path}.requests[{index}]"
+        request_content, kind, request_id, request_pubkey, _, tags = validate_wire_event(
+            raw_request, request_path, require_cursor=False
+        )
+        expect(kind == 46100, f"{request_path}.kind must be 46100")
+        exact_fields(
+            request_content,
+            request_required,
+            {"pr_update_event_id", "parent_attempt", "parent_run_id"},
+            f"{request_path}.content",
+        )
+        expect(request_content["schema_version"] == 1,
+               f"{request_path}.content schema_version must be 1")
+        request_type = text(request_content["request_type"], f"{request_path}.content.request_type")
+        expect(request_type in ("run", "rerun"), f"{request_path}.content request_type is unknown")
+        actor = sha256(request_content["actor"], f"{request_path}.content.actor")
+        expect(request_pubkey == actor, f"{request_path} signer does not match actor")
+        tip_oid = sha40(request_content["tip_oid"], f"{request_path}.content.tip_oid")
+        expect(tip_oid == candidate, f"{request_path}.content tip_oid does not match candidate")
+        base_oid = sha40(request_content["base_oid"], f"{request_path}.content.base_oid")
+        expect(base_oid == base, f"{request_path}.content base_oid does not match top-level base_sha")
+        run_id = run_uuid(request_content["run_id"], f"{request_path}.content.run_id")
+        attempt = positive_integer(request_content["attempt"], f"{request_path}.content.attempt")
+        selected = job_ids(request_content["job_ids"], f"{request_path}.content.job_ids")
+        for name in ("pr_root_event_id", "trigger_event_id"):
+            event_id(request_content[name], f"{request_path}.content.{name}")
+        if "pr_update_event_id" in request_content:
+            event_id(request_content["pr_update_event_id"], f"{request_path}.content.pr_update_event_id")
+        expected_trigger = request_content.get("pr_update_event_id", request_content["pr_root_event_id"])
+        expect(request_content["trigger_event_id"] == expected_trigger,
+               f"{request_path}.content trigger_event_id is not the effective PR event")
+        for name in ("target_repo_a", "workflow_id", "source_clone_url", "immutable_source_ref",
+                     "source_branch", "base_ref", "idempotency_key"):
+            text(request_content[name], f"{request_path}.content.{name}")
+        sha256(request_content["workflow_digest"], f"{request_path}.content.workflow_digest")
+        issued_at = integer(request_content["issued_at"], f"{request_path}.content.issued_at")
+        expires_at = integer(request_content["expires_at"], f"{request_path}.content.expires_at")
+        positive_integer(request_content["timeout_seconds"], f"{request_path}.content.timeout_seconds")
+        expect(0 <= issued_at < expires_at, f"{request_path}.content expiry is invalid")
+        validate_ci_tags(tags, channel_id, request_content, kind, f"{request_path}.content")
+        if request_type == "run":
+            expect(attempt == 1 and "parent_attempt" not in request_content
+                   and "parent_run_id" not in request_content,
+                   f"{request_path}.content run must be attempt one without a parent")
+            expect(initial_content is None, f"{path} must contain exactly one initial request")
+            initial_content = request_content
+            initial_request_id = request_id
+        else:
+            expect(len(selected) == 1 and attempt > 1,
+                   f"{request_path}.content rerun must select one job after attempt one")
+            parent_attempt = positive_integer(request_content.get("parent_attempt"),
+                                              f"{request_path}.content.parent_attempt")
+            expect(attempt == parent_attempt + 1,
+                   f"{request_path}.content rerun parent_attempt is not contiguous")
+            expect(request_content.get("parent_run_id") == run_id,
+                   f"{request_path}.content rerun parent_run_id mismatch")
+        expect(request_id not in requests, f"{request_path}.id is duplicated")
+        requests[request_id] = request_content
+        request_order.append(request_id)
+
+    expect(initial_content is not None, f"{path} has no initial run request")
+    expect(requests[request_order[0]]["request_type"] == "run",
+           f"{path} initial run request must be first")
+    immutable_request_fields = (
+        "target_repo_a", "pr_root_event_id", "pr_update_event_id", "source_clone_url",
+        "immutable_source_ref", "tip_oid", "source_branch", "base_ref", "base_oid",
+        "workflow_id", "workflow_digest", "run_id", "trigger_event_id",
+    )
+    for request_content in requests.values():
+        for name in immutable_request_fields:
+            expect(request_content.get(name) == initial_content.get(name),
+                   f"{path} rerun request changed immutable {name}")
+
+    target_repo_a = initial_content["target_repo_a"]
+    tip_oid = initial_content["tip_oid"]
+    base_oid = initial_content["base_oid"]
+    workflow_id = initial_content["workflow_id"]
+    workflow_digest = initial_content["workflow_digest"]
+    selected_jobs = initial_content["job_ids"]
+    run_id = initial_content["run_id"]
+    actor = initial_content["actor"]
+    for request_id_value in request_order[1:]:
+        if requests[request_id_value]["request_type"] == "rerun":
+            expect(requests[request_id_value]["job_ids"][0] in selected_jobs,
+                   f"{path} rerun request selected an unknown initial job")
+
+    raw_events = array(field(section, "events", path), f"{path}.events")
+    expect(bool(raw_events), f"{path}.events must not be empty")
+    observed_ids = set(requests)
+    observed_kinds: set[int] = set()
+    observed_signers: set[str] = set()
+    cursors: list[int] = []
+    run_histories: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    job_histories: dict[tuple[str, int], list[tuple[int, dict[str, Any]]]] = {}
+    log_events: dict[str, tuple[str, int, int]] = {}
+    artifact_events: dict[str, tuple[str, int, int]] = {}
+    finalized: tuple[int, dict[str, Any]] | None = None
+    teardown: tuple[int, dict[str, Any]] | None = None
+
+    common = {"schema_version", "request_event_id", "run_id", "workflow_id", "target_repo_a", "tip_oid"}
+    for index, raw_event in enumerate(raw_events):
+        event_path = f"{path}.events[{index}]"
+        content, kind, current_id, pubkey, cursor, tags = validate_wire_event(
+            raw_event, event_path, require_cursor=True
+        )
+        expect(kind in CI_EVENT_KINDS, f"{event_path}.kind is not a promotion history kind")
+        observed_kinds.add(kind)
+        expect(current_id not in observed_ids, f"{event_path}.event_id is duplicated")
+        observed_ids.add(current_id)
+        observed_signers.add(pubkey)
+        expect(pubkey in authorized, f"{event_path} signer is not authorized")
+        assert cursor is not None
+        cursors.append(cursor)
+        content_path = f"{event_path}.content"
+
+        if kind == 46101:
+            required = common | {"base_oid", "attempt", "sequence", "state", "job_ids", "relay_signer"}
+            optional = {"conclusion", "reason", "started_at", "finished_at"}
+        elif kind == 46102:
+            required = common | {
+                "base_oid", "job_id", "name", "attempt", "sequence", "state", "required",
+                "skip_policy", "selected_job_instance", "also_reruns", "artifact_refs", "relay_signer",
+            }
+            optional = {"parent_attempt", "conclusion", "reason", "started_at", "finished_at", "log_ref"}
+        elif kind == 46103:
+            required = common | {
+                "job_id", "attempt", "log_sha256", "byte_length", "cap_bytes", "truncated",
+                "created_at", "relay_signer",
+            }
+            optional = {"url", "inline"}
+        elif kind == 46104:
+            required = common | {
+                "job_id", "attempt", "artifact_id", "name", "media_type", "sha256",
+                "byte_length", "url", "created_at", "relay_signer",
+            }
+            optional = set()
+        elif kind == 46105:
+            required = common | {"attempt", "finalized_job_attempts", "finalized_at", "relay_signer"}
+            optional = set()
+        else:
+            required = common | {
+                "base_oid", "workflow_digest", "attempt", "leases", "lease_empty", "teardown_at",
+                "relay_signer",
+            }
+            optional = set()
+        exact_fields(content, required, optional, content_path)
+        expect(field(content, "schema_version", content_path) == 1,
+               f"{content_path}.schema_version must be 1")
+        request_event_id = event_id(field(content, "request_event_id", content_path),
+                                    f"{content_path}.request_event_id")
+        expect(request_event_id in requests, f"{content_path} request_event_id is not a signed request")
+        bound_request = requests[request_event_id]
+        expect(run_uuid(field(content, "run_id", content_path), f"{content_path}.run_id") == run_id,
+               f"{content_path} run_id mismatch")
+        expect(text(field(content, "workflow_id", content_path), f"{content_path}.workflow_id") == workflow_id,
+               f"{content_path} workflow_id mismatch")
+        expect(text(field(content, "target_repo_a", content_path),
+                    f"{content_path}.target_repo_a") == target_repo_a,
+               f"{content_path} repository coordinate mismatch")
+        expect(sha40(field(content, "tip_oid", content_path), f"{content_path}.tip_oid") == tip_oid,
+               f"{content_path} tip_oid mismatch")
+        expect(sha256(field(content, "relay_signer", content_path),
+                      f"{content_path}.relay_signer") == pubkey,
+               f"{content_path} relay_signer does not match event pubkey")
+        if "base_oid" in content:
+            expect(sha40(content["base_oid"], f"{content_path}.base_oid") == base_oid,
+                   f"{content_path} base_oid mismatch")
+            expect(content["base_oid"] == base, f"{content_path} base_oid does not match top-level base_sha")
+        if "workflow_digest" in content:
+            expect(sha256(content["workflow_digest"], f"{content_path}.workflow_digest") == workflow_digest,
+                   f"{content_path} workflow_digest mismatch")
+        attempt = positive_integer(content["attempt"], f"{content_path}.attempt")
+        expect(bound_request["attempt"] == attempt,
+               f"{content_path} attempt does not match signed request")
+        validate_ci_tags(tags, channel_id, content, kind, content_path)
+
+        if kind == 46101:
+            job_ids(content["job_ids"], f"{content_path}.job_ids")
+            state = text(content["state"], f"{content_path}.state")
+            expect(state in RUN_STATES, f"{content_path}.state is unknown")
+            run_histories.setdefault(request_event_id, []).append((cursor, content))
+        elif kind == 46102:
+            job_id_value = text(content["job_id"], f"{content_path}.job_id")
+            expect(job_id_value in selected_jobs, f"{content_path}.job_id was not requested")
+            state = text(content["state"], f"{content_path}.state")
+            expect(state in JOB_STATES, f"{content_path}.state is unknown")
+            expect(isinstance(content["required"], bool), f"{content_path}.required must be boolean")
+            expect(content["skip_policy"] in ("allow", "forbid"), f"{content_path}.skip_policy is unknown")
+            text(content["selected_job_instance"], f"{content_path}.selected_job_instance")
+            refs = array(content["artifact_refs"], f"{content_path}.artifact_refs")
+            expect(len(refs) == len(set(refs)), f"{content_path}.artifact_refs are duplicated")
+            fanout = [text(value, f"{content_path}.also_reruns[]")
+                      for value in array(content["also_reruns"], f"{content_path}.also_reruns")]
+            expect(len(fanout) == len(set(fanout)) and job_id_value not in fanout,
+                   f"{content_path}.also_reruns is invalid")
+            expect(all(JOB_ID.fullmatch(value) is not None and value in selected_jobs for value in fanout),
+                   f"{content_path}.also_reruns contains an unknown job")
+            job_histories.setdefault((job_id_value, attempt), []).append((cursor, content))
+        elif kind == 46103:
+            job_id_value = text(content["job_id"], f"{content_path}.job_id")
+            expect(job_id_value in selected_jobs, f"{content_path}.job_id was not requested")
+            expect(("url" in content) != ("inline" in content),
+                   f"{content_path} must contain exactly one of url or inline")
+            if "url" in content:
+                expected_path = (
+                    f"/ci/logs/{request_event_id}/{run_id}/{job_id_value}/{attempt}/"
+                    f"{content['log_sha256']}"
+                )
+                validate_relay_evidence_url(
+                    content["url"], relay_origin, expected_path, f"{content_path}.url"
+                )
+            expect(field(content, "truncated", content_path) is False, f"{content_path} is truncated")
+            byte_length = positive_integer(content["byte_length"], f"{content_path}.byte_length")
+            expect(byte_length <= positive_integer(content["cap_bytes"], f"{content_path}.cap_bytes"),
+                   f"{content_path} exceeds its byte cap")
+            log_digest = sha256(content["log_sha256"], f"{content_path}.log_sha256")
+            log_events[current_id] = (job_id_value, attempt, integer(content["created_at"],
+                                                                     f"{content_path}.created_at"))
+            decoded_logs = obj(field(section, "decoded_logs", path), f"{path}.decoded_logs")
+            expect(current_id in decoded_logs, f"{content_path} has no decoded log evidence")
+            encoded = text(decoded_logs[current_id], f"{path}.decoded_logs.{current_id}")
+            try:
+                decoded = base64.b64decode(encoded, validate=True)
+            except ValueError:
+                refuse(f"{path}.decoded_logs.{current_id} is not canonical base64")
+            expect(base64.b64encode(decoded).decode() == encoded,
+                   f"{path}.decoded_logs.{current_id} is not canonical base64")
+            expect(len(decoded) == byte_length, f"{content_path} decoded log byte length mismatch")
+            expect(hashlib.sha256(decoded).hexdigest() == log_digest,
+                   f"{content_path} decoded log digest mismatch")
+        elif kind == 46104:
+            job_id_value = text(content["job_id"], f"{content_path}.job_id")
+            expect(job_id_value in selected_jobs, f"{content_path}.job_id was not requested")
+            artifact_digest = sha256(content["sha256"], f"{content_path}.sha256")
+            positive_integer(content["byte_length"], f"{content_path}.byte_length")
+            for name in ("artifact_id", "name", "media_type"):
+                text(content[name], f"{content_path}.{name}")
+            expected_path = (
+                f"/ci/artifacts/{request_event_id}/{run_id}/{job_id_value}/{attempt}/"
+                f"{content['artifact_id']}/{artifact_digest}"
+            )
+            validate_relay_evidence_url(
+                content["url"], relay_origin, expected_path, f"{content_path}.url"
+            )
+            artifact_events[current_id] = (job_id_value, attempt, integer(content["created_at"],
+                                                                          f"{content_path}.created_at"))
+        elif kind == 46105:
+            expect(finalized is None, f"{path} has more than one kind 46105 event")
+            finalized = (cursor, content)
+        else:
+            expect(teardown is None, f"{path} has more than one kind 46106 event")
+            teardown = (cursor, content)
+
+    expect(set(obj(field(section, "decoded_logs", path), f"{path}.decoded_logs")) == set(log_events),
+           f"{path}.decoded_logs does not exactly match signed log events")
+    expect(cursors == list(range(1, len(cursors) + 1)), f"{path}.events watch cursors are not gap-free")
+    expect(observed_kinds == CI_EVENT_KINDS,
+           f"{path}.events kind coverage must deduplicate to 46101 through 46106")
+    expect(len(observed_signers) == 1, f"{path}.events must bind one relay signer")
+    relay_signer = next(iter(observed_signers))
+    expect(finalized is not None and teardown is not None,
+           f"{path}.events must contain one kind 46105 and one kind 46106 fact")
+
+    selected_attempts: dict[str, int] = {}
+    job_attempt_ranges: dict[str, list[int]] = {}
+    job_request_ids: dict[tuple[str, int], str] = {}
+    job_terminals: dict[tuple[str, int], dict[str, Any]] = {}
+    immutable_manifests: dict[str, tuple[Any, ...]] = {}
+    for job_id_value in selected_jobs:
+        job_attempts = sorted(attempt for job, attempt in job_histories if job == job_id_value)
+        expect(bool(job_attempts), f"{path} has no status stream for job {job_id_value}")
+        expect(job_attempts == list(range(1, job_attempts[-1] + 1)),
+               f"{path} job {job_id_value} attempt lineage is not contiguous")
+        job_attempt_ranges[job_id_value] = job_attempts
+        selected_attempts[job_id_value] = job_attempts[-1]
+        for attempt in job_attempts:
+            history_path = f"{path} job {job_id_value} attempt {attempt}"
+            ordered_history = sorted(job_histories[(job_id_value, attempt)])
+            manifest_fields = ("name", "required", "skip_policy", "selected_job_instance",
+                               "parent_attempt", "also_reruns")
+            manifest = tuple(json.dumps(item[1].get(name), sort_keys=True) for item in ordered_history
+                             for name in manifest_fields)
+            width = len(manifest_fields)
+            expect(all(manifest[offset:offset + width] == manifest[:width]
+                       for offset in range(0, len(manifest), width)),
+                   f"{history_path} changed its immutable job manifest")
+            stable_manifest = tuple(ordered_history[0][1].get(name)
+                                    for name in ("name", "required", "skip_policy", "selected_job_instance"))
+            if job_id_value in immutable_manifests:
+                expect(immutable_manifests[job_id_value] == stable_manifest,
+                       f"{history_path} changed its immutable job manifest across attempts")
+            else:
+                immutable_manifests[job_id_value] = stable_manifest
+            parent_attempt = ordered_history[0][1].get("parent_attempt")
+            if attempt == 1:
+                expect(parent_attempt is None, f"{history_path} attempt one has a parent_attempt")
+            else:
+                expect(parent_attempt == attempt - 1,
+                       f"{history_path} parent_attempt is not contiguous")
+            terminal = validate_status_history(job_histories[(job_id_value, attempt)],
+                                               JOB_TRANSITIONS, history_path)
+            terminal_content = ordered_history[-1][1]
+            expect(terminal_content.get("conclusion") == terminal,
+                   f"{history_path} terminal outcome does not match state")
+            request_ids = {item[1]["request_event_id"] for item in ordered_history}
+            expect(len(request_ids) == 1,
+                   f"{history_path} is not bound to one signed request")
+            job_request_ids[(job_id_value, attempt)] = next(iter(request_ids))
+            job_terminals[(job_id_value, attempt)] = terminal_content
+            if attempt < job_attempts[-1]:
+                expect(terminal == "failure", f"{history_path} must fail before a rerun")
+
+    evolving_attempts = {job: 1 for job in selected_jobs}
+    for request_index, request_id_value in enumerate(request_order):
+        request_content = requests[request_id_value]
+        attempt = request_content["attempt"]
+        observed_jobs = {
+            job for (job, _), request_id_for_job in job_request_ids.items()
+            if request_id_for_job == request_id_value
+        }
+        if request_index == 0:
+            expect(observed_jobs == set(selected_jobs), f"{path} attempt one job graph mismatch")
+        else:
+            selected_job = request_content["job_ids"][0]
+            parent_attempt = request_content["parent_attempt"]
+            expect(evolving_attempts[selected_job] == parent_attempt,
+                   f"{path} rerun parent_attempt is stale for selected job")
+            expect((selected_job, attempt) in job_histories,
+                   f"{path} rerun request has no selected job history")
+            selected_history = sorted(job_histories[(selected_job, attempt)])
+            fanout = set(selected_history[0][1]["also_reruns"])
+            expect(observed_jobs == {selected_job} | fanout,
+                   f"{path} rerun fanout does not match signed selected job history")
+            expect((selected_job, parent_attempt) in job_terminals,
+                   f"{path} rerun request has no parent job history")
+            prior = job_terminals[(selected_job, parent_attempt)]
+            expect(prior["state"] == "failure",
+                   f"{path} rerun parent job is not a terminal failure")
+            for job in observed_jobs:
+                expect(evolving_attempts[job] == attempt - 1,
+                       f"{path} rerun fanout does not advance each job contiguously")
+                evolving_attempts[job] = attempt
+        for job in observed_jobs:
+            history = job_histories[(job, attempt)]
+            expect(all(item[1]["request_event_id"] == request_id_value for item in history),
+                   f"{path} job history is not bound to its signed request")
+        run_jobs = [job_ids(item[1]["job_ids"], f"{path} run request {request_index}.job_ids")
+                    for item in run_histories.get(request_id_value, [])]
+        expect(bool(run_jobs) and all(set(value) == observed_jobs for value in run_jobs),
+               f"{path} run job manifest does not match the selected attempt graph")
+        expect(all(item[1]["request_event_id"] == request_id_value
+                   for item in run_histories[request_id_value]),
+               f"{path} run history is not bound to its signed request")
+    expect(evolving_attempts == selected_attempts,
+           f"{path} request lineage does not select the final per-job attempt graph")
+
+    maximum_attempt = max(selected_attempts.values())
+    expect(set(run_histories) == set(request_order),
+           f"{path} run history does not exactly match signed requests")
+    terminal_run: tuple[int, dict[str, Any]] | None = None
+    for request_index, request_id_value in enumerate(request_order):
+        attempt = requests[request_id_value]["attempt"]
+        history_path = f"{path} run request {request_index} attempt {attempt}"
+        terminal_state = validate_status_history(
+            run_histories[request_id_value], RUN_TRANSITIONS, history_path
+        )
+        terminal_content_for_attempt = sorted(run_histories[request_id_value])[-1][1]
+        expect(terminal_content_for_attempt.get("conclusion") == terminal_state,
+               f"{history_path} terminal outcome does not match state")
+        if request_index < len(request_order) - 1:
+            expect(terminal_state == "failure", f"{history_path} must fail before a rerun")
+        else:
+            expect(terminal_state == expected_run_state,
+                   f"{history_path} must conclude {expected_run_state}")
+            terminal_run = sorted(run_histories[request_id_value])[-1]
+    expect(terminal_run is not None, f"{path} has no final terminal run")
+
+    final_job_states = {
+        job: sorted(job_histories[(job, attempt)])[-1][1]
+        for job, attempt in selected_attempts.items()
+    }
+    if expected_run_state == "success":
+        for job, terminal_content in final_job_states.items():
+            terminal_good = terminal_content["state"] == "success" or (
+                terminal_content["state"] == "skipped" and terminal_content["skip_policy"] == "allow"
+            )
+            expect(terminal_good, f"{path} final job {job} is not terminal-good")
+    else:
+        expect(any(content["state"] == "failure" for content in final_job_states.values()),
+               f"{path} deliberate-red evidence has no failed final job")
+
+    finalized_cursor, finalized_content = finalized
+    expect(finalized_content["request_event_id"] == request_order[-1],
+           f"{path} kind 46105 is not bound to the final signed request")
+    expect(positive_integer(finalized_content["attempt"], f"{path}.kind46105.attempt") == maximum_attempt,
+           f"{path} kind 46105 top-level attempt mismatch")
+    finalized_entries = array(finalized_content["finalized_job_attempts"],
+                              f"{path}.kind46105.finalized_job_attempts")
+    finalized_graph: dict[str, int] = {}
+    used_logs: set[str] = set()
+    used_artifacts: set[str] = set()
+    finalized_at = integer(finalized_content["finalized_at"], f"{path}.kind46105.finalized_at")
+    for index, raw_entry in enumerate(finalized_entries):
+        entry_path = f"{path}.kind46105.finalized_job_attempts[{index}]"
+        entry = obj(raw_entry, entry_path)
+        exact_fields(entry, {"job_id", "attempt", "log_ref", "artifact_refs"}, set(), entry_path)
+        job_id_value = text(entry["job_id"], f"{entry_path}.job_id")
+        attempt = positive_integer(entry["attempt"], f"{entry_path}.attempt")
+        expect(job_id_value not in finalized_graph, f"{entry_path} duplicates a job")
+        finalized_graph[job_id_value] = attempt
+        log_ref = event_id(entry["log_ref"], f"{entry_path}.log_ref")
+        expect(log_ref in log_events and log_events[log_ref][:2] == (job_id_value, attempt),
+               f"{entry_path}.log_ref is not bound to the selected job attempt")
+        expect(log_ref not in used_logs, f"{entry_path}.log_ref is duplicated")
+        used_logs.add(log_ref)
+        expect(log_events[log_ref][2] <= finalized_at, f"{entry_path}.log_ref was not stored before finalization")
+        refs = [event_id(value, f"{entry_path}.artifact_refs[]")
+                for value in array(entry["artifact_refs"], f"{entry_path}.artifact_refs")]
+        expect(len(refs) == len(set(refs)), f"{entry_path}.artifact_refs are duplicated")
+        for ref in refs:
+            expect(ref in artifact_events and artifact_events[ref][:2] == (job_id_value, attempt),
+                   f"{entry_path}.artifact_refs is not bound to the selected job attempt")
+            expect(ref not in used_artifacts, f"{entry_path}.artifact_refs contains a reused event")
+            expect(artifact_events[ref][2] <= finalized_at,
+                   f"{entry_path}.artifact_refs was not stored before finalization")
+            used_artifacts.add(ref)
+    expect(finalized_graph == selected_attempts, f"{path} kind 46105 selected job-attempt graph mismatch")
+    expect(used_logs == set(log_events), f"{path} kind 46105 does not bind every log event exactly once")
+    expect(used_artifacts == set(artifact_events),
+           f"{path} kind 46105 does not bind every artifact event exactly once")
+
+    teardown_cursor, teardown_content = teardown
+    expect(teardown_content["request_event_id"] == request_order[-1],
+           f"{path} kind 46106 is not bound to the final signed request")
+    expect(positive_integer(teardown_content["attempt"], f"{path}.kind46106.attempt") == maximum_attempt,
+           f"{path} kind 46106 top-level attempt mismatch")
+    expect(teardown_content["lease_empty"] is True, f"{path} kind 46106 lease_empty must be true")
+    leases = array(teardown_content["leases"], f"{path}.kind46106.leases")
+    lease_tuples: list[tuple[str, int, str]] = []
+    for index, raw_lease in enumerate(leases):
+        lease_path = f"{path}.kind46106.leases[{index}]"
+        lease = obj(raw_lease, lease_path)
+        exact_fields(lease, {"job_id", "attempt", "lease_id"}, set(), lease_path)
+        lease_tuples.append((text(lease["job_id"], f"{lease_path}.job_id"),
+                             positive_integer(lease["attempt"], f"{lease_path}.attempt"),
+                             text(lease["lease_id"], f"{lease_path}.lease_id")))
+    expect(lease_tuples == sorted(lease_tuples), f"{path} kind 46106 leases are not strictly ordered")
+    expect(len(lease_tuples) == len(set(lease_tuples)), f"{path} kind 46106 leases are duplicated")
+    expect(len({item[2] for item in lease_tuples}) == len(lease_tuples),
+           f"{path} kind 46106 lease IDs are duplicated")
+    expect({(job, attempt) for job, attempt, _ in lease_tuples} == set(selected_attempts.items()),
+           f"{path} kind 46106 lease graph does not match selected job attempts")
+
+    terminal_cursor, terminal_content = terminal_run
+    expect(finalized_cursor < terminal_cursor and teardown_cursor < terminal_cursor,
+           f"{path} terminal run was stored before kind 46105 and kind 46106")
+    finished_at = integer(field(terminal_content, "finished_at", f"{path}.terminal_success"),
+                          f"{path}.terminal_success.finished_at")
+    teardown_at = integer(teardown_content["teardown_at"], f"{path}.kind46106.teardown_at")
+    expect(finished_at >= finalized_at and finished_at >= teardown_at,
+           f"{path} terminal run timestamp precedes evidence or teardown")
+    return {
+        "request_event_id": request_event_id,
+        "initial_request_event_id": initial_request_id,
+        "request_event_ids": request_order,
+        "rerun_request_event_ids": request_order[1:],
+        "run_id": run_id,
+        "actor": actor,
+        "relay_signer": relay_signer,
+        "target_repo_a": target_repo_a,
+        "workflow_id": workflow_id,
+        "workflow_digest": workflow_digest,
+        "job_ids": selected_jobs,
+        "selected_job_attempts": selected_attempts,
+        "tip_oid": tip_oid,
+        "base_oid": base_oid,
+        "attempts": sorted({requests[request_id]["attempt"] for request_id in request_order}),
+        "job_attempts": {
+            job: job_attempt_ranges[job] for job in sorted(job_attempt_ranges)
+        },
+        "terminal_events": 1,
+        "log_digests": sorted(
+            sha256(json.loads(event["content"])["log_sha256"], f"{path}.log_digest")
+            for event in raw_events if event["kind"] == 46103
+        ),
+    }
+
+
+def validate_staging(section: dict[str, Any], candidate: str, base: str) -> dict[str, Any]:
     path = "staging"
+    exact_fields(section, {
+        "candidate_sha", "absent_policy_status", "configured_policy_status", "root_executor_handoff",
+        "advertised_bounds_sha256", "enforced_bounds_sha256", "scenarios", "event_evidence", "log",
+    }, set(), path)
     expect(sha40(field(section, "candidate_sha", path), f"{path}.candidate_sha") == candidate,
            "staging candidate mismatch")
     expect(integer(field(section, "absent_policy_status", path), f"{path}.absent_policy_status") == 503,
@@ -388,86 +1224,123 @@ def validate_staging(section: dict[str, Any], candidate: str) -> dict[str, Any]:
     expect(set(scenarios) == required_scenarios, "staging scenarios are incomplete or unknown")
     expect(all(scenarios[name] == "PASS" for name in required_scenarios),
            "a staging scenario did not pass")
-    expect(sha40(field(section, "immutable_request_sha", path), f"{path}.immutable_request_sha") == candidate,
-           "immutable request retrieval did not bind candidate")
-    records = array(field(section, "records", path), f"{path}.records")
-    expect(records == RECORD_KINDS, "staging must record kinds 46101 through 46106 exactly once")
-    signer = sha256(field(section, "signer", path), f"{path}.signer")
-    expect(field(section, "conclusion", path) == "success", "staging conclusion must be success")
+    event_evidence = validate_ci_event_evidence(
+        obj(field(section, "event_evidence", path), f"{path}.event_evidence"), candidate, base,
+        f"{path}.event_evidence", "success",
+    )
     log = validate_log_auth(obj(field(section, "log", path), f"{path}.log"), f"{path}.log")
+    expect(log["sha256"] in event_evidence["log_digests"],
+           "staging authenticated log is not bound to signed decoded log evidence")
     return {
-        "signer": signer,
-        "job_set_sha256": sha256(field(section, "job_set_sha256", path), f"{path}.job_set_sha256"),
-        "evidence_sha256": sha256(field(section, "evidence_sha256", path), f"{path}.evidence_sha256"),
-        "teardown_sha256": sha256(field(section, "teardown_sha256", path), f"{path}.teardown_sha256"),
+        **event_evidence,
         "log": log,
     }
 
 
-def validate_retry(section: dict[str, Any], path: str) -> dict[str, Any]:
-    request_id = text(field(section, "request_id", path), f"{path}.request_id")
-    first = text(field(section, "first_run_id", path), f"{path}.first_run_id")
-    duplicate = text(field(section, "duplicate_run_id", path), f"{path}.duplicate_run_id")
+def validate_retry(section: dict[str, Any], event_evidence: dict[str, Any], path: str) -> dict[str, Any]:
+    exact_fields(section, {
+        "request_id", "rerun_request_id", "first_run_id", "duplicate_run_id", "attempts",
+        "workspaces", "terminal_events",
+    }, set(), path)
+    request_id = event_id(field(section, "request_id", path), f"{path}.request_id")
+    expect(request_id == event_evidence["initial_request_event_id"],
+           f"{path} request_id is not the canonical signed initial request")
+    rerun_request_id = event_id(field(section, "rerun_request_id", path), f"{path}.rerun_request_id")
+    expect(event_evidence["rerun_request_event_ids"] == [rerun_request_id],
+           f"{path} rerun_request_id is not the canonical signed rerun request")
+    first = run_uuid(field(section, "first_run_id", path), f"{path}.first_run_id")
+    duplicate = run_uuid(field(section, "duplicate_run_id", path), f"{path}.duplicate_run_id")
     expect(first == duplicate, f"{path} duplicate request created a second run")
     attempts = array(field(section, "attempts", path), f"{path}.attempts")
     expect(attempts == [1, 2], f"{path} must prove bounded attempts 1 and 2")
+    expect(attempts == event_evidence["attempts"],
+           f"{path} attempts do not match canonical signed rerun lineage")
     workspaces = array(field(section, "workspaces", path), f"{path}.workspaces")
     expect(len(workspaces) == 2 and len(set(workspaces)) == 2,
            f"{path} retry attempts must use distinct workspaces")
     expect(integer(field(section, "terminal_events", path), f"{path}.terminal_events") == 1,
            f"{path} must publish one terminal event")
+    expect(first == event_evidence["run_id"],
+           f"{path} run_id does not match canonical signed event evidence")
     return {"request_id": request_id, "run_id": first, "attempts": attempts}
 
 
-def validate_canary(section: dict[str, Any], candidate: str, staging: dict[str, Any]) -> dict[str, Any]:
+def validate_canary(
+    section: dict[str, Any], candidate: str, base: str, staging: dict[str, Any]
+) -> dict[str, Any]:
     path = "production_canary"
+    exact_fields(section, {"candidate_sha", "accepted_executed", "unaccepted_refused", "event_evidence", "retry"},
+                 set(), path)
     expect(sha40(field(section, "candidate_sha", path), f"{path}.candidate_sha") == candidate,
            "production canary candidate mismatch")
-    expect(integer(field(section, "initial_concurrency", path), f"{path}.initial_concurrency") == 0,
-           "production canary must start at concurrency zero")
-    expect(integer(field(section, "enabled_concurrency", path), f"{path}.enabled_concurrency") == 1,
-           "production canary must enable exactly one slot")
     expect(boolean(field(section, "accepted_executed", path), f"{path}.accepted_executed"),
            "accepted code path did not execute")
     expect(boolean(field(section, "unaccepted_refused", path), f"{path}.unaccepted_refused"),
            "unaccepted code path was not refused")
-    expect(boolean(field(section, "signed", path), f"{path}.signed"), "canary records were not signed")
-    expect(boolean(field(section, "allowed_kinds_only", path), f"{path}.allowed_kinds_only"),
-           "canary accepted a record kind outside signed policy")
-    expect(array(field(section, "records", path), f"{path}.records") == RECORD_KINDS,
-           "canary must record kinds 46101 through 46106 exactly once")
-    signer = sha256(field(section, "signer", path), f"{path}.signer")
-    expect(signer == staging["signer"], "staging and canary signer identities differ")
-    expect(field(section, "conclusion", path) == "success", "production canary must conclude success")
-    retry = validate_retry(obj(field(section, "retry", path), f"{path}.retry"), f"{path}.retry")
+    event_evidence = validate_ci_event_evidence(
+        obj(field(section, "event_evidence", path), f"{path}.event_evidence"), candidate, base,
+        f"{path}.event_evidence", "success",
+    )
+    parity_fields = ("target_repo_a", "workflow_id", "workflow_digest", "job_ids", "relay_signer")
+    for name in parity_fields:
+        expect(event_evidence[name] == staging[name], f"staging/canary parity mismatch for {name}")
+    retry = validate_retry(obj(field(section, "retry", path), f"{path}.retry"),
+                           event_evidence, f"{path}.retry")
     return {
-        "run_id": text(field(section, "run_id", path), f"{path}.run_id"),
-        "signer": signer,
-        "log_sha256": sha256(field(section, "log_sha256", path), f"{path}.log_sha256"),
-        "evidence_sha256": sha256(field(section, "evidence_sha256", path), f"{path}.evidence_sha256"),
-        "teardown_sha256": sha256(field(section, "teardown_sha256", path), f"{path}.teardown_sha256"),
+        **event_evidence,
         "retry": retry,
     }
 
 
-def validate_deliberate_red(section: dict[str, Any], candidate: str) -> dict[str, Any]:
+def validate_deliberate_red(
+    section: dict[str, Any], candidate: str, base: str, canary: dict[str, Any],
+    protected_contexts: list[str]
+) -> dict[str, Any]:
     path = "deliberate_red"
+    exact_fields(section, {
+        "system_sha", "red_sha", "accepted_commit", "required_check", "conclusion", "merge_allowed",
+        "protected_rule", "terminal_events", "first_run_id", "duplicate_run_id", "parity",
+        "event_evidence",
+    }, set(), path)
     expect(sha40(field(section, "system_sha", path), f"{path}.system_sha") == candidate,
            "deliberate-red system SHA mismatch")
     red_sha = sha40(field(section, "red_sha", path), f"{path}.red_sha")
     expect(red_sha != candidate, "deliberate-red commit must differ from system candidate")
     expect(boolean(field(section, "accepted_commit", path), f"{path}.accepted_commit"),
            "deliberate-red commit must be accepted before execution")
-    expect(text(field(section, "required_check", path), f"{path}.required_check"),
-           "deliberate-red required check is missing")
+    required_check = text(field(section, "required_check", path), f"{path}.required_check")
+    expect(required_check in protected_contexts,
+           "deliberate-red required check is not one of the protected exact-head contexts")
     expect(field(section, "conclusion", path) == "failure", "deliberate-red run must fail")
     expect(field(section, "merge_allowed", path) is False, "deliberate-red commit did not block merge")
     expect(field(section, "protected_rule", path) is True, "deliberate-red check was not protected")
     expect(integer(field(section, "terminal_events", path), f"{path}.terminal_events") == 1,
            "deliberate-red run must publish one terminal event")
-    first = text(field(section, "first_run_id", path), f"{path}.first_run_id")
-    expect(text(field(section, "duplicate_run_id", path), f"{path}.duplicate_run_id") == first,
+    event_evidence = validate_ci_event_evidence(
+        obj(field(section, "event_evidence", path), f"{path}.event_evidence"), red_sha, base,
+        f"{path}.event_evidence", "failure",
+    )
+    first = run_uuid(field(section, "first_run_id", path), f"{path}.first_run_id")
+    expect(run_uuid(field(section, "duplicate_run_id", path), f"{path}.duplicate_run_id") == first,
            "deliberate-red duplicate request created a second run")
+    expect(first == event_evidence["run_id"],
+           "deliberate-red run_id does not match canonical signed event evidence")
+    expect(event_evidence["terminal_events"] == 1,
+           "deliberate-red signed history does not contain one final terminal event")
+    parity = obj(field(section, "parity", path), f"{path}.parity")
+    exact_fields(parity, {"target_repo_a", "workflow_id", "workflow_digest", "job_ids", "relay_signer"},
+                 set(), f"{path}.parity")
+    expected = {
+        "target_repo_a": canary["target_repo_a"],
+        "workflow_id": canary["workflow_id"],
+        "workflow_digest": canary["workflow_digest"],
+        "job_ids": canary["job_ids"],
+        "relay_signer": canary["relay_signer"],
+    }
+    expect(parity == expected, "deliberate-red parity does not match the accepted canary contract")
+    for name, expected_value in expected.items():
+        expect(event_evidence[name] == expected_value,
+               f"deliberate-red signed event parity mismatch for {name}")
     return {"red_sha": red_sha, "run_id": first, "merge_blocked": True}
 
 
@@ -553,6 +1426,11 @@ def validate_landing(section: dict[str, Any], candidate: str) -> dict[str, str]:
 
 
 def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_age: int) -> dict[str, Any]:
+    exact_fields(bundle, {
+        "schema_version", "repository", "candidate_sha", "base_sha", "tree_sha", "source",
+        "evidence_files", "protected_ci", "tier2", "artifacts", "staging", "production_canary",
+        "deliberate_red", "deployment", "rollback", "landing",
+    }, set(), "evidence")
     expect(field(bundle, "schema_version", "evidence") == 1, "evidence schema_version must be 1")
     expect(field(bundle, "repository", "evidence") == REPOSITORY, "evidence repository mismatch")
     candidate, base, tree = validate_source(bundle, candidate_dir)
@@ -577,11 +1455,13 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
     contexts = validate_protected_ci(obj(field(bundle, "protected_ci", "evidence"), "protected_ci"), candidate)
     tier2 = validate_tier2(obj(field(bundle, "tier2", "evidence"), "tier2"), candidate, now)
     artifacts = validate_artifacts(obj(field(bundle, "artifacts", "evidence"), "artifacts"), candidate)
-    staging = validate_staging(obj(field(bundle, "staging", "evidence"), "staging"), candidate)
+    staging = validate_staging(obj(field(bundle, "staging", "evidence"), "staging"), candidate, base)
     canary = validate_canary(obj(field(bundle, "production_canary", "evidence"), "production_canary"),
-                             candidate, staging)
-    deliberate_red = validate_deliberate_red(obj(field(bundle, "deliberate_red", "evidence"),
-                                                  "deliberate_red"), candidate)
+                             candidate, base, staging)
+    deliberate_red = validate_deliberate_red(
+        obj(field(bundle, "deliberate_red", "evidence"), "deliberate_red"),
+        candidate, base, canary, contexts,
+    )
     deploy_rollback = validate_deploy_rollback(
         obj(field(bundle, "deployment", "evidence"), "deployment"),
         obj(field(bundle, "rollback", "evidence"), "rollback"), candidate, artifacts,
@@ -608,7 +1488,7 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
             "relay_sha": landing["relay_sha"],
             "mirror_sha": landing["mirror_sha"],
             "merge_sha": landing["merge_sha"],
-            "staging_signer": staging["signer"],
+            "staging_signer": staging["relay_signer"],
             "canary_run_id": canary["run_id"],
             "deliberate_red_sha": deliberate_red["red_sha"],
         },
@@ -621,6 +1501,7 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
             "probes": {"passed_runs": 12, "total_runs": 12},
             "staging": "PASS",
             "production_canary": "PASS",
+            "staging_canary_parity": "PASS",
             "accepted_and_unaccepted_paths": "PASS",
             "idempotent_retries": "PASS",
             "deliberate_red_merge_block": "PASS",
