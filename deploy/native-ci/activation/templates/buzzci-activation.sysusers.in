@@ -1,0 +1,6 @@
+g buzzci-runner @RUNNER_GID@
+u buzzci-runner @RUNNER_UID@:@RUNNER_GID@ "Buzz CI runner" /var/lib/buzzci/runner /usr/sbin/nologin
+g buzzci-controld @CONTROLD_GID@
+u buzzci-controld @CONTROLD_UID@:@CONTROLD_GID@ "Buzz CI controller" /var/lib/buzzci/controld /usr/sbin/nologin
+g buzzci-keyholder @KEYHOLDER_GID@
+u buzzci-keyholder @KEYHOLDER_UID@:@KEYHOLDER_GID@ "Buzz CI keyholder" /var/lib/buzzci/keyholder /usr/sbin/nologin
