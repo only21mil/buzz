@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/runner-package-v1.json",
+  "title": "Buzz CI runner install package v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "package_id",
+    "source_commit",
+    "binary_provenance_sha256",
+    "default_state",
+    "package_uid",
+    "package_gid",
+    "identities",
+    "directories",
+    "entries",
+    "package_digest"
+  ],
+  "properties": {
+    "schema": { "const": "buzz-ci-runner-install-package-v1" },
+    "package_id": { "type": "string", "pattern": "^buzz-ci-runner-[0-9a-f]{12}-[0-9a-f]{12}$" },
+    "source_commit": { "$ref": "#/$defs/gitOid" },
+    "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
+    "default_state": {
+      "const": {
+        "enabled": false,
+        "provisioned": false,
+        "capacity": 0,
+        "host_block": false
+      }
+    },
+    "package_uid": { "const": 0 },
+    "package_gid": { "const": 0 },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "controld"],
+      "properties": {
+        "runner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["user", "group", "uid", "gid"],
+          "properties": {
+            "user": { "const": "buzzci-runner" },
+            "group": { "const": "buzzci-runner" },
+            "uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+            "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+          }
+        },
+        "controld": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["user", "group", "uid", "gid"],
+          "properties": {
+            "user": { "const": "buzzci-controld" },
+            "group": { "const": "buzzci-controld" },
+            "uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+            "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+          }
+        }
+      }
+    },
+    "directories": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/directory" }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "package_digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "gitOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "mode": { "type": "string", "pattern": "^0[4567][0-7]{2}$" },
+    "directory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "mode", "uid", "gid"],
+      "properties": {
+        "target": { "enum": ["/etc/buzzci", "/usr/share/doc/buzz-ci-runner"] },
+        "mode": { "const": "0755" },
+        "uid": { "const": 0 },
+        "gid": { "const": 0 }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"],
+      "properties": {
+        "role": { "enum": ["binary", "config", "service", "socket", "tmpfiles", "documentation"] },
+        "source": { "type": "string", "pattern": "^assets/[A-Za-z0-9._-]+$" },
+        "target": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
+        "source_mode": { "$ref": "#/$defs/mode" },
+        "install_mode": { "$ref": "#/$defs/mode" },
+        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
