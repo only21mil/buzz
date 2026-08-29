@@ -79,27 +79,46 @@ pub enum ControlError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerUidPolicy {
     control_uid: u32,
+    control_gid: u32,
     runner_uid: u32,
+    runner_gid: u32,
 }
 
 impl PeerUidPolicy {
     /// Bind the qualification and ordinary operation families to distinct non-root peers.
     pub fn new(control_uid: u32, runner_uid: u32) -> Result<Self, ControlError> {
-        if control_uid == 0 || runner_uid == 0 || control_uid == runner_uid {
+        Self::new_with_gids(control_uid, control_uid, runner_uid, runner_uid)
+    }
+
+    /// Bind both roles to exact SO_PEERCRED UID and primary GID pairs.
+    pub fn new_with_gids(
+        control_uid: u32,
+        control_gid: u32,
+        runner_uid: u32,
+        runner_gid: u32,
+    ) -> Result<Self, ControlError> {
+        if control_uid == 0
+            || control_gid == 0
+            || runner_uid == 0
+            || runner_gid == 0
+            || control_uid == runner_uid
+        {
             return Err(ControlError::Account(
                 "control and runner UIDs must be distinct and nonzero",
             ));
         }
         Ok(Self {
             control_uid,
+            control_gid,
             runner_uid,
+            runner_gid,
         })
     }
 
-    fn role_for_uid(self, peer_uid: u32) -> Result<PeerRole, ControlError> {
-        if peer_uid == self.control_uid {
+    fn role_for_credentials(self, peer_uid: u32, peer_gid: u32) -> Result<PeerRole, ControlError> {
+        if peer_uid == self.control_uid && peer_gid == self.control_gid {
             Ok(PeerRole::Control)
-        } else if peer_uid == self.runner_uid {
+        } else if peer_uid == self.runner_uid && peer_gid == self.runner_gid {
             Ok(PeerRole::Runner)
         } else {
             Err(ControlError::UnauthorizedPeer)
@@ -441,13 +460,15 @@ pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener,
 /// Resolve the fixed service account used for control-plane peer checks.
 pub fn control_account_uid() -> Result<u32, ControlError> {
     let text = read_account_database()?;
-    parse_control_account(&text)
+    parse_control_account(&text).map(|identity| identity.0)
 }
 
 /// Resolve both dedicated service accounts into the exact socket peer policy.
 pub fn peer_uid_policy() -> Result<PeerUidPolicy, ControlError> {
     let text = read_account_database()?;
-    PeerUidPolicy::new(parse_control_account(&text)?, parse_runner_account(&text)?)
+    let (control_uid, control_gid) = parse_control_account(&text)?;
+    let (runner_uid, runner_gid) = parse_runner_account(&text)?;
+    PeerUidPolicy::new_with_gids(control_uid, control_gid, runner_uid, runner_gid)
 }
 
 fn read_account_database() -> Result<String, ControlError> {
@@ -464,7 +485,7 @@ fn read_account_database() -> Result<String, ControlError> {
         .map_err(|_| ControlError::Account("local account database is not UTF-8"))
 }
 
-fn parse_control_account(text: &str) -> Result<u32, ControlError> {
+fn parse_control_account(text: &str) -> Result<(u32, u32), ControlError> {
     let mut matches = text
         .lines()
         .filter(|line| line.split(':').next() == Some(CONTROL_ACCOUNT));
@@ -490,10 +511,10 @@ fn parse_control_account(text: &str) -> Result<u32, ControlError> {
     if fields[5] != CONTROL_ACCOUNT_HOME || fields[6] != CONTROL_ACCOUNT_SHELL {
         return Err(ControlError::Account("buzzci-ctl login posture is invalid"));
     }
-    Ok(uid)
+    Ok((uid, gid))
 }
 
-fn parse_runner_account(text: &str) -> Result<u32, ControlError> {
+fn parse_runner_account(text: &str) -> Result<(u32, u32), ControlError> {
     let mut matches = text
         .lines()
         .filter(|line| line.split(':').next() == Some(RUNNER_ACCOUNT));
@@ -512,7 +533,7 @@ fn parse_runner_account(text: &str) -> Result<u32, ControlError> {
     let uid = parse_canonical_u32(fields[2])
         .filter(|uid| *uid != 0)
         .ok_or(ControlError::Account("buzzci-runner UID is invalid"))?;
-    parse_canonical_u32(fields[3])
+    let gid = parse_canonical_u32(fields[3])
         .filter(|gid| *gid != 0)
         .ok_or(ControlError::Account("buzzci-runner GID is invalid"))?;
     if fields[6] != RUNNER_ACCOUNT_SHELL {
@@ -520,7 +541,7 @@ fn parse_runner_account(text: &str) -> Result<u32, ControlError> {
             "buzzci-runner login posture is invalid",
         ));
     }
-    Ok(uid)
+    Ok((uid, gid))
 }
 
 fn serve_stream<D: ControlDispatch>(
@@ -531,8 +552,8 @@ fn serve_stream<D: ControlDispatch>(
 ) -> Result<(), ControlError> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let peer_uid = getsockopt(&stream, PeerCredentials).map_err(nix_io)?.uid();
-    let role = peer_policy.role_for_uid(peer_uid)?;
+    let credentials = getsockopt(&stream, PeerCredentials).map_err(nix_io)?;
+    let role = peer_policy.role_for_credentials(credentials.uid(), credentials.gid())?;
     serve_verified_stream(stream, role, dispatch)
 }
 
@@ -1102,6 +1123,25 @@ mod tests {
     }
 
     #[test]
+    fn peer_policy_requires_exact_primary_gid_as_well_as_uid() {
+        let policy = PeerUidPolicy::new_with_gids(961, 971, 962, 972).unwrap();
+        assert_eq!(
+            policy.role_for_credentials(961, 971).unwrap(),
+            PeerRole::Control
+        );
+        assert_eq!(
+            policy.role_for_credentials(962, 972).unwrap(),
+            PeerRole::Runner
+        );
+        for credentials in [(961, 972), (962, 971), (961, 0), (962, 0)] {
+            assert!(matches!(
+                policy.role_for_credentials(credentials.0, credentials.1),
+                Err(ControlError::UnauthorizedPeer)
+            ));
+        }
+    }
+
+    #[test]
     fn peer_roles_are_bound_to_disjoint_operation_families() {
         for operation in [
             Operation::Hello,
@@ -1144,7 +1184,7 @@ mod tests {
     #[test]
     fn control_account_must_match_the_exact_nologin_principal() {
         let exact = "root:x:0:0:root:/root:/bin/bash\nbuzzci-ctl:x:961:961::/var/lib/buzzci/principals/ctl:/usr/sbin/nologin\n";
-        assert_eq!(parse_control_account(exact).unwrap(), 961);
+        assert_eq!(parse_control_account(exact).unwrap(), (961, 961));
         for drift in [
             exact.replace(":961:961:", ":962:961:"),
             exact.replace(":961:961:", ":961:962:"),
@@ -1160,7 +1200,7 @@ mod tests {
     #[test]
     fn runner_account_must_be_unique_nonroot_and_nologin() {
         let exact = "root:x:0:0:root:/root:/bin/bash\nbuzzci-runner:x:972:973::/nonexistent:/usr/sbin/nologin\n";
-        assert_eq!(parse_runner_account(exact).unwrap(), 972);
+        assert_eq!(parse_runner_account(exact).unwrap(), (972, 973));
         for drift in [
             exact.replace(":972:973:", ":0:973:"),
             exact.replace(":972:973:", ":972:0:"),

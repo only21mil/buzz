@@ -738,11 +738,11 @@ where
     pub fn recover_open(&mut self, now: u64) -> Result<(), BindingError> {
         let records = self.journal.list()?;
         for record in records.into_iter().filter(|record| record.needs_recovery()) {
-            match self.host.recover(record)? {
-                HostRecoveryReceipt::CapacityReturned(terminal) => {
+            match self.host.recover(record) {
+                Ok(HostRecoveryReceipt::CapacityReturned(terminal)) => {
                     self.close_record(record, terminal, now)?;
                 }
-                HostRecoveryReceipt::Quarantine => {
+                Ok(HostRecoveryReceipt::Quarantine) | Err(_) => {
                     self.quarantine(record, now)?;
                 }
             }
