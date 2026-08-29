@@ -1,8 +1,9 @@
 # Buzz CI keyholder source package
 
-This directory contains dormant systemd templates for the local signing
-keyholder. Nothing here installs files, creates accounts, loads credentials,
-reloads systemd, enables the socket, or starts the service.
+This directory contains the dormant systemd base templates and an explicit
+acceptance-actor provisioning package for the local signing keyholder. The
+package scripts never create accounts or credentials, read credential bytes,
+reload systemd, enable the socket, or start the service.
 
 The service accepts one bounded request per Unix connection at
 `/run/buzzci/keyholder.sock`. Systemd owns the listener as
@@ -12,8 +13,8 @@ checks the operation against the exact policy in the public config.
 
 ## Public config
 
-`/etc/buzzci/keyholder-v1.json` contains only public values. It uses this closed
-shape:
+`/etc/buzzci/keyholder-v1.json` contains only public values. The dormant shape
+is:
 
 ```json
 {
@@ -45,9 +46,29 @@ timestamp within 60 seconds of the keyholder clock. The three selector public
 keys must be distinct, so a configuration error cannot collapse the signing
 domains onto one credential.
 
+An acceptance package renders one active-only top-level `acceptance` object:
+
+```json
+{
+  "actor": { "public_key": "64 lowercase hex", "generation": 1 },
+  "scenario_sha256": "64 lowercase hex",
+  "run_event": [0, "actor public key", 0, 46100, [], "canonical content"],
+  "grant_event": [0, "actor public key", 0, 46107, [], "canonical content"],
+  "rerun_event": [0, "actor public key", 0, 46100, [], "canonical content"],
+  "tombstone_event": [0, "actor public key", 0, 5, [], ""]
+}
+```
+
+The rendered active peer operation list is exactly the four existing
+operations followed by `describe_acceptance` and
+`sign_acceptance_mutation`. The actor key is distinct from every existing
+selector. Event arrays remain literal JSON values; their event IDs are SHA-256
+over the compact JSON array bytes. The daemon performs the complete
+scenario/template validation before accepting a request.
+
 ## Credentials
 
-The service template uses three `LoadCredentialEncrypted=` entries. Their
+The dormant service template uses three `LoadCredentialEncrypted=` entries. Their
 plaintext values never appear in the unit environment, process arguments,
 config, logs, or error responses. Each decrypted credential must contain
 exactly 32 raw secp256k1 secret-key bytes:
@@ -56,15 +77,53 @@ exactly 32 raw secp256k1 secret-key bytes:
 - `nip98.key`
 - `manifest.key`
 
+The active package adds a separate systemd drop-in with exactly:
+
+```ini
+LoadCredentialEncrypted=acceptance-actor.key:/etc/credstore.encrypted/buzzci-keyholder/acceptance-actor.key
+```
+
+The encrypted source is an external prerequisite owned by root with mode
+`0400`; it is not a package asset. The installer checks only its file metadata
+and size and never opens it. Missing, linked, loose-mode, or wrongly owned
+sources fail closed. The existing three credential mappings remain in the base
+service and never appear in the acceptance drop-in.
+
 The binary opens the systemd credential directory once with `O_NOFOLLOW`, then
 opens these fixed names relative to that descriptor. It rejects links,
 non-regular files, multiple links, wrong lengths, and group- or world-writable
 objects. Error messages identify only the failed class, never the credential,
 path, parser detail, key bytes, request, URL, digest, public key, or signature.
 
-The checked-in unit is not enabled. Creating the dedicated principals,
-installing encrypted credentials and public config, and enabling the socket are
-separate approval-gated activation work.
+The checked-in unit is not enabled. Freezing or installing a package does not
+change that state. Creating the dedicated principals, creating the encrypted
+credential, reloading systemd, and enabling the socket remain separate
+approval-gated activation work.
+
+## Freeze and inspect an acceptance package
+
+The input spec contains only the public peer, three existing selectors,
+NIP-98 origin, actor identity, scenario digest, and four unsigned event arrays.
+It cannot contain an operation list, path, credential selector, or secret.
+
+```bash
+deploy/native-ci/keyholder/freeze_package.py \
+  --source-root "$PWD" \
+  --source-commit "$(git rev-parse HEAD)" \
+  --public-spec /private/path/acceptance-public.json \
+  --output /private/path/keyholder-package \
+  --keyholder-uid 1202 --keyholder-gid 1202 \
+  --controld-uid 1201 --controld-gid 1201
+
+deploy/native-ci/keyholder/install.py verify-package \
+  --package /private/path/keyholder-package
+```
+
+`install.py check` and `install.py install --dry-run` validate the host
+principals and external encrypted credential without mutation. `install`
+copies the public config and static units with exact ownership and modes, but
+does not call systemd. Use `--root` only for a controlled fake root or an
+explicitly approved installation.
 
 ## Targeted checks
 
@@ -76,6 +135,7 @@ python3 deploy/native-ci/package_source.py \
 cargo test -p buzz-ci-keyholder
 cargo check -p buzz-ci-keyholder --all-targets
 cargo clippy -p buzz-ci-keyholder --all-targets -- -D warnings
+python3 -m unittest discover -s deploy/native-ci/keyholder/tests -v
 ```
 
 The source check accepts Git non-executable files materialized as `0600` or
