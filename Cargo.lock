@@ -1021,6 +1021,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-ci-keyholder"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "buzz-ci-materializer"
 version = "0.1.0"
 dependencies = [
