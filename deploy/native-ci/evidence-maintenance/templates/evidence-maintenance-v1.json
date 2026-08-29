@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "page_size": 250,
+  "max_pages": 8,
+  "max_listed_objects": 2000,
+  "max_receipt_bytes": 65536,
+  "max_reported_failures": 20,
+  "timeout_seconds": 120
+}

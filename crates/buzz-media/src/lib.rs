@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod bucket_index;
 pub mod ci_evidence;
+pub mod ci_evidence_maintenance;
 pub mod config;
 pub mod error;
 pub mod storage;
@@ -22,6 +23,10 @@ pub use ci_evidence::{
     prepare_ci_evidence, read_ci_evidence_receipt, validate_ci_evidence_receipt, CiEvidenceBinding,
     CiEvidenceError, CiEvidenceOwner, CiEvidenceReceipt, CiEvidenceRetentionAction,
     PreparedCiEvidence, CI_EVIDENCE_RETENTION_SECONDS, CI_EVIDENCE_TOMBSTONE_SECONDS,
+};
+pub use ci_evidence_maintenance::{
+    maintain_ci_evidence_page, CiEvidenceMaintenanceFailure, CiEvidenceMaintenanceLimits,
+    CiEvidenceMaintenancePage, CiEvidenceMaintenanceStore,
 };
 pub use config::{MediaConfig, S3AddressingStyle};
 pub use error::MediaError;

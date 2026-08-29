@@ -285,6 +285,21 @@ pub fn read_ci_evidence_receipt(
     Ok(stored)
 }
 
+/// Parse a listed receipt, validate all deterministic fields, and require the
+/// listed key to equal the key derived from the embedded immutable binding.
+pub fn read_listed_ci_evidence_receipt(
+    bytes: &[u8],
+    listed_key: &str,
+) -> Result<CiEvidenceReceipt, CiEvidenceError> {
+    let stored: CiEvidenceReceipt =
+        serde_json::from_slice(bytes).map_err(|_| CiEvidenceError::ReceiptConflict)?;
+    stored.validate_binding(&stored.binding)?;
+    if stored.receipt_key != listed_key {
+        return Err(CiEvidenceError::ReceiptConflict);
+    }
+    Ok(stored)
+}
+
 /// CI evidence lifecycle validation failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CiEvidenceError {
@@ -473,6 +488,24 @@ mod tests {
                 .receipt
                 .retention_action(planned.receipt.tombstone_until + 1),
             CiEvidenceRetentionAction::Purge
+        );
+    }
+
+    #[test]
+    fn listed_receipt_must_occupy_its_binding_derived_key() {
+        let bytes = b"artifact";
+        let planned = prepare_ci_evidence(binding(bytes), bytes).expect("plan");
+        assert_eq!(
+            read_listed_ci_evidence_receipt(&planned.receipt_bytes, &planned.receipt.receipt_key)
+                .expect("bound listed receipt"),
+            planned.receipt
+        );
+        assert_eq!(
+            read_listed_ci_evidence_receipt(
+                &planned.receipt_bytes,
+                "_ci/v2/unrelated.receipt.json"
+            ),
+            Err(CiEvidenceError::ReceiptConflict)
         );
     }
 }

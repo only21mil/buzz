@@ -276,10 +276,21 @@ impl MediaStorage {
         continuation_token: Option<String>,
         max_keys: usize,
     ) -> Result<crate::bucket_index::Page, MediaError> {
+        self.list_prefix_page("", continuation_token, max_keys)
+            .await
+    }
+
+    /// Return one bounded page under an exact storage prefix.
+    pub async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<String>,
+        max_keys: usize,
+    ) -> Result<crate::bucket_index::Page, MediaError> {
         let (result, _status) = self
             .bucket
             .list_page(
-                String::new(),
+                prefix.to_owned(),
                 None,
                 continuation_token,
                 None,

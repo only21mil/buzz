@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/evidence-maintenance-config-v1.json",
+  "title": "Buzz CI evidence maintenance config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "page_size",
+    "max_pages",
+    "max_listed_objects",
+    "max_receipt_bytes",
+    "max_reported_failures",
+    "timeout_seconds"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "page_size": { "type": "integer", "minimum": 1, "maximum": 1000 },
+    "max_pages": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "max_listed_objects": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "max_receipt_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 },
+    "max_reported_failures": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 900 }
+  }
+}
