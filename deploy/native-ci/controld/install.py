@@ -36,14 +36,17 @@ DAEMON_CONTRACT = {
     "service_user": "buzzci-controld",
     "config_path": "/etc/buzzci/controld-v1.json",
     "store_root": "/var/lib/buzzci/controld",
-    "capacity": 0,
-    "network": False,
-    "keyholder": False,
+    "default_capacity": 0,
+    "maximum_capacity": 1,
+    "providers_fail_closed": True,
+    "runner_protocol": 2,
+    "acceptance_socket": "/run/buzzci/controld-acceptance.sock",
 }
 EXPECTED_TARGETS = {
     "binary": "/usr/libexec/buzz-ci-controld",
     "config": "/etc/buzzci/controld-v1.json",
     "service": "/etc/systemd/system/buzz-ci-controld.service",
+    "acceptance_socket": "/etc/systemd/system/buzz-ci-controld-acceptance.socket",
     "tmpfiles": "/usr/lib/tmpfiles.d/buzzci-controld.conf",
     "documentation": "/usr/share/doc/buzz-ci-controld/README.md",
 }
@@ -271,18 +274,29 @@ def validate_assets(package: Path, entries: list[Entry]) -> None:
         "ExecStart=/usr/libexec/buzz-ci-controld /etc/buzzci/controld-v1.json",
         "User=buzzci-controld",
         "Group=buzzci-controld",
-        "PrivateNetwork=yes",
-        "RestrictAddressFamilies=AF_UNIX",
-        "ReadOnlyPaths=/etc/buzzci/controld-v1.json",
+        "PrivateNetwork=no",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "ReadOnlyPaths=/etc/buzzci/controld-v1.json -/run/buzzci/runner-control.sock -/run/buzzci/keyholder.sock",
         "ReadWritePaths=/var/lib/buzzci/controld",
-        "Restart=no",
+        "Restart=on-failure",
     }
     service_lines = service.splitlines()
     if not all(line in service_lines for line in required_service) or "[Install]" in service_lines:
         raise ValueError("controld service dormant contract mismatch")
-    forbidden = ("keyholder", "relay", "runner", "execd", "ListenStream", "Socket")
-    if any(token.lower() in (service + tmpfiles).lower() for token in forbidden):
-        raise ValueError("controld package crosses a forbidden subsystem boundary")
+    acceptance = payloads["acceptance_socket"].decode()
+    required_acceptance = {
+        "ListenStream=/run/buzzci/controld-acceptance.sock",
+        "FileDescriptorName=buzz-ci-controld-acceptance",
+        "SocketUser=root",
+        "SocketGroup=buzzci-ctl",
+        "SocketMode=0620",
+        "Accept=no",
+        "Service=buzz-ci-controld.service",
+    }
+    if not required_acceptance.issubset(set(acceptance.splitlines())) or "[Install]" in acceptance:
+        raise ValueError("controld acceptance socket contract mismatch")
+    if "/run/buzzci/execd.sock" in service + acceptance + tmpfiles:
+        raise ValueError("controld must not connect directly to execd")
     expected_tmpfiles = "d /var/lib/buzzci/controld 0700 buzzci-controld buzzci-controld -"
     lines = [line for line in tmpfiles.splitlines() if line and not line.startswith("#")]
     if lines != [expected_tmpfiles]:

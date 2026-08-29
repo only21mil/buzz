@@ -96,7 +96,7 @@ class ControldInstallTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(), b'{"capacity":0,"schema_version":1,"store_root":"/var/lib/buzzci/controld"}\n')
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
         RENDERER.check(output, expected_uid=self.controld_uid)
-        with self.assertRaisesRegex(ValueError, "capacity exactly zero"):
+        with self.assertRaisesRegex(ValueError, "exact provider field set"):
             RENDERER.config_bytes(capacity=1)
         with self.assertRaisesRegex(ValueError, "absolute normalized"):
             RENDERER.config_bytes("relative/store")
@@ -104,6 +104,46 @@ class ControldInstallTests(unittest.TestCase):
         linked.symlink_to(output)
         with self.assertRaises(OSError):
             RENDERER.check(linked)
+
+    def test_renderer_accepts_only_complete_capacity_one_bindings(self) -> None:
+        digest = "11" * 32
+        active = {
+            "relay_url": "wss://relay.example.test",
+            "relay_http_origin": "https://relay.example.test",
+            "channel_id": "123e4567-e89b-12d3-a456-426614174099",
+            "poll_interval_millis": 100,
+            "runner_socket": RENDERER.RUNNER_SOCKET,
+            "runner_uid": 62001,
+            "runner_gid": 62001,
+            "runner_connect_timeout_millis": 500,
+            "runner_io_timeout_millis": 1000,
+            "runner_transport_attempts": 2,
+            "lane_manifest_digest": digest,
+            "lane_epoch": 1,
+            "audience_digest": digest,
+            "isolation_profile_digest": digest,
+            "workflow_id": "native-ci",
+            "workflow_digest": digest,
+            "jobs": [{
+                "job_id": "test", "name": "test", "required": True,
+                "skip_policy": "forbid", "selected_job_instance": "test", "also_reruns": [],
+            }],
+            "keyholder_socket": RENDERER.KEYHOLDER_SOCKET,
+            "keyholder_uid": 62003,
+            "keyholder_gid": 62003,
+            "keyholder_selectors": {
+                name: {"public_key": digest, "generation": index}
+                for index, name in enumerate(("ci_event", "nip98", "manifest"), start=1)
+            },
+            "keyholder_timeout_millis": 500,
+            "keyholder_transport_attempts": 2,
+        }
+        encoded = RENDERER.config_bytes(capacity=1, active=active)
+        self.assertEqual(json.loads(encoded), {"schema_version": 1, "capacity": 1, "store_root": RENDERER.STORE_ROOT, **active})
+        partial = dict(active)
+        del partial["lane_manifest_digest"]
+        with self.assertRaisesRegex(ValueError, "exact provider field set"):
+            RENDERER.config_bytes(capacity=1, active=partial)
 
     def test_freeze_binds_source_binary_manifest_and_dormant_contract(self) -> None:
         manifest = self.freeze()
@@ -256,28 +296,35 @@ class ControldInstallTests(unittest.TestCase):
             INSTALLER.rollback(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT, str(installed["backup_id"]))
         self.assertEqual((root / "etc/buzzci/controld-v1.json").read_bytes(), RENDERER.config_bytes())
 
-    def test_templates_are_static_networkless_and_keyless(self) -> None:
+    def test_templates_support_bounded_activation_while_remaining_disabled(self) -> None:
         service = (CONTROLD_DIR / "templates/buzz-ci-controld.service").read_text()
+        acceptance = (CONTROLD_DIR / "templates/buzz-ci-controld-acceptance.socket").read_text()
         tmpfiles = (CONTROLD_DIR / "templates/buzzci-controld.tmpfiles").read_text()
         self.assertNotIn("[Install]", service)
-        self.assertIn("PrivateNetwork=yes", service)
-        self.assertIn("RestrictAddressFamilies=AF_UNIX", service)
-        self.assertIn("Restart=no", service)
+        self.assertNotIn("[Install]", acceptance)
+        self.assertIn("PrivateNetwork=no", service)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", service)
+        self.assertIn("Restart=on-failure", service)
         self.assertNotIn("ListenStream", service)
-        for token in ("keyholder", "relay", "runner", "execd", "systemctl"):
-            self.assertNotIn(token, (service + tmpfiles).lower())
+        self.assertIn("ListenStream=/run/buzzci/controld-acceptance.sock", acceptance)
+        self.assertIn("FileDescriptorName=buzz-ci-controld-acceptance", acceptance)
+        self.assertIn("SocketGroup=buzzci-ctl", acceptance)
+        self.assertIn("SocketMode=0620", acceptance)
+        self.assertNotIn("/run/buzzci/execd.sock", service + acceptance + tmpfiles)
         self.assertEqual(
             [line for line in tmpfiles.splitlines() if line and not line.startswith("#")],
             ["d /var/lib/buzzci/controld 0700 buzzci-controld buzzci-controld -"],
         )
 
     def test_json_schemas_are_strict_and_parseable(self) -> None:
-        for name in ("binary-provenance.schema.json", "controld-config.schema.json", "package-manifest.schema.json"):
+        for name in ("binary-provenance.schema.json", "package-manifest.schema.json"):
             schema = json.loads((CONTROLD_DIR / name).read_text())
             self.assertFalse(schema["additionalProperties"])
         config_schema = json.loads((CONTROLD_DIR / "controld-config.schema.json").read_text())
-        self.assertEqual(config_schema["properties"]["capacity"]["const"], 0)
-        self.assertEqual(config_schema["properties"]["store_root"]["const"], "/var/lib/buzzci/controld")
+        self.assertEqual(config_schema["$defs"]["dormant"]["properties"]["capacity"]["const"], 0)
+        self.assertEqual(config_schema["$defs"]["active"]["properties"]["capacity"]["const"], 1)
+        self.assertFalse(config_schema["$defs"]["dormant"]["additionalProperties"])
+        self.assertFalse(config_schema["$defs"]["active"]["additionalProperties"])
 
 
 if __name__ == "__main__":

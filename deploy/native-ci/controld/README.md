@@ -1,12 +1,14 @@
-# Buzz CI dormant controld source package
+# Buzz CI controld source package
 
-This directory packages the local-only, capacity-zero `buzz-ci-controld`
-daemon. It accepts a supplied exact release binary and provenance record; it
-does not build, fetch, or install a binary on the live host by itself.
+This directory packages the capacity-zero default and strict capacity-one
+configuration contract for `buzz-ci-controld`. It accepts a supplied exact
+release binary and provenance record; it does not build, fetch, or install a
+binary on the live host by itself.
 
 The checked-in package does not create accounts, run `systemd-tmpfiles`, reload
 systemd, enable or start a unit, provision keys, contact a relay, connect to a
-runner or broker, or grant execution capacity.
+runner or broker, or grant execution capacity. The installed service sandbox
+permits only the network and local sockets needed after a separate activation.
 
 ## Closed contract
 
@@ -15,7 +17,7 @@ The installed default remains:
 - `buzz-ci-controld.service` present but static, disabled, and inactive;
 - `controld-v1.json` contains only schema version 1, capacity exactly `0`, and
   absolute store root `/var/lib/buzzci/controld`;
-- no relay URL, key descriptor, keyholder, runner, broker, socket, or polling
+- no relay URL, key descriptor, keyholder, runner, broker, or polling
   configuration;
 - state reported as `enabled=false`, `active=false`, `provisioned=false`,
   `providers_wired=false`, and `capacity=0`.
@@ -23,7 +25,15 @@ The installed default remains:
 The daemon contract validated in the corresponding source lane opens only its
 owner-private durable control store, reports `ready_closed` with reason
 `production_providers_unwired`, and parks without polling, dispatching,
-networking, or signing. This package does not add capacity-one logic.
+networking, or signing. The parser accepts capacity one only with the complete
+relay authority, channel, runner identity and bounds, static lane and job
+bindings, and keyholder selector generations. The executable still rejects
+that mode until the reviewed runner v2 evidence API is composed.
+
+The disabled `buzz-ci-controld-acceptance.socket` binds
+`/run/buzzci/controld-acceptance.sock` as root:`buzzci-ctl` mode `0620` and names
+the inherited descriptor `buzz-ci-controld-acceptance`. Installation does not
+enable or start it.
 
 The service runs as the pre-existing `buzzci-controld` account. Its config is
 mode `0600` and owned by that account. Its store is mode `0700` and owned by the
