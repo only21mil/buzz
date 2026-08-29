@@ -10,6 +10,7 @@
     "source_commit",
     "default_state",
     "identities",
+    "access_group",
     "components",
     "entries",
     "systemd",
@@ -37,17 +38,28 @@
     "identities": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["runner", "controld", "keyholder"],
+      "required": ["runner", "controld", "keyholder", "qualification"],
       "properties": {
         "runner": { "$ref": "#/$defs/runnerIdentity" },
         "controld": { "$ref": "#/$defs/controldIdentity" },
-        "keyholder": { "$ref": "#/$defs/keyholderIdentity" }
+        "keyholder": { "$ref": "#/$defs/keyholderIdentity" },
+        "qualification": { "$ref": "#/$defs/qualificationIdentity" }
+      }
+    },
+    "access_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group", "gid", "members"],
+      "properties": {
+        "group": { "const": "buzzci-execd" },
+        "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "members": { "const": ["buzzci-ctl", "buzzci-runner"] }
       }
     },
     "components": {
       "type": "array",
-      "minItems": 5,
-      "maxItems": 5,
+      "minItems": 6,
+      "maxItems": 6,
       "items": { "$ref": "#/$defs/component" }
     },
     "entries": {
@@ -83,7 +95,7 @@
         "keyholder": {
           "unit": "buzz-ci-keyholder.socket",
           "path": "/run/buzzci/keyholder.sock",
-          "descriptor_name": "buzz-ci-keyholder",
+          "descriptor_name": "buzz-ci-keyholder-control",
           "user": "buzzci-keyholder",
           "group": "buzzci-controld",
           "mode": "0620"
@@ -93,7 +105,7 @@
           "path": "/run/buzzci/execd.sock",
           "descriptor_name": "buzz-ci-execd",
           "user": "root",
-          "group": "buzzci-runner",
+          "group": "buzzci-execd",
           "mode": "0620"
         },
         "runner": {
@@ -111,17 +123,21 @@
       "additionalProperties": false,
       "required": [
         "program",
+        "principal",
         "request_source",
         "request_sha256",
         "expected_response_sha256",
-        "timeout_seconds"
+        "timeout_seconds",
+        "terminate_grace_seconds"
       ],
       "properties": {
         "program": { "const": "/usr/libexec/buzz-ci-acceptance-ctl" },
+        "principal": { "const": "qualification" },
         "request_source": { "$ref": "#/$defs/asset" },
         "request_sha256": { "$ref": "#/$defs/sha256" },
         "expected_response_sha256": { "$ref": "#/$defs/sha256" },
-        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 300 }
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
+        "terminate_grace_seconds": { "const": 2 }
       }
     },
     "package_uid": { "const": 0 },
@@ -139,14 +155,19 @@
     "identityBase": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["user", "group", "uid", "gid", "home", "shell"],
+      "required": ["user", "group", "uid", "gid", "home", "shell", "supplementary_groups"],
       "properties": {
         "user": { "type": "string" },
         "group": { "type": "string" },
         "uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "home": { "type": "string" },
-        "shell": { "const": "/usr/sbin/nologin" }
+        "shell": { "const": "/usr/sbin/nologin" },
+        "supplementary_groups": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
       }
     },
     "runnerIdentity": {
@@ -156,7 +177,8 @@
           "properties": {
             "user": { "const": "buzzci-runner" },
             "group": { "const": "buzzci-runner" },
-            "home": { "const": "/var/lib/buzzci/runner" }
+            "home": { "const": "/var/lib/buzzci/runner" },
+            "supplementary_groups": { "const": ["buzzci-execd"] }
           }
         }
       ]
@@ -168,7 +190,8 @@
           "properties": {
             "user": { "const": "buzzci-controld" },
             "group": { "const": "buzzci-controld" },
-            "home": { "const": "/var/lib/buzzci/controld" }
+            "home": { "const": "/var/lib/buzzci/controld" },
+            "supplementary_groups": { "const": [] }
           }
         }
       ]
@@ -180,7 +203,21 @@
           "properties": {
             "user": { "const": "buzzci-keyholder" },
             "group": { "const": "buzzci-keyholder" },
-            "home": { "const": "/var/lib/buzzci/keyholder" }
+            "home": { "const": "/var/lib/buzzci/keyholder" },
+            "supplementary_groups": { "const": [] }
+          }
+        }
+      ]
+    },
+    "qualificationIdentity": {
+      "allOf": [
+        { "$ref": "#/$defs/identityBase" },
+        {
+          "properties": {
+            "user": { "const": "buzzci-ctl" },
+            "group": { "const": "buzzci-ctl" },
+            "home": { "const": "/var/lib/buzzci/ctl" },
+            "supplementary_groups": { "const": ["buzzci-execd"] }
           }
         }
       ]
@@ -201,14 +238,15 @@
         "unit"
       ],
       "properties": {
-        "name": { "enum": ["runner", "controld", "execd", "keyholder", "qualification"] },
+        "name": { "enum": ["runner", "controld", "execd", "keyholder", "qualification", "executor"] },
         "binary_path": {
           "enum": [
             "/usr/libexec/buzz-ci-runner",
             "/usr/libexec/buzz-ci-controld",
             "/usr/libexec/buzz-ci-execd",
             "/usr/libexec/buzz-ci-keyholder",
-            "/usr/libexec/buzz-ci-acceptance-ctl"
+            "/usr/libexec/buzz-ci-acceptance-ctl",
+            "/usr/libexec/buzz-ci-executor"
           ]
         },
         "binary_sha256": { "$ref": "#/$defs/sha256" },

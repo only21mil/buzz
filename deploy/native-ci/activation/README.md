@@ -4,13 +4,13 @@ This package moves a fully installed native CI host from dormant capacity zero
 to one ordinary job at a time. The source tree stays dormant. It does not
 contain a frozen package, private key, credential, relay token, or enabled unit.
 
-The controller composes the frozen runner, controld, execd, keyholder, and
-qualification binaries. It does not replace their package installers. Every
-binary has a full source commit, binary digest, and copied mode-`0400`
+The controller composes the frozen runner, controld, execd, keyholder,
+qualification, and runner-executor binaries. It does not replace their package
+installers. Every binary has a full source commit, binary digest, and copied mode-`0400`
 provenance record. The staged and active runner and controld configs have
-separate digests. The keyholder config is secret-free and names a separate
-socket. The controller rejects fields whose names suggest private key material,
-seeds, credentials, or tokens.
+separate digests. The keyholder config is secret-free; its socket ABI remains
+in the manifest and systemd unit. The controller rejects fields whose names
+suggest private key material, seeds, credentials, or tokens.
 
 Live `stage`, `activate`, and `rollback` actions require root and use exact
 `/usr/bin/systemd-sysusers`, `/usr/bin/systemd-tmpfiles`, and
@@ -19,21 +19,26 @@ systemd driver and never invoke those programs.
 
 ## Fixed principal and socket plan
 
-The manifest freezes three distinct numeric UIDs and GIDs:
+The manifest freezes four distinct numeric UIDs and GIDs plus one dedicated
+socket-access group:
 
 - `buzzci-runner` owns runner state and connects to execd.
 - `buzzci-controld` owns controller state and connects to the runner and
   keyholder sockets.
 - `buzzci-keyholder` owns only the signer service and its private state.
+- `buzzci-ctl` runs only the descriptor-bound qualification controller.
+- `buzzci-execd` has exactly `buzzci-runner` and `buzzci-ctl` as supplementary
+  members. Membership grants socket reachability, not protocol authorization;
+  execd must still authorize exact `SO_PEERCRED` UID and primary GID claims.
 
-The generated sysusers file uses nologin shells and no supplementary group
+The generated sysusers file uses nologin shells and exact supplementary group
 memberships. Socket permissions grant only the required adjacent connection:
 
 | Endpoint | Owner | Group | Mode | Accepted peer |
 | --- | --- | --- | --- | --- |
 | `/run/buzzci/keyholder.sock` | `buzzci-keyholder` | `buzzci-controld` | `0620` | controld only |
 | `/run/buzzci/runner-control.sock` | `buzzci-runner` | `buzzci-controld` | `0620` | controld only |
-| `/run/buzzci/execd.sock` | `root` | `buzzci-runner` | `0620` | runner only |
+| `/run/buzzci/execd.sock` | `root` | `buzzci-execd` | `0620` | runner and qualification controller |
 
 Controld cannot connect to execd. Keyholder cannot execute jobs. Execd remains
 the sole privileged executor, and the runner still requires execd's UID 0 peer
@@ -52,12 +57,17 @@ already exist with their frozen staged bytes and metadata.
 2. `activate` replaces only the runner and controld configs with their frozen
    active variants. It starts keyholder, execd, runner, and controld in the
    manifest's fixed order. Socket ownership and mode readback must pass.
-3. The controller sends one bounded, frozen request on stdin to
-   `/usr/libexec/buzz-ci-acceptance-ctl`. It passes no arguments. The exact
-   response digest and a second health readback must pass before the controller
-   enables `buzz-ci-capacity-one.target`.
-4. Any failed activation returns configs and units to staged capacity zero.
-   It does not keep a partly active host.
+3. The controller sends one bounded, frozen request on stdin to the
+   descriptor-opened `/usr/libexec/buzz-ci-acceptance-ctl`. It passes no
+   arguments, clears the environment, applies `no_new_privs` where supported,
+   and runs as the manifest-bound `buzzci-ctl` UID, primary GID, and sole
+   supplementary group. Timeout cleanup sends TERM and then KILL to the whole
+   new process group. The exact response digest and a second health readback
+   must pass before the controller enables `buzz-ci-capacity-one.target`.
+4. Any failed activation attempts every stop, disable, config-restage, reload,
+   and independent readback. It records `rollback_failed` unless both staged
+   configs and inactive units are proven; it never labels an unproven host
+   `staged_zero`.
 5. `rollback` first validates every managed target against its prior, staged,
    or active digest. Unknown drift stops rollback before systemd or file
    mutation. A valid rollback stops and disables the activation, restores exact
@@ -80,10 +90,15 @@ provenance, and qualification request inputs in a private asset directory with
 the exact source modes declared by the draft.
 
 The runner staged config must omit `host`; its active config must add the full
-host block and bind `/run/buzzci/execd.sock` to peer UID 0. Controld must change
-from capacity 0 to capacity 1 without changing its schema or store root. The
+host block, bind `/run/buzzci/execd.sock` to peer UID 0, and name only the
+manifest-bound `/usr/libexec/buzz-ci-executor`. Controld must change from
+capacity 0 to capacity 1 without changing its schema or store root. The
 keyholder config is installed during staging, but the separate socket remains
-inactive until activation.
+inactive until activation. Its exact daemon fields are `schema_version`,
+`peer`, `selectors`, and `nip98_origin`; socket and credential-descriptor
+details remain in the manifest/systemd layer. The active controld config
+carries the same public selectors and generations plus the exact keyholder
+peer UID and GID.
 
 ```bash
 deploy/native-ci/activation/freeze_package.py \

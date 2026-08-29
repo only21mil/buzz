@@ -105,7 +105,7 @@ def _tracked_payload(
     return payload
 
 
-def _render_sysusers(template: bytes, identities: dict[str, object]) -> bytes:
+def _render_sysusers(template: bytes, identities: dict[str, object], access_group: dict[str, object]) -> bytes:
     text = template.decode("utf-8")
     replacements = {
         "@RUNNER_UID@": str(identities["runner"]["uid"]),
@@ -114,6 +114,9 @@ def _render_sysusers(template: bytes, identities: dict[str, object]) -> bytes:
         "@CONTROLD_GID@": str(identities["controld"]["gid"]),
         "@KEYHOLDER_UID@": str(identities["keyholder"]["uid"]),
         "@KEYHOLDER_GID@": str(identities["keyholder"]["gid"]),
+        "@QUALIFICATION_UID@": str(identities["qualification"]["uid"]),
+        "@QUALIFICATION_GID@": str(identities["qualification"]["gid"]),
+        "@EXECD_ACCESS_GID@": str(access_group["gid"]),
     }
     for token, value in replacements.items():
         text = text.replace(token, value)
@@ -122,7 +125,12 @@ def _render_sysusers(template: bytes, identities: dict[str, object]) -> bytes:
     return text.encode()
 
 
-def _static_payload(source_root: Path, role: str, identities: dict[str, object]) -> tuple[bytes, str]:
+def _static_payload(
+    source_root: Path,
+    role: str,
+    identities: dict[str, object],
+    access_group: dict[str, object],
+) -> tuple[bytes, str]:
     template_name, asset_name = STATIC_SOURCES[role]
     payload = _tracked_payload(
         source_root,
@@ -130,7 +138,7 @@ def _static_payload(source_root: Path, role: str, identities: dict[str, object])
         0o100644,
     )
     if role == "sysusers":
-        payload = _render_sysusers(payload, identities)
+        payload = _render_sysusers(payload, identities, access_group)
     return payload, asset_name
 
 
@@ -187,7 +195,12 @@ def freeze_package(
     for entry in draft["entries"]:
         role = entry["role"]
         if role in STATIC_SOURCES:
-            payload, expected_source = _static_payload(source_root, role, draft["identities"])
+            payload, expected_source = _static_payload(
+                source_root,
+                role,
+                draft["identities"],
+                draft["access_group"],
+            )
             if entry["source"] != expected_source:
                 raise ValueError(f"static asset name differs for {role}")
             expected_mode = activation_package.parse_mode(entry["source_mode"])
