@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 buzz-ci-broker-protocol = { workspace = true }
+buzz-core = { workspace = true }
 hex = { workspace = true }
 nostr = { workspace = true }
 serde = { workspace = true }

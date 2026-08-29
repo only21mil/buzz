@@ -71,15 +71,28 @@ fn run(config_path: PathBuf) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let backend = match Secp256k1Backend::from_systemd_credentials(&credentials_directory) {
+    let backend_result = if config.acceptance.is_some() {
+        Secp256k1Backend::from_systemd_credentials_with_acceptance(&credentials_directory)
+    } else {
+        Secp256k1Backend::from_systemd_credentials(&credentials_directory)
+    };
+    let backend = match backend_result {
         Ok(backend) => backend,
         Err(_) => {
             eprintln!(r#"{{"error":"credentials_unavailable"}}"#);
             return ExitCode::from(4);
         }
     };
-    let policy = match SigningPolicy::new(config.peer_policy, config.selectors, config.nip98_origin)
-    {
+    let policy_result = match config.acceptance {
+        Some(acceptance) => SigningPolicy::new_with_acceptance(
+            config.peer_policy,
+            config.selectors,
+            config.nip98_origin,
+            acceptance,
+        ),
+        None => SigningPolicy::new(config.peer_policy, config.selectors, config.nip98_origin),
+    };
+    let policy = match policy_result {
         Ok(policy) => policy,
         Err(_) => {
             eprintln!(r#"{{"error":"invalid_config"}}"#);

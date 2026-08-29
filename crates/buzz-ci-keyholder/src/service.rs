@@ -7,18 +7,23 @@ use uuid::Uuid;
 use buzz_ci_broker_protocol::v2::{
     decode_admission_signature_message, AdmissionSignatureAlgorithm,
 };
+use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType};
+use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
+use serde::Deserialize;
 
 use crate::{
-    BackendError, DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod,
-    KeySelector, KeyholderServer, Nip98AuthorizeRequest, Operation, PeerIdentity, PeerPolicy,
-    PublicIdentity, Request, Response, SelectorSet, SignCiEventRequest, SignManifestRequest,
-    SignatureResponse, SigningBackend,
+    AcceptanceMutation, BackendError, CanonicalPayload, DescribeAcceptanceResponse,
+    DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, KeySelector,
+    KeyholderServer, Nip98AuthorizeRequest, Operation, PeerIdentity, PeerPolicy, PublicIdentity,
+    Request, Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest,
+    SignManifestRequest, SignatureResponse, SigningBackend,
 };
 
 const CI_EVENT_KIND_MIN: u32 = 46_101;
 const CI_EVENT_KIND_MAX: u32 = 46_106;
 const NIP98_EVENT_KIND: u32 = 27_235;
 const NIP98_TIMESTAMP_TOLERANCE_SECONDS: u64 = 60;
+const MAX_ACCEPTANCE_GRANT_WINDOW_SECONDS: i64 = 3_600;
 
 /// Closed operation policy and public selector state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +31,255 @@ pub struct SigningPolicy {
     peer_policy: PeerPolicy,
     selectors: SelectorSet,
     nip98_origin: String,
+    acceptance: Option<AcceptanceSigningPolicy>,
+}
+
+/// Four exact public event templates authorized for one activation scenario.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptanceSigningPolicy {
+    actor: PublicIdentity,
+    scenario_sha256: [u8; 32],
+    event_ids: [[u8; 32]; 4],
+    granted_ci_signer: [u8; 32],
+}
+
+impl AcceptanceSigningPolicy {
+    /// Validate the actor, scenario, and complete Run/Grant/Rerun/Tombstone template set.
+    pub fn new(
+        actor: PublicIdentity,
+        scenario_sha256: [u8; 32],
+        templates: [CanonicalPayload; 4],
+    ) -> Result<Self, ServiceError> {
+        if actor.public_key == [0; 32] || actor.generation == 0 || scenario_sha256 == [0; 32] {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let (event_ids, granted_ci_signer) =
+            validate_acceptance_templates(actor.public_key, &templates)?;
+        Ok(Self {
+            actor,
+            scenario_sha256,
+            event_ids,
+            granted_ci_signer,
+        })
+    }
+
+    /// Dedicated acceptance actor identity.
+    pub const fn actor(&self) -> PublicIdentity {
+        self.actor
+    }
+
+    /// Exact activation scenario digest.
+    pub const fn scenario_sha256(&self) -> [u8; 32] {
+        self.scenario_sha256
+    }
+
+    /// Event IDs in Run, Grant, Rerun, Tombstone order.
+    pub const fn event_ids(&self) -> [[u8; 32]; 4] {
+        self.event_ids
+    }
+
+    fn event_id(&self, mutation: AcceptanceMutation) -> [u8; 32] {
+        self.event_ids[mutation_index(mutation)]
+    }
+}
+
+const fn mutation_index(mutation: AcceptanceMutation) -> usize {
+    match mutation {
+        AcceptanceMutation::Run => 0,
+        AcceptanceMutation::Grant => 1,
+        AcceptanceMutation::Rerun => 2,
+        AcceptanceMutation::Tombstone => 3,
+    }
+}
+
+fn validate_acceptance_templates(
+    actor: [u8; 32],
+    templates: &[CanonicalPayload; 4],
+) -> Result<([[u8; 32]; 4], [u8; 32]), ServiceError> {
+    for (template, kind) in templates.iter().zip([
+        KIND_CI_REQUEST,
+        KIND_CI_GRANT,
+        KIND_CI_REQUEST,
+        KIND_DELETION,
+    ]) {
+        validate_ci_event(template.as_bytes(), actor, kind)?;
+    }
+    let values = templates
+        .iter()
+        .map(|template| validate_canonical_json(template.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let run = request_from_template(&values[0], CiRequestType::Run)?;
+    let rerun = request_from_template(&values[2], CiRequestType::Rerun)?;
+    let run_tags = values[0][4]
+        .as_array()
+        .ok_or(ServiceError::InvalidRequest)?;
+    let channel = exact_channel(run_tags)?;
+    validate_request_template(run_tags, channel, &run)?;
+    validate_request_template(
+        values[2][4]
+            .as_array()
+            .ok_or(ServiceError::InvalidRequest)?,
+        channel,
+        &rerun,
+    )?;
+    if run.target_repo_a != rerun.target_repo_a
+        || run.pr_root_event_id != rerun.pr_root_event_id
+        || run.pr_update_event_id != rerun.pr_update_event_id
+        || run.source_clone_url != rerun.source_clone_url
+        || run.immutable_source_ref != rerun.immutable_source_ref
+        || run.tip_oid != rerun.tip_oid
+        || run.source_branch != rerun.source_branch
+        || run.base_ref != rerun.base_ref
+        || run.base_oid != rerun.base_oid
+        || run.workflow_id != rerun.workflow_id
+        || run.workflow_digest != rerun.workflow_digest
+        || run.run_id != rerun.run_id
+        || run.actor != rerun.actor
+        || run.actor != hex::encode(actor)
+        || rerun.parent_run_id.as_deref() != Some(run.run_id.as_str())
+        || rerun.parent_attempt != Some(1)
+        || rerun.attempt != 2
+        || rerun.job_ids.len() != 1
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let granted_ci_signer = validate_grant_template(&values[1], channel, &run.target_repo_a)?;
+    let event_ids: [[u8; 32]; 4] = templates
+        .iter()
+        .map(|template| Sha256::digest(template.as_bytes()).into())
+        .collect::<Vec<[u8; 32]>>()
+        .try_into()
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    validate_tombstone_template(&values[3], event_ids[2])?;
+    if event_ids.contains(&[0; 32])
+        || event_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != event_ids.len()
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok((event_ids, granted_ci_signer))
+}
+
+fn request_from_template(
+    value: &serde_json::Value,
+    request_type: CiRequestType,
+) -> Result<CiRequestEnvelope, ServiceError> {
+    let content = value[5].as_str().ok_or(ServiceError::InvalidRequest)?;
+    let envelope: CiRequestEnvelope =
+        serde_json::from_str(content).map_err(|_| ServiceError::InvalidRequest)?;
+    envelope
+        .validate()
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    if envelope.request_type != request_type {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(envelope)
+}
+
+fn exact_channel(tags: &[serde_json::Value]) -> Result<&str, ServiceError> {
+    let channels = tags
+        .iter()
+        .filter_map(|tag| {
+            let fields = tag.as_array()?;
+            (fields.first()?.as_str()? == "h")
+                .then(|| fields.get(1)?.as_str())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    match channels.as_slice() {
+        [channel]
+            if Uuid::parse_str(channel)
+                .is_ok_and(|value| value.hyphenated().to_string() == *channel) =>
+        {
+            Ok(channel)
+        }
+        _ => Err(ServiceError::InvalidRequest),
+    }
+}
+
+fn validate_request_template(
+    tags: &[serde_json::Value],
+    channel: &str,
+    envelope: &CiRequestEnvelope,
+) -> Result<(), ServiceError> {
+    let expected = request_tags(channel, envelope).map_err(|_| ServiceError::InvalidRequest)?;
+    let expected = serde_json::to_value(expected).map_err(|_| ServiceError::InvalidRequest)?;
+    (expected == serde_json::Value::Array(tags.to_vec()))
+        .then_some(())
+        .ok_or(ServiceError::InvalidRequest)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptanceGrant {
+    schema_version: u32,
+    target_repo_a: String,
+    signer_pubkey: String,
+    valid_from: serde_json::Value,
+    #[serde(default)]
+    valid_until: Option<serde_json::Value>,
+}
+
+fn validate_grant_template(
+    value: &serde_json::Value,
+    channel: &str,
+    target_repo_a: &str,
+) -> Result<[u8; 32], ServiceError> {
+    let grant: AcceptanceGrant =
+        serde_json::from_str(value[5].as_str().ok_or(ServiceError::InvalidRequest)?)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+    let tags = value[4].as_array().ok_or(ServiceError::InvalidRequest)?;
+    let expected_tags = serde_json::json!([["h", channel]]);
+    let valid_from = grant
+        .valid_from
+        .as_i64()
+        .ok_or(ServiceError::InvalidRequest)?;
+    let valid_until = grant
+        .valid_until
+        .as_ref()
+        .map(|value| value.as_i64().ok_or(ServiceError::InvalidRequest))
+        .transpose()?;
+    let created_at = i64::try_from(value[2].as_u64().ok_or(ServiceError::InvalidRequest)?)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    if grant.schema_version != 1
+        || grant.target_repo_a != target_repo_a
+        || !lower_hex64(&grant.signer_pubkey)
+        || valid_from != created_at
+        || !matches!(
+            valid_until,
+            Some(until)
+                if until > valid_from
+                    && until.saturating_sub(valid_from) <= MAX_ACCEPTANCE_GRANT_WINDOW_SECONDS
+        )
+        || serde_json::Value::Array(tags.to_vec()) != expected_tags
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let signer = hex::decode(grant.signer_pubkey).map_err(|_| ServiceError::InvalidRequest)?;
+    signer.try_into().map_err(|_| ServiceError::InvalidRequest)
+}
+
+fn validate_tombstone_template(
+    value: &serde_json::Value,
+    rerun_event_id: [u8; 32],
+) -> Result<(), ServiceError> {
+    let tags = value[4].as_array().ok_or(ServiceError::InvalidRequest)?;
+    let expected = serde_json::json!([["e", hex::encode(rerun_event_id)]]);
+    if value[5].as_str() != Some("") || serde_json::Value::Array(tags.to_vec()) != expected {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn lower_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 impl SigningPolicy {
@@ -35,12 +289,61 @@ impl SigningPolicy {
         selectors: SelectorSet,
         nip98_origin: String,
     ) -> Result<Self, ServiceError> {
+        if peer_policy
+            .allowed_operations
+            .contains(Operation::DescribeAcceptance)
+            || peer_policy
+                .allowed_operations
+                .contains(Operation::SignAcceptanceMutation)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Self::new_base(peer_policy, selectors, nip98_origin)
+    }
+
+    fn new_base(
+        peer_policy: PeerPolicy,
+        selectors: SelectorSet,
+        nip98_origin: String,
+    ) -> Result<Self, ServiceError> {
         let nip98_origin = Self::validate_nip98_origin(&nip98_origin)?;
         Ok(Self {
             peer_policy,
             selectors,
             nip98_origin,
+            acceptance: None,
         })
+    }
+
+    /// Construct the production policy with a distinct activation-only actor.
+    pub fn new_with_acceptance(
+        peer_policy: PeerPolicy,
+        selectors: SelectorSet,
+        nip98_origin: String,
+        acceptance: AcceptanceSigningPolicy,
+    ) -> Result<Self, ServiceError> {
+        if !peer_policy
+            .allowed_operations
+            .contains(Operation::DescribeAcceptance)
+            || !peer_policy
+                .allowed_operations
+                .contains(Operation::SignAcceptanceMutation)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let mut policy = Self::new_base(peer_policy, selectors, nip98_origin)?;
+        if [
+            selectors.ci_event().public_key,
+            selectors.nip98().public_key,
+            selectors.manifest().public_key,
+        ]
+        .contains(&acceptance.actor.public_key)
+            || acceptance.granted_ci_signer != selectors.ci_event().public_key
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        policy.acceptance = Some(acceptance);
+        Ok(policy)
     }
 
     pub(crate) fn validate_nip98_origin(value: &str) -> Result<String, ServiceError> {
@@ -190,6 +493,11 @@ impl<B: SigningBackend> ProductionKeyholder<B> {
                 return Err(ServiceError::Unavailable);
             }
         }
+        if let Some(acceptance) = &policy.acceptance {
+            if backend.acceptance_public_key()? != acceptance.actor.public_key {
+                return Err(ServiceError::Unavailable);
+            }
+        }
         Ok(Self { policy, backend })
     }
 
@@ -203,6 +511,9 @@ impl<B: SigningBackend> ProductionKeyholder<B> {
         let operation = request.operation();
         let result = match request {
             Request::Describe(request) => self.describe(peer, request).map(Response::Describe),
+            Request::DescribeAcceptance(_) => self
+                .describe_acceptance(peer)
+                .map(Response::DescribeAcceptance),
             Request::SignCiEvent(request) => {
                 self.sign_ci_event(peer, request).map(Response::SignCiEvent)
             }
@@ -212,6 +523,9 @@ impl<B: SigningBackend> ProductionKeyholder<B> {
             Request::SignManifest(request) => self
                 .sign_manifest(peer, request)
                 .map(Response::SignManifest),
+            Request::SignAcceptanceMutation(request) => self
+                .sign_acceptance_mutation(peer, request)
+                .map(Response::SignAcceptanceMutation),
         };
         result.unwrap_or_else(|error| Response::Error {
             operation,
@@ -254,6 +568,50 @@ impl<B: SigningBackend> ProductionKeyholder<B> {
             identity,
             signed_digest: digest,
             signature: self.backend.sign_digest(selector, digest)?,
+        })
+    }
+
+    fn sign_acceptance_mutation(
+        &self,
+        peer: PeerIdentity,
+        request: SignAcceptanceMutationRequest,
+    ) -> Result<SignatureResponse, ServiceError> {
+        self.authorize(peer, Operation::SignAcceptanceMutation)?;
+        let policy = self
+            .policy
+            .acceptance
+            .as_ref()
+            .ok_or(ServiceError::PolicyDenied)?;
+        if request.scenario_sha256 != policy.scenario_sha256 {
+            return Err(ServiceError::PolicyDenied);
+        }
+        if request.expected_generation != policy.actor.generation {
+            return Err(ServiceError::StaleGeneration {
+                current: policy.actor.generation,
+            });
+        }
+        let digest = policy.event_id(request.mutation);
+        Ok(SignatureResponse {
+            identity: policy.actor,
+            signed_digest: digest,
+            signature: self.backend.sign_acceptance_digest(digest)?,
+        })
+    }
+
+    fn describe_acceptance(
+        &self,
+        peer: PeerIdentity,
+    ) -> Result<DescribeAcceptanceResponse, ServiceError> {
+        self.authorize(peer, Operation::DescribeAcceptance)?;
+        let policy = self
+            .policy
+            .acceptance
+            .as_ref()
+            .ok_or(ServiceError::PolicyDenied)?;
+        Ok(DescribeAcceptanceResponse {
+            actor: policy.actor(),
+            scenario_sha256: policy.scenario_sha256(),
+            event_ids: policy.event_ids(),
         })
     }
 }
@@ -503,6 +861,7 @@ mod tests {
     struct FakeBackend {
         public_keys: [[u8; 32]; 3],
         calls: RefCell<Vec<(KeySelector, [u8; 32])>>,
+        acceptance_calls: RefCell<Vec<[u8; 32]>>,
     }
 
     impl SigningBackend for FakeBackend {
@@ -519,6 +878,18 @@ mod tests {
             let mut signature = [0_u8; 64];
             signature[..32].copy_from_slice(&digest);
             signature[32] = index(selector) as u8 + 1;
+            Ok(signature)
+        }
+
+        fn acceptance_public_key(&self) -> Result<[u8; 32], BackendError> {
+            Ok([4; 32])
+        }
+
+        fn sign_acceptance_digest(&self, digest: [u8; 32]) -> Result<[u8; 64], BackendError> {
+            self.acceptance_calls.borrow_mut().push(digest);
+            let mut signature = [0; 64];
+            signature[..32].copy_from_slice(&digest);
+            signature[32] = 4;
             Ok(signature)
         }
     }
@@ -563,9 +934,228 @@ mod tests {
             FakeBackend {
                 public_keys,
                 calls: RefCell::new(Vec::new()),
+                acceptance_calls: RefCell::new(Vec::new()),
             },
         )
         .expect("service")
+    }
+
+    fn acceptance_templates() -> [CanonicalPayload; 4] {
+        let actor = hex::encode([4; 32]);
+        let channel = "123e4567-e89b-12d3-a456-426614174099";
+        let mut run = CiRequestEnvelope {
+            schema_version: buzz_core::ci::CI_SCHEMA_VERSION,
+            request_type: CiRequestType::Run,
+            target_repo_a: format!("30617:{}:buzz", "22".repeat(32)),
+            pr_root_event_id: "33".repeat(32),
+            pr_update_event_id: None,
+            source_clone_url: "https://relay.example/git/repo".to_owned(),
+            immutable_source_ref: "refs/nostr/source".to_owned(),
+            tip_oid: "44".repeat(20),
+            source_branch: "feature".to_owned(),
+            base_ref: "refs/heads/main".to_owned(),
+            base_oid: "55".repeat(20),
+            workflow_id: "ci".to_owned(),
+            workflow_digest: "66".repeat(32),
+            job_ids: vec!["test".to_owned()],
+            run_id: "123e4567-e89b-12d3-a456-426614174011".to_owned(),
+            attempt: 1,
+            parent_attempt: None,
+            parent_run_id: None,
+            trigger_event_id: "33".repeat(32),
+            actor: actor.clone(),
+            timeout_seconds: 30,
+            idempotency_key: "run-key".to_owned(),
+            issued_at: 1_800_000_000,
+            expires_at: 1_800_000_300,
+        };
+        let run_tags = request_tags(channel, &run).expect("run tags");
+        let run_event = serde_json::json!([
+            0,
+            actor,
+            1_800_000_000_u64,
+            KIND_CI_REQUEST,
+            run_tags,
+            serde_json::to_string(&run).expect("run content")
+        ]);
+        let grant_event = serde_json::json!([
+            0,
+            hex::encode([4; 32]),
+            1_800_000_001_u64,
+            KIND_CI_GRANT,
+            [["h", channel]],
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 1,
+                "target_repo_a": run.target_repo_a,
+                "signer_pubkey": hex::encode([1; 32]),
+                "valid_from": 1_800_000_001_i64,
+                "valid_until": 1_800_000_600_i64
+            }))
+            .expect("grant content")
+        ]);
+        run.request_type = CiRequestType::Rerun;
+        run.attempt = 2;
+        run.parent_attempt = Some(1);
+        run.parent_run_id = Some(run.run_id.clone());
+        run.idempotency_key = "rerun-key".to_owned();
+        run.issued_at += 10;
+        run.expires_at += 10;
+        let rerun_tags = request_tags(channel, &run).expect("rerun tags");
+        let rerun_event = serde_json::json!([
+            0,
+            hex::encode([4; 32]),
+            1_800_000_010_u64,
+            KIND_CI_REQUEST,
+            rerun_tags,
+            serde_json::to_string(&run).expect("rerun content")
+        ]);
+        let rerun_bytes = serde_json::to_vec(&rerun_event).expect("rerun bytes");
+        let tombstone_event = serde_json::json!([
+            0,
+            hex::encode([4; 32]),
+            1_800_000_020_u64,
+            KIND_DELETION,
+            [["e", hex::encode(Sha256::digest(&rerun_bytes))]],
+            ""
+        ]);
+        [run_event, grant_event, rerun_event, tombstone_event].map(|value| {
+            CanonicalPayload::new(serde_json::to_vec(&value).expect("template bytes"))
+                .expect("template")
+        })
+    }
+
+    fn acceptance_service() -> ProductionKeyholder<FakeBackend> {
+        let public_keys = [[1_u8; 32], [2_u8; 32], [3_u8; 32]];
+        let selectors = SelectorSet::new(
+            PublicIdentity {
+                public_key: public_keys[0],
+                generation: 7,
+            },
+            PublicIdentity {
+                public_key: public_keys[1],
+                generation: 8,
+            },
+            PublicIdentity {
+                public_key: public_keys[2],
+                generation: 9,
+            },
+        )
+        .expect("selectors");
+        let acceptance = AcceptanceSigningPolicy::new(
+            PublicIdentity {
+                public_key: [4; 32],
+                generation: 10,
+            },
+            [9; 32],
+            acceptance_templates(),
+        )
+        .expect("acceptance policy");
+        let policy = SigningPolicy::new_with_acceptance(
+            PeerPolicy {
+                uid: 1000,
+                gid: 1001,
+                allowed_operations: OperationSet::only(Operation::Describe)
+                    .union(OperationSet::only(Operation::DescribeAcceptance))
+                    .union(OperationSet::only(Operation::SignAcceptanceMutation)),
+            },
+            selectors,
+            "https://relay.example.test".to_owned(),
+            acceptance,
+        )
+        .expect("policy");
+        ProductionKeyholder::new(
+            policy,
+            FakeBackend {
+                public_keys,
+                calls: RefCell::new(Vec::new()),
+                acceptance_calls: RefCell::new(Vec::new()),
+            },
+        )
+        .expect("service")
+    }
+
+    #[test]
+    fn acceptance_mutations_sign_only_the_four_described_event_ids() {
+        let service = acceptance_service();
+        let Response::DescribeAcceptance(description) = service.handle(
+            peer(),
+            Request::DescribeAcceptance(crate::DescribeAcceptanceRequest),
+        ) else {
+            panic!("description");
+        };
+        assert_eq!(
+            description.actor,
+            PublicIdentity {
+                public_key: [4; 32],
+                generation: 10
+            }
+        );
+        assert_eq!(description.scenario_sha256, [9; 32]);
+        let ids = description.event_ids;
+        for (index, mutation) in [
+            AcceptanceMutation::Run,
+            AcceptanceMutation::Grant,
+            AcceptanceMutation::Rerun,
+            AcceptanceMutation::Tombstone,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = service.handle(
+                peer(),
+                Request::SignAcceptanceMutation(SignAcceptanceMutationRequest {
+                    expected_generation: 10,
+                    scenario_sha256: [9; 32],
+                    mutation,
+                }),
+            );
+            let Response::SignAcceptanceMutation(signature) = response else {
+                panic!("mutation should sign");
+            };
+            assert_eq!(signature.signed_digest, ids[index]);
+            assert_eq!(signature.identity.public_key, [4; 32]);
+        }
+        assert_eq!(service.backend.acceptance_calls.borrow().as_slice(), &ids);
+        assert!(service.backend.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn acceptance_generation_scenario_and_template_drift_fail_closed() {
+        let service = acceptance_service();
+        for request in [
+            SignAcceptanceMutationRequest {
+                expected_generation: 9,
+                scenario_sha256: [9; 32],
+                mutation: AcceptanceMutation::Run,
+            },
+            SignAcceptanceMutationRequest {
+                expected_generation: 10,
+                scenario_sha256: [8; 32],
+                mutation: AcceptanceMutation::Run,
+            },
+        ] {
+            assert!(matches!(
+                service.handle(peer(), Request::SignAcceptanceMutation(request)),
+                Response::Error { .. }
+            ));
+        }
+        assert!(service.backend.acceptance_calls.borrow().is_empty());
+
+        let mut templates = acceptance_templates();
+        let mut tombstone: serde_json::Value =
+            serde_json::from_slice(templates[3].as_bytes()).expect("tombstone");
+        tombstone[4] = serde_json::json!([["e", "11".repeat(32)]]);
+        templates[3] =
+            CanonicalPayload::new(serde_json::to_vec(&tombstone).expect("bytes")).expect("payload");
+        assert!(AcceptanceSigningPolicy::new(
+            PublicIdentity {
+                public_key: [4; 32],
+                generation: 10,
+            },
+            [9; 32],
+            templates,
+        )
+        .is_err());
     }
 
     fn peer() -> PeerIdentity {
@@ -940,7 +1530,8 @@ mod tests {
             PeerPolicy {
                 uid: 1,
                 gid: 1,
-                allowed_operations: OperationSet::ALL,
+                allowed_operations: OperationSet::from_bits(0b1111)
+                    .expect("compatibility operations"),
             },
             selectors,
             "https://relay.example.test".to_owned(),
@@ -949,6 +1540,7 @@ mod tests {
         let backend = FakeBackend {
             public_keys: [[1_u8; 32], [2_u8; 32], [3_u8; 32]],
             calls: RefCell::new(Vec::new()),
+            acceptance_calls: RefCell::new(Vec::new()),
         };
         assert!(matches!(
             ProductionKeyholder::new(policy, backend),
