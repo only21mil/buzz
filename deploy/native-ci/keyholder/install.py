@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify or install an acceptance keyholder package without reading credential bytes."""
+"""Verify, install, or roll back a frozen Buzz CI keyholder package."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import stat
 import sys
-import tempfile
+import uuid
 
 KEYHOLDER_DIR = Path(__file__).resolve().parent
 if str(KEYHOLDER_DIR) not in sys.path:
@@ -22,11 +22,15 @@ import freeze_package
 import render_keyholder_config
 
 SCHEMA = freeze_package.SCHEMA
+RECEIPT_SCHEMA = "buzz-ci-keyholder-install-receipt-v1"
+ROLLBACK_SCHEMA = "buzz-ci-keyholder-rollback-receipt-v1"
+RECEIPT_DIRECTORY = "/var/lib/buzzci/keyholder-package"
 MAX_JSON_BYTES = 1024 * 1024
 PACKAGE_ID = re.compile(r"^buzz-ci-keyholder-acceptance-[0-9a-f]{12}-[0-9a-f]{12}$")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_TARGETS = {
+    "binary": "/usr/libexec/buzz-ci-keyholder",
     "config": "/etc/buzzci/keyholder-v1.json",
     "service": "/etc/systemd/system/buzz-ci-keyholder.service",
     "socket": "/etc/systemd/system/buzz-ci-keyholder.socket",
@@ -46,15 +50,16 @@ class Entry:
     uid: int
     gid: int
     sha256: str
+    size: int
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
             raise ValueError("duplicate JSON key")
-        value[key] = item
-    return value
+        result[key] = value
+    return result
 
 
 def canonical_json(value: object) -> bytes:
@@ -78,57 +83,12 @@ def mapped_id(value: int, root: Path, *, group: bool = False) -> int:
     return metadata.st_gid if group else metadata.st_uid
 
 
-def read_regular(path: Path, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
-    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise ValueError(f"unsafe regular file: {path}")
-        chunks: list[bytes] = []
-        size = 0
-        while chunk := os.read(descriptor, 1024 * 1024):
-            size += len(chunk)
-            if size > max_bytes:
-                raise ValueError(f"file exceeds byte limit: {path}")
-            chunks.append(chunk)
-        return b"".join(chunks), metadata
-    finally:
-        os.close(descriptor)
-
-
-def parse_json(path: Path) -> tuple[dict[str, object], bytes, os.stat_result]:
-    raw, metadata = read_regular(path, MAX_JSON_BYTES)
-    value = json.loads(raw, object_pairs_hook=reject_duplicates)
-    if not isinstance(value, dict):
-        raise ValueError("JSON root must be an object")
-    return value, raw, metadata
-
-
-def _mode(value: object) -> int:
-    if not isinstance(value, str) or not re.fullmatch(r"0[4567][0-7]{2}", value):
-        raise ValueError("invalid mode")
-    return int(value, 8)
-
-
-def _u32(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 0xFFFF_FFFF:
-        raise ValueError("invalid service identity")
-    return value
-
-
-def _require_directory(path: Path, uid: int, gid: int, mode: int) -> None:
-    metadata = path.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid or metadata.st_gid != gid or stat.S_IMODE(metadata.st_mode) != mode:
-        raise ValueError(f"unsafe directory metadata: {path}")
-
-
 def _safe_root(root: Path) -> Path:
     root = Path(os.path.abspath(root))
-    if Path(os.path.realpath(root)) != root:
-        raise ValueError("install root must not be a symbolic path")
     metadata = root.lstat()
     if (
-        not stat.S_ISDIR(metadata.st_mode)
+        Path(os.path.realpath(root)) != root
+        or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != mapped_id(0, root)
         or metadata.st_gid != mapped_id(0, root, group=True)
         or metadata.st_mode & 0o022
@@ -137,94 +97,232 @@ def _safe_root(root: Path) -> Path:
     return root
 
 
-def _validate_directory_chain(root: Path, target: Path) -> None:
-    current = root
-    for component in target.relative_to(root).parts:
-        current /= component
-        metadata = current.lstat()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != mapped_id(0, root)
-            or metadata.st_gid != mapped_id(0, root, group=True)
-            or metadata.st_mode & 0o022
-        ):
-            raise ValueError("target directory chain is unsafe")
+def _read_descriptor(descriptor: int, limit: int) -> tuple[bytes, os.stat_result]:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ValueError("unsafe regular file")
+    chunks: list[bytes] = []
+    size = 0
+    while chunk := os.read(descriptor, 1024 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise ValueError("file exceeds byte limit")
+        chunks.append(chunk)
+    return b"".join(chunks), metadata
 
 
-def parse_package(package: Path, root: Path) -> tuple[dict[str, object], list[Entry]]:
+def _read_at(directory_fd: int, name: str, limit: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
+    if "/" in name or name in {"", ".", ".."}:
+        raise ValueError("unsafe descriptor-relative name")
+    descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        return _read_descriptor(descriptor, limit)
+    finally:
+        os.close(descriptor)
+
+
+def read_regular(path: Path, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        return _read_descriptor(descriptor, max_bytes)
+    finally:
+        os.close(descriptor)
+
+
+def _json(raw: bytes) -> dict[str, object]:
+    value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    if not isinstance(value, dict):
+        raise ValueError("JSON root must be an object")
+    return value
+
+
+def parse_json(path: Path) -> tuple[dict[str, object], bytes, os.stat_result]:
+    raw, metadata = read_regular(path, MAX_JSON_BYTES)
+    return _json(raw), raw, metadata
+
+
+def _mode(value: object) -> int:
+    if not isinstance(value, str) or not re.fullmatch(r"0[4567][0-7]{2}", value):
+        raise ValueError("invalid mode")
+    return int(value, 8)
+
+
+def _u32(value: object, *, nonzero: bool = True) -> int:
+    minimum = 1 if nonzero else 0
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= 0xFFFF_FFFF:
+        raise ValueError("invalid numeric identity")
+    return value
+
+
+def _require_directory(path: Path, uid: int, gid: int, mode: int) -> int:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        os.close(descriptor)
+        raise ValueError(f"unsafe directory metadata: {path}")
+    return descriptor
+
+
+def parse_package(package: Path, root: Path | None = None) -> tuple[dict[str, object], list[Entry]]:
     package = Path(os.path.abspath(package))
     if Path(os.path.realpath(package)) != package:
         raise ValueError("package path must not contain symbolic links")
-    package_uid = mapped_id(0, root)
-    package_gid = mapped_id(0, root, group=True)
-    _require_directory(package, package_uid, package_gid, 0o700)
-    _require_directory(package / "assets", package_uid, package_gid, 0o700)
-    manifest, _, metadata = parse_json(package / "package-manifest.json")
-    if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (package_uid, package_gid, 0o600):
-        raise ValueError("package manifest metadata is unsafe")
-    expected_keys = {"schema", "package_id", "source_commit", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"}
-    if set(manifest) != expected_keys or manifest["schema"] != SCHEMA:
-        raise ValueError("invalid package manifest fields")
-    if not isinstance(manifest["package_id"], str) or not PACKAGE_ID.fullmatch(manifest["package_id"]):
-        raise ValueError("invalid package id")
-    if not isinstance(manifest["source_commit"], str) or not GIT_OID.fullmatch(manifest["source_commit"]):
-        raise ValueError("invalid source commit")
-    if manifest["package_uid"] != 0 or manifest["package_gid"] != 0 or manifest["runtime_contract"] != freeze_package.RUNTIME_CONTRACT or manifest["credential_contract"] != freeze_package.CREDENTIAL_CONTRACT:
-        raise ValueError("package runtime contract differs")
-    identities = manifest["identities"]
-    identity_keys = {"keyholder_uid", "keyholder_gid", "controld_uid", "controld_gid"}
-    if not isinstance(identities, dict) or set(identities) != identity_keys:
-        raise ValueError("invalid package identities")
-    for value in identities.values():
-        _u32(value)
-    directories = manifest["directories"]
-    expected_directories = [{"target": target, "mode": "0755", "uid": 0, "gid": 0} for target in freeze_package.DIRECTORIES]
-    if directories != expected_directories:
-        raise ValueError("invalid package directories")
-    claimed_digest = manifest.pop("package_digest")
-    if not isinstance(claimed_digest, str) or not DIGEST.fullmatch(claimed_digest) or sha256(canonical_json(manifest)) != claimed_digest:
-        raise ValueError("package digest mismatch")
-    manifest["package_digest"] = claimed_digest
-    raw_entries = manifest["entries"]
-    if not isinstance(raw_entries, list) or len(raw_entries) != len(EXPECTED_TARGETS):
-        raise ValueError("invalid package inventory")
-    entries: list[Entry] = []
-    for item in raw_entries:
-        if not isinstance(item, dict) or set(item) != {"role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"}:
-            raise ValueError("invalid package entry")
-        role = item["role"]
-        if not isinstance(role, str) or EXPECTED_TARGETS.get(role) != item["target"]:
-            raise ValueError("unexpected package target")
-        source = item["source"]
-        if not isinstance(source, str) or not re.fullmatch(r"assets/[A-Za-z0-9._-]+", source):
-            raise ValueError("invalid package source")
-        source_mode = _mode(item["source_mode"])
-        install_mode = _mode(item["install_mode"])
-        expected_owner = (identities["keyholder_uid"], identities["keyholder_gid"]) if role == "config" else (0, 0)
-        if source_mode != 0o400 or install_mode != (0o600 if role == "config" else 0o644) or (item["uid"], item["gid"]) != expected_owner:
-            raise ValueError("package entry metadata differs")
-        if not isinstance(item["sha256"], str) or not DIGEST.fullmatch(item["sha256"]):
-            raise ValueError("invalid package entry digest")
-        payload, source_metadata = read_regular(package / source)
-        if (source_metadata.st_uid, source_metadata.st_gid, stat.S_IMODE(source_metadata.st_mode)) != (package_uid, package_gid, source_mode) or sha256(payload) != item["sha256"]:
-            raise ValueError("package asset differs")
-        entries.append(Entry(role, source, str(item["target"]), source_mode, install_mode, int(item["uid"]), int(item["gid"]), str(item["sha256"])))
-    if {entry.role for entry in entries} != set(EXPECTED_TARGETS) or len({entry.source for entry in entries}) != len(entries):
-        raise ValueError("package inventory is ambiguous")
-    config_entry = next(entry for entry in entries if entry.role == "config")
-    config, config_raw, _ = parse_json(package / config_entry.source)
-    render_keyholder_config.validate_config(config)
-    if canonical_json(config) != config_raw or (config["peer"]["uid"], config["peer"]["gid"]) != (identities["controld_uid"], identities["controld_gid"]):
-        raise ValueError("packaged config identity or canonical bytes differ")
-    payloads = {entry.role: read_regular(package / entry.source)[0] for entry in entries if entry.role != "config"}
-    freeze_package._validate_units(payloads)
-    return manifest, entries
+    package_metadata = package.lstat()
+    package_fd = _require_directory(package, package_metadata.st_uid, package_metadata.st_gid, 0o700)
+    assets_fd: int | None = None
+    try:
+        assets_fd = os.open("assets", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=package_fd)
+        assets_metadata = os.fstat(assets_fd)
+        if (
+            assets_metadata.st_uid != package_metadata.st_uid
+            or assets_metadata.st_gid != package_metadata.st_gid
+            or stat.S_IMODE(assets_metadata.st_mode) != 0o700
+        ):
+            raise ValueError("package assets metadata is unsafe")
+        manifest_raw, manifest_metadata = _read_at(package_fd, "package-manifest.json", MAX_JSON_BYTES)
+        manifest = _json(manifest_raw)
+        if (
+            manifest_metadata.st_uid != package_metadata.st_uid
+            or manifest_metadata.st_gid != package_metadata.st_gid
+            or stat.S_IMODE(manifest_metadata.st_mode) != 0o600
+            or canonical_json(manifest) != manifest_raw
+        ):
+            raise ValueError("package manifest metadata or encoding is unsafe")
+        expected_keys = {
+            "schema", "package_id", "source_commit", "binary_provenance_sha256",
+            "package_uid", "package_gid", "identities", "runtime_contract",
+            "credential_contract", "directories", "entries", "package_digest",
+        }
+        if set(manifest) != expected_keys or manifest.get("schema") != SCHEMA:
+            raise ValueError("invalid package manifest fields")
+        if not isinstance(manifest.get("package_id"), str) or not PACKAGE_ID.fullmatch(str(manifest["package_id"])):
+            raise ValueError("invalid package id")
+        if not isinstance(manifest.get("source_commit"), str) or not GIT_OID.fullmatch(str(manifest["source_commit"])):
+            raise ValueError("invalid source commit")
+        if not isinstance(manifest.get("binary_provenance_sha256"), str) or not DIGEST.fullmatch(str(manifest["binary_provenance_sha256"])):
+            raise ValueError("invalid provenance digest")
+        if (
+            manifest.get("package_uid") != 0
+            or manifest.get("package_gid") != 0
+            or manifest.get("runtime_contract") != freeze_package.RUNTIME_CONTRACT
+            or manifest.get("credential_contract") != freeze_package.CREDENTIAL_CONTRACT
+        ):
+            raise ValueError("package runtime contract differs")
+        identities = manifest.get("identities")
+        identity_keys = {"keyholder_uid", "keyholder_gid", "controld_uid", "controld_gid"}
+        if not isinstance(identities, dict) or set(identities) != identity_keys:
+            raise ValueError("invalid package identities")
+        for value in identities.values():
+            _u32(value)
+        expected_directories = [
+            {"target": target, "mode": "0755", "uid": 0, "gid": 0}
+            for target in freeze_package.DIRECTORIES
+        ]
+        if manifest.get("directories") != expected_directories:
+            raise ValueError("invalid package directories")
+        claimed_digest = manifest.pop("package_digest")
+        if (
+            not isinstance(claimed_digest, str)
+            or not DIGEST.fullmatch(claimed_digest)
+            or sha256(canonical_json(manifest)) != claimed_digest
+        ):
+            raise ValueError("package digest mismatch")
+        manifest["package_digest"] = claimed_digest
+
+        provenance_raw, provenance_metadata = _read_at(package_fd, "binary-provenance.json", MAX_JSON_BYTES)
+        provenance = _json(provenance_raw)
+        if (
+            provenance_metadata.st_uid != package_metadata.st_uid
+            or provenance_metadata.st_gid != package_metadata.st_gid
+            or stat.S_IMODE(provenance_metadata.st_mode) != 0o600
+            or canonical_json(provenance) != provenance_raw
+            or sha256(provenance_raw) != manifest["binary_provenance_sha256"]
+            or set(provenance) != {"schema", "binary", "source_commit", "profile", "sha256"}
+            or provenance.get("schema") != freeze_package.PROVENANCE_SCHEMA
+            or provenance.get("binary") != "buzz-ci-keyholder"
+            or provenance.get("profile") != "release"
+            or provenance.get("source_commit") != manifest["source_commit"]
+            or not isinstance(provenance.get("sha256"), str)
+            or not DIGEST.fullmatch(str(provenance["sha256"]))
+        ):
+            raise ValueError("binary provenance binding differs")
+
+        raw_entries = manifest.get("entries")
+        if not isinstance(raw_entries, list) or len(raw_entries) != len(EXPECTED_TARGETS):
+            raise ValueError("invalid package inventory")
+        entries: list[Entry] = []
+        for item in raw_entries:
+            if not isinstance(item, dict) or set(item) != {
+                "role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256", "size",
+            }:
+                raise ValueError("invalid package entry")
+            role = item["role"]
+            if not isinstance(role, str) or EXPECTED_TARGETS.get(role) != item["target"]:
+                raise ValueError("unexpected package target")
+            source = item["source"]
+            if not isinstance(source, str) or not re.fullmatch(r"assets/[A-Za-z0-9._-]+", source):
+                raise ValueError("invalid package source")
+            source_mode = _mode(item["source_mode"])
+            install_mode = _mode(item["install_mode"])
+            expected_owner = (identities["keyholder_uid"], identities["keyholder_gid"]) if role == "config" else (0, 0)
+            expected_source_mode = 0o500 if role == "binary" else 0o400
+            expected_install_mode = 0o755 if role == "binary" else (0o600 if role == "config" else 0o644)
+            if (
+                source_mode != expected_source_mode
+                or install_mode != expected_install_mode
+                or (item["uid"], item["gid"]) != expected_owner
+                or isinstance(item["size"], bool)
+                or not isinstance(item["size"], int)
+                or not 0 < item["size"] <= 128 * 1024 * 1024
+                or not isinstance(item["sha256"], str)
+                or not DIGEST.fullmatch(item["sha256"])
+            ):
+                raise ValueError("package entry metadata differs")
+            payload, source_metadata = _read_at(assets_fd, source.removeprefix("assets/"))
+            if (
+                source_metadata.st_uid != package_metadata.st_uid
+                or source_metadata.st_gid != package_metadata.st_gid
+                or stat.S_IMODE(source_metadata.st_mode) != source_mode
+                or len(payload) != item["size"]
+                or sha256(payload) != item["sha256"]
+            ):
+                raise ValueError("package asset differs")
+            entries.append(Entry(role, source, str(item["target"]), source_mode, install_mode, int(item["uid"]), int(item["gid"]), str(item["sha256"]), int(item["size"])))
+        if {entry.role for entry in entries} != set(EXPECTED_TARGETS) or len({entry.source for entry in entries}) != len(entries):
+            raise ValueError("package inventory is ambiguous")
+        binary = next(entry for entry in entries if entry.role == "binary")
+        if binary.sha256 != provenance["sha256"]:
+            raise ValueError("keyholder binary is not bound to provenance")
+        config_entry = next(entry for entry in entries if entry.role == "config")
+        config_raw, _ = _read_at(assets_fd, config_entry.source.removeprefix("assets/"), MAX_JSON_BYTES)
+        config = _json(config_raw)
+        render_keyholder_config.validate_config(config)
+        if canonical_json(config) != config_raw or (config["peer"]["uid"], config["peer"]["gid"]) != (identities["controld_uid"], identities["controld_gid"]):
+            raise ValueError("packaged config identity or canonical bytes differ")
+        payloads = {
+            entry.role: _read_at(assets_fd, entry.source.removeprefix("assets/"))[0]
+            for entry in entries if entry.role not in {"binary", "config"}
+        }
+        freeze_package._validate_units(payloads)
+        return manifest, entries
+    finally:
+        if assets_fd is not None:
+            os.close(assets_fd)
+        os.close(package_fd)
 
 
 def _account_rows(root: Path, target: str, fields: int) -> list[list[str]]:
-    path = rooted(root, target)
-    payload, metadata = read_regular(path, 1024 * 1024)
-    if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (mapped_id(0, root), mapped_id(0, root, group=True), 0o644):
+    payload, metadata = read_regular(rooted(root, target), MAX_JSON_BYTES)
+    if (
+        metadata.st_uid != mapped_id(0, root)
+        or metadata.st_gid != mapped_id(0, root, group=True)
+        or stat.S_IMODE(metadata.st_mode) != 0o644
+    ):
         raise ValueError("account database metadata is unsafe")
     rows = [line.split(":") for line in payload.decode().splitlines() if line and not line.startswith("#")]
     if any(len(row) != fields for row in rows):
@@ -233,7 +331,6 @@ def _account_rows(root: Path, target: str, fields: int) -> list[list[str]]:
 
 
 def validate_host(root: Path, manifest: dict[str, object]) -> None:
-    root = _safe_root(root)
     identities = manifest["identities"]
     users = _account_rows(root, "/etc/passwd", 7)
     groups = _account_rows(root, "/etc/group", 4)
@@ -259,16 +356,18 @@ def validate_host(root: Path, manifest: dict[str, object]) -> None:
 
 
 def validate_encrypted_credential(root: Path) -> None:
-    root = _safe_root(root)
     path = rooted(root, str(freeze_package.CREDENTIAL_CONTRACT["encrypted_source"]))
     try:
-        _validate_directory_chain(root, path.parent)
-        _require_directory(path.parent, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
         metadata = path.lstat()
+        parent_metadata = path.parent.lstat()
     except FileNotFoundError as error:
         raise ValueError("acceptance encrypted credential is unavailable") from error
     if (
-        not stat.S_ISREG(metadata.st_mode)
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != mapped_id(0, root)
+        or parent_metadata.st_gid != mapped_id(0, root, group=True)
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
         or metadata.st_uid != mapped_id(0, root)
         or metadata.st_gid != mapped_id(0, root, group=True)
@@ -278,60 +377,77 @@ def validate_encrypted_credential(root: Path) -> None:
         raise ValueError("acceptance encrypted credential metadata is invalid")
 
 
-def _ensure_directories(root: Path, manifest: dict[str, object]) -> None:
-    root = _safe_root(root)
-    for item in manifest["directories"]:
-        target = rooted(root, str(item["target"]))
-        current = root
-        for component in target.relative_to(root).parts:
-            current /= component
-            if not current.exists():
-                current.mkdir(mode=0o755)
-                os.chown(current, mapped_id(0, root), mapped_id(0, root, group=True))
-            metadata = current.lstat()
+def _open_root(root: Path) -> int:
+    return os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+
+
+def _open_chain(root_fd: int, target: str, root: Path, *, create: bool, created: list[str] | None = None, final_mode: int | None = 0o755) -> int:
+    parts = Path(target.removeprefix("/")).parts
+    descriptor = os.dup(root_fd)
+    current = ""
+    try:
+        for index, component in enumerate(parts):
+            current += f"/{component}"
+            try:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                mode = final_mode if index == len(parts) - 1 and final_mode is not None else 0o755
+                os.mkdir(component, mode, dir_fd=descriptor)
+                os.chown(component, mapped_id(0, root), mapped_id(0, root, group=True), dir_fd=descriptor, follow_symlinks=False)
+                os.chmod(component, mode, dir_fd=descriptor, follow_symlinks=False)
+                if created is not None:
+                    created.append(current)
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=descriptor)
+            metadata = os.fstat(child)
+            wanted_mode = final_mode if index == len(parts) - 1 else None
             if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != mapped_id(0, root)
+                metadata.st_uid != mapped_id(0, root)
                 or metadata.st_gid != mapped_id(0, root, group=True)
                 or metadata.st_mode & 0o022
+                or (wanted_mode is not None and stat.S_IMODE(metadata.st_mode) != wanted_mode)
             ):
-                raise ValueError("target directory chain is unsafe")
-        target.chmod(0o755)
+                os.close(child)
+                raise ValueError(f"unsafe directory metadata: {current}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
-def _target_matches(root: Path, entry: Entry) -> bool:
-    target = rooted(root, entry.target)
-    if not target.exists() or target.is_symlink():
-        return False
-    payload, metadata = read_regular(target)
-    return (
-        sha256(payload) == entry.sha256
-        and stat.S_IMODE(metadata.st_mode) == entry.install_mode
-        and metadata.st_uid == mapped_id(entry.uid, root)
-        and metadata.st_gid == mapped_id(entry.gid, root, group=True)
-    )
+def _open_parent(root_fd: int, target: str, root: Path, *, create: bool = False, created: list[str] | None = None) -> tuple[int, str]:
+    path = Path(target)
+    return _open_chain(root_fd, str(path.parent), root, create=create, created=created, final_mode=None), path.name
 
 
-def check(package: Path, root: Path) -> dict[str, object]:
-    root = _safe_root(root)
-    manifest, entries = parse_package(package, package)
-    validate_host(root, manifest)
-    validate_encrypted_credential(root)
-    changed = [entry.target for entry in entries if not _target_matches(root, entry)]
+def _state(root_fd: int, root: Path, entry: Entry) -> dict[str, object] | None:
+    parent_fd, name = _open_parent(root_fd, entry.target, root)
+    try:
+        try:
+            payload, metadata = _read_at(parent_fd, name)
+        except FileNotFoundError:
+            return None
+        return {
+            "sha256": sha256(payload), "size": len(payload),
+            "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
+        }
+    finally:
+        os.close(parent_fd)
+
+
+def _desired(root: Path, entry: Entry) -> dict[str, object]:
     return {
-        "status": "checked",
-        "package_id": manifest["package_id"],
-        "package_digest": manifest["package_digest"],
-        "changed_targets": changed,
-        "credential_bytes_read": False,
-        "enabled": False,
-        "active": False,
+        "sha256": entry.sha256, "size": entry.size, "mode": entry.install_mode,
+        "uid": mapped_id(entry.uid, root), "gid": mapped_id(entry.gid, root, group=True),
     }
 
 
-def _atomic_write(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(name)
+def _atomic_publish(parent_fd: int, name: str, payload: bytes, mode: int, uid: int, gid: int) -> None:
+    temporary = f".{name}.{uuid.uuid4().hex}"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode, dir_fd=parent_fd)
     try:
         os.fchmod(descriptor, mode)
         os.fchown(descriptor, uid, gid)
@@ -339,45 +455,339 @@ def _atomic_write(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> 
         while view:
             view = view[os.write(descriptor, view):]
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.replace(temporary, path)
-        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        try:
-            os.fsync(parent)
-        finally:
-            os.close(parent)
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != uid or metadata.st_gid != gid or stat.S_IMODE(metadata.st_mode) != mode or metadata.st_size != len(payload):
+            raise OSError("temporary target metadata differs")
+        os.rename(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temporary = ""
+        os.fsync(parent_fd)
+        installed, installed_metadata = _read_at(parent_fd, name)
+        if installed != payload or installed_metadata.st_uid != uid or installed_metadata.st_gid != gid or stat.S_IMODE(installed_metadata.st_mode) != mode:
+            raise OSError("atomic publish readback differs")
     finally:
+        os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _write_once(directory_fd: int, name: str, payload: bytes, mode: int, uid: int, gid: int) -> None:
+    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode, dir_fd=directory_fd)
+    try:
+        os.fchmod(descriptor, mode)
+        os.fchown(descriptor, uid, gid)
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(descriptor, view):]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def _receipt_directory(root_fd: int, root: Path, *, create: bool) -> int:
+    modes = (("/var", 0o755), ("/var/lib", 0o755), ("/var/lib/buzzci", 0o711), (RECEIPT_DIRECTORY, 0o700))
+    descriptor = -1
+    for target, mode in modes:
         if descriptor >= 0:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        descriptor = _open_chain(root_fd, target, root, create=create, final_mode=mode)
+    return descriptor
+
+
+def _read_receipt(directory_fd: int, name: str, *, absent_ok: bool) -> tuple[dict[str, object], bytes] | None:
+    try:
+        raw, metadata = _read_at(directory_fd, name, MAX_JSON_BYTES)
+    except FileNotFoundError:
+        if absent_ok:
+            return None
+        raise ValueError(f"{name} is absent")
+    value = _json(raw)
+    directory_metadata = os.fstat(directory_fd)
+    if (
+        canonical_json(value) != raw
+        or metadata.st_uid != directory_metadata.st_uid
+        or metadata.st_gid != directory_metadata.st_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError(f"{name} metadata or encoding differs")
+    return value, raw
+
+
+def _validate_install_receipt(receipt: dict[str, object], manifest: dict[str, object], entries: list[Entry]) -> None:
+    if (
+        set(receipt) != {"schema", "package_id", "package_digest", "source_commit", "binary_provenance_sha256", "managed", "changes", "created_directories"}
+        or receipt.get("schema") != RECEIPT_SCHEMA
+        or receipt.get("package_id") != manifest["package_id"]
+        or receipt.get("package_digest") != manifest["package_digest"]
+        or receipt.get("source_commit") != manifest["source_commit"]
+        or receipt.get("binary_provenance_sha256") != manifest["binary_provenance_sha256"]
+    ):
+        raise ValueError("keyholder install receipt package binding differs")
+    expected_managed = [
+        {"target": entry.target, "sha256": entry.sha256, "size": entry.size, "mode": entry.install_mode, "uid": entry.uid, "gid": entry.gid}
+        for entry in entries
+    ]
+    if receipt.get("managed") != expected_managed:
+        raise ValueError("keyholder install receipt inventory differs")
+    changes = receipt.get("changes")
+    created = receipt.get("created_directories")
+    if not isinstance(changes, list) or not isinstance(created, list) or len(set(created)) != len(created):
+        raise ValueError("keyholder install receipt plan differs")
+    by_target = {entry.target: entry for entry in entries}
+    for index, record in enumerate(changes):
+        if not isinstance(record, dict) or record.get("target") not in by_target or not isinstance(record.get("existed"), bool):
+            raise ValueError("keyholder install receipt change differs")
+        keys = {"target", "existed"}
+        if record["existed"]:
+            keys |= {"sha256", "size", "mode", "uid", "gid", "backup"}
+            if record.get("backup") != f"prior-{index}" or not isinstance(record.get("sha256"), str) or not DIGEST.fullmatch(str(record["sha256"])):
+                raise ValueError("keyholder install receipt prior binding differs")
+            for field in ("size", "mode", "uid", "gid"):
+                if isinstance(record.get(field), bool) or not isinstance(record.get(field), int) or int(record[field]) < 0:
+                    raise ValueError("keyholder install receipt prior metadata differs")
+        if set(record) != keys:
+            raise ValueError("keyholder install receipt change fields differ")
+
+
+def _package_payload(package: Path, entry: Entry) -> bytes:
+    assets_fd = _require_directory(package / "assets", package.lstat().st_uid, package.lstat().st_gid, 0o700)
+    try:
+        return _read_at(assets_fd, entry.source.removeprefix("assets/"))[0]
+    finally:
+        os.close(assets_fd)
+
+
+def _prepare_receipt(root: Path, root_fd: int, directory_fd: int, manifest: dict[str, object], entries: list[Entry], created: list[str]) -> dict[str, object]:
+    changes: list[dict[str, object]] = []
+    for entry in entries:
+        state = _state(root_fd, root, entry)
+        if state == _desired(root, entry):
+            continue
+        record: dict[str, object] = {"target": entry.target, "existed": state is not None}
+        if state is not None:
+            record.update(state)
+            record["backup"] = f"prior-{len(changes)}"
+            parent_fd, name = _open_parent(root_fd, entry.target, root)
+            try:
+                payload, _ = _read_at(parent_fd, name)
+            finally:
+                os.close(parent_fd)
+            _write_once(directory_fd, str(record["backup"]), payload, 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
+        changes.append(record)
+    receipt = {
+        "schema": RECEIPT_SCHEMA, "package_id": manifest["package_id"], "package_digest": manifest["package_digest"],
+        "source_commit": manifest["source_commit"], "binary_provenance_sha256": manifest["binary_provenance_sha256"],
+        "managed": [{"target": entry.target, "sha256": entry.sha256, "size": entry.size, "mode": entry.install_mode, "uid": entry.uid, "gid": entry.gid} for entry in entries],
+        "changes": changes, "created_directories": created,
+    }
+    _write_once(directory_fd, "receipt-v1.json", canonical_json(receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
+    return receipt
+
+
+def _prior_state(record: dict[str, object]) -> dict[str, object] | None:
+    if not record["existed"]:
+        return None
+    return {field: record[field] for field in ("sha256", "size", "mode", "uid", "gid")}
+
+
+def _result(status: str, manifest: dict[str, object], changed: list[str]) -> dict[str, object]:
+    return {
+        "status": status, "package_id": manifest["package_id"], "package_digest": manifest["package_digest"],
+        "source_commit": manifest["source_commit"], "changed_targets": changed, "credential_bytes_read": False,
+        "enabled": False, "active": False, "exec_start": EXPECTED_TARGETS["binary"],
+    }
+
+
+def check(package: Path, root: Path) -> dict[str, object]:
+    root = _safe_root(root)
+    manifest, entries = parse_package(package, root)
+    validate_host(root, manifest)
+    validate_encrypted_credential(root)
+    root_fd = _open_root(root)
+    try:
+        changed: list[str] = []
+        for entry in entries:
+            try:
+                current = _state(root_fd, root, entry)
+            except FileNotFoundError:
+                current = None
+            if current != _desired(root, entry):
+                changed.append(entry.target)
+        try:
+            receipt_fd = _receipt_directory(root_fd, root, create=False)
+        except FileNotFoundError:
+            receipt = None
+        else:
+            try:
+                receipt = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=True)
+                if receipt is not None:
+                    _validate_install_receipt(receipt[0], manifest, entries)
+            finally:
+                os.close(receipt_fd)
+        result = _result("checked", manifest, changed)
+        result["install_receipt"] = "verified" if receipt is not None else "absent"
+        return result
+    finally:
+        os.close(root_fd)
 
 
 def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, object]:
-    root = _safe_root(root)
-    manifest, entries = parse_package(package, package)
-    validate_host(root, manifest)
-    validate_encrypted_credential(root)
-    if root == Path("/") and os.geteuid() != 0:
-        raise PermissionError("installation requires root")
-    changed = [entry for entry in entries if not _target_matches(root, entry)]
-    result = {
-        "status": "dry_run" if dry_run else ("unchanged" if not changed else "installed"),
-        "package_id": manifest["package_id"],
-        "package_digest": manifest["package_digest"],
-        "changed_targets": [entry.target for entry in changed],
-        "credential_bytes_read": False,
-        "enabled": False,
-        "active": False,
-    }
-    if dry_run or not changed:
-        return result
-    _ensure_directories(root, manifest)
-    for entry in changed:
-        payload, _ = read_regular(package / entry.source)
-        target = rooted(root, entry.target)
-        _atomic_write(target, payload, entry.install_mode, mapped_id(entry.uid, root), mapped_id(entry.gid, root, group=True))
-    return result
+    previous_umask = os.umask(0o077)
+    try:
+        root = _safe_root(root)
+        package = Path(os.path.abspath(package))
+        manifest, entries = parse_package(package, root)
+        validate_host(root, manifest)
+        validate_encrypted_credential(root)
+        if root == Path("/") and os.geteuid() != 0:
+            raise PermissionError("installation requires root")
+        root_fd = _open_root(root)
+        created: list[str] = []
+        try:
+            if dry_run:
+                changed = []
+                for entry in entries:
+                    try:
+                        current = _state(root_fd, root, entry)
+                    except FileNotFoundError:
+                        current = None
+                    if current != _desired(root, entry):
+                        changed.append(entry.target)
+                return _result("dry_run", manifest, changed)
+            for directory in manifest["directories"]:
+                descriptor = _open_chain(root_fd, str(directory["target"]), root, create=True, created=created)
+                os.close(descriptor)
+            receipt_fd = _receipt_directory(root_fd, root, create=True)
+            try:
+                if _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=True) is not None:
+                    raise ValueError("keyholder package was already rolled back")
+                receipt_pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=True)
+                if receipt_pair is None:
+                    receipt = _prepare_receipt(root, root_fd, receipt_fd, manifest, entries, created)
+                    new_receipt = True
+                else:
+                    receipt = receipt_pair[0]
+                    new_receipt = False
+                _validate_install_receipt(receipt, manifest, entries)
+                changes = {record["target"]: record for record in receipt["changes"]}
+                changed: list[str] = []
+                for entry in entries:
+                    current = _state(root_fd, root, entry)
+                    desired = _desired(root, entry)
+                    if current == desired:
+                        continue
+                    record = changes.get(entry.target)
+                    if record is None or current != _prior_state(record):
+                        raise ValueError(f"installed target drift blocks replay: {entry.target}")
+                    parent_fd, name = _open_parent(root_fd, entry.target, root)
+                    try:
+                        _atomic_publish(parent_fd, name, _package_payload(package, entry), entry.install_mode, mapped_id(entry.uid, root), mapped_id(entry.gid, root, group=True))
+                    finally:
+                        os.close(parent_fd)
+                    if _state(root_fd, root, entry) != desired:
+                        raise ValueError(f"installed target readback differs: {entry.target}")
+                    changed.append(entry.target)
+                if any(_state(root_fd, root, entry) != _desired(root, entry) for entry in entries):
+                    raise ValueError("keyholder package exact readback differs")
+                return _result("installed" if changed or new_receipt else "unchanged", manifest, changed)
+            finally:
+                os.close(receipt_fd)
+        finally:
+            os.close(root_fd)
+    finally:
+        os.umask(previous_umask)
+
+
+def rollback(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, object]:
+    previous_umask = os.umask(0o077)
+    try:
+        root = _safe_root(root)
+        manifest, entries = parse_package(package, root)
+        if root == Path("/") and os.geteuid() != 0:
+            raise PermissionError("rollback requires root")
+        root_fd = _open_root(root)
+        try:
+            receipt_fd = _receipt_directory(root_fd, root, create=False)
+            try:
+                receipt_pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=False)
+                assert receipt_pair is not None
+                receipt, receipt_raw = receipt_pair
+                _validate_install_receipt(receipt, manifest, entries)
+                if _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=True) is not None:
+                    raise ValueError("keyholder package rollback was already completed")
+                by_target = {entry.target: entry for entry in entries}
+                plan: list[tuple[dict[str, object], Entry, bytes | None]] = []
+                for record in receipt["changes"]:
+                    entry = by_target[str(record["target"])]
+                    current = _state(root_fd, root, entry)
+                    if current not in (_desired(root, entry), _prior_state(record)):
+                        raise ValueError(f"installed target drift blocks rollback: {entry.target}")
+                    backup: bytes | None = None
+                    if record["existed"]:
+                        backup, metadata = _read_at(receipt_fd, str(record["backup"]))
+                        if metadata.st_uid != mapped_id(0, root) or metadata.st_gid != mapped_id(0, root, group=True) or stat.S_IMODE(metadata.st_mode) != 0o600 or sha256(backup) != record["sha256"] or len(backup) != record["size"]:
+                            raise ValueError("keyholder rollback backup differs")
+                    plan.append((record, entry, backup))
+                removal_plan: list[tuple[int, str]] = []
+                created_directories = set(receipt["created_directories"])
+                absent_targets = {
+                    entry.target for record, entry, _ in plan if not record["existed"]
+                }
+                for directory in receipt["created_directories"]:
+                    directory_fd = _open_chain(root_fd, str(directory), root, create=False)
+                    present = set(os.listdir(directory_fd))
+                    expected = {
+                        Path(target).name for target in absent_targets
+                        if str(Path(target).parent) == directory
+                    } | {
+                        Path(child).name for child in created_directories
+                        if str(Path(child).parent) == directory
+                    }
+                    os.close(directory_fd)
+                    if present != expected:
+                        raise ValueError(f"rollback directory content drift: {directory}")
+                    parent_fd, name = _open_parent(root_fd, str(directory), root)
+                    removal_plan.append((parent_fd, name))
+                if dry_run:
+                    for parent_fd, _ in removal_plan:
+                        os.close(parent_fd)
+                    return _result("rollback_dry_run", manifest, [entry.target for _, entry, _ in plan])
+                for record, entry, backup in reversed(plan):
+                    if _state(root_fd, root, entry) == _prior_state(record):
+                        continue
+                    parent_fd, name = _open_parent(root_fd, entry.target, root)
+                    try:
+                        if backup is None:
+                            os.unlink(name, dir_fd=parent_fd)
+                            os.fsync(parent_fd)
+                        else:
+                            _atomic_publish(parent_fd, name, backup, int(record["mode"]), int(record["uid"]), int(record["gid"]))
+                    finally:
+                        os.close(parent_fd)
+                for record, entry, _ in plan:
+                    if _state(root_fd, root, entry) != _prior_state(record):
+                        raise ValueError(f"rollback readback differs: {entry.target}")
+                for parent_fd, name in reversed(removal_plan):
+                    try:
+                        os.rmdir(name, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                    finally:
+                        os.close(parent_fd)
+                rollback_receipt = {
+                    "schema": ROLLBACK_SCHEMA, "package_id": manifest["package_id"], "package_digest": manifest["package_digest"],
+                    "install_receipt_sha256": sha256(receipt_raw), "restored_targets": [entry.target for _, entry, _ in plan],
+                }
+                _write_once(receipt_fd, "rollback-v1.json", canonical_json(rollback_receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
+                return _result("rolled_back", manifest, rollback_receipt["restored_targets"])
+            finally:
+                os.close(receipt_fd)
+        finally:
+            os.close(root_fd)
+    finally:
+        os.umask(previous_umask)
 
 
 def main() -> int:
@@ -392,12 +802,18 @@ def main() -> int:
     install_parser.add_argument("--package", type=Path, required=True)
     install_parser.add_argument("--root", type=Path, default=Path("/"))
     install_parser.add_argument("--dry-run", action="store_true")
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--package", type=Path, required=True)
+    rollback_parser.add_argument("--root", type=Path, default=Path("/"))
+    rollback_parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
     if arguments.command == "verify-package":
-        manifest, _ = parse_package(arguments.package, arguments.package)
+        manifest, _ = parse_package(arguments.package)
         result = {"status": "verified", "package_id": manifest["package_id"], "package_digest": manifest["package_digest"]}
     elif arguments.command == "check":
         result = check(arguments.package, arguments.root)
+    elif arguments.command == "rollback":
+        result = rollback(arguments.package, arguments.root, dry_run=arguments.dry_run)
     else:
         result = install(arguments.package, arguments.root, dry_run=arguments.dry_run)
     print(json.dumps(result, sort_keys=True))

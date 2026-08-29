@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/keyholder-binary-provenance-v1.json",
+  "title": "Buzz CI keyholder binary provenance v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "binary", "source_commit", "profile", "sha256"],
+  "properties": {
+    "schema": { "const": "buzz-ci-binary-provenance-v1" },
+    "binary": { "const": "buzz-ci-keyholder" },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "profile": { "const": "release" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

@@ -3,7 +3,9 @@
 This directory contains the dormant systemd base templates and an explicit
 acceptance-actor provisioning package for the local signing keyholder. The
 package scripts never create accounts or credentials, read credential bytes,
-reload systemd, enable the socket, or start the service.
+reload systemd, enable the socket, or start the service. The package now owns
+the exact release binary at `/usr/libexec/buzz-ci-keyholder`; activation owns
+neither that path nor a second copy of the daemon.
 
 The service accepts one bounded request per Unix connection at
 `/run/buzzci/keyholder.sock`. Systemd owns the listener as
@@ -134,6 +136,8 @@ participate in a package self-digest cycle.
 deploy/native-ci/keyholder/freeze_package.py \
   --source-root "$PWD" \
   --source-commit "$(git rev-parse HEAD)" \
+  --binary /private/path/buzz-ci-keyholder \
+  --binary-provenance /private/path/binary-provenance.json \
   --public-spec /private/path/acceptance-public.json \
   --output /private/path/keyholder-package \
   --keyholder-uid 1202 --keyholder-gid 1202 \
@@ -146,8 +150,14 @@ deploy/native-ci/keyholder/install.py verify-package \
 `install.py check` and `install.py install --dry-run` validate the host
 principals and external encrypted credential without mutation. `install`
 copies the public config and static units with exact ownership and modes, but
-does not call systemd. Use `--root` only for a controlled fake root or an
-explicitly approved installation.
+does not call systemd. It also installs the provenance-bound release binary,
+publishes every target through descriptor-relative no-follow operations, and
+records one immutable receipt under `/var/lib/buzzci/keyholder-package`.
+Replays accept only the exact receipt and installed bytes. Drift or another
+candidate is refused. `install.py rollback` verifies every installed target and
+backup before restoring the prior file or prior absence, then writes a
+create-once rollback receipt. Use `--root` only for a controlled fake root or
+an explicitly approved installation.
 
 ## Targeted checks
 
