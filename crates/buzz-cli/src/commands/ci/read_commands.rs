@@ -17,13 +17,14 @@ use crate::error::CliError;
 
 // ── Status ──
 
-/// JSON output for `buzz ci status` and the Pending honest report.
+/// Frozen flat JSON output for `buzz ci status`.
 #[derive(Debug, Serialize)]
 struct StatusOutput {
     run_id: String,
-    state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reduction: Option<CiReduction>,
+    sha: String,
+    attempt: u32,
+    state: red::CiReducedState,
+    jobs: Vec<red::CiReducedJob>,
 }
 
 pub(super) async fn cmd_status(
@@ -31,32 +32,14 @@ pub(super) async fn cmd_status(
     run_id: &str,
     trusted: &RunTrustedContext,
 ) -> Result<(), CliError> {
-    let events =
-        super::dispatch::fetch_run_events(client, run_id, trusted, &super::dispatch::STATUS_KINDS)
-            .await?;
-    let (request_event_id, request, accepted) =
-        match super::dispatch::extract_request(&events, trusted) {
-            Some(triple) => triple,
-            None => {
-                return super::dispatch::print_json(&StatusOutput {
-                    run_id: run_id.to_owned(),
-                    state: "pending".into(),
-                    reduction: None,
-                });
-            }
-        };
-    let reduction = red::reduce_status(&request_event_id, &request, &accepted, false);
-    let state = match reduction.state {
-        red::CiReducedState::Pending => "pending",
-        red::CiReducedState::Green => "green",
-        red::CiReducedState::Red => "red",
-        red::CiReducedState::InfrastructureFailure => "infrastructure_failure",
-    };
-    super::dispatch::print_json(&StatusOutput {
-        run_id: run_id.to_owned(),
-        state: state.into(),
-        reduction: Some(reduction),
-    })
+    let snapshot = super::dispatch::fetch_ci_run_snapshot(client, run_id, trusted).await?;
+    let reduction = red::reduce_status(
+        &snapshot.request_event_id,
+        &snapshot.request,
+        &snapshot.accepted,
+        false,
+    );
+    super::dispatch::print_json(&status_output(reduction))
 }
 
 // ── Verdict ──
@@ -67,34 +50,15 @@ pub(super) async fn cmd_verdict(
     expect_sha: &str,
     trusted: &RunTrustedContext,
 ) -> Result<(), CliError> {
-    let events =
-        super::dispatch::fetch_run_events(client, run_id, trusted, &super::dispatch::STATUS_KINDS)
-            .await?;
-    let (request_event_id, request, accepted) =
-        match super::dispatch::extract_request(&events, trusted) {
-            Some(triple) => triple,
-            None => {
-                return super::dispatch::print_json(&StatusOutput {
-                    run_id: run_id.to_owned(),
-                    state: "pending".into(),
-                    reduction: None,
-                });
-            }
-        };
-    match red::reduce_verdict(&request_event_id, &request, &accepted, expect_sha, false) {
-        Ok(reduction) => {
-            let state = match reduction.state {
-                red::CiReducedState::Pending => "pending",
-                red::CiReducedState::Green => "green",
-                red::CiReducedState::Red => "red",
-                red::CiReducedState::InfrastructureFailure => "infrastructure_failure",
-            };
-            super::dispatch::print_json(&StatusOutput {
-                run_id: run_id.to_owned(),
-                state: state.into(),
-                reduction: Some(reduction),
-            })
-        }
+    let snapshot = super::dispatch::fetch_ci_run_snapshot(client, run_id, trusted).await?;
+    match red::reduce_verdict(
+        &snapshot.request_event_id,
+        &snapshot.request,
+        &snapshot.accepted,
+        expect_sha,
+        false,
+    ) {
+        Ok(reduction) => super::dispatch::print_json(&verdict_output(reduction)),
         Err(red::CiReducerError::ShaMismatch {
             requested,
             resolved,
@@ -106,6 +70,45 @@ pub(super) async fn cmd_verdict(
             }))
             .map_err(|e| CliError::Other(format!("failed to serialize verdict error: {e}")))?,
         )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct VerdictOutput {
+    run_id: String,
+    sha: String,
+    attempt: u32,
+    verdict: red::CiReducedState,
+    jobs_terminal: usize,
+    jobs_total: usize,
+    required_failing: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+fn status_output(reduction: CiReduction) -> StatusOutput {
+    StatusOutput {
+        run_id: reduction.run_id,
+        sha: reduction.sha,
+        attempt: reduction.attempt,
+        state: reduction.state,
+        jobs: reduction.jobs,
+    }
+}
+
+fn verdict_output(reduction: CiReduction) -> VerdictOutput {
+    let reason = (reduction.state == red::CiReducedState::InfrastructureFailure)
+        .then_some(reduction.reason)
+        .flatten();
+    VerdictOutput {
+        run_id: reduction.run_id,
+        sha: reduction.sha,
+        attempt: reduction.attempt,
+        verdict: reduction.state,
+        jobs_terminal: reduction.jobs_terminal,
+        jobs_total: reduction.jobs_total,
+        required_failing: reduction.required_failing,
+        reason,
     }
 }
 
@@ -127,20 +130,10 @@ pub(super) async fn cmd_logs(
     raw: bool,
     trusted: &RunTrustedContext,
 ) -> Result<(), CliError> {
-    let events =
-        super::dispatch::fetch_run_events(client, run_id, trusted, &super::dispatch::ALL_CI_KINDS)
-            .await?;
-    let (request_event_id, request, accepted) =
-        match super::dispatch::extract_request(&events, trusted) {
-            Some(triple) => triple,
-            None => {
-                return super::dispatch::print_json(&LogsPendingOutput {
-                    run_id: run_id.to_owned(),
-                    state: "pending".into(),
-                    message: "run has no accepted CI events; logs are not available yet".into(),
-                });
-            }
-        };
+    let snapshot = super::dispatch::fetch_ci_run_snapshot(client, run_id, trusted).await?;
+    let request_event_id = snapshot.request_event_id;
+    let request = snapshot.request;
+    let accepted = snapshot.accepted;
 
     // Reduce to confirm we have terminal state.
     let reduction = red::reduce_status(&request_event_id, &request, &accepted, false);
@@ -231,6 +224,10 @@ fn output_log(bytes: &[u8], raw: bool, result: &ev::LogsResult) -> Result<(), Cl
 /// JSON output for one emitted watch record.
 #[derive(Debug, Serialize)]
 struct WatchRecordOutput {
+    run_id: String,
+    sha: String,
+    attempt: u32,
+    watch_cursor: u64,
     event_id: String,
     scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,79 +237,98 @@ struct WatchRecordOutput {
     timestamp: u64,
 }
 
-/// JSON output for a watch exit.
-#[derive(Debug, Serialize)]
-#[serde(tag = "exit")]
-enum WatchExitOutput {
-    #[serde(rename = "terminal")]
-    Terminal { state: String },
-    #[serde(rename = "infrastructure_failure")]
-    InfrastructureFailure { reason: String },
-}
-
 pub(super) async fn cmd_watch(
     client: &BuzzClient,
     run_id: &str,
     trusted: &RunTrustedContext,
 ) -> Result<(), CliError> {
-    let events =
-        super::dispatch::fetch_run_events(client, run_id, trusted, &super::dispatch::ALL_CI_KINDS)
-            .await?;
-    let (_request_event_id, request, accepted) =
-        match super::dispatch::extract_request(&events, trusted) {
-            Some(triple) => triple,
-            None => {
-                // No request event — nothing to watch yet.
-                return super::dispatch::print_json(&WatchExitOutput::Terminal {
-                    state: "pending".into(),
-                });
+    let request = super::dispatch::fetch_ci_run_request(client, run_id, trusted).await?;
+    let replay_limit = std::num::NonZeroUsize::new(16)
+        .ok_or_else(|| CliError::Other("CI watch replay limit is zero".into()))?;
+    let mut stream = WatchStream::new(
+        &request.request.run_id,
+        &request.request.tip_oid,
+        0,
+        replay_limit,
+    );
+    let mut accepted_by_cursor = std::collections::BTreeMap::new();
+
+    loop {
+        let checkpoint = stream.last_fully_emitted_cursor();
+        let page = match super::dispatch::fetch_ci_run_events_page(
+            client, run_id, &request, trusted, checkpoint,
+        )
+        .await
+        {
+            Ok((page, _next_cursor)) => page,
+            Err(error) if crate::error::is_retryable_error(&error) => {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
+            Err(error) => return Err(error),
         };
+        if page.is_empty() {
+            if checkpoint == 0 {
+                return Err(CliError::Other(
+                    "CI run history omitted its immutable request".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        }
 
-    // Build watch records from accepted events, synthesizing watch_cursor
-    // from created_at since the relay does not assign cursors yet.
-    let records: Vec<WatchRecord> = accepted
-        .iter()
-        .map(|e| build_watch_record(e, &request))
-        .collect::<Result<Vec<_>, CliError>>()?;
-
-    let replay_limit = std::num::NonZeroUsize::new(16).expect("nonzero");
-    let mut stream = WatchStream::new(&request.run_id, &request.tip_oid, 0, replay_limit);
-
-    let mut last_exit = WatchExitOutput::Terminal {
-        state: "pending".into(),
-    };
-
-    for record in records {
-        for action in stream.consume(record) {
-            match action {
-                WatchAction::Emit(rec) => {
-                    super::dispatch::print_json(&WatchRecordOutput {
-                        event_id: rec.event_id,
-                        scope: watch_scope_str(rec.scope).into(),
-                        job_id: rec.job_id,
-                        state: rec.state.map(watch_state_str).map(str::to_owned),
-                        timestamp: rec.timestamp,
-                    })?;
+        for event in &page {
+            match accepted_by_cursor.entry(event.watch_cursor) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(event.clone());
                 }
-                WatchAction::RequestReplay(_) => {}
-                WatchAction::Exit(exit) => match exit {
-                    WatchExit::Terminal { state } => {
-                        last_exit = WatchExitOutput::Terminal {
-                            state: format!("{state:?}").to_lowercase(),
-                        };
-                    }
-                    WatchExit::InfrastructureFailure(failure) => {
-                        last_exit = WatchExitOutput::InfrastructureFailure {
-                            reason: format!("{failure:?}"),
-                        };
-                    }
-                },
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == event => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(CliError::Other(
+                        "CI watch cursor was assigned conflicting events".into(),
+                    ));
+                }
             }
         }
-    }
+        let accepted = accepted_by_cursor.values().cloned().collect::<Vec<_>>();
+        super::dispatch::validate_ci_request_history(&request, &accepted)?;
+        red::validate_accepted_run(&request.request_event_id, &request.request, &accepted)
+            .map_err(|reason| CliError::Other(format!("invalid accepted CI history: {reason}")))?;
 
-    super::dispatch::print_json(&last_exit)
+        for envelope in &page {
+            let record = build_watch_record(envelope, &request.request)?;
+            for action in stream.consume(record) {
+                match action {
+                    WatchAction::Emit(rec) => {
+                        super::dispatch::print_json(&WatchRecordOutput {
+                            run_id: rec.run_id,
+                            sha: rec.sha,
+                            attempt: rec.attempt,
+                            watch_cursor: rec.watch_cursor,
+                            event_id: rec.event_id,
+                            scope: watch_scope_str(rec.scope).into(),
+                            job_id: rec.job_id,
+                            state: rec.state.map(watch_state_str).map(str::to_owned),
+                            timestamp: rec.timestamp,
+                        })?;
+                    }
+                    WatchAction::RequestReplay(_) => {}
+                    WatchAction::Exit(exit) => match exit {
+                        WatchExit::Terminal { .. } => return Ok(()),
+                        WatchExit::InfrastructureFailure(failure) => {
+                            return Err(CliError::Other(format!(
+                                "CI watch infrastructure failure: {failure:?}"
+                            )));
+                        }
+                    },
+                }
+            }
+        }
+        let _ = stream.replay_finished();
+        if stream.last_fully_emitted_cursor() == checkpoint {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
 }
 
 fn watch_scope_str(s: WatchScope) -> &'static str {
@@ -383,12 +399,13 @@ fn build_watch_record(
         ValidatedCiEnvelope::TeardownAttestation(t) => {
             (WatchScope::Teardown, None, None, t.attempt, t.teardown_at)
         }
-        ValidatedCiEnvelope::Request(_) => {
-            // The request event itself is not a watch record.
-            return Err(CliError::Other(
-                "request event cannot be converted to a watch record".into(),
-            ));
-        }
+        ValidatedCiEnvelope::Request(request) => (
+            WatchScope::Run,
+            None,
+            None,
+            request.attempt,
+            request.issued_at,
+        ),
     };
     Ok(WatchRecord {
         run_id: request.run_id.clone(),
@@ -428,5 +445,86 @@ fn map_job_state(state: buzz_core::ci::CiJobState) -> WatchEventState {
         CiJobState::Cancelled => WatchEventState::Cancelled,
         CiJobState::TimedOut => WatchEventState::TimedOut,
         CiJobState::Skipped => WatchEventState::Skipped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reduction(state: red::CiReducedState) -> CiReduction {
+        CiReduction {
+            run_id: "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd45".into(),
+            sha: "11".repeat(20),
+            attempt: 2,
+            state,
+            jobs: vec![red::CiReducedJob {
+                job_id: "test".into(),
+                name: Some("Test".into()),
+                state: Some(buzz_core::ci::CiJobState::Success),
+                required: Some(true),
+                started_at: Some(10),
+                finished_at: Some(20),
+                attempt: 2,
+            }],
+            jobs_terminal: 1,
+            jobs_total: 1,
+            required_failing: Vec::new(),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn status_and_verdict_outputs_are_frozen_flat_schemas() {
+        let status = serde_json::to_value(status_output(reduction(red::CiReducedState::Green)))
+            .expect("serialize status");
+        assert_eq!(
+            status
+                .as_object()
+                .expect("status object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["attempt", "jobs", "run_id", "sha", "state"]
+        );
+        assert!(status.get("reduction").is_none());
+
+        let verdict = serde_json::to_value(verdict_output(reduction(red::CiReducedState::Green)))
+            .expect("serialize verdict");
+        assert_eq!(
+            verdict
+                .as_object()
+                .expect("verdict object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec![
+                "attempt",
+                "jobs_terminal",
+                "jobs_total",
+                "required_failing",
+                "run_id",
+                "sha",
+                "verdict",
+            ]
+        );
+    }
+
+    #[test]
+    fn watch_output_includes_the_real_durable_cursor_coordinates() {
+        let output = WatchRecordOutput {
+            run_id: "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd45".into(),
+            sha: "11".repeat(20),
+            attempt: 2,
+            watch_cursor: 37,
+            event_id: "22".repeat(32),
+            scope: "job".into(),
+            job_id: Some("test".into()),
+            state: Some("success".into()),
+            timestamp: 20,
+        };
+        let value = serde_json::to_value(output).expect("serialize watch output");
+        assert_eq!(value["watch_cursor"], 37);
+        assert_eq!(value["run_id"], "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd45");
+        assert_eq!(value["attempt"], 2);
+        assert_eq!(value["scope"], "job");
     }
 }
