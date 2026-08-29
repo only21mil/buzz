@@ -3,6 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url as ParsedUrl;
 
+use buzz_ci_broker_protocol::v2::{
+    decode_admission_signature_message, AdmissionSignatureAlgorithm,
+};
+
 use crate::{
     BackendError, DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod,
     KeySelector, KeyholderServer, Nip98AuthorizeRequest, Operation, PeerIdentity, PeerPolicy,
@@ -14,7 +18,6 @@ const CI_EVENT_KIND_MIN: u32 = 46_101;
 const CI_EVENT_KIND_MAX: u32 = 46_106;
 const NIP98_EVENT_KIND: u32 = 27_235;
 const NIP98_TIMESTAMP_TOLERANCE_SECONDS: u64 = 60;
-const MANIFEST_DOMAIN: &[u8] = b"buzz-ci-keyholder:manifest:v1\0";
 
 /// Closed operation policy and public selector state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,14 +61,44 @@ impl SigningPolicy {
         Ok(origin)
     }
 
-    fn authorize_url(&self, value: &str) -> Result<(), ServiceError> {
-        let parsed = ParsedUrl::parse(value).map_err(|_| ServiceError::InvalidRequest)?;
+    fn authorize_nip98(&self, request: &Nip98AuthorizeRequest) -> Result<(), ServiceError> {
+        let parsed =
+            ParsedUrl::parse(request.url.as_str()).map_err(|_| ServiceError::InvalidRequest)?;
         if parsed.scheme() != "https"
             || parsed.host_str().is_none()
             || !parsed.username().is_empty()
             || parsed.password().is_some()
+            || parsed.query().is_some()
             || parsed.fragment().is_some()
             || parsed.origin().ascii_serialization() != self.nip98_origin
+            || !matches!(request.payload_digest, Some(digest) if digest != [0; 32])
+        {
+            return Err(ServiceError::PolicyDenied);
+        }
+        let path = parsed.path();
+        if path.contains('%') || path.contains("//") || path.ends_with('/') {
+            return Err(ServiceError::PolicyDenied);
+        }
+        let segments = path
+            .strip_prefix('/')
+            .ok_or(ServiceError::PolicyDenied)?
+            .split('/')
+            .collect::<Vec<_>>();
+        let allowed = match (request.method, segments.as_slice()) {
+            (HttpMethod::Post, ["events"]) => true,
+            (HttpMethod::Put, ["ci", "logs", fields @ ..]) => fields.len() == 5,
+            (HttpMethod::Put, ["ci", "artifacts", fields @ ..]) => fields.len() == 6,
+            _ => false,
+        };
+        if !allowed
+            || segments.iter().any(|segment| {
+                segment.is_empty()
+                    || *segment == "."
+                    || *segment == ".."
+                    || !segment.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
         {
             return Err(ServiceError::PolicyDenied);
         }
@@ -233,7 +266,7 @@ impl<B: SigningBackend> KeyholderServer for ProductionKeyholder<B> {
         self.authorize(peer, Operation::Nip98Authorize)?;
         let identity =
             self.identity_for_generation(KeySelector::Nip98, request.expected_generation)?;
-        self.policy.authorize_url(request.url.as_str())?;
+        self.policy.authorize_nip98(&request)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ServiceError::Unavailable)?
@@ -253,20 +286,25 @@ impl<B: SigningBackend> KeyholderServer for ProductionKeyholder<B> {
         self.authorize(peer, Operation::SignManifest)?;
         let identity =
             self.identity_for_generation(KeySelector::Manifest, request.expected_generation)?;
-        let manifest = validate_canonical_json(request.canonical_manifest.as_bytes())?;
-        if !manifest.is_object() {
-            return Err(ServiceError::InvalidRequest);
+        match request.manifest_kind {
+            crate::ManifestKind::LaneActivationV1 => Err(ServiceError::PolicyDenied),
+            crate::ManifestKind::JobIntentV2 => {
+                let admission =
+                    decode_admission_signature_message(request.canonical_manifest.as_bytes())
+                        .map_err(|_| ServiceError::InvalidRequest)?;
+                if admission.admission_signature_algorithm
+                    != AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256
+                    || admission.admission_key_generation != identity.generation
+                {
+                    return Err(ServiceError::PolicyDenied);
+                }
+                self.signature(
+                    KeySelector::Manifest,
+                    identity,
+                    Sha256::digest(request.canonical_manifest.as_bytes()).into(),
+                )
+            }
         }
-        let mut digest = Sha256::new();
-        digest.update(MANIFEST_DOMAIN);
-        digest.update([request.manifest_kind as u8]);
-        digest.update(
-            u32::try_from(request.canonical_manifest.as_bytes().len())
-                .map_err(|_| ServiceError::InvalidRequest)?
-                .to_be_bytes(),
-        );
-        digest.update(request.canonical_manifest.as_bytes());
-        self.signature(KeySelector::Manifest, identity, digest.finalize().into())
     }
 
     fn public_error(&self, error: &Self::Error) -> ErrorResponse {
@@ -413,6 +451,11 @@ const fn http_method(method: HttpMethod) -> &'static str {
 mod tests {
     use std::cell::RefCell;
 
+    use buzz_ci_broker_protocol::v2::{
+        admission_signature_message, AdmissionSignatureAlgorithm, AdmitAttemptRequest,
+    };
+    use buzz_ci_broker_protocol::{GitOid, TrustClass};
+
     use super::*;
     use crate::{CanonicalPayload, ManifestKind, OperationSet, Url};
 
@@ -492,14 +535,40 @@ mod tests {
         }
     }
 
+    fn admission_message(generation: u64) -> Vec<u8> {
+        admission_signature_message(&AdmitAttemptRequest {
+            signed_request_digest: [1; 32],
+            actor_pubkey: [2; 32],
+            audience_digest: [3; 32],
+            idempotency_digest: [4; 32],
+            source_pin_event_id: [5; 32],
+            workflow_digest: [6; 32],
+            job_intent_digest: [7; 32],
+            isolation_profile_digest: [8; 32],
+            lane_manifest_digest: [9; 32],
+            admission_signature: [10; 64],
+            run_id: [11; 16],
+            tip_oid: GitOid::Sha256([12; 32]),
+            base_oid: GitOid::Sha256([13; 32]),
+            issued_at: 100,
+            expires_at: 200,
+            lane_epoch: 4,
+            admission_key_generation: generation,
+            wall_timeout_seconds: 60,
+            attempt: 1,
+            parent_attempt: 0,
+            trust_class: TrustClass::AcceptedReviewed,
+            admission_signature_algorithm: AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
+        })
+    }
+
     #[test]
     fn exact_peer_operation_and_generation_are_required_before_signing() {
         let service = service(OperationSet::only(Operation::SignManifest));
         let manifest = || SignManifestRequest {
             expected_generation: 9,
             manifest_kind: ManifestKind::JobIntentV2,
-            canonical_manifest: CanonicalPayload::new(br#"{"job":"one"}"#.to_vec())
-                .expect("payload"),
+            canonical_manifest: CanonicalPayload::new(admission_message(9)).expect("payload"),
         };
         assert!(matches!(
             service.handle(
@@ -545,6 +614,39 @@ mod tests {
             Response::SignManifest(_)
         ));
         assert_eq!(service.backend.calls.borrow().len(), 1);
+
+        let wrong_embedded_generation = SignManifestRequest {
+            expected_generation: 9,
+            manifest_kind: ManifestKind::JobIntentV2,
+            canonical_manifest: CanonicalPayload::new(admission_message(8)).expect("payload"),
+        };
+        assert!(matches!(
+            service.handle(peer(), Request::SignManifest(wrong_embedded_generation)),
+            Response::Error {
+                error: ErrorResponse {
+                    code: ErrorCode::PolicyDenied,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let static_lane = SignManifestRequest {
+            expected_generation: 9,
+            manifest_kind: ManifestKind::LaneActivationV1,
+            canonical_manifest: CanonicalPayload::new(br#"{"lane":"one"}"#.to_vec())
+                .expect("payload"),
+        };
+        assert!(matches!(
+            service.handle(peer(), Request::SignManifest(static_lane)),
+            Response::Error {
+                error: ErrorResponse {
+                    code: ErrorCode::PolicyDenied,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -603,7 +705,7 @@ mod tests {
         let request = Nip98AuthorizeRequest {
             expected_generation: 8,
             method: HttpMethod::Post,
-            url: Url::new("https://relay.example.test/api/ci?run=1".to_owned()).expect("url"),
+            url: Url::new("https://relay.example.test/events".to_owned()).expect("url"),
             payload_digest: Some([4_u8; 32]),
             created_at: now,
             nonce: [5_u8; 16],
@@ -614,6 +716,54 @@ mod tests {
             panic!("authorization should sign");
         };
         assert_eq!(signature.signed_digest, expected);
+
+        for denied in [
+            Nip98AuthorizeRequest {
+                expected_generation: 8,
+                method: HttpMethod::Get,
+                url: Url::new("https://relay.example.test/events".to_owned()).expect("url"),
+                payload_digest: Some([4; 32]),
+                created_at: now,
+                nonce: [8; 16],
+            },
+            Nip98AuthorizeRequest {
+                expected_generation: 8,
+                method: HttpMethod::Post,
+                url: Url::new("https://relay.example.test/events?drift=1".to_owned()).expect("url"),
+                payload_digest: Some([4; 32]),
+                created_at: now,
+                nonce: [9; 16],
+            },
+            Nip98AuthorizeRequest {
+                expected_generation: 8,
+                method: HttpMethod::Put,
+                url: Url::new("https://relay.example.test/ci/logs/a/b/c/d/e".to_owned())
+                    .expect("url"),
+                payload_digest: None,
+                created_at: now,
+                nonce: [10; 16],
+            },
+            Nip98AuthorizeRequest {
+                expected_generation: 8,
+                method: HttpMethod::Put,
+                url: Url::new("https://relay.example.test/ci/artifacts/a/b/c/d/e/f".to_owned())
+                    .expect("url"),
+                payload_digest: Some([0; 32]),
+                created_at: now,
+                nonce: [11; 16],
+            },
+        ] {
+            assert!(matches!(
+                service.handle(peer(), Request::Nip98Authorize(denied)),
+                Response::Error {
+                    error: ErrorResponse {
+                        code: ErrorCode::PolicyDenied,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
 
         let denied = Nip98AuthorizeRequest {
             expected_generation: 8,

@@ -42,7 +42,30 @@ pub const MAX_FRAME_SIZE: usize = HEADER_SIZE + MAX_BODY_SIZE;
 
 const ADMISSION_SIGNATURE_START: usize = 288;
 const ADMISSION_SIGNATURE_END: usize = 352;
-const ADMISSION_SIGNED_END: usize = 471;
+const ADMISSION_SIGNED_END: usize = 480;
+/// Exact length of the canonical admission signature message.
+pub const ADMISSION_SIGNATURE_MESSAGE_SIZE: usize =
+    ADMISSION_SIGNATURE_DOMAIN.len() + ADMISSION_SIGNATURE_START + ADMISSION_SIGNED_END
+        - ADMISSION_SIGNATURE_END;
+
+/// Closed signature algorithm accepted by version 2 admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AdmissionSignatureAlgorithm {
+    /// BIP-340 Schnorr over secp256k1 and a SHA-256 message digest.
+    Bip340Secp256k1Sha256 = 1,
+}
+
+impl TryFrom<u8> for AdmissionSignatureAlgorithm {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Bip340Secp256k1Sha256),
+            _ => Err(DecodeError::UnknownEnum),
+        }
+    }
+}
 
 /// Version 2 request header.
 ///
@@ -81,7 +104,8 @@ pub struct AdmitAttemptRequest {
     pub isolation_profile_digest: [u8; 32],
     /// Domain-separated digest of the root-owned LaneActivationManifestV1.
     pub lane_manifest_digest: [u8; 32],
-    /// Detached Ed25519 signature over [`admission_signature_message`].
+    /// Detached BIP-340 signature over the SHA-256 digest of
+    /// [`admission_signature_message`].
     pub admission_signature: [u8; 64],
     /// Public CI run identifier.
     pub run_id: [u8; 16],
@@ -95,6 +119,8 @@ pub struct AdmitAttemptRequest {
     pub expires_at: u64,
     /// Exact root-owned lane authority epoch.
     pub lane_epoch: u64,
+    /// Exact manifest key generation used for this signature.
+    pub admission_key_generation: u64,
     /// Wall-clock execution ceiling.
     pub wall_timeout_seconds: u32,
     /// One-based attempt number.
@@ -103,6 +129,8 @@ pub struct AdmitAttemptRequest {
     pub parent_attempt: u32,
     /// Closed accepted trust class.
     pub trust_class: TrustClass,
+    /// Closed admission signature algorithm.
+    pub admission_signature_algorithm: AdmissionSignatureAlgorithm,
 }
 
 /// Version 2 cancellation bound to one exact execution binding.
@@ -262,6 +290,28 @@ pub fn admission_signature_message(value: &AdmitAttemptRequest) -> Vec<u8> {
     message.extend_from_slice(&body[..ADMISSION_SIGNATURE_START]);
     message.extend_from_slice(&body[ADMISSION_SIGNATURE_END..ADMISSION_SIGNED_END]);
     message
+}
+
+/// Decode and validate one canonical admission signature message.
+///
+/// The returned signature is a nonzero placeholder because signatures are not
+/// part of this message. Every signed request field is decoded by the ordinary
+/// version 2 request validator.
+pub fn decode_admission_signature_message(
+    message: &[u8],
+) -> Result<AdmitAttemptRequest, DecodeError> {
+    if message.len() != ADMISSION_SIGNATURE_MESSAGE_SIZE
+        || !message.starts_with(ADMISSION_SIGNATURE_DOMAIN)
+    {
+        return Err(DecodeError::WrongBodyLength);
+    }
+    let signed = &message[ADMISSION_SIGNATURE_DOMAIN.len()..];
+    let mut body = [0_u8; ADMIT_ATTEMPT_BODY_SIZE];
+    body[..ADMISSION_SIGNATURE_START].copy_from_slice(&signed[..ADMISSION_SIGNATURE_START]);
+    body[ADMISSION_SIGNATURE_START..ADMISSION_SIGNATURE_END].fill(1);
+    body[ADMISSION_SIGNATURE_END..ADMISSION_SIGNED_END]
+        .copy_from_slice(&signed[ADMISSION_SIGNATURE_START..]);
+    decode_admit(&body)
 }
 
 /// Validate an exact version 2 request header before reading its body.
@@ -501,10 +551,11 @@ fn encode_admit(body: &mut [u8], value: AdmitAttemptRequest) {
     put_u32(body, 462, value.attempt);
     put_u32(body, 466, value.parent_attempt);
     body[470] = value.trust_class as u8;
+    put_u64(body, 471, value.admission_key_generation);
+    body[479] = value.admission_signature_algorithm as u8;
 }
 
 fn decode_admit(body: &[u8]) -> Result<AdmitAttemptRequest, DecodeError> {
-    require_zero(&body[471..])?;
     let value = AdmitAttemptRequest {
         signed_request_digest: nonzero_array(&body[0..32])?,
         actor_pubkey: nonzero_array(&body[32..64])?,
@@ -522,15 +573,18 @@ fn decode_admit(body: &[u8]) -> Result<AdmitAttemptRequest, DecodeError> {
         issued_at: get_u64(body, 434),
         expires_at: get_u64(body, 442),
         lane_epoch: get_u64(body, 450),
+        admission_key_generation: get_u64(body, 471),
         wall_timeout_seconds: get_u32(body, 458),
         attempt: get_u32(body, 462),
         parent_attempt: get_u32(body, 466),
         trust_class: TrustClass::try_from(body[470])?,
+        admission_signature_algorithm: AdmissionSignatureAlgorithm::try_from(body[479])?,
     };
     validate_safe(value.issued_at)?;
     validate_safe(value.expires_at)?;
     validate_safe(value.lane_epoch)?;
-    if value.lane_epoch == 0 {
+    validate_safe(value.admission_key_generation)?;
+    if value.lane_epoch == 0 || value.admission_key_generation == 0 {
         return Err(DecodeError::ZeroField);
     }
     if value.expires_at <= value.issued_at || value.wall_timeout_seconds == 0 {
@@ -663,10 +717,12 @@ mod tests {
             issued_at: 100,
             expires_at: 200,
             lane_epoch: 3,
+            admission_key_generation: 4,
             wall_timeout_seconds: 60,
             attempt: 1,
             parent_attempt: 0,
             trust_class: TrustClass::AcceptedReviewed,
+            admission_signature_algorithm: AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
         }
     }
 
@@ -825,7 +881,10 @@ mod tests {
 
         let message = admission_signature_message(&first);
         assert!(message.starts_with(ADMISSION_SIGNATURE_DOMAIN));
-        assert_eq!(message.len(), ADMISSION_SIGNATURE_DOMAIN.len() + 407);
+        assert_eq!(message.len(), ADMISSION_SIGNATURE_MESSAGE_SIZE);
+        let decoded = decode_admission_signature_message(&message).expect("canonical message");
+        assert_eq!(decoded.admission_signature, [1; 64]);
+        assert_eq!(admission_signature_message(&decoded), message);
     }
 
     #[test]
@@ -885,9 +944,19 @@ mod tests {
         put_u64(&mut zero_epoch, body + 450, 0);
         assert_eq!(decode_request(&zero_epoch), Err(DecodeError::ZeroField));
 
-        let mut reserved = original.to_vec();
-        reserved[body + 479] = 1;
-        assert_eq!(decode_request(&reserved), Err(DecodeError::NonZeroReserved));
+        let mut zero_generation = original.to_vec();
+        put_u64(&mut zero_generation, body + 471, 0);
+        assert_eq!(
+            decode_request(&zero_generation),
+            Err(DecodeError::ZeroField)
+        );
+
+        let mut unknown_algorithm = original.to_vec();
+        unknown_algorithm[body + 479] = 2;
+        assert_eq!(
+            decode_request(&unknown_algorithm),
+            Err(DecodeError::UnknownEnum)
+        );
     }
 
     #[test]
@@ -922,11 +991,11 @@ mod tests {
         );
         assert_eq!(
             hex_digest(request.as_bytes()),
-            "d236bafb7938a809ba607b04f6f22e8e39bd598148241129c8dc66e6ca689d45"
+            "b0ddfb8532e880a4a410592423e62a66d168413399d46f7a097ec8fea70a507e"
         );
         assert_eq!(
             hex_digest(&signing_message),
-            "c982b84efe95b862cc72667d27b71ddd1d825364b3d913cdbbde259927a7d478"
+            "628ff200305bf8be825798c6543b996940abf1ad97795fb5a26b707473223fa0"
         );
         assert_eq!(
             hex_digest(response.as_bytes()),
