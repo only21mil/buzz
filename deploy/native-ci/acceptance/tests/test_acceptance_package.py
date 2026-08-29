@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 ACCEPTANCE = ROOT / "deploy/native-ci/acceptance"
+CONTROLD = ROOT / "deploy/native-ci/controld"
 DRIVER = "/usr/libexec/buzz-ci-capacity-one-driver"
 VERIFIER_INSTALL = "/usr/libexec/buzz-ci-verify-acceptance-receipt"
 
@@ -69,23 +70,27 @@ class AcceptancePackageTests(unittest.TestCase):
     def test_systemd_assets_freeze_socket_principals_and_paths(self) -> None:
         templates = ACCEPTANCE / "templates"
         control_socket = (templates / "buzz-ci-acceptance-control.socket").read_text()
-        controld_socket = (templates / "buzz-ci-controld-acceptance.socket").read_text()
         service = (templates / "buzz-ci-acceptance-control.service").read_text()
         self.assertIn(
             "ListenStream=/run/buzzci/acceptance-control.sock", control_socket
         )
         self.assertIn("FileDescriptorName=buzz-ci-acceptance-control", control_socket)
-        self.assertIn(
-            "ListenStream=/run/buzzci/controld-acceptance.sock", controld_socket
-        )
-        self.assertIn("FileDescriptorName=buzz-ci-controld-acceptance", controld_socket)
-        for value in (control_socket, controld_socket):
-            self.assertIn("SocketUser=root", value)
-            self.assertIn("SocketGroup=buzzci-ctl", value)
-            self.assertIn("SocketMode=0620", value)
+        self.assertIn("SocketUser=root", control_socket)
+        self.assertIn("SocketGroup=buzzci-ctl", control_socket)
+        self.assertIn("SocketMode=0620", control_socket)
         self.assertIn("ExecStart=/usr/libexec/buzz-ci-acceptance-control", service)
         self.assertNotIn("Environment=", service)
         self.assertNotIn("sudo", service)
+
+    def test_controld_is_the_only_source_owner_of_its_acceptance_socket(self) -> None:
+        duplicate = ACCEPTANCE / "templates/buzz-ci-controld-acceptance.socket"
+        canonical = CONTROLD / "templates/buzz-ci-controld-acceptance.socket"
+        self.assertFalse(duplicate.exists())
+        self.assertTrue(canonical.is_file())
+        self.assertFalse(canonical.is_symlink())
+        socket = canonical.read_text(encoding="utf-8")
+        self.assertIn("ListenStream=/run/buzzci/controld-acceptance.sock", socket)
+        self.assertIn("FileDescriptorName=buzz-ci-controld-acceptance", socket)
 
     def test_fresh_umask_copy_keeps_declared_template_modes(self) -> None:
         prior = os.umask(0o077)
@@ -99,10 +104,6 @@ class AcceptancePackageTests(unittest.TestCase):
                     ),
                     "buzz-ci-acceptance-control.service": (
                         ACCEPTANCE / "templates" / "buzz-ci-acceptance-control.service",
-                        0o644,
-                    ),
-                    "buzz-ci-controld-acceptance.socket": (
-                        ACCEPTANCE / "templates" / "buzz-ci-controld-acceptance.socket",
                         0o644,
                     ),
                     "buzzci-acceptance.tmpfiles": (

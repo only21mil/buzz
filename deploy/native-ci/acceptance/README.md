@@ -12,6 +12,10 @@ driver reads actual host state through the root acceptance helper, then binds
 that readback into a request to controld. The harness checks the normalized
 response independently.
 
+The acceptance tree does not own or retain a deployable copy of
+`buzz-ci-controld-acceptance.socket`. The controld package is its sole source
+and package owner.
+
 ## What the gate proves
 
 The 13 checks run in this order:

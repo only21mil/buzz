@@ -358,4 +358,7 @@ deploy/native-ci/activation/check_package_inventory.py \
 
 Only the byte-identical dormant runner and controld configs are modeled as
 shared targets. Every other duplicate fails, even with identical bytes. A
-modeled config share fails if its digest, mode, UID, or GID differs.
+modeled config share fails if its digest, mode, UID, or GID differs. The gate
+also checks the source tree and rejects any second
+`buzz-ci-controld-acceptance.socket` template. Its only source and package
+owner is controld.
