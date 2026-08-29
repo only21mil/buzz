@@ -518,6 +518,39 @@ class ActivationControllerTests(unittest.TestCase):
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         return CONTROLLER._parse_zero_request(raw, cli_action, receipt)
 
+    def capacity_one_request(self, operation_digit: str = "b") -> tuple[dict[str, object], bytes]:
+        binding = self.fixture.binding
+        request: dict[str, object] = {
+            "schema_version": CONTROLLER.CAPACITY_ONE_REQUEST_SCHEMA,
+            "action": CONTROLLER.CAPACITY_ONE_WIRE_ACTION,
+            "activation_id": binding["activation_id"],
+            "activation_package_digest": binding["activation_package_digest"],
+            "scenario_sha256": binding["scenario_sha256"],
+            "initial_controller_generation": binding["fixture"]["controller_generation"],
+            "initial_runner_generation": binding["fixture"]["runner_generation"],
+            "operation_id": operation_digit * 64,
+        }
+        return request, CONTROLLER._wire_json(request)
+
+    def set_capacity_one(
+        self, manifest: dict[str, object], payloads: dict[str, bytes], driver: CONTROLLER.FakeSystemd,
+        operation_digit: str = "b",
+    ) -> dict[str, object]:
+        _request, raw = self.capacity_one_request(operation_digit)
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        request, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, receipt)
+        return CONTROLLER._set_capacity_one(
+            manifest, payloads, self.fixture.root, driver, request, request_sha256,
+        )
+
+    def activate_one(
+        self, manifest: dict[str, object], payloads: dict[str, bytes], driver: CONTROLLER.FakeSystemd,
+        operation_digit: str = "b",
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        qualification = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        activated = self.set_capacity_one(manifest, payloads, driver, operation_digit)
+        return qualification, activated
+
     def test_full_fake_root_lifecycle_is_dormant_then_capacity_one_then_closed(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         checked = CONTROLLER.check_current(manifest, self.fixture.root, driver)
@@ -528,9 +561,10 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)["status"], "unchanged")
         self.assertEqual(CONTROLLER.check_current(manifest, self.fixture.root, driver)["state"], "staged_zero")
 
-        activated = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
-        self.assertEqual((activated["state"], activated["capacity"]), ("active_one", 1))
-        self.assertEqual(activated["qualification"]["status"], "qualified_closed")
+        qualification, activated = self.activate_one(manifest, payloads, driver)
+        self.assertEqual((qualification["state"], qualification["capacity"]), ("qualified_closed", 0))
+        self.assertEqual(qualification["qualification"]["status"], "qualified_closed")
+        self.assertEqual(activated["state"], "active_one")
         self.assertEqual(CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["status"], "unchanged")
         self.assertEqual(CONTROLLER.qualify(manifest, payloads, self.fixture.root, driver)["status"], "qualified")
 
@@ -688,7 +722,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "f69452a363c19e487e6c0f3cd383afadd7e699e6d70eb332726cc9afb74b133d",
+            "c11e42ba16093b4ae45a896cb1d843acf5805efca63695c30dbb9b6d6d5d5a2f",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -722,10 +756,163 @@ class ActivationControllerTests(unittest.TestCase):
         fixed_manifest, _fixed_payloads = CONTROLLER.load_package(fixed, live=False)
         self.assertEqual(fixed_manifest, manifest)
 
-    def test_fixed_zero_actions_are_bound_idempotent_and_prove_without_writes(self) -> None:
+    def test_fixed_capacity_one_action_is_bound_idempotent_and_replaces_staged_processes(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        staged_controller = driver.process("buzz-ci-controld.service")
+        request, raw = self.capacity_one_request("b")
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        parsed, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, receipt)
+        reordered = {"action": request["action"], **{key: value for key, value in request.items() if key != "action"}}
+        with self.assertRaisesRegex(ValueError, "field order"):
+            CONTROLLER._parse_capacity_one_request(CONTROLLER._wire_json(reordered), receipt)
+
+        response = CONTROLLER._set_capacity_one(
+            manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+        )
+        self.assertEqual(list(response), [
+            "schema_version", "action", "activation_id", "activation_package_digest",
+            "scenario_sha256", "operation_id", "state", "receipt_sha256",
+        ])
+        self.assertEqual((response["schema_version"], response["action"], response["state"]), (
+            CONTROLLER.CAPACITY_ONE_RESPONSE_SCHEMA, "set_capacity_one", "active_one",
+        ))
+        receipt_path = self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")
+        self.assertEqual(response["receipt_sha256"], activation_package.digest(receipt_path.read_bytes()))
+        final_receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual((final_receipt["state"], final_receipt["capacity_one"]["phase"]), ("active_one", "active_one"))
+        self.assertEqual(
+            final_receipt["capacity_one"]["processes_before"]["buzz-ci-controld.service"],
+            staged_controller,
+        )
+        for unit in CONTROLLER.CAPACITY_ONE_PROCESS_UNITS:
+            active = driver.process(unit)
+            self.assertTrue(active["invocation_id"])
+            self.assertGreater(active["main_pid"], 0)
+        self.assertNotEqual(driver.process("buzz-ci-controld.service")["invocation_id"], staged_controller["invocation_id"])
+        self.assertEqual(driver.process("buzz-ci-runner.service")["invocation_id"], final_receipt["capacity_one"]["processes_after"]["buzz-ci-runner.service"]["invocation_id"])
+        for unit, path in CONTROLLER.CAPACITY_ONE_FRAGMENT_PATHS.items():
+            self.assertEqual(driver.fragment_path(unit), path)
+        self.assertEqual(driver.unit("buzz-ci-acceptance-control.service")["ActiveState"], "active")
+        self.assertEqual(driver.unit("buzz-ci-controld-acceptance.socket")["ActiveState"], "active")
+        self.assertEqual(
+            CONTROLLER._set_capacity_one(manifest, payloads, self.fixture.root, driver, parsed, request_sha256),
+            response,
+        )
+        different, different_raw = self.capacity_one_request("c")
+        different_parsed, different_sha = CONTROLLER._parse_capacity_one_request(different_raw, final_receipt)
+        with self.assertRaisesRegex(ValueError, "exact replay differs"):
+            CONTROLLER._set_capacity_one(
+                manifest, payloads, self.fixture.root, driver, different_parsed, different_sha,
+            )
+
+    def test_capacity_one_restart_failure_compensates_and_exact_retry_succeeds(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        _request, raw = self.capacity_one_request("b")
+        parsed, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, CONTROLLER._read_receipt(self.fixture.root))
+        original_start = driver.start
+        failed_once = True
+
+        def fail_runner_start(unit: str) -> None:
+            nonlocal failed_once
+            if unit == "buzz-ci-runner.service" and failed_once:
+                failed_once = False
+                raise ValueError("injected runner restart failure")
+            original_start(unit)
+
+        driver.start = fail_runner_start
+        with self.assertRaisesRegex(ValueError, "injected runner restart failure"):
+            CONTROLLER._set_capacity_one(
+                manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+            )
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual((receipt["state"], receipt["capacity_one"]["phase"], receipt["capacity_one"]["attempt_count"]), (
+            "qualified_closed", "compensated", 1,
+        ))
+        CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
+        CONTROLLER._staged_zero_readback(manifest, driver)
+        self.assertEqual(driver.unit("buzz-ci-acceptance-control.service")["ActiveState"], "active")
+        driver.start = original_start
+        response = CONTROLLER._set_capacity_one(
+            manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+        )
+        self.assertEqual(response["state"], "active_one")
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["capacity_one"]["attempt_count"], 2)
+
+    def test_capacity_one_partial_config_swap_and_fragment_drift_compensate(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        _request, raw = self.capacity_one_request("b")
+        parsed, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, CONTROLLER._read_receipt(self.fixture.root))
+        controld = next(entry for entry in manifest["entries"] if entry["role"] == "controld_config")
+        original_write = CONTROLLER._atomic_write
+        failed_once = True
+
+        def fail_partial_swap(root: Path, target: str, payload: bytes, mode: int, uid: int, gid: int) -> None:
+            nonlocal failed_once
+            if target == controld["target"] and payload == payloads[controld["active_source"]] and failed_once:
+                failed_once = False
+                raise ValueError("injected partial config swap")
+            original_write(root, target, payload, mode, uid, gid)
+
+        with mock.patch.object(CONTROLLER, "_atomic_write", side_effect=fail_partial_swap):
+            with self.assertRaisesRegex(ValueError, "injected partial config swap"):
+                CONTROLLER._set_capacity_one(
+                    manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+                )
+        CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
+        CONTROLLER._staged_zero_readback(manifest, driver)
+        original_fragment = driver.fragment_path
+        drifted_once = True
+
+        def drift_fragment(unit: str) -> str:
+            nonlocal drifted_once
+            if unit == "buzz-ci-runner.socket" and drifted_once:
+                drifted_once = False
+                return "/etc/systemd/system/stale-runner.socket"
+            return original_fragment(unit)
+
+        driver.fragment_path = drift_fragment
+        with self.assertRaisesRegex(ValueError, "systemd fragment differs"):
+            CONTROLLER._set_capacity_one(
+                manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+            )
+        CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
+        CONTROLLER._staged_zero_readback(manifest, driver)
+
+    def test_capacity_one_rejects_stale_controld_process_and_compensates(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        staged = driver.process("buzz-ci-controld.service")
+        _request, raw = self.capacity_one_request("b")
+        parsed, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, CONTROLLER._read_receipt(self.fixture.root))
+        original_start = driver.start
+
+        def stale_controld(unit: str) -> None:
+            original_start(unit)
+            if unit == "buzz-ci-controld.service":
+                state = json.loads(self.fixture.fake_state.read_bytes())
+                state["units"][unit].update({"InvocationID": staged["invocation_id"], "MainPID": staged["main_pid"]})
+                write_file(self.fixture.fake_state, activation_package.canonical_json(state), 0o600)
+
+        driver.start = stale_controld
+        with self.assertRaisesRegex(ValueError, "process generation is stale"):
+            CONTROLLER._set_capacity_one(
+                manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+            )
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual((receipt["state"], receipt["capacity_one"]["phase"]), ("qualified_closed", "compensated"))
+        CONTROLLER._staged_zero_readback(manifest, driver)
+
+    def test_fixed_zero_actions_are_bound_idempotent_and_prove_without_writes(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.activate_one(manifest, payloads, driver)
 
         prepare, prepare_sha = self.parsed_zero_request("prepare-qualification-zero", "c")
         prepared = CONTROLLER._prepare_qualification_zero(
@@ -769,7 +956,7 @@ class ActivationControllerTests(unittest.TestCase):
     def test_zero_wire_rejects_order_generation_and_replay_drift(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
-        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.activate_one(manifest, payloads, driver)
         request, raw = self.zero_request("prepare_qualification_zero", "c")
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         reordered = {"action": request["action"], **{key: value for key, value in request.items() if key != "action"}}
@@ -790,7 +977,7 @@ class ActivationControllerTests(unittest.TestCase):
     def test_finalize_attempts_every_stop_and_exact_retry_recovers(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
-        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.activate_one(manifest, payloads, driver)
         prepare, prepare_sha = self.parsed_zero_request("prepare-qualification-zero", "c")
         CONTROLLER._prepare_qualification_zero(manifest, payloads, self.fixture.root, driver, prepare, prepare_sha)
         finalize, finalize_sha = self.parsed_zero_request("finalize-qualification-zero", "d")
@@ -822,7 +1009,7 @@ class ActivationControllerTests(unittest.TestCase):
     def test_zero_proof_fails_closed_on_socket_path_readback(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
-        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.activate_one(manifest, payloads, driver)
         prepare, prepare_sha = self.parsed_zero_request("prepare-qualification-zero", "c")
         CONTROLLER._prepare_qualification_zero(manifest, payloads, self.fixture.root, driver, prepare, prepare_sha)
         finalize, finalize_sha = self.parsed_zero_request("finalize-qualification-zero", "d")
@@ -869,7 +1056,7 @@ class ActivationControllerTests(unittest.TestCase):
         write_file(self.fixture.fake_state, activation_package.canonical_json(state), 0o600)
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
-        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.activate_one(manifest, payloads, driver)
         prepare, prepare_sha = self.parsed_zero_request("prepare-qualification-zero", "c")
         CONTROLLER._prepare_qualification_zero(manifest, payloads, self.fixture.root, driver, prepare, prepare_sha)
         finalize, finalize_sha = self.parsed_zero_request("finalize-qualification-zero", "d")
@@ -1037,7 +1224,7 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(state["identities"]["buzzci-runner"]["supplementary_groups"], ["buzzci-execd"])
         self.assertEqual(state["identities"]["buzzci-ctl"]["supplementary_groups"], ["buzzci-execd"])
         self.assertEqual(state["identities"]["buzzci-controld"]["supplementary_groups"], [])
-        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.activate_one(manifest, payloads, driver)
         self.assertEqual(driver.socket(manifest["socket_policy"]["execd"])["gid"], 62005)
 
     def test_runner_and_execd_reject_legacy_or_unbound_executor_programs(self) -> None:
@@ -1138,6 +1325,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         result = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["qualification"]
+        self.set_capacity_one(manifest, payloads, driver)
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         state = receipt["qualification"]
         request_raw = base64.b64decode(state["request_base64"], validate=True)
@@ -1224,8 +1412,9 @@ class ActivationControllerTests(unittest.TestCase):
         component["binary_sha256"] = activation_package.digest(QUALIFICATION_SCRIPT)
         with mock.patch.object(CONTROLLER.time, "time", return_value=1_001):
             result = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.set_capacity_one(manifest, payloads, driver)
         state = CONTROLLER._read_receipt(self.fixture.root)["qualification"]
-        self.assertEqual((result["state"], state["status"], state["attempt_count"]), ("active_one", "passed", 2))
+        self.assertEqual((result["state"], state["status"], state["attempt_count"]), ("qualified_closed", "passed", 2))
         self.assertEqual(base64.b64decode(state["request_base64"], validate=True), before)
 
     def test_expired_uncertain_qualification_requires_rollback_and_new_replay_binding(self) -> None:
@@ -1431,7 +1620,7 @@ while True:
     def test_partial_explicit_rollback_attempts_all_stops_and_persists_failure(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
-        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.activate_one(manifest, payloads, driver)
         stop_attempts: list[str] = []
         original_stop = driver.stop
 

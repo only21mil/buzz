@@ -37,7 +37,11 @@ FIXED_PACKAGE_PATH = activation_package.FIXED_PACKAGE_PATH
 ZERO_REQUEST_SCHEMA = "buzz-ci-activation-qualification-zero-request/v1"
 ZERO_RESPONSE_SCHEMA = "buzz-ci-activation-qualification-zero-response/v1"
 ZERO_SEQUENCE_SCHEMA = "buzz-ci-activation-qualification-zero-state/v1"
+CAPACITY_ONE_REQUEST_SCHEMA = "buzz-ci-activation-capacity-one-request/v1"
+CAPACITY_ONE_RESPONSE_SCHEMA = "buzz-ci-activation-capacity-one-response/v1"
+CAPACITY_ONE_SEQUENCE_SCHEMA = "buzz-ci-activation-capacity-one-state/v1"
 MAX_ZERO_REQUEST_BYTES = 64 * 1024
+MAX_CAPACITY_ONE_ATTEMPTS = 3
 MAX_SCENARIO_BYTES = 256 * 1024
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSUSERS = "/usr/bin/systemd-sysusers"
@@ -50,6 +54,31 @@ QUALIFICATION_STATE_SCHEMA = "buzz-ci-production-qualification-state/v3"
 QUALIFICATION_MAX_ATTEMPTS = 3
 QUALIFICATION_PRINCIPAL_DOMAIN = b"buzz-ci-execd:production-qualification-principal:v1\0"
 QUALIFICATION_EXECUTOR_DOMAIN = b"buzz-ci-execd:production-qualification-executor-provenance:v1\0"
+
+CAPACITY_ONE_FRAGMENT_PATHS = {
+    "buzz-ci-capacity-one.target": "/etc/systemd/system/buzz-ci-capacity-one.target",
+    "buzz-ci-controld.service": "/etc/systemd/system/buzz-ci-controld.service",
+    "buzz-ci-runner.socket": "/etc/systemd/system/buzz-ci-runner.socket",
+    "buzz-ci-execd.socket": "/etc/systemd/system/buzz-ci-execd.socket",
+    "buzz-ci-keyholder.socket": "/etc/systemd/system/buzz-ci-keyholder.socket",
+}
+CAPACITY_ONE_PROCESS_UNITS = (
+    "buzz-ci-keyholder.service",
+    "buzz-ci-execd.service",
+    "buzz-ci-runner.service",
+    "buzz-ci-controld.service",
+)
+CAPACITY_ONE_START_ORDER = (
+    "buzz-ci-keyholder.socket",
+    "buzz-ci-keyholder.service",
+    "buzz-ci-execd.socket",
+    "buzz-ci-execd.service",
+    "buzz-ci-runner.socket",
+    "buzz-ci-runner.service",
+    "buzz-ci-controld-acceptance.socket",
+    "buzz-ci-controld.service",
+    "buzz-ci-capacity-one.target",
+)
 
 
 def utc_now() -> str:
@@ -811,6 +840,22 @@ class LiveSystemd:
             raise ValueError(f"incomplete systemd fragment readback: {name}")
         return value
 
+    def process(self, name: str) -> dict[str, object]:
+        if not activation_package.UNIT.fullmatch(name) or not name.endswith(".service"):
+            raise ValueError("invalid systemd service name")
+        result = self._run(
+            SYSTEMCTL,
+            ["show", "--no-pager", "--property=InvocationID,MainPID", name],
+        )
+        values: dict[str, str] = {}
+        for line in result.stdout.decode("utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+        if set(values) != {"InvocationID", "MainPID"} or not values["MainPID"].isdigit():
+            raise ValueError(f"incomplete systemd process readback: {name}")
+        return {"invocation_id": values["InvocationID"], "main_pid": int(values["MainPID"])}
+
     def provision(self, _identities: dict[str, object]) -> None:
         self._run(SYSUSERS, [activation_package.STATIC_TARGETS["sysusers"]], mutation=True)
 
@@ -947,9 +992,20 @@ class FakeSystemd:
 
     def fragment_path(self, name: str) -> str:
         role = activation_package.PACKAGE_UNIT_ROLES.get(name)
-        if role is None or self.unit(name)["LoadState"] != "loaded":
+        if self.unit(name)["LoadState"] != "loaded":
             return ""
-        return activation_package.STATIC_TARGETS[role]
+        if role is not None:
+            return activation_package.STATIC_TARGETS[role]
+        return CAPACITY_ONE_FRAGMENT_PATHS.get(name, f"/etc/systemd/system/{name}")
+
+    def process(self, name: str) -> dict[str, object]:
+        unit = self._read()["units"].get(name)
+        if not isinstance(unit, dict):
+            return {"invocation_id": "", "main_pid": 0}
+        return {
+            "invocation_id": unit.get("InvocationID", ""),
+            "main_pid": unit.get("MainPID", 0),
+        }
 
     def provision(self, identities: dict[str, object]) -> None:
         state = self._read()
@@ -1018,8 +1074,16 @@ class FakeSystemd:
     def start(self, name: str) -> None:
         state = self._read()
         unit = state["units"].setdefault(name, {})
+        was_active = unit.get("ActiveState") == "active"
         unit.update({"LoadState": "loaded", "ActiveState": "active", "SubState": "listening" if name.endswith(".socket") else "running"})
         unit.setdefault("UnitFileState", "disabled")
+        if name.endswith(".service") and not was_active:
+            start_count = unit.get("StartCount", 0) + 1
+            unit.update({
+                "StartCount": start_count,
+                "InvocationID": hashlib.sha256(f"{name}:{start_count}".encode()).hexdigest()[:32],
+                "MainPID": 1000 + start_count,
+            })
         for policy in self.socket_policy.values():
             if policy["unit"] == name:
                 identity = self.identity(policy["user"]) if policy["user"] != "root" else {"uid": 0}
@@ -1034,6 +1098,8 @@ class FakeSystemd:
         unit = state["units"].setdefault(name, {})
         unit.update({"LoadState": unit.get("LoadState", "loaded"), "ActiveState": "inactive", "SubState": "dead"})
         unit.setdefault("UnitFileState", "disabled")
+        if name.endswith(".service"):
+            unit.update({"InvocationID": "", "MainPID": 0})
         for policy in self.socket_policy.values():
             if policy["unit"] == name:
                 state["sockets"].pop(policy["path"], None)
@@ -1370,6 +1436,7 @@ def _new_receipt(
             sorted(set(activation_package.START_ORDER + activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])),
         ),
         "qualification": None,
+        "capacity_one": None,
         "qualification_zero": None,
         "last_error": None,
     }
@@ -1379,7 +1446,7 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     expected_keys = {
         "schema", "activation_id", "package_digest", "source_commit", "state", "created_at", "updated_at",
         "principals_retained_on_rollback", "targets", "acceptance_generated", "acceptance_ledger_prior",
-        "fixed_package", "systemd_before", "qualification", "qualification_zero", "last_error",
+        "fixed_package", "systemd_before", "qualification", "capacity_one", "qualification_zero", "last_error",
     }
     if set(receipt) != expected_keys or receipt.get("schema") != activation_package.RECEIPT_SCHEMA:
         raise ValueError("activation receipt shape differs")
@@ -1401,6 +1468,7 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     }:
         raise ValueError("receipt fixed activation package binding differs")
     _validate_qualification_state(receipt["qualification"], receipt)
+    _validate_capacity_one_state(receipt["capacity_one"], receipt)
     _validate_qualification_zero_state(receipt["qualification_zero"], receipt)
 
 
@@ -1465,6 +1533,64 @@ def _validate_qualification_state(value: object, receipt: dict[str, Any]) -> Non
     _validate_qualification_response(request, response)
 
 
+def _validate_capacity_one_state(value: object, receipt: dict[str, Any]) -> None:
+    if value is None:
+        return
+    required = {
+        "schema", "activation_id", "activation_package_digest", "scenario_sha256",
+        "initial_controller_generation", "initial_runner_generation", "operation_id",
+        "request_sha256", "phase", "attempt_count", "processes_before", "processes_after",
+        "last_error",
+    }
+    if not isinstance(value, dict) or set(value) != required or value.get("schema") != CAPACITY_ONE_SEQUENCE_SCHEMA:
+        raise ValueError("capacity-one action receipt shape differs")
+    if value["activation_id"] != receipt["activation_id"] or value["activation_package_digest"] != receipt["package_digest"]:
+        raise ValueError("capacity-one action receipt belongs to a different activation")
+    _scenario_hex(value["scenario_sha256"], {64}, "capacity-one scenario digest")
+    _scenario_u64(value["initial_controller_generation"], "capacity-one controller generation")
+    _scenario_u64(value["initial_runner_generation"], "capacity-one runner generation")
+    _scenario_hex(value["operation_id"], {64}, "capacity-one operation id")
+    _scenario_hex(value["request_sha256"], {64}, "capacity-one request digest")
+    if value["phase"] not in {"activating", "compensated", "active_one", "failed"}:
+        raise ValueError("capacity-one action phase differs")
+    if (
+        isinstance(value["attempt_count"], bool)
+        or not isinstance(value["attempt_count"], int)
+        or not 1 <= value["attempt_count"] <= MAX_CAPACITY_ONE_ATTEMPTS
+    ):
+        raise ValueError("capacity-one action attempt count differs")
+    for field in ("processes_before", "processes_after"):
+        processes = value[field]
+        if processes is None:
+            if field == "processes_before":
+                raise ValueError("capacity-one processes_before is absent")
+            continue
+        if not isinstance(processes, dict) or set(processes) != set(CAPACITY_ONE_PROCESS_UNITS):
+            raise ValueError(f"capacity-one {field} differs")
+        for unit, process in processes.items():
+            if not isinstance(process, dict) or set(process) != {"invocation_id", "main_pid"}:
+                raise ValueError(f"capacity-one process readback differs: {unit}")
+            if not isinstance(process["invocation_id"], str) or isinstance(process["main_pid"], bool) or not isinstance(process["main_pid"], int):
+                raise ValueError(f"capacity-one process readback differs: {unit}")
+    if value["phase"] == "active_one" and value["processes_after"] is None:
+        raise ValueError("capacity-one active process readback is absent")
+    if value["last_error"] is not None and (not isinstance(value["last_error"], str) or not value["last_error"]):
+        raise ValueError("capacity-one action error differs")
+    qualification = receipt.get("qualification")
+    if not isinstance(qualification, dict) or qualification.get("status") != "passed":
+        raise ValueError("capacity-one action lacks passed production qualification")
+    request = json.loads(
+        base64.b64decode(qualification["request_base64"], validate=True),
+        object_pairs_hook=activation_package.reject_duplicates,
+    )
+    if (
+        value["scenario_sha256"] != request.get("fixture_digest")
+        or value["initial_controller_generation"] != request.get("controller_generation")
+        or value["initial_runner_generation"] != request.get("runner_generation")
+    ):
+        raise ValueError("capacity-one action scope differs from production qualification")
+
+
 def _validate_qualification_zero_state(value: object, receipt: dict[str, Any]) -> None:
     if value is None:
         return
@@ -1506,6 +1632,8 @@ def _apply_phase(
 ) -> None:
     for entry in manifest["entries"]:
         if entry["role"] == "execd_config":
+            continue
+        if phase == "active" and "active_source" not in entry:
             continue
         if phase == "active" and "active_source" in entry:
             source = entry["active_source"]
@@ -1662,6 +1790,12 @@ ZERO_CLI_ACTIONS = {
     "finalize-qualification-zero": "finalize_qualification_zero",
     "prove-qualification-zero": "prove_qualification_zero",
 }
+CAPACITY_ONE_CLI_ACTION = "set-capacity-one"
+CAPACITY_ONE_WIRE_ACTION = "set_capacity_one"
+CAPACITY_ONE_REQUIRED_FIELDS = (
+    "schema_version", "action", "activation_id", "activation_package_digest", "scenario_sha256",
+    "initial_controller_generation", "initial_runner_generation", "operation_id",
+)
 ZERO_REQUIRED_FIELDS = (
     "schema_version", "action", "activation_id", "activation_package_digest", "scenario_sha256",
     "initial_controller_generation", "initial_runner_generation", "operation_id",
@@ -1690,6 +1824,69 @@ def _binding_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(binding, dict) or activation_package.digest(payload) != record["sha256"]:
         raise ValueError("controld acceptance binding receipt payload differs")
     return binding
+
+
+def _parse_capacity_one_request(raw: bytes, receipt: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    if not raw or len(raw) > MAX_ZERO_REQUEST_BYTES:
+        raise ValueError("capacity-one request size is invalid")
+    try:
+        request = json.loads(raw, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("capacity-one request JSON is invalid") from error
+    if not isinstance(request, dict) or raw != _wire_json(request):
+        raise ValueError("capacity-one request is not canonical compact JSON")
+    if tuple(request) != CAPACITY_ONE_REQUIRED_FIELDS:
+        raise ValueError("capacity-one request field order or shape differs")
+    if request["schema_version"] != CAPACITY_ONE_REQUEST_SCHEMA or request["action"] != CAPACITY_ONE_WIRE_ACTION:
+        raise ValueError("capacity-one request action binding differs")
+    if (
+        request["activation_id"] != receipt["activation_id"]
+        or request["activation_package_digest"] != receipt["package_digest"]
+    ):
+        raise ValueError("capacity-one request belongs to a different activation")
+    _scenario_hex(request["scenario_sha256"], {64}, "capacity-one request scenario digest")
+    _scenario_u64(request["initial_controller_generation"], "capacity-one initial controller generation")
+    _scenario_u64(request["initial_runner_generation"], "capacity-one initial runner generation")
+    _scenario_hex(request["operation_id"], {64}, "capacity-one operation id")
+    binding = _binding_from_receipt(receipt)
+    fixture = binding.get("fixture")
+    if not isinstance(fixture, dict) or (
+        binding.get("activation_id") != request["activation_id"]
+        or binding.get("activation_package_digest") != request["activation_package_digest"]
+        or binding.get("scenario_sha256") != request["scenario_sha256"]
+        or fixture.get("controller_generation") != request["initial_controller_generation"]
+        or fixture.get("runner_generation") != request["initial_runner_generation"]
+    ):
+        raise ValueError("capacity-one request differs from the acceptance binding")
+    qualification = receipt.get("qualification")
+    if not isinstance(qualification, dict) or qualification.get("status") != "passed":
+        raise ValueError("capacity-one requires an exact qualified_closed result")
+    _validate_qualification_state(qualification, receipt)
+    qualification_request = json.loads(
+        base64.b64decode(qualification["request_base64"], validate=True),
+        object_pairs_hook=activation_package.reject_duplicates,
+    )
+    if (
+        qualification_request.get("activation_package_digest") != request["activation_package_digest"]
+        or qualification_request.get("fixture_digest") != request["scenario_sha256"]
+        or qualification_request.get("controller_generation") != request["initial_controller_generation"]
+        or qualification_request.get("runner_generation") != request["initial_runner_generation"]
+    ):
+        raise ValueError("capacity-one request differs from production qualification")
+    return request, activation_package.digest(raw)
+
+
+def _capacity_one_response(request: dict[str, Any], root: Path) -> dict[str, object]:
+    return {
+        "schema_version": CAPACITY_ONE_RESPONSE_SCHEMA,
+        "action": request["action"],
+        "activation_id": request["activation_id"],
+        "activation_package_digest": request["activation_package_digest"],
+        "scenario_sha256": request["scenario_sha256"],
+        "operation_id": request["operation_id"],
+        "state": "active_one",
+        "receipt_sha256": _receipt_sha256(root),
+    }
 
 
 def _parse_zero_request(raw: bytes, cli_action: str, receipt: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -1778,6 +1975,130 @@ def _zero_response(request: dict[str, Any], root: Path) -> dict[str, object]:
         "state": "staged_zero",
         "receipt_sha256": _receipt_sha256(root),
     }
+
+
+def _process_snapshot(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, object]]:
+    return {unit: driver.process(unit) for unit in CAPACITY_ONE_PROCESS_UNITS}
+
+
+def _validate_staged_processes(
+    driver: LiveSystemd | FakeSystemd, processes: dict[str, dict[str, object]],
+) -> None:
+    for unit in CAPACITY_ONE_PROCESS_UNITS:
+        active = driver.unit(unit)["ActiveState"] == "active"
+        process = processes[unit]
+        if unit == "buzz-ci-controld.service":
+            if not active or not re.fullmatch(r"[0-9a-f]{32}", str(process["invocation_id"])) or process["main_pid"] <= 0:
+                raise ValueError("staged controld process generation is absent")
+        elif active or process != {"invocation_id": "", "main_pid": 0}:
+            raise ValueError(f"stale staged process remains active: {unit}")
+
+
+def _capacity_one_fragment_readback(driver: LiveSystemd | FakeSystemd) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for unit, expected in CAPACITY_ONE_FRAGMENT_PATHS.items():
+        observed = driver.fragment_path(unit)
+        if observed != expected:
+            raise ValueError(f"capacity-one systemd fragment differs: {unit}")
+        result[unit] = observed
+    return result
+
+
+def _active_capacity_one_readback(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    processes_before: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("capacity-one readback requires an activation receipt")
+    _bind_receipt(receipt, manifest)
+    managed = _verify_phase(manifest, root, "active")
+    generated = _verify_generated(root, receipt["acceptance_generated"], phase="active")
+    fixed_package = _verify_fixed_package(manifest, root)
+    installed_units = _installed_unit_readback(manifest, root, driver)
+    keyholder = _keyholder_config_readback(manifest, root)
+    principals = _identity_readback(driver, manifest["identities"], allow_absent=False)
+    access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=False)
+    required_units = tuple(dict.fromkeys((
+        "buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service",
+        *CAPACITY_ONE_START_ORDER,
+    )))
+    units = _unit_readback(driver, list(required_units))
+    for unit, state in units.items():
+        if state["LoadState"] != "loaded" or state["ActiveState"] != "active":
+            raise ValueError(f"capacity-one unit is not active: {unit}")
+    if units[activation_package.PERSISTENT_UNIT]["UnitFileState"] != "enabled":
+        raise ValueError("capacity-one target enablement readback failed")
+    fragments = _capacity_one_fragment_readback(driver)
+    processes_after = _process_snapshot(driver)
+    for unit, process in processes_after.items():
+        if not re.fullmatch(r"[0-9a-f]{32}", str(process["invocation_id"])) or process["main_pid"] <= 0:
+            raise ValueError(f"capacity-one process generation is absent: {unit}")
+        before = processes_before[unit]
+        if before["invocation_id"] and process["invocation_id"] == before["invocation_id"]:
+            raise ValueError(f"capacity-one process generation is stale: {unit}")
+    binding = _binding_from_receipt(receipt)
+    qualification = receipt["qualification"]
+    _validate_qualification_state(qualification, receipt)
+    request = json.loads(
+        base64.b64decode(qualification["request_base64"], validate=True),
+        object_pairs_hook=activation_package.reject_duplicates,
+    )
+    fixture = binding["fixture"]
+    expected_principal = _qualification_principal_digest(manifest)
+    if (
+        request["integrated_candidate_sha"] != manifest["source_commit"]
+        or request["activation_package_digest"] != manifest["package_digest"]
+        or request["fixture_digest"] != binding["scenario_sha256"]
+        or request["principal_digest"] != expected_principal
+        or request["controller_generation"] != fixture["controller_generation"]
+        or request["runner_generation"] != fixture["runner_generation"]
+    ):
+        raise ValueError("capacity-one package, candidate, scenario, principal, or generation binding differs")
+    return {
+        "managed_targets": managed,
+        "generated_targets": generated,
+        "fixed_package": fixed_package,
+        "installed_units": installed_units,
+        "keyholder_config": keyholder,
+        "principals": principals,
+        "access_group": access_group,
+        "units": units,
+        "sockets": _socket_readback(manifest, driver),
+        "fragments": fragments,
+        "processes": processes_after,
+        "binding": {
+            "integrated_candidate_sha": request["integrated_candidate_sha"],
+            "activation_package_digest": request["activation_package_digest"],
+            "scenario_sha256": request["fixture_digest"],
+            "principal_digest": request["principal_digest"],
+            "controller_generation": request["controller_generation"],
+            "runner_generation": request["runner_generation"],
+            "capacity": 1,
+            "admission": "open",
+        },
+    }
+
+
+def _capacity_one_stop_errors(driver: LiveSystemd | FakeSystemd) -> list[str]:
+    errors: list[str] = []
+    try:
+        driver.disable(activation_package.PERSISTENT_UNIT)
+    except BaseException as error:
+        errors.append(f"disable {activation_package.PERSISTENT_UNIT}: {error}")
+    ordered = (
+        "buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service",
+        activation_package.PERSISTENT_UNIT,
+        "buzz-ci-runner.service", "buzz-ci-runner.socket",
+        "buzz-ci-execd.service", "buzz-ci-execd.socket",
+        "buzz-ci-keyholder.service", "buzz-ci-keyholder.socket",
+    )
+    for unit in ordered:
+        try:
+            driver.stop(unit)
+        except BaseException as error:
+            errors.append(f"stop {unit}: {error}")
+    return errors
 
 
 def _apply_staged_configs(manifest: dict[str, Any], payloads: dict[str, bytes], root: Path) -> dict[str, str]:
@@ -2582,9 +2903,9 @@ def _run_qualification(manifest: dict[str, Any], root: Path, receipt: dict[str, 
 
 def _return_to_staged_zero(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
-    generated: list[dict[str, object]],
+    generated: list[dict[str, object]], *, keep_acceptance_control: bool = False,
 ) -> dict[str, object]:
-    errors = _stop_zero_errors(driver)
+    errors = _capacity_one_stop_errors(driver) if keep_acceptance_control else _stop_zero_errors(driver)
     for entry in manifest["entries"]:
         if entry["role"] == "execd_config":
             continue
@@ -2631,6 +2952,109 @@ def _return_to_staged_zero(
     return {"managed_targets": targets, "staged_zero": staged_zero}
 
 
+def _set_capacity_one(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
+) -> dict[str, object]:
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("capacity-one action requires an activation receipt")
+    _bind_receipt(receipt, manifest)
+    _verify_fixed_package(manifest, root)
+    existing = receipt["capacity_one"]
+    expected_binding = {
+        "activation_id": request["activation_id"],
+        "activation_package_digest": request["activation_package_digest"],
+        "scenario_sha256": request["scenario_sha256"],
+        "initial_controller_generation": request["initial_controller_generation"],
+        "initial_runner_generation": request["initial_runner_generation"],
+        "operation_id": request["operation_id"],
+        "request_sha256": request_sha256,
+    }
+    if existing is not None:
+        if any(existing.get(field) != value for field, value in expected_binding.items()):
+            raise ValueError("capacity-one exact replay differs")
+        if receipt["state"] == "active_one" and existing["phase"] == "active_one":
+            _active_capacity_one_readback(manifest, root, driver, existing["processes_before"])
+            return _capacity_one_response(request, root)
+        if receipt["state"] != "qualified_closed" or existing["phase"] != "compensated":
+            raise ValueError(f"capacity-one action cannot resume from {receipt['state']}/{existing['phase']}")
+        if existing["attempt_count"] >= MAX_CAPACITY_ONE_ATTEMPTS:
+            raise ValueError("capacity-one exact replay budget is exhausted")
+        state = existing
+    else:
+        if receipt["state"] != "qualified_closed":
+            raise ValueError("capacity-one action requires qualified_closed capacity zero")
+        state = {
+            "schema": CAPACITY_ONE_SEQUENCE_SCHEMA,
+            **expected_binding,
+            "phase": "activating",
+            "attempt_count": 0,
+            "processes_before": None,
+            "processes_after": None,
+            "last_error": None,
+        }
+        receipt["capacity_one"] = state
+    _verify_phase(manifest, root, "staged")
+    _verify_generated(root, receipt["acceptance_generated"], phase="staged")
+    _keyholder_config_readback(manifest, root, payloads)
+    _staged_zero_readback(manifest, driver)
+    processes_before = _process_snapshot(driver)
+    _validate_staged_processes(driver, processes_before)
+    state.update({
+        "phase": "activating",
+        "attempt_count": state["attempt_count"] + 1,
+        "processes_before": processes_before,
+        "processes_after": None,
+        "last_error": None,
+    })
+    receipt.update({"state": "activating", "updated_at": utc_now(), "last_error": None})
+    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    try:
+        stop_errors = _capacity_one_stop_errors(driver)
+        if stop_errors:
+            raise ValueError("capacity-one quiesce failures: " + "; ".join(stop_errors))
+        _apply_phase(manifest, payloads, root, "active")
+        _apply_generated(root, receipt["acceptance_generated"], phase="active")
+        _verify_phase(manifest, root, "active")
+        _verify_generated(root, receipt["acceptance_generated"], phase="active")
+        driver.daemon_reload()
+        _installed_unit_readback(manifest, root, driver)
+        _capacity_one_fragment_readback(driver)
+        for unit in CAPACITY_ONE_START_ORDER:
+            driver.start(unit)
+        driver.enable(activation_package.PERSISTENT_UNIT)
+        active = _active_capacity_one_readback(manifest, root, driver, state["processes_before"])
+        state.update({"phase": "active_one", "processes_after": active["processes"], "last_error": None})
+        receipt.update({"state": "active_one", "updated_at": utc_now(), "last_error": None})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        _active_capacity_one_readback(manifest, root, driver, state["processes_before"])
+        return _capacity_one_response(request, root)
+    except BaseException as error:
+        compensation_error: str | None = None
+        try:
+            _return_to_staged_zero(
+                manifest, payloads, root, driver, receipt["acceptance_generated"],
+                keep_acceptance_control=True,
+            )
+        except BaseException as nested:
+            compensation_error = str(nested)
+        state.update({
+            "phase": "compensated" if compensation_error is None else "failed",
+            "processes_after": None,
+            "last_error": str(error) if compensation_error is None else f"activation={error}; compensation={compensation_error}",
+        })
+        receipt.update({
+            "state": "qualified_closed" if compensation_error is None else "rollback_failed",
+            "updated_at": utc_now(),
+            "last_error": state["last_error"],
+        })
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        if compensation_error is not None:
+            raise ValueError(state["last_error"]) from error
+        raise
+
+
 def activate(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
@@ -2639,12 +3063,24 @@ def activate(
         raise ValueError("activation must be staged before capacity one")
     _bind_receipt(receipt, manifest)
     if receipt["state"] == "active_one":
+        action = receipt["capacity_one"]
+        if not isinstance(action, dict) or action["phase"] != "active_one":
+            raise ValueError("active capacity one lacks the fixed controller action receipt")
         return {
             "status": "unchanged",
             "state": "active_one",
-            "managed_targets": _verify_phase(manifest, root, "active"),
-            "generated_targets": _verify_generated(root, receipt["acceptance_generated"], phase="active"),
-            "health": _active_health(manifest, driver, require_enabled=True),
+            "capacity": 1,
+            "readback": _active_capacity_one_readback(manifest, root, driver, action["processes_before"]),
+        }
+    if receipt["state"] == "qualified_closed":
+        return {
+            "status": "unchanged",
+            "state": "qualified_closed",
+            "capacity": 0,
+            "managed_targets": _verify_phase(manifest, root, "staged"),
+            "generated_targets": _verify_generated(root, receipt["acceptance_generated"], phase="staged"),
+            "staged_zero": _staged_zero_readback(manifest, driver),
+            "qualification": receipt["qualification"],
         }
     if receipt["state"] != "staged_zero":
         raise ValueError(f"activation cannot start from receipt state {receipt['state']}")
@@ -2660,30 +3096,18 @@ def activate(
         qualification = _run_qualification(manifest, root, receipt)
         driver.stop("buzz-ci-execd.service")
         driver.stop("buzz-ci-execd.socket")
-        driver.stop("buzz-ci-controld.service")
-        _apply_phase(manifest, payloads, root, "active")
-        _apply_generated(root, receipt["acceptance_generated"], phase="active")
-        _verify_phase(manifest, root, "active")
-        _verify_generated(root, receipt["acceptance_generated"], phase="active")
-        driver.daemon_reload()
-        for unit in manifest["systemd"]["start_order"]:
-            driver.start(unit)
-        driver.start(manifest["systemd"]["persistent_unit"])
-        prequalification = _active_health(manifest, driver, require_enabled=False)
-        postqualification = _active_health(manifest, driver, require_enabled=False)
-        driver.enable(manifest["systemd"]["persistent_unit"])
-        final_health = _active_health(manifest, driver, require_enabled=True)
-        receipt.update({"state": "active_one", "updated_at": utc_now()})
+        staged_zero = _staged_zero_readback(manifest, driver)
+        _verify_phase(manifest, root, "staged")
+        _verify_generated(root, receipt["acceptance_generated"], phase="staged")
+        receipt.update({"state": "qualified_closed", "updated_at": utc_now(), "last_error": None})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         return {
-            "status": "activated",
-            "state": "active_one",
-            "capacity": 1,
+            "status": "qualified_closed",
+            "state": "qualified_closed",
+            "capacity": 0,
             "activation_id": manifest["activation_id"],
-            "prequalification_health": prequalification,
             "qualification": qualification,
-            "postqualification_health": postqualification,
-            "final_health": final_health,
+            "staged_zero": staged_zero,
         }
     except BaseException as error:
         rollback_error: str | None = None
@@ -2970,7 +3394,7 @@ def rollback(
             "units": _systemd_prior_readback(receipt, driver),
         }
     if receipt["state"] not in {
-        "preparing", "stage_failed", "staged_zero", "activating", "active_one", "preparing_zero", "rollback_failed",
+        "preparing", "stage_failed", "staged_zero", "qualified_closed", "activating", "active_one", "preparing_zero", "rollback_failed",
         "qualification_uncertain",
     }:
         raise ValueError(f"rollback cannot start from receipt state {receipt['state']}")
@@ -3069,12 +3493,24 @@ def check_current(
             "acceptance_generated": _verify_generated(root, receipt["acceptance_generated"]),
             "staged_zero": _staged_zero_readback(manifest, driver),
         }
+    if receipt["state"] == "qualified_closed":
+        return {
+            "status": "ready_for_fixed_capacity_one", "state": "qualified_closed", "capacity": 0,
+            "managed_targets": _verify_phase(manifest, root, "staged"),
+            "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
+            "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
+            "acceptance_generated": _verify_generated(root, receipt["acceptance_generated"]),
+            "fixed_package": _verify_fixed_package(manifest, root),
+            "qualification": receipt["qualification"],
+            "staged_zero": _staged_zero_readback(manifest, driver),
+        }
     if receipt["state"] == "active_one":
+        action = receipt["capacity_one"]
+        if not isinstance(action, dict) or action["phase"] != "active_one":
+            raise ValueError("active capacity one lacks the fixed controller action receipt")
         return {
             "status": "healthy", "state": "active_one", "capacity": 1,
-            "managed_targets": _verify_phase(manifest, root, "active"),
-            "generated_targets": _verify_generated(root, receipt["acceptance_generated"], phase="active"),
-            "health": _active_health(manifest, driver, require_enabled=True),
+            "readback": _active_capacity_one_readback(manifest, root, driver, action["processes_before"]),
             "qualification": receipt.get("qualification"),
         }
     if receipt["state"] == "qualification_uncertain":
@@ -3097,7 +3533,7 @@ def _driver(root: Path, fake_state: Path | None, manifest: dict[str, Any]) -> Li
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     ordinary_actions = ("check", "stage", "activate", "qualify", "rollback")
-    parser.add_argument("action", choices=ordinary_actions + tuple(ZERO_CLI_ACTIONS))
+    parser.add_argument("action", choices=ordinary_actions + (CAPACITY_ONE_CLI_ACTION,) + tuple(ZERO_CLI_ACTIONS))
     parser.add_argument("--package", type=Path)
     parser.add_argument("--scenario", type=Path)
     parser.add_argument("--root", type=Path, default=Path("/"))
@@ -3106,6 +3542,26 @@ def main() -> int:
     root = Path(os.path.abspath(arguments.root))
     live = arguments.fake_systemd_state is None
     try:
+        if arguments.action == CAPACITY_ONE_CLI_ACTION:
+            if (
+                arguments.package is not None or arguments.scenario is not None or root != Path("/")
+                or arguments.fake_systemd_state is not None
+            ):
+                raise ValueError("capacity-one action accepts no package, scenario, root, or fake-state arguments")
+            if os.geteuid() != 0:
+                raise PermissionError("capacity-one action requires root")
+            manifest, payloads = load_package(Path(FIXED_PACKAGE_PATH), live=True)
+            receipt = _read_receipt(root)
+            if receipt is None:
+                raise ValueError("capacity-one action requires an activation receipt")
+            _bind_receipt(receipt, manifest)
+            raw = sys.stdin.buffer.read(MAX_ZERO_REQUEST_BYTES + 1)
+            request, request_sha256 = _parse_capacity_one_request(raw, receipt)
+            result = _set_capacity_one(
+                manifest, payloads, root, LiveSystemd(root), request, request_sha256,
+            )
+            sys.stdout.buffer.write(_wire_json(result))
+            return 0
         if arguments.action in ZERO_CLI_ACTIONS:
             if (
                 arguments.package is not None or arguments.scenario is not None or root != Path("/")
