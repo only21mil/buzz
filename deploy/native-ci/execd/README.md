@@ -22,6 +22,26 @@ opens it beneath the root-owned `attempts` anchor without following links,
 scrubs it, and persists the receipt once before teardown; undeclared, linked,
 oversized, or metadata-drifting outputs fail closed.
 
+Capacity one admits only the single config-declared fixture job. Its static
+declaration digest binds the candidate, activation package, lane and isolation
+manifests, workflow and job identities, exact artifact declaration, all three
+source digests, and the fixed stdout, stderr, memory, process, and wall limits.
+Execd verifies the root-owned package sources at
+`/usr/share/buzzci/execd-v2/fixture/{fixture-manifest.json,input.txt}` and
+`/usr/libexec/buzz-ci-capacity-one-fixture`, then create-once materializes only
+those bytes beneath the attempt root. The private executor RPC carries an
+attempt identifier and binding digests, never argv, environment, or a caller
+path. It invokes only the materialized `run-fixture.sh artifacts` process group.
+
+The executor drains bounded stdout and stderr without persisting raw bytes.
+Exit zero with empty stderr is required. Execd scrubs the bounded stdout and
+the single declared regular, single-link `result.json` before create-once
+evidence. Cancellation and deadline expiry kill the live process group before
+terminal state and teardown are persisted. Startup reconciliation kills any
+remembered live group, or emits a bounded infrastructure-failure receipt when
+the unprivileged executor lost volatile state; ambiguity never reopens
+capacity as success.
+
 Dynamic JobIntentV2 authority crosses the existing authenticated runner socket
 only through protocol operation 9. Execd verifies the embedded manifest-key
 signature and generation, recomputes the established intent digest, and writes
@@ -58,8 +78,23 @@ install receipt. The package creates only the retained state directories; it
 does not bundle, replace, or remove the immutable profile bytes during package
 rollback.
 
+The job principal reaches its exact attempt and pinned seccomp profile through
+execute-only directory chains. `/var/lib/buzzci`, `execd-v2`, `attempts`,
+`seccomp`, `seccomp/v1`, and `seccomp/v1/sha256` are root-owned mode `0711`:
+known names may be traversed but directory contents cannot be listed. Every
+other execd-v2 state child remains root-owned mode `0700`; activation receipts
+remain below root-owned mode-`0700` parents. Attempt children are job-owned mode
+`0500` with a mode-`0700` artifact output directory and are removed after sealed
+teardown. The immutable profile alone is root-owned mode `0444`.
+
 The root execd service retains no Linux capabilities. OCI process execution
-runs only in the separate unprivileged `buzzci-job` executor service. The execd
+runs only in the separate unprivileged `buzzci-job` executor service. The
+executor service retains no capabilities, devices, namespaces, SUID/SGID,
+realtime, resource-control, or kernel mutation syscalls; systemd also pins its
+memory to 128 MiB, tasks and processes to 16, file descriptors to 64, output
+files to 64 KiB, and write access to the attempt root. The executor validates
+the exact installed root-owned seccomp profile digest before accepting its
+root-only socket. The execd
 unit blocks device access, namespace creation, kernel mutation, mounts, raw I/O,
 debug syscalls, reboot, and swap while retaining Unix-socket and descriptor-safe
 file operations for seccomp installation, durable bindings, sealed evidence,
@@ -72,7 +107,9 @@ sensitive child roots remain root-private mode `0700`; the separate activation
 package uses the same ancestor contract so either package installation order is
 idempotent. The only cross-service readable state is the explicitly named,
 root-owned mode-`0444` acceptance receipt beneath the separately traversable
-`activation-controller` directory.
+`activation-controller` directory. The `execd-v2` and `seccomp` parents are the
+only additional traverse-only children; their private descendants remain
+unreadable and unlistable.
 
 Run the local static checks with:
 

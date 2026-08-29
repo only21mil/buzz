@@ -852,6 +852,17 @@ pub trait PrivilegedHostSystem {
         phase: BindingPhase,
     ) -> Result<HostRecoveryReceipt, BindingError>;
 
+    /// Reconcile a broker-owned running process without trusting the runner to
+    /// manufacture terminal evidence. `None` means the fixed process group is
+    /// still live; a receipt is returned only after execd has sealed evidence
+    /// and teardown for the exact binding.
+    fn poll_terminal(
+        &mut self,
+        _binding: ExecutionBindingV1,
+    ) -> Result<Option<HostTerminalReceipt>, BindingError> {
+        Ok(None)
+    }
+
     /// Reopen and verify create-once receipts before exporting any bytes.
     fn sealed_attempt_evidence(
         &mut self,
@@ -939,6 +950,17 @@ impl<S: PrivilegedHostSystem> ConcreteHostAdapters<S> {
             .crash_recovery_coordinator(record.binding, record.phase)?;
         if let HostRecoveryReceipt::CapacityReturned(terminal) = receipt {
             validate_terminal(record.binding, terminal)?;
+        }
+        Ok(receipt)
+    }
+
+    fn poll_terminal(
+        &mut self,
+        binding: ExecutionBindingV1,
+    ) -> Result<Option<HostTerminalReceipt>, BindingError> {
+        let receipt = self.system.poll_terminal(binding)?;
+        if let Some(terminal) = receipt {
+            validate_terminal(binding, terminal)?;
         }
         Ok(receipt)
     }
@@ -1175,6 +1197,22 @@ where
     pub fn maintenance(&mut self, now: u64) -> Result<(), BindingError> {
         if !self.recovery_complete {
             return Err(BindingError::StateConflict);
+        }
+        let records = self.journal.list()?;
+        for record in records
+            .iter()
+            .copied()
+            .filter(|record| record.phase == BindingPhase::Running)
+        {
+            match self.host.poll_terminal(record.binding) {
+                Ok(Some(terminal)) => {
+                    self.close_record(record, terminal, now)?;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    let _ = self.recover_after_failure(record, now);
+                }
+            }
         }
         let records = self.journal.list()?;
         for record in records

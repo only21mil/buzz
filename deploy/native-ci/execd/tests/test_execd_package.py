@@ -21,10 +21,10 @@ SHARED_ANCESTOR = "d /var/lib/buzzci 0711 root root - -"
 ACTIVATION_DIRECTORY_PLAN = (
     SHARED_ANCESTOR,
     "d /var/lib/buzzci/activation-controller 0711 root root -",
-    "d /var/lib/buzzci/seccomp 0700 root root - -",
+    "d /var/lib/buzzci/seccomp 0711 root root - -",
     "d /var/lib/buzzci/activation 0700 root root - -",
     "d /var/lib/buzzci/activation/receipts 0700 root root - -",
-    "d /var/lib/buzzci/execd-v2 0700 root root - -",
+    "d /var/lib/buzzci/execd-v2 0711 root root - -",
     "d /var/lib/buzzci/execd-v2/intents 0700 root root - -",
     "d /var/lib/buzzci/execd-v2/bindings 0700 root root - -",
     "d /var/lib/buzzci/execd-v2/evidence 0700 root root - -",
@@ -81,6 +81,39 @@ class ExecdPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "misses"):
                 VERIFY.verify(fake)
 
+    def test_static_execution_and_sandbox_drift_are_rejected(self) -> None:
+        mutations = (
+            (
+                "execd-config.schema.json",
+                '"max_processes":{"const":16}',
+                '"max_processes":{"const":17}',
+            ),
+            (
+                "execd-config.schema.json",
+                '"relative_name":{"const":"result.json"}',
+                '"relative_name":{"type":"string"}',
+            ),
+            (
+                "templates/buzz-ci-executor.service",
+                "ReadWritePaths=/var/lib/buzzci/execd-v2/attempts",
+                "ReadWritePaths=/var/lib/buzzci/execd-v2",
+            ),
+            (
+                "templates/buzz-ci-executor.service",
+                "MemoryMax=134217728",
+                "MemoryMax=infinity",
+            ),
+        )
+        for relative, original, replacement in mutations:
+            with self.subTest(relative=relative, replacement=replacement):
+                with tempfile.TemporaryDirectory() as directory:
+                    fake = Path(directory)
+                    target = _copy_execd_package(fake)
+                    path = target / relative
+                    path.write_text(path.read_text().replace(original, replacement))
+                    with self.assertRaises(ValueError):
+                        VERIFY.verify(fake)
+
     def test_execd_and_activation_directory_plans_converge_in_either_order_and_umask(self) -> None:
         execd = tuple(EXECD_TMPFILES.read_text().splitlines())
         orders = (
@@ -100,11 +133,11 @@ class ExecdPackageTests(unittest.TestCase):
                         state = Path(directory) / "var/lib/buzzci"
                         self.assertEqual(_mode(state), 0o711)
                         self.assertEqual(_mode(state / "activation-controller"), 0o711)
+                        self.assertEqual(_mode(state / "seccomp"), 0o711)
+                        self.assertEqual(_mode(state / "execd-v2"), 0o711)
                         for private in (
-                            "seccomp",
                             "activation",
                             "activation/receipts",
-                            "execd-v2",
                             "execd-v2/intents",
                             "execd-v2/bindings",
                             "execd-v2/evidence",
@@ -134,7 +167,11 @@ class ExecdPackageTests(unittest.TestCase):
             self.assertTrue(_mode(receipt) & stat.S_IROTH)
             self.assertFalse(_mode(receipt) & stat.S_IWOTH)
             self.assertFalse(_mode(private_state) & stat.S_IROTH)
-            self.assertFalse(_mode(shared / "execd-v2") & stat.S_IXOTH)
+            self.assertTrue(_mode(shared / "execd-v2") & stat.S_IXOTH)
+            self.assertFalse(_mode(shared / "execd-v2") & stat.S_IROTH)
+            self.assertTrue(_mode(shared / "seccomp") & stat.S_IXOTH)
+            self.assertFalse(_mode(shared / "seccomp") & stat.S_IROTH)
+            self.assertFalse(_mode(shared / "execd-v2/intents") & stat.S_IXOTH)
             self.assertFalse(_mode(shared / "activation") & stat.S_IXOTH)
 
     def test_all_packaged_direct_children_are_directories(self) -> None:
@@ -150,8 +187,12 @@ class ExecdPackageTests(unittest.TestCase):
             (SHARED_ANCESTOR, "d /var/lib/buzzci 0700 root root - -"),
             (SHARED_ANCESTOR, "d /var/lib/buzzci 0755 root root - -"),
             (
-                "d /var/lib/buzzci/execd-v2 0700 root root - -",
                 "d /var/lib/buzzci/execd-v2 0711 root root - -",
+                "d /var/lib/buzzci/execd-v2 0700 root root - -",
+            ),
+            (
+                "d /var/lib/buzzci/seccomp 0711 root root - -",
+                "d /var/lib/buzzci/seccomp 0755 root root - -",
             ),
             (SHARED_ANCESTOR, "f /var/lib/buzzci/leaked-secret 0600 root root - payload"),
         )
