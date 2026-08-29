@@ -17,7 +17,8 @@ use buzz_ci_broker_protocol::{
     BrokerState, CancelReason, Conclusion as BrokerConclusion, ResponseCode,
 };
 use buzz_ci_controld::acceptance_socket::{
-    AcceptanceBinding, AcceptanceJournal, AcceptanceOperationHandler, AcceptanceSocketError,
+    AcceptanceAuthorityBinding, AcceptanceBinding, AcceptanceJournal, AcceptanceOperationHandler,
+    AcceptanceSocketError,
 };
 use buzz_ci_controld::controller::{
     CapacityOneConfig, CapacityOneController, CapacityOneProviderSlots, CapacityOneStatus,
@@ -91,7 +92,7 @@ struct AcceptanceAuthority {
 }
 
 impl AcceptanceAuthority {
-    fn new(config: &crate::config::AcceptanceMutationConfig) -> Result<Self, ServiceError> {
+    fn new(config: &AcceptanceAuthorityBinding) -> Result<Self, ServiceError> {
         let actor = PublicIdentity {
             public_key: decode_digest(&config.actor.public_key)?,
             generation: config.actor.generation,
@@ -181,6 +182,9 @@ impl CapacityOneService {
         acceptance_binding: Option<AcceptanceBinding>,
     ) -> Result<Self, ServiceError> {
         let active = config.active().ok_or(ServiceError::InvalidConfig)?;
+        let binding = acceptance_binding
+            .as_ref()
+            .ok_or(ServiceError::InvalidConfig)?;
         let poll_interval = Duration::from_millis(active.poll_interval_millis);
         let controller_config = CapacityOneConfig::new(
             active.channel_id.clone(),
@@ -219,7 +223,7 @@ impl CapacityOneService {
             acceptance_transport,
             acceptance_authorizer,
         )?;
-        let acceptance_authority = AcceptanceAuthority::new(&active.acceptance)?;
+        let acceptance_authority = AcceptanceAuthority::new(&binding.acceptance)?;
         let described = acceptance_signer.describe_acceptance()?;
         if described.actor != acceptance_authority.actor
             || described.scenario_sha256 != acceptance_authority.scenario_sha256
@@ -292,9 +296,6 @@ impl CapacityOneService {
             ),
         )
         .map_err(|_| ServiceError::InvalidConfig)?;
-        let binding = acceptance_binding
-            .as_ref()
-            .ok_or(ServiceError::InvalidConfig)?;
         if binding.scenario_sha256 != hex::encode(acceptance_authority.scenario_sha256)
             || binding.fixture.grant_event_id != hex::encode(acceptance_authority.event_ids[1])
         {

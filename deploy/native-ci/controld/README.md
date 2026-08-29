@@ -26,13 +26,22 @@ In capacity zero the daemon opens only its owner-private durable control store,
 reports the unified `parked` readiness record, and parks without polling,
 dispatching, networking, or signing. An activation may add only the fixed
 post-freeze `acceptance_binding` receipt path while capacity remains zero. The
-root-owned, controld-group-readable receipt binds the complete fixture,
-scenario and package digests, peer identity, and timeout without creating a
-package self-digest cycle. Capacity one is accepted only with the complete relay authority,
-channel, authenticated runner identity and bounds, exact static lane,
-JobIntentV2 job and artifact declaration, keyholder selector generations, and
-the same four public Run/Grant/Rerun/Tombstone acceptance templates configured
-in keyholder.
+central activation controller creates that receipt only after the package and
+scenario digests are final. Its exact schema is
+`buzz-ci-activation-acceptance-binding/v1`; the fixed path is
+`/var/lib/buzzci/activation-controller/controld-acceptance-v1.json`. The compact
+canonical JSON binds the activation, package, candidate, complete fixture,
+scenario, peer identity, generations, timeout, acceptance actor, and the four
+public Run/Grant/Rerun/Tombstone event templates. The regular file is root:root
+mode `0444`, link count one, beneath the exact root:root mode `0711` activation
+controller directory. Both controld and keyholder validate this same public
+receipt. Frozen daemon configs contain only its path, so neither contains a
+digest of bytes that contribute to the package digest.
+
+Capacity one is accepted only with the complete relay authority, channel,
+authenticated runner identity and bounds, exact static lane, JobIntentV2 job
+and artifact declaration, keyholder selector generations, and a receipt whose
+authority description exactly matches keyholder.
 The active daemon polls the authenticated accepted-request source one at a
 time, signs through keyholder, admits only the exact runner-control v2 frame,
 and fetches terminal logs, the declared artifact, and teardown through the

@@ -142,14 +142,6 @@ class ControldInstallTests(unittest.TestCase):
             },
             "keyholder_timeout_millis": 500,
             "keyholder_transport_attempts": 2,
-            "acceptance": {
-                "actor": {"public_key": "22" * 32, "generation": 4},
-                "scenario_sha256": digest,
-                "run_event": [0, "22" * 32, 1, 46100, [], "{}"],
-                "grant_event": [0, "22" * 32, 2, 46107, [], "{}"],
-                "rerun_event": [0, "22" * 32, 3, 46100, [], "{}"],
-                "tombstone_event": [0, "22" * 32, 4, 5, [], ""],
-            },
         }
         encoded = RENDERER.config_bytes(
             capacity=1,
@@ -165,6 +157,16 @@ class ControldInstallTests(unittest.TestCase):
         })
         staged = RENDERER.config_bytes(acceptance_binding=RENDERER.ACCEPTANCE_BINDING)
         self.assertEqual(json.loads(staged)["acceptance_binding"], RENDERER.ACCEPTANCE_BINDING)
+        self.assertNotIn(b"scenario_sha256", encoded)
+        self.assertNotIn(b"activation_package_digest", encoded)
+        cyclic = dict(active)
+        cyclic["acceptance"] = {"scenario_sha256": digest}
+        with self.assertRaisesRegex(ValueError, "exact provider field set"):
+            RENDERER.config_bytes(
+                capacity=1,
+                active=cyclic,
+                acceptance_binding=RENDERER.ACCEPTANCE_BINDING,
+            )
         partial = dict(active)
         del partial["lane_manifest_digest"]
         with self.assertRaisesRegex(ValueError, "exact provider field set"):

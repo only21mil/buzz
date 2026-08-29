@@ -44,32 +44,6 @@
         "max_bytes": { "type": "integer", "minimum": 1, "maximum": 32768 }
       }
     },
-    "acceptance_event": {
-      "type": "array",
-      "minItems": 6,
-      "maxItems": 6,
-      "prefixItems": [
-        { "const": 0 },
-        { "$ref": "#/$defs/digest" },
-        { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-        { "type": "array" },
-        { "type": "string" }
-      ]
-    },
-    "acceptance": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event"],
-      "properties": {
-        "actor": { "$ref": "#/$defs/selector" },
-        "scenario_sha256": { "$ref": "#/$defs/digest" },
-        "run_event": { "$ref": "#/$defs/acceptance_event" },
-        "grant_event": { "$ref": "#/$defs/acceptance_event" },
-        "rerun_event": { "$ref": "#/$defs/acceptance_event" },
-        "tombstone_event": { "$ref": "#/$defs/acceptance_event" }
-      }
-    },
     "dormant": {
       "type": "object",
       "additionalProperties": false,
@@ -91,7 +65,7 @@
         "lane_manifest_digest", "lane_epoch", "audience_digest",
         "isolation_profile_digest", "workflow_id", "workflow_digest", "jobs", "keyholder_socket",
         "keyholder_uid", "keyholder_gid", "keyholder_selectors", "keyholder_timeout_millis",
-        "keyholder_transport_attempts", "acceptance", "acceptance_binding"
+        "keyholder_transport_attempts", "acceptance_binding"
       ],
       "properties": {
         "schema_version": { "const": 1 },
@@ -129,8 +103,7 @@
           }
         },
         "keyholder_timeout_millis": { "type": "integer", "minimum": 1, "maximum": 5000 },
-        "keyholder_transport_attempts": { "type": "integer", "minimum": 1, "maximum": 8 },
-        "acceptance": { "$ref": "#/$defs/acceptance" }
+        "keyholder_transport_attempts": { "type": "integer", "minimum": 1, "maximum": 8 }
       }
     }
   }

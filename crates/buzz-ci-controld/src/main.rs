@@ -34,7 +34,7 @@ fn run() -> Result<(), StartupError> {
     let owner_uid = effective_uid()?;
     let config = DaemonConfig::load(&config_path, owner_uid)?;
     let acceptance_binding = match config.acceptance_binding() {
-        Some(path) => Some(AcceptanceBinding::load(path, effective_gid()?)?),
+        Some(path) => Some(AcceptanceBinding::load(path)?),
         None => None,
     };
     let listener =
@@ -173,22 +173,8 @@ fn effective_uid() -> Result<u32, StartupError> {
     Ok(nix::unistd::geteuid().as_raw())
 }
 
-#[cfg(target_os = "linux")]
-fn effective_gid() -> Result<u32, StartupError> {
-    let gid = nix::unistd::getegid().as_raw();
-    if gid == 0 {
-        return Err(StartupError::Acceptance(AcceptanceSocketError::Binding));
-    }
-    Ok(gid)
-}
-
 #[cfg(not(target_os = "linux"))]
 fn effective_uid() -> Result<u32, StartupError> {
-    Err(StartupError::UnsupportedPlatform)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn effective_gid() -> Result<u32, StartupError> {
     Err(StartupError::UnsupportedPlatform)
 }
 
