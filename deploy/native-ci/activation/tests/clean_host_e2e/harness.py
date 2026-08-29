@@ -1,325 +1,763 @@
 #!/usr/bin/env python3
-"""Prepare and run a fail-closed clean-host activation acceptance container."""
+"""Run capacity-one acceptance behind a disposable offline KVM boundary."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 
-SCHEMA = "buzz-ci-clean-host-e2e-contract/v1"
-BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v1"
+SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v2"
+STATE_SCHEMA = "buzz-ci-clean-host-e2e-vm-state/v2"
+FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
+PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
-PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
-KEY_NAMES = ("ci-event", "nip98", "manifest", "acceptance-actor")
-REQUIRED_CANDIDATE_FILES = (
+MAX_JSON = 1024 * 1024
+MAX_FRAME = 4 * 1024 * 1024
+MAX_FILE = 64 * 1024 * 1024
+MAX_TREE_FILES = 1024
+PREPARE_TIMEOUT = 180
+RUN_TIMEOUT = 900
+SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+TOOLS = {
+    "qemu": "/usr/bin/qemu-system-x86_64",
+    "qemu_img": "/usr/bin/qemu-img",
+    "bwrap": "/usr/bin/bwrap",
+    "xorriso": "/usr/bin/xorriso",
+    "cloud_localds": "/usr/bin/cloud-localds",
+}
+FROZEN_ASSETS = ("guest_entry.py", "local_tls_relay.py")
+REQUIRED_CANDIDATE = (
     "deploy/native-ci/runner/install.py",
     "deploy/native-ci/controld/install.py",
     "deploy/native-ci/keyholder/install.py",
     "deploy/native-ci/execd/install.py",
     "deploy/native-ci/activation/controller.py",
+    "deploy/native-ci/activation/package.py",
 )
-MAX_TREE_FILES = 512
-MAX_INPUT_BYTES = 64 * 1024 * 1024
 
 
 class HarnessError(RuntimeError):
-    """Stable fail-closed harness error."""
+    """Fail-closed harness rejection."""
 
 
 def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
 
 
-def load_json(path: Path, maximum: int = 1024 * 1024) -> object:
-    raw = path.read_bytes()
-    if not raw or len(raw) > maximum:
-        raise HarnessError(f"invalid JSON input size: {path.name}")
+def load_json(path: Path, maximum: int = MAX_JSON) -> object:
+    raw = read_regular(path, maximum)
     try:
         return json.loads(raw)
     except json.JSONDecodeError as error:
-        raise HarnessError(f"invalid JSON input: {path.name}") from error
+        raise HarnessError(f"invalid JSON: {path.name}") from error
 
 
-def private_directory(path: Path, *, create: bool = False) -> Path:
+def read_regular(path: Path, maximum: int = MAX_FILE) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
+            raise HarnessError(f"unsafe input file: {path.name}")
+        raw = b""
+        while chunk := os.read(fd, min(1024 * 1024, maximum + 1 - len(raw))):
+            raw += chunk
+            if len(raw) > maximum:
+                raise HarnessError(f"oversized input file: {path.name}")
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        ):
+            raise HarnessError(f"input changed while read: {path.name}")
+        return raw
+    finally:
+        os.close(fd)
+
+
+def safe_directory(path: Path, *, create: bool = False) -> Path:
     absolute = Path(os.path.abspath(path))
     if create:
-        absolute.mkdir(mode=0o700, parents=True, exist_ok=False)
+        parent = absolute.parent
+        parent_metadata = parent.lstat()
+        if (
+            Path(os.path.realpath(parent)) != parent
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise HarnessError("private directory parent is unsafe")
+        absolute.mkdir(mode=0o700, exist_ok=False)
     metadata = absolute.lstat()
-    if Path(os.path.realpath(absolute)) != absolute or not stat.S_ISDIR(metadata.st_mode):
-        raise HarnessError("state must be a real directory")
-    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
-        raise HarnessError("state must be owned by the caller with mode 0700")
+    if (
+        Path(os.path.realpath(absolute)) != absolute
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise HarnessError("private directory identity or mode differs")
     return absolute
 
 
-def safe_input(path_value: str, *, directory: bool) -> Path:
-    path = Path(os.path.abspath(path_value))
-    metadata = path.lstat()
-    if Path(os.path.realpath(path)) != path:
-        raise HarnessError(f"input must not contain symbolic links: {path.name}")
-    if directory != stat.S_ISDIR(metadata.st_mode):
-        raise HarnessError(f"input type differs: {path.name}")
-    if not directory and not stat.S_ISREG(metadata.st_mode):
-        raise HarnessError(f"input is not a regular file: {path.name}")
+def safe_input_directory(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    metadata = absolute.lstat()
+    if Path(os.path.realpath(absolute)) != absolute or not stat.S_ISDIR(metadata.st_mode):
+        raise HarnessError(f"input directory is not real: {absolute.name}")
     if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise HarnessError(f"input is group or world writable: {path.name}")
-    return path
+        raise HarnessError(f"input directory is writable by another identity: {absolute.name}")
+    return absolute
 
 
-def sha256_tree(path: Path) -> str:
-    digest = hashlib.sha256()
-    count = 0
+def safe_input_file(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    if Path(os.path.realpath(absolute)) != absolute:
+        raise HarnessError(f"input file contains a symbolic path: {absolute.name}")
+    metadata = absolute.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise HarnessError(f"input file metadata is unsafe: {absolute.name}")
+    return absolute
+
+
+def normalized_relative(relative: Path) -> str:
+    value = PurePosixPath(relative.as_posix())
+    if value.is_absolute() or any(part in {"", ".", ".."} for part in value.parts):
+        raise HarnessError("input tree contains an escaping path")
+    return value.as_posix()
+
+
+def tree_records(root: Path) -> list[tuple[str, int, bytes]]:
+    records: list[tuple[str, int, bytes]] = []
     total = 0
-    for item in sorted(path.rglob("*"), key=lambda value: value.relative_to(path).as_posix()):
-        relative = item.relative_to(path).as_posix()
-        metadata = item.lstat()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = normalized_relative(path.relative_to(root))
+        metadata = path.lstat()
         if stat.S_ISDIR(metadata.st_mode):
+            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise HarnessError(f"unsafe package directory: {relative}")
             continue
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise HarnessError(f"package contains a non-regular input: {relative}")
-        count += 1
-        total += metadata.st_size
-        if count > MAX_TREE_FILES or total > MAX_INPUT_BYTES:
-            raise HarnessError("package input exceeds the harness bound")
+            raise HarnessError(f"package path is not one regular file: {relative}")
+        raw = read_regular(path)
+        total += len(raw)
+        if len(records) >= MAX_TREE_FILES or total > MAX_FILE:
+            raise HarnessError("package tree exceeds the fixed bound")
+        records.append((relative, stat.S_IMODE(metadata.st_mode), raw))
+    if not records:
+        raise HarnessError("package tree is empty")
+    return records
+
+
+def tree_digest(records: list[tuple[str, int, bytes]]) -> str:
+    digest = hashlib.sha256()
+    for relative, mode, raw in records:
         digest.update(relative.encode())
         digest.update(b"\0")
-        digest.update(f"{stat.S_IMODE(metadata.st_mode):04o}".encode())
+        digest.update(f"{mode:04o}".encode())
         digest.update(b"\0")
-        digest.update(hashlib.sha256(item.read_bytes()).digest())
+        digest.update(hashlib.sha256(raw).digest())
     return digest.hexdigest()
 
 
-def input_digest(path: Path) -> str:
-    return sha256_tree(path) if path.is_dir() else hashlib.sha256(path.read_bytes()).hexdigest()
+def materialize_tree(records: list[tuple[str, int, bytes]], target: Path) -> None:
+    target.mkdir(mode=0o700)
+    for relative, mode, raw in records:
+        path = target / relative
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(raw)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
-def run_checked(argv: list[str], *, stdin: bytes | None = None) -> bytes:
-    result = subprocess.run(
-        argv,
-        input=stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
-    )
-    if result.returncode != 0:
-        raise HarnessError(f"command failed without accepted evidence: {Path(argv[0]).name}")
-    return result.stdout
+def bounded(
+    argv: list[str], timeout: int = 30, maximum: int = MAX_JSON, *, cwd: Path | None = None,
+) -> bytes:
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(
+            argv, stdout=stdout, stderr=stderr, start_new_session=True, cwd=cwd,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if stdout.tell() > maximum or stderr.tell() > maximum:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+                raise HarnessError(f"bounded command output exceeded limit: {Path(argv[0]).name}")
+            if time.monotonic() >= deadline:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+                raise HarnessError(f"bounded command timed out: {Path(argv[0]).name}")
+            time.sleep(0.01)
+        if stdout.tell() > maximum or stderr.tell() > maximum:
+            raise HarnessError(f"bounded command output exceeded limit: {Path(argv[0]).name}")
+        if process.returncode != 0:
+            raise HarnessError(f"bounded command failed: {Path(argv[0]).name}")
+        stdout.seek(0)
+        return stdout.read(maximum + 1)
 
 
-def openssl_key(private_path: Path) -> str:
-    pem = run_checked(["openssl", "ecparam", "-name", "secp256k1", "-genkey", "-noout"])
-    private_path.write_bytes(pem)
-    private_path.chmod(0o400)
-    encoded_der = run_checked(["openssl", "ec", "-in", str(private_path), "-pubout", "-outform", "DER"])
-    encoded = encoded_der[-65:]
-    if len(encoded) != 65 or encoded[0] != 4:
-        raise HarnessError("OpenSSL returned a non-secp256k1 public key")
-    text = run_checked(["openssl", "ec", "-in", str(private_path), "-text", "-noout"]).decode()
-    private_match = re.search(r"priv:\s*((?:[0-9a-f]{2}:?|\s)+)pub:", text, re.I)
-    if private_match is None:
-        raise HarnessError("OpenSSL private key output is unsupported")
-    raw = bytes.fromhex("".join(re.findall(r"[0-9a-f]{2}", private_match.group(1), re.I)))
-    if len(raw) != 32:
-        raise HarnessError("OpenSSL returned an invalid private scalar")
-    private_path.chmod(0o600)
-    private_path.write_bytes(raw)
-    private_path.chmod(0o400)
-    return encoded[1:33].hex()
+def file_sha256(path: Path) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 16 * 1024 * 1024 * 1024:
+            raise HarnessError(f"unsafe digest input: {path.name}")
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        ):
+            raise HarnessError(f"digest input changed while read: {path.name}")
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
 
 
-def prepare(state_arg: Path, controld_uid: int, controld_gid: int) -> dict[str, object]:
-    if not 1 <= controld_uid <= 0xFFFFFFFF or not 1 <= controld_gid <= 0xFFFFFFFF:
-        raise HarnessError("controld identity is invalid")
-    state = private_directory(state_arg, create=True)
-    private = state / "private"
-    private.mkdir(mode=0o700)
-    public: dict[str, str] = {}
-    for name in KEY_NAMES:
-        public[name] = openssl_key(private / f"{name}.key")
-    ca_key = private / "ca.key"
-    server_key = private / "relay.key"
-    run_checked(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(ca_key)])
-    run_checked(["openssl", "req", "-x509", "-new", "-key", str(ca_key), "-subj", "/CN=Buzz CI disposable E2E CA", "-days", "1", "-out", str(state / "ca.crt")])
-    run_checked(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", str(server_key), "-subj", "/CN=relay.test.invalid", "-addext", "subjectAltName=DNS:relay.test.invalid", "-out", str(private / "relay.csr")])
-    run_checked(["openssl", "x509", "-req", "-in", str(private / "relay.csr"), "-CA", str(state / "ca.crt"), "-CAkey", str(ca_key), "-CAcreateserial", "-days", "1", "-copy_extensions", "copy", "-out", str(state / "relay.crt")])
-    for path in private.iterdir():
-        path.chmod(0o400)
-    binding = {
-        "schema_version": BINDING_SCHEMA,
-        "relay_url": "wss://relay.test.invalid:3443",
-        "relay_http_origin": "https://relay.test.invalid:3443",
-        "acceptance_actor": {"public_key": public["acceptance-actor"], "generation": 1},
-        "keyholder_public_spec": {
-            "schema_version": 1,
-            "peer": {"uid": controld_uid, "gid": controld_gid, "allowed_operations": ["describe", "sign_ci_event", "nip98_authorize", "sign_manifest", "describe_acceptance", "sign_acceptance_mutation"]},
-            "selectors": {
-                "ci_event": {"public_key": public["ci-event"], "generation": 1},
-                "nip98": {"public_key": public["nip98"], "generation": 1},
-                "manifest": {"public_key": public["manifest"], "generation": 1},
-            },
-            "nip98_origin": "https://relay.test.invalid:3443",
-            "acceptance": {"binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json", "credential_selector": "acceptance-actor.key"},
-        },
+def capabilities() -> dict[str, object]:
+    missing = [path for path in TOOLS.values() if not Path(path).is_file()]
+    kvm = Path("/dev/kvm")
+    if not kvm.exists() or not stat.S_ISCHR(kvm.stat().st_mode) or not os.access(kvm, os.R_OK | os.W_OK):
+        missing.append("/dev/kvm")
+    if missing:
+        raise HarnessError("safe KVM capability unavailable: " + ",".join(missing))
+    kvm_fd = os.open(kvm, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+    os.close(kvm_fd)
+    with tempfile.TemporaryDirectory(prefix="buzzci-kvm-capability.") as temporary:
+        scratch = Path(temporary)
+        scratch.chmod(0o700)
+        bounded(bwrap_prefix(scratch) + ["--", "/usr/bin/true"], timeout=10, maximum=4096)
+        sandboxed_version = bounded(
+            bwrap_prefix(scratch) + ["--", TOOLS["qemu"], "--version"],
+            timeout=10, maximum=4096,
+        ).decode().splitlines()[0]
+    qemu_version = bounded([TOOLS["qemu"], "--version"], maximum=4096).decode().splitlines()[0]
+    if sandboxed_version != qemu_version:
+        raise HarnessError("sandboxed QEMU identity differs")
+    return {
+        "status": "ready",
+        "boundary": "bubblewrap+qemu-kvm",
+        "network": "unshared-and-no-nic",
+        "qemu_version": qemu_version,
+        "tool_sha256": {name: file_sha256(Path(path)) for name, path in TOOLS.items()},
     }
-    (state / "public-binding.json").write_bytes(canonical(binding))
-    (state / "public-binding.json").chmod(0o444)
-    return {"status": "prepared", "state": str(state), "public_binding": str(state / "public-binding.json")}
 
 
-def validate_contract(path: Path) -> tuple[dict[str, object], dict[str, Path]]:
+def copy_bound(source: Path, target: Path, expected_sha256: str) -> None:
+    if HEX64.fullmatch(expected_sha256) is None:
+        raise HarnessError("expected file digest is invalid")
+    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    target_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o400)
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise HarnessError("bound source is not one regular file")
+        while chunk := os.read(source_fd, 1024 * 1024):
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(target_fd, view):]
+        os.fchmod(target_fd, 0o400)
+        os.fsync(target_fd)
+        after = os.fstat(source_fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        ):
+            raise HarnessError("bound source changed while copied")
+        if digest.hexdigest() != expected_sha256:
+            raise HarnessError("bound source digest differs")
+    finally:
+        os.close(source_fd)
+        os.close(target_fd)
+
+
+def bwrap_prefix(state: Path) -> list[str]:
+    prefix = [
+        TOOLS["bwrap"], "--unshare-all", "--unshare-net", "--die-with-parent", "--new-session",
+        "--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev",
+        "--dev-bind", "/dev/kvm", "/dev/kvm",
+        "--tmpfs", "/tmp", "--tmpfs", "/run", "--dir", "/etc",
+        "--dir", "/work", "--bind", str(state), "/work",
+        "--chdir", "/work",
+    ]
+    for target, source in (("/bin", "usr/bin"), ("/sbin", "usr/sbin"), ("/lib", "usr/lib"), ("/lib64", "usr/lib64")):
+        prefix.extend(["--symlink", source, target])
+    if Path("/etc/ld.so.cache").is_file():
+        prefix.extend(["--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"])
+    return prefix
+
+
+def qemu_command(state: Path, *, evidence: bool = True) -> list[str]:
+    command = bwrap_prefix(state) + [
+        "--", TOOLS["qemu"], "-nodefaults", "-no-user-config", "-enable-kvm",
+        "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "2048",
+        "-display", "none", "-serial", "none", "-monitor", "none", "-nic", "none",
+        "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
+        "-drive", "file=/work/overlay.qcow2,if=virtio,format=qcow2,cache=none",
+        "-drive", "file=/work/stage.iso,media=cdrom,readonly=on",
+        "-drive", "file=/work/seed.iso,media=cdrom,readonly=on",
+    ]
+    if evidence:
+        command.extend([
+            "-device", "virtio-serial-pci",
+            "-chardev", "file,id=evidence,path=/work/evidence.bin",
+            "-device", "virtserialport,chardev=evidence,name=buzzci.evidence",
+        ])
+    return command
+
+
+def qemu_img_create(state: Path) -> None:
+    bounded([
+        TOOLS["qemu_img"], "create", "-q", "-f", "qcow2", "-F", "qcow2",
+        "-b", "base.qcow2", "overlay.qcow2",
+    ], cwd=state)
+    (state / "overlay.qcow2").chmod(0o600)
+
+
+def make_iso(source: Path, output: Path, label: str) -> None:
+    bounded([
+        TOOLS["xorriso"], "-as", "mkisofs", "-quiet", "-J", "-R",
+        "-V", label, "-o", str(output), str(source),
+    ], timeout=60)
+    output.chmod(0o400)
+
+
+def make_seed(state: Path, instance_id: str) -> None:
+    seed = state / "seed-source"
+    seed.mkdir(mode=0o700)
+    (seed / "meta-data").write_text(f"instance-id: {instance_id}\nlocal-hostname: buzzci-e2e\n")
+    user_data = """#cloud-config
+mounts:
+  - [LABEL=BUZZCI_STAGE, /mnt/buzzci-stage, iso9660, 'ro,nosuid,nodev,noexec', '0', '0']
+runcmd:
+  - [python3, /mnt/buzzci-stage/guest_entry.py, /mnt/buzzci-stage/phase.json]
+power_state:
+  mode: poweroff
+  timeout: 30
+  condition: true
+"""
+    (seed / "user-data").write_text(user_data)
+    bounded([TOOLS["cloud_localds"], str(state / "seed.iso"), str(seed / "user-data"), str(seed / "meta-data")])
+    (state / "seed.iso").chmod(0o400)
+    shutil.rmtree(seed)
+
+
+def stage_common(state: Path, stage: Path, phase: dict[str, object]) -> None:
+    for name in FROZEN_ASSETS:
+        raw = read_regular(state / "frozen-assets" / name, 2 * 1024 * 1024)
+        target = stage / name
+        target.write_bytes(raw)
+        target.chmod(0o444)
+    (stage / "phase.json").write_bytes(canonical(phase))
+    (stage / "phase.json").chmod(0o444)
+
+
+def boot(state: Path, timeout: int, *, evidence_expected: bool = True) -> dict[str, object] | None:
+    evidence = state / "evidence.bin"
+    try:
+        evidence.unlink()
+    except FileNotFoundError:
+        pass
+    process = subprocess.Popen(
+        qemu_command(state, evidence=evidence_expected), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if evidence_expected and evidence.exists() and evidence.stat().st_size > MAX_FRAME + 36:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+            raise HarnessError("guest evidence exceeded its bound")
+        if time.monotonic() >= deadline:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+            raise HarnessError("guest watchdog expired")
+        time.sleep(0.05)
+    code = process.returncode
+    if code != 0:
+        raise HarnessError("isolated guest exited without accepted evidence")
+    if not evidence_expected:
+        if evidence.exists():
+            raise HarnessError("candidate phase unexpectedly reached an evidence channel")
+        return None
+    raw = read_regular(evidence, MAX_FRAME + 36)
+    return parse_frame(raw)
+
+
+def parse_frame(raw: bytes) -> dict[str, object]:
+    if len(raw) < 36:
+        raise HarnessError("evidence frame is truncated")
+    length = struct.unpack(">I", raw[:4])[0]
+    if length == 0 or length > MAX_FRAME or len(raw) != 4 + length + 32:
+        raise HarnessError("evidence frame length differs")
+    payload = raw[4:4 + length]
+    if hashlib.sha256(payload).digest() != raw[-32:]:
+        raise HarnessError("evidence frame digest differs")
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise HarnessError("evidence frame JSON is invalid") from error
+    if not isinstance(value, dict) or value.get("schema_version") != FRAME_SCHEMA:
+        raise HarnessError("evidence frame schema differs")
+    return value
+
+
+def clean_transient(state: Path) -> None:
+    for name in ("stage.iso", "seed.iso", "evidence.bin"):
+        try:
+            (state / name).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def destroy_state(state: Path) -> None:
+    marker = state / "state.json"
+    if not state.exists():
+        return
+    state = safe_directory(state)
+    if not marker.is_file():
+        raise HarnessError("refusing to destroy an unrecognized state directory")
+    value = load_json(marker)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
+            "qemu_version", "tool_sha256", "harness_asset_sha256",
+        }
+        or value.get("schema_version") != STATE_SCHEMA
+        or not isinstance(value.get("challenge"), str) or HEX64.fullmatch(value["challenge"]) is None
+        or any(not isinstance(value.get(name), str) or HEX64.fullmatch(value[name]) is None for name in (
+            "image_sha256", "qemu_sha256", "qemu_img_sha256",
+        ))
+        or not isinstance(value.get("qemu_version"), str) or not value["qemu_version"]
+        or not isinstance(value.get("tool_sha256"), dict) or set(value["tool_sha256"]) != set(TOOLS)
+        or not isinstance(value.get("harness_asset_sha256"), dict) or set(value["harness_asset_sha256"]) != set(FROZEN_ASSETS)
+    ):
+        raise HarnessError("refusing to destroy an unrecognized state directory")
+    shutil.rmtree(state)
+    if state.exists():
+        raise HarnessError("VM state remains after cleanup")
+
+
+def prepare(arguments: argparse.Namespace) -> dict[str, object]:
+    proof = capabilities()
+    if file_sha256(Path(TOOLS["qemu"])) != arguments.qemu_sha256:
+        raise HarnessError("QEMU digest differs")
+    if file_sha256(Path(TOOLS["qemu_img"])) != arguments.qemu_img_sha256:
+        raise HarnessError("qemu-img digest differs")
+    if not 1 <= arguments.controld_uid <= 0xFFFFFFFF or not 1 <= arguments.controld_gid <= 0xFFFFFFFF:
+        raise HarnessError("controld identity is invalid")
+    image = Path(os.path.abspath(arguments.image))
+    if Path(os.path.realpath(image)) != image:
+        raise HarnessError("base image path must not contain symbolic links")
+    here = Path(__file__).resolve().parent
+    asset_digests = {name: file_sha256(here / name) for name in FROZEN_ASSETS}
+    state = safe_directory(arguments.state, create=True)
+    challenge = os.urandom(32).hex()
+    state_record = {
+        "schema_version": STATE_SCHEMA,
+        "challenge": challenge,
+        "image_sha256": arguments.image_sha256,
+        "qemu_sha256": arguments.qemu_sha256,
+        "qemu_img_sha256": arguments.qemu_img_sha256,
+        "qemu_version": proof["qemu_version"],
+        "tool_sha256": proof["tool_sha256"],
+        "harness_asset_sha256": asset_digests,
+    }
+    (state / "state.json").write_bytes(canonical(state_record))
+    (state / "state.json").chmod(0o400)
+    try:
+        frozen = state / "frozen-assets"
+        frozen.mkdir(mode=0o700)
+        for name, digest in asset_digests.items():
+            copy_bound(here / name, frozen / name, digest)
+        copy_bound(image, state / "base.qcow2", arguments.image_sha256)
+        image_info = json.loads(bounded([
+            TOOLS["qemu_img"], "info", "--output=json", "base.qcow2",
+        ], cwd=state, maximum=64 * 1024))
+        if (
+            not isinstance(image_info, dict) or image_info.get("format") != "qcow2"
+            or not isinstance(image_info.get("virtual-size"), int)
+            or not 1024 * 1024 <= image_info["virtual-size"] <= 64 * 1024 * 1024 * 1024
+        ):
+            raise HarnessError("base image format or virtual size differs")
+        qemu_img_create(state)
+        stage = state / "stage"
+        stage.mkdir(mode=0o700)
+        stage_common(state, stage, {
+            "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v2",
+            "phase": "ceremony", "challenge": challenge,
+            "controld_uid": arguments.controld_uid, "controld_gid": arguments.controld_gid,
+        })
+        make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
+        shutil.rmtree(stage)
+        make_seed(state, "buzzci-ceremony-" + challenge[:16])
+        frame = boot(state, PREPARE_TIMEOUT)
+        expected = {"schema_version", "phase", "challenge", "outcome", "public_binding", "raw_key_absence"}
+        if set(frame) != expected or frame["phase"] != "ceremony" or frame["challenge"] != challenge or frame["outcome"] != "pass":
+            raise HarnessError("key ceremony evidence differs")
+        if frame["raw_key_absence"] is not True or not isinstance(frame["public_binding"], dict):
+            raise HarnessError("key ceremony did not prove raw-key destruction")
+        public_path = state / "public-binding.json"
+        public_path.write_bytes(canonical(frame["public_binding"]))
+        public_path.chmod(0o444)
+        clean_transient(state)
+        return {"status": "prepared", "state": str(state), "public_binding": str(public_path), "raw_key_absence": True}
+    except BaseException:
+        destroy_state(state)
+        raise
+
+
+def validate_contract(path: Path) -> tuple[dict[str, object], Path, dict[str, list[tuple[str, int, bytes]]]]:
     value = load_json(path)
-    required = {"schema_version", "candidate_root", "candidate_sha", "image", "image_id", "state", "scenario", "packages"}
+    required = {"schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"}
     if not isinstance(value, dict) or set(value) != required or value["schema_version"] != SCHEMA:
-        raise HarnessError("contract shape or schema differs")
+        raise HarnessError("run contract shape differs")
     if not isinstance(value["candidate_sha"], str) or HEX40.fullmatch(value["candidate_sha"]) is None:
         raise HarnessError("candidate SHA is invalid")
-    if not isinstance(value["image"], str) or not value["image"] or not isinstance(value["image_id"], str) or IMAGE_ID.fullmatch(value["image_id"]) is None:
-        raise HarnessError("container image binding is invalid")
-    candidate = safe_input(str(value["candidate_root"]), directory=True)
-    state = private_directory(Path(str(value["state"])))
-    paths: dict[str, Path] = {"candidate": candidate, "state": state}
-    packages = value["packages"]
-    if not isinstance(packages, dict) or tuple(sorted(packages)) != tuple(sorted(PACKAGE_NAMES)):
-        raise HarnessError("package set differs")
-    for name, descriptor in [("scenario", value["scenario"]), *packages.items()]:
-        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "sha256"} or not isinstance(descriptor["sha256"], str) or HEX64.fullmatch(descriptor["sha256"]) is None:
-            raise HarnessError(f"invalid input descriptor: {name}")
-        item = safe_input(str(descriptor["path"]), directory=name != "scenario")
-        if input_digest(item) != descriptor["sha256"]:
-            raise HarnessError(f"input digest differs: {name}")
-        paths[name] = item
-    actual_sha = run_checked(["git", "-C", str(candidate), "rev-parse", "HEAD"]).decode().strip()
-    if actual_sha != value["candidate_sha"]:
-        raise HarnessError("candidate HEAD differs")
-    if run_checked(["git", "-C", str(candidate), "status", "--porcelain"]):
-        raise HarnessError("candidate worktree is not clean")
-    for relative in REQUIRED_CANDIDATE_FILES:
-        item = candidate / relative
-        if not item.is_file():
-            raise HarnessError(f"candidate prerequisite missing: {relative}")
-    binding = load_json(state / "public-binding.json")
-    if not isinstance(binding, dict) or binding.get("schema_version") != BINDING_SCHEMA:
-        raise HarnessError("prepared public binding is missing")
-    for name in KEY_NAMES:
-        key = state / "private" / f"{name}.key"
-        metadata = key.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o400:
-            raise HarnessError("ephemeral test credential metadata differs")
-    validate_package_binding(paths["keyholder"], paths["activation"], binding)
-    image_id = run_checked(["docker", "image", "inspect", str(value["image"]), "--format", "{{.Id}}"]).decode().strip()
-    if image_id != value["image_id"]:
-        raise HarnessError("local container image ID differs")
-    return value, paths
-
-
-def package_asset(package: Path, manifest: dict[str, object], role: str, *, active: bool = False) -> bytes:
-    entries = manifest.get("entries")
-    entry = next((item for item in entries if isinstance(item, dict) and item.get("role") == role), None) if isinstance(entries, list) else None
-    field = "active_source" if active else "source"
-    digest_field = "active_sha256" if active else "sha256"
-    if not isinstance(entry, dict) or not isinstance(entry.get(field), str) or not isinstance(entry.get(digest_field), str):
-        raise HarnessError(f"package binding asset is absent: {role}")
-    source = package / entry[field]
-    raw = source.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != entry[digest_field]:
-        raise HarnessError(f"package binding asset digest differs: {role}")
-    return raw
-
-
-def validate_package_binding(keyholder: Path, activation: Path, binding: object) -> None:
-    if not isinstance(binding, dict):
-        raise HarnessError("public binding shape differs")
-    keyholder_manifest = load_json(keyholder / "package-manifest.json")
-    activation_manifest = load_json(activation / "activation-manifest.json")
-    if not isinstance(keyholder_manifest, dict) or not isinstance(activation_manifest, dict):
-        raise HarnessError("package manifest shape differs")
-    keyholder_config = json.loads(package_asset(keyholder, keyholder_manifest, "config"))
-    if keyholder_config != binding.get("keyholder_public_spec"):
-        raise HarnessError("keyholder package differs from the ephemeral public binding")
-    if activation_manifest.get("acceptance_template", {}).get("actor") != binding.get("acceptance_actor"):
-        raise HarnessError("activation actor differs from the ephemeral public binding")
-    controld = json.loads(package_asset(activation, activation_manifest, "controld_config", active=True))
-    expected_spec = binding["keyholder_public_spec"]
+    state = safe_directory(Path(str(value["state"])))
+    state_record = load_json(state / "state.json")
+    if not isinstance(state_record, dict) or state_record.get("schema_version") != STATE_SCHEMA:
+        raise HarnessError("VM state binding differs")
+    if file_sha256(Path(TOOLS["qemu"])) != state_record.get("qemu_sha256"):
+        raise HarnessError("QEMU changed after key ceremony")
+    if file_sha256(Path(TOOLS["qemu_img"])) != state_record.get("qemu_img_sha256"):
+        raise HarnessError("qemu-img changed after key ceremony")
+    tool_digests = state_record.get("tool_sha256")
     if (
-        controld.get("relay_url") != binding.get("relay_url")
-        or controld.get("relay_http_origin") != binding.get("relay_http_origin")
-        or controld.get("keyholder_selectors") != expected_spec.get("selectors")
-        or (controld.get("keyholder_uid"), controld.get("keyholder_gid"))
-        != (expected_spec.get("peer", {}).get("uid"), expected_spec.get("peer", {}).get("gid"))
+        not isinstance(tool_digests, dict)
+        or set(tool_digests) != set(TOOLS)
+        or any(not isinstance(digest, str) or HEX64.fullmatch(digest) is None for digest in tool_digests.values())
     ):
-        raise HarnessError("activation provider config differs from the hermetic relay/keyholder binding")
-
-
-def docker_run(contract: dict[str, object], paths: dict[str, Path], results: Path) -> dict[str, object]:
-    results = private_directory(results, create=True)
-    harness_root = Path(__file__).resolve().parent
-    container_name = f"buzzci-clean-e2e-{os.getpid()}-{int(time.time())}"
-    mounts = [
-        (paths["candidate"], "/candidate", "ro"),
-        (paths["state"], "/harness-state", "rw"),
-        (results, "/results", "rw"),
-        (harness_root, "/harness", "ro"),
-        (paths["scenario"], "/inputs/scenario.json", "ro"),
-    ]
+        raise HarnessError("VM harness tool binding differs")
+    if any(file_sha256(Path(TOOLS[name])) != digest for name, digest in tool_digests.items()):
+        raise HarnessError("VM harness tool changed after key ceremony")
+    asset_digests = state_record.get("harness_asset_sha256")
+    if (
+        not isinstance(asset_digests, dict)
+        or set(asset_digests) != set(FROZEN_ASSETS)
+        or any(not isinstance(digest, str) or HEX64.fullmatch(digest) is None for digest in asset_digests.values())
+        or any(file_sha256(state / "frozen-assets" / name) != digest for name, digest in asset_digests.items())
+    ):
+        raise HarnessError("frozen harness asset binding differs")
+    if file_sha256(state / "base.qcow2") != state_record.get("image_sha256"):
+        raise HarnessError("private base image changed after key ceremony")
+    candidate = safe_input_directory(Path(str(value["candidate_root"])))
+    resolved = bounded(["/usr/bin/git", "-C", str(candidate), "rev-parse", f"{value['candidate_sha']}^{{commit}}"] ).decode().strip()
+    if resolved != value["candidate_sha"]:
+        raise HarnessError("candidate commit object differs")
+    for relative in REQUIRED_CANDIDATE:
+        if not bounded(["/usr/bin/git", "-C", str(candidate), "cat-file", "-e", f"{value['candidate_sha']}:{relative}"], maximum=1024) == b"":
+            raise HarnessError("candidate prerequisite probe returned output")
+    packages = value["packages"]
+    if not isinstance(packages, dict) or set(packages) != set(PACKAGE_NAMES):
+        raise HarnessError("package set differs")
+    records: dict[str, list[tuple[str, int, bytes]]] = {}
     for name in PACKAGE_NAMES:
-        mounts.append((paths[name], f"/inputs/{name}", "ro"))
-    inner = dict(contract)
-    inner["candidate_root"] = "/candidate"
-    inner["state"] = "/harness-state"
-    inner["scenario"] = {"path": "/inputs/scenario.json", "sha256": contract["scenario"]["sha256"]}
-    inner["packages"] = {name: {"path": f"/inputs/{name}", "sha256": contract["packages"][name]["sha256"]} for name in PACKAGE_NAMES}
-    inner_path = results / "container-contract.json"
-    inner_path.write_bytes(canonical(inner))
-    inner_path.chmod(0o400)
-    command = [
-        "docker", "run", "--detach", "--name", container_name, "--privileged",
-        "--security-opt", "seccomp=unconfined", "--hostname", "buzzci-e2e",
-        "--add-host", "relay.test.invalid:127.0.0.1", "--stop-signal", "SIGRTMIN+3",
-        "--tmpfs", "/run", "--tmpfs", "/run/lock", "--tmpfs", "/tmp:exec,mode=1777",
-    ]
-    for source, target, mode in mounts:
-        command.extend(["--mount", f"type=bind,src={source},dst={target},{mode}"])
-    command.extend([str(contract["image"]), "/sbin/init"])
-    started = False
+        descriptor = packages[name]
+        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "tree_sha256"} or HEX64.fullmatch(str(descriptor["tree_sha256"])) is None:
+            raise HarnessError(f"package descriptor differs: {name}")
+        item_records = tree_records(safe_input_directory(Path(str(descriptor["path"]))))
+        if tree_digest(item_records) != descriptor["tree_sha256"]:
+            raise HarnessError(f"package tree digest differs: {name}")
+        records[name] = item_records
+    scenario = value["scenario"]
+    if not isinstance(scenario, dict) or set(scenario) != {"path", "sha256"} or HEX64.fullmatch(str(scenario["sha256"])) is None:
+        raise HarnessError("scenario descriptor differs")
+    scenario_raw = read_regular(safe_input_file(Path(str(scenario["path"]))), MAX_JSON)
+    if hashlib.sha256(scenario_raw).hexdigest() != scenario["sha256"]:
+        raise HarnessError("scenario digest differs")
+    seccomp = value["seccomp_source"]
+    if not isinstance(seccomp, dict) or set(seccomp) != {"path", "sha256"} or seccomp.get("sha256") != SECCOMP_SHA256:
+        raise HarnessError("seccomp source descriptor differs")
+    seccomp_raw = read_regular(safe_input_file(Path(str(seccomp["path"]))), 16 * 1024 * 1024)
+    if hashlib.sha256(seccomp_raw).hexdigest() != SECCOMP_SHA256:
+        raise HarnessError("seccomp source digest differs")
+    return value, state, records, scenario_raw, seccomp_raw
+
+
+def create_run_stage(
+    contract: dict[str, object], state: Path,
+    records: dict[str, list[tuple[str, int, bytes]]], scenario_raw: bytes, seccomp_raw: bytes,
+) -> None:
+    stage = state / "stage"
+    stage.mkdir(mode=0o700)
+    candidate_tar = stage / "candidate.tar"
+    bounded([
+        "/usr/bin/git", "-C", str(contract["candidate_root"]), "archive", "--format=tar",
+        f"--output={candidate_tar}", contract["candidate_sha"], "--", "deploy/native-ci",
+    ], timeout=60)
+    candidate_tar.chmod(0o400)
+    inputs = stage / "inputs"
+    inputs.mkdir(mode=0o700)
+    for name in PACKAGE_NAMES:
+        materialize_tree(records[name], inputs / name)
+    (inputs / "scenario.json").write_bytes(scenario_raw)
+    (inputs / "scenario.json").chmod(0o400)
+    (inputs / "seccomp.json").write_bytes(seccomp_raw)
+    (inputs / "seccomp.json").chmod(0o400)
+    public_raw = read_regular(state / "public-binding.json", MAX_JSON)
+    (inputs / "public-binding.json").write_bytes(public_raw)
+    (inputs / "public-binding.json").chmod(0o400)
+    descriptor = {
+        "schema_version": "buzz-ci-clean-host-e2e-stage/v2",
+        "candidate_sha": contract["candidate_sha"],
+        "candidate_tar_sha256": file_sha256(candidate_tar),
+        "scenario_sha256": contract["scenario"]["sha256"],
+        "seccomp_source_sha256": SECCOMP_SHA256,
+        "public_binding_sha256": hashlib.sha256(public_raw).hexdigest(),
+        "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
+    }
+    (stage / "descriptor.json").write_bytes(canonical(descriptor))
+    (stage / "descriptor.json").chmod(0o444)
+    state_record = load_json(state / "state.json")
+    stage_common(state, stage, {
+        "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v2",
+        "phase": "run", "challenge": state_record["challenge"],
+        "descriptor_sha256": hashlib.sha256(canonical(descriptor)).hexdigest(),
+    })
+    make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
+    shutil.rmtree(stage)
+    make_seed(state, "buzzci-run-" + str(state_record["challenge"])[:16])
+
+
+def create_verify_stage(contract: dict[str, object], state: Path, scenario_raw: bytes) -> None:
+    clean_transient(state)
+    stage = state / "stage"
+    stage.mkdir(mode=0o700)
+    scenario_path = stage / "scenario.json"
+    scenario_path.write_bytes(scenario_raw)
+    scenario_path.chmod(0o400)
+    state_record = load_json(state / "state.json")
+    stage_common(state, stage, {
+        "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v2",
+        "phase": "verify", "challenge": state_record["challenge"],
+        "candidate_sha": contract["candidate_sha"],
+        "scenario_sha256": contract["scenario"]["sha256"],
+    })
+    make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
+    shutil.rmtree(stage)
+    make_seed(state, "buzzci-verify-" + str(state_record["challenge"])[:16])
+
+
+def validate_final_frame(frame: dict[str, object], contract: dict[str, object], challenge: str) -> tuple[bytes, bytes, dict[str, object]]:
+    expected = {"schema_version", "phase", "challenge", "outcome", "receipt_base64", "verifier_base64", "dormant_proof"}
+    if set(frame) != expected or frame["phase"] != "run" or frame["challenge"] != challenge or frame["outcome"] != "pass":
+        raise HarnessError("final evidence frame differs")
     try:
-        run_checked(command)
-        started = True
-        deadline = time.monotonic() + 30
-        while True:
-            state = subprocess.run(["docker", "exec", container_name, "systemctl", "is-system-running"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode().strip()
-            if state in {"running", "degraded"}:
-                break
-            if time.monotonic() >= deadline:
-                raise HarnessError("container systemd did not become available")
-            time.sleep(0.25)
-        output = run_checked(["docker", "exec", container_name, "python3", "/harness/container_entry.py", "/results/container-contract.json"])
-        result = json.loads(output)
-        if result.get("status") != "pass":
-            raise HarnessError("container did not return a pass result")
-        return result
+        receipt_raw = base64.b64decode(frame["receipt_base64"], validate=True)
+        verifier_raw = base64.b64decode(frame["verifier_base64"], validate=True)
+    except (TypeError, ValueError) as error:
+        raise HarnessError("final evidence encoding differs") from error
+    if not receipt_raw or len(receipt_raw) > MAX_JSON or not verifier_raw or len(verifier_raw) > MAX_JSON:
+        raise HarnessError("final evidence size differs")
+    try:
+        receipt = json.loads(receipt_raw)
+        verifier = json.loads(verifier_raw)
+    except json.JSONDecodeError as error:
+        raise HarnessError("final evidence JSON differs") from error
+    proof = frame["dormant_proof"]
+    if (
+        not isinstance(receipt, dict) or receipt.get("outcome") != "pass"
+        or receipt.get("integrated_candidate_sha") != contract["candidate_sha"]
+        or receipt.get("scenario_sha256") != contract["scenario"]["sha256"]
+        or not isinstance(verifier, dict) or verifier.get("status") != "pass"
+        or not isinstance(proof, dict)
+        or set(proof) != {
+            "configs_sha256", "units_sha256", "sockets_absent", "processes_absent",
+            "encrypted_credentials_absent", "relay_residue_absent",
+        }
+        or any(proof.get(name) is not True for name in (
+            "sockets_absent", "processes_absent", "encrypted_credentials_absent", "relay_residue_absent",
+        ))
+        or any(not isinstance(proof.get(name), str) or HEX64.fullmatch(proof[name]) is None for name in ("configs_sha256", "units_sha256"))
+    ):
+        raise HarnessError("final receipt identity or dormant proof differs")
+    return receipt_raw, verifier_raw, proof
+
+
+def run_vm(
+    contract: dict[str, object], state: Path, records: dict[str, list[tuple[str, int, bytes]]],
+    scenario_raw: bytes, seccomp_raw: bytes, results_arg: Path,
+) -> dict[str, object]:
+    results = safe_directory(results_arg, create=True)
+    success = False
+    try:
+        challenge = str(load_json(state / "state.json")["challenge"])
+        create_run_stage(contract, state, records, scenario_raw, seccomp_raw)
+        boot(state, RUN_TIMEOUT, evidence_expected=False)
+        create_verify_stage(contract, state, scenario_raw)
+        frame = boot(state, 180, evidence_expected=True)
+        if frame is None:
+            raise HarnessError("verification guest returned no evidence")
+        receipt_raw, verifier_raw, proof = validate_final_frame(frame, contract, challenge)
+        receipt_path = results / "acceptance-receipt.json"
+        verifier_path = results / "verifier.json"
+        state_record = load_json(state / "state.json")
+        receipt_digest = hashlib.sha256(receipt_raw).hexdigest()
+        verifier_digest = hashlib.sha256(verifier_raw).hexdigest()
+        evidence_manifest = {
+            "schema_version": "buzz-ci-clean-host-e2e-evidence/v2",
+            "candidate_sha": contract["candidate_sha"],
+            "image_sha256": state_record["image_sha256"],
+            "tool_sha256": state_record["tool_sha256"],
+            "harness_asset_sha256": state_record["harness_asset_sha256"],
+            "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
+            "scenario_sha256": contract["scenario"]["sha256"],
+            "seccomp_source_sha256": SECCOMP_SHA256,
+            "receipt_sha256": receipt_digest,
+            "verifier_sha256": verifier_digest,
+            "dormant_proof": proof,
+        }
+        evidence_path = results / "evidence-manifest.json"
+        receipt_path.write_bytes(receipt_raw)
+        verifier_path.write_bytes(verifier_raw)
+        evidence_path.write_bytes(canonical(evidence_manifest))
+        receipt_path.chmod(0o400)
+        verifier_path.chmod(0o400)
+        evidence_path.chmod(0o400)
+        success = True
+        return {
+            "status": "pass", "candidate_sha": contract["candidate_sha"],
+            "receipt_sha256": receipt_digest, "verifier_sha256": verifier_digest,
+            "evidence_manifest_sha256": hashlib.sha256(canonical(evidence_manifest)).hexdigest(),
+            "dormant_proof": proof, "vm_state_absent": True,
+        }
     finally:
-        if started:
-            subprocess.run(["docker", "stop", "--time", "10", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["docker", "rm", "--force", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        destroy_state(state)
+        if not success:
+            shutil.rmtree(results, ignore_errors=True)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("capabilities")
     prepare_parser = sub.add_parser("prepare")
     prepare_parser.add_argument("--state", type=Path, required=True)
+    prepare_parser.add_argument("--image", type=Path, required=True)
+    prepare_parser.add_argument("--image-sha256", required=True)
+    prepare_parser.add_argument("--qemu-sha256", required=True)
+    prepare_parser.add_argument("--qemu-img-sha256", required=True)
     prepare_parser.add_argument("--controld-uid", type=int, required=True)
     prepare_parser.add_argument("--controld-gid", type=int, required=True)
     for name in ("preflight", "run"):
@@ -329,13 +767,15 @@ def main() -> int:
             child.add_argument("--results", type=Path, required=True)
     arguments = parser.parse_args()
     try:
-        if arguments.action == "prepare":
-            result = prepare(arguments.state, arguments.controld_uid, arguments.controld_gid)
+        if arguments.action == "capabilities":
+            result = capabilities()
+        elif arguments.action == "prepare":
+            result = prepare(arguments)
         else:
-            contract, paths = validate_contract(arguments.contract)
-            result = {"status": "ready", "candidate_sha": contract["candidate_sha"], "image_id": contract["image_id"]}
+            contract, state, records, scenario_raw, seccomp_raw = validate_contract(arguments.contract)
+            result = {"status": "ready", "candidate_sha": contract["candidate_sha"], "boundary": "bubblewrap+qemu-kvm"}
             if arguments.action == "run":
-                result = docker_run(contract, paths, arguments.results)
+                result = run_vm(contract, state, records, scenario_raw, seccomp_raw, arguments.results)
         sys.stdout.buffer.write(canonical(result))
         return 0
     except (OSError, ValueError, HarnessError, subprocess.SubprocessError) as error:
