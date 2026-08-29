@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Preflight, stage, activate, qualify, or roll back Buzz CI capacity one."""
 
 from __future__ import annotations
@@ -23,11 +23,21 @@ import tempfile
 import time
 from typing import Any
 
-import package as activation_package
+try:
+    import buzz_ci_activation_package as activation_package
+except ModuleNotFoundError:
+    if Path(__file__).name != "controller.py":
+        raise
+    import package as activation_package
 
 RECEIPT_PATH = "/var/lib/buzzci/activation-controller/receipt-v1.json"
 ACCEPTANCE_BINDING_PATH = activation_package.ACCEPTANCE_BINDING_PATH
 CONTROLD_ACCEPTANCE_LEDGER_PATH = "/var/lib/buzzci/controld/acceptance-operation-ledger-v1.json"
+FIXED_PACKAGE_PATH = activation_package.FIXED_PACKAGE_PATH
+ZERO_REQUEST_SCHEMA = "buzz-ci-activation-qualification-zero-request/v1"
+ZERO_RESPONSE_SCHEMA = "buzz-ci-activation-qualification-zero-response/v1"
+ZERO_SEQUENCE_SCHEMA = "buzz-ci-activation-qualification-zero-state/v1"
+MAX_ZERO_REQUEST_BYTES = 64 * 1024
 MAX_SCENARIO_BYTES = 128 * 1024
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSUSERS = "/usr/bin/systemd-sysusers"
@@ -546,6 +556,113 @@ def load_package(package: Path, *, live: bool) -> tuple[dict[str, Any], dict[str
     return manifest, payloads
 
 
+def _package_references(manifest: dict[str, Any]) -> dict[str, int]:
+    references: dict[str, int] = {}
+    for entry in manifest["entries"]:
+        references[entry["source"]] = activation_package.parse_mode(entry["source_mode"])
+        if "active_source" in entry:
+            references[entry["active_source"]] = activation_package.parse_mode(entry["active_source_mode"])
+    for component in manifest["components"]:
+        references[component["provenance_source"]] = 0o400
+    references[manifest["qualification"]["request_source"]] = 0o400
+    return references
+
+
+def _remove_package_tree(root: Path, target: str, *, expected_sources: set[str] | None) -> None:
+    parent_fd, name = activation_package.open_parent_fd(root, target)
+    directory_fd = -1
+    assets_fd = -1
+    try:
+        directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        entries = set(os.listdir(directory_fd))
+        if not entries <= {"activation-manifest.json", "assets"}:
+            raise ValueError("fixed activation package contains unexpected entries")
+        if "assets" in entries:
+            assets_fd = os.open("assets", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+            assets = set(os.listdir(assets_fd))
+            if expected_sources is not None and assets != {Path(item).name for item in expected_sources}:
+                raise ValueError("fixed activation package assets differ before removal")
+            for asset in sorted(assets):
+                metadata = os.stat(asset, dir_fd=assets_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError("fixed activation package contains an unsafe asset")
+                os.unlink(asset, dir_fd=assets_fd)
+            os.close(assets_fd)
+            assets_fd = -1
+            os.rmdir("assets", dir_fd=directory_fd)
+        if "activation-manifest.json" in entries:
+            metadata = os.stat("activation-manifest.json", dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError("fixed activation manifest shape is unsafe")
+            os.unlink("activation-manifest.json", dir_fd=directory_fd)
+        os.close(directory_fd)
+        directory_fd = -1
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if assets_fd >= 0:
+            os.close(assets_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
+def _install_fixed_package(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+) -> dict[str, str]:
+    target = activation_package.rooted(root, FIXED_PACKAGE_PATH)
+    live = root == Path("/")
+    if target.exists():
+        installed_manifest, installed_payloads = load_package(target, live=live)
+        if installed_manifest != manifest or installed_payloads != payloads:
+            raise ValueError("fixed activation package belongs to a different package")
+        return {"path": FIXED_PACKAGE_PATH, "status": "exact", "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest))}
+    parent_fd, final_name = activation_package.open_parent_fd(root, FIXED_PACKAGE_PATH, create=True)
+    temporary_name = f".package-install-{os.getpid()}-{os.urandom(8).hex()}"
+    temporary_target = f"/var/lib/buzzci/activation-controller/{temporary_name}"
+    created = False
+    try:
+        os.mkdir(temporary_name, 0o700, dir_fd=parent_fd)
+        created = True
+        temporary = activation_package.rooted(root, temporary_target)
+        temporary.chmod(0o700)
+        (temporary / "assets").mkdir(mode=0o700)
+        references = _package_references(manifest)
+        for source, mode in sorted(references.items()):
+            _atomic_write(root, f"{temporary_target}/assets/{Path(source).name}", payloads[source], mode, 0, 0)
+        _atomic_write(
+            root, f"{temporary_target}/activation-manifest.json",
+            activation_package.canonical_json(manifest), 0o600, 0, 0,
+        )
+        load_package(temporary, live=live)
+        os.rename(temporary_name, final_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        created = False
+    finally:
+        os.close(parent_fd)
+        if created:
+            try:
+                _remove_package_tree(root, temporary_target, expected_sources=None)
+            except BaseException:
+                pass
+    return {"path": FIXED_PACKAGE_PATH, "status": "installed", "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest))}
+
+
+def _verify_fixed_package(manifest: dict[str, Any], root: Path) -> dict[str, str]:
+    installed, _payloads = load_package(activation_package.rooted(root, FIXED_PACKAGE_PATH), live=root == Path("/"))
+    if installed != manifest:
+        raise ValueError("fixed activation package manifest differs")
+    return {"path": FIXED_PACKAGE_PATH, "status": "exact", "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest))}
+
+
+def _remove_fixed_package(manifest: dict[str, Any], root: Path) -> None:
+    target = activation_package.rooted(root, FIXED_PACKAGE_PATH)
+    if not target.exists():
+        return
+    _verify_fixed_package(manifest, root)
+    _remove_package_tree(root, FIXED_PACKAGE_PATH, expected_sources=set(_package_references(manifest)))
+
+
 def _validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes]) -> None:
     activation_package.validate_phase_configs(manifest, payloads)
 
@@ -663,6 +780,14 @@ class LiveSystemd:
             "uid": metadata.st_uid,
             "gid": metadata.st_gid,
         }
+
+    @staticmethod
+    def socket_absent(policy: dict[str, object]) -> bool:
+        try:
+            os.stat(policy["path"], follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        raise ValueError(f"live endpoint remains present: {policy['path']}")
 
 
 class FakeSystemd:
@@ -826,6 +951,11 @@ class FakeSystemd:
         if value is None:
             raise ValueError(f"fake socket is absent: {policy['path']}")
         return value
+
+    def socket_absent(self, policy: dict[str, object]) -> bool:
+        if policy["path"] in self._read()["sockets"]:
+            raise ValueError(f"fake endpoint remains present: {policy['path']}")
+        return True
 
 
 def _identity_readback(driver: LiveSystemd | FakeSystemd, identities: dict[str, object], *, allow_absent: bool) -> dict[str, object]:
@@ -1030,11 +1160,16 @@ def _new_receipt(
         "targets": records,
         "acceptance_generated": _generated_records(root, generated),
         "acceptance_ledger_prior": _capture_acceptance_ledger(manifest, root),
+        "fixed_package": {
+            "path": FIXED_PACKAGE_PATH,
+            "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest)),
+        },
         "systemd_before": _unit_readback(
             driver,
             sorted(set(activation_package.START_ORDER + activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])),
         ),
         "qualification": None,
+        "qualification_zero": None,
         "last_error": None,
     }
 
@@ -1043,7 +1178,7 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     expected_keys = {
         "schema", "activation_id", "package_digest", "source_commit", "state", "created_at", "updated_at",
         "principals_retained_on_rollback", "targets", "acceptance_generated", "acceptance_ledger_prior",
-        "systemd_before", "qualification", "last_error",
+        "fixed_package", "systemd_before", "qualification", "qualification_zero", "last_error",
     }
     if set(receipt) != expected_keys or receipt.get("schema") != activation_package.RECEIPT_SCHEMA:
         raise ValueError("activation receipt shape differs")
@@ -1059,6 +1194,45 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
         "controld_acceptance_binding", "acceptance_control_config", "acceptance_driver_config",
     }:
         raise ValueError("receipt acceptance generated targets differ")
+    if receipt["fixed_package"] != {
+        "path": FIXED_PACKAGE_PATH,
+        "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest)),
+    }:
+        raise ValueError("receipt fixed activation package binding differs")
+    _validate_qualification_zero_state(receipt["qualification_zero"], receipt)
+
+
+def _validate_qualification_zero_state(value: object, receipt: dict[str, Any]) -> None:
+    if value is None:
+        return
+    required = {
+        "schema", "activation_id", "activation_package_digest", "scenario_sha256",
+        "initial_controller_generation", "initial_runner_generation", "phase",
+        "prepare", "finalize", "last_error",
+    }
+    if not isinstance(value, dict) or set(value) != required or value.get("schema") != ZERO_SEQUENCE_SCHEMA:
+        raise ValueError("qualification-zero receipt shape differs")
+    if value["activation_id"] != receipt["activation_id"] or value["activation_package_digest"] != receipt["package_digest"]:
+        raise ValueError("qualification-zero receipt belongs to a different activation")
+    _scenario_hex(value["scenario_sha256"], {64}, "qualification-zero scenario digest")
+    _scenario_u64(value["initial_controller_generation"], "qualification-zero controller generation")
+    _scenario_u64(value["initial_runner_generation"], "qualification-zero runner generation")
+    if value["phase"] not in {"preparing", "prepared", "prepare_failed", "finalizing", "finalize_failed", "finalized"}:
+        raise ValueError("qualification-zero receipt phase differs")
+    for action in ("prepare", "finalize"):
+        record = value[action]
+        if record is None:
+            if action == "prepare":
+                raise ValueError("qualification-zero prepare record is absent")
+            continue
+        if not isinstance(record, dict) or set(record) != {"operation_id", "request_sha256"}:
+            raise ValueError(f"qualification-zero {action} record differs")
+        _scenario_hex(record["operation_id"], {64}, f"qualification-zero {action} operation id")
+        _scenario_hex(record["request_sha256"], {64}, f"qualification-zero {action} request digest")
+    if value["phase"] in {"finalizing", "finalize_failed", "finalized"} and value["finalize"] is None:
+        raise ValueError("qualification-zero finalize record is absent")
+    if value["last_error"] is not None and (not isinstance(value["last_error"], str) or not value["last_error"]):
+        raise ValueError("qualification-zero last error differs")
 
 
 def _apply_phase(
@@ -1191,6 +1365,395 @@ def _staged_zero_readback(
     return {"units": units, "sockets": sockets}
 
 
+ZERO_CLI_ACTIONS = {
+    "prepare-qualification-zero": "prepare_qualification_zero",
+    "finalize-qualification-zero": "finalize_qualification_zero",
+    "prove-qualification-zero": "prove_qualification_zero",
+}
+ZERO_REQUIRED_FIELDS = (
+    "schema_version", "action", "activation_id", "activation_package_digest", "scenario_sha256",
+    "initial_controller_generation", "initial_runner_generation", "operation_id",
+)
+ZERO_OPTIONAL_FIELDS = (
+    "failed_stage", "final_response_sha256", "expected_controller_generation", "expected_runner_generation",
+)
+
+
+def _wire_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+
+
+def _binding_from_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    record = next(
+        (item for item in receipt["acceptance_generated"] if item["role"] == "controld_acceptance_binding"),
+        None,
+    )
+    if record is None:
+        raise ValueError("controld acceptance binding is absent from the receipt")
+    try:
+        payload = base64.b64decode(record["payload_base64"], validate=True)
+        binding = json.loads(payload, object_pairs_hook=activation_package.reject_duplicates)
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("controld acceptance binding receipt payload is invalid") from error
+    if not isinstance(binding, dict) or activation_package.digest(payload) != record["sha256"]:
+        raise ValueError("controld acceptance binding receipt payload differs")
+    return binding
+
+
+def _parse_zero_request(raw: bytes, cli_action: str, receipt: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    if not raw or len(raw) > MAX_ZERO_REQUEST_BYTES:
+        raise ValueError("qualification-zero request size is invalid")
+    try:
+        request = json.loads(raw, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("qualification-zero request JSON is invalid") from error
+    if not isinstance(request, dict) or raw != _wire_json(request):
+        raise ValueError("qualification-zero request is not canonical compact JSON")
+    present_optional = tuple(field for field in ZERO_OPTIONAL_FIELDS if field in request)
+    if tuple(request) != ZERO_REQUIRED_FIELDS + present_optional:
+        raise ValueError("qualification-zero request field order or shape differs")
+    expected_action = ZERO_CLI_ACTIONS[cli_action]
+    if request["schema_version"] != ZERO_REQUEST_SCHEMA or request["action"] != expected_action:
+        raise ValueError("qualification-zero request action binding differs")
+    if (
+        request["activation_id"] != receipt["activation_id"]
+        or request["activation_package_digest"] != receipt["package_digest"]
+    ):
+        raise ValueError("qualification-zero request belongs to a different activation")
+    _scenario_hex(request["scenario_sha256"], {64}, "qualification-zero request scenario digest")
+    _scenario_u64(request["initial_controller_generation"], "qualification-zero initial controller generation")
+    _scenario_u64(request["initial_runner_generation"], "qualification-zero initial runner generation")
+    _scenario_hex(request["operation_id"], {64}, "qualification-zero operation id")
+    if "failed_stage" in request:
+        value = request["failed_stage"]
+        if not isinstance(value, str) or not 1 <= len(value) <= 64 or re.fullmatch(r"[A-Za-z0-9._-]+", value) is None:
+            raise ValueError("qualification-zero failed stage is invalid")
+    if "final_response_sha256" in request:
+        _scenario_hex(request["final_response_sha256"], {64}, "qualification-zero final response digest")
+    for field in ("expected_controller_generation", "expected_runner_generation"):
+        if field in request:
+            _scenario_u64(request[field], f"qualification-zero {field}")
+    binding = _binding_from_receipt(receipt)
+    fixture = binding.get("fixture")
+    if (
+        binding.get("activation_id") != request["activation_id"]
+        or binding.get("activation_package_digest") != request["activation_package_digest"]
+        or binding.get("scenario_sha256") != request["scenario_sha256"]
+        or not isinstance(fixture, dict)
+        or fixture.get("controller_generation") != request["initial_controller_generation"]
+        or fixture.get("runner_generation") != request["initial_runner_generation"]
+    ):
+        raise ValueError("qualification-zero request differs from the acceptance binding")
+    return request, activation_package.digest(raw)
+
+
+def _qualification_zero_scope(request: dict[str, Any]) -> dict[str, object]:
+    return {
+        "schema": ZERO_SEQUENCE_SCHEMA,
+        "activation_id": request["activation_id"],
+        "activation_package_digest": request["activation_package_digest"],
+        "scenario_sha256": request["scenario_sha256"],
+        "initial_controller_generation": request["initial_controller_generation"],
+        "initial_runner_generation": request["initial_runner_generation"],
+    }
+
+
+def _bind_zero_scope(state: dict[str, Any], request: dict[str, Any]) -> None:
+    expected = _qualification_zero_scope(request)
+    if any(state.get(field) != value for field, value in expected.items()):
+        raise ValueError("qualification-zero request scope differs from the receipt")
+
+
+def _receipt_sha256(root: Path) -> str:
+    opened = _read_target(root, RECEIPT_PATH, activation_package.MAX_JSON_BYTES)
+    if opened is None:
+        raise ValueError("activation receipt is absent")
+    raw, _metadata = opened
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("activation receipt is absent")
+    return activation_package.digest(raw)
+
+
+def _zero_response(request: dict[str, Any], root: Path) -> dict[str, object]:
+    return {
+        "schema_version": ZERO_RESPONSE_SCHEMA,
+        "action": request["action"],
+        "activation_id": request["activation_id"],
+        "activation_package_digest": request["activation_package_digest"],
+        "scenario_sha256": request["scenario_sha256"],
+        "operation_id": request["operation_id"],
+        "state": "staged_zero",
+        "receipt_sha256": _receipt_sha256(root),
+    }
+
+
+def _apply_staged_configs(manifest: dict[str, Any], payloads: dict[str, bytes], root: Path) -> dict[str, str]:
+    entries = {entry["role"]: entry for entry in manifest["entries"]}
+    result: dict[str, str] = {}
+    for role in ("runner_config", "controld_config"):
+        entry = entries[role]
+        _atomic_write(
+            root, entry["target"], payloads[entry["source"]],
+            activation_package.parse_mode(entry["install_mode"]), entry["uid"], entry["gid"],
+        )
+        observed = _entry_state(root, entry, _read_target(root, entry["target"]))
+        if observed != "staged":
+            raise ValueError(f"qualification-zero config readback failed: {role}")
+        result[role] = observed
+    return result
+
+
+def _verify_zero_configs(manifest: dict[str, Any], root: Path) -> dict[str, str]:
+    entries = {entry["role"]: entry for entry in manifest["entries"]}
+    result: dict[str, str] = {}
+    for role in ("runner_config", "controld_config"):
+        observed = _entry_state(root, entries[role], _read_target(root, entries[role]["target"]))
+        if observed != "staged":
+            raise ValueError(f"qualification-zero config readback failed: {role}")
+        result[role] = observed
+    return result
+
+
+def _prepare_zero_readback(manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd) -> None:
+    _verify_phase(manifest, root, "staged")
+    _verify_fixed_package(manifest, root)
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("activation receipt is absent")
+    _bind_receipt(receipt, manifest)
+    _verify_generated(root, receipt["acceptance_generated"])
+    for unit in (
+        "buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service",
+        "buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service",
+    ):
+        if driver.unit(unit)["ActiveState"] != "active":
+            raise ValueError(f"qualification-zero prepare requires active unit: {unit}")
+    _socket_readback(manifest, driver, names={"acceptance_control", "controld_acceptance"})
+
+
+def _finalized_zero_readback(manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd) -> dict[str, object]:
+    managed_targets = _verify_phase(manifest, root, "staged")
+    _verify_fixed_package(manifest, root)
+    units = _unit_readback(driver, sorted(set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])))
+    keep = {"buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service"}
+    for name, state in units.items():
+        wanted = "active" if name in keep else "inactive"
+        if state["ActiveState"] != wanted:
+            raise ValueError(f"qualification-zero final readback found unit {name} {state['ActiveState']}, expected {wanted}")
+    target = units[activation_package.PERSISTENT_UNIT]
+    if target["LoadState"] != "not-found" and target["UnitFileState"] not in {"disabled", "static"}:
+        raise ValueError("capacity-one target remains enabled after qualification zero")
+    sockets = _socket_readback(manifest, driver, names={"acceptance_control"})
+    driver.socket_absent(manifest["socket_policy"]["controld_acceptance"])
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("activation receipt is absent")
+    _bind_receipt(receipt, manifest)
+    generated: dict[str, str] = {}
+    for record in receipt["acceptance_generated"]:
+        if record["role"] == "controld_acceptance_binding":
+            continue
+        _verify_target_digest(root, record["target"], record, MAX_SCENARIO_BYTES)
+        generated[record["role"]] = "exact"
+    binding = _binding_prior_readback(receipt, root)
+    return {
+        "managed_targets": managed_targets, "units": units, "sockets": sockets,
+        "acceptance_generated": generated, "controld_acceptance_path": "absent",
+        "controld_acceptance_binding": binding,
+    }
+
+
+def _binding_record(receipt: dict[str, Any]) -> dict[str, Any]:
+    return next(item for item in receipt["acceptance_generated"] if item["role"] == "controld_acceptance_binding")
+
+
+def _restore_binding_prior(receipt: dict[str, Any], root: Path) -> None:
+    record = _binding_record(receipt)
+    prior = record["prior"]
+    if prior["exists"]:
+        payload = base64.b64decode(prior["payload_base64"], validate=True)
+        _atomic_write(root, record["target"], payload, prior["mode"], prior["uid"], prior["gid"])
+    elif _read_target(root, record["target"], MAX_SCENARIO_BYTES) is not None:
+        _unlink_target(root, record["target"])
+
+
+def _binding_prior_readback(receipt: dict[str, Any] | None, root: Path) -> str:
+    if receipt is None:
+        raise ValueError("activation receipt is absent")
+    record = _binding_record(receipt)
+    prior = record["prior"]
+    opened = _read_target(root, record["target"], MAX_SCENARIO_BYTES)
+    if not prior["exists"]:
+        if opened is not None:
+            raise ValueError("controld acceptance binding was not removed")
+        return "absent"
+    if opened is None:
+        raise ValueError("prior controld acceptance binding is absent")
+    payload, metadata = opened
+    if activation_package.digest(payload) != prior["sha256"] or _metadata_dict(metadata) != {
+        "mode": prior["mode"], "uid": prior["uid"], "gid": prior["gid"],
+    }:
+        raise ValueError("prior controld acceptance binding readback differs")
+    return "restored"
+
+
+def _prepare_qualification_zero(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
+) -> dict[str, object]:
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("qualification-zero prepare requires an activation receipt")
+    _bind_receipt(receipt, manifest)
+    _verify_fixed_package(manifest, root)
+    operation = {"operation_id": request["operation_id"], "request_sha256": request_sha256}
+    state = receipt["qualification_zero"]
+    if state is None:
+        if receipt["state"] != "active_one":
+            raise ValueError("qualification-zero prepare requires active capacity one")
+        state = {
+            **_qualification_zero_scope(request), "phase": "preparing", "prepare": operation,
+            "finalize": None, "last_error": None,
+        }
+        receipt.update({"state": "preparing_zero", "qualification_zero": state, "updated_at": utc_now(), "last_error": None})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    else:
+        _bind_zero_scope(state, request)
+        if state["prepare"] != operation:
+            raise ValueError("qualification-zero prepare replay differs")
+        if state["phase"] == "prepared":
+            _prepare_zero_readback(manifest, root, driver)
+            return _zero_response(request, root)
+        if state["phase"] not in {"preparing", "prepare_failed"}:
+            raise ValueError(f"qualification-zero prepare cannot resume from {state['phase']}")
+    try:
+        records = _validate_generated_records(receipt, root, apply=False)
+        _apply_staged_configs(manifest, payloads, root)
+        _apply_generated(root, records)
+        _prepare_zero_readback(manifest, root, driver)
+    except BaseException as error:
+        state.update({"phase": "prepare_failed", "last_error": str(error)})
+        receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": str(error)})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        raise
+    state.update({"phase": "prepared", "last_error": None})
+    receipt.update({"state": "preparing_zero", "updated_at": utc_now(), "last_error": None})
+    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    return _zero_response(request, root)
+
+
+def _qualification_finalize_stop_errors(driver: LiveSystemd | FakeSystemd) -> list[str]:
+    errors: list[str] = []
+    keep = {"buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service"}
+    ordered = ["buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service"]
+    ordered.extend(unit for unit in activation_package.STOP_ORDER if unit not in keep and unit not in ordered)
+    for unit in ordered:
+        try:
+            driver.stop(unit)
+        except BaseException as error:
+            errors.append(f"stop {unit}: {error}")
+    try:
+        driver.disable(activation_package.PERSISTENT_UNIT)
+    except BaseException as error:
+        errors.append(f"disable {activation_package.PERSISTENT_UNIT}: {error}")
+    try:
+        driver.stop(activation_package.PERSISTENT_UNIT)
+    except BaseException as error:
+        errors.append(f"stop {activation_package.PERSISTENT_UNIT}: {error}")
+    for unit in ("buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service"):
+        try:
+            driver.start(unit)
+        except BaseException as error:
+            errors.append(f"start {unit}: {error}")
+    return errors
+
+
+def _finalize_qualification_zero(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
+    request: dict[str, Any], request_sha256: str,
+) -> dict[str, object]:
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("qualification-zero finalize requires an activation receipt")
+    _bind_receipt(receipt, manifest)
+    _verify_fixed_package(manifest, root)
+    state = receipt["qualification_zero"]
+    if not isinstance(state, dict):
+        raise ValueError("qualification-zero finalize requires prepare")
+    _bind_zero_scope(state, request)
+    operation = {"operation_id": request["operation_id"], "request_sha256": request_sha256}
+    if state["finalize"] is None:
+        if state["phase"] not in {"prepared", "prepare_failed"}:
+            raise ValueError(f"qualification-zero finalize cannot start from {state['phase']}")
+        state.update({"phase": "finalizing", "finalize": operation, "last_error": None})
+        receipt.update({"updated_at": utc_now(), "last_error": None})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    else:
+        if state["finalize"] != operation:
+            raise ValueError("qualification-zero finalize replay differs")
+        if state["phase"] == "finalized":
+            _finalized_zero_readback(manifest, root, driver)
+            return _zero_response(request, root)
+        if state["phase"] not in {"finalizing", "finalize_failed"}:
+            raise ValueError(f"qualification-zero finalize cannot resume from {state['phase']}")
+    errors = _qualification_finalize_stop_errors(driver)
+    try:
+        _apply_staged_configs(manifest, payloads, root)
+    except BaseException as error:
+        errors.append(f"restage capacity-zero configs: {error}")
+    controld_stopped = True
+    for unit in ("buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service"):
+        try:
+            if driver.unit(unit)["ActiveState"] != "inactive":
+                controld_stopped = False
+                errors.append(f"refuse binding restoration while {unit} remains active")
+        except BaseException as error:
+            controld_stopped = False
+            errors.append(f"read {unit} before binding restoration: {error}")
+    if controld_stopped:
+        try:
+            _restore_binding_prior(receipt, root)
+        except BaseException as error:
+            errors.append(f"restore controld acceptance binding: {error}")
+    try:
+        _finalized_zero_readback(manifest, root, driver)
+    except BaseException as error:
+        errors.append(f"qualification-zero readback: {error}")
+    if errors:
+        combined = "qualification-zero finalize failures: " + "; ".join(errors)
+        state.update({"phase": "finalize_failed", "last_error": combined})
+        receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": combined})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        raise ValueError(combined)
+    state.update({"phase": "finalized", "last_error": None})
+    receipt.update({"state": "staged_zero", "updated_at": utc_now(), "last_error": None})
+    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    _finalized_zero_readback(manifest, root, driver)
+    return _zero_response(request, root)
+
+
+def _prove_qualification_zero(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd, request: dict[str, Any],
+) -> dict[str, object]:
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("qualification-zero proof requires an activation receipt")
+    _bind_receipt(receipt, manifest)
+    state = receipt["qualification_zero"]
+    if not isinstance(state, dict):
+        raise ValueError("qualification-zero proof requires finalize")
+    _bind_zero_scope(state, request)
+    if receipt["state"] != "staged_zero" or state["phase"] != "finalized":
+        raise ValueError("qualification-zero proof requires finalized staged zero")
+    before = _receipt_sha256(root)
+    _finalized_zero_readback(manifest, root, driver)
+    after = _receipt_sha256(root)
+    if after != before:
+        raise ValueError("qualification-zero proof changed the activation receipt")
+    return _zero_response(request, root)
+
+
 def stage(
     manifest: dict[str, Any],
     payloads: dict[str, bytes],
@@ -1215,6 +1778,7 @@ def stage(
                     "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
                     "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
                     "acceptance_generated": _verify_generated(root, existing["acceptance_generated"]),
+                    "fixed_package": _verify_fixed_package(manifest, root),
                     "staged_zero": _staged_zero_readback(manifest, driver),
                 }
             raise ValueError(f"activation receipt requires rollback from {existing['state']}")
@@ -1225,6 +1789,7 @@ def stage(
         _apply_phase(manifest, payloads, root, "staged")
         driver.provision(manifest["identities"])
         driver.tmpfiles()
+        fixed_package = _install_fixed_package(manifest, payloads, root)
         _apply_generated(root, receipt["acceptance_generated"])
         driver.daemon_reload()
         _stop_to_zero(driver)
@@ -1248,6 +1813,7 @@ def stage(
             "access_group": access_group,
             "managed_targets": targets,
             "acceptance_generated": generated_readback,
+            "fixed_package": fixed_package,
             "staged_zero": staged_zero,
         }
     except BaseException as error:
@@ -1772,6 +2338,8 @@ def rollback(
         raise ValueError("rollback requires an activation receipt")
     _bind_receipt(receipt, manifest)
     if receipt["state"] == "rolled_back":
+        if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
+            raise ValueError("fixed activation package remains after rollback")
         return {
             "status": "unchanged",
             "state": "rolled_back",
@@ -1779,9 +2347,12 @@ def rollback(
             "managed_targets": _managed_readback(manifest, root, {"absent", "staged"}),
             "acceptance_generated": _generated_prior_readback(receipt, root),
             "acceptance_ledger": _acceptance_ledger_prior_readback(receipt, root),
+            "fixed_package": "absent",
             "units": _systemd_prior_readback(receipt, driver),
         }
-    if receipt["state"] not in {"preparing", "stage_failed", "staged_zero", "activating", "active_one", "rollback_failed"}:
+    if receipt["state"] not in {
+        "preparing", "stage_failed", "staged_zero", "activating", "active_one", "preparing_zero", "rollback_failed",
+    }:
         raise ValueError(f"rollback cannot start from receipt state {receipt['state']}")
     try:
         _validate_receipt_targets(receipt, manifest)
@@ -1796,6 +2367,10 @@ def rollback(
     errors.extend(restore_errors)
     generated_restored, generated_errors = _restore_generated_prior_best_effort(receipt, root)
     errors.extend(generated_errors)
+    try:
+        _remove_fixed_package(manifest, root)
+    except BaseException as error:
+        errors.append(f"remove fixed activation package: {error}")
     try:
         _restore_acceptance_ledger(receipt, manifest, root)
     except BaseException as error:
@@ -1842,6 +2417,7 @@ def rollback(
         "managed_targets": targets,
         "acceptance_generated": generated_prior,
         "acceptance_ledger": ledger_prior,
+        "fixed_package": "absent",
         "retained_principals": sorted(identity["user"] for identity in manifest["identities"].values()),
         "units": units,
     }
@@ -1855,6 +2431,16 @@ def check_current(
         return {"status": "ready_to_stage", "state": "dormant", **preflight(manifest, root, driver, require_dormant=True)}
     _bind_receipt(receipt, manifest)
     if receipt["state"] == "staged_zero":
+        qualification_zero = receipt["qualification_zero"]
+        if isinstance(qualification_zero, dict) and qualification_zero["phase"] == "finalized":
+            return {
+                "status": "qualification_zero_finalized", "state": "staged_zero", "capacity": 0,
+                "managed_targets": _managed_readback(manifest, root, {"staged", "active"}),
+                "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
+                "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
+                "fixed_package": _verify_fixed_package(manifest, root),
+                "qualification_zero": _finalized_zero_readback(manifest, root, driver),
+            }
         return {
             "status": "ready_to_activate", "state": "staged_zero", "capacity": 0,
             "managed_targets": _verify_phase(manifest, root, "staged"),
@@ -1881,8 +2467,9 @@ def _driver(root: Path, fake_state: Path | None, manifest: dict[str, Any]) -> Li
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("check", "stage", "activate", "qualify", "rollback"))
-    parser.add_argument("--package", type=Path, required=True)
+    ordinary_actions = ("check", "stage", "activate", "qualify", "rollback")
+    parser.add_argument("action", choices=ordinary_actions + tuple(ZERO_CLI_ACTIONS))
+    parser.add_argument("--package", type=Path)
     parser.add_argument("--scenario", type=Path)
     parser.add_argument("--root", type=Path, default=Path("/"))
     parser.add_argument("--fake-systemd-state", type=Path)
@@ -1890,6 +2477,32 @@ def main() -> int:
     root = Path(os.path.abspath(arguments.root))
     live = arguments.fake_systemd_state is None
     try:
+        if arguments.action in ZERO_CLI_ACTIONS:
+            if (
+                arguments.package is not None or arguments.scenario is not None or root != Path("/")
+                or arguments.fake_systemd_state is not None
+            ):
+                raise ValueError("qualification-zero actions accept no package, scenario, root, or fake-state arguments")
+            if os.geteuid() != 0:
+                raise PermissionError("qualification-zero actions require root")
+            manifest, payloads = load_package(Path(FIXED_PACKAGE_PATH), live=True)
+            receipt = _read_receipt(root)
+            if receipt is None:
+                raise ValueError("qualification-zero action requires an activation receipt")
+            _bind_receipt(receipt, manifest)
+            raw = sys.stdin.buffer.read(MAX_ZERO_REQUEST_BYTES + 1)
+            request, request_sha256 = _parse_zero_request(raw, arguments.action, receipt)
+            driver = LiveSystemd(root)
+            if arguments.action == "prepare-qualification-zero":
+                result = _prepare_qualification_zero(manifest, payloads, root, driver, request, request_sha256)
+            elif arguments.action == "finalize-qualification-zero":
+                result = _finalize_qualification_zero(manifest, payloads, root, driver, request, request_sha256)
+            else:
+                result = _prove_qualification_zero(manifest, root, driver, request)
+            sys.stdout.buffer.write(_wire_json(result))
+            return 0
+        if arguments.package is None:
+            raise ValueError(f"{arguments.action} requires --package")
         manifest, payloads = load_package(arguments.package, live=live)
         driver = _driver(root, arguments.fake_systemd_state, manifest)
         if arguments.scenario is not None and arguments.action != "stage":

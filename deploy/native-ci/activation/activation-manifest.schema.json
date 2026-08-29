@@ -64,8 +64,8 @@
     },
     "entries": {
       "type": "array",
-      "minItems": 17,
-      "maxItems": 17,
+      "minItems": 19,
+      "maxItems": 19,
       "items": { "$ref": "#/$defs/entry" }
     },
     "systemd": {
@@ -316,6 +316,8 @@
             "acceptance_canary_binary",
             "acceptance_driver_binary",
             "acceptance_control_binary",
+            "activation_controller",
+            "activation_package_module",
             "execd_socket_dropin",
             "runner_service_dropin",
             "controld_service_dropin",
@@ -340,6 +342,8 @@
             "/usr/libexec/buzz-ci-capacity-one-canary",
             "/usr/libexec/buzz-ci-capacity-one-driver",
             "/usr/libexec/buzz-ci-acceptance-control",
+            "/usr/libexec/buzz-ci-activation-controller",
+            "/usr/libexec/buzz_ci_activation_package.py",
             "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",
             "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
             "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf",

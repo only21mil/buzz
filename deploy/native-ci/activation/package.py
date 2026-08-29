@@ -40,6 +40,10 @@ INSTALLABLE_COMPONENT_ROLES = {
     "acceptance_driver_binary": "acceptance_driver",
     "acceptance_control_binary": "acceptance_control",
 }
+TRACKED_INSTALL_ROLES = {
+    "activation_controller": (0o500, 0o755),
+    "activation_package_module": (0o500, 0o644),
+}
 
 IDENTITIES = {
     "runner": "buzzci-runner",
@@ -57,6 +61,9 @@ ACCESS_GROUP_NAME = "buzzci-execd"
 ACCESS_GROUP_MEMBERS = ["buzzci-ctl", "buzzci-runner"]
 ACCEPTANCE_BINDING_PATH = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
 ACCEPTANCE_BINDING_SCHEMA = "buzz-ci-controld-acceptance-binding/v1"
+ACTIVATION_CONTROLLER_PATH = "/usr/libexec/buzz-ci-activation-controller"
+ACTIVATION_PACKAGE_MODULE_PATH = "/usr/libexec/buzz_ci_activation_package.py"
+FIXED_PACKAGE_PATH = "/var/lib/buzzci/activation-controller/package"
 
 CONFIG_TARGETS = {
     "runner_config": "/etc/buzzci/runner-v1.json",
@@ -147,6 +154,8 @@ STATIC_TARGETS = {
     "acceptance_canary_binary": COMPONENTS["acceptance_canary"][0],
     "acceptance_driver_binary": COMPONENTS["acceptance_driver"][0],
     "acceptance_control_binary": COMPONENTS["acceptance_control"][0],
+    "activation_controller": ACTIVATION_CONTROLLER_PATH,
+    "activation_package_module": ACTIVATION_PACKAGE_MODULE_PATH,
     "execd_socket_dropin": "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",
     "runner_service_dropin": "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
     "controld_service_dropin": "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf",
@@ -413,6 +422,10 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
             or parse_mode(entry["source_mode"]) != 0o500
         ):
             raise ValueError(f"installable component entry differs from component provenance: {component_name}")
+    for role, (source_mode, install_mode) in TRACKED_INSTALL_ROLES.items():
+        entry = entries_by_role[role]
+        if parse_mode(entry["source_mode"]) != source_mode or parse_mode(entry["install_mode"]) != install_mode:
+            raise ValueError(f"tracked activation program entry mode differs: {role}")
 
     systemd = manifest["systemd"]
     require_keys(systemd, {"start_order", "stop_order", "persistent_unit", "stage_capacity", "active_capacity"}, "systemd plan")

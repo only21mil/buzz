@@ -59,8 +59,11 @@ already exist with their frozen staged bytes and metadata.
    sysusers, tmpfiles, acceptance binaries and units, target, drop-ins, and
    capacity-zero configs. After the package digest is known, it atomically
    writes the controld binding receipt and the two acceptance adapter configs.
-   Only the two acceptance sockets and their services remain active. Ordinary
-   CI units and the capacity-one target remain inactive and disabled.
+   It also installs the controller and its package module, then copies the
+   validated package to the fixed root-owned mode-`0700`
+   `/var/lib/buzzci/activation-controller/package`. Only the two acceptance
+   sockets and their services remain active. Ordinary CI units and the
+   capacity-one target remain inactive and disabled.
 2. `activate` replaces only the runner and controld configs with their frozen
    active variants. It starts keyholder, execd, runner, and controld in the
    manifest's fixed order. Socket ownership and mode readback must pass.
@@ -81,6 +84,31 @@ already exist with their frozen staged bytes and metadata.
    prior bytes, metadata, and exact unit active/enable state. It restores or
    removes generated acceptance configs and restores the prior controld
    acceptance ledger. Service principals remain for audit and UID stability.
+
+The production canary closes capacity through three root-only calls to the
+installed `/usr/libexec/buzz-ci-activation-controller`. Each call accepts only
+its fixed hyphenated action and a compact JSON request on stdin. It accepts no
+package or root path from the caller.
+
+- `prepare-qualification-zero` verifies the immutable fixed package, restores
+  and reads back the staged runner and controld configs, and keeps controld plus
+  both acceptance services available for the stage-13 durable snapshot.
+- `finalize-qualification-zero` stops the controld acceptance socket first and
+  controld second, closes the remaining capacity-one units, keeps the root
+  acceptance-control service available, restores the prior controld binding,
+  and records `staged_zero` only after independent file, unit, and socket-path
+  readback passes.
+- `prove-qualification-zero` performs the same readback without changing the
+  receipt or reconnecting to controld.
+
+The controller request and response schemas remain
+`buzz-ci-activation-qualification-zero-request/v1` and
+`buzz-ci-activation-qualification-zero-response/v1`. The calling root-control
+protocol is separately versioned as `buzz-ci-acceptance-control-request/v2`
+and `buzz-ci-acceptance-control-response/v2`. Finalize and prove return the
+SHA-256 of the existing private activation receipt. The caller combines that
+digest with its own fresh systemd `zero_proof`; the controller does not create
+a second evidence file.
 
 The root-owned receipt at
 `/var/lib/buzzci/activation-controller/receipt-v1.json` binds the activation ID,
@@ -147,6 +175,15 @@ deploy/native-ci/activation/controller.py stage \
 deploy/native-ci/activation/controller.py activate --package /private/package
 deploy/native-ci/activation/controller.py qualify --package /private/package
 deploy/native-ci/activation/controller.py rollback --package /private/package
+```
+
+The installed canary calls these fixed commands. Operators do not pass a
+package path to them:
+
+```bash
+/usr/libexec/buzz-ci-activation-controller prepare-qualification-zero
+/usr/libexec/buzz-ci-activation-controller finalize-qualification-zero
+/usr/libexec/buzz-ci-activation-controller prove-qualification-zero
 ```
 
 Tests use a non-root filesystem and an explicit fake driver state file:
