@@ -35,9 +35,9 @@ pub const GET_ATTEMPT_BODY_SIZE: usize = 64;
 /// Version 2 complete-attempt body length.
 pub const COMPLETE_ATTEMPT_BODY_SIZE: usize = 192;
 /// Version 2 evidence description request length.
-pub const DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 256;
+pub const DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 416;
 /// Version 2 evidence chunk request length.
-pub const READ_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 288;
+pub const READ_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 448;
 /// Version 2 response body length.
 pub const RESPONSE_BODY_SIZE: usize = 288;
 /// Maximum number of sealed evidence items returned for one attempt.
@@ -45,9 +45,9 @@ pub const MAX_EVIDENCE_ITEMS: usize = 4;
 /// Maximum bytes returned by one evidence read.
 pub const MAX_EVIDENCE_CHUNK_SIZE: usize = 4096;
 /// Fixed evidence description response length.
-pub const EVIDENCE_DESCRIPTION_BODY_SIZE: usize = 768;
+pub const EVIDENCE_DESCRIPTION_BODY_SIZE: usize = 1888;
 /// Fixed evidence chunk response length.
-pub const EVIDENCE_CHUNK_BODY_SIZE: usize = 4224;
+pub const EVIDENCE_CHUNK_BODY_SIZE: usize = 4448;
 /// Largest version 2 request or response body.
 pub const MAX_BODY_SIZE: usize = EVIDENCE_CHUNK_BODY_SIZE;
 /// Largest complete version 2 frame.
@@ -212,6 +212,53 @@ pub struct AttemptEvidenceCoordinates {
     pub attempt_id: [u8; 16],
     pub execution_binding_digest: [u8; 32],
     pub expected_generation: u64,
+    pub request_event_id: [u8; 32],
+    pub workflow_id: WireText64,
+    pub job_id: WireText64,
+}
+
+/// Canonical bounded ASCII text used where callers must reconstruct public
+/// evidence without reversing a digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WireText64 {
+    pub len: u8,
+    pub bytes: [u8; 64],
+}
+
+impl WireText64 {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        bytes: [0; 64],
+    };
+
+    pub fn from_ascii(value: &str) -> Result<Self, DecodeError> {
+        if value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(DecodeError::UnknownEnum);
+        }
+        let mut bytes = [0; 64];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Ok(Self {
+            len: value.len() as u8,
+            bytes,
+        })
+    }
+
+    pub fn as_str(&self) -> Result<&str, DecodeError> {
+        let len = usize::from(self.len);
+        if len == 0 || len > 64 || self.bytes[len..].iter().any(|byte| *byte != 0) {
+            return Err(DecodeError::UnknownEnum);
+        }
+        if !self.bytes[..len]
+            .iter()
+            .all(|byte| (0x21..=0x7e).contains(byte))
+        {
+            return Err(DecodeError::UnknownEnum);
+        }
+        std::str::from_utf8(&self.bytes[..len]).map_err(|_| DecodeError::UnknownEnum)
+    }
 }
 
 /// Describe all sealed evidence owned by execd for one exact attempt.
@@ -268,6 +315,9 @@ pub struct EvidenceDescriptor {
     pub length: u32,
     pub artifact_name_digest: [u8; 32],
     pub artifact_media_type_digest: [u8; 32],
+    pub artifact_id: WireText64,
+    pub artifact_name: WireText64,
+    pub artifact_media_type: WireText64,
     pub teardown_lease_id: [u8; 16],
     pub teardown_lease_generation: u64,
     pub teardown_attestation_digest: [u8; 32],
@@ -283,6 +333,12 @@ pub struct EvidenceDescriptionResponse {
     pub descriptor_set_digest: [u8; 32],
     pub item_count: u8,
     pub items: [Option<EvidenceDescriptor>; MAX_EVIDENCE_ITEMS],
+    pub request_event_id: [u8; 32],
+    pub run_id: [u8; 16],
+    pub workflow_id: WireText64,
+    pub workflow_digest: [u8; 32],
+    pub job_id: WireText64,
+    pub attempt: u32,
 }
 
 /// Result of one bounded evidence read.
@@ -298,6 +354,12 @@ pub struct EvidenceChunkResponse {
     pub offset: u32,
     pub total_length: u32,
     pub bytes: Vec<u8>,
+    pub request_event_id: [u8; 32],
+    pub run_id: [u8; 16],
+    pub workflow_id: WireText64,
+    pub workflow_digest: [u8; 32],
+    pub job_id: WireText64,
+    pub attempt: u32,
 }
 
 /// Version 2 request set.
@@ -817,6 +879,9 @@ fn encode_coordinates(body: &mut [u8], value: AttemptEvidenceCoordinates) {
     body[116..132].copy_from_slice(&value.attempt_id);
     body[132..164].copy_from_slice(&value.execution_binding_digest);
     put_u64(body, 164, value.expected_generation);
+    body[172..204].copy_from_slice(&value.request_event_id);
+    encode_text(&mut body[204..269], value.workflow_id);
+    encode_text(&mut body[269..334], value.job_id);
 }
 
 fn decode_coordinates(body: &[u8]) -> Result<AttemptEvidenceCoordinates, DecodeError> {
@@ -829,6 +894,9 @@ fn decode_coordinates(body: &[u8]) -> Result<AttemptEvidenceCoordinates, DecodeE
         attempt_id: nonzero_array(&body[116..132])?,
         execution_binding_digest: nonzero_array(&body[132..164])?,
         expected_generation: get_u64(body, 164),
+        request_event_id: nonzero_array(&body[172..204])?,
+        workflow_id: decode_text(&body[204..269], false)?,
+        job_id: decode_text(&body[269..334], false)?,
     };
     if value.attempt == 0 || value.expected_generation == 0 {
         return Err(DecodeError::ZeroField);
@@ -837,43 +905,60 @@ fn decode_coordinates(body: &[u8]) -> Result<AttemptEvidenceCoordinates, DecodeE
     Ok(value)
 }
 
+fn encode_text(body: &mut [u8], value: WireText64) {
+    body[0] = value.len;
+    body[1..65].copy_from_slice(&value.bytes);
+}
+
+fn decode_text(body: &[u8], allow_empty: bool) -> Result<WireText64, DecodeError> {
+    let value = WireText64 {
+        len: body[0],
+        bytes: array(&body[1..65]),
+    };
+    if value.len == 0 && allow_empty && value.bytes == [0; 64] {
+        return Ok(value);
+    }
+    value.as_str()?;
+    Ok(value)
+}
+
 fn encode_describe_evidence(body: &mut [u8], value: DescribeAttemptEvidenceRequest) {
     encode_coordinates(body, value.coordinates);
-    body[172..204].copy_from_slice(&value.idempotency_digest);
-    body[204..236].copy_from_slice(&value.request_frame_digest);
+    body[334..366].copy_from_slice(&value.idempotency_digest);
+    body[366..398].copy_from_slice(&value.request_frame_digest);
 }
 
 fn decode_describe_evidence(body: &[u8]) -> Result<DescribeAttemptEvidenceRequest, DecodeError> {
-    require_zero(&body[236..])?;
+    require_zero(&body[398..])?;
     Ok(DescribeAttemptEvidenceRequest {
         coordinates: decode_coordinates(body)?,
-        idempotency_digest: nonzero_array(&body[172..204])?,
-        request_frame_digest: nonzero_array(&body[204..236])?,
+        idempotency_digest: nonzero_array(&body[334..366])?,
+        request_frame_digest: nonzero_array(&body[366..398])?,
     })
 }
 
 fn encode_read_evidence(body: &mut [u8], value: ReadAttemptEvidenceRequest) {
     encode_coordinates(body, value.coordinates);
-    body[172..204].copy_from_slice(&value.idempotency_digest);
-    body[204..236].copy_from_slice(&value.request_frame_digest);
-    body[236] = value.kind as u8;
-    body[237] = value.item_index;
-    body[238..270].copy_from_slice(&value.descriptor_digest);
-    put_u32(body, 270, value.offset);
-    put_u32(body, 274, value.max_length);
+    body[334..366].copy_from_slice(&value.idempotency_digest);
+    body[366..398].copy_from_slice(&value.request_frame_digest);
+    body[398] = value.kind as u8;
+    body[399] = value.item_index;
+    body[400..432].copy_from_slice(&value.descriptor_digest);
+    put_u32(body, 432, value.offset);
+    put_u32(body, 436, value.max_length);
 }
 
 fn decode_read_evidence(body: &[u8]) -> Result<ReadAttemptEvidenceRequest, DecodeError> {
-    require_zero(&body[278..])?;
+    require_zero(&body[440..])?;
     let value = ReadAttemptEvidenceRequest {
         coordinates: decode_coordinates(body)?,
-        idempotency_digest: nonzero_array(&body[172..204])?,
-        request_frame_digest: nonzero_array(&body[204..236])?,
-        kind: EvidenceKind::try_from(body[236])?,
-        item_index: body[237],
-        descriptor_digest: nonzero_array(&body[238..270])?,
-        offset: get_u32(body, 270),
-        max_length: get_u32(body, 274),
+        idempotency_digest: nonzero_array(&body[334..366])?,
+        request_frame_digest: nonzero_array(&body[366..398])?,
+        kind: EvidenceKind::try_from(body[398])?,
+        item_index: body[399],
+        descriptor_digest: nonzero_array(&body[400..432])?,
+        offset: get_u32(body, 432),
+        max_length: get_u32(body, 436),
     };
     if usize::from(value.item_index) >= MAX_EVIDENCE_ITEMS
         || value.max_length == 0
@@ -904,6 +989,11 @@ pub fn evidence_request_frame_digest(header: FrameHeader, request: &Request) -> 
     bytes.extend_from_slice(&coordinates.attempt_id);
     bytes.extend_from_slice(&coordinates.execution_binding_digest);
     bytes.extend_from_slice(&coordinates.expected_generation.to_be_bytes());
+    bytes.extend_from_slice(&coordinates.request_event_id);
+    bytes.push(coordinates.workflow_id.len);
+    bytes.extend_from_slice(&coordinates.workflow_id.bytes);
+    bytes.push(coordinates.job_id.len);
+    bytes.extend_from_slice(&coordinates.job_id.bytes);
     bytes.extend_from_slice(&idempotency);
     if let Request::ReadAttemptEvidence(value) = request {
         bytes.push(value.kind as u8);
@@ -937,9 +1027,15 @@ pub fn encode_evidence_description_response(
     put_u64(body, 35, response.generation);
     body[43..75].copy_from_slice(&response.request_frame_digest);
     body[75..107].copy_from_slice(&response.descriptor_set_digest);
+    body[107..139].copy_from_slice(&response.request_event_id);
+    body[139..155].copy_from_slice(&response.run_id);
+    encode_text(&mut body[155..220], response.workflow_id);
+    body[220..252].copy_from_slice(&response.workflow_digest);
+    encode_text(&mut body[252..317], response.job_id);
+    put_u32(body, 317, response.attempt);
     for (index, item) in response.items.iter().enumerate() {
         if let Some(item) = item {
-            let start = 108 + index * 160;
+            let start = 336 + index * 384;
             body[start] = item.kind as u8;
             body[start + 4..start + 36].copy_from_slice(&item.digest);
             put_u32(body, start + 36, item.length);
@@ -948,6 +1044,12 @@ pub fn encode_evidence_description_response(
             body[start + 104..start + 120].copy_from_slice(&item.teardown_lease_id);
             put_u64(body, start + 120, item.teardown_lease_generation);
             body[start + 128..start + 160].copy_from_slice(&item.teardown_attestation_digest);
+            encode_text(&mut body[start + 160..start + 225], item.artifact_id);
+            encode_text(&mut body[start + 225..start + 290], item.artifact_name);
+            encode_text(
+                &mut body[start + 290..start + 355],
+                item.artifact_media_type,
+            );
         }
     }
     encoded
@@ -971,10 +1073,10 @@ pub fn decode_evidence_description_response(
     }
     let mut items = [None; MAX_EVIDENCE_ITEMS];
     for (index, slot) in items.iter_mut().enumerate() {
-        let start = 108 + index * 160;
+        let start = 336 + index * 384;
         if index < usize::from(item_count) {
             require_zero(&body[start + 1..start + 4])?;
-            *slot = Some(EvidenceDescriptor {
+            let descriptor = EvidenceDescriptor {
                 kind: EvidenceKind::try_from(body[start])?,
                 digest: nonzero_array(&body[start + 4..start + 36])?,
                 length: get_u32(body, start + 36),
@@ -983,13 +1085,44 @@ pub fn decode_evidence_description_response(
                 teardown_lease_id: array(&body[start + 104..start + 120]),
                 teardown_lease_generation: get_u64(body, start + 120),
                 teardown_attestation_digest: array(&body[start + 128..start + 160]),
-            });
+                artifact_id: decode_text(&body[start + 160..start + 225], true)?,
+                artifact_name: decode_text(&body[start + 225..start + 290], true)?,
+                artifact_media_type: decode_text(&body[start + 290..start + 355], true)?,
+            };
+            let has_artifact_metadata = descriptor.artifact_id.len > 0
+                && descriptor.artifact_name.len > 0
+                && descriptor.artifact_media_type.len > 0
+                && descriptor.artifact_name_digest != [0; 32]
+                && descriptor.artifact_media_type_digest != [0; 32];
+            let has_no_artifact_metadata = descriptor.artifact_id == WireText64::EMPTY
+                && descriptor.artifact_name == WireText64::EMPTY
+                && descriptor.artifact_media_type == WireText64::EMPTY
+                && descriptor.artifact_name_digest == [0; 32]
+                && descriptor.artifact_media_type_digest == [0; 32];
+            let has_teardown_coordinates = descriptor.teardown_lease_id != [0; 16]
+                && descriptor.teardown_lease_generation > 0
+                && descriptor.teardown_attestation_digest != [0; 32];
+            let has_no_teardown_coordinates = descriptor.teardown_lease_id == [0; 16]
+                && descriptor.teardown_lease_generation == 0
+                && descriptor.teardown_attestation_digest == [0; 32];
+            let valid_kind = match descriptor.kind {
+                EvidenceKind::Artifact => has_artifact_metadata && has_no_teardown_coordinates,
+                EvidenceKind::Teardown => has_no_artifact_metadata && has_teardown_coordinates,
+                EvidenceKind::Stdout | EvidenceKind::Stderr => {
+                    has_no_artifact_metadata && has_no_teardown_coordinates
+                }
+            };
+            if !valid_kind {
+                return Err(DecodeError::UnknownEnum);
+            }
+            *slot = Some(descriptor);
+            require_zero(&body[start + 355..start + 384])?;
         } else {
-            require_zero(&body[start..start + 160])?;
+            require_zero(&body[start..start + 384])?;
         }
     }
-    require_zero(&body[107..108])?;
-    require_zero(&body[748..])?;
+    require_zero(&body[321..336])?;
+    require_zero(&body[1872..])?;
     Ok(EvidenceDescriptionResponse {
         code: ResponseCode::try_from(get_u16(body, 0))?,
         execution_binding_digest: array(&body[3..35]),
@@ -998,6 +1131,12 @@ pub fn decode_evidence_description_response(
         descriptor_set_digest: array(&body[75..107]),
         item_count,
         items,
+        request_event_id: nonzero_array(&body[107..139])?,
+        run_id: nonzero_array(&body[139..155])?,
+        workflow_id: decode_text(&body[155..220], false)?,
+        workflow_digest: nonzero_array(&body[220..252])?,
+        job_id: decode_text(&body[252..317], false)?,
+        attempt: get_u32(body, 317),
     })
 }
 
@@ -1028,7 +1167,13 @@ pub fn encode_evidence_chunk_response(
     body[48..80].copy_from_slice(&response.execution_binding_digest);
     put_u64(body, 80, response.generation);
     body[88..120].copy_from_slice(&response.request_frame_digest);
-    body[120..120 + response.bytes.len()].copy_from_slice(&response.bytes);
+    body[120..152].copy_from_slice(&response.request_event_id);
+    body[152..168].copy_from_slice(&response.run_id);
+    encode_text(&mut body[168..233], response.workflow_id);
+    body[233..265].copy_from_slice(&response.workflow_digest);
+    encode_text(&mut body[265..330], response.job_id);
+    put_u32(body, 330, response.attempt);
+    body[336..336 + response.bytes.len()].copy_from_slice(&response.bytes);
     encoded
 }
 
@@ -1048,18 +1193,25 @@ pub fn decode_evidence_chunk_response(
     if length > MAX_EVIDENCE_CHUNK_SIZE {
         return Err(DecodeError::WrongBodyLength);
     }
-    require_zero(&body[120 + length..])?;
+    require_zero(&body[334..336])?;
+    require_zero(&body[336 + length..])?;
     Ok(EvidenceChunkResponse {
         code: ResponseCode::try_from(get_u16(body, 0))?,
         kind: EvidenceKind::try_from(body[2])?,
         item_index: body[3],
         offset: get_u32(body, 4),
         total_length: get_u32(body, 8),
-        bytes: body[120..120 + length].to_vec(),
+        bytes: body[336..336 + length].to_vec(),
         descriptor_digest: array(&body[16..48]),
         execution_binding_digest: array(&body[48..80]),
         generation: get_u64(body, 80),
         request_frame_digest: array(&body[88..120]),
+        request_event_id: nonzero_array(&body[120..152])?,
+        run_id: nonzero_array(&body[152..168])?,
+        workflow_id: decode_text(&body[168..233], false)?,
+        workflow_digest: nonzero_array(&body[233..265])?,
+        job_id: decode_text(&body[265..330], false)?,
+        attempt: get_u32(body, 330),
     })
 }
 
@@ -1171,6 +1323,9 @@ mod tests {
             attempt_id: [5; 16],
             execution_binding_digest: digest(6),
             expected_generation: 4,
+            request_event_id: digest(12),
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            job_id: WireText64::from_ascii("job").unwrap(),
         }
     }
 
@@ -1342,10 +1497,10 @@ mod tests {
         assert_eq!(CANCEL_ATTEMPT_BODY_SIZE, 160);
         assert_eq!(GET_ATTEMPT_BODY_SIZE, 64);
         assert_eq!(COMPLETE_ATTEMPT_BODY_SIZE, 192);
-        assert_eq!(DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE, 256);
-        assert_eq!(READ_ATTEMPT_EVIDENCE_BODY_SIZE, 288);
+        assert_eq!(DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE, 416);
+        assert_eq!(READ_ATTEMPT_EVIDENCE_BODY_SIZE, 448);
         assert_eq!(RESPONSE_BODY_SIZE, 288);
-        assert_eq!(MAX_FRAME_SIZE, 4256);
+        assert_eq!(MAX_FRAME_SIZE, 4480);
         assert!(!std::mem::needs_drop::<AdmitAttemptRequest>());
         assert!(!std::mem::needs_drop::<CompleteAttemptRequest>());
 
@@ -1372,6 +1527,9 @@ mod tests {
             teardown_lease_id: [2; 16],
             teardown_lease_generation: 3,
             teardown_attestation_digest: digest(4),
+            artifact_id: WireText64::EMPTY,
+            artifact_name: WireText64::EMPTY,
+            artifact_media_type: WireText64::EMPTY,
         };
         let header = FrameHeader {
             operation: Operation::DescribeAttemptEvidence,
@@ -1385,6 +1543,12 @@ mod tests {
             descriptor_set_digest: digest(9),
             item_count: 1,
             items: [Some(descriptor), None, None, None],
+            request_event_id: digest(12),
+            run_id: [13; 16],
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            workflow_digest: digest(14),
+            job_id: WireText64::from_ascii("job").unwrap(),
+            attempt: 1,
         };
         let encoded = encode_evidence_description_response(header, description);
         assert_eq!(
@@ -1407,6 +1571,12 @@ mod tests {
             offset: 0,
             total_length: 6,
             bytes: b"sealed".to_vec(),
+            request_event_id: digest(12),
+            run_id: [13; 16],
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            workflow_digest: digest(14),
+            job_id: WireText64::from_ascii("job").unwrap(),
+            attempt: 1,
         };
         let encoded = encode_evidence_chunk_response(chunk_header, &chunk);
         assert_eq!(
@@ -1417,7 +1587,7 @@ mod tests {
         let mut hostile = encode_request([9; 16], Request::ReadAttemptEvidence(read()))
             .as_bytes()
             .to_vec();
-        hostile[HEADER_SIZE + 274..HEADER_SIZE + 278]
+        hostile[HEADER_SIZE + 436..HEADER_SIZE + 440]
             .copy_from_slice(&((MAX_EVIDENCE_CHUNK_SIZE as u32) + 1).to_be_bytes());
         assert!(decode_request(&hostile).is_err());
     }

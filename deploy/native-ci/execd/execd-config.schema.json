@@ -40,8 +40,9 @@
         "executor_socket":{"const":"/run/buzzci/executor.sock"},
         "intent_root":{"const":"/var/lib/buzzci/execd-v2/intents"},
         "teardown_root":{"const":"/var/lib/buzzci/execd-v2/teardown"}
+        ,"attempt_root":{"const":"/var/lib/buzzci/execd-v2/attempts"}
       },
-      "required":["intent_root","binding_root","evidence_root","teardown_root","executor_socket"],
+      "required":["intent_root","binding_root","evidence_root","teardown_root","attempt_root","executor_socket"],
       "type":"object"
     },
     "program":{

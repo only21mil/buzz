@@ -60,8 +60,10 @@ def verify(source_root: Path) -> None:
         if missing:
             raise ValueError(f"{relative} misses {missing}")
     tmpfiles = (root / "templates/buzzci-execd.tmpfiles").read_text().splitlines()
-    if len(tmpfiles) != 5 or any(" 0700 root root " not in line for line in tmpfiles):
+    if len(tmpfiles) != 6 or any(" 0700 root root " not in line for line in tmpfiles[:5]):
         raise ValueError("execd state roots are not exact root-owned 0700 directories")
+    if tmpfiles[5] != "d /var/lib/buzzci/execd-v2/attempts 0711 root root - -":
+        raise ValueError("attempt root drift")
 
 
 def main() -> int:

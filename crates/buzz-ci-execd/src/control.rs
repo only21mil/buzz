@@ -257,6 +257,12 @@ pub trait ControlDispatch {
                         descriptor_set_digest: [0; 32],
                         item_count: 0,
                         items: [None; v2::MAX_EVIDENCE_ITEMS],
+                        request_event_id: value.coordinates.request_event_id,
+                        run_id: value.coordinates.run_id,
+                        workflow_id: value.coordinates.workflow_id,
+                        workflow_digest: value.coordinates.workflow_digest,
+                        job_id: value.coordinates.job_id,
+                        attempt: value.coordinates.attempt,
                     },
                 )
             }
@@ -273,6 +279,12 @@ pub trait ControlDispatch {
                     offset: value.offset,
                     total_length: 0,
                     bytes: Vec::new(),
+                    request_event_id: value.coordinates.request_event_id,
+                    run_id: value.coordinates.run_id,
+                    workflow_id: value.coordinates.workflow_id,
+                    workflow_digest: value.coordinates.workflow_digest,
+                    job_id: value.coordinates.job_id,
+                    attempt: value.coordinates.attempt,
                 },
             ),
             _ => {
