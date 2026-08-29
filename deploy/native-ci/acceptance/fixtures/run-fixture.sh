@@ -6,7 +6,7 @@ if [ "$#" -ne 1 ]; then
   exit 2
 fi
 
-fixture_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fixture_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 artifact_dir=$1
 input_sha256=$(sha256sum "$fixture_dir/input.txt" | awk '{print $1}')
 expected_input_sha256=967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6
