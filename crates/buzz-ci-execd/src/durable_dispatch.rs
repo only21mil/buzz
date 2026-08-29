@@ -4,6 +4,10 @@
 //! They never receive the controller. The dispatcher is the sole transition
 //! owner and publishes every transition before returning a successful response.
 
+pub mod crash_recovery;
+pub mod teardown_provider;
+pub mod terminal_evidence_collector;
+
 use buzz_ci_broker_protocol::{
     AdmitAttemptRequest, BrokerResponse, BrokerState, CancelAttemptRequest, CancelReason,
     CompleteAttemptRequest, Conclusion, FrameHeader, QualificationDirective, QualificationRequest,
@@ -190,6 +194,19 @@ pub trait OrdinaryExecutor {
         lease: LeaseToken,
         stop: OrdinaryStop,
     ) -> Result<OrdinaryCleanup, ExecutionUnavailable>;
+
+    /// Observe that the controller durably returned this exact lease's slot.
+    /// Implementations may use this as an audit hook; capacity authority stays
+    /// with the activation controller.
+    fn capacity_returned(
+        &mut self,
+        _request: AdmitAttemptRequest,
+        _admission: OrdinaryAdmission,
+        _lease: LeaseToken,
+        _teardown_digest: [u8; 32],
+    ) -> Result<(), ExecutionUnavailable> {
+        Ok(())
+    }
 }
 
 /// Terminal qualification transition selected by trusted execution evidence.
@@ -550,11 +567,20 @@ where
         if now >= lease.deadline_at() {
             return response(ResponseCode::NotFound, now);
         }
+        let Ok(receipts) = self
+            .ordinary
+            .read_receipts(binding.request, binding.admission, lease)
+        else {
+            return response(ResponseCode::InternalFailure, now);
+        };
+        if receipts.evidence_set_digest == [0; 32] {
+            return response(ResponseCode::InternalFailure, now);
+        }
         self.finish_ordinary(
             binding,
             lease,
             LeaseConclusion::Cancelled,
-            [0; 32],
+            receipts.evidence_set_digest,
             OrdinaryStop::Cancelled {
                 cancel_digest: request.cancel_digest,
                 reason: request.reason,
@@ -615,6 +641,14 @@ where
         if !self.commit(Some(lease)) {
             return response(ResponseCode::InternalFailure, now);
         }
+        if terminal_ok {
+            let _ = self.ordinary.capacity_returned(
+                binding.request,
+                binding.admission,
+                lease,
+                cleanup.teardown_digest,
+            );
+        }
         completed_ordinary_response(
             binding.request,
             binding.admission,
@@ -643,18 +677,32 @@ where
             {
                 return;
             }
+            let receipts = self
+                .ordinary
+                .read_receipts(binding.request, binding.admission, lease);
+            if !receipts.is_ok_and(|receipts| receipts.evidence_set_digest != [0; 32]) {
+                return;
+            }
             let cleanup = self.ordinary.reconcile(
                 binding.request,
                 binding.admission,
                 lease,
                 OrdinaryStop::Recovery,
             );
-            if cleanup.is_ok_and(|cleanup| {
-                cleanup.disposition == CleanupDisposition::Clean
-                    && cleanup.teardown_digest != [0; 32]
-            }) && self.controller.finish_recovery(lease).is_ok()
+            let Ok(cleanup) = cleanup else {
+                return;
+            };
+            if cleanup.disposition == CleanupDisposition::Clean
+                && cleanup.teardown_digest != [0; 32]
+                && self.controller.finish_recovery(lease).is_ok()
+                && self.commit(Some(lease))
             {
-                let _ = self.commit(Some(lease));
+                let _ = self.ordinary.capacity_returned(
+                    binding.request,
+                    binding.admission,
+                    lease,
+                    cleanup.teardown_digest,
+                );
             }
             return;
         }
@@ -667,11 +715,20 @@ where
         else {
             return;
         };
+        let Ok(receipts) = self
+            .ordinary
+            .read_receipts(binding.request, binding.admission, lease)
+        else {
+            return;
+        };
+        if receipts.evidence_set_digest == [0; 32] {
+            return;
+        }
         let _ = self.finish_ordinary(
             binding,
             lease,
-            LeaseConclusion::TimedOut,
-            [0; 32],
+            receipts.conclusion,
+            receipts.evidence_set_digest,
             OrdinaryStop::Expired,
             now,
         );
@@ -1828,7 +1885,7 @@ mod tests {
         assert_eq!(cancelled.conclusion, Conclusion::Cancelled);
         assert_eq!(cancelled.broker_state, BrokerState::Ready);
         assert_eq!(cancelled.teardown_digest, [45; 32]);
-        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.receipts.get(), 1);
         assert_eq!(calls.reconciles.get(), 1);
         let states: Vec<_> = commits.borrow().iter().map(|entry| entry.state).collect();
         assert_eq!(
@@ -1850,7 +1907,7 @@ mod tests {
         assert_eq!(complete.code, ResponseCode::NotFound);
         assert_eq!(dispatch.controller.snapshot(), snapshot);
         assert_eq!(commits.borrow().len(), commit_count);
-        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.receipts.get(), 1);
         assert_eq!(calls.reconciles.get(), 1);
     }
 
@@ -2026,7 +2083,7 @@ mod tests {
 
         assert_eq!(result.code, ResponseCode::InternalFailure);
         assert_ne!(result.broker_state, BrokerState::Ready);
-        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.receipts.get(), 1);
         assert_eq!(calls.reconciles.get(), 1);
         assert_eq!(dispatch.state(), ActivationState::Quarantined);
         assert_eq!(
@@ -2060,7 +2117,7 @@ mod tests {
 
         dispatch.maintenance(51);
 
-        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.receipts.get(), 1);
         assert_eq!(calls.reconciles.get(), 1);
         assert_eq!(dispatch.state(), ActivationState::Quarantined);
         assert_eq!(
@@ -2289,7 +2346,7 @@ mod tests {
         dispatch.maintenance(51);
 
         assert_eq!(dispatch.state(), ActivationState::Ready);
-        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.receipts.get(), 1);
         assert_eq!(calls.reconciles.get(), 1);
         let states: Vec<_> = commits.borrow().iter().map(|entry| entry.state).collect();
         assert_eq!(
@@ -2325,7 +2382,7 @@ mod tests {
 
         assert_eq!(dispatch.state(), ActivationState::Quarantined);
         assert_eq!(dispatch.controller.recovery_lease(), None);
-        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(calls.receipts.get(), 1);
         assert_eq!(calls.reconciles.get(), 1);
         assert_eq!(commits.borrow().len(), 1);
         assert_eq!(commits.borrow()[0].state, ActivationState::Quarantined);
