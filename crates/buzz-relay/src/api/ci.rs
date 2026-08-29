@@ -81,7 +81,10 @@ use buzz_core::kind::{
 use buzz_core::CommunityId;
 use buzz_core::TenantContext;
 use buzz_db::EventQuery;
-use buzz_media::MediaError;
+use buzz_media::{
+    prepare_ci_evidence, read_ci_evidence_receipt, validate_ci_evidence_receipt, CiEvidenceBinding,
+    CiEvidenceError, CiEvidenceRetentionAction, MediaError, MediaStorage,
+};
 
 const MAX_CI_CONTROL_BACKLOG: i64 = 1_001;
 const MAX_CI_RUN_EVENT_PAGE: u32 = 1_000;
@@ -1521,6 +1524,10 @@ struct EvidencePutResponse {
     url: String,
     sha256: String,
     byte_length: u64,
+    receipt_sha256: String,
+    scrubbed: bool,
+    retain_until: u64,
+    tombstone_until: u64,
 }
 
 /// Store one authenticated, descriptor-bound job log.
@@ -1754,12 +1761,12 @@ async fn read_ci_log(
         return Err(hidden());
     }
 
-    let object_key = evidence_object_key(
-        tenant.community(),
-        &request.target_repo_a,
-        &request.tip_oid,
-        &path,
-    );
+    let binding = evidence_binding(tenant.community(), &request, &path, log.byte_length);
+    let object_key =
+        evidence_object_key_for_read(&state.media_storage, &binding, chrono::Utc::now())
+            .await
+            .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?
+            .ok_or_else(hidden)?;
     let metadata = state
         .media_storage
         .head_with_metadata(&object_key)
@@ -2173,12 +2180,12 @@ async fn read_ci_artifact(
         return Err(hidden());
     }
 
-    let object_key = evidence_object_key(
-        tenant.community(),
-        &request.target_repo_a,
-        &request.tip_oid,
-        &path,
-    );
+    let binding = evidence_binding(tenant.community(), &request, &path, artifact.byte_length);
+    let object_key =
+        evidence_object_key_for_read(&state.media_storage, &binding, chrono::Utc::now())
+            .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(hidden)?;
     let metadata = state
         .media_storage
         .head_with_metadata(&object_key)
@@ -2335,41 +2342,87 @@ async fn put_ci_evidence(
         ));
     }
     super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
-    let actual = hex::encode(Sha256::digest(&bytes));
-    if actual != path.sha256 {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "CI evidence digest mismatch",
-        ));
-    }
+    let prepared = prepare_ci_evidence(
+        evidence_binding(tenant.community(), &envelope, &path, declared as u64),
+        &bytes,
+    )
+    .map_err(map_ci_evidence_plan_error)?;
+    let object_key = &prepared.receipt.durable_object_key;
+    let receipt_key = &prepared.receipt.receipt_key;
 
-    let object_key = evidence_object_key(
-        tenant.community(),
-        &envelope.target_repo_a,
-        &envelope.tip_oid,
-        &path,
-    );
-    match state.media_storage.head_with_metadata(&object_key).await {
-        Ok(Some(_)) => map_ci_evidence_replay_verification(
-            state
-                .media_storage
-                .verify_exact_object(&object_key, declared as u64, &path.sha256)
-                .await,
-        )?,
-        Ok(None) => state
-            .media_storage
-            .put(&object_key, &bytes, "application/octet-stream")
-            .await
-            .map_err(|_| {
+    match state.media_storage.head_with_metadata(receipt_key).await {
+        Ok(Some(_)) => {
+            let stored = state.media_storage.get(receipt_key).await.map_err(|_| {
                 api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "CI evidence store unavailable",
+                    "CI evidence receipt unavailable",
                 )
-            })?,
+            })?;
+            validate_ci_evidence_receipt(&stored, &prepared.receipt)
+                .map_err(map_ci_evidence_plan_error)?;
+            map_ci_evidence_replay_verification(
+                state
+                    .media_storage
+                    .verify_exact_object(object_key, declared as u64, &path.sha256)
+                    .await,
+            )?;
+        }
+        Ok(None) => {
+            match state.media_storage.head_with_metadata(object_key).await {
+                Ok(Some(_)) => map_ci_evidence_replay_verification(
+                    state
+                        .media_storage
+                        .verify_exact_object(object_key, declared as u64, &path.sha256)
+                        .await,
+                )?,
+                Ok(None) => state
+                    .media_storage
+                    .put(object_key, &prepared.bytes, "application/octet-stream")
+                    .await
+                    .map_err(|_| {
+                        api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "CI evidence store unavailable",
+                        )
+                    })?,
+                Err(_) => {
+                    return Err(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "CI evidence store unavailable",
+                    ));
+                }
+            }
+            map_ci_evidence_replay_verification(
+                state
+                    .media_storage
+                    .verify_exact_object(object_key, declared as u64, &path.sha256)
+                    .await,
+            )?;
+            state
+                .media_storage
+                .put(receipt_key, &prepared.receipt_bytes, "application/json")
+                .await
+                .map_err(|_| {
+                    api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "CI evidence receipt unavailable",
+                    )
+                })?;
+            map_ci_evidence_replay_verification(
+                state
+                    .media_storage
+                    .verify_exact_object(
+                        receipt_key,
+                        prepared.receipt_bytes.len() as u64,
+                        &prepared.receipt_sha256,
+                    )
+                    .await,
+            )?;
+        }
         Err(_) => {
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "CI evidence store unavailable",
+                "CI evidence receipt unavailable",
             ));
         }
     }
@@ -2377,6 +2430,10 @@ async fn put_ci_evidence(
         url,
         sha256: path.sha256,
         byte_length: declared as u64,
+        receipt_sha256: prepared.receipt_sha256,
+        scrubbed: prepared.scrubbed,
+        retain_until: prepared.receipt.retain_until,
+        tombstone_until: prepared.receipt.tombstone_until,
     };
     serde_json::to_value(response)
         .map(Json)
@@ -2396,6 +2453,25 @@ fn map_ci_evidence_replay_verification(
             StatusCode::SERVICE_UNAVAILABLE,
             "CI evidence store unavailable",
         )),
+    }
+}
+
+fn map_ci_evidence_plan_error(error: CiEvidenceError) -> PreflightApiError {
+    match error {
+        CiEvidenceError::InvalidBinding | CiEvidenceError::LengthMismatch => {
+            api_error(StatusCode::BAD_REQUEST, "invalid CI evidence binding")
+        }
+        CiEvidenceError::DigestMismatch => api_error(
+            StatusCode::CONFLICT,
+            "CI evidence digest mismatch after scrub",
+        ),
+        CiEvidenceError::ReceiptConflict => {
+            api_error(StatusCode::CONFLICT, "stored CI evidence receipt conflicts")
+        }
+        CiEvidenceError::RetentionOverflow | CiEvidenceError::ReceiptEncoding(_) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI evidence lifecycle unavailable",
+        ),
     }
 }
 
@@ -2496,25 +2572,80 @@ fn validate_evidence_path(path: &EvidencePath) -> Result<(), PreflightApiError> 
     Ok(())
 }
 
+fn evidence_binding(
+    community: buzz_core::CommunityId,
+    request: &CiRequestEnvelope,
+    path: &EvidencePath,
+    byte_length: u64,
+) -> CiEvidenceBinding {
+    CiEvidenceBinding {
+        community_id: community.to_string(),
+        target_repo_a: request.target_repo_a.clone(),
+        workflow_id: request.workflow_id.clone(),
+        tip_oid: request.tip_oid.clone(),
+        request_event_id: path.request_id.clone(),
+        run_id: path.run_id.clone(),
+        job_id: path.job_id.clone(),
+        attempt: path.attempt,
+        object_id: path.object_id.clone(),
+        sha256: path.sha256.clone(),
+        byte_length,
+        request_expires_at: request.expires_at,
+    }
+}
+
+#[cfg(test)]
 fn evidence_object_key(
     community: buzz_core::CommunityId,
-    target_repo_a: &str,
-    tip_oid: &str,
+    request: &CiRequestEnvelope,
     path: &EvidencePath,
-) -> String {
+    byte_length: u64,
+) -> Result<String, CiEvidenceError> {
+    evidence_binding(community, request, path, byte_length).object_key()
+}
+
+async fn evidence_object_key_for_read(
+    storage: &MediaStorage,
+    binding: &CiEvidenceBinding,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>, MediaError> {
+    let object_key = binding
+        .object_key()
+        .map_err(|_| MediaError::StoredObjectIntegrityMismatch)?;
+    let receipt_key = binding
+        .receipt_key()
+        .map_err(|_| MediaError::StoredObjectIntegrityMismatch)?;
+    if storage.head_with_metadata(&receipt_key).await?.is_some() {
+        let receipt_bytes = storage.get(&receipt_key).await?;
+        let receipt = read_ci_evidence_receipt(&receipt_bytes, binding)
+            .map_err(|_| MediaError::StoredObjectIntegrityMismatch)?;
+        let now = u64::try_from(now.timestamp())
+            .map_err(|_| MediaError::StoredObjectIntegrityMismatch)?;
+        return Ok(
+            (receipt.retention_action(now) == CiEvidenceRetentionAction::Retain)
+                .then_some(object_key),
+        );
+    }
+    // A v2 blob without its paired receipt is an incomplete handoff and must
+    // stay unreadable. Pre-v2 data lives under the legacy key and remains
+    // available through the same authenticated GET/HEAD contract.
+    Ok(Some(legacy_evidence_object_key(binding)))
+}
+
+fn legacy_evidence_object_key(binding: &CiEvidenceBinding) -> String {
     let repo_binding = hex::encode(Sha256::digest(
-        format!("{target_repo_a}\0{tip_oid}").as_bytes(),
+        format!("{}\0{}", binding.target_repo_a, binding.tip_oid).as_bytes(),
     ));
     format!(
         "_ci/{}/{}/{}/{}/{}/{}/{}/{}",
-        community,
+        binding.community_id,
         repo_binding,
-        path.request_id,
-        path.run_id,
-        path.job_id,
-        path.attempt,
-        path.object_id.as_deref().unwrap_or("log"),
-        path.sha256
+        binding.request_event_id,
+        binding.run_id,
+        binding.job_id,
+        binding.attempt,
+        binding.object_id.as_deref().unwrap_or("log"),
+        binding.sha256
     )
 }
 
@@ -2549,6 +2680,35 @@ mod tests {
         }
     }
 
+    fn evidence_request(tip_oid: String, workflow_id: &str) -> CiRequestEnvelope {
+        CiRequestEnvelope {
+            schema_version: buzz_core::ci::CI_SCHEMA_VERSION,
+            request_type: buzz_core::ci::CiRequestType::Run,
+            target_repo_a: format!("30617:{}:buzz", "33".repeat(32)),
+            pr_root_event_id: "44".repeat(32),
+            pr_update_event_id: None,
+            source_clone_url: "https://example.com/buzz.git".to_owned(),
+            immutable_source_ref: "refs/nostr/source".to_owned(),
+            tip_oid,
+            source_branch: "feature".to_owned(),
+            base_ref: "refs/heads/main".to_owned(),
+            base_oid: "55".repeat(20),
+            workflow_id: workflow_id.to_owned(),
+            workflow_digest: "66".repeat(32),
+            job_ids: vec!["test_job".to_owned()],
+            run_id: "123e4567-e89b-12d3-a456-426614174011".to_owned(),
+            attempt: 1,
+            parent_attempt: None,
+            parent_run_id: None,
+            trigger_event_id: "44".repeat(32),
+            actor: "77".repeat(32),
+            timeout_seconds: 300,
+            idempotency_key: "evidence-test".to_owned(),
+            issued_at: 1_000,
+            expires_at: 1_600,
+        }
+    }
+
     #[test]
     fn evidence_path_and_storage_key_bind_all_immutable_inputs() {
         let path = evidence_path();
@@ -2558,16 +2718,18 @@ mod tests {
         );
         let first = evidence_object_key(
             community,
-            &format!("30617:{}:buzz", "33".repeat(32)),
-            &"44".repeat(20),
+            &evidence_request("44".repeat(20), "ci"),
             &path,
-        );
+            42,
+        )
+        .expect("first key");
         let second = evidence_object_key(
             community,
-            &format!("30617:{}:buzz", "33".repeat(32)),
-            &"55".repeat(20),
+            &evidence_request("55".repeat(20), "ci"),
             &path,
-        );
+            42,
+        )
+        .expect("second key");
         assert_ne!(first, second, "tip OID must change the storage key");
         assert!(first.contains(&path.request_id));
         assert!(first.contains(&path.run_id));
@@ -3273,12 +3435,9 @@ mod tests {
                 object_id: None,
                 sha256: digest,
             };
-            let object_key = evidence_object_key(
-                self.community,
-                &request.target_repo_a,
-                &request.tip_oid,
-                &evidence_path,
-            );
+            let object_key =
+                evidence_object_key(self.community, &request, &evidence_path, bytes.len() as u64)
+                    .expect("CI evidence key");
             self.state
                 .media_storage
                 .put(&object_key, bytes, "application/octet-stream")

@@ -575,6 +575,7 @@ async fn prepare_linked_event(
         }
     }
     validate_status_sequence(tx, community_id, envelope, projection).await?;
+    validate_evidence_set_transition(tx, community_id, envelope, projection).await?;
     match envelope {
         ValidatedCiEnvelope::EvidenceFinalized(evidence) => {
             validate_evidence_finalized(tx, community_id, projection.run_id, evidence).await?;
@@ -589,6 +590,111 @@ async fn prepare_linked_event(
         ValidatedCiEnvelope::RunStatus(status) if status.state == CiRunState::Success
     ) {
         validate_terminal_success(tx, community_id, projection.run_id).await?;
+    }
+    Ok(())
+}
+
+async fn validate_evidence_set_transition(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    envelope: &ValidatedCiEnvelope,
+    projection: &Projection,
+) -> Result<()> {
+    match envelope {
+        ValidatedCiEnvelope::LogReference(_) | ValidatedCiEnvelope::ArtifactReference(_) => {
+            let closed: bool =
+                sqlx::query_scalar(
+                    r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM ci_run_events
+                    WHERE community_id=$1 AND run_id=$2 AND request_event_id=$3
+                      AND event_kind=$4 AND job_id=$5 AND attempt=$6
+                      AND status_state IN (
+                          'success','failure','cancelled','timed_out','skipped'
+                      )
+                )
+                "#,
+                )
+                .bind(community_id.as_uuid())
+                .bind(projection.run_id)
+                .bind(projection.request_event_id.as_deref().ok_or_else(|| {
+                    DbError::InvalidData("CI evidence has no request link".into())
+                })?)
+                .bind(KIND_CI_JOB_STATUS as i32)
+                .bind(projection.job_id.as_deref())
+                .bind(projection.attempt)
+                .fetch_one(&mut **tx)
+                .await?;
+            if closed {
+                return Err(DbError::Conflict(
+                    "CI terminal job status already closed this evidence set".into(),
+                ));
+            }
+        }
+        ValidatedCiEnvelope::JobStatus(status) if status.state.is_terminal() => {
+            validate_terminal_job_evidence_set(tx, community_id, projection.run_id, status).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn validate_terminal_job_evidence_set(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+    status: &CiJobStatusEnvelope,
+) -> Result<()> {
+    let request_event_id = decode_event_id(&status.request_event_id)?;
+    let attempt = i32::try_from(status.attempt)
+        .map_err(|_| DbError::InvalidData("CI evidence attempt exceeds i32".into()))?;
+    let rows = sqlx::query(
+        r#"
+        SELECT encode(event_id, 'hex') AS event_id,event_kind
+        FROM ci_run_events
+        WHERE community_id=$1 AND run_id=$2 AND request_event_id=$3
+          AND job_id=$4 AND attempt=$5 AND event_kind IN ($6,$7)
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(request_event_id)
+    .bind(&status.job_id)
+    .bind(attempt)
+    .bind(KIND_CI_LOG_REFERENCE as i32)
+    .bind(KIND_CI_ARTIFACT_REFERENCE as i32)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut stored_logs = BTreeSet::new();
+    let mut stored_artifacts = BTreeSet::new();
+    for row in rows {
+        let event_id: String = row.try_get("event_id")?;
+        match row.try_get::<i32, _>("event_kind")? {
+            kind if kind == KIND_CI_LOG_REFERENCE as i32 => {
+                stored_logs.insert(event_id);
+            }
+            kind if kind == KIND_CI_ARTIFACT_REFERENCE as i32 => {
+                stored_artifacts.insert(event_id);
+            }
+            _ => {
+                return Err(DbError::InvalidData(
+                    "CI evidence query returned an unexpected kind".into(),
+                ));
+            }
+        }
+    }
+
+    let selected_logs = status.log_ref.iter().cloned().collect::<BTreeSet<_>>();
+    let selected_artifacts = status
+        .artifact_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if stored_logs != selected_logs || stored_artifacts != selected_artifacts {
+        return Err(DbError::InvalidData(
+            "CI terminal job status does not close the exact stored evidence set".into(),
+        ));
     }
     Ok(())
 }

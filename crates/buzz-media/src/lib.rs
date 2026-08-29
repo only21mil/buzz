@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod bucket_index;
+pub mod ci_evidence;
 pub mod config;
 pub mod error;
 pub mod storage;
@@ -16,6 +17,11 @@ pub mod validation;
 pub use bucket_index::{
     classify_key, fold_bucket_listing, BucketAggregate, BucketSnapshot, CommunityStorage, KeyClass,
     Page, SweepError,
+};
+pub use ci_evidence::{
+    prepare_ci_evidence, read_ci_evidence_receipt, validate_ci_evidence_receipt, CiEvidenceBinding,
+    CiEvidenceError, CiEvidenceOwner, CiEvidenceReceipt, CiEvidenceRetentionAction,
+    PreparedCiEvidence, CI_EVIDENCE_RETENTION_SECONDS, CI_EVIDENCE_TOMBSTONE_SECONDS,
 };
 pub use config::{MediaConfig, S3AddressingStyle};
 pub use error::MediaError;
