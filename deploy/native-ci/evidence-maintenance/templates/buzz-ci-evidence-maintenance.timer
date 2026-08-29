@@ -1,0 +1,13 @@
+[Unit]
+Description=Schedule bounded Buzz CI evidence maintenance
+Documentation=file:/usr/share/doc/buzz-ci-evidence-maintenance/README.md
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+AccuracySec=1m
+Persistent=true
+Unit=buzz-ci-evidence-maintenance.service
+
+[Install]
+WantedBy=timers.target

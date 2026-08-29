@@ -1,0 +1,42 @@
+[Unit]
+Description=Buzz CI evidence retention maintenance
+Documentation=file:/usr/share/doc/buzz-ci-evidence-maintenance/README.md
+ConditionPathExists=/etc/buzzci/evidence-maintenance.env
+Wants=network-online.target
+After=network-online.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=oneshot
+User=buzzci-evidence-maintenance
+Group=buzzci-evidence-maintenance
+UMask=0077
+EnvironmentFile=/etc/buzzci/evidence-maintenance.env
+ExecStart=/usr/libexec/buzz-ci-evidence-maintenance
+TimeoutStartSec=150
+CapabilityBoundingSet=
+KeyringMode=private
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateMounts=yes
+PrivateTmp=yes
+ProcSubset=pid
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ReadOnlyPaths=/etc/buzzci/evidence-maintenance-v1.json /etc/buzzci/evidence-maintenance.env
+ReadWritePaths=/var/lib/buzzci/evidence-maintenance
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged @resources

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/evidence-maintenance-package-v1.json",
+  "title": "Buzz CI evidence maintenance install package v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "package_id", "source_commit", "default_state", "identity", "entries", "package_digest"],
+  "properties": {
+    "schema": { "const": "buzz-ci-evidence-maintenance-install-package-v1" },
+    "package_id": { "type": "string", "pattern": "^buzz-ci-evidence-maintenance-[0-9a-f]{12}-[0-9a-f]{12}$" },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "default_state": {
+      "const": { "enabled": false, "active": false, "credentials_installed": false }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user", "group", "uid", "gid"],
+      "properties": {
+        "user": { "const": "buzzci-evidence-maintenance" },
+        "group": { "const": "buzzci-evidence-maintenance" },
+        "uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"],
+        "properties": {
+          "role": { "enum": ["binary", "config", "service", "timer", "sysusers", "tmpfiles", "documentation"] },
+          "source": { "type": "string", "pattern": "^assets/[A-Za-z0-9._-]+$" },
+          "target": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
+          "source_mode": { "type": "string", "pattern": "^0[4567][0-7]{2}$" },
+          "install_mode": { "type": "string", "pattern": "^0[4567][0-7]{2}$" },
+          "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+          "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "package_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

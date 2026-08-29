@@ -1,0 +1,2 @@
+g buzzci-evidence-maintenance @GID@
+u buzzci-evidence-maintenance @UID@:@GID@ "Buzz CI evidence maintenance" /var/lib/buzzci/evidence-maintenance /usr/sbin/nologin
