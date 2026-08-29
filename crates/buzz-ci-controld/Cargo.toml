@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 base64 = { workspace = true }
 buzz-ci-broker-protocol = { workspace = true }
+buzz-ci-acceptance-ctl = { path = "../buzz-ci-acceptance-ctl" }
 buzz-core = { workspace = true }
 buzz-ci-keyholder = { workspace = true }
 hex = { workspace = true }
@@ -34,4 +35,5 @@ uuid = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["fs", "poll", "socket", "user"] }
 
 [dev-dependencies]
+buzz-ci-execd = { path = "../buzz-ci-execd" }
 tempfile = "3"

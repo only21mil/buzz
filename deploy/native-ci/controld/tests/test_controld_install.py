@@ -127,6 +127,11 @@ class ControldInstallTests(unittest.TestCase):
             "jobs": [{
                 "job_id": "test", "name": "test", "required": True,
                 "skip_policy": "forbid", "selected_job_instance": "test", "also_reruns": [],
+                "artifacts": [{
+                    "artifact_id": "result", "name": "result.json",
+                    "media_type": "application/json", "relative_name": "result.json",
+                    "max_bytes": 32768,
+                }],
             }],
             "keyholder_socket": RENDERER.KEYHOLDER_SOCKET,
             "keyholder_uid": 62003,
@@ -137,13 +142,37 @@ class ControldInstallTests(unittest.TestCase):
             },
             "keyholder_timeout_millis": 500,
             "keyholder_transport_attempts": 2,
+            "acceptance": {
+                "actor": {"public_key": "22" * 32, "generation": 4},
+                "scenario_sha256": digest,
+                "run_event": [0, "22" * 32, 1, 46100, [], "{}"],
+                "grant_event": [0, "22" * 32, 2, 46107, [], "{}"],
+                "rerun_event": [0, "22" * 32, 3, 46100, [], "{}"],
+                "tombstone_event": [0, "22" * 32, 4, 5, [], ""],
+            },
         }
-        encoded = RENDERER.config_bytes(capacity=1, active=active)
-        self.assertEqual(json.loads(encoded), {"schema_version": 1, "capacity": 1, "store_root": RENDERER.STORE_ROOT, **active})
+        encoded = RENDERER.config_bytes(
+            capacity=1,
+            active=active,
+            acceptance_binding=RENDERER.ACCEPTANCE_BINDING,
+        )
+        self.assertEqual(json.loads(encoded), {
+            "schema_version": 1,
+            "capacity": 1,
+            "store_root": RENDERER.STORE_ROOT,
+            "acceptance_binding": RENDERER.ACCEPTANCE_BINDING,
+            **active,
+        })
+        staged = RENDERER.config_bytes(acceptance_binding=RENDERER.ACCEPTANCE_BINDING)
+        self.assertEqual(json.loads(staged)["acceptance_binding"], RENDERER.ACCEPTANCE_BINDING)
         partial = dict(active)
         del partial["lane_manifest_digest"]
         with self.assertRaisesRegex(ValueError, "exact provider field set"):
-            RENDERER.config_bytes(capacity=1, active=partial)
+            RENDERER.config_bytes(
+                capacity=1,
+                active=partial,
+                acceptance_binding=RENDERER.ACCEPTANCE_BINDING,
+            )
 
     def test_freeze_binds_source_binary_manifest_and_dormant_contract(self) -> None:
         manifest = self.freeze()

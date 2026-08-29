@@ -978,7 +978,9 @@ name = "buzz-ci-controld"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "buzz-ci-acceptance-ctl",
  "buzz-ci-broker-protocol",
+ "buzz-ci-execd",
  "buzz-ci-keyholder",
  "buzz-core",
  "hex",

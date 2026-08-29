@@ -175,6 +175,18 @@ pub struct CapacityOneStatus {
 }
 
 impl CapacityOneStatus {
+    /// Deliberately dormant default with no admission or provider activity.
+    pub const fn parked() -> Self {
+        Self {
+            schema_version: STATUS_SCHEMA_VERSION,
+            state: ControllerState::Parked,
+            configured_capacity: 0,
+            available_capacity: 0,
+            in_flight: 0,
+            terminal_reason: None,
+        }
+    }
+
     const fn ready() -> Self {
         Self {
             schema_version: STATUS_SCHEMA_VERSION,
@@ -197,6 +209,11 @@ impl CapacityOneStatus {
         }
     }
 
+    /// Readback while the sole attempt is owned by the durable async worker.
+    pub const fn active_attempt() -> Self {
+        Self::polling()
+    }
+
     const fn terminal(reason: TerminalInfrastructureReason) -> Self {
         Self {
             schema_version: STATUS_SCHEMA_VERSION,
@@ -208,12 +225,22 @@ impl CapacityOneStatus {
         }
     }
 
+    /// Closed startup readback when provider construction fails before a
+    /// controller value can exist.
+    pub const fn startup_failure(reason: TerminalInfrastructureReason) -> Self {
+        Self::terminal(reason)
+    }
+
     pub const fn state(self) -> ControllerState {
         self.state
     }
 
     pub const fn available_capacity(self) -> u32 {
         self.available_capacity
+    }
+
+    pub const fn configured_capacity(self) -> u32 {
+        self.configured_capacity
     }
 
     pub const fn in_flight(self) -> u32 {
@@ -228,6 +255,7 @@ impl CapacityOneStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControllerState {
+    Parked,
     Ready,
     Polling,
     TerminalInfrastructureFailure,

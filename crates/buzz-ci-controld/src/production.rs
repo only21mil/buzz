@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Component, Path};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_core::ci::{
     artifact_reference_tags, evidence_finalized_tags, job_status_tags, log_reference_tags,
@@ -469,11 +470,19 @@ where
         if record.state() == RunState::Queued {
             self.publish_run(accepted, &record, "run:queued")?;
         }
-        let completion = self
-            .executor
-            .execute(accepted)
-            .map_err(|_| ProductionError::Runner)?;
-        validate_completion(accepted, &completion, self.signer.pubkey())?;
+        let completion = match self.executor.execute(accepted) {
+            Ok(completion) => completion,
+            Err(_) => {
+                self.publish_terminal_infrastructure_failure(
+                    accepted, &identity, revision, &record,
+                )?;
+                return Err(ProductionError::Runner);
+            }
+        };
+        if let Err(error) = validate_completion(accepted, &completion, self.signer.pubkey()) {
+            self.publish_terminal_infrastructure_failure(accepted, &identity, revision, &record)?;
+            return Err(error);
+        }
 
         if record.state() == RunState::Queued {
             let running = record.transition(RunState::Running, first_started(&completion), None)?;
@@ -482,7 +491,16 @@ where
         }
         if record.state() == RunState::Running {
             self.publish_run(accepted, &record, "run:running")?;
-            let finalized_job_attempts = self.publish_completion(accepted, &completion)?;
+            let finalized_job_attempts = match self.publish_completion(accepted, &completion) {
+                Ok(finalized) => finalized,
+                Err(error @ (ProductionError::Evidence | ProductionError::Invalid)) => {
+                    self.publish_terminal_infrastructure_failure(
+                        accepted, &identity, revision, &record,
+                    )?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
 
             let evidence = CiEvidenceFinalizedEnvelope {
                 schema_version: CI_SCHEMA_VERSION,
@@ -524,6 +542,31 @@ where
             let bound = terminal.with_terminal_event(terminal_event_id)?;
             persist_run(&mut self.store, &identity, terminal_revision, &bound)?;
         }
+        Ok(())
+    }
+
+    fn publish_terminal_infrastructure_failure(
+        &mut self,
+        accepted: &AcceptedRequest,
+        identity: &RunIdentity,
+        revision: u64,
+        record: &RunRecord,
+    ) -> Result<(), ProductionError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ProductionError::Invalid)?
+            .as_secs()
+            .max(record.queued_at())
+            .max(record.started_at().unwrap_or(0));
+        let terminal = record.transition(
+            RunState::InfrastructureFailure,
+            now,
+            Some("runner_or_evidence_provider_failure".to_owned()),
+        )?;
+        let terminal_revision = persist_run(&mut self.store, identity, revision, &terminal)?;
+        let terminal_event_id = self.publish_run(accepted, &terminal, "run:terminal")?;
+        let bound = terminal.with_terminal_event(terminal_event_id)?;
+        persist_run(&mut self.store, identity, terminal_revision, &bound)?;
         Ok(())
     }
 
@@ -1160,6 +1203,19 @@ mod tests {
         }
     }
 
+    struct FailingExecutor;
+
+    impl AttemptExecutor for FailingExecutor {
+        type Error = ();
+
+        fn execute(
+            &mut self,
+            _request: &AcceptedRequest,
+        ) -> Result<AttemptCompletion, Self::Error> {
+            Err(())
+        }
+    }
+
     struct Relay {
         accepted: Option<AcceptedRequest>,
         published: Vec<u32>,
@@ -1334,6 +1390,33 @@ mod tests {
             handler.store.run.as_ref().unwrap().1.state(),
             RunState::Success
         );
+    }
+
+    #[test]
+    fn runner_failure_publishes_durable_terminal_infrastructure_status() {
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted()),
+                published: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            FailingExecutor,
+            MemoryStore::default(),
+            MemoryOutput(Vec::new()),
+        );
+
+        assert!(matches!(
+            handler.poll_once(CHANNEL),
+            Err(ProductionError::Runner)
+        ));
+        assert_eq!(handler.relay.published, vec![46101, 46101]);
+        let record = &handler.store.run.as_ref().expect("durable run").1;
+        assert_eq!(record.state(), RunState::InfrastructureFailure);
+        assert_eq!(record.reason(), Some("runner_or_evidence_provider_failure"));
+        assert!(record.terminal_event_id().is_some());
+        assert_eq!(handler.store.cursor, 0);
     }
 
     #[test]
