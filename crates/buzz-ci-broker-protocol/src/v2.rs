@@ -12,6 +12,7 @@ use super::{
     validate_safe, BrokerState, CancelReason, Conclusion, DecodeError, GitOid, HelloRequest,
     Operation, QualificationRequest, ResponseCode, TrustClass, HEADER_SIZE, MAGIC, OP_RESPONSE_BIT,
 };
+use sha2::{Digest, Sha256};
 
 /// Exact version accepted by the version 2 codecs.
 pub const PROTOCOL_VERSION: u16 = 2;
@@ -33,10 +34,22 @@ pub const CANCEL_ATTEMPT_BODY_SIZE: usize = 160;
 pub const GET_ATTEMPT_BODY_SIZE: usize = 64;
 /// Version 2 complete-attempt body length.
 pub const COMPLETE_ATTEMPT_BODY_SIZE: usize = 192;
+/// Version 2 evidence description request length.
+pub const DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 256;
+/// Version 2 evidence chunk request length.
+pub const READ_ATTEMPT_EVIDENCE_BODY_SIZE: usize = 288;
 /// Version 2 response body length.
 pub const RESPONSE_BODY_SIZE: usize = 288;
-/// Largest version 2 request body.
-pub const MAX_BODY_SIZE: usize = ADMIT_ATTEMPT_BODY_SIZE;
+/// Maximum number of sealed evidence items returned for one attempt.
+pub const MAX_EVIDENCE_ITEMS: usize = 4;
+/// Maximum bytes returned by one evidence read.
+pub const MAX_EVIDENCE_CHUNK_SIZE: usize = 4096;
+/// Fixed evidence description response length.
+pub const EVIDENCE_DESCRIPTION_BODY_SIZE: usize = 768;
+/// Fixed evidence chunk response length.
+pub const EVIDENCE_CHUNK_BODY_SIZE: usize = 4224;
+/// Largest version 2 request or response body.
+pub const MAX_BODY_SIZE: usize = EVIDENCE_CHUNK_BODY_SIZE;
 /// Largest complete version 2 frame.
 pub const MAX_FRAME_SIZE: usize = HEADER_SIZE + MAX_BODY_SIZE;
 
@@ -188,6 +201,105 @@ pub struct CompleteAttemptRequest {
     pub terminal_at: u64,
 }
 
+/// Coordinates that bind every evidence operation to one exact admitted attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptEvidenceCoordinates {
+    pub signed_request_digest: [u8; 32],
+    pub run_id: [u8; 16],
+    pub workflow_digest: [u8; 32],
+    pub job_intent_digest: [u8; 32],
+    pub attempt: u32,
+    pub attempt_id: [u8; 16],
+    pub execution_binding_digest: [u8; 32],
+    pub expected_generation: u64,
+}
+
+/// Describe all sealed evidence owned by execd for one exact attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DescribeAttemptEvidenceRequest {
+    pub coordinates: AttemptEvidenceCoordinates,
+    pub idempotency_digest: [u8; 32],
+    /// Domain-separated digest of the header and every other request field.
+    pub request_frame_digest: [u8; 32],
+}
+
+/// Closed evidence kinds. No filesystem path is representable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum EvidenceKind {
+    Stdout = 1,
+    Stderr = 2,
+    Artifact = 3,
+    Teardown = 4,
+}
+
+impl TryFrom<u8> for EvidenceKind {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Stdout),
+            2 => Ok(Self::Stderr),
+            3 => Ok(Self::Artifact),
+            4 => Ok(Self::Teardown),
+            _ => Err(DecodeError::UnknownEnum),
+        }
+    }
+}
+
+/// Read one bounded chunk from a descriptor returned by describe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadAttemptEvidenceRequest {
+    pub coordinates: AttemptEvidenceCoordinates,
+    pub idempotency_digest: [u8; 32],
+    pub request_frame_digest: [u8; 32],
+    pub kind: EvidenceKind,
+    pub item_index: u8,
+    pub descriptor_digest: [u8; 32],
+    pub offset: u32,
+    pub max_length: u32,
+}
+
+/// One verified, path-free sealed evidence descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidenceDescriptor {
+    pub kind: EvidenceKind,
+    pub digest: [u8; 32],
+    pub length: u32,
+    pub artifact_name_digest: [u8; 32],
+    pub artifact_media_type_digest: [u8; 32],
+    pub teardown_lease_id: [u8; 16],
+    pub teardown_lease_generation: u64,
+    pub teardown_attestation_digest: [u8; 32],
+}
+
+/// Result of describing one exact sealed attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidenceDescriptionResponse {
+    pub code: ResponseCode,
+    pub execution_binding_digest: [u8; 32],
+    pub generation: u64,
+    pub request_frame_digest: [u8; 32],
+    pub descriptor_set_digest: [u8; 32],
+    pub item_count: u8,
+    pub items: [Option<EvidenceDescriptor>; MAX_EVIDENCE_ITEMS],
+}
+
+/// Result of one bounded evidence read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceChunkResponse {
+    pub code: ResponseCode,
+    pub execution_binding_digest: [u8; 32],
+    pub generation: u64,
+    pub request_frame_digest: [u8; 32],
+    pub kind: EvidenceKind,
+    pub item_index: u8,
+    pub descriptor_digest: [u8; 32],
+    pub offset: u32,
+    pub total_length: u32,
+    pub bytes: Vec<u8>,
+}
+
 /// Version 2 request set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -204,6 +316,8 @@ pub enum Request {
     AdmitQualification(QualificationRequest),
     /// Bound completion request.
     CompleteAttempt(CompleteAttemptRequest),
+    DescribeAttemptEvidence(DescribeAttemptEvidenceRequest),
+    ReadAttemptEvidence(ReadAttemptEvidenceRequest),
 }
 
 impl Request {
@@ -216,6 +330,8 @@ impl Request {
             Self::GetAttempt(_) => Operation::GetAttempt,
             Self::AdmitQualification(_) => Operation::AdmitQualification,
             Self::CompleteAttempt(_) => Operation::CompleteAttempt,
+            Self::DescribeAttemptEvidence(_) => Operation::DescribeAttemptEvidence,
+            Self::ReadAttemptEvidence(_) => Operation::ReadAttemptEvidence,
         }
     }
 }
@@ -328,7 +444,7 @@ pub fn decode_request_header(input: &[u8]) -> Result<(FrameHeader, usize), Decod
     if get_u16(input, 4) != PROTOCOL_VERSION {
         return Err(DecodeError::UnsupportedVersion);
     }
-    let operation = Operation::from_u16(get_u16(input, 6))?;
+    let operation = Operation::from_u16_v2(get_u16(input, 6))?;
     if get_u32(input, 8) != 0 {
         return Err(DecodeError::NonZeroFlags);
     }
@@ -368,6 +484,8 @@ pub fn encode_request(request_id: [u8; 16], request: Request) -> EncodedFrame {
         Request::GetAttempt(value) => encode_get(body, value),
         Request::AdmitQualification(value) => super::encode_qualification(body, value),
         Request::CompleteAttempt(value) => encode_complete(body, value),
+        Request::DescribeAttemptEvidence(value) => encode_describe_evidence(body, value),
+        Request::ReadAttemptEvidence(value) => encode_read_evidence(body, value),
     }
     encoded
 }
@@ -395,6 +513,10 @@ pub fn decode_request(frame: &[u8]) -> Result<(FrameHeader, Request), DecodeErro
             Request::AdmitQualification(super::decode_qualification(body)?)
         }
         Operation::CompleteAttempt => Request::CompleteAttempt(decode_complete(body)?),
+        Operation::DescribeAttemptEvidence => {
+            Request::DescribeAttemptEvidence(decode_describe_evidence(body)?)
+        }
+        Operation::ReadAttemptEvidence => Request::ReadAttemptEvidence(decode_read_evidence(body)?),
     };
     Ok((header, request))
 }
@@ -478,6 +600,8 @@ const fn body_size(operation: Operation) -> usize {
         Operation::GetAttempt => GET_ATTEMPT_BODY_SIZE,
         Operation::AdmitQualification => super::ADMIT_QUALIFICATION_BODY_SIZE,
         Operation::CompleteAttempt => COMPLETE_ATTEMPT_BODY_SIZE,
+        Operation::DescribeAttemptEvidence => DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE,
+        Operation::ReadAttemptEvidence => READ_ATTEMPT_EVIDENCE_BODY_SIZE,
     }
 }
 
@@ -684,6 +808,261 @@ fn decode_complete(body: &[u8]) -> Result<CompleteAttemptRequest, DecodeError> {
     Ok(value)
 }
 
+fn encode_coordinates(body: &mut [u8], value: AttemptEvidenceCoordinates) {
+    body[0..32].copy_from_slice(&value.signed_request_digest);
+    body[32..48].copy_from_slice(&value.run_id);
+    body[48..80].copy_from_slice(&value.workflow_digest);
+    body[80..112].copy_from_slice(&value.job_intent_digest);
+    put_u32(body, 112, value.attempt);
+    body[116..132].copy_from_slice(&value.attempt_id);
+    body[132..164].copy_from_slice(&value.execution_binding_digest);
+    put_u64(body, 164, value.expected_generation);
+}
+
+fn decode_coordinates(body: &[u8]) -> Result<AttemptEvidenceCoordinates, DecodeError> {
+    let value = AttemptEvidenceCoordinates {
+        signed_request_digest: nonzero_array(&body[0..32])?,
+        run_id: nonzero_array(&body[32..48])?,
+        workflow_digest: nonzero_array(&body[48..80])?,
+        job_intent_digest: nonzero_array(&body[80..112])?,
+        attempt: get_u32(body, 112),
+        attempt_id: nonzero_array(&body[116..132])?,
+        execution_binding_digest: nonzero_array(&body[132..164])?,
+        expected_generation: get_u64(body, 164),
+    };
+    if value.attempt == 0 || value.expected_generation == 0 {
+        return Err(DecodeError::ZeroField);
+    }
+    validate_safe(value.expected_generation)?;
+    Ok(value)
+}
+
+fn encode_describe_evidence(body: &mut [u8], value: DescribeAttemptEvidenceRequest) {
+    encode_coordinates(body, value.coordinates);
+    body[172..204].copy_from_slice(&value.idempotency_digest);
+    body[204..236].copy_from_slice(&value.request_frame_digest);
+}
+
+fn decode_describe_evidence(body: &[u8]) -> Result<DescribeAttemptEvidenceRequest, DecodeError> {
+    require_zero(&body[236..])?;
+    Ok(DescribeAttemptEvidenceRequest {
+        coordinates: decode_coordinates(body)?,
+        idempotency_digest: nonzero_array(&body[172..204])?,
+        request_frame_digest: nonzero_array(&body[204..236])?,
+    })
+}
+
+fn encode_read_evidence(body: &mut [u8], value: ReadAttemptEvidenceRequest) {
+    encode_coordinates(body, value.coordinates);
+    body[172..204].copy_from_slice(&value.idempotency_digest);
+    body[204..236].copy_from_slice(&value.request_frame_digest);
+    body[236] = value.kind as u8;
+    body[237] = value.item_index;
+    body[238..270].copy_from_slice(&value.descriptor_digest);
+    put_u32(body, 270, value.offset);
+    put_u32(body, 274, value.max_length);
+}
+
+fn decode_read_evidence(body: &[u8]) -> Result<ReadAttemptEvidenceRequest, DecodeError> {
+    require_zero(&body[278..])?;
+    let value = ReadAttemptEvidenceRequest {
+        coordinates: decode_coordinates(body)?,
+        idempotency_digest: nonzero_array(&body[172..204])?,
+        request_frame_digest: nonzero_array(&body[204..236])?,
+        kind: EvidenceKind::try_from(body[236])?,
+        item_index: body[237],
+        descriptor_digest: nonzero_array(&body[238..270])?,
+        offset: get_u32(body, 270),
+        max_length: get_u32(body, 274),
+    };
+    if usize::from(value.item_index) >= MAX_EVIDENCE_ITEMS
+        || value.max_length == 0
+        || value.max_length as usize > MAX_EVIDENCE_CHUNK_SIZE
+    {
+        return Err(DecodeError::WrongBodyLength);
+    }
+    Ok(value)
+}
+
+/// Compute the digest carried by an evidence request, binding request id and
+/// canonical fields without introducing a self-reference.
+pub fn evidence_request_frame_digest(header: FrameHeader, request: &Request) -> Option<[u8; 32]> {
+    let mut bytes = Vec::with_capacity(320);
+    bytes.extend_from_slice(b"buzz-ci-broker:evidence-request-frame:v2\0");
+    bytes.extend_from_slice(&(header.operation as u16).to_be_bytes());
+    bytes.extend_from_slice(&header.request_id);
+    let (coordinates, idempotency) = match request {
+        Request::DescribeAttemptEvidence(value) => (value.coordinates, value.idempotency_digest),
+        Request::ReadAttemptEvidence(value) => (value.coordinates, value.idempotency_digest),
+        _ => return None,
+    };
+    bytes.extend_from_slice(&coordinates.signed_request_digest);
+    bytes.extend_from_slice(&coordinates.run_id);
+    bytes.extend_from_slice(&coordinates.workflow_digest);
+    bytes.extend_from_slice(&coordinates.job_intent_digest);
+    bytes.extend_from_slice(&coordinates.attempt.to_be_bytes());
+    bytes.extend_from_slice(&coordinates.attempt_id);
+    bytes.extend_from_slice(&coordinates.execution_binding_digest);
+    bytes.extend_from_slice(&coordinates.expected_generation.to_be_bytes());
+    bytes.extend_from_slice(&idempotency);
+    if let Request::ReadAttemptEvidence(value) = request {
+        bytes.push(value.kind as u8);
+        bytes.push(value.item_index);
+        bytes.extend_from_slice(&value.descriptor_digest);
+        bytes.extend_from_slice(&value.offset.to_be_bytes());
+        bytes.extend_from_slice(&value.max_length.to_be_bytes());
+    }
+    Some(Sha256::digest(bytes).into())
+}
+
+/// Encode a path-free description response.
+pub fn encode_evidence_description_response(
+    header: FrameHeader,
+    response: EvidenceDescriptionResponse,
+) -> EncodedFrame {
+    let mut encoded = EncodedFrame {
+        bytes: [0; MAX_FRAME_SIZE],
+        len: HEADER_SIZE + EVIDENCE_DESCRIPTION_BODY_SIZE,
+    };
+    encode_header(
+        &mut encoded.bytes[..HEADER_SIZE],
+        (header.operation as u16) | OP_RESPONSE_BIT,
+        EVIDENCE_DESCRIPTION_BODY_SIZE,
+        header.request_id,
+    );
+    let body = &mut encoded.bytes[HEADER_SIZE..encoded.len];
+    put_u16(body, 0, response.code as u16);
+    body[2] = response.item_count;
+    body[3..35].copy_from_slice(&response.execution_binding_digest);
+    put_u64(body, 35, response.generation);
+    body[43..75].copy_from_slice(&response.request_frame_digest);
+    body[75..107].copy_from_slice(&response.descriptor_set_digest);
+    for (index, item) in response.items.iter().enumerate() {
+        if let Some(item) = item {
+            let start = 108 + index * 160;
+            body[start] = item.kind as u8;
+            body[start + 4..start + 36].copy_from_slice(&item.digest);
+            put_u32(body, start + 36, item.length);
+            body[start + 40..start + 72].copy_from_slice(&item.artifact_name_digest);
+            body[start + 72..start + 104].copy_from_slice(&item.artifact_media_type_digest);
+            body[start + 104..start + 120].copy_from_slice(&item.teardown_lease_id);
+            put_u64(body, start + 120, item.teardown_lease_generation);
+            body[start + 128..start + 160].copy_from_slice(&item.teardown_attestation_digest);
+        }
+    }
+    encoded
+}
+
+/// Decode a path-free description response.
+pub fn decode_evidence_description_response(
+    expected: FrameHeader,
+    frame: &[u8],
+) -> Result<EvidenceDescriptionResponse, DecodeError> {
+    let (operation, request_id, body) = decode_header(frame, true)?;
+    if operation != (expected.operation as u16) | OP_RESPONSE_BIT
+        || request_id != expected.request_id
+        || body.len() != EVIDENCE_DESCRIPTION_BODY_SIZE
+    {
+        return Err(DecodeError::WrongBodyLength);
+    }
+    let item_count = body[2];
+    if usize::from(item_count) > MAX_EVIDENCE_ITEMS {
+        return Err(DecodeError::WrongBodyLength);
+    }
+    let mut items = [None; MAX_EVIDENCE_ITEMS];
+    for (index, slot) in items.iter_mut().enumerate() {
+        let start = 108 + index * 160;
+        if index < usize::from(item_count) {
+            require_zero(&body[start + 1..start + 4])?;
+            *slot = Some(EvidenceDescriptor {
+                kind: EvidenceKind::try_from(body[start])?,
+                digest: nonzero_array(&body[start + 4..start + 36])?,
+                length: get_u32(body, start + 36),
+                artifact_name_digest: array(&body[start + 40..start + 72]),
+                artifact_media_type_digest: array(&body[start + 72..start + 104]),
+                teardown_lease_id: array(&body[start + 104..start + 120]),
+                teardown_lease_generation: get_u64(body, start + 120),
+                teardown_attestation_digest: array(&body[start + 128..start + 160]),
+            });
+        } else {
+            require_zero(&body[start..start + 160])?;
+        }
+    }
+    require_zero(&body[107..108])?;
+    require_zero(&body[748..])?;
+    Ok(EvidenceDescriptionResponse {
+        code: ResponseCode::try_from(get_u16(body, 0))?,
+        execution_binding_digest: array(&body[3..35]),
+        generation: get_u64(body, 35),
+        request_frame_digest: array(&body[43..75]),
+        descriptor_set_digest: array(&body[75..107]),
+        item_count,
+        items,
+    })
+}
+
+/// Encode one bounded evidence chunk response.
+pub fn encode_evidence_chunk_response(
+    header: FrameHeader,
+    response: &EvidenceChunkResponse,
+) -> EncodedFrame {
+    assert!(response.bytes.len() <= MAX_EVIDENCE_CHUNK_SIZE);
+    let mut encoded = EncodedFrame {
+        bytes: [0; MAX_FRAME_SIZE],
+        len: HEADER_SIZE + EVIDENCE_CHUNK_BODY_SIZE,
+    };
+    encode_header(
+        &mut encoded.bytes[..HEADER_SIZE],
+        (header.operation as u16) | OP_RESPONSE_BIT,
+        EVIDENCE_CHUNK_BODY_SIZE,
+        header.request_id,
+    );
+    let body = &mut encoded.bytes[HEADER_SIZE..encoded.len];
+    put_u16(body, 0, response.code as u16);
+    body[2] = response.kind as u8;
+    body[3] = response.item_index;
+    put_u32(body, 4, response.offset);
+    put_u32(body, 8, response.total_length);
+    put_u32(body, 12, response.bytes.len() as u32);
+    body[16..48].copy_from_slice(&response.descriptor_digest);
+    body[48..80].copy_from_slice(&response.execution_binding_digest);
+    put_u64(body, 80, response.generation);
+    body[88..120].copy_from_slice(&response.request_frame_digest);
+    body[120..120 + response.bytes.len()].copy_from_slice(&response.bytes);
+    encoded
+}
+
+/// Decode one bounded evidence chunk response.
+pub fn decode_evidence_chunk_response(
+    expected: FrameHeader,
+    frame: &[u8],
+) -> Result<EvidenceChunkResponse, DecodeError> {
+    let (operation, request_id, body) = decode_header(frame, true)?;
+    if operation != (expected.operation as u16) | OP_RESPONSE_BIT
+        || request_id != expected.request_id
+        || body.len() != EVIDENCE_CHUNK_BODY_SIZE
+    {
+        return Err(DecodeError::WrongBodyLength);
+    }
+    let length = get_u32(body, 12) as usize;
+    if length > MAX_EVIDENCE_CHUNK_SIZE {
+        return Err(DecodeError::WrongBodyLength);
+    }
+    require_zero(&body[120 + length..])?;
+    Ok(EvidenceChunkResponse {
+        code: ResponseCode::try_from(get_u16(body, 0))?,
+        kind: EvidenceKind::try_from(body[2])?,
+        item_index: body[3],
+        offset: get_u32(body, 4),
+        total_length: get_u32(body, 8),
+        bytes: body[120..120 + length].to_vec(),
+        descriptor_digest: array(&body[16..48]),
+        execution_binding_digest: array(&body[48..80]),
+        generation: get_u64(body, 80),
+        request_frame_digest: array(&body[88..120]),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -782,6 +1161,55 @@ mod tests {
         }
     }
 
+    fn coordinates() -> AttemptEvidenceCoordinates {
+        AttemptEvidenceCoordinates {
+            signed_request_digest: digest(1),
+            run_id: [2; 16],
+            workflow_digest: digest(3),
+            job_intent_digest: digest(4),
+            attempt: 1,
+            attempt_id: [5; 16],
+            execution_binding_digest: digest(6),
+            expected_generation: 4,
+        }
+    }
+
+    fn describe() -> DescribeAttemptEvidenceRequest {
+        let header = FrameHeader {
+            operation: Operation::DescribeAttemptEvidence,
+            request_id: [9; 16],
+        };
+        let mut value = DescribeAttemptEvidenceRequest {
+            coordinates: coordinates(),
+            idempotency_digest: digest(7),
+            request_frame_digest: digest(8),
+        };
+        value.request_frame_digest =
+            evidence_request_frame_digest(header, &Request::DescribeAttemptEvidence(value))
+                .unwrap();
+        value
+    }
+
+    fn read() -> ReadAttemptEvidenceRequest {
+        let header = FrameHeader {
+            operation: Operation::ReadAttemptEvidence,
+            request_id: [9; 16],
+        };
+        let mut value = ReadAttemptEvidenceRequest {
+            coordinates: coordinates(),
+            idempotency_digest: digest(7),
+            request_frame_digest: digest(8),
+            kind: EvidenceKind::Stdout,
+            item_index: 0,
+            descriptor_digest: digest(10),
+            offset: 3,
+            max_length: 17,
+        };
+        value.request_frame_digest =
+            evidence_request_frame_digest(header, &Request::ReadAttemptEvidence(value)).unwrap();
+        value
+    }
+
     fn response() -> BrokerResponse {
         BrokerResponse {
             code: ResponseCode::Ok,
@@ -817,6 +1245,8 @@ mod tests {
             Request::GetAttempt(get()),
             Request::AdmitQualification(qualification()),
             Request::CompleteAttempt(complete()),
+            Request::DescribeAttemptEvidence(describe()),
+            Request::ReadAttemptEvidence(read()),
         ];
         for request in requests {
             let encoded = encode_request([42; 16], request);
@@ -912,8 +1342,10 @@ mod tests {
         assert_eq!(CANCEL_ATTEMPT_BODY_SIZE, 160);
         assert_eq!(GET_ATTEMPT_BODY_SIZE, 64);
         assert_eq!(COMPLETE_ATTEMPT_BODY_SIZE, 192);
+        assert_eq!(DESCRIBE_ATTEMPT_EVIDENCE_BODY_SIZE, 256);
+        assert_eq!(READ_ATTEMPT_EVIDENCE_BODY_SIZE, 288);
         assert_eq!(RESPONSE_BODY_SIZE, 288);
-        assert_eq!(MAX_FRAME_SIZE, 512);
+        assert_eq!(MAX_FRAME_SIZE, 4256);
         assert!(!std::mem::needs_drop::<AdmitAttemptRequest>());
         assert!(!std::mem::needs_drop::<CompleteAttemptRequest>());
 
@@ -927,6 +1359,67 @@ mod tests {
             get_u32(encoded.as_bytes(), 12),
             ADMIT_ATTEMPT_BODY_SIZE as u32
         );
+    }
+
+    #[test]
+    fn evidence_responses_round_trip_and_reject_trailing_or_oversized_content() {
+        let descriptor = EvidenceDescriptor {
+            kind: EvidenceKind::Teardown,
+            digest: digest(1),
+            length: 6,
+            artifact_name_digest: [0; 32],
+            artifact_media_type_digest: [0; 32],
+            teardown_lease_id: [2; 16],
+            teardown_lease_generation: 3,
+            teardown_attestation_digest: digest(4),
+        };
+        let header = FrameHeader {
+            operation: Operation::DescribeAttemptEvidence,
+            request_id: [5; 16],
+        };
+        let description = EvidenceDescriptionResponse {
+            code: ResponseCode::Ok,
+            execution_binding_digest: digest(6),
+            generation: 7,
+            request_frame_digest: digest(8),
+            descriptor_set_digest: digest(9),
+            item_count: 1,
+            items: [Some(descriptor), None, None, None],
+        };
+        let encoded = encode_evidence_description_response(header, description);
+        assert_eq!(
+            decode_evidence_description_response(header, encoded.as_bytes()),
+            Ok(description)
+        );
+
+        let chunk_header = FrameHeader {
+            operation: Operation::ReadAttemptEvidence,
+            request_id: [10; 16],
+        };
+        let chunk = EvidenceChunkResponse {
+            code: ResponseCode::Ok,
+            execution_binding_digest: digest(6),
+            generation: 7,
+            request_frame_digest: digest(11),
+            kind: EvidenceKind::Teardown,
+            item_index: 0,
+            descriptor_digest: digest(1),
+            offset: 0,
+            total_length: 6,
+            bytes: b"sealed".to_vec(),
+        };
+        let encoded = encode_evidence_chunk_response(chunk_header, &chunk);
+        assert_eq!(
+            decode_evidence_chunk_response(chunk_header, encoded.as_bytes()),
+            Ok(chunk)
+        );
+
+        let mut hostile = encode_request([9; 16], Request::ReadAttemptEvidence(read()))
+            .as_bytes()
+            .to_vec();
+        hostile[HEADER_SIZE + 274..HEADER_SIZE + 278]
+            .copy_from_slice(&((MAX_EVIDENCE_CHUNK_SIZE as u32) + 1).to_be_bytes());
+        assert!(decode_request(&hostile).is_err());
     }
 
     #[test]

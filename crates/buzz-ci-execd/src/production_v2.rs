@@ -16,7 +16,10 @@ use std::{
     time::Duration,
 };
 
-use buzz_ci_broker_protocol::{v2::AdmissionSignatureAlgorithm, Conclusion, GitOid, TrustClass};
+use buzz_ci_broker_protocol::{
+    v2::{AdmissionSignatureAlgorithm, EvidenceDescriptor, EvidenceKind},
+    Conclusion, GitOid, TrustClass,
+};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,10 +28,10 @@ use crate::{
     control::ControlDispatch,
     production_binding::{
         BindingError, BindingPhase, ExecutionBindingJournal, ExecutionBindingRecord,
-        ExecutionBindingV1, HostIdentity, HostRecoveryReceipt, HostStepReceipt, HostStopReason,
-        HostTerminalReceipt, JobIntentSource, JobIntentV2, JournalWrite, LaneActivationManifestV1,
-        PrivilegedHostSystem, ProductionBindingController, StaticLaneManifest,
-        EXECUTION_BINDING_SCHEMA_V1,
+        ExecutionBindingV1, HostEvidenceItem, HostIdentity, HostRecoveryReceipt, HostStepReceipt,
+        HostStopReason, HostTerminalReceipt, JobIntentSource, JobIntentV2, JournalWrite,
+        LaneActivationManifestV1, PrivilegedHostSystem, ProductionBindingController,
+        StaticLaneManifest, EXECUTION_BINDING_SCHEMA_V1,
     },
 };
 
@@ -639,7 +642,8 @@ struct EvidenceDocument {
     output: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TeardownDocument {
     schema_version: u16,
     execution_binding_digest: String,
@@ -783,6 +787,78 @@ impl PrivilegedHostSystem for LocalHostSystem {
         self.teardown_provider(binding, HostStopReason::Recovery)
             .map(HostRecoveryReceipt::CapacityReturned)
             .or(Ok(HostRecoveryReceipt::Quarantine))
+    }
+
+    fn sealed_attempt_evidence(
+        &mut self,
+        binding: ExecutionBindingV1,
+    ) -> Result<Vec<HostEvidenceItem>, BindingError> {
+        let name = format!("{}.json", hex::encode(binding.attempt_id));
+        let evidence_bytes = self
+            .evidence
+            .read(&name, 0o600, MAX_RECORD)
+            .map_err(binding_error)?;
+        let evidence: EvidenceDocument = canonical_parse(&evidence_bytes).map_err(binding_error)?;
+        let output = evidence.output.as_bytes();
+        let evidence_digest: [u8; 32] = Sha256::digest(&evidence_bytes).into();
+        if evidence.schema_version != 1
+            || decode_hex::<32>(&evidence.execution_binding_digest).map_err(binding_error)?
+                != binding.execution_binding_digest
+            || evidence.output_length as usize != output.len()
+            || evidence.output_sha256 != hex::encode(Sha256::digest(output))
+            || parse_conclusion(Some(&evidence.conclusion)).is_err()
+        {
+            return Err(BindingError::HostRefused);
+        }
+
+        let teardown_bytes = self
+            .teardown
+            .read(&name, 0o600, MAX_RECORD)
+            .map_err(binding_error)?;
+        let teardown: TeardownDocument = canonical_parse(&teardown_bytes).map_err(binding_error)?;
+        let teardown_digest: [u8; 32] = Sha256::digest(&teardown_bytes).into();
+        if teardown.schema_version != 1
+            || decode_hex::<32>(&teardown.execution_binding_digest).map_err(binding_error)?
+                != binding.execution_binding_digest
+            || decode_hex::<32>(&teardown.evidence_set_digest).map_err(binding_error)?
+                != evidence_digest
+            || decode_nonzero(&teardown.executor_receipt_digest).is_err()
+            || !matches!(
+                teardown.stop_reason.as_str(),
+                "cancelled" | "completed" | "expired" | "recovery"
+            )
+        {
+            return Err(BindingError::HostRefused);
+        }
+
+        Ok(vec![
+            HostEvidenceItem {
+                descriptor: EvidenceDescriptor {
+                    kind: EvidenceKind::Stdout,
+                    digest: evidence_digest,
+                    length: evidence_bytes.len() as u32,
+                    artifact_name_digest: [0; 32],
+                    artifact_media_type_digest: [0; 32],
+                    teardown_lease_id: [0; 16],
+                    teardown_lease_generation: 0,
+                    teardown_attestation_digest: [0; 32],
+                },
+                bytes: evidence_bytes,
+            },
+            HostEvidenceItem {
+                descriptor: EvidenceDescriptor {
+                    kind: EvidenceKind::Teardown,
+                    digest: teardown_digest,
+                    length: teardown_bytes.len() as u32,
+                    artifact_name_digest: [0; 32],
+                    artifact_media_type_digest: [0; 32],
+                    teardown_lease_id: binding.lease_id,
+                    teardown_lease_generation: binding.lease_generation,
+                    teardown_attestation_digest: teardown_digest,
+                },
+                bytes: teardown_bytes,
+            },
+        ])
     }
 }
 
@@ -1695,10 +1771,29 @@ mod tests {
         let digest = first
             .write_evidence(binding, Conclusion::Success, "ok\n", None)
             .unwrap();
+        let teardown = TeardownDocument {
+            schema_version: 1,
+            execution_binding_digest: hex::encode(binding.execution_binding_digest),
+            evidence_set_digest: hex::encode(digest),
+            stop_reason: "completed".into(),
+            executor_receipt_digest: hex::encode([15; 32]),
+        };
+        first
+            .teardown
+            .write_once(
+                &format!("{}.json", hex::encode(binding.attempt_id)),
+                &canonical_bytes(&teardown).unwrap(),
+                0o600,
+            )
+            .unwrap();
         drop(first);
 
         let mut restarted = make_system();
         assert_eq!(restarted.existing_evidence(binding).unwrap(), Some(digest));
+        let exported = restarted.sealed_attempt_evidence(binding).unwrap();
+        assert_eq!(exported.len(), 2);
+        assert_eq!(exported[0].descriptor.digest, digest);
+        assert_eq!(exported[1].descriptor.teardown_lease_id, binding.lease_id);
 
         let path = evidence_path.join(format!("{}.json", hex::encode(binding.attempt_id)));
         let mut bytes = fs::read(&path).unwrap();
@@ -1708,6 +1803,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let mut tampered = make_system();
         assert!(tampered.existing_evidence(binding).is_err());
+        assert!(tampered.sealed_attempt_evidence(binding).is_err());
     }
 
     #[test]

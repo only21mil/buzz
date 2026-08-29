@@ -7,10 +7,12 @@
 use std::collections::BTreeMap;
 
 use buzz_ci_broker_protocol::v2::{
-    admission_signature_message, AdmissionSignatureAlgorithm, AdmitAttemptRequest, BrokerResponse,
-    CancelAttemptRequest, CompleteAttemptRequest, FrameHeader, GetAttemptRequest, Request,
-    EXECUTION_BINDING_DIGEST_DOMAIN, JOB_INTENT_DIGEST_DOMAIN,
-    LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN,
+    admission_signature_message, evidence_request_frame_digest, AdmissionSignatureAlgorithm,
+    AdmitAttemptRequest, AttemptEvidenceCoordinates, BrokerResponse, CancelAttemptRequest,
+    CompleteAttemptRequest, DescribeAttemptEvidenceRequest, EvidenceChunkResponse,
+    EvidenceDescriptionResponse, EvidenceDescriptor, FrameHeader, GetAttemptRequest,
+    ReadAttemptEvidenceRequest, Request, EXECUTION_BINDING_DIGEST_DOMAIN, JOB_INTENT_DIGEST_DOMAIN,
+    LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN, MAX_EVIDENCE_CHUNK_SIZE, MAX_EVIDENCE_ITEMS,
 };
 use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, ResponseCode, TrustClass};
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
@@ -551,6 +553,13 @@ pub enum HostRecoveryReceipt {
     Quarantine,
 }
 
+/// Verified sealed bytes and their path-free descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostEvidenceItem {
+    pub descriptor: EvidenceDescriptor,
+    pub bytes: Vec<u8>,
+}
+
 /// Seven privileged seams. Production implementations receive only bindings
 /// created and verified by execd.
 pub trait PrivilegedHostSystem {
@@ -588,6 +597,14 @@ pub trait PrivilegedHostSystem {
         binding: ExecutionBindingV1,
         phase: BindingPhase,
     ) -> Result<HostRecoveryReceipt, BindingError>;
+
+    /// Reopen and verify create-once receipts before exporting any bytes.
+    fn sealed_attempt_evidence(
+        &mut self,
+        _binding: ExecutionBindingV1,
+    ) -> Result<Vec<HostEvidenceItem>, BindingError> {
+        Err(BindingError::HostRefused)
+    }
 }
 
 /// Concrete ordering and binding checks around the injected host system.
@@ -671,6 +688,24 @@ impl<S: PrivilegedHostSystem> ConcreteHostAdapters<S> {
         }
         Ok(receipt)
     }
+
+    fn sealed_evidence(
+        &mut self,
+        binding: ExecutionBindingV1,
+    ) -> Result<Vec<HostEvidenceItem>, BindingError> {
+        let items = self.system.sealed_attempt_evidence(binding)?;
+        if items.is_empty() || items.len() > MAX_EVIDENCE_ITEMS {
+            return Err(BindingError::HostRefused);
+        }
+        for item in &items {
+            if item.descriptor.length as usize != item.bytes.len()
+                || sha256(&item.bytes) != item.descriptor.digest
+            {
+                return Err(BindingError::HostRefused);
+            }
+        }
+        Ok(items)
+    }
 }
 
 /// Fail-closed refusal from manifest, state, or host binding.
@@ -728,10 +763,116 @@ where
             Request::CancelAttempt(request) => self.cancel(request, now),
             Request::GetAttempt(request) => self.get(request, now),
             Request::CompleteAttempt(request) => self.complete(request, now),
+            Request::DescribeAttemptEvidence(_) | Request::ReadAttemptEvidence(_) => {
+                empty_response(ResponseCode::BadFrame, now)
+            }
             Request::Hello(_) | Request::AdmitQualification(_) => {
                 empty_response(ResponseCode::NotProvisioned, now)
             }
         }
+    }
+
+    fn validate_evidence_coordinates(
+        &mut self,
+        coordinates: AttemptEvidenceCoordinates,
+        idempotency_digest: [u8; 32],
+    ) -> Result<ExecutionBindingRecord, BindingError> {
+        let record =
+            self.load_bound(coordinates.attempt_id, coordinates.execution_binding_digest)?;
+        let intent = self.intents.load(record.binding.job_intent_digest)?;
+        if record.phase != BindingPhase::CapacityReturned
+            || record.generation != coordinates.expected_generation
+            || record.evidence_set_digest == [0; 32]
+            || record.teardown_digest == [0; 32]
+            || coordinates.signed_request_digest != record.binding.signed_request_digest
+            || coordinates.run_id != record.binding.run_id
+            || coordinates.workflow_digest != intent.workflow_digest
+            || coordinates.job_intent_digest != record.binding.job_intent_digest
+            || coordinates.attempt != record.binding.attempt
+            || idempotency_digest != record.binding.idempotency_digest
+        {
+            return Err(BindingError::StateConflict);
+        }
+        Ok(record)
+    }
+
+    fn describe_evidence(
+        &mut self,
+        header: FrameHeader,
+        request: DescribeAttemptEvidenceRequest,
+    ) -> Result<EvidenceDescriptionResponse, BindingError> {
+        if evidence_request_frame_digest(header, &Request::DescribeAttemptEvidence(request))
+            != Some(request.request_frame_digest)
+        {
+            return Err(BindingError::ReplayConflict);
+        }
+        let record =
+            self.validate_evidence_coordinates(request.coordinates, request.idempotency_digest)?;
+        let items = self.host.sealed_evidence(record.binding)?;
+        if items[0].descriptor.digest != record.evidence_set_digest
+            || items.last().map(|item| item.descriptor.digest) != Some(record.teardown_digest)
+        {
+            return Err(BindingError::HostRefused);
+        }
+        let mut descriptors = [None; MAX_EVIDENCE_ITEMS];
+        let mut digest_material = Vec::with_capacity(items.len() * 160 + 64);
+        digest_material.extend_from_slice(b"buzz-ci-execd:evidence-descriptor-set:v2\0");
+        digest_material.extend_from_slice(&record.binding.execution_binding_digest);
+        for (slot, item) in descriptors.iter_mut().zip(&items) {
+            *slot = Some(item.descriptor);
+            descriptor_digest_material(&mut digest_material, item.descriptor);
+        }
+        Ok(EvidenceDescriptionResponse {
+            code: ResponseCode::Ok,
+            execution_binding_digest: record.binding.execution_binding_digest,
+            generation: record.generation,
+            request_frame_digest: request.request_frame_digest,
+            descriptor_set_digest: sha256(&digest_material),
+            item_count: items.len() as u8,
+            items: descriptors,
+        })
+    }
+
+    fn read_evidence(
+        &mut self,
+        header: FrameHeader,
+        request: ReadAttemptEvidenceRequest,
+    ) -> Result<EvidenceChunkResponse, BindingError> {
+        if evidence_request_frame_digest(header, &Request::ReadAttemptEvidence(request))
+            != Some(request.request_frame_digest)
+        {
+            return Err(BindingError::ReplayConflict);
+        }
+        let record =
+            self.validate_evidence_coordinates(request.coordinates, request.idempotency_digest)?;
+        let items = self.host.sealed_evidence(record.binding)?;
+        let item = items
+            .get(usize::from(request.item_index))
+            .filter(|item| item.descriptor.kind == request.kind)
+            .filter(|item| item.descriptor.digest == request.descriptor_digest)
+            .ok_or(BindingError::ReplayConflict)?;
+        let offset = request.offset as usize;
+        if offset > item.bytes.len()
+            || request.max_length == 0
+            || request.max_length as usize > MAX_EVIDENCE_CHUNK_SIZE
+        {
+            return Err(BindingError::StateConflict);
+        }
+        let end = offset
+            .saturating_add(request.max_length as usize)
+            .min(item.bytes.len());
+        Ok(EvidenceChunkResponse {
+            code: ResponseCode::Ok,
+            execution_binding_digest: record.binding.execution_binding_digest,
+            generation: record.generation,
+            request_frame_digest: request.request_frame_digest,
+            kind: request.kind,
+            item_index: request.item_index,
+            descriptor_digest: item.descriptor.digest,
+            offset: request.offset,
+            total_length: item.descriptor.length,
+            bytes: item.bytes[offset..end].to_vec(),
+        })
     }
 
     /// Recover every nonterminal binding before accepting new capacity.
@@ -1070,6 +1211,56 @@ where
         ProductionBindingController::dispatch(self, header, request, now)
     }
 
+    fn dispatch_v2_encoded(
+        &mut self,
+        header: FrameHeader,
+        request: Request,
+        now: u64,
+    ) -> buzz_ci_broker_protocol::v2::EncodedFrame {
+        match request {
+            Request::DescribeAttemptEvidence(value) => {
+                let response = if header.operation != request.operation() || !self.recovery_complete
+                {
+                    evidence_description_error(
+                        if self.recovery_complete {
+                            ResponseCode::BadFrame
+                        } else {
+                            ResponseCode::Reconciling
+                        },
+                        value,
+                    )
+                } else {
+                    self.describe_evidence(header, value)
+                        .unwrap_or_else(|error| {
+                            evidence_description_error(error_code(error), value)
+                        })
+                };
+                buzz_ci_broker_protocol::v2::encode_evidence_description_response(header, response)
+            }
+            Request::ReadAttemptEvidence(value) => {
+                let response = if header.operation != request.operation() || !self.recovery_complete
+                {
+                    evidence_chunk_error(
+                        if self.recovery_complete {
+                            ResponseCode::BadFrame
+                        } else {
+                            ResponseCode::Reconciling
+                        },
+                        value,
+                    )
+                } else {
+                    self.read_evidence(header, value)
+                        .unwrap_or_else(|error| evidence_chunk_error(error_code(error), value))
+                };
+                buzz_ci_broker_protocol::v2::encode_evidence_chunk_response(header, &response)
+            }
+            _ => {
+                let response = ProductionBindingController::dispatch(self, header, request, now);
+                buzz_ci_broker_protocol::v2::encode_response(header, response)
+            }
+        }
+    }
+
     fn maintenance(&mut self, now: u64) {
         let _ = ProductionBindingController::maintenance(self, now);
     }
@@ -1083,6 +1274,50 @@ fn write_replacement<J: ExecutionBindingJournal>(
     match journal.replace(expected_generation, record)? {
         JournalWrite::Written => Ok(()),
         JournalWrite::Conflict => Err(BindingError::StateConflict),
+    }
+}
+
+fn descriptor_digest_material(bytes: &mut Vec<u8>, descriptor: EvidenceDescriptor) {
+    bytes.push(descriptor.kind as u8);
+    bytes.extend_from_slice(&descriptor.digest);
+    bytes.extend_from_slice(&descriptor.length.to_be_bytes());
+    bytes.extend_from_slice(&descriptor.artifact_name_digest);
+    bytes.extend_from_slice(&descriptor.artifact_media_type_digest);
+    bytes.extend_from_slice(&descriptor.teardown_lease_id);
+    bytes.extend_from_slice(&descriptor.teardown_lease_generation.to_be_bytes());
+    bytes.extend_from_slice(&descriptor.teardown_attestation_digest);
+}
+
+fn evidence_description_error(
+    code: ResponseCode,
+    request: DescribeAttemptEvidenceRequest,
+) -> EvidenceDescriptionResponse {
+    EvidenceDescriptionResponse {
+        code,
+        execution_binding_digest: request.coordinates.execution_binding_digest,
+        generation: request.coordinates.expected_generation,
+        request_frame_digest: request.request_frame_digest,
+        descriptor_set_digest: [0; 32],
+        item_count: 0,
+        items: [None; MAX_EVIDENCE_ITEMS],
+    }
+}
+
+fn evidence_chunk_error(
+    code: ResponseCode,
+    request: ReadAttemptEvidenceRequest,
+) -> EvidenceChunkResponse {
+    EvidenceChunkResponse {
+        code,
+        execution_binding_digest: request.coordinates.execution_binding_digest,
+        generation: request.coordinates.expected_generation,
+        request_frame_digest: request.request_frame_digest,
+        kind: request.kind,
+        item_index: request.item_index,
+        descriptor_digest: request.descriptor_digest,
+        offset: request.offset,
+        total_length: 0,
+        bytes: Vec::new(),
     }
 }
 
@@ -1192,7 +1427,11 @@ pub fn empty_response(code: ResponseCode, now: u64) -> BrokerResponse {
 }
 
 fn error_response(error: BindingError, now: u64) -> BrokerResponse {
-    let code = match error {
+    empty_response(error_code(error), now)
+}
+
+fn error_code(error: BindingError) -> ResponseCode {
+    match error {
         BindingError::ManifestRefused
         | BindingError::IntentRefused
         | BindingError::SignatureRefused => ResponseCode::PolicyDenied,
@@ -1201,8 +1440,7 @@ fn error_response(error: BindingError, now: u64) -> BrokerResponse {
         BindingError::ReplayConflict => ResponseCode::ReplayConflict,
         BindingError::StateConflict => ResponseCode::StateConflict,
         BindingError::HostRefused => ResponseCode::InternalFailure,
-    };
-    empty_response(code, now)
+    }
 }
 
 fn derive_id(domain: &[u8], fields: &[&[u8]]) -> [u8; 16] {
@@ -1257,6 +1495,7 @@ mod tests {
         calls: Vec<&'static str>,
         refuse_at: Option<&'static str>,
         recovery: Option<HostRecoveryReceipt>,
+        evidence: Vec<HostEvidenceItem>,
     }
 
     struct FakeHost {
@@ -1360,6 +1599,14 @@ mod tests {
                     teardown_digest: [10; 32],
                 })))
         }
+
+        fn sealed_attempt_evidence(
+            &mut self,
+            _binding: ExecutionBindingV1,
+        ) -> Result<Vec<HostEvidenceItem>, BindingError> {
+            self.state.borrow_mut().calls.push("evidence_export");
+            Ok(self.state.borrow().evidence.clone())
+        }
     }
 
     fn signing_key() -> Keypair {
@@ -1450,6 +1697,206 @@ mod tests {
     fn request_for(key: &Keypair) -> AdmitAttemptRequest {
         let lane = manifest(key);
         request(key, lane, intent_for(lane))
+    }
+
+    #[test]
+    fn sealed_evidence_export_is_chunked_replay_bound_and_attempt_exact() {
+        use buzz_ci_broker_protocol::v2::{
+            decode_evidence_chunk_response, decode_evidence_description_response,
+            evidence_request_frame_digest, AttemptEvidenceCoordinates,
+            DescribeAttemptEvidenceRequest, EvidenceDescriptor, EvidenceKind,
+            ReadAttemptEvidenceRequest,
+        };
+
+        let key = signing_key();
+        let lane = manifest(&key);
+        let intent = intent_for(lane);
+        let admission = request(&key, lane, intent);
+        let binding = ExecutionBindingV1::create(admission, 20).unwrap();
+        let stdout = vec![b'x'; 5_000];
+        let teardown = b"sealed teardown attestation".to_vec();
+        let stdout_digest = sha256(&stdout);
+        let teardown_digest = sha256(&teardown);
+        let evidence = vec![
+            HostEvidenceItem {
+                descriptor: EvidenceDescriptor {
+                    kind: EvidenceKind::Stdout,
+                    digest: stdout_digest,
+                    length: stdout.len() as u32,
+                    artifact_name_digest: [0; 32],
+                    artifact_media_type_digest: [0; 32],
+                    teardown_lease_id: [0; 16],
+                    teardown_lease_generation: 0,
+                    teardown_attestation_digest: [0; 32],
+                },
+                bytes: stdout.clone(),
+            },
+            HostEvidenceItem {
+                descriptor: EvidenceDescriptor {
+                    kind: EvidenceKind::Teardown,
+                    digest: teardown_digest,
+                    length: teardown.len() as u32,
+                    artifact_name_digest: [0; 32],
+                    artifact_media_type_digest: [0; 32],
+                    teardown_lease_id: binding.lease_id,
+                    teardown_lease_generation: binding.lease_generation,
+                    teardown_attestation_digest: teardown_digest,
+                },
+                bytes: teardown,
+            },
+        ];
+        let state = Rc::new(RefCell::new(HostState {
+            evidence,
+            ..HostState::default()
+        }));
+        let host = FakeHost {
+            state,
+            identity: HostIdentity {
+                broker_build_identity: lane.broker_build_identity,
+                host_profile_digest: lane.host_profile_digest,
+                suite_identity: lane.suite_identity,
+            },
+        };
+        let mut intents = StaticJobIntents::default();
+        intents.insert(intent).unwrap();
+        let mut journal = MemoryExecutionBindingJournal::default();
+        let record = ExecutionBindingRecord {
+            binding,
+            phase: BindingPhase::CapacityReturned,
+            generation: 4,
+            updated_at: 30,
+            conclusion: Conclusion::Success,
+            host_receipt_digest: [21; 32],
+            evidence_set_digest: stdout_digest,
+            teardown_digest,
+        };
+        assert_eq!(journal.insert(record).unwrap(), JournalWrite::Written);
+        let mut controller =
+            ProductionBindingController::new(StaticLaneManifest::new(lane), intents, journal, host);
+        controller.recovery_complete = true;
+        let coordinates = AttemptEvidenceCoordinates {
+            signed_request_digest: binding.signed_request_digest,
+            run_id: binding.run_id,
+            workflow_digest: intent.workflow_digest,
+            job_intent_digest: binding.job_intent_digest,
+            attempt: binding.attempt,
+            attempt_id: binding.attempt_id,
+            execution_binding_digest: binding.execution_binding_digest,
+            expected_generation: record.generation,
+        };
+
+        let describe_header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::DescribeAttemptEvidence,
+            request_id: [31; 16],
+        };
+        let mut describe = DescribeAttemptEvidenceRequest {
+            coordinates,
+            idempotency_digest: binding.idempotency_digest,
+            request_frame_digest: [1; 32],
+        };
+        describe.request_frame_digest = evidence_request_frame_digest(
+            describe_header,
+            &Request::DescribeAttemptEvidence(describe),
+        )
+        .unwrap();
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            describe_header,
+            Request::DescribeAttemptEvidence(describe),
+            31,
+        );
+        let described =
+            decode_evidence_description_response(describe_header, encoded.as_bytes()).unwrap();
+        assert_eq!(described.code, ResponseCode::Ok);
+        assert_eq!(described.item_count, 2);
+        assert_eq!(described.items[0].unwrap().digest, stdout_digest);
+        assert_eq!(
+            described.items[1].unwrap().teardown_lease_id,
+            binding.lease_id
+        );
+
+        let read_header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::ReadAttemptEvidence,
+            request_id: [32; 16],
+        };
+        let mut read = ReadAttemptEvidenceRequest {
+            coordinates,
+            idempotency_digest: binding.idempotency_digest,
+            request_frame_digest: [1; 32],
+            kind: EvidenceKind::Stdout,
+            item_index: 0,
+            descriptor_digest: stdout_digest,
+            offset: 1_000,
+            max_length: MAX_EVIDENCE_CHUNK_SIZE as u32,
+        };
+        read.request_frame_digest =
+            evidence_request_frame_digest(read_header, &Request::ReadAttemptEvidence(read))
+                .unwrap();
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            read_header,
+            Request::ReadAttemptEvidence(read),
+            32,
+        );
+        let chunk = decode_evidence_chunk_response(read_header, encoded.as_bytes()).unwrap();
+        assert_eq!(chunk.code, ResponseCode::Ok);
+        assert_eq!(chunk.bytes.len(), 4_000);
+        assert_eq!(chunk.total_length, 5_000);
+
+        let mut stale = describe;
+        stale.coordinates.expected_generation -= 1;
+        stale.request_frame_digest = evidence_request_frame_digest(
+            describe_header,
+            &Request::DescribeAttemptEvidence(stale),
+        )
+        .unwrap();
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            describe_header,
+            Request::DescribeAttemptEvidence(stale),
+            33,
+        );
+        assert_eq!(
+            decode_evidence_description_response(describe_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::StateConflict
+        );
+
+        let mut hostile = describe;
+        hostile.coordinates.run_id[0] ^= 1;
+        hostile.request_frame_digest[0] ^= 1;
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            describe_header,
+            Request::DescribeAttemptEvidence(hostile),
+            34,
+        );
+        assert_eq!(
+            decode_evidence_description_response(describe_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::ReplayConflict
+        );
+
+        controller
+            .journal
+            .records
+            .get_mut(&binding.attempt_id)
+            .unwrap()
+            .phase = BindingPhase::Running;
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            describe_header,
+            Request::DescribeAttemptEvidence(describe),
+            35,
+        );
+        assert_eq!(
+            decode_evidence_description_response(describe_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::StateConflict
+        );
     }
 
     type Controller = ProductionBindingController<
