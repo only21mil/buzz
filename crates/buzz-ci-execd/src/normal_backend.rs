@@ -4,10 +4,21 @@
 //! handoffs stay behind narrow traits so the backend remains unavailable until
 //! their reviewed implementations land.
 
+mod executor_handoff;
+mod handoff_descriptor;
+mod runtime_descriptor;
+
+pub use executor_handoff::{
+    run_executor_handoff_service, ExecutorUnitHandoff, ExecutorUnitHandoffChild,
+};
+pub use runtime_descriptor::{
+    run_runtime_descriptor_service, RuntimeDescriptorOpener, RuntimeDescriptorProvider,
+};
+
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -821,10 +832,6 @@ pub enum ActProxyLaunchError {
     /// Proxy construction, supervision, or the child process failed closed.
     #[error("Act proxy launch failed closed")]
     Unavailable,
-    /// DNS already owns the exact executor unit, so direct `systemd-run` would
-    /// collide with the retained placeholder instead of entering its cgroup.
-    #[error("the executor unit requires an authenticated process handoff")]
-    ExecutorUnitHandoffRequired,
 }
 
 /// Concurrent supervisor for pinned Act and one broker proxy lease.
@@ -893,126 +900,36 @@ pub trait ActProcessSpawner {
     /// Start the pinned plan as the validated executor principal.
     fn spawn(
         &mut self,
+        lease: LeaseToken,
         plan: &ActLaunchPlan,
         binding: &ValidatedAttemptLeaseBinding,
     ) -> Result<Self::Child, ActProxyLaunchError>;
 }
 
-/// Production no-shell `systemd-run` launcher for the exact Act unit.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemdActProcessSpawner;
-
-/// Controller child for one exact transient Act unit.
-pub struct SystemdActChild {
-    child: Child,
-    unit: String,
-}
-
-impl ActChild for SystemdActChild {
-    fn try_wait(&mut self) -> Result<Option<ExitStatus>, ActProxyLaunchError> {
-        self.child
-            .try_wait()
-            .map_err(|_| ActProxyLaunchError::Unavailable)
-    }
-
-    fn stop_and_reap(&mut self) -> Result<(), ActProxyLaunchError> {
-        let status = Command::new("/usr/bin/systemctl")
-            .arg("stop")
-            .arg(&self.unit)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|_| ActProxyLaunchError::Unavailable)?;
-        let reaped = self
-            .child
-            .wait()
-            .map_err(|_| ActProxyLaunchError::Unavailable)?;
-        if status.success() && reaped.success() {
-            Ok(())
-        } else {
-            Err(ActProxyLaunchError::Unavailable)
-        }
-    }
-}
-
-impl ActProcessSpawner for SystemdActProcessSpawner {
-    type Child = SystemdActChild;
-
-    fn preflight(
-        &self,
-        _plan: &ActLaunchPlan,
-        _binding: &ValidatedAttemptLeaseBinding,
-    ) -> Result<(), ActProxyLaunchError> {
-        Err(ActProxyLaunchError::ExecutorUnitHandoffRequired)
-    }
-
-    fn spawn(
-        &mut self,
-        plan: &ActLaunchPlan,
-        binding: &ValidatedAttemptLeaseBinding,
-    ) -> Result<Self::Child, ActProxyLaunchError> {
-        self.preflight(plan, binding)?;
-        verify_act_binary(plan)?;
-        let argv = plan.argv().map_err(|_| ActProxyLaunchError::Unavailable)?;
-        let environment = plan
-            .environment()
-            .map_err(|_| ActProxyLaunchError::Unavailable)?;
-        let executor_uid = binding.as_binding().principals.executor;
-        let mut command = Command::new("/usr/bin/systemd-run");
-        command
-            .arg("--quiet")
-            .arg("--wait")
-            .arg("--collect")
-            .arg("--service-type=exec")
-            .arg(format!("--unit={}", plan.executor_unit))
-            .arg(format!("--slice={}", plan.lease_slice))
-            .arg(format!("--uid={executor_uid}"))
-            .arg(format!(
-                "--working-directory={}",
-                plan.working_directory.display()
-            ))
-            .arg("--property=NoNewPrivileges=yes")
-            .arg("--property=PrivateTmp=yes");
-        for (name, value) in environment {
-            command.arg(format!("--setenv={name}={value}"));
-        }
-        command
-            .arg("--")
-            .arg(&plan.binary)
-            .args(argv)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = command
-            .spawn()
-            .map_err(|_| ActProxyLaunchError::Unavailable)?;
-        Ok(SystemdActChild {
-            child,
-            unit: plan.executor_unit.clone(),
-        })
-    }
-}
+/// Compatibility name for the production spawner. It no longer creates a
+/// second transient unit; it connects to the DNS-owned executor service.
+pub type SystemdActProcessSpawner = ExecutorUnitHandoff;
 
 /// Bounded production supervisor using both reviewed proxy mediators.
-pub struct MediatedActThroughProxyLauncher<D, S = SystemdActProcessSpawner> {
+pub struct MediatedActThroughProxyLauncher<D, S = ExecutorUnitHandoff> {
     descriptors: D,
     spawner: S,
     maximum_exchanges: usize,
     poll_interval: Duration,
 }
 
-impl<D> MediatedActThroughProxyLauncher<D, SystemdActProcessSpawner> {
+impl<D> MediatedActThroughProxyLauncher<D, ExecutorUnitHandoff> {
     /// Construct the production supervisor with fixed polling bounds.
-    pub fn production(descriptors: D) -> Self {
-        Self {
+    pub fn production(
+        descriptors: D,
+        contract: crate::host_composition::HostCompositionContract,
+    ) -> Result<Self, ActProxyLaunchError> {
+        Ok(Self {
             descriptors,
-            spawner: SystemdActProcessSpawner,
+            spawner: ExecutorUnitHandoff::new(contract)?,
             maximum_exchanges: 4096,
             poll_interval: Duration::from_millis(5),
-        }
+        })
     }
 }
 
@@ -1055,7 +972,7 @@ where
             .filter(|seconds| *seconds > 0)
             .ok_or(ActProxyLaunchError::Unavailable)?;
         let deadline = Instant::now() + Duration::from_secs(remaining);
-        let mut child = self.spawner.spawn(plan, binding)?;
+        let mut child = self.spawner.spawn(lease, plan, binding)?;
         proxy
             .set_listener_nonblocking(true)
             .map_err(|_| ActProxyLaunchError::Unavailable)?;
@@ -1466,6 +1383,7 @@ mod tests {
     use crate::evidence::{
         CiEventBinding, Digest32, ReconcileRecord, ReconcileState, TeardownRecord,
     };
+    use crate::host_composition::HostCompositionContract;
     use crate::normal_engine::tests::ordinary_fixture;
     use buzz_ci_policy_proxy::{
         AllowedMount, EngineKind, IsolationLimits, IsolationProfile, NetworkPolicy,
@@ -1886,8 +1804,32 @@ mod tests {
         assert!(calls.borrow().contains(&"teardown"));
     }
 
+    fn handoff_contract(binding: &ValidatedAttemptLeaseBinding) -> HostCompositionContract {
+        let binding = binding.as_binding();
+        HostCompositionContract {
+            schema_version: 1,
+            revision: 1,
+            executor_uid: binding.principals.executor,
+            runtime_uid: binding.principals.runtime,
+            executor_socket_template: "/run/buzzci-{lease_id}-exec/executor.sock".into(),
+            runtime_socket_template: "/run/buzzci-{lease_id}-runtime/runtime.sock".into(),
+            materialization_authority_root: "/var/lib/buzz-ci/materialization".into(),
+            proxy_authority_root: "/var/lib/buzz-ci/proxy".into(),
+            terminal_evidence_root: "/var/lib/buzz-ci/terminal".into(),
+            teardown_authority_root: "/var/lib/buzz-ci/teardown".into(),
+            qualification_lease_root: "/var/lib/buzz-ci/qualification-leases".into(),
+            qualification_binding_root: "/var/lib/buzz-ci/qualification-bindings".into(),
+            qualification_handoff_root: "/var/lib/buzz-ci/qualification-handoffs".into(),
+            qualification_readback_root: "/var/lib/buzz-ci/qualification-readbacks".into(),
+            proved_invariants: crate::host_composition::REQUIRED_HOST_INVARIANTS
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
     #[test]
-    fn direct_systemd_act_spawn_is_closed_before_executor_unit_collision() {
+    fn handoff_descriptor_binds_exact_identity_without_secret_material() {
         let fixture = ordinary_fixture();
         let binding = fixture
             .plan
@@ -1895,15 +1837,253 @@ mod tests {
             .clone()
             .validate_phase1(&fixture.plan.validation.context())
             .expect("fixture binding should validate");
-        let mut spawner = SystemdActProcessSpawner;
-
+        let contract = handoff_contract(&binding);
+        let identity = handoff_descriptor::HandoffIdentity::from_validated(
+            &fixture.plan.act,
+            &binding,
+            &contract,
+        )
+        .expect("exact identity should bind");
+        assert!(!identity.contains_secret_fields());
+        let serialized = serde_json::to_string(&identity).unwrap();
+        let raw = binding.as_binding();
+        assert!(!serialized.contains(&raw.workspace.object.token));
+        assert!(!serialized.contains(&raw.workspace.quota_token));
+        assert!(!serialized.contains(&raw.cgroup.object.token));
+        assert!(!serialized.contains(&raw.netns.object.token));
+        assert!(!serialized.contains(fixture.plan.act.secrets_path.to_str().unwrap()));
         assert_eq!(
-            spawner.preflight(&fixture.plan.act, &binding),
-            Err(ActProxyLaunchError::ExecutorUnitHandoffRequired)
+            identity.socket(handoff_descriptor::HandoffRole::Executor),
+            std::path::Path::new("/run/buzzci-01ARZ3NDEKTSV4RRFFQ69G5FAV-exec/executor.sock")
         );
-        assert!(matches!(
-            spawner.spawn(&fixture.plan.act, &binding),
-            Err(ActProxyLaunchError::ExecutorUnitHandoffRequired)
-        ));
+        let descriptor = handoff_descriptor::HandoffDescriptor::issue(
+            identity.clone(),
+            handoff_descriptor::HandoffRole::Executor,
+            handoff_descriptor::HandoffOperation::Probe,
+            1,
+            20,
+            None,
+        )
+        .expect("fresh descriptor should issue");
+        descriptor
+            .validate_expected(
+                &identity,
+                handoff_descriptor::HandoffRole::Executor,
+                handoff_descriptor::HandoffOperation::Probe,
+                20,
+            )
+            .expect("exact descriptor should validate");
+
+        let mut mismatch = descriptor.clone();
+        mismatch.identity.mutate_run_id();
+        assert!(mismatch.validate_at(20).is_err());
+        assert!(descriptor.validate_at(50).is_err());
+
+        let mut replay = handoff_descriptor::DescriptorReplayGuard::default();
+        replay
+            .accept(&descriptor, 20)
+            .expect("first descriptor should be accepted");
+        assert!(replay.accept(&descriptor, 20).is_err());
+
+        let launch = handoff_descriptor::HandoffDescriptor::issue(
+            identity,
+            handoff_descriptor::HandoffRole::Executor,
+            handoff_descriptor::HandoffOperation::Launch,
+            2,
+            20,
+            Some(handoff_descriptor::ControllerLeaseIdentity::from_lease(
+                fixture.lease,
+            )),
+        )
+        .unwrap();
+        let mut restarted_service = handoff_descriptor::DescriptorReplayGuard::default();
+        assert!(restarted_service.accept(&launch, 20).is_err());
+    }
+
+    #[test]
+    fn malformed_missing_and_cross_role_descriptors_fail_closed() {
+        let fixture = ordinary_fixture();
+        let binding = fixture
+            .plan
+            .binding
+            .clone()
+            .validate_phase1(&fixture.plan.validation.context())
+            .expect("fixture binding should validate");
+        let identity = handoff_descriptor::HandoffIdentity::from_validated(
+            &fixture.plan.act,
+            &binding,
+            &handoff_contract(&binding),
+        )
+        .unwrap();
+        let descriptor = handoff_descriptor::HandoffDescriptor::issue(
+            identity.clone(),
+            handoff_descriptor::HandoffRole::Runtime,
+            handoff_descriptor::HandoffOperation::Probe,
+            1,
+            20,
+            None,
+        )
+        .unwrap();
+        assert!(descriptor
+            .validate_expected(
+                &identity,
+                handoff_descriptor::HandoffRole::Executor,
+                handoff_descriptor::HandoffOperation::Probe,
+                20,
+            )
+            .is_err());
+        assert!(
+            handoff_descriptor::decode_header(&[0; handoff_descriptor::FRAME_HEADER_BYTES], 1,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn independently_valid_act_plan_paths_cannot_cross_descriptor_identity() {
+        let fixture = ordinary_fixture();
+        let binding = fixture
+            .plan
+            .binding
+            .clone()
+            .validate_phase1(&fixture.plan.validation.context())
+            .unwrap();
+        let contract = handoff_contract(&binding);
+        let identity = handoff_descriptor::HandoffIdentity::from_validated(
+            &fixture.plan.act,
+            &binding,
+            &contract,
+        )
+        .unwrap();
+        let original = handoff_descriptor::HandoffDescriptor::issue(
+            identity.clone(),
+            handoff_descriptor::HandoffRole::Executor,
+            handoff_descriptor::HandoffOperation::Probe,
+            1,
+            20,
+            None,
+        )
+        .unwrap();
+
+        let mut mismatches = Vec::new();
+        let mut plan = fixture.plan.act.clone();
+        plan.working_directory = "/var/lib/buzzci/invocations/other".into();
+        mismatches.push(("working directory", plan));
+        let mut plan = fixture.plan.act.clone();
+        plan.home_directory = "/var/lib/buzzci/invocations/normal/other-home".into();
+        mismatches.push(("home", plan));
+        let mut plan = fixture.plan.act.clone();
+        plan.workflow_path =
+            "/var/lib/buzzci/workspaces/normal/source/.github/workflows/other.yml".into();
+        mismatches.push(("workflow", plan));
+        let mut plan = fixture.plan.act.clone();
+        plan.proxy_socket = "/run/buzzci/other-proxy.sock".into();
+        mismatches.push(("proxy", plan));
+        for (name, path) in [
+            (
+                "secrets",
+                "/var/lib/buzzci/invocations/normal/other/secrets",
+            ),
+            ("vars", "/var/lib/buzzci/invocations/normal/other/vars"),
+            (
+                "environment",
+                "/var/lib/buzzci/invocations/normal/other/env",
+            ),
+            ("inputs", "/var/lib/buzzci/invocations/normal/other/inputs"),
+        ] {
+            let mut plan = fixture.plan.act.clone();
+            match name {
+                "secrets" => plan.secrets_path = path.into(),
+                "vars" => plan.vars_path = path.into(),
+                "environment" => plan.env_path = path.into(),
+                "inputs" => plan.inputs_path = path.into(),
+                _ => unreachable!(),
+            }
+            mismatches.push((name, plan));
+        }
+        for (name, plan) in mismatches {
+            plan.argv()
+                .unwrap_or_else(|_| panic!("{name} mismatch remains independently valid"));
+            plan.environment()
+                .unwrap_or_else(|_| panic!("{name} environment remains independently valid"));
+            assert!(
+                identity
+                    .validate_plan(&plan, binding.as_binding().principals.executor)
+                    .is_err(),
+                "{name} mismatch crossed the descriptor binding"
+            );
+        }
+
+        let mut mismatch = fixture.plan.act.clone();
+        mismatch.working_directory = "/var/lib/buzzci/invocations/other".into();
+        mismatch.home_directory = "/var/lib/buzzci/invocations/other/home".into();
+        mismatch.secrets_path = "/var/lib/buzzci/invocations/other/empty/secrets".into();
+        mismatch.vars_path = "/var/lib/buzzci/invocations/other/empty/vars".into();
+        mismatch.env_path = "/var/lib/buzzci/invocations/other/empty/env".into();
+        mismatch.inputs_path = "/var/lib/buzzci/invocations/other/empty/inputs".into();
+        mismatch.workflow_path =
+            "/var/lib/buzzci/workspaces/normal/source/.github/workflows/other.yml".into();
+        mismatch.proxy_socket = "/run/buzzci/other-proxy.sock".into();
+
+        let mismatch_identity =
+            handoff_descriptor::HandoffIdentity::from_validated(&mismatch, &binding, &contract)
+                .unwrap();
+        let rebound = handoff_descriptor::HandoffDescriptor::issue(
+            mismatch_identity,
+            handoff_descriptor::HandoffRole::Executor,
+            handoff_descriptor::HandoffOperation::Probe,
+            1,
+            20,
+            None,
+        )
+        .unwrap();
+        assert_ne!(original.request_id, rebound.request_id);
+    }
+
+    #[test]
+    fn same_uid_service_misroutes_fail_live_identity_binding_for_both_roles() {
+        let fixture = ordinary_fixture();
+        let binding = fixture
+            .plan
+            .binding
+            .clone()
+            .validate_phase1(&fixture.plan.validation.context())
+            .unwrap();
+        let identity = handoff_descriptor::HandoffIdentity::from_validated(
+            &fixture.plan.act,
+            &binding,
+            &handoff_contract(&binding),
+        )
+        .unwrap();
+
+        for role in [
+            handoff_descriptor::HandoffRole::Executor,
+            handoff_descriptor::HandoffRole::Runtime,
+        ] {
+            let expected = identity.expected_live_service(role);
+            identity
+                .validate_observed_service(role, &expected)
+                .expect("exact live service identity should match");
+
+            let mut wrong_socket = expected.clone();
+            wrong_socket.socket_path.push("misroute");
+            assert!(identity
+                .validate_observed_service(role, &wrong_socket)
+                .is_err());
+            let mut wrong_unit = expected.clone();
+            wrong_unit.unit_name.push_str(".misroute");
+            assert!(identity
+                .validate_observed_service(role, &wrong_unit)
+                .is_err());
+            let mut wrong_cgroup = expected.clone();
+            wrong_cgroup.cgroup_inode ^= 1;
+            assert!(identity
+                .validate_observed_service(role, &wrong_cgroup)
+                .is_err());
+            let mut wrong_netns = expected.clone();
+            wrong_netns.netns_inode ^= 1;
+            assert!(identity
+                .validate_observed_service(role, &wrong_netns)
+                .is_err());
+        }
     }
 }
