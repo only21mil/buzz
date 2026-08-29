@@ -1,0 +1,25 @@
+[Unit]
+Description=Buzz CI unprivileged fixed job executor
+Requires=buzz-ci-executor.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/buzz-ci-executor --socket-activation
+User=buzzci-job
+Group=buzzci-job
+SupplementaryGroups=
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+StandardOutput=null
+StandardError=null

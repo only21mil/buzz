@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "buzz-ci-execd"
 path = "src/main.rs"
 
+[[bin]]
+name = "buzz-ci-executor"
+path = "src/executor_main.rs"
+
 [dependencies]
 buzz-ci-broker-protocol = { workspace = true }
 buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }

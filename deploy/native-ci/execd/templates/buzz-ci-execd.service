@@ -1,0 +1,24 @@
+[Unit]
+Description=Buzz CI privileged execution broker
+Requires=buzz-ci-execd.socket buzz-ci-executor.socket
+After=buzz-ci-executor.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/buzz-ci-execd --socket-activation
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/buzzci/execd-v2.json /usr/libexec/buzz-ci-executor
+ReadWritePaths=/var/lib/buzzci/execd-v2
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=buzz-ci-capacity-one.target
