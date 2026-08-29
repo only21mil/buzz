@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 from typing import Any
+from urllib.parse import urlsplit
 
 MANIFEST_SCHEMA = "buzz-ci-capacity-one-activation-package-v1"
 DRAFT_SCHEMA = "buzz-ci-capacity-one-activation-draft-v1"
@@ -28,13 +29,23 @@ COMPONENTS = {
     "execd": ("/usr/libexec/buzz-ci-execd", "buzz-ci-execd.service"),
     "keyholder": ("/usr/libexec/buzz-ci-keyholder", "buzz-ci-keyholder.service"),
     "qualification": ("/usr/libexec/buzz-ci-acceptance-ctl", None),
+    "executor": ("/usr/libexec/buzz-ci-executor", None),
 }
 
 IDENTITIES = {
     "runner": "buzzci-runner",
     "controld": "buzzci-controld",
     "keyholder": "buzzci-keyholder",
+    "qualification": "buzzci-ctl",
 }
+IDENTITY_HOMES = {
+    "runner": "/var/lib/buzzci/runner",
+    "controld": "/var/lib/buzzci/controld",
+    "keyholder": "/var/lib/buzzci/keyholder",
+    "qualification": "/var/lib/buzzci/ctl",
+}
+ACCESS_GROUP_NAME = "buzzci-execd"
+ACCESS_GROUP_MEMBERS = ["buzzci-ctl", "buzzci-runner"]
 
 CONFIG_TARGETS = {
     "runner_config": "/etc/buzzci/runner-v1.json",
@@ -63,7 +74,7 @@ SOCKET_POLICY = {
     "keyholder": {
         "unit": "buzz-ci-keyholder.socket",
         "path": "/run/buzzci/keyholder.sock",
-        "descriptor_name": "buzz-ci-keyholder",
+        "descriptor_name": "buzz-ci-keyholder-control",
         "user": "buzzci-keyholder",
         "group": "buzzci-controld",
         "mode": "0620",
@@ -73,7 +84,7 @@ SOCKET_POLICY = {
         "path": "/run/buzzci/execd.sock",
         "descriptor_name": "buzz-ci-execd",
         "user": "root",
-        "group": "buzzci-runner",
+        "group": ACCESS_GROUP_NAME,
         "mode": "0620",
     },
     "runner": {
@@ -198,13 +209,16 @@ def require_asset(value: object, where: str) -> str:
 def _validate_identity(role: str, value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"identity {role} must be an object")
-    require_keys(value, {"user", "group", "uid", "gid", "home", "shell"}, f"identity {role}")
+    require_keys(value, {"user", "group", "uid", "gid", "home", "shell", "supplementary_groups"}, f"identity {role}")
     expected_name = IDENTITIES[role]
     if value["user"] != expected_name or value["group"] != expected_name:
         raise ValueError(f"identity {role} has the wrong fixed name")
     require_u32(value["uid"], f"identity {role} uid")
     require_u32(value["gid"], f"identity {role} gid")
-    if value["home"] != f"/var/lib/buzzci/{role}" or value["shell"] != "/usr/sbin/nologin":
+    expected_groups = [ACCESS_GROUP_NAME] if role in {"runner", "qualification"} else []
+    if value["supplementary_groups"] != expected_groups:
+        raise ValueError(f"identity {role} supplementary groups differ from the fixed plan")
+    if value["home"] != IDENTITY_HOMES[role] or value["shell"] != "/usr/sbin/nologin":
         raise ValueError(f"identity {role} home or shell differs from the fixed plan")
     return value
 
@@ -282,7 +296,7 @@ def _validate_entry(value: object) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) -> dict[str, Any]:
     expected = {
         "schema", "activation_id", "source_commit", "default_state", "identities", "components", "entries",
-        "systemd", "socket_policy", "qualification", "package_uid", "package_gid", "package_digest",
+        "access_group", "systemd", "socket_policy", "qualification", "package_uid", "package_gid", "package_digest",
     }
     if not require_digest:
         expected -= {"activation_id", "package_digest"}
@@ -307,6 +321,15 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
     gids = [identities[role]["gid"] for role in IDENTITIES]
     if len(set(uids)) != len(uids) or len(set(gids)) != len(gids):
         raise ValueError("activation service UIDs and GIDs must be distinct")
+    access_group = manifest["access_group"]
+    if not isinstance(access_group, dict):
+        raise ValueError("execd access group must be an object")
+    require_keys(access_group, {"group", "gid", "members"}, "execd access group")
+    require_u32(access_group["gid"], "execd access group gid")
+    if access_group["group"] != ACCESS_GROUP_NAME or access_group["members"] != ACCESS_GROUP_MEMBERS:
+        raise ValueError("execd access group differs from the fixed membership plan")
+    if access_group["gid"] in gids:
+        raise ValueError("execd access group GID must be distinct")
 
     components = manifest["components"]
     if not isinstance(components, list) or len(components) != len(COMPONENTS):
@@ -351,8 +374,12 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
     qualification = manifest["qualification"]
     if not isinstance(qualification, dict):
         raise ValueError("qualification must be an object")
-    require_keys(qualification, {"program", "request_source", "request_sha256", "expected_response_sha256", "timeout_seconds"}, "qualification")
-    if qualification["program"] != COMPONENTS["qualification"][0]:
+    require_keys(
+        qualification,
+        {"program", "principal", "request_source", "request_sha256", "expected_response_sha256", "timeout_seconds", "terminate_grace_seconds"},
+        "qualification",
+    )
+    if qualification["program"] != COMPONENTS["qualification"][0] or qualification["principal"] != "qualification":
         raise ValueError("qualification must use the fixed acceptance controller")
     require_asset(qualification["request_source"], "qualification request")
     for field in ("request_sha256", "expected_response_sha256"):
@@ -361,6 +388,8 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
     timeout = qualification["timeout_seconds"]
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 300:
         raise ValueError("qualification timeout must be between 1 and 300 seconds")
+    if qualification["terminate_grace_seconds"] != 2:
+        raise ValueError("qualification termination grace must be two seconds")
     all_sources = sources + [item["provenance_source"] for item in validated_components] + [qualification["request_source"]]
     if len(all_sources) != len(set(all_sources)):
         raise ValueError("activation assets must not share source names")
@@ -436,7 +465,8 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
             raise ValueError(f"runner active host identity is invalid: {field}")
     if host.get("broker_socket") != SOCKET_POLICY["execd"]["path"] or host.get("broker_uid") != 0:
         raise ValueError("runner active configuration does not bind the root execd peer")
-    require_absolute(host["executor_program"], "runner executor program")
+    if host["executor_program"] != COMPONENTS["executor"][0]:
+        raise ValueError("runner executor program is not bound to the packaged executor component")
     if host["evidence_directory"] != "/var/lib/buzzci/runner/evidence" or host["journal_directory"] != "/var/lib/buzzci/runner/journal":
         raise ValueError("runner active state directories differ from the frozen interface")
     for field, maximum in (
@@ -461,22 +491,74 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         raise ValueError("controld schema changes during activation")
     if controld_staged.get("store_root") != "/var/lib/buzzci/controld" or controld_active.get("store_root") != "/var/lib/buzzci/controld":
         raise ValueError("controld store root changes during activation")
+    active_fields = {
+        "schema_version", "capacity", "store_root", "relay_url", "runner_socket", "keyholder_socket",
+        "keyholder_uid", "keyholder_gid", "keyholder_selectors", "keyholder_timeout_millis",
+        "keyholder_transport_attempts",
+    }
+    if set(controld_active) != active_fields:
+        raise ValueError("active controld configuration differs from the strict interface")
+    if not isinstance(controld_active["relay_url"], str) or not controld_active["relay_url"].startswith("wss://"):
+        raise ValueError("controld relay URL must use wss")
     if controld_active.get("runner_socket") != SOCKET_POLICY["runner"]["path"]:
         raise ValueError("controld active configuration does not bind the runner socket")
     if controld_active.get("keyholder_socket") != SOCKET_POLICY["keyholder"]["path"]:
         raise ValueError("controld active configuration does not bind the separate keyholder socket")
+    keyholder_identity = manifest["identities"]["keyholder"]
+    if (
+        controld_active["keyholder_uid"] != keyholder_identity["uid"]
+        or controld_active["keyholder_gid"] != keyholder_identity["gid"]
+    ):
+        raise ValueError("controld keyholder peer credentials differ from the manifest")
+    for field, maximum in (("keyholder_timeout_millis", 60_000), ("keyholder_transport_attempts", 16)):
+        value = controld_active[field]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+            raise ValueError(f"controld keyholder bound is invalid: {field}")
     controld_encoded = canonical_json(controld_active)
     if SOCKET_POLICY["execd"]["path"].encode() in controld_encoded or COMPONENTS["execd"][0].encode() in controld_encoded:
         raise ValueError("controld configuration must not bypass the runner to reach execd")
 
     keyholder = entries["keyholder_config"]
     keyholder_value = _json_payload(payloads[keyholder["source"]], "keyholder configuration")
-    if keyholder_value.get("schema_version") != 1:
-        raise ValueError("keyholder configuration schema must be version one")
     if any(_contains_private_field(value) for value in (runner_staged, runner_active, controld_staged, controld_active, keyholder_value)):
         raise ValueError("activation packages cannot contain secrets or credentials")
-    if keyholder_value.get("socket") != SOCKET_POLICY["keyholder"]["path"]:
-        raise ValueError("keyholder configuration does not name its separate socket")
+    if set(keyholder_value) != {"schema_version", "peer", "selectors", "nip98_origin"}:
+        raise ValueError("keyholder configuration differs from the daemon interface")
+    if keyholder_value.get("schema_version") != 1:
+        raise ValueError("keyholder configuration schema must be version one")
+    expected_peer = {
+        "uid": manifest["identities"]["controld"]["uid"],
+        "gid": manifest["identities"]["controld"]["gid"],
+    }
+    if keyholder_value["peer"] != expected_peer:
+        raise ValueError("keyholder peer credentials differ from the controld principal")
+    selectors = keyholder_value["selectors"]
+    if not isinstance(selectors, dict) or set(selectors) != {"ci_event", "nip98", "manifest"}:
+        raise ValueError("keyholder selectors are incomplete")
+    for name, selector in selectors.items():
+        if not isinstance(selector, dict) or set(selector) != {"public_key", "generation"}:
+            raise ValueError(f"keyholder selector is invalid: {name}")
+        if not isinstance(selector["public_key"], str) or not SHA256.fullmatch(selector["public_key"]):
+            raise ValueError(f"keyholder selector public key is invalid: {name}")
+        generation = selector["generation"]
+        if isinstance(generation, bool) or not isinstance(generation, int) or not 1 <= generation <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(f"keyholder selector generation is invalid: {name}")
+    origin = keyholder_value["nip98_origin"]
+    if not isinstance(origin, str) or "\0" in origin:
+        raise ValueError("keyholder NIP-98 origin must use https")
+    parsed_origin = urlsplit(origin)
+    if (
+        parsed_origin.scheme != "https"
+        or not parsed_origin.hostname
+        or parsed_origin.username is not None
+        or parsed_origin.password is not None
+        or parsed_origin.path not in {"", "/"}
+        or parsed_origin.query
+        or parsed_origin.fragment
+    ):
+        raise ValueError("keyholder NIP-98 origin must be one HTTPS origin")
+    if controld_active["keyholder_selectors"] != selectors:
+        raise ValueError("controld keyholder selectors differ from the daemon configuration")
     keyholder_encoded = canonical_json(keyholder_value)
     if SOCKET_POLICY["execd"]["path"].encode() in keyholder_encoded or COMPONENTS["execd"][0].encode() in keyholder_encoded:
         raise ValueError("keyholder configuration must not reach execd")

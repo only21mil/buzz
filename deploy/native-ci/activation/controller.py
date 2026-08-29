@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 from datetime import datetime, timezone
 import grp
 import hashlib
@@ -13,10 +14,12 @@ import os
 from pathlib import Path
 import pwd
 import resource
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 import package as activation_package
@@ -319,7 +322,18 @@ class LiveSystemd:
             "primary_gid": account.pw_gid,
             "home": account.pw_dir,
             "shell": account.pw_shell,
+            "supplementary_groups": sorted(
+                candidate.gr_name for candidate in grp.getgrall() if account.pw_name in candidate.gr_mem
+            ),
         }
+
+    @staticmethod
+    def group(name: str) -> dict[str, object] | None:
+        try:
+            group = grp.getgrnam(name)
+        except KeyError:
+            return None
+        return {"group": group.gr_name, "gid": group.gr_gid, "members": sorted(group.gr_mem)}
 
     def numeric_identity(self, uid: int, gid: int) -> dict[str, str | None]:
         try:
@@ -331,6 +345,13 @@ class LiveSystemd:
         except KeyError:
             group = None
         return {"user": user, "group": group}
+
+    @staticmethod
+    def numeric_group(gid: int) -> str | None:
+        try:
+            return grp.getgrgid(gid).gr_name
+        except KeyError:
+            return None
 
     def socket(self, policy: dict[str, object]) -> dict[str, object]:
         metadata = os.stat(policy["path"], follow_symlinks=False)
@@ -347,7 +368,14 @@ class LiveSystemd:
 class FakeSystemd:
     """Deterministic fake-root state driver. It never invokes systemd."""
 
-    def __init__(self, root: Path, state_path: Path, identities: dict[str, object], socket_policy: dict[str, object]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        state_path: Path,
+        identities: dict[str, object],
+        access_group: dict[str, object],
+        socket_policy: dict[str, object],
+    ) -> None:
         if root == Path("/"):
             raise ValueError("fake systemd requires a non-root filesystem")
         self.root = root
@@ -359,13 +387,14 @@ class FakeSystemd:
             raise ValueError("fake systemd state filename is fixed")
         _require_receipt_root(root)
         self.planned_identities = identities
+        self.access_group = access_group
         self.socket_policy = socket_policy
 
     def _read(self) -> dict[str, Any]:
         value, _raw, metadata = activation_package.parse_json(self.state_path)
         if stat.S_IMODE(metadata.st_mode) != 0o600:
             raise ValueError("fake systemd state must be mode 0600")
-        if set(value) != {"schema", "units", "identities", "sockets"} or value["schema"] != "buzz-ci-fake-systemd-v1":
+        if set(value) != {"schema", "units", "identities", "groups", "sockets"} or value["schema"] != "buzz-ci-fake-systemd-v1":
             raise ValueError("fake systemd state schema is invalid")
         return value
 
@@ -386,10 +415,20 @@ class FakeSystemd:
             expected = {
                 "user": identity["user"], "group": identity["group"], "uid": identity["uid"], "gid": identity["gid"],
                 "primary_gid": identity["gid"], "home": identity["home"], "shell": identity["shell"],
+                "supplementary_groups": identity["supplementary_groups"],
             }
             if existing is not None and existing != expected:
                 raise ValueError(f"fake principal drift: {role}")
             state["identities"][identity["user"]] = expected
+        expected_group = {
+            "group": self.access_group["group"],
+            "gid": self.access_group["gid"],
+            "members": self.access_group["members"],
+        }
+        existing_group = state["groups"].get(self.access_group["group"])
+        if existing_group is not None and existing_group != expected_group:
+            raise ValueError("fake execd access group drift")
+        state["groups"][self.access_group["group"]] = expected_group
         self._write(state)
 
     def tmpfiles(self) -> None:
@@ -417,7 +456,7 @@ class FakeSystemd:
         for policy in self.socket_policy.values():
             if policy["unit"] == name:
                 identity = self.identity(policy["user"]) if policy["user"] != "root" else {"uid": 0}
-                group = self.identity(policy["group"])
+                group = self.group(policy["group"])
                 state["sockets"][policy["path"]] = {
                     "path": policy["path"], "mode": policy["mode"], "uid": identity["uid"], "gid": group["gid"],
                 }
@@ -452,11 +491,28 @@ class FakeSystemd:
     def identity(self, name: str) -> dict[str, object] | None:
         return self._read()["identities"].get(name)
 
+    def group(self, name: str) -> dict[str, object] | None:
+        state = self._read()
+        group = state["groups"].get(name)
+        if group is not None:
+            return group
+        identity = state["identities"].get(name)
+        if identity is None:
+            return None
+        return {"group": identity["group"], "gid": identity["gid"], "members": []}
+
     def numeric_identity(self, uid: int, gid: int) -> dict[str, str | None]:
         state = self._read()
         user = next((name for name, value in state["identities"].items() if value.get("uid") == uid), None)
         group = next((value.get("group") for value in state["identities"].values() if value.get("gid") == gid), None)
         return {"user": user, "group": group}
+
+    def numeric_group(self, gid: int) -> str | None:
+        state = self._read()
+        for name, value in state["groups"].items():
+            if value.get("gid") == gid:
+                return name
+        return next((value.get("group") for value in state["identities"].values() if value.get("gid") == gid), None)
 
     def socket(self, policy: dict[str, object]) -> dict[str, object]:
         value = self._read()["sockets"].get(policy["path"])
@@ -485,11 +541,36 @@ def _identity_readback(driver: LiveSystemd | FakeSystemd, identities: dict[str, 
             "primary_gid": identity["gid"],
             "home": identity["home"],
             "shell": identity["shell"],
+            "supplementary_groups": identity["supplementary_groups"],
         }
         if observed != expected:
             raise ValueError(f"principal drift: {identity['user']}")
         result[role] = {"status": "exact", **observed}
     return result
+
+
+def _access_group_readback(
+    driver: LiveSystemd | FakeSystemd,
+    access_group: dict[str, object],
+    *,
+    allow_absent: bool,
+) -> dict[str, object]:
+    observed = driver.group(access_group["group"])
+    if observed is None:
+        if allow_absent:
+            occupied = driver.numeric_group(access_group["gid"])
+            if occupied is not None:
+                raise ValueError("planned execd access group GID is already occupied")
+            return {"status": "absent"}
+        raise ValueError("required execd access group is absent")
+    expected = {
+        "group": access_group["group"],
+        "gid": access_group["gid"],
+        "members": access_group["members"],
+    }
+    if observed != expected:
+        raise ValueError("execd access group drift")
+    return {"status": "exact", **observed}
 
 
 def _component_readback(manifest: dict[str, Any], root: Path) -> dict[str, object]:
@@ -573,6 +654,7 @@ def preflight(
 ) -> dict[str, object]:
     components = _component_readback(manifest, root)
     principals = _identity_readback(driver, manifest["identities"], allow_absent=True)
+    access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=True)
     managed = _managed_readback(manifest, root, {"absent", "staged"})
     for role in ("runner_config", "controld_config"):
         if managed[role] != "staged":
@@ -584,6 +666,7 @@ def preflight(
         "capacity": 0,
         "components": components,
         "principals": principals,
+        "access_group": access_group,
         "managed_targets": managed,
         "units": units,
         "socket_policy": manifest["socket_policy"],
@@ -681,7 +764,7 @@ def _verify_phase(manifest: dict[str, Any], root: Path, phase: str) -> dict[str,
     return result
 
 
-def _stop_to_zero(driver: LiveSystemd | FakeSystemd) -> None:
+def _stop_zero_errors(driver: LiveSystemd | FakeSystemd) -> list[str]:
     errors: list[str] = []
     try:
         driver.disable(activation_package.PERSISTENT_UNIT)
@@ -696,6 +779,11 @@ def _stop_to_zero(driver: LiveSystemd | FakeSystemd) -> None:
         driver.stop(activation_package.PERSISTENT_UNIT)
     except BaseException as error:
         errors.append(f"stop {activation_package.PERSISTENT_UNIT}: {error}")
+    return errors
+
+
+def _stop_to_zero(driver: LiveSystemd | FakeSystemd) -> None:
+    errors = _stop_zero_errors(driver)
     if errors:
         raise ValueError("capacity-zero stop failures: " + "; ".join(errors))
 
@@ -731,6 +819,7 @@ def stage(
                     "capacity": 0,
                     "managed_targets": _verify_phase(manifest, root, "staged"),
                     "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
+                    "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
                     "units": _zero_readback(driver),
                 }
             raise ValueError(f"activation receipt requires rollback from {existing['state']}")
@@ -744,6 +833,7 @@ def stage(
         driver.daemon_reload()
         _stop_to_zero(driver)
         principals = _identity_readback(driver, manifest["identities"], allow_absent=False)
+        access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=False)
         targets = _verify_phase(manifest, root, "staged")
         units = _zero_readback(driver)
         receipt.update({"state": "staged_zero", "updated_at": utc_now()})
@@ -755,6 +845,7 @@ def stage(
             "activation_id": manifest["activation_id"],
             "preflight": report,
             "principals": principals,
+            "access_group": access_group,
             "managed_targets": targets,
             "units": units,
         }
@@ -774,7 +865,12 @@ def _socket_readback(manifest: dict[str, Any], driver: LiveSystemd | FakeSystemd
             expected_uid = identities["keyholder"]["uid"]
         elif policy["user"] == "buzzci-runner":
             expected_uid = identities["runner"]["uid"]
-        expected_gid = identities["controld"]["gid"] if policy["group"] == "buzzci-controld" else identities["runner"]["gid"]
+        if policy["group"] == activation_package.ACCESS_GROUP_NAME:
+            expected_gid = manifest["access_group"]["gid"]
+        elif policy["group"] == "buzzci-controld":
+            expected_gid = identities["controld"]["gid"]
+        else:
+            raise ValueError(f"socket group is not in the fixed plan: {policy['group']}")
         expected = {"path": policy["path"], "mode": policy["mode"], "uid": expected_uid, "gid": expected_gid}
         if observed != expected:
             raise ValueError(f"socket permission readback differs: {policy['path']}")
@@ -795,6 +891,56 @@ def _active_health(manifest: dict[str, Any], driver: LiveSystemd | FakeSystemd, 
 
 def _limit_output() -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_COMMAND_OUTPUT, MAX_COMMAND_OUTPUT))
+
+
+def _qualification_child_setup() -> None:
+    _limit_output()
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = getattr(libc, "prctl", None)
+    if prctl is None:
+        return
+    if prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: int) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=grace_seconds)
+
+
+def _qualification_credentials(manifest: dict[str, Any], root: Path) -> dict[str, object]:
+    if root != Path("/"):
+        return {}
+    qualification = manifest["qualification"]
+    principal = manifest["identities"][qualification["principal"]]
+    return {
+        "user": principal["uid"],
+        "group": principal["gid"],
+        "extra_groups": [manifest["access_group"]["gid"]],
+    }
 
 
 def _run_qualification(manifest: dict[str, Any], payloads: dict[str, bytes], root: Path) -> dict[str, object]:
@@ -830,19 +976,27 @@ def _run_qualification(manifest: dict[str, Any], payloads: dict[str, bytes], roo
         raise ValueError("qualification executable digest differs")
     os.lseek(program_fd, 0, os.SEEK_SET)
     request = payloads[qualification["request_source"]]
+    credential_options = _qualification_credentials(manifest, root)
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [f"/proc/self/fd/{program_fd}"],
-                input=request,
+                stdin=subprocess.PIPE,
                 stdout=stdout,
                 stderr=stderr,
-                check=False,
-                timeout=qualification["timeout_seconds"],
-                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-                preexec_fn=_limit_output,
+                cwd=str(root),
+                env={},
+                preexec_fn=_qualification_child_setup,
                 pass_fds=(program_fd,),
+                start_new_session=True,
+                umask=0o077,
+                **credential_options,
             )
+            try:
+                process.communicate(input=request, timeout=qualification["timeout_seconds"])
+            except subprocess.TimeoutExpired as error:
+                _terminate_process_group(process, qualification["terminate_grace_seconds"])
+                raise ValueError("qualification command timed out") from error
             stdout.seek(0)
             response = stdout.read(MAX_COMMAND_OUTPUT + 1)
             stderr.seek(0)
@@ -851,8 +1005,8 @@ def _run_qualification(manifest: dict[str, Any], payloads: dict[str, bytes], roo
         os.close(program_fd)
     if len(response) > MAX_COMMAND_OUTPUT or len(error_output) > MAX_COMMAND_OUTPUT:
         raise ValueError("qualification output exceeded its fixed bound")
-    if completed.returncode != 0:
-        raise ValueError(f"qualification command failed with status {completed.returncode}")
+    if process.returncode != 0:
+        raise ValueError(f"qualification command failed with status {process.returncode}")
     response_digest = activation_package.digest(response)
     if response_digest != qualification["expected_response_sha256"]:
         raise ValueError("qualification response digest differs")
@@ -866,12 +1020,37 @@ def _run_qualification(manifest: dict[str, Any], payloads: dict[str, bytes], roo
 
 def _return_to_staged_zero(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
-) -> None:
-    _stop_to_zero(driver)
-    _apply_phase(manifest, payloads, root, "staged")
-    driver.daemon_reload()
-    _verify_phase(manifest, root, "staged")
-    _zero_readback(driver)
+) -> dict[str, object]:
+    errors = _stop_zero_errors(driver)
+    for entry in manifest["entries"]:
+        try:
+            _atomic_write(
+                root,
+                entry["target"],
+                payloads[entry["source"]],
+                activation_package.parse_mode(entry["install_mode"]),
+                entry["uid"],
+                entry["gid"],
+            )
+        except BaseException as error:
+            errors.append(f"restage {entry['role']}: {error}")
+    try:
+        driver.daemon_reload()
+    except BaseException as error:
+        errors.append(f"daemon-reload: {error}")
+    targets: dict[str, str] | None = None
+    units: dict[str, dict[str, str]] | None = None
+    try:
+        targets = _verify_phase(manifest, root, "staged")
+    except BaseException as error:
+        errors.append(f"staged readback: {error}")
+    try:
+        units = _zero_readback(driver)
+    except BaseException as error:
+        errors.append(f"capacity-zero readback: {error}")
+    if errors:
+        raise ValueError("return-to-zero failures: " + "; ".join(errors))
+    return {"managed_targets": targets, "units": units}
 
 
 def activate(
@@ -1051,6 +1230,48 @@ def _restore_prior(receipt: dict[str, Any], manifest: dict[str, Any], root: Path
     return restored
 
 
+def _restore_prior_best_effort(receipt: dict[str, Any], manifest: dict[str, Any], root: Path) -> tuple[list[str], list[str]]:
+    records = _validate_receipt_targets(receipt, manifest)
+    restored: list[str] = []
+    errors: list[str] = []
+    for entry in reversed(manifest["entries"]):
+        record = records[entry["role"]]
+        prior = record["prior"]
+        try:
+            opened = _read_target(root, entry["target"])
+            if prior["exists"]:
+                payload = base64.b64decode(prior["payload_base64"], validate=True)
+                _atomic_write(root, entry["target"], payload, prior["mode"], prior["uid"], prior["gid"])
+            elif opened is not None:
+                _unlink_target(root, entry["target"])
+            restored.append(entry["target"])
+        except BaseException as error:
+            errors.append(f"restore {entry['role']}: {error}")
+    return restored, errors
+
+
+def _prior_readback(receipt: dict[str, Any], manifest: dict[str, Any], root: Path) -> dict[str, str]:
+    records = _validate_receipt_targets(receipt, manifest)
+    result: dict[str, str] = {}
+    for entry in manifest["entries"]:
+        prior = records[entry["role"]]["prior"]
+        opened = _read_target(root, entry["target"])
+        if not prior["exists"]:
+            if opened is not None:
+                raise ValueError(f"prior absence readback failed: {entry['target']}")
+            result[entry["role"]] = "absent"
+            continue
+        if opened is None:
+            raise ValueError(f"prior target readback failed: {entry['target']}")
+        payload, metadata = opened
+        if activation_package.digest(payload) != prior["sha256"] or _metadata_dict(metadata) != {
+            "mode": prior["mode"], "uid": prior["uid"], "gid": prior["gid"],
+        }:
+            raise ValueError(f"prior target readback differs: {entry['target']}")
+        result[entry["role"]] = "restored"
+    return result
+
+
 def rollback(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
@@ -1068,12 +1289,35 @@ def rollback(
         }
     if receipt["state"] not in {"preparing", "stage_failed", "staged_zero", "activating", "active_one", "rollback_failed"}:
         raise ValueError(f"rollback cannot start from receipt state {receipt['state']}")
-    _validate_receipt_targets(receipt, manifest)
-    _restore_prior(receipt, manifest, root, apply=False)
-    _stop_to_zero(driver)
-    restored = _restore_prior(receipt, manifest, root)
-    driver.daemon_reload()
-    units = _zero_readback(driver)
+    try:
+        _validate_receipt_targets(receipt, manifest)
+        _restore_prior(receipt, manifest, root, apply=False)
+    except BaseException as error:
+        receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": str(error)})
+        _write_receipt(root, receipt)
+        raise
+    errors = _stop_zero_errors(driver)
+    restored, restore_errors = _restore_prior_best_effort(receipt, manifest, root)
+    errors.extend(restore_errors)
+    try:
+        driver.daemon_reload()
+    except BaseException as error:
+        errors.append(f"daemon-reload: {error}")
+    units: dict[str, dict[str, str]] | None = None
+    targets: dict[str, str] | None = None
+    try:
+        targets = _prior_readback(receipt, manifest, root)
+    except BaseException as error:
+        errors.append(f"prior target readback: {error}")
+    try:
+        units = _zero_readback(driver)
+    except BaseException as error:
+        errors.append(f"capacity-zero readback: {error}")
+    if errors:
+        combined = "rollback failures: " + "; ".join(errors)
+        receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": combined})
+        _write_receipt(root, receipt)
+        raise ValueError(combined)
     receipt.update({"state": "rolled_back", "updated_at": utc_now(), "last_error": None})
     _write_receipt(root, receipt)
     return {
@@ -1082,6 +1326,7 @@ def rollback(
         "capacity": 0,
         "activation_id": manifest["activation_id"],
         "restored_targets": restored,
+        "managed_targets": targets,
         "retained_principals": sorted(identity["user"] for identity in manifest["identities"].values()),
         "units": units,
     }
@@ -1099,6 +1344,7 @@ def check_current(
             "status": "ready_to_activate", "state": "staged_zero", "capacity": 0,
             "managed_targets": _verify_phase(manifest, root, "staged"),
             "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
+            "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
             "units": _zero_readback(driver),
         }
     if receipt["state"] == "active_one":
@@ -1114,7 +1360,7 @@ def check_current(
 def _driver(root: Path, fake_state: Path | None, manifest: dict[str, Any]) -> LiveSystemd | FakeSystemd:
     if fake_state is None:
         return LiveSystemd(root)
-    return FakeSystemd(root, fake_state, manifest["identities"], manifest["socket_policy"])
+    return FakeSystemd(root, fake_state, manifest["identities"], manifest["access_group"], manifest["socket_policy"])
 
 
 def main() -> int:

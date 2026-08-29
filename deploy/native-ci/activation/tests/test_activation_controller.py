@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ACTIVATION_ROOT = Path(__file__).resolve().parents[1]
@@ -49,16 +50,23 @@ class ActivationFixture:
             "runner": {
                 "user": "buzzci-runner", "group": "buzzci-runner", "uid": 62001, "gid": 62001,
                 "home": "/var/lib/buzzci/runner", "shell": "/usr/sbin/nologin",
+                "supplementary_groups": ["buzzci-execd"],
             },
             "controld": {
                 "user": "buzzci-controld", "group": "buzzci-controld", "uid": 62002, "gid": 62002,
-                "home": "/var/lib/buzzci/controld", "shell": "/usr/sbin/nologin",
+                "home": "/var/lib/buzzci/controld", "shell": "/usr/sbin/nologin", "supplementary_groups": [],
             },
             "keyholder": {
                 "user": "buzzci-keyholder", "group": "buzzci-keyholder", "uid": 62003, "gid": 62003,
-                "home": "/var/lib/buzzci/keyholder", "shell": "/usr/sbin/nologin",
+                "home": "/var/lib/buzzci/keyholder", "shell": "/usr/sbin/nologin", "supplementary_groups": [],
+            },
+            "qualification": {
+                "user": "buzzci-ctl", "group": "buzzci-ctl", "uid": 62004, "gid": 62004,
+                "home": "/var/lib/buzzci/ctl", "shell": "/usr/sbin/nologin",
+                "supplementary_groups": ["buzzci-execd"],
             },
         }
+        self.access_group = {"group": "buzzci-execd", "gid": 62005, "members": ["buzzci-ctl", "buzzci-runner"]}
         self.assets: dict[str, tuple[bytes, int]] = {}
         self.entries: list[dict[str, object]] = []
         self._add_configs()
@@ -72,6 +80,8 @@ class ActivationFixture:
             "request_sha256": activation_package.digest(request),
             "expected_response_sha256": activation_package.digest(RESPONSE),
             "timeout_seconds": 5,
+            "terminate_grace_seconds": 2,
+            "principal": "qualification",
         }
         self.manifest = self._manifest()
         self._write_package()
@@ -123,7 +133,7 @@ class ActivationFixture:
                 "relay_signer": "33" * 32,
                 "broker_socket": "/run/buzzci/execd.sock",
                 "broker_uid": 0,
-                "executor_program": "/usr/bin/env",
+                "executor_program": "/usr/libexec/buzz-ci-executor",
                 "evidence_directory": "/var/lib/buzzci/runner/evidence",
                 "journal_directory": "/var/lib/buzzci/runner/journal",
                 "max_argv_items": 32,
@@ -144,13 +154,27 @@ class ActivationFixture:
             "schema_version": 1, "capacity": 1, "store_root": "/var/lib/buzzci/controld",
             "relay_url": "wss://relay.example.invalid", "runner_socket": "/run/buzzci/runner-control.sock",
             "keyholder_socket": "/run/buzzci/keyholder.sock",
+            "keyholder_uid": 62003, "keyholder_gid": 62003,
+            "keyholder_selectors": {
+                "ci_event": {"public_key": "44" * 32, "generation": 1},
+                "nip98": {"public_key": "55" * 32, "generation": 2},
+                "manifest": {"public_key": "66" * 32, "generation": 3},
+            },
+            "keyholder_timeout_millis": 5000, "keyholder_transport_attempts": 2,
         })
         self._asset_entry(
             "controld_config", activation_package.CONFIG_TARGETS["controld_config"], "controld-staged.json", controld_staged,
             0o600, 62002, 62002, "controld-active.json", controld_active,
         )
         keyholder = activation_package.canonical_json({
-            "schema_version": 1, "socket": "/run/buzzci/keyholder.sock", "key_descriptor": "/etc/buzzci/keyholder/key-v1.json",
+            "schema_version": 1,
+            "peer": {"uid": 62002, "gid": 62002},
+            "selectors": {
+                "ci_event": {"public_key": "44" * 32, "generation": 1},
+                "nip98": {"public_key": "55" * 32, "generation": 2},
+                "manifest": {"public_key": "66" * 32, "generation": 3},
+            },
+            "nip98_origin": "https://relay.example.invalid",
         })
         self._asset_entry(
             "keyholder_config", activation_package.CONFIG_TARGETS["keyholder_config"], "keyholder.json", keyholder,
@@ -158,14 +182,11 @@ class ActivationFixture:
         )
 
     def _render_sysusers(self) -> bytes:
-        return (
-            "g buzzci-runner 62001\n"
-            'u buzzci-runner 62001:62001 "Buzz CI runner" /var/lib/buzzci/runner /usr/sbin/nologin\n'
-            "g buzzci-controld 62002\n"
-            'u buzzci-controld 62002:62002 "Buzz CI controller" /var/lib/buzzci/controld /usr/sbin/nologin\n'
-            "g buzzci-keyholder 62003\n"
-            'u buzzci-keyholder 62003:62003 "Buzz CI keyholder" /var/lib/buzzci/keyholder /usr/sbin/nologin\n'
-        ).encode()
+        return FREEZER._render_sysusers(
+            (ACTIVATION_ROOT / "templates/buzzci-activation.sysusers.in").read_bytes(),
+            self.identities,
+            self.access_group,
+        )
 
     def _add_static_assets(self) -> None:
         source_map = {
@@ -218,6 +239,7 @@ class ActivationFixture:
             "source_commit": "a" * 40,
             "default_state": {"capacity": 0, "enabled": False, "active": False, "provisioned": False},
             "identities": self.identities,
+            "access_group": self.access_group,
             "components": self.components,
             "entries": self.entries,
             "systemd": {
@@ -268,14 +290,16 @@ class ActivationFixture:
                 "SubState": "dead",
                 "UnitFileState": "disabled" if name.endswith(".socket") else "static",
             }
-        state = {"schema": "buzz-ci-fake-systemd-v1", "units": units, "identities": {}, "sockets": {}}
+        state = {"schema": "buzz-ci-fake-systemd-v1", "units": units, "identities": {}, "groups": {}, "sockets": {}}
         self.fake_state = self.root / "var/lib/buzzci/activation-controller/fake-systemd-v1.json"
         write_file(self.fake_state, activation_package.canonical_json(state), 0o600)
         self.fake_state.parent.chmod(0o700)
 
     def load(self):
         manifest, payloads = CONTROLLER.load_package(self.package, live=False)
-        driver = CONTROLLER.FakeSystemd(self.root, self.fake_state, manifest["identities"], manifest["socket_policy"])
+        driver = CONTROLLER.FakeSystemd(
+            self.root, self.fake_state, manifest["identities"], manifest["access_group"], manifest["socket_policy"],
+        )
         return manifest, payloads, driver
 
 
@@ -308,7 +332,7 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["status"], "unchanged")
         self.assertEqual(
             rolled_back["retained_principals"],
-            ["buzzci-controld", "buzzci-keyholder", "buzzci-runner"],
+            ["buzzci-controld", "buzzci-ctl", "buzzci-keyholder", "buzzci-runner"],
         )
         for entry in manifest["entries"]:
             target = self.fixture.root / entry["target"].lstrip("/")
@@ -391,6 +415,174 @@ class ActivationControllerTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "cannot contain"):
             CONTROLLER._validate_phase_configs(manifest, payloads)
+
+    def test_keyholder_and_controld_configs_compose_without_local_secret_descriptors(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        keyholder = json.loads(payloads[entries["keyholder_config"]["source"]])
+        controld = json.loads(payloads[entries["controld_config"]["active_source"]])
+        self.assertEqual(set(keyholder), {"schema_version", "peer", "selectors", "nip98_origin"})
+        self.assertEqual(keyholder["peer"], {"uid": 62002, "gid": 62002})
+        self.assertEqual(controld["keyholder_selectors"], keyholder["selectors"])
+        self.assertEqual((controld["keyholder_uid"], controld["keyholder_gid"]), (62003, 62003))
+        self.assertNotIn("key_descriptor", activation_package.canonical_json(keyholder).decode())
+        self.assertNotIn("private", activation_package.canonical_json(controld).decode())
+
+    def test_keyholder_fd_name_and_execd_access_group_are_exact(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        self.assertEqual(manifest["socket_policy"]["keyholder"]["descriptor_name"], "buzz-ci-keyholder-control")
+        template = (ACTIVATION_ROOT / "templates/20-keyholder-capacity-one.conf").read_text()
+        self.assertNotIn("FileDescriptorName", template)
+        sysusers = FREEZER._render_sysusers(
+            (ACTIVATION_ROOT / "templates/buzzci-activation.sysusers.in").read_bytes(),
+            manifest["identities"],
+            manifest["access_group"],
+        ).decode()
+        self.assertIn("g buzzci-execd 62005\n", sysusers)
+        self.assertIn("m buzzci-runner buzzci-execd\n", sysusers)
+        self.assertIn("m buzzci-ctl buzzci-execd\n", sysusers)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        state = json.loads(self.fixture.fake_state.read_bytes())
+        self.assertEqual(
+            state["groups"],
+            {"buzzci-execd": {"group": "buzzci-execd", "gid": 62005, "members": ["buzzci-ctl", "buzzci-runner"]}},
+        )
+        self.assertEqual(state["identities"]["buzzci-runner"]["supplementary_groups"], ["buzzci-execd"])
+        self.assertEqual(state["identities"]["buzzci-ctl"]["supplementary_groups"], ["buzzci-execd"])
+        self.assertEqual(state["identities"]["buzzci-controld"]["supplementary_groups"], [])
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.assertEqual(driver.socket(manifest["socket_policy"]["execd"])["gid"], 62005)
+
+    def test_executor_program_and_installed_binary_are_manifest_bound(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        runner = next(entry for entry in manifest["entries"] if entry["role"] == "runner_config")
+        active = json.loads(payloads[runner["active_source"]])
+        active["host"]["executor_program"] = "/usr/bin/env"
+        payloads[runner["active_source"]] = activation_package.canonical_json(active)
+        with self.assertRaisesRegex(ValueError, "packaged executor component"):
+            CONTROLLER._validate_phase_configs(manifest, payloads)
+
+        manifest, _payloads, driver = self.fixture.load()
+        executor = next(item for item in manifest["components"] if item["name"] == "executor")
+        program = self.fixture.root / executor["binary_path"].lstrip("/")
+        program.write_bytes(b"drifted-executor\n")
+        program.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "target content drift"):
+            CONTROLLER.preflight(manifest, self.fixture.root, driver, require_dormant=True)
+
+    def test_qualification_process_is_hardened_and_manifest_principal_is_exact(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        component = next(item for item in manifest["components"] if item["name"] == "qualification")
+        program = self.fixture.root / component["binary_path"].lstrip("/")
+        script = b"""#!/usr/bin/python3
+import json
+import os
+status = open('/proc/self/status', encoding='utf-8').read().splitlines()
+no_new_privs = int(next(line.split()[1] for line in status if line.startswith('NoNewPrivs:')))
+print(json.dumps({'egid': os.getegid(), 'euid': os.geteuid(), 'leaked': os.getenv('ACTIVATION_TEST_LEAK'), 'no_new_privs': no_new_privs}, sort_keys=True, separators=(',', ':')))
+"""
+        write_file(program, script, 0o755)
+        component["binary_sha256"] = activation_package.digest(script)
+        expected = activation_package.canonical_json({
+            "egid": os.getegid(), "euid": os.geteuid(), "leaked": None, "no_new_privs": 1,
+        })
+        manifest["qualification"]["expected_response_sha256"] = activation_package.digest(expected)
+        os.environ["ACTIVATION_TEST_LEAK"] = "must-not-cross-exec"
+        try:
+            self.assertEqual(CONTROLLER._run_qualification(manifest, payloads, self.fixture.root)["status"], "passed")
+        finally:
+            del os.environ["ACTIVATION_TEST_LEAK"]
+        self.assertEqual(
+            CONTROLLER._qualification_credentials(manifest, Path("/")),
+            {"user": 62004, "group": 62004, "extra_groups": [62005]},
+        )
+
+    def test_qualification_timeout_kills_descendant_process_group(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        component = next(item for item in manifest["components"] if item["name"] == "qualification")
+        program = self.fixture.root / component["binary_path"].lstrip("/")
+        marker = self.fixture.temporary / "descendant.pid"
+        script = f"""#!/usr/bin/python3
+import os
+import signal
+import time
+pid = os.fork()
+if pid == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open({str(marker)!r}, 'w', encoding='ascii') as stream:
+        stream.write(str(os.getpid()))
+        stream.flush()
+    while True:
+        time.sleep(1)
+while True:
+    time.sleep(1)
+""".encode()
+        write_file(program, script, 0o755)
+        component["binary_sha256"] = activation_package.digest(script)
+        manifest["qualification"]["timeout_seconds"] = 1
+        with self.assertRaisesRegex(ValueError, "timed out"):
+            CONTROLLER._run_qualification(manifest, payloads, self.fixture.root)
+        descendant = int(marker.read_text())
+        for _ in range(20):
+            try:
+                state = Path(f"/proc/{descendant}/stat").read_text().split()[2]
+            except FileNotFoundError:
+                break
+            if state == "Z":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("qualification descendant survived process-group timeout cleanup")
+
+    def test_failed_return_to_zero_attempts_all_steps_and_persists_truth(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        manifest["qualification"]["expected_response_sha256"] = "0" * 64
+        stop_attempts: list[str] = []
+        original_stop = driver.stop
+        original_disable = driver.disable
+
+        def partial_stop(name: str) -> None:
+            stop_attempts.append(name)
+            if name == "buzz-ci-execd.socket":
+                raise ValueError("injected stop failure")
+            original_stop(name)
+
+        def partial_disable(name: str) -> None:
+            if name == activation_package.PERSISTENT_UNIT:
+                raise ValueError("injected disable failure")
+            original_disable(name)
+
+        driver.stop = partial_stop
+        driver.disable = partial_disable
+        with self.assertRaisesRegex(ValueError, "qualification response digest differs"):
+            CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        self.assertEqual(stop_attempts, activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])
+        self.assertEqual(CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")["controld_config"], "staged")
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual(receipt["state"], "rollback_failed")
+        self.assertIn("capacity-zero readback", receipt["last_error"])
+
+    def test_partial_explicit_rollback_attempts_all_stops_and_persists_failure(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        stop_attempts: list[str] = []
+        original_stop = driver.stop
+
+        def partial_stop(name: str) -> None:
+            stop_attempts.append(name)
+            if name == "buzz-ci-runner.socket":
+                raise ValueError("injected explicit rollback failure")
+            original_stop(name)
+
+        driver.stop = partial_stop
+        with self.assertRaisesRegex(ValueError, "rollback failures"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(stop_attempts, activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual(receipt["state"], "rollback_failed")
+        self.assertIn("capacity-zero readback", receipt["last_error"])
 
     def test_qualification_executable_mode_drift_is_rejected(self) -> None:
         manifest, payloads, driver = self.fixture.load()
