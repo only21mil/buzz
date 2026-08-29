@@ -67,9 +67,10 @@ impl ConfiguredRunner {
     pub fn handle(
         &mut self,
         request: RunnerRequest,
+        request_frame_digest: [u8; 32],
         writer: &mut impl Write,
     ) -> Result<(), crate::handler::HandlerError> {
-        self.handler.handle(request, writer)
+        self.handler.handle(request, request_frame_digest, writer)
     }
 }
 
