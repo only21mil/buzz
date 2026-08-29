@@ -369,6 +369,8 @@ def _activation_receipt_state(root: Path, manifest: dict[str, object]) -> str:
         "systemd_before",
         "qualification",
         "capacity_one",
+        "persistent_authorization",
+        "persistent_activation",
         "qualification_zero",
         "last_error",
     }

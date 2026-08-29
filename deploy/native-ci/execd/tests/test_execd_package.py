@@ -413,6 +413,8 @@ class ExecdPackageTests(unittest.TestCase):
                     "systemd_before": {},
                     "qualification": None,
                     "capacity_one": None,
+                    "persistent_authorization": None,
+                    "persistent_activation": None,
                     "qualification_zero": None,
                     "last_error": None,
                 }

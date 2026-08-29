@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Preflight, stage, activate, qualify, or roll back Buzz CI capacity one."""
+"""Preflight, stage, qualify, persist, or roll back Buzz CI capacity one."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import base64
 import ctypes
 from datetime import datetime, timezone
+import fcntl
 import grp
 import hashlib
 import json
@@ -31,6 +32,7 @@ except ModuleNotFoundError:
     import package as activation_package
 
 RECEIPT_PATH = "/var/lib/buzzci/activation-controller/receipt-v1.json"
+OPERATOR_LOCK_PATH = "/var/lib/buzzci/activation-controller/operator.lock"
 ACCEPTANCE_BINDING_PATH = activation_package.ACCEPTANCE_BINDING_PATH
 CONTROLD_ACCEPTANCE_LEDGER_PATH = "/var/lib/buzzci/controld/acceptance-operation-ledger-v1.json"
 FIXED_PACKAGE_PATH = activation_package.FIXED_PACKAGE_PATH
@@ -40,6 +42,9 @@ ZERO_SEQUENCE_SCHEMA = "buzz-ci-activation-qualification-zero-state/v1"
 CAPACITY_ONE_REQUEST_SCHEMA = "buzz-ci-activation-capacity-one-request/v1"
 CAPACITY_ONE_RESPONSE_SCHEMA = "buzz-ci-activation-capacity-one-response/v1"
 CAPACITY_ONE_SEQUENCE_SCHEMA = "buzz-ci-activation-capacity-one-state/v1"
+PERSISTENT_AUTHORIZATION_SCHEMA = "buzz-ci-persistent-capacity-one-authorization/v1"
+PERSISTENT_CAPACITY_ONE_ACTION = "persist-capacity-one"
+PERSISTENT_OPERATION_DOMAIN = b"buzz-ci:persistent-capacity-one:v1\0"
 MAX_ZERO_REQUEST_BYTES = 64 * 1024
 MAX_CAPACITY_ONE_ATTEMPTS = 3
 MAX_SCENARIO_BYTES = 256 * 1024
@@ -205,6 +210,32 @@ def _unlink_target(root: Path, target: str) -> None:
 def _write_receipt(root: Path, receipt: dict[str, object], controld_gid: int) -> None:
     _require_receipt_root(root, controld_gid, allow_private=True)
     _atomic_write(root, RECEIPT_PATH, activation_package.canonical_json(receipt), 0o600, 0 if os.geteuid() == 0 else os.geteuid(), 0 if os.geteuid() == 0 else os.getegid())
+
+
+def _acquire_operator_lock(root: Path, controld_gid: int) -> int:
+    _require_receipt_root(root, controld_gid, allow_private=True)
+    parent_fd, name = activation_package.open_parent_fd(root, OPERATOR_LOCK_PATH, create=True)
+    try:
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    try:
+        metadata = os.fstat(fd)
+        expected_uid, expected_gid = _physical_ids(root, 0, 0)
+        if (
+            not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != expected_uid or metadata.st_gid != expected_gid
+        ):
+            raise ValueError("persistent activation operator lock metadata is unsafe")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("another persistent activation operation is active") from error
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _read_receipt(root: Path) -> dict[str, Any] | None:
@@ -1567,6 +1598,8 @@ def _new_receipt(
         ),
         "qualification": None,
         "capacity_one": None,
+        "persistent_authorization": None,
+        "persistent_activation": None,
         "qualification_zero": None,
         "last_error": None,
     }
@@ -1576,7 +1609,8 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     expected_keys = {
         "schema", "activation_id", "package_digest", "source_commit", "state", "created_at", "updated_at",
         "principals_retained_on_rollback", "targets", "acceptance_generated", "acceptance_ledger_prior",
-        "fixed_package", "systemd_before", "qualification", "capacity_one", "qualification_zero", "last_error",
+        "fixed_package", "systemd_before", "qualification", "capacity_one", "persistent_authorization",
+        "persistent_activation", "qualification_zero", "last_error",
     }
     if set(receipt) != expected_keys or receipt.get("schema") != activation_package.RECEIPT_SCHEMA:
         raise ValueError("activation receipt shape differs")
@@ -1599,6 +1633,8 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
         raise ValueError("receipt fixed activation package binding differs")
     _validate_qualification_state(receipt["qualification"], receipt)
     _validate_capacity_one_state(receipt["capacity_one"], receipt)
+    _validate_persistent_authorization(receipt["persistent_authorization"], receipt)
+    _validate_capacity_one_state(receipt["persistent_activation"], receipt)
     _validate_qualification_zero_state(receipt["qualification_zero"], receipt)
 
 
@@ -1719,6 +1755,34 @@ def _validate_capacity_one_state(value: object, receipt: dict[str, Any]) -> None
         or value["initial_runner_generation"] != request.get("runner_generation")
     ):
         raise ValueError("capacity-one action scope differs from production qualification")
+
+
+def _validate_persistent_authorization(value: object, receipt: dict[str, Any]) -> None:
+    if value is None:
+        if receipt.get("persistent_activation") is not None:
+            raise ValueError("persistent activation lacks acceptance authorization")
+        return
+    required = {
+        "schema", "activation_id", "activation_package_digest", "integrated_candidate_sha",
+        "scenario_sha256", "acceptance_scenario_sha256", "acceptance_receipt_sha256",
+        "verifier_output_sha256", "zero_receipt_sha256", "operation_id",
+    }
+    if not isinstance(value, dict) or set(value) != required or value.get("schema") != PERSISTENT_AUTHORIZATION_SCHEMA:
+        raise ValueError("persistent activation authorization shape differs")
+    if (
+        value["activation_id"] != receipt["activation_id"]
+        or value["activation_package_digest"] != receipt["package_digest"]
+        or value["integrated_candidate_sha"] != receipt["source_commit"]
+    ):
+        raise ValueError("persistent activation authorization belongs to a different package")
+    for field in (
+        "scenario_sha256", "acceptance_scenario_sha256", "acceptance_receipt_sha256",
+        "verifier_output_sha256", "zero_receipt_sha256", "operation_id",
+    ):
+        _scenario_hex(value[field], {64}, f"persistent activation {field}")
+    activation = receipt.get("persistent_activation")
+    if activation is not None and activation.get("operation_id") != value["operation_id"]:
+        raise ValueError("persistent activation operation differs from its authorization")
 
 
 def _validate_qualification_zero_state(value: object, receipt: dict[str, Any]) -> None:
@@ -2097,6 +2161,169 @@ def _receipt_sha256(root: Path) -> str:
     if receipt is None:
         raise ValueError("activation receipt is absent")
     return activation_package.digest(raw)
+
+
+def _read_operator_evidence(path: Path) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_mode & 0o022:
+            raise ValueError(f"operator evidence file is unsafe: {path}")
+        if os.geteuid() == 0 and metadata.st_uid != 0:
+            raise ValueError(f"operator evidence file is not root-owned: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(fd, min(1024 * 1024, activation_package.MAX_JSON_BYTES + 1 - total)):
+            total += len(chunk)
+            if total > activation_package.MAX_JSON_BYTES:
+                raise ValueError(f"operator evidence file exceeds its byte limit: {path}")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _open_verified_program(
+    root: Path, target: str, expected: dict[str, object], limit: int,
+) -> int:
+    parent_fd, name = activation_package.open_parent_fd(root, target)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    try:
+        metadata = os.fstat(fd)
+        expected_uid, expected_gid = _physical_ids(root, expected["uid"], expected["gid"])
+        expected_mode = activation_package.parse_mode(expected["mode"])
+        if (
+            not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+            or metadata.st_uid != expected_uid or metadata.st_gid != expected_gid
+        ):
+            raise ValueError(f"program metadata drift: {target}")
+        hasher = hashlib.sha256()
+        total = 0
+        while chunk := os.read(fd, min(1024 * 1024, limit + 1 - total)):
+            total += len(chunk)
+            if total > limit:
+                raise ValueError(f"program exceeds byte limit: {target}")
+            hasher.update(chunk)
+        if hasher.hexdigest() != expected["sha256"]:
+            raise ValueError(f"program content drift: {target}")
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _acceptance_authorization(
+    manifest: dict[str, Any], root: Path, scenario_path: Path, acceptance_receipt_path: Path,
+) -> dict[str, object]:
+    scenario_raw = _read_operator_evidence(scenario_path)
+    acceptance_raw = _read_operator_evidence(acceptance_receipt_path)
+    try:
+        scenario = json.loads(scenario_raw, object_pairs_hook=activation_package.reject_duplicates)
+        acceptance = json.loads(acceptance_raw, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("persistent activation evidence JSON is invalid") from error
+    if not isinstance(scenario, dict) or not isinstance(acceptance, dict):
+        raise ValueError("persistent activation evidence must contain JSON objects")
+    binding = _acceptance_binding(manifest, scenario)
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("persistent activation requires an activation receipt")
+    _bind_receipt(receipt, manifest)
+    installed_binding = _binding_from_receipt(receipt)
+    if binding != installed_binding:
+        raise ValueError("persistent activation scenario differs from the installed acceptance binding")
+
+    verifier_component = next(item for item in manifest["components"] if item["name"] == "receipt_verifier")
+    verifier_fd = _open_verified_program(root, verifier_component["binary_path"], {
+        "sha256": verifier_component["binary_sha256"], "mode": verifier_component["mode"],
+        "uid": verifier_component["uid"], "gid": verifier_component["gid"],
+    }, MAX_BINARY_BYTES)
+    receipt_root = _require_receipt_root(root, manifest["identities"]["controld"]["gid"], allow_private=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="authorization-", dir=receipt_root) as temporary:
+            temporary_root = Path(temporary)
+            os.chmod(temporary_root, 0o700)
+            frozen_scenario = temporary_root / "scenario.json"
+            frozen_receipt = temporary_root / "acceptance-receipt.json"
+            _atomic_write(temporary_root, "/scenario.json", scenario_raw, 0o600, 0, 0)
+            _atomic_write(temporary_root, "/acceptance-receipt.json", acceptance_raw, 0o600, 0, 0)
+            completed = subprocess.run(
+                [f"/proc/self/fd/{verifier_fd}", str(frozen_scenario), str(frozen_receipt)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                cwd=str(receipt_root),
+                timeout=60,
+                check=False,
+                pass_fds=(verifier_fd,),
+                preexec_fn=_qualification_child_setup,
+                start_new_session=True,
+                umask=0o077,
+            )
+    finally:
+        os.close(verifier_fd)
+    expected_output = b'{"outcome":"pass","status":"verified"}\n'
+    if completed.returncode != 0 or completed.stdout != expected_output or completed.stderr:
+        raise ValueError("acceptance receipt verifier did not return its exact pass result")
+
+    scenario_sha256 = installed_binding["scenario_sha256"]
+    zero_transition = acceptance.get("zero_transition") if isinstance(acceptance, dict) else None
+    phases = zero_transition.get("phases") if isinstance(zero_transition, dict) else None
+    final_response = phases[-1].get("response") if isinstance(phases, list) and len(phases) == 2 and isinstance(phases[-1], dict) else None
+    zero_receipt_sha256 = final_response.get("controller_receipt_sha256") if isinstance(final_response, dict) else None
+    if (
+        acceptance.get("outcome") != "pass"
+        or acceptance.get("scenario_sha256") != scenario_sha256
+        or acceptance.get("integrated_candidate_sha") != manifest["source_commit"]
+        or not isinstance(zero_receipt_sha256, str)
+    ):
+        raise ValueError("acceptance receipt does not authorize this persistent activation")
+    _scenario_hex(zero_receipt_sha256, {64}, "persistent activation final zero receipt digest")
+    authorization_base = {
+        "schema": PERSISTENT_AUTHORIZATION_SCHEMA,
+        "activation_id": manifest["activation_id"],
+        "activation_package_digest": manifest["package_digest"],
+        "integrated_candidate_sha": manifest["source_commit"],
+        "scenario_sha256": scenario_sha256,
+        "acceptance_scenario_sha256": activation_package.digest(scenario_raw),
+        "acceptance_receipt_sha256": activation_package.digest(acceptance_raw),
+        "verifier_output_sha256": activation_package.digest(expected_output),
+        "zero_receipt_sha256": zero_receipt_sha256,
+    }
+    operation_id = activation_package.digest(
+        PERSISTENT_OPERATION_DOMAIN + activation_package.canonical_json(authorization_base),
+    )
+    authorization = {**authorization_base, "operation_id": operation_id}
+    existing = receipt["persistent_authorization"]
+    if existing is not None:
+        if existing != authorization:
+            raise ValueError("persistent activation authorization replay differs")
+        return authorization
+    if _receipt_sha256(root) != zero_receipt_sha256:
+        raise ValueError("acceptance receipt is stale or does not bind the current finalized zero receipt")
+    return authorization
+
+
+def _persistent_capacity_one_request(authorization: dict[str, Any], receipt: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    binding = _binding_from_receipt(receipt)
+    fixture = binding["fixture"]
+    request = {
+        "schema_version": CAPACITY_ONE_REQUEST_SCHEMA,
+        "action": CAPACITY_ONE_WIRE_ACTION,
+        "activation_id": authorization["activation_id"],
+        "activation_package_digest": authorization["activation_package_digest"],
+        "scenario_sha256": authorization["scenario_sha256"],
+        "initial_controller_generation": fixture["controller_generation"],
+        "initial_runner_generation": fixture["runner_generation"],
+        "operation_id": authorization["operation_id"],
+    }
+    return _parse_capacity_one_request(_wire_json(request), receipt)
 
 
 def _zero_response(request: dict[str, Any], root: Path) -> dict[str, object]:
@@ -3097,13 +3324,16 @@ def _return_to_staged_zero(
 def _set_capacity_one(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
     driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
+    *, state_field: str = "capacity_one",
 ) -> dict[str, object]:
     receipt = _read_receipt(root)
     if receipt is None:
         raise ValueError("capacity-one action requires an activation receipt")
     _bind_receipt(receipt, manifest)
     _verify_fixed_package(manifest, root)
-    existing = receipt["capacity_one"]
+    if state_field not in {"capacity_one", "persistent_activation"}:
+        raise ValueError("capacity-one state field is invalid")
+    existing = receipt[state_field]
     expected_binding = {
         "activation_id": request["activation_id"],
         "activation_package_digest": request["activation_package_digest"],
@@ -3136,7 +3366,7 @@ def _set_capacity_one(
             "processes_after": None,
             "last_error": None,
         }
-        receipt["capacity_one"] = state
+        receipt[state_field] = state
     _verify_phase(manifest, root, "staged")
     _verify_generated(root, receipt["acceptance_generated"], phase="staged")
     _keyholder_config_readback(manifest, root, payloads)
@@ -3197,6 +3427,133 @@ def _set_capacity_one(
         raise
 
 
+def _restore_finalized_zero_after_persistent_prepare(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, receipt: dict[str, Any],
+) -> list[str]:
+    errors = _qualification_finalize_stop_errors(driver)
+    try:
+        _apply_staged_configs(manifest, payloads, root)
+        _apply_generated(root, receipt["acceptance_generated"], phase="staged")
+    except BaseException as error:
+        errors.append(f"restage persistent preparation: {error}")
+    stopped = True
+    for unit in ("buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service"):
+        try:
+            if driver.unit(unit)["ActiveState"] != "inactive":
+                stopped = False
+                errors.append(f"refuse binding restoration while {unit} remains active")
+        except BaseException as error:
+            stopped = False
+            errors.append(f"read {unit} before binding restoration: {error}")
+    if stopped:
+        try:
+            _restore_binding_prior(receipt, root)
+        except BaseException as error:
+            errors.append(f"restore controld acceptance binding: {error}")
+    try:
+        _finalized_zero_readback(manifest, root, driver)
+    except BaseException as error:
+        errors.append(f"finalized-zero recovery readback: {error}")
+    return errors
+
+
+def _persist_capacity_one_locked(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, scenario_path: Path, acceptance_receipt_path: Path,
+) -> dict[str, object]:
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("persistent activation requires an activation receipt")
+    _bind_receipt(receipt, manifest)
+    _verify_fixed_package(manifest, root)
+    authorization = _acceptance_authorization(manifest, root, scenario_path, acceptance_receipt_path)
+    if receipt["persistent_authorization"] is None:
+        zero = receipt["qualification_zero"]
+        if receipt["state"] != "staged_zero" or not isinstance(zero, dict) or zero["phase"] != "finalized":
+            raise ValueError("persistent activation requires a verified canary returned to finalized capacity zero")
+        already_prepared = False
+        try:
+            _finalized_zero_readback(manifest, root, driver)
+        except ValueError as finalized_error:
+            try:
+                _verify_phase(manifest, root, "staged")
+                _verify_generated(root, receipt["acceptance_generated"], phase="staged")
+                _staged_zero_readback(manifest, root, driver)
+                already_prepared = True
+            except ValueError:
+                raise finalized_error
+        if not already_prepared:
+            try:
+                _return_to_staged_zero(
+                    manifest, payloads, root, driver, receipt["acceptance_generated"],
+                    keep_acceptance_control=True,
+                )
+            except BaseException as error:
+                recovery_errors = _restore_finalized_zero_after_persistent_prepare(
+                    manifest, payloads, root, driver, receipt,
+                )
+                if recovery_errors:
+                    combined = f"persistent preparation={error}; recovery=" + "; ".join(recovery_errors)
+                    receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": combined})
+                    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+                    raise ValueError(combined) from error
+                raise
+        receipt = _read_receipt(root)
+        if receipt is None:
+            raise ValueError("activation receipt disappeared during persistent preparation")
+        _bind_receipt(receipt, manifest)
+        receipt.update({
+            "state": "qualified_closed", "persistent_authorization": authorization,
+            "updated_at": utc_now(), "last_error": None,
+        })
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    elif receipt["persistent_authorization"] != authorization:
+        raise ValueError("persistent activation authorization replay differs")
+
+    receipt = _read_receipt(root)
+    if receipt is None:
+        raise ValueError("activation receipt disappeared before persistent cutover")
+    _bind_receipt(receipt, manifest)
+    request, request_sha256 = _persistent_capacity_one_request(authorization, receipt)
+    response = _set_capacity_one(
+        manifest, payloads, root, driver, request, request_sha256,
+        state_field="persistent_activation",
+    )
+    final_receipt = _read_receipt(root)
+    if final_receipt is None:
+        raise ValueError("activation receipt disappeared after persistent cutover")
+    _bind_receipt(final_receipt, manifest)
+    state = final_receipt["persistent_activation"]
+    if not isinstance(state, dict) or state["phase"] != "active_one":
+        raise ValueError("persistent activation did not reach its terminal state")
+    readback = _active_capacity_one_readback(manifest, root, driver, state["processes_before"])
+    return {
+        "status": "persistent_active", "state": "active_one", "capacity": 1,
+        "activation_id": manifest["activation_id"], "activation_package_digest": manifest["package_digest"],
+        "integrated_candidate_sha": manifest["source_commit"], "operation_id": authorization["operation_id"],
+        "acceptance_receipt_sha256": authorization["acceptance_receipt_sha256"],
+        "verifier_output_sha256": authorization["verifier_output_sha256"],
+        "controller_response_sha256": activation_package.digest(_wire_json(response)),
+        "readback_sha256": activation_package.digest(activation_package.canonical_json(readback)),
+        "receipt_sha256": _receipt_sha256(root),
+    }
+
+
+def persist_capacity_one(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, scenario_path: Path, acceptance_receipt_path: Path,
+) -> dict[str, object]:
+    lock_fd = _acquire_operator_lock(root, manifest["identities"]["controld"]["gid"])
+    try:
+        return _persist_capacity_one_locked(
+            manifest, payloads, root, driver, scenario_path, acceptance_receipt_path,
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def activate(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
@@ -3205,7 +3562,7 @@ def activate(
         raise ValueError("activation must be staged before capacity one")
     _bind_receipt(receipt, manifest)
     if receipt["state"] == "active_one":
-        action = receipt["capacity_one"]
+        action = receipt["persistent_activation"] or receipt["capacity_one"]
         if not isinstance(action, dict) or action["phase"] != "active_one":
             raise ValueError("active capacity one lacks the fixed controller action receipt")
         return {
@@ -3647,7 +4004,7 @@ def check_current(
             "staged_zero": _staged_zero_readback(manifest, root, driver),
         }
     if receipt["state"] == "active_one":
-        action = receipt["capacity_one"]
+        action = receipt["persistent_activation"] or receipt["capacity_one"]
         if not isinstance(action, dict) or action["phase"] != "active_one":
             raise ValueError("active capacity one lacks the fixed controller action receipt")
         return {
@@ -3678,19 +4035,40 @@ def _driver(root: Path, fake_state: Path | None, manifest: dict[str, Any]) -> Li
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     ordinary_actions = ("check", "stage", "activate", "qualify", "rollback")
-    parser.add_argument("action", choices=ordinary_actions + (CAPACITY_ONE_CLI_ACTION,) + tuple(ZERO_CLI_ACTIONS))
+    parser.add_argument(
+        "action",
+        choices=ordinary_actions + (CAPACITY_ONE_CLI_ACTION, PERSISTENT_CAPACITY_ONE_ACTION) + tuple(ZERO_CLI_ACTIONS),
+    )
     parser.add_argument("--package", type=Path)
     parser.add_argument("--scenario", type=Path)
+    parser.add_argument("--acceptance-receipt", type=Path)
     parser.add_argument("--root", type=Path, default=Path("/"))
     parser.add_argument("--fake-systemd-state", type=Path)
     arguments = parser.parse_args()
     root = Path(os.path.abspath(arguments.root))
     live = arguments.fake_systemd_state is None
     try:
+        if arguments.action == PERSISTENT_CAPACITY_ONE_ACTION:
+            if (
+                arguments.package is not None or root != Path("/") or arguments.fake_systemd_state is not None
+                or arguments.scenario is None or arguments.acceptance_receipt is None
+            ):
+                raise ValueError(
+                    "persistent capacity-one accepts only --scenario and --acceptance-receipt on the live root"
+                )
+            if os.geteuid() != 0:
+                raise PermissionError("persistent capacity-one requires root")
+            manifest, payloads = load_package(Path(FIXED_PACKAGE_PATH), live=True)
+            result = persist_capacity_one(
+                manifest, payloads, root, LiveSystemd(root),
+                arguments.scenario, arguments.acceptance_receipt,
+            )
+            print(activation_package.canonical_json(result).decode(), end="")
+            return 0
         if arguments.action == CAPACITY_ONE_CLI_ACTION:
             if (
                 arguments.package is not None or arguments.scenario is not None or root != Path("/")
-                or arguments.fake_systemd_state is not None
+                or arguments.fake_systemd_state is not None or arguments.acceptance_receipt is not None
             ):
                 raise ValueError("capacity-one action accepts no package, scenario, root, or fake-state arguments")
             if os.geteuid() != 0:
@@ -3710,7 +4088,7 @@ def main() -> int:
         if arguments.action in ZERO_CLI_ACTIONS:
             if (
                 arguments.package is not None or arguments.scenario is not None or root != Path("/")
-                or arguments.fake_systemd_state is not None
+                or arguments.fake_systemd_state is not None or arguments.acceptance_receipt is not None
             ):
                 raise ValueError("qualification-zero actions accept no package, scenario, root, or fake-state arguments")
             if os.geteuid() != 0:
@@ -3733,6 +4111,8 @@ def main() -> int:
             return 0
         if arguments.package is None:
             raise ValueError(f"{arguments.action} requires --package")
+        if arguments.acceptance_receipt is not None:
+            raise ValueError("--acceptance-receipt is accepted only by persist-capacity-one")
         manifest, payloads = load_package(arguments.package, live=live)
         driver = _driver(root, arguments.fake_systemd_state, manifest)
         if arguments.scenario is not None and arguments.action != "stage":
