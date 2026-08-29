@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use buzz_ci_broker_protocol::v2::{self, BrokerResponse, FrameHeader, Request};
-use buzz_ci_broker_protocol::{ResponseCode, HEADER_SIZE};
+use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, ResponseCode, HEADER_SIZE};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -121,6 +121,25 @@ struct ReplayDocument {
 struct ReplayEntry {
     request_digest: String,
     response_frame: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admitted_binding: Option<AdmittedBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdmittedBinding {
+    attempt_id: String,
+    execution_binding_digest: String,
+    actor_pubkey: String,
+    signed_request_digest: String,
+    run_id: String,
+    workflow_digest: String,
+    job_intent_digest: String,
+    tip_oid: String,
+    attempt: u32,
+    generation: u64,
+    accepted_at: u64,
+    lease_generation: u64,
 }
 
 pub struct DurableReplayMap {
@@ -178,10 +197,29 @@ impl DurableReplayMap {
             ReplayEntry {
                 request_digest: digest,
                 response_frame: None,
+                admitted_binding: None,
             },
         );
         self.persist()?;
         Ok(ReplayDecision::Forward)
+    }
+
+    fn cached_exact(
+        &self,
+        request_id: [u8; 16],
+        request_digest: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, ProxyError> {
+        let Some(entry) = self.document.entries.get(&hex::encode(request_id)) else {
+            return Ok(None);
+        };
+        if entry.request_digest != hex::encode(request_digest) {
+            return Err(ProxyError::ReplayConflict);
+        }
+        entry
+            .response_frame
+            .as_ref()
+            .map(|response| hex::decode(response).map_err(|_| ProxyError::ReplayUnavailable))
+            .transpose()
     }
 
     fn complete(
@@ -207,6 +245,87 @@ impl DurableReplayMap {
             return Err(ProxyError::ReplayConflict);
         }
         entry.response_frame = Some(encoded);
+        self.persist()
+    }
+
+    fn admitted_binding_for_cancel(
+        &self,
+        request: v2::CancelAttemptRequest,
+    ) -> Result<AdmittedBinding, ProxyError> {
+        let attempt_id = hex::encode(request.attempt_id);
+        let mut found: Option<AdmittedBinding> = None;
+        for candidate in self
+            .document
+            .entries
+            .values()
+            .filter_map(|entry| entry.admitted_binding.as_ref())
+            .filter(|binding| binding.attempt_id == attempt_id)
+        {
+            if let Some(current) = found.as_mut() {
+                if !current.same_identity(candidate) {
+                    return Err(ProxyError::ReplayUnavailable);
+                }
+                current.generation = current.generation.max(candidate.generation);
+            } else {
+                found = Some(candidate.clone());
+            }
+        }
+        let binding = found.ok_or(ProxyError::InvalidActivationCoordinates)?;
+        if binding.execution_binding_digest != hex::encode(request.execution_binding_digest)
+            || binding.actor_pubkey != hex::encode(request.actor_pubkey)
+        {
+            return Err(ProxyError::InvalidActivationCoordinates);
+        }
+        Ok(binding)
+    }
+
+    fn remember_admission(
+        &mut self,
+        request_id: [u8; 16],
+        request: v2::AdmitAttemptRequest,
+        response: BrokerResponse,
+    ) -> Result<(), ProxyError> {
+        let binding = AdmittedBinding::from_admission(request, response)?;
+        let entry = self
+            .document
+            .entries
+            .get_mut(&hex::encode(request_id))
+            .ok_or(ProxyError::ReplayUnavailable)?;
+        if entry.response_frame.is_none() {
+            return Err(ProxyError::ReplayUnavailable);
+        }
+        if let Some(current) = entry.admitted_binding.as_ref() {
+            return current
+                .same_identity(&binding)
+                .then_some(())
+                .ok_or(ProxyError::ReplayConflict);
+        }
+        entry.admitted_binding = Some(binding);
+        self.persist()
+    }
+
+    fn remember_cancelled(
+        &mut self,
+        admitted: &AdmittedBinding,
+        response: BrokerResponse,
+    ) -> Result<(), ProxyError> {
+        let mut found = false;
+        for binding in self
+            .document
+            .entries
+            .values_mut()
+            .filter_map(|entry| entry.admitted_binding.as_mut())
+            .filter(|binding| binding.attempt_id == admitted.attempt_id)
+        {
+            if !binding.same_identity(admitted) {
+                return Err(ProxyError::ReplayUnavailable);
+            }
+            binding.generation = response.generation;
+            found = true;
+        }
+        if !found {
+            return Err(ProxyError::ReplayUnavailable);
+        }
         self.persist()
     }
 
@@ -246,6 +365,58 @@ impl DurableReplayMap {
     }
 }
 
+impl AdmittedBinding {
+    fn from_admission(
+        request: v2::AdmitAttemptRequest,
+        response: BrokerResponse,
+    ) -> Result<Self, ProxyError> {
+        let tip_oid = response.tip_oid.ok_or(ProxyError::InvalidExecdResponse)?;
+        Ok(Self {
+            attempt_id: hex::encode(response.attempt_id),
+            execution_binding_digest: hex::encode(response.execution_binding_digest),
+            actor_pubkey: hex::encode(request.actor_pubkey),
+            signed_request_digest: hex::encode(request.signed_request_digest),
+            run_id: hex::encode(request.run_id),
+            workflow_digest: hex::encode(request.workflow_digest),
+            job_intent_digest: hex::encode(request.job_intent_digest),
+            tip_oid: encode_git_oid(tip_oid),
+            attempt: request.attempt,
+            generation: response.generation,
+            accepted_at: response.accepted_at,
+            lease_generation: response.lease_generation,
+        })
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.attempt_id == other.attempt_id
+            && self.execution_binding_digest == other.execution_binding_digest
+            && self.actor_pubkey == other.actor_pubkey
+            && self.signed_request_digest == other.signed_request_digest
+            && self.run_id == other.run_id
+            && self.workflow_digest == other.workflow_digest
+            && self.job_intent_digest == other.job_intent_digest
+            && self.tip_oid == other.tip_oid
+            && self.attempt == other.attempt
+            && self.accepted_at == other.accepted_at
+            && self.lease_generation == other.lease_generation
+    }
+
+    fn is_valid(&self) -> bool {
+        decode_nonzero::<16>(&self.attempt_id).is_some()
+            && decode_nonzero::<32>(&self.execution_binding_digest).is_some()
+            && decode_nonzero::<32>(&self.actor_pubkey).is_some()
+            && decode_nonzero::<32>(&self.signed_request_digest).is_some()
+            && decode_nonzero::<16>(&self.run_id).is_some()
+            && decode_nonzero::<32>(&self.workflow_digest).is_some()
+            && decode_nonzero::<32>(&self.job_intent_digest).is_some()
+            && valid_git_oid(&self.tip_oid)
+            && self.attempt != 0
+            && self.generation != 0
+            && self.accepted_at != 0
+            && self.lease_generation != 0
+    }
+}
+
 fn read_replay_document(path: &Path) -> Result<ReplayDocument, ProxyError> {
     let file = OpenOptions::new()
         .read(true)
@@ -278,11 +449,34 @@ fn read_replay_document(path: &Path) -> Result<ReplayDocument, ProxyError> {
                         .map(|value| value.len() < HEADER_SIZE || value.len() > v2::MAX_FRAME_SIZE)
                         .unwrap_or(true)
                 })
+                || entry
+                    .admitted_binding
+                    .as_ref()
+                    .is_some_and(|binding| !binding.is_valid())
         })
+        || !admitted_bindings_are_consistent(&document)
     {
         return Err(ProxyError::ReplayUnavailable);
     }
     Ok(document)
+}
+
+fn admitted_bindings_are_consistent(document: &ReplayDocument) -> bool {
+    let mut observed: BTreeMap<&str, &AdmittedBinding> = BTreeMap::new();
+    for binding in document
+        .entries
+        .values()
+        .filter_map(|entry| entry.admitted_binding.as_ref())
+    {
+        if observed
+            .get(binding.attempt_id.as_str())
+            .is_some_and(|current| !current.same_identity(binding))
+        {
+            return false;
+        }
+        observed.insert(binding.attempt_id.as_str(), binding);
+    }
+    true
 }
 
 pub struct ConnectedExecd {
@@ -364,8 +558,28 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
             return Err(ProxyError::InvalidControlFrame);
         }
         validate_request(&self.settings, header, request, unix_now()?)?;
+        let admitted_binding = match request {
+            Request::CancelAttempt(request) => {
+                Some(self.replay.admitted_binding_for_cancel(request)?)
+            }
+            _ => None,
+        };
         let request_digest: [u8; 32] = Sha256::digest(&frame).into();
-        let response = match self.replay.reserve(header.request_id, request_digest)? {
+        let stale_cancel = matches!(
+            (request, admitted_binding.as_ref()),
+            (Request::CancelAttempt(request), Some(binding))
+                if request.expected_generation != binding.generation
+        );
+        let decision = if stale_cancel {
+            ReplayDecision::Cached(
+                self.replay
+                    .cached_exact(header.request_id, request_digest)?
+                    .ok_or(ProxyError::InvalidActivationCoordinates)?,
+            )
+        } else {
+            self.replay.reserve(header.request_id, request_digest)?
+        };
+        let response = match decision {
             ReplayDecision::Cached(response) => response,
             ReplayDecision::Forward => {
                 let response = self.forward(header, request, &frame)?;
@@ -375,6 +589,26 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
             }
         };
         validate_encoded_response(header, request, &response)?;
+        match request {
+            Request::AdmitAttempt(request) => {
+                let decoded = v2::decode_response(header, &response)
+                    .map_err(|_| ProxyError::InvalidExecdResponse)?;
+                if matches!(decoded.code, ResponseCode::Ok | ResponseCode::Existing) {
+                    self.replay
+                        .remember_admission(header.request_id, request, decoded)?;
+                }
+            }
+            Request::CancelAttempt(request) => {
+                let decoded = v2::decode_response(header, &response)
+                    .map_err(|_| ProxyError::InvalidExecdResponse)?;
+                let admitted = admitted_binding
+                    .as_ref()
+                    .ok_or(ProxyError::InvalidActivationCoordinates)?;
+                validate_cancelled_binding(request, decoded, admitted)?;
+                self.replay.remember_cancelled(admitted, decoded)?;
+            }
+            _ => {}
+        }
         control
             .write_all(&response)
             .and_then(|()| control.flush())
@@ -528,6 +762,19 @@ fn validate_request(
                 return Err(ProxyError::InvalidActivationCoordinates);
             }
         }
+        Request::CancelAttempt(request) => {
+            if request.attempt_id == [0; 16]
+                || request.execution_binding_digest == [0; 32]
+                || request.actor_pubkey == [0; 32]
+                || request.cancel_digest == [0; 32]
+                || request.issued_at == 0
+                || request.issued_at > now
+                || now >= request.expires_at
+                || request.expected_generation == 0
+            {
+                return Err(ProxyError::InvalidActivationCoordinates);
+            }
+        }
         Request::DescribeAttemptEvidence(request) => {
             if v2::evidence_request_frame_digest(header, &Request::DescribeAttemptEvidence(request))
                 != Some(request.request_frame_digest)
@@ -542,15 +789,17 @@ fn validate_request(
                 return Err(ProxyError::InvalidActivationCoordinates);
             }
         }
-        Request::Hello(_)
-        | Request::CancelAttempt(_)
-        | Request::AdmitQualification(_)
-        | Request::CompleteAttempt(_) => return Err(ProxyError::InvalidActivationCoordinates),
+        Request::Hello(_) | Request::AdmitQualification(_) | Request::CompleteAttempt(_) => {
+            return Err(ProxyError::InvalidActivationCoordinates)
+        }
     }
     Ok(())
 }
 
 fn validate_response(request: Request, response: BrokerResponse) -> Result<(), ProxyError> {
+    if let Request::CancelAttempt(request) = request {
+        return validate_cancel_response(request, response);
+    }
     if !matches!(response.code, ResponseCode::Ok | ResponseCode::Existing) {
         return Ok(());
     }
@@ -582,6 +831,42 @@ fn validate_response(request: Request, response: BrokerResponse) -> Result<(), P
         | Request::ReadAttemptEvidence(_) => false,
     };
     bound.then_some(()).ok_or(ProxyError::InvalidExecdResponse)
+}
+
+fn validate_cancel_response(
+    request: v2::CancelAttemptRequest,
+    response: BrokerResponse,
+) -> Result<(), ProxyError> {
+    let valid = matches!(response.code, ResponseCode::Ok | ResponseCode::Existing)
+        && response.attempt_id == request.attempt_id
+        && response.execution_binding_digest == request.execution_binding_digest
+        && response.generation > request.expected_generation
+        && response.broker_state == BrokerState::Terminal
+        && response.conclusion == Conclusion::Cancelled
+        && response.accepted_at != 0
+        && response.updated_at >= response.accepted_at
+        && response.lease_generation != 0
+        && response.evidence_set_digest != [0; 32]
+        && response.teardown_digest != [0; 32];
+    valid.then_some(()).ok_or(ProxyError::InvalidExecdResponse)
+}
+
+fn validate_cancelled_binding(
+    request: v2::CancelAttemptRequest,
+    response: BrokerResponse,
+    admitted: &AdmittedBinding,
+) -> Result<(), ProxyError> {
+    let valid = admitted.attempt_id == hex::encode(request.attempt_id)
+        && admitted.execution_binding_digest == hex::encode(request.execution_binding_digest)
+        && admitted.actor_pubkey == hex::encode(request.actor_pubkey)
+        && admitted.signed_request_digest == hex::encode(response.accepted_request_digest)
+        && admitted.run_id == hex::encode(response.run_id)
+        && admitted.job_intent_digest == hex::encode(response.job_intent_digest)
+        && git_oid_matches(&admitted.tip_oid, response.tip_oid)
+        && admitted.attempt == response.attempt
+        && admitted.accepted_at == response.accepted_at
+        && admitted.lease_generation == response.lease_generation;
+    valid.then_some(()).ok_or(ProxyError::InvalidExecdResponse)
 }
 
 fn response_body_length(request: Request) -> usize {
@@ -760,6 +1045,33 @@ fn decode_exact<const N: usize>(value: &str) -> Option<[u8; N]> {
     hex::decode(value).ok()?.try_into().ok()
 }
 
+fn decode_nonzero<const N: usize>(value: &str) -> Option<[u8; N]> {
+    let decoded = decode_exact(value)?;
+    (decoded != [0; N]).then_some(decoded)
+}
+
+fn encode_git_oid(value: GitOid) -> String {
+    match value {
+        GitOid::Sha1(bytes) => format!("sha1:{}", hex::encode(bytes)),
+        GitOid::Sha256(bytes) => format!("sha256:{}", hex::encode(bytes)),
+    }
+}
+
+fn valid_git_oid(value: &str) -> bool {
+    value
+        .strip_prefix("sha1:")
+        .and_then(decode_nonzero::<20>)
+        .is_some()
+        || value
+            .strip_prefix("sha256:")
+            .and_then(decode_nonzero::<32>)
+            .is_some()
+}
+
+fn git_oid_matches(encoded: &str, value: Option<GitOid>) -> bool {
+    value.is_some_and(|value| encode_git_oid(value) == encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -767,7 +1079,9 @@ mod tests {
     use std::sync::Arc;
 
     use buzz_ci_broker_protocol::v2::AdmissionSignatureAlgorithm;
-    use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, Operation, TrustClass};
+    use buzz_ci_broker_protocol::{
+        BrokerState, CancelReason, Conclusion, GitOid, Operation, TrustClass,
+    };
     use tempfile::{tempdir, TempDir};
 
     use super::*;
@@ -872,6 +1186,36 @@ mod tests {
         v2::encode_request(request_id, Request::AdmitAttempt(request))
             .as_bytes()
             .to_vec()
+    }
+
+    fn cancel_request(
+        admitted: v2::AdmitAttemptRequest,
+        response: BrokerResponse,
+        now: u64,
+    ) -> v2::CancelAttemptRequest {
+        v2::CancelAttemptRequest {
+            attempt_id: response.attempt_id,
+            execution_binding_digest: response.execution_binding_digest,
+            actor_pubkey: admitted.actor_pubkey,
+            cancel_digest: [19; 32],
+            issued_at: now,
+            expires_at: now + 60,
+            expected_generation: response.generation,
+            reason: CancelReason::UserRequest,
+        }
+    }
+
+    fn cancelled_response(admitted: BrokerResponse) -> BrokerResponse {
+        BrokerResponse {
+            code: ResponseCode::Ok,
+            broker_state: BrokerState::Terminal,
+            conclusion: Conclusion::Cancelled,
+            generation: admitted.generation + 3,
+            updated_at: admitted.updated_at + 3,
+            evidence_set_digest: [20; 32],
+            teardown_digest: [21; 32],
+            ..admitted
+        }
     }
 
     fn evidence_coordinates() -> v2::AttemptEvidenceCoordinates {
@@ -1007,6 +1351,177 @@ mod tests {
             response
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancel_is_bound_to_cached_admission_and_replays_only_exact_terminal_response() {
+        let directory = private_directory();
+        let settings = settings(directory.path());
+        let now = unix_now().expect("clock");
+        let admitted_request = admission(now);
+        let admitted_header = FrameHeader {
+            operation: Operation::AdmitAttempt,
+            request_id: [50; 16],
+        };
+        let admitted_frame = request_frame(admitted_header.request_id, admitted_request);
+        let admitted_response_value = response(admitted_request);
+        let admitted_response = v2::encode_response(admitted_header, admitted_response_value)
+            .as_bytes()
+            .to_vec();
+
+        let cancel_header = FrameHeader {
+            operation: Operation::CancelAttempt,
+            request_id: [51; 16],
+        };
+        let cancel_request = cancel_request(admitted_request, admitted_response_value, now);
+        let cancel_frame = v2::encode_request(
+            cancel_header.request_id,
+            Request::CancelAttempt(cancel_request),
+        )
+        .as_bytes()
+        .to_vec();
+        let cancelled_response_value = cancelled_response(admitted_response_value);
+        let cancelled_response = v2::encode_response(cancel_header, cancelled_response_value)
+            .as_bytes()
+            .to_vec();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut proxy = RunnerV2Proxy::with_connector(
+            settings.clone(),
+            FakeConnector {
+                connections: VecDeque::from([Ok(fake_execd(
+                    admitted_frame.clone(),
+                    admitted_response.clone(),
+                    settings.execd_uid,
+                    settings.execd_gid,
+                ))]),
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("proxy");
+        assert_eq!(
+            exchange(&mut proxy, &admitted_frame).expect("admit"),
+            admitted_response
+        );
+
+        let mut wrong_actor = cancel_request;
+        wrong_actor.actor_pubkey[0] ^= 1;
+        let wrong_actor_frame = v2::encode_request([52; 16], Request::CancelAttempt(wrong_actor))
+            .as_bytes()
+            .to_vec();
+        assert!(matches!(
+            exchange(&mut proxy, &wrong_actor_frame),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let mut wrong_binding = cancel_request;
+        wrong_binding.execution_binding_digest[0] ^= 1;
+        let wrong_binding_frame =
+            v2::encode_request([54; 16], Request::CancelAttempt(wrong_binding))
+                .as_bytes()
+                .to_vec();
+        assert!(matches!(
+            exchange(&mut proxy, &wrong_binding_frame),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let mut stale = cancel_request;
+        stale.expected_generation = stale.expected_generation.saturating_add(1);
+        let stale_frame = v2::encode_request([53; 16], Request::CancelAttempt(stale))
+            .as_bytes()
+            .to_vec();
+        assert!(matches!(
+            exchange(&mut proxy, &stale_frame),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let mut expired = cancel_request;
+        expired.issued_at = now.saturating_sub(2);
+        expired.expires_at = now.saturating_sub(1);
+        let expired_frame = v2::encode_request([55; 16], Request::CancelAttempt(expired))
+            .as_bytes()
+            .to_vec();
+        assert!(matches!(
+            exchange(&mut proxy, &expired_frame),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let admitted_binding = proxy
+            .replay
+            .admitted_binding_for_cancel(cancel_request)
+            .expect("cached binding");
+        let mut wrong_job = cancelled_response_value;
+        wrong_job.job_intent_digest[0] ^= 1;
+        assert!(matches!(
+            validate_cancelled_binding(cancel_request, wrong_job, &admitted_binding),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
+        let nonterminal = BrokerResponse {
+            code: ResponseCode::Existing,
+            ..admitted_response_value
+        };
+        assert!(matches!(
+            validate_cancel_response(cancel_request, nonterminal),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
+        let stale_response = BrokerResponse {
+            code: ResponseCode::StateConflict,
+            generation: admitted_response_value.generation + 1,
+            ..cancelled_response_value
+        };
+        assert!(matches!(
+            validate_cancel_response(cancel_request, stale_response),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
+        drop(proxy);
+
+        let mut cancel_proxy = RunnerV2Proxy::with_connector(
+            settings.clone(),
+            FakeConnector {
+                connections: VecDeque::from([Ok(fake_execd(
+                    cancel_frame.clone(),
+                    cancelled_response.clone(),
+                    settings.execd_uid,
+                    settings.execd_gid,
+                ))]),
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("cancel restart");
+        assert_eq!(
+            exchange(&mut cancel_proxy, &cancel_frame).expect("cancel"),
+            cancelled_response
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(cancel_proxy);
+
+        let mut restarted = RunnerV2Proxy::with_connector(
+            settings,
+            FakeConnector {
+                connections: VecDeque::new(),
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("restart");
+        assert_eq!(
+            exchange(&mut restarted, &admitted_frame).expect("cached admission"),
+            admitted_response
+        );
+        assert_eq!(
+            exchange(&mut restarted, &cancel_frame).expect("cached cancel"),
+            cancelled_response
+        );
+        let mut drift = cancel_request;
+        drift.cancel_digest[0] ^= 1;
+        let drift_frame =
+            v2::encode_request(cancel_header.request_id, Request::CancelAttempt(drift))
+                .as_bytes()
+                .to_vec();
+        assert!(matches!(
+            exchange(&mut restarted, &drift_frame),
+            Err(ProxyError::ReplayConflict)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
