@@ -38,7 +38,7 @@ ZERO_REQUEST_SCHEMA = "buzz-ci-activation-qualification-zero-request/v1"
 ZERO_RESPONSE_SCHEMA = "buzz-ci-activation-qualification-zero-response/v1"
 ZERO_SEQUENCE_SCHEMA = "buzz-ci-activation-qualification-zero-state/v1"
 MAX_ZERO_REQUEST_BYTES = 64 * 1024
-MAX_SCENARIO_BYTES = 128 * 1024
+MAX_SCENARIO_BYTES = 256 * 1024
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSUSERS = "/usr/bin/systemd-sysusers"
 TMPFILES = "/usr/bin/systemd-tmpfiles"
@@ -181,7 +181,7 @@ def _read_receipt(root: Path) -> dict[str, Any] | None:
     return receipt
 
 
-def _require_receipt_root(root: Path, controld_gid: int, *, allow_private: bool = False) -> Path:
+def _require_receipt_root(root: Path, _controld_gid: int, *, allow_private: bool = False) -> Path:
     directory = activation_package.rooted(root, "/var/lib/buzzci/activation-controller")
     parent_fd, name = activation_package.open_parent_fd(root, "/var/lib/buzzci/activation-controller", create=True)
     try:
@@ -196,9 +196,9 @@ def _require_receipt_root(root: Path, controld_gid: int, *, allow_private: bool 
         metadata = os.fstat(directory_fd)
     finally:
         os.close(directory_fd)
-    expected_uid, expected_gid = _physical_ids(root, 0, controld_gid)
+    expected_uid, expected_gid = _physical_ids(root, 0, 0)
     observed = (stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid)
-    final = (0o710, expected_uid, expected_gid)
+    final = (0o711, expected_uid, expected_gid)
     private_uid, private_gid = _physical_ids(root, 0, 0)
     private = (0o700, private_uid, private_gid)
     if (
@@ -298,17 +298,57 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
     ordered_driver["timeout_seconds"] = timeout_seconds
     ordered_scenario = {"schema_version": scenario["schema_version"], "fixture": ordered_fixture, "driver": ordered_driver}
     rust_bytes = json.dumps(ordered_scenario, ensure_ascii=False, separators=(",", ":")).encode()
+    scenario_sha256 = activation_package.digest(rust_bytes)
+    template = activation_package.validate_acceptance_template(manifest["acceptance_template"])
+    grant_event_id = activation_package.digest(json.dumps(
+        template["grant_event"], ensure_ascii=False, separators=(",", ":"),
+    ).encode())
+    if ordered_fixture["grant_event_id"] != grant_event_id:
+        raise ValueError("acceptance grant event id differs from the frozen public template")
+    acceptance = {
+        "actor": {
+            "public_key": template["actor"]["public_key"],
+            "generation": template["actor"]["generation"],
+        },
+        "scenario_sha256": scenario_sha256,
+        "run_event": template["run_event"],
+        "grant_event": template["grant_event"],
+        "rerun_event": template["rerun_event"],
+        "tombstone_event": template["tombstone_event"],
+    }
     qualification = manifest["identities"]["qualification"]
     return {
         "schema_version": activation_package.ACCEPTANCE_BINDING_SCHEMA,
         "activation_id": manifest["activation_id"],
         "activation_package_digest": manifest["package_digest"],
-        "scenario_sha256": activation_package.digest(rust_bytes),
+        "scenario_sha256": scenario_sha256,
         "peer_uid": qualification["uid"],
         "peer_gid": qualification["gid"],
         "timeout_millis": timeout_seconds * 1000,
         "fixture": ordered_fixture,
+        "acceptance": acceptance,
     }
+
+
+def _acceptance_binding_bytes(binding: dict[str, object]) -> bytes:
+    expected_top = [
+        "schema_version", "activation_id", "activation_package_digest", "scenario_sha256",
+        "peer_uid", "peer_gid", "timeout_millis", "fixture", "acceptance",
+    ]
+    expected_acceptance = [
+        "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event",
+    ]
+    acceptance = binding.get("acceptance")
+    if (
+        list(binding) != expected_top or binding["schema_version"] != activation_package.ACCEPTANCE_BINDING_SCHEMA
+        or not isinstance(acceptance, dict) or list(acceptance) != expected_acceptance
+        or binding["scenario_sha256"] != acceptance["scenario_sha256"]
+    ):
+        raise ValueError("acceptance binding scenario digests differ")
+    payload = json.dumps(binding, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(payload) > MAX_SCENARIO_BYTES:
+        raise ValueError("acceptance binding exceeds its fixed byte bound")
+    return payload
 
 
 def load_acceptance_scenario(path: Path, manifest: dict[str, Any], *, live: bool) -> dict[str, object]:
@@ -361,8 +401,7 @@ def _generated_acceptance_files(manifest: dict[str, Any], binding: dict[str, obj
     return [
         {
             "role": "controld_acceptance_binding", "target": ACCEPTANCE_BINDING_PATH,
-            "payload": activation_package.canonical_json(binding), "mode": 0o440, "uid": 0,
-            "gid": controld["gid"],
+            "payload": _acceptance_binding_bytes(binding), "mode": 0o444, "uid": 0, "gid": 0,
         },
         {
             "role": "acceptance_control_config", "target": "/etc/buzzci/acceptance-control-v1.json",
@@ -860,10 +899,25 @@ class FakeSystemd:
         directory = _require_receipt_root(
             self.root, self.planned_identities["controld"]["gid"], allow_private=True,
         )
-        directory.chmod(0o710)
+        directory.chmod(0o711)
         acceptance = activation_package.rooted(self.root, "/var/lib/buzzci/acceptance-control")
         acceptance.mkdir(parents=True, mode=0o700, exist_ok=True)
         acceptance.chmod(0o700)
+        for target, mode in (
+            ("/var/lib/buzzci", 0o711),
+            ("/var/lib/buzzci/seccomp", 0o700),
+            ("/var/lib/buzzci/activation", 0o700),
+            ("/var/lib/buzzci/activation/receipts", 0o700),
+            ("/var/lib/buzzci/execd-v2", 0o700),
+            (activation_package.EXECD_INTENT_ROOT, 0o700),
+            (activation_package.EXECD_BINDING_ROOT, 0o700),
+            (activation_package.EXECD_EVIDENCE_ROOT, 0o700),
+            (activation_package.EXECD_TEARDOWN_ROOT, 0o700),
+            (activation_package.EXECD_ATTEMPT_ROOT, 0o711),
+        ):
+            directory = activation_package.rooted(self.root, target)
+            directory.mkdir(parents=True, mode=mode, exist_ok=True)
+            directory.chmod(mode)
         _require_receipt_root(self.root, self.planned_identities["controld"]["gid"])
 
     def daemon_reload(self) -> None:
@@ -1094,12 +1148,43 @@ def _preflight_units(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, s
     return result
 
 
+def _keyholder_config_readback(
+    manifest: dict[str, Any], root: Path, payloads: dict[str, bytes] | None = None,
+) -> dict[str, object]:
+    opened = _read_target(root, activation_package.KEYHOLDER_CONFIG_PATH, 64 * 1024)
+    if opened is None:
+        raise ValueError("external keyholder configuration is absent")
+    raw, metadata = opened
+    identity = manifest["identities"]["keyholder"]
+    expected_uid, expected_gid = _physical_ids(root, identity["uid"], identity["gid"])
+    if _metadata_dict(metadata) != {"mode": 0o600, "uid": expected_uid, "gid": expected_gid}:
+        raise ValueError("external keyholder configuration metadata differs")
+    try:
+        value = json.loads(raw, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("external keyholder configuration is invalid JSON") from error
+    expected_selectors = None
+    expected_nip98_origin = None
+    if payloads is not None:
+        entry = next(item for item in manifest["entries"] if item["role"] == "controld_config")
+        active = json.loads(payloads[entry["active_source"]], object_pairs_hook=activation_package.reject_duplicates)
+        expected_selectors = active["keyholder_selectors"]
+        expected_nip98_origin = active["relay_http_origin"]
+    activation_package.validate_external_keyholder_config(
+        value, manifest, expected_selectors, expected_nip98_origin,
+    )
+    if raw != activation_package.canonical_json(value):
+        raise ValueError("external keyholder configuration bytes are not canonical")
+    return {"path": activation_package.KEYHOLDER_CONFIG_PATH, "sha256": activation_package.digest(raw), "status": "exact"}
+
+
 def preflight(
     manifest: dict[str, Any],
     root: Path,
     driver: LiveSystemd | FakeSystemd,
     *,
     require_dormant: bool,
+    payloads: dict[str, bytes] | None = None,
 ) -> dict[str, object]:
     components = _component_readback(manifest, root, allow_installable_absent=True)
     principals = _identity_readback(driver, manifest["identities"], allow_absent=True)
@@ -1109,11 +1194,13 @@ def preflight(
         if managed[role] != "staged":
             raise ValueError(f"frozen component config is absent before activation: {role}")
     units = _preflight_units(driver) if require_dormant else {}
+    keyholder_config = _keyholder_config_readback(manifest, root, payloads)
     return {
         "activation_id": manifest["activation_id"],
         "package_digest": manifest["package_digest"],
         "capacity": 0,
         "components": components,
+        "keyholder_config": keyholder_config,
         "principals": principals,
         "access_group": access_group,
         "managed_targets": managed,
@@ -1782,7 +1869,7 @@ def stage(
                     "staged_zero": _staged_zero_readback(manifest, driver),
                 }
             raise ValueError(f"activation receipt requires rollback from {existing['state']}")
-    report = preflight(manifest, root, driver, require_dormant=True)
+    report = preflight(manifest, root, driver, require_dormant=True, payloads=payloads)
     receipt = _new_receipt(manifest, root, driver, generated)
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     try:
@@ -2054,6 +2141,7 @@ def activate(
         raise ValueError(f"activation cannot start from receipt state {receipt['state']}")
     _verify_phase(manifest, root, "staged")
     _verify_generated(root, receipt["acceptance_generated"])
+    _keyholder_config_readback(manifest, root, payloads)
     _staged_zero_readback(manifest, driver)
     receipt.update({"state": "activating", "updated_at": utc_now(), "last_error": None})
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
