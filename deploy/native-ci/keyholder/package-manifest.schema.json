@@ -4,11 +4,12 @@
   "title": "Buzz CI acceptance keyholder provisioning package v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "package_id", "source_commit", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"],
+  "required": ["schema", "package_id", "source_commit", "binary_provenance_sha256", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"],
   "properties": {
     "schema": { "const": "buzz-ci-keyholder-acceptance-package-v1" },
     "package_id": { "type": "string", "pattern": "^buzz-ci-keyholder-acceptance-[0-9a-f]{12}-[0-9a-f]{12}$" },
     "source_commit": { "$ref": "#/$defs/gitOid" },
+    "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
     "package_uid": { "const": 0 },
     "package_gid": { "const": 0 },
     "identities": {
@@ -44,14 +45,14 @@
     },
     "directories": {
       "type": "array",
-      "minItems": 4,
-      "maxItems": 4,
+      "minItems": 5,
+      "maxItems": 5,
       "items": { "$ref": "#/$defs/directory" }
     },
     "entries": {
       "type": "array",
-      "minItems": 6,
-      "maxItems": 6,
+      "minItems": 7,
+      "maxItems": 7,
       "items": { "$ref": "#/$defs/entry" }
     },
     "package_digest": { "$ref": "#/$defs/sha256" }
@@ -66,7 +67,7 @@
       "additionalProperties": false,
       "required": ["target", "mode", "uid", "gid"],
       "properties": {
-        "target": { "enum": ["/etc/buzzci", "/etc/systemd/system/buzz-ci-keyholder.service.d", "/usr/lib/tmpfiles.d", "/usr/share/doc/buzz-ci-keyholder"] },
+        "target": { "enum": ["/etc/buzzci", "/etc/systemd/system/buzz-ci-keyholder.service.d", "/usr/libexec", "/usr/lib/tmpfiles.d", "/usr/share/doc/buzz-ci-keyholder"] },
         "mode": { "const": "0755" },
         "uid": { "const": 0 },
         "gid": { "const": 0 }
@@ -75,16 +76,17 @@
     "entry": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"],
+      "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256", "size"],
       "properties": {
-        "role": { "enum": ["config", "service", "socket", "tmpfiles", "acceptance_credential_dropin", "documentation"] },
+        "role": { "enum": ["binary", "config", "service", "socket", "tmpfiles", "acceptance_credential_dropin", "documentation"] },
         "source": { "type": "string", "pattern": "^assets/[A-Za-z0-9._-]+$" },
         "target": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
         "source_mode": { "$ref": "#/$defs/mode" },
         "install_mode": { "$ref": "#/$defs/mode" },
         "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
         "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-        "sha256": { "$ref": "#/$defs/sha256" }
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 134217728 }
       }
     }
   }

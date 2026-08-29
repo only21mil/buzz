@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 KEYHOLDER_DIR = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = KEYHOLDER_DIR.parents[2]
@@ -68,11 +69,25 @@ class KeyholderPackageTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             text=True,
         ).stdout.strip()
+        self.binary = self.base / "buzz-ci-keyholder"
+        self.binary.write_bytes(b"fixed keyholder release binary\n")
+        self.binary.chmod(0o755)
+        self.provenance = self.base / "binary-provenance.json"
+        self.provenance.write_bytes(FREEZER.canonical_json({
+            "schema": FREEZER.PROVENANCE_SCHEMA,
+            "binary": "buzz-ci-keyholder",
+            "source_commit": self.commit,
+            "profile": "release",
+            "sha256": hashlib.sha256(self.binary.read_bytes()).hexdigest(),
+        }))
+        self.provenance.chmod(0o600)
 
     def freeze(self, source_root: Path = SOURCE_ROOT) -> dict[str, object]:
         return FREEZER.freeze_package(
             source_root,
             self.commit,
+            self.binary,
+            self.provenance,
             self.spec,
             self.package,
             keyholder_uid=os.getuid(),
@@ -144,10 +159,13 @@ class KeyholderPackageTests(unittest.TestCase):
     def test_schemas_are_closed_parseable_and_match_required_contracts(self) -> None:
         config_schema = json.loads((KEYHOLDER_DIR / "keyholder-config.schema.json").read_text())
         package_schema = json.loads((KEYHOLDER_DIR / "package-manifest.schema.json").read_text())
+        provenance_schema = json.loads((KEYHOLDER_DIR / "binary-provenance.schema.json").read_text())
         self.assertFalse(config_schema["additionalProperties"])
         self.assertFalse(config_schema["properties"]["acceptance"]["additionalProperties"])
         self.assertEqual(config_schema["properties"]["peer"]["properties"]["allowed_operations"]["const"], RENDERER.OPERATIONS)
         self.assertFalse(package_schema["additionalProperties"])
+        self.assertFalse(provenance_schema["additionalProperties"])
+        self.assertEqual(provenance_schema["properties"]["binary"]["const"], "buzz-ci-keyholder")
         self.assertEqual(package_schema["properties"]["credential_contract"]["const"], FREEZER.CREDENTIAL_CONTRACT)
         self.assertEqual(package_schema["properties"]["runtime_contract"]["const"], FREEZER.RUNTIME_CONTRACT)
 
@@ -200,6 +218,10 @@ class KeyholderPackageTests(unittest.TestCase):
         self.assertFalse(manifest["credential_contract"]["packaged"])
         self.assertFalse(any("credstore" in entry["source"] for entry in manifest["entries"]))
         self.assertEqual({entry["role"] for entry in manifest["entries"]}, set(INSTALLER.EXPECTED_TARGETS))
+        binary_entry = next(entry for entry in manifest["entries"] if entry["role"] == "binary")
+        self.assertEqual(binary_entry["target"], "/usr/libexec/buzz-ci-keyholder")
+        self.assertEqual(binary_entry["sha256"], hashlib.sha256(self.binary.read_bytes()).hexdigest())
+        self.assertEqual(binary_entry["size"], len(self.binary.read_bytes()))
         parsed, _ = INSTALLER.parse_package(self.package, self.package)
         self.assertEqual(parsed["package_digest"], manifest["package_digest"])
         config_entry = next(entry for entry in manifest["entries"] if entry["role"] == "config")
@@ -212,7 +234,9 @@ class KeyholderPackageTests(unittest.TestCase):
         for forbidden in ("scenario_sha256", "activation_package_digest", "run_event", "grant_event"):
             self.assertNotIn(forbidden, serialized)
         self.assertEqual(stat.S_IMODE(self.package.stat().st_mode), 0o700)
-        self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o400 for path in (self.package / "assets").iterdir()))
+        asset_modes = {path.name: stat.S_IMODE(path.stat().st_mode) for path in (self.package / "assets").iterdir()}
+        self.assertEqual(asset_modes.pop("buzz-ci-keyholder"), 0o500)
+        self.assertEqual(set(asset_modes.values()), {0o400})
 
     def test_fake_root_fails_closed_without_credential_or_with_loose_mode(self) -> None:
         self.freeze()
@@ -239,8 +263,125 @@ class KeyholderPackageTests(unittest.TestCase):
         for role, target in INSTALLER.EXPECTED_TARGETS.items():
             path = INSTALLER.rooted(root, target)
             self.assertTrue(path.is_file())
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600 if role == "config" else 0o644)
+            expected_mode = 0o755 if role == "binary" else (0o600 if role == "config" else 0o644)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
         self.assertEqual(INSTALLER.install(self.package, root)["status"], "unchanged")
+
+    def test_fresh_host_not_found_installs_exec_start_and_rollback_restores_absence(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        binary = root / "usr/libexec/buzz-ci-keyholder"
+        self.assertFalse(binary.exists())
+        installed = INSTALLER.install(self.package, root)
+        self.assertEqual(installed["status"], "installed")
+        self.assertEqual(binary.read_bytes(), self.binary.read_bytes())
+        self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o755)
+        preview = INSTALLER.rollback(self.package, root, dry_run=True)
+        self.assertEqual(preview["status"], "rollback_dry_run")
+        rolled_back = INSTALLER.rollback(self.package, root)
+        self.assertEqual(rolled_back["status"], "rolled_back")
+        for target in INSTALLER.EXPECTED_TARGETS.values():
+            self.assertFalse(INSTALLER.rooted(root, target).exists())
+        self.assertFalse((root / "usr/libexec").exists())
+        self.assertFalse((root / "etc/buzzci").exists())
+        with self.assertRaisesRegex(ValueError, "already rolled back"):
+            INSTALLER.install(self.package, root)
+
+    def test_rollback_restores_preexisting_binary_bytes_and_metadata(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        binary = root / "usr/libexec/buzz-ci-keyholder"
+        binary.parent.mkdir(mode=0o755)
+        binary.parent.chmod(0o755)
+        binary.write_bytes(b"prior keyholder binary\n")
+        binary.chmod(0o700)
+        before = (binary.read_bytes(), stat.S_IMODE(binary.stat().st_mode), binary.stat().st_uid, binary.stat().st_gid)
+        INSTALLER.install(self.package, root)
+        self.assertEqual(binary.read_bytes(), self.binary.read_bytes())
+        INSTALLER.rollback(self.package, root)
+        after = (binary.read_bytes(), stat.S_IMODE(binary.stat().st_mode), binary.stat().st_uid, binary.stat().st_gid)
+        self.assertEqual(after, before)
+
+    def test_umask_0000_and_0077_produce_exact_package_and_install_modes(self) -> None:
+        package_digests = []
+        for index, mask in enumerate((0o000, 0o077)):
+            with self.subTest(mask=oct(mask)):
+                self.package = self.base / f"package-{index}"
+                previous = os.umask(mask)
+                try:
+                    manifest = self.freeze()
+                finally:
+                    os.umask(previous)
+                package_digests.append(manifest["package_digest"])
+                self.assertEqual(stat.S_IMODE(self.package.stat().st_mode), 0o700)
+                root = self.make_root() if index == 0 else self.base / f"root-{index}"
+                if index:
+                    original_base = self.base
+                    self.base = self.base / f"fixture-{index}"
+                    self.base.mkdir(mode=0o700)
+                    try:
+                        root = self.make_root()
+                    finally:
+                        self.base = original_base
+                self.add_credential(root)
+                previous = os.umask(mask)
+                try:
+                    INSTALLER.install(self.package, root)
+                finally:
+                    os.umask(previous)
+                for role, target in INSTALLER.EXPECTED_TARGETS.items():
+                    expected = 0o755 if role == "binary" else (0o600 if role == "config" else 0o644)
+                    self.assertEqual(stat.S_IMODE(INSTALLER.rooted(root, target).stat().st_mode), expected)
+        self.assertEqual(package_digests[0], package_digests[1])
+
+    def test_hostile_link_replay_drift_and_candidate_receipt_mismatch_are_rejected(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        (root / "usr/libexec").mkdir(mode=0o755)
+        (root / "usr/libexec").chmod(0o755)
+        outside = self.base / "outside"
+        outside.write_text("untouched\n")
+        target = root / "usr/libexec/buzz-ci-keyholder"
+        target.symlink_to(outside)
+        with self.assertRaises(OSError):
+            INSTALLER.install(self.package, root)
+        self.assertEqual(outside.read_text(), "untouched\n")
+        target.unlink()
+        INSTALLER.install(self.package, root)
+        target.write_text("drift\n")
+        target.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "drift blocks replay"):
+            INSTALLER.install(self.package, root)
+        receipt = root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/") / "receipt-v1.json"
+        value = json.loads(receipt.read_text())
+        value["source_commit"] = "f" * 40
+        receipt.write_bytes(INSTALLER.canonical_json(value))
+        receipt.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "package binding differs"):
+            INSTALLER.install(self.package, root)
+
+    def test_parent_rename_during_publish_fails_exact_readback(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        real_rename = os.rename
+        moved = False
+
+        def hostile_rename(source, destination, *args, **kwargs):
+            nonlocal moved
+            if destination == "buzz-ci-keyholder" and not moved:
+                moved = True
+                real_rename(root / "usr/libexec", root / "usr/libexec-moved")
+                (root / "usr/libexec").mkdir(mode=0o755)
+                (root / "usr/libexec").chmod(0o755)
+            return real_rename(source, destination, *args, **kwargs)
+
+        with mock.patch.object(INSTALLER.os, "rename", side_effect=hostile_rename):
+            with self.assertRaisesRegex(ValueError, "readback differs"):
+                INSTALLER.install(self.package, root)
 
     def test_fresh_restrictive_umask_checkout_freezes_identically(self) -> None:
         clone = self.base / "clone"
