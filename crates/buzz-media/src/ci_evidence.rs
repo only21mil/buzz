@@ -227,7 +227,7 @@ pub fn prepare_ci_evidence(
         return Err(CiEvidenceError::LengthMismatch);
     }
 
-    let bytes = scrub_sensitive_assignments(input);
+    let bytes = scrub_sensitive_content(input)?;
     let scrubbed = bytes != input;
     let digest = hex::encode(Sha256::digest(&bytes));
     if digest != binding.sha256 {
@@ -323,49 +323,373 @@ pub enum CiEvidenceError {
     ReceiptEncoding(String),
 }
 
-fn scrub_sensitive_assignments(input: &[u8]) -> Vec<u8> {
-    let mut output = input.to_vec();
-    let mut offset = 0;
-    while offset < output.len() {
-        let line_end = output[offset..]
+const REDACTED: &str = "[REDACTED]";
+const SENSITIVE_KEYS: [&str; 14] = [
+    "aws_secret_access_key",
+    "buzz_s3_secret_key",
+    "secret_access_key",
+    "authorization",
+    "client_secret",
+    "secret",
+    "access_token",
+    "private_key",
+    "private key",
+    "auth_token",
+    "password",
+    "passwd",
+    "api_key",
+    "token",
+];
+
+/// Apply the relay's independent, idempotent secret gate. UTF-8 text and JSON
+/// are the only evidence forms the upstream executor can seal. Anything else
+/// cannot be proven safe and fails before an object key or receipt is written.
+fn scrub_sensitive_content(input: &[u8]) -> Result<Vec<u8>, CiEvidenceError> {
+    let text = std::str::from_utf8(input).map_err(|_| CiEvidenceError::InvalidBinding)?;
+    if contains_disallowed_text_char(text) {
+        return Err(CiEvidenceError::InvalidBinding);
+    }
+
+    let scrubbed = scrub_sensitive_content_once(text)?;
+    let scrubbed_text =
+        std::str::from_utf8(&scrubbed).map_err(|_| CiEvidenceError::InvalidBinding)?;
+    if scrub_sensitive_content_once(scrubbed_text)? != scrubbed {
+        return Err(CiEvidenceError::InvalidBinding);
+    }
+    Ok(scrubbed)
+}
+
+fn scrub_sensitive_content_once(text: &str) -> Result<Vec<u8>, CiEvidenceError> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let mut value: serde_json::Value =
+            serde_json::from_str(text).map_err(|_| CiEvidenceError::InvalidBinding)?;
+        if scrub_json_value(&mut value)? {
+            serde_json::to_vec(&value).map_err(|_| CiEvidenceError::InvalidBinding)
+        } else {
+            Ok(text.as_bytes().to_vec())
+        }
+    } else {
+        Ok(scrub_text(text).into_bytes())
+    }
+}
+
+fn scrub_json_value(value: &mut serde_json::Value) -> Result<bool, CiEvidenceError> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut changed = scrub_evidence_document(fields)?;
+            for (key, value) in fields {
+                if contains_disallowed_text_char(key)
+                    || contains_sensitive_assignment(key)
+                    || contains_authorization_value(key)
+                    || private_key_begin(key).is_some()
+                {
+                    return Err(CiEvidenceError::InvalidBinding);
+                }
+                if is_sensitive_key(key) {
+                    if value.as_str() != Some(REDACTED) {
+                        *value = serde_json::Value::String(REDACTED.to_owned());
+                        changed = true;
+                    }
+                } else {
+                    changed |= scrub_json_value(value)?;
+                }
+            }
+            Ok(changed)
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= scrub_json_value(item)?;
+            }
+            Ok(changed)
+        }
+        serde_json::Value::String(text) => {
+            if contains_disallowed_text_char(text) {
+                return Err(CiEvidenceError::InvalidBinding);
+            }
+            let scrubbed = scrub_text(text);
+            if scrubbed == *text {
+                Ok(false)
+            } else {
+                *text = scrubbed;
+                Ok(true)
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+fn contains_disallowed_text_char(text: &str) -> bool {
+    text.contains('\0') || text.contains('\u{feff}')
+}
+
+fn scrub_evidence_document(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, CiEvidenceError> {
+    let looks_like_evidence_document = fields.contains_key("schema_version")
+        && fields.contains_key("execution_binding_digest")
+        && ["output", "output_length", "output_sha256"]
             .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(output.len(), |index| offset + index);
-        scrub_line(&mut output[offset..line_end]);
-        offset = line_end.saturating_add(1);
+            .any(|key| fields.contains_key(*key));
+    if !looks_like_evidence_document {
+        return Ok(false);
+    }
+
+    const EXPECTED_FIELDS: [&str; 6] = [
+        "schema_version",
+        "execution_binding_digest",
+        "conclusion",
+        "output_sha256",
+        "output_length",
+        "output",
+    ];
+    if fields.len() != EXPECTED_FIELDS.len()
+        || !EXPECTED_FIELDS.iter().all(|key| fields.contains_key(*key))
+        || fields
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || !fields
+            .get("execution_binding_digest")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|digest| is_lower_hex(digest, 64))
+        || !fields
+            .get("conclusion")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|conclusion| {
+                matches!(
+                    conclusion,
+                    "none"
+                        | "success"
+                        | "failure"
+                        | "cancelled"
+                        | "timed_out"
+                        | "infrastructure_failure"
+                )
+            })
+    {
+        return Err(CiEvidenceError::InvalidBinding);
+    }
+
+    let output = fields
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(CiEvidenceError::InvalidBinding)?;
+    let output_length = fields
+        .get("output_length")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|length| usize::try_from(length).ok())
+        .ok_or(CiEvidenceError::InvalidBinding)?;
+    let output_sha256 = fields
+        .get("output_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(CiEvidenceError::InvalidBinding)?;
+    if output.len() != output_length
+        || output_sha256 != hex::encode(Sha256::digest(output.as_bytes()))
+    {
+        return Err(CiEvidenceError::InvalidBinding);
+    }
+
+    let scrubbed = scrub_text(output);
+    if scrubbed == output {
+        return Ok(false);
+    }
+    fields.insert("output_length".to_owned(), scrubbed.len().into());
+    fields.insert(
+        "output_sha256".to_owned(),
+        hex::encode(Sha256::digest(scrubbed.as_bytes())).into(),
+    );
+    fields.insert("output".to_owned(), scrubbed.into());
+    Ok(true)
+}
+
+fn scrub_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut pem_end: Option<String> = None;
+
+    for segment in text.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let (line, carriage_return) = line
+            .strip_suffix('\r')
+            .map_or((line, ""), |line| (line, "\r"));
+
+        if let Some(expected_end) = pem_end.as_deref() {
+            if let Some(end) = find_ascii_case_insensitive(line, expected_end) {
+                let suffix = &line[end + expected_end.len()..];
+                if !suffix.is_empty() {
+                    output.push_str(&scrub_text_line(suffix));
+                    output.push_str(carriage_return);
+                    output.push_str(newline);
+                }
+                pem_end = None;
+            }
+            continue;
+        }
+
+        if let Some((begin, expected_end)) = private_key_begin(line) {
+            output.push_str(&scrub_text_line(&line[..begin]));
+            output.push_str(REDACTED);
+            let marker_end = begin + private_key_begin_marker_len(&line[begin..]);
+            if let Some(relative_end) =
+                find_ascii_case_insensitive(&line[marker_end..], &expected_end)
+            {
+                let suffix = &line[marker_end + relative_end + expected_end.len()..];
+                output.push_str(&scrub_text_line(suffix));
+            } else {
+                pem_end = Some(expected_end);
+            }
+            output.push_str(carriage_return);
+            output.push_str(newline);
+            continue;
+        }
+
+        output.push_str(&scrub_text_line(line));
+        output.push_str(carriage_return);
+        output.push_str(newline);
     }
     output
 }
 
-fn scrub_line(line: &mut [u8]) {
-    let Some(separator) = line.iter().position(|byte| matches!(byte, b'=' | b':')) else {
-        return;
-    };
-    let key = line[..separator]
-        .iter()
-        .copied()
-        .filter(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        .map(|byte| byte.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let sensitive = [
-        b"authorization".as_slice(),
-        b"api_key".as_slice(),
-        b"access_token".as_slice(),
-        b"auth_token".as_slice(),
-        b"client_secret".as_slice(),
-        b"password".as_slice(),
-        b"private_key".as_slice(),
-        b"secret".as_slice(),
-        b"token".as_slice(),
-    ];
-    if !sensitive.iter().any(|candidate| key.ends_with(candidate)) {
-        return;
+fn scrub_text_line(line: &str) -> String {
+    if let Some(value_start) = authorization_value_start(line) {
+        return replace_sensitive_tail(line, value_start);
     }
-    for byte in &mut line[separator + 1..] {
-        if !byte.is_ascii_whitespace() && !matches!(*byte, b'\'' | b'"') {
-            *byte = b'*';
+    if let Some(value_start) = sensitive_assignment_value_start(line) {
+        return replace_sensitive_tail(line, value_start);
+    }
+    line.to_owned()
+}
+
+fn replace_sensitive_tail(line: &str, value_start: usize) -> String {
+    if line[value_start..].trim() == REDACTED {
+        return line.to_owned();
+    }
+    let mut output = String::with_capacity(value_start + REDACTED.len());
+    output.push_str(&line[..value_start]);
+    output.push_str(REDACTED);
+    output
+}
+
+fn authorization_value_start(line: &str) -> Option<usize> {
+    find_key_value_start(line, "authorization").and_then(|value_start| {
+        let value = &line[value_start..];
+        (starts_ascii_word(value, "bearer") || starts_ascii_word(value, "basic"))
+            .then_some(value_start)
+    })
+}
+
+fn sensitive_assignment_value_start(line: &str) -> Option<usize> {
+    SENSITIVE_KEYS
+        .iter()
+        .filter(|key| **key != "authorization")
+        .filter_map(|key| find_key_value_start(line, key))
+        .min()
+}
+
+fn find_key_value_start(line: &str, key: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(found) = find_ascii_case_insensitive(&line[offset..], key) {
+        let start = offset + found;
+        let before_ok = start == 0 || !line.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let mut after = start + key.len();
+        let after_ok = after == line.len() || !is_key_byte(line.as_bytes()[after]);
+        if before_ok && after_ok {
+            after += line[after..]
+                .bytes()
+                .take_while(u8::is_ascii_whitespace)
+                .count();
+            if matches!(line.as_bytes().get(after), Some(b'=') | Some(b':')) {
+                after += 1;
+                after += line[after..]
+                    .bytes()
+                    .take_while(u8::is_ascii_whitespace)
+                    .count();
+                return Some(after);
+            }
+        }
+        offset = start + key.len();
+    }
+    None
+}
+
+fn contains_sensitive_assignment(text: &str) -> bool {
+    sensitive_assignment_value_start(text).is_some()
+}
+
+fn contains_authorization_value(text: &str) -> bool {
+    authorization_value_start(text).is_some()
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = normalize_key(key);
+    SENSITIVE_KEYS.iter().any(|candidate| {
+        let candidate = normalize_key(candidate);
+        normalized == candidate || normalized.ends_with(&format!("_{candidate}"))
+    })
+}
+
+fn normalize_key(key: &str) -> String {
+    let mut normalized = String::with_capacity(key.len());
+    let mut separator = false;
+    for byte in key.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            if separator && !normalized.is_empty() {
+                normalized.push('_');
+            }
+            normalized.push(char::from(byte.to_ascii_lowercase()));
+            separator = false;
+        } else {
+            separator = true;
         }
     }
+    normalized
+}
+
+fn private_key_begin(line: &str) -> Option<(usize, String)> {
+    const PREFIX: &str = "-----begin ";
+    let begin = find_ascii_case_insensitive(line, PREFIX)?;
+    let label_start = begin + PREFIX.len();
+    let label_end = line[label_start..].find("-----")? + label_start;
+    let label = &line[label_start..label_end];
+    if !label.to_ascii_lowercase().ends_with("private key") {
+        return None;
+    }
+    Some((
+        begin,
+        format!("-----end {}-----", label.to_ascii_lowercase()),
+    ))
+}
+
+fn private_key_begin_marker_len(text: &str) -> usize {
+    const PREFIX_LEN: usize = "-----begin ".len();
+    text[PREFIX_LEN..]
+        .find("-----")
+        .map_or(text.len(), |end| PREFIX_LEN + end + 5)
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn starts_ascii_word(value: &str, word: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..word.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word.as_bytes()))
+        && value
+            .as_bytes()
+            .get(word.len())
+            .is_some_and(u8::is_ascii_whitespace)
+}
+
+const fn is_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -443,14 +767,168 @@ mod tests {
 
     #[test]
     fn scrub_happens_before_digest_and_receipt_creation() {
-        let raw = b"step=build\nAUTH_TOKEN=super-secret\n";
-        let scrubbed = b"step=build\nAUTH_TOKEN=************\n";
+        let raw = b"step=build\nAUTH_TOKEN=1234567890\n";
+        let scrubbed = b"step=build\nAUTH_TOKEN=[REDACTED]\n";
         let planned = prepare_ci_evidence(binding(scrubbed), raw).expect("scrubbed plan");
         assert_eq!(planned.bytes, scrubbed);
         assert!(planned.scrubbed);
 
         let error = prepare_ci_evidence(binding(raw), raw).expect_err("raw digest must fail");
         assert_eq!(error, CiEvidenceError::DigestMismatch);
+    }
+
+    #[test]
+    fn secondary_scrub_matches_the_shared_case_insensitive_assignment_corpus() {
+        let raw = concat!(
+            "safe before\n",
+            "aws_secret_access_key=first\n",
+            "prefix BUZZ_S3_SECRET_KEY : second\n",
+            "Access_Token=third\n",
+            "API_KEY=fourth\n",
+            "PASSWORD=fifth\n",
+            "passwd=sixth\n",
+            "client_secret=seventh\n",
+            "private key=eighth\n",
+            "suffix token=ninth\n",
+            "DATABASE_PASSWORD=tenth\n",
+            "safe after\n",
+        );
+        let expected = concat!(
+            "safe before\n",
+            "aws_secret_access_key=[REDACTED]\n",
+            "prefix BUZZ_S3_SECRET_KEY : [REDACTED]\n",
+            "Access_Token=[REDACTED]\n",
+            "API_KEY=[REDACTED]\n",
+            "PASSWORD=[REDACTED]\n",
+            "passwd=[REDACTED]\n",
+            "client_secret=[REDACTED]\n",
+            "private key=[REDACTED]\n",
+            "suffix token=[REDACTED]\n",
+            "DATABASE_PASSWORD=[REDACTED]\n",
+            "safe after\n",
+        );
+        assert_eq!(
+            scrub_sensitive_content(raw.as_bytes()).expect("scrub assignment corpus"),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn secondary_scrub_handles_authorization_and_private_key_blocks() {
+        let raw = concat!(
+            "request Authorization: Bearer raw-token\n",
+            "proxy authorization: basic dXNlcjpwYXNz\r\n",
+            "before\n",
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "raw key material\n",
+            "-----END RSA PRIVATE KEY-----\n",
+            "after\n",
+            "-----begin private key-----\n",
+            "unterminated key material",
+        );
+        let expected = concat!(
+            "request Authorization: [REDACTED]\n",
+            "proxy authorization: [REDACTED]\r\n",
+            "before\n",
+            "[REDACTED]\n",
+            "after\n",
+            "[REDACTED]\n",
+        );
+        assert_eq!(
+            scrub_sensitive_content(raw.as_bytes()).expect("scrub authorization and PEM"),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn secondary_scrub_walks_every_json_field_array_and_nested_object() {
+        let raw = br#"{
+  "safe": "keep formatting when safe",
+  "nested": {
+    "AWS_SECRET_ACCESS_KEY": "raw-one",
+    "items": ["safe", "authorization: Bearer raw-two", {"password": "raw-three"}]
+  }
+}"#;
+        let scrubbed = scrub_sensitive_content(raw).expect("scrub structured evidence");
+        let value: serde_json::Value = serde_json::from_slice(&scrubbed).expect("scrubbed JSON");
+        assert_eq!(value["safe"], "keep formatting when safe");
+        assert_eq!(value["nested"]["AWS_SECRET_ACCESS_KEY"], REDACTED);
+        assert_eq!(value["nested"]["items"][0], "safe");
+        assert_eq!(value["nested"]["items"][1], "authorization: [REDACTED]");
+        assert_eq!(value["nested"]["items"][2]["password"], REDACTED);
+        assert!(!String::from_utf8(scrubbed).expect("UTF-8").contains("raw-"));
+    }
+
+    #[test]
+    fn secondary_scrub_inspects_the_evidence_document_output_field() {
+        let output = "build ok\nBUZZ_S3_SECRET_KEY=raw\n";
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "execution_binding_digest": "aa".repeat(32),
+            "conclusion": "success",
+            "output_sha256": hex::encode(Sha256::digest(output.as_bytes())),
+            "output_length": output.len(),
+            "output": output,
+        }))
+        .expect("EvidenceDocument bytes");
+        let scrubbed = scrub_sensitive_content(&raw).expect("scrub EvidenceDocument");
+        let value: serde_json::Value = serde_json::from_slice(&scrubbed).expect("document JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["conclusion"], "success");
+        assert_eq!(value["output"], "build ok\nBUZZ_S3_SECRET_KEY=[REDACTED]\n");
+        let scrubbed_output = value["output"].as_str().expect("scrubbed output");
+        assert_eq!(value["output_length"], scrubbed_output.len());
+        assert_eq!(
+            value["output_sha256"],
+            hex::encode(Sha256::digest(scrubbed_output.as_bytes()))
+        );
+        assert!(!scrubbed.windows(3).any(|window| window == b"raw"));
+    }
+
+    #[test]
+    fn safe_text_and_structured_evidence_remain_byte_exact() {
+        for safe in [
+            b"plain test output\nsha256=0123456789abcdef\n".as_slice(),
+            b"basic compile mode\nauthorization: digest abc123\n".as_slice(),
+            br#"{ "output": "compiled 12 targets", "sha256": "abc123" }
+"#,
+        ] {
+            assert_eq!(
+                scrub_sensitive_content(safe).expect("safe evidence"),
+                safe,
+                "safe evidence bytes must not be normalized"
+            );
+        }
+    }
+
+    #[test]
+    fn unprovable_or_malformed_structured_content_fails_closed() {
+        assert_eq!(
+            scrub_sensitive_content(b"\xff\xfe"),
+            Err(CiEvidenceError::InvalidBinding)
+        );
+        assert_eq!(
+            scrub_sensitive_content(b"safe\0hidden"),
+            Err(CiEvidenceError::InvalidBinding)
+        );
+        assert_eq!(
+            scrub_sensitive_content("\u{feff}{\"safe\":true}".as_bytes()),
+            Err(CiEvidenceError::InvalidBinding)
+        );
+        assert_eq!(
+            scrub_sensitive_content(br#"{"token":"unterminated}"#),
+            Err(CiEvidenceError::InvalidBinding)
+        );
+        assert_eq!(
+            scrub_sensitive_content(br#"{"safe":"value","token=raw":"key"}"#),
+            Err(CiEvidenceError::InvalidBinding),
+            "secret-bearing JSON keys cannot be rewritten without changing identity"
+        );
+        assert_eq!(
+            scrub_sensitive_content(br#"{"schema_version":1,"execution_binding_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conclusion":"success","output_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","output_length":4,"output":"safe"}"#),
+            Err(CiEvidenceError::InvalidBinding),
+            "EvidenceDocument integrity fields must bind the pre-scrub output"
+        );
     }
 
     #[test]
