@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url as ParsedUrl;
+use uuid::Uuid;
 
 use buzz_ci_broker_protocol::v2::{
     decode_admission_signature_message, AdmissionSignatureAlgorithm,
@@ -68,15 +69,21 @@ impl SigningPolicy {
             || parsed.host_str().is_none()
             || !parsed.username().is_empty()
             || parsed.password().is_some()
-            || parsed.query().is_some()
             || parsed.fragment().is_some()
             || parsed.origin().ascii_serialization() != self.nip98_origin
-            || !matches!(request.payload_digest, Some(digest) if digest != [0; 32])
         {
             return Err(ServiceError::PolicyDenied);
         }
         let path = parsed.path();
         if path.contains('%') || path.contains("//") || path.ends_with('/') {
+            return Err(ServiceError::PolicyDenied);
+        }
+        if request.method == HttpMethod::Get {
+            return authorize_accepted_read(&parsed, request);
+        }
+        if parsed.query().is_some()
+            || !matches!(request.payload_digest, Some(digest) if digest != [0; 32])
+        {
             return Err(ServiceError::PolicyDenied);
         }
         let segments = path
@@ -104,6 +111,39 @@ impl SigningPolicy {
         }
         Ok(())
     }
+}
+
+fn authorize_accepted_read(
+    parsed: &ParsedUrl,
+    request: &Nip98AuthorizeRequest,
+) -> Result<(), ServiceError> {
+    if parsed.path() != "/ci/control/accepted" || request.payload_digest.is_some() {
+        return Err(ServiceError::PolicyDenied);
+    }
+    let query = parsed.query().ok_or(ServiceError::PolicyDenied)?;
+    let mut fields = query.split('&');
+    let channel_id = fields
+        .next()
+        .and_then(|field| field.strip_prefix("channel_id="))
+        .ok_or(ServiceError::PolicyDenied)?;
+    let after_cursor = fields
+        .next()
+        .and_then(|field| field.strip_prefix("after_cursor="))
+        .ok_or(ServiceError::PolicyDenied)?;
+    if fields.next() != Some("limit=1") || fields.next().is_some() {
+        return Err(ServiceError::PolicyDenied);
+    }
+    let channel_uuid = Uuid::parse_str(channel_id).map_err(|_| ServiceError::PolicyDenied)?;
+    let cursor = after_cursor
+        .parse::<u64>()
+        .map_err(|_| ServiceError::PolicyDenied)?;
+    if channel_uuid.hyphenated().to_string() != channel_id
+        || cursor.to_string() != after_cursor
+        || cursor > buzz_ci_broker_protocol::MAX_SAFE_INTEGER
+    {
+        return Err(ServiceError::PolicyDenied);
+    }
+    Ok(())
 }
 
 /// Sanitized service failure mapped to the closed public protocol errors.
@@ -717,6 +757,81 @@ mod tests {
         };
         assert_eq!(signature.signed_digest, expected);
 
+        let accepted_read_url = "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1";
+        let accepted_read = Nip98AuthorizeRequest {
+            expected_generation: 8,
+            method: HttpMethod::Get,
+            url: Url::new(accepted_read_url.to_owned()).expect("url"),
+            payload_digest: None,
+            created_at: now,
+            nonce: [6; 16],
+        };
+        let expected = nip98_event_digest([2; 32], &accepted_read).expect("digest");
+        let response = service.handle(peer(), Request::Nip98Authorize(accepted_read));
+        let Response::Nip98Authorize(signature) = response else {
+            panic!("accepted read should sign");
+        };
+        assert_eq!(signature.signed_digest, expected);
+
+        for (index, url) in [
+            "https://relay.example.test/ci/control/accepted?after_cursor=42&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&after_cursor=43&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1&extra=1",
+            "https://relay.example.test/ci/control/accepted?after_cursor=42&channel_id=123e4567-e89b-12d3-a456-426614174000&limit=1",
+            "https://relay.example.test/ci/control/accepted/other?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123E4567-E89B-12D3-A456-426614174000&after_cursor=42&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567e89b12d3a456426614174000&after_cursor=42&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=042&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=9007199254740992&limit=1",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=2",
+            "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1#fragment",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let denied = Nip98AuthorizeRequest {
+                expected_generation: 8,
+                method: HttpMethod::Get,
+                url: Url::new(url.to_owned()).expect("url"),
+                payload_digest: None,
+                created_at: now,
+                nonce: [u8::try_from(index + 20).expect("bounded index"); 16],
+            };
+            assert!(matches!(
+                service.handle(peer(), Request::Nip98Authorize(denied)),
+                Response::Error {
+                    error: ErrorResponse {
+                        code: ErrorCode::PolicyDenied,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+
+        let payload_on_get = Nip98AuthorizeRequest {
+            expected_generation: 8,
+            method: HttpMethod::Get,
+            url: Url::new(accepted_read_url.to_owned()).expect("url"),
+            payload_digest: Some([9; 32]),
+            created_at: now,
+            nonce: [40; 16],
+        };
+        assert!(matches!(
+            service.handle(peer(), Request::Nip98Authorize(payload_on_get)),
+            Response::Error {
+                error: ErrorResponse {
+                    code: ErrorCode::PolicyDenied,
+                    ..
+                },
+                ..
+            }
+        ));
+
         for denied in [
             Nip98AuthorizeRequest {
                 expected_generation: 8,
@@ -787,7 +902,7 @@ mod tests {
         let stale = Nip98AuthorizeRequest {
             expected_generation: 8,
             method: HttpMethod::Get,
-            url: Url::new("https://relay.example.test/".to_owned()).expect("url"),
+            url: Url::new(accepted_read_url.to_owned()).expect("url"),
             payload_digest: None,
             created_at: now.saturating_sub(NIP98_TIMESTAMP_TOLERANCE_SECONDS + 1),
             nonce: [7_u8; 16],
