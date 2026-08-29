@@ -300,6 +300,19 @@ impl ControlDispatch for ProductionDispatch {
         }
     }
 
+    fn dispatch_v2_encoded(
+        &mut self,
+        header: buzz_ci_broker_protocol::v2::FrameHeader,
+        request: buzz_ci_broker_protocol::v2::Request,
+        now: u64,
+    ) -> buzz_ci_broker_protocol::v2::EncodedFrame {
+        match self {
+            Self::ConfiguredV2(dispatch) => dispatch.dispatch_v2_encoded(header, request, now),
+            Self::Closed(dispatch) => dispatch.dispatch_v2_encoded(header, request, now),
+            Self::Configured(dispatch) => dispatch.dispatch_v2_encoded(header, request, now),
+        }
+    }
+
     fn maintenance(&mut self, now: u64) {
         match self {
             Self::Configured(dispatch) => dispatch.maintenance(now),

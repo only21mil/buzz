@@ -143,6 +143,8 @@ impl PeerRole {
                     | Operation::CancelAttempt
                     | Operation::GetAttempt
                     | Operation::CompleteAttempt
+                    | Operation::DescribeAttemptEvidence
+                    | Operation::ReadAttemptEvidence
             ),
         }
     }
@@ -233,6 +235,51 @@ pub trait ControlDispatch {
         now: u64,
     ) -> v2::BrokerResponse {
         crate::production_binding::empty_response(ResponseCode::NotProvisioned, now)
+    }
+
+    /// Encode an operation-specific v2 response. Evidence export overrides
+    /// this seam; existing operations retain their frozen broker response.
+    fn dispatch_v2_encoded(
+        &mut self,
+        header: v2::FrameHeader,
+        request: v2::Request,
+        now: u64,
+    ) -> v2::EncodedFrame {
+        match request {
+            v2::Request::DescribeAttemptEvidence(value) => {
+                v2::encode_evidence_description_response(
+                    header,
+                    v2::EvidenceDescriptionResponse {
+                        code: ResponseCode::NotProvisioned,
+                        execution_binding_digest: value.coordinates.execution_binding_digest,
+                        generation: value.coordinates.expected_generation,
+                        request_frame_digest: value.request_frame_digest,
+                        descriptor_set_digest: [0; 32],
+                        item_count: 0,
+                        items: [None; v2::MAX_EVIDENCE_ITEMS],
+                    },
+                )
+            }
+            v2::Request::ReadAttemptEvidence(value) => v2::encode_evidence_chunk_response(
+                header,
+                &v2::EvidenceChunkResponse {
+                    code: ResponseCode::NotProvisioned,
+                    execution_binding_digest: value.coordinates.execution_binding_digest,
+                    generation: value.coordinates.expected_generation,
+                    request_frame_digest: value.request_frame_digest,
+                    kind: value.kind,
+                    item_index: value.item_index,
+                    descriptor_digest: value.descriptor_digest,
+                    offset: value.offset,
+                    total_length: 0,
+                    bytes: Vec::new(),
+                },
+            ),
+            _ => {
+                let response = self.dispatch_v2(header, request, now);
+                v2::encode_response(header, response)
+            }
+        }
     }
 
     /// Run traffic-independent lease maintenance at one trusted clock reading.
@@ -608,8 +655,8 @@ fn serve_verified_stream_mode<D: ControlDispatch>(
             let (decoded_header, request) = v2::decode_request(&frame[..frame_size])
                 .map_err(|_| ControlError::Frame("malformed body"))?;
             debug_assert_eq!(decoded_header, header);
-            let response = dispatch.dispatch_v2(header, request, unix_now()?);
-            write_all_fd(&stream, v2::encode_response(header, response).as_bytes())
+            let response = dispatch.dispatch_v2_encoded(header, request, unix_now()?);
+            write_all_fd(&stream, response.as_bytes())
         }
         _ => Err(ControlError::Frame("malformed header")),
     }
@@ -1149,6 +1196,8 @@ mod tests {
             Operation::CancelAttempt,
             Operation::GetAttempt,
             Operation::CompleteAttempt,
+            Operation::DescribeAttemptEvidence,
+            Operation::ReadAttemptEvidence,
         ] {
             assert!(PeerRole::Runner.permits(operation));
             assert!(!PeerRole::Control.permits(operation));
