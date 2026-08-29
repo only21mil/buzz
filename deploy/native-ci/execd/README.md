@@ -111,35 +111,76 @@ root-owned mode-`0444` acceptance receipt beneath the separately traversable
 only additional traverse-only children; their private descendants remain
 unreadable and unlistable.
 
-The standalone execd package owns only `/usr/libexec/buzz-ci-execd`. The
-central activation package owns the executor binary, all four execd/executor
-units, fixture files, sysusers, tmpfiles, and their transactional rollback.
-`freeze_package.py` requires that exact activation package and binds its package
-and manifest digests, execd provenance, and eight activation-owned targets.
+The standalone execd package owns only `/usr/libexec/buzz-ci-execd`. Before the
+activation package exists, `freeze_package.py prepare-input` emits one canonical
+mode-`0600` `buzz-ci-execd-preactivation-input-v1` file. It contains only the
+source commit, execd binary SHA-256, and provenance-file SHA-256. It is not an
+install package or manifest and claims no targets.
+
+The central activation package owns the executor binary, all four
+execd/executor units, fixture files, sysusers, tmpfiles, and their transactional
+rollback. After that package freezes, `freeze-package` reopens the same execd
+binary, provenance, and pre-activation input. It rejects any tuple drift, then
+binds the exact pre-activation-input digest, final activation ID, package and
+manifest digests, execd provenance, and eight activation-owned targets.
 The installer never writes those targets. On a clean host their receipt state
 is `pending`; after activation has written its central receipt, `check` requires
 the exact package, source, fixed-manifest, and managed-target binding.
 
 The standalone package does not bundle the distribution seccomp profile. It
-checks `/usr/share/containers/seccomp.json` against the compiled digest and
-writes a create-once root-owned mode-`0600` package receipt at
-`/var/lib/buzzci/execd-v2/package/receipt-v1.json`. Execd startup remains the
-only owner of the content-addressed runtime profile and runtime receipt.
+checks `/usr/share/containers/seccomp.json` against the compiled digest. Before
+replacing `/usr/libexec/buzz-ci-execd`, the installer captures the exact prior
+binary bytes and metadata. A present baseline is held at
+`/var/lib/buzzci/execd-v2/package/preimage-v1.bin`; an absent baseline is
+recorded explicitly. The root-owned mode-`0600` install receipt at
+`/var/lib/buzzci/execd-v2/package/receipt-v1.json` binds that baseline and
+preimage to the execd package digest, source commit, binary digest, and fixed
+activation package. The package directory is root-owned mode `0700`, and all
+custody reads and writes use no-follow, descriptor-relative operations. Execd
+startup remains the only owner of the content-addressed runtime profile and
+runtime receipt.
 
-Freeze and install the package with:
+`install.py rollback` checks the current candidate binary, active receipt,
+preimage, ownership, modes, and directory bindings before mutation. It restores
+the prior binary atomically, or removes the candidate when the baseline was
+absent. It then removes active custody and writes a mode-`0600`
+`rollback-v1.json` terminal receipt. Candidate drift, a receipt from another
+package, a swapped preimage, or a prior terminal receipt from another candidate
+fails closed. A failed rollback compensates to the fully installed candidate;
+the operator can retry the same command. An exact retry after success returns
+`unchanged` only after rechecking the restored baseline and terminal receipt.
+
+Prepare the activation input, then freeze and install the final package with:
 
 ```bash
-deploy/native-ci/execd/freeze_package.py \
+deploy/native-ci/execd/freeze_package.py prepare-input \
   --source-root . --source-commit "$SOURCE_COMMIT" \
   --binary "$EXECD_BINARY" --binary-provenance "$EXECD_PROVENANCE" \
+  --output "$EXECD_PREACTIVATION_INPUT"
+
+# Render and freeze the activation package before this command.
+deploy/native-ci/execd/freeze_package.py freeze-package \
+  --source-root . --source-commit "$SOURCE_COMMIT" \
+  --binary "$EXECD_BINARY" --binary-provenance "$EXECD_PROVENANCE" \
+  --preactivation-input "$EXECD_PREACTIVATION_INPUT" \
   --activation-package "$ACTIVATION_PACKAGE" --output "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py verify-package --package "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py install --package "$EXECD_PACKAGE"
+deploy/native-ci/execd/install.py rollback --package "$EXECD_PACKAGE"
 ```
 
-Both commands reject symbolic paths, hard links, noncanonical manifests,
-metadata or digest drift, overlapping ownership, and mismatched activation
+Both freezer phases reject symbolic paths, hard links, noncanonical input,
+metadata or digest drift, and source-commit replay. Final freeze also rejects a
+different pre-activation tuple, overlapping ownership, and mismatched activation
 bindings. Installation does not reload, enable, or start a unit.
+
+If the activation receipt says the prior execd socket or service was active,
+activation rollback stops the capacity-one units and restores file state but
+holds before restoring prior systemd state while the candidate package receipt
+is active. Run the bound execd package rollback, then retry activation rollback.
+The retry verifies the execd terminal receipt and restored binary before it can
+restart the prior execd unit. This ordering prevents systemd from restarting
+the newly installed binary under the old unit state.
 
 Run the local static checks with:
 

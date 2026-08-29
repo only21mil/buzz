@@ -146,6 +146,12 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    prior bytes, metadata, and exact unit active/enable state. It restores or
    removes generated acceptance configs and restores the prior controld
    acceptance ledger. Service principals remain for audit and UID stability.
+   If the prior execd service or socket was active, rollback stops at a safe
+   capacity-zero hold before restoring prior unit state while the standalone
+   execd package receipt is active. Run the exact execd package's
+   `install.py rollback`, then retry activation rollback. The retry accepts only
+   a bound terminal execd rollback receipt and exact restored binary baseline
+   before systemd may restart the prior execd unit.
 
 The production canary closes capacity through three root-only calls to the
 installed `/usr/libexec/buzz-ci-activation-controller`. Each call accepts only
@@ -297,6 +303,32 @@ binds the activation ID to its package digest.
 The draft's controld component names a mode-`0400` copy of the frozen controld
 `package-manifest.json` in `--asset-root`. The freezer checks its canonical
 package digest, source commit, and both controld unit entries.
+
+## Package bootstrap sequence
+
+Use one full candidate SHA for every step. This order removes the former cycle
+between the execd and activation packages:
+
+1. Freeze and verify the final runner, controld, and keyholder packages.
+2. Run `deploy/native-ci/execd/freeze_package.py prepare-input` against the exact
+   execd release binary and its canonical provenance. Keep those bytes fixed.
+3. Run `render_inputs.py render-draft`. Its descriptor names the three ready
+   manifests and the pre-activation execd input. It does not name an execd
+   package manifest.
+4. Freeze the activation package from that rendered draft and the exact asset
+   directory.
+5. Run `deploy/native-ci/execd/freeze_package.py freeze-package` with the same
+   binary, provenance, and pre-activation input plus the final activation
+   package. Any changed or replayed tuple fails.
+6. Run `render-scenario`, then `render-clean-host`, with all five final package
+   manifests and trees.
+7. Run `check_package_inventory.py` against those same five manifests before
+   installation.
+
+Do not substitute a provisional execd manifest, a synthetic activation
+manifest, or a fixed-point digest. The pre-activation file carries no ownership
+or install claims. Only the final execd manifest binds the final activation ID,
+package digest, manifest digest, and activation-owned target hashes.
 
 Clean-host preflight permits `not-found` only for the seven fragments installed
 by this package. Every external dependency unit, including the controld

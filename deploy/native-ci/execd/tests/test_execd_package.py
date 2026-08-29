@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -134,6 +135,7 @@ def _manual_execd_package(path: Path, binary: bytes) -> dict[str, object]:
         "source_commit": "a" * 40,
         "execd_binary_sha256": binary_sha256,
         "execd_provenance_sha256": hashlib.sha256(provenance_raw).hexdigest(),
+        "preactivation_input_sha256": "e" * 64,
         "owned_entries_sha256": "d" * 64,
         "owned_target_sha256": target_digests,
         "receipt_path": "/var/lib/buzzci/activation-controller/receipt-v1.json",
@@ -349,9 +351,13 @@ class ExecdPackageTests(unittest.TestCase):
                 root / "activation", source_commit, binary_sha256,
                 hashlib.sha256(provenance.read_bytes()).hexdigest(),
             )
+            preactivation = root / "execd-preactivation.json"
+            prepared = FREEZER.prepare_preactivation_input(
+                repository, source_commit, binary, provenance, preactivation
+            )
             output = root / "execd-package"
             manifest = FREEZER.freeze_package(
-                repository, source_commit, binary, provenance, activation, output
+                repository, source_commit, binary, provenance, preactivation, activation, output
             )
             parsed, entry = INSTALL.parse_package(output)
             self.assertEqual(parsed, manifest)
@@ -360,7 +366,78 @@ class ExecdPackageTests(unittest.TestCase):
                 parsed["activation_binding"]["package_digest"],
                 json.loads((activation / "activation-manifest.json").read_bytes())["package_digest"],
             )
+            self.assertEqual(
+                parsed["activation_binding"]["preactivation_input_sha256"],
+                hashlib.sha256(preactivation.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(prepared["binary_sha256"], binary_sha256)
             self.assertNotIn("/usr/libexec/buzz-ci-executor", [item["target"] for item in parsed["entries"]])
+
+    def test_final_freeze_rejects_mismatched_replayed_and_tampered_preactivation_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "source"
+            package_source = repository / "deploy/native-ci/execd"
+            package_source.mkdir(parents=True)
+            (package_source / "marker").write_text("tracked\n")
+            subprocess.run(["git", "init", "-q", repository], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", repository, "add", "."], check=True)
+            subprocess.run(["git", "-C", repository, "commit", "-q", "-m", "fixture"], check=True)
+            source_commit = subprocess.check_output(
+                ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+            ).strip()
+            binary = root / "buzz-ci-execd"
+            binary.write_bytes(b"fixed execd binary\n")
+            binary.chmod(0o755)
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            provenance = root / "binary-provenance.json"
+            provenance.write_bytes(FREEZER.canonical_json({
+                "binary": "buzz-ci-execd", "profile": "release",
+                "schema": FREEZER.PROVENANCE_SCHEMA, "sha256": binary_sha256,
+                "source_commit": source_commit,
+            }))
+            provenance.chmod(0o600)
+            provenance_sha256 = hashlib.sha256(provenance.read_bytes()).hexdigest()
+            activation = _activation_package(
+                root / "activation", source_commit, binary_sha256, provenance_sha256,
+            )
+            preactivation = root / "preactivation.json"
+            FREEZER.prepare_preactivation_input(
+                repository, source_commit, binary, provenance, preactivation,
+            )
+
+            replayed = root / "replayed.json"
+            replayed.write_bytes(FREEZER.canonical_json({
+                **json.loads(preactivation.read_bytes()), "source_commit": "f" * 40,
+            }))
+            replayed.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "tuple differs"):
+                FREEZER.freeze_package(
+                    repository, source_commit, binary, provenance, replayed,
+                    activation, root / "replayed-package",
+                )
+
+            tampered = root / "tampered.json"
+            tampered.write_bytes(preactivation.read_bytes()[:-1] + b" \n")
+            tampered.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                FREEZER.freeze_package(
+                    repository, source_commit, binary, provenance, tampered,
+                    activation, root / "tampered-package",
+                )
+
+            mismatched = root / "mismatched.json"
+            mismatch_value = json.loads(preactivation.read_bytes())
+            mismatch_value["binary_sha256"] = "d" * 64
+            mismatched.write_bytes(FREEZER.canonical_json(mismatch_value))
+            mismatched.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "tuple differs"):
+                FREEZER.freeze_package(
+                    repository, source_commit, binary, provenance, mismatched,
+                    activation, root / "mismatched-package",
+                )
 
     def test_installer_is_create_once_dormant_and_central_receipt_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -640,6 +717,208 @@ class ExecdPackageTests(unittest.TestCase):
                 asset.symlink_to(replacement.name)
                 with self.assertRaises((OSError, ValueError)):
                     INSTALL.parse_package(package)
+
+    def test_rollback_restores_replaced_binary_and_is_terminally_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            prior = b"prior exact execd binary\n"
+            candidate = b"candidate execd binary\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, candidate, seccomp)
+                target = root / "usr/libexec/buzz-ci-execd"
+                target.parent.mkdir(mode=0o755)
+                target.parent.chmod(0o755)
+                target.write_bytes(prior)
+                target.chmod(0o751)
+                installed = INSTALL.install(package, root)
+                self.assertEqual(installed["status"], "installed")
+                preimage = root / "var/lib/buzzci/execd-v2/package/preimage-v1.bin"
+                self.assertEqual((preimage.read_bytes(), _mode(preimage)), (prior, 0o600))
+
+                result = INSTALL.rollback(package, root)
+                self.assertEqual((result["status"], result["prior_state"]), ("rolled_back", "present"))
+                self.assertEqual((target.read_bytes(), _mode(target)), (prior, 0o751))
+                custody = preimage.parent
+                self.assertFalse((custody / "receipt-v1.json").exists())
+                self.assertFalse(preimage.exists())
+                terminal = json.loads((custody / "rollback-v1.json").read_bytes())
+                self.assertEqual(terminal["state"], "rolled_back")
+                self.assertEqual(INSTALL.rollback(package, root)["status"], "unchanged")
+
+    def test_rollback_restores_an_absent_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"candidate\n", seccomp)
+                INSTALL.install(package, root)
+                target = root / "usr/libexec/buzz-ci-execd"
+                self.assertTrue(target.exists())
+                output = io.StringIO()
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["install.py", "rollback", "--package", str(package), "--root", str(root)],
+                ), mock.patch.object(sys, "stdout", output):
+                    self.assertEqual(INSTALL.main(), 0)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["prior_state"], "absent")
+                self.assertFalse(target.exists())
+                self.assertEqual(INSTALL.rollback(package, root)["status"], "unchanged")
+
+    def test_rollback_rejects_binary_drift_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"candidate\n", seccomp)
+                target = root / "usr/libexec/buzz-ci-execd"
+                target.parent.mkdir(mode=0o755)
+                target.parent.chmod(0o755)
+                target.write_bytes(b"prior\n")
+                target.chmod(0o755)
+                INSTALL.install(package, root)
+                target.write_bytes(b"hostile drift\n")
+                with self.assertRaisesRegex(ValueError, "binary drift blocks rollback"):
+                    INSTALL.rollback(package, root)
+                self.assertEqual(target.read_bytes(), b"hostile drift\n")
+                custody = root / "var/lib/buzzci/execd-v2/package"
+                self.assertTrue((custody / "receipt-v1.json").exists())
+                self.assertTrue((custody / "preimage-v1.bin").exists())
+                self.assertFalse((custody / "rollback-v1.json").exists())
+
+    def test_rollback_rejects_swapped_preimage_and_mismatched_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"candidate one\n", seccomp)
+                target = root / "usr/libexec/buzz-ci-execd"
+                target.parent.mkdir(mode=0o755)
+                target.parent.chmod(0o755)
+                target.write_bytes(b"prior one\n")
+                target.chmod(0o755)
+                INSTALL.install(package, root)
+                preimage = root / "var/lib/buzzci/execd-v2/package/preimage-v1.bin"
+                preimage.write_bytes(b"swapped preimage\n")
+                preimage.chmod(0o600)
+                with self.assertRaisesRegex(ValueError, "preimage differs"):
+                    INSTALL.rollback(package, root)
+                self.assertEqual(target.read_bytes(), b"candidate one\n")
+
+                preimage.write_bytes(b"prior one\n")
+                preimage.chmod(0o600)
+                receipt = preimage.parent / "receipt-v1.json"
+                original_receipt = receipt.read_bytes()
+                (base / "second").mkdir(mode=0o700)
+                other, other_root = _manual_install_fixture(
+                    base / "second", b"candidate two\n", seccomp
+                )
+                other_target = other_root / "usr/libexec/buzz-ci-execd"
+                other_target.parent.mkdir(mode=0o755)
+                other_target.parent.chmod(0o755)
+                other_target.write_bytes(b"prior two\n")
+                other_target.chmod(0o755)
+                INSTALL.install(other, other_root)
+                receipt.write_bytes(
+                    (other_root / "var/lib/buzzci/execd-v2/package/receipt-v1.json").read_bytes()
+                )
+                receipt.chmod(0o600)
+                with self.assertRaisesRegex(ValueError, "install receipt differs"):
+                    INSTALL.rollback(package, root)
+                self.assertEqual(target.read_bytes(), b"candidate one\n")
+
+                receipt.write_bytes(original_receipt)
+                receipt.chmod(0o600)
+                with self.assertRaisesRegex(ValueError, "install receipt differs"):
+                    INSTALL.rollback(other, root)
+                self.assertEqual(target.read_bytes(), b"candidate one\n")
+
+    def test_rollback_partial_failure_compensates_and_retry_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            prior = b"prior exact\n"
+            candidate = b"candidate exact\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, candidate, seccomp)
+                target = root / "usr/libexec/buzz-ci-execd"
+                target.parent.mkdir(mode=0o755)
+                target.parent.chmod(0o755)
+                target.write_bytes(prior)
+                target.chmod(0o755)
+                INSTALL.install(package, root)
+                original_remove = INSTALL._remove_rollback_managed_at
+
+                def fail_after_remove(directory_fd: int, baseline: object) -> None:
+                    original_remove(directory_fd, baseline)
+                    raise OSError("forced rollback custody failure")
+
+                with mock.patch.object(
+                    INSTALL, "_remove_rollback_managed_at", side_effect=fail_after_remove
+                ):
+                    with self.assertRaisesRegex(OSError, "forced rollback custody failure"):
+                        INSTALL.rollback(package, root)
+                self.assertEqual(target.read_bytes(), candidate)
+                custody = root / "var/lib/buzzci/execd-v2/package"
+                self.assertTrue((custody / "receipt-v1.json").exists())
+                self.assertTrue((custody / "preimage-v1.bin").exists())
+                self.assertFalse((custody / "rollback-v1.json").exists())
+
+                self.assertEqual(INSTALL.rollback(package, root)["status"], "rolled_back")
+                self.assertEqual(target.read_bytes(), prior)
+
+    def test_rollback_resumes_a_durable_inflight_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            prior = b"prior crash baseline\n"
+            candidate = b"candidate crash baseline\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, candidate, seccomp)
+                target = root / "usr/libexec/buzz-ci-execd"
+                target.parent.mkdir(mode=0o755)
+                target.parent.chmod(0o755)
+                target.write_bytes(prior)
+                target.chmod(0o750)
+                INSTALL.install(package, root)
+                custody = root / "var/lib/buzzci/execd-v2/package"
+                install_receipt = json.loads((custody / "receipt-v1.json").read_bytes())
+                write_file = custody / "rollback-v1.json"
+                write_file.write_bytes(INSTALL.canonical_json({
+                    "schema": "buzz-ci-execd-package-rollback-receipt-v1",
+                    "state": "rolling_back",
+                    "install_receipt": install_receipt,
+                }))
+                write_file.chmod(0o600)
+                target.write_bytes(prior)
+                target.chmod(0o750)
+                (custody / "receipt-v1.json").unlink()
+                (custody / "preimage-v1.bin").unlink()
+
+                result = INSTALL.rollback(package, root)
+                self.assertEqual((result["status"], result["prior_state"]), ("rolled_back", "present"))
+                self.assertEqual((target.read_bytes(), _mode(target)), (prior, 0o750))
+                self.assertEqual(INSTALL.rollback(package, root)["status"], "unchanged")
 
 
 if __name__ == "__main__":

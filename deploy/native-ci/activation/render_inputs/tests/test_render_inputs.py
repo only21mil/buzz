@@ -497,6 +497,26 @@ class RendererTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDER.RenderError, "shape differs|private"):
             RENDER.validate_public_binding(binding)
 
+    def test_execd_preactivation_input_is_candidate_bound_and_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            value = {
+                "schema": "buzz-ci-execd-preactivation-input-v1",
+                "source_commit": CANDIDATE,
+                "binary_sha256": "8" * 64,
+                "provenance_sha256": "9" * 64,
+            }
+            reference = write_json(root_path, "execd-preactivation.json", value)
+            root = self.output_root(root_path)
+            try:
+                loaded, digest = RENDER.load_execd_preactivation(root, reference, CANDIDATE)
+                self.assertEqual(loaded, value)
+                self.assertEqual(digest, reference["sha256"])
+                with self.assertRaisesRegex(RENDER.RenderError, "candidate differs"):
+                    RENDER.load_execd_preactivation(root, reference, "d" * 40)
+            finally:
+                root.close()
+
     def test_sealed_freeze_requires_cross_bound_manifests(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
