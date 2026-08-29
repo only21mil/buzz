@@ -11,13 +11,19 @@ use std::{
     os::unix::{
         fs::{MetadataExt, PermissionsExt},
         net::UnixStream,
+        process::CommandExt,
     },
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
 
+use nix::{
+    sys::signal::{killpg, Signal},
+    unistd::Pid,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1614,56 +1620,161 @@ fn run_bounded_controller(
     input: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, ControlError> {
+    run_bounded_controller_process(ACTIVATION_CONTROLLER_PROGRAM, &[action], input, timeout)
+}
+
+fn run_bounded_controller_process(
+    program: &str,
+    args: &[&str],
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, ControlError> {
     const MAX_OUTPUT: usize = 64 * 1024;
+    const TERMINATE_GRACE: Duration = Duration::from_millis(100);
+    const READER_GRACE: Duration = Duration::from_millis(100);
     if input.is_empty() || input.len() > MAX_OUTPUT {
         return Err(ControlError::HostAction);
     }
-    let mut child = Command::new(ACTIVATION_CONTROLLER_PROGRAM)
-        .arg(action)
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|_| ControlError::HostAction)?;
-    let mut stdin = child.stdin.take().ok_or(ControlError::HostAction)?;
-    let write_result = stdin
-        .write_all(input)
-        .and_then(|()| stdin.write_all(b"\n"))
-        .map_err(|_| ControlError::HostAction);
-    drop(stdin);
-    if write_result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(ControlError::HostAction);
-    }
-    let stdout = child.stdout.take().ok_or(ControlError::HostAction)?;
-    let stderr = child.stderr.take().ok_or(ControlError::HostAction)?;
-    let stdout_reader = thread::spawn(move || read_process_output(stdout, MAX_OUTPUT));
-    let stderr_reader = thread::spawn(move || read_process_output(stderr, MAX_OUTPUT));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().map_err(|_| ControlError::HostAction)? {
-            Some(value) => break value,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(ControlError::HostAction);
-            }
-            None => thread::sleep(Duration::from_millis(10)),
+    let process_group =
+        Pid::from_raw(i32::try_from(child.id()).map_err(|_| ControlError::HostAction)?);
+    let stdin = match child.stdin.take() {
+        Some(value) => value,
+        None => {
+            terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+            return Err(ControlError::HostAction);
         }
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| ControlError::HostAction)??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| ControlError::HostAction)??;
+    let stdout = match child.stdout.take() {
+        Some(value) => value,
+        None => {
+            terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+            return Err(ControlError::HostAction);
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(value) => value,
+        None => {
+            terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+            return Err(ControlError::HostAction);
+        }
+    };
+    let input_writer = process_input_writer(stdin, input.to_vec());
+    let stdout_reader = process_output_reader(stdout, MAX_OUTPUT);
+    let stderr_reader = process_output_reader(stderr, MAX_OUTPUT);
+    let deadline = Instant::now() + timeout;
+    if !matches!(input_writer.recv_timeout(timeout), Ok(Ok(()))) {
+        terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+        drain_process_output(&stdout_reader, READER_GRACE);
+        drain_process_output(&stderr_reader, READER_GRACE);
+        return Err(ControlError::HostAction);
+    }
+    let status = loop {
+        match child.try_wait() {
+            Err(_) => {
+                terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+                drain_process_output(&stdout_reader, READER_GRACE);
+                drain_process_output(&stderr_reader, READER_GRACE);
+                return Err(ControlError::HostAction);
+            }
+            Ok(Some(value)) => break value,
+            Ok(None) if Instant::now() >= deadline => {
+                terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+                drain_process_output(&stdout_reader, READER_GRACE);
+                drain_process_output(&stderr_reader, READER_GRACE);
+                return Err(ControlError::HostAction);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let stdout = match receive_process_output(&stdout_reader, deadline) {
+        Ok(value) => value,
+        Err(()) => {
+            terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+            drain_process_output(&stdout_reader, READER_GRACE);
+            drain_process_output(&stderr_reader, READER_GRACE);
+            return Err(ControlError::HostAction);
+        }
+    }?;
+    let stderr = match receive_process_output(&stderr_reader, deadline) {
+        Ok(value) => value,
+        Err(()) => {
+            terminate_process_group(&mut child, process_group, TERMINATE_GRACE);
+            drain_process_output(&stderr_reader, READER_GRACE);
+            return Err(ControlError::HostAction);
+        }
+    }?;
     if !status.success() || !stderr.is_empty() || stdout.is_empty() {
         return Err(ControlError::HostAction);
     }
     Ok(stdout)
+}
+
+fn process_input_writer(
+    mut writer: impl Write + Send + 'static,
+    input: Vec<u8>,
+) -> Receiver<Result<(), ControlError>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = writer
+            .write_all(&input)
+            .and_then(|()| writer.write_all(b"\n"))
+            .map_err(|_| ControlError::HostAction);
+        drop(writer);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn process_output_reader(
+    reader: impl Read + Send + 'static,
+    maximum: usize,
+) -> Receiver<Result<Vec<u8>, ControlError>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(read_process_output(reader, maximum));
+    });
+    receiver
+}
+
+fn receive_process_output(
+    receiver: &Receiver<Result<Vec<u8>, ControlError>>,
+    deadline: Instant,
+) -> Result<Result<Vec<u8>, ControlError>, ()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    receiver.recv_timeout(remaining).map_err(|_| ())
+}
+
+fn drain_process_output(receiver: &Receiver<Result<Vec<u8>, ControlError>>, timeout: Duration) {
+    match receiver.recv_timeout(timeout) {
+        Ok(_) | Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => {}
+    }
+}
+
+fn terminate_process_group(child: &mut std::process::Child, group: Pid, grace: Duration) {
+    let _ = killpg(group, Signal::SIGTERM);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = killpg(group, Signal::SIGKILL);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn read_process_output(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>, ControlError> {
@@ -2795,5 +2906,31 @@ mod tests {
         ] {
             assert_eq!(run_simulation(fault).outcome, Outcome::Fail);
         }
+    }
+
+    #[test]
+    fn controller_descendant_retaining_output_pipe_is_killed_without_unbounded_join() {
+        let started = Instant::now();
+        let result = run_bounded_controller_process(
+            "/bin/sh",
+            &["-c", "printf '{\"status\":\"ok\"}'; sleep 30 &"],
+            b"{}",
+            Duration::from_millis(80),
+        );
+        assert_eq!(result, Err(ControlError::HostAction));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn controller_timeout_kills_term_ignoring_process_group_and_returns_boundedly() {
+        let started = Instant::now();
+        let result = run_bounded_controller_process(
+            "/bin/sh",
+            &["-c", "trap '' TERM; (trap '' TERM; sleep 30) & wait"],
+            b"{}",
+            Duration::from_millis(40),
+        );
+        assert_eq!(result, Err(ControlError::HostAction));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

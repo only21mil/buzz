@@ -9,6 +9,7 @@ pub mod acceptance_binding;
 #[doc(hidden)]
 pub mod acceptance_binding_test_support;
 pub mod production;
+pub mod production_qualification;
 
 use std::{
     fmt,
