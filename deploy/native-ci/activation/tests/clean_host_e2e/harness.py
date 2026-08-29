@@ -390,15 +390,23 @@ def copy_bound(source: Path, target: Path, expected_sha256: str) -> None:
         os.close(target_fd)
 
 
-def bwrap_prefix(state: Path) -> list[str]:
+def bwrap_prefix(state: Path, *, writable_files: tuple[str, ...] = ()) -> list[str]:
+    allowed_writable = {
+        "ceremony.qcow2", "candidate.qcow2", "verifier.qcow2",
+        "transfer.raw", "evidence.bin",
+    }
+    if len(set(writable_files)) != len(writable_files) or any(name not in allowed_writable for name in writable_files):
+        raise HarnessError("Bubblewrap writable-file allowlist differs")
     prefix = [
         TOOLS["bwrap"], "--unshare-all", "--unshare-net", "--die-with-parent", "--new-session",
         "--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev",
         "--dev-bind", "/dev/kvm", "/dev/kvm",
         "--tmpfs", "/tmp", "--tmpfs", "/run", "--dir", "/etc",
-        "--dir", "/work", "--bind", str(state), "/work",
+        "--dir", "/work", "--ro-bind", str(state), "/work",
         "--chdir", "/work",
     ]
+    for name in writable_files:
+        prefix.extend(["--bind", str(state / name), f"/work/{name}"])
     for target, source in (("/bin", "usr/bin"), ("/sbin", "usr/sbin"), ("/lib", "usr/lib"), ("/lib64", "usr/lib64")):
         prefix.extend(["--symlink", source, target])
     if Path("/etc/ld.so.cache").is_file():
@@ -413,7 +421,12 @@ def qemu_command(
         raise HarnessError("unknown VM overlay")
     if transfer not in {None, "read-write", "read-only"}:
         raise HarnessError("unknown evidence-transfer mode")
-    command = bwrap_prefix(state) + [
+    writable_files = [overlay]
+    if transfer == "read-write":
+        writable_files.append("transfer.raw")
+    if evidence:
+        writable_files.append("evidence.bin")
+    command = bwrap_prefix(state, writable_files=tuple(writable_files)) + [
         "--", TOOLS["qemu"], "-nodefaults", "-no-user-config", "-enable-kvm",
         "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "2048",
         "-display", "none", "-serial", "none", "-monitor", "none", "-nic", "none",
@@ -571,6 +584,13 @@ def boot(
         evidence.unlink()
     except FileNotFoundError:
         pass
+    if evidence_expected:
+        evidence_fd = os.open(
+            evidence,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        os.close(evidence_fd)
     process = subprocess.Popen(
         qemu_command(state, overlay=overlay, evidence=evidence_expected, transfer=transfer), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
@@ -721,16 +741,18 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         raise
 
 
-def validate_contract(path: Path) -> tuple[dict[str, object], Path, dict[str, list[tuple[str, int, bytes]]]]:
-    value = load_json(path)
-    required = {"schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"}
-    if not isinstance(value, dict) or set(value) != required or value["schema_version"] != SCHEMA:
-        raise HarnessError("run contract shape differs")
-    if not isinstance(value["candidate_sha"], str) or HEX40.fullmatch(value["candidate_sha"]) is None:
-        raise HarnessError("candidate SHA is invalid")
-    state = safe_directory(Path(str(value["state"])))
+def validate_prepared_state(state: Path) -> dict[str, object]:
+    """Revalidate every prepared host input before a trusted VM use."""
+    state = safe_directory(state)
     state_record = load_json(state / "state.json")
-    if not isinstance(state_record, dict) or state_record.get("schema_version") != STATE_SCHEMA:
+    if (
+        not isinstance(state_record, dict)
+        or set(state_record) != {
+            "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
+            "qemu_version", "tool_sha256", "harness_asset_sha256", "trusted_image_sha256",
+        }
+        or state_record.get("schema_version") != STATE_SCHEMA
+    ):
         raise HarnessError("VM state binding differs")
     if file_sha256(Path(TOOLS["qemu"])) != state_record.get("qemu_sha256"):
         raise HarnessError("QEMU changed after key ceremony")
@@ -759,6 +781,22 @@ def validate_contract(path: Path) -> tuple[dict[str, object], Path, dict[str, li
     if file_sha256(state / "trusted.qcow2") != trusted_digest:
         raise HarnessError("trusted ceremony image changed after preparation")
     validate_flat_qcow2(state, "trusted.qcow2")
+    return state_record
+
+
+def validate_contract(
+    path: Path,
+) -> tuple[
+    dict[str, object], Path, dict[str, list[tuple[str, int, bytes]]], bytes, bytes,
+]:
+    value = load_json(path)
+    required = {"schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"}
+    if not isinstance(value, dict) or set(value) != required or value["schema_version"] != SCHEMA:
+        raise HarnessError("run contract shape differs")
+    if not isinstance(value["candidate_sha"], str) or HEX40.fullmatch(value["candidate_sha"]) is None:
+        raise HarnessError("candidate SHA is invalid")
+    state = safe_directory(Path(str(value["state"])))
+    validate_prepared_state(state)
     candidate = safe_input_directory(Path(str(value["candidate_root"])))
     resolved = bounded(["/usr/bin/git", "-C", str(candidate), "rev-parse", f"{value['candidate_sha']}^{{commit}}"] ).decode().strip()
     if resolved != value["candidate_sha"]:
@@ -841,6 +879,7 @@ def create_run_stage(
 def create_verify_stage(
     contract: dict[str, object], state: Path, scenario_raw: bytes,
 ) -> None:
+    validate_prepared_state(state)
     clean_transient(state)
     stage = state / "stage"
     stage.mkdir(mode=0o700)
@@ -910,9 +949,11 @@ def run_vm(
     contract: dict[str, object], state: Path, records: dict[str, list[tuple[str, int, bytes]]],
     scenario_raw: bytes, seccomp_raw: bytes, results_arg: Path,
 ) -> dict[str, object]:
-    results = safe_directory(results_arg, create=True)
-    success = False
+    results: Path | None = None
+    outcome: dict[str, object] | None = None
+    run_error: BaseException | None = None
     try:
+        results = safe_directory(results_arg, create=True)
         challenge = str(load_json(state / "state.json")["challenge"])
         if any((state / name).exists() for name in ("candidate.qcow2", "verifier.qcow2", "transfer.raw")):
             raise HarnessError("prior VM run residue exists")
@@ -929,8 +970,10 @@ def run_vm(
         if (state / "evidence.bin").exists():
             raise HarnessError("candidate VM reached verifier evidence storage")
         validate_transfer(state)
+        validate_prepared_state(state)
         qemu_img_create(state, "verifier.qcow2", "trusted.qcow2")
         create_verify_stage(contract, state, scenario_raw)
+        validate_prepared_state(state)
         frame = boot(
             state, 180, overlay="verifier.qcow2",
             evidence_expected=True, transfer="read-only",
@@ -966,17 +1009,36 @@ def run_vm(
         receipt_path.chmod(0o400)
         verifier_path.chmod(0o400)
         evidence_path.chmod(0o400)
-        success = True
-        return {
+        outcome = {
             "status": "pass", "candidate_sha": contract["candidate_sha"],
             "receipt_sha256": receipt_digest, "verifier_sha256": verifier_digest,
             "evidence_manifest_sha256": hashlib.sha256(canonical(evidence_manifest)).hexdigest(),
             "dormant_proof": proof, "vm_state_absent": True,
         }
-    finally:
+    except BaseException as error:
+        run_error = error
+
+    cleanup_errors: list[BaseException] = []
+    try:
         destroy_state(state)
-        if not success:
-            shutil.rmtree(results, ignore_errors=True)
+    except BaseException as error:
+        cleanup_errors.append(error)
+    if run_error is not None or cleanup_errors:
+        if results is not None:
+            try:
+                shutil.rmtree(results)
+                if results.exists():
+                    raise HarnessError("run results remain after cleanup")
+            except BaseException as error:
+                cleanup_errors.append(error)
+    if cleanup_errors:
+        detail = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
+        raise HarnessError(f"terminal run cleanup failed: {detail}") from run_error
+    if run_error is not None:
+        raise run_error.with_traceback(run_error.__traceback__)
+    if outcome is None:
+        raise HarnessError("terminal run produced no outcome")
+    return outcome
 
 
 def main() -> int:

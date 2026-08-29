@@ -33,6 +33,63 @@ relay = load("local_tls_relay")
 guest = load("guest_entry")
 
 
+def state_record(trusted_digest: str = "1" * 64) -> dict[str, object]:
+    digest = "1" * 64
+    return {
+        "schema_version": harness.STATE_SCHEMA,
+        "challenge": digest,
+        "image_sha256": digest,
+        "qemu_sha256": digest,
+        "qemu_img_sha256": digest,
+        "qemu_version": "test",
+        "tool_sha256": {name: digest for name in harness.TOOLS},
+        "harness_asset_sha256": {name: digest for name in harness.FROZEN_ASSETS},
+        "trusted_image_sha256": trusted_digest,
+    }
+
+
+def make_destroyable_state(parent: Path) -> Path:
+    state = parent / "state"
+    state.mkdir(mode=0o700)
+    (state / "state.json").write_bytes(harness.canonical(state_record()))
+    return state
+
+
+def make_prepared_state(parent: Path) -> Path:
+    state = parent / "state"
+    frozen = state / "frozen-assets"
+    frozen.mkdir(mode=0o700, parents=True)
+    asset_digests = {}
+    for name in harness.FROZEN_ASSETS:
+        path = frozen / name
+        path.write_bytes(("trusted-" + name).encode())
+        asset_digests[name] = harness.file_sha256(path)
+    trusted = state / "trusted.qcow2"
+    trusted.write_bytes(b"trusted-image")
+    trusted.chmod(0o400)
+    tool_digests = {
+        name: harness.file_sha256(Path(path))
+        for name, path in harness.TOOLS.items()
+    }
+    record = state_record(harness.file_sha256(trusted))
+    record.update({
+        "qemu_sha256": tool_digests["qemu"],
+        "qemu_img_sha256": tool_digests["qemu_img"],
+        "tool_sha256": tool_digests,
+        "harness_asset_sha256": asset_digests,
+    })
+    (state / "state.json").write_bytes(harness.canonical(record))
+    return state
+
+
+def mount_pairs(command: list[str], option: str) -> list[tuple[str, str]]:
+    return [
+        (command[index + 1], command[index + 2])
+        for index, value in enumerate(command[:-2])
+        if value == option
+    ]
+
+
 def schnorr_sign(message: bytes, secret: int) -> tuple[str, str]:
     point = relay.point_mul(secret)
     assert point is not None
@@ -86,7 +143,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn("docker", joined)
         self.assertNotIn("--privileged", joined)
         self.assertNotIn("virtfs", joined)
-        self.assertNotIn("--ro-bind /home", joined)
+        self.assertNotIn(("/home", "/home"), mount_pairs(command, "--ro-bind"))
         self.assertNotIn("--bind /home/victor /home/victor", joined)
         candidate_command = " ".join(harness.qemu_command(
             Path("/private-state"), overlay="candidate.qcow2",
@@ -103,6 +160,79 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("verifier.qcow2", verifier_command)
         self.assertIn("readonly=on", verifier_command)
         self.assertIn("evidence.bin", verifier_command)
+
+    def test_hostile_candidate_can_write_only_overlay_and_transfer(self) -> None:
+        state = Path("/private/state")
+        candidate = harness.qemu_command(
+            state, overlay="candidate.qcow2", evidence=False, transfer="read-write",
+        )
+        verifier = harness.qemu_command(
+            state, overlay="verifier.qcow2", evidence=True, transfer="read-only",
+        )
+        self.assertIn((str(state), "/work"), mount_pairs(candidate, "--ro-bind"))
+        self.assertEqual(
+            mount_pairs(candidate, "--bind"),
+            [
+                (str(state / "candidate.qcow2"), "/work/candidate.qcow2"),
+                (str(state / "transfer.raw"), "/work/transfer.raw"),
+            ],
+        )
+        self.assertEqual(
+            mount_pairs(verifier, "--bind"),
+            [
+                (str(state / "verifier.qcow2"), "/work/verifier.qcow2"),
+                (str(state / "evidence.bin"), "/work/evidence.bin"),
+            ],
+        )
+        for protected in (
+            "trusted.qcow2", "state.json", "public-binding.json",
+            *[f"frozen-assets/{name}" for name in harness.FROZEN_ASSETS],
+        ):
+            self.assertNotIn((str(state / protected), f"/work/{protected}"), mount_pairs(candidate, "--bind"))
+
+    def test_bubblewrap_rejects_hostile_writes_to_verifier_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            frozen = state / "frozen-assets"
+            frozen.mkdir()
+            protected = {
+                "trusted.qcow2": b"trusted-image",
+                "state.json": b"trusted-state",
+                "frozen-assets/receipt_verifier.py": b"trusted-verifier",
+            }
+            for relative, raw in protected.items():
+                (state / relative).write_bytes(raw)
+            (state / "candidate.qcow2").write_bytes(b"overlay")
+            (state / "transfer.raw").write_bytes(b"transfer")
+            command = harness.bwrap_prefix(
+                state, writable_files=("candidate.qcow2", "transfer.raw"),
+            ) + [
+                "--", "/bin/sh", "-c",
+                "printf overlay-write > /work/candidate.qcow2 && "
+                "printf transfer-write > /work/transfer.raw && "
+                "! printf hostile > /work/trusted.qcow2 && "
+                "! printf hostile > /work/state.json && "
+                "! printf hostile > /work/frozen-assets/receipt_verifier.py",
+            ]
+            harness.bounded(command, timeout=10, maximum=4096)
+            self.assertEqual((state / "candidate.qcow2").read_bytes(), b"overlay-write")
+            self.assertEqual((state / "transfer.raw").read_bytes(), b"transfer-write")
+            for relative, raw in protected.items():
+                self.assertEqual((state / relative).read_bytes(), raw)
+
+    def test_evidence_destination_exists_before_qemu_is_spawned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+
+            def command(*_args, **_kwargs):
+                evidence = state / "evidence.bin"
+                self.assertTrue(evidence.is_file())
+                self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
+                return ["/usr/bin/true"]
+
+            with mock.patch.object(harness, "qemu_command", side_effect=command):
+                with self.assertRaisesRegex(harness.HarnessError, "truncated"):
+                    harness.boot(state, 1, overlay="verifier.qcow2", evidence_expected=True)
 
     def test_hostile_candidate_persistence_has_no_verifier_overlay_or_evidence_path(self) -> None:
         candidate = " ".join(harness.qemu_command(
@@ -350,6 +480,122 @@ class InputTests(unittest.TestCase):
             (state / "candidate.qcow2").write_bytes(b"ephemeral")
             harness.destroy_state(state)
             self.assertFalse(state.exists())
+
+    def test_post_candidate_drift_blocks_verifier_and_destroys_state(self) -> None:
+        cases = (
+            ("frozen-assets/receipt_verifier.py", "frozen harness asset"),
+            ("trusted.qcow2", "trusted ceremony image"),
+        )
+        for relative, expected_error in cases:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = make_prepared_state(root)
+                results = root / "results"
+                boots = []
+
+                def create_image(image_state, name, _backing):
+                    (image_state / name).write_bytes(b"overlay")
+
+                def hostile_boot(image_state, _timeout, *, overlay, **_kwargs):
+                    boots.append(overlay)
+                    if overlay == "candidate.qcow2":
+                        target = image_state / relative
+                        target.chmod(0o600)
+                        target.write_bytes(b"hostile")
+                        return None
+                    self.fail("verifier booted after trusted verifier drift")
+
+                with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                    harness, "qemu_img_create", side_effect=create_image,
+                ), mock.patch.object(harness, "create_run_stage"), mock.patch.object(
+                    harness, "boot", side_effect=hostile_boot,
+                ):
+                    with self.assertRaisesRegex(harness.HarnessError, expected_error):
+                        harness.run_vm({}, state, {}, b"{}\n", b"{}\n", results)
+                self.assertEqual(boots, ["candidate.qcow2"])
+                self.assertFalse(state.exists())
+                self.assertFalse(results.exists())
+
+    def test_existing_results_setup_failure_destroys_state_but_preserves_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_destroyable_state(root)
+            results = root / "results"
+            results.mkdir(mode=0o700)
+            sentinel = results / "owned-by-caller"
+            sentinel.write_text("keep")
+            with self.assertRaises(FileExistsError):
+                harness.run_vm({}, state, {}, b"", b"", results)
+            self.assertFalse(state.exists())
+            self.assertEqual(sentinel.read_text(), "keep")
+
+    def test_cleanup_failure_removes_results_and_cannot_report_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_destroyable_state(root)
+            (state / "candidate.qcow2").write_bytes(b"residue")
+            results = root / "results"
+            cleanup_error = harness.HarnessError("simulated state cleanup failure")
+            with mock.patch.object(harness, "destroy_state", side_effect=cleanup_error):
+                with self.assertRaisesRegex(harness.HarnessError, "terminal run cleanup failed") as caught:
+                    harness.run_vm({}, state, {}, b"", b"", results)
+            self.assertIsInstance(caught.exception.__cause__, harness.HarnessError)
+            self.assertIn("prior VM run residue", str(caught.exception.__cause__))
+            self.assertFalse(results.exists())
+            self.assertTrue(state.exists())
+
+    def test_success_publishes_evidence_only_after_state_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_destroyable_state(root)
+            results = root / "results"
+            candidate_sha = "2" * 40
+            scenario_sha = "3" * 64
+            contract = {"candidate_sha": candidate_sha, "scenario": {"sha256": scenario_sha}}
+            records = {
+                name: [("payload", 0o400, name.encode())]
+                for name in harness.PACKAGE_NAMES
+            }
+            receipt = {
+                "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2",
+                "outcome": "pass", "scenario_sha256": scenario_sha,
+                "integrated_candidate_sha": candidate_sha, "run_id": "4" * 32,
+                "checks": [], "zero_transition": {},
+            }
+            verifier = {"outcome": "pass", "status": "verified"}
+            proof = {
+                "configs_sha256": "5" * 64, "units_sha256": "6" * 64,
+                "sockets_absent": True, "processes_absent": True,
+                "encrypted_credentials_absent": True, "relay_residue_absent": True,
+            }
+            frame = {
+                "schema_version": harness.FRAME_SCHEMA, "phase": "run",
+                "challenge": "1" * 64, "outcome": "pass",
+                "receipt_base64": base64.b64encode(harness.canonical(receipt)).decode(),
+                "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
+                "dormant_proof": proof,
+            }
+
+            def create_image(image_state, name, _backing):
+                (image_state / name).write_bytes(b"overlay")
+
+            def boot(_state, _timeout, *, overlay, **_kwargs):
+                return frame if overlay == "verifier.qcow2" else None
+
+            with mock.patch.object(harness, "qemu_img_create", side_effect=create_image), mock.patch.object(
+                harness, "create_run_stage",
+            ), mock.patch.object(harness, "create_verify_stage"), mock.patch.object(
+                harness, "validate_prepared_state", return_value=state_record(),
+            ), mock.patch.object(harness, "boot", side_effect=boot):
+                outcome = harness.run_vm(contract, state, records, b"{}\n", b"{}\n", results)
+            self.assertEqual(outcome["status"], "pass")
+            self.assertTrue(outcome["vm_state_absent"])
+            self.assertFalse(state.exists())
+            self.assertEqual(
+                {path.name for path in results.iterdir()},
+                {"acceptance-receipt.json", "verifier.json", "evidence-manifest.json"},
+            )
+            self.assertEqual((results / "acceptance-receipt.json").read_bytes(), harness.canonical(receipt))
 
     def test_backed_or_external_data_qcow2_is_rejected(self) -> None:
         base = {"format": "qcow2", "virtual-size": 1024 * 1024, "backing-filename": "parent.qcow2"}

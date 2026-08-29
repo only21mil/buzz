@@ -5,8 +5,11 @@ containers are rejected: they are not a security boundary. QEMU runs beneath
 Bubblewrap with a private mount namespace, no host home, no network namespace,
 no NIC, no shared filesystem, no USB, and only `/dev/kvm`. The guest receives
 immutable read-only ISO media and writes only its ephemeral qcow2 overlay plus
-a fixed 8 MiB raw transfer device. Only the trusted verifier boot receives the
-bounded virtio-serial evidence channel.
+a fixed 8 MiB raw transfer device. Bubblewrap mounts the prepared state
+read-only, then exposes only the current overlay, the candidate's transfer
+device, and the verifier's pre-created evidence destination as writable files.
+Only the trusted verifier boot receives the bounded virtio-serial evidence
+channel.
 
 The flow has two user-visible phases and three isolated boots:
 
@@ -32,8 +35,11 @@ The flow has two user-visible phases and three isolated boots:
    deletes the candidate overlay before continuing.
 4. A fresh verifier overlay over the same frozen ceremony image receives the
    transfer device read-only, no candidate archive, and the only final evidence
-   device in the flow. A verifier frozen before candidate execution validates
-   the receipt's closed schema and all strict acceptance checks. Guest code
+   device in the flow. The host rehashes and validates the trusted ceremony
+   image and every frozen harness asset after the candidate exits, before
+   verifier staging, and again before verifier boot. A verifier frozen before
+   candidate execution validates the receipt's closed schema and all strict
+   acceptance checks. Guest code
    reconstructs canonical receipt and verdict objects from allowlisted fields
    and emits only those objects in a bounded digest-framed receipt. The host
    revalidates the frame and writes the receipt, verifier
@@ -87,7 +93,9 @@ digests, guest prerequisites, package bindings, or immutable staging differ.
 All subprocesses have fixed time and output bounds. Every process group is
 unconditionally killed, reaped, and checked for absence on success, failure,
 timeout, and interruption. The private state is removed on every terminal
-`run` path.
+`run` path, including setup failure. Results are retained only after successful
+state cleanup; a cleanup failure removes harness-created results and fails the
+run.
 
 The authoritative base `d9360cc3203681797902cb0cf48bba6a152a0e82` does not
 yet contain the sealed execd installer. A runnable final candidate must include
