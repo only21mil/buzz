@@ -16,6 +16,12 @@ use crate::{
         OrdinaryReceipts, OrdinaryStop, QualificationCleanup, QualificationExecution,
         QualificationExecutor, QualificationStop, ReadyHostProofs, ReadyValidationProvider,
     },
+    host_composition::HostCompositionContract,
+    normal_backend::{
+        materialization_input::MaterializationInputProvider,
+        proxy_input::{BoundPrestartPersister, ProxyInputProvider},
+        BrokerProxyRuntime, MediatedActThroughProxyLauncher, RuntimeDescriptorProvider,
+    },
     runtime::ReadyValidationTarget,
 };
 
@@ -49,6 +55,60 @@ pub enum ProductionCompositionError {
     HostContractUnavailable,
     /// Lease-scoped providers are absent even though the static contract loaded.
     HostBackendsMissing(&'static [HostBackendSeam]),
+}
+
+/// Concrete PR112/PR113 input consumers bound to one descriptor sequence.
+///
+/// This composition deliberately does not author the root-owned input records,
+/// create the lease-scoped materializer observer, or provide reconciliation.
+/// Those host dependencies remain required before canonical activation.
+pub struct ProductionInputProviders<P> {
+    materialization: MaterializationInputProvider,
+    proxy_source: ProxyInputProvider<RuntimeDescriptorProvider, P>,
+    proxy_launcher: MediatedActThroughProxyLauncher<RuntimeDescriptorProvider>,
+}
+
+/// Concrete proxy runtime assembled from the production input providers.
+pub type ProductionProxyInputRuntime<P, R> = BrokerProxyRuntime<
+    ProxyInputProvider<RuntimeDescriptorProvider, P>,
+    MediatedActThroughProxyLauncher<RuntimeDescriptorProvider>,
+    R,
+>;
+
+impl<P: BoundPrestartPersister> ProductionInputProviders<P> {
+    /// Open both authority consumers with one shared runtime descriptor stream.
+    pub fn open(
+        contract: &HostCompositionContract,
+        persister: P,
+    ) -> Result<Self, ExecutionUnavailable> {
+        let materialization = MaterializationInputProvider::from_contract(contract)?;
+        let descriptors =
+            RuntimeDescriptorProvider::new(contract.clone()).map_err(|_| ExecutionUnavailable)?;
+        let proxy_source =
+            ProxyInputProvider::from_contract(contract, descriptors.clone(), persister)?;
+        let proxy_launcher =
+            MediatedActThroughProxyLauncher::production(descriptors, contract.clone())
+                .map_err(|_| ExecutionUnavailable)?;
+        Ok(Self {
+            materialization,
+            proxy_source,
+            proxy_launcher,
+        })
+    }
+
+    /// Finish proxy assembly once the caller supplies its durable reconciler.
+    pub fn into_proxy_runtime<R>(
+        self,
+        reconciler: R,
+    ) -> (
+        MaterializationInputProvider,
+        ProductionProxyInputRuntime<P, R>,
+    ) {
+        (
+            self.materialization,
+            BrokerProxyRuntime::new(self.proxy_source, self.proxy_launcher, reconciler),
+        )
+    }
 }
 
 /// Fresh host proof adapter. The source must bind all facts to `target`.
@@ -123,6 +183,17 @@ impl OrdinaryExecutor for ProductionOrdinaryExecutor {
         stop: OrdinaryStop,
     ) -> Result<OrdinaryCleanup, ExecutionUnavailable> {
         self.backend.reconcile(request, admission, lease, stop)
+    }
+
+    fn capacity_returned(
+        &mut self,
+        request: AdmitAttemptRequest,
+        admission: OrdinaryAdmission,
+        lease: LeaseToken,
+        teardown_digest: [u8; 32],
+    ) -> Result<(), ExecutionUnavailable> {
+        self.backend
+            .capacity_returned(request, admission, lease, teardown_digest)
     }
 }
 
@@ -237,6 +308,15 @@ fn compose_production_dispatch(now: u64, mut adapters: ProductionAdapters) -> Pr
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
+    use crate::{
+        activation::LeaseConclusion,
+        durable_dispatch::crash_recovery::{
+            AttemptEvidenceBinding, CrashRecoveryCoordinator, MemoryRecoveryJournal,
+            RecoveryJournal, RecoveryRecord, RecoveryStage,
+        },
+        normal_engine::tests::ordinary_fixture,
+    };
+
     use super::*;
 
     struct TestClosedExecutor;
@@ -300,6 +380,59 @@ mod tests {
 
     struct TestQualificationForwarder {
         reconciles: Rc<Cell<usize>>,
+    }
+
+    struct TestOrdinaryForwarder {
+        capacity_returns: Rc<Cell<usize>>,
+    }
+
+    impl OrdinaryExecutor for TestOrdinaryForwarder {
+        fn preflight(
+            &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
+        ) -> Result<(), ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn provision(
+            &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
+            _lease: LeaseToken,
+        ) -> Result<(), ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn read_receipts(
+            &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
+            _lease: LeaseToken,
+        ) -> Result<OrdinaryReceipts, ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn reconcile(
+            &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
+            _lease: LeaseToken,
+            _stop: OrdinaryStop,
+        ) -> Result<OrdinaryCleanup, ExecutionUnavailable> {
+            Err(ExecutionUnavailable)
+        }
+
+        fn capacity_returned(
+            &mut self,
+            _request: AdmitAttemptRequest,
+            _admission: OrdinaryAdmission,
+            _lease: LeaseToken,
+            _teardown_digest: [u8; 32],
+        ) -> Result<(), ExecutionUnavailable> {
+            self.capacity_returns.set(self.capacity_returns.get() + 1);
+            Ok(())
+        }
     }
 
     impl QualificationExecutor for TestQualificationForwarder {
@@ -430,5 +563,87 @@ mod tests {
             crate::activation::CleanupDisposition::Clean
         );
         assert_eq!(cleanup.teardown_digest, [91; 32]);
+    }
+
+    #[test]
+    fn production_ordinary_adapter_forwards_capacity_returned() {
+        let fixture = ordinary_fixture();
+        let capacity_returns = Rc::new(Cell::new(0));
+        let mut executor = ProductionOrdinaryExecutor::new(Box::new(TestOrdinaryForwarder {
+            capacity_returns: Rc::clone(&capacity_returns),
+        }));
+
+        executor
+            .capacity_returned(fixture.request, fixture.admission, fixture.lease, [8; 32])
+            .expect("capacity returned");
+
+        assert_eq!(capacity_returns.get(), 1);
+    }
+
+    #[test]
+    fn production_wrapper_advances_crash_recovery_journal_to_capacity_returned() {
+        let fixture = ordinary_fixture();
+        let host_binding = &fixture.plan.binding;
+        let mut binding = AttemptEvidenceBinding {
+            run_id: fixture.request.run_id,
+            job_id: host_binding.job_id.clone(),
+            attempt: fixture.request.attempt,
+            controller_lease_id: fixture.lease.lease_id(),
+            lease_generation: fixture.lease.generation(),
+            lease_deadline_at: fixture.lease.deadline_at(),
+            host_lease_id: host_binding.lease_id.clone(),
+            workspace_sha256:
+                crate::durable_dispatch::terminal_evidence_collector::workspace_digest(host_binding),
+            binding_sha256: [0; 32],
+        };
+        binding.binding_sha256 = binding.digest();
+        let journal = MemoryRecoveryJournal::default();
+        journal
+            .advance(RecoveryRecord {
+                binding: binding.clone(),
+                stage: RecoveryStage::Active,
+            })
+            .expect("active");
+        journal
+            .advance(RecoveryRecord {
+                binding: binding.clone(),
+                stage: RecoveryStage::EvidenceUploaded {
+                    conclusion: LeaseConclusion::Failure,
+                    evidence_set_digest: [7; 32],
+                },
+            })
+            .expect("evidence uploaded");
+        journal
+            .advance(RecoveryRecord {
+                binding,
+                stage: RecoveryStage::TeardownReadback {
+                    conclusion: LeaseConclusion::Failure,
+                    evidence_set_digest: [7; 32],
+                    teardown_digest: [8; 32],
+                },
+            })
+            .expect("teardown readback");
+        let capacity_returns = Rc::new(Cell::new(0));
+        let coordinator = CrashRecoveryCoordinator::new(
+            TestOrdinaryForwarder {
+                capacity_returns: Rc::clone(&capacity_returns),
+            },
+            journal.clone(),
+        );
+        let mut executor = ProductionOrdinaryExecutor::new(Box::new(coordinator));
+
+        executor
+            .capacity_returned(fixture.request, fixture.admission, fixture.lease, [8; 32])
+            .expect("capacity returned");
+
+        assert_eq!(capacity_returns.get(), 1);
+        assert!(matches!(
+            journal
+                .load(fixture.lease.lease_id())
+                .expect("journal")
+                .expect("record")
+                .stage,
+            RecoveryStage::CapacityReturned { .. }
+        ));
     }
 }

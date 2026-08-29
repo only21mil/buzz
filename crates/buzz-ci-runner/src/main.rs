@@ -105,7 +105,11 @@ fn run(config: RunnerConfig) -> ExitCode {
             Some(handler) => serve_runner_connection_with_handler(
                 stream,
                 config.controld_uid,
-                &mut |request, writer| handler.handle(request, writer).map_err(|_| ()),
+                &mut |request, request_frame_digest, writer| {
+                    handler
+                        .handle(request, request_frame_digest, writer)
+                        .map_err(|_| ())
+                },
             ),
             None => serve_runner_connection(stream, config.controld_uid),
         };

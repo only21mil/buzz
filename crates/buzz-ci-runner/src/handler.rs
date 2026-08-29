@@ -64,11 +64,16 @@ pub trait JobExecutor {
 
 /// Atomic replay journal for a complete terminal receipt set.
 pub trait ReceiptJournal {
-    fn load(&self, dispatch_id: &str) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError>;
+    fn load(
+        &self,
+        dispatch_id: &str,
+        request_frame_digest: [u8; 32],
+    ) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError>;
 
     fn store_if_absent(
         &mut self,
         dispatch_id: &str,
+        request_frame_digest: [u8; 32],
         receipts: &[RunnerReceipt],
     ) -> Result<JournalWrite, ReceiptJournalError>;
 }
@@ -138,18 +143,20 @@ where
     pub fn handle(
         &mut self,
         request: RunnerRequest,
+        request_frame_digest: [u8; 32],
         writer: &mut impl Write,
     ) -> Result<(), HandlerError> {
         let dispatch_id = request.refusal_identity().0.to_owned();
-        if let Some(stored) = self.journal.load(&dispatch_id)? {
+        if let Some(stored) = self.journal.load(&dispatch_id, request_frame_digest)? {
             return write_receipts(writer, &stored).map_err(HandlerError::Receipt);
         }
 
         let receipts = self.build_receipts(&request);
-        let canonical = match self
-            .journal
-            .store_if_absent(&dispatch_id, receipts.as_slice())?
-        {
+        let canonical = match self.journal.store_if_absent(
+            &dispatch_id,
+            request_frame_digest,
+            receipts.as_slice(),
+        )? {
             JournalWrite::Written => receipts,
             JournalWrite::Existing(existing) if existing == receipts => existing,
             JournalWrite::Existing(_) => return Err(HandlerError::JournalConflict),
@@ -536,25 +543,39 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MemoryJournal(HashMap<String, Vec<RunnerReceipt>>);
+    struct MemoryJournal(HashMap<String, ([u8; 32], Vec<RunnerReceipt>)>);
 
     impl ReceiptJournal for MemoryJournal {
         fn load(
             &self,
             dispatch_id: &str,
+            request_frame_digest: [u8; 32],
         ) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError> {
-            Ok(self.0.get(dispatch_id).cloned())
+            match self.0.get(dispatch_id) {
+                Some((stored_digest, receipts)) if *stored_digest == request_frame_digest => {
+                    Ok(Some(receipts.clone()))
+                }
+                Some(_) => Err(ReceiptJournalError),
+                None => Ok(None),
+            }
         }
 
         fn store_if_absent(
             &mut self,
             dispatch_id: &str,
+            request_frame_digest: [u8; 32],
             receipts: &[RunnerReceipt],
         ) -> Result<JournalWrite, ReceiptJournalError> {
-            if let Some(existing) = self.0.get(dispatch_id) {
+            if let Some((stored_digest, existing)) = self.0.get(dispatch_id) {
+                if *stored_digest != request_frame_digest {
+                    return Err(ReceiptJournalError);
+                }
                 return Ok(JournalWrite::Existing(existing.clone()));
             }
-            self.0.insert(dispatch_id.to_owned(), receipts.to_vec());
+            self.0.insert(
+                dispatch_id.to_owned(),
+                (request_frame_digest, receipts.to_vec()),
+            );
             Ok(JournalWrite::Written)
         }
     }
@@ -694,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_broker_backend_emits_ordered_terminal_receipts_and_replays_them() {
+    fn same_frame_replays_but_a_second_client_with_divergent_frame_is_rejected() {
         let mut handler = BrokerAttemptHandler::new(
             Allow,
             Verify,
@@ -703,9 +724,9 @@ mod tests {
             MemoryJournal::default(),
         );
         let mut first = Vec::new();
-        handler.handle(request(), &mut first).unwrap();
+        handler.handle(request(), [0x42; 32], &mut first).unwrap();
         let mut replay = Vec::new();
-        handler.handle(request(), &mut replay).unwrap();
+        handler.handle(request(), [0x42; 32], &mut replay).unwrap();
         assert_eq!(first, replay);
 
         let mut cursor = Cursor::new(first);
@@ -722,6 +743,11 @@ mod tests {
             }
         }
         assert_eq!(kinds, vec![(1, false), (2, false), (3, false), (4, true)]);
+
+        assert!(matches!(
+            handler.handle(request(), [0x43; 32], &mut Vec::new()),
+            Err(HandlerError::Journal(_))
+        ));
     }
 
     #[test]
@@ -744,7 +770,7 @@ mod tests {
             MemoryJournal::default(),
         );
         let mut bytes = Vec::new();
-        handler.handle(request(), &mut bytes).unwrap();
+        handler.handle(request(), [0x42; 32], &mut bytes).unwrap();
         let receipt: RunnerReceipt = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert!(matches!(
             receipt,
@@ -783,7 +809,7 @@ mod tests {
             MemoryJournal::default(),
         );
         let mut bytes = Vec::new();
-        handler.handle(request(), &mut bytes).unwrap();
+        handler.handle(request(), [0x42; 32], &mut bytes).unwrap();
         let (_, _, broker, _, _) = handler.into_parts();
         assert!(broker.lease.is_none());
     }
