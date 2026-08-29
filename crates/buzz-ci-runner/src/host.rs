@@ -78,6 +78,8 @@ impl ConfiguredRunner {
     }
 }
 
+// Closed legacy v1 compatibility. Activation admissions use the distinct
+// BIP-340 broker v2 contract in `control` and never pass through this verifier.
 const MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"buzz-ci-runner:job-manifest-signature:v1\0";
 const EVIDENCE_DOMAIN: &[u8] = b"buzz-ci-runner:executor-evidence:v1\0";
 
@@ -151,6 +153,7 @@ impl SignedJobManifest {
 }
 
 #[derive(Clone, Debug)]
+/// Legacy Ed25519 job-manifest verifier for broker v1 compatibility only.
 pub struct ManifestDispatchVerifier {
     key: VerifyingKey,
     relay_signer: String,

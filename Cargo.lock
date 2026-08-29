@@ -999,9 +999,9 @@ dependencies = [
  "buzz-ci-isolation-contract",
  "buzz-ci-materializer",
  "buzz-ci-policy-proxy",
- "ed25519-dalek",
  "hex",
  "nix 0.31.3",
+ "nostr",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -1026,6 +1026,7 @@ dependencies = [
 name = "buzz-ci-keyholder"
 version = "0.1.0"
 dependencies = [
+ "buzz-ci-broker-protocol",
  "hex",
  "nix 0.31.3",
  "nostr",

@@ -207,9 +207,10 @@ impl TryFrom<u8> for HttpMethod {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ManifestKind {
-    /// Static root-owned lane activation policy.
+    /// Static root-owned lane activation policy. Production signing refuses
+    /// this kind because activation authority is provisioned, not minted.
     LaneActivationV1 = 1,
-    /// Immutable pre-admission job intent.
+    /// Immutable pre-admission JobIntentV2 admission message.
     JobIntentV2 = 2,
 }
 
@@ -264,7 +265,8 @@ pub struct SignManifestRequest {
     pub expected_generation: u64,
     /// Closed manifest domain.
     pub manifest_kind: ManifestKind,
-    /// Canonical manifest bytes checked and hashed by the signer.
+    /// Canonical manifest bytes checked and hashed by the signer. For
+    /// JobIntentV2 these are the exact broker v2 admission-signature message.
     pub canonical_manifest: CanonicalPayload,
 }
 

@@ -7,13 +7,13 @@
 use std::collections::BTreeMap;
 
 use buzz_ci_broker_protocol::v2::{
-    admission_signature_message, AdmitAttemptRequest, BrokerResponse, CancelAttemptRequest,
-    CompleteAttemptRequest, FrameHeader, GetAttemptRequest, Request,
+    admission_signature_message, AdmissionSignatureAlgorithm, AdmitAttemptRequest, BrokerResponse,
+    CancelAttemptRequest, CompleteAttemptRequest, FrameHeader, GetAttemptRequest, Request,
     EXECUTION_BINDING_DIGEST_DOMAIN, JOB_INTENT_DIGEST_DOMAIN,
     LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN,
 };
 use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, ResponseCode, TrustClass};
-use ed25519_dalek::{Signature, VerifyingKey};
+use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
 use sha2::{Digest, Sha256};
 
 /// Frozen lane-manifest schema.
@@ -37,7 +37,9 @@ pub struct LaneActivationManifestV1 {
     pub schema_version: u16,
     pub lane_id: [u8; 32],
     pub lane_epoch: u64,
+    pub admission_signature_algorithm: AdmissionSignatureAlgorithm,
     pub admission_verifying_key: [u8; 32],
+    pub admission_key_generation: u64,
     pub broker_build_identity: [u8; 32],
     pub host_profile_digest: [u8; 32],
     pub suite_identity: [u8; 32],
@@ -55,7 +57,9 @@ impl LaneActivationManifestV1 {
         put_u16(&mut bytes, self.schema_version);
         bytes.extend_from_slice(&self.lane_id);
         put_u64(&mut bytes, self.lane_epoch);
+        bytes.push(self.admission_signature_algorithm as u8);
         bytes.extend_from_slice(&self.admission_verifying_key);
+        put_u64(&mut bytes, self.admission_key_generation);
         bytes.extend_from_slice(&self.broker_build_identity);
         bytes.extend_from_slice(&self.host_profile_digest);
         bytes.extend_from_slice(&self.suite_identity);
@@ -75,10 +79,13 @@ impl LaneActivationManifestV1 {
         if self.schema_version != LANE_ACTIVATION_MANIFEST_SCHEMA_V1
             || manifest_fields(self).contains(&[0; 32])
             || self.lane_epoch == 0
+            || self.admission_key_generation == 0
             || self.not_before == 0
             || self.not_before > now
             || now >= self.expires_at
             || request.lane_epoch != self.lane_epoch
+            || request.admission_signature_algorithm != self.admission_signature_algorithm
+            || request.admission_key_generation != self.admission_key_generation
             || request.lane_manifest_digest != self.digest()
             || request.isolation_profile_digest != self.isolation_profile_digest
             || request.wall_timeout_seconds == 0
@@ -116,6 +123,10 @@ pub struct JobIntentV2 {
     pub source_pin_event_id: [u8; 32],
     pub workflow_digest: [u8; 32],
     pub isolation_profile_digest: [u8; 32],
+    pub lane_manifest_digest: [u8; 32],
+    pub lane_epoch: u64,
+    pub admission_signature_algorithm: AdmissionSignatureAlgorithm,
+    pub admission_key_generation: u64,
     pub run_id: [u8; 16],
     pub tip_oid: GitOid,
     pub base_oid: GitOid,
@@ -140,6 +151,10 @@ impl JobIntentV2 {
         bytes.extend_from_slice(&self.source_pin_event_id);
         bytes.extend_from_slice(&self.workflow_digest);
         bytes.extend_from_slice(&self.isolation_profile_digest);
+        bytes.extend_from_slice(&self.lane_manifest_digest);
+        put_u64(&mut bytes, self.lane_epoch);
+        bytes.push(self.admission_signature_algorithm as u8);
+        put_u64(&mut bytes, self.admission_key_generation);
         bytes.extend_from_slice(&self.run_id);
         put_oid(&mut bytes, self.tip_oid);
         put_oid(&mut bytes, self.base_oid);
@@ -162,6 +177,10 @@ impl JobIntentV2 {
             || self.source_pin_event_id != request.source_pin_event_id
             || self.workflow_digest != request.workflow_digest
             || self.isolation_profile_digest != request.isolation_profile_digest
+            || self.lane_manifest_digest != request.lane_manifest_digest
+            || self.lane_epoch != request.lane_epoch
+            || self.admission_signature_algorithm != request.admission_signature_algorithm
+            || self.admission_key_generation != request.admission_key_generation
             || self.run_id != request.run_id
             || self.tip_oid != request.tip_oid
             || self.base_oid != request.base_oid
@@ -1071,10 +1090,19 @@ fn verify_admission_signature(
     manifest: LaneActivationManifestV1,
     request: AdmitAttemptRequest,
 ) -> Result<(), BindingError> {
-    let key = VerifyingKey::from_bytes(&manifest.admission_verifying_key)
+    if manifest.admission_signature_algorithm != AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256
+        || request.admission_signature_algorithm != manifest.admission_signature_algorithm
+        || request.admission_key_generation != manifest.admission_key_generation
+    {
+        return Err(BindingError::SignatureRefused);
+    }
+    let key = XOnlyPublicKey::from_slice(&manifest.admission_verifying_key)
         .map_err(|_| BindingError::SignatureRefused)?;
-    let signature = Signature::from_bytes(&request.admission_signature);
-    key.verify_strict(&admission_signature_message(&request), &signature)
+    let signature = Signature::from_slice(&request.admission_signature)
+        .map_err(|_| BindingError::SignatureRefused)?;
+    let digest = sha256(&admission_signature_message(&request));
+    SECP256K1
+        .verify_schnorr(&signature, &Message::from_digest(digest), &key)
         .map_err(|_| BindingError::SignatureRefused)
 }
 
@@ -1220,7 +1248,7 @@ fn put_oid(bytes: &mut Vec<u8>, oid: GitOid) {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use ed25519_dalek::{Signer, SigningKey};
+    use nostr::secp256k1::{Keypair, SecretKey};
 
     use super::*;
 
@@ -1334,12 +1362,19 @@ mod tests {
         }
     }
 
-    fn manifest(key: &SigningKey) -> LaneActivationManifestV1 {
+    fn signing_key() -> Keypair {
+        let secret = SecretKey::from_slice(&[44; 32]).unwrap();
+        Keypair::from_secret_key(SECP256K1, &secret)
+    }
+
+    fn manifest(key: &Keypair) -> LaneActivationManifestV1 {
         LaneActivationManifestV1 {
             schema_version: 1,
             lane_id: [1; 32],
             lane_epoch: 4,
-            admission_verifying_key: *key.verifying_key().as_bytes(),
+            admission_signature_algorithm: AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
+            admission_verifying_key: key.x_only_public_key().0.serialize(),
+            admission_key_generation: 9,
             broker_build_identity: [2; 32],
             host_profile_digest: [3; 32],
             suite_identity: [4; 32],
@@ -1350,7 +1385,7 @@ mod tests {
         }
     }
 
-    fn intent() -> JobIntentV2 {
+    fn intent_for(lane: LaneActivationManifestV1) -> JobIntentV2 {
         JobIntentV2 {
             schema_version: 2,
             signed_request_digest: [10; 32],
@@ -1360,6 +1395,10 @@ mod tests {
             source_pin_event_id: [14; 32],
             workflow_digest: [15; 32],
             isolation_profile_digest: [5; 32],
+            lane_manifest_digest: lane.digest(),
+            lane_epoch: lane.lane_epoch,
+            admission_signature_algorithm: lane.admission_signature_algorithm,
+            admission_key_generation: lane.admission_key_generation,
             run_id: [16; 16],
             tip_oid: GitOid::Sha256([17; 32]),
             base_oid: GitOid::Sha256([18; 32]),
@@ -1373,7 +1412,7 @@ mod tests {
     }
 
     fn request(
-        key: &SigningKey,
+        key: &Keypair,
         lane: LaneActivationManifestV1,
         job: JobIntentV2,
     ) -> AdmitAttemptRequest {
@@ -1394,13 +1433,23 @@ mod tests {
             issued_at: job.issued_at,
             expires_at: job.expires_at,
             lane_epoch: lane.lane_epoch,
+            admission_key_generation: lane.admission_key_generation,
             wall_timeout_seconds: job.wall_timeout_seconds,
             attempt: job.attempt,
             parent_attempt: job.parent_attempt,
             trust_class: job.trust_class,
+            admission_signature_algorithm: lane.admission_signature_algorithm,
         };
-        request.admission_signature = key.sign(&admission_signature_message(&request)).to_bytes();
+        let digest = sha256(&admission_signature_message(&request));
+        request.admission_signature = SECP256K1
+            .sign_schnorr_no_aux_rand(&Message::from_digest(digest), key)
+            .serialize();
         request
+    }
+
+    fn request_for(key: &Keypair) -> AdmitAttemptRequest {
+        let lane = manifest(key);
+        request(key, lane, intent_for(lane))
     }
 
     type Controller = ProductionBindingController<
@@ -1410,10 +1459,10 @@ mod tests {
         FakeHost,
     >;
 
-    fn controller() -> (Controller, SigningKey, Rc<RefCell<HostState>>) {
-        let key = SigningKey::from_bytes(&[44; 32]);
+    fn controller() -> (Controller, Keypair, Rc<RefCell<HostState>>) {
+        let key = signing_key();
         let manifest = manifest(&key);
-        let job = intent();
+        let job = intent_for(manifest);
         let mut intents = StaticJobIntents::default();
         intents.insert(job).unwrap();
         let state = Rc::new(RefCell::new(HostState::default()));
@@ -1446,7 +1495,8 @@ mod tests {
     fn admission_binds_manifest_intent_signature_and_all_start_seams() {
         let (mut controller, key, state) = controller();
         let lane = manifest(&key);
-        let request = request(&key, lane, intent());
+        let job = intent_for(lane);
+        let request = request(&key, lane, job);
         let response = controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
             Request::AdmitAttempt(request),
@@ -1454,7 +1504,7 @@ mod tests {
         );
         assert_eq!(response.code, ResponseCode::Ok);
         assert_ne!(response.execution_binding_digest, [0; 32]);
-        assert_eq!(response.job_intent_digest, intent().digest());
+        assert_eq!(response.job_intent_digest, job.digest());
         assert_eq!(response.broker_state, BrokerState::Leased);
         assert_eq!(
             state.borrow().calls,
@@ -1464,9 +1514,9 @@ mod tests {
 
     #[test]
     fn fresh_controller_stays_reconciling_until_startup_recovery_completes() {
-        let key = SigningKey::from_bytes(&[44; 32]);
+        let key = signing_key();
         let manifest = manifest(&key);
-        let job = intent();
+        let job = intent_for(manifest);
         let mut intents = StaticJobIntents::default();
         intents.insert(job).unwrap();
         let state = Rc::new(RefCell::new(HostState::default()));
@@ -1499,7 +1549,7 @@ mod tests {
     #[test]
     fn replay_is_idempotent_but_any_signed_coordinate_drift_is_refused() {
         let (mut controller, key, state) = controller();
-        let request = request(&key, manifest(&key), intent());
+        let request = request_for(&key);
         let first = controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
             Request::AdmitAttempt(request),
@@ -1541,7 +1591,7 @@ mod tests {
         }
         let response = controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         assert_eq!(response.code, ResponseCode::InternalFailure);
@@ -1556,7 +1606,7 @@ mod tests {
         state.borrow_mut().refuse_at = Some("proxy");
         let response = controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         assert_eq!(response.code, ResponseCode::InternalFailure);
@@ -1575,13 +1625,14 @@ mod tests {
         }
         let first = controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         assert_eq!(first.code, ResponseCode::InternalFailure);
 
         state.borrow_mut().refuse_at = None;
-        let mut second_intent = intent();
+        let lane = manifest(&key);
+        let mut second_intent = intent_for(lane);
         second_intent.idempotency_digest = [71; 32];
         second_intent.run_id = [72; 16];
         controller.intents.insert(second_intent).unwrap();
@@ -1607,7 +1658,7 @@ mod tests {
         let (mut controller, key, state) = controller();
         let admitted = controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         let record = controller.journal.list().unwrap()[0];
@@ -1643,7 +1694,7 @@ mod tests {
         let (mut controller, key, state) = controller();
         controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         let record = controller.journal.list().unwrap()[0];
@@ -1700,7 +1751,7 @@ mod tests {
         let (mut first_process, key, state) = controller();
         let admitted = first_process.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         let ProductionBindingController {
@@ -1741,7 +1792,7 @@ mod tests {
         let (mut first_process, key, state) = controller();
         let admitted = first_process.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         state.borrow_mut().recovery = Some(HostRecoveryReceipt::Quarantine);
@@ -1773,8 +1824,8 @@ mod tests {
 
     #[test]
     fn lifecycle_refuses_skips_and_terminal_reentry_without_mutation() {
-        let key = SigningKey::from_bytes(&[44; 32]);
-        let request = request(&key, manifest(&key), intent());
+        let key = signing_key();
+        let request = request_for(&key);
         let binding = ExecutionBindingV1::create(request, 20).unwrap();
         let mut record = ExecutionBindingRecord::admitted(binding, 20);
         let admitted = record;
@@ -1798,11 +1849,14 @@ mod tests {
     #[test]
     fn digest_identity_and_signature_mismatches_fail_before_host_mutation() {
         let (mut first_controller, key, state) = controller();
-        let mut hostile_request = request(&key, manifest(&key), intent());
+        let mut hostile_request = request_for(&key);
         hostile_request.job_intent_digest[0] ^= 1;
-        hostile_request.admission_signature = key
-            .sign(&admission_signature_message(&hostile_request))
-            .to_bytes();
+        hostile_request.admission_signature = SECP256K1
+            .sign_schnorr_no_aux_rand(
+                &Message::from_digest(sha256(&admission_signature_message(&hostile_request))),
+                &key,
+            )
+            .serialize();
         let response = first_controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
             Request::AdmitAttempt(hostile_request),
@@ -1815,10 +1869,33 @@ mod tests {
         second_controller.host.system.identity.host_profile_digest[0] ^= 1;
         let response = second_controller.dispatch(
             header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
-            Request::AdmitAttempt(request(&key, manifest(&key), intent())),
+            Request::AdmitAttempt(request_for(&key)),
             20,
         );
         assert_eq!(response.code, ResponseCode::PolicyDenied);
         assert_eq!(state.borrow().calls, ["identity"]);
+    }
+
+    #[test]
+    fn admission_key_generation_mismatch_is_rejected_before_host_mutation() {
+        let (mut controller, key, state) = controller();
+        let mut hostile_request = request_for(&key);
+        hostile_request.admission_key_generation += 1;
+        hostile_request.admission_signature = SECP256K1
+            .sign_schnorr_no_aux_rand(
+                &Message::from_digest(sha256(&admission_signature_message(&hostile_request))),
+                &key,
+            )
+            .serialize();
+
+        let response = controller.dispatch(
+            header(buzz_ci_broker_protocol::Operation::AdmitAttempt),
+            Request::AdmitAttempt(hostile_request),
+            20,
+        );
+
+        assert_eq!(response.code, ResponseCode::PolicyDenied);
+        assert_eq!(state.borrow().calls, ["identity"]);
+        assert!(controller.journal.list().unwrap().is_empty());
     }
 }
