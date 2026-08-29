@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/controld-package-v1.json",
+  "title": "Buzz CI dormant controld install package v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "package_id",
+    "source_commit",
+    "binary_provenance_sha256",
+    "default_state",
+    "daemon_contract",
+    "package_uid",
+    "package_gid",
+    "identity",
+    "directories",
+    "entries",
+    "package_digest"
+  ],
+  "properties": {
+    "schema": { "const": "buzz-ci-controld-install-package-v1" },
+    "package_id": { "type": "string", "pattern": "^buzz-ci-controld-[0-9a-f]{12}-[0-9a-f]{12}$" },
+    "source_commit": { "$ref": "#/$defs/gitOid" },
+    "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
+    "default_state": {
+      "const": {
+        "enabled": false,
+        "active": false,
+        "provisioned": false,
+        "capacity": 0,
+        "providers_wired": false
+      }
+    },
+    "daemon_contract": {
+      "const": {
+        "service_user": "buzzci-controld",
+        "config_path": "/etc/buzzci/controld-v1.json",
+        "store_root": "/var/lib/buzzci/controld",
+        "capacity": 0,
+        "network": false,
+        "keyholder": false
+      }
+    },
+    "package_uid": { "const": 0 },
+    "package_gid": { "const": 0 },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user", "group", "uid", "gid"],
+      "properties": {
+        "user": { "const": "buzzci-controld" },
+        "group": { "const": "buzzci-controld" },
+        "uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "directories": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/directory" }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "package_digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "gitOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "mode": { "type": "string", "pattern": "^0[4567][0-7]{2}$" },
+    "directory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "mode", "uid", "gid"],
+      "properties": {
+        "target": { "enum": ["/etc/buzzci", "/usr/share/doc/buzz-ci-controld"] },
+        "mode": { "const": "0755" },
+        "uid": { "const": 0 },
+        "gid": { "const": 0 }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"],
+      "properties": {
+        "role": { "enum": ["binary", "config", "service", "tmpfiles", "documentation"] },
+        "source": { "type": "string", "pattern": "^assets/[A-Za-z0-9._-]+$" },
+        "target": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
+        "source_mode": { "$ref": "#/$defs/mode" },
+        "install_mode": { "$ref": "#/$defs/mode" },
+        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
