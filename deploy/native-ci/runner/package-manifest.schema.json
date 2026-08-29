@@ -10,6 +10,7 @@
     "source_commit",
     "binary_provenance_sha256",
     "default_state",
+    "peer_policy",
     "package_uid",
     "package_gid",
     "identities",
@@ -25,9 +26,27 @@
     "default_state": {
       "const": {
         "enabled": false,
+        "active": false,
         "provisioned": false,
         "capacity": 0,
         "host_block": false
+      }
+    },
+    "peer_policy": {
+      "const": {
+        "runner_control_socket": {
+          "path": "/run/buzzci/runner-control.sock",
+          "descriptor_name": "buzz-ci-runner-control",
+          "user": "buzzci-runner",
+          "group": "buzzci-controld",
+          "mode": "0620",
+          "directory_mode": "0711"
+        },
+        "broker_socket": {
+          "path": "/run/buzzci/execd.sock",
+          "expected_uid": 0,
+          "managed_by_package": false
+        }
       }
     },
     "package_uid": { "const": 0 },

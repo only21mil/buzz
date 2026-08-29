@@ -13,7 +13,7 @@ use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
 #[cfg(target_os = "linux")]
 use buzz_ci_execd::control::{
-    control_account_uid, validate_systemd_environment, validate_systemd_listener, ControlError,
+    peer_uid_policy, validate_systemd_environment, validate_systemd_listener, ControlError,
     ControlServer,
 };
 #[cfg(target_os = "linux")]
@@ -75,10 +75,10 @@ fn main() -> ExitCode {
                         return ExitCode::from(4);
                     }
                 };
-                let control_uid = match control_account_uid() {
-                    Ok(uid) => uid,
+                let peer_policy = match peer_uid_policy() {
+                    Ok(policy) => policy,
                     Err(error) => {
-                        eprintln!(r#"{{"error":"control_account","reason":"{error}"}}"#);
+                        eprintln!(r#"{{"error":"peer_accounts","reason":"{error}"}}"#);
                         return ExitCode::from(4);
                     }
                 };
@@ -90,7 +90,7 @@ fn main() -> ExitCode {
                     }
                 };
                 let dispatch = load_production_dispatch(startup_now);
-                let mut server = match ControlServer::new_polling(listener, control_uid, dispatch) {
+                let mut server = match ControlServer::new_polling(listener, peer_policy, dispatch) {
                     Ok(server) => server,
                     Err(error) => {
                         eprintln!(r#"{{"error":"control_listener","reason":"{error}"}}"#);

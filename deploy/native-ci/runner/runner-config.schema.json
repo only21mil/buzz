@@ -31,7 +31,7 @@
         "manifest_verification_key": { "$ref": "#/$defs/lowerHex64" },
         "relay_signer": { "$ref": "#/$defs/lowerHex64" },
         "broker_socket": { "const": "/run/buzzci/execd.sock" },
-        "broker_uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "broker_uid": { "const": 0 },
         "executor_program": { "type": "string", "pattern": "^/[^\\u0000]+$" },
         "evidence_directory": { "const": "/var/lib/buzzci/runner/evidence" },
         "journal_directory": { "const": "/var/lib/buzzci/runner/journal" },

@@ -27,9 +27,25 @@ MAX_JSON_BYTES = 1024 * 1024
 
 DEFAULT_STATE = {
     "enabled": False,
+    "active": False,
     "provisioned": False,
     "capacity": 0,
     "host_block": False,
+}
+PEER_POLICY = {
+    "runner_control_socket": {
+        "path": "/run/buzzci/runner-control.sock",
+        "descriptor_name": "buzz-ci-runner-control",
+        "user": "buzzci-runner",
+        "group": "buzzci-controld",
+        "mode": "0620",
+        "directory_mode": "0711",
+    },
+    "broker_socket": {
+        "path": "/run/buzzci/execd.sock",
+        "expected_uid": 0,
+        "managed_by_package": False,
+    },
 }
 EXPECTED_TARGETS = {
     "binary": "/usr/libexec/buzz-ci-runner",
@@ -146,7 +162,8 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
         raise ValueError("package manifest metadata is unsafe")
     expected_keys = {
         "schema", "package_id", "source_commit", "binary_provenance_sha256",
-        "default_state", "package_uid", "package_gid", "identities", "directories", "entries", "package_digest",
+        "default_state", "peer_policy", "package_uid", "package_gid", "identities",
+        "directories", "entries", "package_digest",
     }
     if set(manifest) != expected_keys or manifest["schema"] != SCHEMA:
         raise ValueError("invalid package manifest fields")
@@ -156,6 +173,8 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
         raise ValueError("invalid source commit")
     if manifest["default_state"] != DEFAULT_STATE or manifest["package_uid"] != 0 or manifest["package_gid"] != 0:
         raise ValueError("package is not closed by default")
+    if manifest["peer_policy"] != PEER_POLICY:
+        raise ValueError("package peer policy is invalid")
     identities = manifest["identities"]
     if not isinstance(identities, dict) or set(identities) != {"runner", "controld"}:
         raise ValueError("invalid package identities")
@@ -173,6 +192,11 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
             raise ValueError("invalid package identity binding")
         u32(identity["uid"], nonzero=True)
         u32(identity["gid"], nonzero=True)
+    if (
+        identities["runner"]["uid"] == identities["controld"]["uid"]
+        or identities["runner"]["gid"] == identities["controld"]["gid"]
+    ):
+        raise ValueError("runner and controld identities must be distinct")
     digest = manifest.pop("package_digest")
     if not isinstance(digest, str) or not DIGEST.fullmatch(digest) or sha256(canonical_json(manifest)) != digest:
         raise ValueError("package digest mismatch")
@@ -275,8 +299,11 @@ def validate_assets(package: Path, entries: list[Entry], identities: dict[str, o
     required_socket = {
         "ListenStream=/run/buzzci/runner-control.sock",
         "FileDescriptorName=buzz-ci-runner-control",
+        "SocketUser=buzzci-runner",
         "SocketMode=0620",
         "SocketGroup=buzzci-controld",
+        "DirectoryMode=0711",
+        "Service=buzz-ci-runner.service",
     }
     if not all(line in socket.splitlines() for line in required_socket) or "execd.sock" in socket:
         raise ValueError("runner and broker socket contracts overlap")
@@ -469,6 +496,7 @@ def check(package: Path, root: Path) -> dict[str, object]:
         "package_id": manifest["package_id"],
         "package_digest": manifest["package_digest"],
         "changed_targets": [entry.target for entry in planned],
+        "peer_policy": manifest["peer_policy"],
         **DEFAULT_STATE,
     }
 
@@ -484,9 +512,8 @@ def install(package: Path, root: Path, backup_root: Path, *, dry_run: bool = Fal
         "package_id": manifest["package_id"],
         "package_digest": manifest["package_digest"],
         "changed_targets": [entry.target for entry in planned],
-        "enabled": False,
-        "provisioned": False,
-        "capacity": 0,
+        "peer_policy": manifest["peer_policy"],
+        **DEFAULT_STATE,
     }
     if dry_run or not planned:
         return result

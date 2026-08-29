@@ -23,9 +23,25 @@ DIGEST = re.compile(r"^[0-9a-f]{64}$")
 PACKAGE_RELATIVE = Path("deploy/native-ci/runner")
 DEFAULT_STATE = {
     "enabled": False,
+    "active": False,
     "provisioned": False,
     "capacity": 0,
     "host_block": False,
+}
+PEER_POLICY = {
+    "runner_control_socket": {
+        "path": "/run/buzzci/runner-control.sock",
+        "descriptor_name": "buzz-ci-runner-control",
+        "user": "buzzci-runner",
+        "group": "buzzci-controld",
+        "mode": "0620",
+        "directory_mode": "0711",
+    },
+    "broker_socket": {
+        "path": render_runner_config.BROKER_SOCKET,
+        "expected_uid": render_runner_config.BROKER_UID,
+        "managed_by_package": False,
+    },
 }
 
 STATIC_ASSETS = (
@@ -157,6 +173,8 @@ def freeze_package(
     source_root = verify_source(source_root, source_commit)
     if any(not 1 <= identity <= (1 << 32) - 1 for identity in (runner_uid, runner_gid, controld_uid, controld_gid)):
         raise ValueError("runner and controld identities must be nonzero u32 values")
+    if runner_uid == controld_uid or runner_gid == controld_gid:
+        raise ValueError("runner and controld identities must be distinct")
     provenance, provenance_raw = load_provenance(provenance_path)
     if provenance["source_commit"] != source_commit:
         raise ValueError("binary provenance is bound to another source commit")
@@ -198,6 +216,7 @@ def freeze_package(
             "source_commit": source_commit,
             "binary_provenance_sha256": sha256(provenance_raw),
             "default_state": DEFAULT_STATE,
+            "peer_policy": PEER_POLICY,
             "package_uid": 0,
             "package_gid": 0,
             "identities": {
