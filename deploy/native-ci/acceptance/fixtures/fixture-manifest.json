@@ -1,0 +1,19 @@
+{
+  "schema_version": "buzz-ci-capacity-one-fixture/v1",
+  "command": [
+    "deploy/native-ci/acceptance/fixtures/run-fixture.sh",
+    "artifacts"
+  ],
+  "inputs": [
+    {
+      "path": "deploy/native-ci/acceptance/fixtures/input.txt",
+      "sha256": "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"
+    }
+  ],
+  "evidence": {
+    "log": "job.log",
+    "artifacts": [
+      "result.json"
+    ]
+  }
+}

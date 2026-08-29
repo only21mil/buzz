@@ -11,6 +11,18 @@ workflow, job, generic fault, or acceptance-case input. Its only optional
 directive is `"teardown_failure"`. Ordinary `buzz-ci-runner` does not depend on
 this crate or invoke the binary.
 
+The crate also builds `buzz-ci-capacity-one-canary`. That binary owns the
+activation acceptance sequence. It reads a scenario from standard input,
+invokes absolute provider adapter and process-control commands without a
+shell, validates 13 ordered system snapshots, and writes a receipt. Driver
+exit status is transport evidence only. The binary checks identities, state,
+digests, byte lengths, attempt lineage, tombstone folding, restart recovery,
+and final capacity zero itself.
+
+The canary is not part of the ordinary runner path. See
+`deploy/native-ci/acceptance/README.md` for its operator runbook and current
+activation status.
+
 The library exposes `QualificationTransport` for deterministic zero-transport
 validation tests. The installed binary maps the validated request into the
 fixed `AdmitQualification` frame and exchanges it only with

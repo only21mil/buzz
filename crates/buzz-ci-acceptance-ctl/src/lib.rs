@@ -3,6 +3,8 @@
 //! Authentication happens outside this crate. Signer fields are non-zero
 //! claims bound into the request, never proof that a signer authenticated.
 
+pub mod acceptance;
+
 use std::{
     fmt,
     io::{Read, Write},

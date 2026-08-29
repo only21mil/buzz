@@ -1,0 +1,50 @@
+{
+  "schema_version": "buzz-ci-capacity-one-scenario/v1",
+  "fixture": {
+    "integrated_candidate_sha": "edf07d62cfdfa65a8352d04503e08ca21c7371db",
+    "run_id": "11111111111111111111111111111111",
+    "request_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "manifest_digest": "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23",
+    "source_oid": "edf07d62cfdfa65a8352d04503e08ca21c7371db",
+    "approval_id": "33333333333333333333333333333333",
+    "grant_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+    "approved_by": "5555555555555555555555555555555555555555555555555555555555555555",
+    "export_subject": "6666666666666666666666666666666666666666666666666666666666666666",
+    "export_authorization_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "expected_log": {
+      "name": "job.log",
+      "sha256": "54e15345b0e920fd0b3c3864422c336f4f66f023b5b2a9cf7874c8a6fe2984ff",
+      "bytes": 131
+    },
+    "expected_artifacts": [
+      {
+        "name": "result.json",
+        "sha256": "fde27be36048dd6a5bdc9961882391f46102d86dac76c106787dba9ff7551d66",
+        "bytes": 107
+      }
+    ]
+  },
+  "driver": {
+    "control": {
+      "program": "/opt/buzzci/libexec/acceptance-control-adapter",
+      "args": []
+    },
+    "observe": {
+      "program": "/opt/buzzci/libexec/acceptance-observe-adapter",
+      "args": []
+    },
+    "export": {
+      "program": "/opt/buzzci/libexec/acceptance-export-adapter",
+      "args": []
+    },
+    "controller_process": {
+      "program": "/opt/buzzci/libexec/acceptance-controller-process",
+      "args": []
+    },
+    "runner_process": {
+      "program": "/opt/buzzci/libexec/acceptance-runner-process",
+      "args": []
+    },
+    "timeout_seconds": 120
+  }
+}
