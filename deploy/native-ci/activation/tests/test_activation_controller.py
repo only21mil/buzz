@@ -26,6 +26,7 @@ def load_module(name: str, path: Path):
 
 
 CONTROLLER = load_module("activation_controller", ACTIVATION_ROOT / "controller.py")
+FREEZER = load_module("activation_freezer", ACTIVATION_ROOT / "freeze_package.py")
 
 RESPONSE = b'{"status":"qualification_passed"}\n'
 
@@ -390,6 +391,85 @@ class ActivationControllerTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "cannot contain"):
             CONTROLLER._validate_phase_configs(manifest, payloads)
+
+    def test_qualification_executable_mode_drift_is_rejected(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        qualification = next(item for item in manifest["components"] if item["name"] == "qualification")
+        program = self.fixture.root / qualification["binary_path"].lstrip("/")
+        program.chmod(0o700)
+        with self.assertRaisesRegex(ValueError, "target metadata drift"):
+            CONTROLLER.preflight(manifest, self.fixture.root, driver, require_dormant=True)
+
+
+class ActivationFreezerModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _metadata(self, name: str, mode: int) -> os.stat_result:
+        path = self.root / name
+        write_file(path, b"payload\n", mode)
+        return path.stat()
+
+    def test_private_checkout_modes_preserve_git_executable_intent(self) -> None:
+        FREEZER._validate_checkout_metadata(
+            self._metadata("nonexecuted", 0o600), 0o100644, os.geteuid(), "nonexecuted",
+        )
+        FREEZER._validate_checkout_metadata(
+            self._metadata("executed", 0o700), 0o100755, os.geteuid(), "executed",
+        )
+
+    def test_checkout_executable_class_and_unexpected_writes_are_rejected(self) -> None:
+        cases = (
+            ("nonexecuted-is-executable", 0o700, 0o100644, "executable class differs"),
+            ("executed-is-nonexecutable", 0o600, 0o100755, "executable class differs"),
+            ("nonexecuted-group-writable", 0o620, 0o100644, "unsafe permissions"),
+            ("executed-world-writable", 0o702, 0o100755, "unsafe permissions"),
+        )
+        for name, materialized_mode, git_mode, message in cases:
+            with self.subTest(name=name):
+                metadata = self._metadata(name, materialized_mode)
+                with self.assertRaisesRegex(ValueError, message):
+                    FREEZER._validate_checkout_metadata(metadata, git_mode, os.geteuid(), name)
+
+    def test_checkout_owner_read_access_is_required(self) -> None:
+        with self.assertRaisesRegex(ValueError, "owner access differs"):
+            FREEZER._validate_checkout_metadata(
+                self._metadata("write-only", 0o200), 0o100644, os.geteuid(), "write-only",
+            )
+        with self.assertRaisesRegex(ValueError, "owner access differs"):
+            FREEZER._validate_checkout_metadata(
+                self._metadata("wrong-owner", 0o600), 0o100644, os.geteuid() + 1, "wrong-owner",
+            )
+
+    def test_tracked_payload_rejects_symbolic_link_shape(self) -> None:
+        relative = Path("deploy/native-ci/activation/templates/static.conf")
+        source = self.root / relative
+        write_file(source, b"static\n", 0o600)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "core.sharedRepository", "true"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", str(relative)], check=True)
+        self.assertEqual(FREEZER._tracked_payload(self.root, relative, 0o100644), b"static\n")
+        target = self.root / "target.conf"
+        write_file(target, b"static\n", 0o600)
+        source.unlink()
+        source.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "symbolic links"):
+            FREEZER._tracked_payload(self.root, relative, 0o100644)
+
+    def test_asset_writer_materializes_declared_modes_under_private_umask(self) -> None:
+        original_umask = os.umask(0o077)
+        try:
+            for name, mode in (("private-source", 0o400), ("manifest", 0o600), ("executable", 0o500)):
+                with self.subTest(name=name):
+                    path = self.root / name
+                    FREEZER._write_asset(path, b"payload\n", mode)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+        finally:
+            os.umask(original_umask)
 
 
 if __name__ == "__main__":
