@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 ACCEPTANCE = ROOT / "deploy/native-ci/acceptance"
 DRIVER = "/usr/libexec/buzz-ci-capacity-one-driver"
+VERIFIER_INSTALL = "/usr/libexec/buzz-ci-verify-acceptance-receipt"
+
+SOURCE_SPEC = importlib.util.spec_from_file_location(
+    "acceptance_verifier_source", ACCEPTANCE / "verifier_source.py"
+)
+assert SOURCE_SPEC is not None and SOURCE_SPEC.loader is not None
+VERIFIER_SOURCE = importlib.util.module_from_spec(SOURCE_SPEC)
+SOURCE_SPEC.loader.exec_module(VERIFIER_SOURCE)
 
 
 class AcceptancePackageTests(unittest.TestCase):
@@ -42,7 +51,11 @@ class AcceptancePackageTests(unittest.TestCase):
             set(scenario["driver"]),
         )
         self.assertEqual(
-            {value["program"] for value in scenario["driver"].values() if isinstance(value, dict)},
+            {
+                value["program"]
+                for value in scenario["driver"].values()
+                if isinstance(value, dict)
+            },
             {DRIVER},
         )
         self.assertTrue(
@@ -58,9 +71,13 @@ class AcceptancePackageTests(unittest.TestCase):
         control_socket = (templates / "buzz-ci-acceptance-control.socket").read_text()
         controld_socket = (templates / "buzz-ci-controld-acceptance.socket").read_text()
         service = (templates / "buzz-ci-acceptance-control.service").read_text()
-        self.assertIn("ListenStream=/run/buzzci/acceptance-control.sock", control_socket)
+        self.assertIn(
+            "ListenStream=/run/buzzci/acceptance-control.sock", control_socket
+        )
         self.assertIn("FileDescriptorName=buzz-ci-acceptance-control", control_socket)
-        self.assertIn("ListenStream=/run/buzzci/controld-acceptance.sock", controld_socket)
+        self.assertIn(
+            "ListenStream=/run/buzzci/controld-acceptance.sock", controld_socket
+        )
         self.assertIn("FileDescriptorName=buzz-ci-controld-acceptance", controld_socket)
         for value in (control_socket, controld_socket):
             self.assertIn("SocketUser=root", value)
@@ -70,21 +87,30 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertNotIn("Environment=", service)
         self.assertNotIn("sudo", service)
 
-    def test_fresh_umask_copy_keeps_declared_package_modes(self) -> None:
+    def test_fresh_umask_copy_keeps_declared_template_modes(self) -> None:
         prior = os.umask(0o077)
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 destinations = {
-                    "buzz-ci-acceptance-control.socket": (ACCEPTANCE / "templates" / "buzz-ci-acceptance-control.socket", 0o644),
-                    "buzz-ci-acceptance-control.service": (ACCEPTANCE / "templates" / "buzz-ci-acceptance-control.service", 0o644),
-                    "buzz-ci-controld-acceptance.socket": (ACCEPTANCE / "templates" / "buzz-ci-controld-acceptance.socket", 0o644),
-                    "buzzci-acceptance.tmpfiles": (ACCEPTANCE / "templates" / "buzzci-acceptance.tmpfiles", 0o644),
-                    "verify-receipt.py": (ACCEPTANCE / "verify-receipt.py", 0o755),
+                    "buzz-ci-acceptance-control.socket": (
+                        ACCEPTANCE / "templates" / "buzz-ci-acceptance-control.socket",
+                        0o644,
+                    ),
+                    "buzz-ci-acceptance-control.service": (
+                        ACCEPTANCE / "templates" / "buzz-ci-acceptance-control.service",
+                        0o644,
+                    ),
+                    "buzz-ci-controld-acceptance.socket": (
+                        ACCEPTANCE / "templates" / "buzz-ci-controld-acceptance.socket",
+                        0o644,
+                    ),
+                    "buzzci-acceptance.tmpfiles": (
+                        ACCEPTANCE / "templates" / "buzzci-acceptance.tmpfiles",
+                        0o644,
+                    ),
                 }
                 for name, (source, mode) in destinations.items():
-                    if name == "verify-receipt.py":
-                        self.assertEqual(stat.S_IMODE(source.stat().st_mode), mode)
                     target = root / name
                     shutil.copyfile(source, target)
                     os.chmod(target, mode)
@@ -92,10 +118,141 @@ class AcceptancePackageTests(unittest.TestCase):
         finally:
             os.umask(prior)
 
+    def test_verifier_source_contract_accepts_restrictive_git_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed = root / "seed"
+            checkout = root / "checkout"
+            source = seed / VERIFIER_SOURCE.SOURCE_RELATIVE
+            source.parent.mkdir(parents=True)
+            shutil.copyfile(ACCEPTANCE / "verify-receipt.py", source)
+            os.chmod(source, 0o755)
+            subprocess.run(["git", "init", "-q", str(seed)], check=True)
+            subprocess.run(
+                ["git", "-C", str(seed), "config", "user.name", "Acceptance Tests"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(seed),
+                    "config",
+                    "user.email",
+                    "acceptance@example.invalid",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(seed), "config", "core.sharedRepository", "true"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(seed), "add", str(VERIFIER_SOURCE.SOURCE_RELATIVE)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(seed), "commit", "-qm", "fixture"], check=True
+            )
+
+            prior = os.umask(0o077)
+            try:
+                subprocess.run(
+                    ["git", "clone", "-q", "--no-hardlinks", str(seed), str(checkout)],
+                    check=True,
+                )
+            finally:
+                os.umask(prior)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "config",
+                    "core.sharedRepository",
+                    "true",
+                ],
+                check=True,
+            )
+
+            materialized = checkout / VERIFIER_SOURCE.SOURCE_RELATIVE
+            self.assertEqual(stat.S_IMODE(materialized.stat().st_mode), 0o700)
+            contract = VERIFIER_SOURCE.source_contract(checkout)
+            self.assertEqual(contract["source_git_mode"], "100755")
+            self.assertEqual(contract["materialized_source_mode"], "0700")
+            self.assertEqual(contract["install_path"], VERIFIER_INSTALL)
+            self.assertEqual(contract["install_mode"], "0755")
+
+    def test_verifier_source_contract_rejects_unsafe_modes_and_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / VERIFIER_SOURCE.SOURCE_RELATIVE
+            source.parent.mkdir(parents=True)
+            shutil.copyfile(ACCEPTANCE / "verify-receipt.py", source)
+            os.chmod(source, 0o755)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "add", str(VERIFIER_SOURCE.SOURCE_RELATIVE)],
+                check=True,
+            )
+
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "update-index",
+                    "--chmod=-x",
+                    str(VERIFIER_SOURCE.SOURCE_RELATIVE),
+                ],
+                check=True,
+            )
+            with self.assertRaisesRegex(ValueError, "Git mode differs"):
+                VERIFIER_SOURCE.tracked_verifier(root)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "update-index",
+                    "--chmod=+x",
+                    str(VERIFIER_SOURCE.SOURCE_RELATIVE),
+                ],
+                check=True,
+            )
+
+            os.chmod(source, 0o100)
+            with self.assertRaisesRegex(
+                ValueError, "cannot be opened safely|owner access differs"
+            ):
+                VERIFIER_SOURCE.tracked_verifier(root)
+
+            for mode in (0o720, 0o740, 0o600):
+                with self.subTest(mode=oct(mode)):
+                    os.chmod(source, mode)
+                    with self.assertRaisesRegex(
+                        ValueError, "permissions|executable class"
+                    ):
+                        VERIFIER_SOURCE.tracked_verifier(root)
+
+            os.chmod(source, 0o700)
+            target = root / "verifier-target"
+            shutil.copyfile(source, target)
+            source.unlink()
+            source.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "symbolic links"):
+                VERIFIER_SOURCE.tracked_verifier(root)
+
+            source.unlink()
+            os.link(target, source)
+            with self.assertRaisesRegex(ValueError, "single regular file"):
+                VERIFIER_SOURCE.tracked_verifier(root)
+
     def test_no_placeholder_or_ambient_credential_channel(self) -> None:
         checked = [
             ACCEPTANCE / "scenario.template.json",
             ACCEPTANCE / "verify-receipt.py",
+            ACCEPTANCE / "verifier_source.py",
             *sorted((ACCEPTANCE / "templates").iterdir()),
         ]
         for path in checked:

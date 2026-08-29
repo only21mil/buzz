@@ -95,10 +95,17 @@ check-jsonschema \
   --schemafile deploy/native-ci/acceptance/receipt.schema.json \
   /protected/path/capacity-one-receipt.json
 
-deploy/native-ci/acceptance/verify-receipt.py \
+/usr/libexec/buzz-ci-verify-acceptance-receipt \
   /protected/path/capacity-one-scenario.json \
   /protected/path/capacity-one-receipt.json
 ```
+
+The central activation package installs that sole verifier path with mode
+`0755`. Its source is the Git-`100755` file
+`deploy/native-ci/acceptance/verify-receipt.py`; restrictive checkouts may
+materialize it as `0700`. Packaging must validate the tracked execute intent
+and hardened file metadata through `verifier_source.py`, then install and read
+back the declared `0755` mode.
 
 The verifier rejects reordered, duplicate, partial, or hash-only stage records.
 It recomputes every retained driver-response and root-phase digest; binds the
