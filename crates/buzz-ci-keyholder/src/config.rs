@@ -6,7 +6,10 @@ use nostr::secp256k1::XOnlyPublicKey;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{Operation, OperationSet, PeerPolicy, PublicIdentity, SelectorSet, SigningPolicy};
+use crate::{
+    AcceptanceSigningPolicy, CanonicalPayload, Operation, OperationSet, PeerPolicy, PublicIdentity,
+    SelectorSet, SigningPolicy,
+};
 
 /// Exact production configuration schema.
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -21,6 +24,8 @@ pub struct KeyholderConfig {
     pub selectors: SelectorSet,
     /// Exact HTTPS origin accepted for NIP-98 authorization.
     pub nip98_origin: String,
+    /// Optional activation-only acceptance mutation authority.
+    pub acceptance: Option<AcceptanceSigningPolicy>,
 }
 
 impl KeyholderConfig {
@@ -69,6 +74,12 @@ impl KeyholderConfig {
         .ok_or(ConfigError::Invalid)?;
         SigningPolicy::validate_nip98_origin(&raw.nip98_origin)
             .map_err(|_| ConfigError::Invalid)?;
+        let acceptance = raw.acceptance.map(RawAcceptance::policy).transpose()?;
+        if operations.contains(Operation::SignAcceptanceMutation) != acceptance.is_some()
+            || operations.contains(Operation::DescribeAcceptance) != acceptance.is_some()
+        {
+            return Err(ConfigError::Invalid);
+        }
         Ok(Self {
             peer_policy: PeerPolicy {
                 uid: raw.peer.uid,
@@ -77,6 +88,7 @@ impl KeyholderConfig {
             },
             selectors,
             nip98_origin: raw.nip98_origin,
+            acceptance,
         })
     }
 }
@@ -99,6 +111,8 @@ struct RawConfig {
     peer: RawPeer,
     selectors: RawSelectors,
     nip98_origin: String,
+    #[serde(default)]
+    acceptance: Option<RawAcceptance>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +130,8 @@ enum RawOperation {
     SignCiEvent,
     Nip98Authorize,
     SignManifest,
+    DescribeAcceptance,
+    SignAcceptanceMutation,
 }
 
 impl RawOperation {
@@ -125,6 +141,8 @@ impl RawOperation {
             Self::SignCiEvent => Operation::SignCiEvent,
             Self::Nip98Authorize => Operation::Nip98Authorize,
             Self::SignManifest => Operation::SignManifest,
+            Self::DescribeAcceptance => Operation::DescribeAcceptance,
+            Self::SignAcceptanceMutation => Operation::SignAcceptanceMutation,
         }
     }
 }
@@ -142,6 +160,53 @@ struct RawSelectors {
 struct RawIdentity {
     public_key: String,
     generation: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcceptance {
+    actor: RawIdentity,
+    scenario_sha256: String,
+    run_event: serde_json::Value,
+    grant_event: serde_json::Value,
+    rerun_event: serde_json::Value,
+    tombstone_event: serde_json::Value,
+}
+
+impl RawAcceptance {
+    fn policy(self) -> Result<AcceptanceSigningPolicy, ConfigError> {
+        let scenario = decode_hex32(&self.scenario_sha256)?;
+        let payload = |value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).map_err(|_| ConfigError::Invalid)?;
+            CanonicalPayload::new(bytes).map_err(|_| ConfigError::Invalid)
+        };
+        AcceptanceSigningPolicy::new(
+            self.actor.identity()?,
+            scenario,
+            [
+                payload(self.run_event)?,
+                payload(self.grant_event)?,
+                payload(self.rerun_event)?,
+                payload(self.tombstone_event)?,
+            ],
+        )
+        .map_err(|_| ConfigError::Invalid)
+    }
+}
+
+fn decode_hex32(value: &str) -> Result<[u8; 32], ConfigError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ConfigError::Invalid);
+    }
+    let bytes = hex::decode(value).map_err(|_| ConfigError::Invalid)?;
+    let digest: [u8; 32] = bytes.try_into().map_err(|_| ConfigError::Invalid)?;
+    (digest != [0; 32])
+        .then_some(digest)
+        .ok_or(ConfigError::Invalid)
 }
 
 impl RawIdentity {
@@ -198,7 +263,14 @@ mod tests {
             "https://relay.example.test",
         ))
         .expect("valid config");
-        assert_eq!(parsed.peer_policy.allowed_operations, OperationSet::ALL);
+        let compatibility_operations = OperationSet::only(Operation::Describe)
+            .union(OperationSet::only(Operation::SignCiEvent))
+            .union(OperationSet::only(Operation::Nip98Authorize))
+            .union(OperationSet::only(Operation::SignManifest));
+        assert_eq!(
+            parsed.peer_policy.allowed_operations,
+            compatibility_operations
+        );
         assert_eq!(
             parsed
                 .selectors
@@ -229,6 +301,11 @@ mod tests {
             .expect("UTF-8 config")
             .replace(CI_KEY, &CI_KEY.to_uppercase());
         assert!(KeyholderConfig::from_slice(uppercase.as_bytes()).is_err());
+        assert!(KeyholderConfig::from_slice(&config(
+            r#"["sign_acceptance_mutation"]"#,
+            "https://relay.example.test"
+        ))
+        .is_err());
     }
 
     #[test]

@@ -16,9 +16,11 @@ impl KeySelector {
     pub const fn for_operation(operation: Operation) -> Option<Self> {
         match operation {
             Operation::Describe => None,
+            Operation::DescribeAcceptance => None,
             Operation::SignCiEvent => Some(Self::CiEvent),
             Operation::Nip98Authorize => Some(Self::Nip98),
             Operation::SignManifest => Some(Self::Manifest),
+            Operation::SignAcceptanceMutation => None,
         }
     }
 

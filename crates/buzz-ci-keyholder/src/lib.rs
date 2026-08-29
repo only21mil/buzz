@@ -32,11 +32,12 @@ pub use ipc::{
 #[cfg(target_os = "linux")]
 pub use ipc::{validate_systemd_environment, validate_systemd_listener, ActivationError};
 pub use selector::{KeySelector, SelectorSet};
-pub use service::{ProductionKeyholder, ServiceError, SigningPolicy};
+pub use service::{AcceptanceSigningPolicy, ProductionKeyholder, ServiceError, SigningPolicy};
 pub use traits::{KeyholderClient, KeyholderServer};
 pub use types::{
-    CanonicalPayload, DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod,
-    ManifestKind, Nip98AuthorizeRequest, Operation, OperationSet, PeerIdentity, PeerPolicy,
-    PublicIdentity, Request, Response, SignCiEventRequest, SignManifestRequest, SignatureResponse,
-    Url, ValueError, MAX_CANONICAL_PAYLOAD_SIZE, MAX_URL_SIZE,
+    AcceptanceMutation, CanonicalPayload, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
+    DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, ManifestKind,
+    Nip98AuthorizeRequest, Operation, OperationSet, PeerIdentity, PeerPolicy, PublicIdentity,
+    Request, Response, SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest,
+    SignatureResponse, Url, ValueError, MAX_CANONICAL_PAYLOAD_SIZE, MAX_URL_SIZE,
 };

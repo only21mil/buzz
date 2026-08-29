@@ -18,6 +18,16 @@ pub trait SigningBackend {
         selector: KeySelector,
         digest: [u8; 32],
     ) -> Result<[u8; 64], BackendError>;
+
+    /// Return the dedicated acceptance actor public key when provisioned.
+    fn acceptance_public_key(&self) -> Result<[u8; 32], BackendError> {
+        Err(BackendError::Credential)
+    }
+
+    /// Sign one already policy-selected acceptance event ID.
+    fn sign_acceptance_digest(&self, _digest: [u8; 32]) -> Result<[u8; 64], BackendError> {
+        Err(BackendError::Credential)
+    }
 }
 
 /// Sanitized backend failure. It never contains credential names, paths, or key bytes.
@@ -78,6 +88,7 @@ pub struct Secp256k1Backend {
     ci_event: SigningKey,
     nip98: SigningKey,
     manifest: SigningKey,
+    acceptance_actor: Option<SigningKey>,
 }
 
 impl fmt::Debug for Secp256k1Backend {
@@ -90,7 +101,7 @@ impl fmt::Debug for Secp256k1Backend {
 }
 
 impl Secp256k1Backend {
-    /// Load the three exact 32-byte raw secret-key credentials.
+    /// Load the three compatibility-profile 32-byte raw secret-key credentials.
     ///
     /// The directory is opened once without following its final component.
     /// Each fixed credential is then opened relative to that descriptor with
@@ -161,11 +172,80 @@ impl Secp256k1Backend {
             ci_event: read_key(KeySelector::CiEvent)?,
             nip98: read_key(KeySelector::Nip98)?,
             manifest: read_key(KeySelector::Manifest)?,
+            acceptance_actor: None,
         })
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn from_systemd_credentials(_directory: &Path) -> Result<Self, BackendError> {
+        Err(BackendError::CredentialDirectory)
+    }
+
+    /// Load the compatibility credentials plus the distinct acceptance actor key.
+    #[cfg(target_os = "linux")]
+    pub fn from_systemd_credentials_with_acceptance(
+        directory: &Path,
+    ) -> Result<Self, BackendError> {
+        use nix::fcntl::{open, openat, OFlag};
+        use nix::sys::stat::{fstat, Mode, SFlag};
+        use nix::unistd::geteuid;
+        use std::fs::File;
+        use std::io::Read;
+
+        let mut backend = Self::from_systemd_credentials(directory)?;
+        let descriptor = open(
+            directory,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| BackendError::CredentialDirectory)?;
+        let stat = fstat(&descriptor).map_err(|_| BackendError::CredentialDirectory)?;
+        let owner_uid = geteuid().as_raw();
+        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR
+            || stat.st_uid != owner_uid
+            || stat.st_mode & 0o7000 != 0
+            || stat.st_mode & 0o077 != 0
+            || stat.st_mode & 0o500 != 0o500
+        {
+            return Err(BackendError::CredentialDirectory);
+        }
+        let key_fd = openat(
+            &descriptor,
+            "acceptance-actor.key",
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| BackendError::Credential)?;
+        let stat = fstat(&key_fd).map_err(|_| BackendError::Credential)?;
+        if !credential_metadata_is_secure(
+            stat.st_mode,
+            stat.st_uid,
+            stat.st_nlink,
+            stat.st_size,
+            owner_uid,
+        ) {
+            return Err(BackendError::Credential);
+        }
+        let mut bytes = Zeroizing::new([0_u8; 32]);
+        let mut file = File::from(key_fd);
+        file.read_exact(bytes.as_mut())
+            .map_err(|_| BackendError::Credential)?;
+        let mut trailing = [0_u8; 1];
+        if file
+            .read(&mut trailing)
+            .map_err(|_| BackendError::Credential)?
+            != 0
+        {
+            return Err(BackendError::Credential);
+        }
+        backend.acceptance_actor = Some(SigningKey::from_bytes(bytes)?);
+        Ok(backend)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn from_systemd_credentials_with_acceptance(
+        _directory: &Path,
+    ) -> Result<Self, BackendError> {
         Err(BackendError::CredentialDirectory)
     }
 
@@ -206,6 +286,20 @@ impl SigningBackend for Secp256k1Backend {
         digest: [u8; 32],
     ) -> Result<[u8; 64], BackendError> {
         self.key(selector).sign(digest)
+    }
+
+    fn acceptance_public_key(&self) -> Result<[u8; 32], BackendError> {
+        self.acceptance_actor
+            .as_ref()
+            .ok_or(BackendError::Credential)?
+            .public_key()
+    }
+
+    fn sign_acceptance_digest(&self, digest: [u8; 32]) -> Result<[u8; 64], BackendError> {
+        self.acceptance_actor
+            .as_ref()
+            .ok_or(BackendError::Credential)?
+            .sign(digest)
     }
 }
 
@@ -258,6 +352,42 @@ mod tests {
         SECP256K1
             .verify_schnorr(&signature, &Message::from_digest(digest), &public)
             .expect("signature verifies");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn acceptance_profile_requires_and_uses_the_distinct_fixed_credential() {
+        let directory = tempdir().expect("credential directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("credential directory mode");
+        for (name, scalar) in [
+            ("ci-event.key", 1_u8),
+            ("nip98.key", 2),
+            ("manifest.key", 3),
+            ("acceptance-actor.key", 4),
+        ] {
+            let mut bytes = [0_u8; 32];
+            bytes[31] = scalar;
+            let path = directory.path().join(name);
+            fs::write(&path, bytes).expect("write synthetic key");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400)).expect("credential mode");
+        }
+        let backend = Secp256k1Backend::from_systemd_credentials_with_acceptance(directory.path())
+            .expect("load acceptance credentials");
+        let digest = [8; 32];
+        let signature = backend
+            .sign_acceptance_digest(digest)
+            .expect("acceptance signature");
+        let public = XOnlyPublicKey::from_slice(
+            &backend
+                .acceptance_public_key()
+                .expect("acceptance public key"),
+        )
+        .expect("valid acceptance public key");
+        let signature = Signature::from_slice(&signature).expect("valid signature");
+        SECP256K1
+            .verify_schnorr(&signature, &Message::from_digest(digest), &public)
+            .expect("acceptance signature verifies");
     }
 
     #[test]
