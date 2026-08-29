@@ -37,32 +37,39 @@ pub enum BackendError {
     Signing,
 }
 
-struct SigningKey(Keypair);
+struct SigningKey(Zeroizing<[u8; 32]>);
 
 impl SigningKey {
     fn from_bytes(bytes: Zeroizing<[u8; 32]>) -> Result<Self, BackendError> {
         let mut secret =
             SecretKey::from_slice(bytes.as_ref()).map_err(|_| BackendError::InvalidKey)?;
-        let keypair = Keypair::from_secret_key(SECP256K1, &secret);
         secret.non_secure_erase();
-        Ok(Self(keypair))
+        Ok(Self(bytes))
     }
 
-    fn public_key(&self) -> [u8; 32] {
-        self.0.x_only_public_key().0.serialize()
+    fn keypair(&self) -> Result<Keypair, BackendError> {
+        let mut secret =
+            SecretKey::from_slice(self.0.as_ref()).map_err(|_| BackendError::InvalidKey)?;
+        let keypair = Keypair::from_secret_key(SECP256K1, &secret);
+        secret.non_secure_erase();
+        Ok(keypair)
+    }
+
+    fn public_key(&self) -> Result<[u8; 32], BackendError> {
+        let mut keypair = self.keypair()?;
+        let public_key = keypair.x_only_public_key().0.serialize();
+        keypair.non_secure_erase();
+        Ok(public_key)
     }
 
     fn sign(&self, digest: [u8; 32]) -> Result<[u8; 64], BackendError> {
         let message = Message::from_digest(digest);
-        Ok(SECP256K1
-            .sign_schnorr_no_aux_rand(&message, &self.0)
-            .serialize())
-    }
-}
-
-impl Drop for SigningKey {
-    fn drop(&mut self) {
-        self.0.non_secure_erase();
+        let mut keypair = self.keypair()?;
+        let signature = SECP256K1
+            .sign_schnorr_no_aux_rand(&message, &keypair)
+            .serialize();
+        keypair.non_secure_erase();
+        Ok(signature)
     }
 }
 
@@ -93,6 +100,7 @@ impl Secp256k1Backend {
     pub fn from_systemd_credentials(directory: &Path) -> Result<Self, BackendError> {
         use nix::fcntl::{open, openat, OFlag};
         use nix::sys::stat::{fstat, Mode, SFlag};
+        use nix::unistd::geteuid;
         use std::fs::File;
         use std::io::Read;
 
@@ -106,7 +114,13 @@ impl Secp256k1Backend {
         )
         .map_err(|_| BackendError::CredentialDirectory)?;
         let stat = fstat(&descriptor).map_err(|_| BackendError::CredentialDirectory)?;
-        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR || stat.st_mode & 0o022 != 0 {
+        let owner_uid = geteuid().as_raw();
+        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR
+            || stat.st_uid != owner_uid
+            || stat.st_mode & 0o7000 != 0
+            || stat.st_mode & 0o077 != 0
+            || stat.st_mode & 0o500 != 0o500
+        {
             return Err(BackendError::CredentialDirectory);
         }
 
@@ -119,11 +133,13 @@ impl Secp256k1Backend {
             )
             .map_err(|_| BackendError::Credential)?;
             let stat = fstat(&key_fd).map_err(|_| BackendError::Credential)?;
-            if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFREG
-                || stat.st_nlink != 1
-                || stat.st_size != 32
-                || stat.st_mode & 0o022 != 0
-            {
+            if !credential_metadata_is_secure(
+                stat.st_mode,
+                stat.st_uid,
+                stat.st_nlink,
+                stat.st_size,
+                owner_uid,
+            ) {
                 return Err(BackendError::Credential);
             }
             let mut bytes = Zeroizing::new([0_u8; 32]);
@@ -162,9 +178,26 @@ impl Secp256k1Backend {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn credential_metadata_is_secure(
+    mode: u32,
+    owner_uid: u32,
+    link_count: u64,
+    size: i64,
+    expected_owner_uid: u32,
+) -> bool {
+    use nix::sys::stat::SFlag;
+
+    SFlag::from_bits_truncate(mode) == SFlag::S_IFREG
+        && mode & 0o7777 == 0o400
+        && owner_uid == expected_owner_uid
+        && link_count == 1
+        && size == 32
+}
+
 impl SigningBackend for Secp256k1Backend {
     fn public_key(&self, selector: KeySelector) -> Result<[u8; 32], BackendError> {
-        Ok(self.key(selector).public_key())
+        self.key(selector).public_key()
     }
 
     fn sign_digest(
@@ -238,6 +271,58 @@ mod tests {
         symlink(&target, directory.path().join("ci-event.key")).expect("link credential");
         fs::write(directory.path().join("nip98.key"), [2_u8; 31]).expect("short credential");
         fs::write(directory.path().join("manifest.key"), [3_u8; 32]).expect("manifest credential");
+        assert_eq!(
+            Secp256k1Backend::from_systemd_credentials(directory.path()).unwrap_err(),
+            BackendError::Credential
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn loose_mode_and_wrong_owner_are_rejected_without_detail() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        use nix::sys::stat::SFlag;
+        use nix::unistd::geteuid;
+
+        let regular = SFlag::S_IFREG.bits();
+        let owner = geteuid().as_raw();
+        assert!(!credential_metadata_is_secure(
+            regular | 0o444,
+            owner,
+            1,
+            32,
+            owner,
+        ));
+        assert!(!credential_metadata_is_secure(
+            regular | 0o400,
+            owner,
+            1,
+            32,
+            owner.wrapping_add(1),
+        ));
+        assert_eq!(
+            BackendError::Credential.to_string(),
+            "required credential is unavailable"
+        );
+        assert!(!BackendError::Credential.to_string().contains("owner"));
+        assert!(!BackendError::Credential.to_string().contains("mode"));
+
+        let directory = tempdir().expect("credential directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("credential directory mode");
+        for (selector, mode) in [
+            (KeySelector::CiEvent, 0o444),
+            (KeySelector::Nip98, 0o400),
+            (KeySelector::Manifest, 0o400),
+        ] {
+            let mut bytes = [0_u8; 32];
+            bytes[31] = selector as u8;
+            let path = directory.path().join(selector.credential_name());
+            fs::write(&path, bytes).expect("write credential");
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("credential mode");
+        }
         assert_eq!(
             Secp256k1Backend::from_systemd_credentials(directory.path()).unwrap_err(),
             BackendError::Credential
