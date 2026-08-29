@@ -36,6 +36,9 @@ pub enum MediaError {
     TimestampOutOfWindow,
     #[error("storage error: {0}")]
     StorageError(String),
+    /// Stored bytes do not match the caller's immutable size and SHA-256 identity.
+    #[error("stored object integrity mismatch")]
+    StoredObjectIntegrityMismatch,
     #[error("internal error")]
     Internal,
     #[error("not found")]
@@ -151,7 +154,10 @@ impl IntoResponse for MediaError {
             | Self::InvalidVideo
             | Self::InvalidImage
             | Self::MetadataForbidden => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
-            Self::Io(_) | Self::StorageError(_) | Self::Internal => {
+            Self::Io(_)
+            | Self::StorageError(_)
+            | Self::StoredObjectIntegrityMismatch
+            | Self::Internal => {
                 tracing::error!(error = %self, "media storage error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }

@@ -72,16 +72,19 @@ use crate::config::CiPolicyConfig;
 use crate::state::AppState;
 use crate::tenant::bind_community;
 use buzz_core::channel::MemberRole;
-use buzz_core::ci::{CiRequestEnvelope, ValidatedCiEnvelope};
+use buzz_core::ci::{CiArtifactReferenceEnvelope, CiRequestEnvelope, ValidatedCiEnvelope};
 use buzz_core::kind::{
-    KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_GIT_PR_UPDATE,
+    KIND_GIT_PULL_REQUEST,
 };
 #[cfg(test)]
 use buzz_core::CommunityId;
 use buzz_core::TenantContext;
 use buzz_db::EventQuery;
+use buzz_media::MediaError;
 
 const MAX_CI_CONTROL_BACKLOG: i64 = 1_001;
+const MAX_CI_RUN_EVENT_PAGE: u32 = 1_000;
 /// Maximum bytes accepted by either CI evidence upload route.
 pub const MAX_CI_EVIDENCE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -1250,6 +1253,37 @@ struct AcceptedControlEvent {
     event: nostr::Event,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CiRunEventsQuery {
+    after: u64,
+    limit: u32,
+}
+
+#[derive(Serialize)]
+struct CiRunEventResponse {
+    watch_cursor: u64,
+    accepted_at: chrono::DateTime<chrono::Utc>,
+    event: nostr::Event,
+}
+
+#[derive(Serialize)]
+struct CiRunRequestResponse {
+    run_id: String,
+    request_event_id: String,
+    watch_cursor: u64,
+    accepted_at: chrono::DateTime<chrono::Utc>,
+    event: nostr::Event,
+}
+
+#[derive(Serialize)]
+struct CiRunEventsResponse {
+    run_id: String,
+    request_event_id: String,
+    events: Vec<CiRunEventResponse>,
+    next_cursor: u64,
+}
+
 /// Return the next durably stored kind-46100 request for one channel.
 pub async fn next_accepted_control(
     State(state): State<Arc<AppState>>,
@@ -1337,6 +1371,149 @@ pub async fn next_accepted_control(
     serde_json::to_value(AcceptedControlResponse { accepted })
         .map(Json)
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+/// Return the immutable initial request for one member-authorized CI run.
+pub async fn get_ci_run_request(
+    State(state): State<Arc<AppState>>,
+    AxumPath(run_id): AxumPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, PreflightApiError> {
+    let (tenant, caller) = authenticate_ci_run_read(&state, &headers, &uri).await?;
+    let run_id = uuid::Uuid::parse_str(&run_id).map_err(|_| ci_run_hidden())?;
+    let channel_id = authorize_ci_run_member(&state, &tenant, run_id, &caller).await?;
+    let stored = state
+        .db
+        .get_ci_run_request(tenant.community(), channel_id, run_id)
+        .await
+        .map_err(|_| ci_run_unavailable())?
+        .ok_or_else(ci_run_hidden)?;
+    let watch_cursor = ci_watch_cursor(stored.watch_cursor)?;
+    let event = stored.stored_event.event;
+    let response = CiRunRequestResponse {
+        run_id: run_id.to_string(),
+        request_event_id: event.id.to_hex(),
+        watch_cursor,
+        accepted_at: stored.accepted_at,
+        event,
+    };
+    serde_json::to_value(response)
+        .map(Json)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+/// Return a cursor-paged stream of durably accepted events for one CI run.
+pub async fn get_ci_run_events(
+    State(state): State<Arc<AppState>>,
+    AxumPath(run_id): AxumPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, PreflightApiError> {
+    let (tenant, caller) = authenticate_ci_run_read(&state, &headers, &uri).await?;
+    let run_id = uuid::Uuid::parse_str(&run_id).map_err(|_| ci_run_hidden())?;
+    let query = parse_ci_run_events_query(&uri)?;
+    let channel_id = authorize_ci_run_member(&state, &tenant, run_id, &caller).await?;
+    let request = state
+        .db
+        .get_ci_run_request(tenant.community(), channel_id, run_id)
+        .await
+        .map_err(|_| ci_run_unavailable())?
+        .ok_or_else(ci_run_hidden)?;
+    let after_cursor = i64::try_from(query.after)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid CI run events cursor"))?;
+    let stored_events = state
+        .db
+        .list_ci_run_events(
+            tenant.community(),
+            channel_id,
+            run_id,
+            after_cursor,
+            query.limit,
+        )
+        .await
+        .map_err(|_| ci_run_unavailable())?;
+    let events = stored_events
+        .into_iter()
+        .map(|stored| {
+            Ok(CiRunEventResponse {
+                watch_cursor: ci_watch_cursor(stored.watch_cursor)?,
+                accepted_at: stored.accepted_at,
+                event: stored.stored_event.event,
+            })
+        })
+        .collect::<Result<Vec<_>, PreflightApiError>>()?;
+    let next_cursor = events
+        .last()
+        .map_or(query.after, |event| event.watch_cursor);
+    let response = CiRunEventsResponse {
+        run_id: run_id.to_string(),
+        request_event_id: request.stored_event.event.id.to_hex(),
+        events,
+        next_cursor,
+    };
+    serde_json::to_value(response)
+        .map(Json)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+async fn authenticate_ci_run_read(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<(TenantContext, nostr::PublicKey), PreflightApiError> {
+    let tenant = bind_request_tenant(state, headers).await?;
+    let request_path = uri
+        .path_and_query()
+        .map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
+    let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, request_path);
+    let (caller, auth_id) = super::bridge::verify_bridge_auth(headers, "GET", &url, None, true)?;
+    super::bridge::check_nip98_replay(state, &tenant, auth_id).await?;
+    Ok((tenant, caller))
+}
+
+async fn authorize_ci_run_member(
+    state: &AppState,
+    tenant: &TenantContext,
+    run_id: uuid::Uuid,
+    caller: &nostr::PublicKey,
+) -> Result<uuid::Uuid, PreflightApiError> {
+    let caller = caller.to_bytes();
+    state
+        .db
+        .get_ci_run_member_channel(tenant.community(), run_id, &caller)
+        .await
+        .map_err(|_| ci_run_unavailable())?
+        .ok_or_else(ci_run_hidden)
+}
+
+fn parse_ci_run_events_query(uri: &axum::http::Uri) -> Result<CiRunEventsQuery, PreflightApiError> {
+    let Query(query) = Query::<CiRunEventsQuery>::try_from_uri(uri)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid CI run events query"))?;
+    if query.after > buzz_ci_controld_safe_cursor()
+        || !(1..=MAX_CI_RUN_EVENT_PAGE).contains(&query.limit)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid CI run events cursor",
+        ));
+    }
+    Ok(query)
+}
+
+fn ci_watch_cursor(cursor: i64) -> Result<u64, PreflightApiError> {
+    u64::try_from(cursor)
+        .ok()
+        .filter(|cursor| *cursor <= buzz_ci_controld_safe_cursor())
+        .ok_or_else(ci_run_unavailable)
+}
+
+fn ci_run_hidden() -> PreflightApiError {
+    api_error(StatusCode::NOT_FOUND, "CI run not found")
+}
+
+fn ci_run_unavailable() -> PreflightApiError {
+    api_error(StatusCode::SERVICE_UNAVAILABLE, "CI run unavailable")
 }
 
 #[derive(Serialize)]
@@ -1686,6 +1863,21 @@ fn map_log_read_authorization(
     }
 }
 
+fn map_artifact_read_authorization(
+    result: Result<uuid::Uuid, PreflightReject>,
+) -> Result<uuid::Uuid, PreflightApiError> {
+    match result {
+        Ok(channel_id) => Ok(channel_id),
+        Err(reject) if matches!(reject.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {
+            Err(api_error(StatusCode::NOT_FOUND, "CI artifact not found"))
+        }
+        Err(_) => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI artifact unavailable",
+        )),
+    }
+}
+
 fn validate_log_read_path(path: &EvidencePath) -> Result<(), PreflightApiError> {
     if !is_lower_hex_value(&path.request_id, 64)
         || uuid::Uuid::parse_str(&path.run_id).is_err()
@@ -1695,6 +1887,26 @@ fn validate_log_read_path(path: &EvidencePath) -> Result<(), PreflightApiError> 
         || path.object_id.is_some()
     {
         return Err(api_error(StatusCode::NOT_FOUND, "CI log not found"));
+    }
+    Ok(())
+}
+
+fn validate_artifact_read_path(path: &EvidencePath) -> Result<(), PreflightApiError> {
+    let valid_artifact_id = path.object_id.as_deref().is_some_and(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    });
+    if !is_lower_hex_value(&path.request_id, 64)
+        || uuid::Uuid::parse_str(&path.run_id).is_err()
+        || !is_valid_static_job_id(&path.job_id)
+        || path.attempt == 0
+        || !is_lower_hex_value(&path.sha256, 64)
+        || !valid_artifact_id
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "CI artifact not found"));
     }
     Ok(())
 }
@@ -1767,6 +1979,247 @@ pub async fn put_ci_artifact(
     .await
 }
 
+/// Read one authenticated, signed-reference-bound job artifact.
+pub async fn get_ci_artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, artifact_id, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response<Body>, PreflightApiError> {
+    read_ci_artifact(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: Some(artifact_id),
+            sha256,
+        },
+        uri.path(),
+        headers,
+        "GET",
+        false,
+    )
+    .await
+}
+
+/// Return verified metadata for one authenticated job artifact without a body.
+pub async fn head_ci_artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, artifact_id, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response<Body>, PreflightApiError> {
+    read_ci_artifact(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: Some(artifact_id),
+            sha256,
+        },
+        uri.path(),
+        headers,
+        "HEAD",
+        true,
+    )
+    .await
+}
+
+async fn read_ci_artifact(
+    state: Arc<AppState>,
+    path: EvidencePath,
+    request_path: &str,
+    headers: HeaderMap,
+    method: &'static str,
+    head_only: bool,
+) -> Result<Response<Body>, PreflightApiError> {
+    let tenant = bind_request_tenant(&state, &headers).await?;
+    let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, request_path);
+
+    // Authenticate before any request, repository, event, or object lookup so
+    // absence and membership denial remain indistinguishable to valid callers.
+    let (caller, auth_id) = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
+    super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
+    validate_artifact_read_path(&path)?;
+
+    let hidden = || api_error(StatusCode::NOT_FOUND, "CI artifact not found");
+    let unavailable = || api_error(StatusCode::SERVICE_UNAVAILABLE, "CI artifact unavailable");
+    let request_bytes = hex::decode(&path.request_id).map_err(|_| hidden())?;
+    let stored = state
+        .db
+        .get_event_by_id(tenant.community(), &request_bytes)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(hidden)?;
+    let channel_id = stored.channel_id.ok_or_else(hidden)?;
+    let request = validate_control_request(&stored.event, channel_id).map_err(|_| hidden())?;
+    if stored.event.id.to_hex() != path.request_id
+        || request.run_id != path.run_id
+        || request.attempt != path.attempt
+        || !request.job_ids.iter().any(|job| job == &path.job_id)
+    {
+        return Err(hidden());
+    }
+
+    let (owner, repo) = parse_repo_coordinate(&request.target_repo_a).ok_or_else(hidden)?;
+    let authorized_channel = map_artifact_read_authorization(
+        authorize_ci_read(&state, &tenant, &caller, owner, repo, "ci_artifact_read").await,
+    )?;
+    if authorized_channel != channel_id {
+        return Err(hidden());
+    }
+
+    let mut signers = state.config.ci_status_signer_pubkeys.clone();
+    signers.extend(
+        state
+            .db
+            .get_active_ci_signers(
+                tenant.community(),
+                channel_id,
+                &request.target_repo_a,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|_| unavailable())?,
+    );
+    if signers.is_empty() {
+        return Err(unavailable());
+    }
+    let events = state
+        .db
+        .query_events(&EventQuery {
+            channel_id: Some(channel_id),
+            kinds: Some(vec![
+                KIND_CI_JOB_STATUS as i32,
+                KIND_CI_ARTIFACT_REFERENCE as i32,
+            ]),
+            e_tags: Some(vec![path.request_id.clone()]),
+            limit: Some(MAX_CI_CONTROL_BACKLOG),
+            max_limit: Some(MAX_CI_CONTROL_BACKLOG),
+            ..EventQuery::for_community(tenant.community())
+        })
+        .await
+        .map_err(|_| unavailable())?;
+    if events.len() as i64 == MAX_CI_CONTROL_BACKLOG {
+        return Err(unavailable());
+    }
+
+    let mut artifacts = Vec::new();
+    let mut statuses = Vec::new();
+    for stored_event in events {
+        let event_id = stored_event.event.id.to_hex();
+        match buzz_core::ci::validate_signed_ci_event(
+            &stored_event.event,
+            &channel_id.to_string(),
+            &signers,
+        ) {
+            Ok(ValidatedCiEnvelope::ArtifactReference(artifact))
+                if artifact_reference_matches(
+                    &artifact,
+                    &path,
+                    &request.workflow_id,
+                    &request.target_repo_a,
+                    &request.tip_oid,
+                    &url,
+                ) =>
+            {
+                artifacts.push((event_id, artifact));
+            }
+            Ok(ValidatedCiEnvelope::JobStatus(status))
+                if status.request_event_id == path.request_id
+                    && status.run_id == path.run_id
+                    && status.workflow_id == request.workflow_id
+                    && status.target_repo_a == request.target_repo_a
+                    && status.tip_oid == request.tip_oid
+                    && status.base_oid == request.base_oid
+                    && status.job_id == path.job_id
+                    && status.attempt == path.attempt
+                    && status.state.is_terminal() =>
+            {
+                statuses.push(status);
+            }
+            _ => {}
+        }
+    }
+    if artifacts.len() != 1 {
+        return Err(hidden());
+    }
+    let (artifact_event_id, artifact) = artifacts.pop().ok_or_else(hidden)?;
+    if !statuses.iter().any(|status| {
+        status
+            .artifact_refs
+            .iter()
+            .any(|reference| reference == &artifact_event_id)
+    }) || artifact.byte_length > MAX_CI_EVIDENCE_BYTES as u64
+    {
+        return Err(hidden());
+    }
+
+    let object_key = evidence_object_key(
+        tenant.community(),
+        &request.target_repo_a,
+        &request.tip_oid,
+        &path,
+    );
+    let metadata = state
+        .media_storage
+        .head_with_metadata(&object_key)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(hidden)?;
+    if metadata.size != artifact.byte_length {
+        return Err(unavailable());
+    }
+    let bytes = state
+        .media_storage
+        .get(&object_key)
+        .await
+        .map_err(|_| unavailable())?;
+    if bytes.len() as u64 != artifact.byte_length
+        || hex::encode(Sha256::digest(&bytes)) != artifact.sha256
+    {
+        return Err(unavailable());
+    }
+
+    let content_type = artifact
+        .media_type
+        .parse::<axum::http::HeaderValue>()
+        .map_err(|_| unavailable())?;
+    let digest = base64::engine::general_purpose::STANDARD
+        .encode(hex::decode(&artifact.sha256).map_err(|_| unavailable())?);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, artifact.byte_length.to_string())
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header("digest", format!("sha-256={digest}"))
+        .body(if head_only {
+            Body::empty()
+        } else {
+            Body::from(bytes)
+        })
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
 struct EvidencePath {
     request_id: String,
     run_id: String,
@@ -1774,6 +2227,26 @@ struct EvidencePath {
     attempt: u32,
     object_id: Option<String>,
     sha256: String,
+}
+
+fn artifact_reference_matches(
+    artifact: &CiArtifactReferenceEnvelope,
+    path: &EvidencePath,
+    workflow_id: &str,
+    target_repo_a: &str,
+    tip_oid: &str,
+    expected_url: &str,
+) -> bool {
+    artifact.request_event_id == path.request_id
+        && artifact.run_id == path.run_id
+        && artifact.workflow_id == workflow_id
+        && artifact.target_repo_a == target_repo_a
+        && artifact.tip_oid == tip_oid
+        && artifact.job_id == path.job_id
+        && artifact.attempt == path.attempt
+        && path.object_id.as_deref() == Some(artifact.artifact_id.as_str())
+        && artifact.sha256 == path.sha256
+        && artifact.url == expected_url
 }
 
 async fn put_ci_evidence(
@@ -1877,13 +2350,12 @@ async fn put_ci_evidence(
         &path,
     );
     match state.media_storage.head_with_metadata(&object_key).await {
-        Ok(Some(metadata)) if metadata.size != declared as u64 => {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                "stored CI evidence conflicts",
-            ));
-        }
-        Ok(Some(_)) => {}
+        Ok(Some(_)) => map_ci_evidence_replay_verification(
+            state
+                .media_storage
+                .verify_exact_object(&object_key, declared as u64, &path.sha256)
+                .await,
+        )?,
         Ok(None) => state
             .media_storage
             .put(&object_key, &bytes, "application/octet-stream")
@@ -1909,6 +2381,22 @@ async fn put_ci_evidence(
     serde_json::to_value(response)
         .map(Json)
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+fn map_ci_evidence_replay_verification(
+    result: Result<(), MediaError>,
+) -> Result<(), PreflightApiError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(MediaError::StoredObjectIntegrityMismatch) => Err(api_error(
+            StatusCode::CONFLICT,
+            "stored CI evidence conflicts",
+        )),
+        Err(_) => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI evidence store unavailable",
+        )),
+    }
 }
 
 async fn bind_request_tenant(
@@ -2092,6 +2580,25 @@ mod tests {
     }
 
     #[test]
+    fn evidence_replay_mapping_rejects_drift_and_preserves_storage_outages() {
+        let drift =
+            map_ci_evidence_replay_verification(Err(MediaError::StoredObjectIntegrityMismatch))
+                .expect_err("stored byte drift must fail closed");
+        assert_eq!(drift.0, StatusCode::CONFLICT);
+        assert_eq!(
+            drift.1 .0,
+            serde_json::json!({"error": "stored CI evidence conflicts"})
+        );
+
+        let outage = map_ci_evidence_replay_verification(Err(MediaError::StorageError(
+            "unavailable".to_owned(),
+        )))
+        .expect_err("storage failures must remain unavailable");
+        assert_eq!(outage.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(map_ci_evidence_replay_verification(Ok(())).is_ok());
+    }
+
+    #[test]
     fn log_read_path_uses_the_static_job_grammar() {
         let mut path = evidence_path();
         path.object_id = None;
@@ -2105,6 +2612,83 @@ mod tests {
                 "hostile job component must fail: {hostile}"
             );
         }
+    }
+
+    #[test]
+    fn artifact_read_path_and_reference_bind_every_coordinate() {
+        let path = evidence_path();
+        validate_artifact_read_path(&path).expect("valid artifact path");
+        let expected_url = format!(
+            "https://relay.example/ci/artifacts/{}/{}/{}/{}/{}/{}",
+            path.request_id,
+            path.run_id,
+            path.job_id,
+            path.attempt,
+            path.object_id.as_deref().expect("artifact id"),
+            path.sha256,
+        );
+        let artifact = CiArtifactReferenceEnvelope {
+            schema_version: 1,
+            request_event_id: path.request_id.clone(),
+            run_id: path.run_id.clone(),
+            workflow_id: "ci".to_owned(),
+            target_repo_a: format!("30617:{}:buzz", "33".repeat(32)),
+            tip_oid: "44".repeat(20),
+            job_id: path.job_id.clone(),
+            attempt: path.attempt,
+            artifact_id: path.object_id.clone().expect("artifact id"),
+            name: "results.tar.zst".to_owned(),
+            media_type: "application/zstd".to_owned(),
+            sha256: path.sha256.clone(),
+            byte_length: 42,
+            url: expected_url.clone(),
+            created_at: 1,
+            relay_signer: "55".repeat(32),
+        };
+        assert!(artifact_reference_matches(
+            &artifact,
+            &path,
+            "ci",
+            &format!("30617:{}:buzz", "33".repeat(32)),
+            &"44".repeat(20),
+            &expected_url,
+        ));
+
+        macro_rules! rejects_drift {
+            ($field:ident, $value:expr) => {{
+                let mut drifted = artifact.clone();
+                drifted.$field = $value;
+                assert!(
+                    !artifact_reference_matches(
+                        &drifted,
+                        &path,
+                        "ci",
+                        &format!("30617:{}:buzz", "33".repeat(32)),
+                        &"44".repeat(20),
+                        &expected_url,
+                    ),
+                    "{} drift must be rejected",
+                    stringify!($field),
+                );
+            }};
+        }
+        rejects_drift!(request_event_id, "77".repeat(32));
+        rejects_drift!(run_id, uuid::Uuid::new_v4().to_string());
+        rejects_drift!(workflow_id, "other".to_owned());
+        rejects_drift!(target_repo_a, format!("30617:{}:other", "33".repeat(32)));
+        rejects_drift!(tip_oid, "88".repeat(20));
+        rejects_drift!(job_id, "other_job".to_owned());
+        rejects_drift!(attempt, 2);
+        rejects_drift!(artifact_id, "other".to_owned());
+        rejects_drift!(sha256, "66".repeat(32));
+        rejects_drift!(url, format!("{expected_url}?other=1"));
+
+        let mut hostile = evidence_path();
+        hostile.object_id = Some("../escape".to_owned());
+        assert!(validate_artifact_read_path(&hostile).is_err());
+        hostile = evidence_path();
+        hostile.object_id = None;
+        assert!(validate_artifact_read_path(&hostile).is_err());
     }
 
     #[test]
@@ -2169,6 +2753,31 @@ mod tests {
     }
 
     #[test]
+    fn artifact_read_authorization_hides_denials_but_preserves_outages() {
+        let reject = |status| PreflightReject {
+            status,
+            message: "private detail".to_owned(),
+        };
+        for status in [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND] {
+            let denied = map_artifact_read_authorization(Err(reject(status)))
+                .expect_err("artifact denial must fail");
+            assert_eq!(denied.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                denied.1 .0,
+                serde_json::json!({"error": "CI artifact not found"})
+            );
+        }
+
+        let outage = map_artifact_read_authorization(Err(reject(StatusCode::SERVICE_UNAVAILABLE)))
+            .expect_err("artifact authorization outage must fail");
+        assert_eq!(outage.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            outage.1 .0,
+            serde_json::json!({"error": "CI artifact unavailable"})
+        );
+    }
+
+    #[test]
     fn accepted_control_query_rejects_unknown_fields() {
         assert!(
             serde_json::from_value::<AcceptedControlQuery>(serde_json::json!({
@@ -2179,6 +2788,56 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn ci_run_events_query_is_exact_and_bounded() {
+        let parse = |query: &str| {
+            let uri = format!("/ci/runs/run/events?{query}")
+                .parse::<axum::http::Uri>()
+                .expect("test URI");
+            parse_ci_run_events_query(&uri)
+        };
+        assert_eq!(
+            parse("after=7&limit=1000").expect("valid page"),
+            CiRunEventsQuery {
+                after: 7,
+                limit: 1_000,
+            }
+        );
+        assert_eq!(
+            parse("limit=1&after=0").expect("order-independent page"),
+            CiRunEventsQuery { after: 0, limit: 1 }
+        );
+        for invalid in [
+            "",
+            "after=0",
+            "limit=1",
+            "after=0&limit=0",
+            "after=0&limit=1001",
+            "after=9007199254740992&limit=1",
+            "after=0&limit=1&repo=private",
+            "after=bad&after=0&limit=1",
+            "after=0&after=1&limit=1",
+        ] {
+            assert!(
+                parse(invalid).is_err(),
+                "invalid query must fail: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_run_cursor_and_hidden_error_contract_are_stable() {
+        assert_eq!(ci_watch_cursor(1).expect("cursor one"), 1);
+        assert!(ci_watch_cursor(-1).is_err());
+        assert!(ci_watch_cursor(9_007_199_254_740_992).is_err());
+        assert_eq!(ci_run_hidden().0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            ci_run_hidden().1 .0,
+            serde_json::json!({"error": "CI run not found"})
+        );
+        assert_eq!(ci_run_unavailable().0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // ── B1 rev-2 acceptance helpers ────────────────────────────────────────

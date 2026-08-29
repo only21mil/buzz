@@ -8,9 +8,11 @@ use buzz_core::tenant::{CommunityId, TenantContext};
 use crate::config::{MediaConfig, S3AddressingStyle};
 use crate::error::MediaError;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// A stream of byte chunks from S3, usable with `axum::body::Body::from_stream()`.
 pub type ByteStream = Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, MediaError>> + Send>>;
@@ -177,6 +179,33 @@ impl MediaStorage {
         }
     }
 
+    /// Verify that an existing object matches one immutable size and SHA-256 identity.
+    ///
+    /// The preliminary HEAD rejects an obvious size mismatch before downloading.
+    /// The subsequent bounded stream independently verifies the bytes and catches
+    /// storage drift between HEAD and GET without buffering the complete object.
+    pub async fn verify_exact_object(
+        &self,
+        key: &str,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), MediaError> {
+        let mut verifier = ObjectIntegrityVerifier::new(expected_size, expected_sha256)?;
+        let metadata = self
+            .head_with_metadata(key)
+            .await?
+            .ok_or(MediaError::NotFound)?;
+        if metadata.size != expected_size {
+            return Err(MediaError::StoredObjectIntegrityMismatch);
+        }
+
+        let mut stream = self.get_stream(key).await?;
+        while let Some(chunk) = stream.next().await {
+            verifier.update(&chunk?)?;
+        }
+        verifier.finish()
+    }
+
     /// Build the community-scoped sidecar key for a given sha256 (bare hash).
     ///
     /// Raw media bytes remain shared content-addressed CAS (`{sha}.{ext}`), but
@@ -266,6 +295,48 @@ impl MediaStorage {
             next_continuation_token: result.next_continuation_token,
             is_truncated: result.is_truncated,
         })
+    }
+}
+
+struct ObjectIntegrityVerifier {
+    expected_size: u64,
+    expected_sha256: [u8; 32],
+    observed_size: u64,
+    hasher: Sha256,
+}
+
+impl ObjectIntegrityVerifier {
+    fn new(expected_size: u64, expected_sha256: &str) -> Result<Self, MediaError> {
+        let expected_sha256 = hex::decode(expected_sha256)
+            .ok()
+            .and_then(|digest| digest.try_into().ok())
+            .ok_or(MediaError::StoredObjectIntegrityMismatch)?;
+        Ok(Self {
+            expected_size,
+            expected_sha256,
+            observed_size: 0,
+            hasher: Sha256::new(),
+        })
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> Result<(), MediaError> {
+        self.observed_size = self
+            .observed_size
+            .checked_add(bytes.len() as u64)
+            .ok_or(MediaError::StoredObjectIntegrityMismatch)?;
+        if self.observed_size > self.expected_size {
+            return Err(MediaError::StoredObjectIntegrityMismatch);
+        }
+        self.hasher.update(bytes);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), MediaError> {
+        let observed_sha256: [u8; 32] = self.hasher.finalize().into();
+        if self.observed_size != self.expected_size || observed_sha256 != self.expected_sha256 {
+            return Err(MediaError::StoredObjectIntegrityMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -393,6 +464,48 @@ mod tests {
             sidecars[&MediaStorage::ctx_sidecar_key(&b, &sha)],
             "video/mp4"
         );
+    }
+
+    #[test]
+    fn exact_object_verifier_accepts_matching_chunked_bytes() {
+        let bytes = b"immutable evidence";
+        let digest = hex::encode(Sha256::digest(bytes));
+        let mut verifier = ObjectIntegrityVerifier::new(bytes.len() as u64, &digest).unwrap();
+
+        verifier.update(&bytes[..5]).unwrap();
+        verifier.update(&bytes[5..]).unwrap();
+        verifier.finish().unwrap();
+    }
+
+    #[test]
+    fn exact_object_verifier_rejects_same_size_digest_drift() {
+        let expected = b"expected evidence";
+        let drifted = b"drifted! evidence";
+        assert_eq!(expected.len(), drifted.len());
+        let digest = hex::encode(Sha256::digest(expected));
+        let mut verifier = ObjectIntegrityVerifier::new(expected.len() as u64, &digest).unwrap();
+
+        verifier.update(drifted).unwrap();
+        assert!(matches!(
+            verifier.finish(),
+            Err(MediaError::StoredObjectIntegrityMismatch)
+        ));
+    }
+
+    #[test]
+    fn exact_object_verifier_rejects_invalid_length_and_digest() {
+        let bytes = b"evidence";
+        let digest = hex::encode(Sha256::digest(bytes));
+        let mut oversized =
+            ObjectIntegrityVerifier::new((bytes.len() - 1) as u64, &digest).unwrap();
+        assert!(matches!(
+            oversized.update(bytes),
+            Err(MediaError::StoredObjectIntegrityMismatch)
+        ));
+        assert!(matches!(
+            ObjectIntegrityVerifier::new(bytes.len() as u64, "not-a-sha256"),
+            Err(MediaError::StoredObjectIntegrityMismatch)
+        ));
     }
 }
 

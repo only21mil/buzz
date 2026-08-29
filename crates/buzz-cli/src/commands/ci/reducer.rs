@@ -123,6 +123,15 @@ pub fn reduce_verdict(
     ))
 }
 
+/// Validate signatures' already-decoded immutable coordinates and stream history.
+pub(super) fn validate_accepted_run(
+    request_event_id: &str,
+    request: &CiRequestEnvelope,
+    events: &[AcceptedCiEnvelope],
+) -> Result<(), String> {
+    reduce_checked(request_event_id, request, events, false).map(|_| ())
+}
+
 fn reduce_checked(
     request_event_id: &str,
     request: &CiRequestEnvelope,

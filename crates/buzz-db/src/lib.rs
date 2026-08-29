@@ -2214,6 +2214,46 @@ impl Db {
         ci::store_ci_event(&self.pool, community_id, channel_id, event, envelope).await
     }
 
+    /// Resolve a CI run's channel only for a current channel member.
+    pub async fn get_ci_run_member_channel(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<Option<Uuid>> {
+        ci::get_ci_run_member_channel(&self.pool, community_id, run_id, pubkey).await
+    }
+
+    /// Load the immutable initial request for a member-authorized CI run.
+    pub async fn get_ci_run_request(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<ci::CiStoredEvent>> {
+        ci::get_ci_run_request(&self.pool, community_id, channel_id, run_id).await
+    }
+
+    /// List accepted CI events after an exclusive durable per-run cursor.
+    pub async fn list_ci_run_events(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        run_id: Uuid,
+        after_cursor: i64,
+        limit: u32,
+    ) -> Result<Vec<ci::CiStoredEvent>> {
+        ci::list_ci_run_events(
+            &self.pool,
+            community_id,
+            channel_id,
+            run_id,
+            after_cursor,
+            limit,
+        )
+        .await
+    }
+
     /// Upsert a CI control-plane signer grant (kind 46107).
     ///
     /// Idempotent per `(community, channel, target_repo_a, signer)`: the

@@ -51,6 +51,40 @@ pub enum StoreCiEventOutcome {
     Reused(CiStoredEvent),
 }
 
+/// Resolve a CI run's channel only when `pubkey` is a current member.
+///
+/// Unknown runs, deleted channels, removed members, and non-members all return
+/// `None`, allowing authenticated read APIs to avoid exposing run existence.
+pub async fn get_ci_run_member_channel(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    pubkey: &[u8],
+) -> Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT run.channel_id
+        FROM ci_runs AS run
+        JOIN channels AS channel
+          ON channel.community_id=run.community_id
+         AND channel.id=run.channel_id
+         AND channel.deleted_at IS NULL
+        JOIN channel_members AS member
+          ON member.community_id=run.community_id
+         AND member.channel_id=run.channel_id
+         AND member.pubkey=$3
+         AND member.removed_at IS NULL
+        WHERE run.community_id=$1 AND run.run_id=$2
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(pubkey)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
 #[derive(Debug)]
 struct Projection {
     kind: i32,
