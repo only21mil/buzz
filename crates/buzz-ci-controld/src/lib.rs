@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod controller;
 pub mod keyholder;
 pub mod manifest;
 pub mod production;

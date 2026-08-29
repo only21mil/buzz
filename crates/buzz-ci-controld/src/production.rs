@@ -458,6 +458,11 @@ where
             },
         };
         if record.state().is_terminal() {
+            if record.terminal_event_id().is_none() {
+                let terminal_event_id = self.publish_run(accepted, &record, "run:terminal")?;
+                let bound = record.with_terminal_event(terminal_event_id)?;
+                persist_run(&mut self.store, &identity, revision, &bound)?;
+            }
             return Ok(());
         }
 
@@ -474,9 +479,9 @@ where
             let running = record.transition(RunState::Running, first_started(&completion), None)?;
             revision = persist_run(&mut self.store, &identity, revision, &running)?;
             record = running;
-            self.publish_run(accepted, &record, "run:running")?;
         }
         if record.state() == RunState::Running {
+            self.publish_run(accepted, &record, "run:running")?;
             let finalized_job_attempts = self.publish_completion(accepted, &completion)?;
 
             let evidence = CiEvidenceFinalizedEnvelope {
@@ -1329,6 +1334,96 @@ mod tests {
             handler.store.run.as_ref().unwrap().1.state(),
             RunState::Success
         );
+    }
+
+    #[test]
+    fn restart_republishes_running_status_before_completion() {
+        let accepted = accepted();
+        let identity = RunIdentity::new(
+            accepted.event_id.clone(),
+            Uuid::parse_str(&accepted.envelope.run_id).expect("run id"),
+            accepted.envelope.attempt,
+            accepted.envelope.target_repo_a.clone(),
+            accepted.envelope.tip_oid.clone(),
+            accepted.envelope.workflow_id.clone(),
+        )
+        .expect("identity");
+        let queued = RunRecord::queued(identity, accepted.envelope.issued_at).expect("queued");
+        let running = queued
+            .transition(RunState::Running, 11, None)
+            .expect("running");
+        let log = b"ok\n".to_vec();
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted),
+                published: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            Executor(completion(&log)),
+            MemoryStore {
+                cursor: 0,
+                run: Some((2, running)),
+                publications: HashMap::new(),
+            },
+            MemoryOutput(log),
+        );
+
+        assert!(handler.poll_once(CHANNEL).expect("reconcile running"));
+        assert_eq!(handler.relay.published.first(), Some(&KIND_CI_RUN_STATUS));
+        assert!(handler
+            .store
+            .publications
+            .contains_key(&format!("{}:run:running", "11".repeat(32))));
+    }
+
+    #[test]
+    fn restart_binds_unpublished_terminal_status_before_advancing_cursor() {
+        let accepted = accepted();
+        let identity = RunIdentity::new(
+            accepted.event_id.clone(),
+            Uuid::parse_str(&accepted.envelope.run_id).expect("run id"),
+            accepted.envelope.attempt,
+            accepted.envelope.target_repo_a.clone(),
+            accepted.envelope.tip_oid.clone(),
+            accepted.envelope.workflow_id.clone(),
+        )
+        .expect("identity");
+        let terminal = RunRecord::queued(identity, accepted.envelope.issued_at)
+            .expect("queued")
+            .transition(RunState::Running, 11, None)
+            .expect("running")
+            .transition(RunState::Failure, 12, Some("failed".to_owned()))
+            .expect("terminal");
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted),
+                published: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            Executor(completion(b"unused")),
+            MemoryStore {
+                cursor: 0,
+                run: Some((3, terminal)),
+                publications: HashMap::new(),
+            },
+            MemoryOutput(Vec::new()),
+        );
+
+        assert!(handler.poll_once(CHANNEL).expect("reconcile terminal"));
+        assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);
+        assert_eq!(handler.store.cursor, 7);
+        assert!(handler
+            .store
+            .run
+            .as_ref()
+            .expect("stored run")
+            .1
+            .terminal_event_id()
+            .is_some());
     }
 
     #[test]
