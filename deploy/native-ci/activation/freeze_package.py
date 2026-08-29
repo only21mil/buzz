@@ -32,6 +32,17 @@ TRACKED_ROOT_SOURCES = {
     "activation_controller": ("controller.py", "assets/buzz-ci-activation-controller", 0o100755, 0o500),
     "activation_package_module": ("package.py", "assets/buzz_ci_activation_package.py", 0o100755, 0o500),
 }
+TRACKED_REPO_SOURCES = {
+    "receipt_verifier_binary": (
+        Path("deploy/native-ci/acceptance/verify-receipt.py"),
+        "assets/buzz-ci-verify-acceptance-receipt",
+        0o100755,
+        0o500,
+    ),
+}
+TRACKED_COMPONENT_PROVENANCE = {
+    "receipt_verifier": "assets/receipt-verifier-provenance.json",
+}
 TRACKED_EXECUTABLES = (
     "controller.py",
     "freeze_package.py",
@@ -124,6 +135,8 @@ def _render_sysusers(template: bytes, identities: dict[str, object], access_grou
         "@KEYHOLDER_GID@": str(identities["keyholder"]["gid"]),
         "@QUALIFICATION_UID@": str(identities["qualification"]["uid"]),
         "@QUALIFICATION_GID@": str(identities["qualification"]["gid"]),
+        "@JOB_UID@": str(identities["job"]["uid"]),
+        "@JOB_GID@": str(identities["job"]["gid"]),
         "@EXECD_ACCESS_GID@": str(access_group["gid"]),
     }
     for token, value in replacements.items():
@@ -142,6 +155,10 @@ def _static_payload(
     if role in TRACKED_ROOT_SOURCES:
         source_name, asset_name, git_mode, _source_mode = TRACKED_ROOT_SOURCES[role]
         payload = _tracked_payload(source_root, PACKAGE_RELATIVE / source_name, git_mode, 1024 * 1024)
+        return payload, asset_name
+    if role in TRACKED_REPO_SOURCES:
+        relative, asset_name, git_mode, _source_mode = TRACKED_REPO_SOURCES[role]
+        payload = _tracked_payload(source_root, relative, git_mode, 1024 * 1024)
         return payload, asset_name
     template_name, asset_name = STATIC_SOURCES[role]
     payload = _tracked_payload(
@@ -191,7 +208,8 @@ def freeze_package(
         raise ValueError("source commit must be a full lowercase Git object ID")
     if _git(source_root, "rev-parse", "HEAD") != source_commit:
         raise ValueError("source checkout does not match the requested commit")
-    if _git(source_root, "status", "--porcelain", "--", str(PACKAGE_RELATIVE)):
+    tracked_roots = [str(PACKAGE_RELATIVE), *(str(item[0]) for item in TRACKED_REPO_SOURCES.values())]
+    if _git(source_root, "status", "--porcelain", "--", *tracked_roots):
         raise ValueError("activation package source is dirty")
     for name in TRACKED_EXECUTABLES:
         _tracked_payload(source_root, PACKAGE_RELATIVE / name, 0o100755, 1024 * 1024)
@@ -206,7 +224,7 @@ def freeze_package(
     payloads: dict[str, tuple[bytes, int]] = {}
     for entry in draft["entries"]:
         role = entry["role"]
-        if role in STATIC_SOURCES or role in TRACKED_ROOT_SOURCES:
+        if role in STATIC_SOURCES or role in TRACKED_ROOT_SOURCES or role in TRACKED_REPO_SOURCES:
             payload, expected_source = _static_payload(
                 source_root,
                 role,
@@ -216,7 +234,9 @@ def freeze_package(
             if entry["source"] != expected_source:
                 raise ValueError(f"static asset name differs for {role}")
             expected_mode = activation_package.parse_mode(entry["source_mode"])
-            wanted_mode = TRACKED_ROOT_SOURCES.get(role, (None, None, None, 0o400))[3]
+            wanted_mode = TRACKED_ROOT_SOURCES.get(
+                role, TRACKED_REPO_SOURCES.get(role, (None, None, None, 0o400)),
+            )[3]
             if expected_mode != wanted_mode:
                 raise ValueError(f"tracked source mode differs for {role}")
         else:
@@ -234,7 +254,22 @@ def freeze_package(
 
     for component in draft["components"]:
         source = component["provenance_source"]
-        raw = _external_payload(asset_root, source, 0o400)
+        tracked_source = TRACKED_COMPONENT_PROVENANCE.get(component["name"])
+        if tracked_source is not None:
+            relative = TRACKED_REPO_SOURCES["receipt_verifier_binary"][0]
+            source_blob = _git(source_root, "rev-parse", f"{component['source_commit']}:{relative}")
+            checkout_blob = _git(source_root, "rev-parse", f"HEAD:{relative}")
+            if source != tracked_source or source_blob != checkout_blob:
+                raise ValueError(f"tracked component provenance differs: {component['name']}")
+            raw = activation_package.canonical_json({
+                "binary": Path(component["binary_path"]).name,
+                "profile": "release",
+                "schema": activation_package.PROVENANCE_SCHEMA,
+                "sha256": component["binary_sha256"],
+                "source_commit": component["source_commit"],
+            })
+        else:
+            raw = _external_payload(asset_root, source, 0o400)
         provenance = json.loads(raw, object_pairs_hook=activation_package.reject_duplicates)
         if provenance != {
             "binary": Path(component["binary_path"]).name,

@@ -6,12 +6,14 @@ contain a frozen package, private key, credential, relay token, or enabled unit.
 
 The controller composes the frozen runner, controld, execd, keyholder,
 qualification, and runner-executor binaries. It also installs the three frozen
-capacity-one acceptance binaries because no other package owns them. Every
+capacity-one acceptance binaries and the tracked receipt verifier because no
+other package owns them. Every
 binary has a full source commit, binary digest, and copied mode-`0400`
 provenance record. The staged and active runner and controld configs have
-separate digests. The keyholder config is secret-free; its socket ABI remains
-in the manifest and systemd unit. The controller rejects fields whose names
-suggest private key material, seeds, credentials, or tokens.
+separate digests. The separate keyholder package solely owns
+`/etc/buzzci/keyholder-v1.json`; activation validates its exact public receipt
+reference, peer operations, selectors, origin, owner, and mode but never writes
+the file.
 
 Live `stage`, `activate`, and `rollback` actions require root and use exact
 `/usr/bin/systemd-sysusers`, `/usr/bin/systemd-tmpfiles`, and
@@ -20,7 +22,7 @@ systemd driver and never invoke those programs.
 
 ## Fixed principal and socket plan
 
-The manifest freezes four distinct numeric UIDs and GIDs plus one dedicated
+The manifest freezes five distinct numeric UIDs and GIDs plus one dedicated
 socket-access group:
 
 - `buzzci-runner` owns runner state and connects to execd.
@@ -28,6 +30,8 @@ socket-access group:
   keyholder sockets.
 - `buzzci-keyholder` owns only the signer service and its private state.
 - `buzzci-ctl` runs only the descriptor-bound qualification controller.
+- `buzzci-job` runs the fixed unprivileged executor and has no supplementary
+  groups.
 - `buzzci-execd` has exactly `buzzci-runner` and `buzzci-ctl` as supplementary
   members. Membership grants socket reachability, not protocol authorization;
   execd must still authorize exact `SO_PEERCRED` UID and primary GID claims.
@@ -58,7 +62,8 @@ already exist with their frozen staged bytes and metadata.
 1. `stage --scenario` validates the exact scenario, installs the generated
    sysusers, tmpfiles, acceptance binaries and units, target, drop-ins, and
    capacity-zero configs. After the package digest is known, it atomically
-   writes the controld binding receipt and the two acceptance adapter configs.
+   writes the shared acceptance binding receipt and the two acceptance adapter
+   configs.
    It also installs the controller and its package module, then copies the
    validated package to the fixed root-owned mode-`0700`
    `/var/lib/buzzci/activation-controller/package`. Only the two acceptance
@@ -116,9 +121,15 @@ package digest, source commit, previous target contents and metadata, unit
 readback, qualification result, and current state. Reusing a receipt with a
 different package fails closed.
 
-The same directory is `root:buzzci-controld` mode `0710`. The private controller
-receipt remains `root:root` mode `0600`; the daemon sees only the separate
-`controld-acceptance-v1.json` binding at `root:buzzci-controld` mode `0440`.
+The shared `/var/lib/buzzci` ancestor and this directory are `root:root` mode
+`0711`; sensitive child roots remain mode `0700`. The private controller receipt
+remains `root:root` mode `0600`; both controld and keyholder read only the
+separate `controld-acceptance-v1.json` binding at `root:root` mode `0444`.
+Its compact declaration-order JSON has no trailing newline and uses schema
+`buzz-ci-activation-acceptance-binding/v1`. The frozen public acceptance
+template omits the scenario digest. After the package and scenario are final,
+the controller injects the independently computed digest at the receipt top
+level and in the nested acceptance object, where the two values must match.
 The scenario digest matches `serde_json::to_vec` field order used by the Rust
 canary, not the input file's whitespace or key order.
 
@@ -131,16 +142,37 @@ Create a private mode-`0600` draft that follows
 provenance, and qualification request inputs in a private asset directory with
 the exact source modes declared by the draft.
 
-The runner staged config must omit `host`; its active config must add the full
-host block, bind `/run/buzzci/execd.sock` to peer UID 0, and name only the
-manifest-bound `/usr/libexec/buzz-ci-executor`. Controld must change from
-capacity 0 to capacity 1 without changing its schema or store root. The
-keyholder config is installed during staging, but the separate socket remains
-inactive until activation. Its exact daemon fields are `schema_version`,
-`peer`, `selectors`, and `nip98_origin`; socket and credential-descriptor
-details remain in the manifest/systemd layer. The active controld config
-carries the same public selectors and generations plus the exact keyholder
-peer UID and GID.
+The runner staged config is the exact runner-v2 `dormant` shape at
+`/etc/buzzci/runner-v2.json`. Its active config selects `mode=v2_proxy`, binds
+the root execd peer at `/run/buzzci/execd.sock`, and carries the frozen lane
+authority. The root-owned `/etc/buzzci/execd-v2.json` binds protocol v2,
+`RegisterJobIntent` operation 9, exact runner and qualification peers, the
+`buzzci-job` executor principal, retained intent/state roots, the executor
+socket, lane manifest digest, and packaged `/usr/libexec/buzz-ci-executor`
+provenance. Dynamic accepted-request intent files are runtime state and are
+never frozen into the activation package.
+
+The package also freezes the tracked Git-`100755` receipt verifier from
+`deploy/native-ci/acceptance/verify-receipt.py`, records its source commit and
+digest, and installs it only at
+`/usr/libexec/buzz-ci-verify-acceptance-receipt` mode `0755`. A private
+umask checkout may materialize that source as `0700`; the freezer checks the
+Git executable class and writes the package asset and installed target at their
+declared exact modes. The settled source contract is commit
+`84698212017eb20891c931c645024c0e7de265f8`, SHA-256
+`2d95e2a97655e40ef779804065f68450dd6745ba2b499e4ecf9218f25540c6fd`.
+
+The activation tmpfiles entry creates retained execd and seccomp parent
+directories only. The execd composition package owns the immutable seccomp
+profile and receipt; stage and rollback neither create nor remove those files.
+Controld changes from capacity 0 to capacity 1 without changing its schema,
+store root, or fixed receipt path. Its active config carries the complete relay,
+runner-v2, lane, workflow, single-job, single-artifact, and keyholder public
+bindings from controld commit `65f1dee3bbad485ba4f9746c839ee0b7fd385fb3`.
+It contains no inline acceptance policy or scenario/package digest. The static
+keyholder config exposes only the fixed shared receipt reference and
+`acceptance-actor.key` credential selector; the credential bytes never enter
+the activation package.
 
 ```bash
 deploy/native-ci/activation/freeze_package.py \

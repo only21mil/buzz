@@ -65,13 +65,17 @@ class ActivationFixture:
                 "home": "/var/lib/buzzci/ctl", "shell": "/usr/sbin/nologin",
                 "supplementary_groups": ["buzzci-execd"],
             },
+            "job": {
+                "user": "buzzci-job", "group": "buzzci-job", "uid": 62006, "gid": 62006,
+                "home": "/var/empty", "shell": "/usr/sbin/nologin", "supplementary_groups": [],
+            },
         }
         self.access_group = {"group": "buzzci-execd", "gid": 62005, "members": ["buzzci-ctl", "buzzci-runner"]}
         self.assets: dict[str, tuple[bytes, int]] = {}
         self.entries: list[dict[str, object]] = []
+        self.components = self._add_components()
         self._add_configs()
         self._add_static_assets()
-        self.components = self._add_components()
         request = b'{"version":"qualification_v1"}\n'
         self.assets["assets/qualification-request.json"] = (request, 0o400)
         self.qualification = {
@@ -82,6 +86,14 @@ class ActivationFixture:
             "timeout_seconds": 5,
             "terminate_grace_seconds": 2,
             "principal": "qualification",
+        }
+        actor = "90" * 32
+        self.acceptance_template = {
+            "actor": {"public_key": actor, "generation": 10},
+            "run_event": [0, actor, 1_800_000_000, 46_100, [["h", "capacity-one"]], "{\"type\":\"run\"}"],
+            "grant_event": [0, actor, 1_800_000_001, 46_107, [["h", "capacity-one"]], "{\"type\":\"grant\"}"],
+            "rerun_event": [0, actor, 1_800_000_010, 46_100, [["h", "capacity-one"]], "{\"type\":\"rerun\"}"],
+            "tombstone_event": [0, actor, 1_800_000_020, 5, [["e", "08" * 32]], ""],
         }
         self.manifest = self._manifest()
         self.scenario = self._scenario()
@@ -125,29 +137,80 @@ class ActivationFixture:
         self.entries.append(entry)
 
     def _add_configs(self) -> None:
-        runner_staged = activation_package.canonical_json({"schema_version": 1, "controld_uid": 62002})
-        runner_active = activation_package.canonical_json({
+        lane_manifest = {
             "schema_version": 1,
+            "lane_id": "10" * 32,
+            "lane_epoch": 4,
+            "admission_verifying_key": "20" * 32,
+            "admission_key_generation": 9,
+            "broker_build_identity": "30" * 32,
+            "host_profile_digest": "40" * 32,
+            "suite_identity": "50" * 32,
+            "isolation_profile_digest": "60" * 32,
+            "not_before": 1,
+            "expires_at": 4_102_444_800,
+            "max_wall_timeout_seconds": 300,
+        }
+        lane_manifest_digest = activation_package.lane_manifest_digest(lane_manifest)
+        runner_staged = activation_package.canonical_json({
+            "schema_version": 2, "controld_uid": 62002, "controld_gid": 62002, "mode": "dormant",
+        })
+        runner_active = activation_package.canonical_json({
+            "schema_version": 2,
             "controld_uid": 62002,
-            "host": {
-                "owner_pubkey": "11" * 32,
-                "manifest_verification_key": "22" * 32,
-                "relay_signer": "33" * 32,
-                "broker_socket": "/run/buzzci/execd.sock",
-                "broker_uid": 0,
-                "executor_program": "/usr/libexec/buzz-ci-executor",
-                "evidence_directory": "/var/lib/buzzci/runner/evidence",
-                "journal_directory": "/var/lib/buzzci/runner/journal",
-                "max_argv_items": 32,
-                "max_argv_bytes": 8192,
-                "max_environment_items": 32,
-                "max_environment_bytes": 8192,
-                "max_output_bytes": 1048576,
-            },
+            "controld_gid": 62002,
+            "mode": "v2_proxy",
+            "execd_socket": "/run/buzzci/execd.sock",
+            "execd_uid": 0,
+            "execd_gid": 0,
+            "replay_journal": "/var/lib/buzzci/runner/v2-replay.json",
+            "connect_timeout_millis": 1000,
+            "io_timeout_millis": 5000,
+            "transport_attempts": 3,
+            "retry_delay_millis": 100,
+            "lane_manifest_digest": lane_manifest_digest,
+            "lane_epoch": lane_manifest["lane_epoch"],
+            "admission_key_generation": lane_manifest["admission_key_generation"],
+            "isolation_profile_digest": lane_manifest["isolation_profile_digest"],
+            "audience_digest": "70" * 32,
         })
         self._asset_entry(
             "runner_config", activation_package.CONFIG_TARGETS["runner_config"], "runner-staged.json", runner_staged,
             0o600, 62001, 62001, "runner-active.json", runner_active,
+        )
+        executor = next(item for item in self.components if item["name"] == "executor")
+        execd_config = activation_package.canonical_json({
+            "schema_version": 2,
+            "enabled_protocol": 2,
+            "capacity": 1,
+            "identities": {
+                "execd_uid": 0, "execd_gid": 0,
+                "runner_uid": 62001, "runner_gid": 62001,
+                "control_uid": 62004, "control_gid": 62004,
+                "job_uid": 62006, "job_gid": 62006,
+                "access_group": "buzzci-execd", "access_group_gid": 62005,
+                "access_group_members": ["buzzci-ctl", "buzzci-runner"],
+            },
+            "paths": {
+                "intent_root": "/var/lib/buzzci/execd-v2/intents",
+                "binding_root": "/var/lib/buzzci/execd-v2/bindings",
+                "evidence_root": "/var/lib/buzzci/execd-v2/evidence",
+                "teardown_root": "/var/lib/buzzci/execd-v2/teardown",
+                "attempt_root": "/var/lib/buzzci/execd-v2/attempts",
+                "executor_socket": "/run/buzzci/executor.sock",
+            },
+            "lane_manifest": lane_manifest,
+            "lane_manifest_digest": lane_manifest_digest,
+            "executor": {
+                "path": "/usr/libexec/buzz-ci-executor",
+                "sha256": executor["binary_sha256"],
+                "source_commit": executor["source_commit"],
+                "uid": 0, "gid": 0, "mode": 0o755,
+            },
+        })
+        self._asset_entry(
+            "execd_config", activation_package.CONFIG_TARGETS["execd_config"], "execd-v2.json",
+            execd_config, 0o600, 0, 0,
         )
         controld_staged = activation_package.canonical_json({
             "schema_version": 1, "capacity": 0, "store_root": "/var/lib/buzzci/controld",
@@ -156,7 +219,23 @@ class ActivationFixture:
         controld_active = activation_package.canonical_json({
             "schema_version": 1, "capacity": 1, "store_root": "/var/lib/buzzci/controld",
             "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
-            "relay_url": "wss://relay.example.invalid", "runner_socket": "/run/buzzci/runner-control.sock",
+            "relay_url": "wss://relay.example.invalid", "relay_http_origin": "https://relay.example.invalid",
+            "channel_id": "12345678-1234-4abc-8def-123456789abc", "poll_interval_millis": 1000,
+            "runner_socket": "/run/buzzci/runner-control.sock", "runner_uid": 62001, "runner_gid": 62001,
+            "runner_connect_timeout_millis": 1000, "runner_io_timeout_millis": 5000,
+            "runner_transport_attempts": 3, "lane_manifest_digest": lane_manifest_digest,
+            "lane_epoch": lane_manifest["lane_epoch"], "audience_digest": "70" * 32,
+            "isolation_profile_digest": lane_manifest["isolation_profile_digest"],
+            "workflow_id": "capacity-one", "workflow_digest": "80" * 32,
+            "jobs": [{
+                "job_id": "capacity-one-fixture", "name": "capacity-one-fixture", "required": True,
+                "skip_policy": "forbid", "selected_job_instance": "capacity-one-fixture",
+                "also_reruns": [],
+                "artifacts": [{
+                    "artifact_id": "result", "name": "result.json", "media_type": "application/json",
+                    "relative_name": "result.json", "max_bytes": 32768,
+                }],
+            }],
             "keyholder_socket": "/run/buzzci/keyholder.sock",
             "keyholder_uid": 62003, "keyholder_gid": 62003,
             "keyholder_selectors": {
@@ -169,20 +248,6 @@ class ActivationFixture:
         self._asset_entry(
             "controld_config", activation_package.CONFIG_TARGETS["controld_config"], "controld-staged.json", controld_staged,
             0o600, 62002, 62002, "controld-active.json", controld_active,
-        )
-        keyholder = activation_package.canonical_json({
-            "schema_version": 1,
-            "peer": {"uid": 62002, "gid": 62002},
-            "selectors": {
-                "ci_event": {"public_key": "44" * 32, "generation": 1},
-                "nip98": {"public_key": "55" * 32, "generation": 2},
-                "manifest": {"public_key": "66" * 32, "generation": 3},
-            },
-            "nip98_origin": "https://relay.example.invalid",
-        })
-        self._asset_entry(
-            "keyholder_config", activation_package.CONFIG_TARGETS["keyholder_config"], "keyholder.json", keyholder,
-            0o600, 62003, 62003,
         )
 
     def _render_sysusers(self) -> bytes:
@@ -222,11 +287,13 @@ class ActivationFixture:
         for index, (name, (binary_path, unit)) in enumerate(activation_package.COMPONENTS.items(), start=1):
             if name == "qualification":
                 binary = b"#!/usr/bin/python3\nimport sys\nsys.stdin.buffer.read()\nsys.stdout.buffer.write(" + repr(RESPONSE).encode() + b")\n"
+            elif name == "receipt_verifier":
+                binary = b"#!/usr/bin/python3\nraise SystemExit(0)\n"
             else:
                 binary = f"{name}-binary\n".encode()
             if name not in set(activation_package.INSTALLABLE_COMPONENT_ROLES.values()):
                 write_file(self.root / binary_path.lstrip("/"), binary, 0o755)
-            source_commit = f"{index:x}" * 40
+            source_commit = "a" * 40 if name == "receipt_verifier" else f"{index:x}" * 40
             provenance = activation_package.canonical_json({
                 "binary": Path(binary_path).name,
                 "profile": "release",
@@ -234,7 +301,11 @@ class ActivationFixture:
                 "sha256": activation_package.digest(binary),
                 "source_commit": source_commit,
             })
-            provenance_source = f"assets/{name}-provenance.json"
+            provenance_source = (
+                FREEZER.TRACKED_COMPONENT_PROVENANCE[name]
+                if name in FREEZER.TRACKED_COMPONENT_PROVENANCE
+                else f"assets/{name}-provenance.json"
+            )
             self.assets[provenance_source] = (provenance, 0o400)
             install_role = next((role for role, component_name in activation_package.INSTALLABLE_COMPONENT_ROLES.items() if component_name == name), None)
             if install_role is not None:
@@ -259,6 +330,9 @@ class ActivationFixture:
 
     def _scenario(self) -> dict[str, object]:
         endpoint = {"program": "/usr/libexec/buzz-ci-capacity-one-driver", "args": []}
+        grant_event_id = activation_package.digest(json.dumps(
+            self.acceptance_template["grant_event"], ensure_ascii=False, separators=(",", ":"),
+        ).encode())
         return {
             "schema_version": "buzz-ci-capacity-one-scenario/v1",
             "fixture": {
@@ -271,7 +345,7 @@ class ActivationFixture:
                 "manifest_digest": "3" * 64,
                 "source_oid": "a" * 40,
                 "approval_id": "4" * 32,
-                "grant_event_id": "5" * 64,
+                "grant_event_id": grant_event_id,
                 "grant_digest": "6" * 64,
                 "approved_by": "7" * 64,
                 "export_subject": "8" * 64,
@@ -294,6 +368,7 @@ class ActivationFixture:
             "default_state": {"capacity": 0, "enabled": False, "active": False, "provisioned": False},
             "identities": self.identities,
             "access_group": self.access_group,
+            "acceptance_template": self.acceptance_template,
             "components": self.components,
             "entries": self.entries,
             "systemd": {
@@ -334,6 +409,28 @@ class ActivationFixture:
                 self.assets[entry["source"]][0],
                 0o600,
             )
+        keyholder = {
+            "schema_version": 1,
+            "peer": {
+                "uid": 62002, "gid": 62002,
+                "allowed_operations": activation_package.KEYHOLDER_ALLOWED_OPERATIONS,
+            },
+            "selectors": {
+                "ci_event": {"public_key": "44" * 32, "generation": 1},
+                "nip98": {"public_key": "55" * 32, "generation": 2},
+                "manifest": {"public_key": "66" * 32, "generation": 3},
+            },
+            "nip98_origin": "https://relay.example.invalid",
+            "acceptance": {
+                "binding_receipt_path": activation_package.ACCEPTANCE_BINDING_PATH,
+                "credential_selector": "acceptance-actor.key",
+            },
+        }
+        write_file(
+            self.root / activation_package.KEYHOLDER_CONFIG_PATH.lstrip("/"),
+            activation_package.canonical_json(keyholder),
+            0o600,
+        )
 
     def _write_fake_systemd(self) -> None:
         units: dict[str, object] = {}
@@ -410,7 +507,7 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["status"], "unchanged")
         self.assertEqual(
             rolled_back["retained_principals"],
-            ["buzzci-controld", "buzzci-ctl", "buzzci-keyholder", "buzzci-runner"],
+            ["buzzci-controld", "buzzci-ctl", "buzzci-job", "buzzci-keyholder", "buzzci-runner"],
         )
         for entry in manifest["entries"]:
             target = self.fixture.root / entry["target"].lstrip("/")
@@ -447,15 +544,25 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "7dde3109ceb0ce2a27b4616aac230e4953248386ec861291c140e43e431ec54f",
+            "7818b9104369a86274a3f1f5a20f9929d697de11f1427a3b93081fb4fd73d7a8",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
         for unit in activation_package.STAGED_ZERO_UNITS:
             self.assertEqual(staged["staged_zero"]["units"][unit]["ActiveState"], "active")
         binding_path = self.fixture.root / activation_package.ACCEPTANCE_BINDING_PATH.lstrip("/")
-        self.assertEqual(stat.S_IMODE(binding_path.stat().st_mode), 0o440)
+        self.assertEqual((stat.S_IMODE(binding_path.stat().st_mode), binding_path.stat().st_gid), (0o444, os.getegid()))
+        self.assertFalse(binding_path.read_bytes().endswith(b"\n"))
         self.assertEqual(json.loads(binding_path.read_bytes()), self.fixture.binding)
+        self.assertEqual(self.fixture.binding["scenario_sha256"], self.fixture.binding["acceptance"]["scenario_sha256"])
+        self.assertEqual(list(self.fixture.binding), [
+            "schema_version", "activation_id", "activation_package_digest", "scenario_sha256",
+            "peer_uid", "peer_gid", "timeout_millis", "fixture", "acceptance",
+        ])
+        self.assertEqual(list(self.fixture.binding["acceptance"]), [
+            "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event",
+        ])
+        self.assertEqual(list(self.fixture.binding["acceptance"]["actor"]), ["public_key", "generation"])
         controld = json.loads((self.fixture.root / activation_package.CONFIG_TARGETS["controld_config"].lstrip("/")).read_bytes())
         self.assertEqual((controld["capacity"], controld["acceptance_binding"]), (0, activation_package.ACCEPTANCE_BINDING_PATH))
         for role, component_name in activation_package.INSTALLABLE_COMPONENT_ROLES.items():
@@ -606,6 +713,7 @@ class ActivationControllerTests(unittest.TestCase):
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         different = copy.deepcopy(self.fixture.binding)
         different["scenario_sha256"] = "c" * 64
+        different["acceptance"]["scenario_sha256"] = "c" * 64
         with self.assertRaisesRegex(ValueError, "scenario differs"):
             CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, different)
 
@@ -713,26 +821,55 @@ class ActivationControllerTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(completed.stdout)["status"], "ready_to_stage")
 
-    def test_keyholder_private_fields_are_rejected(self) -> None:
-        manifest, payloads, _driver = self.fixture.load()
-        entry = next(item for item in manifest["entries"] if item["role"] == "keyholder_config")
-        payloads[entry["source"]] = activation_package.canonical_json({
-            "schema_version": 1, "socket": "/run/buzzci/keyholder.sock", "private_key": "forbidden",
-        })
-        with self.assertRaisesRegex(ValueError, "cannot contain"):
-            CONTROLLER._validate_phase_configs(manifest, payloads)
-
-    def test_keyholder_and_controld_configs_compose_without_local_secret_descriptors(self) -> None:
+    def test_keyholder_config_is_external_and_controld_has_only_the_shared_receipt_path(self) -> None:
         manifest, payloads, _driver = self.fixture.load()
         entries = {entry["role"]: entry for entry in manifest["entries"]}
-        keyholder = json.loads(payloads[entries["keyholder_config"]["source"]])
         controld = json.loads(payloads[entries["controld_config"]["active_source"]])
-        self.assertEqual(set(keyholder), {"schema_version", "peer", "selectors", "nip98_origin"})
-        self.assertEqual(keyholder["peer"], {"uid": 62002, "gid": 62002})
-        self.assertEqual(controld["keyholder_selectors"], keyholder["selectors"])
+        self.assertNotIn("keyholder_config", entries)
+        self.assertFalse(any(entry["target"] == activation_package.KEYHOLDER_CONFIG_PATH for entry in manifest["entries"]))
         self.assertEqual((controld["keyholder_uid"], controld["keyholder_gid"]), (62003, 62003))
-        self.assertNotIn("key_descriptor", activation_package.canonical_json(keyholder).decode())
+        self.assertEqual(controld["acceptance_binding"], activation_package.ACCEPTANCE_BINDING_PATH)
+        self.assertNotIn("acceptance", controld)
         self.assertNotIn("private", activation_package.canonical_json(controld).decode())
+
+    def test_external_keyholder_config_is_read_back_and_never_overwritten(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        target = self.fixture.root / activation_package.KEYHOLDER_CONFIG_PATH.lstrip("/")
+        before = target.read_bytes()
+        report = CONTROLLER.preflight(manifest, self.fixture.root, driver, require_dormant=True, payloads=payloads)
+        self.assertEqual(report["keyholder_config"]["status"], "exact")
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual((target.read_bytes(), stat.S_IMODE(target.stat().st_mode)), (before, 0o600))
+
+    def test_external_keyholder_config_drift_blocks_activation(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        target = self.fixture.root / activation_package.KEYHOLDER_CONFIG_PATH.lstrip("/")
+        value = json.loads(target.read_bytes())
+        value["selectors"]["ci_event"]["generation"] += 1
+        write_file(target, activation_package.canonical_json(value), 0o600)
+        with self.assertRaisesRegex(ValueError, "selectors differ from active controld"):
+            CONTROLLER.preflight(manifest, self.fixture.root, driver, require_dormant=True, payloads=payloads)
+        write_file(target, activation_package.canonical_json(value), 0o640)
+        with self.assertRaisesRegex(ValueError, "metadata differs"):
+            CONTROLLER.preflight(manifest, self.fixture.root, driver, require_dormant=True, payloads=payloads)
+
+    def test_public_acceptance_template_omits_scenario_and_binds_event_ids(self) -> None:
+        manifest, _payloads, _driver = self.fixture.load()
+        template = manifest["acceptance_template"]
+        self.assertNotIn("scenario_sha256", template)
+        for field in ("run_event", "grant_event", "rerun_event", "tombstone_event"):
+            event_id = activation_package.digest(json.dumps(
+                template[field], ensure_ascii=False, separators=(",", ":"),
+            ).encode())
+            self.assertRegex(event_id, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            self.fixture.scenario["fixture"]["grant_event_id"],
+            activation_package.digest(json.dumps(
+                template["grant_event"], ensure_ascii=False, separators=(",", ":"),
+            ).encode()),
+        )
 
     def test_keyholder_fd_name_and_execd_access_group_are_exact(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -759,13 +896,21 @@ class ActivationControllerTests(unittest.TestCase):
         CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
         self.assertEqual(driver.socket(manifest["socket_policy"]["execd"])["gid"], 62005)
 
-    def test_executor_program_and_installed_binary_are_manifest_bound(self) -> None:
+    def test_runner_and_execd_reject_legacy_or_unbound_executor_programs(self) -> None:
         manifest, payloads, driver = self.fixture.load()
-        runner = next(entry for entry in manifest["entries"] if entry["role"] == "runner_config")
-        active = json.loads(payloads[runner["active_source"]])
-        active["host"]["executor_program"] = "/usr/bin/env"
-        payloads[runner["active_source"]] = activation_package.canonical_json(active)
-        with self.assertRaisesRegex(ValueError, "packaged executor component"):
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        active = json.loads(payloads[entries["runner_config"]["active_source"]])
+        active["host"] = {"executor_program": "/usr/bin/env"}
+        payloads[entries["runner_config"]["active_source"]] = activation_package.canonical_json(active)
+        with self.assertRaisesRegex(ValueError, "complete v2 proxy contract"):
+            CONTROLLER._validate_phase_configs(manifest, payloads)
+
+        manifest, payloads, _driver = self.fixture.load()
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        execd = json.loads(payloads[entries["execd_config"]["source"]])
+        execd["executor"]["path"] = "/usr/bin/env"
+        payloads[entries["execd_config"]["source"]] = activation_package.canonical_json(execd)
+        with self.assertRaisesRegex(ValueError, "executor provenance"):
             CONTROLLER._validate_phase_configs(manifest, payloads)
 
         manifest, _payloads, driver = self.fixture.load()
@@ -775,6 +920,97 @@ class ActivationControllerTests(unittest.TestCase):
         program.chmod(0o755)
         with self.assertRaisesRegex(ValueError, "target content drift"):
             CONTROLLER.preflight(manifest, self.fixture.root, driver, require_dormant=True)
+
+    def test_runner_v2_and_execd_v2_are_exact_and_cross_bound(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        runner = entries["runner_config"]
+        execd = entries["execd_config"]
+        staged = json.loads(payloads[runner["source"]])
+        active = json.loads(payloads[runner["active_source"]])
+        broker = json.loads(payloads[execd["source"]])
+
+        self.assertEqual((runner["target"], runner["install_mode"]), ("/etc/buzzci/runner-v2.json", "0600"))
+        self.assertEqual((execd["target"], execd["install_mode"], execd["uid"], execd["gid"]), ("/etc/buzzci/execd-v2.json", "0600", 0, 0))
+        self.assertEqual(staged, {"schema_version": 2, "controld_uid": 62002, "controld_gid": 62002, "mode": "dormant"})
+        self.assertEqual((active["mode"], active["execd_socket"], active["execd_uid"], active["execd_gid"]), ("v2_proxy", "/run/buzzci/execd.sock", 0, 0))
+        self.assertEqual((broker["enabled_protocol"], broker["capacity"], activation_package.REGISTER_JOB_INTENT_OPERATION), (2, 1, 9))
+        self.assertEqual(broker["identities"]["access_group_members"], ["buzzci-ctl", "buzzci-runner"])
+        self.assertEqual((broker["identities"]["control_uid"], broker["identities"]["job_uid"]), (62004, 62006))
+        self.assertEqual(broker["paths"]["intent_root"], activation_package.EXECD_INTENT_ROOT)
+        self.assertEqual(broker["paths"]["executor_socket"], activation_package.EXECUTOR_SOCKET_PATH)
+        self.assertEqual(active["lane_manifest_digest"], broker["lane_manifest_digest"])
+        self.assertEqual(
+            activation_package.lane_manifest_digest(broker["lane_manifest"]),
+            "12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04",
+        )
+        self.assertEqual(
+            (activation_package.SECCOMP_PROFILE_PATH, activation_package.SECCOMP_PROFILE_DIGEST),
+            (
+                "/var/lib/buzzci/seccomp/v1/sha256/2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4.json",
+                "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4",
+            ),
+        )
+        self.assertFalse(any(entry["target"] == activation_package.SECCOMP_PROFILE_PATH for entry in manifest["entries"]))
+        self.assertFalse(any(str(entry["target"]).startswith(activation_package.EXECD_INTENT_ROOT + "/") for entry in manifest["entries"]))
+        verifier = next(item for item in manifest["components"] if item["name"] == "receipt_verifier")
+        verifier_entry = entries["receipt_verifier_binary"]
+        self.assertEqual(
+            (verifier["binary_path"], verifier_entry["target"], verifier_entry["source_mode"], verifier_entry["install_mode"]),
+            (
+                "/usr/libexec/buzz-ci-verify-acceptance-receipt",
+                "/usr/libexec/buzz-ci-verify-acceptance-receipt",
+                "0500",
+                "0755",
+            ),
+        )
+
+    def test_execd_contract_drift_is_rejected(self) -> None:
+        mutations = (
+            ("peer", lambda value: value["identities"].__setitem__("runner_uid", 62004), "peer and job identities"),
+            ("intent", lambda value: value["paths"].__setitem__("intent_root", "/tmp/intents"), "intent, evidence, teardown"),
+            ("lane", lambda value: value.__setitem__("lane_manifest_digest", "f" * 64), "Rust contract"),
+        )
+        for label, mutate, message in mutations:
+            with self.subTest(label=label):
+                manifest, payloads, _driver = self.fixture.load()
+                entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+                value = json.loads(payloads[entry["source"]])
+                mutate(value)
+                payloads[entry["source"]] = activation_package.canonical_json(value)
+                with self.assertRaisesRegex(ValueError, message):
+                    CONTROLLER._validate_phase_configs(manifest, payloads)
+
+    def test_execd_config_and_retained_directories_install_and_rollback(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+        target = self.fixture.root / entry["target"].lstrip("/")
+        self.assertEqual((target.read_bytes(), stat.S_IMODE(target.stat().st_mode)), (payloads[entry["source"]], 0o600))
+        self.assertEqual(stat.S_IMODE((self.fixture.root / "var/lib/buzzci").stat().st_mode), 0o711)
+        for path, mode in (
+            (activation_package.EXECD_INTENT_ROOT, 0o700),
+            (activation_package.EXECD_BINDING_ROOT, 0o700),
+            (activation_package.EXECD_EVIDENCE_ROOT, 0o700),
+            (activation_package.EXECD_TEARDOWN_ROOT, 0o700),
+            (activation_package.EXECD_ATTEMPT_ROOT, 0o711),
+        ):
+            directory = self.fixture.root / path.lstrip("/")
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), mode)
+        self.assertFalse((self.fixture.root / activation_package.SECCOMP_PROFILE_PATH.lstrip("/")).exists())
+        self.assertFalse((self.fixture.root / "var/lib/buzzci/activation/receipts/seccomp.json").exists())
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertFalse(target.exists())
+        self.assertTrue((self.fixture.root / activation_package.EXECD_INTENT_ROOT.lstrip("/")).is_dir())
+
+    def test_rollback_restores_preexisting_exact_execd_v2_config(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+        target = self.fixture.root / entry["target"].lstrip("/")
+        write_file(target, payloads[entry["source"]], 0o600)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual((target.read_bytes(), stat.S_IMODE(target.stat().st_mode)), (payloads[entry["source"]], 0o600))
 
     def test_qualification_process_is_hardened_and_manifest_principal_is_exact(self) -> None:
         manifest, payloads, _driver = self.fixture.load()
@@ -929,6 +1165,22 @@ class ActivationFreezerModeTests(unittest.TestCase):
         FREEZER._validate_checkout_metadata(
             self._metadata("executed", 0o700), 0o100755, os.geteuid(), "executed",
         )
+
+    def test_receipt_verifier_accepts_private_checkout_and_installs_public_executable(self) -> None:
+        relative, asset_name, git_mode, source_mode = FREEZER.TRACKED_REPO_SOURCES["receipt_verifier_binary"]
+        source = self.root / relative
+        write_file(source, b"#!/usr/bin/python3\nraise SystemExit(0)\n", 0o700)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "core.sharedRepository", "true"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", str(relative)], check=True)
+        self.assertEqual((git_mode, source_mode, asset_name), (0o100755, 0o500, "assets/buzz-ci-verify-acceptance-receipt"))
+        payload, actual_name = FREEZER._static_payload(
+            self.root, "receipt_verifier_binary", {}, {},
+        )
+        self.assertEqual((payload, actual_name), (source.read_bytes(), asset_name))
+        installed = self.root / "installed-verifier"
+        FREEZER._write_asset(installed, payload, 0o755)
+        self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o755)
 
     def test_checkout_executable_class_and_unexpected_writes_are_rejected(self) -> None:
         cases = (
