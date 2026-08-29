@@ -16,6 +16,12 @@ use crate::{
         OrdinaryReceipts, OrdinaryStop, QualificationCleanup, QualificationExecution,
         QualificationExecutor, QualificationStop, ReadyHostProofs, ReadyValidationProvider,
     },
+    host_composition::HostCompositionContract,
+    normal_backend::{
+        materialization_input::MaterializationInputProvider,
+        proxy_input::{BoundPrestartPersister, ProxyInputProvider},
+        BrokerProxyRuntime, MediatedActThroughProxyLauncher, RuntimeDescriptorProvider,
+    },
     runtime::ReadyValidationTarget,
 };
 
@@ -49,6 +55,60 @@ pub enum ProductionCompositionError {
     HostContractUnavailable,
     /// Lease-scoped providers are absent even though the static contract loaded.
     HostBackendsMissing(&'static [HostBackendSeam]),
+}
+
+/// Concrete PR112/PR113 input consumers bound to one descriptor sequence.
+///
+/// This composition deliberately does not author the root-owned input records,
+/// create the lease-scoped materializer observer, or provide reconciliation.
+/// Those host dependencies remain required before canonical activation.
+pub struct ProductionInputProviders<P> {
+    materialization: MaterializationInputProvider,
+    proxy_source: ProxyInputProvider<RuntimeDescriptorProvider, P>,
+    proxy_launcher: MediatedActThroughProxyLauncher<RuntimeDescriptorProvider>,
+}
+
+/// Concrete proxy runtime assembled from the production input providers.
+pub type ProductionProxyInputRuntime<P, R> = BrokerProxyRuntime<
+    ProxyInputProvider<RuntimeDescriptorProvider, P>,
+    MediatedActThroughProxyLauncher<RuntimeDescriptorProvider>,
+    R,
+>;
+
+impl<P: BoundPrestartPersister> ProductionInputProviders<P> {
+    /// Open both authority consumers with one shared runtime descriptor stream.
+    pub fn open(
+        contract: &HostCompositionContract,
+        persister: P,
+    ) -> Result<Self, ExecutionUnavailable> {
+        let materialization = MaterializationInputProvider::from_contract(contract)?;
+        let descriptors =
+            RuntimeDescriptorProvider::new(contract.clone()).map_err(|_| ExecutionUnavailable)?;
+        let proxy_source =
+            ProxyInputProvider::from_contract(contract, descriptors.clone(), persister)?;
+        let proxy_launcher =
+            MediatedActThroughProxyLauncher::production(descriptors, contract.clone())
+                .map_err(|_| ExecutionUnavailable)?;
+        Ok(Self {
+            materialization,
+            proxy_source,
+            proxy_launcher,
+        })
+    }
+
+    /// Finish proxy assembly once the caller supplies its durable reconciler.
+    pub fn into_proxy_runtime<R>(
+        self,
+        reconciler: R,
+    ) -> (
+        MaterializationInputProvider,
+        ProductionProxyInputRuntime<P, R>,
+    ) {
+        (
+            self.materialization,
+            BrokerProxyRuntime::new(self.proxy_source, self.proxy_launcher, reconciler),
+        )
+    }
 }
 
 /// Fresh host proof adapter. The source must bind all facts to `target`.

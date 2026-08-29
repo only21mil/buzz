@@ -117,12 +117,17 @@ struct RuntimeState {
 }
 
 /// Fresh one-shot Podman descriptor provider for the DNS-owned runtime unit.
+///
+/// Clones share the probe state and monotonic descriptor sequence. The proxy
+/// input source and Act launcher must not issue independent sequence streams
+/// to the same runtime handoff service.
+#[derive(Clone)]
 pub struct RuntimeDescriptorProvider {
     contract: HostCompositionContract,
     connector: Arc<dyn RuntimeConnector>,
     clock: Arc<dyn Clock>,
-    sequence: Sequencer,
-    state: Mutex<Option<RuntimeState>>,
+    sequence: Arc<Sequencer>,
+    state: Arc<Mutex<Option<RuntimeState>>>,
 }
 
 impl RuntimeDescriptorProvider {
@@ -135,8 +140,8 @@ impl RuntimeDescriptorProvider {
             contract,
             connector: Arc::new(UnixRuntimeConnector),
             clock: Arc::new(SystemClock),
-            sequence: Sequencer::new(),
-            state: Mutex::new(None),
+            sequence: Arc::new(Sequencer::new()),
+            state: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -150,8 +155,8 @@ impl RuntimeDescriptorProvider {
             contract,
             connector,
             clock,
-            sequence: Sequencer::new(),
-            state: Mutex::new(None),
+            sequence: Arc::new(Sequencer::new()),
+            state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -544,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_provider_returns_one_authenticated_fresh_descriptor() {
+    fn cloned_runtime_provider_shares_probe_state_and_descriptor_sequence() {
         let (fixture, binding) = fixture_binding();
         let runtime_uid = binding.as_binding().principals.runtime;
         let (probe_client, mut probe_server) = UnixStream::pair().unwrap();
@@ -571,14 +576,15 @@ mod tests {
             (probe_client, runtime_uid),
             (acquire_client, runtime_uid),
         ]));
-        let mut provider = RuntimeDescriptorProvider::test_with(
+        let provider = RuntimeDescriptorProvider::test_with(
             contract(&binding),
             connector,
             Arc::new(FixedClock(20)),
         );
+        let mut launcher_provider = provider.clone();
 
         provider.preflight(&fixture.plan.act, &binding).unwrap();
-        let upstream = provider
+        let upstream = launcher_provider
             .next_upstream(fixture.lease, Instant::now() + Duration::from_secs(1))
             .unwrap();
         assert_eq!(

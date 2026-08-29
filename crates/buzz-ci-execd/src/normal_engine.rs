@@ -187,6 +187,7 @@ pub struct NormalJobPlan {
     pub evidence_root: PathBuf,
     pub lease_record: LeaseRecord,
     pub event_binding: CiEventBinding,
+    pub job_manifest_digest: [u8; 32],
     pub act: ActLaunchPlan,
 }
 
@@ -200,6 +201,8 @@ impl NormalJobPlan {
         if admission.trust_class != AdmissionTrustClass::AcceptedReviewed
             || request.signed_request_digest != admission.job.request_digest
             || request.job_manifest_digest != admission.job.manifest_digest
+            || self.job_manifest_digest != request.job_manifest_digest
+            || self.job_manifest_digest == [0; 32]
             || request.isolation_profile_digest != admission.job.isolation_profile_digest
             || request.tip_oid != admission.job.source_oid
             || request.base_oid != admission.job.base_oid
@@ -279,7 +282,7 @@ pub trait NormalExecutionBackend {
         &mut self,
         admission: OrdinaryAdmission,
         lease: LeaseToken,
-        plan: &ActLaunchPlan,
+        plan: &NormalJobPlan,
         binding: &ValidatedAttemptLeaseBinding,
         store: &EvidenceStore,
     ) -> Result<(), ExecutionUnavailable>;
@@ -421,7 +424,7 @@ impl<S: NormalJobSource, B: NormalExecutionBackend> OrdinaryExecutor
         self.backend.run_act_through_proxy(
             admission,
             lease,
-            &active.plan.act,
+            &active.plan,
             &active.binding,
             &store,
         )?;
@@ -1364,19 +1367,21 @@ pub(crate) mod tests {
             &mut self,
             _admission: OrdinaryAdmission,
             _lease: LeaseToken,
-            plan: &ActLaunchPlan,
+            plan: &NormalJobPlan,
             _binding: &ValidatedAttemptLeaseBinding,
             store: &EvidenceStore,
         ) -> Result<(), ExecutionUnavailable> {
             self.push("proxy-ready");
             self.fail_if(FailStage::ActThroughProxy)?;
             self.push("act-start");
-            assert_eq!(plan.environment()?.len(), 4);
+            assert_eq!(plan.act.environment()?.len(), 4);
             assert!(plan
+                .act
                 .environment()?
                 .iter()
                 .any(|(key, value)| key == "DOCKER_HOST" && value.contains("proxy.sock")));
             assert!(!plan
+                .act
                 .argv()?
                 .iter()
                 .any(|value| value.contains("DOCKER_HOST")));
@@ -1734,6 +1739,7 @@ pub(crate) mod tests {
                 created_at_unix_ns: 1,
             },
             event_binding,
+            job_manifest_digest: request.job_manifest_digest,
             act,
         };
         OrdinaryFixture {
@@ -1878,6 +1884,7 @@ pub(crate) mod tests {
             evidence_root: fixture.plan.evidence_root.clone(),
             lease_record: fixture.plan.lease_record.clone(),
             event_binding: fixture.plan.event_binding,
+            job_manifest_digest: fixture.plan.job_manifest_digest,
             act: fixture.plan.act.clone(),
         }
     }
