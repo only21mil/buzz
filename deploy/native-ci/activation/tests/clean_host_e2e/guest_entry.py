@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import select
 import shutil
 import signal
 import stat
@@ -25,6 +29,7 @@ BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v2"
 STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v2"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
 EVIDENCE_DEVICE = Path("/dev/virtio-ports/buzzci.evidence")
+TRANSFER_DEVICE = Path("/dev/vdb")
 KEY_NAMES = ("ci-event", "nip98", "manifest", "acceptance-actor")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -33,6 +38,8 @@ MAX_JSON = 1024 * 1024
 MAX_COMMAND = 4 * 1024 * 1024
 MAX_TREE_FILES = 1024
 MAX_TREE_BYTES = 64 * 1024 * 1024
+TRANSFER_SIZE = 8 * 1024 * 1024
+TRANSFER_MAGIC = b"BUZZCI-EVIDENCE\0"
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 SCRATCH_ROOT = Path("/run")
 SWAPS_PATH = Path("/proc/swaps")
@@ -56,30 +63,106 @@ class GuestError(RuntimeError):
 
 
 def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode() + b"\n"
 
 
-def read_file(path: Path, maximum: int = MAX_JSON) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise GuestError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def open_absolute(path: Path, *, directory: bool = False) -> int:
+    absolute = Path(os.path.abspath(path))
+    if not absolute.is_absolute() or any(part in {"", ".", ".."} for part in absolute.parts[1:]):
+        raise GuestError("staged path is invalid")
+    current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > maximum:
-            raise GuestError(f"unsafe staged file: {path.name}")
+        parts = absolute.parts[1:]
+        for index, part in enumerate(parts):
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            if index < len(parts) - 1 or directory:
+                flags |= os.O_DIRECTORY
+            child = os.open(
+                part, flags, dir_fd=current,
+            )
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def read_open_file(fd: int, name: str, maximum: int) -> bytes:
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
+            raise GuestError(f"unsafe staged file: {name}")
         raw = b""
         while chunk := os.read(fd, min(1024 * 1024, maximum + 1 - len(raw))):
             raw += chunk
             if len(raw) > maximum:
-                raise GuestError(f"oversized staged file: {path.name}")
+                raise GuestError(f"oversized staged file: {name}")
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        ):
+            raise GuestError(f"staged file changed while read: {name}")
         return raw
+    except BaseException:
+        raise
+
+
+def read_file(path: Path, maximum: int = MAX_JSON) -> bytes:
+    fd = open_absolute(path)
+    try:
+        return read_open_file(fd, path.name, maximum)
     finally:
         os.close(fd)
 
 
 def load_json(path: Path) -> object:
     try:
-        return json.loads(read_file(path))
+        return json.loads(read_file(path), object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise GuestError(f"invalid staged JSON: {path.name}") from error
+
+
+def parse_verdict(raw: bytes) -> dict[str, object]:
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuestError("strict verifier verdict JSON differs") from error
+    expected = {"outcome": "pass", "status": "verified"}
+    if value != expected or canonical(value) != raw:
+        raise GuestError("strict verifier verdict differs")
+    return expected
+
+
+def reap_process_group(process: subprocess.Popen[bytes], *, wait_seconds: float = 10) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + wait_seconds
+    while process.poll() is None and time.monotonic() < deadline:
+        try:
+            select.select([], [], [], min(0.05, max(0.001, deadline - time.monotonic())))
+        except BaseException:
+            pass
+    if process.poll() is None:
+        raise GuestError("guest process could not be reaped")
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        raise GuestError("guest process-group absence cannot be proved") from error
+    raise GuestError("guest process group remains after reap")
 
 
 def command(argv: list[str], *, stdin: bytes | None = None, timeout: int = 30, allow_failure: bool = False) -> subprocess.CompletedProcess[bytes]:
@@ -96,20 +179,19 @@ def command(argv: list[str], *, stdin: bytes | None = None, timeout: int = 30, a
             stdout=stdout, stderr=stderr, start_new_session=True,
             env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
         )
-        deadline = time.monotonic() + timeout
-        while process.poll() is None:
-            if stdout.tell() > MAX_COMMAND or stderr.tell() > MAX_COMMAND:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=10)
-                raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
-            if time.monotonic() >= deadline:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=10)
-                raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
-            time.sleep(0.01)
-        stdout.seek(0)
-        stderr.seek(0)
-        result = subprocess.CompletedProcess(argv, process.returncode, stdout.read(MAX_COMMAND + 1), stderr.read(MAX_COMMAND + 1))
+        try:
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if stdout.tell() > MAX_COMMAND or stderr.tell() > MAX_COMMAND:
+                    raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
+                if time.monotonic() >= deadline:
+                    raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
+                time.sleep(0.01)
+            stdout.seek(0)
+            stderr.seek(0)
+            result = subprocess.CompletedProcess(argv, process.returncode, stdout.read(MAX_COMMAND + 1), stderr.read(MAX_COMMAND + 1))
+        finally:
+            reap_process_group(process)
     if len(result.stdout) > MAX_COMMAND or len(result.stderr) > MAX_COMMAND:
         raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
     if result.returncode != 0 and not allow_failure:
@@ -142,6 +224,96 @@ def emit(value: dict[str, object]) -> None:
     fd = os.open(EVIDENCE_DEVICE, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         view = memoryview(frame)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def encode_transfer(value: dict[str, object]) -> bytes:
+    payload = canonical(value)
+    if not payload or len(payload) > MAX_COMMAND:
+        raise GuestError("evidence transfer payload exceeds bound")
+    header = TRANSFER_MAGIC + struct.pack(">I", len(payload)) + hashlib.sha256(payload).digest()
+    if len(header) + len(payload) > TRANSFER_SIZE:
+        raise GuestError("evidence transfer exceeds fixed capacity")
+    return header + payload + bytes(TRANSFER_SIZE - len(header) - len(payload))
+
+
+def decode_transfer(raw: bytes) -> dict[str, object]:
+    header_size = len(TRANSFER_MAGIC) + 4 + 32
+    if len(raw) != TRANSFER_SIZE or raw[:len(TRANSFER_MAGIC)] != TRANSFER_MAGIC:
+        raise GuestError("evidence transfer framing differs")
+    length = struct.unpack(">I", raw[len(TRANSFER_MAGIC):len(TRANSFER_MAGIC) + 4])[0]
+    if length == 0 or length > MAX_COMMAND or header_size + length > TRANSFER_SIZE:
+        raise GuestError("evidence transfer length differs")
+    expected = raw[len(TRANSFER_MAGIC) + 4:header_size]
+    payload = raw[header_size:header_size + length]
+    if hashlib.sha256(payload).digest() != expected or any(raw[header_size + length:]):
+        raise GuestError("evidence transfer digest or padding differs")
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuestError("evidence transfer JSON differs") from error
+    if not isinstance(value, dict):
+        raise GuestError("evidence transfer object differs")
+    return value
+
+
+def transfer_capacity(fd: int) -> int:
+    metadata = os.fstat(fd)
+    if not stat.S_ISBLK(metadata.st_mode):
+        raise GuestError("evidence transfer is not a block device")
+    try:
+        raw = fcntl.ioctl(fd, 0x80081272, struct.pack("Q", 0))
+    except OSError as error:
+        raise GuestError("evidence transfer capacity is unavailable") from error
+    capacity = struct.unpack("Q", raw)[0]
+    if capacity != TRANSFER_SIZE:
+        raise GuestError("evidence transfer capacity differs")
+    return capacity
+
+
+def write_transfer(value: dict[str, object]) -> None:
+    fd = os.open(TRANSFER_DEVICE, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        transfer_capacity(fd)
+        view = memoryview(encode_transfer(value))
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_transfer() -> dict[str, object]:
+    fd = os.open(TRANSFER_DEVICE, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        transfer_capacity(fd)
+        chunks: list[bytes] = []
+        size = 0
+        while size < TRANSFER_SIZE:
+            chunk = os.read(fd, min(1024 * 1024, TRANSFER_SIZE - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size != TRANSFER_SIZE or os.read(fd, 1):
+            raise GuestError("evidence transfer read bound differs")
+        return decode_transfer(b"".join(chunks))
+    finally:
+        os.close(fd)
+
+
+def write_exclusive(path: Path, raw: bytes, mode: int) -> None:
+    fd = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        mode,
+    )
+    try:
+        os.fchmod(fd, mode)
+        view = memoryview(raw)
         while view:
             view = view[os.write(fd, view):]
         os.fsync(fd)
@@ -262,29 +434,51 @@ def tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     count = 0
     total = 0
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        relative = normalized(path.relative_to(root))
-        metadata = path.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            continue
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise GuestError(f"staged tree member differs: {relative}")
-        raw = read_file(path, MAX_TREE_BYTES)
-        count += 1
-        total += len(raw)
-        if count > MAX_TREE_FILES or total > MAX_TREE_BYTES:
-            raise GuestError("staged tree exceeds bound")
-        digest.update(relative.encode())
-        digest.update(b"\0")
-        digest.update(f"{stat.S_IMODE(metadata.st_mode):04o}".encode())
-        digest.update(b"\0")
-        digest.update(hashlib.sha256(raw).digest())
+    root_fd = open_absolute(root, directory=True)
+    try:
+        def walk(directory_fd: int, prefix: PurePosixPath) -> None:
+            nonlocal count, total
+            with os.scandir(directory_fd) as iterator:
+                names = sorted(entry.name for entry in iterator)
+            for name in names:
+                relative_path = prefix / name
+                relative = normalized(Path(relative_path.as_posix()))
+                try:
+                    child_fd = os.open(
+                        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    raise GuestError(f"staged tree member differs: {relative}") from error
+                try:
+                    metadata = os.fstat(child_fd)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        walk(child_fd, relative_path)
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise GuestError(f"staged tree member differs: {relative}")
+                    raw = read_open_file(child_fd, name, MAX_TREE_BYTES)
+                    count += 1
+                    total += len(raw)
+                    if count > MAX_TREE_FILES or total > MAX_TREE_BYTES:
+                        raise GuestError("staged tree exceeds bound")
+                    digest.update(relative.encode())
+                    digest.update(b"\0")
+                    digest.update(f"{stat.S_IMODE(metadata.st_mode):04o}".encode())
+                    digest.update(b"\0")
+                    digest.update(hashlib.sha256(raw).digest())
+                finally:
+                    os.close(child_fd)
+
+        walk(root_fd, PurePosixPath())
+    finally:
+        os.close(root_fd)
     return digest.hexdigest()
 
 
-def extract_candidate(archive: Path, target: Path) -> None:
+def extract_candidate(archive_raw: bytes, target: Path) -> None:
     target.mkdir(mode=0o700)
-    with tarfile.open(archive, "r:") as handle:
+    with tarfile.open(fileobj=io.BytesIO(archive_raw), mode="r:") as handle:
         members = handle.getmembers()
         if not members or len(members) > 4096:
             raise GuestError("candidate archive inventory differs")
@@ -307,27 +501,50 @@ def package_manifest(package: Path, name: str) -> dict[str, object]:
     return value
 
 
-def package_member(package: Path, source: object) -> Path:
+def open_package_member(package: Path, source: object) -> tuple[int, Path]:
     if not isinstance(source, str):
         raise GuestError("package member path is not a string")
     relative = PurePosixPath(source)
     if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
         raise GuestError("package member path escapes")
-    current = package
-    for part in relative.parts[:-1]:
-        current /= part
-        metadata = current.lstat()
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise GuestError("package member parent differs")
-    target = package / Path(*relative.parts)
-    if Path(os.path.realpath(target)) != target:
-        raise GuestError("package member contains a symbolic path")
-    return target
+    directory = open_absolute(package, directory=True)
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = child
+        fd = os.open(
+            relative.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+        return fd, package / Path(*relative.parts)
+    except OSError as error:
+        raise GuestError("package member contains an escaping or symbolic path") from error
+    finally:
+        os.close(directory)
+
+
+def package_member(package: Path, source: object) -> Path:
+    fd, path = open_package_member(package, source)
+    os.close(fd)
+    return path
+
+
+def read_package_member(package: Path, source: object, maximum: int = MAX_JSON) -> bytes:
+    fd, path = open_package_member(package, source)
+    try:
+        return read_open_file(fd, path.name, maximum)
+    finally:
+        os.close(fd)
 
 
 def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[str, object], dict[str, object]]:
     candidate_tar = stage / "candidate.tar"
-    if hashlib.sha256(read_file(candidate_tar, MAX_TREE_BYTES)).hexdigest() != descriptor.get("candidate_tar_sha256"):
+    candidate_raw = read_file(candidate_tar, MAX_TREE_BYTES)
+    if hashlib.sha256(candidate_raw).hexdigest() != descriptor.get("candidate_tar_sha256"):
         raise GuestError("candidate archive digest differs inside guest")
     inputs = stage / "inputs"
     for name in PACKAGE_NAMES:
@@ -345,7 +562,7 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
     if binding_raw != read_file(STATE_ROOT / "public-binding.json"):
         raise GuestError("public binding differs from key ceremony")
     candidate = STATE_ROOT / "candidate"
-    extract_candidate(candidate_tar, candidate)
+    extract_candidate(candidate_raw, candidate)
     candidate_sha = descriptor.get("candidate_sha")
     if not isinstance(candidate_sha, str) or HEX40.fullmatch(candidate_sha) is None:
         raise GuestError("candidate binding differs")
@@ -365,7 +582,7 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         or binding.get("activation_id") != activation_id
     ):
         raise GuestError("execd package differs from activation package")
-    scenario = json.loads(scenario_raw)
+    scenario = json.loads(scenario_raw, object_pairs_hook=reject_duplicates)
     fixture = scenario.get("fixture") if isinstance(scenario, dict) else None
     if (
         not isinstance(fixture, dict)
@@ -374,11 +591,14 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         or fixture.get("activation_id") != activation_id
     ):
         raise GuestError("scenario differs from candidate or activation package")
-    public = json.loads(binding_raw)
+    public = json.loads(binding_raw, object_pairs_hook=reject_duplicates)
     keyholder_entry = next((item for item in manifests["keyholder"].get("entries", []) if item.get("role") == "config"), None)
     if not isinstance(keyholder_entry, dict):
         raise GuestError("keyholder config package entry is absent")
-    keyholder_config = json.loads(read_file(package_member(inputs / "keyholder", keyholder_entry["source"])))
+    keyholder_config = json.loads(
+        read_package_member(inputs / "keyholder", keyholder_entry["source"]),
+        object_pairs_hook=reject_duplicates,
+    )
     if keyholder_config != public.get("keyholder_public_spec"):
         raise GuestError("keyholder package differs from ceremony public keys")
     if activation.get("acceptance_template", {}).get("actor") != public.get("acceptance_actor"):
@@ -386,7 +606,10 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
     controld_entry = next((item for item in activation.get("entries", []) if item.get("role") == "controld_config"), None)
     if not isinstance(controld_entry, dict):
         raise GuestError("activation controld config entry is absent")
-    controld_active = json.loads(read_file(package_member(inputs / "activation", controld_entry.get("active_source"))))
+    controld_active = json.loads(
+        read_package_member(inputs / "activation", controld_entry.get("active_source")),
+        object_pairs_hook=reject_duplicates,
+    )
     public_spec = public.get("keyholder_public_spec")
     if (
         not isinstance(public_spec, dict)
@@ -480,18 +703,42 @@ def prove_installed_units(expected: dict[str, dict[str, str]]) -> dict[str, dict
 
 def tree_state(root: Path) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {}
-    if not root.exists():
+    try:
+        root_fd = open_absolute(root, directory=True)
+    except FileNotFoundError:
         return result
-    for path in sorted(root.rglob("*")):
-        metadata = path.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            continue
-        if not stat.S_ISREG(metadata.st_mode):
-            raise GuestError("config tree contains a non-regular member")
-        result[str(path.relative_to(root))] = {
-            "sha256": hashlib.sha256(read_file(path)).hexdigest(),
-            "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
-        }
+    try:
+        def walk(directory_fd: int, prefix: PurePosixPath) -> None:
+            with os.scandir(directory_fd) as iterator:
+                names = sorted(entry.name for entry in iterator)
+            for name in names:
+                relative = prefix / name
+                try:
+                    child_fd = os.open(
+                        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    raise GuestError("config tree contains an unsafe member") from error
+                try:
+                    metadata = os.fstat(child_fd)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        walk(child_fd, relative)
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise GuestError("config tree contains a non-regular member")
+                    result[relative.as_posix()] = {
+                        "sha256": hashlib.sha256(read_open_file(child_fd, name, MAX_JSON)).hexdigest(),
+                        "mode": stat.S_IMODE(metadata.st_mode),
+                        "uid": metadata.st_uid,
+                        "gid": metadata.st_gid,
+                    }
+                finally:
+                    os.close(child_fd)
+
+        walk(root_fd, PurePosixPath())
+    finally:
+        os.close(root_fd)
     return result
 
 
@@ -692,9 +939,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         receipt_path.write_bytes(receipt_raw)
         receipt_path.chmod(0o400)
         verifier_raw = command(["/usr/libexec/buzz-ci-verify-acceptance-receipt", str(inputs / "scenario.json"), str(receipt_path)], timeout=60).stdout
-        verifier = json.loads(verifier_raw)
-        if not isinstance(verifier, dict) or verifier.get("status") != "pass":
-            raise GuestError("installed receipt verifier did not pass")
+        parse_verdict(verifier_raw)
     except BaseException as error:
         primary = error
     cleanup_errors = cleanup(candidate, activation_package, attempted_stage, hosts_added)
@@ -721,20 +966,20 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         "candidate_sha": descriptor["candidate_sha"],
         "scenario_sha256": descriptor["scenario_sha256"],
         "receipt_base64": base64.b64encode(receipt_raw).decode(),
-        "verifier_base64": base64.b64encode(verifier_raw).decode(),
         "dormant_proof": proof,
     }
-    pending_path = STATE_ROOT / "pending-evidence.json"
-    pending_path.write_bytes(canonical(pending))
-    pending_path.chmod(0o400)
+    write_transfer(pending)
     return pending
 
 
 def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
-    pending_path = STATE_ROOT / "pending-evidence.json"
-    pending = load_json(pending_path)
+    pending = read_transfer()
     if (
         not isinstance(pending, dict)
+        or set(pending) != {
+            "schema_version", "challenge", "candidate_sha", "scenario_sha256",
+            "receipt_base64", "dormant_proof",
+        }
         or pending.get("schema_version") != "buzz-ci-clean-host-e2e-pending-evidence/v2"
         or pending.get("challenge") != phase["challenge"]
         or pending.get("candidate_sha") != phase.get("candidate_sha")
@@ -744,37 +989,71 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
         raise GuestError("pending evidence binding differs")
     try:
         receipt_raw = base64.b64decode(pending["receipt_base64"], validate=True)
-        first_verifier = base64.b64decode(pending["verifier_base64"], validate=True)
     except (TypeError, ValueError) as error:
         raise GuestError("pending evidence encoding differs") from error
+    if not receipt_raw or len(receipt_raw) > MAX_COMMAND:
+        raise GuestError("pending receipt size differs")
+    try:
+        receipt = json.loads(receipt_raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuestError("pending receipt JSON differs") from error
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "schema_version", "outcome", "scenario_sha256", "integrated_candidate_sha",
+        "run_id", "checks", "zero_transition",
+    } or receipt.get("schema_version") != "buzz-ci-capacity-one-acceptance-receipt/v2":
+        raise GuestError("pending receipt closed schema differs")
     receipt_path = STATE_ROOT / "verify-receipt.json"
-    receipt_path.write_bytes(receipt_raw)
+    receipt_path.write_bytes(canonical(receipt))
     receipt_path.chmod(0o400)
-    second_verifier = command([
-        "/usr/libexec/buzz-ci-verify-acceptance-receipt", str(stage / "scenario.json"), str(receipt_path),
-    ], timeout=60).stdout
-    if second_verifier != first_verifier:
-        raise GuestError("independent verifier replay differs")
-    verifier = json.loads(second_verifier)
-    if not isinstance(verifier, dict) or verifier.get("status") != "pass":
-        raise GuestError("independent verifier replay did not pass")
-    receipt = json.loads(receipt_raw)
+    verifier_raw = read_file(stage / "receipt_verifier.py", MAX_COMMAND)
+    stages_raw = read_file(stage / "expected-stages.json", MAX_JSON)
     if (
-        not isinstance(receipt, dict) or receipt.get("outcome") != "pass"
+        hashlib.sha256(verifier_raw).hexdigest() != phase.get("trusted_verifier_sha256")
+        or hashlib.sha256(stages_raw).hexdigest() != phase.get("expected_stages_sha256")
+    ):
+        raise GuestError("trusted verifier asset digest differs")
+    try:
+        trusted_binary = STATE_ROOT / "trusted-verifier.py"
+        stages_path = STATE_ROOT / "expected-stages.json"
+        write_exclusive(trusted_binary, verifier_raw, 0o500)
+        write_exclusive(stages_path, stages_raw, 0o644)
+        spec = importlib.util.spec_from_file_location("buzzci_frozen_receipt_verifier", trusted_binary)
+        if spec is None or spec.loader is None:
+            raise GuestError("trusted verifier loader differs")
+        verifier_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier_module)
+        expected_stages = verifier_module.load_expected_stages(stages_path, 0, 0)
+        verifier_module.verify(
+            verifier_module.load_json(receipt_path),
+            verifier_module.load_json(stage / "scenario.json"),
+            expected_stages,
+        )
+        verifier = {"outcome": "pass", "status": "verified"}
+    except (AttributeError, ImportError, OSError, ValueError) as error:
+        raise GuestError("trusted verifier rejected pending receipt") from error
+    if verifier != {"outcome": "pass", "status": "verified"}:
+        raise GuestError("independent verifier replay did not pass")
+    if (
+        receipt.get("outcome") != "pass"
         or receipt.get("integrated_candidate_sha") != phase.get("candidate_sha")
         or receipt.get("scenario_sha256") != phase.get("scenario_sha256")
         or not isinstance(pending.get("dormant_proof"), dict)
+        or set(pending["dormant_proof"]) != {
+            "configs_sha256", "units_sha256", "sockets_absent", "processes_absent",
+            "encrypted_credentials_absent", "relay_residue_absent",
+        }
         or any(pending["dormant_proof"].get(name) is not True for name in (
             "sockets_absent", "processes_absent", "encrypted_credentials_absent", "relay_residue_absent",
         ))
     ):
         raise GuestError("independent receipt identity differs")
-    pending_path.unlink()
     receipt_path.unlink()
+    trusted_binary.unlink()
+    stages_path.unlink()
     return {
         "phase": "run", "challenge": phase["challenge"], "outcome": "pass",
-        "receipt_base64": pending["receipt_base64"],
-        "verifier_base64": pending["verifier_base64"],
+        "receipt_base64": base64.b64encode(canonical(receipt)).decode(),
+        "verifier_base64": base64.b64encode(canonical({"outcome": "pass", "status": "verified"})).decode(),
         "dormant_proof": pending["dormant_proof"],
     }
 
@@ -791,18 +1070,44 @@ def main(argv: list[str]) -> int:
         require_guest()
         disable_swap()
         if phase.get("phase") == "ceremony":
+            if set(phase) != {"schema_version", "phase", "challenge", "controld_uid", "controld_gid"}:
+                raise GuestError("ceremony phase fields differ")
             if not EVIDENCE_DEVICE.exists() or not stat.S_ISCHR(EVIDENCE_DEVICE.stat().st_mode):
                 raise GuestError("ceremony evidence transport is absent")
+            if TRANSFER_DEVICE.exists():
+                raise GuestError("ceremony must not have an evidence-transfer device")
             result = ceremony(phase)
             emit(result)
         elif phase.get("phase") == "run":
+            if set(phase) != {"schema_version", "phase", "challenge", "descriptor_sha256"}:
+                raise GuestError("candidate phase fields differ")
             if EVIDENCE_DEVICE.exists():
                 raise GuestError("candidate execution must not have an evidence transport")
+            transfer_fd = os.open(TRANSFER_DEVICE, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                transfer_capacity(transfer_fd)
+            finally:
+                os.close(transfer_fd)
             run_acceptance(phase, Path(argv[0]).parent)
             return 0
         elif phase.get("phase") == "verify":
+            if set(phase) != {
+                "schema_version", "phase", "challenge", "candidate_sha",
+                "scenario_sha256", "trusted_verifier_sha256", "expected_stages_sha256",
+            }:
+                raise GuestError("verification phase fields differ")
             if not EVIDENCE_DEVICE.exists() or not stat.S_ISCHR(EVIDENCE_DEVICE.stat().st_mode):
                 raise GuestError("verification evidence transport is absent")
+            transfer_fd = os.open(TRANSFER_DEVICE, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                transfer_capacity(transfer_fd)
+            finally:
+                os.close(transfer_fd)
+            if any(
+                not isinstance(phase[name], str) or HEX64.fullmatch(phase[name]) is None
+                for name in ("trusted_verifier_sha256", "expected_stages_sha256")
+            ):
+                raise GuestError("trusted verifier binding differs")
             result = verify_pending(phase, Path(argv[0]).parent)
             emit(result)
         else:
