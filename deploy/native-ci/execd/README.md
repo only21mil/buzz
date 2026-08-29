@@ -42,6 +42,15 @@ install receipt. The package creates only the retained state directories; it
 does not bundle, replace, or remove the immutable profile bytes during package
 rollback.
 
+The shared `/var/lib/buzzci` ancestor is root:root mode `0711`: service
+principals may traverse an already-known child name but cannot list the
+directory. No regular file may live directly beneath that ancestor. Execd's
+sensitive child roots remain root-private mode `0700`; the separate activation
+package uses the same ancestor contract so either package installation order is
+idempotent. The only cross-service readable state is the explicitly named,
+root-owned mode-`0444` acceptance receipt beneath the separately traversable
+`activation-controller` directory.
+
 Run the local static checks with:
 
 ```bash

@@ -62,15 +62,27 @@ def verify(source_root: Path) -> None:
             raise ValueError(f"{relative} misses {missing}")
     tmpfiles = (root / "templates/buzzci-execd.tmpfiles").read_text().splitlines()
     retained = [
-        "d /var/lib/buzzci 0700 root root - -",
+        "d /var/lib/buzzci 0711 root root - -",
         "d /var/lib/buzzci/seccomp 0700 root root - -",
         "d /var/lib/buzzci/activation 0700 root root - -",
         "d /var/lib/buzzci/activation/receipts 0700 root root - -",
+        "d /var/lib/buzzci/execd-v2 0700 root root - -",
+        "d /var/lib/buzzci/execd-v2/intents 0700 root root - -",
+        "d /var/lib/buzzci/execd-v2/bindings 0700 root root - -",
+        "d /var/lib/buzzci/execd-v2/evidence 0700 root root - -",
+        "d /var/lib/buzzci/execd-v2/teardown 0700 root root - -",
+        "d /var/lib/buzzci/execd-v2/attempts 0711 root root - -",
     ]
-    if tmpfiles[:4] != retained or len(tmpfiles) != 10 or any(" 0700 root root " not in line for line in tmpfiles[:9]):
-        raise ValueError("execd state roots are not exact root-owned 0700 directories")
-    if tmpfiles[9] != "d /var/lib/buzzci/execd-v2/attempts 0711 root root - -":
-        raise ValueError("attempt root drift")
+    for line in tmpfiles:
+        fields = line.split()
+        if (
+            len(fields) >= 2
+            and Path(fields[1]).parent == Path("/var/lib/buzzci")
+            and fields[0] != "d"
+        ):
+            raise ValueError("regular files are forbidden directly under the shared state ancestor")
+    if tmpfiles != retained:
+        raise ValueError("execd shared ancestor or private state root drift")
 
 
 def main() -> int:
