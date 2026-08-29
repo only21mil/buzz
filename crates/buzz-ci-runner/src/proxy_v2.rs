@@ -884,6 +884,9 @@ mod tests {
             attempt_id: [35; 16],
             execution_binding_digest: [36; 32],
             expected_generation: 7,
+            request_event_id: [40; 32],
+            workflow_id: v2::WireText64::from_ascii("workflow").expect("workflow id"),
+            job_id: v2::WireText64::from_ascii("job").expect("job id"),
         }
     }
 
@@ -1161,6 +1164,9 @@ mod tests {
             length: 3,
             artifact_name_digest: [0; 32],
             artifact_media_type_digest: [0; 32],
+            artifact_id: v2::WireText64::EMPTY,
+            artifact_name: v2::WireText64::EMPTY,
+            artifact_media_type: v2::WireText64::EMPTY,
             teardown_lease_id: [0; 16],
             teardown_lease_generation: 0,
             teardown_attestation_digest: [0; 32],
@@ -1177,6 +1183,12 @@ mod tests {
                 descriptor_set_digest: [39; 32],
                 item_count: 1,
                 items,
+                request_event_id: request.coordinates.request_event_id,
+                run_id: request.coordinates.run_id,
+                workflow_id: request.coordinates.workflow_id,
+                workflow_digest: request.coordinates.workflow_digest,
+                job_id: request.coordinates.job_id,
+                attempt: request.coordinates.attempt,
             },
         )
         .as_bytes()
@@ -1229,6 +1241,12 @@ mod tests {
             offset: request.offset,
             total_length: 3,
             bytes: b"log".to_vec(),
+            request_event_id: request.coordinates.request_event_id,
+            run_id: request.coordinates.run_id,
+            workflow_id: request.coordinates.workflow_id,
+            workflow_digest: request.coordinates.workflow_digest,
+            job_id: request.coordinates.job_id,
+            attempt: request.coordinates.attempt,
         };
         let response = v2::encode_evidence_chunk_response(header, &response_value)
             .as_bytes()
