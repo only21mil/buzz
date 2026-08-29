@@ -1,15 +1,29 @@
-use std::{fs, io::Read, os::unix::net::UnixListener, process::Command, thread, time::Duration};
+use std::{
+    fs,
+    io::{Read, Write},
+    os::unix::net::UnixListener,
+    process::Command,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use buzz_ci_acceptance_ctl::production_qualification::{
     dispatch, DispatchError, ExchangeError, ProductionQualificationTransport,
     UnixProductionQualificationTransport, REQUEST_SCHEMA, RESPONSE_SCHEMA,
+};
+use buzz_ci_broker_protocol::{
+    v2::{
+        decode_request, decode_request_header, encode_production_qualification_response,
+        production_qualification_receipt_digest, ProductionQualificationRequest,
+        ProductionQualificationResponse, Request,
+    },
+    ResponseCode,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const HEADER: usize = 32;
 const REQUEST_BODY: usize = 640;
-const RESPONSE_BODY: usize = 576;
 
 fn request() -> Value {
     json!({
@@ -60,39 +74,48 @@ impl ProductionQualificationTransport for ScriptedTransport {
 }
 
 fn response_for(request: &[u8], code: u16) -> Vec<u8> {
-    assert_eq!(request.len(), HEADER + REQUEST_BODY);
-    let request_body = &request[HEADER..];
-    let mut response = vec![0; HEADER + RESPONSE_BODY];
-    response[..4].copy_from_slice(b"BZCI");
-    response[4..6].copy_from_slice(&2_u16.to_be_bytes());
-    response[6..8].copy_from_slice(&0x8005_u16.to_be_bytes());
-    response[12..16].copy_from_slice(&(RESPONSE_BODY as u32).to_be_bytes());
-    response[16..32].copy_from_slice(&request[16..32]);
-    let body = &mut response[HEADER..];
-    body[0..2].copy_from_slice(&code.to_be_bytes());
-    body[6..38].copy_from_slice(&request_body[465..497]);
-    body[38..70].fill(0x71);
-    body[70..103].copy_from_slice(&request_body[0..33]);
-    for (response_offset, request_offset) in [
-        (103, 33),
-        (135, 65),
-        (167, 97),
-        (199, 129),
-        (231, 161),
-        (263, 193),
-        (295, 225),
-        (327, 257),
-        (359, 289),
-        (423, 321),
-        (455, 353),
-    ] {
-        body[response_offset..response_offset + 32]
-            .copy_from_slice(&request_body[request_offset..request_offset + 32]);
-    }
-    body[391..423].fill(0x72);
-    body[487..519].copy_from_slice(&request_body[417..449]);
-    body[519..527].copy_from_slice(&150_u64.to_be_bytes());
-    body[527..535].copy_from_slice(&request_body[457..465]);
+    let (header, decoded) = decode_request(request).expect("decode request fixture");
+    let Request::AdmitQualification(request) = decoded else {
+        panic!("fixture must be production qualification");
+    };
+    let code = ResponseCode::try_from(code).expect("known response code");
+    let response = qualification_response(request, code, 150);
+    encode_production_qualification_response(header, response)
+        .as_bytes()
+        .to_vec()
+}
+
+fn qualification_response(
+    request: ProductionQualificationRequest,
+    code: ResponseCode,
+    qualified_at: u64,
+) -> ProductionQualificationResponse {
+    let mut response = ProductionQualificationResponse {
+        code,
+        retry_after_millis: 0,
+        request_frame_digest: request.request_frame_digest,
+        qualification_receipt_digest: [0; 32],
+        integrated_candidate_sha: request.integrated_candidate_sha,
+        activation_package_digest: request.activation_package_digest,
+        fixture_digest: request.fixture_digest,
+        principal_digest: request.principal_digest,
+        lane_manifest_digest: request.lane_manifest_digest,
+        broker_build_identity: request.broker_build_identity,
+        host_profile_digest: request.host_profile_digest,
+        suite_identity: request.suite_identity,
+        isolation_profile_digest: request.isolation_profile_digest,
+        seccomp_profile_digest: request.seccomp_profile_digest,
+        seccomp_install_receipt_digest: [0x72; 32],
+        executor_program_digest: request.executor_program_digest,
+        executor_provenance_digest: request.executor_provenance_digest,
+        controller_generation: request.controller_generation,
+        runner_generation: request.runner_generation,
+        lane_epoch: request.lane_epoch,
+        admission_key_generation: request.admission_key_generation,
+        qualified_at,
+        request_expires_at: request.expires_at,
+    };
+    response.qualification_receipt_digest = production_qualification_receipt_digest(&response);
     response
 }
 
@@ -189,7 +212,38 @@ fn not_provisioned_and_every_other_error_fail_closed() {
 #[test]
 fn response_drift_and_noncanonical_frames_fail_closed() {
     let input = serde_json::to_vec(&request()).unwrap();
-    for offset in [16, HEADER + 6, HEADER + 103, HEADER + 487, HEADER + 535] {
+    for offset in [
+        0,
+        4,
+        6,
+        8,
+        12,
+        16,
+        HEADER,
+        HEADER + 2,
+        HEADER + 6,
+        HEADER + 38,
+        HEADER + 71,
+        HEADER + 103,
+        HEADER + 135,
+        HEADER + 167,
+        HEADER + 199,
+        HEADER + 231,
+        HEADER + 263,
+        HEADER + 295,
+        HEADER + 327,
+        HEADER + 359,
+        HEADER + 391,
+        HEADER + 423,
+        HEADER + 455,
+        HEADER + 487,
+        HEADER + 495,
+        HEADER + 503,
+        HEADER + 511,
+        HEADER + 519,
+        HEADER + 527,
+        HEADER + 535,
+    ] {
         let mut transport = ScriptedTransport {
             mutate: Some(offset),
             ..ScriptedTransport::default()
@@ -205,8 +259,9 @@ fn unix_transport_timeout_is_typed_and_bounded() {
     let listener = UnixListener::bind(&socket).unwrap();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut request = vec![0; HEADER + REQUEST_BODY];
-        stream.read_exact(&mut request).unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).unwrap();
+        assert_eq!(request.len(), HEADER + REQUEST_BODY);
         thread::sleep(Duration::from_millis(150));
     });
     let input = serde_json::to_vec(&request()).unwrap();
@@ -214,6 +269,73 @@ fn unix_transport_timeout_is_typed_and_bounded() {
         UnixProductionQualificationTransport::at_path(socket, Duration::from_millis(20));
     let error = dispatch(&input, 150, &mut transport).unwrap_err();
     assert_eq!(error, DispatchError::Exchange(ExchangeError::Timeout));
+    server.join().unwrap();
+}
+
+fn serve_production_style_qualification(listener: UnixListener) {
+    let (mut stream, _) = listener.accept().expect("accept production client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    let mut header_bytes = [0; HEADER];
+    stream
+        .read_exact(&mut header_bytes)
+        .expect("read qualification header");
+    let (_, body_size) = decode_request_header(&header_bytes).expect("decode v2 request header");
+    assert_eq!(body_size, REQUEST_BODY);
+    let mut frame = header_bytes.to_vec();
+    frame.resize(HEADER + body_size, 0);
+    stream
+        .read_exact(&mut frame[HEADER..])
+        .expect("read qualification body");
+
+    let mut trailing = [0; 1];
+    assert_eq!(
+        stream.read(&mut trailing).expect("read request EOF"),
+        0,
+        "production framing requires the client to half-close SHUT_WR"
+    );
+
+    let (header, decoded) = decode_request(&frame).expect("decode production qualification");
+    let Request::AdmitQualification(request) = decoded else {
+        panic!("client sent an unexpected operation");
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let qualified_at = now.clamp(request.issued_at, request.expires_at - 1);
+    let response = qualification_response(request, ResponseCode::Ok, qualified_at);
+    stream
+        .write_all(encode_production_qualification_response(header, response).as_bytes())
+        .expect("write production qualification response");
+}
+
+#[test]
+fn real_unix_client_interoperates_with_production_server_frame_handler() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("execd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || serve_production_style_qualification(listener));
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut value = request();
+    value["issued_at"] = Value::from(now);
+    value["expires_at"] = Value::from(now + 60);
+    let input = serde_json::to_vec(&value).unwrap();
+    let mut transport =
+        UnixProductionQualificationTransport::at_path(socket, Duration::from_secs(2));
+    let receipt = dispatch(&input, now, &mut transport).expect("production-v2 qualification");
+    assert_eq!(receipt.status, "qualified_closed");
+    assert_eq!(receipt.disposition, "created");
+    assert_eq!(receipt.request_expires_at, now + 60);
     server.join().unwrap();
 }
 
@@ -266,4 +388,9 @@ fn compatibility_fixture_matches_exact_frames_and_receipt() {
     assert_eq!(serde_json::to_value(receipt).unwrap(), fixture["receipt"]);
     let digest = hex::encode(Sha256::digest(&transport.frames[0]));
     assert_eq!(digest, fixture["request_frame_sha256"]);
+    let response = response_for(&transport.frames[0], 0);
+    assert_eq!(
+        hex::encode(Sha256::digest(response)),
+        fixture["response_frame_sha256"]
+    );
 }

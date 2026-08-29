@@ -7,12 +7,16 @@
 use std::{
     fmt,
     io::{Read, Write},
+    net::Shutdown,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use buzz_ci_broker_protocol::ResponseCode;
+use buzz_ci_broker_protocol::{
+    v2::{production_qualification_receipt_digest, ProductionQualificationResponse},
+    GitOid as ProtocolGitOid, ResponseCode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -392,8 +396,34 @@ fn decode_and_validate_response(
     ];
     let qualified_at = u64_at(body, 519);
     let request_expires_at = u64_at(body, 527);
+    let shared_response = ProductionQualificationResponse {
+        code,
+        retry_after_millis: u32_at(body, 2),
+        request_frame_digest: response_frame_digest,
+        qualification_receipt_digest,
+        integrated_candidate_sha: protocol_oid(candidate),
+        activation_package_digest: echoed[0],
+        fixture_digest: echoed[1],
+        principal_digest: echoed[2],
+        lane_manifest_digest: echoed[3],
+        broker_build_identity: echoed[4],
+        host_profile_digest: echoed[5],
+        suite_identity: echoed[6],
+        isolation_profile_digest: echoed[7],
+        seccomp_profile_digest: echoed[8],
+        seccomp_install_receipt_digest,
+        executor_program_digest: echoed[9],
+        executor_provenance_digest: echoed[10],
+        controller_generation: generations[0],
+        runner_generation: generations[1],
+        lane_epoch: generations[2],
+        admission_key_generation: generations[3],
+        qualified_at,
+        request_expires_at,
+    };
     if response_frame_digest != expected_frame_digest
         || qualification_receipt_digest == [0; 32]
+        || production_qualification_receipt_digest(&shared_response) != qualification_receipt_digest
         || candidate != request.candidate
         || echoed != request.digests
         || seccomp_install_receipt_digest == [0; 32]
@@ -447,6 +477,7 @@ fn exchange_unix(path: &Path, timeout: Duration, request: &[u8]) -> Result<Vec<u
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(|_| ExchangeError::Transport)?;
     stream.write_all(request).map_err(map_io_error)?;
+    stream.shutdown(Shutdown::Write).map_err(map_io_error)?;
     let mut response = Vec::with_capacity(RESPONSE_FRAME_SIZE + 1);
     stream
         .take((RESPONSE_FRAME_SIZE + 1) as u64)
@@ -495,6 +526,13 @@ fn decode_oid(input: &[u8]) -> Option<GitOid> {
         }
         2 => Some(GitOid::Sha256(input[1..33].try_into().ok()?)),
         _ => None,
+    }
+}
+
+fn protocol_oid(oid: GitOid) -> ProtocolGitOid {
+    match oid {
+        GitOid::Sha1(bytes) => ProtocolGitOid::Sha1(bytes),
+        GitOid::Sha256(bytes) => ProtocolGitOid::Sha256(bytes),
     }
 }
 

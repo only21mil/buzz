@@ -2214,8 +2214,12 @@ mod tests {
         );
 
         let mut response = qualification_response(request);
-        response.qualification_receipt_digest = [0x71; 32];
         response.seccomp_install_receipt_digest = [0x72; 32];
+        response.qualification_receipt_digest = production_qualification_receipt_digest(&response);
+        assert_eq!(
+            lowercase_hex(response.qualification_receipt_digest),
+            "7fcaa7478a07d9352b885f5db12b40c4bc719680d2bf282b1a4ca5b0975f93ad"
+        );
         let frame = encode_production_qualification_response(header, response);
         assert_eq!(frame.as_bytes().len(), 608);
         assert_eq!(

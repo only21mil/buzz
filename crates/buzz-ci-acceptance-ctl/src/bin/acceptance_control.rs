@@ -4,7 +4,7 @@
 use std::{
     io::{Read, Write},
     os::{
-        fd::FromRawFd,
+        fd::{AsFd, FromRawFd},
         unix::net::{UnixListener, UnixStream},
     },
     path::Path,
@@ -43,10 +43,10 @@ fn run() -> Result<(), ControlError> {
         return Err(ControlError::InvalidConfig);
     }
     validate_systemd_environment()?;
+    let listener = adopt_listener()?;
+    validate_listener(&listener)?;
     let config = AcceptanceControlConfig::load(Path::new(CONTROL_CONFIG_PATH))?;
     let mut host = SystemdHostControl::open(config.clone())?;
-    let listener = adopt_listener();
-    validate_listener(&listener)?;
     loop {
         let (stream, _) = listener.accept().map_err(|_| ControlError::HostAction)?;
         if serve_connection(stream, &config, &mut host).is_err() {
@@ -69,10 +69,27 @@ fn validate_systemd_environment() -> Result<(), ControlError> {
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn adopt_listener() -> UnixListener {
+fn adopt_listener() -> Result<UnixListener, ControlError> {
     // SAFETY: validate_systemd_environment proves systemd assigned the sole
     // named listener to descriptor 3. This function adopts it exactly once.
-    unsafe { UnixListener::from_raw_fd(3) }
+    let listener = unsafe { UnixListener::from_raw_fd(3) };
+    mark_close_on_exec(&listener)?;
+    Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+fn mark_close_on_exec(descriptor: &impl AsFd) -> Result<(), ControlError> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+    let current = fcntl(descriptor, FcntlArg::F_GETFD).map_err(|_| ControlError::InvalidConfig)?;
+    let mut flags = FdFlag::from_bits_truncate(current);
+    flags.insert(FdFlag::FD_CLOEXEC);
+    fcntl(descriptor, FcntlArg::F_SETFD(flags)).map_err(|_| ControlError::InvalidConfig)?;
+    let updated = fcntl(descriptor, FcntlArg::F_GETFD).map_err(|_| ControlError::InvalidConfig)?;
+    if !FdFlag::from_bits_truncate(updated).contains(FdFlag::FD_CLOEXEC) {
+        return Err(ControlError::InvalidConfig);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -137,5 +154,24 @@ fn emit_error(error: ControlError) {
     };
     if serde_json::to_writer(std::io::stderr().lock(), &line).is_ok() {
         eprintln!();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+    #[test]
+    fn adopted_listener_helper_sets_and_proves_close_on_exec() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let listener =
+            UnixListener::bind(directory.path().join("control.sock")).expect("bind listener");
+        fcntl(&listener, FcntlArg::F_SETFD(FdFlag::empty())).expect("clear descriptor flags");
+
+        mark_close_on_exec(&listener).expect("set close-on-exec");
+
+        let flags = fcntl(&listener, FcntlArg::F_GETFD).expect("read descriptor flags");
+        assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
     }
 }
