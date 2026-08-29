@@ -121,6 +121,12 @@ def _validate_units(payloads: dict[str, bytes]) -> None:
         raise ValueError("keyholder socket/FD contract differs")
     if "LimitCORE=0" not in service or "ExecStart=/usr/libexec/buzz-ci-keyholder --config /etc/buzzci/keyholder-v1.json" not in service:
         raise ValueError("keyholder service contract differs")
+    expected_read_only = (
+        "ReadOnlyPaths=/etc/buzzci/keyholder-v1.json /run/buzzci "
+        "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
+    )
+    if expected_read_only not in service.splitlines():
+        raise ValueError("acceptance binding receipt mount contract differs")
 
 
 def freeze_package(

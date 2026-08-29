@@ -1031,6 +1031,7 @@ dependencies = [
 name = "buzz-ci-keyholder"
 version = "0.1.0"
 dependencies = [
+ "buzz-ci-acceptance-ctl",
  "buzz-ci-broker-protocol",
  "buzz-core",
  "hex",

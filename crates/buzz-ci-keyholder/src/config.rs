@@ -7,8 +7,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    AcceptanceSigningPolicy, CanonicalPayload, Operation, OperationSet, PeerPolicy, PublicIdentity,
-    SelectorSet, SigningPolicy,
+    Operation, OperationSet, PeerPolicy, PublicIdentity, SelectorSet, SigningPolicy,
+    ACCEPTANCE_BINDING_PATH,
 };
 
 /// Exact production configuration schema.
@@ -24,9 +24,22 @@ pub struct KeyholderConfig {
     pub selectors: SelectorSet,
     /// Exact HTTPS origin accepted for NIP-98 authorization.
     pub nip98_origin: String,
-    /// Optional activation-only acceptance mutation authority.
-    pub acceptance: Option<AcceptanceSigningPolicy>,
+    /// Optional static locator and credential selector for acceptance authority.
+    pub acceptance: Option<AcceptanceBindingConfig>,
 }
+
+/// Static acceptance authority configuration. Dynamic activation values are
+/// loaded only from the post-freeze root-owned receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptanceBindingConfig {
+    /// Fixed public receipt shared with controld.
+    pub binding_receipt_path: std::path::PathBuf,
+    /// Fixed systemd credential selector for the dedicated actor key.
+    pub credential_selector: String,
+}
+
+/// Exact fixed systemd credential name for acceptance signing.
+pub const ACCEPTANCE_CREDENTIAL_SELECTOR: &str = "acceptance-actor.key";
 
 impl KeyholderConfig {
     /// Load a bounded JSON configuration file.
@@ -74,7 +87,7 @@ impl KeyholderConfig {
         .ok_or(ConfigError::Invalid)?;
         SigningPolicy::validate_nip98_origin(&raw.nip98_origin)
             .map_err(|_| ConfigError::Invalid)?;
-        let acceptance = raw.acceptance.map(RawAcceptance::policy).transpose()?;
+        let acceptance = raw.acceptance.map(RawAcceptance::binding).transpose()?;
         if operations.contains(Operation::SignAcceptanceMutation) != acceptance.is_some()
             || operations.contains(Operation::DescribeAcceptance) != acceptance.is_some()
         {
@@ -165,48 +178,22 @@ struct RawIdentity {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAcceptance {
-    actor: RawIdentity,
-    scenario_sha256: String,
-    run_event: serde_json::Value,
-    grant_event: serde_json::Value,
-    rerun_event: serde_json::Value,
-    tombstone_event: serde_json::Value,
+    binding_receipt_path: String,
+    credential_selector: String,
 }
 
 impl RawAcceptance {
-    fn policy(self) -> Result<AcceptanceSigningPolicy, ConfigError> {
-        let scenario = decode_hex32(&self.scenario_sha256)?;
-        let payload = |value: serde_json::Value| {
-            let bytes = serde_json::to_vec(&value).map_err(|_| ConfigError::Invalid)?;
-            CanonicalPayload::new(bytes).map_err(|_| ConfigError::Invalid)
-        };
-        AcceptanceSigningPolicy::new(
-            self.actor.identity()?,
-            scenario,
-            [
-                payload(self.run_event)?,
-                payload(self.grant_event)?,
-                payload(self.rerun_event)?,
-                payload(self.tombstone_event)?,
-            ],
-        )
-        .map_err(|_| ConfigError::Invalid)
+    fn binding(self) -> Result<AcceptanceBindingConfig, ConfigError> {
+        if self.binding_receipt_path != ACCEPTANCE_BINDING_PATH
+            || self.credential_selector != ACCEPTANCE_CREDENTIAL_SELECTOR
+        {
+            return Err(ConfigError::Invalid);
+        }
+        Ok(AcceptanceBindingConfig {
+            binding_receipt_path: self.binding_receipt_path.into(),
+            credential_selector: self.credential_selector,
+        })
     }
-}
-
-fn decode_hex32(value: &str) -> Result<[u8; 32], ConfigError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(ConfigError::Invalid);
-    }
-    let bytes = hex::decode(value).map_err(|_| ConfigError::Invalid)?;
-    let digest: [u8; 32] = bytes.try_into().map_err(|_| ConfigError::Invalid)?;
-    (digest != [0; 32])
-        .then_some(digest)
-        .ok_or(ConfigError::Invalid)
 }
 
 impl RawIdentity {
@@ -306,6 +293,46 @@ mod tests {
             "https://relay.example.test"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn acceptance_config_contains_only_fixed_receipt_and_credential_selectors() {
+        let mut value: serde_json::Value = serde_json::from_slice(&config(
+            r#"["describe", "describe_acceptance", "sign_acceptance_mutation"]"#,
+            "https://relay.example.test",
+        ))
+        .expect("config");
+        value.as_object_mut().expect("config object").insert(
+            "acceptance".to_owned(),
+            serde_json::json!({
+                "binding_receipt_path": ACCEPTANCE_BINDING_PATH,
+                "credential_selector": ACCEPTANCE_CREDENTIAL_SELECTOR
+            }),
+        );
+        let parsed =
+            KeyholderConfig::from_slice(&serde_json::to_vec(&value).expect("config bytes"))
+                .expect("static acceptance config");
+        let acceptance = parsed.acceptance.expect("acceptance binding");
+        assert_eq!(
+            acceptance.binding_receipt_path,
+            Path::new(ACCEPTANCE_BINDING_PATH)
+        );
+        assert_eq!(
+            acceptance.credential_selector,
+            ACCEPTANCE_CREDENTIAL_SELECTOR
+        );
+
+        value["acceptance"]["binding_receipt_path"] = serde_json::json!("/tmp/forbidden");
+        assert!(
+            KeyholderConfig::from_slice(&serde_json::to_vec(&value).expect("config bytes"))
+                .is_err()
+        );
+        value["acceptance"]["binding_receipt_path"] = serde_json::json!(ACCEPTANCE_BINDING_PATH);
+        value["acceptance"]["scenario_sha256"] = serde_json::json!("09".repeat(32));
+        assert!(
+            KeyholderConfig::from_slice(&serde_json::to_vec(&value).expect("config bytes"))
+                .is_err()
+        );
     }
 
     #[test]

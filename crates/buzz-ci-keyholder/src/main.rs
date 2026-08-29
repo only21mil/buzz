@@ -9,8 +9,9 @@ use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
 #[cfg(target_os = "linux")]
 use buzz_ci_keyholder::{
-    serve_connection, validate_systemd_environment, validate_systemd_listener, KeyholderConfig,
-    ProductionKeyholder, Secp256k1Backend, SigningPolicy, SYSTEMD_LISTEN_FD,
+    serve_connection, validate_systemd_environment, validate_systemd_listener,
+    AcceptanceBindingReceipt, KeyholderConfig, ProductionKeyholder, Secp256k1Backend,
+    SigningPolicy, SYSTEMD_LISTEN_FD,
 };
 
 #[cfg(target_os = "linux")]
@@ -71,7 +72,32 @@ fn run(config_path: PathBuf) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let backend_result = if config.acceptance.is_some() {
+    let acceptance_policy = match config.acceptance.as_ref() {
+        Some(acceptance) => {
+            let receipt = match AcceptanceBindingReceipt::load(&acceptance.binding_receipt_path) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    eprintln!(r#"{{"error":"invalid_acceptance_binding"}}"#);
+                    return ExitCode::from(4);
+                }
+            };
+            if (receipt.peer_uid, receipt.peer_gid)
+                != (config.peer_policy.uid, config.peer_policy.gid)
+            {
+                eprintln!(r#"{{"error":"invalid_acceptance_binding"}}"#);
+                return ExitCode::from(4);
+            }
+            match receipt.signing_policy() {
+                Ok(policy) => Some(policy),
+                Err(_) => {
+                    eprintln!(r#"{{"error":"invalid_acceptance_binding"}}"#);
+                    return ExitCode::from(4);
+                }
+            }
+        }
+        None => None,
+    };
+    let backend_result = if acceptance_policy.is_some() {
         Secp256k1Backend::from_systemd_credentials_with_acceptance(&credentials_directory)
     } else {
         Secp256k1Backend::from_systemd_credentials(&credentials_directory)
@@ -83,7 +109,7 @@ fn run(config_path: PathBuf) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let policy_result = match config.acceptance {
+    let policy_result = match acceptance_policy {
         Some(acceptance) => SigningPolicy::new_with_acceptance(
             config.peer_policy,
             config.selectors,

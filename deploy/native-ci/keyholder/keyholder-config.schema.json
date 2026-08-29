@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/keyholder-acceptance-config-v1.json",
-  "title": "Buzz CI active acceptance keyholder config v1",
+  "$id": "https://buzz.dev/schemas/native-ci/keyholder-config-v1.json",
+  "title": "Buzz CI static keyholder config v1",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "peer", "selectors", "nip98_origin", "acceptance"],
@@ -40,14 +40,10 @@
     "acceptance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event"],
+      "required": ["binding_receipt_path", "credential_selector"],
       "properties": {
-        "actor": { "$ref": "#/$defs/identity" },
-        "scenario_sha256": { "$ref": "#/$defs/lowerHex64" },
-        "run_event": { "$ref": "#/$defs/event" },
-        "grant_event": { "$ref": "#/$defs/event" },
-        "rerun_event": { "$ref": "#/$defs/event" },
-        "tombstone_event": { "$ref": "#/$defs/event" }
+        "binding_receipt_path": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json" },
+        "credential_selector": { "const": "acceptance-actor.key" }
       }
     }
   },
@@ -63,20 +59,6 @@
         "public_key": { "$ref": "#/$defs/lowerHex64" },
         "generation": { "$ref": "#/$defs/generation" }
       }
-    },
-    "event": {
-      "type": "array",
-      "prefixItems": [
-        { "const": 0 },
-        { "$ref": "#/$defs/lowerHex64" },
-        { "type": "integer", "minimum": 0 },
-        { "type": "integer", "minimum": 0 },
-        { "type": "array" },
-        { "type": "string" }
-      ],
-      "items": false,
-      "minItems": 6,
-      "maxItems": 6
     }
   }
 }

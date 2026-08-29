@@ -36,8 +36,6 @@ def identity(public_key: str, generation: int) -> dict[str, object]:
 
 
 def public_spec(uid: int = 1201, gid: int = 1201) -> dict[str, object]:
-    actor = "04" * 32
-    channel = "123e4567-e89b-12d3-a456-426614174099"
     return {
         "schema_version": 1,
         "peer": {"uid": uid, "gid": gid},
@@ -48,12 +46,8 @@ def public_spec(uid: int = 1201, gid: int = 1201) -> dict[str, object]:
         },
         "nip98_origin": "https://relay.example.test",
         "acceptance": {
-            "actor": identity(actor, 10),
-            "scenario_sha256": "09" * 32,
-            "run_event": [0, actor, 1_800_000_000, 46100, [["h", channel]], "{\"type\":\"run\"}"],
-            "grant_event": [0, actor, 1_800_000_001, 46107, [["h", channel]], "{\"type\":\"grant\"}"],
-            "rerun_event": [0, actor, 1_800_000_010, 46100, [["h", channel]], "{\"type\":\"rerun\"}"],
-            "tombstone_event": [0, actor, 1_800_000_020, 5, [["e", "08" * 32]], ""],
+            "binding_receipt_path": RENDERER.BINDING_RECEIPT_PATH,
+            "credential_selector": RENDERER.ACCEPTANCE_CREDENTIAL_SELECTOR,
         },
     }
 
@@ -116,28 +110,32 @@ class KeyholderPackageTests(unittest.TestCase):
         credential.chmod(mode)
         return credential
 
-    def test_renderer_emits_exact_active_contract_and_event_ids_are_public(self) -> None:
+    def test_renderer_emits_exact_static_contract_without_activation_values(self) -> None:
         rendered = RENDERER.validate_spec(public_spec())
         self.assertEqual(rendered["peer"]["allowed_operations"], RENDERER.OPERATIONS)
         self.assertEqual(set(rendered["selectors"]), {"ci_event", "nip98", "manifest"})
         self.assertNotIn("acceptance", rendered["selectors"])
-        self.assertEqual(rendered["acceptance"]["actor"]["generation"], 10)
-        event_ids = [
-            hashlib.sha256(json.dumps(rendered["acceptance"][field], separators=(",", ":")).encode()).hexdigest()
-            for field in RENDERER.EVENT_FIELDS
-        ]
-        self.assertEqual(len(set(event_ids)), 4)
-        self.assertTrue(all(len(event_id) == 64 for event_id in event_ids))
+        self.assertEqual(rendered["acceptance"], {
+            "binding_receipt_path": RENDERER.BINDING_RECEIPT_PATH,
+            "credential_selector": RENDERER.ACCEPTANCE_CREDENTIAL_SELECTOR,
+        })
+        encoded = RENDERER.canonical_json(rendered).decode()
+        for forbidden in ("scenario_sha256", "activation_package_digest", "run_event", "grant_event"):
+            self.assertNotIn(forbidden, encoded)
 
-    def test_renderer_rejects_unknown_fields_wrong_actor_and_operation_injection(self) -> None:
+    def test_renderer_rejects_unknown_fields_binding_drift_and_operation_injection(self) -> None:
         unknown = public_spec()
         unknown["key_descriptor"] = "/forbidden"
         with self.assertRaisesRegex(ValueError, "fields"):
             RENDERER.validate_spec(unknown)
-        wrong_actor = public_spec()
-        wrong_actor["acceptance"]["run_event"][1] = "05" * 32
-        with self.assertRaisesRegex(ValueError, "identity"):
-            RENDERER.validate_spec(wrong_actor)
+        drifted = public_spec()
+        drifted["acceptance"]["binding_receipt_path"] = "/tmp/receipt"
+        with self.assertRaisesRegex(ValueError, "contract differs"):
+            RENDERER.validate_spec(drifted)
+        dynamic = public_spec()
+        dynamic["acceptance"]["scenario_sha256"] = "09" * 32
+        with self.assertRaisesRegex(ValueError, "fields"):
+            RENDERER.validate_spec(dynamic)
         active = RENDERER.validate_spec(public_spec())
         active["peer"]["allowed_operations"] = RENDERER.OPERATIONS + ["unknown"]
         with self.assertRaisesRegex(ValueError, "operation set"):
@@ -165,6 +163,8 @@ class KeyholderPackageTests(unittest.TestCase):
         self.assertIn("ListenStream=/run/buzzci/keyholder.sock", socket)
         self.assertIn("FileDescriptorName=buzz-ci-keyholder-control", socket)
         self.assertIn("LimitCORE=0", service)
+        self.assertIn(RENDERER.BINDING_RECEIPT_PATH, service)
+        self.assertIn("ProtectSystem=strict", service)
 
     def test_systemd_units_verify_with_active_dropin(self) -> None:
         root = self.base / "systemd-root"
@@ -202,6 +202,15 @@ class KeyholderPackageTests(unittest.TestCase):
         self.assertEqual({entry["role"] for entry in manifest["entries"]}, set(INSTALLER.EXPECTED_TARGETS))
         parsed, _ = INSTALLER.parse_package(self.package, self.package)
         self.assertEqual(parsed["package_digest"], manifest["package_digest"])
+        config_entry = next(entry for entry in manifest["entries"] if entry["role"] == "config")
+        config = json.loads((self.package / config_entry["source"]).read_bytes())
+        self.assertEqual(config["acceptance"], {
+            "binding_receipt_path": RENDERER.BINDING_RECEIPT_PATH,
+            "credential_selector": RENDERER.ACCEPTANCE_CREDENTIAL_SELECTOR,
+        })
+        serialized = json.dumps(config, sort_keys=True)
+        for forbidden in ("scenario_sha256", "activation_package_digest", "run_event", "grant_event"):
+            self.assertNotIn(forbidden, serialized)
         self.assertEqual(stat.S_IMODE(self.package.stat().st_mode), 0o700)
         self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o400 for path in (self.package / "assets").iterdir()))
 
