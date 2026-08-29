@@ -24,7 +24,7 @@ ACTIVE_FIELDS = {
     "lane_manifest_digest", "lane_epoch", "audience_digest", "isolation_profile_digest",
     "workflow_id", "workflow_digest", "jobs", "keyholder_socket", "keyholder_uid",
     "keyholder_gid", "keyholder_selectors", "keyholder_timeout_millis",
-    "keyholder_transport_attempts", "acceptance",
+    "keyholder_transport_attempts",
 }
 
 
@@ -135,37 +135,6 @@ def validate_active(active: dict[str, object] | None) -> None:
     selectors = active["keyholder_selectors"]
     if not isinstance(selectors, dict) or set(selectors) != {"ci_event", "nip98", "manifest"}:
         raise ValueError("keyholder selectors are incomplete")
-    acceptance = active["acceptance"]
-    if not isinstance(acceptance, dict) or set(acceptance) != {
-        "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event"
-    }:
-        raise ValueError("acceptance mutation binding is incomplete")
-    actor = acceptance["actor"]
-    if not isinstance(actor, dict) or set(actor) != {"public_key", "generation"}:
-        raise ValueError("acceptance actor binding is incomplete")
-    if (
-        not isinstance(actor["public_key"], str) or len(actor["public_key"]) != 64
-        or any(ch not in "0123456789abcdef" for ch in actor["public_key"])
-        or isinstance(actor["generation"], bool) or not isinstance(actor["generation"], int)
-        or actor["generation"] < 1
-        or not isinstance(acceptance["scenario_sha256"], str)
-        or len(acceptance["scenario_sha256"]) != 64
-        or any(ch not in "0123456789abcdef" for ch in acceptance["scenario_sha256"])
-    ):
-        raise ValueError("acceptance actor or scenario binding is invalid")
-    for field in ("run_event", "grant_event", "rerun_event", "tombstone_event"):
-        event = acceptance[field]
-        if (
-            not isinstance(event, list) or len(event) != 6 or event[0] != 0
-            or event[1] != actor["public_key"]
-            or isinstance(event[2], bool) or not isinstance(event[2], int) or event[2] < 0
-            or isinstance(event[3], bool) or not isinstance(event[3], int) or event[3] < 0
-            or not isinstance(event[4], list) or not isinstance(event[5], str)
-            or len(json.dumps(event, separators=(",", ":")).encode()) > 48 * 1024
-        ):
-            raise ValueError(f"invalid acceptance event template: {field}")
-
-
 def require_safe_parent(path: Path) -> Path:
     parent = path.parent
     lexical = Path(os.path.abspath(parent))

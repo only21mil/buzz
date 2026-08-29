@@ -17,7 +17,10 @@ pub mod runner_v2;
 pub mod source;
 pub mod store;
 
-pub use acceptance_socket::ACCEPTANCE_BINDING_PATH;
+pub use acceptance_socket::{
+    AcceptanceActorBinding, AcceptanceAuthorityBinding, AcceptanceBinding, ACCEPTANCE_BINDING_PATH,
+    ACCEPTANCE_BINDING_SCHEMA,
+};
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};

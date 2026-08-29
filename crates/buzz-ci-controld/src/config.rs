@@ -8,9 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{de, Deserialize, Deserializer};
 use thiserror::Error;
 
-use buzz_ci_controld::keyholder::{
-    KeyholderClientConfig, KeyholderSelectorBinding, KeyholderSelectorBindings,
-};
+use buzz_ci_controld::keyholder::{KeyholderClientConfig, KeyholderSelectorBindings};
 use buzz_ci_controld::runner_client::UnixRunnerConnectorConfig;
 use buzz_ci_controld::{ACCEPTANCE_BINDING_PATH, RUNNER_CONTROL_SOCKET_PATH};
 
@@ -46,18 +44,6 @@ pub(crate) struct ActiveConfig {
     pub(crate) workflow_digest: String,
     pub(crate) jobs: Vec<StaticJobConfig>,
     pub(crate) keyholder: KeyholderClientConfig,
-    pub(crate) acceptance: AcceptanceMutationConfig,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AcceptanceMutationConfig {
-    pub(crate) actor: KeyholderSelectorBinding,
-    pub(crate) scenario_sha256: String,
-    pub(crate) run_event: serde_json::Value,
-    pub(crate) grant_event: serde_json::Value,
-    pub(crate) rerun_event: serde_json::Value,
-    pub(crate) tombstone_event: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -112,7 +98,6 @@ struct RawDaemonConfig {
     keyholder_selectors: Option<KeyholderSelectorBindings>,
     keyholder_timeout_millis: Option<u64>,
     keyholder_transport_attempts: Option<u32>,
-    acceptance: Option<AcceptanceMutationConfig>,
 }
 
 impl<'de> Deserialize<'de> for DaemonConfig {
@@ -199,8 +184,7 @@ impl DaemonConfig {
             || raw.keyholder_gid.is_some()
             || raw.keyholder_selectors.is_some()
             || raw.keyholder_timeout_millis.is_some()
-            || raw.keyholder_transport_attempts.is_some()
-            || raw.acceptance.is_some();
+            || raw.keyholder_transport_attempts.is_some();
         let acceptance_binding = raw.acceptance_binding.take();
         if acceptance_binding
             .as_deref()
@@ -292,8 +276,6 @@ impl DaemonConfig {
                 keyholder
                     .validate()
                     .map_err(|_| ConfigError::InvalidSchema)?;
-                let acceptance = raw.acceptance.take().ok_or(ConfigError::InvalidSchema)?;
-                validate_acceptance(&acceptance)?;
                 Some(ActiveConfig {
                     relay_url,
                     relay_http_origin,
@@ -309,7 +291,6 @@ impl DaemonConfig {
                     workflow_digest: raw.workflow_digest.take().unwrap(),
                     jobs,
                     keyholder,
-                    acceptance,
                 })
             }
             _ => return Err(ConfigError::InvalidSchema),
@@ -410,38 +391,6 @@ fn validate_static_jobs(workflow_id: &str, jobs: &[StaticJobConfig]) -> Result<(
         })
     {
         return Err(ConfigError::InvalidSchema);
-    }
-    Ok(())
-}
-
-fn validate_acceptance(value: &AcceptanceMutationConfig) -> Result<(), ConfigError> {
-    if !is_lower_hex(&value.actor.public_key, 64)
-        || value.actor.generation == 0
-        || !is_lower_hex(&value.scenario_sha256, 64)
-    {
-        return Err(ConfigError::InvalidSchema);
-    }
-    for event in [
-        &value.run_event,
-        &value.grant_event,
-        &value.rerun_event,
-        &value.tombstone_event,
-    ] {
-        let fields = event.as_array().ok_or(ConfigError::InvalidSchema)?;
-        if fields.len() != 6
-            || fields[0].as_u64() != Some(0)
-            || fields[1].as_str() != Some(&value.actor.public_key)
-            || !fields[2].is_u64()
-            || !fields[3].is_u64()
-            || !fields[4].is_array()
-            || !fields[5].is_string()
-            || serde_json::to_vec(event)
-                .map_err(|_| ConfigError::InvalidSchema)?
-                .len()
-                > 48 * 1024
-        {
-            return Err(ConfigError::InvalidSchema);
-        }
     }
     Ok(())
 }
@@ -572,21 +521,15 @@ mod tests {
                     "manifest":{{"public_key":"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9","generation":3}}
                 }},
                 "keyholder_timeout_millis":500,
-                "keyholder_transport_attempts":2,
-                "acceptance":{{
-                    "actor":{{"public_key":"{actor}","generation":4}},
-                    "scenario_sha256":"{digest}",
-                    "run_event":[0,"{actor}",1,46100,[],"{{}}"],
-                    "grant_event":[0,"{actor}",2,46107,[],"{{}}"],
-                    "rerun_event":[0,"{actor}",3,46100,[],"{{}}"],
-                    "tombstone_event":[0,"{actor}",4,5,[],""]
-                }}
+                "keyholder_transport_attempts":2
             }}"#,
             store.path().display(),
             digest = "11".repeat(32),
-            actor = "2a".repeat(32),
         );
         let (_root, path, owner_uid) = fixture(&json);
+
+        assert!(!json.contains("scenario_sha256"));
+        assert!(!json.contains("activation_package_digest"));
 
         let config = DaemonConfig::load(&path, owner_uid).expect("active configuration");
         let active = config.active().expect("active binding");
@@ -605,7 +548,20 @@ mod tests {
             PathBuf::from(KEYHOLDER_SOCKET_PATH)
         );
         assert_eq!(active.keyholder.keyholder_selectors.nip98.generation, 2);
-        assert_eq!(active.acceptance.actor.generation, 4);
+
+        let cyclic = json.replacen(
+            "\"keyholder_transport_attempts\":2",
+            &format!(
+                "\"keyholder_transport_attempts\":2,\"acceptance\":{{\"scenario_sha256\":\"{}\"}}",
+                "11".repeat(32)
+            ),
+            1,
+        );
+        let (_root, path, owner_uid) = fixture(&cyclic);
+        assert_eq!(
+            DaemonConfig::load(&path, owner_uid),
+            Err(ConfigError::InvalidSyntax)
+        );
     }
 
     #[test]

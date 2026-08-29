@@ -12,6 +12,7 @@ use buzz_ci_acceptance_ctl::production::{
     expected_adapter_operation_id, AdapterRequest, AdapterResponse, ControlReadback,
     ADAPTER_REQUEST_SCHEMA, ADAPTER_RESPONSE_SCHEMA, MAX_ADAPTER_FRAME_BYTES,
 };
+use buzz_ci_keyholder::{AcceptanceSigningPolicy, CanonicalPayload, PublicIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -20,9 +21,10 @@ pub const ACCEPTANCE_SOCKET_PATH: &str = "/run/buzzci/controld-acceptance.sock";
 pub const ACCEPTANCE_FD_NAME: &str = "buzz-ci-controld-acceptance";
 pub const ACCEPTANCE_BINDING_PATH: &str =
     "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json";
-pub const ACCEPTANCE_BINDING_SCHEMA: &str = "buzz-ci-controld-acceptance-binding/v1";
+pub const ACCEPTANCE_BINDING_SCHEMA: &str = "buzz-ci-activation-acceptance-binding/v1";
 pub const SYSTEMD_LISTEN_FD: i32 = 3;
-const ACCEPTANCE_BINDING_MODE: u32 = 0o440;
+const ACCEPTANCE_BINDING_MODE: u32 = 0o444;
+const ACCEPTANCE_BINDING_PARENT_MODE: u32 = 0o711;
 const MAX_ACCEPTANCE_BINDING_BYTES: u64 = 256 * 1024;
 const ACCEPTANCE_LEDGER_SCHEMA: &str = "buzz-ci-controld-acceptance-ledger/v1";
 const ACCEPTANCE_LEDGER_NAME: &str = "acceptance-operation-ledger-v1.json";
@@ -45,21 +47,70 @@ pub struct AcceptanceBinding {
     pub peer_gid: u32,
     pub timeout_millis: u64,
     pub fixture: FixtureSpec,
+    pub acceptance: AcceptanceAuthorityBinding,
+}
+
+/// Post-freeze public acceptance authority. It lives only in the root-owned
+/// receipt because its scenario digest commits the final package digest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceAuthorityBinding {
+    pub actor: AcceptanceActorBinding,
+    pub scenario_sha256: String,
+    pub run_event: serde_json::Value,
+    pub grant_event: serde_json::Value,
+    pub rerun_event: serde_json::Value,
+    pub tombstone_event: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceActorBinding {
+    pub public_key: String,
+    pub generation: u64,
+}
+
+impl AcceptanceAuthorityBinding {
+    pub fn signing_policy(&self) -> Result<AcceptanceSigningPolicy, AcceptanceSocketError> {
+        let actor = PublicIdentity {
+            public_key: decode_hex32(&self.actor.public_key)?,
+            generation: self.actor.generation,
+        };
+        let scenario_sha256 = decode_hex32(&self.scenario_sha256)?;
+        let payload = |event: &serde_json::Value| {
+            CanonicalPayload::new(
+                serde_json::to_vec(event).map_err(|_| AcceptanceSocketError::Binding)?,
+            )
+            .map_err(|_| AcceptanceSocketError::Binding)
+        };
+        AcceptanceSigningPolicy::new(
+            actor,
+            scenario_sha256,
+            [
+                payload(&self.run_event)?,
+                payload(&self.grant_event)?,
+                payload(&self.rerun_event)?,
+                payload(&self.tombstone_event)?,
+            ],
+        )
+        .map_err(|_| AcceptanceSocketError::Binding)
+    }
 }
 
 impl AcceptanceBinding {
-    /// Read one canonical root-owned, controld-group-readable receipt without
-    /// following links or accepting a replaced inode.
+    /// Read one canonical root-owned public receipt without following links or
+    /// accepting a replaced inode.
     #[cfg(target_os = "linux")]
-    pub fn load(path: &Path, expected_group_gid: u32) -> Result<Self, AcceptanceSocketError> {
+    pub fn load(path: &Path) -> Result<Self, AcceptanceSocketError> {
         use nix::fcntl::{open, OFlag};
         use nix::sys::stat::Mode;
 
         if path != Path::new(ACCEPTANCE_BINDING_PATH) || !normalized_absolute(path) {
             return Err(AcceptanceSocketError::Binding);
         }
+        validate_binding_parent(path.parent().ok_or(AcceptanceSocketError::Binding)?)?;
         let before = fs::symlink_metadata(path).map_err(|_| AcceptanceSocketError::Binding)?;
-        validate_binding_metadata(&before, expected_group_gid)?;
+        validate_binding_metadata(&before)?;
         if fs::canonicalize(path).map_err(|_| AcceptanceSocketError::Binding)? != path
             || before.len() > MAX_ACCEPTANCE_BINDING_BYTES
         {
@@ -75,7 +126,7 @@ impl AcceptanceBinding {
         let opened = file
             .metadata()
             .map_err(|_| AcceptanceSocketError::Binding)?;
-        validate_binding_metadata(&opened, expected_group_gid)?;
+        validate_binding_metadata(&opened)?;
         if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
             return Err(AcceptanceSocketError::Binding);
         }
@@ -86,21 +137,16 @@ impl AcceptanceBinding {
         if bytes.len() as u64 > MAX_ACCEPTANCE_BINDING_BYTES {
             return Err(AcceptanceSocketError::Binding);
         }
-        let binding: Self =
-            serde_json::from_slice(&bytes).map_err(|_| AcceptanceSocketError::Binding)?;
-        binding.validate()?;
-        if serde_json::to_vec(&binding).map_err(|_| AcceptanceSocketError::Binding)? != bytes {
-            return Err(AcceptanceSocketError::Binding);
-        }
-        Ok(binding)
+        Self::from_canonical_bytes(&bytes)
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn load(_path: &Path, _expected_group_gid: u32) -> Result<Self, AcceptanceSocketError> {
+    pub fn load(_path: &Path) -> Result<Self, AcceptanceSocketError> {
         Err(AcceptanceSocketError::Activation)
     }
 
     pub fn validate(&self) -> Result<(), AcceptanceSocketError> {
+        let policy = self.acceptance.signing_policy()?;
         if self.schema_version != ACCEPTANCE_BINDING_SCHEMA
             || self.activation_id != self.fixture.activation_id
             || self.activation_package_digest != self.fixture.activation_package_digest
@@ -109,6 +155,10 @@ impl AcceptanceBinding {
             || self.peer_gid == 0
             || self.timeout_millis == 0
             || self.timeout_millis > 300_000
+            || self.acceptance.scenario_sha256 != self.scenario_sha256
+            || self.fixture.request_digest != hex::encode(policy.event_ids()[0])
+            || self.fixture.grant_event_id != hex::encode(policy.event_ids()[1])
+            || self.fixture.approved_by != hex::encode(policy.actor().public_key)
         {
             return Err(AcceptanceSocketError::Binding);
         }
@@ -136,6 +186,29 @@ impl AcceptanceBinding {
             expected_adapter_operation_id(&probe).map_err(|_| AcceptanceSocketError::Binding)?;
         probe.validate().map_err(|_| AcceptanceSocketError::Binding)
     }
+
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, AcceptanceSocketError> {
+        if bytes.len() as u64 > MAX_ACCEPTANCE_BINDING_BYTES {
+            return Err(AcceptanceSocketError::Binding);
+        }
+        let binding: Self =
+            serde_json::from_slice(bytes).map_err(|_| AcceptanceSocketError::Binding)?;
+        binding.validate()?;
+        if serde_json::to_vec(&binding).map_err(|_| AcceptanceSocketError::Binding)? != bytes {
+            return Err(AcceptanceSocketError::Binding);
+        }
+        Ok(binding)
+    }
+}
+
+fn decode_hex32(value: &str) -> Result<[u8; 32], AcceptanceSocketError> {
+    if !lower_hex(value, 64) {
+        return Err(AcceptanceSocketError::Binding);
+    }
+    hex::decode(value)
+        .map_err(|_| AcceptanceSocketError::Binding)?
+        .try_into()
+        .map_err(|_| AcceptanceSocketError::Binding)
 }
 
 /// Durable request replay and sequence boundary for one activation scenario.
@@ -470,16 +543,27 @@ fn lower_hex(value: &str, length: usize) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_binding_metadata(
-    metadata: &fs::Metadata,
-    expected_group_gid: u32,
-) -> Result<(), AcceptanceSocketError> {
-    if expected_group_gid == 0
-        || !metadata.file_type().is_file()
+fn validate_binding_metadata(metadata: &fs::Metadata) -> Result<(), AcceptanceSocketError> {
+    if !metadata.file_type().is_file()
         || metadata.permissions().mode() & 0o7777 != ACCEPTANCE_BINDING_MODE
         || metadata.uid() != 0
-        || metadata.gid() != expected_group_gid
+        || metadata.gid() != 0
         || metadata.nlink() != 1
+    {
+        return Err(AcceptanceSocketError::Binding);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_binding_parent(path: &Path) -> Result<(), AcceptanceSocketError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| AcceptanceSocketError::Binding)?;
+    if path != Path::new("/var/lib/buzzci/activation-controller")
+        || fs::canonicalize(path).map_err(|_| AcceptanceSocketError::Binding)? != path
+        || !metadata.file_type().is_dir()
+        || metadata.permissions().mode() & 0o7777 != ACCEPTANCE_BINDING_PARENT_MODE
+        || metadata.uid() != 0
+        || metadata.gid() != 0
     {
         return Err(AcceptanceSocketError::Binding);
     }
@@ -673,6 +757,8 @@ mod tests {
     use buzz_ci_acceptance_ctl::production::{
         expected_adapter_operation_id, ControlReadback, ADAPTER_REQUEST_SCHEMA,
     };
+    use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
+    use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
 
     struct Handler;
 
@@ -710,19 +796,21 @@ mod tests {
     }
 
     fn request() -> AdapterRequest {
+        let acceptance = authority();
+        let policy = acceptance.signing_policy().unwrap();
         let fixture = FixtureSpec {
             integrated_candidate_sha: "11".repeat(20),
             activation_id: "activation-1".into(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
             job_id: "test".into(),
-            request_digest: "14".repeat(32),
+            request_digest: hex::encode(policy.event_ids()[0]),
             manifest_digest: "15".repeat(32),
             source_oid: "16".repeat(20),
             approval_id: "17".repeat(16),
-            grant_event_id: "18".repeat(32),
+            grant_event_id: hex::encode(policy.event_ids()[1]),
             grant_digest: "19".repeat(32),
-            approved_by: "1a".repeat(32),
+            approved_by: acceptance.actor.public_key,
             export_subject: "1b".repeat(32),
             export_authorization_digest: "1c".repeat(32),
             controller_generation: 7,
@@ -772,7 +860,155 @@ mod tests {
             peer_gid: nix::unistd::getegid().as_raw(),
             timeout_millis: 1_000,
             fixture: request.fixture.clone(),
+            acceptance: authority(),
         }
+    }
+
+    fn authority() -> AcceptanceAuthorityBinding {
+        let actor = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let channel = "123e4567-e89b-12d3-a456-426614174099";
+        let mut run = CiRequestEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_type: CiRequestType::Run,
+            target_repo_a: format!("30617:{}:buzz", "22".repeat(32)),
+            pr_root_event_id: "33".repeat(32),
+            pr_update_event_id: None,
+            source_clone_url: "https://relay.example/git/repo".into(),
+            immutable_source_ref: "refs/nostr/source".into(),
+            tip_oid: "16".repeat(20),
+            source_branch: "feature".into(),
+            base_ref: "refs/heads/main".into(),
+            base_oid: "55".repeat(20),
+            workflow_id: "native-ci".into(),
+            workflow_digest: "66".repeat(32),
+            job_ids: vec!["test".into()],
+            run_id: "13131313-1313-1313-1313-131313131313".into(),
+            attempt: 1,
+            parent_attempt: None,
+            parent_run_id: None,
+            trigger_event_id: "33".repeat(32),
+            actor: actor.into(),
+            timeout_seconds: 30,
+            idempotency_key: "123e4567-e89b-12d3-a456-426614174012".into(),
+            issued_at: 1_800_000_000,
+            expires_at: 1_800_000_300,
+        };
+        let run_event = serde_json::json!([
+            0,
+            actor,
+            run.issued_at,
+            KIND_CI_REQUEST,
+            request_tags(channel, &run).unwrap(),
+            serde_json::to_string(&run).unwrap()
+        ]);
+        let grant_event = serde_json::json!([
+            0,
+            actor,
+            1_800_000_001_u64,
+            KIND_CI_GRANT,
+            [["h", channel]],
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 1,
+                "target_repo_a": run.target_repo_a,
+                "signer_pubkey": actor,
+                "valid_from": 1_800_000_001_i64,
+                "valid_until": 1_800_000_600_i64,
+            }))
+            .unwrap()
+        ]);
+        run.request_type = CiRequestType::Rerun;
+        run.attempt = 2;
+        run.parent_attempt = Some(1);
+        run.parent_run_id = Some(run.run_id.clone());
+        run.idempotency_key = "123e4567-e89b-12d3-a456-426614174013".into();
+        run.issued_at += 10;
+        run.expires_at += 10;
+        let rerun_event = serde_json::json!([
+            0,
+            actor,
+            run.issued_at,
+            KIND_CI_REQUEST,
+            request_tags(channel, &run).unwrap(),
+            serde_json::to_string(&run).unwrap()
+        ]);
+        let rerun_id = Sha256::digest(serde_json::to_vec(&rerun_event).unwrap());
+        let tombstone_event = serde_json::json!([
+            0,
+            actor,
+            1_800_000_020_u64,
+            KIND_DELETION,
+            [["e", hex::encode(rerun_id)]],
+            ""
+        ]);
+        AcceptanceAuthorityBinding {
+            actor: AcceptanceActorBinding {
+                public_key: actor.into(),
+                generation: 10,
+            },
+            scenario_sha256: "1f".repeat(32),
+            run_event,
+            grant_event,
+            rerun_event,
+            tombstone_event,
+        }
+    }
+
+    #[test]
+    fn post_freeze_binding_reloads_identically_and_rejects_dynamic_drift() {
+        let expected = binding(&request());
+        let canonical = serde_json::to_vec(&expected).unwrap();
+        assert_eq!(
+            AcceptanceBinding::from_canonical_bytes(&canonical).unwrap(),
+            expected
+        );
+        assert_eq!(
+            AcceptanceBinding::from_canonical_bytes(&canonical).unwrap(),
+            expected
+        );
+
+        let mut tampered = Vec::new();
+
+        let mut value = expected.clone();
+        value.activation_package_digest = "00".repeat(32);
+        tampered.push(value);
+
+        let mut value = expected.clone();
+        value.acceptance.scenario_sha256 = "00".repeat(32);
+        tampered.push(value);
+
+        let mut value = expected.clone();
+        value.fixture.integrated_candidate_sha = "not-a-candidate".into();
+        tampered.push(value);
+
+        let mut value = expected.clone();
+        value.fixture.request_digest = "00".repeat(32);
+        tampered.push(value);
+
+        let mut value = expected.clone();
+        value.fixture.controller_generation = 0;
+        tampered.push(value);
+
+        let mut value = expected.clone();
+        value.acceptance.actor.generation = 0;
+        tampered.push(value);
+
+        let mut value = expected.clone();
+        value.peer_uid = 0;
+        tampered.push(value);
+
+        for value in tampered {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                AcceptanceBinding::from_canonical_bytes(&bytes),
+                Err(AcceptanceSocketError::Binding)
+            );
+        }
+
+        let noncanonical = serde_json::to_vec_pretty(&expected).unwrap();
+        assert_eq!(
+            AcceptanceBinding::from_canonical_bytes(&noncanonical),
+            Err(AcceptanceSocketError::Binding)
+        );
     }
 
     #[test]
@@ -835,6 +1071,14 @@ mod tests {
             serde_json::to_vec(&replayed).unwrap(),
             serde_json::to_vec(&first).unwrap()
         );
+
+        let mut replaced_binding = binding(&request);
+        replaced_binding.activation_id = "activation-2".into();
+        replaced_binding.fixture.activation_id = "activation-2".into();
+        assert!(matches!(
+            AcceptanceJournal::open(root.path(), owner_uid, replaced_binding),
+            Err(AcceptanceSocketError::Replay)
+        ));
 
         let mut divergent = exact.clone();
         divergent.push(b' ');
