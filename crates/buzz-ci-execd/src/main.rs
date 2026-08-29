@@ -13,8 +13,7 @@ use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
 #[cfg(target_os = "linux")]
 use buzz_ci_execd::control::{
-    peer_uid_policy, validate_systemd_environment, validate_systemd_listener, ControlError,
-    ControlServer,
+    validate_systemd_environment, validate_systemd_listener, ControlError, ControlServer,
 };
 #[cfg(target_os = "linux")]
 use buzz_ci_execd::materializer_handoff::run_materializer_handoff_service;
@@ -75,13 +74,6 @@ fn main() -> ExitCode {
                         return ExitCode::from(4);
                     }
                 };
-                let peer_policy = match peer_uid_policy() {
-                    Ok(policy) => policy,
-                    Err(error) => {
-                        eprintln!(r#"{{"error":"peer_accounts","reason":"{error}"}}"#);
-                        return ExitCode::from(4);
-                    }
-                };
                 let startup_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
                     Ok(duration) => duration.as_secs(),
                     Err(_) => {
@@ -89,8 +81,18 @@ fn main() -> ExitCode {
                         return ExitCode::from(4);
                     }
                 };
-                let dispatch = load_production_dispatch(startup_now);
-                let mut server = match ControlServer::new_polling(listener, peer_policy, dispatch) {
+                let runtime = match load_production_dispatch(startup_now) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        eprintln!(r#"{{"error":"production_v2","reason":"{error:?}"}}"#);
+                        return ExitCode::from(4);
+                    }
+                };
+                let mut server = match ControlServer::new_polling(
+                    listener,
+                    runtime.peer_policy,
+                    runtime.dispatch,
+                ) {
                     Ok(server) => server,
                     Err(error) => {
                         eprintln!(r#"{{"error":"control_listener","reason":"{error}"}}"#);

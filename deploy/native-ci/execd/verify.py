@@ -20,6 +20,12 @@ EXPECTED = {
         "ReadOnlyPaths=/etc/buzzci/execd-v2.json /usr/libexec/buzz-ci-executor /usr/share/containers/seccomp.json",
         "ReadWritePaths=/var/lib/buzzci/execd-v2 /var/lib/buzzci/seccomp /var/lib/buzzci/activation/receipts",
         "RestrictAddressFamilies=AF_UNIX",
+        "PrivateDevices=yes",
+        "DevicePolicy=closed",
+        "RestrictNamespaces=yes",
+        "CapabilityBoundingSet=",
+        "AmbientCapabilities=",
+        "SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap",
     ),
     "templates/buzz-ci-executor.service": (
         "User=buzzci-job",
@@ -47,11 +53,21 @@ EXPECTED = {
 def verify(source_root: Path) -> None:
     root = source_root.resolve(strict=True) / "deploy/native-ci/execd"
     schema = json.loads((root / "execd-config.schema.json").read_bytes())
-    if schema["properties"]["capacity"] != {"const": 1}:
-        raise ValueError("capacity-one schema drift")
+    if schema["properties"]["capacity"] != {"enum": [0, 1]}:
+        raise ValueError("closed/active capacity schema drift")
     members = schema["$defs"]["identities"]["properties"]["access_group_members"]
     if members != {"const": ["buzzci-ctl", "buzzci-runner"]}:
         raise ValueError("execd access group drift")
+    identities = schema["$defs"]["identities"]["properties"]
+    expected_control = {
+        "control_user": {"const": "buzzci-ctl"},
+        "control_group": {"const": "buzzci-ctl"},
+        "control_home": {"const": "/var/lib/buzzci/ctl"},
+        "control_shell": {"const": "/usr/sbin/nologin"},
+        "control_supplementary_groups": {"const": ["buzzci-execd"]},
+    }
+    if any(identities.get(name) != value for name, value in expected_control.items()):
+        raise ValueError("qualification principal schema drift")
     program = schema["$defs"]["program"]["properties"]
     if program["path"] != {"const": "/usr/libexec/buzz-ci-executor"} or program["mode"] != {"const": 493}:
         raise ValueError("executor provenance schema drift")
@@ -72,6 +88,7 @@ def verify(source_root: Path) -> None:
         "d /var/lib/buzzci/execd-v2/evidence 0700 root root - -",
         "d /var/lib/buzzci/execd-v2/teardown 0700 root root - -",
         "d /var/lib/buzzci/execd-v2/attempts 0711 root root - -",
+        "d /var/lib/buzzci/execd-v2/qualification 0700 root root - -",
     ]
     for line in tmpfiles:
         fields = line.split()
@@ -90,7 +107,7 @@ def main() -> int:
     parser.add_argument("--source-root", type=Path, required=True)
     args = parser.parse_args()
     verify(args.source_root)
-    print('{"status":"ok","capacity":1,"executor":"buzzci-job"}')
+    print('{"status":"ok","capacity":"0_or_1","executor":"buzzci-job","production_protocol":2}')
     return 0
 
 

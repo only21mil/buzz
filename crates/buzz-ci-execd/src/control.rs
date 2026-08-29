@@ -5,7 +5,6 @@
 
 use std::{
     env,
-    fs::File,
     io::{self, Read},
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
@@ -38,16 +37,8 @@ use crate::qualification_host::{
     QualificationHostExecution, QualificationHostOutcome, QualificationHostPlan,
 };
 
-const CONTROL_ACCOUNT: &str = "buzzci-ctl";
-const CONTROL_ACCOUNT_UID: u32 = 961;
-const CONTROL_ACCOUNT_HOME: &str = "/var/lib/buzzci/principals/ctl";
-const CONTROL_ACCOUNT_SHELL: &str = "/usr/sbin/nologin";
-const RUNNER_ACCOUNT: &str = "buzzci-runner";
-const RUNNER_ACCOUNT_SHELL: &str = "/usr/sbin/nologin";
 const SYSTEMD_FD_NAME: &str = "buzz-ci-execd";
 pub const EXECD_SOCKET_PATH: &str = "/run/buzzci/execd.sock";
-const PASSWD_PATH: &str = "/etc/passwd";
-const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn sha256_v2_admission(request: v2::AdmitAttemptRequest) -> [u8; 32] {
@@ -326,6 +317,110 @@ pub trait ControlDispatch {
     fn maintenance(&mut self, _now: u64) {}
 }
 
+impl<T: ControlDispatch + ?Sized> ControlDispatch for Box<T> {
+    fn dispatch(&mut self, header: FrameHeader, request: Request, now: u64) -> BrokerResponse {
+        (**self).dispatch(header, request, now)
+    }
+
+    fn dispatch_v2(
+        &mut self,
+        header: v2::FrameHeader,
+        request: v2::Request,
+        now: u64,
+    ) -> v2::BrokerResponse {
+        (**self).dispatch_v2(header, request, now)
+    }
+
+    fn dispatch_v2_encoded(
+        &mut self,
+        header: v2::FrameHeader,
+        request: v2::Request,
+        now: u64,
+    ) -> v2::EncodedFrame {
+        (**self).dispatch_v2_encoded(header, request, now)
+    }
+
+    fn maintenance(&mut self, now: u64) {
+        (**self).maintenance(now);
+    }
+}
+
+/// Encode the operation-specific capacity-zero response without constructing a
+/// legacy dispatcher.
+pub fn encode_not_provisioned_v2(
+    header: v2::FrameHeader,
+    request: v2::Request,
+    now: u64,
+) -> v2::EncodedFrame {
+    match request {
+        v2::Request::DescribeAttemptEvidence(value) => v2::encode_evidence_description_response(
+            header,
+            v2::EvidenceDescriptionResponse {
+                code: ResponseCode::NotProvisioned,
+                execution_binding_digest: value.coordinates.execution_binding_digest,
+                generation: value.coordinates.expected_generation,
+                request_frame_digest: value.request_frame_digest,
+                descriptor_set_digest: [0; 32],
+                item_count: 0,
+                items: [None; v2::MAX_EVIDENCE_ITEMS],
+                request_event_id: value.coordinates.request_event_id,
+                run_id: value.coordinates.run_id,
+                workflow_id: value.coordinates.workflow_id,
+                workflow_digest: value.coordinates.workflow_digest,
+                job_id: value.coordinates.job_id,
+                attempt: value.coordinates.attempt,
+            },
+        ),
+        v2::Request::ReadAttemptEvidence(value) => v2::encode_evidence_chunk_response(
+            header,
+            &v2::EvidenceChunkResponse {
+                code: ResponseCode::NotProvisioned,
+                execution_binding_digest: value.coordinates.execution_binding_digest,
+                generation: value.coordinates.expected_generation,
+                request_frame_digest: value.request_frame_digest,
+                kind: value.kind,
+                item_index: value.item_index,
+                descriptor_digest: value.descriptor_digest,
+                offset: value.offset,
+                total_length: 0,
+                bytes: Vec::new(),
+                request_event_id: value.coordinates.request_event_id,
+                run_id: value.coordinates.run_id,
+                workflow_id: value.coordinates.workflow_id,
+                workflow_digest: value.coordinates.workflow_digest,
+                job_id: value.coordinates.job_id,
+                attempt: value.coordinates.attempt,
+            },
+        ),
+        v2::Request::RegisterJobIntent(value) => {
+            let admission = value.admission;
+            v2::encode_intent_registration_response(
+                header,
+                v2::IntentRegistrationResponse {
+                    code: ResponseCode::NotProvisioned,
+                    retry_after_millis: 0,
+                    signed_request_digest: admission.signed_request_digest,
+                    job_intent_digest: admission.job_intent_digest,
+                    request_frame_digest: value.request_frame_digest,
+                    admission_message_digest: sha256_v2_admission(admission),
+                    registration_key_digest: v2::intent_registration_key_digest(&value),
+                    lane_manifest_digest: admission.lane_manifest_digest,
+                    run_id: admission.run_id,
+                    lane_epoch: admission.lane_epoch,
+                    admission_key_generation: admission.admission_key_generation,
+                    issued_at: admission.issued_at,
+                    expires_at: admission.expires_at,
+                    attempt: admission.attempt,
+                },
+            )
+        }
+        _ => v2::encode_response(
+            header,
+            crate::production_binding::empty_response(ResponseCode::NotProvisioned, now),
+        ),
+    }
+}
+
 /// Ordinary admission dispatcher backed by the activation state machine.
 pub struct ActivationDispatch<A, Q> {
     controller: ActivationController,
@@ -454,6 +549,7 @@ pub struct ControlServer<D> {
     peer_policy: PeerUidPolicy,
     dispatch: D,
     io_timeout: Duration,
+    allow_v1: bool,
 }
 
 impl<D: ControlDispatch> ControlServer<D> {
@@ -464,6 +560,7 @@ impl<D: ControlDispatch> ControlServer<D> {
             peer_policy,
             dispatch,
             io_timeout: IO_TIMEOUT,
+            allow_v1: true,
         }
     }
 
@@ -474,17 +571,20 @@ impl<D: ControlDispatch> ControlServer<D> {
         dispatch: D,
     ) -> Result<Self, ControlError> {
         listener.set_nonblocking(true).map_err(ControlError::Io)?;
-        Ok(Self::new(listener, peer_policy, dispatch))
+        let mut server = Self::new(listener, peer_policy, dispatch);
+        server.allow_v1 = false;
+        Ok(server)
     }
 
     /// Accept and process one connection. The caller owns loop policy.
     pub fn serve_once(&mut self) -> Result<(), ControlError> {
         let (stream, _) = self.listener.accept().map_err(ControlError::Accept)?;
-        serve_stream(
+        serve_stream_mode(
             stream,
             self.peer_policy,
             self.io_timeout,
             &mut self.dispatch,
+            self.allow_v1,
         )
     }
 
@@ -496,11 +596,12 @@ impl<D: ControlDispatch> ControlServer<D> {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(ControlError::Accept(error)),
         };
-        serve_stream(
+        serve_stream_mode(
             stream,
             self.peer_policy,
             self.io_timeout,
             &mut self.dispatch,
+            self.allow_v1,
         )
     }
 }
@@ -544,104 +645,28 @@ pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener,
     Ok(listener)
 }
 
-/// Resolve the fixed service account used for control-plane peer checks.
-pub fn control_account_uid() -> Result<u32, ControlError> {
-    let text = read_account_database()?;
-    parse_control_account(&text).map(|identity| identity.0)
-}
-
-/// Resolve both dedicated service accounts into the exact socket peer policy.
-pub fn peer_uid_policy() -> Result<PeerUidPolicy, ControlError> {
-    let text = read_account_database()?;
-    let (control_uid, control_gid) = parse_control_account(&text)?;
-    let (runner_uid, runner_gid) = parse_runner_account(&text)?;
-    PeerUidPolicy::new_with_gids(control_uid, control_gid, runner_uid, runner_gid)
-}
-
-fn read_account_database() -> Result<String, ControlError> {
-    let file = File::open(PASSWD_PATH)
-        .map_err(|_| ControlError::Account("local account database is unavailable"))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_PASSWD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ControlError::Account("local account database read failed"))?;
-    if bytes.len() as u64 > MAX_PASSWD_BYTES {
-        return Err(ControlError::Account("local account database is oversized"));
-    }
-    String::from_utf8(bytes)
-        .map_err(|_| ControlError::Account("local account database is not UTF-8"))
-}
-
-fn parse_control_account(text: &str) -> Result<(u32, u32), ControlError> {
-    let mut matches = text
-        .lines()
-        .filter(|line| line.split(':').next() == Some(CONTROL_ACCOUNT));
-    let line = matches
-        .next()
-        .ok_or(ControlError::Account("buzzci-ctl account is absent"))?;
-    if matches.next().is_some() {
-        return Err(ControlError::Account("buzzci-ctl account is duplicated"));
-    }
-    let fields: Vec<_> = line.split(':').collect();
-    if fields.len() != 7 {
-        return Err(ControlError::Account("buzzci-ctl account shape is invalid"));
-    }
-    let uid =
-        parse_canonical_u32(fields[2]).ok_or(ControlError::Account("buzzci-ctl UID is invalid"))?;
-    let gid =
-        parse_canonical_u32(fields[3]).ok_or(ControlError::Account("buzzci-ctl GID is invalid"))?;
-    if uid != CONTROL_ACCOUNT_UID || gid != CONTROL_ACCOUNT_UID {
-        return Err(ControlError::Account(
-            "buzzci-ctl identity does not match the deployment contract",
-        ));
-    }
-    if fields[5] != CONTROL_ACCOUNT_HOME || fields[6] != CONTROL_ACCOUNT_SHELL {
-        return Err(ControlError::Account("buzzci-ctl login posture is invalid"));
-    }
-    Ok((uid, gid))
-}
-
-fn parse_runner_account(text: &str) -> Result<(u32, u32), ControlError> {
-    let mut matches = text
-        .lines()
-        .filter(|line| line.split(':').next() == Some(RUNNER_ACCOUNT));
-    let line = matches
-        .next()
-        .ok_or(ControlError::Account("buzzci-runner account is absent"))?;
-    if matches.next().is_some() {
-        return Err(ControlError::Account("buzzci-runner account is duplicated"));
-    }
-    let fields: Vec<_> = line.split(':').collect();
-    if fields.len() != 7 {
-        return Err(ControlError::Account(
-            "buzzci-runner account shape is invalid",
-        ));
-    }
-    let uid = parse_canonical_u32(fields[2])
-        .filter(|uid| *uid != 0)
-        .ok_or(ControlError::Account("buzzci-runner UID is invalid"))?;
-    let gid = parse_canonical_u32(fields[3])
-        .filter(|gid| *gid != 0)
-        .ok_or(ControlError::Account("buzzci-runner GID is invalid"))?;
-    if fields[6] != RUNNER_ACCOUNT_SHELL {
-        return Err(ControlError::Account(
-            "buzzci-runner login posture is invalid",
-        ));
-    }
-    Ok((uid, gid))
-}
-
+#[cfg(test)]
 fn serve_stream<D: ControlDispatch>(
     stream: UnixStream,
     peer_policy: PeerUidPolicy,
     timeout: Duration,
     dispatch: &mut D,
 ) -> Result<(), ControlError> {
+    serve_stream_mode(stream, peer_policy, timeout, dispatch, true)
+}
+
+fn serve_stream_mode<D: ControlDispatch>(
+    stream: UnixStream,
+    peer_policy: PeerUidPolicy,
+    timeout: Duration,
+    dispatch: &mut D,
+    allow_v1: bool,
+) -> Result<(), ControlError> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let credentials = getsockopt(&stream, PeerCredentials).map_err(nix_io)?;
     let role = peer_policy.role_for_credentials(credentials.uid(), credentials.gid())?;
-    serve_verified_stream(stream, role, dispatch)
+    serve_verified_stream_protocol_mode(stream, role, dispatch, allow_v1)
 }
 
 fn serve_verified_stream<D: ControlDispatch>(
@@ -652,17 +677,40 @@ fn serve_verified_stream<D: ControlDispatch>(
     serve_verified_stream_mode(stream, role, dispatch, true)
 }
 
+fn serve_verified_stream_protocol_mode<D: ControlDispatch>(
+    stream: UnixStream,
+    role: PeerRole,
+    dispatch: &mut D,
+    allow_v1: bool,
+) -> Result<(), ControlError> {
+    if allow_v1 {
+        serve_verified_stream(stream, role, dispatch)
+    } else {
+        serve_verified_stream_mode_with_protocol(stream, role, dispatch, true, false)
+    }
+}
+
 fn serve_verified_stream_mode<D: ControlDispatch>(
+    stream: UnixStream,
+    role: PeerRole,
+    dispatch: &mut D,
+    require_write_shutdown: bool,
+) -> Result<(), ControlError> {
+    serve_verified_stream_mode_with_protocol(stream, role, dispatch, require_write_shutdown, true)
+}
+
+fn serve_verified_stream_mode_with_protocol<D: ControlDispatch>(
     mut stream: UnixStream,
     role: PeerRole,
     dispatch: &mut D,
     require_write_shutdown: bool,
+    allow_v1: bool,
 ) -> Result<(), ControlError> {
     let mut frame = [0_u8; HEADER_SIZE + v2::MAX_BODY_SIZE];
     read_exact_frame_part(&mut stream, &mut frame[..HEADER_SIZE], "short header")?;
     let version = u16::from_be_bytes([frame[4], frame[5]]);
     match version {
-        PROTOCOL_VERSION => {
+        PROTOCOL_VERSION if allow_v1 => {
             let (header, body_size) = decode_request_header(&frame[..HEADER_SIZE])
                 .map_err(|_| ControlError::Frame("malformed header"))?;
             authorize_and_read_body(
@@ -698,6 +746,7 @@ fn serve_verified_stream_mode<D: ControlDispatch>(
             let response = dispatch.dispatch_v2_encoded(header, request, unix_now()?);
             write_all_fd(&stream, response.as_bytes())
         }
+        PROTOCOL_VERSION => Err(ControlError::Frame("version 1 is disabled")),
         _ => Err(ControlError::Frame("malformed header")),
     }
 }
@@ -1272,33 +1321,22 @@ mod tests {
     }
 
     #[test]
-    fn control_account_must_match_the_exact_nologin_principal() {
-        let exact = "root:x:0:0:root:/root:/bin/bash\nbuzzci-ctl:x:961:961::/var/lib/buzzci/principals/ctl:/usr/sbin/nologin\n";
-        assert_eq!(parse_control_account(exact).unwrap(), (961, 961));
-        for drift in [
-            exact.replace(":961:961:", ":962:961:"),
-            exact.replace(":961:961:", ":961:962:"),
-            exact.replace("/usr/sbin/nologin", "/bin/bash"),
-            format!(
-                "{exact}buzzci-ctl:x:961:961::/var/lib/buzzci/principals/ctl:/usr/sbin/nologin\n"
-            ),
-        ] {
-            assert!(parse_control_account(&drift).is_err());
-        }
-    }
-
-    #[test]
-    fn runner_account_must_be_unique_nonroot_and_nologin() {
-        let exact = "root:x:0:0:root:/root:/bin/bash\nbuzzci-runner:x:972:973::/nonexistent:/usr/sbin/nologin\n";
-        assert_eq!(parse_runner_account(exact).unwrap(), (972, 973));
-        for drift in [
-            exact.replace(":972:973:", ":0:973:"),
-            exact.replace(":972:973:", ":972:0:"),
-            exact.replace("/usr/sbin/nologin", "/bin/bash"),
-            format!("{exact}buzzci-runner:x:972:973::/nonexistent:/usr/sbin/nologin\n"),
-        ] {
-            assert!(parse_runner_account(&drift).is_err());
-        }
+    fn production_protocol_mode_rejects_every_v1_frame() {
+        let encoded = hello();
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &encoded.as_bytes()[..HEADER_SIZE]).expect("write header");
+        let error = serve_verified_stream_mode_with_protocol(
+            server,
+            PeerRole::Runner,
+            &mut ClosedDispatch::new(),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlError::Frame("version 1 is disabled")
+        ));
     }
 
     #[test]

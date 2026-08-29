@@ -4,23 +4,29 @@
 //! linked. Partial discovery never falls through to an executor with weaker
 //! facts, and tests inject typed fakes without running host commands.
 
+#[cfg(test)]
 use buzz_ci_broker_protocol::{
     AdmitAttemptRequest, BrokerResponse, FrameHeader, QualificationRequest, Request,
 };
 
 use crate::{
-    activation::{LeaseToken, OrdinaryAdmission, QualificationLease},
-    control::{ClosedDispatch, ControlDispatch},
-    durable_dispatch::{
-        load_dispatch, BootstrapDispatch, ExecutionUnavailable, OrdinaryCleanup, OrdinaryExecutor,
-        OrdinaryReceipts, OrdinaryStop, QualificationCleanup, QualificationExecution,
-        QualificationExecutor, QualificationStop, ReadyHostProofs, ReadyValidationProvider,
-    },
+    durable_dispatch::ExecutionUnavailable,
     host_composition::HostCompositionContract,
     normal_backend::{
         materialization_input::MaterializationInputProvider,
         proxy_input::{BoundPrestartPersister, ProxyInputProvider},
         BrokerProxyRuntime, MediatedActThroughProxyLauncher, RuntimeDescriptorProvider,
+    },
+};
+
+#[cfg(test)]
+use crate::{
+    activation::{LeaseToken, OrdinaryAdmission, QualificationLease},
+    control::{ClosedDispatch, ControlDispatch},
+    durable_dispatch::{
+        load_dispatch, BootstrapDispatch, OrdinaryCleanup, OrdinaryExecutor, OrdinaryReceipts,
+        OrdinaryStop, QualificationCleanup, QualificationExecution, QualificationExecutor,
+        QualificationStop, ReadyHostProofs, ReadyValidationProvider,
     },
     runtime::ReadyValidationTarget,
 };
@@ -112,21 +118,25 @@ impl<P: BoundPrestartPersister> ProductionInputProviders<P> {
 }
 
 /// Fresh host proof adapter. The source must bind all facts to `target`.
+#[cfg(test)]
 pub trait ProductionReadyProofSource {
     fn validate(&mut self, target: &ReadyValidationTarget, now: u64) -> Option<ReadyHostProofs>;
 }
 
 /// Ready validator used by the production bootstrap path.
+#[cfg(test)]
 pub struct ProductionReadyValidator {
     source: Box<dyn ProductionReadyProofSource>,
 }
 
+#[cfg(test)]
 impl ProductionReadyValidator {
     pub fn new(source: Box<dyn ProductionReadyProofSource>) -> Self {
         Self { source }
     }
 }
 
+#[cfg(test)]
 impl ReadyValidationProvider for ProductionReadyValidator {
     fn ready_validation(
         &mut self,
@@ -138,16 +148,19 @@ impl ReadyValidationProvider for ProductionReadyValidator {
 }
 
 /// Ordinary adapter that accepts only the durable dispatcher's typed seam.
+#[cfg(test)]
 pub struct ProductionOrdinaryExecutor {
     backend: Box<dyn OrdinaryExecutor>,
 }
 
+#[cfg(test)]
 impl ProductionOrdinaryExecutor {
     pub fn new(backend: Box<dyn OrdinaryExecutor>) -> Self {
         Self { backend }
     }
 }
 
+#[cfg(test)]
 impl OrdinaryExecutor for ProductionOrdinaryExecutor {
     fn preflight(
         &mut self,
@@ -198,16 +211,19 @@ impl OrdinaryExecutor for ProductionOrdinaryExecutor {
 }
 
 /// Qualification adapter that accepts only the durable dispatcher's typed seam.
+#[cfg(test)]
 pub struct ProductionQualificationExecutor {
     backend: Box<dyn QualificationExecutor>,
 }
 
+#[cfg(test)]
 impl ProductionQualificationExecutor {
     pub fn new(backend: Box<dyn QualificationExecutor>) -> Self {
         Self { backend }
     }
 }
 
+#[cfg(test)]
 impl QualificationExecutor for ProductionQualificationExecutor {
     fn preflight(&mut self, request: QualificationRequest) -> Result<(), ExecutionUnavailable> {
         self.backend.preflight(request)
@@ -234,6 +250,7 @@ impl QualificationExecutor for ProductionQualificationExecutor {
 }
 
 /// Complete production adapter set. It cannot represent a partial composition.
+#[cfg(test)]
 pub enum ProductionAdapters {
     Legacy {
         validation: ProductionReadyValidator,
@@ -243,6 +260,7 @@ pub enum ProductionAdapters {
     V2(Box<dyn ControlDispatch>),
 }
 
+#[cfg(test)]
 impl ProductionAdapters {
     pub fn from_backends(
         validation: Box<dyn ProductionReadyProofSource>,
@@ -262,20 +280,23 @@ impl ProductionAdapters {
     /// execution adapter is bound. It never assembles a partial host path.
     pub fn canonical(now: u64) -> Result<Self, ProductionCompositionError> {
         crate::production_v2::load_canonical(now)
-            .map(Self::V2)
+            .map(|runtime| Self::V2(runtime.dispatch))
             .map_err(|_| {
                 ProductionCompositionError::V2CompositionUnavailable(&REQUIRED_ORDINARY_HOST_SEAMS)
             })
     }
 }
 
-/// Concrete dispatch type used by `buzz-ci-execd` production main.
+/// Test-only legacy dispatch composition. Production startup has no injected
+/// adapter or closed fallback path.
+#[cfg(test)]
 pub enum ProductionDispatch {
     Closed(ClosedDispatch),
     Configured(BootstrapDispatch<ProductionOrdinaryExecutor, ProductionQualificationExecutor>),
     ConfiguredV2(Box<dyn ControlDispatch>),
 }
 
+#[cfg(test)]
 impl ControlDispatch for ProductionDispatch {
     fn dispatch(&mut self, header: FrameHeader, request: Request, now: u64) -> BrokerResponse {
         match self {
@@ -322,14 +343,16 @@ impl ControlDispatch for ProductionDispatch {
     }
 }
 
-/// Load the exact production composition. Missing backends expose zero capacity.
-pub fn load_production_dispatch(now: u64) -> ProductionDispatch {
-    let Ok(adapters) = ProductionAdapters::canonical(now) else {
-        return ProductionDispatch::Closed(ClosedDispatch::new());
-    };
-    compose_production_dispatch(now, adapters)
+/// Load the exact production-v2 composition. Any failure prevents serving.
+pub fn load_production_dispatch(
+    now: u64,
+) -> Result<crate::production_v2::ProductionRuntime, ProductionCompositionError> {
+    crate::production_v2::load_canonical(now).map_err(|_| {
+        ProductionCompositionError::V2CompositionUnavailable(&REQUIRED_ORDINARY_HOST_SEAMS)
+    })
 }
 
+#[cfg(test)]
 fn compose_production_dispatch(now: u64, adapters: ProductionAdapters) -> ProductionDispatch {
     match adapters {
         ProductionAdapters::Legacy {
@@ -556,10 +579,7 @@ mod tests {
                 HostBackendSeam::CrashRecoveryCoordinator,
             ]
         );
-        assert!(matches!(
-            load_production_dispatch(1),
-            ProductionDispatch::Closed(_)
-        ));
+        assert!(load_production_dispatch(1).is_err());
     }
 
     #[test]
