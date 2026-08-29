@@ -5,20 +5,56 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
 use thiserror::Error;
+
+use buzz_ci_controld::keyholder::{KeyholderClientConfig, KeyholderSelectorBindings};
+use buzz_ci_controld::RUNNER_CONTROL_SOCKET_PATH;
 
 const CONFIG_MODE: u32 = 0o600;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const SCHEMA_VERSION: u32 = 1;
 
-/// Validated local-only service configuration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// Validated local service configuration. Capacity zero contains no active
+/// endpoints. Capacity one contains every public provider binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DaemonConfig {
+    capacity: u32,
+    store_root: PathBuf,
+    active: Option<ActiveConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveConfig {
+    pub(crate) relay_url: String,
+    pub(crate) runner_socket: PathBuf,
+    pub(crate) keyholder: KeyholderClientConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDaemonConfig {
     schema_version: u32,
     capacity: u32,
     store_root: PathBuf,
+    relay_url: Option<String>,
+    runner_socket: Option<PathBuf>,
+    keyholder_socket: Option<PathBuf>,
+    keyholder_uid: Option<u32>,
+    keyholder_gid: Option<u32>,
+    keyholder_selectors: Option<KeyholderSelectorBindings>,
+    keyholder_timeout_millis: Option<u64>,
+    keyholder_transport_attempts: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for DaemonConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawDaemonConfig::deserialize(deserializer)?;
+        Self::from_raw(raw).map_err(de::Error::custom)
+    }
 }
 
 impl DaemonConfig {
@@ -58,10 +94,9 @@ impl DaemonConfig {
         if bytes.len() as u64 > MAX_CONFIG_BYTES {
             return Err(ConfigError::Oversized);
         }
-        let config: Self =
+        let raw: RawDaemonConfig =
             serde_json::from_slice(&bytes).map_err(|_| ConfigError::InvalidSyntax)?;
-        config.validate()?;
-        Ok(config)
+        Self::from_raw(raw)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -69,15 +104,64 @@ impl DaemonConfig {
         Err(ConfigError::UnsupportedPlatform)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema_version != SCHEMA_VERSION {
+    fn from_raw(raw: RawDaemonConfig) -> Result<Self, ConfigError> {
+        if raw.schema_version != SCHEMA_VERSION {
             return Err(ConfigError::InvalidSchema);
         }
-        validate_absolute_path(&self.store_root)?;
-        if self.capacity != 0 {
-            return Err(ConfigError::ProvidersUnavailable);
-        }
-        Ok(())
+        validate_absolute_path(&raw.store_root)?;
+        let active_fields = (
+            raw.relay_url,
+            raw.runner_socket,
+            raw.keyholder_socket,
+            raw.keyholder_uid,
+            raw.keyholder_gid,
+            raw.keyholder_selectors,
+            raw.keyholder_timeout_millis,
+            raw.keyholder_transport_attempts,
+        );
+        let active = match (raw.capacity, active_fields) {
+            (0, (None, None, None, None, None, None, None, None)) => None,
+            (
+                1,
+                (
+                    Some(relay_url),
+                    Some(runner_socket),
+                    Some(keyholder_socket),
+                    Some(keyholder_uid),
+                    Some(keyholder_gid),
+                    Some(keyholder_selectors),
+                    Some(keyholder_timeout_millis),
+                    Some(keyholder_transport_attempts),
+                ),
+            ) => {
+                validate_relay_url(&relay_url)?;
+                if runner_socket != Path::new(RUNNER_CONTROL_SOCKET_PATH) {
+                    return Err(ConfigError::InvalidSchema);
+                }
+                let keyholder = KeyholderClientConfig {
+                    keyholder_socket,
+                    keyholder_uid,
+                    keyholder_gid,
+                    keyholder_selectors,
+                    keyholder_timeout_millis,
+                    keyholder_transport_attempts,
+                };
+                keyholder
+                    .validate()
+                    .map_err(|_| ConfigError::InvalidSchema)?;
+                Some(ActiveConfig {
+                    relay_url,
+                    runner_socket,
+                    keyholder,
+                })
+            }
+            _ => return Err(ConfigError::InvalidSchema),
+        };
+        Ok(Self {
+            capacity: raw.capacity,
+            store_root: raw.store_root,
+            active,
+        })
     }
 
     pub(crate) fn store_root(&self) -> &Path {
@@ -86,6 +170,10 @@ impl DaemonConfig {
 
     pub(crate) const fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    pub(crate) const fn active(&self) -> Option<&ActiveConfig> {
+        self.active.as_ref()
     }
 }
 
@@ -107,8 +195,19 @@ pub(crate) enum ConfigError {
     InvalidSyntax,
     #[error("controld configuration schema is unsupported")]
     InvalidSchema,
-    #[error("capacity above zero requires production provider and keyholder wiring")]
-    ProvidersUnavailable,
+}
+
+fn validate_relay_url(value: &str) -> Result<(), ConfigError> {
+    let parsed = url::Url::parse(value).map_err(|_| ConfigError::InvalidSchema)?;
+    if parsed.scheme() != "wss"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidSchema);
+    }
+    Ok(())
 }
 
 fn validate_absolute_path(path: &Path) -> Result<(), ConfigError> {
@@ -143,6 +242,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use buzz_ci_keyholder::KEYHOLDER_SOCKET_PATH;
+
     use super::*;
 
     fn fixture(json: &str) -> (TempDir, PathBuf, u32) {
@@ -171,25 +272,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_capacity_one_until_providers_are_wired() {
+    fn loads_exact_capacity_one_public_provider_bindings() {
         let store = tempfile::tempdir().expect("store directory");
         let json = format!(
-            r#"{{"schema_version":1,"capacity":1,"store_root":"{}"}}"#,
+            r#"{{
+                "schema_version":1,
+                "capacity":1,
+                "store_root":"{}",
+                "relay_url":"wss://relay.example.test",
+                "runner_socket":"/run/buzzci/runner-control.sock",
+                "keyholder_socket":"/run/buzzci/keyholder.sock",
+                "keyholder_uid":1001,
+                "keyholder_gid":1002,
+                "keyholder_selectors":{{
+                    "ci_event":{{"public_key":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","generation":1}},
+                    "nip98":{{"public_key":"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5","generation":2}},
+                    "manifest":{{"public_key":"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9","generation":3}}
+                }},
+                "keyholder_timeout_millis":500,
+                "keyholder_transport_attempts":2
+            }}"#,
             store.path().display()
         );
         let (_root, path, owner_uid) = fixture(&json);
 
+        let config = DaemonConfig::load(&path, owner_uid).expect("active configuration");
+        let active = config.active().expect("active binding");
+        assert_eq!(config.capacity(), 1);
+        assert_eq!(active.relay_url, "wss://relay.example.test");
+        assert_eq!(active.runner_socket, Path::new(RUNNER_CONTROL_SOCKET_PATH));
         assert_eq!(
-            DaemonConfig::load(&path, owner_uid),
-            Err(ConfigError::ProvidersUnavailable)
+            active.keyholder.keyholder_socket,
+            PathBuf::from(KEYHOLDER_SOCKET_PATH)
         );
+        assert_eq!(active.keyholder.keyholder_selectors.nip98.generation, 2);
+    }
+
+    #[test]
+    fn capacity_modes_reject_partial_or_cross_mode_provider_fields() {
+        let store = tempfile::tempdir().expect("store directory");
+        for json in [
+            format!(
+                r#"{{"schema_version":1,"capacity":1,"store_root":"{}"}}"#,
+                store.path().display()
+            ),
+            format!(
+                r#"{{"schema_version":1,"capacity":0,"store_root":"{}","keyholder_socket":"/run/buzzci/keyholder.sock"}}"#,
+                store.path().display()
+            ),
+        ] {
+            let (_root, path, owner_uid) = fixture(&json);
+            assert_eq!(
+                DaemonConfig::load(&path, owner_uid),
+                Err(ConfigError::InvalidSchema)
+            );
+        }
     }
 
     #[test]
     fn rejects_unknown_fields_and_insecure_mode() {
         let store = tempfile::tempdir().expect("store directory");
         let json = format!(
-            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","relay_url":"https://example.invalid"}}"#,
+            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","secret_path":"/forbidden"}}"#,
             store.path().display()
         );
         let (_root, path, owner_uid) = fixture(&json);

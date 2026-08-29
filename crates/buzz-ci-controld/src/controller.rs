@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::production::{
@@ -16,10 +16,8 @@ use crate::production::{
 };
 use crate::runner_client::{RunnerClient, RunnerConnector};
 
-const CONFIG_SCHEMA_VERSION: u32 = 1;
 const STATUS_SCHEMA_VERSION: u32 = 1;
 const CAPACITY: u32 = 1;
-const MAX_CONFIG_BYTES: usize = 4 * 1024;
 const MAX_CHANNEL_BYTES: usize = 512;
 const MAX_POLL_INTERVAL_MILLIS: u64 = 60_000;
 const MAX_RUNNER_TRANSPORT_ATTEMPTS: u32 = 8;
@@ -32,35 +30,9 @@ pub struct CapacityOneConfig {
     runner_transport_attempts: u32,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CapacityOneConfigWire {
-    schema_version: u32,
-    capacity: u32,
-    channel_id: String,
-    poll_interval_millis: u64,
-    runner_transport_attempts: u32,
-}
-
 impl CapacityOneConfig {
-    /// Parse a bounded, closed JSON object. Capacity must be exactly one.
-    pub fn parse(bytes: &[u8]) -> Result<Self, ActivationError> {
-        if bytes.is_empty() || bytes.len() > MAX_CONFIG_BYTES {
-            return Err(ActivationError::InvalidConfig);
-        }
-        let wire: CapacityOneConfigWire =
-            serde_json::from_slice(bytes).map_err(|_| ActivationError::InvalidConfig)?;
-        if wire.schema_version != CONFIG_SCHEMA_VERSION || wire.capacity != CAPACITY {
-            return Err(ActivationError::InvalidConfig);
-        }
-        Self::new(
-            wire.channel_id,
-            Duration::from_millis(wire.poll_interval_millis),
-            wire.runner_transport_attempts,
-        )
-    }
-
-    /// Build validated configuration supplied by a typed host.
+    /// Build validated configuration supplied by the sole daemon-config
+    /// deserializer after every production provider has been validated.
     pub fn new(
         channel_id: String,
         poll_interval: Duration,
@@ -541,24 +513,16 @@ mod tests {
     }
 
     #[test]
-    fn strict_config_accepts_only_explicit_capacity_one() {
-        let parsed = CapacityOneConfig::parse(
-            br#"{"schema_version":1,"capacity":1,"channel_id":"ci","poll_interval_millis":2000,"runner_transport_attempts":2}"#,
-        )
-        .expect("capacity one config");
-        assert_eq!(parsed, config());
-
+    fn typed_config_preserves_strict_bounds_without_a_second_json_schema() {
+        assert_eq!(config().channel_id(), "ci");
         for invalid in [
-            br#"{"schema_version":1,"capacity":0,"channel_id":"ci","poll_interval_millis":2000,"runner_transport_attempts":2}"#.as_slice(),
-            br#"{"schema_version":1,"capacity":2,"channel_id":"ci","poll_interval_millis":2000,"runner_transport_attempts":2}"#.as_slice(),
-            br#"{"schema_version":1,"capacity":1,"channel_id":"ci","poll_interval_millis":0,"runner_transport_attempts":2}"#.as_slice(),
-            br#"{"schema_version":1,"capacity":1,"channel_id":"ci","poll_interval_millis":2000,"runner_transport_attempts":0}"#.as_slice(),
-            br#"{"schema_version":1,"capacity":1,"channel_id":"ci","poll_interval_millis":2000,"runner_transport_attempts":2,"extra":true}"#.as_slice(),
+            CapacityOneConfig::new(String::new(), Duration::from_secs(2), 2),
+            CapacityOneConfig::new("ci".to_owned(), Duration::ZERO, 2),
+            CapacityOneConfig::new("ci".to_owned(), Duration::from_secs(2), 0),
+            CapacityOneConfig::new("ci".to_owned(), Duration::from_secs(61), 2),
+            CapacityOneConfig::new("ci".to_owned(), Duration::from_secs(2), 9),
         ] {
-            assert_eq!(
-                CapacityOneConfig::parse(invalid),
-                Err(ActivationError::InvalidConfig)
-            );
+            assert_eq!(invalid, Err(ActivationError::InvalidConfig));
         }
     }
 

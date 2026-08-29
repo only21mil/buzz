@@ -42,6 +42,10 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 fn run(config_path: PathBuf) -> ExitCode {
+    if harden_process().is_err() {
+        eprintln!(r#"{{"error":"process_hardening"}}"#);
+        return ExitCode::from(4);
+    }
     if validate_systemd_environment().is_err() {
         eprintln!(r#"{{"error":"socket_activation"}}"#);
         return ExitCode::from(4);
@@ -102,6 +106,22 @@ fn run(config_path: PathBuf) -> ExitCode {
             eprintln!(r#"{{"event":"connection_rejected"}}"#);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn harden_process() -> Result<(), rustix::io::Errno> {
+    use rustix::mm::{mlockall, MlockAllFlags};
+    use rustix::process::{set_dumpable_behavior, setrlimit, DumpableBehavior, Resource, Rlimit};
+
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )?;
+    set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
+    mlockall(MlockAllFlags::CURRENT | MlockAllFlags::FUTURE)
 }
 
 #[cfg(not(target_os = "linux"))]

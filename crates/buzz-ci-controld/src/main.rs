@@ -24,6 +24,9 @@ fn run() -> Result<(), StartupError> {
     let config_path = parse_args(env::args_os())?;
     let owner_uid = effective_uid()?;
     let config = DaemonConfig::load(&config_path, owner_uid)?;
+    if config.active().is_some() {
+        return Err(StartupError::ActiveProvidersUnavailable);
+    }
     let service = CapacityZeroService::start(&config, owner_uid)?;
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(&mut stdout, &service.status()).map_err(|_| StartupError::Status)?;
@@ -65,6 +68,8 @@ enum StartupError {
     Config(#[from] config::ConfigError),
     #[error(transparent)]
     Service(#[from] service::ServiceError),
+    #[error("capacity-one providers are unavailable in this binary composition")]
+    ActiveProvidersUnavailable,
     #[error("failed to report service status")]
     Status,
 }

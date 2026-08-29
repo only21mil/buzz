@@ -976,6 +976,7 @@ name = "buzz-ci-controld"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "buzz-ci-keyholder",
  "buzz-core",
  "hex",
  "nix 0.31.3",
@@ -988,7 +989,6 @@ dependencies = [
  "thiserror 2.0.18",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -1031,6 +1031,7 @@ dependencies = [
  "nix 0.31.3",
  "nostr",
  "proptest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",

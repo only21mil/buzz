@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::keyholder::KeyDescriptor;
+use crate::keyholder::KeyholderClientConfig;
 use crate::production::{
     AcceptedRequest, ArtifactCompletion, JobCompletion, RelayControl, SignedCiEvent, StoredObject,
 };
@@ -25,7 +25,7 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const CONFIG_MODE: u32 = 0o600;
 
-/// Complete opt-in source configuration. Omitting the key descriptor or any
+/// Complete opt-in source configuration. Omitting the keyholder binding or any
 /// other field is a parse error, so the default binary remains closed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,7 +34,7 @@ pub struct RelaySourceConfig {
     pub relay_base_url: String,
     pub channel_id: String,
     pub store_root: PathBuf,
-    pub key: KeyDescriptor,
+    pub keyholder: KeyholderClientConfig,
 }
 
 impl RelaySourceConfig {
@@ -89,7 +89,7 @@ impl RelaySourceConfig {
             return Err(SourceError::InvalidConfig);
         }
         validate_config_path(&self.store_root)?;
-        self.key
+        self.keyholder
             .validate()
             .map_err(|_| SourceError::InvalidConfig)?;
         AuthenticatedRelay::<(), ()>::validate_base_url(&self.relay_base_url)?;
@@ -869,10 +869,26 @@ mod tests {
             "relay_base_url": "https://relay.example/community/",
             "channel_id": "channel",
             "store_root": root.join("store"),
-            "key": {
-                "path": root.join("ci-status.key"),
-                "expected_owner_uid": fs::metadata(root).expect("metadata").uid(),
-                "expected_pubkey": "11".repeat(32)
+            "keyholder": {
+                "keyholder_socket": "/run/buzzci/keyholder.sock",
+                "keyholder_uid": fs::metadata(root).expect("metadata").uid(),
+                "keyholder_gid": fs::metadata(root).expect("metadata").gid(),
+                "keyholder_selectors": {
+                    "ci_event": {
+                        "public_key": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                        "generation": 1
+                    },
+                    "nip98": {
+                        "public_key": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+                        "generation": 1
+                    },
+                    "manifest": {
+                        "public_key": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+                        "generation": 1
+                    }
+                },
+                "keyholder_timeout_millis": 500,
+                "keyholder_transport_attempts": 2
             }
         })
     }
@@ -885,7 +901,7 @@ mod tests {
         let uid = fs::metadata(&root).expect("metadata").uid();
 
         let mut missing = valid_config_json(&root);
-        missing.as_object_mut().expect("object").remove("key");
+        missing.as_object_mut().expect("object").remove("keyholder");
         fs::write(&path, serde_json::to_vec(&missing).expect("json")).expect("write");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
         assert_eq!(
@@ -926,5 +942,23 @@ mod tests {
             RelaySourceConfig::load(&linked, uid),
             Err(SourceError::InsecureConfig)
         );
+    }
+
+    #[test]
+    fn active_source_config_rejects_local_secret_descriptors() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        let mut value = valid_config_json(&root);
+        let object = value.as_object_mut().expect("object");
+        object.remove("keyholder");
+        object.insert(
+            "key".to_owned(),
+            serde_json::json!({
+                "path": root.join("ci-status.key"),
+                "expected_owner_uid": fs::metadata(&root).expect("metadata").uid(),
+                "expected_pubkey": "11".repeat(32)
+            }),
+        );
+        assert!(serde_json::from_value::<RelaySourceConfig>(value).is_err());
     }
 }

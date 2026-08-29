@@ -230,4 +230,31 @@ mod tests {
             .replace(CI_KEY, &CI_KEY.to_uppercase());
         assert!(KeyholderConfig::from_slice(uppercase.as_bytes()).is_err());
     }
+
+    #[test]
+    fn socket_and_secret_descriptor_fields_are_not_part_of_the_daemon_schema() {
+        let valid = config(r#"["describe"]"#, "https://relay.example.test");
+        let mut value: serde_json::Value = serde_json::from_slice(&valid).expect("config value");
+        value.as_object_mut().expect("config object").insert(
+            "socket".to_owned(),
+            serde_json::json!(crate::KEYHOLDER_SOCKET_PATH),
+        );
+        assert!(
+            KeyholderConfig::from_slice(&serde_json::to_vec(&value).expect("config bytes"))
+                .is_err()
+        );
+
+        value
+            .as_object_mut()
+            .expect("config object")
+            .remove("socket");
+        value
+            .as_object_mut()
+            .expect("config object")
+            .insert("key_descriptor".to_owned(), serde_json::json!("/forbidden"));
+        assert!(
+            KeyholderConfig::from_slice(&serde_json::to_vec(&value).expect("config bytes"))
+                .is_err()
+        );
+    }
 }
