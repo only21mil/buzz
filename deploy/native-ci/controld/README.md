@@ -22,13 +22,22 @@ The installed default remains:
 - state reported as `enabled=false`, `active=false`, `provisioned=false`,
   `providers_wired=false`, and `capacity=0`.
 
-The daemon contract validated in the corresponding source lane opens only its
-owner-private durable control store, reports `ready_closed` with reason
-`production_providers_unwired`, and parks without polling, dispatching,
-networking, or signing. The parser accepts capacity one only with the complete
-relay authority, channel, runner identity and bounds, static lane and job
-bindings, and keyholder selector generations. The executable still rejects
-that mode until the reviewed runner v2 evidence API is composed.
+In capacity zero the daemon opens only its owner-private durable control store,
+reports the unified `parked` readiness record, and parks without polling,
+dispatching, networking, or signing. An activation may add only the fixed
+post-freeze `acceptance_binding` receipt path while capacity remains zero. The
+root-owned, controld-group-readable receipt binds the complete fixture,
+scenario and package digests, peer identity, and timeout without creating a
+package self-digest cycle. Capacity one is accepted only with the complete relay authority,
+channel, authenticated runner identity and bounds, exact static lane,
+JobIntentV2 job and artifact declaration, keyholder selector generations, and
+the same four public Run/Grant/Rerun/Tombstone acceptance templates configured
+in keyholder.
+The active daemon polls the authenticated accepted-request source one at a
+time, signs through keyholder, admits only the exact runner-control v2 frame,
+and fetches terminal logs, the declared artifact, and teardown through the
+runner-forwarded bounded evidence operations. It never connects to execd or
+reads an evidence filesystem.
 
 The disabled `buzz-ci-controld-acceptance.socket` binds
 `/run/buzzci/controld-acceptance.sock` as root:`buzzci-ctl` mode `0620` and names

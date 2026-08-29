@@ -598,6 +598,8 @@ pub enum UnixRunnerConnectorError {
     WrongPeer,
     #[error("runner connection timed out")]
     Timeout,
+    #[error("runner returned an invalid response frame")]
+    InvalidResponse,
 }
 
 /// Per-attempt connection factory for the dedicated runner-control socket.
@@ -610,6 +612,74 @@ impl UnixRunnerConnector {
     pub fn new(config: UnixRunnerConnectorConfig) -> Result<Self, UnixRunnerConnectorError> {
         config.validate()?;
         Ok(Self { config })
+    }
+
+    /// Send one immutable v2 frame, close the write half, and read one exact
+    /// operation-specific response. Every retry reuses the same bytes.
+    #[cfg(target_os = "linux")]
+    pub fn exchange_v2_frame(
+        &mut self,
+        frame: &[u8],
+        response_length: usize,
+        transport_attempts: u32,
+    ) -> Result<Vec<u8>, UnixRunnerConnectorError> {
+        use std::net::Shutdown;
+
+        if frame.is_empty()
+            || frame.len() > buzz_ci_broker_protocol::v2::MAX_FRAME_SIZE
+            || response_length == 0
+            || response_length > buzz_ci_broker_protocol::v2::MAX_FRAME_SIZE
+            || !(1..=8).contains(&transport_attempts)
+        {
+            return Err(UnixRunnerConnectorError::InvalidConfig);
+        }
+        for attempt in 1..=transport_attempts {
+            let result = (|| {
+                let mut stream = self.connect()?;
+                stream
+                    .write_all(frame)
+                    .and_then(|()| stream.flush())
+                    .and_then(|()| stream.shutdown(Shutdown::Write))
+                    .map_err(|error| {
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            UnixRunnerConnectorError::Timeout
+                        } else {
+                            UnixRunnerConnectorError::Unavailable
+                        }
+                    })?;
+                let mut response = Vec::with_capacity(response_length);
+                stream
+                    .take(response_length as u64 + 1)
+                    .read_to_end(&mut response)
+                    .map_err(|error| {
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            UnixRunnerConnectorError::Timeout
+                        } else {
+                            UnixRunnerConnectorError::Unavailable
+                        }
+                    })?;
+                if response.len() != response_length {
+                    return Err(UnixRunnerConnectorError::InvalidResponse);
+                }
+                Ok(response)
+            })();
+            match result {
+                Err(UnixRunnerConnectorError::Unavailable | UnixRunnerConnectorError::Timeout)
+                    if attempt < transport_attempts => {}
+                other => return other,
+            }
+        }
+        Err(UnixRunnerConnectorError::Unavailable)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn exchange_v2_frame(
+        &mut self,
+        _frame: &[u8],
+        _response_length: usize,
+        _transport_attempts: u32,
+    ) -> Result<Vec<u8>, UnixRunnerConnectorError> {
+        Err(UnixRunnerConnectorError::Unavailable)
     }
 }
 

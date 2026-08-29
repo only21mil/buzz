@@ -16,6 +16,7 @@ STORE_ROOT = "/var/lib/buzzci/controld"
 MAX_CONFIG_BYTES = 16 * 1024
 RUNNER_SOCKET = "/run/buzzci/runner-control.sock"
 KEYHOLDER_SOCKET = "/run/buzzci/keyholder.sock"
+ACCEPTANCE_BINDING = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
 ACTIVE_FIELDS = {
     "relay_url", "relay_http_origin", "channel_id", "poll_interval_millis",
     "runner_socket", "runner_uid", "runner_gid", "runner_connect_timeout_millis",
@@ -23,7 +24,7 @@ ACTIVE_FIELDS = {
     "lane_manifest_digest", "lane_epoch", "audience_digest", "isolation_profile_digest",
     "workflow_id", "workflow_digest", "jobs", "keyholder_socket", "keyholder_uid",
     "keyholder_gid", "keyholder_selectors", "keyholder_timeout_millis",
-    "keyholder_transport_attempts",
+    "keyholder_transport_attempts", "acceptance",
 }
 
 
@@ -41,15 +42,22 @@ def config_bytes(
     store_root: str = STORE_ROOT,
     capacity: int = CAPACITY,
     active: dict[str, object] | None = None,
+    acceptance_binding: str | None = None,
 ) -> bytes:
     validate_store_root(store_root)
     if isinstance(capacity, bool) or capacity not in {0, 1}:
         raise ValueError("controld capacity must be exactly zero or one")
     if capacity == 0 and active is not None:
         raise ValueError("capacity zero cannot contain provider bindings")
+    if acceptance_binding is not None and acceptance_binding != ACCEPTANCE_BINDING:
+        raise ValueError("acceptance binding differs from the fixed receipt")
     if capacity == 1:
         validate_active(active)
+        if acceptance_binding != ACCEPTANCE_BINDING:
+            raise ValueError("capacity one requires the post-freeze acceptance binding")
     value = {"schema_version": 1, "capacity": capacity, "store_root": store_root}
+    if acceptance_binding is not None:
+        value["acceptance_binding"] = acceptance_binding
     if active is not None:
         value.update(active)
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
@@ -96,11 +104,66 @@ def validate_active(active: dict[str, object] | None) -> None:
     if not isinstance(active["channel_id"], str) or not isinstance(active["workflow_id"], str):
         raise ValueError("invalid channel or workflow identity")
     jobs = active["jobs"]
-    if not isinstance(jobs, list) or not jobs:
-        raise ValueError("static job source is empty")
+    if not isinstance(jobs, list) or len(jobs) != 1:
+        raise ValueError("capacity-one static job source must contain exactly one job")
+    artifacts = jobs[0].get("artifacts") if isinstance(jobs[0], dict) else None
+    if not isinstance(artifacts, list) or len(artifacts) != 1:
+        raise ValueError("capacity-one static job must declare exactly one artifact")
+    artifact = artifacts[0]
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "artifact_id", "name", "media_type", "relative_name", "max_bytes"
+    }:
+        raise ValueError("capacity-one artifact declaration is incomplete")
+    for field in ("artifact_id", "name", "relative_name"):
+        value = artifact[field]
+        if (
+            not isinstance(value, str) or not 1 <= len(value) <= 64
+            or value in {".", ".."}
+            or any(not (ch.isascii() and (ch.isalnum() or ch in "._-")) for ch in value)
+        ):
+            raise ValueError(f"invalid artifact field: {field}")
+    media_type = artifact["media_type"]
+    if (
+        not isinstance(media_type, str) or not 1 <= len(media_type) <= 64
+        or "/" not in media_type
+        or any(not (ch.isascii() and (ch.isalnum() or ch in "/+.-")) for ch in media_type)
+    ):
+        raise ValueError("invalid artifact media type")
+    maximum = artifact["max_bytes"]
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= 32768:
+        raise ValueError("invalid artifact byte bound")
     selectors = active["keyholder_selectors"]
     if not isinstance(selectors, dict) or set(selectors) != {"ci_event", "nip98", "manifest"}:
         raise ValueError("keyholder selectors are incomplete")
+    acceptance = active["acceptance"]
+    if not isinstance(acceptance, dict) or set(acceptance) != {
+        "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event"
+    }:
+        raise ValueError("acceptance mutation binding is incomplete")
+    actor = acceptance["actor"]
+    if not isinstance(actor, dict) or set(actor) != {"public_key", "generation"}:
+        raise ValueError("acceptance actor binding is incomplete")
+    if (
+        not isinstance(actor["public_key"], str) or len(actor["public_key"]) != 64
+        or any(ch not in "0123456789abcdef" for ch in actor["public_key"])
+        or isinstance(actor["generation"], bool) or not isinstance(actor["generation"], int)
+        or actor["generation"] < 1
+        or not isinstance(acceptance["scenario_sha256"], str)
+        or len(acceptance["scenario_sha256"]) != 64
+        or any(ch not in "0123456789abcdef" for ch in acceptance["scenario_sha256"])
+    ):
+        raise ValueError("acceptance actor or scenario binding is invalid")
+    for field in ("run_event", "grant_event", "rerun_event", "tombstone_event"):
+        event = acceptance[field]
+        if (
+            not isinstance(event, list) or len(event) != 6 or event[0] != 0
+            or event[1] != actor["public_key"]
+            or isinstance(event[2], bool) or not isinstance(event[2], int) or event[2] < 0
+            or isinstance(event[3], bool) or not isinstance(event[3], int) or event[3] < 0
+            or not isinstance(event[4], list) or not isinstance(event[5], str)
+            or len(json.dumps(event, separators=(",", ":")).encode()) > 48 * 1024
+        ):
+            raise ValueError(f"invalid acceptance event template: {field}")
 
 
 def require_safe_parent(path: Path) -> Path:

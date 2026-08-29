@@ -9,11 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use buzz_ci_keyholder::{
-    decode_response, encode_request, CanonicalPayload, DescribeRequest, DescribeResponse,
+    decode_response, encode_request, AcceptanceMutation, CanonicalPayload,
+    DescribeAcceptanceRequest, DescribeAcceptanceResponse, DescribeRequest, DescribeResponse,
     ErrorCode, FrameHeader, HttpMethod as KeyholderHttpMethod, KeySelector, KeyholderClient,
     ManifestKind, Nip98AuthorizeRequest, OperationSet, PeerPolicy, PublicIdentity, Request,
-    Response, SelectorSet, SignCiEventRequest, SignManifestRequest, SignatureResponse,
-    Url as KeyholderUrl, HEADER_SIZE, KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
+    Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest,
+    SignatureResponse, Url as KeyholderUrl, HEADER_SIZE, KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
 };
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
 use nostr::{Event, Tag};
@@ -257,7 +258,9 @@ impl UnixKeyholderClient {
             | Response::Nip98Authorize(value)
             | Response::SignManifest(value) => value,
             Response::Error { error, .. } => return Err(map_server_error(error)),
-            Response::Describe(_) => return Err(KeyholderError::Protocol),
+            Response::Describe(_)
+            | Response::DescribeAcceptance(_)
+            | Response::SignAcceptanceMutation(_) => return Err(KeyholderError::Protocol),
         };
         let expected_identity = self.config.expected_identity(selector)?;
         if signature.identity != expected_identity {
@@ -302,6 +305,47 @@ impl UnixKeyholderClient {
         )?;
         request.admission_signature = response.signature;
         Ok(())
+    }
+
+    /// Read the activation-bound acceptance authority over the same exact
+    /// authenticated keyholder socket used for production signing.
+    pub fn describe_acceptance(&self) -> Result<DescribeAcceptanceResponse, KeyholderError> {
+        match self.exchange(&Request::DescribeAcceptance(DescribeAcceptanceRequest))? {
+            Response::DescribeAcceptance(value) => Ok(value),
+            Response::Error { error, .. } => Err(map_server_error(error)),
+            _ => Err(KeyholderError::Protocol),
+        }
+    }
+
+    /// Sign one preconfigured activation mutation and verify the returned
+    /// actor, digest, generation, and BIP-340 signature locally.
+    pub fn sign_acceptance_mutation(
+        &self,
+        actor: PublicIdentity,
+        scenario_sha256: [u8; 32],
+        mutation: AcceptanceMutation,
+        event_id: [u8; 32],
+    ) -> Result<SignatureResponse, KeyholderError> {
+        let response = self.exchange(&Request::SignAcceptanceMutation(
+            SignAcceptanceMutationRequest {
+                expected_generation: actor.generation,
+                scenario_sha256,
+                mutation,
+            },
+        ))?;
+        let signature = match response {
+            Response::SignAcceptanceMutation(value) => value,
+            Response::Error { error, .. } => return Err(map_server_error(error)),
+            _ => return Err(KeyholderError::Protocol),
+        };
+        if signature.identity != actor {
+            return Err(KeyholderError::WrongIdentity);
+        }
+        if signature.signed_digest != event_id {
+            return Err(KeyholderError::WrongDigest);
+        }
+        verify_signature(signature)?;
+        Ok(signature)
     }
 }
 
@@ -683,7 +727,8 @@ mod tests {
     use std::thread;
 
     use buzz_ci_keyholder::{
-        decode_request, encode_response, ErrorResponse, Operation, SignCiEventRequest,
+        decode_request, encode_response, DescribeAcceptanceResponse, ErrorResponse, Operation,
+        SignCiEventRequest,
     };
     use nix::unistd::{getegid, geteuid};
     use tempfile::TempDir;
@@ -698,6 +743,8 @@ mod tests {
     enum Reply {
         Describe,
         SignCiEvent,
+        DescribeAcceptance,
+        SignAcceptance,
         Stale,
         WrongOperation,
         WrongRequestId,
@@ -804,6 +851,51 @@ mod tests {
                             }),
                         )
                     }
+                    Reply::DescribeAcceptance => (
+                        request_header,
+                        Response::DescribeAcceptance(DescribeAcceptanceResponse {
+                            actor: PublicIdentity {
+                                public_key: selector_state
+                                    .identity(KeySelector::CiEvent)
+                                    .public_key,
+                                generation: 10,
+                            },
+                            scenario_sha256: [9; 32],
+                            event_ids: [[1; 32], [2; 32], [3; 32], [4; 32]],
+                        }),
+                    ),
+                    Reply::SignAcceptance => {
+                        use nostr::secp256k1::{Keypair, SecretKey};
+
+                        let Request::SignAcceptanceMutation(request) = request else {
+                            panic!("acceptance sign request")
+                        };
+                        assert_eq!(request.scenario_sha256, [9; 32]);
+                        assert_eq!(request.mutation, AcceptanceMutation::Run);
+                        let mut scalar = [0_u8; 32];
+                        scalar[31] = 1;
+                        let secret = SecretKey::from_slice(&scalar).expect("secret");
+                        let keypair = Keypair::from_secret_key(SECP256K1, &secret);
+                        let digest = [1; 32];
+                        (
+                            request_header,
+                            Response::SignAcceptanceMutation(SignatureResponse {
+                                identity: PublicIdentity {
+                                    public_key: selector_state
+                                        .identity(KeySelector::CiEvent)
+                                        .public_key,
+                                    generation: 10,
+                                },
+                                signed_digest: digest,
+                                signature: SECP256K1
+                                    .sign_schnorr_no_aux_rand(
+                                        &Message::from_digest(digest),
+                                        &keypair,
+                                    )
+                                    .serialize(),
+                            }),
+                        )
+                    }
                     Reply::WrongOperation => {
                         let header = FrameHeader {
                             operation: Operation::SignManifest,
@@ -897,6 +989,33 @@ mod tests {
         let event: Event = serde_json::from_value(signed.signed_event).expect("signed event");
         event.verify().expect("valid event");
         assert_eq!(event.pubkey.to_hex(), CI_KEY);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn acceptance_authority_description_and_signature_are_exactly_bound() {
+        let (_directory, path, server) = spawn_server(vec![
+            Reply::Describe,
+            Reply::DescribeAcceptance,
+            Reply::SignAcceptance,
+        ]);
+        let client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
+            .expect("authenticated client");
+        let description = client
+            .describe_acceptance()
+            .expect("acceptance description");
+        assert_eq!(description.scenario_sha256, [9; 32]);
+        assert_eq!(description.event_ids[0], [1; 32]);
+
+        let signature = client
+            .sign_acceptance_mutation(
+                description.actor,
+                description.scenario_sha256,
+                AcceptanceMutation::Run,
+                description.event_ids[0],
+            )
+            .expect("acceptance signature");
+        assert_eq!(signature.signed_digest, description.event_ids[0]);
         server.join().expect("server");
     }
 

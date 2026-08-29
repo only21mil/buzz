@@ -8,9 +8,11 @@ use std::path::{Component, Path, PathBuf};
 use serde::{de, Deserialize, Deserializer};
 use thiserror::Error;
 
-use buzz_ci_controld::keyholder::{KeyholderClientConfig, KeyholderSelectorBindings};
+use buzz_ci_controld::keyholder::{
+    KeyholderClientConfig, KeyholderSelectorBinding, KeyholderSelectorBindings,
+};
 use buzz_ci_controld::runner_client::UnixRunnerConnectorConfig;
-use buzz_ci_controld::RUNNER_CONTROL_SOCKET_PATH;
+use buzz_ci_controld::{ACCEPTANCE_BINDING_PATH, RUNNER_CONTROL_SOCKET_PATH};
 
 const CONFIG_MODE: u32 = 0o600;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
@@ -24,6 +26,7 @@ const MAX_RUNNER_TRANSPORT_ATTEMPTS: u32 = 8;
 pub(crate) struct DaemonConfig {
     capacity: u32,
     store_root: PathBuf,
+    acceptance_binding: Option<PathBuf>,
     active: Option<ActiveConfig>,
 }
 
@@ -43,6 +46,18 @@ pub(crate) struct ActiveConfig {
     pub(crate) workflow_digest: String,
     pub(crate) jobs: Vec<StaticJobConfig>,
     pub(crate) keyholder: KeyholderClientConfig,
+    pub(crate) acceptance: AcceptanceMutationConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptanceMutationConfig {
+    pub(crate) actor: KeyholderSelectorBinding,
+    pub(crate) scenario_sha256: String,
+    pub(crate) run_event: serde_json::Value,
+    pub(crate) grant_event: serde_json::Value,
+    pub(crate) rerun_event: serde_json::Value,
+    pub(crate) tombstone_event: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -54,6 +69,17 @@ pub(crate) struct StaticJobConfig {
     pub(crate) skip_policy: buzz_core::ci::CiSkipPolicy,
     pub(crate) selected_job_instance: String,
     pub(crate) also_reruns: Vec<String>,
+    pub(crate) artifacts: Vec<StaticArtifactConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StaticArtifactConfig {
+    pub(crate) artifact_id: String,
+    pub(crate) name: String,
+    pub(crate) media_type: String,
+    pub(crate) relative_name: String,
+    pub(crate) max_bytes: u32,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +88,7 @@ struct RawDaemonConfig {
     schema_version: u32,
     capacity: u32,
     store_root: PathBuf,
+    acceptance_binding: Option<PathBuf>,
     relay_url: Option<String>,
     relay_http_origin: Option<String>,
     channel_id: Option<String>,
@@ -85,6 +112,7 @@ struct RawDaemonConfig {
     keyholder_selectors: Option<KeyholderSelectorBindings>,
     keyholder_timeout_millis: Option<u64>,
     keyholder_transport_attempts: Option<u32>,
+    acceptance: Option<AcceptanceMutationConfig>,
 }
 
 impl<'de> Deserialize<'de> for DaemonConfig {
@@ -171,10 +199,21 @@ impl DaemonConfig {
             || raw.keyholder_gid.is_some()
             || raw.keyholder_selectors.is_some()
             || raw.keyholder_timeout_millis.is_some()
-            || raw.keyholder_transport_attempts.is_some();
+            || raw.keyholder_transport_attempts.is_some()
+            || raw.acceptance.is_some();
+        let acceptance_binding = raw.acceptance_binding.take();
+        if acceptance_binding
+            .as_deref()
+            .is_some_and(|path| path != Path::new(ACCEPTANCE_BINDING_PATH))
+        {
+            return Err(ConfigError::InvalidSchema);
+        }
         let active = match raw.capacity {
             0 if !any_active => None,
             1 => {
+                if acceptance_binding.is_none() {
+                    return Err(ConfigError::InvalidSchema);
+                }
                 let relay_url = raw.relay_url.take().ok_or(ConfigError::InvalidSchema)?;
                 let relay_http_origin = raw
                     .relay_http_origin
@@ -253,6 +292,8 @@ impl DaemonConfig {
                 keyholder
                     .validate()
                     .map_err(|_| ConfigError::InvalidSchema)?;
+                let acceptance = raw.acceptance.take().ok_or(ConfigError::InvalidSchema)?;
+                validate_acceptance(&acceptance)?;
                 Some(ActiveConfig {
                     relay_url,
                     relay_http_origin,
@@ -268,6 +309,7 @@ impl DaemonConfig {
                     workflow_digest: raw.workflow_digest.take().unwrap(),
                     jobs,
                     keyholder,
+                    acceptance,
                 })
             }
             _ => return Err(ConfigError::InvalidSchema),
@@ -275,6 +317,7 @@ impl DaemonConfig {
         Ok(Self {
             capacity: raw.capacity,
             store_root: raw.store_root,
+            acceptance_binding,
             active,
         })
     }
@@ -285,6 +328,10 @@ impl DaemonConfig {
 
     pub(crate) const fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    pub(crate) fn acceptance_binding(&self) -> Option<&Path> {
+        self.acceptance_binding.as_deref()
     }
 
     pub(crate) const fn active(&self) -> Option<&ActiveConfig> {
@@ -339,18 +386,73 @@ fn validate_relay_pair(relay_url: &str, http_origin: &str) -> Result<(), ConfigE
 fn validate_static_jobs(workflow_id: &str, jobs: &[StaticJobConfig]) -> Result<(), ConfigError> {
     let mut ids = std::collections::BTreeSet::new();
     if workflow_id.is_empty()
-        || jobs.is_empty()
+        || jobs.len() != 1
         || jobs.iter().any(|job| {
             job.job_id.is_empty()
                 || job.name.is_empty()
                 || job.selected_job_instance.is_empty()
                 || !ids.insert(job.job_id.as_str())
                 || job.also_reruns.iter().any(|value| value.is_empty())
+                || job.artifacts.len() != 1
+                || job.artifacts.iter().any(|artifact| {
+                    !valid_artifact_name(&artifact.artifact_id)
+                        || !valid_artifact_name(&artifact.name)
+                        || !valid_artifact_name(&artifact.relative_name)
+                        || artifact.max_bytes == 0
+                        || artifact.max_bytes > 32 * 1024
+                        || !artifact.media_type.contains('/')
+                        || artifact.media_type.len() > 64
+                        || !artifact.media_type.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'/' | b'+' | b'.' | b'-')
+                        })
+                })
         })
     {
         return Err(ConfigError::InvalidSchema);
     }
     Ok(())
+}
+
+fn validate_acceptance(value: &AcceptanceMutationConfig) -> Result<(), ConfigError> {
+    if !is_lower_hex(&value.actor.public_key, 64)
+        || value.actor.generation == 0
+        || !is_lower_hex(&value.scenario_sha256, 64)
+    {
+        return Err(ConfigError::InvalidSchema);
+    }
+    for event in [
+        &value.run_event,
+        &value.grant_event,
+        &value.rerun_event,
+        &value.tombstone_event,
+    ] {
+        let fields = event.as_array().ok_or(ConfigError::InvalidSchema)?;
+        if fields.len() != 6
+            || fields[0].as_u64() != Some(0)
+            || fields[1].as_str() != Some(&value.actor.public_key)
+            || !fields[2].is_u64()
+            || !fields[3].is_u64()
+            || !fields[4].is_array()
+            || !fields[5].is_string()
+            || serde_json::to_vec(event)
+                .map_err(|_| ConfigError::InvalidSchema)?
+                .len()
+                > 48 * 1024
+        {
+            return Err(ConfigError::InvalidSchema);
+        }
+    }
+    Ok(())
+}
+
+fn valid_artifact_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -429,6 +531,7 @@ mod tests {
                 "schema_version":1,
                 "capacity":1,
                 "store_root":"{}",
+                "acceptance_binding":"/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
                 "relay_url":"wss://relay.example.test",
                 "relay_http_origin":"https://relay.example.test",
                 "channel_id":"123e4567-e89b-12d3-a456-426614174099",
@@ -451,7 +554,14 @@ mod tests {
                     "required":true,
                     "skip_policy":"forbid",
                     "selected_job_instance":"test",
-                    "also_reruns":[]
+                    "also_reruns":[],
+                    "artifacts":[{{
+                        "artifact_id":"result",
+                        "name":"result.json",
+                        "media_type":"application/json",
+                        "relative_name":"result.json",
+                        "max_bytes":32768
+                    }}]
                 }}],
                 "keyholder_socket":"/run/buzzci/keyholder.sock",
                 "keyholder_uid":1001,
@@ -462,16 +572,29 @@ mod tests {
                     "manifest":{{"public_key":"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9","generation":3}}
                 }},
                 "keyholder_timeout_millis":500,
-                "keyholder_transport_attempts":2
+                "keyholder_transport_attempts":2,
+                "acceptance":{{
+                    "actor":{{"public_key":"{actor}","generation":4}},
+                    "scenario_sha256":"{digest}",
+                    "run_event":[0,"{actor}",1,46100,[],"{{}}"],
+                    "grant_event":[0,"{actor}",2,46107,[],"{{}}"],
+                    "rerun_event":[0,"{actor}",3,46100,[],"{{}}"],
+                    "tombstone_event":[0,"{actor}",4,5,[],""]
+                }}
             }}"#,
             store.path().display(),
             digest = "11".repeat(32),
+            actor = "2a".repeat(32),
         );
         let (_root, path, owner_uid) = fixture(&json);
 
         let config = DaemonConfig::load(&path, owner_uid).expect("active configuration");
         let active = config.active().expect("active binding");
         assert_eq!(config.capacity(), 1);
+        assert_eq!(
+            config.acceptance_binding(),
+            Some(Path::new(ACCEPTANCE_BINDING_PATH))
+        );
         assert_eq!(active.relay_url, "wss://relay.example.test");
         assert_eq!(
             active.runner.socket_path,
@@ -482,6 +605,33 @@ mod tests {
             PathBuf::from(KEYHOLDER_SOCKET_PATH)
         );
         assert_eq!(active.keyholder.keyholder_selectors.nip98.generation, 2);
+        assert_eq!(active.acceptance.actor.generation, 4);
+    }
+
+    #[test]
+    fn capacity_zero_accepts_only_the_fixed_post_freeze_acceptance_binding() {
+        let store = tempfile::tempdir().expect("store directory");
+        let valid = format!(
+            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","acceptance_binding":"{}"}}"#,
+            store.path().display(),
+            ACCEPTANCE_BINDING_PATH
+        );
+        let (_root, path, owner_uid) = fixture(&valid);
+        let config = DaemonConfig::load(&path, owner_uid).expect("staged-zero configuration");
+        assert_eq!(
+            config.acceptance_binding(),
+            Some(Path::new(ACCEPTANCE_BINDING_PATH))
+        );
+
+        let invalid = format!(
+            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","acceptance_binding":"/var/lib/buzzci/controld/acceptance.json"}}"#,
+            store.path().display()
+        );
+        let (_root, path, owner_uid) = fixture(&invalid);
+        assert_eq!(
+            DaemonConfig::load(&path, owner_uid),
+            Err(ConfigError::InvalidSchema)
+        );
     }
 
     #[test]
