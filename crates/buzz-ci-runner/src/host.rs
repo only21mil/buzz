@@ -2,11 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use buzz_ci_broker_protocol::{Conclusion, TrustClass};
 use buzz_core::ci::{CiJobState, CiRequestEnvelope};
@@ -67,9 +71,10 @@ impl ConfiguredRunner {
     pub fn handle(
         &mut self,
         request: RunnerRequest,
+        request_frame_digest: [u8; 32],
         writer: &mut impl Write,
     ) -> Result<(), crate::handler::HandlerError> {
-        self.handler.handle(request, writer)
+        self.handler.handle(request, request_frame_digest, writer)
     }
 }
 
@@ -149,10 +154,19 @@ impl SignedJobManifest {
 pub struct ManifestDispatchVerifier {
     key: VerifyingKey,
     relay_signer: String,
+    clock: fn() -> Result<u64, ExecutionBackendError>,
 }
 
 impl ManifestDispatchVerifier {
     pub fn new(key_hex: &str, relay_signer: String) -> Result<Self, HostConfigurationError> {
+        Self::with_clock(key_hex, relay_signer, now)
+    }
+
+    fn with_clock(
+        key_hex: &str,
+        relay_signer: String,
+        clock: fn() -> Result<u64, ExecutionBackendError>,
+    ) -> Result<Self, HostConfigurationError> {
         let key: [u8; 32] = hex::decode(key_hex)
             .map_err(|_| HostConfigurationError::InvalidVerificationKey)?
             .try_into()
@@ -161,6 +175,7 @@ impl ManifestDispatchVerifier {
             key: VerifyingKey::from_bytes(&key)
                 .map_err(|_| HostConfigurationError::InvalidVerificationKey)?,
             relay_signer,
+            clock,
         })
     }
 }
@@ -169,14 +184,23 @@ impl DispatchVerifier for ManifestDispatchVerifier {
     fn verify(
         &self,
         request: &RunnerRequest,
-        _now: u64,
+        _assigned_at: u64,
     ) -> Result<VerifiedDispatch, RefusalReason> {
         let RunnerRequest::ExecuteAttempt {
             request_event_id,
+            request_event,
             signed_request_digest,
+            deadline_at,
             jobs,
             ..
         } = request;
+        let runner_now = (self.clock)().map_err(|_| RefusalReason::BackendUnavailable)?;
+        if runner_now >= request_event.expires_at {
+            return Err(RefusalReason::Expired);
+        }
+        if runner_now >= *deadline_at {
+            return Err(RefusalReason::DeadlineExceeded);
+        }
         let signed_digest =
             decode_digest(signed_request_digest).ok_or(RefusalReason::InvalidRequest)?;
         let mut verified = Vec::with_capacity(jobs.len());
@@ -280,6 +304,7 @@ impl JobExecutor for ProcessJobExecutor {
         &mut self,
         job: &ExecuteJob,
         lease: &AdmittedLease,
+        deadline_at: u64,
     ) -> Result<JobExecution, ExecutionBackendError> {
         let manifest: SignedJobManifest =
             serde_json::from_str(&job.job_manifest).map_err(|_| ExecutionBackendError::Failed)?;
@@ -290,7 +315,7 @@ impl JobExecutor for ProcessJobExecutor {
         let path = self.evidence_directory.join(&relative_path);
         // The synced exclusive log entry is also the durable at-most-once execution claim.
         // A restart after this point refuses rather than invoking the program twice.
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -300,25 +325,17 @@ impl JobExecutor for ProcessJobExecutor {
             .and_then(|()| File::open(&self.evidence_directory)?.sync_all())
             .map_err(|_| ExecutionBackendError::MissingEvidence)?;
         let started_at = now()?;
-        let output = Command::new(&self.program)
+        if started_at >= deadline_at {
+            return Err(ExecutionBackendError::DeadlineExceeded);
+        }
+        let mut command = Command::new(&self.program);
+        command
             .args(&manifest.argv)
             .env_clear()
             .envs(&manifest.environment)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|_| ExecutionBackendError::Unavailable)?;
+            .stdin(Stdio::null());
+        let output = run_bounded_process(&mut command, file, self.max_output_bytes, deadline_at)?;
         let finished_at = now()?.max(started_at);
-        let mut log_bytes = output.stdout;
-        log_bytes.extend_from_slice(&output.stderr);
-        if log_bytes.len() > self.max_output_bytes {
-            return Err(ExecutionBackendError::MissingEvidence);
-        }
-        let log_digest: [u8; 32] = Sha256::digest(&log_bytes).into();
-        file.write_all(&log_bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|_| ExecutionBackendError::MissingEvidence)?;
         let state = if output.status.success() {
             CiJobState::Success
         } else {
@@ -332,7 +349,7 @@ impl JobExecutor for ProcessJobExecutor {
         let evidence_digest: [u8; 32] = Sha256::new()
             .chain_update(EVIDENCE_DOMAIN)
             .chain_update(lease.lease_id())
-            .chain_update(log_digest)
+            .chain_update(output.log_digest)
             .finalize()
             .into();
         Ok(JobExecution {
@@ -342,8 +359,8 @@ impl JobExecutor for ProcessJobExecutor {
             finished_at,
             log: LogEvidence {
                 relative_path,
-                sha256: hex::encode(log_digest),
-                byte_length: log_bytes.len() as u64,
+                sha256: hex::encode(output.log_digest),
+                byte_length: output.byte_length,
                 cap_bytes: self.max_output_bytes as u64,
                 truncated: false,
             },
@@ -355,6 +372,199 @@ impl JobExecutor for ProcessJobExecutor {
             )
             .map_err(|_| ExecutionBackendError::MissingEvidence)?,
         })
+    }
+}
+
+struct BoundedProcessOutput {
+    status: ExitStatus,
+    log_digest: [u8; 32],
+    byte_length: u64,
+}
+
+struct OutputSink {
+    file: File,
+    hasher: Sha256,
+    byte_length: usize,
+    max_bytes: usize,
+}
+
+fn run_bounded_process(
+    command: &mut Command,
+    file: File,
+    max_output_bytes: usize,
+    deadline_at: u64,
+) -> Result<BoundedProcessOutput, ExecutionBackendError> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|_| ExecutionBackendError::Unavailable)?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = terminate_process_group(&mut child);
+        return Err(ExecutionBackendError::Unavailable);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = terminate_process_group(&mut child);
+        return Err(ExecutionBackendError::Unavailable);
+    };
+    let sink = Arc::new(Mutex::new(OutputSink {
+        file,
+        hasher: Sha256::new(),
+        byte_length: 0,
+        max_bytes: max_output_bytes,
+    }));
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let io_failed = Arc::new(AtomicBool::new(false));
+    let stdout_done = Arc::new(AtomicBool::new(false));
+    let stderr_done = Arc::new(AtomicBool::new(false));
+    let stdout_thread = spawn_output_drain(
+        stdout,
+        sink.clone(),
+        overflowed.clone(),
+        io_failed.clone(),
+        stdout_done.clone(),
+    );
+    let stderr_thread = spawn_output_drain(
+        stderr,
+        sink.clone(),
+        overflowed.clone(),
+        io_failed.clone(),
+        stderr_done.clone(),
+    );
+
+    let mut deadline_exceeded = false;
+    let mut leader_status = None;
+    let status = loop {
+        if overflowed.load(Ordering::Acquire) || io_failed.load(Ordering::Acquire) {
+            break terminate_process_group(&mut child)?;
+        }
+        match now() {
+            Ok(current) if current >= deadline_at => {
+                deadline_exceeded = true;
+                break terminate_process_group(&mut child)?;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = terminate_process_group(&mut child);
+                return Err(error);
+            }
+        }
+        if leader_status.is_none() {
+            match child.try_wait() {
+                Ok(status) => leader_status = status,
+                Err(_) => {
+                    let _ = terminate_process_group(&mut child);
+                    return Err(ExecutionBackendError::Unavailable);
+                }
+            }
+        }
+        if stdout_done.load(Ordering::Acquire) && stderr_done.load(Ordering::Acquire) {
+            if let Some(status) = leader_status {
+                break status;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    if stdout_thread.join().is_err() || stderr_thread.join().is_err() {
+        return Err(ExecutionBackendError::MissingEvidence);
+    }
+    if deadline_exceeded {
+        return Err(ExecutionBackendError::DeadlineExceeded);
+    }
+    if overflowed.load(Ordering::Acquire) || io_failed.load(Ordering::Acquire) {
+        return Err(ExecutionBackendError::MissingEvidence);
+    }
+
+    let sink = Arc::try_unwrap(sink)
+        .map_err(|_| ExecutionBackendError::MissingEvidence)?
+        .into_inner()
+        .map_err(|_| ExecutionBackendError::MissingEvidence)?;
+    sink.file
+        .sync_all()
+        .map_err(|_| ExecutionBackendError::MissingEvidence)?;
+    Ok(BoundedProcessOutput {
+        status,
+        log_digest: sink.hasher.finalize().into(),
+        byte_length: sink.byte_length as u64,
+    })
+}
+
+fn spawn_output_drain(
+    mut reader: impl Read + Send + 'static,
+    sink: Arc<Mutex<OutputSink>>,
+    overflowed: Arc<AtomicBool>,
+    io_failed: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        struct Done(Arc<AtomicBool>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _done = Done(done);
+        let mut buffer = [0_u8; 8192];
+        loop {
+            if overflowed.load(Ordering::Acquire) || io_failed.load(Ordering::Acquire) {
+                return;
+            }
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => read,
+                Err(_) => {
+                    io_failed.store(true, Ordering::Release);
+                    return;
+                }
+            };
+            let mut sink = match sink.lock() {
+                Ok(sink) => sink,
+                Err(_) => {
+                    io_failed.store(true, Ordering::Release);
+                    return;
+                }
+            };
+            let remaining = sink.max_bytes.saturating_sub(sink.byte_length);
+            let accepted = read.min(remaining);
+            if accepted > 0 {
+                if sink.file.write_all(&buffer[..accepted]).is_err() {
+                    io_failed.store(true, Ordering::Release);
+                    return;
+                }
+                sink.hasher.update(&buffer[..accepted]);
+                sink.byte_length += accepted;
+            }
+            if accepted != read {
+                overflowed.store(true, Ordering::Release);
+                return;
+            }
+        }
+    })
+}
+
+fn terminate_process_group(
+    child: &mut std::process::Child,
+) -> Result<ExitStatus, ExecutionBackendError> {
+    let raw_pid = i32::try_from(child.id()).map_err(|_| ExecutionBackendError::Unavailable)?;
+    let process_group = nix::unistd::Pid::from_raw(raw_pid);
+    let _ = nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGTERM);
+    let grace_deadline = Instant::now() + Duration::from_millis(250);
+    let mut leader_status = None;
+    while Instant::now() < grace_deadline {
+        if leader_status.is_none() {
+            leader_status = child
+                .try_wait()
+                .map_err(|_| ExecutionBackendError::Unavailable)?;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL);
+    if let Some(status) = leader_status {
+        Ok(status)
+    } else {
+        child.wait().map_err(|_| ExecutionBackendError::Unavailable)
     }
 }
 
@@ -392,6 +602,8 @@ pub(crate) fn validate_private_directory(path: &PathBuf) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use buzz_core::ci::{CiRequestType, CI_SCHEMA_VERSION};
     use ed25519_dalek::{Signer, SigningKey};
@@ -439,7 +651,7 @@ mod tests {
                 timeout_seconds: 10,
                 idempotency_key: "123e4567-e89b-12d3-a456-426614174012".into(),
                 issued_at: 10,
-                expires_at: 20,
+                expires_at: 30,
             },
             signed_request_digest: manifest.signed_request_digest.clone(),
             assigned_at: 10,
@@ -460,9 +672,10 @@ mod tests {
     #[test]
     fn manifest_signature_and_raw_digest_are_both_bound() {
         let key = SigningKey::from_bytes(&[7; 32]);
-        let verifier = ManifestDispatchVerifier::new(
+        let verifier = ManifestDispatchVerifier::with_clock(
             &hex::encode(key.verifying_key().as_bytes()),
             "bb".repeat(32),
+            || Ok(10),
         )
         .unwrap();
         let request = request_with_manifest(&key);
@@ -477,14 +690,42 @@ mod tests {
         ));
 
         let other_key = SigningKey::from_bytes(&[8; 32]);
-        let wrong_verifier = ManifestDispatchVerifier::new(
+        let wrong_verifier = ManifestDispatchVerifier::with_clock(
             &hex::encode(other_key.verifying_key().as_bytes()),
             "bb".repeat(32),
+            || Ok(10),
         )
         .unwrap();
         assert!(matches!(
             wrong_verifier.verify(&request, 10),
             Err(RefusalReason::InvalidManifest)
+        ));
+    }
+
+    #[test]
+    fn verifier_uses_runner_clock_for_deadline_and_expiry() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let request = request_with_manifest(&key);
+        let deadline = ManifestDispatchVerifier::with_clock(
+            &hex::encode(key.verifying_key().as_bytes()),
+            "bb".repeat(32),
+            || Ok(20),
+        )
+        .unwrap();
+        assert!(matches!(
+            deadline.verify(&request, 10),
+            Err(RefusalReason::DeadlineExceeded)
+        ));
+
+        let expired = ManifestDispatchVerifier::with_clock(
+            &hex::encode(key.verifying_key().as_bytes()),
+            "bb".repeat(32),
+            || Ok(30),
+        )
+        .unwrap();
+        assert!(matches!(
+            expired.verify(&request, 10),
+            Err(RefusalReason::Expired)
         ));
     }
 
@@ -513,6 +754,49 @@ mod tests {
         manifest.argv = vec!["test".into()];
         manifest.environment.insert("bad-key".into(), "x".into());
         assert!(!executor.inputs_within_bounds(&manifest));
+    }
+
+    #[test]
+    fn executor_streams_output_with_a_hard_combined_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded.log");
+        let file = File::create(&path).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "while :; do printf 0123456789; done"]);
+
+        assert!(matches!(
+            run_bounded_process(&mut command, file, 128, now().unwrap() + 5),
+            Err(ExecutionBackendError::MissingEvidence)
+        ));
+        assert!(fs::metadata(path).unwrap().len() <= 128);
+    }
+
+    #[test]
+    fn executor_deadline_terminates_and_reaps_the_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deadline.log");
+        let pid_path = directory.path().join("child.pid");
+        let file = File::create(&path).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"")
+            .arg("runner-test")
+            .arg(&pid_path);
+        let started = Instant::now();
+
+        assert!(matches!(
+            run_bounded_process(&mut command, file, 128, now().unwrap() + 1),
+            Err(ExecutionBackendError::DeadlineExceeded)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let child_pid = fs::read_to_string(pid_path).unwrap();
+        let child_proc = PathBuf::from(format!("/proc/{}", child_pid.trim()));
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        while child_proc.exists() && Instant::now() < reap_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!child_proc.exists(), "child process was not reaped");
     }
 
     #[test]

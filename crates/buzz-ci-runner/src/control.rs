@@ -196,6 +196,8 @@ pub enum ExecutionBackendError {
     Failed,
     /// Execution returned without a complete bounded evidence set.
     MissingEvidence,
+    /// The trusted runner wall deadline elapsed before the process tree exited.
+    DeadlineExceeded,
 }
 
 impl From<ExecutionBackendError> for ControlError {
@@ -204,6 +206,7 @@ impl From<ExecutionBackendError> for ControlError {
             ExecutionBackendError::Unavailable => Self::ExecutionBackendUnavailable,
             ExecutionBackendError::Failed => Self::ExecutionFailed,
             ExecutionBackendError::MissingEvidence => Self::InvalidExecutionEvidence,
+            ExecutionBackendError::DeadlineExceeded => Self::ExpiredRequest,
         }
     }
 }

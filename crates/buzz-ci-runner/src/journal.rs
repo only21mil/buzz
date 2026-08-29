@@ -11,7 +11,7 @@ use crate::handler::{JournalWrite, ReceiptJournal, ReceiptJournalError};
 use crate::host::validate_private_directory;
 use crate::transport::{ReceiptWriter, RunnerReceipt};
 
-const JOURNAL_SCHEMA_VERSION: u32 = 1;
+const JOURNAL_SCHEMA_VERSION: u32 = 2;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -24,6 +24,7 @@ pub struct DurableReceiptJournal {
 struct JournalRecord {
     schema_version: u32,
     dispatch_id: String,
+    request_frame_digest: [u8; 32],
     receipts: Vec<RunnerReceipt>,
 }
 
@@ -44,6 +45,7 @@ impl DurableReceiptJournal {
         &self,
         path: &Path,
         dispatch_id: &str,
+        expected_request_frame_digest: Option<[u8; 32]>,
     ) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError> {
         let mut file = match OpenOptions::new()
             .read(true)
@@ -73,7 +75,11 @@ impl DurableReceiptJournal {
         }
         let record: JournalRecord =
             serde_json::from_slice(&bytes).map_err(|_| ReceiptJournalError)?;
-        if record.schema_version != JOURNAL_SCHEMA_VERSION || record.dispatch_id != dispatch_id {
+        if record.schema_version != JOURNAL_SCHEMA_VERSION
+            || record.dispatch_id != dispatch_id
+            || expected_request_frame_digest
+                .is_some_and(|expected| expected != record.request_frame_digest)
+        {
             return Err(ReceiptJournalError);
         }
         validate_receipts(&record.receipts)?;
@@ -104,7 +110,7 @@ impl DurableReceiptJournal {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     // A crash after syncing the temp but before linking the final name
                     // must promote the already-durable terminal set, never re-execute it.
-                    self.read(&entry.path(), dispatch_id)?
+                    self.read(&entry.path(), dispatch_id, None)?
                         .ok_or(ReceiptJournalError)?;
                     fs::hard_link(entry.path(), &final_path).map_err(|_| ReceiptJournalError)?;
                     fs::remove_file(entry.path()).map_err(|_| ReceiptJournalError)?;
@@ -119,24 +125,34 @@ impl DurableReceiptJournal {
 }
 
 impl ReceiptJournal for DurableReceiptJournal {
-    fn load(&self, dispatch_id: &str) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError> {
-        self.read(&self.path(dispatch_id)?, dispatch_id)
+    fn load(
+        &self,
+        dispatch_id: &str,
+        request_frame_digest: [u8; 32],
+    ) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError> {
+        self.read(
+            &self.path(dispatch_id)?,
+            dispatch_id,
+            Some(request_frame_digest),
+        )
     }
 
     fn store_if_absent(
         &mut self,
         dispatch_id: &str,
+        request_frame_digest: [u8; 32],
         receipts: &[RunnerReceipt],
     ) -> Result<JournalWrite, ReceiptJournalError> {
         validate_receipts(receipts)?;
         let final_path = self.path(dispatch_id)?;
-        if let Some(existing) = self.read(&final_path, dispatch_id)? {
+        if let Some(existing) = self.read(&final_path, dispatch_id, Some(request_frame_digest))? {
             return Ok(JournalWrite::Existing(existing));
         }
         let temp_path = self.directory.join(format!(".{dispatch_id}.tmp"));
         let record = JournalRecord {
             schema_version: JOURNAL_SCHEMA_VERSION,
             dispatch_id: dispatch_id.to_owned(),
+            request_frame_digest,
             receipts: receipts.to_vec(),
         };
         let bytes = serde_json::to_vec(&record).map_err(|_| ReceiptJournalError)?;
@@ -166,7 +182,7 @@ impl ReceiptJournal for DurableReceiptJournal {
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 fs::remove_file(&temp_path).map_err(|_| ReceiptJournalError)?;
-                self.read(&final_path, dispatch_id)?
+                self.read(&final_path, dispatch_id, Some(request_frame_digest))?
                     .map(JournalWrite::Existing)
                     .ok_or(ReceiptJournalError)
             }
@@ -194,6 +210,8 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tempfile::tempdir;
 
+    const REQUEST_FRAME_DIGEST: [u8; 32] = [0x42; 32];
+
     fn terminal(sequence: u64) -> RunnerReceipt {
         RunnerReceipt::Refused {
             schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
@@ -214,16 +232,24 @@ mod tests {
         let receipts = vec![terminal(1)];
         let mut journal = DurableReceiptJournal::open(directory.path().to_owned()).unwrap();
         assert_eq!(
-            journal.store_if_absent(id, &receipts).unwrap(),
+            journal
+                .store_if_absent(id, REQUEST_FRAME_DIGEST, &receipts)
+                .unwrap(),
             JournalWrite::Written
         );
         assert_eq!(
-            journal.store_if_absent(id, &receipts).unwrap(),
+            journal
+                .store_if_absent(id, REQUEST_FRAME_DIGEST, &receipts)
+                .unwrap(),
             JournalWrite::Existing(receipts.clone())
         );
         drop(journal);
         let restarted = DurableReceiptJournal::open(directory.path().to_owned()).unwrap();
-        assert_eq!(restarted.load(id).unwrap(), Some(receipts));
+        assert_eq!(
+            restarted.load(id, REQUEST_FRAME_DIGEST).unwrap(),
+            Some(receipts)
+        );
+        assert_eq!(restarted.load(id, [0x43; 32]), Err(ReceiptJournalError));
         let metadata = fs::metadata(directory.path().join(format!("{id}.json"))).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
         assert_eq!(metadata.nlink(), 1);
@@ -235,7 +261,11 @@ mod tests {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut journal = DurableReceiptJournal::open(directory.path().to_owned()).unwrap();
         assert_eq!(
-            journal.store_if_absent("123e4567-e89b-12d3-a456-426614174010", &[terminal(2)]),
+            journal.store_if_absent(
+                "123e4567-e89b-12d3-a456-426614174010",
+                REQUEST_FRAME_DIGEST,
+                &[terminal(2)]
+            ),
             Err(ReceiptJournalError)
         );
     }
@@ -246,14 +276,16 @@ mod tests {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let id = "123e4567-e89b-12d3-a456-426614174010";
         let mut journal = DurableReceiptJournal::open(directory.path().to_owned()).unwrap();
-        journal.store_if_absent(id, &[terminal(1)]).unwrap();
+        journal
+            .store_if_absent(id, REQUEST_FRAME_DIGEST, &[terminal(1)])
+            .unwrap();
         let final_path = directory.path().join(format!("{id}.json"));
         let temp_path = directory.path().join(format!(".{id}.tmp"));
         fs::hard_link(&final_path, &temp_path).unwrap();
         assert_eq!(fs::metadata(&final_path).unwrap().nlink(), 2);
         let restarted = DurableReceiptJournal::open(directory.path().to_owned()).unwrap();
         assert_eq!(fs::metadata(&final_path).unwrap().nlink(), 1);
-        assert!(restarted.load(id).unwrap().is_some());
+        assert!(restarted.load(id, REQUEST_FRAME_DIGEST).unwrap().is_some());
     }
 
     #[test]
@@ -262,12 +294,17 @@ mod tests {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let id = "123e4567-e89b-12d3-a456-426614174010";
         let mut journal = DurableReceiptJournal::open(directory.path().to_owned()).unwrap();
-        journal.store_if_absent(id, &[terminal(1)]).unwrap();
+        journal
+            .store_if_absent(id, REQUEST_FRAME_DIGEST, &[terminal(1)])
+            .unwrap();
         let final_path = directory.path().join(format!("{id}.json"));
         let temp_path = directory.path().join(format!(".{id}.tmp"));
         fs::rename(&final_path, &temp_path).unwrap();
         let restarted = DurableReceiptJournal::open(directory.path().to_owned()).unwrap();
         assert!(!temp_path.exists());
-        assert_eq!(restarted.load(id).unwrap(), Some(vec![terminal(1)]));
+        assert_eq!(
+            restarted.load(id, REQUEST_FRAME_DIGEST).unwrap(),
+            Some(vec![terminal(1)])
+        );
     }
 }

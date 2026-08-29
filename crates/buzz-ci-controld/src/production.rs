@@ -4,6 +4,7 @@
 //! seams. This module owns their ordering, durable publication intents, event
 //! envelopes, evidence binding, and descriptor-relative output reads.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Component, Path};
 
@@ -23,6 +24,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::runner_client::{
+    AttemptOutcome, PreparedRunnerRequest, RunnerClient, RunnerConnector, ValidatedRunnerResult,
+};
 use crate::{RunIdentity, RunRecord, RunState, StateError, StoreWrite};
 
 /// One stored, relay-accepted kind-46100 intake item.
@@ -155,6 +159,160 @@ pub trait AttemptExecutor {
     type Error;
 
     fn execute(&mut self, request: &AcceptedRequest) -> Result<AttemptCompletion, Self::Error>;
+}
+
+/// Host-owned preparation step for one accepted controller request.
+pub trait RunnerAttemptPreparer {
+    type Error;
+
+    /// Compile the selected jobs and bind them to one immutable runner request.
+    fn prepare(&mut self, accepted: &AcceptedRequest)
+        -> Result<PreparedRunnerAttempt, Self::Error>;
+}
+
+/// One prepared runner request and its trusted publication metadata.
+pub struct PreparedRunnerAttempt {
+    request: PreparedRunnerRequest,
+    jobs: BTreeMap<String, JobMetadata>,
+}
+
+impl PreparedRunnerAttempt {
+    /// Bind publication metadata to every job in the exact prepared request.
+    pub fn new(
+        request: PreparedRunnerRequest,
+        jobs: Vec<JobMetadata>,
+    ) -> Result<Self, RunnerBridgeError> {
+        let mut jobs_by_id = BTreeMap::new();
+        for metadata in jobs {
+            if metadata.job_id.is_empty()
+                || jobs_by_id
+                    .insert(metadata.job_id.clone(), metadata)
+                    .is_some()
+            {
+                return Err(RunnerBridgeError::JobMetadataMismatch);
+            }
+        }
+        if jobs_by_id.keys().map(String::as_str).ne(request.job_ids()) {
+            return Err(RunnerBridgeError::JobMetadataMismatch);
+        }
+        Ok(Self {
+            request,
+            jobs: jobs_by_id,
+        })
+    }
+}
+
+/// Failure before the production controller receives a complete runner result.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum RunnerBridgeError {
+    #[error("runner request preparation failed")]
+    Preparation,
+    #[error("prepared runner request does not match the accepted controller request")]
+    RequestMismatch,
+    #[error("runner job metadata does not match the prepared job set")]
+    JobMetadataMismatch,
+    #[error("runner client validation failed")]
+    Client,
+    #[error("runner refused the accepted request")]
+    Refused,
+    #[error("runner terminal result lacks complete teardown-backed evidence")]
+    Incomplete,
+}
+
+/// Production controller executor backed by the frozen runner protocol client.
+pub struct RunnerAttemptExecutor<C, P> {
+    client: RunnerClient<C>,
+    preparer: P,
+}
+
+impl<C, P> RunnerAttemptExecutor<C, P> {
+    /// Compose the controller's runner seam from a client and host preparer.
+    pub const fn new(client: RunnerClient<C>, preparer: P) -> Self {
+        Self { client, preparer }
+    }
+
+    /// Return the client and preparer after host composition finishes.
+    pub fn into_parts(self) -> (RunnerClient<C>, P) {
+        (self.client, self.preparer)
+    }
+}
+
+impl<C, P> AttemptExecutor for RunnerAttemptExecutor<C, P>
+where
+    C: RunnerConnector,
+    P: RunnerAttemptPreparer,
+{
+    type Error = RunnerBridgeError;
+
+    fn execute(&mut self, accepted: &AcceptedRequest) -> Result<AttemptCompletion, Self::Error> {
+        let mut prepared = self
+            .preparer
+            .prepare(accepted)
+            .map_err(|_| RunnerBridgeError::Preparation)?;
+        if !prepared
+            .request
+            .matches_request(&accepted.event_id, &accepted.envelope)
+        {
+            return Err(RunnerBridgeError::RequestMismatch);
+        }
+        let result = self
+            .client
+            .execute(&prepared.request)
+            .map_err(|_| RunnerBridgeError::Client)?;
+        let ValidatedRunnerResult::Finished(receipt) = result else {
+            return Err(RunnerBridgeError::Refused);
+        };
+        if receipt.outcome != AttemptOutcome::Completed {
+            return Err(RunnerBridgeError::Incomplete);
+        }
+        let teardown = receipt
+            .teardown_attestation
+            .ok_or(RunnerBridgeError::Incomplete)?;
+        let mut jobs = Vec::with_capacity(receipt.jobs.len());
+        for job in receipt.jobs {
+            let metadata = prepared
+                .jobs
+                .remove(&job.job_id)
+                .ok_or(RunnerBridgeError::JobMetadataMismatch)?;
+            let artifacts = job
+                .artifacts
+                .into_iter()
+                .map(|artifact| ArtifactCompletion {
+                    descriptor: OutputDescriptor {
+                        relative_path: artifact.relative_path,
+                        sha256: artifact.sha256,
+                        byte_length: artifact.byte_length,
+                    },
+                    artifact_id: artifact.logical_name.clone(),
+                    name: artifact.logical_name,
+                    media_type: artifact.media_type,
+                })
+                .collect();
+            jobs.push(JobCompletion {
+                metadata,
+                attempt: job.attempt,
+                state: job.state,
+                reason: job.reason,
+                started_at: job.started_at,
+                finished_at: job.finished_at,
+                log: OutputDescriptor {
+                    relative_path: job.log.relative_path,
+                    sha256: job.log.sha256,
+                    byte_length: job.log.byte_length,
+                },
+                log_cap_bytes: job.log.cap_bytes,
+                artifacts,
+            });
+        }
+        if !prepared.jobs.is_empty() {
+            return Err(RunnerBridgeError::JobMetadataMismatch);
+        }
+        Ok(AttemptCompletion {
+            jobs,
+            teardown,
+            finished_at: receipt.finished_at,
+        })
+    }
 }
 
 /// Descriptor-bound access to runner output bytes.

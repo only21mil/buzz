@@ -20,6 +20,13 @@ use crate::{
     TeardownLeaseReceipt,
 };
 
+const MAX_ARTIFACTS_PER_JOB: usize = 128;
+const MAX_ARTIFACT_DESCRIPTOR_BYTES: usize = 64 * 1024;
+const MAX_EVIDENCE_PATH_BYTES: usize = 4096;
+const MAX_MEDIA_TYPE_BYTES: usize = 256;
+const MAX_LOGICAL_NAME_BYTES: usize = 1024;
+const MAX_REASON_BYTES: usize = 1024;
+
 /// Request facts established by signature, channel, workflow, and manifest verification.
 #[derive(Clone, Debug)]
 pub struct VerifiedDispatch {
@@ -59,16 +66,22 @@ pub trait JobExecutor {
         &mut self,
         job: &ExecuteJob,
         lease: &AdmittedLease,
+        deadline_at: u64,
     ) -> Result<JobExecution, ExecutionBackendError>;
 }
 
 /// Atomic replay journal for a complete terminal receipt set.
 pub trait ReceiptJournal {
-    fn load(&self, dispatch_id: &str) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError>;
+    fn load(
+        &self,
+        dispatch_id: &str,
+        request_frame_digest: [u8; 32],
+    ) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError>;
 
     fn store_if_absent(
         &mut self,
         dispatch_id: &str,
+        request_frame_digest: [u8; 32],
         receipts: &[RunnerReceipt],
     ) -> Result<JournalWrite, ReceiptJournalError>;
 }
@@ -138,18 +151,20 @@ where
     pub fn handle(
         &mut self,
         request: RunnerRequest,
+        request_frame_digest: [u8; 32],
         writer: &mut impl Write,
     ) -> Result<(), HandlerError> {
         let dispatch_id = request.refusal_identity().0.to_owned();
-        if let Some(stored) = self.journal.load(&dispatch_id)? {
+        if let Some(stored) = self.journal.load(&dispatch_id, request_frame_digest)? {
             return write_receipts(writer, &stored).map_err(HandlerError::Receipt);
         }
 
-        let receipts = self.build_receipts(&request);
-        let canonical = match self
-            .journal
-            .store_if_absent(&dispatch_id, receipts.as_slice())?
-        {
+        let receipts = self.build_receipts(&request)?;
+        let canonical = match self.journal.store_if_absent(
+            &dispatch_id,
+            request_frame_digest,
+            receipts.as_slice(),
+        )? {
             JournalWrite::Written => receipts,
             JournalWrite::Existing(existing) if existing == receipts => existing,
             JournalWrite::Existing(_) => return Err(HandlerError::JournalConflict),
@@ -157,7 +172,10 @@ where
         write_receipts(writer, &canonical).map_err(HandlerError::Receipt)
     }
 
-    fn build_receipts(&mut self, request: &RunnerRequest) -> Vec<RunnerReceipt> {
+    fn build_receipts(
+        &mut self,
+        request: &RunnerRequest,
+    ) -> Result<Vec<RunnerReceipt>, HandlerError> {
         let RunnerRequest::ExecuteAttempt {
             dispatch_id,
             request_event_id,
@@ -177,12 +195,12 @@ where
 
         let verified = match self.verifier.verify(request, *assigned_at) {
             Ok(verified) if verified.jobs.len() == jobs.len() => verified,
-            Ok(_) => return vec![identity.refused(RefusalReason::InvalidManifest)],
-            Err(reason) => return vec![identity.refused(reason)],
+            Ok(_) => return Ok(vec![identity.refused(RefusalReason::InvalidManifest)]),
+            Err(reason) => return Ok(vec![identity.refused(reason)]),
         };
         let signed_request_digest = match decode_digest(signed_request_digest) {
             Some(digest) => digest,
-            None => return vec![identity.refused(RefusalReason::InvalidRequest)],
+            None => return Ok(vec![identity.refused(RefusalReason::InvalidRequest)]),
         };
 
         let mut receipts = vec![RunnerReceipt::Accepted {
@@ -208,8 +226,8 @@ where
                     *deadline_at,
                     selected,
                     AttemptFailureReason::DeadlineExceeded,
-                );
-                return receipts;
+                )?;
+                return Ok(receipts);
             }
             let input = AdmitRequestInput {
                 request: AuthenticatedCiRequest::new(request_event, signed_request_digest),
@@ -227,11 +245,11 @@ where
                         finished_at,
                         selected,
                         attempt_failure(error),
-                    );
-                    return receipts;
+                    )?;
+                    return Ok(receipts);
                 }
             };
-            let execution = match self.executor.execute(job, &lease) {
+            let execution = match self.executor.execute(job, &lease, *deadline_at) {
                 Ok(execution) if valid_execution(job, &execution, *deadline_at) => execution,
                 Ok(_) => {
                     push_infrastructure_terminal(
@@ -241,8 +259,8 @@ where
                         finished_at,
                         selected,
                         AttemptFailureReason::EvidenceInvalid,
-                    );
-                    return receipts;
+                    )?;
+                    return Ok(receipts);
                 }
                 Err(error) => {
                     push_infrastructure_terminal(
@@ -252,8 +270,8 @@ where
                         finished_at,
                         selected,
                         execution_failure(error),
-                    );
-                    return receipts;
+                    )?;
+                    return Ok(receipts);
                 }
             };
             let terminal =
@@ -267,8 +285,8 @@ where
                             execution.finished_at,
                             selected,
                             attempt_failure(error),
-                        );
-                        return receipts;
+                        )?;
+                        return Ok(receipts);
                     }
                 };
 
@@ -319,6 +337,7 @@ where
             .collect();
         let teardown = match build_teardown_attestation(
             request_event_id,
+            signed_request_digest,
             request_event,
             &verified.relay_signer,
             &selected_pairs,
@@ -333,11 +352,11 @@ where
                     finished_at,
                     selected,
                     AttemptFailureReason::TeardownUnproven,
-                );
-                return receipts;
+                )?;
+                return Ok(receipts);
             }
         };
-        let digest = receipt_set_digest(&receipts).unwrap_or_default();
+        let digest = receipt_set_digest(&receipts)?;
         receipts.push(RunnerReceipt::AttemptFinished {
             schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
             dispatch_id: dispatch_id.clone(),
@@ -352,7 +371,7 @@ where
             teardown_attestation: Some(teardown),
             receipt_set_digest: digest,
         });
-        receipts
+        Ok(receipts)
     }
 }
 
@@ -385,8 +404,8 @@ fn push_infrastructure_terminal(
     finished_at: u64,
     selected_job_attempts: Vec<SelectedJobAttempt>,
     reason: AttemptFailureReason,
-) {
-    let digest = receipt_set_digest(receipts).unwrap_or_default();
+) -> Result<(), crate::transport::FrameError> {
+    let digest = receipt_set_digest(receipts)?;
     receipts.push(RunnerReceipt::AttemptFinished {
         schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
         dispatch_id: identity.dispatch_id.to_owned(),
@@ -401,6 +420,7 @@ fn push_infrastructure_terminal(
         teardown_attestation: None,
         receipt_set_digest: digest,
     });
+    Ok(())
 }
 
 fn receipt_set_digest(receipts: &[RunnerReceipt]) -> Result<String, crate::transport::FrameError> {
@@ -429,12 +449,32 @@ fn valid_execution(job: &ExecuteJob, execution: &JobExecution, deadline_at: u64)
         && execution.finished_at >= execution.started_at
         && execution.finished_at <= deadline_at
         && execution.finished_at <= CI_MAX_SAFE_INTEGER
+        && execution
+            .reason
+            .as_ref()
+            .is_none_or(|reason| reason.len() <= MAX_REASON_BYTES)
         && !execution.log.truncated
         && execution.log.byte_length <= execution.log.cap_bytes
+        && execution.log.relative_path.len() <= MAX_EVIDENCE_PATH_BYTES
         && is_relative_evidence_path(&execution.log.relative_path)
         && is_lower_hex(&execution.log.sha256, 64)
+        && execution.artifacts.len() <= MAX_ARTIFACTS_PER_JOB
+        && execution
+            .artifacts
+            .iter()
+            .try_fold(0_usize, |total, artifact| {
+                total
+                    .checked_add(artifact.relative_path.len())?
+                    .checked_add(artifact.sha256.len())?
+                    .checked_add(artifact.media_type.len())?
+                    .checked_add(artifact.logical_name.len())
+            })
+            .is_some_and(|total| total <= MAX_ARTIFACT_DESCRIPTOR_BYTES)
         && execution.artifacts.iter().all(|artifact| {
-            is_relative_evidence_path(&artifact.relative_path)
+            artifact.relative_path.len() <= MAX_EVIDENCE_PATH_BYTES
+                && artifact.media_type.len() <= MAX_MEDIA_TYPE_BYTES
+                && artifact.logical_name.len() <= MAX_LOGICAL_NAME_BYTES
+                && is_relative_evidence_path(&artifact.relative_path)
                 && is_lower_hex(&artifact.sha256, 64)
                 && !artifact.media_type.is_empty()
                 && !artifact.logical_name.is_empty()
@@ -479,6 +519,7 @@ fn execution_failure(error: ExecutionBackendError) -> AttemptFailureReason {
         ExecutionBackendError::Unavailable => AttemptFailureReason::BackendUnavailable,
         ExecutionBackendError::Failed => AttemptFailureReason::ExecutionFailed,
         ExecutionBackendError::MissingEvidence => AttemptFailureReason::EvidenceInvalid,
+        ExecutionBackendError::DeadlineExceeded => AttemptFailureReason::DeadlineExceeded,
     }
 }
 
@@ -494,7 +535,7 @@ mod tests {
     use buzz_core::ci::{CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
 
     use super::*;
-    use crate::transport::{read_frame, write_frame};
+    use crate::transport::{read_frame, write_frame, FrameError, MAX_FRAME_BODY_BYTES};
 
     struct Allow;
 
@@ -523,7 +564,7 @@ mod tests {
                             false,
                         ),
                         binding: BrokerManifestBinding {
-                            signed_request_digest: [0x11; 32],
+                            signed_request_digest: [0x12; 32],
                             audience_digest: decode_digest(&job.audience_digest).unwrap(),
                             job_manifest_digest: decode_digest(&job.job_manifest_digest).unwrap(),
                             isolation_profile_digest: decode_digest(&job.isolation_profile_digest)
@@ -536,25 +577,39 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MemoryJournal(HashMap<String, Vec<RunnerReceipt>>);
+    struct MemoryJournal(HashMap<String, ([u8; 32], Vec<RunnerReceipt>)>);
 
     impl ReceiptJournal for MemoryJournal {
         fn load(
             &self,
             dispatch_id: &str,
+            request_frame_digest: [u8; 32],
         ) -> Result<Option<Vec<RunnerReceipt>>, ReceiptJournalError> {
-            Ok(self.0.get(dispatch_id).cloned())
+            match self.0.get(dispatch_id) {
+                Some((stored_digest, receipts)) if *stored_digest == request_frame_digest => {
+                    Ok(Some(receipts.clone()))
+                }
+                Some(_) => Err(ReceiptJournalError),
+                None => Ok(None),
+            }
         }
 
         fn store_if_absent(
             &mut self,
             dispatch_id: &str,
+            request_frame_digest: [u8; 32],
             receipts: &[RunnerReceipt],
         ) -> Result<JournalWrite, ReceiptJournalError> {
-            if let Some(existing) = self.0.get(dispatch_id) {
+            if let Some((stored_digest, existing)) = self.0.get(dispatch_id) {
+                if *stored_digest != request_frame_digest {
+                    return Err(ReceiptJournalError);
+                }
                 return Ok(JournalWrite::Existing(existing.clone()));
             }
-            self.0.insert(dispatch_id.to_owned(), receipts.to_vec());
+            self.0.insert(
+                dispatch_id.to_owned(),
+                (request_frame_digest, receipts.to_vec()),
+            );
             Ok(JournalWrite::Written)
         }
     }
@@ -626,6 +681,7 @@ mod tests {
             &mut self,
             _job: &ExecuteJob,
             _lease: &AdmittedLease,
+            _deadline_at: u64,
         ) -> Result<JobExecution, ExecutionBackendError> {
             Ok(JobExecution {
                 state: CiJobState::Success,
@@ -677,7 +733,7 @@ mod tests {
                 issued_at: 10,
                 expires_at: 20,
             },
-            signed_request_digest: "11".repeat(32),
+            signed_request_digest: "12".repeat(32),
             assigned_at: 10,
             deadline_at: 20,
             jobs: vec![ExecuteJob {
@@ -694,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_broker_backend_emits_ordered_terminal_receipts_and_replays_them() {
+    fn same_frame_replays_but_a_second_client_with_divergent_frame_is_rejected() {
         let mut handler = BrokerAttemptHandler::new(
             Allow,
             Verify,
@@ -703,16 +759,20 @@ mod tests {
             MemoryJournal::default(),
         );
         let mut first = Vec::new();
-        handler.handle(request(), &mut first).unwrap();
+        handler.handle(request(), [0x42; 32], &mut first).unwrap();
         let mut replay = Vec::new();
-        handler.handle(request(), &mut replay).unwrap();
+        handler.handle(request(), [0x42; 32], &mut replay).unwrap();
         assert_eq!(first, replay);
 
         let mut cursor = Cursor::new(first);
         let mut kinds = Vec::new();
+        let mut terminal_outcome = None;
         loop {
             match read_frame::<RunnerReceipt>(&mut cursor) {
                 Ok(receipt) => {
+                    if let RunnerReceipt::AttemptFinished { outcome, .. } = &receipt {
+                        terminal_outcome = Some(*outcome);
+                    }
                     kinds.push((receipt.receipt_sequence(), receipt.is_terminal()));
                     if receipt.is_terminal() {
                         break;
@@ -722,6 +782,76 @@ mod tests {
             }
         }
         assert_eq!(kinds, vec![(1, false), (2, false), (3, false), (4, true)]);
+        assert_eq!(terminal_outcome, Some(AttemptOutcome::Completed));
+
+        assert!(matches!(
+            handler.handle(request(), [0x43; 32], &mut Vec::new()),
+            Err(HandlerError::Journal(_))
+        ));
+    }
+
+    #[test]
+    fn execution_descriptor_bounds_are_enforced() {
+        let RunnerRequest::ExecuteAttempt { jobs, .. } = request();
+        let mut execution = JobExecution {
+            state: CiJobState::Success,
+            reason: None,
+            started_at: 11,
+            finished_at: 12,
+            log: LogEvidence {
+                relative_path: "dispatch/test/attempt-1.log".into(),
+                sha256: "aa".repeat(32),
+                byte_length: 4,
+                cap_bytes: 1024,
+                truncated: false,
+            },
+            artifacts: Vec::new(),
+            broker_evidence: BoundedExecutionEvidence::new(Conclusion::Success, [7; 32], 12)
+                .unwrap(),
+        };
+        execution.reason = Some("x".repeat(MAX_REASON_BYTES + 1));
+        assert!(!valid_execution(&jobs[0], &execution, 20));
+        execution.reason = None;
+        execution.artifacts.push(ArtifactEvidence {
+            relative_path: "artifact.txt".into(),
+            sha256: "aa".repeat(32),
+            byte_length: 1,
+            media_type: "text/plain".into(),
+            logical_name: "x".repeat(MAX_LOGICAL_NAME_BYTES + 1),
+        });
+
+        assert!(!valid_execution(&jobs[0], &execution, 20));
+    }
+
+    #[test]
+    fn receipt_digest_propagates_oversized_frame_errors() {
+        let receipt = RunnerReceipt::JobFinished {
+            schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
+            dispatch_id: "123e4567-e89b-12d3-a456-426614174010".into(),
+            request_event_id: "11".repeat(32),
+            run_id: "123e4567-e89b-12d3-a456-426614174011".into(),
+            attempt: 1,
+            receipt_sequence: 1,
+            job_id: "test".into(),
+            job_attempt: 1,
+            state: CiJobState::Failure,
+            reason: Some("x".repeat(MAX_FRAME_BODY_BYTES)),
+            started_at: 11,
+            finished_at: 12,
+            log: LogEvidence {
+                relative_path: "test.log".into(),
+                sha256: "aa".repeat(32),
+                byte_length: 0,
+                cap_bytes: 1,
+                truncated: false,
+            },
+            artifacts: Vec::new(),
+        };
+
+        assert!(matches!(
+            receipt_set_digest(&[receipt]),
+            Err(FrameError::Oversized)
+        ));
     }
 
     #[test]
@@ -744,7 +874,7 @@ mod tests {
             MemoryJournal::default(),
         );
         let mut bytes = Vec::new();
-        handler.handle(request(), &mut bytes).unwrap();
+        handler.handle(request(), [0x42; 32], &mut bytes).unwrap();
         let receipt: RunnerReceipt = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert!(matches!(
             receipt,
@@ -771,6 +901,7 @@ mod tests {
                 &mut self,
                 _job: &ExecuteJob,
                 _lease: &AdmittedLease,
+                _deadline_at: u64,
             ) -> Result<JobExecution, ExecutionBackendError> {
                 panic!("executor called before owner authorization")
             }
@@ -783,7 +914,7 @@ mod tests {
             MemoryJournal::default(),
         );
         let mut bytes = Vec::new();
-        handler.handle(request(), &mut bytes).unwrap();
+        handler.handle(request(), [0x42; 32], &mut bytes).unwrap();
         let (_, _, broker, _, _) = handler.into_parts();
         assert!(broker.lease.is_none());
     }

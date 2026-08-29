@@ -17,7 +17,7 @@ use nix::sys::socket::{
 use thiserror::Error;
 
 use crate::transport::{
-    read_request_frame, ReceiptWriteError, ReceiptWriter, RefusalReason, RunnerReceipt,
+    read_request_frame_with_digest, ReceiptWriteError, ReceiptWriter, RefusalReason, RunnerReceipt,
     RunnerRequest, RUNNER_TRANSPORT_SCHEMA_VERSION,
 };
 #[cfg(target_os = "linux")]
@@ -135,19 +135,23 @@ pub fn serve_runner_connection(
     stream: UnixStream,
     expected_controld_uid: u32,
 ) -> Result<(), RunnerConnectionError> {
-    serve_runner_connection_with_handler(stream, expected_controld_uid, &mut |request, writer| {
-        let (dispatch_id, request_event_id, run_id, attempt) = request.refusal_identity();
-        let refusal = RunnerReceipt::Refused {
-            schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
-            dispatch_id: dispatch_id.to_owned(),
-            request_event_id: request_event_id.to_owned(),
-            run_id: run_id.to_owned(),
-            attempt,
-            receipt_sequence: 1,
-            reason: RefusalReason::BackendUnavailable,
-        };
-        ReceiptWriter::new(writer).send(&refusal).map_err(|_| ())
-    })
+    serve_runner_connection_with_handler(
+        stream,
+        expected_controld_uid,
+        &mut |request, _, writer| {
+            let (dispatch_id, request_event_id, run_id, attempt) = request.refusal_identity();
+            let refusal = RunnerReceipt::Refused {
+                schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
+                dispatch_id: dispatch_id.to_owned(),
+                request_event_id: request_event_id.to_owned(),
+                run_id: run_id.to_owned(),
+                attempt,
+                receipt_sequence: 1,
+                reason: RefusalReason::BackendUnavailable,
+            };
+            ReceiptWriter::new(writer).send(&refusal).map_err(|_| ())
+        },
+    )
 }
 
 /// Authenticate controld, parse one frame, and invoke an injected production handler.
@@ -158,7 +162,7 @@ pub fn serve_runner_connection(
 pub fn serve_runner_connection_with_handler(
     mut stream: UnixStream,
     expected_controld_uid: u32,
-    handler: &mut impl FnMut(RunnerRequest, &mut UnixStream) -> Result<(), ()>,
+    handler: &mut impl FnMut(RunnerRequest, [u8; 32], &mut UnixStream) -> Result<(), ()>,
 ) -> Result<(), RunnerConnectionError> {
     let credentials = getsockopt(&stream, PeerCredentials).map_err(|error| {
         RunnerConnectionError::Socket(io::Error::from_raw_os_error(error as i32))
@@ -171,8 +175,8 @@ pub fn serve_runner_connection_with_handler(
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
         .map_err(RunnerConnectionError::Socket)?;
 
-    let request = read_request_frame(&mut stream)?;
-    handler(request, &mut stream).map_err(|()| RunnerConnectionError::Handler)
+    let (request, request_frame_digest) = read_request_frame_with_digest(&mut stream)?;
+    handler(request, request_frame_digest, &mut stream).map_err(|()| RunnerConnectionError::Handler)
 }
 
 /// Hand one local connection to a caller-supplied protocol implementation.
@@ -213,6 +217,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use buzz_core::ci::{CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
+    #[cfg(target_os = "linux")]
+    use sha2::{Digest, Sha256};
     #[cfg(target_os = "linux")]
     use tempfile::tempdir;
 
@@ -309,27 +315,35 @@ mod tests {
     #[test]
     fn authenticated_dispatch_reaches_injected_handler() {
         let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let request_frame = crate::transport::encode_frame(&request()).expect("request frame");
+        let expected_digest: [u8; 32] = Sha256::digest(&request_frame).into();
         let uid = getsockopt(&server, PeerCredentials)
             .expect("peer credentials")
             .uid();
         let worker = thread::spawn(move || {
-            serve_runner_connection_with_handler(server, uid, &mut |request, stream| {
-                let (dispatch_id, request_event_id, run_id, attempt) = request.refusal_identity();
-                ReceiptWriter::new(stream)
-                    .send(&RunnerReceipt::Accepted {
-                        schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
-                        dispatch_id: dispatch_id.to_owned(),
-                        request_event_id: request_event_id.to_owned(),
-                        run_id: run_id.to_owned(),
-                        attempt,
-                        receipt_sequence: 1,
-                        accepted_at: 10,
-                    })
-                    .map_err(|_| ())
-            })
+            serve_runner_connection_with_handler(
+                server,
+                uid,
+                &mut |request, request_frame_digest, stream| {
+                    assert_eq!(request_frame_digest, expected_digest);
+                    let (dispatch_id, request_event_id, run_id, attempt) =
+                        request.refusal_identity();
+                    ReceiptWriter::new(stream)
+                        .send(&RunnerReceipt::Accepted {
+                            schema_version: RUNNER_TRANSPORT_SCHEMA_VERSION,
+                            dispatch_id: dispatch_id.to_owned(),
+                            request_event_id: request_event_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            attempt,
+                            receipt_sequence: 1,
+                            accepted_at: 10,
+                        })
+                        .map_err(|_| ())
+                },
+            )
         });
 
-        write_frame(&mut client, &request()).expect("request frame");
+        client.write_all(&request_frame).expect("request frame");
         let receipt: RunnerReceipt = read_frame(&mut client).expect("accepted frame");
         assert!(matches!(receipt, RunnerReceipt::Accepted { .. }));
         worker.join().expect("join").expect("serve connection");

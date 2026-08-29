@@ -177,6 +177,7 @@ pub fn normalize_admit_request(
 
 pub fn build_teardown_attestation(
     request_event_id: &str,
+    accepted_request_digest: [u8; 32],
     request: &CiRequestEnvelope,
     relay_signer: &str,
     reducer_selected_job_attempts: &[(String, u32)],
@@ -186,7 +187,6 @@ pub fn build_teardown_attestation(
         .validate()
         .map_err(|_| ControlError::InvalidRequest)?;
     let run_id = Uuid::parse_str(&request.run_id).map_err(|_| ControlError::InvalidUuid)?;
-    let request_id: [u8; 32] = parse_hex_array(request_event_id)?;
     let tip_oid = parse_oid(&request.tip_oid)?;
     if lease_receipts.is_empty() {
         return Err(ControlError::TeardownNotProven);
@@ -228,7 +228,7 @@ pub fn build_teardown_attestation(
             || receipt.updated_at > CI_MAX_SAFE_INTEGER
             || receipt.lease_generation == 0
             || receipt.run_id != *run_id.as_bytes()
-            || receipt.accepted_request_digest != request_id
+            || receipt.accepted_request_digest != accepted_request_digest
             || receipt.job_manifest_digest != require_nonzero(proof.job_manifest_digest)?
             || receipt.tip_oid != Some(tip_oid)
             || receipt.attempt == 0
@@ -430,7 +430,8 @@ mod tests {
         receipts: Vec<TeardownLeaseReceipt>,
     ) -> Result<CiTeardownAttestationEnvelope, ControlError> {
         build_teardown_attestation(
-            &"77".repeat(32),
+            &"76".repeat(32),
+            [0x77; 32],
             request,
             &"88".repeat(32),
             selected_job_attempts,

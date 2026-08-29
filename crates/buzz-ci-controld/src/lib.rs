@@ -7,7 +7,9 @@
 #![forbid(unsafe_code)]
 
 pub mod keyholder;
+pub mod manifest;
 pub mod production;
+pub mod runner_client;
 pub mod source;
 pub mod store;
 
