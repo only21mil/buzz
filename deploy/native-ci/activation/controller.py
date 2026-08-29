@@ -46,7 +46,8 @@ MAX_COMMAND_OUTPUT = 256 * 1024
 MAX_BINARY_BYTES = 128 * 1024 * 1024
 QUALIFICATION_REQUEST_SCHEMA = "buzz-ci-production-qualification-request/v2"
 QUALIFICATION_RESPONSE_SCHEMA = "buzz-ci-production-qualification-response/v2"
-QUALIFICATION_STATE_SCHEMA = "buzz-ci-production-qualification-state/v2"
+QUALIFICATION_STATE_SCHEMA = "buzz-ci-production-qualification-state/v3"
+QUALIFICATION_MAX_ATTEMPTS = 3
 QUALIFICATION_PRINCIPAL_DOMAIN = b"buzz-ci-execd:production-qualification-principal:v1\0"
 QUALIFICATION_EXECUTOR_DOMAIN = b"buzz-ci-execd:production-qualification-executor-provenance:v1\0"
 
@@ -801,6 +802,15 @@ class LiveSystemd:
             raise ValueError(f"incomplete systemd readback: {name}")
         return values
 
+    def fragment_path(self, name: str) -> str:
+        if not activation_package.UNIT.fullmatch(name):
+            raise ValueError("invalid systemd unit name")
+        result = self._run(SYSTEMCTL, ["show", "--no-pager", "--property=FragmentPath", name])
+        key, separator, value = result.stdout.decode("utf-8").strip().partition("=")
+        if key != "FragmentPath" or not separator:
+            raise ValueError(f"incomplete systemd fragment readback: {name}")
+        return value
+
     def provision(self, _identities: dict[str, object]) -> None:
         self._run(SYSUSERS, [activation_package.STATIC_TARGETS["sysusers"]], mutation=True)
 
@@ -935,6 +945,12 @@ class FakeSystemd:
             return {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled"}
         return dict(unit)
 
+    def fragment_path(self, name: str) -> str:
+        role = activation_package.PACKAGE_UNIT_ROLES.get(name)
+        if role is None or self.unit(name)["LoadState"] != "loaded":
+            return ""
+        return activation_package.STATIC_TARGETS[role]
+
     def provision(self, identities: dict[str, object]) -> None:
         state = self._read()
         for role, identity in identities.items():
@@ -986,16 +1002,17 @@ class FakeSystemd:
 
     def daemon_reload(self) -> None:
         state = self._read()
-        target_path = activation_package.rooted(self.root, activation_package.STATIC_TARGETS["capacity_target"])
-        if target_path.exists():
-            state["units"].setdefault(activation_package.PERSISTENT_UNIT, {
-                "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
-            })
-            state["units"][activation_package.PERSISTENT_UNIT]["LoadState"] = "loaded"
-        else:
-            state["units"][activation_package.PERSISTENT_UNIT] = {
-                "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
-            }
+        for unit, role in activation_package.PACKAGE_UNIT_ROLES.items():
+            unit_path = activation_package.rooted(self.root, activation_package.STATIC_TARGETS[role])
+            if unit_path.exists():
+                state["units"].setdefault(unit, {
+                    "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
+                })
+                state["units"][unit]["LoadState"] = "loaded"
+            else:
+                state["units"][unit] = {
+                    "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
+                }
         self._write(state)
 
     def start(self, name: str) -> None:
@@ -1198,8 +1215,13 @@ def _preflight_units(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, s
     names = sorted(set(activation_package.START_ORDER + activation_package.STOP_ORDER))
     result = _unit_readback(driver, names)
     for name, state in result.items():
-        if state["LoadState"] != "loaded":
+        package_owned = name in activation_package.PACKAGE_UNIT_ROLES
+        if state["LoadState"] not in ({"loaded", "not-found"} if package_owned else {"loaded"}):
             raise ValueError(f"required systemd unit is not loaded: {name}")
+        if state["LoadState"] == "not-found" and (
+            state["ActiveState"] != "inactive" or state["UnitFileState"] not in {"disabled", "static"}
+        ):
+            raise ValueError(f"absent package-owned systemd unit is not dormant: {name}")
         baseline_execd = name == "buzz-ci-execd.socket"
         if state["ActiveState"] != "inactive" and not baseline_execd:
             raise ValueError(f"systemd unit is not dormant: {name}")
@@ -1211,6 +1233,32 @@ def _preflight_units(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, s
     if target["LoadState"] == "loaded" and target["UnitFileState"] not in {"disabled", "static"}:
         raise ValueError("capacity-one target is enabled before activation")
     result[activation_package.PERSISTENT_UNIT] = target
+    return result
+
+
+def _installed_unit_readback(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+) -> dict[str, dict[str, object]]:
+    entries = {entry["role"]: entry for entry in manifest["entries"]}
+    result: dict[str, dict[str, object]] = {}
+    for unit, role in activation_package.PACKAGE_UNIT_ROLES.items():
+        entry = entries[role]
+        _verify_target_digest(root, entry["target"], {
+            "sha256": entry["sha256"], "mode": entry["install_mode"],
+            "uid": entry["uid"], "gid": entry["gid"],
+        }, activation_package.MAX_ASSET_BYTES)
+        state = driver.unit(unit)
+        if state["LoadState"] != "loaded":
+            raise ValueError(f"installed package-owned systemd unit is not loaded: {unit}")
+        fragment_path = driver.fragment_path(unit)
+        if fragment_path != entry["target"]:
+            raise ValueError(f"installed package-owned systemd fragment differs: {unit}")
+        result[unit] = {"fragment_path": fragment_path, "sha256": entry["sha256"], **state}
+    for unit in activation_package.DEPENDENCY_UNITS:
+        state = driver.unit(unit)
+        if state["LoadState"] != "loaded":
+            raise ValueError(f"required dependency systemd unit is not loaded after installation: {unit}")
+        result[unit] = state
     return result
 
 
@@ -1361,12 +1409,23 @@ def _validate_qualification_state(value: object, receipt: dict[str, Any]) -> Non
         return
     required = {
         "schema", "status", "request_sha256", "request_base64",
-        "response_sha256", "response_base64", "completed_at",
+        "response_sha256", "response_base64", "completed_at", "attempt_count",
+        "last_error", "expired_at",
     }
     if not isinstance(value, dict) or set(value) != required or value.get("schema") != QUALIFICATION_STATE_SCHEMA:
         raise ValueError("production qualification receipt state differs")
-    if value["status"] not in {"pending", "passed"}:
+    if value["status"] not in {"pending", "passed", "expired_uncertain"}:
         raise ValueError("production qualification status differs")
+    if (
+        isinstance(value["attempt_count"], bool)
+        or not isinstance(value["attempt_count"], int)
+        or not 0 <= value["attempt_count"] <= QUALIFICATION_MAX_ATTEMPTS
+    ):
+        raise ValueError("production qualification attempt count differs")
+    if value["last_error"] is not None and (
+        not isinstance(value["last_error"], str) or not value["last_error"]
+    ):
+        raise ValueError("production qualification error evidence differs")
     try:
         request = base64.b64decode(value["request_base64"], validate=True)
         parsed = json.loads(request, object_pairs_hook=activation_package.reject_duplicates)
@@ -1374,14 +1433,32 @@ def _validate_qualification_state(value: object, receipt: dict[str, Any]) -> Non
         raise ValueError("production qualification request receipt is invalid") from error
     if activation_package.digest(request) != value["request_sha256"] or request != _wire_qualification_json(parsed):
         raise ValueError("production qualification request receipt bytes differ")
-    if parsed.get("schema_version") != QUALIFICATION_REQUEST_SCHEMA or parsed.get("activation_package_digest") != receipt["package_digest"]:
+    if (
+        parsed.get("schema_version") != QUALIFICATION_REQUEST_SCHEMA
+        or parsed.get("activation_package_digest") != receipt["package_digest"]
+        or isinstance(parsed.get("issued_at"), bool)
+        or not isinstance(parsed.get("issued_at"), int)
+        or not isinstance(parsed.get("expires_at"), int)
+        or parsed["expires_at"] - parsed["issued_at"] != 60
+    ):
         raise ValueError("production qualification request belongs to a different package")
     if value["status"] == "pending":
-        if any(value[field] is not None for field in ("response_sha256", "response_base64", "completed_at")):
+        if any(value[field] is not None for field in ("response_sha256", "response_base64", "completed_at", "expired_at")):
             raise ValueError("pending production qualification contains response state")
+        return
+    if value["status"] == "expired_uncertain":
+        if (
+            any(value[field] is not None for field in ("response_sha256", "response_base64", "completed_at"))
+            or not isinstance(value["expired_at"], str)
+            or not value["expired_at"]
+            or not isinstance(value["last_error"], str)
+        ):
+            raise ValueError("expired production qualification evidence is incomplete")
         return
     if not all(isinstance(value[field], str) and value[field] for field in ("response_sha256", "response_base64", "completed_at")):
         raise ValueError("passed production qualification response state is incomplete")
+    if value["expired_at"] is not None or value["last_error"] is not None:
+        raise ValueError("passed production qualification contains unresolved error state")
     response = base64.b64decode(value["response_base64"], validate=True)
     if activation_package.digest(response) != value["response_sha256"]:
         raise ValueError("passed production qualification response digest differs")
@@ -2015,7 +2092,11 @@ def stage(
     existing = _read_receipt(root)
     if existing is not None:
         if existing.get("state") == "rolled_back":
-            pass
+            prior_scope = _qualification_replay_scope(existing.get("qualification"), existing)
+            if prior_scope is not None and prior_scope == _generated_qualification_replay_scope(manifest, generated):
+                raise ValueError(
+                    "unresolved qualification delivery forbids request rotation under the same package, fixture, and generations"
+                )
         else:
             _bind_receipt(existing, manifest)
             if existing["state"] == "staged_zero":
@@ -2028,6 +2109,7 @@ def stage(
                     access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=False)
                     generated_readback = _verify_generated(root, existing["acceptance_generated"])
                     fixed_package = _verify_fixed_package(manifest, root)
+                    installed_units = _installed_unit_readback(manifest, root, driver)
                     _staged_zero_convergence_readback(manifest, driver)
                     for unit in activation_package.STAGED_ZERO_UNITS:
                         driver.start(unit)
@@ -2041,6 +2123,7 @@ def stage(
                         "access_group": access_group,
                         "acceptance_generated": generated_readback,
                         "fixed_package": fixed_package,
+                        "installed_units": installed_units,
                         "staged_zero": staged_zero,
                     }
                 except BaseException as error:
@@ -2066,6 +2149,7 @@ def stage(
         fixed_package = _install_fixed_package(manifest, payloads, root)
         _apply_generated(root, receipt["acceptance_generated"])
         driver.daemon_reload()
+        installed_units = _installed_unit_readback(manifest, root, driver)
         _stop_to_zero(driver)
         _zero_readback(driver)
         _remove_captured_ledger(root, receipt["acceptance_ledger_prior"])
@@ -2089,6 +2173,7 @@ def stage(
             "managed_targets": targets,
             "acceptance_generated": generated_readback,
             "fixed_package": fixed_package,
+            "installed_units": installed_units,
             "staged_zero": staged_zero,
         }
     except BaseException as error:
@@ -2290,6 +2375,9 @@ def _qualification_request(manifest: dict[str, Any], receipt: dict[str, Any], ro
             "response_sha256": None,
             "response_base64": None,
             "completed_at": None,
+            "attempt_count": 0,
+            "last_error": None,
+            "expired_at": None,
         }
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         return request
@@ -2297,7 +2385,66 @@ def _qualification_request(manifest: dict[str, Any], receipt: dict[str, Any], ro
     request = base64.b64decode(state["request_base64"], validate=True)
     if activation_package.digest(request) != state["request_sha256"]:
         raise ValueError("persisted qualification request digest differs")
+    if state["status"] == "expired_uncertain":
+        raise ValueError("qualification delivery outcome is unresolved after request expiry; rollback and restage with a new replay binding")
+    if state["status"] == "pending":
+        parsed = json.loads(request, object_pairs_hook=activation_package.reject_duplicates)
+        if int(time.time()) >= parsed["expires_at"]:
+            message = "qualification delivery outcome remained unresolved when the exact request expired"
+            state.update({"status": "expired_uncertain", "expired_at": utc_now()})
+            if state["last_error"] is None:
+                state["last_error"] = message
+            _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+            raise ValueError(message + "; rollback and restage with a new replay binding")
     return request
+
+
+def _record_qualification_failure(
+    manifest: dict[str, Any], root: Path, receipt: dict[str, Any], error: BaseException,
+) -> None:
+    state = receipt["qualification"]
+    if not isinstance(state, dict) or state.get("status") != "pending":
+        return
+    request = json.loads(
+        base64.b64decode(state["request_base64"], validate=True),
+        object_pairs_hook=activation_package.reject_duplicates,
+    )
+    state["last_error"] = str(error)
+    if int(time.time()) >= request["expires_at"]:
+        state.update({"status": "expired_uncertain", "expired_at": utc_now()})
+    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+
+
+def _qualification_requires_restage(value: object) -> bool:
+    return isinstance(value, dict) and (
+        value.get("status") == "expired_uncertain"
+        or value.get("status") == "pending" and value.get("attempt_count") == QUALIFICATION_MAX_ATTEMPTS
+    )
+
+
+def _qualification_replay_scope(value: object, receipt: dict[str, Any]) -> tuple[object, ...] | None:
+    if not isinstance(value, dict) or value.get("status") == "passed":
+        return None
+    _validate_qualification_state(value, receipt)
+    request = json.loads(
+        base64.b64decode(value["request_base64"], validate=True),
+        object_pairs_hook=activation_package.reject_duplicates,
+    )
+    return tuple(request[field] for field in (
+        "activation_package_digest", "fixture_digest", "controller_generation", "runner_generation",
+    ))
+
+
+def _generated_qualification_replay_scope(
+    manifest: dict[str, Any], generated: list[dict[str, object]],
+) -> tuple[object, ...]:
+    record = next(item for item in generated if item["role"] == "execd_config")
+    config = json.loads(record["payload"], object_pairs_hook=activation_package.reject_duplicates)
+    qualification = config["qualification"]
+    return (
+        manifest["package_digest"], qualification["fixture_digest"],
+        qualification["controller_generation"], qualification["runner_generation"],
+    )
 
 
 def _validate_qualification_response(request_raw: bytes, response: bytes) -> dict[str, Any]:
@@ -2375,45 +2522,59 @@ def _run_qualification(manifest: dict[str, Any], root: Path, receipt: dict[str, 
         response = base64.b64decode(state["response_base64"], validate=True)
         parsed = _validate_qualification_response(request, response)
         return {"controller_status": "passed", **parsed, "request_sha256": state["request_sha256"], "response_sha256": state["response_sha256"]}
+    if state["attempt_count"] >= QUALIFICATION_MAX_ATTEMPTS:
+        message = "qualification exact-request retry budget is exhausted with an unresolved delivery outcome"
+        state["last_error"] = message
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        os.close(program_fd)
+        raise ValueError(message + "; rollback and restage with a new replay binding")
+    state["attempt_count"] += 1
+    state["last_error"] = None
+    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     credential_options = _qualification_credentials(manifest, root)
     try:
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            process = subprocess.Popen(
-                [f"/proc/self/fd/{program_fd}"],
-                stdin=subprocess.PIPE,
-                stdout=stdout,
-                stderr=stderr,
-                cwd=str(root),
-                env={},
-                preexec_fn=_qualification_child_setup,
-                pass_fds=(program_fd,),
-                start_new_session=True,
-                umask=0o077,
-                **credential_options,
-            )
-            try:
-                process.communicate(input=request, timeout=qualification["timeout_seconds"])
-            except subprocess.TimeoutExpired as error:
-                _terminate_process_group(process, qualification["terminate_grace_seconds"])
-                raise ValueError("qualification command timed out") from error
-            stdout.seek(0)
-            response = stdout.read(MAX_COMMAND_OUTPUT + 1)
-            stderr.seek(0)
-            error_output = stderr.read(MAX_COMMAND_OUTPUT + 1)
+        try:
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                process = subprocess.Popen(
+                    [f"/proc/self/fd/{program_fd}"],
+                    stdin=subprocess.PIPE,
+                    stdout=stdout,
+                    stderr=stderr,
+                    cwd=str(root),
+                    env={},
+                    preexec_fn=_qualification_child_setup,
+                    pass_fds=(program_fd,),
+                    start_new_session=True,
+                    umask=0o077,
+                    **credential_options,
+                )
+                try:
+                    process.communicate(input=request, timeout=qualification["timeout_seconds"])
+                except subprocess.TimeoutExpired as error:
+                    _terminate_process_group(process, qualification["terminate_grace_seconds"])
+                    raise ValueError("qualification command timed out") from error
+                stdout.seek(0)
+                response = stdout.read(MAX_COMMAND_OUTPUT + 1)
+                stderr.seek(0)
+                error_output = stderr.read(MAX_COMMAND_OUTPUT + 1)
+            if len(response) > MAX_COMMAND_OUTPUT or len(error_output) > MAX_COMMAND_OUTPUT:
+                raise ValueError("qualification output exceeded its fixed bound")
+            if process.returncode != 0:
+                raise ValueError(f"qualification command failed with status {process.returncode}")
+            if error_output:
+                raise ValueError("qualification command wrote stderr on success")
+            response_digest = activation_package.digest(response)
+            parsed = _validate_qualification_response(request, response)
+        except BaseException as error:
+            _record_qualification_failure(manifest, root, receipt, error)
+            raise
     finally:
         os.close(program_fd)
-    if len(response) > MAX_COMMAND_OUTPUT or len(error_output) > MAX_COMMAND_OUTPUT:
-        raise ValueError("qualification output exceeded its fixed bound")
-    if process.returncode != 0:
-        raise ValueError(f"qualification command failed with status {process.returncode}")
-    if error_output:
-        raise ValueError("qualification command wrote stderr on success")
-    response_digest = activation_package.digest(response)
-    parsed = _validate_qualification_response(request, response)
     state = receipt["qualification"]
     state.update({
         "status": "passed", "response_sha256": response_digest,
         "response_base64": base64.b64encode(response).decode("ascii"), "completed_at": utc_now(),
+        "last_error": None, "expired_at": None,
     })
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     return {"status": "passed", **parsed, "request_sha256": state["request_sha256"], "response_sha256": response_digest}
@@ -2530,8 +2691,9 @@ def activate(
             _return_to_staged_zero(manifest, payloads, root, driver, receipt["acceptance_generated"])
         except BaseException as nested:
             rollback_error = str(nested)
+        safe_state = "qualification_uncertain" if _qualification_requires_restage(receipt["qualification"]) else "staged_zero"
         receipt.update({
-            "state": "staged_zero" if rollback_error is None else "rollback_failed",
+            "state": safe_state if rollback_error is None else "rollback_failed",
             "updated_at": utc_now(),
             "last_error": str(error),
         })
@@ -2809,6 +2971,7 @@ def rollback(
         }
     if receipt["state"] not in {
         "preparing", "stage_failed", "staged_zero", "activating", "active_one", "preparing_zero", "rollback_failed",
+        "qualification_uncertain",
     }:
         raise ValueError(f"rollback cannot start from receipt state {receipt['state']}")
     try:
@@ -2913,6 +3076,14 @@ def check_current(
             "generated_targets": _verify_generated(root, receipt["acceptance_generated"], phase="active"),
             "health": _active_health(manifest, driver, require_enabled=True),
             "qualification": receipt.get("qualification"),
+        }
+    if receipt["state"] == "qualification_uncertain":
+        return {
+            "status": "rollback_and_restage_required", "state": "qualification_uncertain", "capacity": 0,
+            "managed_targets": _verify_phase(manifest, root, "staged"),
+            "acceptance_generated": _verify_generated(root, receipt["acceptance_generated"]),
+            "staged_zero": _staged_zero_readback(manifest, driver),
+            "qualification": receipt["qualification"],
         }
     raise ValueError(f"activation receipt requires recovery: {receipt['state']}")
 

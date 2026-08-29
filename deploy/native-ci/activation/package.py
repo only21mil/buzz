@@ -130,7 +130,7 @@ RUNNER_REPLAY_JOURNAL = "/var/lib/buzzci/runner/v2-replay.json"
 SECCOMP_PROFILE_DIGEST = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 SECCOMP_PROFILE_PATH = f"/var/lib/buzzci/seccomp/v1/sha256/{SECCOMP_PROFILE_DIGEST}.json"
 RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "c8addbb42bace522e99fc8fe00603c9245db61ac8a599ef5762c2744267189cd"
-QUALIFICATION_SOURCE_COMMIT = "a86023a797aa6251001829aefcc30698b3580bc0"
+QUALIFICATION_SOURCE_COMMIT = "564e41fda889f25b094b79524b3fb409121794c7"
 LANE_MANIFEST_DIGEST_DOMAIN = b"buzz-ci:lane-activation-manifest:v1\0"
 
 SOCKET_POLICY = {
@@ -197,6 +197,16 @@ STATIC_TARGETS = {
     "controld_service_dropin": "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf",
     "keyholder_socket_dropin": "/etc/systemd/system/buzz-ci-keyholder.socket.d/20-capacity-one.conf",
 }
+
+PACKAGE_UNIT_ROLES = {
+    PERSISTENT_UNIT: "capacity_target",
+    "buzz-ci-controld-acceptance.socket": "controld_acceptance_socket",
+    "buzz-ci-acceptance-control.socket": "acceptance_control_socket",
+    "buzz-ci-acceptance-control.service": "acceptance_control_service",
+}
+DEPENDENCY_UNITS = sorted(
+    set(START_ORDER + STOP_ORDER) - set(PACKAGE_UNIT_ROLES)
+)
 
 
 def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
