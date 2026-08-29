@@ -10,8 +10,8 @@ pub mod terminal_evidence_collector;
 
 use buzz_ci_broker_protocol::{
     AdmitAttemptRequest, BrokerResponse, BrokerState, CancelAttemptRequest, CancelReason,
-    CompleteAttemptRequest, Conclusion, FrameHeader, QualificationDirective, QualificationRequest,
-    Request, ResponseCode,
+    CompleteAttemptRequest, Conclusion, FrameHeader, GetAttemptRequest, QualificationDirective,
+    QualificationRequest, Request, ResponseCode,
 };
 
 use crate::{
@@ -540,6 +540,43 @@ where
         )
     }
 
+    fn get_ordinary(&mut self, request: GetAttemptRequest, now: u64) -> BrokerResponse {
+        let snapshot = self.controller.snapshot();
+        let Some(lease) = snapshot.active_lease else {
+            return response(ResponseCode::NotFound, now);
+        };
+        if request.attempt_id != lease.lease_id() {
+            return response(ResponseCode::NotFound, now);
+        }
+        let binding = match self
+            .authority
+            .authenticate_ordinary_signer(lease.signer().0)
+        {
+            Ok(binding) => binding,
+            Err(error) => return boundary_error_response(error, now),
+        };
+        if !ordinary_binding_matches_lease(binding, lease) {
+            return response(ResponseCode::PolicyDenied, now);
+        }
+        let accepted_at = match self.controller.lease_admitted_at(lease) {
+            Ok(accepted_at) => accepted_at,
+            Err(_) => return response(ResponseCode::InternalFailure, now),
+        };
+        if now < accepted_at {
+            return response(ResponseCode::InternalFailure, now);
+        }
+        let receipts = match self
+            .ordinary
+            .read_receipts(binding.request, binding.admission, lease)
+        {
+            Ok(receipts) if receipts.evidence_set_digest != [0; 32] => receipts,
+            Ok(_) | Err(ExecutionUnavailable) => {
+                return response(ResponseCode::InternalFailure, now)
+            }
+        };
+        ordinary_readback_response(binding, lease, receipts, accepted_at, now)
+    }
+
     fn cancel_ordinary(&mut self, request: CancelAttemptRequest, now: u64) -> BrokerResponse {
         let binding = match self
             .authority
@@ -844,10 +881,10 @@ where
         match request {
             Request::AdmitAttempt(request) => self.admit_ordinary(request, now),
             Request::CancelAttempt(request) => self.cancel_ordinary(request, now),
+            Request::GetAttempt(request) => self.get_ordinary(request, now),
             Request::CompleteAttempt(request) => self.complete_ordinary(request, now),
             Request::AdmitQualification(request) => self.qualification(header, request, now),
             Request::Hello(_) => response(ResponseCode::NotProvisioned, now),
-            Request::GetAttempt(_) => response(ResponseCode::NotFound, now),
         }
     }
 
@@ -952,6 +989,59 @@ fn admitted_ordinary_response(
         evidence_set_digest: [0; 32],
         teardown_digest: [0; 32],
         attempt: request.attempt,
+    }
+}
+
+fn ordinary_binding_matches_lease(binding: OrdinaryAuthorityBinding, lease: LeaseToken) -> bool {
+    let request = binding.request;
+    let admission = binding.admission;
+    request.signed_request_digest != [0; 32]
+        && request.signed_request_digest == admission.job.request_digest
+        && request.signed_request_digest == lease.signed_request_digest()
+        && request.actor_pubkey == admission.signer.0
+        && admission.signer == lease.signer()
+        && request.run_id == admission.run_id
+        && request.run_id == lease.run_id()
+        && request.attempt == admission.attempt
+        && request.attempt == lease.attempt()
+        && request.job_manifest_digest == admission.job.manifest_digest
+        && request.isolation_profile_digest == admission.job.isolation_profile_digest
+        && request.tip_oid == admission.job.source_oid
+        && request.base_oid == admission.job.base_oid
+        && request.expires_at == admission.expires_at
+        && request.wall_timeout_seconds == admission.wall_timeout_seconds
+        && admission.lease_id == lease.lease_id()
+        && admission.nonce == lease.nonce()
+        && lease.generation() != 0
+        && lease.deadline_at() != 0
+        && lease.deadline_at() <= admission.expires_at
+}
+
+fn ordinary_readback_response(
+    binding: OrdinaryAuthorityBinding,
+    lease: LeaseToken,
+    receipts: OrdinaryReceipts,
+    accepted_at: u64,
+    now: u64,
+) -> BrokerResponse {
+    BrokerResponse {
+        code: ResponseCode::Existing,
+        retry_after_millis: 0,
+        attempt_id: lease.lease_id(),
+        run_id: lease.run_id(),
+        accepted_request_digest: lease.signed_request_digest(),
+        job_manifest_digest: binding.request.job_manifest_digest,
+        tip_oid: Some(binding.request.tip_oid),
+        broker_state: BrokerState::Terminal,
+        conclusion: protocol_conclusion(receipts.conclusion),
+        terminal_reason: 0,
+        generation: lease.generation(),
+        accepted_at,
+        updated_at: now,
+        lease_generation: lease.generation(),
+        evidence_set_digest: receipts.evidence_set_digest,
+        teardown_digest: [0; 32],
+        attempt: lease.attempt(),
     }
 }
 
@@ -1158,6 +1248,10 @@ mod tests {
     use buzz_ci_broker_protocol::{GitOid, Operation, TrustClass};
     use buzz_ci_isolation_contract::{PHASE1_SECCOMP_PROFILE_DIGEST, PHASE1_SECCOMP_PROFILE_PATH};
 
+    use super::crash_recovery::{
+        AttemptEvidenceBinding, CrashRecoveryCoordinator, MemoryRecoveryJournal, RecoveryJournal,
+        RecoveryRecord, RecoveryStage,
+    };
     use super::*;
     use crate::{
         activation::{
@@ -1649,6 +1743,33 @@ mod tests {
         }
     }
 
+    fn get_header() -> FrameHeader {
+        FrameHeader {
+            operation: Operation::GetAttempt,
+            request_id: [34; 16],
+        }
+    }
+
+    fn get_request(attempt_id: [u8; 16]) -> GetAttemptRequest {
+        GetAttemptRequest { attempt_id }
+    }
+
+    fn recovery_binding(lease: LeaseToken) -> AttemptEvidenceBinding {
+        let mut binding = AttemptEvidenceBinding {
+            run_id: lease.run_id(),
+            job_id: "durable-readback-job".to_owned(),
+            attempt: lease.attempt(),
+            controller_lease_id: lease.lease_id(),
+            lease_generation: lease.generation(),
+            lease_deadline_at: lease.deadline_at(),
+            host_lease_id: "durable-readback-host-lease".to_owned(),
+            workspace_sha256: [71; 32],
+            binding_sha256: [0; 32],
+        };
+        binding.binding_sha256 = binding.digest();
+        binding
+    }
+
     fn cancel_request(generation: u64) -> CancelAttemptRequest {
         CancelAttemptRequest {
             attempt_id: ordinary_request().run_id,
@@ -1751,6 +1872,173 @@ mod tests {
             restart.quarantine_reason,
             Some(crate::activation::ActivationError::RestartAmbiguous)
         );
+    }
+
+    #[test]
+    fn get_attempt_returns_exact_terminal_receipts_without_state_change() {
+        let store = FakeStore::new(None);
+        let commits = Rc::clone(&store.commits);
+        let calls = OrdinaryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            ready_controller(),
+            authority(),
+            store,
+            ordinary_fake(calls.clone()),
+            QualificationFake,
+        );
+        let admitted = dispatch.dispatch(
+            ordinary_header(),
+            Request::AdmitAttempt(ordinary_request()),
+            21,
+        );
+        let snapshot = dispatch.controller.snapshot();
+        let commit_count = commits.borrow().len();
+
+        let result = dispatch.dispatch(
+            get_header(),
+            Request::GetAttempt(get_request(admitted.attempt_id)),
+            22,
+        );
+
+        assert_eq!(result.code, ResponseCode::Existing);
+        assert_eq!(result.attempt_id, admitted.attempt_id);
+        assert_eq!(result.run_id, admitted.run_id);
+        assert_eq!(
+            result.accepted_request_digest,
+            admitted.accepted_request_digest
+        );
+        assert_eq!(result.job_manifest_digest, admitted.job_manifest_digest);
+        assert_eq!(result.tip_oid, admitted.tip_oid);
+        assert_eq!(result.broker_state, BrokerState::Terminal);
+        assert_eq!(result.conclusion, Conclusion::Success);
+        assert_eq!(result.generation, admitted.generation);
+        assert_eq!(result.accepted_at, admitted.accepted_at);
+        assert_eq!(result.updated_at, 22);
+        assert_eq!(result.lease_generation, admitted.lease_generation);
+        assert_eq!(result.evidence_set_digest, [44; 32]);
+        assert_eq!(result.teardown_digest, [0; 32]);
+        assert_eq!(result.attempt, admitted.attempt);
+        assert_eq!(calls.receipts.get(), 1);
+        assert_eq!(calls.reconciles.get(), 0);
+        assert_eq!(dispatch.controller.snapshot(), snapshot);
+        assert_eq!(commits.borrow().len(), commit_count);
+    }
+
+    #[test]
+    fn get_attempt_refuses_unknown_or_mismatched_durable_bindings() {
+        let store = FakeStore::new(None);
+        let commits = Rc::clone(&store.commits);
+        let calls = OrdinaryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            ready_controller(),
+            authority(),
+            store,
+            ordinary_fake(calls.clone()),
+            QualificationFake,
+        );
+        let admitted = dispatch.dispatch(
+            ordinary_header(),
+            Request::AdmitAttempt(ordinary_request()),
+            21,
+        );
+        let snapshot = dispatch.controller.snapshot();
+        let commit_count = commits.borrow().len();
+
+        let unknown =
+            dispatch.dispatch(get_header(), Request::GetAttempt(get_request([99; 16])), 22);
+        assert_eq!(unknown.code, ResponseCode::NotFound);
+
+        dispatch.authority.ordinary_request.run_id = [98; 16];
+        let wrong_binding = dispatch.dispatch(
+            get_header(),
+            Request::GetAttempt(get_request(admitted.attempt_id)),
+            22,
+        );
+        assert_eq!(wrong_binding.code, ResponseCode::PolicyDenied);
+
+        dispatch.authority.ordinary_request.run_id = ordinary_request().run_id;
+        dispatch.authority.ordinary_request.signed_request_digest = [97; 32];
+        let wrong_digest = dispatch.dispatch(
+            get_header(),
+            Request::GetAttempt(get_request(admitted.attempt_id)),
+            22,
+        );
+        assert_eq!(wrong_digest.code, ResponseCode::PolicyDenied);
+        assert_eq!(calls.receipts.get(), 0);
+        assert_eq!(dispatch.controller.snapshot(), snapshot);
+        assert_eq!(commits.borrow().len(), commit_count);
+    }
+
+    #[test]
+    fn get_attempt_replays_persisted_terminal_receipts_after_restart() {
+        let store = FakeStore::new(None);
+        let commits = Rc::clone(&store.commits);
+        let journal = MemoryRecoveryJournal::default();
+        let first_calls = OrdinaryCalls::new();
+        let mut dispatch = DurableDispatch::new(
+            ready_controller(),
+            authority(),
+            store,
+            CrashRecoveryCoordinator::new(ordinary_fake(first_calls), journal.clone()),
+            QualificationFake,
+        );
+        let admitted = dispatch.dispatch(
+            ordinary_header(),
+            Request::AdmitAttempt(ordinary_request()),
+            21,
+        );
+        let lease = dispatch
+            .controller
+            .snapshot()
+            .active_lease
+            .expect("active lease");
+        let binding = recovery_binding(lease);
+        journal
+            .advance(RecoveryRecord {
+                binding: binding.clone(),
+                stage: RecoveryStage::Active,
+            })
+            .unwrap();
+        journal
+            .advance(RecoveryRecord {
+                binding,
+                stage: RecoveryStage::EvidenceUploaded {
+                    conclusion: LeaseConclusion::Success,
+                    evidence_set_digest: [44; 32],
+                },
+            })
+            .unwrap();
+        let persisted = commits.borrow()[0];
+        let restored = ActivationController::restore(ROOT, persisted, None);
+        assert_eq!(restored.controller.state(), ActivationState::Quarantined);
+        drop(dispatch);
+
+        let restarted_store = FakeStore::new(None);
+        let restarted_commits = Rc::clone(&restarted_store.commits);
+        let restarted_calls = OrdinaryCalls::new();
+        let mut restarted = DurableDispatch::new(
+            restored.controller,
+            authority(),
+            restarted_store,
+            CrashRecoveryCoordinator::new(ordinary_fake(restarted_calls.clone()), journal),
+            QualificationFake,
+        );
+        let restart_snapshot = restarted.controller.snapshot();
+        let result = restarted.dispatch(
+            get_header(),
+            Request::GetAttempt(get_request(admitted.attempt_id)),
+            23,
+        );
+
+        assert_eq!(result.code, ResponseCode::Existing);
+        assert_eq!(result.attempt_id, admitted.attempt_id);
+        assert_eq!(result.accepted_at, admitted.accepted_at);
+        assert_eq!(result.broker_state, BrokerState::Terminal);
+        assert_eq!(result.conclusion, Conclusion::Success);
+        assert_eq!(result.evidence_set_digest, [44; 32]);
+        assert_eq!(restarted_calls.receipts.get(), 0);
+        assert_eq!(restarted.controller.snapshot(), restart_snapshot);
+        assert!(restarted_commits.borrow().is_empty());
     }
 
     #[test]

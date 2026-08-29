@@ -8,6 +8,12 @@
 
 #![forbid(unsafe_code)]
 
+/// Version 2 protocol types and codecs.
+///
+/// Version 2 is a separate wire contract. Its codecs never reinterpret a
+/// version 1 frame, and the legacy top-level API remains frozen at version 1.
+pub mod v2;
+
 pub const MAGIC: [u8; 4] = *b"BZCI";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const HEADER_SIZE: usize = 32;
