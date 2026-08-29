@@ -89,23 +89,6 @@ class RunnerInstallTests(unittest.TestCase):
             self.controld_gid,
         )
 
-    def host_config(self, broker_uid: int = 0) -> dict[str, object]:
-        return {
-            "owner_pubkey": "11" * 32,
-            "manifest_verification_key": "22" * 32,
-            "relay_signer": "33" * 32,
-            "broker_socket": "/run/buzzci/execd.sock",
-            "broker_uid": broker_uid,
-            "executor_program": "/usr/libexec/buzz-ci-executor",
-            "evidence_directory": "/var/lib/buzzci/runner/evidence",
-            "journal_directory": "/var/lib/buzzci/runner/journal",
-            "max_argv_items": 32,
-            "max_argv_bytes": 8192,
-            "max_environment_items": 32,
-            "max_environment_bytes": 8192,
-            "max_output_bytes": 1048576,
-        }
-
     def make_root(self, name: str = "root") -> Path:
         root = self.base / name
         root.mkdir(mode=0o700)
@@ -193,10 +176,8 @@ class RunnerInstallTests(unittest.TestCase):
         self.assertNotIn("host", value)
         self.assertNotIn("capacity", value)
 
-        active = json.loads(RENDERER.config_bytes(self.controld_uid, self.host_config()))
-        self.assertEqual(active["host"]["broker_uid"], 0)
-        with self.assertRaisesRegex(ValueError, "root execd socket"):
-            RENDERER.config_bytes(self.controld_uid, self.host_config(broker_uid=1))
+        with self.assertRaises(TypeError):
+            RENDERER.config_bytes(self.controld_uid, {"executor_program": "/bin/true"})
 
         linked = self.base / "linked.json"
         linked.symlink_to(output)
@@ -217,6 +198,20 @@ class RunnerInstallTests(unittest.TestCase):
         self.assertEqual({entry.role for entry in entries}, set(INSTALLER.EXPECTED_TARGETS))
         binary = next(entry for entry in entries if entry.role == "binary")
         self.assertEqual(binary.sha256, hashlib.sha256(self.binary.read_bytes()).hexdigest())
+
+    def test_freeze_enforces_exact_private_modes_and_restores_umask(self) -> None:
+        previous = os.umask(0)
+        try:
+            self.freeze()
+            observed = os.umask(0)
+        finally:
+            os.umask(previous)
+        self.assertEqual(observed, 0)
+        self.assertEqual(stat.S_IMODE(self.package.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.package / "assets").stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.package / "package-manifest.json").stat().st_mode), 0o600)
+        for asset in (self.package / "assets").iterdir():
+            self.assertIn(stat.S_IMODE(asset.stat().st_mode), {0o400, 0o500})
 
     def test_freeze_rejects_shared_runner_and_controld_identity(self) -> None:
         with self.assertRaisesRegex(ValueError, "identities must be distinct"):
@@ -460,9 +455,36 @@ class RunnerInstallTests(unittest.TestCase):
         self.assertIn("SocketUser=buzzci-runner", socket)
         self.assertIn("SocketGroup=buzzci-controld", socket)
         self.assertIn("SocketMode=0620", socket)
+        self.assertIn("User=buzzci-runner", service)
+        self.assertIn("SupplementaryGroups=buzzci-execd", service)
+        self.assertNotIn("CapabilityBoundingSet", service)
+        self.assertNotIn("User=root", service)
         self.assertIn("ReadWritePaths=/var/lib/buzzci/runner", service)
+        self.assertNotIn("executor", service.lower())
         self.assertNotIn("/var/lib/buzzci/runner-output", service + tmpfiles)
         self.assertNotIn("systemctl", (RUNNER_DIR / "install.py").read_text())
+
+    def test_dormant_legacy_state_has_bounded_cleanup(self) -> None:
+        lines = (RUNNER_DIR / "templates/buzzci-runner.tmpfiles").read_text().splitlines()
+        self.assertIn(
+            "d /var/lib/buzzci/runner/evidence 0700 buzzci-runner buzzci-runner 7d",
+            lines,
+        )
+        self.assertIn(
+            "d /var/lib/buzzci/runner/journal 0700 buzzci-runner buzzci-runner 30d",
+            lines,
+        )
+        self.assertFalse(any("/var/lib/buzzci/runner/evidence" in line and line.endswith(" -") for line in lines))
+        self.assertFalse(any("/var/lib/buzzci/runner/journal" in line and line.endswith(" -") for line in lines))
+
+    def test_closed_config_cannot_select_local_execution_or_evidence_persistence(self) -> None:
+        config = RENDERER.config_bytes(self.controld_uid)
+        self.assertEqual(
+            json.loads(config),
+            {"schema_version": 1, "controld_uid": self.controld_uid},
+        )
+        for forbidden in (b"host", b"executor", b"evidence", b"journal"):
+            self.assertNotIn(forbidden, config)
 
     def test_schemas_are_strict_json(self) -> None:
         for name in (
@@ -473,7 +495,7 @@ class RunnerInstallTests(unittest.TestCase):
             schema = json.loads((RUNNER_DIR / name).read_text())
             self.assertFalse(schema["additionalProperties"])
         runner_schema = json.loads((RUNNER_DIR / "runner-config.schema.json").read_text())
-        self.assertEqual(runner_schema["properties"]["host"]["properties"]["broker_uid"], {"const": 0})
+        self.assertEqual(set(runner_schema["properties"]), {"schema_version", "controld_uid"})
         manifest_schema = json.loads((RUNNER_DIR / "package-manifest.schema.json").read_text())
         self.assertEqual(manifest_schema["properties"]["peer_policy"]["const"], INSTALLER.PEER_POLICY)
 

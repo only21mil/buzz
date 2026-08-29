@@ -13,8 +13,11 @@ The installed default stays closed:
   manually. The package records `enabled=false`, `active=false`,
   `provisioned=false`, `host_block=false`, and `capacity=0`.
 
-Provisioning a host block and enabling the socket require a separate reviewed
-activation package. This installer does neither.
+The package does not enable the socket, and the production parser rejects a
+`host` block. No activation package can select the removed same-UID local
+executor. Broker v2
+reaches execd through its separate fixed-width transport, and execd alone owns
+job execution and durable evidence.
 
 ## Fixed resources
 
@@ -26,12 +29,16 @@ package manifest and every `check`, `dry-run`, and install readback report that
 identity contract together with the dormant state.
 
 The privileged broker socket remains `/run/buzzci/execd.sock`; this package
-does not create or own it. A provisioned `host` block must bind `broker_uid`
-to exact UID `0`, matching the reviewed root `buzz-ci-execd` peer. The checked-in
-schema and renderer accept that exact value and reject a different broker UID.
-The package still never emits a `host` block itself.
+does not create or own it. Its frozen access contract is
+`root:buzzci-execd` mode `0620`, with `buzzci-runner` and `buzzci-ctl` as the
+exact supplementary members. The runner service declares only its own required
+membership. Broker authorization still checks the exact root `SO_PEERCRED` UID.
 
-Runner-owned evidence and journal data live under `/var/lib/buzzci/runner`.
+Legacy runner evidence and journal roots remain under
+`/var/lib/buzzci/runner` for restart compatibility, but the production binary
+cannot write new execution evidence there. Tmpfiles expires dormant evidence
+contents after 7 days and journal contents after 30 days. Execd owns active v2
+evidence retention.
 The controld handoff root remains `/var/lib/buzzci/runner-output`; this package
 does not create it and the runner service cannot write it.
 
@@ -46,12 +53,9 @@ config is mode `0600` and owned by the runner UID and GID. The binary, units,
 tmpfiles file, documentation, and their installed directory roots are
 root-owned.
 
-The current execd deployment contract owns `/run/buzzci/execd.sock` as
-`buzzci-ctl:buzzci-ctl` mode `0600`. That socket is not reachable by the
-distinct `buzzci-runner` account. A separate reviewed control-plane change must
-resolve the execd socket ownership/mode dependency while preserving exact root
-peer authentication before any activation package may add a `host` block.
-This dormant runner package deliberately does not weaken or modify that socket.
+This package does not alter the execd socket or group database. The activation
+package owns both. Installation here remains dormant and does not grant group
+membership, start a service, or expose execution capacity.
 
 ## Freeze a package
 

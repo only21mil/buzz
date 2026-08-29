@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::config::RunnerHostConfig;
+use crate::config::{validate_private_directory, RunnerHostConfig};
 use crate::control::{
     AdmittedLease, BoundedExecutionEvidence, CiWorkflowPolicy, ExecutionBackendError,
     UnixBrokerTransport,
@@ -589,18 +589,6 @@ fn valid_env_key(key: &str) -> bool {
         && key
             .bytes()
             .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
-}
-
-pub(crate) fn validate_private_directory(path: &PathBuf) -> Result<(), ()> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o7777 != 0o700
-        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
-    {
-        return Err(());
-    }
-    Ok(())
 }
 
 #[cfg(test)]

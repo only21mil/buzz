@@ -15,6 +15,10 @@
 pub mod config;
 pub mod control;
 pub mod handler;
+// The legacy v1 host executor remains available only to its unit tests. The
+// production binary has no local-executor composition; broker v2 execution and
+// evidence ownership stay inside execd.
+#[cfg(test)]
 pub mod host;
 pub mod journal;
 pub mod service;

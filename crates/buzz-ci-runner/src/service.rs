@@ -2,6 +2,8 @@
 
 use std::convert::Infallible;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
@@ -108,7 +110,19 @@ pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener,
             "fd 3 is not the fixed runner control socket",
         ));
     }
+    mark_close_on_exec(&listener)?;
     Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+fn mark_close_on_exec(descriptor: &impl AsFd) -> Result<(), ActivationError> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+    let current = fcntl(descriptor, FcntlArg::F_GETFD).map_err(nix_io)?;
+    let mut flags = FdFlag::from_bits_truncate(current);
+    flags.insert(FdFlag::FD_CLOEXEC);
+    fcntl(descriptor, FcntlArg::F_SETFD(flags)).map_err(nix_io)?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -164,6 +178,12 @@ pub fn serve_runner_connection_with_handler(
     expected_controld_uid: u32,
     handler: &mut impl FnMut(RunnerRequest, [u8; 32], &mut UnixStream) -> Result<(), ()>,
 ) -> Result<(), RunnerConnectionError> {
+    mark_close_on_exec(&stream).map_err(|error| match error {
+        ActivationError::Inspect(error) => RunnerConnectionError::Socket(error),
+        ActivationError::Invalid(_) => RunnerConnectionError::Socket(io::Error::other(
+            "runner control descriptor setup failed",
+        )),
+    })?;
     let credentials = getsockopt(&stream, PeerCredentials).map_err(|error| {
         RunnerConnectionError::Socket(io::Error::from_raw_os_error(error as i32))
     })?;
@@ -239,6 +259,17 @@ mod tests {
         .expect("serve connection");
 
         assert_eq!(observed, b"opaque");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_descriptors_are_marked_close_on_exec() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+        let (_peer, stream) = UnixStream::pair().expect("socket pair");
+        mark_close_on_exec(&stream).expect("set close-on-exec");
+        let flags = fcntl(&stream, FcntlArg::F_GETFD).expect("read descriptor flags");
+        assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
     }
 
     #[cfg(target_os = "linux")]

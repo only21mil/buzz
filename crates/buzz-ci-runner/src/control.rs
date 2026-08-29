@@ -660,6 +660,7 @@ fn exchange_unix(
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(path).map_err(|_| ControlError::BrokerUnavailable)?;
+    mark_control_stream_close_on_exec(&stream)?;
     let credentials =
         getsockopt(&stream, PeerCredentials).map_err(|_| ControlError::TransportFailure)?;
     authorize_broker_peer(credentials.uid(), expected_uid)?;
@@ -688,6 +689,7 @@ fn exchange_unix_v2(
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(path).map_err(|_| ControlError::BrokerUnavailable)?;
+    mark_control_stream_close_on_exec(&stream)?;
     let credentials =
         getsockopt(&stream, PeerCredentials).map_err(|_| ControlError::TransportFailure)?;
     authorize_broker_peer(credentials.uid(), expected_uid)?;
@@ -696,6 +698,19 @@ fn exchange_unix_v2(
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
         .map_err(|_| ControlError::TransportFailure)?;
     exchange_stream_v2(&mut stream, request)
+}
+
+#[cfg(unix)]
+fn mark_control_stream_close_on_exec(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), ControlError> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+    let current = fcntl(stream, FcntlArg::F_GETFD).map_err(|_| ControlError::TransportFailure)?;
+    let mut flags = FdFlag::from_bits_truncate(current);
+    flags.insert(FdFlag::FD_CLOEXEC);
+    fcntl(stream, FcntlArg::F_SETFD(flags)).map_err(|_| ControlError::TransportFailure)?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -950,6 +965,68 @@ mod tests {
             admit_signed_job_intent_v2(request, &mut hostile),
             Err(ControlError::InvalidBrokerResponse)
         );
+    }
+
+    #[test]
+    fn version_two_transport_failure_never_falls_back_to_legacy_execution() {
+        #[derive(Default)]
+        struct DualTransport {
+            v1_calls: usize,
+            v2_calls: usize,
+        }
+
+        impl BrokerTransportV2 for DualTransport {
+            fn exchange(
+                &mut self,
+                _request: v2::Request,
+            ) -> Result<v2::BrokerResponse, ControlError> {
+                self.v2_calls += 1;
+                Err(ControlError::BrokerUnavailable)
+            }
+        }
+
+        impl BrokerTransport for DualTransport {
+            fn admit(
+                &mut self,
+                _request: AdmitAttemptRequest,
+            ) -> Result<BrokerResponse, ControlError> {
+                self.v1_calls += 1;
+                Err(ControlError::BrokerUnavailable)
+            }
+
+            fn get(&mut self, _request: GetAttemptRequest) -> Result<BrokerResponse, ControlError> {
+                self.v1_calls += 1;
+                Err(ControlError::BrokerUnavailable)
+            }
+
+            fn complete(
+                &mut self,
+                _request: CompleteAttemptRequest,
+            ) -> Result<BrokerResponse, ControlError> {
+                self.v1_calls += 1;
+                Err(ControlError::BrokerUnavailable)
+            }
+        }
+
+        let mut transport = DualTransport::default();
+        assert_eq!(
+            admit_signed_job_intent_v2(activation_request(), &mut transport),
+            Err(ControlError::BrokerUnavailable)
+        );
+        assert_eq!(transport.v2_calls, 1);
+        assert_eq!(transport.v1_calls, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_descriptors_are_marked_close_on_exec() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use std::os::unix::net::UnixStream;
+
+        let (_peer, stream) = UnixStream::pair().expect("socket pair");
+        mark_control_stream_close_on_exec(&stream).expect("set close-on-exec");
+        let flags = fcntl(&stream, FcntlArg::F_GETFD).expect("read descriptor flags");
+        assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
     }
 
     #[test]

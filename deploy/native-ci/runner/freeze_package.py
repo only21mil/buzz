@@ -40,6 +40,10 @@ PEER_POLICY = {
     "broker_socket": {
         "path": render_runner_config.BROKER_SOCKET,
         "expected_uid": render_runner_config.BROKER_UID,
+        "owner": "root",
+        "group": "buzzci-execd",
+        "mode": "0620",
+        "supplementary_members": ["buzzci-runner", "buzzci-ctl"],
         "managed_by_package": False,
     },
 }
@@ -60,14 +64,20 @@ def sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def read_regular(path: Path, mode: int | None = None, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
+def read_regular(
+    path: Path,
+    mode: int | frozenset[int] | None = None,
+    max_bytes: int = 128 * 1024 * 1024,
+) -> tuple[bytes, os.stat_result]:
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise ValueError(f"unsafe regular file: {path}")
-        if mode is not None and stat.S_IMODE(metadata.st_mode) != mode:
-            raise ValueError(f"wrong source mode: {path}")
+        if mode is not None:
+            allowed_modes = mode if isinstance(mode, frozenset) else frozenset({mode})
+            if stat.S_IMODE(metadata.st_mode) not in allowed_modes:
+                raise ValueError(f"wrong source mode: {path}")
         chunks: list[bytes] = []
         size = 0
         while chunk := os.read(fd, 1024 * 1024):
@@ -159,7 +169,7 @@ def entry(role: str, source: str, target: str, source_mode: int, install_mode: i
     }
 
 
-def freeze_package(
+def _freeze_package(
     source_root: Path,
     source_commit: str,
     binary: Path,
@@ -205,7 +215,7 @@ def freeze_package(
 
         package_dir = source_root / PACKAGE_RELATIVE
         for role, source_name, asset_name, target, source_mode, install_mode, uid, gid in STATIC_ASSETS:
-            payload, _ = read_regular(package_dir / source_name, 0o644)
+            payload, _ = read_regular(package_dir / source_name, frozenset({0o600, 0o644}))
             write_asset(assets / asset_name, payload, source_mode)
             entries.append(entry(role, asset_name, target, source_mode, install_mode, uid, gid, payload))
 
@@ -237,6 +247,34 @@ def freeze_package(
     except BaseException:
         shutil.rmtree(stage)
         raise
+
+
+def freeze_package(
+    source_root: Path,
+    source_commit: str,
+    binary: Path,
+    provenance_path: Path,
+    output: Path,
+    runner_uid: int,
+    runner_gid: int,
+    controld_uid: int,
+    controld_gid: int,
+) -> dict[str, object]:
+    previous_umask = os.umask(0o077)
+    try:
+        return _freeze_package(
+            source_root,
+            source_commit,
+            binary,
+            provenance_path,
+            output,
+            runner_uid,
+            runner_gid,
+            controld_uid,
+            controld_gid,
+        )
+    finally:
+        os.umask(previous_umask)
 
 
 def main() -> int:

@@ -8,6 +8,7 @@ After=local-fs.target buzz-ci-runner.socket systemd-tmpfiles-setup.service
 Type=exec
 User=buzzci-runner
 Group=buzzci-runner
+SupplementaryGroups=buzzci-execd
 UMask=0077
 ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v1.json
 NoNewPrivileges=yes
