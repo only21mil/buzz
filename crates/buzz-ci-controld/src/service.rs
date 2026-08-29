@@ -17,8 +17,7 @@ use buzz_ci_broker_protocol::{
     BrokerState, CancelReason, Conclusion as BrokerConclusion, ResponseCode,
 };
 use buzz_ci_controld::acceptance_socket::{
-    AcceptanceAuthorityBinding, AcceptanceBinding, AcceptanceJournal, AcceptanceOperationHandler,
-    AcceptanceSocketError,
+    AcceptanceBinding, AcceptanceJournal, AcceptanceOperationHandler, AcceptanceSocketError,
 };
 use buzz_ci_controld::controller::{
     CapacityOneConfig, CapacityOneController, CapacityOneProviderSlots, CapacityOneStatus,
@@ -36,9 +35,7 @@ use buzz_ci_controld::runner_v2::{
 };
 use buzz_ci_controld::source::{AuthenticatedRelay, ReqwestTransport, SourceError, TransportError};
 use buzz_ci_controld::store::{DurableControlStore, StoreError};
-use buzz_ci_keyholder::{
-    AcceptanceMutation, AcceptanceSigningPolicy, CanonicalPayload, PublicIdentity,
-};
+use buzz_ci_keyholder::{AcceptanceMutation, PublicIdentity};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
@@ -92,39 +89,25 @@ struct AcceptanceAuthority {
 }
 
 impl AcceptanceAuthority {
-    fn new(config: &AcceptanceAuthorityBinding) -> Result<Self, ServiceError> {
+    fn new(binding: &AcceptanceBinding) -> Result<Self, ServiceError> {
+        let validated = binding
+            .validate()
+            .map_err(|_| ServiceError::InvalidConfig)?;
+        let config = &binding.acceptance;
         let actor = PublicIdentity {
-            public_key: decode_digest(&config.actor.public_key)?,
-            generation: config.actor.generation,
+            public_key: validated.actor_public_key(),
+            generation: validated.actor_generation(),
         };
-        let scenario_sha256 = decode_digest(&config.scenario_sha256)?;
         let templates = [
             config.run_event.clone(),
             config.grant_event.clone(),
             config.rerun_event.clone(),
             config.tombstone_event.clone(),
         ];
-        let payload = |value: &serde_json::Value| {
-            CanonicalPayload::new(
-                serde_json::to_vec(value).map_err(|_| ServiceError::InvalidConfig)?,
-            )
-            .map_err(|_| ServiceError::InvalidConfig)
-        };
-        let policy = AcceptanceSigningPolicy::new(
-            actor,
-            scenario_sha256,
-            [
-                payload(&templates[0])?,
-                payload(&templates[1])?,
-                payload(&templates[2])?,
-                payload(&templates[3])?,
-            ],
-        )
-        .map_err(|_| ServiceError::InvalidConfig)?;
         Ok(Self {
-            actor: policy.actor(),
-            scenario_sha256: policy.scenario_sha256(),
-            event_ids: policy.event_ids(),
+            actor,
+            scenario_sha256: validated.scenario_sha256(),
+            event_ids: validated.event_ids(),
             templates,
         })
     }
@@ -223,7 +206,7 @@ impl CapacityOneService {
             acceptance_transport,
             acceptance_authorizer,
         )?;
-        let acceptance_authority = AcceptanceAuthority::new(&binding.acceptance)?;
+        let acceptance_authority = AcceptanceAuthority::new(binding)?;
         let described = acceptance_signer.describe_acceptance()?;
         if described.actor != acceptance_authority.actor
             || described.scenario_sha256 != acceptance_authority.scenario_sha256

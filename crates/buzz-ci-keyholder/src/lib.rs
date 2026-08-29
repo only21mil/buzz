@@ -36,8 +36,8 @@ pub use ipc::{
 #[cfg(target_os = "linux")]
 pub use ipc::{validate_systemd_environment, validate_systemd_listener, ActivationError};
 pub use receipt::{
-    AcceptanceBindingReceipt, AcceptanceReceiptIdentity, AcceptanceReceiptPolicy, ReceiptError,
-    ACCEPTANCE_BINDING_PATH, ACCEPTANCE_BINDING_SCHEMA,
+    acceptance_signing_policy, AcceptanceBindingReceipt, AcceptanceReceiptIdentity,
+    AcceptanceReceiptPolicy, ReceiptError, ACCEPTANCE_BINDING_PATH, ACCEPTANCE_BINDING_SCHEMA,
 };
 pub use selector::{KeySelector, SelectorSet};
 pub use service::{AcceptanceSigningPolicy, ProductionKeyholder, ServiceError, SigningPolicy};

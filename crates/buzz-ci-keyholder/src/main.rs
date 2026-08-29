@@ -9,9 +9,9 @@ use std::os::{fd::FromRawFd, unix::net::UnixListener};
 
 #[cfg(target_os = "linux")]
 use buzz_ci_keyholder::{
-    serve_connection, validate_systemd_environment, validate_systemd_listener,
-    AcceptanceBindingReceipt, KeyholderConfig, ProductionKeyholder, Secp256k1Backend,
-    SigningPolicy, SYSTEMD_LISTEN_FD,
+    acceptance_signing_policy, serve_connection, validate_systemd_environment,
+    validate_systemd_listener, AcceptanceBindingReceipt, KeyholderConfig, ProductionKeyholder,
+    Secp256k1Backend, SigningPolicy, SYSTEMD_LISTEN_FD,
 };
 
 #[cfg(target_os = "linux")]
@@ -87,7 +87,7 @@ fn run(config_path: PathBuf) -> ExitCode {
                 eprintln!(r#"{{"error":"invalid_acceptance_binding"}}"#);
                 return ExitCode::from(4);
             }
-            match receipt.signing_policy() {
+            match acceptance_signing_policy(&receipt) {
                 Ok(policy) => Some(policy),
                 Err(_) => {
                     eprintln!(r#"{{"error":"invalid_acceptance_binding"}}"#);

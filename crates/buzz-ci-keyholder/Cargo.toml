@@ -35,5 +35,6 @@ rustix = { workspace = true, features = ["mm", "process"] }
 nix = { version = "0.31", default-features = false, features = ["fs", "process", "socket", "user"] }
 
 [dev-dependencies]
+buzz-ci-acceptance-ctl = { path = "../buzz-ci-acceptance-ctl", features = ["test-support"] }
 proptest.workspace = true
 tempfile = "3"
