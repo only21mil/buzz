@@ -54,10 +54,18 @@ def install_package(package: Path, root: Path) -> dict[str, object]:
             raise ValueError("refusing symlink install target")
         descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, int(str(item["install_mode"]), 8))
         try:
-            os.write(descriptor, payload)
-            os.fchmod(descriptor, int(str(item["install_mode"]), 8))
+            install_mode = int(str(item["install_mode"]), 8)
+            os.fchmod(descriptor, install_mode)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != install_mode:
+                raise OSError(f"could not materialize exact install mode: {target}")
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(descriptor, view):]
+            os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        if stat.S_IMODE(target.lstat().st_mode) != install_mode:
+            raise OSError(f"installed target mode readback differs: {target}")
     return manifest
 
 

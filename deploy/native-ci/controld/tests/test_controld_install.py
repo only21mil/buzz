@@ -40,10 +40,14 @@ class ControldInstallTests(unittest.TestCase):
         copied = self.source_root / "deploy/native-ci/controld"
         copied.parent.mkdir(mode=0o700, parents=True)
         shutil.copytree(CONTROLD_DIR, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy2(CONTROLD_DIR.parent / "package_source.py", self.source_root / "deploy/native-ci/package_source.py")
         subprocess.run(["git", "init", "-q", str(self.source_root)], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.name", "Controld test"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.email", "controld@test.invalid"], check=True)
-        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci/controld"], check=True)
+        subprocess.run([
+            "git", "-C", str(self.source_root), "add",
+            "deploy/native-ci/controld", "deploy/native-ci/package_source.py",
+        ], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "commit", "-qm", "fixture"], check=True)
         self.source_commit = FREEZER.git_output(self.source_root, "rev-parse", "HEAD")
         self.binary = self.base / "buzz-ci-controld"
@@ -64,10 +68,10 @@ class ControldInstallTests(unittest.TestCase):
         if self.controld_uid == 0 or self.controld_gid == 0:
             self.skipTest("fake-root tests require a non-root invoking identity")
 
-    def freeze(self) -> dict[str, object]:
+    def freeze(self, source_root: Path | None = None, package: Path | None = None) -> dict[str, object]:
         return FREEZER.freeze_package(
-            self.source_root, self.source_commit, self.binary, self.provenance,
-            self.package, self.controld_uid, self.controld_gid,
+            source_root or self.source_root, self.source_commit, self.binary, self.provenance,
+            package or self.package, self.controld_uid, self.controld_gid,
         )
 
     def make_root(self, name: str = "root") -> Path:
@@ -112,6 +116,51 @@ class ControldInstallTests(unittest.TestCase):
         binary = next(entry for entry in entries if entry.role == "binary")
         self.assertEqual(binary.sha256, hashlib.sha256(self.binary.read_bytes()).hexdigest())
         self.assertNotIn("socket", {entry.role for entry in entries})
+        self.assertEqual(stat.S_IMODE(self.package.lstat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.package / "assets").lstat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.package / "package-manifest.json").lstat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((self.package / "binary-provenance.json").lstat().st_mode), 0o600)
+        for entry in entries:
+            self.assertEqual(
+                stat.S_IMODE((self.package / entry.source).lstat().st_mode),
+                entry.source_mode,
+            )
+
+    def test_freeze_from_fresh_umask_0077_checkout_needs_no_source_chmod(self) -> None:
+        checkout = self.base / "private-checkout"
+        prior_umask = os.umask(0o077)
+        try:
+            subprocess.run(["git", "clone", "-q", str(self.source_root), str(checkout)], check=True)
+        finally:
+            os.umask(prior_umask)
+        self.assertEqual(
+            stat.S_IMODE((checkout / "deploy/native-ci/controld/README.md").lstat().st_mode),
+            0o600,
+        )
+        self.assertEqual(
+            stat.S_IMODE((checkout / "deploy/native-ci/controld/freeze_package.py").lstat().st_mode),
+            0o700,
+        )
+        private_package = self.base / "private-package"
+        manifest = self.freeze(checkout, private_package)
+        self.assertEqual(manifest["source_commit"], self.source_commit)
+        self.assertEqual(stat.S_IMODE(private_package.lstat().st_mode), 0o700)
+
+    def test_freezer_rejects_unsafe_mode_and_link_drift(self) -> None:
+        unsafe = self.base / "unsafe-checkout"
+        linked = self.base / "linked-checkout"
+        subprocess.run(["git", "clone", "-q", str(self.source_root), str(unsafe)], check=True)
+        subprocess.run(["git", "clone", "-q", str(self.source_root), str(linked)], check=True)
+        (unsafe / "deploy/native-ci/controld/README.md").chmod(0o664)
+        with self.assertRaisesRegex(ValueError, "unsafe permissions"):
+            self.freeze(unsafe, self.base / "unsafe-package")
+        source = linked / "deploy/native-ci/controld/README.md"
+        replacement = linked / "README-replacement"
+        replacement.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(replacement)
+        with self.assertRaisesRegex(ValueError, "symbolic links"):
+            self.freeze(linked, self.base / "linked-package")
 
     def test_package_refuses_symlink_and_provenance_drift(self) -> None:
         self.freeze()

@@ -12,8 +12,14 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+import package_source
 import render_controld_config
 
 SCHEMA = "buzz-ci-controld-install-package-v1"
@@ -84,26 +90,21 @@ def git_output(root: Path, *arguments: str) -> str:
 
 
 def verify_source(root: Path, source_commit: str) -> Path:
-    if not GIT_OID.fullmatch(source_commit):
-        raise ValueError("source commit must be a full lowercase Git object id")
-    root = Path(git_output(root, "rev-parse", "--show-toplevel"))
-    if git_output(root, "rev-parse", "HEAD") != source_commit:
-        raise ValueError("source checkout HEAD does not match the requested commit")
-    if git_output(root, "status", "--porcelain", "--untracked-files=all", "--", str(PACKAGE_RELATIVE)):
-        raise ValueError("controld package source path is not clean")
-    package_dir = root / PACKAGE_RELATIVE
-    if Path(os.path.realpath(package_dir)) != package_dir:
-        raise ValueError("controld package source directory must not contain symbolic links")
-    subprocess.run(["git", "-C", str(root), "diff", "--quiet", source_commit, "--", str(PACKAGE_RELATIVE)], check=True)
-    for path in (PACKAGE_RELATIVE / "README.md", PACKAGE_RELATIVE / "templates/buzz-ci-controld.service", PACKAGE_RELATIVE / "templates/buzzci-controld.tmpfiles"):
-        subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", str(path)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return root
+    return package_source.verify_checkout(root, source_commit, PACKAGE_RELATIVE)
+
+
+def require_exact_mode(path: Path, expected_mode: int) -> None:
+    metadata = path.lstat()
+    if stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise OSError(f"could not materialize exact mode: {path}")
 
 
 def write_asset(path: Path, payload: bytes, file_mode: int) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, file_mode)
     try:
         os.fchmod(fd, file_mode)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != file_mode:
+            raise OSError(f"could not materialize exact asset mode: {path}")
         view = memoryview(payload)
         while view:
             view = view[os.write(fd, view):]
@@ -138,8 +139,11 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, provenan
         raise ValueError("package output must not already exist")
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=parent))
     stage.chmod(0o700)
+    require_exact_mode(stage, 0o700)
     assets = stage / "assets"
     assets.mkdir(mode=0o700)
+    assets.chmod(0o700)
+    require_exact_mode(assets, 0o700)
     try:
         entries: list[dict[str, object]] = []
         write_asset(assets / "buzz-ci-controld", binary_payload, 0o500)
@@ -148,9 +152,10 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, provenan
         write_asset(assets / "controld-v1.json", config_payload, 0o400)
         entries.append(entry("config", "controld-v1.json", "/etc/buzzci/controld-v1.json", 0o400, 0o600, controld_uid, controld_gid, config_payload))
 
-        package_dir = source_root / PACKAGE_RELATIVE
         for role, source_name, asset_name, target, source_mode, install_mode, uid, gid in STATIC_ASSETS:
-            payload, _ = read_regular(package_dir / source_name, 0o644)
+            payload, _ = package_source.tracked_payload(
+                source_root, PACKAGE_RELATIVE / source_name, 0o100644,
+            )
             write_asset(assets / asset_name, payload, source_mode)
             entries.append(entry(role, asset_name, target, source_mode, install_mode, uid, gid, payload))
         entries.sort(key=lambda item: str(item["target"]).encode())
@@ -171,6 +176,7 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, provenan
         write_asset(stage / "binary-provenance.json", provenance_raw, 0o600)
         write_asset(stage / "package-manifest.json", canonical_json(manifest), 0o600)
         os.replace(stage, output)
+        require_exact_mode(output, 0o700)
         return manifest
     except BaseException:
         shutil.rmtree(stage)

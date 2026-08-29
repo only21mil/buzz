@@ -69,7 +69,16 @@ separate approval-gated activation work.
 ## Targeted checks
 
 ```bash
+python3 deploy/native-ci/package_source.py \
+  --source-root "$PWD" \
+  --source-commit "$(git rev-parse HEAD)" \
+  --package-path deploy/native-ci/keyholder
 cargo test -p buzz-ci-keyholder
 cargo check -p buzz-ci-keyholder --all-targets
 cargo clippy -p buzz-ci-keyholder --all-targets -- -D warnings
 ```
+
+The source check accepts Git non-executable files materialized as `0600` or
+`0644`. It rejects executable-class drift, missing owner read access, ownership
+drift, group or world writes, symbolic links, and hard links. It does not repair
+source modes.
