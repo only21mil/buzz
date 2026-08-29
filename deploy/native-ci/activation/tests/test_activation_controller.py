@@ -757,7 +757,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "cbace246eefc17033ff171a620d827933a09aace1992dbfb9c5c7144f1ac9b50",
+            "328792c2b73addb204b9c98fd114cc1ab11952026a29c6434243f078e82e8e40",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
