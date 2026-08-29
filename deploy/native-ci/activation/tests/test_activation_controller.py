@@ -932,8 +932,12 @@ class ActivationControllerTests(unittest.TestCase):
             "seccomp_contract": {"runtime_receipt": "/var/lib/buzzci/activation/receipts/seccomp.json"},
         })
 
-        report = INVENTORY.check_inventory(packages)
+        report = INVENTORY.check_inventory(packages, source_root=REPO_ROOT)
         self.assertEqual((report["status"], report["packages"]), ("pass", sorted(INVENTORY.PACKAGE_SCHEMAS)))
+        self.assertEqual(
+            report["source_inventory"]["controld_acceptance_source"],
+            str(INVENTORY.CONTROLD_ACCEPTANCE_SOURCE),
+        )
         for category in ("binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt"):
             self.assertGreater(report["categories"].get(category, 0), 0, category)
 
@@ -949,10 +953,30 @@ class ActivationControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "undeclared final package ownership collision"):
             INVENTORY.check_inventory(collision)
 
+        missing_owner = copy.deepcopy(packages)
+        missing_owner["controld"]["entries"] = [
+            item for item in missing_owner["controld"]["entries"]
+            if item["target"] != INVENTORY.CONTROLD_ACCEPTANCE_TARGET
+        ]
+        with self.assertRaisesRegex(ValueError, "controld must solely own"):
+            INVENTORY.check_inventory(missing_owner)
+
         receipt_collision = copy.deepcopy(packages)
         receipt_collision["execd"]["install_receipt"]["path"] = INVENTORY.ACTIVATION_RECEIPT["path"]
         with self.assertRaisesRegex(ValueError, "undeclared final package ownership collision"):
             INVENTORY.check_inventory(receipt_collision)
+
+    def test_source_inventory_rejects_a_second_controld_acceptance_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / INVENTORY.CONTROLD_ACCEPTANCE_SOURCE
+            write_file(canonical, b"canonical\n", 0o644)
+            report = INVENTORY.check_source_inventory(root)
+            self.assertEqual(report["controld_acceptance_source"], str(INVENTORY.CONTROLD_ACCEPTANCE_SOURCE))
+            duplicate = root / "deploy/native-ci/acceptance/templates" / INVENTORY.CONTROLD_ACCEPTANCE_NAME
+            write_file(duplicate, b"divergent\n", 0o644)
+            with self.assertRaisesRegex(ValueError, "exactly one canonical source"):
+                INVENTORY.check_source_inventory(root)
 
     def test_stage_persists_staged_zero_before_starting_acceptance_control(self) -> None:
         manifest, payloads, driver = self.fixture.load()

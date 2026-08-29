@@ -31,6 +31,11 @@ ACTIVATION_RECEIPT = {
     "gid": 0,
     "schema": "buzz-ci-capacity-one-activation-receipt-v1",
 }
+CONTROLD_ACCEPTANCE_TARGET = "/etc/systemd/system/buzz-ci-controld-acceptance.socket"
+CONTROLD_ACCEPTANCE_SOURCE = Path(
+    "deploy/native-ci/controld/templates/buzz-ci-controld-acceptance.socket"
+)
+CONTROLD_ACCEPTANCE_NAME = CONTROLD_ACCEPTANCE_SOURCE.name
 
 
 def _canonical(value: object) -> bytes:
@@ -72,7 +77,29 @@ def _entry_claim(package: str, entry: dict[str, Any]) -> dict[str, object]:
     }
 
 
-def check_inventory(manifests: dict[str, dict[str, Any]]) -> dict[str, object]:
+def check_source_inventory(source_root: Path) -> dict[str, object]:
+    native_ci = source_root / "deploy/native-ci"
+    matches = sorted(
+        path.relative_to(source_root)
+        for path in native_ci.rglob(CONTROLD_ACCEPTANCE_NAME)
+    )
+    if matches != [CONTROLD_ACCEPTANCE_SOURCE]:
+        raise ValueError(
+            "controld acceptance socket must have exactly one canonical source: "
+            f"{[str(path) for path in matches]}"
+        )
+    canonical = source_root / CONTROLD_ACCEPTANCE_SOURCE
+    if not canonical.is_file() or canonical.is_symlink():
+        raise ValueError("controld acceptance socket canonical source is not a regular file")
+    return {
+        "controld_acceptance_source": str(CONTROLD_ACCEPTANCE_SOURCE),
+        "sha256": hashlib.sha256(canonical.read_bytes()).hexdigest(),
+    }
+
+
+def check_inventory(
+    manifests: dict[str, dict[str, Any]], *, source_root: Path | None = None,
+) -> dict[str, object]:
     if set(manifests) != set(PACKAGE_SCHEMAS):
         raise ValueError("final package set must contain runner, controld, keyholder, execd, and activation")
     claims: list[dict[str, object]] = []
@@ -137,6 +164,13 @@ def check_inventory(manifests: dict[str, dict[str, Any]]) -> dict[str, object]:
         if observed_packages != expected_packages:
             raise ValueError(f"explicitly shared package target is incomplete: {target}")
 
+    controld_acceptance_claims = by_target.get(CONTROLD_ACCEPTANCE_TARGET, [])
+    if (
+        len(controld_acceptance_claims) != 1
+        or controld_acceptance_claims[0]["package"] != "controld"
+    ):
+        raise ValueError("controld must solely own its acceptance socket package target")
+
     activation = manifests["activation"]
     effective = activation.get("effective_systemd")
     if not isinstance(effective, list):
@@ -162,7 +196,7 @@ def check_inventory(manifests: dict[str, dict[str, Any]]) -> dict[str, object]:
     missing_categories = sorted(REQUIRED_CATEGORIES - set(categories))
     if missing_categories:
         raise ValueError(f"final package inventory categories are incomplete: {missing_categories}")
-    return {
+    report = {
         "status": "pass",
         "packages": sorted(manifests),
         "claims": len(ordered),
@@ -171,6 +205,9 @@ def check_inventory(manifests: dict[str, dict[str, Any]]) -> dict[str, object]:
         "categories": dict(sorted(categories.items())),
         "inventory_sha256": hashlib.sha256(_canonical(ordered)).hexdigest(),
     }
+    if source_root is not None:
+        report["source_inventory"] = check_source_inventory(source_root)
+    return report
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -184,8 +221,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for package in PACKAGE_SCHEMAS:
         parser.add_argument(f"--{package}", type=Path, required=True)
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[3],
+        help="repository root used to enforce the sole canonical controld socket source",
+    )
     arguments = parser.parse_args()
-    report = check_inventory({package: _load(getattr(arguments, package)) for package in PACKAGE_SCHEMAS})
+    report = check_inventory(
+        {package: _load(getattr(arguments, package)) for package in PACKAGE_SCHEMAS},
+        source_root=arguments.source_root.resolve(),
+    )
     print(json.dumps(report, sort_keys=True))
     return 0
 
