@@ -58,6 +58,8 @@ pub const CONTROL_LEDGER_PATH: &str = "/var/lib/buzzci/acceptance-control/operat
 
 const CONFIG_SCHEMA: &str = "buzz-ci-capacity-one-driver-config/v1";
 const CONTROL_CONFIG_SCHEMA: &str = "buzz-ci-acceptance-control-config/v1";
+const CAPACITY_ONE_REQUEST_SCHEMA: &str = "buzz-ci-activation-capacity-one-request/v1";
+const CAPACITY_ONE_RESPONSE_SCHEMA: &str = "buzz-ci-activation-capacity-one-response/v1";
 const QUALIFICATION_ZERO_REQUEST_SCHEMA: &str = "buzz-ci-activation-qualification-zero-request/v1";
 const QUALIFICATION_ZERO_RESPONSE_SCHEMA: &str =
     "buzz-ci-activation-qualification-zero-response/v1";
@@ -341,6 +343,45 @@ pub enum ControlOperation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CapacityOneAction {
+    SetCapacityOne,
+}
+
+impl CapacityOneAction {
+    const fn argument(self) -> &'static str {
+        match self {
+            Self::SetCapacityOne => "set-capacity-one",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CapacityOneRequest<'a> {
+    schema_version: &'static str,
+    action: CapacityOneAction,
+    activation_id: &'a str,
+    activation_package_digest: &'a str,
+    scenario_sha256: &'a str,
+    initial_controller_generation: u64,
+    initial_runner_generation: u64,
+    operation_id: &'a str,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityOneResponse {
+    schema_version: String,
+    action: CapacityOneAction,
+    activation_id: String,
+    activation_package_digest: String,
+    scenario_sha256: String,
+    operation_id: String,
+    state: String,
+    receipt_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 enum QualificationZeroAction {
     #[serde(rename = "prepare_qualification_zero")]
     Prepare,
@@ -411,6 +452,11 @@ pub struct ControlResponse {
 
 pub struct HostZeroResult {
     pub proof: ZeroProof,
+    pub controller_receipt_sha256: String,
+}
+
+pub struct HostCapacityOneResult {
+    pub readback: ControlReadback,
     pub controller_receipt_sha256: String,
 }
 
@@ -737,11 +783,13 @@ fn validate_control_response(
             return Err(DriverError::StaleGeneration);
         }
     }
-    if matches!(
+    let zero_operation = matches!(
         request.operation,
         ControlOperation::FinalizeCapacityZero | ControlOperation::ProveCapacityZero
-    ) != response.zero_proof.is_some()
-        || response.zero_proof.is_some() != response.controller_receipt_sha256.is_some()
+    );
+    let receipt_operation = zero_operation || request.operation == ControlOperation::SetCapacityOne;
+    if zero_operation != response.zero_proof.is_some()
+        || receipt_operation != response.controller_receipt_sha256.is_some()
         || response
             .controller_receipt_sha256
             .as_deref()
@@ -1242,7 +1290,10 @@ pub trait HostControl {
     type Error;
 
     fn observe(&mut self) -> Result<ControlReadback, Self::Error>;
-    fn set_capacity_one(&mut self) -> Result<ControlReadback, Self::Error>;
+    fn set_capacity_one(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<HostCapacityOneResult, Self::Error>;
     fn restart_controller(&mut self) -> Result<ControlReadback, Self::Error>;
     fn restart_runner(&mut self) -> Result<ControlReadback, Self::Error>;
     fn prepare_capacity_zero(
@@ -1258,6 +1309,255 @@ pub trait HostControl {
         request: &ControlRequest,
     ) -> Result<HostZeroResult, Self::Error>;
     fn emergency_capacity_zero(&mut self) -> Result<ZeroProof, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnitState {
+    Active,
+    Inactive,
+    Failed,
+}
+
+trait CapacityOneRuntime {
+    fn activate(&mut self, input: &[u8], timeout: Duration) -> Result<Vec<u8>, ControlError>;
+    fn unit_state(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<UnitState, ControlError>;
+    fn invocation(&mut self, unit: &'static str, timeout: Duration)
+        -> Result<String, ControlError>;
+    fn optional_invocation(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError>;
+    fn fragment_path(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError>;
+    fn active_receipt_sha256(
+        &mut self,
+        config: &AcceptanceControlConfig,
+    ) -> Result<String, ControlError>;
+    fn prove_qualified_receipt(
+        &mut self,
+        config: &AcceptanceControlConfig,
+    ) -> Result<(), ControlError>;
+}
+
+struct LiveCapacityOneRuntime;
+
+impl CapacityOneRuntime for LiveCapacityOneRuntime {
+    fn activate(&mut self, input: &[u8], timeout: Duration) -> Result<Vec<u8>, ControlError> {
+        run_bounded_controller(CapacityOneAction::SetCapacityOne.argument(), input, timeout)
+    }
+
+    fn unit_state(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<UnitState, ControlError> {
+        unit_state(unit, timeout)
+    }
+
+    fn invocation(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        unit_invocation(unit, timeout)
+    }
+
+    fn optional_invocation(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        unit_invocation_optional(unit, timeout)
+    }
+
+    fn fragment_path(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        unit_fragment_path(unit, timeout)
+    }
+
+    fn active_receipt_sha256(
+        &mut self,
+        config: &AcceptanceControlConfig,
+    ) -> Result<String, ControlError> {
+        active_activation_receipt_sha256(config)
+    }
+
+    fn prove_qualified_receipt(
+        &mut self,
+        config: &AcceptanceControlConfig,
+    ) -> Result<(), ControlError> {
+        validate_activation_receipt_state(config, "qualified_closed")
+    }
+}
+
+struct CapacityOneTransition {
+    result: HostCapacityOneResult,
+    controller_invocation: String,
+    runner_invocation: String,
+}
+
+fn activate_capacity_one<R: CapacityOneRuntime>(
+    config: &AcceptanceControlConfig,
+    request: &ControlRequest,
+    staged_controller_invocation: &str,
+    staged_runner_invocation: &str,
+    timeout: Duration,
+    runtime: &mut R,
+) -> Result<CapacityOneTransition, ControlError> {
+    if request.sequence != 2
+        || request.operation != ControlOperation::SetCapacityOne
+        || request.expected_controller_generation != Some(config.controller_generation)
+        || request.expected_runner_generation != Some(config.runner_generation)
+        || !lower_hex(staged_controller_invocation, &[32])
+        || !staged_runner_invocation.is_empty()
+    {
+        return Err(ControlError::BindingMismatch);
+    }
+    runtime.prove_qualified_receipt(config)?;
+    for unit in [
+        "buzz-ci-controld.service",
+        "buzz-ci-controld-acceptance.socket",
+        "buzz-ci-acceptance-control.socket",
+        "buzz-ci-acceptance-control.service",
+    ] {
+        if runtime.unit_state(unit, timeout)? != UnitState::Active {
+            return Err(ControlError::ReadbackMismatch);
+        }
+    }
+    for unit in [
+        "buzz-ci-capacity-one.target",
+        "buzz-ci-runner.service",
+        "buzz-ci-runner.socket",
+        "buzz-ci-execd.service",
+        "buzz-ci-execd.socket",
+        "buzz-ci-keyholder.service",
+        "buzz-ci-keyholder.socket",
+    ] {
+        if runtime.unit_state(unit, timeout)? != UnitState::Inactive {
+            return Err(ControlError::ReadbackMismatch);
+        }
+    }
+    if runtime.invocation("buzz-ci-controld.service", timeout)? != staged_controller_invocation
+        || !runtime
+            .optional_invocation("buzz-ci-runner.service", timeout)?
+            .is_empty()
+    {
+        return Err(ControlError::StaleGeneration);
+    }
+
+    let body = CapacityOneRequest {
+        schema_version: CAPACITY_ONE_REQUEST_SCHEMA,
+        action: CapacityOneAction::SetCapacityOne,
+        activation_id: &request.activation_id,
+        activation_package_digest: &request.activation_package_digest,
+        scenario_sha256: &request.scenario_sha256,
+        initial_controller_generation: config.controller_generation,
+        initial_runner_generation: config.runner_generation,
+        operation_id: &request.operation_id,
+    };
+    let input = serde_json::to_vec(&body).map_err(|_| ControlError::HostAction)?;
+    let output = runtime.activate(&input, timeout)?;
+    let response_bytes = output
+        .strip_suffix(b"\n")
+        .ok_or(ControlError::BindingMismatch)?;
+    let response: CapacityOneResponse =
+        serde_json::from_slice(response_bytes).map_err(|_| ControlError::BindingMismatch)?;
+    if serde_json::to_vec(&response).map_err(|_| ControlError::HostAction)? != response_bytes
+        || response.schema_version != CAPACITY_ONE_RESPONSE_SCHEMA
+        || response.action != CapacityOneAction::SetCapacityOne
+        || response.activation_id != request.activation_id
+        || response.activation_package_digest != request.activation_package_digest
+        || response.scenario_sha256 != request.scenario_sha256
+        || response.operation_id != request.operation_id
+        || response.state != "active_one"
+        || !lower_hex(&response.receipt_sha256, &[64])
+        || runtime.active_receipt_sha256(config)? != response.receipt_sha256
+    {
+        return Err(ControlError::BindingMismatch);
+    }
+
+    for unit in [
+        "buzz-ci-capacity-one.target",
+        "buzz-ci-controld.service",
+        "buzz-ci-controld-acceptance.socket",
+        "buzz-ci-acceptance-control.socket",
+        "buzz-ci-acceptance-control.service",
+        "buzz-ci-runner.service",
+        "buzz-ci-runner.socket",
+        "buzz-ci-execd.service",
+        "buzz-ci-execd.socket",
+        "buzz-ci-keyholder.service",
+        "buzz-ci-keyholder.socket",
+    ] {
+        if runtime.unit_state(unit, timeout)? != UnitState::Active {
+            return Err(ControlError::ReadbackMismatch);
+        }
+    }
+    for (unit, expected) in [
+        (
+            "buzz-ci-capacity-one.target",
+            "/etc/systemd/system/buzz-ci-capacity-one.target",
+        ),
+        (
+            "buzz-ci-controld.service",
+            "/etc/systemd/system/buzz-ci-controld.service",
+        ),
+        (
+            "buzz-ci-runner.socket",
+            "/etc/systemd/system/buzz-ci-runner.socket",
+        ),
+        (
+            "buzz-ci-execd.socket",
+            "/etc/systemd/system/buzz-ci-execd.socket",
+        ),
+        (
+            "buzz-ci-keyholder.socket",
+            "/etc/systemd/system/buzz-ci-keyholder.socket",
+        ),
+    ] {
+        if runtime.fragment_path(unit, timeout)? != expected {
+            return Err(ControlError::ReadbackMismatch);
+        }
+    }
+    let controller_invocation = runtime.invocation("buzz-ci-controld.service", timeout)?;
+    let runner_invocation = runtime.invocation("buzz-ci-runner.service", timeout)?;
+    let execd_invocation = runtime.invocation("buzz-ci-execd.service", timeout)?;
+    let keyholder_invocation = runtime.invocation("buzz-ci-keyholder.service", timeout)?;
+    if controller_invocation == staged_controller_invocation
+        || runner_invocation == staged_runner_invocation
+        || execd_invocation.is_empty()
+        || keyholder_invocation.is_empty()
+    {
+        return Err(ControlError::StaleGeneration);
+    }
+
+    Ok(CapacityOneTransition {
+        result: HostCapacityOneResult {
+            readback: ControlReadback {
+                activation_id: config.activation_id.clone(),
+                activation_package_digest: config.activation_package_digest.clone(),
+                integrated_candidate_sha: config.integrated_candidate_sha.clone(),
+                capacity: 1,
+                admission: AdmissionState::Open,
+                controller_generation: config.controller_generation,
+                runner_generation: config.runner_generation,
+            },
+            controller_receipt_sha256: response.receipt_sha256,
+        },
+        controller_invocation,
+        runner_invocation,
+    })
 }
 
 /// Fixed systemd-backed host control. Unit names and the executable are not configurable.
@@ -1407,14 +1707,22 @@ impl HostControl for SystemdHostControl {
         self.readback()
     }
 
-    fn set_capacity_one(&mut self) -> Result<ControlReadback, Self::Error> {
-        self.systemctl("start", "buzz-ci-capacity-one.target")?;
-        let readback = self.readback()?;
-        if readback.capacity != 1 || readback.admission != AdmissionState::Open {
-            let _ = self.close_capacity();
-            return Err(ControlError::ReadbackMismatch);
-        }
-        Ok(readback)
+    fn set_capacity_one(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<HostCapacityOneResult, Self::Error> {
+        let mut runtime = LiveCapacityOneRuntime;
+        let transition = activate_capacity_one(
+            &self.config,
+            request,
+            &self.controller_invocation,
+            &self.runner_invocation,
+            self.timeout,
+            &mut runtime,
+        )?;
+        self.controller_invocation = transition.controller_invocation;
+        self.runner_invocation = transition.runner_invocation;
+        Ok(transition.result)
     }
 
     fn restart_controller(&mut self) -> Result<ControlReadback, Self::Error> {
@@ -1503,7 +1811,9 @@ impl HostControl for SystemdHostControl {
     }
 }
 
-fn validate_activation_receipt(config: &AcceptanceControlConfig) -> Result<(), ControlError> {
+fn activation_receipt(
+    config: &AcceptanceControlConfig,
+) -> Result<(Vec<u8>, serde_json::Value), ControlError> {
     let bytes = read_secure_file(
         Path::new(ACTIVATION_RECEIPT_PATH),
         0,
@@ -1521,25 +1831,58 @@ fn validate_activation_receipt(config: &AcceptanceControlConfig) -> Result<(), C
             != Some(&config.integrated_candidate_sha)
         || !matches!(
             value.get("state").and_then(|item| item.as_str()),
-            Some("staged_zero" | "activating" | "active_one")
+            Some("staged_zero" | "qualified_closed" | "activating" | "active_one")
         )
     {
         return Err(ControlError::BindingMismatch);
     }
-    Ok(())
+    Ok((bytes, value))
 }
 
-fn unit_active(unit: &'static str, timeout: Duration) -> Result<bool, ControlError> {
+fn validate_activation_receipt(config: &AcceptanceControlConfig) -> Result<(), ControlError> {
+    activation_receipt(config).map(|_| ())
+}
+
+fn validate_activation_receipt_state(
+    config: &AcceptanceControlConfig,
+    expected: &str,
+) -> Result<(), ControlError> {
+    let (_, value) = activation_receipt(config)?;
+    if value.get("state").and_then(|item| item.as_str()) == Some(expected) {
+        Ok(())
+    } else {
+        Err(ControlError::BindingMismatch)
+    }
+}
+
+fn active_activation_receipt_sha256(
+    config: &AcceptanceControlConfig,
+) -> Result<String, ControlError> {
+    let (bytes, value) = activation_receipt(config)?;
+    if value.get("state").and_then(|item| item.as_str()) != Some("active_one")
+        || !bytes.ends_with(b"\n")
+    {
+        return Err(ControlError::BindingMismatch);
+    }
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn unit_state(unit: &'static str, timeout: Duration) -> Result<UnitState, ControlError> {
     let output = run_bounded_command(
         "/usr/bin/systemctl",
         &["show", "--property=ActiveState", "--value", unit],
         timeout,
     )?;
     match output.as_slice() {
-        b"active\n" => Ok(true),
-        b"inactive\n" | b"failed\n" => Ok(false),
+        b"active\n" => Ok(UnitState::Active),
+        b"inactive\n" => Ok(UnitState::Inactive),
+        b"failed\n" => Ok(UnitState::Failed),
         _ => Err(ControlError::ReadbackMismatch),
     }
+}
+
+fn unit_active(unit: &'static str, timeout: Duration) -> Result<bool, ControlError> {
+    Ok(unit_state(unit, timeout)? == UnitState::Active)
 }
 
 fn unit_invocation(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
@@ -1568,6 +1911,23 @@ fn unit_invocation_optional(unit: &'static str, timeout: Duration) -> Result<Str
         .map_err(|_| ControlError::ReadbackMismatch)?
         .trim();
     if value.is_empty() || lower_hex(value, &[32]) {
+        Ok(value.to_owned())
+    } else {
+        Err(ControlError::ReadbackMismatch)
+    }
+}
+
+fn unit_fragment_path(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
+    let output = run_bounded_command(
+        "/usr/bin/systemctl",
+        &["show", "--property=FragmentPath", "--value", unit],
+        timeout,
+    )?;
+    let value = std::str::from_utf8(&output)
+        .map_err(|_| ControlError::ReadbackMismatch)?
+        .strip_suffix('\n')
+        .ok_or(ControlError::ReadbackMismatch)?;
+    if valid_absolute(Path::new(value)) {
         Ok(value.to_owned())
     } else {
         Err(ControlError::ReadbackMismatch)
@@ -1629,14 +1989,23 @@ fn run_bounded_controller_process(
     input: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, ControlError> {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_bounded_controller_command(command, input, timeout)
+}
+
+fn run_bounded_controller_command(
+    mut command: Command,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, ControlError> {
     const MAX_OUTPUT: usize = 64 * 1024;
     const TERMINATE_GRACE: Duration = Duration::from_millis(100);
     const READER_GRACE: Duration = Duration::from_millis(100);
     if input.is_empty() || input.len() > MAX_OUTPUT {
         return Err(ControlError::HostAction);
     }
-    let mut child = Command::new(program)
-        .args(args)
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1833,12 +2202,16 @@ pub fn handle_control<H: HostControl>(
             None,
             None,
         ),
-        ControlOperation::SetCapacityOne => (
-            host.set_capacity_one()
-                .map_err(|_| ControlError::HostAction)?,
-            None,
-            None,
-        ),
+        ControlOperation::SetCapacityOne => {
+            let result = host
+                .set_capacity_one(request)
+                .map_err(|_| ControlError::HostAction)?;
+            (
+                result.readback,
+                None,
+                Some(result.controller_receipt_sha256),
+            )
+        }
         ControlOperation::RestartController => (
             host.restart_controller()
                 .map_err(|_| ControlError::HostAction)?,
@@ -2108,7 +2481,7 @@ impl ControlError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, convert::Infallible};
+    use std::{collections::VecDeque, convert::Infallible, path::PathBuf};
 
     use super::*;
     use crate::acceptance::{
@@ -2176,6 +2549,35 @@ mod tests {
         }
     }
 
+    fn control_config() -> AcceptanceControlConfig {
+        let fixture = fixture();
+        AcceptanceControlConfig {
+            schema_version: CONTROL_CONFIG_SCHEMA.into(),
+            activation_id: fixture.activation_id,
+            activation_package_digest: fixture.activation_package_digest,
+            integrated_candidate_sha: fixture.integrated_candidate_sha,
+            scenario_sha256: hex('9', 64),
+            run_id: fixture.run_id,
+            job_id: fixture.job_id,
+            request_digest: fixture.request_digest,
+            manifest_digest: fixture.manifest_digest,
+            approval_id: fixture.approval_id,
+            grant_event_id: fixture.grant_event_id,
+            grant_digest: fixture.grant_digest,
+            qualification_uid: 1001,
+            qualification_gid: 1001,
+            controller_generation: 7,
+            runner_generation: 9,
+        }
+    }
+
+    fn capacity_one_control_request() -> ControlRequest {
+        let fixture = fixture();
+        let scenario_sha256 = hex('9', 64);
+        let request = request(&fixture, &scenario_sha256);
+        control_request(&request, &operation_id(&request).unwrap())
+    }
+
     fn fake_zero_proof(readback: &ControlReadback) -> ZeroProof {
         ZeroProof {
             schema_version: ZERO_PROOF_VERSION.into(),
@@ -2197,6 +2599,13 @@ mod tests {
         HostZeroResult {
             proof: fake_zero_proof(readback),
             controller_receipt_sha256: hex('7', 64),
+        }
+    }
+
+    fn fake_host_capacity_one(readback: &ControlReadback) -> HostCapacityOneResult {
+        HostCapacityOneResult {
+            readback: readback.clone(),
+            controller_receipt_sha256: hex('6', 64),
         }
     }
 
@@ -2268,7 +2677,7 @@ mod tests {
             operation_id: operation_id.clone(),
             readback: host.clone(),
             zero_proof: None,
-            controller_receipt_sha256: None,
+            controller_receipt_sha256: Some(hex('6', 64)),
         };
         let driver_response = DriverResponse {
             schema_version: DRIVER_VERSION.into(),
@@ -2305,6 +2714,19 @@ mod tests {
         assert_eq!(
             driver.into_transport().endpoints,
             [AdapterEndpoint::Control, AdapterEndpoint::Controld]
+        );
+
+        let mut unproved = control;
+        unproved.controller_receipt_sha256 = None;
+        let transport = FakeTransport {
+            replies: VecDeque::from([serde_json::to_vec(&unproved).unwrap()]),
+            endpoints: Vec::new(),
+        };
+        let mut driver = ProductionDriver::new(driver_config.clone(), transport).unwrap();
+        assert_eq!(driver.execute(&request), Err(DriverError::BindingMismatch));
+        assert_eq!(
+            driver.into_transport().endpoints,
+            [AdapterEndpoint::Control]
         );
     }
 
@@ -2376,7 +2798,7 @@ mod tests {
                 runner_generation: 9,
             },
             zero_proof: None,
-            controller_receipt_sha256: None,
+            controller_receipt_sha256: Some(hex('6', 64)),
         };
         let transport = FakeTransport {
             replies: VecDeque::from([serde_json::to_vec(&wrong_capacity).unwrap()]),
@@ -2394,8 +2816,11 @@ mod tests {
             fn observe(&mut self) -> Result<ControlReadback, Self::Error> {
                 Ok(self.0.clone())
             }
-            fn set_capacity_one(&mut self) -> Result<ControlReadback, Self::Error> {
-                Ok(self.0.clone())
+            fn set_capacity_one(
+                &mut self,
+                _request: &ControlRequest,
+            ) -> Result<HostCapacityOneResult, Self::Error> {
+                Ok(fake_host_capacity_one(&self.0))
             }
             fn restart_controller(&mut self) -> Result<ControlReadback, Self::Error> {
                 Ok(self.0.clone())
@@ -2488,6 +2913,7 @@ mod tests {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum Fault {
         None,
+        CapacityActivation,
         WrongManifest,
         UnauthenticatedExport,
         StaleRestart,
@@ -2525,6 +2951,9 @@ mod tests {
             self.trace.push((endpoint, sequence));
             if endpoint == AdapterEndpoint::Control {
                 self.control_frames.push((sequence, request.to_vec()));
+                if sequence == 2 && self.fault == Fault::CapacityActivation {
+                    return Err("capacity-one activation rejected");
+                }
                 if sequence == 14 && self.finalize_failures > 0 {
                     self.finalize_failures -= 1;
                     return Err("transport lost after durable finalize");
@@ -2539,7 +2968,11 @@ mod tests {
                         11 => (1, 8, 9),
                         12 => (1, 8, 10),
                         13 => (0, 8, 10),
-                        14 | 15 => (0, 8, 10),
+                        14 | 15 => (
+                            0,
+                            request.expected_controller_generation.unwrap_or(8),
+                            request.expected_runner_generation.unwrap_or(10),
+                        ),
                         _ => unreachable!(),
                     };
                     if self.fault == Fault::StaleRestart && request.sequence == 11 {
@@ -2582,7 +3015,9 @@ mod tests {
                             runner_generation: runner,
                         },
                         zero_proof,
-                        controller_receipt_sha256: (request.sequence >= 14).then(|| hex('7', 64)),
+                        controller_receipt_sha256: (request.sequence == 2)
+                            .then(|| hex('6', 64))
+                            .or_else(|| (request.sequence >= 14).then(|| hex('7', 64))),
                     };
                     serde_json::to_vec(&response).unwrap()
                 }
@@ -2906,6 +3341,359 @@ mod tests {
         ] {
             assert_eq!(run_simulation(fault).outcome, Outcome::Fail);
         }
+    }
+
+    #[test]
+    fn capacity_one_control_failure_never_reaches_controld_and_compensates_to_zero() {
+        let scenario = scenario();
+        let scenario_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&scenario).unwrap()));
+        let mut config = config();
+        config.scenario_sha256 = scenario_sha256;
+        let transport = ScenarioTransport {
+            fault: Fault::CapacityActivation,
+            trace: Vec::new(),
+            control_frames: Vec::new(),
+            finalize_failures: 0,
+        };
+        let mut driver = ProductionDriver::new(config, transport).unwrap();
+        let receipt = run_acceptance(&scenario, &mut driver);
+        let transport = driver.into_transport();
+        assert_eq!(receipt.outcome, Outcome::Fail);
+        assert!(!transport.trace.contains(&(AdapterEndpoint::Controld, 2)));
+        assert_eq!(
+            &transport.trace[transport.trace.len() - 2..],
+            &[
+                (AdapterEndpoint::Control, 14),
+                (AdapterEndpoint::Control, 15),
+            ]
+        );
+    }
+
+    struct FixtureCapacityOneRuntime {
+        controller: PathBuf,
+        state: PathBuf,
+        receipt: PathBuf,
+        mode: &'static str,
+        controller_calls: usize,
+    }
+
+    impl FixtureCapacityOneRuntime {
+        fn state(&self) -> serde_json::Value {
+            serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap()
+        }
+
+        fn unit_value(&self, unit: &str, field: &str) -> String {
+            self.state()["units"][unit][field]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    }
+
+    impl CapacityOneRuntime for FixtureCapacityOneRuntime {
+        fn activate(&mut self, input: &[u8], timeout: Duration) -> Result<Vec<u8>, ControlError> {
+            self.controller_calls += 1;
+            let mut command = Command::new(&self.controller);
+            command
+                .arg(CapacityOneAction::SetCapacityOne.argument())
+                .env("BUZZ_FAKE_SYSTEMD_STATE", &self.state)
+                .env("BUZZ_FAKE_ACTIVATION_RECEIPT", &self.receipt)
+                .env("BUZZ_FAKE_CAPACITY_ONE_MODE", self.mode);
+            run_bounded_controller_command(command, input, timeout)
+        }
+
+        fn unit_state(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<UnitState, ControlError> {
+            match self.unit_value(unit, "state").as_str() {
+                "active" => Ok(UnitState::Active),
+                "inactive" => Ok(UnitState::Inactive),
+                "failed" => Ok(UnitState::Failed),
+                _ => Err(ControlError::ReadbackMismatch),
+            }
+        }
+
+        fn invocation(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<String, ControlError> {
+            let value = self.unit_value(unit, "invocation_id");
+            if lower_hex(&value, &[32]) {
+                Ok(value)
+            } else {
+                Err(ControlError::ReadbackMismatch)
+            }
+        }
+
+        fn optional_invocation(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<String, ControlError> {
+            let value = self.unit_value(unit, "invocation_id");
+            if value.is_empty() || lower_hex(&value, &[32]) {
+                Ok(value)
+            } else {
+                Err(ControlError::ReadbackMismatch)
+            }
+        }
+
+        fn fragment_path(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<String, ControlError> {
+            Ok(self.unit_value(unit, "fragment_path"))
+        }
+
+        fn active_receipt_sha256(
+            &mut self,
+            config: &AcceptanceControlConfig,
+        ) -> Result<String, ControlError> {
+            let bytes = fs::read(&self.receipt).map_err(|_| ControlError::ReadbackMismatch)?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| ControlError::ReadbackMismatch)?;
+            if !bytes.ends_with(b"\n")
+                || value["state"] != "active_one"
+                || value["activation_id"] != config.activation_id
+                || value["package_digest"] != config.activation_package_digest
+                || value["scenario_sha256"] != config.scenario_sha256
+                || value["source_commit"] != config.integrated_candidate_sha
+            {
+                return Err(ControlError::BindingMismatch);
+            }
+            Ok(hex::encode(Sha256::digest(bytes)))
+        }
+
+        fn prove_qualified_receipt(
+            &mut self,
+            config: &AcceptanceControlConfig,
+        ) -> Result<(), ControlError> {
+            let value: serde_json::Value = serde_json::from_slice(
+                &fs::read(&self.receipt).map_err(|_| ControlError::ReadbackMismatch)?,
+            )
+            .map_err(|_| ControlError::ReadbackMismatch)?;
+            if value["state"] == "qualified_closed"
+                && value["activation_id"] == config.activation_id
+                && value["package_digest"] == config.activation_package_digest
+                && value["scenario_sha256"] == config.scenario_sha256
+                && value["source_commit"] == config.integrated_candidate_sha
+            {
+                Ok(())
+            } else {
+                Err(ControlError::BindingMismatch)
+            }
+        }
+    }
+
+    fn capacity_one_fixture(
+        mode: &'static str,
+    ) -> (
+        tempfile::TempDir,
+        FixtureCapacityOneRuntime,
+        AcceptanceControlConfig,
+        ControlRequest,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("systemd.json");
+        let receipt_path = directory.path().join("receipt.json");
+        let mut units = serde_json::Map::new();
+        let staged_active = [
+            "buzz-ci-controld.service",
+            "buzz-ci-controld-acceptance.socket",
+            "buzz-ci-acceptance-control.socket",
+            "buzz-ci-acceptance-control.service",
+        ];
+        for unit in [
+            "buzz-ci-capacity-one.target",
+            "buzz-ci-controld.service",
+            "buzz-ci-controld-acceptance.socket",
+            "buzz-ci-acceptance-control.socket",
+            "buzz-ci-acceptance-control.service",
+            "buzz-ci-runner.service",
+            "buzz-ci-runner.socket",
+            "buzz-ci-execd.service",
+            "buzz-ci-execd.socket",
+            "buzz-ci-keyholder.service",
+            "buzz-ci-keyholder.socket",
+        ] {
+            let fragment_path = match unit {
+                "buzz-ci-capacity-one.target" => "/etc/systemd/system/buzz-ci-capacity-one.target",
+                "buzz-ci-controld.service" => "/etc/systemd/system/buzz-ci-controld.service",
+                "buzz-ci-runner.socket" => "/etc/systemd/system/buzz-ci-runner.socket",
+                "buzz-ci-execd.socket" => "/etc/systemd/system/buzz-ci-execd.socket",
+                "buzz-ci-keyholder.socket" => "/etc/systemd/system/buzz-ci-keyholder.socket",
+                _ => "/etc/systemd/system/fixture-unit",
+            };
+            units.insert(
+                unit.to_owned(),
+                serde_json::json!({
+                    "state": if staged_active.contains(&unit) { "active" } else { "inactive" },
+                    "invocation_id": if unit == "buzz-ci-controld.service" { hex('1', 32) } else { String::new() },
+                    "fragment_path": fragment_path,
+                }),
+            );
+        }
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&serde_json::json!({"units": units})).unwrap(),
+        )
+        .unwrap();
+        let config = control_config();
+        let mut receipt = serde_json::to_vec(&serde_json::json!({
+            "state": "qualified_closed",
+            "activation_id": config.activation_id,
+            "package_digest": config.activation_package_digest,
+            "source_commit": config.integrated_candidate_sha,
+            "scenario_sha256": config.scenario_sha256,
+            "controller_generation": config.controller_generation,
+            "runner_generation": config.runner_generation,
+        }))
+        .unwrap();
+        receipt.push(b'\n');
+        fs::write(&receipt_path, receipt).unwrap();
+        let runtime = FixtureCapacityOneRuntime {
+            controller: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/fake-capacity-one-controller.py"),
+            state: state_path,
+            receipt: receipt_path,
+            mode,
+            controller_calls: 0,
+        };
+        let request = capacity_one_control_request();
+        (directory, runtime, config, request)
+    }
+
+    fn run_capacity_one_fixture(
+        mode: &'static str,
+    ) -> Result<(CapacityOneTransition, FixtureCapacityOneRuntime), ControlError> {
+        let (_directory, mut runtime, config, request) = capacity_one_fixture(mode);
+        let result = activate_capacity_one(
+            &config,
+            &request,
+            &hex('1', 32),
+            "",
+            Duration::from_millis(500),
+            &mut runtime,
+        )?;
+        Ok((result, runtime))
+    }
+
+    #[test]
+    fn fixed_controller_replaces_staged_processes_before_capacity_one_readback() {
+        let (transition, runtime) = run_capacity_one_fixture("success").unwrap();
+        assert_eq!(transition.result.readback.capacity, 1);
+        assert_eq!(transition.result.readback.admission, AdmissionState::Open);
+        assert_eq!(transition.result.readback.controller_generation, 7);
+        assert_eq!(transition.result.readback.runner_generation, 9);
+        assert_eq!(transition.controller_invocation, hex('2', 32));
+        assert_eq!(transition.runner_invocation, hex('3', 32));
+        assert_eq!(runtime.controller_calls, 1);
+        assert!(lower_hex(
+            &transition.result.controller_receipt_sha256,
+            &[64]
+        ));
+    }
+
+    #[test]
+    fn stale_zero_process_is_rejected_before_controller_invocation() {
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+        let mut state = runtime.state();
+        state["units"]["buzz-ci-runner.service"]["state"] = "active".into();
+        state["units"]["buzz-ci-runner.service"]["invocation_id"] = hex('a', 32).into();
+        fs::write(&runtime.state, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            activate_capacity_one(
+                &config,
+                &request,
+                &hex('1', 32),
+                "",
+                Duration::from_millis(500),
+                &mut runtime,
+            )
+            .map(|_| ()),
+            Err(ControlError::ReadbackMismatch)
+        );
+        assert_eq!(runtime.controller_calls, 0);
+    }
+
+    #[test]
+    fn capacity_one_controller_rejects_malformed_drift_and_stale_readback() {
+        for (mode, expected) in [
+            ("malformed", ControlError::BindingMismatch),
+            ("drift_response", ControlError::BindingMismatch),
+            ("stale_controller", ControlError::StaleGeneration),
+            ("wrong_fragment", ControlError::ReadbackMismatch),
+        ] {
+            assert_eq!(run_capacity_one_fixture(mode).err().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn capacity_one_controller_timeout_is_bounded() {
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("timeout");
+        let started = Instant::now();
+        assert_eq!(
+            activate_capacity_one(
+                &config,
+                &request,
+                &hex('1', 32),
+                "",
+                Duration::from_millis(40),
+                &mut runtime,
+            )
+            .map(|_| ()),
+            Err(ControlError::HostAction)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn capacity_one_controller_exact_replay_is_idempotent_and_drift_is_rejected() {
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+        let body = CapacityOneRequest {
+            schema_version: CAPACITY_ONE_REQUEST_SCHEMA,
+            action: CapacityOneAction::SetCapacityOne,
+            activation_id: &request.activation_id,
+            activation_package_digest: &request.activation_package_digest,
+            scenario_sha256: &request.scenario_sha256,
+            initial_controller_generation: config.controller_generation,
+            initial_runner_generation: config.runner_generation,
+            operation_id: &request.operation_id,
+        };
+        let input = serde_json::to_vec(&body).unwrap();
+        let first = runtime
+            .activate(&input, Duration::from_millis(500))
+            .unwrap();
+        let replay = runtime
+            .activate(&input, Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(first, replay);
+
+        let mut drift = request.clone();
+        drift.operation_id = hex('f', 64);
+        let drift = CapacityOneRequest {
+            schema_version: CAPACITY_ONE_REQUEST_SCHEMA,
+            action: CapacityOneAction::SetCapacityOne,
+            activation_id: &drift.activation_id,
+            activation_package_digest: &drift.activation_package_digest,
+            scenario_sha256: &drift.scenario_sha256,
+            initial_controller_generation: config.controller_generation,
+            initial_runner_generation: config.runner_generation,
+            operation_id: &drift.operation_id,
+        };
+        assert_eq!(
+            runtime
+                .activate(
+                    &serde_json::to_vec(&drift).unwrap(),
+                    Duration::from_millis(500),
+                )
+                .map(|_| ()),
+            Err(ControlError::HostAction)
+        );
     }
 
     #[test]
