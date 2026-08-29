@@ -649,6 +649,49 @@ class ActivationControllerTests(unittest.TestCase):
         activated = self.set_capacity_one(manifest, payloads, driver, operation_digit)
         return qualification, activated
 
+    def finalized_canary_evidence(
+        self, manifest: dict[str, object], payloads: dict[str, bytes], driver: CONTROLLER.FakeSystemd,
+    ) -> tuple[Path, Path]:
+        self.activate_one(manifest, payloads, driver)
+        prepare, prepare_sha = self.parsed_zero_request("prepare-qualification-zero", "c")
+        CONTROLLER._prepare_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, prepare, prepare_sha,
+        )
+        finalize, finalize_sha = self.parsed_zero_request(
+            "finalize-qualification-zero", "d", final_response_sha256="e" * 64,
+            expected_controller_generation=self.fixture.binding["fixture"]["controller_generation"],
+            expected_runner_generation=self.fixture.binding["fixture"]["runner_generation"],
+        )
+        CONTROLLER._finalize_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, finalize, finalize_sha,
+        )
+        prove, _prove_sha = self.parsed_zero_request(
+            "prove-qualification-zero", "e", final_response_sha256="e" * 64,
+            expected_controller_generation=self.fixture.binding["fixture"]["controller_generation"],
+            expected_runner_generation=self.fixture.binding["fixture"]["runner_generation"],
+        )
+        proved = CONTROLLER._prove_qualification_zero(manifest, self.fixture.root, driver, prove)
+        scenario_path = self.fixture.temporary / "persistent-scenario.json"
+        acceptance_path = self.fixture.temporary / "persistent-acceptance.json"
+        write_file(scenario_path, activation_package.canonical_json(self.fixture.scenario), 0o600)
+        acceptance = {
+            "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2",
+            "outcome": "pass",
+            "scenario_sha256": self.fixture.binding["scenario_sha256"],
+            "integrated_candidate_sha": manifest["source_commit"],
+            "zero_transition": {
+                "phases": [{}, {"response": {"controller_receipt_sha256": proved["receipt_sha256"]}}],
+            },
+        }
+        write_file(acceptance_path, activation_package.canonical_json(acceptance), 0o600)
+        return scenario_path, acceptance_path
+
+    @staticmethod
+    def verifier_pass(*_arguments: object, **_keywords: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            [], 0, b'{"outcome":"pass","status":"verified"}\n', b"",
+        )
+
     def test_full_fake_root_lifecycle_is_dormant_then_capacity_one_then_closed(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         checked = CONTROLLER.check_current(manifest, self.fixture.root, driver)
@@ -1093,7 +1136,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "d2a6ce74f1a7a2532e3e7f5e1f353ba1e9bc989a32db87ede368bd3dc716f2c5",
+            "0ee16915f56ffdea4096cd5e11b353e71437d797e5786a890631be854fd333ba",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1397,6 +1440,160 @@ class ActivationControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "endpoint remains present"):
             CONTROLLER._prove_qualification_zero(manifest, self.fixture.root, driver, prove)
         self.assertEqual((self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")).read_bytes(), before)
+
+    def test_persistent_activation_is_bound_idempotent_and_rolls_back_to_zero(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        scenario, acceptance = self.finalized_canary_evidence(manifest, payloads, driver)
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass):
+            first = CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+            receipt_before = (self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")).read_bytes()
+            second = CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+        self.assertEqual((first["status"], first["state"], first["capacity"]), ("persistent_active", "active_one", 1))
+        self.assertEqual(first, second)
+        self.assertEqual(
+            (self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")).read_bytes(), receipt_before,
+        )
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual(receipt["persistent_activation"]["phase"], "active_one")
+        self.assertEqual(
+            receipt["persistent_activation"]["operation_id"],
+            receipt["persistent_authorization"]["operation_id"],
+        )
+        rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual((rolled_back["state"], rolled_back["capacity"]), ("rolled_back", 0))
+        self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["status"], "unchanged")
+
+    def test_persistent_activation_rejects_stale_mismatch_and_changed_replay(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        scenario, acceptance = self.finalized_canary_evidence(manifest, payloads, driver)
+        original = json.loads(acceptance.read_bytes())
+        lock_fd = CONTROLLER._acquire_operator_lock(
+            self.fixture.root, manifest["identities"]["controld"]["gid"],
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "another persistent activation operation"):
+                CONTROLLER.persist_capacity_one(
+                    manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+                )
+        finally:
+            CONTROLLER.fcntl.flock(lock_fd, CONTROLLER.fcntl.LOCK_UN)
+            os.close(lock_fd)
+        rejected = subprocess.CompletedProcess([], 1, b"", b"receipt rejected\n")
+        before = (self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")).read_bytes()
+        with mock.patch.object(CONTROLLER.subprocess, "run", return_value=rejected), self.assertRaisesRegex(
+            ValueError, "verifier did not return",
+        ):
+            CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+        self.assertEqual((self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")).read_bytes(), before)
+
+        stale = copy.deepcopy(original)
+        stale["zero_transition"]["phases"][1]["response"]["controller_receipt_sha256"] = "f" * 64
+        write_file(acceptance, activation_package.canonical_json(stale), 0o600)
+        before = (self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")).read_bytes()
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass), self.assertRaisesRegex(
+            ValueError, "stale",
+        ):
+            CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+        self.assertEqual((self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")).read_bytes(), before)
+
+        mismatched = copy.deepcopy(original)
+        mismatched["integrated_candidate_sha"] = "f" * 40
+        write_file(acceptance, activation_package.canonical_json(mismatched), 0o600)
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass), self.assertRaisesRegex(
+            ValueError, "does not authorize",
+        ):
+            CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+
+        write_file(acceptance, activation_package.canonical_json(original), 0o600)
+        CONTROLLER._return_to_staged_zero(
+            manifest, payloads, self.fixture.root, driver,
+            CONTROLLER._read_receipt(self.fixture.root)["acceptance_generated"],
+            keep_acceptance_control=True,
+        )
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass):
+            CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+        acceptance.write_bytes(acceptance.read_bytes() + b" ")
+        acceptance.chmod(0o600)
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass), self.assertRaisesRegex(
+            ValueError, "authorization replay differs",
+        ):
+            CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+
+    def test_persistent_activation_compensates_partial_failure_and_exact_retry_succeeds(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        scenario, acceptance = self.finalized_canary_evidence(manifest, payloads, driver)
+        original_start = driver.start
+        injected = False
+
+        def fail_once(unit: str) -> None:
+            nonlocal injected
+            if unit == "buzz-ci-runner.service" and not injected:
+                injected = True
+                raise ValueError("injected persistent start failure")
+            original_start(unit)
+
+        driver.start = fail_once
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass), self.assertRaisesRegex(
+            ValueError, "injected persistent start failure",
+        ):
+            CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual(
+            (receipt["state"], receipt["persistent_activation"]["phase"]),
+            ("qualified_closed", "compensated"),
+        )
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
+        driver.start = original_start
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass):
+            result = CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+        self.assertEqual((result["state"], result["capacity"]), ("active_one", 1))
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["persistent_activation"]["attempt_count"], 2)
+
+    def test_persistent_activation_readback_mismatch_compensates_to_zero(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        scenario, acceptance = self.finalized_canary_evidence(manifest, payloads, driver)
+        original_fragment = driver.fragment_path
+        injected = False
+
+        def mismatch_once(unit: str) -> str:
+            nonlocal injected
+            if unit == "buzz-ci-runner.socket" and not injected:
+                injected = True
+                return "/wrong/persistent.fragment"
+            return original_fragment(unit)
+
+        driver.fragment_path = mismatch_once
+        with mock.patch.object(CONTROLLER.subprocess, "run", side_effect=self.verifier_pass), self.assertRaisesRegex(
+            ValueError, "fragment differs",
+        ):
+            CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, scenario, acceptance,
+            )
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual((receipt["state"], receipt["persistent_activation"]["phase"]), ("qualified_closed", "compensated"))
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
 
     def test_acceptance_scenario_package_and_peer_binding_are_fail_closed(self) -> None:
         changed = copy.deepcopy(self.fixture.scenario)

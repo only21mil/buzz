@@ -130,7 +130,17 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    configs and capacity zero are proven. A proven compensation returns to
    `qualified_closed` and permits only the same request bytes and operation ID,
    at most three attempts; it never labels an unproven host safe.
-7. `rollback` first validates every managed target against its prior, staged,
+7. After the canary returns capacity to zero, `persist-capacity-one` accepts the
+   protected scenario and the canary's pass receipt. It freezes both inputs,
+   runs the installed semantic receipt verifier, requires the receipt's final
+   zero-controller digest to match the current private controller receipt, and
+   derives a domain-separated operation ID from those exact bytes. It then
+   reconstructs the bound `set-capacity-one` request, performs the same cutover,
+   and reads back configs, fragments, sockets, process generations, target
+   enablement, capacity one, and open admission again before returning. The
+   private receipt retains the candidate, package, scenario, acceptance receipt,
+   verifier output, zero receipt, operation, and final readback digests.
+8. `rollback` first validates every managed target against its prior, staged,
    or active digest. Unknown drift stops rollback before systemd or file
    mutation. A valid rollback stops and disables the activation, restores exact
    prior bytes, metadata, and exact unit active/enable state. It restores or
@@ -312,9 +322,42 @@ deploy/native-ci/activation/controller.py stage \
   --package /private/package \
   --scenario /private/capacity-one-scenario.json
 deploy/native-ci/activation/controller.py activate --package /private/package
-deploy/native-ci/activation/controller.py qualify --package /private/package
 deploy/native-ci/activation/controller.py rollback --package /private/package
 ```
+
+`activate` runs the closed production qualification and stops at
+`qualified_closed`. The acceptance canary then uses the fixed controller calls
+above, exercises capacity one, and returns the host to proven capacity zero.
+Validate its pass receipt as described in
+[`../acceptance/README.md`](../acceptance/README.md). The approved keyholder then
+runs the maintained persistent cutover against those exact protected files:
+
+```bash
+/usr/libexec/buzz-ci-activation-controller persist-capacity-one \
+  --scenario /protected/path/capacity-one-scenario.json \
+  --acceptance-receipt /protected/path/capacity-one-receipt.json
+```
+
+The command accepts no package, root, or fake-state override. Both evidence
+files must be regular, singly linked, non-writable by group or other, and
+root-owned on the live host. An exact repeat is read-only and returns the same
+terminal receipt. Changed, stale, mismatched, or differently bound evidence
+fails closed. A root-owned nonblocking operator lock serializes persistent
+cutover and rejects concurrent attempts before evidence verification or state
+mutation.
+
+If cutover fails but compensation proves staged capacity zero, rerun the exact
+command. It reuses the same operation ID for at most three attempts. If the
+receipt reports `rollback_failed`, or if independent readback is not exact, do
+not retry activation. Recover deterministically with the fixed package path:
+
+```bash
+/usr/libexec/buzz-ci-activation-controller rollback \
+  --package /var/lib/buzzci/activation-controller/package
+```
+
+`qualify --package ...` remains a post-activation health probe. It is not the
+persistent cutover and requires `active_one`.
 
 The installed canary calls these fixed commands. Operators do not pass a
 package path to them:
