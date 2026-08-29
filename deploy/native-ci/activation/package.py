@@ -44,12 +44,20 @@ INSTALLABLE_COMPONENT_ROLES = {
     "acceptance_driver_binary": "acceptance_driver",
     "acceptance_control_binary": "acceptance_control",
     "receipt_verifier_binary": "receipt_verifier",
+    "executor_binary": "executor",
 }
 TRACKED_INSTALL_ROLES = {
     "activation_controller": (0o500, 0o755),
     "activation_package_module": (0o500, 0o644),
     "receipt_verifier_binary": (0o500, 0o755),
     "receipt_verifier_expected_stages": (0o400, 0o644),
+    "fixture_manifest": (0o400, 0o444),
+    "fixture_input": (0o400, 0o444),
+    "fixture_script": (0o500, 0o555),
+    "execd_service": (0o400, 0o644),
+    "execd_socket": (0o400, 0o644),
+    "executor_service": (0o400, 0o644),
+    "executor_socket": (0o400, 0o644),
 }
 
 IDENTITIES = {
@@ -90,6 +98,7 @@ START_ORDER = [
     "buzz-ci-acceptance-control.socket",
     "buzz-ci-acceptance-control.service",
     "buzz-ci-keyholder.socket",
+    "buzz-ci-executor.socket",
     "buzz-ci-execd.socket",
     "buzz-ci-runner.socket",
     "buzz-ci-controld.service",
@@ -125,6 +134,14 @@ EXECD_TEARDOWN_ROOT = "/var/lib/buzzci/execd-v2/teardown"
 EXECD_ATTEMPT_ROOT = "/var/lib/buzzci/execd-v2/attempts"
 EXECD_QUALIFICATION_ROOT = "/var/lib/buzzci/execd-v2/qualification"
 EXECD_DYNAMIC_DIGEST_PLACEHOLDER = "0" * 64
+EXECUTION_SCHEMA_VERSION = 1
+EXECUTION_DIGEST_DOMAIN = b"buzz-ci-execd:static-execution:v1\0"
+FIXTURE_MANIFEST_SHA256 = "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"
+FIXTURE_INPUT_SHA256 = "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"
+FIXTURE_SCRIPT_SHA256 = "f0f4fa8b4f47a2edf4d3a080b2f3e818c69647441376b927265572191655c9d6"
+FIXTURE_MANIFEST_PATH = "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json"
+FIXTURE_INPUT_PATH = "/usr/share/buzzci/execd-v2/fixture/input.txt"
+FIXTURE_SCRIPT_PATH = "/usr/libexec/buzz-ci-capacity-one-fixture"
 EXECUTOR_SOCKET_PATH = "/run/buzzci/executor.sock"
 RUNNER_REPLAY_JOURNAL = "/var/lib/buzzci/runner/v2-replay.json"
 SECCOMP_PROFILE_DIGEST = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
@@ -174,6 +191,14 @@ SOCKET_POLICY = {
         "group": "buzzci-controld",
         "mode": "0620",
     },
+    "executor": {
+        "unit": "buzz-ci-executor.socket",
+        "path": EXECUTOR_SOCKET_PATH,
+        "descriptor_name": "buzz-ci-executor",
+        "user": "root",
+        "group": "root",
+        "mode": "0600",
+    },
 }
 
 STATIC_TARGETS = {
@@ -190,6 +215,14 @@ STATIC_TARGETS = {
     "receipt_verifier_binary": COMPONENTS["receipt_verifier"][0],
     "receipt_verifier_expected_stages": "/usr/libexec/buzz-ci-acceptance-expected-stages.json",
     "qualification_binary": COMPONENTS["qualification"][0],
+    "executor_binary": COMPONENTS["executor"][0],
+    "fixture_manifest": FIXTURE_MANIFEST_PATH,
+    "fixture_input": FIXTURE_INPUT_PATH,
+    "fixture_script": FIXTURE_SCRIPT_PATH,
+    "execd_service": "/usr/lib/systemd/system/buzz-ci-execd.service",
+    "execd_socket": "/usr/lib/systemd/system/buzz-ci-execd.socket",
+    "executor_service": "/usr/lib/systemd/system/buzz-ci-executor.service",
+    "executor_socket": "/usr/lib/systemd/system/buzz-ci-executor.socket",
     "activation_controller": ACTIVATION_CONTROLLER_PATH,
     "activation_package_module": ACTIVATION_PACKAGE_MODULE_PATH,
     "execd_socket_dropin": "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",
@@ -203,6 +236,10 @@ PACKAGE_UNIT_ROLES = {
     "buzz-ci-controld-acceptance.socket": "controld_acceptance_socket",
     "buzz-ci-acceptance-control.socket": "acceptance_control_socket",
     "buzz-ci-acceptance-control.service": "acceptance_control_service",
+    "buzz-ci-execd.service": "execd_service",
+    "buzz-ci-execd.socket": "execd_socket",
+    "buzz-ci-executor.service": "executor_service",
+    "buzz-ci-executor.socket": "executor_socket",
 }
 DEPENDENCY_UNITS = sorted(
     set(START_ORDER + STOP_ORDER) - set(PACKAGE_UNIT_ROLES)
@@ -461,6 +498,13 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
             raise ValueError(f"static entry {role} must be root owned")
     if entries_by_role["receipt_verifier_expected_stages"]["sha256"] != RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256:
         raise ValueError("receipt verifier expected stages digest differs from the frozen contract")
+    for role, expected in (
+        ("fixture_manifest", FIXTURE_MANIFEST_SHA256),
+        ("fixture_input", FIXTURE_INPUT_SHA256),
+        ("fixture_script", FIXTURE_SCRIPT_SHA256),
+    ):
+        if entries_by_role[role]["sha256"] != expected:
+            raise ValueError(f"capacity-one fixture digest differs: {role}")
     components_by_name = {item["name"]: item for item in validated_components}
     if components_by_name["qualification"]["source_commit"] != QUALIFICATION_SOURCE_COMMIT:
         raise ValueError("production-v2 qualification client source commit differs from the frozen ABI")
@@ -687,6 +731,98 @@ def lane_manifest_digest(value: object) -> str:
     return digest(bytes(encoded))
 
 
+def _wire_text64(value: object, where: str) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"{where} must be ASCII text")
+    try:
+        raw = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{where} must be ASCII text") from error
+    if not 1 <= len(raw) <= 64:
+        raise ValueError(f"{where} must contain one through sixty-four ASCII bytes")
+    return bytes([len(raw)]) + raw.ljust(64, b"\0")
+
+
+def validate_execution_declaration(value: object, *, allow_placeholder: bool) -> dict[str, Any]:
+    fields = {
+        "schema_version", "declaration_digest", "workflow_id", "workflow_digest", "job_id", "artifact",
+        "fixture_manifest_sha256", "fixture_input_sha256", "fixture_script_sha256", "max_stdout_bytes",
+        "max_stderr_bytes", "max_memory_bytes", "max_processes", "max_wall_seconds",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("execd execution declaration shape differs from production")
+    if isinstance(value["schema_version"], bool) or value["schema_version"] != EXECUTION_SCHEMA_VERSION:
+        raise ValueError("execd execution declaration schema differs")
+    declaration_digest = value["declaration_digest"]
+    if allow_placeholder and declaration_digest == EXECD_DYNAMIC_DIGEST_PLACEHOLDER:
+        pass
+    else:
+        _nonzero_sha256(declaration_digest, "execd execution declaration digest")
+    _wire_text64(value["workflow_id"], "execd workflow id")
+    _nonzero_sha256(value["workflow_digest"], "execd workflow digest")
+    if value["job_id"] != "capacity-one-fixture":
+        raise ValueError("execd execution job id differs from the fixed fixture")
+    artifact = value["artifact"]
+    expected_artifact = {
+        "artifact_id": "result", "name": "result.json", "media_type": "application/json",
+        "relative_name": "result.json", "max_bytes": 32_768,
+    }
+    if artifact != expected_artifact:
+        raise ValueError("execd execution artifact differs from the fixed fixture")
+    for field, expected in (
+        ("fixture_manifest_sha256", FIXTURE_MANIFEST_SHA256),
+        ("fixture_input_sha256", FIXTURE_INPUT_SHA256),
+        ("fixture_script_sha256", FIXTURE_SCRIPT_SHA256),
+    ):
+        if value[field] != expected:
+            raise ValueError(f"execd execution source digest differs: {field}")
+    expected_limits = {
+        "max_stdout_bytes": 32_768,
+        "max_stderr_bytes": 32_768,
+        "max_memory_bytes": 134_217_728,
+        "max_processes": 16,
+        "max_wall_seconds": 120,
+    }
+    if any(value[field] != expected for field, expected in expected_limits.items()):
+        raise ValueError("execd execution resource limits differ")
+    return value
+
+
+def execution_declaration_digest(
+    source_commit: str, package_digest: str, lane_manifest: object, execution: object,
+) -> str:
+    if not isinstance(source_commit, str) or not GIT_OID.fullmatch(source_commit):
+        raise ValueError("execution candidate must be a full SHA-1 object id")
+    package_digest = _nonzero_sha256(package_digest, "execution activation package digest")
+    declaration = validate_execution_declaration(execution, allow_placeholder=True)
+    lane_digest = lane_manifest_digest(lane_manifest)
+    isolation_digest = _nonzero_sha256(
+        lane_manifest["isolation_profile_digest"] if isinstance(lane_manifest, dict) else None,
+        "execution isolation profile digest",
+    )
+    encoded = bytearray(EXECUTION_DIGEST_DOMAIN)
+    encoded.append(0x01)
+    encoded.extend(bytes.fromhex(source_commit))
+    encoded.extend(bytes.fromhex(package_digest))
+    encoded.extend(bytes.fromhex(lane_digest))
+    encoded.extend(bytes.fromhex(isolation_digest))
+    encoded.extend(_wire_text64(declaration["workflow_id"], "execd workflow id"))
+    encoded.extend(bytes.fromhex(_nonzero_sha256(declaration["workflow_digest"], "execd workflow digest")))
+    encoded.extend(_wire_text64(declaration["job_id"], "execd job id"))
+    artifact = declaration["artifact"]
+    for field in ("artifact_id", "name", "media_type", "relative_name"):
+        encoded.extend(_wire_text64(artifact[field], f"execd artifact {field}"))
+    encoded.extend(struct.pack(">I", artifact["max_bytes"]))
+    for field in ("fixture_manifest_sha256", "fixture_input_sha256", "fixture_script_sha256"):
+        encoded.extend(bytes.fromhex(declaration[field]))
+    encoded.extend(struct.pack(">I", declaration["max_stdout_bytes"]))
+    encoded.extend(struct.pack(">I", declaration["max_stderr_bytes"]))
+    encoded.extend(struct.pack(">Q", declaration["max_memory_bytes"]))
+    encoded.extend(struct.pack(">I", declaration["max_processes"]))
+    encoded.extend(struct.pack(">I", declaration["max_wall_seconds"]))
+    return digest(bytes(encoded))
+
+
 def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes]) -> None:
     entries = {entry["role"]: entry for entry in manifest["entries"]}
     for role in CONFIG_TARGETS:
@@ -755,7 +891,7 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
     execd_active = _json_payload(payloads[execd["active_source"]], "active execd v2 configuration template")
     execd_fields = {
         "schema_version", "enabled_protocol", "capacity", "identities", "paths",
-        "lane_manifest", "lane_manifest_digest", "executor", "qualification",
+        "lane_manifest", "lane_manifest_digest", "executor", "qualification", "execution",
     }
     if set(execd_staged) != execd_fields or set(execd_active) != execd_fields:
         raise ValueError("execd v2 configuration shape differs from production")
@@ -830,6 +966,9 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         "runner_generation": 1,
     }:
         raise ValueError("execd qualification template is not the fixed post-freeze placeholder")
+    execution_template = validate_execution_declaration(execd_staged["execution"], allow_placeholder=True)
+    if execution_template["declaration_digest"] != EXECD_DYNAMIC_DIGEST_PLACEHOLDER:
+        raise ValueError("execd execution declaration must be post-freeze bound")
     lane_manifest = execd_staged["lane_manifest"]
     if (
         runner_active["lane_manifest_digest"] != lane_digest
@@ -959,6 +1098,13 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         raise ValueError("controld artifact media type is invalid")
     if isinstance(artifact["max_bytes"], bool) or not isinstance(artifact["max_bytes"], int) or not 1 <= artifact["max_bytes"] <= 32_768:
         raise ValueError("controld artifact byte bound is invalid")
+    if (
+        execution_template["workflow_id"] != controld_active["workflow_id"]
+        or execution_template["workflow_digest"] != controld_active["workflow_digest"]
+        or execution_template["job_id"] != job["job_id"]
+        or execution_template["artifact"] != artifact
+    ):
+        raise ValueError("execd execution declaration differs from active controld workflow")
     selectors = controld_active["keyholder_selectors"]
     if not isinstance(selectors, dict) or set(selectors) != {"ci_event", "nip98", "manifest"}:
         raise ValueError("controld keyholder selectors are incomplete")
