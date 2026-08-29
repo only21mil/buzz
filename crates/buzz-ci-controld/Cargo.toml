@@ -35,5 +35,6 @@ uuid = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["fs", "poll", "socket", "user"] }
 
 [dev-dependencies]
+buzz-ci-acceptance-ctl = { path = "../buzz-ci-acceptance-ctl", features = ["test-support"] }
 buzz-ci-execd = { path = "../buzz-ci-execd" }
 tempfile = "3"

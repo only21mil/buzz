@@ -34,7 +34,9 @@ fn run() -> Result<(), StartupError> {
     let owner_uid = effective_uid()?;
     let config = DaemonConfig::load(&config_path, owner_uid)?;
     let acceptance_binding = match config.acceptance_binding() {
-        Some(path) => Some(AcceptanceBinding::load(path)?),
+        Some(path) => {
+            Some(AcceptanceBinding::load(path).map_err(|_| AcceptanceSocketError::Binding)?)
+        }
         None => None,
     };
     let listener =

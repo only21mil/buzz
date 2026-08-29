@@ -4,12 +4,12 @@ use thiserror::Error;
 use url::Url as ParsedUrl;
 use uuid::Uuid;
 
+use buzz_ci_acceptance_ctl::acceptance_binding::{
+    validate_acceptance_event_templates, ValidatedAcceptanceBinding,
+};
 use buzz_ci_broker_protocol::v2::{
     decode_admission_signature_message, AdmissionSignatureAlgorithm,
 };
-use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType};
-use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
-use serde::Deserialize;
 
 use crate::{
     AcceptanceMutation, BackendError, CanonicalPayload, DescribeAcceptanceResponse,
@@ -23,7 +23,6 @@ const CI_EVENT_KIND_MIN: u32 = 46_101;
 const CI_EVENT_KIND_MAX: u32 = 46_106;
 const NIP98_EVENT_KIND: u32 = 27_235;
 const NIP98_TIMESTAMP_TOLERANCE_SECONDS: u64 = 60;
-const MAX_ACCEPTANCE_GRANT_WINDOW_SECONDS: i64 = 3_600;
 
 /// Closed operation policy and public selector state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,14 +52,29 @@ impl AcceptanceSigningPolicy {
         if actor.public_key == [0; 32] || actor.generation == 0 || scenario_sha256 == [0; 32] {
             return Err(ServiceError::InvalidRequest);
         }
-        let (event_ids, granted_ci_signer) =
-            validate_acceptance_templates(actor.public_key, &templates)?;
+        let validated = validate_acceptance_event_templates(
+            actor.public_key,
+            templates.each_ref().map(CanonicalPayload::as_bytes),
+        )
+        .map_err(|_| ServiceError::InvalidRequest)?;
         Ok(Self {
             actor,
             scenario_sha256,
-            event_ids,
-            granted_ci_signer,
+            event_ids: validated.event_ids(),
+            granted_ci_signer: validated.granted_ci_signer(),
         })
+    }
+
+    pub(crate) fn from_validated(
+        actor: PublicIdentity,
+        validated: ValidatedAcceptanceBinding,
+    ) -> Self {
+        Self {
+            actor,
+            scenario_sha256: validated.scenario_sha256(),
+            event_ids: validated.event_ids(),
+            granted_ci_signer: validated.granted_ci_signer(),
+        }
     }
 
     /// Dedicated acceptance actor identity.
@@ -90,196 +104,6 @@ const fn mutation_index(mutation: AcceptanceMutation) -> usize {
         AcceptanceMutation::Rerun => 2,
         AcceptanceMutation::Tombstone => 3,
     }
-}
-
-fn validate_acceptance_templates(
-    actor: [u8; 32],
-    templates: &[CanonicalPayload; 4],
-) -> Result<([[u8; 32]; 4], [u8; 32]), ServiceError> {
-    for (template, kind) in templates.iter().zip([
-        KIND_CI_REQUEST,
-        KIND_CI_GRANT,
-        KIND_CI_REQUEST,
-        KIND_DELETION,
-    ]) {
-        validate_ci_event(template.as_bytes(), actor, kind)?;
-    }
-    let values = templates
-        .iter()
-        .map(|template| validate_canonical_json(template.as_bytes()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let run = request_from_template(&values[0], CiRequestType::Run)?;
-    let rerun = request_from_template(&values[2], CiRequestType::Rerun)?;
-    let run_tags = values[0][4]
-        .as_array()
-        .ok_or(ServiceError::InvalidRequest)?;
-    let channel = exact_channel(run_tags)?;
-    validate_request_template(run_tags, channel, &run)?;
-    validate_request_template(
-        values[2][4]
-            .as_array()
-            .ok_or(ServiceError::InvalidRequest)?,
-        channel,
-        &rerun,
-    )?;
-    if run.target_repo_a != rerun.target_repo_a
-        || run.pr_root_event_id != rerun.pr_root_event_id
-        || run.pr_update_event_id != rerun.pr_update_event_id
-        || run.source_clone_url != rerun.source_clone_url
-        || run.immutable_source_ref != rerun.immutable_source_ref
-        || run.tip_oid != rerun.tip_oid
-        || run.source_branch != rerun.source_branch
-        || run.base_ref != rerun.base_ref
-        || run.base_oid != rerun.base_oid
-        || run.workflow_id != rerun.workflow_id
-        || run.workflow_digest != rerun.workflow_digest
-        || run.run_id != rerun.run_id
-        || run.actor != rerun.actor
-        || run.actor != hex::encode(actor)
-        || rerun.parent_run_id.as_deref() != Some(run.run_id.as_str())
-        || rerun.parent_attempt != Some(1)
-        || rerun.attempt != 2
-        || rerun.job_ids.len() != 1
-    {
-        return Err(ServiceError::InvalidRequest);
-    }
-    let granted_ci_signer = validate_grant_template(&values[1], channel, &run.target_repo_a)?;
-    let event_ids: [[u8; 32]; 4] = templates
-        .iter()
-        .map(|template| Sha256::digest(template.as_bytes()).into())
-        .collect::<Vec<[u8; 32]>>()
-        .try_into()
-        .map_err(|_| ServiceError::InvalidRequest)?;
-    validate_tombstone_template(&values[3], event_ids[2])?;
-    if event_ids.contains(&[0; 32])
-        || event_ids
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != event_ids.len()
-    {
-        return Err(ServiceError::InvalidRequest);
-    }
-    Ok((event_ids, granted_ci_signer))
-}
-
-fn request_from_template(
-    value: &serde_json::Value,
-    request_type: CiRequestType,
-) -> Result<CiRequestEnvelope, ServiceError> {
-    let content = value[5].as_str().ok_or(ServiceError::InvalidRequest)?;
-    let envelope: CiRequestEnvelope =
-        serde_json::from_str(content).map_err(|_| ServiceError::InvalidRequest)?;
-    envelope
-        .validate()
-        .map_err(|_| ServiceError::InvalidRequest)?;
-    if envelope.request_type != request_type {
-        return Err(ServiceError::InvalidRequest);
-    }
-    Ok(envelope)
-}
-
-fn exact_channel(tags: &[serde_json::Value]) -> Result<&str, ServiceError> {
-    let channels = tags
-        .iter()
-        .filter_map(|tag| {
-            let fields = tag.as_array()?;
-            (fields.first()?.as_str()? == "h")
-                .then(|| fields.get(1)?.as_str())
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    match channels.as_slice() {
-        [channel]
-            if Uuid::parse_str(channel)
-                .is_ok_and(|value| value.hyphenated().to_string() == *channel) =>
-        {
-            Ok(channel)
-        }
-        _ => Err(ServiceError::InvalidRequest),
-    }
-}
-
-fn validate_request_template(
-    tags: &[serde_json::Value],
-    channel: &str,
-    envelope: &CiRequestEnvelope,
-) -> Result<(), ServiceError> {
-    let expected = request_tags(channel, envelope).map_err(|_| ServiceError::InvalidRequest)?;
-    let expected = serde_json::to_value(expected).map_err(|_| ServiceError::InvalidRequest)?;
-    (expected == serde_json::Value::Array(tags.to_vec()))
-        .then_some(())
-        .ok_or(ServiceError::InvalidRequest)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AcceptanceGrant {
-    schema_version: u32,
-    target_repo_a: String,
-    signer_pubkey: String,
-    valid_from: serde_json::Value,
-    #[serde(default)]
-    valid_until: Option<serde_json::Value>,
-}
-
-fn validate_grant_template(
-    value: &serde_json::Value,
-    channel: &str,
-    target_repo_a: &str,
-) -> Result<[u8; 32], ServiceError> {
-    let grant: AcceptanceGrant =
-        serde_json::from_str(value[5].as_str().ok_or(ServiceError::InvalidRequest)?)
-            .map_err(|_| ServiceError::InvalidRequest)?;
-    let tags = value[4].as_array().ok_or(ServiceError::InvalidRequest)?;
-    let expected_tags = serde_json::json!([["h", channel]]);
-    let valid_from = grant
-        .valid_from
-        .as_i64()
-        .ok_or(ServiceError::InvalidRequest)?;
-    let valid_until = grant
-        .valid_until
-        .as_ref()
-        .map(|value| value.as_i64().ok_or(ServiceError::InvalidRequest))
-        .transpose()?;
-    let created_at = i64::try_from(value[2].as_u64().ok_or(ServiceError::InvalidRequest)?)
-        .map_err(|_| ServiceError::InvalidRequest)?;
-    if grant.schema_version != 1
-        || grant.target_repo_a != target_repo_a
-        || !lower_hex64(&grant.signer_pubkey)
-        || valid_from != created_at
-        || !matches!(
-            valid_until,
-            Some(until)
-                if until > valid_from
-                    && until.saturating_sub(valid_from) <= MAX_ACCEPTANCE_GRANT_WINDOW_SECONDS
-        )
-        || serde_json::Value::Array(tags.to_vec()) != expected_tags
-    {
-        return Err(ServiceError::InvalidRequest);
-    }
-    let signer = hex::decode(grant.signer_pubkey).map_err(|_| ServiceError::InvalidRequest)?;
-    signer.try_into().map_err(|_| ServiceError::InvalidRequest)
-}
-
-fn validate_tombstone_template(
-    value: &serde_json::Value,
-    rerun_event_id: [u8; 32],
-) -> Result<(), ServiceError> {
-    let tags = value[4].as_array().ok_or(ServiceError::InvalidRequest)?;
-    let expected = serde_json::json!([["e", hex::encode(rerun_event_id)]]);
-    if value[5].as_str() != Some("") || serde_json::Value::Array(tags.to_vec()) != expected {
-        return Err(ServiceError::InvalidRequest);
-    }
-    Ok(())
-}
-
-fn lower_hex64(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        && value.bytes().any(|byte| byte != b'0')
 }
 
 impl SigningPolicy {
@@ -853,6 +677,8 @@ pub(crate) mod tests {
         admission_signature_message, AdmissionSignatureAlgorithm, AdmitAttemptRequest,
     };
     use buzz_ci_broker_protocol::{GitOid, TrustClass};
+    use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType};
+    use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
 
     use super::*;
     use crate::{CanonicalPayload, ManifestKind, OperationSet, Url};
