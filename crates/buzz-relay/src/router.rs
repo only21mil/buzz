@@ -55,7 +55,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/ci/artifacts/{request_id}/{run_id}/{job_id}/{attempt}/{artifact_id}/{sha256}",
-            put(api::ci::put_ci_artifact),
+            put(api::ci::put_ci_artifact)
+                .get(api::ci::get_ci_artifact)
+                .head(api::ci::head_ci_artifact),
         )
         .layer(RequestBodyLimitLayer::new(api::ci::MAX_CI_EVIDENCE_BYTES))
         .with_state(state.clone());
@@ -89,6 +91,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // CI preflight (NIP-98 auth)
         .route("/ci/preflight", post(api::ci::ci_preflight))
         .route("/ci/control/accepted", get(api::ci::next_accepted_control))
+        .route(
+            "/ci/runs/{run_id}/request",
+            get(api::ci::get_ci_run_request),
+        )
+        .route("/ci/runs/{run_id}/events", get(api::ci::get_ci_run_events))
         .route(
             "/workflows/{workflow_id}/runs",
             get(api::bridge::workflow_runs),
