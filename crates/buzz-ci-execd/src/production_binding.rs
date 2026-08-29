@@ -11,8 +11,9 @@ use buzz_ci_broker_protocol::v2::{
     AdmitAttemptRequest, AttemptEvidenceCoordinates, BrokerResponse, CancelAttemptRequest,
     CompleteAttemptRequest, DescribeAttemptEvidenceRequest, EvidenceChunkResponse,
     EvidenceDescriptionResponse, EvidenceDescriptor, FrameHeader, GetAttemptRequest,
-    ReadAttemptEvidenceRequest, Request, EXECUTION_BINDING_DIGEST_DOMAIN, JOB_INTENT_DIGEST_DOMAIN,
-    LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN, MAX_EVIDENCE_CHUNK_SIZE, MAX_EVIDENCE_ITEMS,
+    ReadAttemptEvidenceRequest, Request, WireText64, EXECUTION_BINDING_DIGEST_DOMAIN,
+    JOB_INTENT_DIGEST_DOMAIN, LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN, MAX_EVIDENCE_CHUNK_SIZE,
+    MAX_EVIDENCE_ITEMS,
 };
 use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, ResponseCode, TrustClass};
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
@@ -24,6 +25,40 @@ pub const LANE_ACTIVATION_MANIFEST_SCHEMA_V1: u16 = 1;
 pub const JOB_INTENT_SCHEMA_V2: u16 = 2;
 /// Frozen execd-owned execution-binding schema.
 pub const EXECUTION_BINDING_SCHEMA_V1: u16 = 1;
+pub const MAX_DECLARED_ARTIFACTS: usize = 1;
+pub const MAX_ARTIFACT_BYTES: u32 = 32 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactDeclarationV1 {
+    pub artifact_id: WireText64,
+    pub name: WireText64,
+    pub media_type: WireText64,
+    pub relative_name: WireText64,
+    pub max_bytes: u32,
+}
+
+impl ArtifactDeclarationV1 {
+    pub(crate) fn validate(self) -> bool {
+        self.artifact_id.as_str().is_ok_and(safe_artifact_name)
+            && self.name.as_str().is_ok_and(safe_artifact_name)
+            && self.media_type.as_str().is_ok_and(|value| {
+                value.contains('/')
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'+' | b'.' | b'-')
+                    })
+            })
+            && self.relative_name.as_str().is_ok_and(safe_artifact_name)
+            && self.max_bytes > 0
+            && self.max_bytes <= MAX_ARTIFACT_BYTES
+    }
+}
+
+fn safe_artifact_name(value: &str) -> bool {
+    !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 /// Host identities measured by execd, never supplied by the runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +173,11 @@ pub struct JobIntentV2 {
     pub attempt: u32,
     pub parent_attempt: u32,
     pub trust_class: TrustClass,
+    pub request_event_id: [u8; 32],
+    pub workflow_id: WireText64,
+    pub job_id: WireText64,
+    pub artifact_count: u8,
+    pub artifacts: [Option<ArtifactDeclarationV1>; MAX_DECLARED_ARTIFACTS],
 }
 
 impl JobIntentV2 {
@@ -166,6 +206,23 @@ impl JobIntentV2 {
         put_u32(&mut bytes, self.attempt);
         put_u32(&mut bytes, self.parent_attempt);
         bytes.push(self.trust_class as u8);
+        bytes.extend_from_slice(&self.request_event_id);
+        put_text(&mut bytes, self.workflow_id);
+        put_text(&mut bytes, self.job_id);
+        bytes.push(self.artifact_count);
+        for artifact in self.artifacts {
+            match artifact {
+                Some(artifact) => {
+                    bytes.push(1);
+                    put_text(&mut bytes, artifact.artifact_id);
+                    put_text(&mut bytes, artifact.name);
+                    put_text(&mut bytes, artifact.media_type);
+                    put_text(&mut bytes, artifact.relative_name);
+                    put_u32(&mut bytes, artifact.max_bytes);
+                }
+                None => bytes.push(0),
+            }
+        }
         sha256(&bytes)
     }
 
@@ -192,6 +249,13 @@ impl JobIntentV2 {
             || self.attempt != request.attempt
             || self.parent_attempt != request.parent_attempt
             || self.trust_class != request.trust_class
+            || self.request_event_id == [0; 32]
+            || self.workflow_id.as_str().is_err()
+            || !self.job_id.as_str().is_ok_and(safe_artifact_name)
+            || usize::from(self.artifact_count) > MAX_DECLARED_ARTIFACTS
+            || usize::from(self.artifact_count)
+                != self.artifacts.iter().filter(|item| item.is_some()).count()
+            || self.artifacts.iter().flatten().any(|item| !item.validate())
             || request.issued_at == 0
             || request.issued_at > now
             || now >= request.expires_at
@@ -290,10 +354,20 @@ pub struct ExecutionBindingV1 {
     pub admitted_at: u64,
     pub deadline_at: u64,
     pub execution_binding_digest: [u8; 32],
+    pub request_event_id: [u8; 32],
+    pub workflow_digest: [u8; 32],
+    pub workflow_id: WireText64,
+    pub job_id: WireText64,
+    pub artifact_count: u8,
+    pub artifacts: [Option<ArtifactDeclarationV1>; MAX_DECLARED_ARTIFACTS],
 }
 
 impl ExecutionBindingV1 {
-    fn create(request: AdmitAttemptRequest, admitted_at: u64) -> Result<Self, BindingError> {
+    fn create(
+        request: AdmitAttemptRequest,
+        intent: JobIntentV2,
+        admitted_at: u64,
+    ) -> Result<Self, BindingError> {
         let deadline_at = admitted_at
             .checked_add(u64::from(request.wall_timeout_seconds))
             .map(|deadline| deadline.min(request.expires_at))
@@ -336,6 +410,12 @@ impl ExecutionBindingV1 {
             admitted_at,
             deadline_at,
             execution_binding_digest: [0; 32],
+            request_event_id: intent.request_event_id,
+            workflow_digest: intent.workflow_digest,
+            workflow_id: intent.workflow_id,
+            job_id: intent.job_id,
+            artifact_count: intent.artifact_count,
+            artifacts: intent.artifacts,
         };
         binding.execution_binding_digest = binding.computed_digest();
         Ok(binding)
@@ -362,6 +442,24 @@ impl ExecutionBindingV1 {
         put_oid(&mut bytes, self.base_oid);
         put_u64(&mut bytes, self.admitted_at);
         put_u64(&mut bytes, self.deadline_at);
+        bytes.extend_from_slice(&self.request_event_id);
+        bytes.extend_from_slice(&self.workflow_digest);
+        put_text(&mut bytes, self.workflow_id);
+        put_text(&mut bytes, self.job_id);
+        bytes.push(self.artifact_count);
+        for artifact in self.artifacts {
+            match artifact {
+                Some(artifact) => {
+                    bytes.push(1);
+                    put_text(&mut bytes, artifact.artifact_id);
+                    put_text(&mut bytes, artifact.name);
+                    put_text(&mut bytes, artifact.media_type);
+                    put_text(&mut bytes, artifact.relative_name);
+                    put_u32(&mut bytes, artifact.max_bytes);
+                }
+                None => bytes.push(0),
+            }
+        }
         sha256(&bytes)
     }
 
@@ -379,6 +477,7 @@ impl ExecutionBindingV1 {
             && self.attempt == request.attempt
             && self.tip_oid == request.tip_oid
             && self.base_oid == request.base_oid
+            && self.workflow_digest == request.workflow_digest
     }
 }
 
@@ -787,6 +886,9 @@ where
             || coordinates.signed_request_digest != record.binding.signed_request_digest
             || coordinates.run_id != record.binding.run_id
             || coordinates.workflow_digest != intent.workflow_digest
+            || coordinates.request_event_id != record.binding.request_event_id
+            || coordinates.workflow_id != record.binding.workflow_id
+            || coordinates.job_id != record.binding.job_id
             || coordinates.job_intent_digest != record.binding.job_intent_digest
             || coordinates.attempt != record.binding.attempt
             || idempotency_digest != record.binding.idempotency_digest
@@ -830,6 +932,12 @@ where
             descriptor_set_digest: sha256(&digest_material),
             item_count: items.len() as u8,
             items: descriptors,
+            request_event_id: record.binding.request_event_id,
+            run_id: record.binding.run_id,
+            workflow_id: record.binding.workflow_id,
+            workflow_digest: record.binding.workflow_digest,
+            job_id: record.binding.job_id,
+            attempt: record.binding.attempt,
         })
     }
 
@@ -872,6 +980,12 @@ where
             offset: request.offset,
             total_length: item.descriptor.length,
             bytes: item.bytes[offset..end].to_vec(),
+            request_event_id: record.binding.request_event_id,
+            run_id: record.binding.run_id,
+            workflow_id: record.binding.workflow_id,
+            workflow_digest: record.binding.workflow_digest,
+            job_id: record.binding.job_id,
+            attempt: record.binding.attempt,
         })
     }
 
@@ -958,7 +1072,7 @@ where
         if occupied {
             return empty_response(ResponseCode::NoCapacity, now);
         }
-        let binding = match ExecutionBindingV1::create(request, now) {
+        let binding = match ExecutionBindingV1::create(request, intent, now) {
             Ok(binding) => binding,
             Err(error) => return error_response(error, now),
         };
@@ -1286,6 +1400,9 @@ fn descriptor_digest_material(bytes: &mut Vec<u8>, descriptor: EvidenceDescripto
     bytes.extend_from_slice(&descriptor.teardown_lease_id);
     bytes.extend_from_slice(&descriptor.teardown_lease_generation.to_be_bytes());
     bytes.extend_from_slice(&descriptor.teardown_attestation_digest);
+    put_text(bytes, descriptor.artifact_id);
+    put_text(bytes, descriptor.artifact_name);
+    put_text(bytes, descriptor.artifact_media_type);
 }
 
 fn evidence_description_error(
@@ -1300,6 +1417,12 @@ fn evidence_description_error(
         descriptor_set_digest: [0; 32],
         item_count: 0,
         items: [None; MAX_EVIDENCE_ITEMS],
+        request_event_id: request.coordinates.request_event_id,
+        run_id: request.coordinates.run_id,
+        workflow_id: request.coordinates.workflow_id,
+        workflow_digest: request.coordinates.workflow_digest,
+        job_id: request.coordinates.job_id,
+        attempt: request.coordinates.attempt,
     }
 }
 
@@ -1318,6 +1441,12 @@ fn evidence_chunk_error(
         offset: request.offset,
         total_length: 0,
         bytes: Vec::new(),
+        request_event_id: request.coordinates.request_event_id,
+        run_id: request.coordinates.run_id,
+        workflow_id: request.coordinates.workflow_id,
+        workflow_digest: request.coordinates.workflow_digest,
+        job_id: request.coordinates.job_id,
+        attempt: request.coordinates.attempt,
     }
 }
 
@@ -1467,6 +1596,11 @@ fn put_u32(bytes: &mut Vec<u8>, value: u32) {
 
 fn put_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_text(bytes: &mut Vec<u8>, value: WireText64) {
+    bytes.push(value.len);
+    bytes.extend_from_slice(&value.bytes);
 }
 
 fn put_oid(bytes: &mut Vec<u8>, oid: GitOid) {
@@ -1655,6 +1789,11 @@ mod tests {
             attempt: 1,
             parent_attempt: 0,
             trust_class: TrustClass::AcceptedReviewed,
+            request_event_id: [19; 32],
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            job_id: WireText64::from_ascii("job").unwrap(),
+            artifact_count: 0,
+            artifacts: [None],
         }
     }
 
@@ -1712,7 +1851,7 @@ mod tests {
         let lane = manifest(&key);
         let intent = intent_for(lane);
         let admission = request(&key, lane, intent);
-        let binding = ExecutionBindingV1::create(admission, 20).unwrap();
+        let binding = ExecutionBindingV1::create(admission, intent, 20).unwrap();
         let stdout = vec![b'x'; 5_000];
         let teardown = b"sealed teardown attestation".to_vec();
         let stdout_digest = sha256(&stdout);
@@ -1725,6 +1864,9 @@ mod tests {
                     length: stdout.len() as u32,
                     artifact_name_digest: [0; 32],
                     artifact_media_type_digest: [0; 32],
+                    artifact_id: WireText64::EMPTY,
+                    artifact_name: WireText64::EMPTY,
+                    artifact_media_type: WireText64::EMPTY,
                     teardown_lease_id: [0; 16],
                     teardown_lease_generation: 0,
                     teardown_attestation_digest: [0; 32],
@@ -1738,6 +1880,9 @@ mod tests {
                     length: teardown.len() as u32,
                     artifact_name_digest: [0; 32],
                     artifact_media_type_digest: [0; 32],
+                    artifact_id: WireText64::EMPTY,
+                    artifact_name: WireText64::EMPTY,
+                    artifact_media_type: WireText64::EMPTY,
                     teardown_lease_id: binding.lease_id,
                     teardown_lease_generation: binding.lease_generation,
                     teardown_attestation_digest: teardown_digest,
@@ -1783,6 +1928,9 @@ mod tests {
             attempt_id: binding.attempt_id,
             execution_binding_digest: binding.execution_binding_digest,
             expected_generation: record.generation,
+            request_event_id: binding.request_event_id,
+            workflow_id: binding.workflow_id,
+            job_id: binding.job_id,
         };
 
         let describe_header = FrameHeader {
@@ -1854,6 +2002,26 @@ mod tests {
             &mut controller,
             describe_header,
             Request::DescribeAttemptEvidence(stale),
+            33,
+        );
+        assert_eq!(
+            decode_evidence_description_response(describe_header, encoded.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::StateConflict
+        );
+
+        let mut mixed = describe;
+        mixed.coordinates.job_id = WireText64::from_ascii("other-job").unwrap();
+        mixed.request_frame_digest = evidence_request_frame_digest(
+            describe_header,
+            &Request::DescribeAttemptEvidence(mixed),
+        )
+        .unwrap();
+        let encoded = crate::control::ControlDispatch::dispatch_v2_encoded(
+            &mut controller,
+            describe_header,
+            Request::DescribeAttemptEvidence(mixed),
             33,
         );
         assert_eq!(
@@ -2272,8 +2440,10 @@ mod tests {
     #[test]
     fn lifecycle_refuses_skips_and_terminal_reentry_without_mutation() {
         let key = signing_key();
-        let request = request_for(&key);
-        let binding = ExecutionBindingV1::create(request, 20).unwrap();
+        let lane = manifest(&key);
+        let intent = intent_for(lane);
+        let request = request(&key, lane, intent);
+        let binding = ExecutionBindingV1::create(request, intent, 20).unwrap();
         let mut record = ExecutionBindingRecord::admitted(binding, 20);
         let admitted = record;
         assert_eq!(

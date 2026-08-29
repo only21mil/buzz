@@ -17,7 +17,7 @@ use std::{
 };
 
 use buzz_ci_broker_protocol::{
-    v2::{AdmissionSignatureAlgorithm, EvidenceDescriptor, EvidenceKind},
+    v2::{AdmissionSignatureAlgorithm, EvidenceDescriptor, EvidenceKind, WireText64},
     Conclusion, GitOid, TrustClass,
 };
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -27,11 +27,11 @@ use sha2::{Digest, Sha256};
 use crate::{
     control::ControlDispatch,
     production_binding::{
-        BindingError, BindingPhase, ExecutionBindingJournal, ExecutionBindingRecord,
-        ExecutionBindingV1, HostEvidenceItem, HostIdentity, HostRecoveryReceipt, HostStepReceipt,
-        HostStopReason, HostTerminalReceipt, JobIntentSource, JobIntentV2, JournalWrite,
-        LaneActivationManifestV1, PrivilegedHostSystem, ProductionBindingController,
-        StaticLaneManifest, EXECUTION_BINDING_SCHEMA_V1,
+        ArtifactDeclarationV1, BindingError, BindingPhase, ExecutionBindingJournal,
+        ExecutionBindingRecord, ExecutionBindingV1, HostEvidenceItem, HostIdentity,
+        HostRecoveryReceipt, HostStepReceipt, HostStopReason, HostTerminalReceipt, JobIntentSource,
+        JobIntentV2, JournalWrite, LaneActivationManifestV1, PrivilegedHostSystem,
+        ProductionBindingController, StaticLaneManifest, EXECUTION_BINDING_SCHEMA_V1,
     },
 };
 
@@ -40,6 +40,7 @@ pub const INTENT_ROOT: &str = "/var/lib/buzzci/execd-v2/intents";
 pub const BINDING_ROOT: &str = "/var/lib/buzzci/execd-v2/bindings";
 pub const EVIDENCE_ROOT: &str = "/var/lib/buzzci/execd-v2/evidence";
 pub const TEARDOWN_ROOT: &str = "/var/lib/buzzci/execd-v2/teardown";
+pub const ATTEMPT_ROOT: &str = "/var/lib/buzzci/execd-v2/attempts";
 pub const EXECUTOR_SOCKET: &str = "/run/buzzci/executor.sock";
 pub const EXECUTOR_PROGRAM: &str = "/usr/libexec/buzz-ci-executor";
 pub const ACCESS_GROUP: &str = "buzzci-execd";
@@ -94,6 +95,7 @@ struct PathConfig {
     evidence_root: String,
     teardown_root: String,
     executor_socket: String,
+    attempt_root: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,6 +149,20 @@ struct IntentDocument {
     attempt: u32,
     parent_attempt: u32,
     trust_class: String,
+    request_event_id: String,
+    workflow_id: String,
+    job_id: String,
+    artifacts: Vec<ArtifactDocument>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactDocument {
+    artifact_id: String,
+    name: String,
+    media_type: String,
+    relative_name: String,
+    max_bytes: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -184,6 +200,11 @@ struct BindingDocument {
     host_receipt_digest: String,
     evidence_set_digest: String,
     teardown_digest: String,
+    request_event_id: String,
+    workflow_digest: String,
+    workflow_id: String,
+    job_id: String,
+    artifacts: Vec<ArtifactDocument>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -266,6 +287,27 @@ impl SafeDirectory {
 
     fn descriptor_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+
+    fn open_child(&self, name: &str, owner: u32, mode: u32) -> Result<Self, ProductionV2Error> {
+        if !safe_name(name) {
+            return Err(ProductionV2Error::Closed);
+        }
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(self.descriptor_path().join(name))
+            .map_err(|_| ProductionV2Error::Closed)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|_| ProductionV2Error::Closed)?;
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o7777 != mode
+        {
+            return Err(ProductionV2Error::Closed);
+        }
+        Ok(Self { directory, owner })
     }
 
     fn open_file(
@@ -473,6 +515,8 @@ struct LocalHostSystem {
     evidence: SafeDirectory,
     teardown: SafeDirectory,
     evidence_by_binding: BTreeMap<[u8; 32], [u8; 32]>,
+    attempts: SafeDirectory,
+    job_uid: u32,
 }
 
 impl LocalHostSystem {
@@ -629,6 +673,185 @@ impl LocalHostSystem {
             .insert(binding.execution_binding_digest, digest);
         Ok(Some(digest))
     }
+
+    fn sealed_artifacts(
+        &self,
+        binding: ExecutionBindingV1,
+    ) -> Result<(Vec<HostEvidenceItem>, [u8; 32]), BindingError> {
+        let attempt_name = hex::encode(binding.attempt_id);
+        let attempt_path = self.attempts.descriptor_path().join(&attempt_name);
+        let declarations: Vec<_> = binding.artifacts.iter().flatten().copied().collect();
+        let all_sealed = declarations.iter().all(|declaration| {
+            declaration.artifact_id.as_str().is_ok_and(|artifact_id| {
+                self.evidence
+                    .descriptor_path()
+                    .join(format!("{}-{}.json", attempt_name, artifact_id))
+                    .exists()
+            })
+        });
+        let attempt = match self.attempts.open_child(&attempt_name, self.job_uid, 0o700) {
+            Ok(directory) => Some(directory),
+            Err(_) if all_sealed => None,
+            Err(_) if declarations.is_empty() && !attempt_path.exists() => None,
+            Err(_) => return Err(BindingError::HostRefused),
+        };
+        if let Some(attempt) = &attempt {
+            let mut observed = Vec::new();
+            for entry in
+                fs::read_dir(attempt.descriptor_path()).map_err(|_| BindingError::HostRefused)?
+            {
+                let name = entry
+                    .map_err(|_| BindingError::HostRefused)?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| BindingError::HostRefused)?;
+                if !declarations
+                    .iter()
+                    .any(|declared| declared.relative_name.as_str().ok() == Some(name.as_str()))
+                {
+                    return Err(BindingError::HostRefused);
+                }
+                observed.push(name);
+            }
+            if observed.len() != declarations.len() {
+                return Err(BindingError::HostRefused);
+            }
+        }
+
+        let mut items = Vec::new();
+        let mut set_material = Vec::from(b"buzz-ci-execd:artifact-receipt-set:v1\0".as_slice());
+        set_material.extend_from_slice(&binding.execution_binding_digest);
+        for declaration in declarations {
+            let artifact_id = declaration
+                .artifact_id
+                .as_str()
+                .map_err(|_| BindingError::HostRefused)?;
+            let receipt_name = format!("{}-{}.json", attempt_name, artifact_id);
+            let bytes = match self.evidence.read(&receipt_name, 0o600, MAX_RECORD) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let attempt = attempt.as_ref().ok_or(BindingError::HostRefused)?;
+                    let raw = attempt
+                        .read(
+                            declaration
+                                .relative_name
+                                .as_str()
+                                .map_err(|_| BindingError::HostRefused)?,
+                            0o600,
+                            u64::from(declaration.max_bytes),
+                        )
+                        .map_err(binding_error)?;
+                    let scrubbed = scrub(&raw)?;
+                    if scrubbed.len() > declaration.max_bytes as usize {
+                        return Err(BindingError::HostRefused);
+                    }
+                    let receipt = ArtifactReceiptDocument {
+                        schema_version: 1,
+                        execution_binding_digest: hex::encode(binding.execution_binding_digest),
+                        request_event_id: hex::encode(binding.request_event_id),
+                        run_id: hex::encode(binding.run_id),
+                        workflow_id: binding
+                            .workflow_id
+                            .as_str()
+                            .map_err(|_| BindingError::HostRefused)?
+                            .into(),
+                        workflow_digest: hex::encode(binding.workflow_digest),
+                        job_id: binding
+                            .job_id
+                            .as_str()
+                            .map_err(|_| BindingError::HostRefused)?
+                            .into(),
+                        attempt: binding.attempt,
+                        artifact_id: artifact_id.into(),
+                        name: declaration
+                            .name
+                            .as_str()
+                            .map_err(|_| BindingError::HostRefused)?
+                            .into(),
+                        media_type: declaration
+                            .media_type
+                            .as_str()
+                            .map_err(|_| BindingError::HostRefused)?
+                            .into(),
+                        sha256: hex::encode(Sha256::digest(&scrubbed)),
+                        byte_length: scrubbed.len() as u32,
+                        content_hex: hex::encode(scrubbed),
+                    };
+                    let bytes = canonical_bytes(&receipt).map_err(binding_error)?;
+                    match self.evidence.write_once(&receipt_name, &bytes, 0o600) {
+                        Ok(()) => bytes,
+                        Err(_) => self
+                            .evidence
+                            .read(&receipt_name, 0o600, MAX_RECORD)
+                            .map_err(binding_error)?,
+                    }
+                }
+            };
+            let receipt: ArtifactReceiptDocument =
+                canonical_parse(&bytes).map_err(binding_error)?;
+            let content = if receipt.content_hex.len().is_multiple_of(2)
+                && receipt.content_hex.len() <= declaration.max_bytes as usize * 2
+                && lower_hex(&receipt.content_hex)
+            {
+                hex::decode(&receipt.content_hex).map_err(|_| BindingError::HostRefused)?
+            } else {
+                return Err(BindingError::HostRefused);
+            };
+            let digest: [u8; 32] = Sha256::digest(&content).into();
+            if receipt.schema_version != 1
+                || receipt.execution_binding_digest != hex::encode(binding.execution_binding_digest)
+                || receipt.request_event_id != hex::encode(binding.request_event_id)
+                || receipt.run_id != hex::encode(binding.run_id)
+                || receipt.workflow_id
+                    != binding
+                        .workflow_id
+                        .as_str()
+                        .map_err(|_| BindingError::HostRefused)?
+                || receipt.workflow_digest != hex::encode(binding.workflow_digest)
+                || receipt.job_id
+                    != binding
+                        .job_id
+                        .as_str()
+                        .map_err(|_| BindingError::HostRefused)?
+                || receipt.attempt != binding.attempt
+                || receipt.artifact_id != artifact_id
+                || receipt.name
+                    != declaration
+                        .name
+                        .as_str()
+                        .map_err(|_| BindingError::HostRefused)?
+                || receipt.media_type
+                    != declaration
+                        .media_type
+                        .as_str()
+                        .map_err(|_| BindingError::HostRefused)?
+                || receipt.sha256 != hex::encode(digest)
+                || receipt.byte_length as usize != content.len()
+            {
+                return Err(BindingError::HostRefused);
+            }
+            let receipt_digest: [u8; 32] = Sha256::digest(&bytes).into();
+            set_material.extend_from_slice(&receipt_digest);
+            items.push(HostEvidenceItem {
+                descriptor: EvidenceDescriptor {
+                    kind: EvidenceKind::Artifact,
+                    digest,
+                    length: content.len() as u32,
+                    artifact_name_digest: Sha256::digest(receipt.name.as_bytes()).into(),
+                    artifact_media_type_digest: Sha256::digest(receipt.media_type.as_bytes())
+                        .into(),
+                    artifact_id: declaration.artifact_id,
+                    artifact_name: declaration.name,
+                    artifact_media_type: declaration.media_type,
+                    teardown_lease_id: [0; 16],
+                    teardown_lease_generation: 0,
+                    teardown_attestation_digest: [0; 32],
+                },
+                bytes: content,
+            });
+        }
+        Ok((items, Sha256::digest(set_material).into()))
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -644,12 +867,40 @@ struct EvidenceDocument {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct ArtifactReceiptDocument {
+    schema_version: u16,
+    execution_binding_digest: String,
+    request_event_id: String,
+    run_id: String,
+    workflow_id: String,
+    workflow_digest: String,
+    job_id: String,
+    attempt: u32,
+    artifact_id: String,
+    name: String,
+    media_type: String,
+    sha256: String,
+    byte_length: u32,
+    content_hex: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TeardownDocument {
     schema_version: u16,
     execution_binding_digest: String,
     evidence_set_digest: String,
     stop_reason: String,
     executor_receipt_digest: String,
+    request_event_id: String,
+    run_id: String,
+    workflow_id: String,
+    workflow_digest: String,
+    job_id: String,
+    attempt: u32,
+    lease_id: String,
+    lease_generation: u64,
+    artifact_receipt_set_digest: String,
 }
 
 impl PrivilegedHostSystem for LocalHostSystem {
@@ -702,6 +953,7 @@ impl PrivilegedHostSystem for LocalHostSystem {
             None,
         )?;
         let conclusion = parse_conclusion(response.conclusion.as_deref())?;
+        self.sealed_artifacts(binding)?;
         let digest = self.write_evidence(
             binding,
             conclusion,
@@ -722,6 +974,9 @@ impl PrivilegedHostSystem for LocalHostSystem {
         binding: ExecutionBindingV1,
         reason: HostStopReason,
     ) -> Result<HostTerminalReceipt, BindingError> {
+        let captured = (reason == HostStopReason::Completed)
+            .then(|| self.sealed_artifacts(binding))
+            .transpose()?;
         let response = self.request("teardown", binding, None, None, None, Some(reason))?;
         let conclusion = parse_conclusion(response.conclusion.as_deref())?;
         let evidence = match self.existing_evidence(binding)? {
@@ -737,12 +992,33 @@ impl PrivilegedHostSystem for LocalHostSystem {
             )?,
         };
         let executor_receipt = decode_nonzero(&response.receipt_digest)?;
+        let artifact_receipt_set_digest = match captured {
+            Some((_, digest)) => digest,
+            None => self.sealed_artifacts(binding)?.1,
+        };
         let document = TeardownDocument {
             schema_version: 1,
             execution_binding_digest: hex::encode(binding.execution_binding_digest),
             evidence_set_digest: hex::encode(evidence),
             stop_reason: stop_name(reason).to_owned(),
             executor_receipt_digest: hex::encode(executor_receipt),
+            request_event_id: hex::encode(binding.request_event_id),
+            run_id: hex::encode(binding.run_id),
+            workflow_id: binding
+                .workflow_id
+                .as_str()
+                .map_err(|_| BindingError::HostRefused)?
+                .into(),
+            workflow_digest: hex::encode(binding.workflow_digest),
+            job_id: binding
+                .job_id
+                .as_str()
+                .map_err(|_| BindingError::HostRefused)?
+                .into(),
+            attempt: binding.attempt,
+            lease_id: hex::encode(binding.lease_id),
+            lease_generation: binding.lease_generation,
+            artifact_receipt_set_digest: hex::encode(artifact_receipt_set_digest),
         };
         let bytes = canonical_bytes(&document).map_err(binding_error)?;
         let teardown_digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -817,12 +1093,30 @@ impl PrivilegedHostSystem for LocalHostSystem {
             .map_err(binding_error)?;
         let teardown: TeardownDocument = canonical_parse(&teardown_bytes).map_err(binding_error)?;
         let teardown_digest: [u8; 32] = Sha256::digest(&teardown_bytes).into();
+        let (artifact_items, artifact_receipt_set_digest) = self.sealed_artifacts(binding)?;
         if teardown.schema_version != 1
             || decode_hex::<32>(&teardown.execution_binding_digest).map_err(binding_error)?
                 != binding.execution_binding_digest
             || decode_hex::<32>(&teardown.evidence_set_digest).map_err(binding_error)?
                 != evidence_digest
             || decode_nonzero(&teardown.executor_receipt_digest).is_err()
+            || teardown.request_event_id != hex::encode(binding.request_event_id)
+            || teardown.run_id != hex::encode(binding.run_id)
+            || teardown.workflow_id
+                != binding
+                    .workflow_id
+                    .as_str()
+                    .map_err(|_| BindingError::HostRefused)?
+            || teardown.workflow_digest != hex::encode(binding.workflow_digest)
+            || teardown.job_id
+                != binding
+                    .job_id
+                    .as_str()
+                    .map_err(|_| BindingError::HostRefused)?
+            || teardown.attempt != binding.attempt
+            || teardown.lease_id != hex::encode(binding.lease_id)
+            || teardown.lease_generation != binding.lease_generation
+            || teardown.artifact_receipt_set_digest != hex::encode(artifact_receipt_set_digest)
             || !matches!(
                 teardown.stop_reason.as_str(),
                 "cancelled" | "completed" | "expired" | "recovery"
@@ -831,34 +1125,40 @@ impl PrivilegedHostSystem for LocalHostSystem {
             return Err(BindingError::HostRefused);
         }
 
-        Ok(vec![
-            HostEvidenceItem {
-                descriptor: EvidenceDescriptor {
-                    kind: EvidenceKind::Stdout,
-                    digest: evidence_digest,
-                    length: evidence_bytes.len() as u32,
-                    artifact_name_digest: [0; 32],
-                    artifact_media_type_digest: [0; 32],
-                    teardown_lease_id: [0; 16],
-                    teardown_lease_generation: 0,
-                    teardown_attestation_digest: [0; 32],
-                },
-                bytes: evidence_bytes,
+        let mut items = vec![HostEvidenceItem {
+            descriptor: EvidenceDescriptor {
+                kind: EvidenceKind::Stdout,
+                digest: evidence_digest,
+                length: evidence_bytes.len() as u32,
+                artifact_name_digest: [0; 32],
+                artifact_media_type_digest: [0; 32],
+                artifact_id: WireText64::EMPTY,
+                artifact_name: WireText64::EMPTY,
+                artifact_media_type: WireText64::EMPTY,
+                teardown_lease_id: [0; 16],
+                teardown_lease_generation: 0,
+                teardown_attestation_digest: [0; 32],
             },
-            HostEvidenceItem {
-                descriptor: EvidenceDescriptor {
-                    kind: EvidenceKind::Teardown,
-                    digest: teardown_digest,
-                    length: teardown_bytes.len() as u32,
-                    artifact_name_digest: [0; 32],
-                    artifact_media_type_digest: [0; 32],
-                    teardown_lease_id: binding.lease_id,
-                    teardown_lease_generation: binding.lease_generation,
-                    teardown_attestation_digest: teardown_digest,
-                },
-                bytes: teardown_bytes,
+            bytes: evidence_bytes,
+        }];
+        items.extend(artifact_items);
+        items.push(HostEvidenceItem {
+            descriptor: EvidenceDescriptor {
+                kind: EvidenceKind::Teardown,
+                digest: teardown_digest,
+                length: teardown_bytes.len() as u32,
+                artifact_name_digest: [0; 32],
+                artifact_media_type_digest: [0; 32],
+                artifact_id: WireText64::EMPTY,
+                artifact_name: WireText64::EMPTY,
+                artifact_media_type: WireText64::EMPTY,
+                teardown_lease_id: binding.lease_id,
+                teardown_lease_generation: binding.lease_generation,
+                teardown_attestation_digest: teardown_digest,
             },
-        ])
+            bytes: teardown_bytes,
+        });
+        Ok(items)
     }
 }
 
@@ -897,6 +1197,8 @@ fn load_from(
         evidence: SafeDirectory::open(paths.resolve(EVIDENCE_ROOT)?, owner, 0o700)?,
         teardown: SafeDirectory::open(paths.resolve(TEARDOWN_ROOT)?, owner, 0o700)?,
         evidence_by_binding: BTreeMap::new(),
+        attempts: SafeDirectory::open(paths.resolve(ATTEMPT_ROOT)?, owner, 0o711)?,
+        job_uid: config.identities.job_uid,
     };
     let mut controller =
         ProductionBindingController::new(StaticLaneManifest::new(manifest), intents, journal, host);
@@ -936,6 +1238,7 @@ fn validate_config(
         || config.paths.binding_root != BINDING_ROOT
         || config.paths.evidence_root != EVIDENCE_ROOT
         || config.paths.teardown_root != TEARDOWN_ROOT
+        || config.paths.attempt_root != ATTEMPT_ROOT
         || config.paths.executor_socket != EXECUTOR_SOCKET
         || config.executor.path != EXECUTOR_PROGRAM
         || config.executor.source_commit.len() != 40
@@ -1099,6 +1402,7 @@ impl ManifestDocument {
 
 impl IntentDocument {
     fn into_intent(self) -> Result<JobIntentV2, ProductionV2Error> {
+        let artifacts = artifact_array(&self.artifacts)?;
         Ok(JobIntentV2 {
             schema_version: self.schema_version,
             signed_request_digest: decode_hex(&self.signed_request_digest)?,
@@ -1124,6 +1428,11 @@ impl IntentDocument {
                 "accepted_reviewed" => TrustClass::AcceptedReviewed,
                 _ => return Err(ProductionV2Error::Closed),
             },
+            request_event_id: decode_hex(&self.request_event_id)?,
+            workflow_id: wire_text(&self.workflow_id)?,
+            job_id: wire_text(&self.job_id)?,
+            artifact_count: self.artifacts.len() as u8,
+            artifacts,
         })
     }
 }
@@ -1180,12 +1489,23 @@ impl From<ExecutionBindingRecord> for BindingDocument {
             host_receipt_digest: hex::encode(record.host_receipt_digest),
             evidence_set_digest: hex::encode(record.evidence_set_digest),
             teardown_digest: hex::encode(record.teardown_digest),
+            request_event_id: hex::encode(binding.request_event_id),
+            workflow_digest: hex::encode(binding.workflow_digest),
+            workflow_id: binding.workflow_id.as_str().unwrap_or_default().into(),
+            job_id: binding.job_id.as_str().unwrap_or_default().into(),
+            artifacts: binding
+                .artifacts
+                .iter()
+                .flatten()
+                .map(ArtifactDocument::from)
+                .collect(),
         }
     }
 }
 
 impl BindingDocument {
     fn into_record(self) -> Result<ExecutionBindingRecord, ProductionV2Error> {
+        let artifacts = artifact_array(&self.artifacts)?;
         let binding = ExecutionBindingV1 {
             schema_version: self.schema_version,
             lane_manifest_digest: decode_hex(&self.lane_manifest_digest)?,
@@ -1205,9 +1525,21 @@ impl BindingDocument {
             admitted_at: self.admitted_at,
             deadline_at: self.deadline_at,
             execution_binding_digest: decode_hex(&self.execution_binding_digest)?,
+            request_event_id: decode_hex(&self.request_event_id)?,
+            workflow_digest: decode_hex(&self.workflow_digest)?,
+            workflow_id: wire_text(&self.workflow_id)?,
+            job_id: wire_text(&self.job_id)?,
+            artifact_count: self.artifacts.len() as u8,
+            artifacts,
         };
         if binding.schema_version != EXECUTION_BINDING_SCHEMA_V1
             || binding.execution_binding_digest != binding.computed_digest()
+            || usize::from(binding.artifact_count) != self.artifacts.len()
+            || binding
+                .artifacts
+                .iter()
+                .flatten()
+                .any(|item| !item.validate())
         {
             return Err(ProductionV2Error::Closed);
         }
@@ -1223,6 +1555,41 @@ impl BindingDocument {
             teardown_digest: decode_hex(&self.teardown_digest)?,
         })
     }
+}
+
+impl From<&ArtifactDeclarationV1> for ArtifactDocument {
+    fn from(value: &ArtifactDeclarationV1) -> Self {
+        Self {
+            artifact_id: value.artifact_id.as_str().unwrap_or_default().into(),
+            name: value.name.as_str().unwrap_or_default().into(),
+            media_type: value.media_type.as_str().unwrap_or_default().into(),
+            relative_name: value.relative_name.as_str().unwrap_or_default().into(),
+            max_bytes: value.max_bytes,
+        }
+    }
+}
+
+fn artifact_array(
+    documents: &[ArtifactDocument],
+) -> Result<[Option<ArtifactDeclarationV1>; 1], ProductionV2Error> {
+    if documents.len() > 1 {
+        return Err(ProductionV2Error::Closed);
+    }
+    let mut artifacts = [None];
+    if let Some(value) = documents.first() {
+        artifacts[0] = Some(ArtifactDeclarationV1 {
+            artifact_id: wire_text(&value.artifact_id)?,
+            name: wire_text(&value.name)?,
+            media_type: wire_text(&value.media_type)?,
+            relative_name: wire_text(&value.relative_name)?,
+            max_bytes: value.max_bytes,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn wire_text(value: &str) -> Result<WireText64, ProductionV2Error> {
+    WireText64::from_ascii(value).map_err(|_| ProductionV2Error::Closed)
 }
 
 fn read_document<T: for<'de> Deserialize<'de> + Serialize>(
@@ -1573,7 +1940,7 @@ fn executable_sha256() -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn valid_record() -> ExecutionBindingRecord {
         let mut binding = ExecutionBindingV1 {
@@ -1595,6 +1962,12 @@ mod tests {
             admitted_at: 1,
             deadline_at: 2,
             execution_binding_digest: [0; 32],
+            request_event_id: [12; 32],
+            workflow_digest: [13; 32],
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            job_id: WireText64::from_ascii("job").unwrap(),
+            artifact_count: 0,
+            artifacts: [None],
         };
         binding.execution_binding_digest = binding.computed_digest();
         ExecutionBindingRecord {
@@ -1619,6 +1992,115 @@ mod tests {
     }
 
     #[test]
+    fn declared_artifact_capture_is_exact_scrubbed_restartable_and_hostile_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let evidence_path = temporary.path().join("evidence");
+        let teardown_path = temporary.path().join("teardown");
+        let attempts_path = temporary.path().join("attempts");
+        for (path, mode) in [
+            (&evidence_path, 0o700),
+            (&teardown_path, 0o700),
+            (&attempts_path, 0o711),
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = fs::metadata(&evidence_path).unwrap().uid();
+        let make_system = || LocalHostSystem {
+            identity: HostIdentity {
+                broker_build_identity: [1; 32],
+                host_profile_digest: [2; 32],
+                suite_identity: [3; 32],
+            },
+            socket: "/nonexistent".into(),
+            executor_uid: owner,
+            executor_gid: fs::metadata(&evidence_path).unwrap().gid(),
+            executor: ProgramProvenance {
+                path: "/nonexistent".into(),
+                sha256: hex::encode([4; 32]),
+                source_commit: "1".repeat(40),
+                uid: owner,
+                gid: 0,
+                mode: 0o755,
+            },
+            evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
+            teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts_path.clone(), owner, 0o711).unwrap(),
+            job_uid: owner,
+        };
+
+        let mut empty_binding = valid_record().binding;
+        empty_binding.execution_binding_digest = empty_binding.computed_digest();
+        assert!(make_system()
+            .sealed_artifacts(empty_binding)
+            .unwrap()
+            .0
+            .is_empty());
+
+        let declaration = ArtifactDeclarationV1 {
+            artifact_id: wire_text("canary-report").unwrap(),
+            name: wire_text("report.txt").unwrap(),
+            media_type: wire_text("text/plain").unwrap(),
+            relative_name: wire_text("report.txt").unwrap(),
+            max_bytes: 1024,
+        };
+        let mut binding = empty_binding;
+        binding.artifact_count = 1;
+        binding.artifacts = [Some(declaration)];
+        binding.execution_binding_digest = binding.computed_digest();
+        let attempt_path = attempts_path.join(hex::encode(binding.attempt_id));
+        fs::create_dir(&attempt_path).unwrap();
+        fs::set_permissions(&attempt_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let artifact_path = attempt_path.join("report.txt");
+        fs::write(&artifact_path, b"ok\nTOKEN=secret\n").unwrap();
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let captured = make_system().sealed_artifacts(binding).unwrap().0;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].descriptor.kind, EvidenceKind::Artifact);
+        assert_eq!(captured[0].descriptor.artifact_id, declaration.artifact_id);
+        assert_eq!(captured[0].bytes, b"ok\n[redacted]\n");
+        fs::remove_file(&artifact_path).unwrap();
+        fs::remove_dir(&attempt_path).unwrap();
+        assert_eq!(make_system().sealed_artifacts(binding).unwrap().0, captured);
+
+        let mut hostile = binding;
+        hostile.attempt_id = [55; 16];
+        hostile.execution_binding_digest = hostile.computed_digest();
+        let hostile_root = attempts_path.join(hex::encode(hostile.attempt_id));
+        fs::create_dir(&hostile_root).unwrap();
+        fs::set_permissions(&hostile_root, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink("../outside", hostile_root.join("report.txt")).unwrap();
+        assert!(make_system().sealed_artifacts(hostile).is_err());
+
+        let mut undeclared = binding;
+        undeclared.attempt_id = [56; 16];
+        undeclared.execution_binding_digest = undeclared.computed_digest();
+        let undeclared_root = attempts_path.join(hex::encode(undeclared.attempt_id));
+        fs::create_dir(&undeclared_root).unwrap();
+        fs::set_permissions(&undeclared_root, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["report.txt", "extra.txt"] {
+            let path = undeclared_root.join(name);
+            fs::write(&path, b"content\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(make_system().sealed_artifacts(undeclared).is_err());
+
+        let mut hardlinked = binding;
+        hardlinked.attempt_id = [57; 16];
+        hardlinked.execution_binding_digest = hardlinked.computed_digest();
+        let hardlink_root = attempts_path.join(hex::encode(hardlinked.attempt_id));
+        fs::create_dir(&hardlink_root).unwrap();
+        fs::set_permissions(&hardlink_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = temporary.path().join("outside-artifact");
+        fs::write(&outside, b"content\n").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&outside, hardlink_root.join("report.txt")).unwrap();
+        assert!(make_system().sealed_artifacts(hardlinked).is_err());
+    }
+
+    #[test]
     fn binding_document_rejects_digest_tampering() {
         let binding = ExecutionBindingV1 {
             schema_version: EXECUTION_BINDING_SCHEMA_V1,
@@ -1639,6 +2121,12 @@ mod tests {
             admitted_at: 1,
             deadline_at: 2,
             execution_binding_digest: [12; 32],
+            request_event_id: [13; 32],
+            workflow_digest: [14; 32],
+            workflow_id: WireText64::from_ascii("workflow").unwrap(),
+            job_id: WireText64::from_ascii("job").unwrap(),
+            artifact_count: 0,
+            artifacts: [None],
         };
         let record = ExecutionBindingRecord {
             binding,
@@ -1740,10 +2228,13 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let evidence_path = temporary.path().join("evidence");
         let teardown_path = temporary.path().join("teardown");
+        let attempts_path = temporary.path().join("attempts");
         fs::create_dir(&evidence_path).unwrap();
         fs::create_dir(&teardown_path).unwrap();
+        fs::create_dir(&attempts_path).unwrap();
         fs::set_permissions(&evidence_path, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&teardown_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&attempts_path, fs::Permissions::from_mode(0o711)).unwrap();
         let owner = fs::metadata(&evidence_path).unwrap().uid();
         let make_system = || LocalHostSystem {
             identity: HostIdentity {
@@ -1765,6 +2256,8 @@ mod tests {
             evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
             teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
             evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts_path.clone(), owner, 0o711).unwrap(),
+            job_uid: owner,
         };
         let binding = valid_record().binding;
         let mut first = make_system();
@@ -1777,6 +2270,15 @@ mod tests {
             evidence_set_digest: hex::encode(digest),
             stop_reason: "completed".into(),
             executor_receipt_digest: hex::encode([15; 32]),
+            request_event_id: hex::encode(binding.request_event_id),
+            run_id: hex::encode(binding.run_id),
+            workflow_id: binding.workflow_id.as_str().unwrap().into(),
+            workflow_digest: hex::encode(binding.workflow_digest),
+            job_id: binding.job_id.as_str().unwrap().into(),
+            attempt: binding.attempt,
+            lease_id: hex::encode(binding.lease_id),
+            lease_generation: binding.lease_generation,
+            artifact_receipt_set_digest: hex::encode(first.sealed_artifacts(binding).unwrap().1),
         };
         first
             .teardown
@@ -1786,6 +2288,34 @@ mod tests {
                 0o600,
             )
             .unwrap();
+        let reopened_teardown: TeardownDocument = canonical_parse(
+            &first
+                .teardown
+                .read(
+                    &format!("{}.json", hex::encode(binding.attempt_id)),
+                    0o600,
+                    MAX_RECORD,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_teardown.request_event_id,
+            hex::encode(binding.request_event_id)
+        );
+        assert_eq!(reopened_teardown.run_id, hex::encode(binding.run_id));
+        assert_eq!(
+            reopened_teardown.workflow_id,
+            binding.workflow_id.as_str().unwrap()
+        );
+        assert_eq!(
+            reopened_teardown.workflow_digest,
+            hex::encode(binding.workflow_digest)
+        );
+        assert_eq!(reopened_teardown.job_id, binding.job_id.as_str().unwrap());
+        assert_eq!(reopened_teardown.attempt, binding.attempt);
+        assert_eq!(reopened_teardown.lease_id, hex::encode(binding.lease_id));
+        assert_eq!(reopened_teardown.lease_generation, binding.lease_generation);
         drop(first);
 
         let mut restarted = make_system();
@@ -1816,6 +2346,7 @@ mod tests {
             "var/lib/buzzci/execd-v2/bindings",
             "var/lib/buzzci/execd-v2/evidence",
             "var/lib/buzzci/execd-v2/teardown",
+            "var/lib/buzzci/execd-v2/attempts",
             "usr/libexec",
             "run/buzzci",
         ] {
@@ -1824,6 +2355,11 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         fs::set_permissions(prefix.join("etc/buzzci"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            prefix.join("var/lib/buzzci/execd-v2/attempts"),
+            fs::Permissions::from_mode(0o711),
+        )
+        .unwrap();
         let owner = fs::metadata(prefix).unwrap().uid();
         let group = fs::metadata(prefix).unwrap().gid();
         let program_path = prefix.join("usr/libexec/buzz-ci-executor");
@@ -1869,6 +2405,7 @@ mod tests {
                 evidence_root: EVIDENCE_ROOT.into(),
                 teardown_root: TEARDOWN_ROOT.into(),
                 executor_socket: EXECUTOR_SOCKET.into(),
+                attempt_root: ATTEMPT_ROOT.into(),
             },
             lane_manifest: manifest_document,
             lane_manifest_digest: manifest_digest,

@@ -10,6 +10,10 @@ persists bindings, collects terminal output, scrubs it, or writes evidence.
 `/usr/libexec/buzz-ci-executor` runs as the separate `buzzci-job` principal and
 accepts only the typed, binding-digest protocol over its root-only systemd
 socket. It cannot receive argv, environment, prior claims, or log paths.
+Declared artifacts are limited to one 32 KiB text output per attempt. Execd
+opens it beneath the root-owned `attempts` anchor without following links,
+scrubs it, and persists the receipt once before teardown; undeclared, linked,
+oversized, or metadata-drifting outputs fail closed.
 
 The activation access group is `buzzci-execd`, with exactly `buzzci-runner` and
 `buzzci-ctl` as members. The execd control socket is root:`buzzci-execd` mode
