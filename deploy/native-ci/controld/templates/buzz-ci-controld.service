@@ -1,0 +1,26 @@
+[Unit]
+Description=Buzz CI capacity-zero control daemon
+Documentation=file:/usr/share/doc/buzz-ci-controld/README.md
+Requires=systemd-tmpfiles-setup.service
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=exec
+User=buzzci-controld
+Group=buzzci-controld
+UMask=0077
+ExecStart=/usr/libexec/buzz-ci-controld /etc/buzzci/controld-v1.json
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/buzzci/controld-v1.json
+ReadWritePaths=/var/lib/buzzci/controld
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+Restart=no

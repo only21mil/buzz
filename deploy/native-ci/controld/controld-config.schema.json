@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/controld-config-v1.json",
+  "title": "Buzz CI capacity-zero controld configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "capacity", "store_root"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "capacity": { "const": 0 },
+    "store_root": { "const": "/var/lib/buzzci/controld" }
+  }
+}
