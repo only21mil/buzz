@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -14,6 +19,11 @@ SPEC = importlib.util.spec_from_file_location("execd_verify", VERIFY_PATH)
 assert SPEC and SPEC.loader
 VERIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VERIFY)
+
+EXECD_DIR = ROOT / "deploy/native-ci/execd"
+sys.path.insert(0, str(EXECD_DIR))
+import freeze_package as FREEZER  # noqa: E402
+import install as INSTALL  # noqa: E402
 
 EXECD_TMPFILES = ROOT / "deploy/native-ci/execd/templates/buzzci-execd.tmpfiles"
 SHARED_ANCESTOR = "d /var/lib/buzzci 0711 root root - -"
@@ -42,6 +52,7 @@ def _copy_execd_package(fake: Path) -> Path:
             destination = target / source.relative_to(ROOT / "deploy/native-ci/execd")
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(source.read_bytes())
+            destination.chmod(stat.S_IMODE(source.stat().st_mode))
     return target
 
 
@@ -66,6 +77,93 @@ def _apply_directory_plan(root: Path, lines: tuple[str, ...] | list[str]) -> Non
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+
+
+def _activation_package(path: Path, source_commit: str, binary_sha256: str, provenance_sha256: str) -> Path:
+    path.mkdir(mode=0o700)
+    entries = [
+        {"role": f"owned-{index}", "source": f"assets/{index}", "source_mode": "0400", "sha256": hashlib.sha256(target.encode()).hexdigest(), "target": target, "install_mode": "0644", "uid": 0, "gid": 0}
+        for index, target in enumerate(FREEZER.ACTIVATION_OWNED_TARGETS)
+    ]
+    draft = {
+        "schema": FREEZER.ACTIVATION_DRAFT_SCHEMA,
+        "source_commit": source_commit,
+        "components": [{
+            "name": "execd", "binary_path": "/usr/libexec/buzz-ci-execd",
+            "binary_sha256": binary_sha256, "source_commit": source_commit,
+            "provenance_sha256": provenance_sha256, "uid": 0, "gid": 0, "mode": "0755",
+        }],
+        "entries": entries,
+    }
+    package_digest = FREEZER.sha256(FREEZER.canonical_json(draft))
+    manifest = dict(draft)
+    manifest["schema"] = FREEZER.ACTIVATION_SCHEMA
+    manifest["activation_id"] = f"buzz-ci-capacity-one-{source_commit[:12]}-{package_digest[:12]}"
+    manifest["package_digest"] = package_digest
+    target = path / "activation-manifest.json"
+    target.write_bytes(FREEZER.canonical_json(manifest))
+    target.chmod(0o600)
+    return path
+
+
+def _manual_execd_package(path: Path, binary: bytes) -> dict[str, object]:
+    path.mkdir(mode=0o700)
+    assets = path / "assets"
+    assets.mkdir(mode=0o700)
+    binary_path = assets / "buzz-ci-execd"
+    binary_path.write_bytes(binary)
+    binary_path.chmod(0o500)
+    binary_sha256 = hashlib.sha256(binary).hexdigest()
+    provenance = {
+        "binary": "buzz-ci-execd", "profile": "release",
+        "schema": FREEZER.PROVENANCE_SCHEMA, "sha256": binary_sha256,
+        "source_commit": "a" * 40,
+    }
+    provenance_raw = FREEZER.canonical_json(provenance)
+    provenance_path = path / "binary-provenance.json"
+    provenance_path.write_bytes(provenance_raw)
+    provenance_path.chmod(0o600)
+    target_digests = [
+        {"target": target, "sha256": hashlib.sha256(target.encode()).hexdigest()}
+        for target in FREEZER.ACTIVATION_OWNED_TARGETS
+    ]
+    binding = {
+        "activation_id": "buzz-ci-capacity-one-aaaaaaaaaaaa-" + "b" * 12,
+        "package_digest": "b" * 64,
+        "manifest_sha256": "c" * 64,
+        "source_commit": "a" * 40,
+        "execd_binary_sha256": binary_sha256,
+        "execd_provenance_sha256": hashlib.sha256(provenance_raw).hexdigest(),
+        "owned_entries_sha256": "d" * 64,
+        "owned_target_sha256": target_digests,
+        "receipt_path": "/var/lib/buzzci/activation-controller/receipt-v1.json",
+        "receipt_schema": "buzz-ci-capacity-one-activation-receipt-v1",
+    }
+    manifest: dict[str, object] = {
+        "schema": FREEZER.SCHEMA,
+        "package_id": f"buzz-ci-execd-aaaaaaaaaaaa-{binary_sha256[:12]}",
+        "source_commit": "a" * 40,
+        "binary_provenance_sha256": hashlib.sha256(provenance_raw).hexdigest(),
+        "default_state": FREEZER.DEFAULT_STATE,
+        "runtime_contract": FREEZER.RUNTIME_CONTRACT,
+        "activation_owned_targets": FREEZER.ACTIVATION_OWNED_TARGETS,
+        "activation_binding": binding,
+        "seccomp_contract": FREEZER.SECCOMP_CONTRACT,
+        "install_receipt": FREEZER.INSTALL_RECEIPT,
+        "package_uid": 0,
+        "package_gid": 0,
+        "directories": FREEZER.DIRECTORIES,
+        "entries": [{
+            "role": "binary", "source": "assets/buzz-ci-execd",
+            "target": "/usr/libexec/buzz-ci-execd", "source_mode": "0500",
+            "install_mode": "0755", "uid": 0, "gid": 0, "sha256": binary_sha256,
+        }],
+    }
+    manifest["package_digest"] = FREEZER.sha256(FREEZER.canonical_json(manifest))
+    manifest_path = path / "package-manifest.json"
+    manifest_path.write_bytes(FREEZER.canonical_json(manifest))
+    manifest_path.chmod(0o600)
+    return manifest
 
 
 class ExecdPackageTests(unittest.TestCase):
@@ -205,6 +303,148 @@ class ExecdPackageTests(unittest.TestCase):
                     tmpfiles.write_text(tmpfiles.read_text().replace(original, replacement))
                     with self.assertRaises(ValueError):
                         VERIFY.verify(fake)
+
+    def test_binary_only_freezer_binds_the_central_activation_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "source"
+            package_source = repository / "deploy/native-ci/execd"
+            package_source.mkdir(parents=True)
+            (package_source / "marker").write_text("tracked\n")
+            subprocess.run(["git", "init", "-q", repository], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", repository, "add", "."], check=True)
+            subprocess.run(["git", "-C", repository, "commit", "-q", "-m", "fixture"], check=True)
+            source_commit = subprocess.check_output(
+                ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+            ).strip()
+            binary = root / "buzz-ci-execd"
+            binary.write_bytes(b"fixed execd binary\n")
+            binary.chmod(0o755)
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            provenance_value = {
+                "binary": "buzz-ci-execd", "profile": "release",
+                "schema": FREEZER.PROVENANCE_SCHEMA, "sha256": binary_sha256,
+                "source_commit": source_commit,
+            }
+            provenance = root / "binary-provenance.json"
+            provenance.write_bytes(FREEZER.canonical_json(provenance_value))
+            provenance.chmod(0o600)
+            activation = _activation_package(
+                root / "activation", source_commit, binary_sha256,
+                hashlib.sha256(provenance.read_bytes()).hexdigest(),
+            )
+            output = root / "execd-package"
+            manifest = FREEZER.freeze_package(
+                repository, source_commit, binary, provenance, activation, output
+            )
+            parsed, entry = INSTALL.parse_package(output)
+            self.assertEqual(parsed, manifest)
+            self.assertEqual(entry.target, "/usr/libexec/buzz-ci-execd")
+            self.assertEqual(
+                parsed["activation_binding"]["package_digest"],
+                json.loads((activation / "activation-manifest.json").read_bytes())["package_digest"],
+            )
+            self.assertNotIn("/usr/libexec/buzz-ci-executor", [item["target"] for item in parsed["entries"]])
+
+    def test_installer_is_create_once_dormant_and_central_receipt_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            package = base / "package"
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                manifest = _manual_execd_package(package, b"fixed execd binary\n")
+                root = base / "root"
+                root.mkdir(mode=0o700)
+                seccomp_path = root / "usr/share/containers/seccomp.json"
+                seccomp_path.parent.mkdir(parents=True)
+                for parent in (root / "usr", root / "usr/share", root / "usr/share/containers"):
+                    parent.chmod(0o755)
+                seccomp_path.write_bytes(seccomp)
+                seccomp_path.chmod(0o644)
+
+                result = INSTALL.install(package, root)
+                self.assertEqual(result["status"], "installed")
+                self.assertEqual(result["activation_receipt"], "pending")
+                self.assertEqual(result["install_receipt"], "verified")
+                installed = root / "usr/libexec/buzz-ci-execd"
+                self.assertEqual(installed.read_bytes(), b"fixed execd binary\n")
+                self.assertEqual(_mode(installed), 0o755)
+                self.assertEqual(INSTALL.install(package, root)["status"], "unchanged")
+
+                binding = manifest["activation_binding"]
+                receipt = {
+                    "schema": binding["receipt_schema"],
+                    "activation_id": binding["activation_id"],
+                    "package_digest": binding["package_digest"],
+                    "source_commit": binding["source_commit"],
+                    "targets": [
+                        {"target": item["target"], "staged_sha256": item["sha256"]}
+                        for item in binding["owned_target_sha256"]
+                    ],
+                    "state": "staged",
+                    "created_at": "2026-08-29T00:00:00Z",
+                    "updated_at": "2026-08-29T00:00:00Z",
+                    "principals_retained_on_rollback": True,
+                    "acceptance_generated": [],
+                    "acceptance_ledger_prior": None,
+                    "fixed_package": {
+                        "path": "/var/lib/buzzci/activation-controller/package",
+                        "manifest_sha256": binding["manifest_sha256"],
+                    },
+                    "systemd_before": {},
+                    "qualification": None,
+                    "capacity_one": None,
+                    "qualification_zero": None,
+                    "last_error": None,
+                }
+                receipt_path = root / "var/lib/buzzci/activation-controller/receipt-v1.json"
+                receipt_path.parent.mkdir(mode=0o711)
+                receipt_path.parent.chmod(0o711)
+                receipt_path.write_bytes(FREEZER.canonical_json(receipt))
+                receipt_path.chmod(0o600)
+                self.assertEqual(INSTALL.inspect(package, root)["activation_receipt"], "verified")
+                receipt["targets"][0]["staged_sha256"] = "f" * 64
+                receipt_path.write_bytes(FREEZER.canonical_json(receipt))
+                with self.assertRaisesRegex(ValueError, "managed bindings"):
+                    INSTALL.inspect(package, root)
+
+    def test_installer_rejects_links_drift_and_unreceipted_central_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package = base / "package"
+                _manual_execd_package(package, b"fixed execd binary\n")
+                root = base / "root"
+                root.mkdir(mode=0o700)
+                seccomp_path = root / "usr/share/containers/seccomp.json"
+                seccomp_path.parent.mkdir(parents=True)
+                for parent in (root / "usr", root / "usr/share", root / "usr/share/containers"):
+                    parent.chmod(0o755)
+                seccomp_path.write_bytes(seccomp)
+                seccomp_path.chmod(0o644)
+                central = root / FREEZER.ACTIVATION_OWNED_TARGETS[0].removeprefix("/")
+                central.parent.mkdir(parents=True)
+                central.write_bytes(b"unreceipted\n")
+                with self.assertRaisesRegex(ValueError, "without a central receipt"):
+                    INSTALL.install(package, root)
+                central.unlink()
+                asset = package / "assets/buzz-ci-execd"
+                replacement = package / "assets/replacement"
+                replacement.write_bytes(asset.read_bytes())
+                replacement.chmod(0o500)
+                asset.unlink()
+                asset.symlink_to(replacement.name)
+                with self.assertRaises((OSError, ValueError)):
+                    INSTALL.parse_package(package)
 
 
 if __name__ == "__main__":
