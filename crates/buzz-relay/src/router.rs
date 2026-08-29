@@ -49,7 +49,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let ci_evidence_router = Router::new()
         .route(
             "/ci/logs/{request_id}/{run_id}/{job_id}/{attempt}/{sha256}",
-            put(api::ci::put_ci_log),
+            put(api::ci::put_ci_log)
+                .get(api::ci::get_ci_log)
+                .head(api::ci::head_ci_log),
         )
         .route(
             "/ci/artifacts/{request_id}/{run_id}/{job_id}/{attempt}/{artifact_id}/{sha256}",

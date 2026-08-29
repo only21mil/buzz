@@ -528,6 +528,30 @@ fn advance_query_cursor(
     Ok(())
 }
 
+async fn read_http_body_bounded(
+    response: &mut reqwest::Response,
+    cap_bytes: u64,
+    overflow_message: &'static str,
+) -> Result<Vec<u8>, CliError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let next = (body.len() as u64)
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| CliError::Other("CI log response length overflow".into()))?;
+        if next > cap_bytes {
+            return Err(CliError::Other(overflow_message.into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(crate) struct AuthedByteResponse {
+    pub final_url: String,
+    pub content_length: Option<u64>,
+    pub body: Vec<u8>,
+}
+
 pub struct BuzzClient {
     http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
@@ -858,6 +882,78 @@ impl BuzzClient {
                     .send()
                     .await?;
                 self.handle_response(resp).await
+            }
+        })
+        .await
+    }
+
+    /// GET an absolute, same-relay NIP-98 URL with redirects disabled and a
+    /// hard response-byte ceiling. CI verifies the returned bytes against the
+    /// signed log reference before writing any output.
+    pub(crate) async fn get_authed_bytes_bounded(
+        &self,
+        url: &str,
+        cap_bytes: u64,
+    ) -> Result<AuthedByteResponse, CliError> {
+        let http = reqwest::Client::builder()
+            .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
+            .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| CliError::Other(format!("http client init failed: {error}")))?;
+        let url = url.to_owned();
+        self.with_retry_body(|| {
+            let http = http.clone();
+            let url = url.clone();
+            async move {
+                let auth = sign_nip98(&self.keys, "GET", &url, None)?;
+                let mut response = self
+                    .with_auth_tag(http.get(&url).header("Authorization", auth))
+                    .send()
+                    .await?;
+                let final_url = response.url().to_string();
+                if response.status().is_redirection() {
+                    return Err(CliError::Relay {
+                        status: response.status().as_u16(),
+                        body: "CI log redirect refused".into(),
+                    });
+                }
+                if !response.status().is_success() {
+                    let status = response.status().as_u16();
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > cap_bytes)
+                    {
+                        return Err(CliError::Other(
+                            "CI log error response exceeds signed byte cap".into(),
+                        ));
+                    }
+                    let body = read_http_body_bounded(
+                        &mut response,
+                        cap_bytes,
+                        "CI log error response exceeds signed byte cap",
+                    )
+                    .await?;
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    return Err(CliError::Relay { status, body });
+                }
+                let content_length = response.content_length();
+                if content_length.is_some_and(|length| length > cap_bytes) {
+                    return Err(CliError::Other(
+                        "CI log response exceeds signed byte cap".into(),
+                    ));
+                }
+                let body = read_http_body_bounded(
+                    &mut response,
+                    cap_bytes,
+                    "CI log response exceeds signed byte cap",
+                )
+                .await?;
+                Ok(AuthedByteResponse {
+                    final_url,
+                    content_length,
+                    body,
+                })
             }
         })
         .await
@@ -2645,5 +2741,152 @@ mod tests {
             built.headers().get("x-auth-tag").is_none(),
             "x-auth-tag header must not be present when no auth tag is configured"
         );
+    }
+
+    #[tokio::test]
+    async fn ci_log_get_is_authenticated_and_byte_bounded() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = Arc::new(Mutex::new(String::new()));
+        let captured = request.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 8192];
+            let count = stream.read(&mut buffer).await.unwrap();
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..count]).into_owned();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let client = BuzzClient::new(base.clone(), Keys::generate(), None, None).unwrap();
+        let url = format!("{base}/ci/logs/test");
+        let response = client.get_authed_bytes_bounded(&url, 5).await.unwrap();
+        assert_eq!(response.final_url, url);
+        assert_eq!(response.content_length, Some(5));
+        assert_eq!(response.body, b"hello");
+        let request = request.lock().unwrap();
+        assert!(request.starts_with("GET /ci/logs/test HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: nostr "));
+    }
+
+    #[tokio::test]
+    async fn ci_log_get_refuses_redirects_before_following_them() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            stream
+                .write_all(b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /stolen\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let client = BuzzClient::new(base.clone(), Keys::generate(), None, None).unwrap();
+        let result = client
+            .get_authed_bytes_bounded(&format!("{base}/ci/logs/test"), 5)
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::super::error::CliError::Relay { status: 307, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn ci_log_get_refuses_declared_oversize_before_reading_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nsecret")
+                .await
+                .unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let client = BuzzClient::new(base.clone(), Keys::generate(), None, None).unwrap();
+        let result = client
+            .get_authed_bytes_bounded(&format!("{base}/ci/logs/test"), 5)
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::super::error::CliError::Other(message))
+                if message == "CI log response exceeds signed byte cap"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ci_log_get_refuses_oversized_4xx_body_before_decoding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 6\r\n\r\nsecret")
+                .await
+                .unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let client = BuzzClient::new(base.clone(), Keys::generate(), None, None).unwrap();
+        let result = client
+            .get_authed_bytes_bounded(&format!("{base}/ci/logs/test"), 5)
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::super::error::CliError::Other(message))
+                if message == "CI log error response exceeds signed byte cap"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ci_log_get_refuses_oversized_5xx_chunked_body_before_decoding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ntransfer-encoding: chunked\r\n\r\n6\r\nsecret\r\n0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let client = BuzzClient::new(base.clone(), Keys::generate(), None, None).unwrap();
+        let result = client
+            .get_authed_bytes_bounded(&format!("{base}/ci/logs/test"), 5)
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::super::error::CliError::Other(message))
+                if message == "CI log error response exceeds signed byte cap"
+        ));
     }
 }

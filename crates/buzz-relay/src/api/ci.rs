@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path as AxumPath, Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Json;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Json, Response};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,8 +72,10 @@ use crate::config::CiPolicyConfig;
 use crate::state::AppState;
 use crate::tenant::bind_community;
 use buzz_core::channel::MemberRole;
-use buzz_core::ci::CiRequestEnvelope;
-use buzz_core::kind::{KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST};
+use buzz_core::ci::{CiRequestEnvelope, ValidatedCiEnvelope};
+use buzz_core::kind::{
+    KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+};
 #[cfg(test)]
 use buzz_core::CommunityId;
 use buzz_core::TenantContext;
@@ -299,9 +301,16 @@ pub async fn ci_preflight(
 
     // Repo resolution + membership decision (the git read gate's own path).
     // 404 for unknown/unbound, 403 for non-member, 503 on backend failure.
-    let channel_id = authorize_ci_read(&state, &tenant, &pubkey, owner, repo_id_canonical)
-        .await
-        .map_err(|error| api_error(error.status, &error.message))?;
+    let channel_id = authorize_ci_read(
+        &state,
+        &tenant,
+        &pubkey,
+        owner,
+        repo_id_canonical,
+        "ci_preflight",
+    )
+    .await
+    .map_err(|error| api_error(error.status, &error.message))?;
 
     // Load the authoritative published manifest (same `info/refs` read) so the
     // base ref/oid and the requested tip's reachability come from the exact
@@ -1120,6 +1129,7 @@ async fn authorize_ci_read(
     caller: &nostr::PublicKey,
     owner_hex: &str,
     repo_name: &str,
+    command: &'static str,
 ) -> Result<uuid::Uuid, PreflightReject> {
     let Ok(owner_bytes) = hex::decode(owner_hex) else {
         return Err(PreflightReject {
@@ -1154,10 +1164,10 @@ async fn authorize_ci_read(
         },
         Err(e) => {
             tracing::error!(
-                command = "ci_preflight",
+                command,
                 error = %e,
                 repo = %repo_name,
-                "CI preflight: 30617 lookup failed (deny)"
+                "CI read authorization: 30617 lookup failed (deny)"
             );
             return Err(PreflightReject {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1192,10 +1202,10 @@ async fn authorize_ci_read(
         }),
         Err(e) => {
             tracing::error!(
-                command = "ci_preflight",
+                command,
                 error = %e,
                 repo = %repo_name,
-                "CI preflight: role lookup failed (deny)"
+                "CI read authorization: role lookup failed (deny)"
             );
             Err(PreflightReject {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1365,6 +1375,364 @@ pub async fn put_ci_log(
         body,
     )
     .await
+}
+
+/// Read one authenticated, signed-reference-bound job log.
+pub async fn get_ci_log(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response<Body>, PreflightApiError> {
+    read_ci_log(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: None,
+            sha256,
+        },
+        uri.path(),
+        headers,
+        "GET",
+        false,
+    )
+    .await
+}
+
+/// Return verified metadata for one authenticated job log without a body.
+pub async fn head_ci_log(
+    State(state): State<Arc<AppState>>,
+    AxumPath((request_id, run_id, job_id, attempt, sha256)): AxumPath<(
+        String,
+        String,
+        String,
+        u32,
+        String,
+    )>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response<Body>, PreflightApiError> {
+    read_ci_log(
+        state,
+        EvidencePath {
+            request_id,
+            run_id,
+            job_id,
+            attempt,
+            object_id: None,
+            sha256,
+        },
+        uri.path(),
+        headers,
+        "HEAD",
+        true,
+    )
+    .await
+}
+
+async fn read_ci_log(
+    state: Arc<AppState>,
+    path: EvidencePath,
+    request_path: &str,
+    headers: HeaderMap,
+    method: &'static str,
+    head_only: bool,
+) -> Result<Response<Body>, PreflightApiError> {
+    let tenant = bind_request_tenant(&state, &headers).await?;
+    let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, request_path);
+
+    // Authenticate the exact method and URL before any request, repository,
+    // event, or object lookup. A valid non-member receives the same 404 as a
+    // missing object, so this endpoint is not an existence oracle.
+    let (caller, auth_id) = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
+    super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
+    validate_log_read_path(&path)?;
+
+    let hidden = || api_error(StatusCode::NOT_FOUND, "CI log not found");
+    let request_bytes = hex::decode(&path.request_id).map_err(|_| hidden())?;
+    let stored = state
+        .db
+        .get_event_by_id(tenant.community(), &request_bytes)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?
+        .ok_or_else(hidden)?;
+    let channel_id = stored.channel_id.ok_or_else(hidden)?;
+    let request = validate_control_request(&stored.event, channel_id).map_err(|_| hidden())?;
+    if stored.event.id.to_hex() != path.request_id
+        || request.run_id != path.run_id
+        || request.attempt != path.attempt
+        || !request.job_ids.iter().any(|job| job == &path.job_id)
+    {
+        return Err(hidden());
+    }
+
+    let (owner, repo) = parse_repo_coordinate(&request.target_repo_a).ok_or_else(hidden)?;
+    let authorized_channel = map_log_read_authorization(
+        authorize_ci_read(&state, &tenant, &caller, owner, repo, "ci_log_read").await,
+    )?;
+    if authorized_channel != channel_id {
+        return Err(hidden());
+    }
+
+    let mut signers = state.config.ci_status_signer_pubkeys.clone();
+    signers.extend(
+        state
+            .db
+            .get_active_ci_signers(
+                tenant.community(),
+                channel_id,
+                &request.target_repo_a,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?,
+    );
+    if signers.is_empty() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+    let events = state
+        .db
+        .query_events(&EventQuery {
+            channel_id: Some(channel_id),
+            kinds: Some(vec![
+                KIND_CI_JOB_STATUS as i32,
+                KIND_CI_LOG_REFERENCE as i32,
+            ]),
+            e_tags: Some(vec![path.request_id.clone()]),
+            limit: Some(MAX_CI_CONTROL_BACKLOG),
+            max_limit: Some(MAX_CI_CONTROL_BACKLOG),
+            ..EventQuery::for_community(tenant.community())
+        })
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?;
+    if events.len() as i64 == MAX_CI_CONTROL_BACKLOG {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+
+    let mut logs = Vec::new();
+    let mut statuses = Vec::new();
+    for stored_event in events {
+        let event_id = stored_event.event.id.to_hex();
+        match buzz_core::ci::validate_signed_ci_event(
+            &stored_event.event,
+            &channel_id.to_string(),
+            &signers,
+        ) {
+            Ok(ValidatedCiEnvelope::LogReference(log))
+                if log.request_event_id == path.request_id
+                    && log.run_id == path.run_id
+                    && log.workflow_id == request.workflow_id
+                    && log.target_repo_a == request.target_repo_a
+                    && log.tip_oid == request.tip_oid
+                    && log.job_id == path.job_id
+                    && log.attempt == path.attempt
+                    && log.log_sha256 == path.sha256
+                    && log.url.as_deref() == Some(url.as_str())
+                    && log.validate_url_for_relay(url.as_str()).is_ok() =>
+            {
+                logs.push((event_id, log));
+            }
+            Ok(ValidatedCiEnvelope::JobStatus(status))
+                if status.request_event_id == path.request_id
+                    && status.run_id == path.run_id
+                    && status.workflow_id == request.workflow_id
+                    && status.target_repo_a == request.target_repo_a
+                    && status.tip_oid == request.tip_oid
+                    && status.base_oid == request.base_oid
+                    && status.job_id == path.job_id
+                    && status.attempt == path.attempt
+                    && status.state.is_terminal() =>
+            {
+                statuses.push(status);
+            }
+            _ => {}
+        }
+    }
+    if logs.len() != 1 {
+        return Err(hidden());
+    }
+    let (log_event_id, log) = logs.pop().ok_or_else(hidden)?;
+    if !statuses
+        .iter()
+        .any(|status| status.log_ref.as_deref() == Some(log_event_id.as_str()))
+        || log.truncated
+        || log.byte_length > log.cap_bytes
+        || log.cap_bytes > MAX_CI_EVIDENCE_BYTES as u64
+    {
+        return Err(hidden());
+    }
+
+    let object_key = evidence_object_key(
+        tenant.community(),
+        &request.target_repo_a,
+        &request.tip_oid,
+        &path,
+    );
+    let metadata = state
+        .media_storage
+        .head_with_metadata(&object_key)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?
+        .ok_or_else(hidden)?;
+    if metadata.size != log.byte_length || metadata.size > log.cap_bytes {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+    let bytes = state
+        .media_storage
+        .get(&object_key)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "CI log unavailable"))?;
+    if bytes.len() as u64 != log.byte_length || hex::encode(Sha256::digest(&bytes)) != path.sha256 {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        ));
+    }
+
+    let selected = match select_log_range(headers.get(header::RANGE), log.byte_length) {
+        Ok(selected) => selected,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes */{}", log.byte_length),
+                )
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::empty())
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"));
+        }
+    };
+    let (status, body, content_length, content_range) = match selected {
+        Some((start, end)) => {
+            let range = start as usize..=end as usize;
+            let body = if head_only {
+                Body::empty()
+            } else {
+                Body::from(bytes[range].to_vec())
+            };
+            (
+                StatusCode::PARTIAL_CONTENT,
+                body,
+                end - start + 1,
+                Some(format!("bytes {start}-{end}/{}", log.byte_length)),
+            )
+        }
+        None => (
+            StatusCode::OK,
+            if head_only {
+                Body::empty()
+            } else {
+                Body::from(bytes)
+            },
+            log.byte_length,
+            None,
+        ),
+    };
+    let digest = base64::engine::general_purpose::STANDARD
+        .encode(hex::decode(&path.sha256).map_err(|_| hidden())?);
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header("digest", format!("sha-256={digest}"));
+    if let Some(value) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, value);
+    }
+    builder
+        .body(body)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+fn parse_repo_coordinate(target_repo_a: &str) -> Option<(&str, &str)> {
+    let mut parts = target_repo_a.splitn(3, ':');
+    (parts.next()? == "30617").then_some((parts.next()?, parts.next()?))
+}
+
+fn map_log_read_authorization(
+    result: Result<uuid::Uuid, PreflightReject>,
+) -> Result<uuid::Uuid, PreflightApiError> {
+    match result {
+        Ok(channel_id) => Ok(channel_id),
+        Err(reject) if matches!(reject.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {
+            Err(api_error(StatusCode::NOT_FOUND, "CI log not found"))
+        }
+        Err(_) => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI log unavailable",
+        )),
+    }
+}
+
+fn validate_log_read_path(path: &EvidencePath) -> Result<(), PreflightApiError> {
+    if !is_lower_hex_value(&path.request_id, 64)
+        || uuid::Uuid::parse_str(&path.run_id).is_err()
+        || !is_valid_static_job_id(&path.job_id)
+        || path.attempt == 0
+        || !is_lower_hex_value(&path.sha256, 64)
+        || path.object_id.is_some()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "CI log not found"));
+    }
+    Ok(())
+}
+
+fn select_log_range(
+    range: Option<&axum::http::HeaderValue>,
+    total: u64,
+) -> Result<Option<(u64, u64)>, PreflightApiError> {
+    let Some(range) = range else { return Ok(None) };
+    let range = range
+        .to_str()
+        .ok()
+        .filter(|value| !value.contains(','))
+        .and_then(|value| parse_log_byte_range(value, total))
+        .ok_or_else(|| api_error(StatusCode::RANGE_NOT_SATISFIABLE, "invalid byte range"))?;
+    Ok(Some(range))
+}
+
+fn parse_log_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    let value = value.strip_prefix("bytes=")?;
+    if let Some(suffix) = value.strip_prefix('-') {
+        let length = suffix.parse::<u64>().ok()?;
+        if length == 0 || total == 0 {
+            return None;
+        }
+        return Some((total.saturating_sub(length), total - 1));
+    }
+    let (start, end) = value.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<u64>().ok()?.min(total - 1)
+    };
+    (start <= end).then_some((start, end))
 }
 
 /// Store one authenticated, descriptor-bound job artifact.
@@ -1724,6 +2092,83 @@ mod tests {
     }
 
     #[test]
+    fn log_read_path_uses_the_static_job_grammar() {
+        let mut path = evidence_path();
+        path.object_id = None;
+        path.job_id = "desktop-smoke-e2e".to_owned();
+        validate_log_read_path(&path).expect("valid log path");
+
+        for hostile in ["..", ".hidden", "0job", "job/name", "job%2fescape"] {
+            path.job_id = hostile.to_owned();
+            assert!(
+                validate_log_read_path(&path).is_err(),
+                "hostile job component must fail: {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_ranges_are_single_bounded_and_deterministic() {
+        assert_eq!(parse_log_byte_range("bytes=0-3", 10), Some((0, 3)));
+        assert_eq!(parse_log_byte_range("bytes=4-", 10), Some((4, 9)));
+        assert_eq!(parse_log_byte_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_log_byte_range("bytes=8-99", 10), Some((8, 9)));
+        for invalid in [
+            "items=0-1",
+            "bytes=10-11",
+            "bytes=5-4",
+            "bytes=-0",
+            "bytes=0-1,3-4",
+        ] {
+            let parsed = if invalid.contains(',') {
+                None
+            } else {
+                parse_log_byte_range(invalid, 10)
+            };
+            assert_eq!(parsed, None, "invalid range must fail: {invalid}");
+        }
+    }
+
+    #[test]
+    fn log_read_authorization_hides_denials_but_preserves_outages() {
+        let reject = |status, message: &str| PreflightReject {
+            status,
+            message: message.to_owned(),
+        };
+        let forbidden = map_log_read_authorization(Err(reject(
+            StatusCode::FORBIDDEN,
+            "private membership detail",
+        )))
+        .expect_err("forbidden read must fail");
+        let missing = map_log_read_authorization(Err(reject(
+            StatusCode::NOT_FOUND,
+            "private repository detail",
+        )))
+        .expect_err("missing read must fail");
+        assert_eq!(forbidden.0, StatusCode::NOT_FOUND);
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            forbidden.1 .0, missing.1 .0,
+            "denial and absence must be indistinguishable"
+        );
+        assert_eq!(
+            forbidden.1 .0,
+            serde_json::json!({"error": "CI log not found"})
+        );
+
+        let outage = map_log_read_authorization(Err(reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "private database detail",
+        )))
+        .expect_err("authorization outage must fail");
+        assert_eq!(outage.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            outage.1 .0,
+            serde_json::json!({"error": "CI log unavailable"})
+        );
+    }
+
+    #[test]
     fn accepted_control_query_rejects_unknown_fields() {
         assert!(
             serde_json::from_value::<AcceptedControlQuery>(serde_json::json!({
@@ -1786,6 +2231,43 @@ mod tests {
             nip98_auth(keys, url, body).parse().unwrap(),
         );
         request
+    }
+
+    fn nip98_get_auth(keys: &nostr::Keys, url: &str) -> String {
+        let event = EventBuilder::new(nostr::Kind::Custom(27_235), "")
+            .tags(vec![
+                nostr::Tag::parse(["u", url]).unwrap(),
+                nostr::Tag::parse(["method", "GET"]).unwrap(),
+                nostr::Tag::parse(["nonce", &uuid::Uuid::new_v4().to_string()]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .expect("sign NIP-98 log read event");
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_string(&event).expect("serialize nip98"))
+        )
+    }
+
+    async fn ci_log_request(
+        state: std::sync::Arc<AppState>,
+        host: &str,
+        keys: &nostr::Keys,
+        path: &str,
+        signed_url: &str,
+    ) -> axum::response::Response {
+        crate::router::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .header(header::AUTHORIZATION, nip98_get_auth(keys, signed_url))
+                    .body(Body::empty())
+                    .expect("CI log request"),
+            )
+            .await
+            .expect("CI log response")
     }
 
     /// Exercise the full preflight route in-process. The handler derives the
@@ -1883,8 +2365,24 @@ mod tests {
     /// route-level execution (same pattern as `api::media::tests::test_state`).
     struct TestHarness {
         state: std::sync::Arc<AppState>,
+        community: CommunityId,
         host: String,
         owner: nostr::Keys,
+    }
+
+    struct AlwaysFreshReplayGuard;
+
+    impl buzz_auth::Nip98ReplayGuard for AlwaysFreshReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            _event_id: &'a nostr::EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(true) })
+        }
     }
 
     impl TestHarness {
@@ -1943,7 +2441,7 @@ mod tests {
             .await
             .expect("insert owner as channel member");
 
-            let state = Self::make_state(pool).await;
+            let state = Self::make_state(pool, &owner).await;
 
             // Seed the exact kind:30617 repository announcement the route test
             // fixture depends on, bound to the test channel (the relay's git
@@ -1953,7 +2451,12 @@ mod tests {
             // → (non-member → 403) instead of 404-gating on a missing repo.
             Self::seed_repo_announcement(&state, community_id, &owner).await;
 
-            TestHarness { state, host, owner }
+            TestHarness {
+                state,
+                community: CommunityId::from_uuid(community_id),
+                host,
+                owner,
+            }
         }
 
         /// Kind-30617 announcement for `repo_d`, bound to `TEST_CHANNEL`,
@@ -1987,10 +2490,152 @@ mod tests {
             format!("30617:{}:test-repo", self.owner.public_key().to_hex())
         }
 
-        async fn make_state(pool: sqlx::PgPool) -> std::sync::Arc<AppState> {
+        async fn seed_log_read(&self, bytes: &[u8]) -> String {
+            use buzz_core::ci::{
+                job_status_tags, log_reference_tags, request_tags, CiJobState, CiJobStatusEnvelope,
+                CiLogReferenceEnvelope, CiRequestType, CiSkipPolicy, CI_SCHEMA_VERSION,
+            };
+
+            let channel_id = uuid::Uuid::parse_str(TEST_CHANNEL).unwrap();
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().timestamp() as u64;
+            let digest = hex::encode(Sha256::digest(bytes));
+            let request = CiRequestEnvelope {
+                schema_version: CI_SCHEMA_VERSION,
+                request_type: CiRequestType::Run,
+                target_repo_a: self.repo_a(),
+                pr_root_event_id: "11".repeat(32),
+                pr_update_event_id: None,
+                source_clone_url: "https://example.com/test-repo.git".to_owned(),
+                immutable_source_ref: "refs/buzz/objects/test-repo".to_owned(),
+                tip_oid: "22".repeat(20),
+                source_branch: "feature".to_owned(),
+                base_ref: "refs/heads/main".to_owned(),
+                base_oid: "33".repeat(20),
+                workflow_id: "ci".to_owned(),
+                workflow_digest: "44".repeat(32),
+                job_ids: vec!["test_job".to_owned()],
+                run_id: run_id.clone(),
+                attempt: 1,
+                parent_attempt: None,
+                parent_run_id: None,
+                trigger_event_id: "11".repeat(32),
+                actor: self.owner.public_key().to_hex(),
+                timeout_seconds: 300,
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                issued_at: now,
+                expires_at: now + 600,
+            };
+            let request_event = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_CI_REQUEST as u16),
+                serde_json::to_string(&request).expect("serialize CI request"),
+            )
+            .tags(request_tags(TEST_CHANNEL, &request).expect("CI request tags"))
+            .sign_with_keys(&self.owner)
+            .expect("sign CI request");
+            let request_id = request_event.id.to_hex();
+            let path = format!("/ci/logs/{request_id}/{run_id}/test_job/1/{digest}");
+            let expected_url = super::super::bridge::nip98_expected_url(
+                &self.state.config.relay_url,
+                &TenantContext::resolved(self.community, self.host.clone()),
+                &path,
+            );
+            let log = CiLogReferenceEnvelope {
+                schema_version: CI_SCHEMA_VERSION,
+                request_event_id: request_id.clone(),
+                run_id: run_id.clone(),
+                workflow_id: request.workflow_id.clone(),
+                target_repo_a: request.target_repo_a.clone(),
+                tip_oid: request.tip_oid.clone(),
+                job_id: "test_job".to_owned(),
+                attempt: 1,
+                log_sha256: digest.clone(),
+                byte_length: bytes.len() as u64,
+                cap_bytes: bytes.len() as u64,
+                truncated: false,
+                url: Some(expected_url),
+                inline: None,
+                created_at: now,
+                relay_signer: self.owner.public_key().to_hex(),
+            };
+            let log_event = EventBuilder::new(
+                nostr::Kind::Custom(KIND_CI_LOG_REFERENCE as u16),
+                serde_json::to_string(&log).expect("serialize log reference"),
+            )
+            .tags(log_reference_tags(TEST_CHANNEL, &log).expect("log reference tags"))
+            .sign_with_keys(&self.owner)
+            .expect("sign log reference");
+            let status = CiJobStatusEnvelope {
+                schema_version: CI_SCHEMA_VERSION,
+                request_event_id: request_id.clone(),
+                run_id: run_id.clone(),
+                workflow_id: request.workflow_id.clone(),
+                target_repo_a: request.target_repo_a.clone(),
+                tip_oid: request.tip_oid.clone(),
+                base_oid: request.base_oid.clone(),
+                job_id: "test_job".to_owned(),
+                name: "test_job".to_owned(),
+                attempt: 1,
+                parent_attempt: None,
+                sequence: 3,
+                state: CiJobState::Success,
+                conclusion: Some("success".to_owned()),
+                reason: None,
+                required: true,
+                skip_policy: CiSkipPolicy::Forbid,
+                selected_job_instance: "test_job".to_owned(),
+                also_reruns: Vec::new(),
+                started_at: Some(now),
+                finished_at: Some(now + 1),
+                log_ref: Some(log_event.id.to_hex()),
+                artifact_refs: Vec::new(),
+                relay_signer: self.owner.public_key().to_hex(),
+            };
+            let status_event = EventBuilder::new(
+                nostr::Kind::Custom(KIND_CI_JOB_STATUS as u16),
+                serde_json::to_string(&status).expect("serialize job status"),
+            )
+            .tags(job_status_tags(TEST_CHANNEL, &status).expect("job status tags"))
+            .sign_with_keys(&self.owner)
+            .expect("sign job status");
+
+            for event in [&request_event, &log_event, &status_event] {
+                self.state
+                    .db
+                    .insert_event(self.community, event, Some(channel_id))
+                    .await
+                    .expect("insert CI route fixture");
+            }
+            let evidence_path = EvidencePath {
+                request_id,
+                run_id,
+                job_id: "test_job".to_owned(),
+                attempt: 1,
+                object_id: None,
+                sha256: digest,
+            };
+            let object_key = evidence_object_key(
+                self.community,
+                &request.target_repo_a,
+                &request.tip_oid,
+                &evidence_path,
+            );
+            self.state
+                .media_storage
+                .put(&object_key, bytes, "application/octet-stream")
+                .await
+                .expect("store CI log bytes");
+            path
+        }
+
+        async fn make_state(
+            pool: sqlx::PgPool,
+            ci_signer: &nostr::Keys,
+        ) -> std::sync::Arc<AppState> {
             let mut config = crate::config::Config::from_env().expect("default config loads");
             config.require_relay_membership = false;
-            config.ci_status_signer_pubkeys = Default::default();
+            config.ci_status_signer_pubkeys =
+                [ci_signer.public_key().to_hex()].into_iter().collect();
             // Pin the relay origin so the NIP-98 expected URL resolves to
             // `https://{tenant-host}/ci/preflight` (wss → https), matching the
             // contract's transport mapping and the test-signing scheme.
@@ -2015,7 +2660,7 @@ mod tests {
             ));
             let media_storage =
                 buzz_media::MediaStorage::new(&config.media).expect("media storage");
-            let (state, _audit_shutdown) = AppState::new(
+            let (mut state, _audit_shutdown) = AppState::new(
                 config,
                 db,
                 redis_pool,
@@ -2027,12 +2672,60 @@ mod tests {
                 nostr::Keys::generate(),
                 media_storage,
             );
+            state.nip98_replay = std::sync::Arc::new(AlwaysFreshReplayGuard);
             std::sync::Arc::new(state)
         }
     }
 
     fn preflight_scratch_env_ready() -> bool {
         std::env::var("BUZZ_TEST_DATABASE_URL").is_ok_and(|v| !v.is_empty())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch Postgres and CI evidence storage"]
+    async fn route_log_read_uses_tenant_host_not_config_host() {
+        if !preflight_scratch_env_ready() {
+            return;
+        }
+        let harness = TestHarness::connect().await;
+        assert_ne!(
+            harness.host, "relay.example",
+            "tenant host must differ from config.relay_url"
+        );
+        let bytes = b"tenant-bound CI log";
+        let path = harness.seed_log_read(bytes).await;
+
+        let config_host_url = format!("https://relay.example{path}");
+        let rejected = ci_log_request(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &path,
+            &config_host_url,
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let tenant_url = format!("https://{}{path}", harness.host);
+        let accepted = ci_log_request(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &path,
+            &tenant_url,
+        )
+        .await;
+        let accepted_status = accepted.status();
+        let body = axum::body::to_bytes(accepted.into_body(), 4096)
+            .await
+            .expect("read CI log body");
+        assert_eq!(
+            accepted_status,
+            StatusCode::OK,
+            "unexpected CI log response: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), bytes);
     }
 
     /// Route-bearing 404 contract: an unknown repo coordinate on a live route
