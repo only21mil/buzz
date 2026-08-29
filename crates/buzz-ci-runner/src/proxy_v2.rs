@@ -27,6 +27,7 @@ use crate::config::{validate_private_directory, RunnerConfig, RunnerMode};
 const REPLAY_SCHEMA_VERSION: u16 = 1;
 const MAX_REPLAY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_REPLAY_ENTRIES: usize = 4096;
+const INTENT_REGISTRATION_REQUEST_ID_DOMAIN: &[u8] = b"buzz-ci-runner:broker-request-id:v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxySettings {
@@ -757,6 +758,15 @@ fn validate_request(
                 return Err(ProxyError::InvalidActivationCoordinates);
             }
         }
+        Request::RegisterJobIntent(request) => {
+            validate_admission(settings, request.admission, now)?;
+            if header.request_id != intent_registration_request_id(request)
+                || v2::intent_registration_request_frame_digest(header, &request)
+                    != Some(request.request_frame_digest)
+            {
+                return Err(ProxyError::InvalidActivationCoordinates);
+            }
+        }
         Request::GetAttempt(request) => {
             if request.attempt_id == [0; 16] || request.execution_binding_digest == [0; 32] {
                 return Err(ProxyError::InvalidActivationCoordinates);
@@ -796,6 +806,46 @@ fn validate_request(
     Ok(())
 }
 
+fn intent_registration_request_id(request: v2::RegisterJobIntentRequest) -> [u8; 16] {
+    let mut canonical = request;
+    canonical.request_frame_digest = [0; 32];
+    let frame = v2::encode_request([0; 16], Request::RegisterJobIntent(canonical));
+    let mut hasher = Sha256::new();
+    hasher.update(INTENT_REGISTRATION_REQUEST_ID_DOMAIN);
+    hasher.update(frame.as_bytes());
+    let digest = hasher.finalize();
+    let mut request_id = [0; 16];
+    request_id.copy_from_slice(&digest[..16]);
+    request_id
+}
+
+fn validate_admission(
+    settings: &ProxySettings,
+    request: v2::AdmitAttemptRequest,
+    now: u64,
+) -> Result<(), ProxyError> {
+    let valid = request.audience_digest == settings.audience_digest
+        && request.isolation_profile_digest == settings.isolation_profile_digest
+        && request.lane_manifest_digest == settings.lane_manifest_digest
+        && request.lane_epoch == settings.lane_epoch
+        && request.admission_key_generation == settings.admission_key_generation
+        && request.signed_request_digest != [0; 32]
+        && request.job_intent_digest != [0; 32]
+        && request.admission_signature != [0; 64]
+        && request.run_id != [0; 16]
+        && request.issued_at != 0
+        && request.issued_at <= now
+        && now < request.expires_at
+        && request.wall_timeout_seconds != 0
+        && request.attempt != 0
+        && ((request.attempt == 1 && request.parent_attempt == 0)
+            || (request.attempt > 1
+                && request.parent_attempt.checked_add(1) == Some(request.attempt)));
+    valid
+        .then_some(())
+        .ok_or(ProxyError::InvalidActivationCoordinates)
+}
+
 fn validate_response(request: Request, response: BrokerResponse) -> Result<(), ProxyError> {
     if let Request::CancelAttempt(request) = request {
         return validate_cancel_response(request, response);
@@ -828,7 +878,8 @@ fn validate_response(request: Request, response: BrokerResponse) -> Result<(), P
         | Request::AdmitQualification(_)
         | Request::CompleteAttempt(_)
         | Request::DescribeAttemptEvidence(_)
-        | Request::ReadAttemptEvidence(_) => false,
+        | Request::ReadAttemptEvidence(_)
+        | Request::RegisterJobIntent(_) => false,
     };
     bound.then_some(()).ok_or(ProxyError::InvalidExecdResponse)
 }
@@ -873,6 +924,7 @@ fn response_body_length(request: Request) -> usize {
     match request {
         Request::DescribeAttemptEvidence(_) => v2::EVIDENCE_DESCRIPTION_BODY_SIZE,
         Request::ReadAttemptEvidence(_) => v2::EVIDENCE_CHUNK_BODY_SIZE,
+        Request::RegisterJobIntent(_) => v2::INTENT_REGISTRATION_RESPONSE_BODY_SIZE,
         _ => v2::RESPONSE_BODY_SIZE,
     }
 }
@@ -883,6 +935,11 @@ fn validate_encoded_response(
     response: &[u8],
 ) -> Result<(), ProxyError> {
     match request {
+        Request::RegisterJobIntent(request) => {
+            let response = v2::decode_intent_registration_response(header, response)
+                .map_err(|_| ProxyError::InvalidExecdResponse)?;
+            validate_intent_registration_response(request, response)
+        }
         Request::DescribeAttemptEvidence(request) => {
             let response = v2::decode_evidence_description_response(header, response)
                 .map_err(|_| ProxyError::InvalidExecdResponse)?;
@@ -899,6 +956,30 @@ fn validate_encoded_response(
             validate_response(request, decoded)
         }
     }
+}
+
+fn validate_intent_registration_response(
+    request: v2::RegisterJobIntentRequest,
+    response: v2::IntentRegistrationResponse,
+) -> Result<(), ProxyError> {
+    let admission = request.admission;
+    let admission_message_digest: [u8; 32] =
+        Sha256::digest(v2::admission_signature_message(&admission)).into();
+    let valid = matches!(response.code, ResponseCode::Ok | ResponseCode::Existing)
+        && response.retry_after_millis == 0
+        && response.signed_request_digest == admission.signed_request_digest
+        && response.job_intent_digest == admission.job_intent_digest
+        && response.request_frame_digest == request.request_frame_digest
+        && response.admission_message_digest == admission_message_digest
+        && response.registration_key_digest == v2::intent_registration_key_digest(&request)
+        && response.lane_manifest_digest == admission.lane_manifest_digest
+        && response.run_id == admission.run_id
+        && response.lane_epoch == admission.lane_epoch
+        && response.admission_key_generation == admission.admission_key_generation
+        && response.issued_at == admission.issued_at
+        && response.expires_at == admission.expires_at
+        && response.attempt == admission.attempt;
+    valid.then_some(()).ok_or(ProxyError::InvalidExecdResponse)
 }
 
 fn validate_description_response(
@@ -1261,6 +1342,56 @@ mod tests {
             v2::evidence_request_frame_digest(header, &Request::ReadAttemptEvidence(request))
                 .expect("read digest");
         request
+    }
+
+    fn registration_request(now: u64) -> (FrameHeader, v2::RegisterJobIntentRequest) {
+        let mut request = v2::RegisterJobIntentRequest {
+            admission: admission(now),
+            request_event_id: [24; 32],
+            workflow_id: v2::WireText64::from_ascii("workflow").expect("workflow id"),
+            job_id: v2::WireText64::from_ascii("job").expect("job id"),
+            artifact_count: 1,
+            artifacts: [Some(v2::JobArtifactDeclaration {
+                artifact_id: v2::WireText64::from_ascii("report").expect("artifact id"),
+                name: v2::WireText64::from_ascii("report.txt").expect("artifact name"),
+                media_type: v2::WireText64::from_ascii("text/plain").expect("media type"),
+                relative_name: v2::WireText64::from_ascii("report.txt").expect("relative name"),
+                max_bytes: 4096,
+            })],
+            request_frame_digest: [25; 32],
+        };
+        let header = FrameHeader {
+            operation: Operation::RegisterJobIntent,
+            request_id: intent_registration_request_id(request),
+        };
+        request.request_frame_digest =
+            v2::intent_registration_request_frame_digest(header, &request)
+                .expect("registration frame digest");
+        (header, request)
+    }
+
+    fn registration_response(
+        request: v2::RegisterJobIntentRequest,
+        code: ResponseCode,
+    ) -> v2::IntentRegistrationResponse {
+        let admission = request.admission;
+        v2::IntentRegistrationResponse {
+            code,
+            retry_after_millis: 0,
+            signed_request_digest: admission.signed_request_digest,
+            job_intent_digest: admission.job_intent_digest,
+            request_frame_digest: request.request_frame_digest,
+            admission_message_digest: Sha256::digest(v2::admission_signature_message(&admission))
+                .into(),
+            registration_key_digest: v2::intent_registration_key_digest(&request),
+            lane_manifest_digest: admission.lane_manifest_digest,
+            run_id: admission.run_id,
+            lane_epoch: admission.lane_epoch,
+            admission_key_generation: admission.admission_key_generation,
+            issued_at: admission.issued_at,
+            expires_at: admission.expires_at,
+            attempt: admission.attempt,
+        }
     }
 
     fn fake_execd(
@@ -1794,5 +1925,110 @@ mod tests {
             validate_chunk_response(request, &hostile),
             Err(ProxyError::InvalidExecdResponse)
         ));
+    }
+
+    #[test]
+    fn intent_registration_forwards_exact_frame_and_rejects_drift_or_unbound_response() {
+        let directory = private_directory();
+        let settings = settings(directory.path());
+        let now = unix_now().expect("clock");
+        let (header, request) = registration_request(now);
+        let frame = v2::encode_request(header.request_id, Request::RegisterJobIntent(request))
+            .as_bytes()
+            .to_vec();
+        let response_value = registration_response(request, ResponseCode::Ok);
+        let response = v2::encode_intent_registration_response(header, response_value)
+            .as_bytes()
+            .to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut proxy = RunnerV2Proxy::with_connector(
+            settings.clone(),
+            FakeConnector {
+                connections: VecDeque::from([Ok(fake_execd(
+                    frame.clone(),
+                    response.clone(),
+                    settings.execd_uid,
+                    settings.execd_gid,
+                ))]),
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("proxy");
+        assert_eq!(
+            exchange(&mut proxy, &frame).expect("register intent"),
+            response
+        );
+        drop(proxy);
+
+        let mut restarted = RunnerV2Proxy::with_connector(
+            settings.clone(),
+            FakeConnector {
+                connections: VecDeque::new(),
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("restart");
+        assert_eq!(
+            exchange(&mut restarted, &frame).expect("cached registration"),
+            response
+        );
+
+        let mut drift = request;
+        drift.job_id = v2::WireText64::from_ascii("other-job").expect("drift job id");
+        drift.request_frame_digest = v2::intent_registration_request_frame_digest(header, &drift)
+            .expect("drift frame digest");
+        let drift_frame = v2::encode_request(header.request_id, Request::RegisterJobIntent(drift))
+            .as_bytes()
+            .to_vec();
+        assert!(matches!(
+            exchange(&mut restarted, &drift_frame),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let wrong_header = FrameHeader {
+            operation: Operation::RegisterJobIntent,
+            request_id: [61; 16],
+        };
+        let wrong_digest_frame =
+            v2::encode_request(wrong_header.request_id, Request::RegisterJobIntent(request))
+                .as_bytes()
+                .to_vec();
+        assert!(matches!(
+            exchange(&mut restarted, &wrong_digest_frame),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let (_, mut wrong_static) = registration_request(now);
+        wrong_static.admission.lane_epoch = wrong_static.admission.lane_epoch.saturating_add(1);
+        let static_header = FrameHeader {
+            operation: Operation::RegisterJobIntent,
+            request_id: intent_registration_request_id(wrong_static),
+        };
+        wrong_static.request_frame_digest =
+            v2::intent_registration_request_frame_digest(static_header, &wrong_static)
+                .expect("static frame digest");
+        let wrong_static_frame = v2::encode_request(
+            static_header.request_id,
+            Request::RegisterJobIntent(wrong_static),
+        )
+        .as_bytes()
+        .to_vec();
+        assert!(matches!(
+            exchange(&mut restarted, &wrong_static_frame),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let mut wrong_response = response_value;
+        wrong_response.run_id[0] ^= 1;
+        assert!(matches!(
+            validate_intent_registration_response(request, wrong_response),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
+        let conflict = registration_response(request, ResponseCode::ReplayConflict);
+        assert!(matches!(
+            validate_intent_registration_response(request, conflict),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
