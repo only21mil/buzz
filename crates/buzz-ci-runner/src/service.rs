@@ -148,10 +148,12 @@ fn nix_io(error: nix::errno::Errno) -> ActivationError {
 pub fn serve_runner_connection(
     stream: UnixStream,
     expected_controld_uid: u32,
+    expected_controld_gid: u32,
 ) -> Result<(), RunnerConnectionError> {
     serve_runner_connection_with_handler(
         stream,
         expected_controld_uid,
+        expected_controld_gid,
         &mut |request, _, writer| {
             let (dispatch_id, request_event_id, run_id, attempt) = request.refusal_identity();
             let refusal = RunnerReceipt::Refused {
@@ -176,6 +178,7 @@ pub fn serve_runner_connection(
 pub fn serve_runner_connection_with_handler(
     mut stream: UnixStream,
     expected_controld_uid: u32,
+    expected_controld_gid: u32,
     handler: &mut impl FnMut(RunnerRequest, [u8; 32], &mut UnixStream) -> Result<(), ()>,
 ) -> Result<(), RunnerConnectionError> {
     mark_close_on_exec(&stream).map_err(|error| match error {
@@ -187,7 +190,7 @@ pub fn serve_runner_connection_with_handler(
     let credentials = getsockopt(&stream, PeerCredentials).map_err(|error| {
         RunnerConnectionError::Socket(io::Error::from_raw_os_error(error as i32))
     })?;
-    if credentials.uid() != expected_controld_uid {
+    if credentials.uid() != expected_controld_uid || credentials.gid() != expected_controld_gid {
         return Err(RunnerConnectionError::UnauthorizedPeer);
     }
     stream
@@ -327,7 +330,10 @@ mod tests {
         let uid = getsockopt(&server, PeerCredentials)
             .expect("peer credentials")
             .uid();
-        let worker = thread::spawn(move || serve_runner_connection(server, uid));
+        let gid = getsockopt(&server, PeerCredentials)
+            .expect("peer credentials")
+            .gid();
+        let worker = thread::spawn(move || serve_runner_connection(server, uid, gid));
 
         write_frame(&mut client, &request()).expect("request frame");
         let receipt: RunnerReceipt = read_frame(&mut client).expect("refusal frame");
@@ -351,10 +357,14 @@ mod tests {
         let uid = getsockopt(&server, PeerCredentials)
             .expect("peer credentials")
             .uid();
+        let gid = getsockopt(&server, PeerCredentials)
+            .expect("peer credentials")
+            .gid();
         let worker = thread::spawn(move || {
             serve_runner_connection_with_handler(
                 server,
                 uid,
+                gid,
                 &mut |request, request_frame_digest, stream| {
                     assert_eq!(request_frame_digest, expected_digest);
                     let (dispatch_id, request_event_id, run_id, attempt) =
@@ -387,8 +397,11 @@ mod tests {
         let uid = getsockopt(&server, PeerCredentials)
             .expect("peer credentials")
             .uid();
+        let gid = getsockopt(&server, PeerCredentials)
+            .expect("peer credentials")
+            .gid();
         assert!(matches!(
-            serve_runner_connection(server, uid.saturating_add(1)),
+            serve_runner_connection(server, uid.saturating_add(1), gid),
             Err(RunnerConnectionError::UnauthorizedPeer)
         ));
     }

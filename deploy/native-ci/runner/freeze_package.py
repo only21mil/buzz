@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze an exact, dormant Buzz CI runner installation package."""
+"""Freeze an exact Buzz CI runner installation package."""
 
 from __future__ import annotations
 
@@ -209,9 +209,9 @@ def _freeze_package(
         write_asset(assets / "buzz-ci-runner", binary_payload, 0o500)
         entries.append(entry("binary", "buzz-ci-runner", "/usr/libexec/buzz-ci-runner", 0o500, 0o755, 0, 0, binary_payload))
 
-        config_payload = render_runner_config.config_bytes(controld_uid)
-        write_asset(assets / "runner-v1.json", config_payload, 0o400)
-        entries.append(entry("config", "runner-v1.json", "/etc/buzzci/runner-v1.json", 0o400, 0o600, runner_uid, runner_gid, config_payload))
+        config_payload = render_runner_config.config_bytes(controld_uid, controld_gid)
+        write_asset(assets / "runner-v2.json", config_payload, 0o400)
+        entries.append(entry("config", "runner-v2.json", "/etc/buzzci/runner-v2.json", 0o400, 0o600, runner_uid, runner_gid, config_payload))
 
         package_dir = source_root / PACKAGE_RELATIVE
         for role, source_name, asset_name, target, source_mode, install_mode, uid, gid in STATIC_ASSETS:

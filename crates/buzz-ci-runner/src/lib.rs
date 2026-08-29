@@ -21,6 +21,7 @@ pub mod handler;
 #[cfg(test)]
 pub mod host;
 pub mod journal;
+pub mod proxy_v2;
 pub mod service;
 pub mod transport;
 

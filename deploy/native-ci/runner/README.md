@@ -7,8 +7,8 @@ systemd, or enable or start a unit.
 The installed default stays closed:
 
 - `buzz-ci-runner.socket` is installed but disabled.
-- `runner-v1.json` contains only `schema_version` and `controld_uid`. It has no
-  `host` block.
+- `runner-v2.json` defaults to `mode=dormant` and binds the exact controld UID
+  and GID. It has no `host` block.
 - The runner returns `backend_unavailable` when someone starts the dormant unit
   manually. The package records `enabled=false`, `active=false`,
   `provisioned=false`, `host_block=false`, and `capacity=0`.
@@ -34,11 +34,8 @@ does not create or own it. Its frozen access contract is
 exact supplementary members. The runner service declares only its own required
 membership. Broker authorization still checks the exact root `SO_PEERCRED` UID.
 
-Legacy runner evidence and journal roots remain under
-`/var/lib/buzzci/runner` for restart compatibility, but the production binary
-cannot write new execution evidence there. Tmpfiles expires dormant evidence
-contents after 7 days and journal contents after 30 days. Execd owns active v2
-evidence retention.
+The runner writes only its bounded request-ID replay map under
+`/var/lib/buzzci/runner`. Execd owns active v2 evidence retention.
 The controld handoff root remains `/var/lib/buzzci/runner-output`; this package
 does not create it and the runner service cannot write it.
 
