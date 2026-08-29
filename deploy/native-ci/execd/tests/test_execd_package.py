@@ -166,6 +166,20 @@ def _manual_execd_package(path: Path, binary: bytes) -> dict[str, object]:
     return manifest
 
 
+def _manual_install_fixture(base: Path, binary: bytes, seccomp: bytes) -> tuple[Path, Path]:
+    package = base / "package"
+    _manual_execd_package(package, binary)
+    root = base / "root"
+    root.mkdir(mode=0o700)
+    seccomp_path = root / "usr/share/containers/seccomp.json"
+    seccomp_path.parent.mkdir(parents=True)
+    for parent in (root / "usr", root / "usr/share", root / "usr/share/containers"):
+        parent.chmod(0o755)
+    seccomp_path.write_bytes(seccomp)
+    seccomp_path.chmod(0o644)
+    return package, root
+
+
 class ExecdPackageTests(unittest.TestCase):
     def test_checked_in_contract(self) -> None:
         VERIFY.verify(ROOT)
@@ -412,6 +426,185 @@ class ExecdPackageTests(unittest.TestCase):
                 receipt_path.write_bytes(FREEZER.canonical_json(receipt))
                 with self.assertRaisesRegex(ValueError, "managed bindings"):
                     INSTALL.inspect(package, root)
+
+    def test_installer_never_reopens_the_validated_binary_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            binary = b"validated execd binary\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, binary, seccomp)
+                asset = Path(os.path.abspath(package / "assets/buzz-ci-execd"))
+                original_read = INSTALL.read_regular
+                asset_reads = 0
+
+                def substitute_second_read(
+                    path: Path,
+                    maximum: int = 128 * 1024 * 1024,
+                ) -> tuple[bytes, os.stat_result]:
+                    nonlocal asset_reads
+                    payload, metadata = original_read(path, maximum)
+                    if Path(os.path.abspath(path)) == asset:
+                        asset_reads += 1
+                        if asset_reads > 1:
+                            return b"caller-controlled substitute\n", metadata
+                    return payload, metadata
+
+                with mock.patch.object(INSTALL, "read_regular", side_effect=substitute_second_read):
+                    INSTALL.install(package, root)
+                self.assertEqual(asset_reads, 1)
+                self.assertEqual((root / "usr/libexec/buzz-ci-execd").read_bytes(), binary)
+
+    def test_package_rename_and_symlink_substitution_keeps_validated_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            binary = b"validated execd binary\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, binary, seccomp)
+                original_parse = INSTALL.parse_package
+
+                def swap_after_validation(path: Path) -> tuple[dict[str, object], INSTALL.Entry]:
+                    parsed = original_parse(path)
+                    assets = package / "assets"
+                    assets.rename(package / "validated-assets")
+                    hostile = package / "hostile-assets"
+                    hostile.mkdir(mode=0o700)
+                    substitute = hostile / "buzz-ci-execd"
+                    substitute.write_bytes(b"caller-controlled substitute\n")
+                    substitute.chmod(0o500)
+                    assets.symlink_to(hostile, target_is_directory=True)
+                    return parsed
+
+                with mock.patch.object(INSTALL, "parse_package", side_effect=swap_after_validation):
+                    INSTALL.install(package, root)
+                self.assertEqual((root / "usr/libexec/buzz-ci-execd").read_bytes(), binary)
+
+    def test_target_directory_rename_and_symlink_is_detected_and_cleaned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"fixed execd binary\n", seccomp)
+                original_write = INSTALL._write_temporary_at
+                attacked = False
+
+                def rename_parent(
+                    directory_fd: int,
+                    stem: str,
+                    payload: bytes,
+                    mode: int,
+                    uid: int,
+                    gid: int,
+                ) -> str:
+                    nonlocal attacked
+                    if stem == "buzz-ci-execd" and not attacked:
+                        attacked = True
+                        target_parent = root / "usr/libexec"
+                        target_parent.rename(root / "usr/libexec-held")
+                        attacker = root / "attacker"
+                        attacker.mkdir(mode=0o755)
+                        target_parent.symlink_to(attacker, target_is_directory=True)
+                    return original_write(directory_fd, stem, payload, mode, uid, gid)
+
+                with mock.patch.object(INSTALL, "_write_temporary_at", side_effect=rename_parent):
+                    with self.assertRaisesRegex(ValueError, "directory changed"):
+                        INSTALL.install(package, root)
+                self.assertFalse((root / "usr/libexec-held/buzz-ci-execd").exists())
+                self.assertFalse((root / "attacker/buzz-ci-execd").exists())
+                self.assertEqual(list((root / "usr/libexec-held").glob(".buzz-ci-execd.*")), [])
+                self.assertFalse(
+                    (root / "var/lib/buzzci/execd-v2/package/receipt-v1.json").exists()
+                )
+
+    def test_binary_readback_failure_removes_an_absent_prior_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"fixed execd binary\n", seccomp)
+                original_matches = INSTALL._binary_matches_at
+                calls = 0
+
+                def fail_first_readback(*args: object) -> bool:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        return False
+                    return original_matches(*args)
+
+                with mock.patch.object(INSTALL, "_binary_matches_at", side_effect=fail_first_readback):
+                    with self.assertRaisesRegex(ValueError, "readback differs"):
+                        INSTALL.install(package, root)
+                target_parent = root / "usr/libexec"
+                self.assertFalse((target_parent / "buzz-ci-execd").exists())
+                self.assertEqual(list(target_parent.glob(".buzz-ci-execd.*")), [])
+
+    def test_receipt_readback_failure_restores_prior_target_and_removes_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            prior = b"prior execd binary\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"fixed execd binary\n", seccomp)
+                target = root / "usr/libexec/buzz-ci-execd"
+                target.parent.mkdir(mode=0o755)
+                target.parent.chmod(0o755)
+                target.write_bytes(prior)
+                target.chmod(0o755)
+                original_verify = INSTALL._verify_receipt_at
+
+                def fail_present_receipt(*args: object) -> None:
+                    original_verify(*args)
+                    raise OSError("forced receipt readback failure")
+
+                with mock.patch.object(INSTALL, "_verify_receipt_at", side_effect=fail_present_receipt):
+                    with self.assertRaisesRegex(OSError, "forced receipt readback"):
+                        INSTALL.install(package, root)
+                self.assertEqual(target.read_bytes(), prior)
+                self.assertEqual(_mode(target), 0o755)
+                self.assertEqual(list(target.parent.glob(".buzz-ci-execd.*")), [])
+                self.assertFalse(
+                    (root / "var/lib/buzzci/execd-v2/package/receipt-v1.json").exists()
+                )
+
+    def test_receipt_publication_failure_removes_new_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"fixed execd binary\n", seccomp)
+                with mock.patch.object(
+                    INSTALL,
+                    "_publish_receipt",
+                    side_effect=OSError("forced receipt publication failure"),
+                ):
+                    with self.assertRaisesRegex(OSError, "forced receipt publication"):
+                        INSTALL.install(package, root)
+                target_parent = root / "usr/libexec"
+                self.assertFalse((target_parent / "buzz-ci-execd").exists())
+                self.assertEqual(list(target_parent.glob(".buzz-ci-execd.*")), [])
+                self.assertFalse(
+                    (root / "var/lib/buzzci/execd-v2/package/receipt-v1.json").exists()
+                )
 
     def test_installer_rejects_links_drift_and_unreceipted_central_assets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -10,9 +10,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
-import tempfile
 
 EXECD_DIR = Path(__file__).resolve().parent
 if str(EXECD_DIR) not in sys.path:
@@ -35,6 +35,7 @@ class Entry:
     uid: int
     gid: int
     sha256: str
+    payload: bytes
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -293,6 +294,7 @@ def parse_package(package: Path) -> tuple[dict[str, object], Entry]:
         uid=0,
         gid=0,
         sha256=str(item["sha256"]),
+        payload=payload,
     )
 
 
@@ -398,31 +400,6 @@ def _activation_receipt_state(root: Path, manifest: dict[str, object]) -> str:
     return "verified"
 
 
-def _ensure_state_directories(root: Path) -> Path:
-    plan = (
-        ("/var", 0o755),
-        ("/var/lib", 0o755),
-        ("/var/lib/buzzci", 0o711),
-        ("/var/lib/buzzci/execd-v2", 0o711),
-        ("/var/lib/buzzci/execd-v2/package", 0o700),
-    )
-    for target, mode in plan:
-        path = rooted(root, target)
-        if not path.exists():
-            path.mkdir(mode=mode)
-            os.chown(path, mapped_id(0, root), mapped_id(0, root, group=True))
-            path.chmod(mode)
-        metadata = path.lstat()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != mapped_id(0, root)
-            or metadata.st_gid != mapped_id(0, root, group=True)
-            or stat.S_IMODE(metadata.st_mode) != mode
-        ):
-            raise ValueError("execd package state directory differs")
-    return rooted(root, str(freeze_package.INSTALL_RECEIPT["path"]))
-
-
 def _receipt_bytes(manifest: dict[str, object]) -> bytes:
     binding = manifest["activation_binding"]
     return canonical_json(
@@ -489,75 +466,403 @@ def _target_matches(root: Path, entry: Entry) -> bool:
     )
 
 
-def _ensure_directories(root: Path) -> None:
-    current = root
-    target = rooted(root, "/usr/libexec")
-    for component in target.relative_to(root).parts:
-        current /= component
-        if not current.exists():
-            current.mkdir(mode=0o755)
-            os.chown(current, mapped_id(0, root), mapped_id(0, root, group=True))
-        metadata = current.lstat()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != mapped_id(0, root)
-            or metadata.st_gid != mapped_id(0, root, group=True)
-            or metadata.st_mode & 0o022
-        ):
-            raise ValueError("target directory chain is unsafe")
-    target.chmod(0o755)
+@dataclass(frozen=True)
+class _PriorTarget:
+    payload: bytes
+    mode: int
+    uid: int
+    gid: int
 
 
-def _atomic_write(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(name)
-    try:
-        os.fchmod(descriptor, mode)
-        os.fchown(descriptor, uid, gid)
-        view = memoryview(payload)
-        while view:
-            view = view[os.write(descriptor, view) :]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.replace(temporary, path)
-        parent = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
-        try:
-            os.fsync(parent)
-        finally:
-            os.close(parent)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+@dataclass
+class _Publication:
+    directory_fd: int
+    name: str
+    rollback_name: str | None
+    prior: _PriorTarget | None
 
 
-def _write_once(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
+def _open_root(root: Path) -> int:
     descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-        mode,
-    )
-    try:
-        os.fchmod(descriptor, mode)
-        os.fchown(descriptor, uid, gid)
-        view = memoryview(payload)
-        while view:
-            view = view[os.write(descriptor, view) :]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    parent = os.open(
-        path.parent,
+        root,
         os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
     )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != mapped_id(0, root)
+        or metadata.st_gid != mapped_id(0, root, group=True)
+        or metadata.st_mode & 0o022
+    ):
+        os.close(descriptor)
+        raise ValueError("install root metadata is unsafe")
+    return descriptor
+
+
+def _open_directory_chain(
+    root_fd: int,
+    plan: tuple[tuple[str, int | None], ...],
+    uid: int,
+    gid: int,
+) -> int:
+    current = os.dup(root_fd)
     try:
-        os.fsync(parent)
+        for component, exact_mode in plan:
+            created = False
+            try:
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=current,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, exact_mode or 0o755, dir_fd=current)
+                    created = True
+                except FileExistsError:
+                    pass
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=current,
+                )
+            try:
+                if created:
+                    os.fchown(child, uid, gid)
+                    os.fchmod(child, exact_mode or 0o755)
+                    os.fsync(child)
+                    os.fsync(current)
+                metadata = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != uid
+                    or metadata.st_gid != gid
+                    or (exact_mode is not None and stat.S_IMODE(metadata.st_mode) != exact_mode)
+                    or (exact_mode is None and metadata.st_mode & 0o022)
+                ):
+                    raise ValueError("target directory chain is unsafe")
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _directory_binding_matches(
+    root_fd: int,
+    components: tuple[str, ...],
+    expected_fd: int,
+) -> bool:
+    current = os.dup(root_fd)
+    try:
+        for component in components:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = child
+        observed = os.fstat(current)
+        expected = os.fstat(expected_fd)
+        return (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino)
+    except OSError:
+        return False
     finally:
-        os.close(parent)
+        os.close(current)
+
+
+def _read_regular_at(
+    directory_fd: int,
+    name: str,
+    maximum: int = 128 * 1024 * 1024,
+) -> tuple[bytes, os.stat_result]:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(f"unsafe regular file: {name}")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            size += len(chunk)
+            if size > maximum:
+                raise ValueError(f"file exceeds byte limit: {name}")
+            chunks.append(chunk)
+        if size == 0:
+            raise ValueError(f"empty regular file: {name}")
+        return b"".join(chunks), metadata
+    finally:
+        os.close(descriptor)
+
+
+def _binary_matches_at(directory_fd: int, entry: Entry, uid: int, gid: int) -> bool:
+    try:
+        payload, metadata = _read_regular_at(directory_fd, Path(entry.target).name)
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    return (
+        sha256(payload) == entry.sha256
+        and stat.S_IMODE(metadata.st_mode) == entry.install_mode
+        and metadata.st_uid == uid
+        and metadata.st_gid == gid
+    )
+
+
+def _temporary_name(directory_fd: int, stem: str) -> str:
+    for _ in range(128):
+        name = f".{stem}.{secrets.token_hex(12)}"
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return name
+    raise FileExistsError("could not allocate a private publication name")
+
+
+def _write_temporary_at(
+    directory_fd: int,
+    stem: str,
+    payload: bytes,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> str:
+    name = _temporary_name(directory_fd, stem)
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        os.fchmod(descriptor, mode)
+        os.fchown(descriptor, uid, gid)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                raise OSError("short write while publishing execd package")
+            view = view[written:]
+        os.fsync(descriptor)
+        return name
+    except BaseException:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def _prior_target_at(directory_fd: int, name: str) -> _PriorTarget | None:
+    try:
+        payload, metadata = _read_regular_at(directory_fd, name)
+    except FileNotFoundError:
+        return None
+    return _PriorTarget(
+        payload=payload,
+        mode=stat.S_IMODE(metadata.st_mode),
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+    )
+
+
+def _assert_prior_restored(publication: _Publication) -> None:
+    if publication.prior is None:
+        try:
+            os.stat(publication.name, dir_fd=publication.directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise ValueError("new execd binary remains after rollback")
+    payload, metadata = _read_regular_at(publication.directory_fd, publication.name)
+    if (
+        payload != publication.prior.payload
+        or stat.S_IMODE(metadata.st_mode) != publication.prior.mode
+        or metadata.st_uid != publication.prior.uid
+        or metadata.st_gid != publication.prior.gid
+    ):
+        raise ValueError("prior execd binary restore differs")
+
+
+def _restore_publication(publication: _Publication) -> None:
+    if publication.prior is None:
+        try:
+            os.unlink(publication.name, dir_fd=publication.directory_fd)
+        except FileNotFoundError:
+            pass
+    else:
+        restored = False
+        if publication.rollback_name is not None:
+            try:
+                os.replace(
+                    publication.rollback_name,
+                    publication.name,
+                    src_dir_fd=publication.directory_fd,
+                    dst_dir_fd=publication.directory_fd,
+                )
+                restored = True
+            except FileNotFoundError:
+                pass
+        if not restored:
+            temporary = _write_temporary_at(
+                publication.directory_fd,
+                publication.name,
+                publication.prior.payload,
+                publication.prior.mode,
+                publication.prior.uid,
+                publication.prior.gid,
+            )
+            os.replace(
+                temporary,
+                publication.name,
+                src_dir_fd=publication.directory_fd,
+                dst_dir_fd=publication.directory_fd,
+            )
+    os.fsync(publication.directory_fd)
+    _assert_prior_restored(publication)
+
+
+def _publish_binary(directory_fd: int, entry: Entry, uid: int, gid: int) -> _Publication:
+    name = Path(entry.target).name
+    prior = _prior_target_at(directory_fd, name)
+    temporary = _write_temporary_at(
+        directory_fd,
+        name,
+        entry.payload,
+        entry.install_mode,
+        uid,
+        gid,
+    )
+    rollback_name: str | None = None
+    prior_moved = False
+    published = False
+    publication = _Publication(directory_fd, name, None, prior)
+    try:
+        if prior is not None:
+            rollback_name = _temporary_name(directory_fd, f"{name}.rollback")
+            os.replace(
+                name,
+                rollback_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            prior_moved = True
+            publication.rollback_name = rollback_name
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        published = True
+        temporary = ""
+        os.fsync(directory_fd)
+        if not _binary_matches_at(directory_fd, entry, uid, gid):
+            raise ValueError("installed execd binary readback differs")
+        return publication
+    except BaseException:
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if published or prior_moved:
+            _restore_publication(publication)
+        raise
+
+
+def _discard_rollback(publication: _Publication) -> None:
+    if publication.rollback_name is None:
+        return
+    os.unlink(publication.rollback_name, dir_fd=publication.directory_fd)
+    os.fsync(publication.directory_fd)
+
+
+def _verify_receipt_at(
+    directory_fd: int,
+    manifest: dict[str, object],
+    uid: int,
+    gid: int,
+) -> None:
+    payload, metadata = _read_regular_at(directory_fd, "receipt-v1.json", MAX_JSON_BYTES)
+    if (
+        payload != _receipt_bytes(manifest)
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError("execd package install receipt differs")
+
+
+def _publish_receipt(
+    directory_fd: int,
+    manifest: dict[str, object],
+    uid: int,
+    gid: int,
+) -> bool:
+    temporary = _write_temporary_at(
+        directory_fd,
+        "receipt-v1.json",
+        _receipt_bytes(manifest),
+        0o600,
+        uid,
+        gid,
+    )
+    created = False
+    try:
+        try:
+            os.link(
+                temporary,
+                "receipt-v1.json",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            created = True
+        except FileExistsError:
+            pass
+        os.unlink(temporary, dir_fd=directory_fd)
+        temporary = ""
+        os.fsync(directory_fd)
+        return created
+    except BaseException:
+        if created:
+            try:
+                os.unlink("receipt-v1.json", dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _remove_created_receipt(directory_fd: int) -> None:
+    try:
+        os.unlink("receipt-v1.json", dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+    os.fsync(directory_fd)
+    try:
+        os.stat("receipt-v1.json", dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise ValueError("execd package receipt remains after rollback")
 
 
 def inspect(package: Path, root: Path) -> dict[str, object]:
@@ -603,33 +908,90 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
     }
     if dry_run:
         return result
-    if changed:
-        _ensure_directories(root)
-        payload, _ = read_regular(package / entry.source)
-        _atomic_write(
-            rooted(root, entry.target),
-            payload,
-            entry.install_mode,
-            mapped_id(entry.uid, root),
-            mapped_id(entry.gid, root, group=True),
+    uid = mapped_id(0, root)
+    gid = mapped_id(0, root, group=True)
+    root_fd = _open_root(root)
+    binary_directory = -1
+    receipt_directory = -1
+    publication: _Publication | None = None
+    receipt_created = False
+    try:
+        binary_directory = _open_directory_chain(
+            root_fd,
+            (("usr", None), ("libexec", 0o755)),
+            uid,
+            gid,
         )
-    if not _target_matches(root, entry):
-        raise ValueError("installed execd binary readback differs")
-    if not receipt_present:
-        receipt_path = _ensure_state_directories(root)
+        receipt_directory = _open_directory_chain(
+            root_fd,
+            (
+                ("var", 0o755),
+                ("lib", 0o755),
+                ("buzzci", 0o711),
+                ("execd-v2", 0o711),
+                ("package", 0o700),
+            ),
+            uid,
+            gid,
+        )
+        changed = not _binary_matches_at(binary_directory, entry, uid, gid)
         try:
-            _write_once(
-                receipt_path,
-                _receipt_bytes(manifest),
-                0o600,
-                mapped_id(0, root),
-                mapped_id(0, root, group=True),
+            _verify_receipt_at(receipt_directory, manifest, uid, gid)
+            receipt_present = True
+        except FileNotFoundError:
+            receipt_present = False
+        result["status"] = "installed" if changed or not receipt_present else "unchanged"
+        result["changed_targets"] = ([entry.target] if changed else []) + (
+            [] if receipt_present else [str(freeze_package.INSTALL_RECEIPT["path"])]
+        )
+        result["install_receipt"] = "pending" if changed or not receipt_present else "verified"
+
+        if changed:
+            publication = _publish_binary(binary_directory, entry, uid, gid)
+        if not _binary_matches_at(binary_directory, entry, uid, gid):
+            raise ValueError("installed execd binary readback differs")
+        if not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory):
+            raise ValueError("execd binary directory changed during installation")
+        if not receipt_present:
+            receipt_created = _publish_receipt(receipt_directory, manifest, uid, gid)
+        _verify_receipt_at(receipt_directory, manifest, uid, gid)
+        if not _binary_matches_at(binary_directory, entry, uid, gid):
+            raise ValueError("installed execd binary readback differs")
+        if (
+            not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory)
+            or not _directory_binding_matches(
+                root_fd,
+                ("var", "lib", "buzzci", "execd-v2", "package"),
+                receipt_directory,
             )
-        except FileExistsError:
-            pass
-    _verify_install_receipt(root, manifest, absent_ok=False)
-    result["install_receipt"] = "verified"
-    return result
+        ):
+            raise ValueError("execd publication directory changed during installation")
+        if publication is not None:
+            _discard_rollback(publication)
+        result["install_receipt"] = "verified"
+        return result
+    except BaseException as install_error:
+        rollback_errors: list[BaseException] = []
+        if receipt_created and receipt_directory >= 0:
+            try:
+                _remove_created_receipt(receipt_directory)
+            except BaseException as error:
+                rollback_errors.append(error)
+        if publication is not None:
+            try:
+                _restore_publication(publication)
+            except BaseException as error:
+                rollback_errors.append(error)
+        if rollback_errors:
+            detail = "; ".join(str(error) for error in rollback_errors)
+            raise RuntimeError(f"execd installation rollback failed: {detail}") from install_error
+        raise
+    finally:
+        if receipt_directory >= 0:
+            os.close(receipt_directory)
+        if binary_directory >= 0:
+            os.close(binary_directory)
+        os.close(root_fd)
 
 
 def main() -> int:
