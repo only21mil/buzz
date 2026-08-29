@@ -1069,7 +1069,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "d2a6ce74f1a7a2532e3e7f5e1f353ba1e9bc989a32db87ede368bd3dc716f2c5",
+            "a42ad16ec761c8776f966b53b146e5623301447fef20bfa2182724b10c5e425c",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1396,6 +1396,55 @@ class ActivationControllerTests(unittest.TestCase):
             CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, different)
 
     def test_rollback_restores_enabled_listening_execd_baseline(self) -> None:
+        component = next(
+            item for item in self.fixture.manifest["components"]
+            if item["name"] == "execd"
+        )
+        prior_binary = b"prior execd binary\n"
+        uid = os.geteuid()
+        gid = os.getegid()
+        install_receipt = {
+            "schema": "buzz-ci-execd-install-receipt-v1",
+            "state": "installed",
+            "package_id": "buzz-ci-execd-111111111111-222222222222",
+            "package_digest": "1" * 64,
+            "source_commit": component["source_commit"],
+            "binary_sha256": component["binary_sha256"],
+            "binary_target": CONTROLLER.EXECD_BINARY_PATH,
+            "binary_mode": 0o755,
+            "binary_uid": uid,
+            "binary_gid": gid,
+            "activation_id": self.fixture.manifest["activation_id"],
+            "activation_package_digest": self.fixture.manifest["package_digest"],
+            "activation_manifest_sha256": activation_package.digest(
+                activation_package.canonical_json(self.fixture.manifest)
+            ),
+            "activation_owned_entries_sha256": "3" * 64,
+            "seccomp_source_sha256": "4" * 64,
+            "enabled": False,
+            "active": False,
+            "capacity": 0,
+            "prior": {
+                "state": "present",
+                "binary": {
+                    "sha256": activation_package.digest(prior_binary),
+                    "mode": 0o755,
+                    "uid": uid,
+                    "gid": gid,
+                },
+                "preimage": {
+                    "name": "preimage-v1.bin",
+                    "sha256": activation_package.digest(prior_binary),
+                    "mode": 0o600,
+                    "uid": uid,
+                    "gid": gid,
+                },
+            },
+        }
+        package_receipt = self.fixture.root / CONTROLLER.EXECD_PACKAGE_RECEIPT_PATH.lstrip("/")
+        package_preimage = self.fixture.root / CONTROLLER.EXECD_PACKAGE_PREIMAGE_PATH.lstrip("/")
+        write_file(package_receipt, activation_package.canonical_json(install_receipt), 0o600)
+        write_file(package_preimage, prior_binary, 0o600)
         effective = next(
             item for item in self.fixture.manifest["effective_systemd"]
             if item["unit"] == "buzz-ci-execd.socket"
@@ -1422,6 +1471,26 @@ class ActivationControllerTests(unittest.TestCase):
         CONTROLLER._prepare_qualification_zero(manifest, payloads, self.fixture.root, driver, prepare, prepare_sha)
         finalize, finalize_sha = self.parsed_zero_request("finalize-qualification-zero", "d")
         CONTROLLER._finalize_qualification_zero(manifest, payloads, self.fixture.root, driver, finalize, finalize_sha)
+        with self.assertRaisesRegex(ValueError, "execd package rollback is required"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(driver.unit("buzz-ci-execd.socket")["ActiveState"], "inactive")
+
+        write_file(
+            self.fixture.root / CONTROLLER.EXECD_BINARY_PATH.lstrip("/"),
+            prior_binary,
+            0o755,
+        )
+        package_receipt.unlink()
+        package_preimage.unlink()
+        write_file(
+            self.fixture.root / CONTROLLER.EXECD_PACKAGE_ROLLBACK_PATH.lstrip("/"),
+            activation_package.canonical_json({
+                "schema": "buzz-ci-execd-package-rollback-receipt-v1",
+                "state": "rolled_back",
+                "install_receipt": install_receipt,
+            }),
+            0o600,
+        )
         rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
         self.assertEqual(
             (rolled_back["units"]["buzz-ci-execd.socket"]["ActiveState"], rolled_back["units"]["buzz-ci-execd.socket"]["UnitFileState"]),

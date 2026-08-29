@@ -48,6 +48,10 @@ SYSUSERS = "/usr/bin/systemd-sysusers"
 TMPFILES = "/usr/bin/systemd-tmpfiles"
 MAX_COMMAND_OUTPUT = 256 * 1024
 MAX_BINARY_BYTES = 128 * 1024 * 1024
+EXECD_BINARY_PATH = "/usr/libexec/buzz-ci-execd"
+EXECD_PACKAGE_RECEIPT_PATH = "/var/lib/buzzci/execd-v2/package/receipt-v1.json"
+EXECD_PACKAGE_PREIMAGE_PATH = "/var/lib/buzzci/execd-v2/package/preimage-v1.bin"
+EXECD_PACKAGE_ROLLBACK_PATH = "/var/lib/buzzci/execd-v2/package/rollback-v1.json"
 QUALIFICATION_REQUEST_SCHEMA = "buzz-ci-production-qualification-request/v2"
 QUALIFICATION_RESPONSE_SCHEMA = "buzz-ci-production-qualification-response/v2"
 QUALIFICATION_STATE_SCHEMA = "buzz-ci-production-qualification-state/v3"
@@ -116,6 +120,146 @@ def _physical_ids(root: Path, uid: int, gid: int) -> tuple[int, int]:
     if root != Path("/") and os.geteuid() != 0:
         return os.geteuid(), os.getegid()
     return uid, gid
+
+
+def _execd_package_json(root: Path, target: str) -> dict[str, Any] | None:
+    opened = _read_target(root, target, MAX_SCENARIO_BYTES)
+    if opened is None:
+        return None
+    payload, metadata = opened
+    uid, gid = _physical_ids(root, 0, 0)
+    if (
+        metadata.st_uid != uid
+        or metadata.st_gid != gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError(f"execd package receipt metadata differs: {target}")
+    try:
+        value = json.loads(payload, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"execd package receipt is invalid: {target}") from error
+    if not isinstance(value, dict) or activation_package.canonical_json(value) != payload:
+        raise ValueError(f"execd package receipt is noncanonical: {target}")
+    return value
+
+
+def _bind_execd_install_receipt(
+    manifest: dict[str, Any], root: Path, value: dict[str, Any]
+) -> dict[str, Any]:
+    component = next(item for item in manifest["components"] if item["name"] == "execd")
+    root_uid, root_gid = _physical_ids(root, 0, 0)
+    expected_keys = {
+        "schema", "state", "package_id", "package_digest", "source_commit",
+        "binary_sha256", "binary_target", "binary_mode", "binary_uid", "binary_gid",
+        "activation_id", "activation_package_digest", "activation_manifest_sha256",
+        "activation_owned_entries_sha256", "seccomp_source_sha256", "enabled", "active",
+        "capacity", "prior",
+    }
+    prior = value.get("prior")
+    if (
+        set(value) != expected_keys
+        or value.get("schema") != "buzz-ci-execd-install-receipt-v1"
+        or value.get("state") != "installed"
+        or value.get("source_commit") != component["source_commit"]
+        or value.get("binary_sha256") != component["binary_sha256"]
+        or value.get("binary_target") != EXECD_BINARY_PATH
+        or value.get("binary_mode") != 0o755
+        or value.get("binary_uid") != root_uid
+        or value.get("binary_gid") != root_gid
+        or value.get("activation_id") != manifest["activation_id"]
+        or value.get("activation_package_digest") != manifest["package_digest"]
+        or value.get("activation_manifest_sha256")
+        != activation_package.digest(activation_package.canonical_json(manifest))
+        or value.get("enabled") is not False
+        or value.get("active") is not False
+        or value.get("capacity") != 0
+        or not isinstance(value.get("package_id"), str)
+        or not re.fullmatch(r"buzz-ci-execd-[0-9a-f]{12}-[0-9a-f]{12}", value["package_id"])
+        or not isinstance(value.get("package_digest"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["package_digest"])
+        or not isinstance(value.get("activation_owned_entries_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["activation_owned_entries_sha256"])
+        or not isinstance(value.get("seccomp_source_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["seccomp_source_sha256"])
+        or not isinstance(prior, dict)
+    ):
+        raise ValueError("execd package receipt belongs to a different candidate")
+    if prior == {"state": "absent", "binary": None, "preimage": None}:
+        return prior
+    binary = prior.get("binary")
+    preimage = prior.get("preimage")
+    if (
+        set(prior) != {"state", "binary", "preimage"}
+        or prior.get("state") != "present"
+        or not isinstance(binary, dict)
+        or set(binary) != {"sha256", "mode", "uid", "gid"}
+        or not isinstance(preimage, dict)
+        or set(preimage) != {"name", "sha256", "mode", "uid", "gid"}
+        or not isinstance(binary.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", binary["sha256"])
+        or preimage.get("name") != "preimage-v1.bin"
+        or preimage.get("sha256") != binary["sha256"]
+        or preimage.get("mode") != 0o600
+        or preimage.get("uid") != root_uid
+        or preimage.get("gid") != root_gid
+        or isinstance(binary.get("mode"), bool)
+        or not isinstance(binary.get("mode"), int)
+        or not 0 <= binary["mode"] <= 0o7777
+        or isinstance(binary.get("uid"), bool)
+        or not isinstance(binary.get("uid"), int)
+        or binary["uid"] < 0
+        or isinstance(binary.get("gid"), bool)
+        or not isinstance(binary.get("gid"), int)
+        or binary["gid"] < 0
+    ):
+        raise ValueError("execd package prior receipt differs")
+    return prior
+
+
+def _execd_package_rollback_readback(
+    manifest: dict[str, Any], root: Path, activation_receipt: dict[str, Any]
+) -> str:
+    prior_systemd = activation_receipt.get("systemd_before")
+    if not isinstance(prior_systemd, dict) or not any(
+        prior_systemd.get(unit, {}).get("ActiveState") == "active"
+        for unit in ("buzz-ci-execd.socket", "buzz-ci-execd.service")
+    ):
+        return "not_required"
+    active = _execd_package_json(root, EXECD_PACKAGE_RECEIPT_PATH)
+    terminal = _execd_package_json(root, EXECD_PACKAGE_ROLLBACK_PATH)
+    if terminal is None:
+        if active is None:
+            raise ValueError("active execd baseline lacks package rollback evidence")
+        _bind_execd_install_receipt(manifest, root, active)
+        return "required"
+    if (
+        set(terminal) != {"schema", "state", "install_receipt"}
+        or terminal.get("schema") != "buzz-ci-execd-package-rollback-receipt-v1"
+        or terminal.get("state") != "rolled_back"
+        or not isinstance(terminal.get("install_receipt"), dict)
+        or active is not None
+        or _read_target(root, EXECD_PACKAGE_PREIMAGE_PATH) is not None
+    ):
+        raise ValueError("execd package rollback receipt differs")
+    prior = _bind_execd_install_receipt(manifest, root, terminal["install_receipt"])
+    target = _read_target(root, EXECD_BINARY_PATH, MAX_BINARY_BYTES)
+    if prior["state"] == "absent":
+        if target is not None:
+            raise ValueError("rolled-back absent execd baseline differs")
+    else:
+        if target is None:
+            raise ValueError("rolled-back execd baseline is absent")
+        payload, metadata = target
+        binary = prior["binary"]
+        expected_uid, expected_gid = _physical_ids(root, binary["uid"], binary["gid"])
+        if (
+            activation_package.digest(payload) != binary["sha256"]
+            or stat.S_IMODE(metadata.st_mode) != binary["mode"]
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+        ):
+            raise ValueError("rolled-back execd baseline differs")
+    return "rolled_back"
 
 
 def _verify_target_digest(root: Path, target: str, expected: dict[str, object], limit: int) -> None:
@@ -3544,6 +3688,9 @@ def rollback(
         _validate_receipt_targets(receipt, manifest)
         _restore_prior(receipt, manifest, root, apply=False)
         _validate_generated_records(receipt, root, apply=False)
+        execd_package_rollback = _execd_package_rollback_readback(
+            manifest, root, receipt
+        )
     except BaseException as error:
         receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": str(error)})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
@@ -3571,11 +3718,17 @@ def rollback(
         targets = _prior_readback(receipt, manifest, root)
     except BaseException as error:
         errors.append(f"prior target readback: {error}")
-    try:
-        errors.extend(_restore_systemd_prior_errors(receipt, driver))
-        units = _systemd_prior_readback(receipt, manifest, root, driver)
-    except BaseException as error:
-        errors.append(f"systemd prior readback: {error}")
+    if execd_package_rollback == "required":
+        errors.append(
+            "execd package rollback is required before systemd prior restore; "
+            "run the bound execd package rollback and retry activation rollback"
+        )
+    else:
+        try:
+            errors.extend(_restore_systemd_prior_errors(receipt, driver))
+            units = _systemd_prior_readback(receipt, manifest, root, driver)
+        except BaseException as error:
+            errors.append(f"systemd prior readback: {error}")
     generated_prior: dict[str, str] | None = None
     try:
         generated_prior = _generated_prior_readback(receipt, root)

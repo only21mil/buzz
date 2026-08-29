@@ -136,6 +136,12 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    prior bytes, metadata, and exact unit active/enable state. It restores or
    removes generated acceptance configs and restores the prior controld
    acceptance ledger. Service principals remain for audit and UID stability.
+   If the prior execd service or socket was active, rollback stops at a safe
+   capacity-zero hold before restoring prior unit state while the standalone
+   execd package receipt is active. Run the exact execd package's
+   `install.py rollback`, then retry activation rollback. The retry accepts only
+   a bound terminal execd rollback receipt and exact restored binary baseline
+   before systemd may restart the prior execd unit.
 
 The production canary closes capacity through three root-only calls to the
 installed `/usr/libexec/buzz-ci-activation-controller`. Each call accepts only

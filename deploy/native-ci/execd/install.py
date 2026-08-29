@@ -24,6 +24,9 @@ MAX_JSON_BYTES = 1024 * 1024
 PACKAGE_ID = re.compile(r"^buzz-ci-execd-[0-9a-f]{12}-[0-9a-f]{12}$")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
+RECEIPT_NAME = "receipt-v1.json"
+PREIMAGE_NAME = "preimage-v1.bin"
+ROLLBACK_RECEIPT_NAME = "rollback-v1.json"
 
 
 @dataclass(frozen=True)
@@ -400,25 +403,111 @@ def _activation_receipt_state(root: Path, manifest: dict[str, object]) -> str:
     return "verified"
 
 
-def _receipt_bytes(manifest: dict[str, object]) -> bytes:
+def _prior_record(prior: _PriorTarget | None, uid: int, gid: int) -> dict[str, object]:
+    if prior is None:
+        return {"state": "absent", "binary": None, "preimage": None}
+    digest = sha256(prior.payload)
+    return {
+        "state": "present",
+        "binary": {
+            "sha256": digest,
+            "mode": prior.mode,
+            "uid": prior.uid,
+            "gid": prior.gid,
+        },
+        "preimage": {
+            "name": PREIMAGE_NAME,
+            "sha256": digest,
+            "mode": 0o600,
+            "uid": uid,
+            "gid": gid,
+        },
+    }
+
+
+def _receipt_value(
+    manifest: dict[str, object],
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+) -> dict[str, object]:
     binding = manifest["activation_binding"]
-    return canonical_json(
-        {
-            "schema": freeze_package.INSTALL_RECEIPT["schema"],
-            "package_id": manifest["package_id"],
-            "package_digest": manifest["package_digest"],
-            "source_commit": manifest["source_commit"],
-            "binary_sha256": binding["execd_binary_sha256"],
-            "activation_id": binding["activation_id"],
-            "activation_package_digest": binding["package_digest"],
-            "activation_manifest_sha256": binding["manifest_sha256"],
-            "activation_owned_entries_sha256": binding["owned_entries_sha256"],
-            "seccomp_source_sha256": freeze_package.SECCOMP_CONTRACT["source_sha256"],
-            "enabled": False,
-            "active": False,
-            "capacity": 0,
+    return {
+        "schema": freeze_package.INSTALL_RECEIPT["schema"],
+        "state": "installed",
+        "package_id": manifest["package_id"],
+        "package_digest": manifest["package_digest"],
+        "source_commit": manifest["source_commit"],
+        "binary_sha256": binding["execd_binary_sha256"],
+        "binary_target": freeze_package.RUNTIME_CONTRACT["binary"],
+        "binary_mode": _mode(freeze_package.RUNTIME_CONTRACT["mode"]),
+        "binary_uid": uid,
+        "binary_gid": gid,
+        "activation_id": binding["activation_id"],
+        "activation_package_digest": binding["package_digest"],
+        "activation_manifest_sha256": binding["manifest_sha256"],
+        "activation_owned_entries_sha256": binding["owned_entries_sha256"],
+        "seccomp_source_sha256": freeze_package.SECCOMP_CONTRACT["source_sha256"],
+        "enabled": False,
+        "active": False,
+        "capacity": 0,
+        "prior": _prior_record(prior, uid, gid),
+    }
+
+
+def _receipt_bytes(
+    manifest: dict[str, object],
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+) -> bytes:
+    return canonical_json(_receipt_value(manifest, prior, uid, gid))
+
+
+def _receipt_prior(
+    value: dict[str, object],
+    manifest: dict[str, object],
+    uid: int,
+    gid: int,
+) -> _PriorTarget | None:
+    expected = _receipt_value(manifest, None, uid, gid)
+    expected.pop("prior")
+    observed = dict(value)
+    prior = observed.pop("prior", None)
+    if observed != expected or not isinstance(prior, dict):
+        raise ValueError("execd package install receipt differs")
+    if prior == {"state": "absent", "binary": None, "preimage": None}:
+        return None
+    if set(prior) != {"state", "binary", "preimage"} or prior.get("state") != "present":
+        raise ValueError("execd package prior receipt differs")
+    binary = prior.get("binary")
+    preimage = prior.get("preimage")
+    if (
+        not isinstance(binary, dict)
+        or set(binary) != {"sha256", "mode", "uid", "gid"}
+        or not isinstance(preimage, dict)
+        or set(preimage) != {"name", "sha256", "mode", "uid", "gid"}
+        or not isinstance(binary.get("sha256"), str)
+        or not DIGEST.fullmatch(str(binary["sha256"]))
+        or preimage != {
+            "name": PREIMAGE_NAME,
+            "sha256": binary["sha256"],
+            "mode": 0o600,
+            "uid": uid,
+            "gid": gid,
         }
-    )
+        or isinstance(binary.get("mode"), bool)
+        or not isinstance(binary.get("mode"), int)
+        or not 0 <= int(binary["mode"]) <= 0o7777
+        or isinstance(binary.get("uid"), bool)
+        or not isinstance(binary.get("uid"), int)
+        or int(binary["uid"]) < 0
+        or isinstance(binary.get("gid"), bool)
+        or not isinstance(binary.get("gid"), int)
+        or int(binary["gid"]) < 0
+    ):
+        raise ValueError("execd package prior receipt differs")
+    return _PriorTarget(b"", int(binary["mode"]), int(binary["uid"]), int(binary["gid"]))
 
 
 def _verify_install_receipt(root: Path, manifest: dict[str, object], *, absent_ok: bool) -> bool:
@@ -442,13 +531,21 @@ def _verify_install_receipt(root: Path, manifest: dict[str, object], *, absent_o
             return False
         raise ValueError("execd package install receipt is absent")
     payload, metadata = read_regular(path, MAX_JSON_BYTES)
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("execd package install receipt is invalid") from error
+    uid = mapped_id(0, root)
+    gid = mapped_id(0, root, group=True)
     if (
-        payload != _receipt_bytes(manifest)
-        or metadata.st_uid != mapped_id(0, root)
-        or metadata.st_gid != mapped_id(0, root, group=True)
+        not isinstance(value, dict)
+        or canonical_json(value) != payload
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
         raise ValueError("execd package install receipt differs")
+    _receipt_prior(value, manifest, uid, gid)
     return True
 
 
@@ -504,6 +601,8 @@ def _open_directory_chain(
     plan: tuple[tuple[str, int | None], ...],
     uid: int,
     gid: int,
+    *,
+    create: bool = True,
 ) -> int:
     current = os.dup(root_fd)
     try:
@@ -516,6 +615,8 @@ def _open_directory_chain(
                     dir_fd=current,
                 )
             except FileNotFoundError:
+                if not create:
+                    raise
                 try:
                     os.mkdir(component, exact_mode or 0o755, dir_fd=current)
                     created = True
@@ -787,42 +888,64 @@ def _discard_rollback(publication: _Publication) -> None:
     os.fsync(publication.directory_fd)
 
 
+def _absent_at(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    return False
+
+
 def _verify_receipt_at(
     directory_fd: int,
     manifest: dict[str, object],
     uid: int,
     gid: int,
-) -> None:
-    payload, metadata = _read_regular_at(directory_fd, "receipt-v1.json", MAX_JSON_BYTES)
+) -> _PriorTarget | None:
+    payload, metadata = _read_regular_at(directory_fd, RECEIPT_NAME, MAX_JSON_BYTES)
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("execd package install receipt is invalid") from error
     if (
-        payload != _receipt_bytes(manifest)
+        not isinstance(value, dict)
+        or canonical_json(value) != payload
         or metadata.st_uid != uid
         or metadata.st_gid != gid
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
         raise ValueError("execd package install receipt differs")
+    prior = _receipt_prior(value, manifest, uid, gid)
+    if prior is None:
+        if not _absent_at(directory_fd, PREIMAGE_NAME):
+            raise ValueError("execd package has an unexpected preimage")
+        return None
+    preimage, preimage_metadata = _read_regular_at(directory_fd, PREIMAGE_NAME)
+    if (
+        sha256(preimage) != value["prior"]["preimage"]["sha256"]
+        or preimage_metadata.st_uid != uid
+        or preimage_metadata.st_gid != gid
+        or stat.S_IMODE(preimage_metadata.st_mode) != 0o600
+    ):
+        raise ValueError("execd package preimage differs")
+    return _PriorTarget(preimage, prior.mode, prior.uid, prior.gid)
 
 
-def _publish_receipt(
+def _publish_create_once(
     directory_fd: int,
-    manifest: dict[str, object],
+    name: str,
+    payload: bytes,
+    mode: int,
     uid: int,
     gid: int,
 ) -> bool:
-    temporary = _write_temporary_at(
-        directory_fd,
-        "receipt-v1.json",
-        _receipt_bytes(manifest),
-        0o600,
-        uid,
-        gid,
-    )
+    temporary = _write_temporary_at(directory_fd, name, payload, mode, uid, gid)
     created = False
     try:
         try:
             os.link(
                 temporary,
-                "receipt-v1.json",
+                name,
                 src_dir_fd=directory_fd,
                 dst_dir_fd=directory_fd,
                 follow_symlinks=False,
@@ -837,7 +960,7 @@ def _publish_receipt(
     except BaseException:
         if created:
             try:
-                os.unlink("receipt-v1.json", dir_fd=directory_fd)
+                os.unlink(name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
         if temporary:
@@ -852,14 +975,31 @@ def _publish_receipt(
         raise
 
 
+def _publish_receipt(
+    directory_fd: int,
+    manifest: dict[str, object],
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+) -> bool:
+    return _publish_create_once(
+        directory_fd,
+        RECEIPT_NAME,
+        _receipt_bytes(manifest, prior, uid, gid),
+        0o600,
+        uid,
+        gid,
+    )
+
+
 def _remove_created_receipt(directory_fd: int) -> None:
     try:
-        os.unlink("receipt-v1.json", dir_fd=directory_fd)
+        os.unlink(RECEIPT_NAME, dir_fd=directory_fd)
     except FileNotFoundError:
         pass
     os.fsync(directory_fd)
     try:
-        os.stat("receipt-v1.json", dir_fd=directory_fd, follow_symlinks=False)
+        os.stat(RECEIPT_NAME, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
     raise ValueError("execd package receipt remains after rollback")
@@ -915,6 +1055,7 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
     receipt_directory = -1
     publication: _Publication | None = None
     receipt_created = False
+    preimage_created = False
     try:
         binary_directory = _open_directory_chain(
             root_fd,
@@ -934,18 +1075,39 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             uid,
             gid,
         )
+        if not _absent_at(receipt_directory, ROLLBACK_RECEIPT_NAME):
+            raise ValueError("execd package rollback receipt blocks install replay")
         changed = not _binary_matches_at(binary_directory, entry, uid, gid)
+        receipt_prior: _PriorTarget | None = None
         try:
-            _verify_receipt_at(receipt_directory, manifest, uid, gid)
+            receipt_prior = _verify_receipt_at(receipt_directory, manifest, uid, gid)
             receipt_present = True
         except FileNotFoundError:
             receipt_present = False
+            if not _absent_at(receipt_directory, PREIMAGE_NAME):
+                raise ValueError("unreceipted execd package preimage blocks installation")
+        if receipt_present and changed:
+            raise ValueError("installed execd binary drift blocks replacement")
         result["status"] = "installed" if changed or not receipt_present else "unchanged"
         result["changed_targets"] = ([entry.target] if changed else []) + (
             [] if receipt_present else [str(freeze_package.INSTALL_RECEIPT["path"])]
         )
         result["install_receipt"] = "pending" if changed or not receipt_present else "verified"
 
+        prior = receipt_prior if receipt_present else _prior_target_at(
+            binary_directory, Path(entry.target).name
+        )
+        if not receipt_present and prior is not None:
+            preimage_created = _publish_create_once(
+                receipt_directory,
+                PREIMAGE_NAME,
+                prior.payload,
+                0o600,
+                uid,
+                gid,
+            )
+            if not preimage_created:
+                raise ValueError("execd package preimage appeared during installation")
         if changed:
             publication = _publish_binary(binary_directory, entry, uid, gid)
         if not _binary_matches_at(binary_directory, entry, uid, gid):
@@ -953,7 +1115,11 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
         if not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory):
             raise ValueError("execd binary directory changed during installation")
         if not receipt_present:
-            receipt_created = _publish_receipt(receipt_directory, manifest, uid, gid)
+            receipt_created = _publish_receipt(
+                receipt_directory, manifest, prior, uid, gid
+            )
+            if not receipt_created:
+                raise ValueError("execd package receipt appeared during installation")
         _verify_receipt_at(receipt_directory, manifest, uid, gid)
         if not _binary_matches_at(binary_directory, entry, uid, gid):
             raise ValueError("installed execd binary readback differs")
@@ -982,10 +1148,425 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
                 _restore_publication(publication)
             except BaseException as error:
                 rollback_errors.append(error)
+        if preimage_created and receipt_directory >= 0:
+            try:
+                os.unlink(PREIMAGE_NAME, dir_fd=receipt_directory)
+                os.fsync(receipt_directory)
+            except BaseException as error:
+                rollback_errors.append(error)
         if rollback_errors:
             detail = "; ".join(str(error) for error in rollback_errors)
             raise RuntimeError(f"execd installation rollback failed: {detail}") from install_error
         raise
+    finally:
+        if receipt_directory >= 0:
+            os.close(receipt_directory)
+        if binary_directory >= 0:
+            os.close(binary_directory)
+        os.close(root_fd)
+
+
+def _rollback_receipt_bytes(
+    manifest: dict[str, object],
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+    state: str,
+) -> bytes:
+    if state not in {"rolling_back", "rolled_back"}:
+        raise ValueError("invalid execd rollback receipt state")
+    return canonical_json({
+        "schema": "buzz-ci-execd-package-rollback-receipt-v1",
+        "state": state,
+        "install_receipt": _receipt_value(manifest, prior, uid, gid),
+    })
+
+
+def _atomic_replace_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> None:
+    temporary = _write_temporary_at(directory_fd, name, payload, mode, uid, gid)
+    try:
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary = ""
+        os.fsync(directory_fd)
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _read_rollback_receipt_at(
+    directory_fd: int,
+    manifest: dict[str, object],
+    uid: int,
+    gid: int,
+) -> tuple[str, _PriorTarget | None, dict[str, object]]:
+    payload, metadata = _read_regular_at(
+        directory_fd, ROLLBACK_RECEIPT_NAME, MAX_JSON_BYTES
+    )
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("execd package rollback receipt is invalid") from error
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "state", "install_receipt"}
+        or value.get("schema") != "buzz-ci-execd-package-rollback-receipt-v1"
+        or value.get("state") not in {"rolling_back", "rolled_back"}
+        or not isinstance(value.get("install_receipt"), dict)
+        or canonical_json(value) != payload
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError("execd package rollback receipt differs")
+    install_receipt = value["install_receipt"]
+    prior = _receipt_prior(install_receipt, manifest, uid, gid)
+    return str(value["state"]), prior, install_receipt
+
+
+def _resume_prior_at(
+    receipt_directory: int,
+    binary_directory: int,
+    entry: Entry,
+    prior: _PriorTarget | None,
+    install_receipt: dict[str, object],
+    uid: int,
+    gid: int,
+) -> _PriorTarget | None:
+    if prior is None:
+        if not _absent_at(receipt_directory, PREIMAGE_NAME):
+            raise ValueError("absent execd baseline has an unexpected preimage")
+        return None
+    record = install_receipt["prior"]["binary"]
+    try:
+        payload, metadata = _read_regular_at(receipt_directory, PREIMAGE_NAME)
+        from_preimage = True
+    except FileNotFoundError:
+        payload, metadata = _read_regular_at(binary_directory, Path(entry.target).name)
+        from_preimage = False
+    if (
+        sha256(payload) != record["sha256"]
+        or (
+            from_preimage
+            and (
+                stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != uid
+                or metadata.st_gid != gid
+            )
+        )
+        or (
+            not from_preimage
+            and (
+                stat.S_IMODE(metadata.st_mode) != int(record["mode"])
+                or metadata.st_uid != int(record["uid"])
+                or metadata.st_gid != int(record["gid"])
+            )
+        )
+    ):
+        raise ValueError("rolling-back execd preimage differs")
+    return _PriorTarget(
+        payload,
+        int(record["mode"]),
+        int(record["uid"]),
+        int(record["gid"]),
+    )
+
+
+def _target_matches_prior_at(
+    directory_fd: int,
+    name: str,
+    prior: _PriorTarget | None,
+) -> bool:
+    if prior is None:
+        return _absent_at(directory_fd, name)
+    try:
+        payload, metadata = _read_regular_at(directory_fd, name)
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    return (
+        sha256(payload) == sha256(prior.payload)
+        and stat.S_IMODE(metadata.st_mode) == prior.mode
+        and metadata.st_uid == prior.uid
+        and metadata.st_gid == prior.gid
+    )
+
+
+def _restore_prior_at(
+    directory_fd: int,
+    name: str,
+    prior: _PriorTarget | None,
+) -> None:
+    if prior is None:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(directory_fd)
+    else:
+        _atomic_replace_at(
+            directory_fd,
+            name,
+            prior.payload,
+            prior.mode,
+            prior.uid,
+            prior.gid,
+        )
+    if not _target_matches_prior_at(directory_fd, name, prior):
+        raise ValueError("prior execd binary rollback readback differs")
+
+
+def _restore_candidate_at(
+    directory_fd: int,
+    entry: Entry,
+    uid: int,
+    gid: int,
+) -> None:
+    _atomic_replace_at(
+        directory_fd,
+        Path(entry.target).name,
+        entry.payload,
+        entry.install_mode,
+        uid,
+        gid,
+    )
+    if not _binary_matches_at(directory_fd, entry, uid, gid):
+        raise ValueError("execd candidate compensation readback differs")
+
+
+def _remove_rollback_managed_at(directory_fd: int, prior: _PriorTarget | None) -> None:
+    try:
+        os.unlink(RECEIPT_NAME, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+    if prior is not None:
+        try:
+            os.unlink(PREIMAGE_NAME, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+    os.fsync(directory_fd)
+
+
+def _compensate_rollback(
+    receipt_directory: int,
+    binary_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+) -> None:
+    _restore_candidate_at(binary_directory, entry, uid, gid)
+    if prior is not None:
+        _atomic_replace_at(
+            receipt_directory,
+            PREIMAGE_NAME,
+            prior.payload,
+            0o600,
+            uid,
+            gid,
+        )
+    elif not _absent_at(receipt_directory, PREIMAGE_NAME):
+        os.unlink(PREIMAGE_NAME, dir_fd=receipt_directory)
+    _atomic_replace_at(
+        receipt_directory,
+        RECEIPT_NAME,
+        _receipt_bytes(manifest, prior, uid, gid),
+        0o600,
+        uid,
+        gid,
+    )
+    try:
+        os.unlink(ROLLBACK_RECEIPT_NAME, dir_fd=receipt_directory)
+    except FileNotFoundError:
+        pass
+    os.fsync(receipt_directory)
+    _verify_receipt_at(receipt_directory, manifest, uid, gid)
+
+
+def rollback(package: Path, root: Path) -> dict[str, object]:
+    root = _safe_root(root)
+    manifest, entry = parse_package(package)
+    if root == Path("/") and os.geteuid() != 0:
+        raise PermissionError("rollback requires root")
+    uid = mapped_id(0, root)
+    gid = mapped_id(0, root, group=True)
+    root_fd = _open_root(root)
+    binary_directory = -1
+    receipt_directory = -1
+    try:
+        binary_directory = _open_directory_chain(
+            root_fd,
+            (("usr", None), ("libexec", 0o755)),
+            uid,
+            gid,
+            create=False,
+        )
+        receipt_directory = _open_directory_chain(
+            root_fd,
+            (
+                ("var", 0o755),
+                ("lib", 0o755),
+                ("buzzci", 0o711),
+                ("execd-v2", 0o711),
+                ("package", 0o700),
+            ),
+            uid,
+            gid,
+            create=False,
+        )
+        if (
+            not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory)
+            or not _directory_binding_matches(
+                root_fd,
+                ("var", "lib", "buzzci", "execd-v2", "package"),
+                receipt_directory,
+            )
+        ):
+            raise ValueError("execd rollback directory binding differs")
+        try:
+            marker_state, marker_prior, marker_receipt = _read_rollback_receipt_at(
+                receipt_directory, manifest, uid, gid
+            )
+        except FileNotFoundError:
+            marker_state = "absent"
+            marker_prior = None
+            marker_receipt = None
+        if marker_state == "rolled_back":
+            if not _absent_at(receipt_directory, RECEIPT_NAME) or not _absent_at(
+                receipt_directory, PREIMAGE_NAME
+            ):
+                raise ValueError("rolled-back execd package retains active custody")
+            assert marker_receipt is not None
+            prior_record = marker_receipt["prior"]
+            if marker_prior is not None:
+                marker_prior = _PriorTarget(
+                    b"",
+                    marker_prior.mode,
+                    marker_prior.uid,
+                    marker_prior.gid,
+                )
+                payload, metadata = _read_regular_at(binary_directory, Path(entry.target).name)
+                if (
+                    sha256(payload) != prior_record["binary"]["sha256"]
+                    or stat.S_IMODE(metadata.st_mode) != marker_prior.mode
+                    or metadata.st_uid != marker_prior.uid
+                    or metadata.st_gid != marker_prior.gid
+                ):
+                    raise ValueError("rolled-back execd binary baseline differs")
+            elif not _absent_at(binary_directory, Path(entry.target).name):
+                raise ValueError("rolled-back absent execd baseline differs")
+            return {
+                "status": "unchanged",
+                "state": "rolled_back",
+                "package_id": manifest["package_id"],
+                "package_digest": manifest["package_digest"],
+                "restored_target": entry.target,
+                "prior_state": prior_record["state"],
+            }
+        if marker_state == "rolling_back":
+            assert marker_receipt is not None
+            prior = _resume_prior_at(
+                receipt_directory,
+                binary_directory,
+                entry,
+                marker_prior,
+                marker_receipt,
+                uid,
+                gid,
+            )
+            candidate_current = _binary_matches_at(binary_directory, entry, uid, gid)
+            prior_current = _target_matches_prior_at(
+                binary_directory, Path(entry.target).name, prior
+            )
+            if not candidate_current and not prior_current:
+                raise ValueError("rolling-back execd binary differs from candidate and baseline")
+            try:
+                active_prior = _verify_receipt_at(
+                    receipt_directory, manifest, uid, gid
+                )
+                if active_prior != prior:
+                    raise ValueError("rolling-back execd active custody differs")
+            except FileNotFoundError:
+                if not prior_current:
+                    raise ValueError(
+                        "rolling-back execd candidate lacks active custody"
+                    ) from None
+        else:
+            prior = _verify_receipt_at(receipt_directory, manifest, uid, gid)
+            if not _binary_matches_at(binary_directory, entry, uid, gid):
+                raise ValueError("installed execd binary drift blocks rollback")
+            if not _absent_at(receipt_directory, ROLLBACK_RECEIPT_NAME):
+                raise ValueError("execd rollback receipt appeared during validation")
+            rolling = _rollback_receipt_bytes(
+                manifest, prior, uid, gid, "rolling_back"
+            )
+            if not _publish_create_once(
+                receipt_directory,
+                ROLLBACK_RECEIPT_NAME,
+                rolling,
+                0o600,
+                uid,
+                gid,
+            ):
+                raise ValueError("execd rollback receipt appeared during publication")
+        try:
+            _restore_prior_at(binary_directory, Path(entry.target).name, prior)
+            if not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory):
+                raise ValueError("execd binary directory changed during rollback")
+            _remove_rollback_managed_at(receipt_directory, prior)
+            _atomic_replace_at(
+                receipt_directory,
+                ROLLBACK_RECEIPT_NAME,
+                _rollback_receipt_bytes(manifest, prior, uid, gid, "rolled_back"),
+                0o600,
+                uid,
+                gid,
+            )
+            state, _, _ = _read_rollback_receipt_at(
+                receipt_directory, manifest, uid, gid
+            )
+            if state != "rolled_back" or not _absent_at(
+                receipt_directory, RECEIPT_NAME
+            ) or not _absent_at(receipt_directory, PREIMAGE_NAME):
+                raise ValueError("execd rollback terminal readback differs")
+        except BaseException as rollback_error:
+            try:
+                _compensate_rollback(
+                    receipt_directory,
+                    binary_directory,
+                    manifest,
+                    entry,
+                    prior,
+                    uid,
+                    gid,
+                )
+            except BaseException as compensation_error:
+                raise RuntimeError(
+                    f"execd rollback compensation failed: {compensation_error}"
+                ) from rollback_error
+            raise
+        return {
+            "status": "rolled_back",
+            "state": "rolled_back",
+            "package_id": manifest["package_id"],
+            "package_digest": manifest["package_digest"],
+            "restored_target": entry.target,
+            "prior_state": "absent" if prior is None else "present",
+        }
     finally:
         if receipt_directory >= 0:
             os.close(receipt_directory)
@@ -1006,6 +1587,9 @@ def main() -> int:
     install_parser.add_argument("--package", type=Path, required=True)
     install_parser.add_argument("--root", type=Path, default=Path("/"))
     install_parser.add_argument("--dry-run", action="store_true")
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--package", type=Path, required=True)
+    rollback_parser.add_argument("--root", type=Path, default=Path("/"))
     arguments = parser.parse_args()
     if arguments.command == "verify-package":
         manifest, _ = parse_package(arguments.package)
@@ -1016,8 +1600,10 @@ def main() -> int:
         }
     elif arguments.command == "check":
         result = inspect(arguments.package, arguments.root)
-    else:
+    elif arguments.command == "install":
         result = install(arguments.package, arguments.root, dry_run=arguments.dry_run)
+    else:
+        result = rollback(arguments.package, arguments.root)
     print(json.dumps(result, sort_keys=True))
     return 0
 
