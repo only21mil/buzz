@@ -7,6 +7,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
+// Configuration tests temporarily mutate process-wide environment variables.
+// Relay test helpers that can overlap those writes share this test-only lock.
+#[cfg(test)]
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Default maximum inbound WebSocket frame size in bytes.
 ///
 /// Must comfortably exceed accepted event content sizes after Nostr JSON and
@@ -641,6 +646,14 @@ fn inert_env_vars<'a>(names: &[&'a str], lookup: impl Fn(&str) -> Option<String>
 impl Config {
     /// Loads configuration from environment variables, falling back to development defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
+        #[cfg(test)]
+        let _guard = ENV_MUTEX.lock().unwrap();
+        Self::load_env()
+    }
+
+    // Test callers use this only while holding ENV_MUTEX across a complete
+    // mutate-load-restore sequence. Production reaches it through from_env.
+    fn load_env() -> Result<Self, ConfigError> {
         let bind_addr_raw =
             std::env::var("BUZZ_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
         let bind_addr = parse_bind_addr(&bind_addr_raw)?;
@@ -1249,11 +1262,6 @@ impl Config {
 mod tests {
     use super::*;
 
-    // Mutex to serialize tests that mutate environment variables.
-    // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
-    // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Look up against a fixed set, standing in for process env.
     fn env_of<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {
         move |name| {
@@ -1261,6 +1269,44 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_string())
         }
+    }
+
+    mod adversarial_call_shapes {
+        pub(super) fn load_from_nested_config() -> Result<super::Config, super::ConfigError> {
+            config::load()
+        }
+
+        pub(super) fn load_from_nested_main() -> Result<super::Config, super::ConfigError> {
+            main::load()
+        }
+
+        pub(super) mod config {
+            pub(super) fn load() -> Result<super::super::Config, super::super::ConfigError> {
+                super::super::Config::from_env
+                    /* comments and whitespace cannot bypass the API lock */
+                    ()
+            }
+        }
+
+        pub(super) mod main {
+            use super::super::Config as RenamedConfig;
+
+            pub(super) fn load() -> Result<RenamedConfig, super::super::ConfigError> {
+                let comment_like_string = "https://relay.example//Config::from_env()";
+                assert!(comment_like_string.contains("//"));
+                RenamedConfig::from_env()
+            }
+        }
+    }
+
+    #[test]
+    fn locked_test_loader_is_independent_of_source_spelling() {
+        use Config as ImportedConfigAlias;
+
+        let function_alias = ImportedConfigAlias::from_env;
+        assert!(function_alias().is_ok());
+        assert!(adversarial_call_shapes::load_from_nested_config().is_ok());
+        assert!(adversarial_call_shapes::load_from_nested_main().is_ok());
     }
 
     /// The case that matters: an operator who pinned the old flag to `false`
@@ -1310,7 +1356,7 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let config = Config::from_env().expect("default config");
+        let config = Config::load_env().expect("default config");
         assert!(config.bind_addr.port() > 0);
         assert!(!config.database_url.is_empty());
         assert!(!config.redis_url.is_empty());
@@ -1378,13 +1424,13 @@ mod tests {
         let previous = std::env::var_os("BUZZ_S3_ADDRESSING_STYLE");
 
         std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", "virtual");
-        let configured = Config::from_env()
+        let configured = Config::load_env()
             .expect("virtual style config")
             .media
             .s3_addressing_style;
 
         std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", "auto");
-        let invalid = Config::from_env();
+        let invalid = Config::load_env();
 
         if let Some(value) = previous {
             std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", value);
@@ -1412,7 +1458,7 @@ mod tests {
             std::ffi::OsString::from_vec(vec![0xff]),
         );
 
-        let invalid = Config::from_env();
+        let invalid = Config::load_env();
 
         if let Some(value) = previous {
             std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", value);
@@ -1433,13 +1479,13 @@ mod tests {
         let previous = std::env::var_os("BUZZ_REDIS_POOL_SIZE");
 
         std::env::set_var("BUZZ_REDIS_POOL_SIZE", "32");
-        let overridden = Config::from_env().expect("config").redis_pool_size;
+        let overridden = Config::load_env().expect("config").redis_pool_size;
 
         std::env::set_var("BUZZ_REDIS_POOL_SIZE", "0");
-        let zero = Config::from_env().expect("config").redis_pool_size;
+        let zero = Config::load_env().expect("config").redis_pool_size;
 
         std::env::set_var("BUZZ_REDIS_POOL_SIZE", "not-a-number");
-        let junk = Config::from_env().expect("config").redis_pool_size;
+        let junk = Config::load_env().expect("config").redis_pool_size;
 
         if let Some(value) = previous {
             std::env::set_var("BUZZ_REDIS_POOL_SIZE", value);
@@ -1458,13 +1504,13 @@ mod tests {
         let previous = std::env::var_os("BUZZ_DB_POOL_SIZE");
 
         std::env::set_var("BUZZ_DB_POOL_SIZE", "80");
-        let overridden = Config::from_env().expect("config").db_pool_size;
+        let overridden = Config::load_env().expect("config").db_pool_size;
 
         std::env::set_var("BUZZ_DB_POOL_SIZE", "0");
-        let zero = Config::from_env().expect("config").db_pool_size;
+        let zero = Config::load_env().expect("config").db_pool_size;
 
         std::env::set_var("BUZZ_DB_POOL_SIZE", "not-a-number");
-        let junk = Config::from_env().expect("config").db_pool_size;
+        let junk = Config::load_env().expect("config").db_pool_size;
 
         if let Some(value) = previous {
             std::env::set_var("BUZZ_DB_POOL_SIZE", value);
@@ -1483,16 +1529,16 @@ mod tests {
         let previous = std::env::var_os("BUZZ_DB_READ_POOL_SIZE");
 
         std::env::remove_var("BUZZ_DB_READ_POOL_SIZE");
-        let unset = Config::from_env().expect("config").db_read_pool_size;
+        let unset = Config::load_env().expect("config").db_read_pool_size;
 
         std::env::set_var("BUZZ_DB_READ_POOL_SIZE", "40");
-        let overridden = Config::from_env().expect("config").db_read_pool_size;
+        let overridden = Config::load_env().expect("config").db_read_pool_size;
 
         std::env::set_var("BUZZ_DB_READ_POOL_SIZE", "0");
-        let zero = Config::from_env().expect("config").db_read_pool_size;
+        let zero = Config::load_env().expect("config").db_read_pool_size;
 
         std::env::set_var("BUZZ_DB_READ_POOL_SIZE", "not-a-number");
-        let junk = Config::from_env().expect("config").db_read_pool_size;
+        let junk = Config::load_env().expect("config").db_read_pool_size;
 
         if let Some(value) = previous {
             std::env::set_var("BUZZ_DB_READ_POOL_SIZE", value);
@@ -1512,13 +1558,13 @@ mod tests {
         let previous = std::env::var_os("READ_DATABASE_URL");
 
         std::env::remove_var("READ_DATABASE_URL");
-        let unset = Config::from_env().expect("config").read_database_url;
+        let unset = Config::load_env().expect("config").read_database_url;
 
         std::env::set_var("READ_DATABASE_URL", "   ");
-        let blank = Config::from_env().expect("config").read_database_url;
+        let blank = Config::load_env().expect("config").read_database_url;
 
         std::env::set_var("READ_DATABASE_URL", "postgres://buzz:pw@replica:5432/buzz"); // sadscan:disable np.postgres.1
-        let set = Config::from_env().expect("config").read_database_url;
+        let set = Config::load_env().expect("config").read_database_url;
 
         if let Some(value) = previous {
             std::env::set_var("READ_DATABASE_URL", value);
@@ -1542,23 +1588,23 @@ mod tests {
         std::env::remove_var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS");
 
         std::env::remove_var("BUZZ_REPLICA_READ_MAX_AGE_MS");
-        let unset = Config::from_env().expect("config").replica_read_max_age_ms;
+        let unset = Config::load_env().expect("config").replica_read_max_age_ms;
 
         std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "1000");
-        let set = Config::from_env().expect("config").replica_read_max_age_ms;
+        let set = Config::load_env().expect("config").replica_read_max_age_ms;
 
         std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "0");
-        let zero = Config::from_env().expect("config").replica_read_max_age_ms;
+        let zero = Config::load_env().expect("config").replica_read_max_age_ms;
 
         std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "soon");
-        let junk = Config::from_env();
+        let junk = Config::load_env();
 
         // The retired seconds-denominated name must be a hard startup
         // error even alongside a valid new-name value: silently ignoring
         // it (or honouring it) would mean 1000x the intended budget.
         std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "1000");
         std::env::set_var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS", "5");
-        let old_name = Config::from_env();
+        let old_name = Config::load_env();
 
         std::env::remove_var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS");
         if let Some(value) = previous {
@@ -1592,27 +1638,27 @@ mod tests {
         let previous = std::env::var_os("BUZZ_DRAIN_JITTER_MS");
 
         std::env::remove_var("BUZZ_DRAIN_JITTER_MS");
-        let unset = Config::from_env().expect("config").drain_jitter_ms;
+        let unset = Config::load_env().expect("config").drain_jitter_ms;
 
         std::env::set_var("BUZZ_DRAIN_JITTER_MS", "20000");
-        let set = Config::from_env().expect("config").drain_jitter_ms;
+        let set = Config::load_env().expect("config").drain_jitter_ms;
 
         std::env::set_var("BUZZ_DRAIN_JITTER_MS", "60000");
-        let capped = Config::from_env().expect("config").drain_jitter_ms;
+        let capped = Config::load_env().expect("config").drain_jitter_ms;
 
         std::env::set_var("BUZZ_DRAIN_JITTER_MS", "0");
-        let zero = Config::from_env().expect("config").drain_jitter_ms;
+        let zero = Config::load_env().expect("config").drain_jitter_ms;
 
         std::env::set_var("BUZZ_DRAIN_JITTER_MS", "soon");
-        let junk = Config::from_env();
+        let junk = Config::load_env();
 
         std::env::set_var("BUZZ_DRAIN_JITTER_MS", "");
-        let empty = Config::from_env()
+        let empty = Config::load_env()
             .expect("empty is a valid kill switch")
             .drain_jitter_ms;
 
         std::env::set_var("BUZZ_DRAIN_JITTER_MS", "   ");
-        let blank = Config::from_env()
+        let blank = Config::load_env()
             .expect("whitespace-only is a valid kill switch")
             .drain_jitter_ms;
 
@@ -1698,7 +1744,7 @@ mod tests {
         std::env::set_var("BUZZ_RATE_LIMIT_HUMAN_API_CALLS_PER_MIN", "1002");
         std::env::set_var("BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC", "1003");
 
-        let config = Config::from_env().expect("config");
+        let config = Config::load_env().expect("config");
 
         std::env::remove_var("BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN");
         std::env::remove_var("BUZZ_RATE_LIMIT_HUMAN_API_CALLS_PER_MIN");
@@ -1712,7 +1758,7 @@ mod tests {
     fn rate_limit_overrides_reject_zero() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC", "0");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC");
 
         assert!(matches!(
@@ -1733,7 +1779,7 @@ mod tests {
             "RELAY_OPERATOR_API_ORIGIN",
             "http://buzz.mesh.bb-production.com",
         );
-        let config = Config::from_env().expect("config");
+        let config = Config::load_env().expect("config");
         std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
         std::env::remove_var("RELAY_OPERATOR_API_ORIGIN");
 
@@ -1750,7 +1796,7 @@ mod tests {
     fn relay_operator_pubkeys_invalid_entry_is_error() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("RELAY_OPERATOR_PUBKEYS", "not-a-pubkey");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
 
         assert!(matches!(
@@ -1766,7 +1812,7 @@ mod tests {
             "BUZZ_CI_STATUS_SIGNER_PUBKEYS",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         );
-        let config = Config::from_env().expect("config");
+        let config = Config::load_env().expect("config");
         std::env::remove_var("BUZZ_CI_STATUS_SIGNER_PUBKEYS");
 
         assert_eq!(config.ci_status_signer_pubkeys.len(), 2);
@@ -1782,7 +1828,7 @@ mod tests {
     fn ci_status_signers_reject_invalid_entry() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("BUZZ_CI_STATUS_SIGNER_PUBKEYS", "not-a-pubkey");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("BUZZ_CI_STATUS_SIGNER_PUBKEYS");
 
         assert!(matches!(
@@ -1890,7 +1936,7 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         std::env::remove_var("RELAY_OPERATOR_API_ORIGIN");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
 
         assert!(matches!(
@@ -1903,7 +1949,7 @@ mod tests {
     fn relay_operator_api_origin_rejects_paths() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("RELAY_OPERATOR_API_ORIGIN", "https://buzz.example/operator");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("RELAY_OPERATOR_API_ORIGIN");
 
         assert!(matches!(
@@ -1917,7 +1963,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         let previous = std::env::var_os("BUZZ_PUSH_GATEWAY_DELIVERY_URL");
         std::env::remove_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL");
-        let config = Config::from_env().expect("default config");
+        let config = Config::load_env().expect("default config");
         assert_eq!(
             config
                 .push_gateway_delivery_url
@@ -1927,7 +1973,7 @@ mod tests {
         );
 
         std::env::set_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL", "");
-        let config = Config::from_env().expect("disabled push config");
+        let config = Config::load_env().expect("disabled push config");
         assert!(config.push_gateway_delivery_url.is_none());
 
         if let Some(value) = previous {
@@ -1957,7 +2003,7 @@ mod tests {
     fn invalid_push_gateway_timeout_is_not_silently_defaulted() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("BUZZ_PUSH_GATEWAY_TIMEOUT_MS", "99");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("BUZZ_PUSH_GATEWAY_TIMEOUT_MS");
         assert!(matches!(
             result,
@@ -1970,7 +2016,7 @@ mod tests {
     fn invalid_push_executor_key_id_is_rejected() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("BUZZ_PUSH_EXECUTOR_KEY_ID", "");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("BUZZ_PUSH_EXECUTOR_KEY_ID");
         assert!(matches!(
             result,
@@ -1983,7 +2029,7 @@ mod tests {
     fn huddle_audio_available_can_be_disabled_for_horizontal_scaling() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("BUZZ_HUDDLE_AUDIO_AVAILABLE", "false");
-        let config = Config::from_env().expect("config");
+        let config = Config::load_env().expect("config");
         std::env::remove_var("BUZZ_HUDDLE_AUDIO_AVAILABLE");
         assert!(
             !config.huddle_audio_available,
@@ -2003,14 +2049,14 @@ mod tests {
     fn pairing_relay_url_accepts_websocket_urls_and_rejects_http() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("BUZZ_PAIRING_RELAY_URL", "wss://pairing.buzz.xyz");
-        let config = Config::from_env().expect("config");
+        let config = Config::load_env().expect("config");
         assert_eq!(
             config.pairing_relay_url.as_deref(),
             Some("wss://pairing.buzz.xyz")
         );
 
         std::env::set_var("BUZZ_PAIRING_RELAY_URL", "https://pairing.buzz.xyz");
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("BUZZ_PAIRING_RELAY_URL");
         assert!(matches!(
             result,
@@ -2022,7 +2068,7 @@ mod tests {
     fn max_frame_bytes_can_be_configured() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var("BUZZ_MAX_FRAME_BYTES", "262144");
-        let config = Config::from_env().expect("config");
+        let config = Config::load_env().expect("config");
         std::env::remove_var("BUZZ_MAX_FRAME_BYTES");
         assert_eq!(config.max_frame_bytes, 262_144);
     }
@@ -2043,7 +2089,7 @@ mod tests {
         assert!(!nested.exists(), "test precondition: path must not exist");
 
         std::env::set_var("BUZZ_GIT_REPO_PATH", &nested);
-        let result = Config::from_env();
+        let result = Config::load_env();
         std::env::remove_var("BUZZ_GIT_REPO_PATH");
 
         let config = result.expect("config should self-bootstrap missing git_repo_path");
