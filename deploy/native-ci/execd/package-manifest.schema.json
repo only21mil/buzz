@@ -15,7 +15,7 @@
     "activation_binding":{
       "type":"object",
       "additionalProperties":false,
-      "required":["activation_id","package_digest","manifest_sha256","source_commit","execd_binary_sha256","execd_provenance_sha256","owned_entries_sha256","owned_target_sha256","receipt_path","receipt_schema"],
+      "required":["activation_id","package_digest","manifest_sha256","source_commit","execd_binary_sha256","execd_provenance_sha256","preactivation_input_sha256","owned_entries_sha256","owned_target_sha256","receipt_path","receipt_schema"],
       "properties":{
         "activation_id":{"pattern":"^buzz-ci-capacity-one-[0-9a-f]{12}-[0-9a-f]{12}$","type":"string"},
         "package_digest":{"$ref":"#/$defs/sha256"},
@@ -23,6 +23,7 @@
         "source_commit":{"$ref":"#/$defs/git_oid"},
         "execd_binary_sha256":{"$ref":"#/$defs/sha256"},
         "execd_provenance_sha256":{"$ref":"#/$defs/sha256"},
+        "preactivation_input_sha256":{"$ref":"#/$defs/sha256"},
         "owned_entries_sha256":{"$ref":"#/$defs/sha256"},
         "owned_target_sha256":{
           "type":"array",

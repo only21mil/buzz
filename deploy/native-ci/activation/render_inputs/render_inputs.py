@@ -27,7 +27,7 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MODE = re.compile(r"^[0-7]{4}$")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
-PRE_ACTIVATION_PACKAGE_NAMES = PACKAGE_NAMES[:-1]
+PRE_ACTIVATION_PACKAGE_NAMES = PACKAGE_NAMES[:3]
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 PACKAGE_SCHEMAS = {
     "runner": "buzz-ci-runner-install-package-v1",
@@ -487,6 +487,31 @@ def activation_package_module() -> Any:
     return module
 
 
+def execd_preactivation_module() -> Any:
+    path = Path(__file__).resolve().parents[2] / "execd" / "freeze_package.py"
+    spec = importlib.util.spec_from_file_location("buzz_ci_execd_preactivation_for_renderer", path)
+    if spec is None or spec.loader is None:
+        raise RenderError("execd pre-activation input validator is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_execd_preactivation(
+    root: DescriptorRoot,
+    value: object,
+    candidate: str,
+) -> tuple[dict[str, Any], str]:
+    raw, _relative = root.read_ref(value, "execd pre-activation input", MAX_JSON)
+    try:
+        preactivation = execd_preactivation_module().parse_preactivation_input(raw)
+    except (KeyError, TypeError, ValueError) as error:
+        raise RenderError(f"execd pre-activation input validation failed: {error}") from error
+    if preactivation["source_commit"] != candidate:
+        raise RenderError("execd pre-activation input candidate differs")
+    return preactivation, hashlib.sha256(raw).hexdigest()
+
+
 def receipt_verifier_module() -> Any:
     path = Path(__file__).resolve().parents[2] / "acceptance" / "verify-receipt.py"
     spec = importlib.util.spec_from_file_location("buzz_ci_acceptance_verifier_for_renderer", path)
@@ -498,8 +523,17 @@ def receipt_verifier_module() -> Any:
 
 
 def render_draft(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, Any]:
-    require_keys(descriptor, {"schema_version", "candidate_sha", "public_binding", "package_manifests", "template"}, "draft descriptor")
+    require_keys(
+        descriptor,
+        {"schema_version", "candidate_sha", "public_binding", "package_manifests", "execd_preactivation", "template"},
+        "draft descriptor",
+    )
     template, bindings = load_template_bindings(root, descriptor, PRE_ACTIVATION_PACKAGE_NAMES)
+    preactivation, preactivation_sha256 = load_execd_preactivation(
+        root, descriptor["execd_preactivation"], bindings["candidate_sha"],
+    )
+    bindings["execd_preactivation"] = preactivation
+    bindings["execd_preactivation_sha256"] = preactivation_sha256
     value = resolve_template(template, "activation-draft", bindings)
     if not isinstance(value, dict):
         raise RenderError("activation draft template did not render an object")
@@ -593,6 +627,20 @@ def validate_package_tree(root: DescriptorRoot, name: str, package: dict[str, An
         actual = record_map.get(source)
         if actual is None or hashlib.sha256(actual[1]).hexdigest() != component["provenance_sha256"]:
             raise RenderError(f"activation component provenance differs: {source}")
+        if "package_manifest_source" in component:
+            package_source = normalized(
+                component["package_manifest_source"], "activation component package manifest",
+            )
+            expected.add(package_source)
+            package_actual = record_map.get(package_source)
+            if (
+                package_actual is None
+                or hashlib.sha256(package_actual[1]).hexdigest()
+                != component.get("package_manifest_sha256")
+            ):
+                raise RenderError(
+                    f"activation component package manifest differs: {package_source}"
+                )
     if "binary_provenance_sha256" in manifest:
         source = "binary-provenance.json"
         expected.add(source)

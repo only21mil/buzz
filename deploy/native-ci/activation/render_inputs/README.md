@@ -36,18 +36,26 @@ python3 "$RENDER" record-sealed-freeze \
 The clean-host contract preserves those relative paths. Run the v2 harness from
 that same directory when consuming the contract.
 
-`render-draft` consumes the four component package manifests, the ceremony's
-public binding, and a checked template. `render-scenario` also requires the
-frozen activation manifest. A checked template has this exact envelope:
+`render-draft` consumes the final runner, controld, and keyholder package
+manifests, the execd pre-activation input, the ceremony's public binding, and a
+checked template. The execd input uses schema
+`buzz-ci-execd-preactivation-input-v1`; it binds only the exact candidate,
+execd binary digest, and binary-provenance digest. It is not a package manifest
+and carries no package ID, package digest, activation ID, entries, or target
+claims. `render-scenario` requires all five final manifests. A checked template
+has this exact envelope:
 
 ```json
 {"definitions":{},"document":{"source_commit":{"$copy":"candidate_sha"}},"kind":"activation-draft","schema_version":"buzz-ci-checked-render-template/v1"}
 ```
 
 `$copy` reads only the immutable binding graph: `candidate_sha`,
-`public_binding`, `packages`, their manifest file hashes, and the public-binding
-file hash. `$ref` may point only below `#/definitions/`. Missing references,
-unknown directives, and reference cycles fail.
+`public_binding`, `packages`, their manifest file hashes,
+`execd_preactivation`, `execd_preactivation_sha256`, and the public-binding file
+hash. `$ref` may point only below `#/definitions/`. Missing references, unknown
+directives, and reference cycles fail. The draft descriptor's
+`execd_preactivation` file reference must name the exact mode-`0600` canonical
+file emitted by `execd/freeze_package.py prepare-input`.
 
 `render-clean-host` computes the same path, mode, and content tree hash as the
 v2 clean-host harness. It checks every package member against the package

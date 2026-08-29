@@ -23,6 +23,14 @@
         "mode": {"type": "string", "pattern": "^[0-7]{4}$"}
       }
     },
+    "threeManifests": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/file"}, "controld": {"$ref": "#/$defs/file"},
+        "keyholder": {"$ref": "#/$defs/file"}
+      }
+    },
     "fourManifests": {
       "type": "object", "additionalProperties": false,
       "required": ["runner", "controld", "keyholder", "execd"],
@@ -69,11 +77,12 @@
     },
     "draft": {
       "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "candidate_sha", "public_binding", "package_manifests", "template"],
+      "required": ["schema_version", "candidate_sha", "public_binding", "package_manifests", "execd_preactivation", "template"],
       "properties": {
         "schema_version": {"const": "buzz-ci-activation-draft-render-input/v1"},
         "candidate_sha": {"$ref": "#/$defs/candidate"}, "public_binding": {"$ref": "#/$defs/file"},
-        "package_manifests": {"$ref": "#/$defs/fourManifests"}, "template": {"$ref": "#/$defs/file"}
+        "package_manifests": {"$ref": "#/$defs/threeManifests"},
+        "execd_preactivation": {"$ref": "#/$defs/file"}, "template": {"$ref": "#/$defs/file"}
       }
     },
     "scenario": {

@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 
 SCHEMA = "buzz-ci-execd-install-package-v1"
+PREACTIVATION_SCHEMA = "buzz-ci-execd-preactivation-input-v1"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
 PACKAGE_RELATIVE = Path("deploy/native-ci/execd")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
@@ -125,6 +126,29 @@ def load_provenance(path: Path) -> tuple[dict[str, object], bytes, os.stat_resul
     return value, raw, metadata
 
 
+def parse_preactivation_input(raw: bytes) -> dict[str, object]:
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("pre-activation execd input is not valid JSON") from error
+    expected = {"schema", "source_commit", "binary_sha256", "provenance_sha256"}
+    if not isinstance(value, dict) or set(value) != expected or canonical_json(value) != raw:
+        raise ValueError("pre-activation execd input fields or canonical bytes differ")
+    if (
+        value["schema"] != PREACTIVATION_SCHEMA
+        or not isinstance(value["source_commit"], str)
+        or not GIT_OID.fullmatch(value["source_commit"])
+        or any(
+            not isinstance(value[field], str) or not DIGEST.fullmatch(value[field])
+            or value[field] == "0" * 64
+            for field in ("binary_sha256", "provenance_sha256")
+        )
+        or value["source_commit"] == "0" * 40
+    ):
+        raise ValueError("pre-activation execd input identity differs")
+    return value
+
+
 def _git(root: Path, *arguments: str) -> str:
     return subprocess.run(
         ["git", "-C", str(root), *arguments],
@@ -149,10 +173,107 @@ def verify_source(root: Path, source_commit: str) -> Path:
     return root
 
 
+def _validated_binary_input(
+    source_root: Path,
+    source_commit: str,
+    binary: Path,
+    provenance_path: Path,
+) -> tuple[bytes, dict[str, object], bytes]:
+    verify_source(source_root, source_commit)
+    for source in (binary, provenance_path):
+        absolute = Path(os.path.abspath(source))
+        if Path(os.path.realpath(absolute)) != absolute:
+            raise ValueError("binary input path must not contain symbolic links")
+    provenance, provenance_raw, provenance_metadata = load_provenance(provenance_path)
+    if provenance["source_commit"] != source_commit:
+        raise ValueError("binary provenance is bound to another source commit")
+    payload, binary_metadata = read_regular(binary, 0o755)
+    if (
+        (binary_metadata.st_uid, binary_metadata.st_gid)
+        != (provenance_metadata.st_uid, provenance_metadata.st_gid)
+        or sha256(payload) != provenance["sha256"]
+    ):
+        raise ValueError("binary bytes or ownership differ from provenance")
+    return payload, provenance, provenance_raw
+
+
+def _private_output(path: Path) -> Path:
+    output = Path(os.path.abspath(path))
+    parent = output.parent
+    parent_metadata = parent.lstat()
+    if (
+        Path(os.path.realpath(parent)) != parent
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_mode & 0o022
+    ):
+        raise ValueError("output parent must be a private real directory")
+    if output.exists() or output.is_symlink():
+        raise ValueError("output must not already exist")
+    return output
+
+
+def prepare_preactivation_input(
+    source_root: Path,
+    source_commit: str,
+    binary: Path,
+    provenance_path: Path,
+    output: Path,
+) -> dict[str, object]:
+    payload, _provenance, provenance_raw = _validated_binary_input(
+        source_root, source_commit, binary, provenance_path,
+    )
+    value: dict[str, object] = {
+        "schema": PREACTIVATION_SCHEMA,
+        "source_commit": source_commit,
+        "binary_sha256": sha256(payload),
+        "provenance_sha256": sha256(provenance_raw),
+    }
+    output = _private_output(output)
+    stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
+    stage.chmod(0o700)
+    staged = stage / "preactivation-input.json"
+    try:
+        _write(staged, canonical_json(value), 0o600)
+        os.link(staged, output, follow_symlinks=False)
+        parent_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return value
+
+
+def load_preactivation_input(
+    path: Path,
+    source_commit: str,
+    binary_sha256: str,
+    provenance_sha256: str,
+) -> tuple[dict[str, object], bytes]:
+    path = Path(os.path.abspath(path))
+    if Path(os.path.realpath(path)) != path:
+        raise ValueError("pre-activation execd input path contains a symbolic link")
+    raw, metadata = read_regular(path, 0o600, 64 * 1024)
+    if metadata.st_nlink != 1:
+        raise ValueError("pre-activation execd input must have one link")
+    value = parse_preactivation_input(raw)
+    expected = {
+        "source_commit": source_commit,
+        "binary_sha256": binary_sha256,
+        "provenance_sha256": provenance_sha256,
+    }
+    if any(value[field] != wanted for field, wanted in expected.items()):
+        raise ValueError("pre-activation execd input tuple differs from final inputs")
+    return value, raw
+
+
 def activation_binding(
     package: Path,
     source_commit: str,
     binary_sha256: str,
+    provenance_sha256: str,
+    preactivation_sha256: str,
 ) -> dict[str, object]:
     package = Path(os.path.abspath(package))
     package_metadata = package.lstat()
@@ -197,8 +318,7 @@ def activation_binding(
         or component.get("uid") != 0
         or component.get("gid") != 0
         or component.get("mode") != "0755"
-        or not isinstance(component.get("provenance_sha256"), str)
-        or not DIGEST.fullmatch(str(component["provenance_sha256"]))
+        or component.get("provenance_sha256") != provenance_sha256
     ):
         raise ValueError("activation execd component differs")
     entries = manifest["entries"]
@@ -218,7 +338,8 @@ def activation_binding(
         "manifest_sha256": sha256(raw),
         "source_commit": source_commit,
         "execd_binary_sha256": binary_sha256,
-        "execd_provenance_sha256": component["provenance_sha256"],
+        "execd_provenance_sha256": provenance_sha256,
+        "preactivation_input_sha256": preactivation_sha256,
         "owned_entries_sha256": sha256(canonical_json(selected)),
         "owned_target_sha256": [
             {"target": item["target"], "sha256": item["sha256"]} for item in selected
@@ -249,37 +370,26 @@ def freeze_package(
     source_commit: str,
     binary: Path,
     provenance_path: Path,
+    preactivation_path: Path,
     activation_package: Path,
     output: Path,
 ) -> dict[str, object]:
-    verify_source(source_root, source_commit)
-    for source in (binary, provenance_path):
-        absolute = Path(os.path.abspath(source))
-        if Path(os.path.realpath(absolute)) != absolute:
-            raise ValueError("binary input path must not contain symbolic links")
-    provenance, provenance_raw, provenance_metadata = load_provenance(provenance_path)
-    if provenance["source_commit"] != source_commit:
-        raise ValueError("binary provenance is bound to another source commit")
-    payload, binary_metadata = read_regular(binary, 0o755)
-    if (
-        (binary_metadata.st_uid, binary_metadata.st_gid)
-        != (provenance_metadata.st_uid, provenance_metadata.st_gid)
-        or sha256(payload) != provenance["sha256"]
-    ):
-        raise ValueError("binary bytes or ownership differ from provenance")
-    binding = activation_binding(activation_package, source_commit, sha256(payload))
+    payload, _provenance, provenance_raw = _validated_binary_input(
+        source_root, source_commit, binary, provenance_path,
+    )
+    _preactivation, preactivation_raw = load_preactivation_input(
+        preactivation_path, source_commit, sha256(payload), sha256(provenance_raw),
+    )
+    binding = activation_binding(
+        activation_package,
+        source_commit,
+        sha256(payload),
+        sha256(provenance_raw),
+        sha256(preactivation_raw),
+    )
 
-    output = Path(os.path.abspath(output))
+    output = _private_output(output)
     parent = output.parent
-    parent_metadata = parent.lstat()
-    if (
-        Path(os.path.realpath(parent)) != parent
-        or not stat.S_ISDIR(parent_metadata.st_mode)
-        or parent_metadata.st_mode & 0o022
-    ):
-        raise ValueError("package output parent must be a private real directory")
-    if output.exists() or output.is_symlink():
-        raise ValueError("package output must not already exist")
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=parent))
     stage.chmod(0o700)
     assets = stage / "assets"
@@ -324,18 +434,34 @@ def freeze_package(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-root", type=Path, required=True)
-    parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--binary-provenance", type=Path, required=True)
-    parser.add_argument("--activation-package", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    actions = parser.add_subparsers(dest="action", required=True)
+    prepare = actions.add_parser("prepare-input")
+    freeze = actions.add_parser("freeze-package")
+    for action in (prepare, freeze):
+        action.add_argument("--source-root", type=Path, required=True)
+        action.add_argument("--source-commit", required=True)
+        action.add_argument("--binary", type=Path, required=True)
+        action.add_argument("--binary-provenance", type=Path, required=True)
+        action.add_argument("--output", type=Path, required=True)
+    freeze.add_argument("--preactivation-input", type=Path, required=True)
+    freeze.add_argument("--activation-package", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.action == "prepare-input":
+        value = prepare_preactivation_input(
+            arguments.source_root,
+            arguments.source_commit,
+            arguments.binary,
+            arguments.binary_provenance,
+            arguments.output,
+        )
+        print(json.dumps({"status": "prepared", **value}, sort_keys=True))
+        return 0
     manifest = freeze_package(
         arguments.source_root,
         arguments.source_commit,
         arguments.binary,
         arguments.binary_provenance,
+        arguments.preactivation_input,
         arguments.activation_package,
         arguments.output,
     )

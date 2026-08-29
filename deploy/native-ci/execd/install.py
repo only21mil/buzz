@@ -189,6 +189,7 @@ def parse_package(package: Path) -> tuple[dict[str, object], Entry]:
             "source_commit",
             "execd_binary_sha256",
             "execd_provenance_sha256",
+            "preactivation_input_sha256",
             "owned_entries_sha256",
             "owned_target_sha256",
             "receipt_path",
@@ -204,6 +205,7 @@ def parse_package(package: Path) -> tuple[dict[str, object], Entry]:
                 "manifest_sha256",
                 "execd_binary_sha256",
                 "execd_provenance_sha256",
+                "preactivation_input_sha256",
                 "owned_entries_sha256",
             )
         )

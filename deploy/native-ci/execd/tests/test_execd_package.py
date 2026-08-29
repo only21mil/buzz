@@ -134,6 +134,7 @@ def _manual_execd_package(path: Path, binary: bytes) -> dict[str, object]:
         "source_commit": "a" * 40,
         "execd_binary_sha256": binary_sha256,
         "execd_provenance_sha256": hashlib.sha256(provenance_raw).hexdigest(),
+        "preactivation_input_sha256": "e" * 64,
         "owned_entries_sha256": "d" * 64,
         "owned_target_sha256": target_digests,
         "receipt_path": "/var/lib/buzzci/activation-controller/receipt-v1.json",
@@ -349,9 +350,13 @@ class ExecdPackageTests(unittest.TestCase):
                 root / "activation", source_commit, binary_sha256,
                 hashlib.sha256(provenance.read_bytes()).hexdigest(),
             )
+            preactivation = root / "execd-preactivation.json"
+            prepared = FREEZER.prepare_preactivation_input(
+                repository, source_commit, binary, provenance, preactivation
+            )
             output = root / "execd-package"
             manifest = FREEZER.freeze_package(
-                repository, source_commit, binary, provenance, activation, output
+                repository, source_commit, binary, provenance, preactivation, activation, output
             )
             parsed, entry = INSTALL.parse_package(output)
             self.assertEqual(parsed, manifest)
@@ -360,7 +365,78 @@ class ExecdPackageTests(unittest.TestCase):
                 parsed["activation_binding"]["package_digest"],
                 json.loads((activation / "activation-manifest.json").read_bytes())["package_digest"],
             )
+            self.assertEqual(
+                parsed["activation_binding"]["preactivation_input_sha256"],
+                hashlib.sha256(preactivation.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(prepared["binary_sha256"], binary_sha256)
             self.assertNotIn("/usr/libexec/buzz-ci-executor", [item["target"] for item in parsed["entries"]])
+
+    def test_final_freeze_rejects_mismatched_replayed_and_tampered_preactivation_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "source"
+            package_source = repository / "deploy/native-ci/execd"
+            package_source.mkdir(parents=True)
+            (package_source / "marker").write_text("tracked\n")
+            subprocess.run(["git", "init", "-q", repository], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", repository, "add", "."], check=True)
+            subprocess.run(["git", "-C", repository, "commit", "-q", "-m", "fixture"], check=True)
+            source_commit = subprocess.check_output(
+                ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+            ).strip()
+            binary = root / "buzz-ci-execd"
+            binary.write_bytes(b"fixed execd binary\n")
+            binary.chmod(0o755)
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            provenance = root / "binary-provenance.json"
+            provenance.write_bytes(FREEZER.canonical_json({
+                "binary": "buzz-ci-execd", "profile": "release",
+                "schema": FREEZER.PROVENANCE_SCHEMA, "sha256": binary_sha256,
+                "source_commit": source_commit,
+            }))
+            provenance.chmod(0o600)
+            provenance_sha256 = hashlib.sha256(provenance.read_bytes()).hexdigest()
+            activation = _activation_package(
+                root / "activation", source_commit, binary_sha256, provenance_sha256,
+            )
+            preactivation = root / "preactivation.json"
+            FREEZER.prepare_preactivation_input(
+                repository, source_commit, binary, provenance, preactivation,
+            )
+
+            replayed = root / "replayed.json"
+            replayed.write_bytes(FREEZER.canonical_json({
+                **json.loads(preactivation.read_bytes()), "source_commit": "f" * 40,
+            }))
+            replayed.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "tuple differs"):
+                FREEZER.freeze_package(
+                    repository, source_commit, binary, provenance, replayed,
+                    activation, root / "replayed-package",
+                )
+
+            tampered = root / "tampered.json"
+            tampered.write_bytes(preactivation.read_bytes()[:-1] + b" \n")
+            tampered.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                FREEZER.freeze_package(
+                    repository, source_commit, binary, provenance, tampered,
+                    activation, root / "tampered-package",
+                )
+
+            mismatched = root / "mismatched.json"
+            mismatch_value = json.loads(preactivation.read_bytes())
+            mismatch_value["binary_sha256"] = "d" * 64
+            mismatched.write_bytes(FREEZER.canonical_json(mismatch_value))
+            mismatched.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "tuple differs"):
+                FREEZER.freeze_package(
+                    repository, source_commit, binary, provenance, mismatched,
+                    activation, root / "mismatched-package",
+                )
 
     def test_installer_is_create_once_dormant_and_central_receipt_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

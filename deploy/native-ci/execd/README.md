@@ -111,11 +111,18 @@ root-owned mode-`0444` acceptance receipt beneath the separately traversable
 only additional traverse-only children; their private descendants remain
 unreadable and unlistable.
 
-The standalone execd package owns only `/usr/libexec/buzz-ci-execd`. The
-central activation package owns the executor binary, all four execd/executor
-units, fixture files, sysusers, tmpfiles, and their transactional rollback.
-`freeze_package.py` requires that exact activation package and binds its package
-and manifest digests, execd provenance, and eight activation-owned targets.
+The standalone execd package owns only `/usr/libexec/buzz-ci-execd`. Before the
+activation package exists, `freeze_package.py prepare-input` emits one canonical
+mode-`0600` `buzz-ci-execd-preactivation-input-v1` file. It contains only the
+source commit, execd binary SHA-256, and provenance-file SHA-256. It is not an
+install package or manifest and claims no targets.
+
+The central activation package owns the executor binary, all four
+execd/executor units, fixture files, sysusers, tmpfiles, and their transactional
+rollback. After that package freezes, `freeze-package` reopens the same execd
+binary, provenance, and pre-activation input. It rejects any tuple drift, then
+binds the exact pre-activation-input digest, final activation ID, package and
+manifest digests, execd provenance, and eight activation-owned targets.
 The installer never writes those targets. On a clean host their receipt state
 is `pending`; after activation has written its central receipt, `check` requires
 the exact package, source, fixed-manifest, and managed-target binding.
@@ -126,19 +133,27 @@ writes a create-once root-owned mode-`0600` package receipt at
 `/var/lib/buzzci/execd-v2/package/receipt-v1.json`. Execd startup remains the
 only owner of the content-addressed runtime profile and runtime receipt.
 
-Freeze and install the package with:
+Prepare the activation input, then freeze and install the final package with:
 
 ```bash
-deploy/native-ci/execd/freeze_package.py \
+deploy/native-ci/execd/freeze_package.py prepare-input \
   --source-root . --source-commit "$SOURCE_COMMIT" \
   --binary "$EXECD_BINARY" --binary-provenance "$EXECD_PROVENANCE" \
+  --output "$EXECD_PREACTIVATION_INPUT"
+
+# Render and freeze the activation package before this command.
+deploy/native-ci/execd/freeze_package.py freeze-package \
+  --source-root . --source-commit "$SOURCE_COMMIT" \
+  --binary "$EXECD_BINARY" --binary-provenance "$EXECD_PROVENANCE" \
+  --preactivation-input "$EXECD_PREACTIVATION_INPUT" \
   --activation-package "$ACTIVATION_PACKAGE" --output "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py verify-package --package "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py install --package "$EXECD_PACKAGE"
 ```
 
-Both commands reject symbolic paths, hard links, noncanonical manifests,
-metadata or digest drift, overlapping ownership, and mismatched activation
+Both freezer phases reject symbolic paths, hard links, noncanonical input,
+metadata or digest drift, and source-commit replay. Final freeze also rejects a
+different pre-activation tuple, overlapping ownership, and mismatched activation
 bindings. Installation does not reload, enable, or start a unit.
 
 Run the local static checks with:
