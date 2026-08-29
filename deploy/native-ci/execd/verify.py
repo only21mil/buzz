@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import stat
 
 
 EXPECTED = {
@@ -69,6 +70,38 @@ EXPECTED = {
 def verify(source_root: Path) -> None:
     root = source_root.resolve(strict=True) / "deploy/native-ci/execd"
     schema = json.loads((root / "execd-config.schema.json").read_bytes())
+    package_schema = json.loads((root / "package-manifest.schema.json").read_bytes())
+    if (
+        package_schema["properties"]["schema"]
+        != {"const": "buzz-ci-execd-install-package-v1"}
+        or package_schema["properties"]["runtime_contract"]
+        != {"const": {"binary": "/usr/libexec/buzz-ci-execd", "gid": 0, "mode": "0755", "uid": 0}}
+        or package_schema["properties"]["seccomp_contract"]["const"]["packaged_bytes"] is not False
+        or package_schema["properties"]["install_receipt"]["const"]["path"]
+        != "/var/lib/buzzci/execd-v2/package/receipt-v1.json"
+    ):
+        raise ValueError("execd binary package manifest ABI drift")
+    for executable in ("freeze_package.py", "install.py", "verify.py"):
+        metadata = (root / executable).stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or not metadata.st_mode & stat.S_IXUSR
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError(f"execd package helper mode drift: {executable}")
+    package_helpers = (root / "freeze_package.py").read_text() + (root / "install.py").read_text()
+    for required in (
+        'SCHEMA = "buzz-ci-execd-install-package-v1"',
+        '"binary": "/usr/libexec/buzz-ci-execd"',
+        '"packaged_bytes": False',
+        '"path": "/var/lib/buzzci/execd-v2/package/receipt-v1.json"',
+        '"activation_owned_targets"',
+        '"central activation receipt binding differs"',
+        '"external seccomp source provenance differs"',
+        '"installed execd binary readback differs"',
+    ):
+        if required not in package_helpers:
+            raise ValueError(f"execd package helper contract misses {required}")
     if schema["properties"]["capacity"] != {"enum": [0, 1]}:
         raise ValueError("closed/active capacity schema drift")
     members = schema["$defs"]["identities"]["properties"]["access_group_members"]
