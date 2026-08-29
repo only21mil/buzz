@@ -31,6 +31,25 @@ class EvidenceMaintenancePackageTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.private = self.root / "private"
         self.private.mkdir(mode=0o700)
+        self.source_root = self.root / "source"
+        copied = self.source_root / "deploy/native-ci/evidence-maintenance"
+        copied.parent.mkdir(mode=0o700, parents=True)
+        shutil.copytree(PACKAGE_DIR, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy2(PACKAGE_DIR.parent / "package_source.py", self.source_root / "deploy/native-ci/package_source.py")
+        subprocess.run(["git", "init", "-q", str(self.source_root)], check=True)
+        subprocess.run(["git", "-C", str(self.source_root), "config", "user.name", "Evidence package test"], check=True)
+        subprocess.run(["git", "-C", str(self.source_root), "config", "user.email", "evidence@test.invalid"], check=True)
+        subprocess.run([
+            "git", "-C", str(self.source_root), "add",
+            "deploy/native-ci/evidence-maintenance", "deploy/native-ci/package_source.py",
+        ], check=True)
+        subprocess.run(["git", "-C", str(self.source_root), "commit", "-qm", "fixture"], check=True)
+        self.source_commit = subprocess.run(
+            ["git", "-C", str(self.source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         self.binary = self.root / "buzz-ci-evidence-maintenance"
         self.binary.write_bytes(b"#!/bin/sh\nexit 0\n")
         self.binary.chmod(0o755)
@@ -38,11 +57,11 @@ class EvidenceMaintenancePackageTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def freeze(self) -> tuple[Path, dict[str, object]]:
-        output = self.private / "package"
+    def freeze(self, source_root: Path | None = None, output_name: str = "package") -> tuple[Path, dict[str, object]]:
+        output = self.private / output_name
         manifest = PACKAGER.freeze_package(
-            PACKAGE_DIR.parents[2],
-            "a" * 40,
+            source_root or self.source_root,
+            self.source_commit,
             self.binary,
             output,
             1234,
@@ -54,6 +73,12 @@ class EvidenceMaintenancePackageTests(unittest.TestCase):
         package, manifest = self.freeze()
         self.assertEqual(manifest["default_state"], {"enabled": False, "active": False, "credentials_installed": False})
         self.assertEqual(len(manifest["entries"]), 7)
+        self.assertEqual(stat.S_IMODE(package.lstat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((package / "assets").lstat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((package / "package-manifest.json").lstat().st_mode), 0o600)
+        for item in manifest["entries"]:
+            source = package / str(item["source"])
+            self.assertEqual(stat.S_IMODE(source.lstat().st_mode), int(str(item["source_mode"]), 8))
         install_root = self.root / "install-root"
         install_root.mkdir()
         installed = INSTALLER.install_package(package, install_root)
@@ -69,6 +94,9 @@ class EvidenceMaintenancePackageTests(unittest.TestCase):
         self.assertFalse(any((install_root / "etc/systemd/system").glob("**/*.wants/*")))
         binary = install_root / "usr/libexec/buzz-ci-evidence-maintenance"
         self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o500)
+        for item in manifest["entries"]:
+            target = install_root / str(item["target"]).lstrip("/")
+            self.assertEqual(stat.S_IMODE(target.lstat().st_mode), int(str(item["install_mode"]), 8))
         analyzer = shutil.which("systemd-analyze")
         if analyzer is not None:
             unit_dir = install_root / "usr/lib/systemd/system"
@@ -81,6 +109,41 @@ class EvidenceMaintenancePackageTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_freeze_from_fresh_umask_0077_checkout_needs_no_source_chmod(self) -> None:
+        checkout = self.root / "private-checkout"
+        prior_umask = os.umask(0o077)
+        try:
+            subprocess.run(["git", "clone", "-q", str(self.source_root), str(checkout)], check=True)
+        finally:
+            os.umask(prior_umask)
+        self.assertEqual(
+            stat.S_IMODE((checkout / "deploy/native-ci/evidence-maintenance/README.md").lstat().st_mode),
+            0o600,
+        )
+        self.assertEqual(
+            stat.S_IMODE((checkout / "deploy/native-ci/evidence-maintenance/package.py").lstat().st_mode),
+            0o700,
+        )
+        package, manifest = self.freeze(checkout, "private-package")
+        self.assertEqual(stat.S_IMODE(package.lstat().st_mode), 0o700)
+        self.assertEqual(manifest["source_commit"], self.source_commit)
+
+    def test_freezer_rejects_unsafe_mode_and_link_drift(self) -> None:
+        unsafe = self.root / "unsafe-checkout"
+        linked = self.root / "linked-checkout"
+        subprocess.run(["git", "clone", "-q", str(self.source_root), str(unsafe)], check=True)
+        subprocess.run(["git", "clone", "-q", str(self.source_root), str(linked)], check=True)
+        (unsafe / "deploy/native-ci/evidence-maintenance/README.md").chmod(0o664)
+        with self.assertRaisesRegex(ValueError, "unsafe permissions"):
+            self.freeze(unsafe, "unsafe-package")
+        source = linked / "deploy/native-ci/evidence-maintenance/README.md"
+        replacement = linked / "README-replacement"
+        replacement.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(replacement)
+        with self.assertRaisesRegex(ValueError, "symbolic links"):
+            self.freeze(linked, "linked-package")
 
     def test_installer_rejects_asset_tampering_and_symlink_targets(self) -> None:
         package, _ = self.freeze()

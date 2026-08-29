@@ -24,6 +24,11 @@ must allow list on `_ci/v2/` and get, head, and delete only within that prefix.
 Activation is a separate approval-gated operation. The checked-in timer has an
 `[Install]` target but the package installer never enables it.
 
+The freezer accepts clean Git sources from ordinary or `umask 0077` checkouts.
+It preserves Git's executable class, rejects unsafe permissions and links, and
+does not repair source modes. Frozen package files and installed targets use
+the manifest's exact modes regardless of the invoking umask.
+
 ## Checks
 
 ```bash

@@ -9,8 +9,15 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 from pathlib import Path
+
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+import package_source
 
 PACKAGE_RELATIVE = Path("deploy/native-ci/evidence-maintenance")
 SCHEMA = "buzz-ci-evidence-maintenance-install-package-v1"
@@ -26,19 +33,35 @@ def canonical_json(value: object) -> bytes:
 
 
 def read_regular(path: Path, mode: int) -> bytes:
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise ValueError(f"source is not a single regular file: {path.name}")
-    if stat.S_IMODE(metadata.st_mode) != mode:
-        raise ValueError(f"source mode mismatch: {path.name}")
-    return path.read_bytes()
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(f"source is not a single regular file: {path.name}")
+        if stat.S_IMODE(metadata.st_mode) != mode:
+            raise ValueError(f"source mode mismatch: {path.name}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def require_exact_mode(path: Path, expected_mode: int) -> None:
+    if stat.S_IMODE(path.lstat().st_mode) != expected_mode:
+        raise OSError(f"could not materialize exact mode: {path}")
 
 
 def write_asset(path: Path, payload: bytes, mode: int) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
     try:
         os.fchmod(descriptor, mode)
-        os.write(descriptor, payload)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+            raise OSError(f"could not materialize exact asset mode: {path}")
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(descriptor, view):]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -62,7 +85,7 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, output: 
         raise ValueError("source commit must be 40 lowercase hex characters")
     if not 1 <= service_uid <= (1 << 32) - 1 or not 1 <= service_gid <= (1 << 32) - 1:
         raise ValueError("service identity must use nonzero u32 values")
-    source_root = Path(os.path.realpath(source_root))
+    source_root = package_source.verify_checkout(source_root, source_commit, PACKAGE_RELATIVE)
     binary_payload = read_regular(binary, 0o755)
     output = Path(os.path.abspath(output))
     if output.exists() or output.is_symlink():
@@ -73,8 +96,11 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, output: 
 
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=parent))
     stage.chmod(0o700)
+    require_exact_mode(stage, 0o700)
     assets = stage / "assets"
     assets.mkdir(mode=0o700)
+    assets.chmod(0o700)
+    require_exact_mode(assets, 0o700)
     package_dir = source_root / PACKAGE_RELATIVE
     try:
         entries: list[dict[str, object]] = []
@@ -87,11 +113,19 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, output: 
             ("documentation", package_dir / "README.md", "README.md", "/usr/share/doc/buzz-ci-evidence-maintenance/README.md", 0o644, 0o644, 0, 0, None),
         ]
         for role, source, asset_name, target, source_mode, install_mode, uid, gid, known_payload in files:
-            payload = known_payload if known_payload is not None else read_regular(source, source_mode)
+            payload = known_payload
+            if payload is None:
+                payload, _ = package_source.tracked_payload(
+                    source_root, source.relative_to(source_root), 0o100644,
+                )
             write_asset(assets / asset_name, payload, source_mode)
             entries.append(entry(role, asset_name, target, source_mode, install_mode, uid, gid, payload))
 
-        sysusers = read_regular(package_dir / "templates/buzzci-evidence-maintenance.sysusers.in", 0o644)
+        sysusers, _ = package_source.tracked_payload(
+            source_root,
+            PACKAGE_RELATIVE / "templates/buzzci-evidence-maintenance.sysusers.in",
+            0o100644,
+        )
         sysusers = sysusers.replace(b"@UID@", str(service_uid).encode()).replace(b"@GID@", str(service_gid).encode())
         write_asset(assets / "buzzci-evidence-maintenance.sysusers", sysusers, 0o644)
         entries.append(entry("sysusers", "buzzci-evidence-maintenance.sysusers", "/usr/lib/sysusers.d/buzzci-evidence-maintenance.conf", 0o644, 0o644, 0, 0, sysusers))
@@ -107,6 +141,7 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, output: 
         manifest["package_digest"] = sha256(canonical_json(manifest))
         write_asset(stage / "package-manifest.json", canonical_json(manifest), 0o600)
         os.replace(stage, output)
+        require_exact_mode(output, 0o700)
         return manifest
     except BaseException:
         shutil.rmtree(stage)

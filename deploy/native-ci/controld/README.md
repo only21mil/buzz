@@ -60,7 +60,10 @@ deploy/native-ci/controld/freeze_package.py \
 The freezer binds the supplied binary digest and provenance, exact commit,
 every payload and destination, identity, mode, capacity-zero config, daemon
 contract, and default state. It refuses dirty package sources, links, broad
-modes, provenance mismatch, and pre-existing output.
+modes, provenance mismatch, and pre-existing output. A clean checkout may
+materialize Git non-executable sources as `0600` or `0644` and executable
+sources as `0700` or `0755`; the freezer preserves Git's executable class and
+does not repair source modes.
 
 Before any install against `/`, the package root and assets directory must be
 root-owned mode `0700`. Manifest and provenance files must be root-owned mode
