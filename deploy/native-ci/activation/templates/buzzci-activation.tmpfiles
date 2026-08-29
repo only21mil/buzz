@@ -1,1 +1,1 @@
-d /var/lib/buzzci/activation-controller 0700 root root -
+d /var/lib/buzzci/activation-controller 0710 root buzzci-controld -

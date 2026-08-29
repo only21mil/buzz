@@ -84,6 +84,8 @@ class ActivationFixture:
             "principal": "qualification",
         }
         self.manifest = self._manifest()
+        self.scenario = self._scenario()
+        self.binding = CONTROLLER._acceptance_binding(self.manifest, self.scenario)
         self._write_package()
         self._write_installed_closed_configs()
         self._write_fake_systemd()
@@ -149,9 +151,11 @@ class ActivationFixture:
         )
         controld_staged = activation_package.canonical_json({
             "schema_version": 1, "capacity": 0, "store_root": "/var/lib/buzzci/controld",
+            "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
         })
         controld_active = activation_package.canonical_json({
             "schema_version": 1, "capacity": 1, "store_root": "/var/lib/buzzci/controld",
+            "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
             "relay_url": "wss://relay.example.invalid", "runner_socket": "/run/buzzci/runner-control.sock",
             "keyholder_socket": "/run/buzzci/keyholder.sock",
             "keyholder_uid": 62003, "keyholder_gid": 62003,
@@ -193,6 +197,10 @@ class ActivationFixture:
             "sysusers": ("buzzci-activation.conf", self._render_sysusers()),
             "tmpfiles": ("buzzci-activation.tmpfiles", (ACTIVATION_ROOT / "templates/buzzci-activation.tmpfiles").read_bytes()),
             "capacity_target": ("buzz-ci-capacity-one.target", (ACTIVATION_ROOT / "templates/buzz-ci-capacity-one.target").read_bytes()),
+            "controld_acceptance_socket": ("buzz-ci-controld-acceptance.socket", (ACTIVATION_ROOT / "templates/buzz-ci-controld-acceptance.socket").read_bytes()),
+            "acceptance_control_socket": ("buzz-ci-acceptance-control.socket", (ACTIVATION_ROOT / "templates/buzz-ci-acceptance-control.socket").read_bytes()),
+            "acceptance_control_service": ("buzz-ci-acceptance-control.service", (ACTIVATION_ROOT / "templates/buzz-ci-acceptance-control.service").read_bytes()),
+            "acceptance_tmpfiles": ("buzzci-acceptance.tmpfiles", (ACTIVATION_ROOT / "templates/buzzci-acceptance.tmpfiles").read_bytes()),
             "execd_socket_dropin": ("20-execd-capacity-one.conf", (ACTIVATION_ROOT / "templates/20-execd-capacity-one.conf").read_bytes()),
             "runner_service_dropin": ("20-runner-capacity-one.conf", (ACTIVATION_ROOT / "templates/20-runner-capacity-one.conf").read_bytes()),
             "controld_service_dropin": ("20-controld-capacity-one.conf", (ACTIVATION_ROOT / "templates/20-controld-capacity-one.conf").read_bytes()),
@@ -208,7 +216,8 @@ class ActivationFixture:
                 binary = b"#!/usr/bin/python3\nimport sys\nsys.stdin.buffer.read()\nsys.stdout.buffer.write(" + repr(RESPONSE).encode() + b")\n"
             else:
                 binary = f"{name}-binary\n".encode()
-            write_file(self.root / binary_path.lstrip("/"), binary, 0o755)
+            if name not in set(activation_package.INSTALLABLE_COMPONENT_ROLES.values()):
+                write_file(self.root / binary_path.lstrip("/"), binary, 0o755)
             source_commit = f"{index:x}" * 40
             provenance = activation_package.canonical_json({
                 "binary": Path(binary_path).name,
@@ -219,6 +228,13 @@ class ActivationFixture:
             })
             provenance_source = f"assets/{name}-provenance.json"
             self.assets[provenance_source] = (provenance, 0o400)
+            install_role = next((role for role, component_name in activation_package.INSTALLABLE_COMPONENT_ROLES.items() if component_name == name), None)
+            if install_role is not None:
+                self._asset_entry(
+                    install_role, binary_path, f"{name}.bin", binary, 0o755, 0, 0,
+                )
+                self.entries[-1]["source_mode"] = "0500"
+                self.assets[self.entries[-1]["source"]] = (binary, 0o500)
             components.append({
                 "name": name,
                 "binary_path": binary_path,
@@ -232,6 +248,36 @@ class ActivationFixture:
                 "unit": unit,
             })
         return components
+
+    def _scenario(self) -> dict[str, object]:
+        endpoint = {"program": "/usr/libexec/buzz-ci-capacity-one-driver", "args": []}
+        return {
+            "schema_version": "buzz-ci-capacity-one-scenario/v1",
+            "fixture": {
+                "integrated_candidate_sha": self.manifest["source_commit"],
+                "activation_id": self.manifest["activation_id"],
+                "activation_package_digest": self.manifest["package_digest"],
+                "run_id": "1" * 32,
+                "job_id": "capacity-one-fixture",
+                "request_digest": "2" * 64,
+                "manifest_digest": "3" * 64,
+                "source_oid": "a" * 40,
+                "approval_id": "4" * 32,
+                "grant_event_id": "5" * 64,
+                "grant_digest": "6" * 64,
+                "approved_by": "7" * 64,
+                "export_subject": "8" * 64,
+                "export_authorization_digest": "9" * 64,
+                "controller_generation": 7,
+                "runner_generation": 11,
+                "expected_log": {"name": "job.log", "sha256": "a" * 64, "bytes": 10},
+                "expected_artifacts": [{"name": "result.json", "sha256": "b" * 64, "bytes": 20}],
+            },
+            "driver": {
+                "control": endpoint, "observe": endpoint, "export": endpoint,
+                "controller_process": endpoint, "runner_process": endpoint, "timeout_seconds": 120,
+            },
+        }
 
     def _manifest(self) -> dict[str, object]:
         draft: dict[str, object] = {
@@ -316,9 +362,9 @@ class ActivationControllerTests(unittest.TestCase):
         checked = CONTROLLER.check_current(manifest, self.fixture.root, driver)
         self.assertEqual(checked["state"], "dormant")
 
-        staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual((staged["state"], staged["capacity"]), ("staged_zero", 0))
-        self.assertEqual(CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)["status"], "unchanged")
+        self.assertEqual(CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)["status"], "unchanged")
         self.assertEqual(CONTROLLER.check_current(manifest, self.fixture.root, driver)["state"], "staged_zero")
 
         activated = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
@@ -341,20 +387,107 @@ class ActivationControllerTests(unittest.TestCase):
             else:
                 self.assertFalse(target.exists())
 
+    def test_manifest_schema_mirrors_fixed_package_counts_and_systemd_abi(self) -> None:
+        schema = json.loads((ACTIVATION_ROOT / "activation-manifest.schema.json").read_bytes())
+        properties = schema["properties"]
+        self.assertEqual((properties["components"]["minItems"], properties["components"]["maxItems"]), (len(activation_package.COMPONENTS), len(activation_package.COMPONENTS)))
+        expected_entries = len(activation_package.CONFIG_TARGETS) + len(activation_package.STATIC_TARGETS)
+        self.assertEqual((properties["entries"]["minItems"], properties["entries"]["maxItems"]), (expected_entries, expected_entries))
+        self.assertEqual(properties["socket_policy"]["const"], activation_package.SOCKET_POLICY)
+        self.assertEqual(
+            properties["systemd"]["const"],
+            {
+                "start_order": activation_package.START_ORDER,
+                "stop_order": activation_package.STOP_ORDER,
+                "persistent_unit": activation_package.PERSISTENT_UNIT,
+                "stage_capacity": 0,
+                "active_capacity": 1,
+            },
+        )
+
+    def test_acceptance_binding_matches_rust_field_order_and_staged_zero_contract(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        self.assertEqual(
+            self.fixture.binding["scenario_sha256"],
+            "c7d8b76623f5a1076225ab6dad16efc75247a1ddd01a98523731e941e79f21c2",
+        )
+        staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
+        for unit in activation_package.STAGED_ZERO_UNITS:
+            self.assertEqual(staged["staged_zero"]["units"][unit]["ActiveState"], "active")
+        binding_path = self.fixture.root / activation_package.ACCEPTANCE_BINDING_PATH.lstrip("/")
+        self.assertEqual(stat.S_IMODE(binding_path.stat().st_mode), 0o440)
+        self.assertEqual(json.loads(binding_path.read_bytes()), self.fixture.binding)
+        controld = json.loads((self.fixture.root / activation_package.CONFIG_TARGETS["controld_config"].lstrip("/")).read_bytes())
+        self.assertEqual((controld["capacity"], controld["acceptance_binding"]), (0, activation_package.ACCEPTANCE_BINDING_PATH))
+        for role, component_name in activation_package.INSTALLABLE_COMPONENT_ROLES.items():
+            component = next(item for item in manifest["components"] if item["name"] == component_name)
+            installed = self.fixture.root / activation_package.STATIC_TARGETS[role].lstrip("/")
+            self.assertEqual((stat.S_IMODE(installed.stat().st_mode), activation_package.digest(installed.read_bytes())), (0o755, component["binary_sha256"]))
+
+    def test_acceptance_scenario_package_and_peer_binding_are_fail_closed(self) -> None:
+        changed = copy.deepcopy(self.fixture.scenario)
+        changed["fixture"]["activation_package_digest"] = "c" * 64
+        with self.assertRaisesRegex(ValueError, "different activation package"):
+            CONTROLLER._acceptance_binding(self.fixture.manifest, changed)
+        changed = copy.deepcopy(self.fixture.scenario)
+        changed["fixture"]["expected_artifacts"].append(copy.deepcopy(changed["fixture"]["expected_artifacts"][0]))
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            CONTROLLER._acceptance_binding(self.fixture.manifest, changed)
+        self.assertEqual(
+            (self.fixture.binding["peer_uid"], self.fixture.binding["peer_gid"]),
+            (self.fixture.identities["qualification"]["uid"], self.fixture.identities["qualification"]["gid"]),
+        )
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        different = copy.deepcopy(self.fixture.binding)
+        different["scenario_sha256"] = "c" * 64
+        with self.assertRaisesRegex(ValueError, "scenario differs"):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, different)
+
+    def test_rollback_restores_enabled_listening_execd_baseline(self) -> None:
+        state = json.loads(self.fixture.fake_state.read_bytes())
+        state["units"]["buzz-ci-execd.socket"].update({
+            "ActiveState": "active", "SubState": "listening", "UnitFileState": "enabled",
+        })
+        write_file(self.fixture.fake_state, activation_package.canonical_json(state), 0o600)
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(
+            (rolled_back["units"]["buzz-ci-execd.socket"]["ActiveState"], rolled_back["units"]["buzz-ci-execd.socket"]["UnitFileState"]),
+            ("active", "enabled"),
+        )
+        self.assertEqual(driver.socket(manifest["socket_policy"]["execd"])["path"], "/run/buzzci/execd.sock")
+
+    def test_new_activation_replaces_and_rollback_restores_prior_controld_ledger(self) -> None:
+        ledger = self.fixture.root / CONTROLLER.CONTROLD_ACCEPTANCE_LEDGER_PATH.lstrip("/")
+        prior = b'{"prior":"activation"}\n'
+        write_file(ledger, prior, 0o600)
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertFalse(ledger.exists())
+        write_file(ledger, b'{"current":"activation"}\n', 0o600)
+        rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual((rolled_back["acceptance_ledger"], ledger.read_bytes()), ("restored", prior))
+
     def test_failed_qualification_returns_to_staged_capacity_zero(self) -> None:
         manifest, payloads, driver = self.fixture.load()
-        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         manifest["qualification"]["expected_response_sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "qualification response digest differs"):
             CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual(receipt["state"], "staged_zero")
-        self.assertEqual(CONTROLLER._zero_readback(driver)[activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
+        self.assertEqual(
+            CONTROLLER._staged_zero_readback(manifest, driver)["units"][activation_package.PERSISTENT_UNIT]["ActiveState"],
+            "inactive",
+        )
         CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
 
     def test_rollback_refuses_drift_before_systemd_mutation(self) -> None:
         manifest, payloads, driver = self.fixture.load()
-        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
         target = self.fixture.root / activation_package.CONFIG_TARGETS["controld_config"].lstrip("/")
         target.write_bytes(b'{"drift":true}\n')
@@ -441,7 +574,7 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertIn("g buzzci-execd 62005\n", sysusers)
         self.assertIn("m buzzci-runner buzzci-execd\n", sysusers)
         self.assertIn("m buzzci-ctl buzzci-execd\n", sysusers)
-        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         state = json.loads(self.fixture.fake_state.read_bytes())
         self.assertEqual(
             state["groups"],
@@ -536,7 +669,7 @@ while True:
 
     def test_failed_return_to_zero_attempts_all_steps_and_persists_truth(self) -> None:
         manifest, payloads, driver = self.fixture.load()
-        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         manifest["qualification"]["expected_response_sha256"] = "0" * 64
         stop_attempts: list[str] = []
         original_stop = driver.stop
@@ -557,7 +690,10 @@ while True:
         driver.disable = partial_disable
         with self.assertRaisesRegex(ValueError, "qualification response digest differs"):
             CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
-        self.assertEqual(stop_attempts, activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])
+        self.assertEqual(
+            stop_attempts,
+            ["buzz-ci-controld.service", *activation_package.STOP_ORDER, activation_package.PERSISTENT_UNIT],
+        )
         self.assertEqual(CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")["controld_config"], "staged")
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual(receipt["state"], "rollback_failed")
@@ -565,7 +701,7 @@ while True:
 
     def test_partial_explicit_rollback_attempts_all_stops_and_persists_failure(self) -> None:
         manifest, payloads, driver = self.fixture.load()
-        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
         stop_attempts: list[str] = []
         original_stop = driver.stop
@@ -579,10 +715,13 @@ while True:
         driver.stop = partial_stop
         with self.assertRaisesRegex(ValueError, "rollback failures"):
             CONTROLLER.rollback(manifest, self.fixture.root, driver)
-        self.assertEqual(stop_attempts, activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])
+        self.assertEqual(
+            stop_attempts[:len(activation_package.STOP_ORDER) + 1],
+            activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT],
+        )
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual(receipt["state"], "rollback_failed")
-        self.assertIn("capacity-zero readback", receipt["last_error"])
+        self.assertIn("systemd prior readback", receipt["last_error"])
 
     def test_qualification_executable_mode_drift_is_rejected(self) -> None:
         manifest, payloads, driver = self.fixture.load()

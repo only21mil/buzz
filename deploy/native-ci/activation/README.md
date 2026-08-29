@@ -5,8 +5,9 @@ to one ordinary job at a time. The source tree stays dormant. It does not
 contain a frozen package, private key, credential, relay token, or enabled unit.
 
 The controller composes the frozen runner, controld, execd, keyholder,
-qualification, and runner-executor binaries. It does not replace their package
-installers. Every binary has a full source commit, binary digest, and copied mode-`0400`
+qualification, and runner-executor binaries. It also installs the three frozen
+capacity-one acceptance binaries because no other package owns them. Every
+binary has a full source commit, binary digest, and copied mode-`0400`
 provenance record. The staged and active runner and controld configs have
 separate digests. The keyholder config is secret-free; its socket ABI remains
 in the manifest and systemd unit. The controller rejects fields whose names
@@ -39,6 +40,8 @@ memberships. Socket permissions grant only the required adjacent connection:
 | `/run/buzzci/keyholder.sock` | `buzzci-keyholder` | `buzzci-controld` | `0620` | controld only |
 | `/run/buzzci/runner-control.sock` | `buzzci-runner` | `buzzci-controld` | `0620` | controld only |
 | `/run/buzzci/execd.sock` | `root` | `buzzci-execd` | `0620` | runner and qualification controller |
+| `/run/buzzci/acceptance-control.sock` | `root` | `buzzci-ctl` | `0620` | qualification controller only |
+| `/run/buzzci/controld-acceptance.sock` | `root` | `buzzci-ctl` | `0620` | qualification controller only |
 
 Controld cannot connect to execd. Keyholder cannot execute jobs. Execd remains
 the sole privileged executor, and the runner still requires execd's UID 0 peer
@@ -46,14 +49,18 @@ credential.
 
 ## State machine
 
-`check` starts from installed component packages and requires every existing
-service and socket to be inactive. Managed activation files must be absent or
+`check` starts from installed component packages and requires activation-owned
+services and sockets to be inactive. A pre-existing enabled and listening execd
+socket is captured as baseline state. Managed activation files must be absent or
 match the staged payload exactly. The runner and controld closed configs must
 already exist with their frozen staged bytes and metadata.
 
-1. `stage` installs the generated sysusers, tmpfiles, target, drop-ins, and
-   capacity-zero configs. It provisions or verifies exact principals, reloads
-   systemd, and reads back capacity zero. No unit is enabled or left active.
+1. `stage --scenario` validates the exact scenario, installs the generated
+   sysusers, tmpfiles, acceptance binaries and units, target, drop-ins, and
+   capacity-zero configs. After the package digest is known, it atomically
+   writes the controld binding receipt and the two acceptance adapter configs.
+   Only the two acceptance sockets and their services remain active. Ordinary
+   CI units and the capacity-one target remain inactive and disabled.
 2. `activate` replaces only the runner and controld configs with their frozen
    active variants. It starts keyholder, execd, runner, and controld in the
    manifest's fixed order. Socket ownership and mode readback must pass.
@@ -71,14 +78,21 @@ already exist with their frozen staged bytes and metadata.
 5. `rollback` first validates every managed target against its prior, staged,
    or active digest. Unknown drift stops rollback before systemd or file
    mutation. A valid rollback stops and disables the activation, restores exact
-   prior bytes and metadata, and retains service principals for audit and UID
-   stability.
+   prior bytes, metadata, and exact unit active/enable state. It restores or
+   removes generated acceptance configs and restores the prior controld
+   acceptance ledger. Service principals remain for audit and UID stability.
 
-The root-private receipt at
+The root-owned receipt at
 `/var/lib/buzzci/activation-controller/receipt-v1.json` binds the activation ID,
 package digest, source commit, previous target contents and metadata, unit
 readback, qualification result, and current state. Reusing a receipt with a
 different package fails closed.
+
+The same directory is `root:buzzci-controld` mode `0710`. The private controller
+receipt remains `root:root` mode `0600`; the daemon sees only the separate
+`controld-acceptance-v1.json` binding at `root:buzzci-controld` mode `0440`.
+The scenario digest matches `serde_json::to_vec` field order used by the Rust
+canary, not the input file's whitespace or key order.
 
 ## Freeze
 
@@ -127,7 +141,9 @@ mutation actions without the separate deployment approval.
 
 ```bash
 deploy/native-ci/activation/controller.py check --package /private/package
-deploy/native-ci/activation/controller.py stage --package /private/package
+deploy/native-ci/activation/controller.py stage \
+  --package /private/package \
+  --scenario /private/capacity-one-scenario.json
 deploy/native-ci/activation/controller.py activate --package /private/package
 deploy/native-ci/activation/controller.py qualify --package /private/package
 deploy/native-ci/activation/controller.py rollback --package /private/package
