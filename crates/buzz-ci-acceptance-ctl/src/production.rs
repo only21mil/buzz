@@ -9,7 +9,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::{
-        fs::{MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream,
         process::CommandExt,
     },
@@ -55,6 +55,14 @@ pub const CONTROL_CONFIG_PATH: &str = "/etc/buzzci/acceptance-control-v1.json";
 pub const ACTIVATION_RECEIPT_PATH: &str = "/var/lib/buzzci/activation-controller/receipt-v1.json";
 /// Root helper replay ledger.
 pub const CONTROL_LEDGER_PATH: &str = "/var/lib/buzzci/acceptance-control/operation-ledger-v1.json";
+
+const EXECD_SERVICE: &str = "buzz-ci-execd.service";
+const EXECD_SOCKET: &str = "buzz-ci-execd.socket";
+const EXECUTOR_SERVICE: &str = "buzz-ci-executor.service";
+const EXECUTOR_SOCKET: &str = "buzz-ci-executor.socket";
+const EXECUTOR_SOCKET_PATH: &str = "/run/buzzci/executor.sock";
+const EXECUTOR_PROGRAM: &str = "/usr/libexec/buzz-ci-executor";
+const EXECUTOR_SERVICE_ACCOUNT: &str = "buzzci-job";
 
 const CONFIG_SCHEMA: &str = "buzz-ci-capacity-one-driver-config/v1";
 const CONTROL_CONFIG_SCHEMA: &str = "buzz-ci-acceptance-control-config/v1";
@@ -1318,6 +1326,19 @@ enum UnitState {
     Failed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcessIdentity {
+    executable: PathBuf,
+    arguments: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
 trait CapacityOneRuntime {
     fn activate(&mut self, input: &[u8], timeout: Duration) -> Result<Vec<u8>, ControlError>;
     fn unit_state(
@@ -1337,6 +1358,24 @@ trait CapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError>;
+    fn load_state(&mut self, unit: &'static str, timeout: Duration)
+        -> Result<String, ControlError>;
+    fn sub_state(&mut self, unit: &'static str, timeout: Duration) -> Result<String, ControlError>;
+    fn main_pid(&mut self, unit: &'static str, timeout: Duration) -> Result<u32, ControlError>;
+    fn process_identity(
+        &mut self,
+        pid: u32,
+        timeout: Duration,
+    ) -> Result<ProcessIdentity, ControlError>;
+    fn service_account(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<(String, String, String), ControlError>;
+    fn executor_socket_identity(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<SocketIdentity, ControlError>;
     fn active_receipt_sha256(
         &mut self,
         config: &AcceptanceControlConfig,
@@ -1384,6 +1423,49 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         timeout: Duration,
     ) -> Result<String, ControlError> {
         unit_fragment_path(unit, timeout)
+    }
+
+    fn load_state(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        unit_property(unit, "LoadState", timeout)
+    }
+
+    fn sub_state(&mut self, unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
+        unit_property(unit, "SubState", timeout)
+    }
+
+    fn main_pid(&mut self, unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
+        unit_main_pid(unit, timeout)
+    }
+
+    fn process_identity(
+        &mut self,
+        pid: u32,
+        _timeout: Duration,
+    ) -> Result<ProcessIdentity, ControlError> {
+        live_process_identity(pid)
+    }
+
+    fn service_account(
+        &mut self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<(String, String, String), ControlError> {
+        Ok((
+            unit_property(unit, "User", timeout)?,
+            unit_property(unit, "Group", timeout)?,
+            unit_property(unit, "SupplementaryGroups", timeout)?,
+        ))
+    }
+
+    fn executor_socket_identity(
+        &mut self,
+        _timeout: Duration,
+    ) -> Result<SocketIdentity, ControlError> {
+        live_socket_identity(Path::new(EXECUTOR_SOCKET_PATH))
     }
 
     fn active_receipt_sha256(
@@ -1439,8 +1521,10 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
         "buzz-ci-capacity-one.target",
         "buzz-ci-runner.service",
         "buzz-ci-runner.socket",
-        "buzz-ci-execd.service",
-        "buzz-ci-execd.socket",
+        EXECD_SERVICE,
+        EXECD_SOCKET,
+        EXECUTOR_SERVICE,
+        EXECUTOR_SOCKET,
         "buzz-ci-keyholder.service",
         "buzz-ci-keyholder.socket",
     ] {
@@ -1452,6 +1536,14 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
         || !runtime
             .optional_invocation("buzz-ci-runner.service", timeout)?
             .is_empty()
+        || !runtime
+            .optional_invocation(EXECD_SERVICE, timeout)?
+            .is_empty()
+        || !runtime
+            .optional_invocation(EXECUTOR_SERVICE, timeout)?
+            .is_empty()
+        || runtime.main_pid(EXECD_SERVICE, timeout)? != 0
+        || runtime.main_pid(EXECUTOR_SERVICE, timeout)? != 0
     {
         return Err(ControlError::StaleGeneration);
     }
@@ -1495,8 +1587,10 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
         "buzz-ci-acceptance-control.service",
         "buzz-ci-runner.service",
         "buzz-ci-runner.socket",
-        "buzz-ci-execd.service",
-        "buzz-ci-execd.socket",
+        EXECD_SERVICE,
+        EXECD_SOCKET,
+        EXECUTOR_SERVICE,
+        EXECUTOR_SOCKET,
         "buzz-ci-keyholder.service",
         "buzz-ci-keyholder.socket",
     ] {
@@ -1517,13 +1611,22 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
             "buzz-ci-runner.socket",
             "/etc/systemd/system/buzz-ci-runner.socket",
         ),
-        (
-            "buzz-ci-execd.socket",
-            "/etc/systemd/system/buzz-ci-execd.socket",
-        ),
+        (EXECD_SOCKET, "/usr/lib/systemd/system/buzz-ci-execd.socket"),
         (
             "buzz-ci-keyholder.socket",
             "/etc/systemd/system/buzz-ci-keyholder.socket",
+        ),
+        (
+            EXECD_SERVICE,
+            "/usr/lib/systemd/system/buzz-ci-execd.service",
+        ),
+        (
+            EXECUTOR_SERVICE,
+            "/usr/lib/systemd/system/buzz-ci-executor.service",
+        ),
+        (
+            EXECUTOR_SOCKET,
+            "/usr/lib/systemd/system/buzz-ci-executor.socket",
         ),
     ] {
         if runtime.fragment_path(unit, timeout)? != expected {
@@ -1532,14 +1635,59 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
     }
     let controller_invocation = runtime.invocation("buzz-ci-controld.service", timeout)?;
     let runner_invocation = runtime.invocation("buzz-ci-runner.service", timeout)?;
-    let execd_invocation = runtime.invocation("buzz-ci-execd.service", timeout)?;
+    for unit in [
+        EXECD_SERVICE,
+        EXECD_SOCKET,
+        EXECUTOR_SERVICE,
+        EXECUTOR_SOCKET,
+    ] {
+        if runtime.load_state(unit, timeout)? != "loaded" {
+            return Err(ControlError::ReadbackMismatch);
+        }
+    }
+    for unit in [EXECD_SOCKET, EXECUTOR_SOCKET] {
+        if runtime.sub_state(unit, timeout)? != "listening" {
+            return Err(ControlError::ReadbackMismatch);
+        }
+    }
+
+    let execd_invocation = runtime.invocation(EXECD_SERVICE, timeout)?;
+    let executor_invocation = runtime.invocation(EXECUTOR_SERVICE, timeout)?;
     let keyholder_invocation = runtime.invocation("buzz-ci-keyholder.service", timeout)?;
+    let execd_pid = runtime.main_pid(EXECD_SERVICE, timeout)?;
+    let executor_pid = runtime.main_pid(EXECUTOR_SERVICE, timeout)?;
     if controller_invocation == staged_controller_invocation
         || runner_invocation == staged_runner_invocation
         || execd_invocation.is_empty()
+        || executor_invocation.is_empty()
         || keyholder_invocation.is_empty()
+        || execd_pid == 0
+        || executor_pid == 0
     {
         return Err(ControlError::StaleGeneration);
+    }
+    if runtime.process_identity(executor_pid, timeout)?
+        != (ProcessIdentity {
+            executable: PathBuf::from(EXECUTOR_PROGRAM),
+            arguments: vec![
+                EXECUTOR_PROGRAM.as_bytes().to_vec(),
+                b"--socket-activation".to_vec(),
+            ],
+        })
+        || runtime.service_account(EXECUTOR_SERVICE, timeout)?
+            != (
+                EXECUTOR_SERVICE_ACCOUNT.to_owned(),
+                EXECUTOR_SERVICE_ACCOUNT.to_owned(),
+                String::new(),
+            )
+        || runtime.executor_socket_identity(timeout)?
+            != (SocketIdentity {
+                uid: 0,
+                gid: 0,
+                mode: 0o600,
+            })
+    {
+        return Err(ControlError::ReadbackMismatch);
     }
 
     Ok(CapacityOneTransition {
@@ -1627,8 +1775,10 @@ impl SystemdHostControl {
             "buzz-ci-capacity-one.target",
             "buzz-ci-runner.service",
             "buzz-ci-runner.socket",
-            "buzz-ci-execd.service",
-            "buzz-ci-execd.socket",
+            EXECD_SERVICE,
+            EXECD_SOCKET,
+            EXECUTOR_SERVICE,
+            EXECUTOR_SOCKET,
             "buzz-ci-keyholder.service",
             "buzz-ci-keyholder.socket",
         ] {
@@ -1639,6 +1789,21 @@ impl SystemdHostControl {
 
     fn zero_proof(&self) -> Result<ZeroProof, ControlError> {
         let readback = self.readback()?;
+        for unit in [
+            "buzz-ci-capacity-one.target",
+            "buzz-ci-runner.service",
+            "buzz-ci-runner.socket",
+            EXECD_SERVICE,
+            EXECD_SOCKET,
+            EXECUTOR_SERVICE,
+            EXECUTOR_SOCKET,
+            "buzz-ci-keyholder.service",
+            "buzz-ci-keyholder.socket",
+        ] {
+            if unit_state(unit, self.timeout)? != UnitState::Inactive {
+                return Err(ControlError::ReadbackMismatch);
+            }
+        }
         let socket_active = unit_active("buzz-ci-controld-acceptance.socket", self.timeout)?;
         let service_active = unit_active("buzz-ci-controld.service", self.timeout)?;
         let socket_present = match fs::symlink_metadata(CONTROLD_SOCKET_PATH) {
@@ -1932,6 +2097,91 @@ fn unit_fragment_path(unit: &'static str, timeout: Duration) -> Result<String, C
     } else {
         Err(ControlError::ReadbackMismatch)
     }
+}
+
+fn unit_property(
+    unit: &'static str,
+    property: &'static str,
+    timeout: Duration,
+) -> Result<String, ControlError> {
+    let property_argument = match property {
+        "LoadState" => "--property=LoadState",
+        "SubState" => "--property=SubState",
+        "MainPID" => "--property=MainPID",
+        "User" => "--property=User",
+        "Group" => "--property=Group",
+        "SupplementaryGroups" => "--property=SupplementaryGroups",
+        _ => return Err(ControlError::ReadbackMismatch),
+    };
+    let output = run_bounded_command(
+        "/usr/bin/systemctl",
+        &["show", property_argument, "--value", unit],
+        timeout,
+    )?;
+    let value = std::str::from_utf8(&output)
+        .map_err(|_| ControlError::ReadbackMismatch)?
+        .strip_suffix('\n')
+        .ok_or(ControlError::ReadbackMismatch)?;
+    if value.contains(['\n', '\r']) {
+        Err(ControlError::ReadbackMismatch)
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn unit_main_pid(unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
+    unit_property(unit, "MainPID", timeout)?
+        .parse()
+        .map_err(|_| ControlError::ReadbackMismatch)
+}
+
+fn live_process_identity(pid: u32) -> Result<ProcessIdentity, ControlError> {
+    const MAX_CMDLINE_BYTES: u64 = 4096;
+    if pid == 0 {
+        return Err(ControlError::ReadbackMismatch);
+    }
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    let executable =
+        fs::read_link(process.join("exe")).map_err(|_| ControlError::ReadbackMismatch)?;
+    if !valid_absolute(&executable) {
+        return Err(ControlError::ReadbackMismatch);
+    }
+    let mut command_line = Vec::new();
+    File::open(process.join("cmdline"))
+        .and_then(|file| {
+            file.take(MAX_CMDLINE_BYTES + 1)
+                .read_to_end(&mut command_line)
+        })
+        .map_err(|_| ControlError::ReadbackMismatch)?;
+    if command_line.is_empty()
+        || command_line.len() as u64 > MAX_CMDLINE_BYTES
+        || !command_line.ends_with(&[0])
+    {
+        return Err(ControlError::ReadbackMismatch);
+    }
+    let arguments = command_line[..command_line.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if arguments.iter().any(Vec::is_empty) {
+        return Err(ControlError::ReadbackMismatch);
+    }
+    Ok(ProcessIdentity {
+        executable,
+        arguments,
+    })
+}
+
+fn live_socket_identity(path: &Path) -> Result<SocketIdentity, ControlError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| ControlError::ReadbackMismatch)?;
+    if !metadata.file_type().is_socket() {
+        return Err(ControlError::ReadbackMismatch);
+    }
+    Ok(SocketIdentity {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o7777,
+    })
 }
 
 fn run_bounded_command(
@@ -3359,6 +3609,22 @@ mod tests {
         let receipt = run_acceptance(&scenario, &mut driver);
         let transport = driver.into_transport();
         assert_eq!(receipt.outcome, Outcome::Fail);
+        let zero_transition = receipt.zero_transition.as_ref().unwrap();
+        assert_eq!(zero_transition.outcome, Outcome::Pass);
+        assert_eq!(zero_transition.phases.len(), 2);
+        assert_eq!(zero_transition.phases[0].sequence, 14);
+        assert_eq!(zero_transition.phases[0].outcome, Outcome::Pass);
+        assert_eq!(zero_transition.phases[1].sequence, 15);
+        assert_eq!(zero_transition.phases[1].outcome, Outcome::Pass);
+        assert_eq!(zero_transition.zero_proof.capacity, 0);
+        assert_eq!(zero_transition.zero_proof.admission, AdmissionState::Closed);
+        assert!(!zero_transition.zero_proof.controld_service_active);
+        assert!(!zero_transition.zero_proof.controld_acceptance_socket_active);
+        assert!(
+            !zero_transition
+                .zero_proof
+                .controld_acceptance_socket_present
+        );
         assert!(!transport.trace.contains(&(AdapterEndpoint::Controld, 2)));
         assert_eq!(
             &transport.trace[transport.trace.len() - 2..],
@@ -3375,11 +3641,14 @@ mod tests {
         receipt: PathBuf,
         mode: &'static str,
         controller_calls: usize,
+        post_state: Option<serde_json::Value>,
     }
 
     impl FixtureCapacityOneRuntime {
         fn state(&self) -> serde_json::Value {
-            serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap()
+            self.post_state
+                .clone()
+                .unwrap_or_else(|| serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap())
         }
 
         fn unit_value(&self, unit: &str, field: &str) -> String {
@@ -3399,7 +3668,73 @@ mod tests {
                 .env("BUZZ_FAKE_SYSTEMD_STATE", &self.state)
                 .env("BUZZ_FAKE_ACTIVATION_RECEIPT", &self.receipt)
                 .env("BUZZ_FAKE_CAPACITY_ONE_MODE", self.mode);
-            run_bounded_controller_command(command, input, timeout)
+            let output = run_bounded_controller_command(command, input, timeout)?;
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap();
+            for unit in [
+                EXECD_SERVICE,
+                EXECD_SOCKET,
+                EXECUTOR_SERVICE,
+                EXECUTOR_SOCKET,
+            ] {
+                state["units"][unit]["state"] = "active".into();
+                state["units"][unit]["load_state"] = "loaded".into();
+            }
+            state["units"][EXECD_SOCKET]["sub_state"] = "listening".into();
+            state["units"][EXECUTOR_SOCKET]["sub_state"] = "listening".into();
+            state["units"][EXECD_SERVICE]["invocation_id"] = hex('4', 32).into();
+            state["units"][EXECD_SERVICE]["main_pid"] = 404.into();
+            state["units"][EXECUTOR_SERVICE]["invocation_id"] = hex('6', 32).into();
+            state["units"][EXECUTOR_SERVICE]["main_pid"] = 606.into();
+            state["units"][EXECUTOR_SERVICE]["user"] = EXECUTOR_SERVICE_ACCOUNT.into();
+            state["units"][EXECUTOR_SERVICE]["group"] = EXECUTOR_SERVICE_ACCOUNT.into();
+            state["units"][EXECUTOR_SERVICE]["supplementary_groups"] = "".into();
+            state["units"][EXECUTOR_SERVICE]["executable"] = EXECUTOR_PROGRAM.into();
+            state["units"][EXECUTOR_SERVICE]["arguments"] =
+                serde_json::json!([EXECUTOR_PROGRAM, "--socket-activation"]);
+            state["executor_socket"] = serde_json::json!({
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o600,
+            });
+            match self.mode {
+                "missing_executor" => {
+                    state["units"][EXECUTOR_SERVICE]["state"] = "inactive".into();
+                    state["units"][EXECUTOR_SERVICE]["load_state"] = "not-found".into();
+                }
+                "wrong_executor_fragment" => {
+                    state["units"][EXECUTOR_SERVICE]["fragment_path"] =
+                        "/etc/systemd/system/buzz-ci-executor.service".into();
+                }
+                "stale_executor" => {
+                    state["units"][EXECUTOR_SERVICE]["invocation_id"] = "".into();
+                    state["units"][EXECUTOR_SERVICE]["main_pid"] = 0.into();
+                }
+                "stopped_executor_socket" => {
+                    state["units"][EXECUTOR_SOCKET]["state"] = "inactive".into();
+                    state["units"][EXECUTOR_SOCKET]["sub_state"] = "dead".into();
+                }
+                "wrong_executor_process" => {
+                    state["units"][EXECUTOR_SERVICE]["arguments"] =
+                        serde_json::json!([EXECUTOR_PROGRAM, "--standalone"]);
+                }
+                "wrong_executor_account" => {
+                    state["units"][EXECUTOR_SERVICE]["supplementary_groups"] = "wheel".into();
+                }
+                "wrong_executor_socket_metadata" => {
+                    state["executor_socket"]["mode"] = 0o660.into();
+                }
+                "stale_execd" => {
+                    state["units"][EXECD_SERVICE]["invocation_id"] = "".into();
+                    state["units"][EXECD_SERVICE]["main_pid"] = 0.into();
+                }
+                "unloaded_execd_socket" => {
+                    state["units"][EXECD_SOCKET]["load_state"] = "not-found".into();
+                }
+                _ => {}
+            }
+            self.post_state = Some(state);
+            Ok(output)
         }
 
         fn unit_state(
@@ -3447,6 +3782,98 @@ mod tests {
             _timeout: Duration,
         ) -> Result<String, ControlError> {
             Ok(self.unit_value(unit, "fragment_path"))
+        }
+
+        fn load_state(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<String, ControlError> {
+            Ok(self.unit_value(unit, "load_state"))
+        }
+
+        fn sub_state(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<String, ControlError> {
+            Ok(self.unit_value(unit, "sub_state"))
+        }
+
+        fn main_pid(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<u32, ControlError> {
+            self.state()["units"][unit]["main_pid"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or(ControlError::ReadbackMismatch)
+        }
+
+        fn process_identity(
+            &mut self,
+            pid: u32,
+            _timeout: Duration,
+        ) -> Result<ProcessIdentity, ControlError> {
+            let state = self.state();
+            let unit = &state["units"][EXECUTOR_SERVICE];
+            if unit["main_pid"].as_u64() != Some(u64::from(pid)) {
+                return Err(ControlError::ReadbackMismatch);
+            }
+            let arguments = unit["arguments"]
+                .as_array()
+                .ok_or(ControlError::ReadbackMismatch)?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(|item| item.as_bytes().to_vec())
+                        .ok_or(ControlError::ReadbackMismatch)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ProcessIdentity {
+                executable: PathBuf::from(
+                    unit["executable"]
+                        .as_str()
+                        .ok_or(ControlError::ReadbackMismatch)?,
+                ),
+                arguments,
+            })
+        }
+
+        fn service_account(
+            &mut self,
+            unit: &'static str,
+            _timeout: Duration,
+        ) -> Result<(String, String, String), ControlError> {
+            Ok((
+                self.unit_value(unit, "user"),
+                self.unit_value(unit, "group"),
+                self.unit_value(unit, "supplementary_groups"),
+            ))
+        }
+
+        fn executor_socket_identity(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<SocketIdentity, ControlError> {
+            let state = self.state();
+            let socket = &state["executor_socket"];
+            Ok(SocketIdentity {
+                uid: socket["uid"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or(ControlError::ReadbackMismatch)?,
+                gid: socket["gid"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or(ControlError::ReadbackMismatch)?,
+                mode: socket["mode"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or(ControlError::ReadbackMismatch)?,
+            })
         }
 
         fn active_receipt_sha256(
@@ -3515,8 +3942,10 @@ mod tests {
             "buzz-ci-acceptance-control.service",
             "buzz-ci-runner.service",
             "buzz-ci-runner.socket",
-            "buzz-ci-execd.service",
-            "buzz-ci-execd.socket",
+            EXECD_SERVICE,
+            EXECD_SOCKET,
+            EXECUTOR_SERVICE,
+            EXECUTOR_SOCKET,
             "buzz-ci-keyholder.service",
             "buzz-ci-keyholder.socket",
         ] {
@@ -3524,7 +3953,10 @@ mod tests {
                 "buzz-ci-capacity-one.target" => "/etc/systemd/system/buzz-ci-capacity-one.target",
                 "buzz-ci-controld.service" => "/etc/systemd/system/buzz-ci-controld.service",
                 "buzz-ci-runner.socket" => "/etc/systemd/system/buzz-ci-runner.socket",
-                "buzz-ci-execd.socket" => "/etc/systemd/system/buzz-ci-execd.socket",
+                EXECD_SERVICE => "/usr/lib/systemd/system/buzz-ci-execd.service",
+                EXECD_SOCKET => "/usr/lib/systemd/system/buzz-ci-execd.socket",
+                EXECUTOR_SERVICE => "/usr/lib/systemd/system/buzz-ci-executor.service",
+                EXECUTOR_SOCKET => "/usr/lib/systemd/system/buzz-ci-executor.socket",
                 "buzz-ci-keyholder.socket" => "/etc/systemd/system/buzz-ci-keyholder.socket",
                 _ => "/etc/systemd/system/fixture-unit",
             };
@@ -3534,6 +3966,14 @@ mod tests {
                     "state": if staged_active.contains(&unit) { "active" } else { "inactive" },
                     "invocation_id": if unit == "buzz-ci-controld.service" { hex('1', 32) } else { String::new() },
                     "fragment_path": fragment_path,
+                    "load_state": "loaded",
+                    "sub_state": "dead",
+                    "main_pid": 0,
+                    "user": "",
+                    "group": "",
+                    "supplementary_groups": "",
+                    "executable": "",
+                    "arguments": [],
                 }),
             );
         }
@@ -3562,6 +4002,7 @@ mod tests {
             receipt: receipt_path,
             mode,
             controller_calls: 0,
+            post_state: None,
         };
         let request = capacity_one_control_request();
         (directory, runtime, config, request)
@@ -3584,7 +4025,16 @@ mod tests {
 
     #[test]
     fn fixed_controller_replaces_staged_processes_before_capacity_one_readback() {
-        let (transition, runtime) = run_capacity_one_fixture("success").unwrap();
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+        let transition = activate_capacity_one(
+            &config,
+            &request,
+            &hex('1', 32),
+            "",
+            Duration::from_millis(500),
+            &mut runtime,
+        )
+        .unwrap();
         assert_eq!(transition.result.readback.capacity, 1);
         assert_eq!(transition.result.readback.admission, AdmissionState::Open);
         assert_eq!(transition.result.readback.controller_generation, 7);
@@ -3592,6 +4042,19 @@ mod tests {
         assert_eq!(transition.controller_invocation, hex('2', 32));
         assert_eq!(transition.runner_invocation, hex('3', 32));
         assert_eq!(runtime.controller_calls, 1);
+        let state = runtime.state();
+        assert_eq!(state["units"][EXECD_SERVICE]["load_state"], "loaded");
+        assert_eq!(state["units"][EXECD_SOCKET]["sub_state"], "listening");
+        assert_eq!(state["units"][EXECUTOR_SERVICE]["load_state"], "loaded");
+        assert_eq!(state["units"][EXECUTOR_SERVICE]["main_pid"], 606);
+        assert_eq!(
+            state["units"][EXECUTOR_SERVICE]["fragment_path"],
+            "/usr/lib/systemd/system/buzz-ci-executor.service"
+        );
+        assert_eq!(state["units"][EXECUTOR_SOCKET]["sub_state"], "listening");
+        assert_eq!(state["executor_socket"]["uid"], 0);
+        assert_eq!(state["executor_socket"]["gid"], 0);
+        assert_eq!(state["executor_socket"]["mode"], 0o600);
         assert!(lower_hex(
             &transition.result.controller_receipt_sha256,
             &[64]
@@ -3629,6 +4092,30 @@ mod tests {
             ("wrong_fragment", ControlError::ReadbackMismatch),
         ] {
             assert_eq!(run_capacity_one_fixture(mode).err().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn capacity_one_rejects_hostile_execd_and_executor_readback() {
+        for (mode, expected) in [
+            ("missing_executor", ControlError::ReadbackMismatch),
+            ("wrong_executor_fragment", ControlError::ReadbackMismatch),
+            ("stale_executor", ControlError::ReadbackMismatch),
+            ("stopped_executor_socket", ControlError::ReadbackMismatch),
+            ("wrong_executor_process", ControlError::ReadbackMismatch),
+            ("wrong_executor_account", ControlError::ReadbackMismatch),
+            (
+                "wrong_executor_socket_metadata",
+                ControlError::ReadbackMismatch,
+            ),
+            ("stale_execd", ControlError::ReadbackMismatch),
+            ("unloaded_execd_socket", ControlError::ReadbackMismatch),
+        ] {
+            assert_eq!(
+                run_capacity_one_fixture(mode).err().unwrap(),
+                expected,
+                "mode {mode} must fail closed"
+            );
         }
     }
 
