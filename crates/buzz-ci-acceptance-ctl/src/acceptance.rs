@@ -21,7 +21,7 @@ use thiserror::Error;
 pub const MAX_SCENARIO_BYTES: usize = 128 * 1024;
 const MAX_DRIVER_OUTPUT_BYTES: usize = 1024 * 1024;
 const SCENARIO_VERSION: &str = "buzz-ci-capacity-one-scenario/v1";
-const DRIVER_VERSION: &str = "buzz-ci-capacity-one-driver/v1";
+pub const DRIVER_VERSION: &str = "buzz-ci-capacity-one-driver/v1";
 const RECEIPT_VERSION: &str = "buzz-ci-capacity-one-acceptance-receipt/v1";
 
 /// One executable endpoint. The harness never invokes a shell.
@@ -59,15 +59,21 @@ pub struct EvidenceObject {
 #[serde(deny_unknown_fields)]
 pub struct FixtureSpec {
     pub integrated_candidate_sha: String,
+    pub activation_id: String,
+    pub activation_package_digest: String,
     pub run_id: String,
+    pub job_id: String,
     pub request_digest: String,
     pub manifest_digest: String,
     pub source_oid: String,
     pub approval_id: String,
+    pub grant_event_id: String,
     pub grant_digest: String,
     pub approved_by: String,
     pub export_subject: String,
     pub export_authorization_digest: String,
+    pub controller_generation: u64,
+    pub runner_generation: u64,
     pub expected_log: EvidenceObject,
     pub expected_artifacts: Vec<EvidenceObject>,
 }
@@ -105,11 +111,16 @@ pub enum Operation {
 #[serde(deny_unknown_fields)]
 pub struct DriverRequest<'a> {
     pub schema_version: &'static str,
+    pub scenario_sha256: &'a str,
     pub sequence: u32,
     pub operation: Operation,
     pub fixture: &'a FixtureSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_controller_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_runner_generation: Option<u64>,
 }
 
 /// Admission posture returned by every observation.
@@ -157,6 +168,7 @@ pub enum Conclusion {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalSnapshot {
     pub approval_id: String,
+    pub grant_event_id: String,
     pub grant_digest: String,
     pub approved_by: String,
     pub resumed: bool,
@@ -413,7 +425,12 @@ pub fn run_acceptance<D: AcceptanceDriver>(
         failure: None,
     };
 
-    if let Err((stage, error)) = run_sequence(scenario, driver, &mut receipt.checks) {
+    if let Err((stage, error)) = run_sequence(
+        scenario,
+        &receipt.scenario_sha256,
+        driver,
+        &mut receipt.checks,
+    ) {
         receipt.outcome = Outcome::Fail;
         receipt.failure = Some(FailureReceipt {
             stage,
@@ -426,6 +443,7 @@ pub fn run_acceptance<D: AcceptanceDriver>(
 
 fn run_sequence<D: AcceptanceDriver>(
     scenario: &AcceptanceScenario,
+    scenario_sha256: &str,
     driver: &mut D,
     checks: &mut Vec<StageReceipt>,
 ) -> Result<(), (Stage, AcceptanceError)> {
@@ -433,51 +451,61 @@ fn run_sequence<D: AcceptanceDriver>(
     let initial = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         1,
         Operation::ObserveInitial,
         Stage::CapacityZeroClosed,
         None,
-        |response| validate_initial(&response.snapshot),
+        None,
+        |response| validate_initial(&response.snapshot, fixture),
     )?;
     let one = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         2,
         Operation::SetCapacityOne,
         Stage::CapacityOneOpen,
         None,
+        Some(&initial),
         |response| validate_capacity_one(&response.snapshot, &initial),
     )?;
     let submitted = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         3,
         Operation::SubmitManifest,
         Stage::ManifestIdentity,
         None,
+        Some(&one),
         |response| validate_submitted(&response.snapshot, fixture, &one),
     )?;
     let granted = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         4,
         Operation::ApproveGrant,
         Stage::ApprovalGrant,
         None,
+        Some(&submitted),
         |response| validate_granted(&response.snapshot, fixture, &submitted),
     )?;
     let running_one = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         5,
         Operation::ResumeGrant,
         Stage::GrantResume,
         None,
+        Some(&granted),
         |response| validate_running_first(&response.snapshot, fixture, &granted),
     )?;
     let attempt_one_id = only_attempt(&running_one)
@@ -487,11 +515,13 @@ fn run_sequence<D: AcceptanceDriver>(
     let terminal_one = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         6,
         Operation::AwaitFirstTerminal,
         Stage::FirstAttemptTerminal,
         Some(&attempt_one_id),
+        Some(&running_one),
         |response| {
             validate_terminal_first(&response.snapshot, fixture, &running_one, &attempt_one_id)
         },
@@ -499,21 +529,25 @@ fn run_sequence<D: AcceptanceDriver>(
     let exported = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         7,
         Operation::ExportFirstEvidence,
         Stage::AuthenticatedExport,
         Some(&attempt_one_id),
+        Some(&terminal_one),
         |response| validate_export(response, fixture, &terminal_one, &attempt_one_id),
     )?;
     let rerun = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         8,
         Operation::Rerun,
         Stage::RerunSeparation,
         Some(&attempt_one_id),
+        Some(&exported),
         |response| validate_rerun(&response.snapshot, fixture, &exported, &attempt_one_id),
     )?;
     let attempt_two_id = attempt_by_number(&rerun, 2)
@@ -523,11 +557,13 @@ fn run_sequence<D: AcceptanceDriver>(
     let cancelled = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         9,
         Operation::CancelRerun,
         Stage::CancellationTerminal,
         Some(&attempt_two_id),
+        Some(&rerun),
         |response| {
             validate_cancelled(
                 &response.snapshot,
@@ -541,11 +577,13 @@ fn run_sequence<D: AcceptanceDriver>(
     let tombstoned = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         10,
         Operation::TombstoneRerun,
         Stage::TombstoneFolding,
         Some(&attempt_two_id),
+        Some(&cancelled),
         |response| {
             validate_tombstoned(
                 &response.snapshot,
@@ -559,31 +597,37 @@ fn run_sequence<D: AcceptanceDriver>(
     let controller_recovered = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         11,
         Operation::RestartController,
         Stage::ControllerRestartRecovery,
         None,
+        Some(&tombstoned),
         |response| validate_controller_restart(&response.snapshot, &tombstoned),
     )?;
     let runner_recovered = step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         12,
         Operation::RestartRunner,
         Stage::RunnerRestartRecovery,
         None,
+        Some(&controller_recovered),
         |response| validate_runner_restart(&response.snapshot, &controller_recovered),
     )?;
     step(
         driver,
         fixture,
+        scenario_sha256,
         checks,
         13,
         Operation::SetCapacityZero,
         Stage::ReturnCapacityZero,
         None,
+        Some(&runner_recovered),
         |response| validate_final_zero(&response.snapshot, &runner_recovered),
     )?;
     Ok(())
@@ -593,11 +637,13 @@ fn run_sequence<D: AcceptanceDriver>(
 fn step<D, F>(
     driver: &mut D,
     fixture: &FixtureSpec,
+    scenario_sha256: &str,
     checks: &mut Vec<StageReceipt>,
     sequence: u32,
     operation: Operation,
     stage: Stage,
     attempt_id: Option<&str>,
+    expected: Option<&SystemSnapshot>,
     validate: F,
 ) -> Result<SystemSnapshot, (Stage, AcceptanceError)>
 where
@@ -606,10 +652,13 @@ where
 {
     let request = DriverRequest {
         schema_version: DRIVER_VERSION,
+        scenario_sha256,
         sequence,
         operation,
         fixture,
         attempt_id,
+        expected_controller_generation: expected.map(|value| value.controller_generation),
+        expected_runner_generation: expected.map(|value| value.runner_generation),
     };
     let response = driver
         .execute(&request)
@@ -658,8 +707,19 @@ where
     }
 }
 
-fn validate_initial(snapshot: &SystemSnapshot) -> Result<(), AcceptanceError> {
+fn validate_initial(
+    snapshot: &SystemSnapshot,
+    fixture: &FixtureSpec,
+) -> Result<(), AcceptanceError> {
     validate_global(snapshot)?;
+    require(
+        snapshot.controller_generation == fixture.controller_generation,
+        "initial controller generation does not match the scenario",
+    )?;
+    require(
+        snapshot.runner_generation == fixture.runner_generation,
+        "initial runner generation does not match the scenario",
+    )?;
     require(snapshot.capacity == 0, "initial capacity is not zero")?;
     require(
         snapshot.admission == AdmissionState::Closed,
@@ -1174,6 +1234,11 @@ fn validate_approval(
 ) -> Result<(), AcceptanceError> {
     exact(&approval.approval_id, &fixture.approval_id, "approval ID")?;
     exact(
+        &approval.grant_event_id,
+        &fixture.grant_event_id,
+        "grant event ID",
+    )?;
+    exact(
         &approval.grant_digest,
         &fixture.grant_digest,
         "grant digest",
@@ -1397,6 +1462,11 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
         "fixture.integrated_candidate_sha",
     )?;
     for (value, field, lengths) in [
+        (
+            &fixture.activation_package_digest,
+            "fixture.activation_package_digest",
+            &[64][..],
+        ),
         (&fixture.run_id, "fixture.run_id", &[32][..]),
         (&fixture.request_digest, "fixture.request_digest", &[64][..]),
         (
@@ -1406,6 +1476,7 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
         ),
         (&fixture.source_oid, "fixture.source_oid", &[40, 64][..]),
         (&fixture.approval_id, "fixture.approval_id", &[32][..]),
+        (&fixture.grant_event_id, "fixture.grant_event_id", &[64][..]),
         (&fixture.grant_digest, "fixture.grant_digest", &[64][..]),
         (&fixture.approved_by, "fixture.approved_by", &[64][..]),
         (&fixture.export_subject, "fixture.export_subject", &[64][..]),
@@ -1416,6 +1487,27 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
         ),
     ] {
         validate_hex_field(value, lengths, field)?;
+    }
+    if fixture.activation_id.is_empty()
+        || fixture.activation_id.len() > 128
+        || !fixture
+            .activation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ScenarioError::InvalidField("fixture.activation_id"));
+    }
+    if fixture.job_id.is_empty()
+        || fixture.job_id.len() > 64
+        || !fixture
+            .job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ScenarioError::InvalidField("fixture.job_id"));
+    }
+    if fixture.controller_generation == 0 || fixture.runner_generation == 0 {
+        return Err(ScenarioError::InvalidField("fixture.service_generation"));
     }
     validate_expected_evidence(&fixture.expected_log, "fixture.expected_log")?;
     if fixture.expected_artifacts.is_empty() {
@@ -1460,10 +1552,9 @@ fn validate_expected_evidence(
 }
 
 fn validate_endpoint(endpoint: &ProcessEndpoint) -> Result<(), ScenarioError> {
-    if !Path::new(&endpoint.program).is_absolute()
-        || endpoint.program.is_empty()
-        || endpoint.args.len() > 32
-        || endpoint.args.iter().any(|arg| arg.len() > 4096)
+    if endpoint.program != "/usr/libexec/buzz-ci-capacity-one-driver"
+        || !Path::new(&endpoint.program).is_absolute()
+        || !endpoint.args.is_empty()
     {
         return Err(ScenarioError::InvalidField("driver endpoint"));
     }
@@ -1677,22 +1768,28 @@ mod tests {
 
     fn scenario() -> AcceptanceScenario {
         let endpoint = ProcessEndpoint {
-            program: "/bin/true".to_owned(),
+            program: "/usr/libexec/buzz-ci-capacity-one-driver".to_owned(),
             args: Vec::new(),
         };
         AcceptanceScenario {
             schema_version: SCENARIO_VERSION.to_owned(),
             fixture: FixtureSpec {
                 integrated_candidate_sha: hex('a', 40),
+                activation_id: "buzz-ci-capacity-one-test".to_owned(),
+                activation_package_digest: hex('8', 64),
                 run_id: hex('b', 32),
+                job_id: "fixture".to_owned(),
                 request_digest: hex('c', 64),
                 manifest_digest: hex('d', 64),
                 source_oid: hex('e', 40),
                 approval_id: hex('1', 32),
+                grant_event_id: hex('9', 64),
                 grant_digest: hex('2', 64),
                 approved_by: hex('3', 64),
                 export_subject: hex('4', 64),
                 export_authorization_digest: hex('5', 64),
+                controller_generation: 1,
+                runner_generation: 1,
                 expected_log: evidence("job.log", '6', 12),
                 expected_artifacts: vec![evidence("result.json", '7', 24)],
             },
@@ -1710,6 +1807,7 @@ mod tests {
     fn approval(fixture: &FixtureSpec, resumed: bool) -> ApprovalSnapshot {
         ApprovalSnapshot {
             approval_id: fixture.approval_id.clone(),
+            grant_event_id: fixture.grant_event_id.clone(),
             grant_digest: fixture.grant_digest.clone(),
             approved_by: fixture.approved_by.clone(),
             resumed,
