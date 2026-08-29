@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import select
 import shutil
 import signal
 import stat
@@ -29,6 +30,7 @@ MAX_JSON = 1024 * 1024
 MAX_FRAME = 4 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
 MAX_TREE_FILES = 1024
+TRANSFER_SIZE = 8 * 1024 * 1024
 PREPARE_TIMEOUT = 180
 RUN_TIMEOUT = 900
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
@@ -39,7 +41,9 @@ TOOLS = {
     "xorriso": "/usr/bin/xorriso",
     "cloud_localds": "/usr/bin/cloud-localds",
 }
-FROZEN_ASSETS = ("guest_entry.py", "local_tls_relay.py")
+FROZEN_ASSETS = (
+    "guest_entry.py", "local_tls_relay.py", "receipt_verifier.py", "expected-stages.json",
+)
 REQUIRED_CANDIDATE = (
     "deploy/native-ci/runner/install.py",
     "deploy/native-ci/controld/install.py",
@@ -55,34 +59,79 @@ class HarnessError(RuntimeError):
 
 
 def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+
+
+def asset_source(here: Path, name: str) -> Path:
+    if name in {"guest_entry.py", "local_tls_relay.py"}:
+        return here / name
+    if name == "receipt_verifier.py":
+        return here.parents[2] / "acceptance" / "verify-receipt.py"
+    if name == "expected-stages.json":
+        return here.parents[2] / "acceptance" / "expected-stages.json"
+    raise HarnessError("unknown frozen asset")
+
+
+def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise HarnessError("duplicate JSON field")
+        value[key] = item
+    return value
 
 
 def load_json(path: Path, maximum: int = MAX_JSON) -> object:
     raw = read_regular(path, maximum)
     try:
-        return json.loads(raw)
+        return json.loads(raw, object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise HarnessError(f"invalid JSON: {path.name}") from error
 
 
-def read_regular(path: Path, maximum: int = MAX_FILE) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+def read_fd(fd: int, name: str, maximum: int = MAX_FILE) -> bytes:
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
-            raise HarnessError(f"unsafe input file: {path.name}")
+            raise HarnessError(f"unsafe input file: {name}")
         raw = b""
         while chunk := os.read(fd, min(1024 * 1024, maximum + 1 - len(raw))):
             raw += chunk
             if len(raw) > maximum:
-                raise HarnessError(f"oversized input file: {path.name}")
+                raise HarnessError(f"oversized input file: {name}")
         after = os.fstat(fd)
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
             after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
         ):
-            raise HarnessError(f"input changed while read: {path.name}")
+            raise HarnessError(f"input changed while read: {name}")
         return raw
+    except BaseException:
+        raise
+
+
+def open_absolute(path: Path, *, directory: bool = False) -> int:
+    absolute = Path(os.path.abspath(path))
+    if not absolute.is_absolute() or any(part in {"", ".", ".."} for part in absolute.parts[1:]):
+        raise HarnessError("input path is invalid")
+    current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, part in enumerate(absolute.parts[1:]):
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            if index < len(absolute.parts[1:]) - 1 or directory:
+                flags |= os.O_DIRECTORY
+            child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def read_regular(path: Path, maximum: int = MAX_FILE) -> bytes:
+    fd = open_absolute(path)
+    try:
+        return read_fd(fd, path.name, maximum)
     finally:
         os.close(fd)
 
@@ -112,21 +161,25 @@ def safe_directory(path: Path, *, create: bool = False) -> Path:
 
 def safe_input_directory(path: Path) -> Path:
     absolute = Path(os.path.abspath(path))
-    metadata = absolute.lstat()
-    if Path(os.path.realpath(absolute)) != absolute or not stat.S_ISDIR(metadata.st_mode):
-        raise HarnessError(f"input directory is not real: {absolute.name}")
-    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise HarnessError(f"input directory is writable by another identity: {absolute.name}")
+    fd = open_absolute(absolute, directory=True)
+    try:
+        metadata = os.fstat(fd)
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise HarnessError(f"input directory is writable by another identity: {absolute.name}")
+    finally:
+        os.close(fd)
     return absolute
 
 
 def safe_input_file(path: Path) -> Path:
     absolute = Path(os.path.abspath(path))
-    if Path(os.path.realpath(absolute)) != absolute:
-        raise HarnessError(f"input file contains a symbolic path: {absolute.name}")
-    metadata = absolute.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise HarnessError(f"input file metadata is unsafe: {absolute.name}")
+    fd = open_absolute(absolute)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise HarnessError(f"input file metadata is unsafe: {absolute.name}")
+    finally:
+        os.close(fd)
     return absolute
 
 
@@ -140,22 +193,47 @@ def normalized_relative(relative: Path) -> str:
 def tree_records(root: Path) -> list[tuple[str, int, bytes]]:
     records: list[tuple[str, int, bytes]] = []
     total = 0
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        relative = normalized_relative(path.relative_to(root))
-        metadata = path.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                raise HarnessError(f"unsafe package directory: {relative}")
-            continue
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise HarnessError(f"package path is not one regular file: {relative}")
-        raw = read_regular(path)
-        total += len(raw)
-        if len(records) >= MAX_TREE_FILES or total > MAX_FILE:
-            raise HarnessError("package tree exceeds the fixed bound")
-        records.append((relative, stat.S_IMODE(metadata.st_mode), raw))
+    root_fd = open_absolute(root, directory=True)
+    try:
+        root_metadata = os.fstat(root_fd)
+        if root_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise HarnessError("package root is writable by another identity")
+
+        def walk(directory_fd: int, prefix: PurePosixPath) -> None:
+            nonlocal total
+            with os.scandir(directory_fd) as iterator:
+                names = sorted(entry.name for entry in iterator)
+            for name in names:
+                relative_path = prefix / name
+                relative = normalized_relative(Path(relative_path.as_posix()))
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                try:
+                    child_fd = os.open(name, flags, dir_fd=directory_fd)
+                except OSError as error:
+                    raise HarnessError(f"package path is not one regular file: {relative}") from error
+                try:
+                    metadata = os.fstat(child_fd)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                            raise HarnessError(f"unsafe package directory: {relative}")
+                        walk(child_fd, relative_path)
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise HarnessError(f"package path is not one regular file: {relative}")
+                    raw = read_fd(child_fd, name)
+                    total += len(raw)
+                    if len(records) >= MAX_TREE_FILES or total > MAX_FILE:
+                        raise HarnessError("package tree exceeds the fixed bound")
+                    records.append((relative, stat.S_IMODE(metadata.st_mode), raw))
+                finally:
+                    os.close(child_fd)
+
+        walk(root_fd, PurePosixPath())
+    finally:
+        os.close(root_fd)
     if not records:
         raise HarnessError("package tree is empty")
+    records.sort(key=lambda item: item[0])
     return records
 
 
@@ -186,6 +264,29 @@ def materialize_tree(records: list[tuple[str, int, bytes]], target: Path) -> Non
             os.close(fd)
 
 
+def reap_process_group(process: subprocess.Popen[bytes], *, wait_seconds: float = 10) -> None:
+    """Unconditionally kill, reap, and prove absence of a spawned process group."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + wait_seconds
+    while process.poll() is None and time.monotonic() < deadline:
+        try:
+            select.select([], [], [], min(0.05, max(0.001, deadline - time.monotonic())))
+        except BaseException:
+            pass
+    if process.poll() is None:
+        raise HarnessError("spawned process could not be reaped")
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        raise HarnessError("spawned process-group absence cannot be proved") from error
+    raise HarnessError("spawned process group remains after reap")
+
+
 def bounded(
     argv: list[str], timeout: int = 30, maximum: int = MAX_JSON, *, cwd: Path | None = None,
 ) -> bytes:
@@ -194,27 +295,26 @@ def bounded(
             argv, stdout=stdout, stderr=stderr, start_new_session=True, cwd=cwd,
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
         )
-        deadline = time.monotonic() + timeout
-        while process.poll() is None:
+        try:
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if stdout.tell() > maximum or stderr.tell() > maximum:
+                    raise HarnessError(f"bounded command output exceeded limit: {Path(argv[0]).name}")
+                if time.monotonic() >= deadline:
+                    raise HarnessError(f"bounded command timed out: {Path(argv[0]).name}")
+                time.sleep(0.01)
             if stdout.tell() > maximum or stderr.tell() > maximum:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=10)
                 raise HarnessError(f"bounded command output exceeded limit: {Path(argv[0]).name}")
-            if time.monotonic() >= deadline:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=10)
-                raise HarnessError(f"bounded command timed out: {Path(argv[0]).name}")
-            time.sleep(0.01)
-        if stdout.tell() > maximum or stderr.tell() > maximum:
-            raise HarnessError(f"bounded command output exceeded limit: {Path(argv[0]).name}")
-        if process.returncode != 0:
-            raise HarnessError(f"bounded command failed: {Path(argv[0]).name}")
-        stdout.seek(0)
-        return stdout.read(maximum + 1)
+            if process.returncode != 0:
+                raise HarnessError(f"bounded command failed: {Path(argv[0]).name}")
+            stdout.seek(0)
+            return stdout.read(maximum + 1)
+        finally:
+            reap_process_group(process)
 
 
 def file_sha256(path: Path) -> str:
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    fd = open_absolute(path)
     digest = hashlib.sha256()
     try:
         before = os.fstat(fd)
@@ -264,7 +364,7 @@ def capabilities() -> dict[str, object]:
 def copy_bound(source: Path, target: Path, expected_sha256: str) -> None:
     if HEX64.fullmatch(expected_sha256) is None:
         raise HarnessError("expected file digest is invalid")
-    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    source_fd = open_absolute(source)
     target_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o400)
     digest = hashlib.sha256()
     try:
@@ -306,16 +406,28 @@ def bwrap_prefix(state: Path) -> list[str]:
     return prefix
 
 
-def qemu_command(state: Path, *, evidence: bool = True) -> list[str]:
+def qemu_command(
+    state: Path, *, overlay: str, evidence: bool, transfer: str | None = None,
+) -> list[str]:
+    if overlay not in {"ceremony.qcow2", "candidate.qcow2", "verifier.qcow2"}:
+        raise HarnessError("unknown VM overlay")
+    if transfer not in {None, "read-write", "read-only"}:
+        raise HarnessError("unknown evidence-transfer mode")
     command = bwrap_prefix(state) + [
         "--", TOOLS["qemu"], "-nodefaults", "-no-user-config", "-enable-kvm",
         "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "2048",
         "-display", "none", "-serial", "none", "-monitor", "none", "-nic", "none",
         "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
-        "-drive", "file=/work/overlay.qcow2,if=virtio,format=qcow2,cache=none",
+        "-drive", f"file=/work/{overlay},if=virtio,format=qcow2,cache=none",
         "-drive", "file=/work/stage.iso,media=cdrom,readonly=on",
         "-drive", "file=/work/seed.iso,media=cdrom,readonly=on",
     ]
+    if transfer is not None:
+        readonly = ",readonly=on" if transfer == "read-only" else ""
+        command.extend([
+            "-drive", f"file=/work/transfer.raw,if=none,format=raw,cache=none,id=transfer{readonly}",
+            "-device", "virtio-blk-pci,drive=transfer,serial=buzzci-transfer",
+        ])
     if evidence:
         command.extend([
             "-device", "virtio-serial-pci",
@@ -325,12 +437,91 @@ def qemu_command(state: Path, *, evidence: bool = True) -> list[str]:
     return command
 
 
-def qemu_img_create(state: Path) -> None:
+def qemu_img_create(state: Path, name: str, backing: str) -> None:
+    if name not in {"ceremony.qcow2", "candidate.qcow2", "verifier.qcow2"} or backing not in {"base.qcow2", "trusted.qcow2"}:
+        raise HarnessError("unknown VM image role")
     bounded([
         TOOLS["qemu_img"], "create", "-q", "-f", "qcow2", "-F", "qcow2",
-        "-b", "base.qcow2", "overlay.qcow2",
+        "-b", backing, name,
     ], cwd=state)
-    (state / "overlay.qcow2").chmod(0o600)
+    (state / name).chmod(0o600)
+
+
+def qemu_image_info(state: Path, name: str) -> dict[str, object]:
+    value = json.loads(bounded([
+        TOOLS["qemu_img"], "info", "--output=json", "--backing-chain", name,
+    ], cwd=state, maximum=64 * 1024), object_pairs_hook=reject_duplicates)
+    if not isinstance(value, list) or not value or any(not isinstance(item, dict) for item in value):
+        raise HarnessError("qcow2 image metadata differs")
+    return value[0]
+
+
+def validate_flat_qcow2(state: Path, name: str) -> dict[str, object]:
+    info = qemu_image_info(state, name)
+
+    def contains_external_reference(value: object) -> bool:
+        forbidden = {
+            "backing-filename", "full-backing-filename", "backing-filename-format",
+            "data-file", "data-file-raw", "data_file", "data_file_raw",
+        }
+        if isinstance(value, dict):
+            return any(key in forbidden or contains_external_reference(item) for key, item in value.items())
+        if isinstance(value, list):
+            return any(contains_external_reference(item) for item in value)
+        return False
+
+    if (
+        info.get("format") != "qcow2"
+        or contains_external_reference(info)
+        or not isinstance(info.get("virtual-size"), int)
+        or not 1024 * 1024 <= info["virtual-size"] <= 64 * 1024 * 1024 * 1024
+    ):
+        raise HarnessError("qcow2 backing, data file, format, or virtual size differs")
+    chain = json.loads(bounded([
+        TOOLS["qemu_img"], "info", "--output=json", "--backing-chain", name,
+    ], cwd=state, maximum=64 * 1024), object_pairs_hook=reject_duplicates)
+    if not isinstance(chain, list) or len(chain) != 1:
+        raise HarnessError("qcow2 backing chain is not flat")
+    return info
+
+
+def flatten_ceremony(state: Path) -> str:
+    bounded([
+        TOOLS["qemu_img"], "convert", "-q", "-O", "qcow2", "ceremony.qcow2", "trusted.qcow2",
+    ], cwd=state, timeout=180)
+    (state / "trusted.qcow2").chmod(0o400)
+    validate_flat_qcow2(state, "trusted.qcow2")
+    digest = file_sha256(state / "trusted.qcow2")
+    (state / "ceremony.qcow2").unlink()
+    (state / "base.qcow2").unlink()
+    if (state / "ceremony.qcow2").exists() or (state / "base.qcow2").exists():
+        raise HarnessError("ceremony image residue remains")
+    return digest
+
+
+def create_transfer(state: Path) -> None:
+    fd = os.open(state / "transfer.raw", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.ftruncate(fd, TRANSFER_SIZE)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def validate_transfer(state: Path) -> None:
+    fd = open_absolute(state / "transfer.raw")
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != TRANSFER_SIZE
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise HarnessError("fixed-capacity evidence transfer metadata differs")
+    finally:
+        os.close(fd)
 
 
 def make_iso(source: Path, output: Path, label: str) -> None:
@@ -371,28 +562,30 @@ def stage_common(state: Path, stage: Path, phase: dict[str, object]) -> None:
     (stage / "phase.json").chmod(0o444)
 
 
-def boot(state: Path, timeout: int, *, evidence_expected: bool = True) -> dict[str, object] | None:
+def boot(
+    state: Path, timeout: int, *, overlay: str,
+    evidence_expected: bool, transfer: str | None = None,
+) -> dict[str, object] | None:
     evidence = state / "evidence.bin"
     try:
         evidence.unlink()
     except FileNotFoundError:
         pass
     process = subprocess.Popen(
-        qemu_command(state, evidence=evidence_expected), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        qemu_command(state, overlay=overlay, evidence=evidence_expected, transfer=transfer), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
     )
-    deadline = time.monotonic() + timeout
-    while process.poll() is None:
-        if evidence_expected and evidence.exists() and evidence.stat().st_size > MAX_FRAME + 36:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=10)
-            raise HarnessError("guest evidence exceeded its bound")
-        if time.monotonic() >= deadline:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=10)
-            raise HarnessError("guest watchdog expired")
-        time.sleep(0.05)
-    code = process.returncode
+    try:
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if evidence_expected and evidence.exists() and evidence.stat().st_size > MAX_FRAME + 36:
+                raise HarnessError("guest evidence exceeded its bound")
+            if time.monotonic() >= deadline:
+                raise HarnessError("guest watchdog expired")
+            time.sleep(0.05)
+        code = process.returncode
+    finally:
+        reap_process_group(process)
     if code != 0:
         raise HarnessError("isolated guest exited without accepted evidence")
     if not evidence_expected:
@@ -413,7 +606,7 @@ def parse_frame(raw: bytes) -> dict[str, object]:
     if hashlib.sha256(payload).digest() != raw[-32:]:
         raise HarnessError("evidence frame digest differs")
     try:
-        value = json.loads(payload)
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise HarnessError("evidence frame JSON is invalid") from error
     if not isinstance(value, dict) or value.get("schema_version") != FRAME_SCHEMA:
@@ -441,13 +634,15 @@ def destroy_state(state: Path) -> None:
         not isinstance(value, dict)
         or set(value) != {
             "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
-            "qemu_version", "tool_sha256", "harness_asset_sha256",
+            "qemu_version", "tool_sha256", "harness_asset_sha256", "trusted_image_sha256",
         }
         or value.get("schema_version") != STATE_SCHEMA
         or not isinstance(value.get("challenge"), str) or HEX64.fullmatch(value["challenge"]) is None
         or any(not isinstance(value.get(name), str) or HEX64.fullmatch(value[name]) is None for name in (
             "image_sha256", "qemu_sha256", "qemu_img_sha256",
         ))
+        or value.get("trusted_image_sha256") is not None
+        and (not isinstance(value["trusted_image_sha256"], str) or HEX64.fullmatch(value["trusted_image_sha256"]) is None)
         or not isinstance(value.get("qemu_version"), str) or not value["qemu_version"]
         or not isinstance(value.get("tool_sha256"), dict) or set(value["tool_sha256"]) != set(TOOLS)
         or not isinstance(value.get("harness_asset_sha256"), dict) or set(value["harness_asset_sha256"]) != set(FROZEN_ASSETS)
@@ -470,7 +665,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
     if Path(os.path.realpath(image)) != image:
         raise HarnessError("base image path must not contain symbolic links")
     here = Path(__file__).resolve().parent
-    asset_digests = {name: file_sha256(here / name) for name in FROZEN_ASSETS}
+    asset_digests = {name: file_sha256(asset_source(here, name)) for name in FROZEN_ASSETS}
     state = safe_directory(arguments.state, create=True)
     challenge = os.urandom(32).hex()
     state_record = {
@@ -482,6 +677,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         "qemu_version": proof["qemu_version"],
         "tool_sha256": proof["tool_sha256"],
         "harness_asset_sha256": asset_digests,
+        "trusted_image_sha256": None,
     }
     (state / "state.json").write_bytes(canonical(state_record))
     (state / "state.json").chmod(0o400)
@@ -489,18 +685,10 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         frozen = state / "frozen-assets"
         frozen.mkdir(mode=0o700)
         for name, digest in asset_digests.items():
-            copy_bound(here / name, frozen / name, digest)
+            copy_bound(asset_source(here, name), frozen / name, digest)
         copy_bound(image, state / "base.qcow2", arguments.image_sha256)
-        image_info = json.loads(bounded([
-            TOOLS["qemu_img"], "info", "--output=json", "base.qcow2",
-        ], cwd=state, maximum=64 * 1024))
-        if (
-            not isinstance(image_info, dict) or image_info.get("format") != "qcow2"
-            or not isinstance(image_info.get("virtual-size"), int)
-            or not 1024 * 1024 <= image_info["virtual-size"] <= 64 * 1024 * 1024 * 1024
-        ):
-            raise HarnessError("base image format or virtual size differs")
-        qemu_img_create(state)
+        validate_flat_qcow2(state, "base.qcow2")
+        qemu_img_create(state, "ceremony.qcow2", "base.qcow2")
         stage = state / "stage"
         stage.mkdir(mode=0o700)
         stage_common(state, stage, {
@@ -511,7 +699,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
         shutil.rmtree(stage)
         make_seed(state, "buzzci-ceremony-" + challenge[:16])
-        frame = boot(state, PREPARE_TIMEOUT)
+        frame = boot(state, PREPARE_TIMEOUT, overlay="ceremony.qcow2", evidence_expected=True)
         expected = {"schema_version", "phase", "challenge", "outcome", "public_binding", "raw_key_absence"}
         if set(frame) != expected or frame["phase"] != "ceremony" or frame["challenge"] != challenge or frame["outcome"] != "pass":
             raise HarnessError("key ceremony evidence differs")
@@ -521,6 +709,12 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         public_path.write_bytes(canonical(frame["public_binding"]))
         public_path.chmod(0o444)
         clean_transient(state)
+        trusted_digest = flatten_ceremony(state)
+        state_record["trusted_image_sha256"] = trusted_digest
+        marker = state / "state.json"
+        marker.chmod(0o600)
+        marker.write_bytes(canonical(state_record))
+        marker.chmod(0o400)
         return {"status": "prepared", "state": str(state), "public_binding": str(public_path), "raw_key_absence": True}
     except BaseException:
         destroy_state(state)
@@ -559,8 +753,12 @@ def validate_contract(path: Path) -> tuple[dict[str, object], Path, dict[str, li
         or any(file_sha256(state / "frozen-assets" / name) != digest for name, digest in asset_digests.items())
     ):
         raise HarnessError("frozen harness asset binding differs")
-    if file_sha256(state / "base.qcow2") != state_record.get("image_sha256"):
-        raise HarnessError("private base image changed after key ceremony")
+    trusted_digest = state_record.get("trusted_image_sha256")
+    if not isinstance(trusted_digest, str) or HEX64.fullmatch(trusted_digest) is None:
+        raise HarnessError("trusted ceremony image binding differs")
+    if file_sha256(state / "trusted.qcow2") != trusted_digest:
+        raise HarnessError("trusted ceremony image changed after preparation")
+    validate_flat_qcow2(state, "trusted.qcow2")
     candidate = safe_input_directory(Path(str(value["candidate_root"])))
     resolved = bounded(["/usr/bin/git", "-C", str(candidate), "rev-parse", f"{value['candidate_sha']}^{{commit}}"] ).decode().strip()
     if resolved != value["candidate_sha"]:
@@ -640,7 +838,9 @@ def create_run_stage(
     make_seed(state, "buzzci-run-" + str(state_record["challenge"])[:16])
 
 
-def create_verify_stage(contract: dict[str, object], state: Path, scenario_raw: bytes) -> None:
+def create_verify_stage(
+    contract: dict[str, object], state: Path, scenario_raw: bytes,
+) -> None:
     clean_transient(state)
     stage = state / "stage"
     stage.mkdir(mode=0o700)
@@ -648,11 +848,14 @@ def create_verify_stage(contract: dict[str, object], state: Path, scenario_raw: 
     scenario_path.write_bytes(scenario_raw)
     scenario_path.chmod(0o400)
     state_record = load_json(state / "state.json")
+    assets = state_record["harness_asset_sha256"]
     stage_common(state, stage, {
         "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v2",
         "phase": "verify", "challenge": state_record["challenge"],
         "candidate_sha": contract["candidate_sha"],
         "scenario_sha256": contract["scenario"]["sha256"],
+        "trusted_verifier_sha256": assets["receipt_verifier.py"],
+        "expected_stages_sha256": assets["expected-stages.json"],
     })
     make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
     shutil.rmtree(stage)
@@ -671,16 +874,24 @@ def validate_final_frame(frame: dict[str, object], contract: dict[str, object], 
     if not receipt_raw or len(receipt_raw) > MAX_JSON or not verifier_raw or len(verifier_raw) > MAX_JSON:
         raise HarnessError("final evidence size differs")
     try:
-        receipt = json.loads(receipt_raw)
-        verifier = json.loads(verifier_raw)
+        receipt = json.loads(receipt_raw, object_pairs_hook=reject_duplicates)
+        verifier = json.loads(verifier_raw, object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise HarnessError("final evidence JSON differs") from error
     proof = frame["dormant_proof"]
     if (
-        not isinstance(receipt, dict) or receipt.get("outcome") != "pass"
+        not isinstance(receipt, dict)
+        or set(receipt) != {
+            "schema_version", "outcome", "scenario_sha256", "integrated_candidate_sha",
+            "run_id", "checks", "zero_transition",
+        }
+        or canonical(receipt) != receipt_raw
+        or receipt.get("schema_version") != "buzz-ci-capacity-one-acceptance-receipt/v2"
+        or receipt.get("outcome") != "pass"
         or receipt.get("integrated_candidate_sha") != contract["candidate_sha"]
         or receipt.get("scenario_sha256") != contract["scenario"]["sha256"]
-        or not isinstance(verifier, dict) or verifier.get("status") != "pass"
+        or verifier != {"outcome": "pass", "status": "verified"}
+        or canonical(verifier) != verifier_raw
         or not isinstance(proof, dict)
         or set(proof) != {
             "configs_sha256", "units_sha256", "sockets_absent", "processes_absent",
@@ -703,12 +914,30 @@ def run_vm(
     success = False
     try:
         challenge = str(load_json(state / "state.json")["challenge"])
+        if any((state / name).exists() for name in ("candidate.qcow2", "verifier.qcow2", "transfer.raw")):
+            raise HarnessError("prior VM run residue exists")
+        qemu_img_create(state, "candidate.qcow2", "trusted.qcow2")
+        create_transfer(state)
         create_run_stage(contract, state, records, scenario_raw, seccomp_raw)
-        boot(state, RUN_TIMEOUT, evidence_expected=False)
+        boot(
+            state, RUN_TIMEOUT, overlay="candidate.qcow2",
+            evidence_expected=False, transfer="read-write",
+        )
+        (state / "candidate.qcow2").unlink()
+        if (state / "candidate.qcow2").exists():
+            raise HarnessError("candidate VM overlay remains before evidence transfer")
+        if (state / "evidence.bin").exists():
+            raise HarnessError("candidate VM reached verifier evidence storage")
+        validate_transfer(state)
+        qemu_img_create(state, "verifier.qcow2", "trusted.qcow2")
         create_verify_stage(contract, state, scenario_raw)
-        frame = boot(state, 180, evidence_expected=True)
+        frame = boot(
+            state, 180, overlay="verifier.qcow2",
+            evidence_expected=True, transfer="read-only",
+        )
         if frame is None:
             raise HarnessError("verification guest returned no evidence")
+        validate_transfer(state)
         receipt_raw, verifier_raw, proof = validate_final_frame(frame, contract, challenge)
         receipt_path = results / "acceptance-receipt.json"
         verifier_path = results / "verifier.json"
@@ -724,6 +953,8 @@ def run_vm(
             "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
             "scenario_sha256": contract["scenario"]["sha256"],
             "seccomp_source_sha256": SECCOMP_SHA256,
+            "transfer_bytes": TRANSFER_SIZE,
+            "transfer_sha256": file_sha256(state / "transfer.raw"),
             "receipt_sha256": receipt_digest,
             "verifier_sha256": verifier_digest,
             "dormant_proof": proof,

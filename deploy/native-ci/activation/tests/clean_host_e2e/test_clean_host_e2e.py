@@ -75,7 +75,9 @@ def nip98(secret: int, method: str, url: str, body: bytes, now: int) -> str:
 class BoundaryTests(unittest.TestCase):
     def test_qemu_boundary_has_no_container_network_or_host_share(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            command = harness.qemu_command(Path(temporary))
+            command = harness.qemu_command(
+                Path(temporary), overlay="ceremony.qcow2", evidence=True,
+            )
         joined = " ".join(command)
         self.assertIn("--unshare-net", command)
         self.assertIn("--dev-bind /dev/kvm /dev/kvm", joined)
@@ -86,9 +88,39 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn("virtfs", joined)
         self.assertNotIn("--ro-bind /home", joined)
         self.assertNotIn("--bind /home/victor /home/victor", joined)
-        candidate_command = " ".join(harness.qemu_command(Path("/private-state"), evidence=False))
+        candidate_command = " ".join(harness.qemu_command(
+            Path("/private-state"), overlay="candidate.qcow2",
+            evidence=False, transfer="read-write",
+        ))
+        verifier_command = " ".join(harness.qemu_command(
+            Path("/private-state"), overlay="verifier.qcow2",
+            evidence=True, transfer="read-only",
+        ))
         self.assertNotIn("evidence.bin", candidate_command)
         self.assertNotIn("virtserialport", candidate_command)
+        self.assertIn("candidate.qcow2", candidate_command)
+        self.assertNotIn("verifier.qcow2", candidate_command)
+        self.assertIn("verifier.qcow2", verifier_command)
+        self.assertIn("readonly=on", verifier_command)
+        self.assertIn("evidence.bin", verifier_command)
+
+    def test_hostile_candidate_persistence_has_no_verifier_overlay_or_evidence_path(self) -> None:
+        candidate = " ".join(harness.qemu_command(
+            Path("/state"), overlay="candidate.qcow2",
+            evidence=False, transfer="read-write",
+        ))
+        verifier = " ".join(harness.qemu_command(
+            Path("/state"), overlay="verifier.qcow2",
+            evidence=True, transfer="read-only",
+        ))
+        self.assertIn("candidate.qcow2", candidate)
+        self.assertNotIn("trusted.qcow2,if=virtio", candidate)
+        self.assertNotIn("verifier.qcow2", candidate)
+        self.assertNotIn("evidence.bin", candidate)
+        self.assertIn("verifier.qcow2", verifier)
+        self.assertNotIn("candidate.qcow2", verifier)
+        self.assertIn("transfer.raw", verifier)
+        self.assertIn("readonly=on", verifier)
 
     def test_host_capability_proof_is_exact_and_missing_tool_fails_closed(self) -> None:
         proof = harness.capabilities()
@@ -108,6 +140,35 @@ class BoundaryTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 3)
         with self.assertRaisesRegex(harness.HarnessError, "output exceeded"):
             harness.bounded(["/usr/bin/yes"], timeout=5, maximum=1024)
+
+    def test_keyboard_interrupt_always_kills_and_reaps_host_and_guest_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            original_scratch = guest.SCRATCH_ROOT
+            guest.SCRATCH_ROOT = Path(scratch)
+            try:
+                self._assert_keyboard_interrupt_cleanup(harness, harness.bounded)
+                self._assert_keyboard_interrupt_cleanup(guest, guest.command)
+            finally:
+                guest.SCRATCH_ROOT = original_scratch
+
+    def _assert_keyboard_interrupt_cleanup(self, module, function) -> None:
+        spawned = []
+        real_popen = module.subprocess.Popen
+
+        def capture(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        with mock.patch.object(module.subprocess, "Popen", side_effect=capture), mock.patch.object(
+            module.time, "sleep", side_effect=KeyboardInterrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                function(["/usr/bin/sleep", "30"], timeout=10)
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].poll())
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(spawned[0].pid, 0)
 
     def test_guest_secret_scratch_is_tmpfs_and_swap_must_be_absent(self) -> None:
         self.assertEqual(guest.SCRATCH_ROOT, Path("/run"))
@@ -135,6 +196,17 @@ class BoundaryTests(unittest.TestCase):
         with mock.patch.object(guest, "command", return_value=failed):
             with self.assertRaisesRegex(guest.GuestError, "readback failed"):
                 guest.unit_state()
+
+    def test_strict_verifier_verdict_rejects_status_and_outcome_mutation(self) -> None:
+        valid = guest.canonical({"outcome": "pass", "status": "verified"})
+        self.assertEqual(guest.parse_verdict(valid), {"outcome": "pass", "status": "verified"})
+        for value in (
+            {"outcome": "pass", "status": "pass"},
+            {"outcome": "failure", "status": "verified"},
+            {"outcome": "pass", "status": "verified", "detail": "secret"},
+        ):
+            with self.assertRaisesRegex(guest.GuestError, "verdict differs"):
+                guest.parse_verdict(guest.canonical(value))
 
 
 class InputTests(unittest.TestCase):
@@ -178,6 +250,38 @@ class InputTests(unittest.TestCase):
             (root / "link").symlink_to(item)
             with self.assertRaisesRegex(harness.HarnessError, "not one regular"):
                 harness.tree_records(root)
+
+    def test_tree_read_retains_root_dirfd_across_parent_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = parent / "package"
+            original = parent / "original"
+            attacker = parent / "attacker"
+            root.mkdir()
+            attacker.mkdir()
+            (root / "value").write_bytes(b"trusted")
+            (root / "value").chmod(0o644)
+            (attacker / "value").write_bytes(b"secret")
+            real_scandir = os.scandir
+            swapped = False
+
+            def swap_then_scan(fd):
+                nonlocal swapped
+                if not swapped:
+                    root.rename(original)
+                    root.symlink_to(attacker, target_is_directory=True)
+                    swapped = True
+                return real_scandir(fd)
+
+            try:
+                with mock.patch.object(harness.os, "scandir", side_effect=swap_then_scan):
+                    records = harness.tree_records(root)
+                self.assertEqual(records, [("value", 0o644, b"trusted")])
+            finally:
+                if root.is_symlink():
+                    root.unlink()
+                if original.exists():
+                    original.rename(root)
 
     def test_authoritative_parent_contains_complete_execd_package(self) -> None:
         candidate = HERE.parents[4]
@@ -241,10 +345,79 @@ class InputTests(unittest.TestCase):
                 "qemu_version": "test",
                 "tool_sha256": {name: digest for name in harness.TOOLS},
                 "harness_asset_sha256": {name: digest for name in harness.FROZEN_ASSETS},
+                "trusted_image_sha256": digest,
             }))
-            (state / "overlay.qcow2").write_bytes(b"ephemeral")
+            (state / "candidate.qcow2").write_bytes(b"ephemeral")
             harness.destroy_state(state)
             self.assertFalse(state.exists())
+
+    def test_backed_or_external_data_qcow2_is_rejected(self) -> None:
+        base = {"format": "qcow2", "virtual-size": 1024 * 1024, "backing-filename": "parent.qcow2"}
+        with mock.patch.object(harness, "qemu_image_info", return_value=base):
+            with self.assertRaisesRegex(harness.HarnessError, "backing"):
+                harness.validate_flat_qcow2(Path("/unused"), "base.qcow2")
+        external = {
+            "format": "qcow2", "virtual-size": 1024 * 1024,
+            "format-specific": {"data": {"data-file": "payload.raw"}},
+        }
+        with mock.patch.object(harness, "qemu_image_info", return_value=external):
+            with self.assertRaisesRegex(harness.HarnessError, "data file"):
+                harness.validate_flat_qcow2(Path("/unused"), "base.qcow2")
+
+    def test_fixed_transfer_rejects_digest_padding_bounds_and_extra_secret(self) -> None:
+        value = {
+            "schema_version": "buzz-ci-clean-host-e2e-pending-evidence/v2",
+            "challenge": "1" * 64,
+        }
+        raw = guest.encode_transfer(value)
+        self.assertEqual(guest.decode_transfer(raw), value)
+        for malformed in (
+            raw[:-1] + b"x",
+            raw[:len(guest.TRANSFER_MAGIC) + 4] + bytes([raw[len(guest.TRANSFER_MAGIC) + 4] ^ 1]) + raw[len(guest.TRANSFER_MAGIC) + 5:],
+            raw[:-1],
+        ):
+            with self.assertRaises(guest.GuestError):
+                guest.decode_transfer(malformed)
+        with mock.patch.object(guest, "MAX_COMMAND", 1):
+            with self.assertRaisesRegex(guest.GuestError, "payload exceeds"):
+                guest.encode_transfer({"secret": "must-not-cross"})
+
+    def test_transfer_file_capacity_and_mode_are_fixed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            harness.create_transfer(state)
+            harness.validate_transfer(state)
+            with (state / "transfer.raw").open("r+b") as stream:
+                stream.truncate(harness.TRANSFER_SIZE - 1)
+            with self.assertRaisesRegex(harness.HarnessError, "fixed-capacity"):
+                harness.validate_transfer(state)
+
+    def test_pending_transfer_rejects_extra_secret_before_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary) / "stage"
+            state = Path(temporary) / "state"
+            stage.mkdir()
+            state.mkdir()
+            scenario = b"{}\n"
+            (stage / "scenario.json").write_bytes(scenario)
+            phase = {
+                "challenge": "1" * 64, "candidate_sha": "2" * 40,
+                "scenario_sha256": hashlib.sha256(scenario).hexdigest(),
+            }
+            pending = {
+                "schema_version": "buzz-ci-clean-host-e2e-pending-evidence/v2",
+                "challenge": phase["challenge"], "candidate_sha": phase["candidate_sha"],
+                "scenario_sha256": phase["scenario_sha256"], "receipt_base64": "e30=",
+                "dormant_proof": {}, "secret": "must-not-cross",
+            }
+            original_state = guest.STATE_ROOT
+            guest.STATE_ROOT = state
+            try:
+                with mock.patch.object(guest, "read_transfer", return_value=pending):
+                    with self.assertRaisesRegex(guest.GuestError, "binding differs"):
+                        guest.verify_pending(phase, stage)
+            finally:
+                guest.STATE_ROOT = original_state
 
     def test_final_frame_rejects_candidate_cross_binding_drift(self) -> None:
         contract = {"candidate_sha": "1" * 40, "scenario": {"sha256": "2" * 64}}
@@ -258,6 +431,29 @@ class InputTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(harness.HarnessError, "identity"):
             harness.validate_final_frame(frame, contract, "4" * 64)
+
+    def test_final_frame_rejects_extra_receipt_and_verdict_fields(self) -> None:
+        contract = {"candidate_sha": "1" * 40, "scenario": {"sha256": "2" * 64}}
+        proof = {
+            "configs_sha256": "3" * 64, "units_sha256": "4" * 64,
+            "sockets_absent": True, "processes_absent": True,
+            "encrypted_credentials_absent": True, "relay_residue_absent": True,
+        }
+        receipt = {
+            "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2",
+            "outcome": "pass", "scenario_sha256": "2" * 64,
+            "integrated_candidate_sha": "1" * 40, "run_id": "5" * 32,
+            "checks": [], "zero_transition": {}, "secret": "do-not-export",
+        }
+        verifier = {"outcome": "pass", "status": "verified", "secret": "do-not-export"}
+        frame = {
+            "schema_version": harness.FRAME_SCHEMA, "phase": "run", "challenge": "6" * 64,
+            "outcome": "pass", "receipt_base64": base64.b64encode(harness.canonical(receipt)).decode(),
+            "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
+            "dormant_proof": proof,
+        }
+        with self.assertRaisesRegex(harness.HarnessError, "identity"):
+            harness.validate_final_frame(frame, contract, "6" * 64)
 
 
 class RelayCryptoTests(unittest.TestCase):
