@@ -24,6 +24,11 @@ STATIC_SOURCES = {
     "controld_service_dropin": ("20-controld-capacity-one.conf", "assets/20-controld-capacity-one.conf"),
     "keyholder_socket_dropin": ("20-keyholder-capacity-one.conf", "assets/20-keyholder-capacity-one.conf"),
 }
+TRACKED_EXECUTABLES = (
+    "controller.py",
+    "freeze_package.py",
+    "package.py",
+)
 
 
 def _git(source_root: Path, *arguments: str) -> str:
@@ -48,6 +53,58 @@ def _safe_input_directory(path: Path, where: str) -> Path:
     return absolute
 
 
+def _git_file_mode(source_root: Path, relative: Path) -> int:
+    output = _git(source_root, "ls-files", "--stage", "--", str(relative))
+    lines = output.splitlines()
+    if len(lines) != 1:
+        raise ValueError(f"tracked source is missing or ambiguous: {relative}")
+    fields = lines[0].split(maxsplit=3)
+    if len(fields) != 4 or fields[2] != "0" or fields[3] != str(relative):
+        raise ValueError(f"tracked source index entry differs: {relative}")
+    if fields[0] not in {"100644", "100755"}:
+        raise ValueError(f"tracked source is not a regular file: {relative}")
+    return int(fields[0], 8)
+
+
+def _validate_checkout_metadata(
+    metadata: os.stat_result,
+    git_mode: int,
+    expected_uid: int,
+    where: str,
+) -> None:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if metadata.st_uid != expected_uid or not mode & stat.S_IRUSR:
+        raise ValueError(f"tracked source owner access differs: {where}")
+    if mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+        raise ValueError(f"tracked source has unsafe permissions: {where}")
+    if git_mode == 0o100644:
+        if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            raise ValueError(f"tracked source executable class differs: {where}")
+    elif git_mode == 0o100755:
+        if not mode & stat.S_IXUSR:
+            raise ValueError(f"tracked source executable class differs: {where}")
+    else:
+        raise ValueError(f"tracked source Git mode is unsupported: {where}")
+
+
+def _tracked_payload(
+    source_root: Path,
+    relative: Path,
+    expected_git_mode: int,
+    limit: int = 64 * 1024,
+) -> bytes:
+    path = source_root / relative
+    absolute = Path(os.path.abspath(path))
+    if Path(os.path.realpath(absolute)) != absolute:
+        raise ValueError(f"tracked source must not contain symbolic links: {relative}")
+    git_mode = _git_file_mode(source_root, relative)
+    if git_mode != expected_git_mode:
+        raise ValueError(f"tracked source Git mode differs: {relative}")
+    payload, metadata = activation_package.read_fd(absolute, limit)
+    _validate_checkout_metadata(metadata, git_mode, source_root.lstat().st_uid, str(relative))
+    return payload
+
+
 def _render_sysusers(template: bytes, identities: dict[str, object]) -> bytes:
     text = template.decode("utf-8")
     replacements = {
@@ -67,12 +124,11 @@ def _render_sysusers(template: bytes, identities: dict[str, object]) -> bytes:
 
 def _static_payload(source_root: Path, role: str, identities: dict[str, object]) -> tuple[bytes, str]:
     template_name, asset_name = STATIC_SOURCES[role]
-    payload, metadata = activation_package.read_fd(
-        source_root / PACKAGE_RELATIVE / "templates" / template_name,
-        64 * 1024,
+    payload = _tracked_payload(
+        source_root,
+        PACKAGE_RELATIVE / "templates" / template_name,
+        0o100644,
     )
-    if stat.S_IMODE(metadata.st_mode) != 0o644:
-        raise ValueError(f"static template mode differs: {template_name}")
     if role == "sysusers":
         payload = _render_sysusers(payload, identities)
     return payload, asset_name
@@ -92,6 +148,8 @@ def _write_asset(path: Path, payload: bytes, mode: int) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
     try:
         os.fchmod(fd, mode)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != mode:
+            raise OSError(f"could not materialize exact asset mode: {path}")
         view = memoryview(payload)
         while view:
             view = view[os.write(fd, view):]
@@ -115,6 +173,8 @@ def freeze_package(
         raise ValueError("source checkout does not match the requested commit")
     if _git(source_root, "status", "--porcelain", "--", str(PACKAGE_RELATIVE)):
         raise ValueError("activation package source is dirty")
+    for name in TRACKED_EXECUTABLES:
+        _tracked_payload(source_root, PACKAGE_RELATIVE / name, 0o100755, 1024 * 1024)
 
     draft, _draft_raw, draft_metadata = activation_package.parse_json(draft_path)
     if stat.S_IMODE(draft_metadata.st_mode) & 0o077:
