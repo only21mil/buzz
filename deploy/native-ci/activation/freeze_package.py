@@ -19,7 +19,6 @@ STATIC_SOURCES = {
     "sysusers": ("buzzci-activation.sysusers.in", "assets/buzzci-activation.conf"),
     "tmpfiles": ("buzzci-activation.tmpfiles", "assets/buzzci-activation.tmpfiles"),
     "capacity_target": ("buzz-ci-capacity-one.target", "assets/buzz-ci-capacity-one.target"),
-    "controld_acceptance_socket": ("buzz-ci-controld-acceptance.socket", "assets/buzz-ci-controld-acceptance.socket"),
     "acceptance_control_socket": ("buzz-ci-acceptance-control.socket", "assets/buzz-ci-acceptance-control.socket"),
     "acceptance_control_service": ("buzz-ci-acceptance-control.service", "assets/buzz-ci-acceptance-control.service"),
     "acceptance_tmpfiles": ("buzzci-acceptance.tmpfiles", "assets/buzzci-acceptance.tmpfiles"),
@@ -97,6 +96,27 @@ TRACKED_EXECUTABLES = (
     "package.py",
 )
 
+SYSTEMD_SOURCE_PATHS = {
+    "/etc/systemd/system/buzz-ci-capacity-one.target": Path("deploy/native-ci/activation/templates/buzz-ci-capacity-one.target"),
+    "/etc/systemd/system/buzz-ci-controld-acceptance.socket": Path("deploy/native-ci/controld/templates/buzz-ci-controld-acceptance.socket"),
+    "/etc/systemd/system/buzz-ci-acceptance-control.socket": Path("deploy/native-ci/activation/templates/buzz-ci-acceptance-control.socket"),
+    "/etc/systemd/system/buzz-ci-acceptance-control.service": Path("deploy/native-ci/activation/templates/buzz-ci-acceptance-control.service"),
+    "/etc/systemd/system/buzz-ci-runner.service": Path("deploy/native-ci/runner/templates/buzz-ci-runner.service"),
+    "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf": Path("deploy/native-ci/activation/templates/20-runner-capacity-one.conf"),
+    "/etc/systemd/system/buzz-ci-runner.socket": Path("deploy/native-ci/runner/templates/buzz-ci-runner.socket"),
+    "/etc/systemd/system/buzz-ci-controld.service": Path("deploy/native-ci/controld/templates/buzz-ci-controld.service"),
+    "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf": Path("deploy/native-ci/activation/templates/20-controld-capacity-one.conf"),
+    "/etc/systemd/system/buzz-ci-keyholder.service": Path("deploy/native-ci/keyholder/templates/buzz-ci-keyholder.service"),
+    "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf": Path("deploy/native-ci/keyholder/templates/20-acceptance-actor.conf"),
+    "/etc/systemd/system/buzz-ci-keyholder.socket": Path("deploy/native-ci/keyholder/templates/buzz-ci-keyholder.socket"),
+    "/etc/systemd/system/buzz-ci-keyholder.socket.d/20-capacity-one.conf": Path("deploy/native-ci/activation/templates/20-keyholder-capacity-one.conf"),
+    "/usr/lib/systemd/system/buzz-ci-execd.service": Path("deploy/native-ci/execd/templates/buzz-ci-execd.service"),
+    "/usr/lib/systemd/system/buzz-ci-execd.socket": Path("deploy/native-ci/execd/templates/buzz-ci-execd.socket"),
+    "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf": Path("deploy/native-ci/activation/templates/20-execd-capacity-one.conf"),
+    "/usr/lib/systemd/system/buzz-ci-executor.service": Path("deploy/native-ci/execd/templates/buzz-ci-executor.service"),
+    "/usr/lib/systemd/system/buzz-ci-executor.socket": Path("deploy/native-ci/execd/templates/buzz-ci-executor.socket"),
+}
+
 
 def _git(source_root: Path, *arguments: str) -> str:
     result = subprocess.run(
@@ -108,6 +128,17 @@ def _git(source_root: Path, *arguments: str) -> str:
         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
     )
     return result.stdout.strip()
+
+
+def _git_blob(source_root: Path, revision: str, relative: Path) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", str(source_root), "show", f"{revision}:{relative}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    return result.stdout
 
 
 def _shared_repository_root(path: Path, metadata: os.stat_result, where: str) -> None:
@@ -389,6 +420,22 @@ def freeze_package(
         if activation_package.digest(raw) != component["provenance_sha256"]:
             raise ValueError(f"component provenance digest differs: {component['name']}")
         payloads[source] = (raw, 0o400)
+        if component["name"] == "controld":
+            package_source = component["package_manifest_source"]
+            package_raw = _external_payload(asset_root, package_source, 0o400)
+            if activation_package.digest(package_raw) != component["package_manifest_sha256"]:
+                raise ValueError("controld package manifest digest differs")
+            payloads[package_source] = (package_raw, 0o400)
+
+    component_commits = {item["name"]: item["source_commit"] for item in draft["components"]}
+    for unit in draft["effective_systemd"]:
+        for record in (unit["fragment"], *unit["drop_ins"]):
+            source_path = SYSTEMD_SOURCE_PATHS.get(record["path"])
+            if source_path is None:
+                raise ValueError(f"effective systemd source is unknown: {record['path']}")
+            revision = source_commit if record["owner"] == "activation" else component_commits[record["owner"]]
+            if activation_package.digest(_git_blob(source_root, revision, source_path)) != record["sha256"]:
+                raise ValueError(f"effective systemd source digest differs: {record['path']}")
 
     activation_package.validate_payloads(
         draft,
@@ -402,6 +449,11 @@ def freeze_package(
     } | {
         component["provenance_source"] for component in draft["components"]
     }
+    referenced_sources.add(next(
+        component["package_manifest_source"]
+        for component in draft["components"]
+        if component["name"] == "controld"
+    ))
     if set(payloads) != referenced_sources:
         raise ValueError("package assets collide")
 

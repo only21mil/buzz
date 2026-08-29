@@ -205,7 +205,6 @@ STATIC_TARGETS = {
     "sysusers": "/usr/lib/sysusers.d/buzzci-activation.conf",
     "tmpfiles": "/usr/lib/tmpfiles.d/buzzci-activation.conf",
     "capacity_target": "/etc/systemd/system/buzz-ci-capacity-one.target",
-    "controld_acceptance_socket": "/etc/systemd/system/buzz-ci-controld-acceptance.socket",
     "acceptance_control_socket": "/etc/systemd/system/buzz-ci-acceptance-control.socket",
     "acceptance_control_service": "/etc/systemd/system/buzz-ci-acceptance-control.service",
     "acceptance_tmpfiles": "/usr/lib/tmpfiles.d/buzzci-acceptance.conf",
@@ -233,7 +232,6 @@ STATIC_TARGETS = {
 
 PACKAGE_UNIT_ROLES = {
     PERSISTENT_UNIT: "capacity_target",
-    "buzz-ci-controld-acceptance.socket": "controld_acceptance_socket",
     "buzz-ci-acceptance-control.socket": "acceptance_control_socket",
     "buzz-ci-acceptance-control.service": "acceptance_control_service",
     "buzz-ci-execd.service": "execd_service",
@@ -244,6 +242,77 @@ PACKAGE_UNIT_ROLES = {
 DEPENDENCY_UNITS = sorted(
     set(START_ORDER + STOP_ORDER) - set(PACKAGE_UNIT_ROLES)
 )
+
+SYSTEMD_UNIT_LAYOUT = {
+    "buzz-ci-capacity-one.target": {
+        "fragment": {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-capacity-one.target"},
+        "drop_ins": [],
+    },
+    "buzz-ci-controld-acceptance.socket": {
+        "fragment": {"owner": "controld", "path": "/etc/systemd/system/buzz-ci-controld-acceptance.socket"},
+        "drop_ins": [],
+    },
+    "buzz-ci-acceptance-control.socket": {
+        "fragment": {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-acceptance-control.socket"},
+        "drop_ins": [],
+    },
+    "buzz-ci-acceptance-control.service": {
+        "fragment": {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-acceptance-control.service"},
+        "drop_ins": [],
+    },
+    "buzz-ci-runner.service": {
+        "fragment": {"owner": "runner", "path": "/etc/systemd/system/buzz-ci-runner.service"},
+        "drop_ins": [
+            {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf"},
+        ],
+    },
+    "buzz-ci-runner.socket": {
+        "fragment": {"owner": "runner", "path": "/etc/systemd/system/buzz-ci-runner.socket"},
+        "drop_ins": [],
+    },
+    "buzz-ci-controld.service": {
+        "fragment": {"owner": "controld", "path": "/etc/systemd/system/buzz-ci-controld.service"},
+        "drop_ins": [
+            {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf"},
+        ],
+    },
+    "buzz-ci-keyholder.service": {
+        "fragment": {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.service"},
+        "drop_ins": [
+            {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf"},
+        ],
+    },
+    "buzz-ci-keyholder.socket": {
+        "fragment": {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.socket"},
+        "drop_ins": [
+            {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-keyholder.socket.d/20-capacity-one.conf"},
+        ],
+    },
+    "buzz-ci-execd.service": {
+        "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-execd.service"},
+        "drop_ins": [],
+    },
+    "buzz-ci-execd.socket": {
+        "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-execd.socket"},
+        "drop_ins": [
+            {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf"},
+        ],
+    },
+    "buzz-ci-executor.service": {
+        "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-executor.service"},
+        "drop_ins": [],
+    },
+    "buzz-ci-executor.socket": {
+        "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-executor.socket"},
+        "drop_ins": [],
+    },
+}
+
+SYSTEMD_ENTRY_ROLES = {
+    target: role
+    for role, target in STATIC_TARGETS.items()
+    if target.startswith(("/etc/systemd/system/", "/usr/lib/systemd/system/"))
+}
 
 
 def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -364,12 +433,19 @@ def _validate_identity(role: str, value: object) -> dict[str, Any]:
 def _validate_component(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("component must be an object")
+    base_fields = {
+        "name", "binary_path", "binary_sha256", "source_commit", "provenance_source",
+        "provenance_sha256", "uid", "gid", "mode", "unit",
+    }
+    controld_manifest_fields = {
+        "package_manifest_source", "package_manifest_sha256", "package_digest",
+    }
+    name = value.get("name")
     require_keys(
         value,
-        {"name", "binary_path", "binary_sha256", "source_commit", "provenance_source", "provenance_sha256", "uid", "gid", "mode", "unit"},
+        base_fields | (controld_manifest_fields if name == "controld" else set()),
         "component",
     )
-    name = value["name"]
     if name not in COMPONENTS:
         raise ValueError("unknown component")
     expected_path, expected_unit = COMPONENTS[name]
@@ -388,7 +464,62 @@ def _validate_component(value: object) -> dict[str, Any]:
         raise ValueError(f"component {name} binary must be root owned")
     if parse_mode(value["mode"]) != 0o755:
         raise ValueError(f"component {name} binary mode must be 0755")
+    if name == "controld":
+        require_asset(value["package_manifest_source"], "controld package manifest")
+        for field in ("package_manifest_sha256", "package_digest"):
+            if not isinstance(value[field], str) or not SHA256.fullmatch(value[field]):
+                raise ValueError(f"controld {field} is invalid")
     return value
+
+
+def _validate_effective_systemd(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(SYSTEMD_UNIT_LAYOUT):
+        raise ValueError("effective systemd inventory is incomplete")
+    result: list[dict[str, Any]] = []
+    observed_units: set[str] = set()
+    observed_paths: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("effective systemd item must be an object")
+        require_keys(item, {"unit", "fragment", "drop_ins"}, "effective systemd item")
+        unit = item["unit"]
+        if not isinstance(unit, str) or unit not in SYSTEMD_UNIT_LAYOUT or unit in observed_units:
+            raise ValueError("effective systemd unit is unknown or duplicated")
+        observed_units.add(unit)
+        layout = SYSTEMD_UNIT_LAYOUT[unit]
+        fragment = item["fragment"]
+        if not isinstance(fragment, dict):
+            raise ValueError(f"effective systemd fragment is invalid: {unit}")
+        require_keys(fragment, {"owner", "path", "sha256"}, f"effective systemd fragment {unit}")
+        if {key: fragment[key] for key in ("owner", "path")} != layout["fragment"]:
+            raise ValueError(f"effective systemd fragment owner or path differs: {unit}")
+        if not isinstance(fragment["sha256"], str) or not SHA256.fullmatch(fragment["sha256"]):
+            raise ValueError(f"effective systemd fragment digest is invalid: {unit}")
+        require_absolute(fragment["path"], f"effective systemd fragment path {unit}")
+        if fragment["path"] in observed_paths:
+            raise ValueError("effective systemd path is duplicated")
+        observed_paths.add(fragment["path"])
+        drop_ins = item["drop_ins"]
+        if not isinstance(drop_ins, list) or len(drop_ins) != len(layout["drop_ins"]):
+            raise ValueError(f"effective systemd drop-in inventory differs: {unit}")
+        for index, (drop_in, expected) in enumerate(zip(drop_ins, layout["drop_ins"], strict=True)):
+            if not isinstance(drop_in, dict):
+                raise ValueError(f"effective systemd drop-in is invalid: {unit}")
+            require_keys(drop_in, {"owner", "path", "sha256"}, f"effective systemd drop-in {unit}")
+            if {key: drop_in[key] for key in ("owner", "path")} != expected:
+                raise ValueError(f"effective systemd drop-in owner, path, or order differs: {unit} index {index}")
+            if not isinstance(drop_in["sha256"], str) or not SHA256.fullmatch(drop_in["sha256"]):
+                raise ValueError(f"effective systemd drop-in digest is invalid: {unit}")
+            require_absolute(drop_in["path"], f"effective systemd drop-in path {unit}")
+            if drop_in["path"] in observed_paths:
+                raise ValueError("effective systemd path is duplicated")
+            observed_paths.add(drop_in["path"])
+        result.append(item)
+    if observed_units != set(SYSTEMD_UNIT_LAYOUT):
+        raise ValueError("effective systemd units are incomplete")
+    if [item["unit"] for item in result] != sorted(SYSTEMD_UNIT_LAYOUT):
+        raise ValueError("effective systemd units must use bytewise name order")
+    return result
 
 
 def _validate_entry(value: object) -> dict[str, Any]:
@@ -431,7 +562,7 @@ def _validate_entry(value: object) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) -> dict[str, Any]:
     expected = {
         "schema", "activation_id", "source_commit", "default_state", "identities", "components", "entries",
-        "access_group", "acceptance_template", "systemd", "socket_policy", "qualification", "package_uid",
+        "access_group", "acceptance_template", "systemd", "effective_systemd", "socket_policy", "qualification", "package_uid",
         "package_gid", "package_digest",
     }
     if not require_digest:
@@ -522,6 +653,16 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
         if parse_mode(entry["source_mode"]) != source_mode or parse_mode(entry["install_mode"]) != install_mode:
             raise ValueError(f"tracked activation program entry mode differs: {role}")
 
+    effective_systemd = _validate_effective_systemd(manifest["effective_systemd"])
+    for unit in effective_systemd:
+        for record in (unit["fragment"], *unit["drop_ins"]):
+            role = SYSTEMD_ENTRY_ROLES.get(record["path"])
+            if record["owner"] == "activation":
+                if role is None or entries_by_role[role]["sha256"] != record["sha256"]:
+                    raise ValueError(f"activation effective systemd bytes differ: {record['path']}")
+            elif role is not None:
+                raise ValueError(f"non-activation systemd path is activation-owned: {record['path']}")
+
     systemd = manifest["systemd"]
     require_keys(systemd, {"start_order", "stop_order", "persistent_unit", "stage_capacity", "active_capacity"}, "systemd plan")
     if systemd != {
@@ -553,6 +694,7 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
     if qualification["terminate_grace_seconds"] != 2:
         raise ValueError("qualification termination grace must be two seconds")
     all_sources = sources + [item["provenance_source"] for item in validated_components]
+    all_sources.append(components_by_name["controld"]["package_manifest_source"])
     if len(all_sources) != len(set(all_sources)):
         raise ValueError("activation assets must not share source names")
 
@@ -1121,8 +1263,55 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         raise ValueError("activation packages cannot contain secrets or credentials")
 
 
+def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes) -> None:
+    component = next(item for item in manifest["components"] if item["name"] == "controld")
+    if digest(payload) != component["package_manifest_sha256"]:
+        raise ValueError("controld package manifest bytes differ")
+    package = _json_payload(payload, "controld package manifest")
+    if canonical_json(package) != payload:
+        raise ValueError("controld package manifest is not canonical")
+    required = {"schema", "source_commit", "entries", "package_digest"}
+    if not required <= set(package) or package["schema"] != "buzz-ci-controld-install-package-v1":
+        raise ValueError("controld package manifest identity differs")
+    package_digest = package["package_digest"]
+    unsigned = dict(package)
+    unsigned.pop("package_digest", None)
+    if (
+        package["source_commit"] != component["source_commit"]
+        or package_digest != component["package_digest"]
+        or not isinstance(package_digest, str)
+        or not SHA256.fullmatch(package_digest)
+        or digest(canonical_json(unsigned)) != package_digest
+    ):
+        raise ValueError("controld package manifest digest or source differs")
+    entries = package["entries"]
+    if not isinstance(entries, list):
+        raise ValueError("controld package entry inventory differs")
+    by_target: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("target"), str):
+            raise ValueError("controld package entry is invalid")
+        if entry["target"] in by_target:
+            raise ValueError("controld package target is duplicated")
+        by_target[entry["target"]] = entry
+    effective = {item["unit"]: item for item in manifest["effective_systemd"]}
+    for unit in ("buzz-ci-controld.service", "buzz-ci-controld-acceptance.socket"):
+        fragment = effective[unit]["fragment"]
+        entry = by_target.get(fragment["path"])
+        if (
+            not isinstance(entry, dict)
+            or entry.get("sha256") != fragment["sha256"]
+            or entry.get("install_mode") != "0644"
+            or entry.get("uid") != 0
+            or entry.get("gid") != 0
+        ):
+            raise ValueError(f"controld package effective unit binding differs: {unit}")
+
+
 def validate_payloads(manifest: dict[str, Any], payloads: dict[str, bytes]) -> None:
     validate_phase_configs(manifest, payloads)
+    component = next(item for item in manifest["components"] if item["name"] == "controld")
+    _validate_controld_package_manifest(manifest, payloads[component["package_manifest_source"]])
 
 
 def rooted(root: Path, target: str) -> Path:

@@ -32,6 +32,7 @@ def load_module(name: str, path: Path):
 
 CONTROLLER = load_module("activation_controller", ACTIVATION_ROOT / "controller.py")
 FREEZER = load_module("activation_freezer", ACTIVATION_ROOT / "freeze_package.py")
+INVENTORY = load_module("activation_inventory", ACTIVATION_ROOT / "check_package_inventory.py")
 
 QUALIFICATION_SCRIPT = b'''#!/usr/bin/python3
 import json, os, sys
@@ -306,7 +307,6 @@ class ActivationFixture:
             "sysusers": ("buzzci-activation.conf", self._render_sysusers()),
             "tmpfiles": ("buzzci-activation.tmpfiles", (ACTIVATION_ROOT / "templates/buzzci-activation.tmpfiles").read_bytes()),
             "capacity_target": ("buzz-ci-capacity-one.target", (ACTIVATION_ROOT / "templates/buzz-ci-capacity-one.target").read_bytes()),
-            "controld_acceptance_socket": ("buzz-ci-controld-acceptance.socket", (ACTIVATION_ROOT / "templates/buzz-ci-controld-acceptance.socket").read_bytes()),
             "acceptance_control_socket": ("buzz-ci-acceptance-control.socket", (ACTIVATION_ROOT / "templates/buzz-ci-acceptance-control.socket").read_bytes()),
             "acceptance_control_service": ("buzz-ci-acceptance-control.service", (ACTIVATION_ROOT / "templates/buzz-ci-acceptance-control.service").read_bytes()),
             "acceptance_tmpfiles": ("buzzci-acceptance.tmpfiles", (ACTIVATION_ROOT / "templates/buzzci-acceptance.tmpfiles").read_bytes()),
@@ -380,7 +380,7 @@ class ActivationFixture:
                 )
                 self.entries[-1]["source_mode"] = "0500"
                 self.assets[self.entries[-1]["source"]] = (binary, 0o500)
-            components.append({
+            component: dict[str, object] = {
                 "name": name,
                 "binary_path": binary_path,
                 "binary_sha256": activation_package.digest(binary),
@@ -391,8 +391,53 @@ class ActivationFixture:
                 "gid": 0,
                 "mode": "0755",
                 "unit": unit,
-            })
+            }
+            if name == "controld":
+                package: dict[str, object] = {
+                    "schema": "buzz-ci-controld-install-package-v1",
+                    "source_commit": source_commit,
+                    "entries": [],
+                }
+                for role, relative, target in (
+                    ("service", "deploy/native-ci/controld/templates/buzz-ci-controld.service", "/etc/systemd/system/buzz-ci-controld.service"),
+                    ("acceptance_socket", "deploy/native-ci/controld/templates/buzz-ci-controld-acceptance.socket", "/etc/systemd/system/buzz-ci-controld-acceptance.socket"),
+                ):
+                    payload = (REPO_ROOT / relative).read_bytes()
+                    package["entries"].append({
+                        "role": role, "target": target, "sha256": activation_package.digest(payload),
+                        "install_mode": "0644", "uid": 0, "gid": 0,
+                    })
+                package["package_digest"] = activation_package.digest(activation_package.canonical_json(package))
+                package_raw = activation_package.canonical_json(package)
+                source = "assets/controld-package-manifest.json"
+                self.assets[source] = (package_raw, 0o400)
+                component.update({
+                    "package_manifest_source": source,
+                    "package_manifest_sha256": activation_package.digest(package_raw),
+                    "package_digest": package["package_digest"],
+                })
+            components.append(component)
         return components
+
+    def _effective_systemd(self) -> list[dict[str, object]]:
+        entries = {entry["target"]: entry for entry in self.entries}
+        result: list[dict[str, object]] = []
+        for unit, layout in sorted(activation_package.SYSTEMD_UNIT_LAYOUT.items()):
+            def record(value: dict[str, str]) -> dict[str, str]:
+                entry = entries.get(value["path"])
+                payload = (
+                    self.assets[entry["source"]][0]
+                    if entry is not None
+                    else (REPO_ROOT / FREEZER.SYSTEMD_SOURCE_PATHS[value["path"]]).read_bytes()
+                )
+                return {**value, "sha256": activation_package.digest(payload)}
+
+            result.append({
+                "unit": unit,
+                "fragment": record(layout["fragment"]),
+                "drop_ins": [record(item) for item in layout["drop_ins"]],
+            })
+        return result
 
     def _scenario(self) -> dict[str, object]:
         endpoint = {"program": "/usr/libexec/buzz-ci-capacity-one-driver", "args": []}
@@ -444,6 +489,7 @@ class ActivationFixture:
                 "stage_capacity": 0,
                 "active_capacity": 1,
             },
+            "effective_systemd": self._effective_systemd(),
             "socket_policy": activation_package.SOCKET_POLICY,
             "qualification": self.qualification,
             "package_uid": 0,
@@ -475,6 +521,15 @@ class ActivationFixture:
                 self.assets[entry["source"]][0],
                 0o600,
             )
+        for unit in self.manifest["effective_systemd"]:
+            for record in (unit["fragment"], *unit["drop_ins"]):
+                if record["owner"] == "activation":
+                    continue
+                write_file(
+                    self.root / record["path"].lstrip("/"),
+                    (REPO_ROOT / FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes(),
+                    0o644,
+                )
         keyholder = {
             "schema_version": 1,
             "peer": {
@@ -500,13 +555,20 @@ class ActivationFixture:
 
     def _write_fake_systemd(self) -> None:
         units: dict[str, object] = {}
+        effective = {item["unit"]: item for item in self.manifest["effective_systemd"]}
         for name in sorted(set(activation_package.START_ORDER + activation_package.STOP_ORDER)):
-            load_state = "not-found" if name in activation_package.PACKAGE_UNIT_ROLES else "loaded"
+            item = effective[name]
+            load_state = "not-found" if item["fragment"]["owner"] == "activation" else "loaded"
             units[name] = {
                 "LoadState": load_state,
                 "ActiveState": "inactive",
                 "SubState": "dead",
                 "UnitFileState": "disabled" if load_state == "not-found" or name.endswith(".socket") else "static",
+                "FragmentPath": "" if load_state == "not-found" else item["fragment"]["path"],
+                "DropInPaths": [
+                    record["path"] for record in item["drop_ins"]
+                    if record["owner"] != "activation"
+                ],
             }
         state = {"schema": "buzz-ci-fake-systemd-v1", "units": units, "identities": {}, "groups": {}, "sockets": {}}
         self.fake_state = self.root / "var/lib/buzzci/activation-controller/fake-systemd-v1.json"
@@ -516,7 +578,8 @@ class ActivationFixture:
     def load(self):
         manifest, payloads = CONTROLLER.load_package(self.package, live=False)
         driver = CONTROLLER.FakeSystemd(
-            self.root, self.fake_state, manifest["identities"], manifest["access_group"], manifest["socket_policy"],
+            self.root, self.fake_state, manifest["identities"], manifest["access_group"],
+            manifest["socket_policy"], manifest["effective_systemd"],
         )
         return manifest, payloads, driver
 
@@ -593,6 +656,14 @@ class ActivationControllerTests(unittest.TestCase):
 
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual((staged["state"], staged["capacity"]), ("staged_zero", 0))
+        effective = {item["unit"]: item for item in manifest["effective_systemd"]}
+        self.assertEqual(set(staged["installed_units"]), set(effective))
+        for unit, expected in effective.items():
+            observed = staged["installed_units"][unit]
+            self.assertEqual(observed["fragment_path"], expected["fragment"]["path"])
+            self.assertEqual(observed["fragment_sha256"], expected["fragment"]["sha256"])
+            self.assertEqual(observed["drop_in_paths"], [item["path"] for item in expected["drop_ins"]])
+            self.assertEqual(observed["drop_in_sha256"], [item["sha256"] for item in expected["drop_ins"]])
         self.assertEqual(CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)["status"], "unchanged")
         self.assertEqual(CONTROLLER.check_current(manifest, self.fixture.root, driver)["state"], "staged_zero")
 
@@ -600,12 +671,20 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual((qualification["state"], qualification["capacity"]), ("qualified_closed", 0))
         self.assertEqual(qualification["qualification"]["status"], "qualified_closed")
         self.assertEqual(activated["state"], "active_one")
+        active = CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        self.assertEqual(active["readback"]["installed_units"]["buzz-ci-runner.service"]["drop_in_paths"], [
+            "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+        ])
         self.assertEqual(CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["status"], "unchanged")
         self.assertEqual(CONTROLLER.qualify(manifest, payloads, self.fixture.root, driver)["status"], "qualified")
 
         rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
         self.assertEqual((rolled_back["state"], rolled_back["capacity"]), ("rolled_back", 0))
         self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["status"], "unchanged")
+        dormant = CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        self.assertEqual((dormant["state"], dormant["capacity"]), ("dormant", 0))
+        self.assertEqual(dormant["units"]["buzz-ci-controld-acceptance.socket"]["fragment_path"],
+                         "/etc/systemd/system/buzz-ci-controld-acceptance.socket")
         self.assertEqual(
             rolled_back["retained_principals"],
             ["buzzci-controld", "buzzci-ctl", "buzzci-job", "buzzci-keyholder", "buzzci-runner"],
@@ -645,6 +724,235 @@ class ActivationControllerTests(unittest.TestCase):
             self.assertEqual(staged["installed_units"][unit]["LoadState"], "loaded")
             self.assertEqual(staged["installed_units"][unit]["fragment_path"], entries[role]["target"])
             self.assertEqual(staged["installed_units"][unit]["sha256"], entries[role]["sha256"])
+
+    def test_effective_systemd_rejects_missing_extra_order_relocation_digest_and_duplicate_drift(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        runner = "buzz-ci-runner.service"
+        expected = next(item for item in manifest["effective_systemd"] if item["unit"] == runner)
+
+        state = driver._read()
+        state["units"][runner]["DropInPaths"] = []
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "drop-in paths or order"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+        state = driver._read()
+        state["units"][runner]["DropInPaths"] = [
+            expected["drop_ins"][0]["path"],
+            "/etc/systemd/system/buzz-ci-runner.service.d/99-extra.conf",
+        ]
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "drop-in paths or order"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+        state = driver._read()
+        state["units"][runner]["DropInPaths"] = [
+            "/etc/systemd/system/buzz-ci-runner.service.d/99-late.conf",
+            expected["drop_ins"][0]["path"],
+        ]
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "drop-in paths or order"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+        state = driver._read()
+        state["units"][runner]["DropInPaths"] = [expected["drop_ins"][0]["path"]]
+        state["units"][runner]["FragmentPath"] = "/usr/lib/systemd/system/buzz-ci-runner.service"
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "fragment is relocated"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+        state = driver._read()
+        state["units"][runner]["FragmentPath"] = expected["fragment"]["path"]
+        state["units"][runner]["DropInPaths"] = [
+            expected["drop_ins"][0]["path"], expected["drop_ins"][0]["path"],
+        ]
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "duplicated systemd drop-in"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+        state = driver._read()
+        state["units"][runner]["DropInPaths"] = [expected["drop_ins"][0]["path"]]
+        driver._write(state)
+        drop_in = self.fixture.root / expected["drop_ins"][0]["path"].lstrip("/")
+        drop_in.write_bytes(b"[Service]\nEnvironment=HOSTILE=1\n")
+        with self.assertRaisesRegex(ValueError, "(?:file digest differs|staged readback failed)"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+    def test_dependency_drop_in_rejects_missing_and_stale_bytes(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        effective = next(
+            item for item in manifest["effective_systemd"]
+            if item["unit"] == "buzz-ci-keyholder.service"
+        )
+        record = effective["drop_ins"][0]
+        target = self.fixture.root / record["path"].lstrip("/")
+        expected = (REPO_ROOT / FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes()
+
+        target.unlink()
+        with self.assertRaisesRegex(ValueError, "effective systemd file is missing"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+        write_file(target, b"[Service]\nEnvironment=STALE=1\n", 0o644)
+        with self.assertRaisesRegex(ValueError, "effective systemd file digest differs"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+        write_file(target, expected, 0o644)
+        self.assertEqual(
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)["state"],
+            "staged_zero",
+        )
+
+    def test_effective_systemd_is_rechecked_across_every_lifecycle_state(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        unit = "buzz-ci-runner.service"
+        hostile = "/etc/systemd/system/buzz-ci-runner.service.d/99-hostile.conf"
+
+        def reject_hostile_drop_in(label: str, readback) -> None:
+            state = driver._read()
+            pristine = copy.deepcopy(state)
+            state["units"][unit]["DropInPaths"].append(hostile)
+            driver._write(state)
+            with self.subTest(state=label):
+                with self.assertRaisesRegex(ValueError, "drop-in paths or order"):
+                    readback()
+            driver._write(pristine)
+
+        reject_hostile_drop_in(
+            "dormant",
+            lambda: CONTROLLER.check_current(manifest, self.fixture.root, driver),
+        )
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        reject_hostile_drop_in(
+            "staged_zero",
+            lambda: CONTROLLER.check_current(manifest, self.fixture.root, driver),
+        )
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        reject_hostile_drop_in(
+            "qualified_closed",
+            lambda: CONTROLLER.check_current(manifest, self.fixture.root, driver),
+        )
+        self.set_capacity_one(manifest, payloads, driver)
+        reject_hostile_drop_in(
+            "active_one",
+            lambda: CONTROLLER.check_current(manifest, self.fixture.root, driver),
+        )
+
+        prepare, prepare_sha = self.parsed_zero_request("prepare-qualification-zero", "c")
+        CONTROLLER._prepare_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, prepare, prepare_sha,
+        )
+        reject_hostile_drop_in(
+            "prepare_zero",
+            lambda: CONTROLLER._prepare_qualification_zero(
+                manifest, payloads, self.fixture.root, driver, prepare, prepare_sha,
+            ),
+        )
+        finalize, finalize_sha = self.parsed_zero_request("finalize-qualification-zero", "d")
+        CONTROLLER._finalize_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, finalize, finalize_sha,
+        )
+        prove, _prove_sha = self.parsed_zero_request("prove-qualification-zero", "e")
+        reject_hostile_drop_in(
+            "finalized_prove_zero",
+            lambda: CONTROLLER._prove_qualification_zero(
+                manifest, self.fixture.root, driver, prove,
+            ),
+        )
+
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        reject_hostile_drop_in(
+            "rolled_back_dormant",
+            lambda: CONTROLLER.check_current(manifest, self.fixture.root, driver),
+        )
+
+    def test_rollback_rejects_stale_drop_in_after_daemon_reload(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        stale = self.fixture.root / "etc/systemd/system/buzz-ci-runner.service.d/99-stale.conf"
+        write_file(stale, b"[Service]\nEnvironment=STALE=1\n", 0o644)
+        with self.assertRaisesRegex(ValueError, "drop-in paths or order"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rollback_failed")
+
+    def test_controld_component_package_manifest_binds_effective_unit_bytes(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        component = next(item for item in manifest["components"] if item["name"] == "controld")
+        raw = payloads[component["package_manifest_source"]]
+        activation_package._validate_controld_package_manifest(manifest, raw)
+        package = json.loads(raw)
+        package["entries"][0]["sha256"] = "0" * 64
+        hostile = activation_package.canonical_json(package)
+        changed = copy.deepcopy(manifest)
+        changed_component = next(item for item in changed["components"] if item["name"] == "controld")
+        changed_component["package_manifest_sha256"] = activation_package.digest(hostile)
+        with self.assertRaisesRegex(ValueError, "package manifest digest or source"):
+            activation_package._validate_controld_package_manifest(changed, hostile)
+
+    def test_static_five_package_inventory_is_collision_closed(self) -> None:
+        activation = copy.deepcopy(self.fixture.manifest)
+        activation_entries = {entry["target"]: entry for entry in activation["entries"]}
+        self.assertNotIn(
+            "/etc/systemd/system/buzz-ci-controld-acceptance.socket",
+            activation_entries,
+        )
+
+        def entry(role: str, target: str, payload: bytes, *, mode: str = "0644", uid: int = 0, gid: int = 0) -> dict[str, object]:
+            return {
+                "role": role, "target": target, "sha256": activation_package.digest(payload),
+                "install_mode": mode, "uid": uid, "gid": gid,
+            }
+
+        packages: dict[str, dict[str, object]] = {"activation": activation}
+        for owner, schema in INVENTORY.PACKAGE_SCHEMAS.items():
+            if owner == "activation":
+                continue
+            owned: list[dict[str, object]] = []
+            for unit in activation["effective_systemd"]:
+                for record in (unit["fragment"], *unit["drop_ins"]):
+                    if record["owner"] != owner:
+                        continue
+                    payload = (REPO_ROOT / FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes()
+                    owned.append(entry("socket" if record["path"].endswith(".socket") else "unit", record["path"], payload))
+            if owner in {"runner", "controld"}:
+                target = f"/etc/buzzci/{'runner-v2' if owner == 'runner' else 'controld-v1'}.json"
+                shared = activation_entries[target]
+                owned.append({
+                    "role": "config", "target": target, "sha256": shared["sha256"],
+                    "install_mode": shared["install_mode"], "uid": shared["uid"], "gid": shared["gid"],
+                })
+            owned.extend([
+                entry("binary", f"/usr/libexec/buzz-ci-{owner}", f"{owner}-binary\n".encode(), mode="0755"),
+                entry("tmpfiles", f"/usr/lib/tmpfiles.d/buzzci-{owner}.conf", f"{owner}-tmpfiles\n".encode()),
+            ])
+            packages[owner] = {"schema": schema, "entries": owned}
+        packages["execd"].update({
+            "install_receipt": {"path": "/var/lib/buzzci/execd-v2/package/receipt-v1.json", "mode": "0600", "uid": 0, "gid": 0, "schema": "buzz-ci-execd-install-receipt-v1"},
+            "seccomp_contract": {"runtime_receipt": "/var/lib/buzzci/activation/receipts/seccomp.json"},
+        })
+
+        report = INVENTORY.check_inventory(packages)
+        self.assertEqual((report["status"], report["packages"]), ("pass", sorted(INVENTORY.PACKAGE_SCHEMAS)))
+        for category in ("binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt"):
+            self.assertGreater(report["categories"].get(category, 0), 0, category)
+
+        divergent = copy.deepcopy(packages)
+        runner_config = next(item for item in divergent["runner"]["entries"] if item["target"] == "/etc/buzzci/runner-v2.json")
+        runner_config["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "divergent explicitly shared"):
+            INVENTORY.check_inventory(divergent)
+
+        collision = copy.deepcopy(packages)
+        socket = next(item for item in collision["controld"]["entries"] if item["target"] == "/etc/systemd/system/buzz-ci-controld-acceptance.socket")
+        collision["activation"]["entries"].append(copy.deepcopy(socket))
+        with self.assertRaisesRegex(ValueError, "undeclared final package ownership collision"):
+            INVENTORY.check_inventory(collision)
+
+        receipt_collision = copy.deepcopy(packages)
+        receipt_collision["execd"]["install_receipt"]["path"] = INVENTORY.ACTIVATION_RECEIPT["path"]
+        with self.assertRaisesRegex(ValueError, "undeclared final package ownership collision"):
+            INVENTORY.check_inventory(receipt_collision)
 
     def test_stage_persists_staged_zero_before_starting_acceptance_control(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -686,7 +994,7 @@ class ActivationControllerTests(unittest.TestCase):
             "acceptance_driver_config": "absent",
             "execd_config": "absent",
         })
-        self.assertEqual(CONTROLLER._systemd_prior_readback(receipt, driver)["buzz-ci-acceptance-control.service"]["ActiveState"], "inactive")
+        self.assertEqual(CONTROLLER._systemd_prior_readback(receipt, manifest, self.fixture.root, driver)["buzz-ci-acceptance-control.service"]["ActiveState"], "inactive")
         self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["state"], "rolled_back")
 
     def test_staged_zero_resume_restarts_only_missing_staged_unit(self) -> None:
@@ -704,7 +1012,7 @@ class ActivationControllerTests(unittest.TestCase):
         result = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual((result["status"], result["state"]), ("unchanged", "staged_zero"))
         self.assertEqual(restarted, activation_package.STAGED_ZERO_UNITS)
-        self.assertTrue(CONTROLLER._staged_zero_readback(manifest, driver)["units"])
+        self.assertTrue(CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)["units"])
 
     def test_stage_compensation_aggregates_partial_systemd_failure(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -735,6 +1043,10 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual((properties["components"]["minItems"], properties["components"]["maxItems"]), (len(activation_package.COMPONENTS), len(activation_package.COMPONENTS)))
         expected_entries = len(activation_package.CONFIG_TARGETS) + len(activation_package.STATIC_TARGETS)
         self.assertEqual((properties["entries"]["minItems"], properties["entries"]["maxItems"]), (expected_entries, expected_entries))
+        self.assertEqual(
+            (properties["effective_systemd"]["minItems"], properties["effective_systemd"]["maxItems"]),
+            (len(activation_package.SYSTEMD_UNIT_LAYOUT), len(activation_package.SYSTEMD_UNIT_LAYOUT)),
+        )
         self.assertEqual(properties["socket_policy"]["const"], activation_package.SOCKET_POLICY)
         self.assertEqual(
             properties["systemd"]["const"],
@@ -757,7 +1069,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "328792c2b73addb204b9c98fd114cc1ab11952026a29c6434243f078e82e8e40",
+            "d2a6ce74f1a7a2532e3e7f5e1f353ba1e9bc989a32db87ede368bd3dc716f2c5",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -868,7 +1180,7 @@ class ActivationControllerTests(unittest.TestCase):
             "qualified_closed", "compensated", 1,
         ))
         CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
-        CONTROLLER._staged_zero_readback(manifest, driver)
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
         self.assertEqual(driver.unit("buzz-ci-acceptance-control.service")["ActiveState"], "active")
         driver.start = original_start
         response = CONTROLLER._set_capacity_one(
@@ -900,7 +1212,7 @@ class ActivationControllerTests(unittest.TestCase):
                     manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
                 )
         CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
-        CONTROLLER._staged_zero_readback(manifest, driver)
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
         original_fragment = driver.fragment_path
         drifted_once = True
 
@@ -917,7 +1229,7 @@ class ActivationControllerTests(unittest.TestCase):
                 manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
             )
         CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
-        CONTROLLER._staged_zero_readback(manifest, driver)
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
 
     def test_capacity_one_rejects_stale_controld_process_and_compensates(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -942,7 +1254,7 @@ class ActivationControllerTests(unittest.TestCase):
             )
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual((receipt["state"], receipt["capacity_one"]["phase"]), ("qualified_closed", "compensated"))
-        CONTROLLER._staged_zero_readback(manifest, driver)
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
 
     def test_fixed_zero_actions_are_bound_idempotent_and_prove_without_writes(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -1084,9 +1396,23 @@ class ActivationControllerTests(unittest.TestCase):
             CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, different)
 
     def test_rollback_restores_enabled_listening_execd_baseline(self) -> None:
+        effective = next(
+            item for item in self.fixture.manifest["effective_systemd"]
+            if item["unit"] == "buzz-ci-execd.socket"
+        )
+        entries = {entry["target"]: entry for entry in self.fixture.manifest["entries"]}
+        for record in (effective["fragment"], *effective["drop_ins"]):
+            source = entries[record["path"]]["source"]
+            write_file(
+                self.fixture.root / record["path"].lstrip("/"),
+                self.fixture.assets[source][0],
+                0o644,
+            )
         state = json.loads(self.fixture.fake_state.read_bytes())
         state["units"]["buzz-ci-execd.socket"].update({
             "LoadState": "loaded", "ActiveState": "active", "SubState": "listening", "UnitFileState": "enabled",
+            "FragmentPath": effective["fragment"]["path"],
+            "DropInPaths": [record["path"] for record in effective["drop_ins"]],
         })
         write_file(self.fixture.fake_state, activation_package.canonical_json(state), 0o600)
         manifest, payloads, driver = self.fixture.load()
@@ -1127,7 +1453,7 @@ class ActivationControllerTests(unittest.TestCase):
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual(receipt["state"], "staged_zero")
         self.assertEqual(
-            CONTROLLER._staged_zero_readback(manifest, driver)["units"][activation_package.PERSISTENT_UNIT]["ActiveState"],
+            CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)["units"][activation_package.PERSISTENT_UNIT]["ActiveState"],
             "inactive",
         )
         CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
