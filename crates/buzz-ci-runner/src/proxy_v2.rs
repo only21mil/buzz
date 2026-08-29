@@ -27,7 +27,6 @@ use crate::config::{validate_private_directory, RunnerConfig, RunnerMode};
 const REPLAY_SCHEMA_VERSION: u16 = 1;
 const MAX_REPLAY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_REPLAY_ENTRIES: usize = 4096;
-const RESPONSE_FRAME_SIZE: usize = HEADER_SIZE + v2::RESPONSE_BODY_SIZE;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxySettings {
@@ -276,7 +275,7 @@ fn read_replay_document(path: &Path) -> Result<ReplayDocument, ProxyError> {
                 || decode_exact::<32>(&entry.request_digest).is_none()
                 || entry.response_frame.as_ref().is_some_and(|response| {
                     hex::decode(response)
-                        .map(|value| value.len() != RESPONSE_FRAME_SIZE)
+                        .map(|value| value.len() < HEADER_SIZE || value.len() > v2::MAX_FRAME_SIZE)
                         .unwrap_or(true)
                 })
         })
@@ -364,7 +363,7 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
         if header.request_id == [0; 16] {
             return Err(ProxyError::InvalidControlFrame);
         }
-        validate_request(&self.settings, request, unix_now()?)?;
+        validate_request(&self.settings, header, request, unix_now()?)?;
         let request_digest: [u8; 32] = Sha256::digest(&frame).into();
         let response = match self.replay.reserve(header.request_id, request_digest)? {
             ReplayDecision::Cached(response) => response,
@@ -375,6 +374,7 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
                 response
             }
         };
+        validate_encoded_response(header, request, &response)?;
         control
             .write_all(&response)
             .and_then(|()| control.flush())
@@ -435,10 +435,26 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
             .and_then(|()| connected.stream.flush())
             .and_then(|()| connected.stream.shutdown(Shutdown::Write))
             .map_err(|_| ProxyError::ExecdUnavailable)?;
-        let mut response = vec![0; RESPONSE_FRAME_SIZE];
+        let expected_body_length = response_body_length(request);
+        let mut response_header = [0_u8; HEADER_SIZE];
         connected
             .stream
-            .read_exact(&mut response)
+            .read_exact(&mut response_header)
+            .map_err(|_| ProxyError::ExecdUnavailable)?;
+        let declared_body_length = u32::from_be_bytes(
+            response_header[12..16]
+                .try_into()
+                .map_err(|_| ProxyError::InvalidExecdResponse)?,
+        ) as usize;
+        if declared_body_length != expected_body_length {
+            return Err(ProxyError::InvalidExecdResponse);
+        }
+        let mut response = Vec::with_capacity(HEADER_SIZE + expected_body_length);
+        response.extend_from_slice(&response_header);
+        response.resize(HEADER_SIZE + expected_body_length, 0);
+        connected
+            .stream
+            .read_exact(&mut response[HEADER_SIZE..])
             .map_err(|_| ProxyError::ExecdUnavailable)?;
         let mut trailing = [0_u8; 1];
         if connected
@@ -449,9 +465,7 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
         {
             return Err(ProxyError::InvalidExecdResponse);
         }
-        let decoded =
-            v2::decode_response(header, &response).map_err(|_| ProxyError::InvalidExecdResponse)?;
-        validate_response(request, decoded)?;
+        validate_encoded_response(header, request, &response)?;
         Ok(response)
     }
 }
@@ -482,6 +496,7 @@ fn read_v2_request(stream: &mut UnixStream) -> Result<Vec<u8>, ProxyError> {
 
 fn validate_request(
     settings: &ProxySettings,
+    header: FrameHeader,
     request: Request,
     now: u64,
 ) -> Result<(), ProxyError> {
@@ -510,6 +525,20 @@ fn validate_request(
         }
         Request::GetAttempt(request) => {
             if request.attempt_id == [0; 16] || request.execution_binding_digest == [0; 32] {
+                return Err(ProxyError::InvalidActivationCoordinates);
+            }
+        }
+        Request::DescribeAttemptEvidence(request) => {
+            if v2::evidence_request_frame_digest(header, &Request::DescribeAttemptEvidence(request))
+                != Some(request.request_frame_digest)
+            {
+                return Err(ProxyError::InvalidActivationCoordinates);
+            }
+        }
+        Request::ReadAttemptEvidence(request) => {
+            if v2::evidence_request_frame_digest(header, &Request::ReadAttemptEvidence(request))
+                != Some(request.request_frame_digest)
+            {
                 return Err(ProxyError::InvalidActivationCoordinates);
             }
         }
@@ -548,9 +577,127 @@ fn validate_response(request: Request, response: BrokerResponse) -> Result<(), P
         Request::Hello(_)
         | Request::CancelAttempt(_)
         | Request::AdmitQualification(_)
-        | Request::CompleteAttempt(_) => false,
+        | Request::CompleteAttempt(_)
+        | Request::DescribeAttemptEvidence(_)
+        | Request::ReadAttemptEvidence(_) => false,
     };
     bound.then_some(()).ok_or(ProxyError::InvalidExecdResponse)
+}
+
+fn response_body_length(request: Request) -> usize {
+    match request {
+        Request::DescribeAttemptEvidence(_) => v2::EVIDENCE_DESCRIPTION_BODY_SIZE,
+        Request::ReadAttemptEvidence(_) => v2::EVIDENCE_CHUNK_BODY_SIZE,
+        _ => v2::RESPONSE_BODY_SIZE,
+    }
+}
+
+fn validate_encoded_response(
+    header: FrameHeader,
+    request: Request,
+    response: &[u8],
+) -> Result<(), ProxyError> {
+    match request {
+        Request::DescribeAttemptEvidence(request) => {
+            let response = v2::decode_evidence_description_response(header, response)
+                .map_err(|_| ProxyError::InvalidExecdResponse)?;
+            validate_description_response(request, response)
+        }
+        Request::ReadAttemptEvidence(request) => {
+            let response = v2::decode_evidence_chunk_response(header, response)
+                .map_err(|_| ProxyError::InvalidExecdResponse)?;
+            validate_chunk_response(request, &response)
+        }
+        _ => {
+            let decoded = v2::decode_response(header, response)
+                .map_err(|_| ProxyError::InvalidExecdResponse)?;
+            validate_response(request, decoded)
+        }
+    }
+}
+
+fn validate_description_response(
+    request: v2::DescribeAttemptEvidenceRequest,
+    response: v2::EvidenceDescriptionResponse,
+) -> Result<(), ProxyError> {
+    if response.execution_binding_digest != request.coordinates.execution_binding_digest
+        || response.generation != request.coordinates.expected_generation
+        || response.request_frame_digest != request.request_frame_digest
+    {
+        return Err(ProxyError::InvalidExecdResponse);
+    }
+    if response.code != ResponseCode::Ok {
+        return (response.item_count == 0
+            && response.descriptor_set_digest == [0; 32]
+            && response.items.iter().all(Option::is_none))
+        .then_some(())
+        .ok_or(ProxyError::InvalidExecdResponse);
+    }
+    if response.item_count == 0
+        || response.descriptor_set_digest == [0; 32]
+        || usize::from(response.item_count) > v2::MAX_EVIDENCE_ITEMS
+    {
+        return Err(ProxyError::InvalidExecdResponse);
+    }
+    for item in response.items.iter().flatten() {
+        validate_descriptor(*item)?;
+    }
+    Ok(())
+}
+
+fn validate_descriptor(item: v2::EvidenceDescriptor) -> Result<(), ProxyError> {
+    let zero_artifact =
+        item.artifact_name_digest == [0; 32] && item.artifact_media_type_digest == [0; 32];
+    let zero_teardown = item.teardown_lease_id == [0; 16]
+        && item.teardown_lease_generation == 0
+        && item.teardown_attestation_digest == [0; 32];
+    let valid = match item.kind {
+        v2::EvidenceKind::Stdout | v2::EvidenceKind::Stderr => zero_artifact && zero_teardown,
+        v2::EvidenceKind::Artifact => {
+            item.artifact_name_digest != [0; 32]
+                && item.artifact_media_type_digest != [0; 32]
+                && zero_teardown
+        }
+        v2::EvidenceKind::Teardown => {
+            zero_artifact
+                && item.teardown_lease_id != [0; 16]
+                && item.teardown_lease_generation != 0
+                && item.teardown_attestation_digest != [0; 32]
+        }
+    };
+    valid.then_some(()).ok_or(ProxyError::InvalidExecdResponse)
+}
+
+fn validate_chunk_response(
+    request: v2::ReadAttemptEvidenceRequest,
+    response: &v2::EvidenceChunkResponse,
+) -> Result<(), ProxyError> {
+    if response.execution_binding_digest != request.coordinates.execution_binding_digest
+        || response.generation != request.coordinates.expected_generation
+        || response.request_frame_digest != request.request_frame_digest
+        || response.kind != request.kind
+        || response.item_index != request.item_index
+        || response.descriptor_digest != request.descriptor_digest
+        || response.offset != request.offset
+    {
+        return Err(ProxyError::InvalidExecdResponse);
+    }
+    if response.code != ResponseCode::Ok {
+        return (response.bytes.is_empty() && response.total_length == 0)
+            .then_some(())
+            .ok_or(ProxyError::InvalidExecdResponse);
+    }
+    let end = response
+        .offset
+        .checked_add(response.bytes.len() as u32)
+        .ok_or(ProxyError::InvalidExecdResponse)?;
+    if response.bytes.len() > request.max_length as usize
+        || end > response.total_length
+        || (response.bytes.len() < request.max_length as usize && end != response.total_length)
+    {
+        return Err(ProxyError::InvalidExecdResponse);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -725,6 +872,48 @@ mod tests {
         v2::encode_request(request_id, Request::AdmitAttempt(request))
             .as_bytes()
             .to_vec()
+    }
+
+    fn evidence_coordinates() -> v2::AttemptEvidenceCoordinates {
+        v2::AttemptEvidenceCoordinates {
+            signed_request_digest: [31; 32],
+            run_id: [32; 16],
+            workflow_digest: [33; 32],
+            job_intent_digest: [34; 32],
+            attempt: 1,
+            attempt_id: [35; 16],
+            execution_binding_digest: [36; 32],
+            expected_generation: 7,
+        }
+    }
+
+    fn describe_request(header: FrameHeader) -> v2::DescribeAttemptEvidenceRequest {
+        let mut request = v2::DescribeAttemptEvidenceRequest {
+            coordinates: evidence_coordinates(),
+            idempotency_digest: [37; 32],
+            request_frame_digest: [1; 32],
+        };
+        request.request_frame_digest =
+            v2::evidence_request_frame_digest(header, &Request::DescribeAttemptEvidence(request))
+                .expect("describe digest");
+        request
+    }
+
+    fn read_request(header: FrameHeader) -> v2::ReadAttemptEvidenceRequest {
+        let mut request = v2::ReadAttemptEvidenceRequest {
+            coordinates: evidence_coordinates(),
+            idempotency_digest: [37; 32],
+            request_frame_digest: [1; 32],
+            kind: v2::EvidenceKind::Stdout,
+            item_index: 0,
+            descriptor_digest: [38; 32],
+            offset: 0,
+            max_length: 16,
+        };
+        request.request_frame_digest =
+            v2::evidence_request_frame_digest(header, &Request::ReadAttemptEvidence(request))
+                .expect("read digest");
+        request
     }
 
     fn fake_execd(
@@ -914,5 +1103,163 @@ mod tests {
             Err(ProxyError::ExecdUnavailable)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn evidence_requests_reject_divergent_coordinates_and_idempotency() {
+        let directory = private_directory();
+        let settings = settings(directory.path());
+        let describe_header = FrameHeader {
+            operation: Operation::DescribeAttemptEvidence,
+            request_id: [40; 16],
+        };
+        let mut describe = describe_request(describe_header);
+        describe.idempotency_digest[0] ^= 1;
+        assert!(matches!(
+            validate_request(
+                &settings,
+                describe_header,
+                Request::DescribeAttemptEvidence(describe),
+                unix_now().expect("clock")
+            ),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let read_header = FrameHeader {
+            operation: Operation::ReadAttemptEvidence,
+            request_id: [43; 16],
+        };
+        let mut read = read_request(read_header);
+        read.coordinates.attempt = read.coordinates.attempt.saturating_add(1);
+        assert!(matches!(
+            validate_request(
+                &settings,
+                read_header,
+                Request::ReadAttemptEvidence(read),
+                unix_now().expect("clock")
+            ),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+    }
+
+    #[test]
+    fn describe_evidence_forwards_exact_frame_and_binds_path_free_descriptors() {
+        let directory = private_directory();
+        let settings = settings(directory.path());
+        let header = FrameHeader {
+            operation: Operation::DescribeAttemptEvidence,
+            request_id: [41; 16],
+        };
+        let request = describe_request(header);
+        let frame =
+            v2::encode_request(header.request_id, Request::DescribeAttemptEvidence(request))
+                .as_bytes()
+                .to_vec();
+        let descriptor = v2::EvidenceDescriptor {
+            kind: v2::EvidenceKind::Stdout,
+            digest: [38; 32],
+            length: 3,
+            artifact_name_digest: [0; 32],
+            artifact_media_type_digest: [0; 32],
+            teardown_lease_id: [0; 16],
+            teardown_lease_generation: 0,
+            teardown_attestation_digest: [0; 32],
+        };
+        let mut items = [None; v2::MAX_EVIDENCE_ITEMS];
+        items[0] = Some(descriptor);
+        let response = v2::encode_evidence_description_response(
+            header,
+            v2::EvidenceDescriptionResponse {
+                code: ResponseCode::Ok,
+                execution_binding_digest: request.coordinates.execution_binding_digest,
+                generation: request.coordinates.expected_generation,
+                request_frame_digest: request.request_frame_digest,
+                descriptor_set_digest: [39; 32],
+                item_count: 1,
+                items,
+            },
+        )
+        .as_bytes()
+        .to_vec();
+        let connected = fake_execd(
+            frame.clone(),
+            response.clone(),
+            settings.execd_uid,
+            settings.execd_gid,
+        );
+        let mut proxy = RunnerV2Proxy::with_connector(
+            settings,
+            FakeConnector {
+                connections: VecDeque::from([Ok(connected)]),
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("proxy");
+        assert_eq!(exchange(&mut proxy, &frame).expect("describe"), response);
+
+        let mut wrong_binding =
+            v2::decode_evidence_description_response(header, &response).expect("decode response");
+        wrong_binding.execution_binding_digest[0] ^= 1;
+        assert!(matches!(
+            validate_description_response(request, wrong_binding),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
+    }
+
+    #[test]
+    fn read_evidence_binds_chunk_coordinates_and_bounds() {
+        let directory = private_directory();
+        let settings = settings(directory.path());
+        let header = FrameHeader {
+            operation: Operation::ReadAttemptEvidence,
+            request_id: [42; 16],
+        };
+        let request = read_request(header);
+        let frame = v2::encode_request(header.request_id, Request::ReadAttemptEvidence(request))
+            .as_bytes()
+            .to_vec();
+        let response_value = v2::EvidenceChunkResponse {
+            code: ResponseCode::Ok,
+            execution_binding_digest: request.coordinates.execution_binding_digest,
+            generation: request.coordinates.expected_generation,
+            request_frame_digest: request.request_frame_digest,
+            kind: request.kind,
+            item_index: request.item_index,
+            descriptor_digest: request.descriptor_digest,
+            offset: request.offset,
+            total_length: 3,
+            bytes: b"log".to_vec(),
+        };
+        let response = v2::encode_evidence_chunk_response(header, &response_value)
+            .as_bytes()
+            .to_vec();
+        let connected = fake_execd(
+            frame.clone(),
+            response.clone(),
+            settings.execd_uid,
+            settings.execd_gid,
+        );
+        let mut proxy = RunnerV2Proxy::with_connector(
+            settings,
+            FakeConnector {
+                connections: VecDeque::from([Ok(connected)]),
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("proxy");
+        assert_eq!(exchange(&mut proxy, &frame).expect("read"), response);
+
+        let mut hostile = response_value.clone();
+        hostile.total_length = 2;
+        assert!(matches!(
+            validate_chunk_response(request, &hostile),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
+        hostile = response_value;
+        hostile.generation = hostile.generation.saturating_add(1);
+        assert!(matches!(
+            validate_chunk_response(request, &hostile),
+            Err(ProxyError::InvalidExecdResponse)
+        ));
     }
 }
