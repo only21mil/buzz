@@ -490,14 +490,20 @@ fn exchange_unix(
     let mut stream = UnixStream::connect(path).map_err(|_| ControlError::BrokerUnavailable)?;
     let credentials =
         getsockopt(&stream, PeerCredentials).map_err(|_| ControlError::TransportFailure)?;
-    if expected_uid == 0 || credentials.uid() != expected_uid {
-        return Err(ControlError::BrokerRejected);
-    }
+    authorize_broker_peer(credentials.uid(), expected_uid)?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
         .map_err(|_| ControlError::TransportFailure)?;
     exchange_stream(&mut stream, request)
+}
+
+fn authorize_broker_peer(peer_uid: u32, expected_uid: u32) -> Result<(), ControlError> {
+    if peer_uid == expected_uid {
+        Ok(())
+    } else {
+        Err(ControlError::BrokerRejected)
+    }
 }
 
 #[cfg(not(unix))]
@@ -596,6 +602,19 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn configured_root_broker_uid_is_accepted_exactly() {
+        assert_eq!(authorize_broker_peer(0, 0), Ok(()));
+        assert_eq!(
+            authorize_broker_peer(1, 0),
+            Err(ControlError::BrokerRejected)
+        );
+        assert_eq!(
+            authorize_broker_peer(0, 1),
+            Err(ControlError::BrokerRejected)
+        );
+    }
 
     struct Policy(bool);
 

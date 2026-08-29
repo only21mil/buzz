@@ -125,7 +125,6 @@ impl RunnerHostConfig {
         is_lower_hex(&self.owner_pubkey, 64)
             && is_lower_hex(&self.manifest_verification_key, 64)
             && is_lower_hex(&self.relay_signer, 64)
-            && self.broker_uid != 0
             && self.broker_socket.is_absolute()
             && self.executor_program.is_absolute()
             && self.evidence_directory.is_absolute()
@@ -187,7 +186,7 @@ mod tests {
                 "manifest_verification_key": "22".repeat(32),
                 "relay_signer": "33".repeat(32),
                 "broker_socket": "/run/buzzci/execd.sock",
-                "broker_uid": 963,
+                "broker_uid": 0,
                 "executor_program": "/usr/bin/buzz-ci-executor",
                 "evidence_directory": "/var/lib/buzz-ci-runner/evidence",
                 "journal_directory": "/var/lib/buzz-ci-runner/journal",
@@ -199,7 +198,8 @@ mod tests {
             }
         });
         write_config(&complete, &serde_json::to_vec(&value).unwrap(), 0o600);
-        assert!(RunnerConfig::load(&complete).unwrap().host.is_some());
+        let loaded = RunnerConfig::load(&complete).unwrap();
+        assert_eq!(loaded.host.as_ref().unwrap().broker_uid, 0);
 
         let partial = directory.path().join("partial.json");
         write_config(

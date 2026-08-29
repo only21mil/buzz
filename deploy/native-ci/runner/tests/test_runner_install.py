@@ -73,6 +73,8 @@ class RunnerInstallTests(unittest.TestCase):
         self.package = self.base / "package"
         self.runner_uid = os.geteuid()
         self.runner_gid = os.getegid()
+        self.controld_uid = self.runner_uid + 1
+        self.controld_gid = self.runner_gid + 1
 
     def freeze(self) -> dict[str, object]:
         return FREEZER.freeze_package(
@@ -83,9 +85,26 @@ class RunnerInstallTests(unittest.TestCase):
             self.package,
             self.runner_uid,
             self.runner_gid,
-            self.runner_uid,
-            self.runner_gid,
+            self.controld_uid,
+            self.controld_gid,
         )
+
+    def host_config(self, broker_uid: int = 0) -> dict[str, object]:
+        return {
+            "owner_pubkey": "11" * 32,
+            "manifest_verification_key": "22" * 32,
+            "relay_signer": "33" * 32,
+            "broker_socket": "/run/buzzci/execd.sock",
+            "broker_uid": broker_uid,
+            "executor_program": "/usr/libexec/buzz-ci-executor",
+            "evidence_directory": "/var/lib/buzzci/runner/evidence",
+            "journal_directory": "/var/lib/buzzci/runner/journal",
+            "max_argv_items": 32,
+            "max_argv_bytes": 8192,
+            "max_environment_items": 32,
+            "max_environment_bytes": 8192,
+            "max_output_bytes": 1048576,
+        }
 
     def make_root(self, name: str = "root") -> Path:
         root = self.base / name
@@ -103,11 +122,11 @@ class RunnerInstallTests(unittest.TestCase):
                 current.mkdir(mode=0o755, exist_ok=True)
         (root / "etc/passwd").write_text(
             f"buzzci-runner:x:{self.runner_uid}:{self.runner_gid}:runner:/nonexistent:/usr/sbin/nologin\n"
-            f"buzzci-controld:x:{self.runner_uid}:{self.runner_gid}:controld:/nonexistent:/usr/sbin/nologin\n"
+            f"buzzci-controld:x:{self.controld_uid}:{self.controld_gid}:controld:/nonexistent:/usr/sbin/nologin\n"
         )
         (root / "etc/group").write_text(
             f"buzzci-runner:x:{self.runner_gid}:\n"
-            f"buzzci-controld:x:{self.runner_gid}:\n"
+            f"buzzci-controld:x:{self.controld_gid}:\n"
         )
         (root / "etc/passwd").chmod(0o644)
         (root / "etc/group").chmod(0o644)
@@ -174,6 +193,11 @@ class RunnerInstallTests(unittest.TestCase):
         self.assertNotIn("host", value)
         self.assertNotIn("capacity", value)
 
+        active = json.loads(RENDERER.config_bytes(self.controld_uid, self.host_config()))
+        self.assertEqual(active["host"]["broker_uid"], 0)
+        with self.assertRaisesRegex(ValueError, "root execd socket"):
+            RENDERER.config_bytes(self.controld_uid, self.host_config(broker_uid=1))
+
         linked = self.base / "linked.json"
         linked.symlink_to(output)
         with self.assertRaises(OSError):
@@ -184,10 +208,29 @@ class RunnerInstallTests(unittest.TestCase):
         parsed, entries = INSTALLER.parse_manifest(self.package, self.base)
         self.assertEqual(parsed["source_commit"], self.source_commit)
         self.assertEqual(parsed["default_state"], INSTALLER.DEFAULT_STATE)
+        self.assertEqual(parsed["peer_policy"], INSTALLER.PEER_POLICY)
+        self.assertNotEqual(
+            parsed["identities"]["runner"]["uid"],
+            parsed["identities"]["controld"]["uid"],
+        )
         self.assertEqual(parsed["package_digest"], manifest["package_digest"])
         self.assertEqual({entry.role for entry in entries}, set(INSTALLER.EXPECTED_TARGETS))
         binary = next(entry for entry in entries if entry.role == "binary")
         self.assertEqual(binary.sha256, hashlib.sha256(self.binary.read_bytes()).hexdigest())
+
+    def test_freeze_rejects_shared_runner_and_controld_identity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "identities must be distinct"):
+            FREEZER.freeze_package(
+                self.source_root,
+                self.source_commit,
+                self.binary,
+                self.provenance,
+                self.package,
+                self.runner_uid,
+                self.runner_gid,
+                self.runner_uid,
+                self.runner_gid,
+            )
 
     def test_check_rejects_linked_asset_and_binary_provenance_drift(self) -> None:
         self.freeze()
@@ -243,6 +286,12 @@ class RunnerInstallTests(unittest.TestCase):
         result = json.loads(completed.stdout)
         self.assertEqual(result["status"], "checked")
         self.assertEqual(result["changed_targets"], sorted(INSTALLER.EXPECTED_TARGETS.values()))
+        self.assertEqual(result["peer_policy"], INSTALLER.PEER_POLICY)
+        self.assertFalse(result["enabled"])
+        self.assertFalse(result["active"])
+        self.assertFalse(result["provisioned"])
+        self.assertFalse(result["host_block"])
+        self.assertEqual(result["capacity"], 0)
         self.assertEqual(snapshot(), before)
 
         INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
@@ -276,8 +325,11 @@ class RunnerInstallTests(unittest.TestCase):
         installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
         self.assertEqual(installed["status"], "installed")
         self.assertFalse(installed["enabled"])
+        self.assertFalse(installed["active"])
         self.assertFalse(installed["provisioned"])
+        self.assertFalse(installed["host_block"])
         self.assertEqual(installed["capacity"], 0)
+        self.assertEqual(installed["peer_policy"], INSTALLER.PEER_POLICY)
         unchanged = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
         self.assertEqual(unchanged["status"], "unchanged")
         self.assertEqual(unchanged["changed_targets"], [])
@@ -405,6 +457,9 @@ class RunnerInstallTests(unittest.TestCase):
         tmpfiles = (RUNNER_DIR / "templates/buzzci-runner.tmpfiles").read_text()
         self.assertIn("/run/buzzci/runner-control.sock", socket)
         self.assertNotIn("/run/buzzci/execd.sock", socket)
+        self.assertIn("SocketUser=buzzci-runner", socket)
+        self.assertIn("SocketGroup=buzzci-controld", socket)
+        self.assertIn("SocketMode=0620", socket)
         self.assertIn("ReadWritePaths=/var/lib/buzzci/runner", service)
         self.assertNotIn("/var/lib/buzzci/runner-output", service + tmpfiles)
         self.assertNotIn("systemctl", (RUNNER_DIR / "install.py").read_text())
@@ -417,6 +472,10 @@ class RunnerInstallTests(unittest.TestCase):
         ):
             schema = json.loads((RUNNER_DIR / name).read_text())
             self.assertFalse(schema["additionalProperties"])
+        runner_schema = json.loads((RUNNER_DIR / "runner-config.schema.json").read_text())
+        self.assertEqual(runner_schema["properties"]["host"]["properties"]["broker_uid"], {"const": 0})
+        manifest_schema = json.loads((RUNNER_DIR / "package-manifest.schema.json").read_text())
+        self.assertEqual(manifest_schema["properties"]["peer_policy"]["const"], INSTALLER.PEER_POLICY)
 
 
 if __name__ == "__main__":
