@@ -5,11 +5,12 @@ unit tests pass. A real acceptance run must finish with a schema-valid `pass`
 receipt against the exact installed candidate. The run ends by closing
 admission and returning capacity to zero.
 
-The harness drives a fixed sequence through injected commands. It does not
-contain provider URLs, service-manager commands, credentials, or prebaked
-success responses. Each adapter must read actual system state and return the
-normalized response described in [driver-protocol.md](driver-protocol.md). The
-harness checks that response independently.
+The harness drives a fixed sequence through the installed
+`/usr/libexec/buzz-ci-capacity-one-driver`. It does not contain provider URLs,
+service-manager commands, credentials, or prebaked success responses. The
+driver reads actual host state through the root acceptance helper, then binds
+that readback into a request to controld. The harness checks the normalized
+response independently.
 
 ## What the gate proves
 
@@ -35,11 +36,12 @@ receipt never authorizes activation.
 
 ## Inputs
 
-Start from [scenario.template.json](scenario.template.json), but replace every
-identity and command with values from the frozen activation package. In
-particular, replace the template candidate SHA and placeholder approval values
-after the final integrated commit exists. Adapter programs must be absolute
-paths. Do not put secrets in `args`.
+Start from [scenario.template.json](scenario.template.json), then replace the
+activation package digest, activation ID suffix, scenario-specific identities,
+grant event, and initial systemd generations with frozen-package readback. The
+candidate path is pinned to the integrated base. All five endpoint entries are
+the same installed driver with an empty argument list. The schema rejects any
+other executable or arguments.
 
 The checked-in fixture runs
 [`fixtures/run-fixture.sh`](fixtures/run-fixture.sh). It verifies the source
@@ -65,9 +67,10 @@ qualification host and only while the ordinary CI path remains closed.
 
 ```bash
 . ./bin/activate-hermit
-cargo build --locked --release \
-  -p buzz-ci-acceptance-ctl \
-  --bin buzz-ci-capacity-one-canary
+cargo build --locked --release -p buzz-ci-acceptance-ctl \
+  --bin buzz-ci-capacity-one-canary \
+  --bin buzz-ci-capacity-one-driver \
+  --bin buzz-ci-acceptance-control
 
 target/release/buzz-ci-capacity-one-canary \
   < /protected/path/capacity-one-scenario.json \

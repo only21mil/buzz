@@ -1,0 +1,16 @@
+[Unit]
+Description=Buzz CI controld capacity-one acceptance socket
+
+[Socket]
+ListenStream=/run/buzzci/controld-acceptance.sock
+FileDescriptorName=buzz-ci-controld-acceptance
+Accept=no
+SocketUser=root
+SocketGroup=buzzci-ctl
+SocketMode=0620
+DirectoryMode=0711
+RemoveOnStop=yes
+Service=buzz-ci-controld.service
+
+[Install]
+WantedBy=sockets.target

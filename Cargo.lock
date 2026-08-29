@@ -957,6 +957,8 @@ name = "buzz-ci-acceptance-ctl"
 version = "0.1.0"
 dependencies = [
  "buzz-ci-broker-protocol",
+ "hex",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",

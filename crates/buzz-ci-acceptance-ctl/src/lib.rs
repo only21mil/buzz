@@ -4,6 +4,7 @@
 //! claims bound into the request, never proof that a signer authenticated.
 
 pub mod acceptance;
+pub mod production;
 
 use std::{
     fmt,
