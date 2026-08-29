@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 import importlib.util
 import json
 import os
@@ -29,7 +30,15 @@ def load_module(name: str, path: Path):
 CONTROLLER = load_module("activation_controller", ACTIVATION_ROOT / "controller.py")
 FREEZER = load_module("activation_freezer", ACTIVATION_ROOT / "freeze_package.py")
 
-RESPONSE = b'{"status":"qualification_passed"}\n'
+QUALIFICATION_SCRIPT = b'''#!/usr/bin/python3
+import json, os, sys
+status=open('/proc/self/status',encoding='utf-8').read().splitlines()
+if os.getenv('ACTIVATION_TEST_LEAK') is not None or int(next(line.split()[1] for line in status if line.startswith('NoNewPrivs:'))) != 1:
+    raise SystemExit(3)
+r=json.load(sys.stdin)
+o={"schema_version":"buzz-ci-production-qualification-response/v2","status":"qualified_closed","disposition":"created","request_id":r["request_id"],"request_frame_digest":"71"*32,"qualification_receipt_digest":"72"*32,"integrated_candidate_sha":r["integrated_candidate_sha"],"activation_package_digest":r["activation_package_digest"],"fixture_digest":r["fixture_digest"],"principal_digest":r["principal_digest"],"lane_manifest_digest":r["lane_manifest_digest"],"broker_build_identity_digest":r["broker_build_identity_digest"],"host_profile_digest":r["host_profile_digest"],"suite_digest":r["suite_digest"],"isolation_profile_digest":r["isolation_profile_digest"],"seccomp_profile_digest":r["seccomp_profile_digest"],"seccomp_install_receipt_digest":"73"*32,"executor_program_digest":r["executor_program_digest"],"executor_provenance_digest":r["executor_provenance_digest"],"controller_generation":r["controller_generation"],"runner_generation":r["runner_generation"],"lane_epoch":r["lane_epoch"],"admission_key_generation":r["admission_key_generation"],"qualified_at":r["issued_at"],"request_expires_at":r["expires_at"]}
+sys.stdout.write(json.dumps(o,separators=(",",":"))+"\\n")
+'''
 
 
 def write_file(path: Path, payload: bytes, mode: int) -> None:
@@ -76,13 +85,9 @@ class ActivationFixture:
         self.components = self._add_components()
         self._add_configs()
         self._add_static_assets()
-        request = b'{"version":"qualification_v1"}\n'
-        self.assets["assets/qualification-request.json"] = (request, 0o400)
         self.qualification = {
-            "program": "/usr/libexec/buzz-ci-acceptance-ctl",
-            "request_source": "assets/qualification-request.json",
-            "request_sha256": activation_package.digest(request),
-            "expected_response_sha256": activation_package.digest(RESPONSE),
+            "program": "/usr/libexec/buzz-ci-production-qualification",
+            "request_validity_seconds": 60,
             "timeout_seconds": 5,
             "terminate_grace_seconds": 2,
             "principal": "qualification",
@@ -179,14 +184,17 @@ class ActivationFixture:
             0o600, 62001, 62001, "runner-active.json", runner_active,
         )
         executor = next(item for item in self.components if item["name"] == "executor")
-        execd_config = activation_package.canonical_json({
+        execd_template = {
             "schema_version": 2,
             "enabled_protocol": 2,
-            "capacity": 1,
+            "capacity": 0,
             "identities": {
                 "execd_uid": 0, "execd_gid": 0,
                 "runner_uid": 62001, "runner_gid": 62001,
                 "control_uid": 62004, "control_gid": 62004,
+                "control_user": "buzzci-ctl", "control_group": "buzzci-ctl",
+                "control_home": "/var/lib/buzzci/ctl", "control_shell": "/usr/sbin/nologin",
+                "control_supplementary_groups": ["buzzci-execd"],
                 "job_uid": 62006, "job_gid": 62006,
                 "access_group": "buzzci-execd", "access_group_gid": 62005,
                 "access_group_members": ["buzzci-ctl", "buzzci-runner"],
@@ -197,6 +205,7 @@ class ActivationFixture:
                 "evidence_root": "/var/lib/buzzci/execd-v2/evidence",
                 "teardown_root": "/var/lib/buzzci/execd-v2/teardown",
                 "attempt_root": "/var/lib/buzzci/execd-v2/attempts",
+                "qualification_root": "/var/lib/buzzci/execd-v2/qualification",
                 "executor_socket": "/run/buzzci/executor.sock",
             },
             "lane_manifest": lane_manifest,
@@ -207,10 +216,22 @@ class ActivationFixture:
                 "source_commit": executor["source_commit"],
                 "uid": 0, "gid": 0, "mode": 0o755,
             },
-        })
+            "qualification": {
+                "integrated_candidate_sha": "0" * 40,
+                "activation_package_digest": "0" * 64,
+                "fixture_digest": "0" * 64,
+                "controller_generation": 1,
+                "runner_generation": 1,
+            },
+        }
+        execd_template["qualification"]["integrated_candidate_sha"] = "a" * 40
+        execd_staged = activation_package.canonical_json(execd_template)
+        execd_active_template = copy.deepcopy(execd_template)
+        execd_active_template["capacity"] = 1
+        execd_active = activation_package.canonical_json(execd_active_template)
         self._asset_entry(
-            "execd_config", activation_package.CONFIG_TARGETS["execd_config"], "execd-v2.json",
-            execd_config, 0o600, 0, 0,
+            "execd_config", activation_package.CONFIG_TARGETS["execd_config"], "execd-staged-template.json",
+            execd_staged, 0o600, 0, 0, "execd-active-template.json", execd_active,
         )
         controld_staged = activation_package.canonical_json({
             "schema_version": 1, "capacity": 0, "store_root": "/var/lib/buzzci/controld",
@@ -270,6 +291,10 @@ class ActivationFixture:
             "runner_service_dropin": ("20-runner-capacity-one.conf", (ACTIVATION_ROOT / "templates/20-runner-capacity-one.conf").read_bytes()),
             "controld_service_dropin": ("20-controld-capacity-one.conf", (ACTIVATION_ROOT / "templates/20-controld-capacity-one.conf").read_bytes()),
             "keyholder_socket_dropin": ("20-keyholder-capacity-one.conf", (ACTIVATION_ROOT / "templates/20-keyholder-capacity-one.conf").read_bytes()),
+            "receipt_verifier_expected_stages": (
+                "buzz-ci-acceptance-expected-stages.json",
+                (ACTIVATION_ROOT.parent / "acceptance/expected-stages.json").read_bytes(),
+            ),
         }
         for role, (name, payload) in source_map.items():
             self._asset_entry(role, activation_package.STATIC_TARGETS[role], name, payload, 0o644, 0, 0)
@@ -286,14 +311,19 @@ class ActivationFixture:
         components: list[dict[str, object]] = []
         for index, (name, (binary_path, unit)) in enumerate(activation_package.COMPONENTS.items(), start=1):
             if name == "qualification":
-                binary = b"#!/usr/bin/python3\nimport sys\nsys.stdin.buffer.read()\nsys.stdout.buffer.write(" + repr(RESPONSE).encode() + b")\n"
+                binary = QUALIFICATION_SCRIPT
             elif name == "receipt_verifier":
                 binary = b"#!/usr/bin/python3\nraise SystemExit(0)\n"
             else:
                 binary = f"{name}-binary\n".encode()
             if name not in set(activation_package.INSTALLABLE_COMPONENT_ROLES.values()):
                 write_file(self.root / binary_path.lstrip("/"), binary, 0o755)
-            source_commit = "a" * 40 if name == "receipt_verifier" else f"{index:x}" * 40
+            source_commit = (
+                "a" * 40 if name == "receipt_verifier"
+                else activation_package.QUALIFICATION_SOURCE_COMMIT if name == "qualification"
+                else "a" * 40 if name == "executor"
+                else f"{index:x}" * 40
+            )
             provenance = activation_package.canonical_json({
                 "binary": Path(binary_path).name,
                 "profile": "release",
@@ -498,7 +528,7 @@ class ActivationControllerTests(unittest.TestCase):
 
         activated = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
         self.assertEqual((activated["state"], activated["capacity"]), ("active_one", 1))
-        self.assertEqual(activated["qualification"]["status"], "passed")
+        self.assertEqual(activated["qualification"]["status"], "qualified_closed")
         self.assertEqual(CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["status"], "unchanged")
         self.assertEqual(CONTROLLER.qualify(manifest, payloads, self.fixture.root, driver)["status"], "qualified")
 
@@ -515,6 +545,89 @@ class ActivationControllerTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), payloads[entry["source"]])
             else:
                 self.assertFalse(target.exists())
+
+    def test_stage_persists_staged_zero_before_starting_acceptance_control(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        observed: list[tuple[str, str]] = []
+        original_start = driver.start
+
+        def receipt_bound_start(name: str) -> None:
+            receipt = CONTROLLER._read_receipt(self.fixture.root)
+            observed.append((name, receipt["state"]))
+            if name == "buzz-ci-acceptance-control.service" and receipt["state"] != "staged_zero":
+                raise ValueError("acceptance-control refused activation receipt")
+            original_start(name)
+
+        driver.start = receipt_bound_start
+        staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertEqual(staged["state"], "staged_zero")
+        self.assertEqual([name for name, _state in observed], activation_package.STAGED_ZERO_UNITS)
+        self.assertTrue(all(state == "staged_zero" for _name, state in observed))
+
+    def test_stage_service_exit_compensates_to_exact_prior_state(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        original_start = driver.start
+        original_stop = driver.stop
+
+        def exiting_start(name: str) -> None:
+            original_start(name)
+            if name == "buzz-ci-acceptance-control.service":
+                original_stop(name)
+
+        driver.start = exiting_start
+        with self.assertRaisesRegex(ValueError, "staged-zero readback"):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual(receipt["state"], "stage_failed")
+        self.assertFalse((self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")).exists())
+        self.assertEqual(CONTROLLER._generated_prior_readback(receipt, self.fixture.root), {
+            "controld_acceptance_binding": "absent",
+            "acceptance_control_config": "absent",
+            "acceptance_driver_config": "absent",
+            "execd_config": "absent",
+        })
+        self.assertEqual(CONTROLLER._systemd_prior_readback(receipt, driver)["buzz-ci-acceptance-control.service"]["ActiveState"], "inactive")
+        self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["state"], "rolled_back")
+
+    def test_staged_zero_resume_restarts_only_missing_staged_unit(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        driver.stop("buzz-ci-acceptance-control.service")
+        restarted: list[str] = []
+        original_start = driver.start
+
+        def record_start(name: str) -> None:
+            restarted.append(name)
+            original_start(name)
+
+        driver.start = record_start
+        result = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertEqual((result["status"], result["state"]), ("unchanged", "staged_zero"))
+        self.assertEqual(restarted, activation_package.STAGED_ZERO_UNITS)
+        self.assertTrue(CONTROLLER._staged_zero_readback(manifest, driver)["units"])
+
+    def test_stage_compensation_aggregates_partial_systemd_failure(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        original_start = driver.start
+        original_stop = driver.stop
+
+        def exiting_start(name: str) -> None:
+            original_start(name)
+            if name == "buzz-ci-acceptance-control.service":
+                original_stop(name)
+
+        def partial_stop(name: str) -> None:
+            if name == "buzz-ci-runner.socket":
+                raise ValueError("injected stage compensation stop failure")
+            original_stop(name)
+
+        driver.start = exiting_start
+        driver.stop = partial_stop
+        with self.assertRaisesRegex(ValueError, "compensation=.*injected stage compensation stop failure"):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual(receipt["state"], "rollback_failed")
+        self.assertIn("restore active state buzz-ci-runner.socket", receipt["last_error"])
 
     def test_manifest_schema_mirrors_fixed_package_counts_and_systemd_abi(self) -> None:
         schema = json.loads((ACTIVATION_ROOT / "activation-manifest.schema.json").read_bytes())
@@ -544,7 +657,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "7818b9104369a86274a3f1f5a20f9929d697de11f1427a3b93081fb4fd73d7a8",
+            "87f985d2cefa08b60f0fcb0283363e1be12dc7533b7dc385535ffd2ded3c6871",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -910,6 +1023,9 @@ class ActivationControllerTests(unittest.TestCase):
         execd = json.loads(payloads[entries["execd_config"]["source"]])
         execd["executor"]["path"] = "/usr/bin/env"
         payloads[entries["execd_config"]["source"]] = activation_package.canonical_json(execd)
+        active_execd = json.loads(payloads[entries["execd_config"]["active_source"]])
+        active_execd["executor"]["path"] = "/usr/bin/env"
+        payloads[entries["execd_config"]["active_source"]] = activation_package.canonical_json(active_execd)
         with self.assertRaisesRegex(ValueError, "executor provenance"):
             CONTROLLER._validate_phase_configs(manifest, payloads)
 
@@ -929,20 +1045,42 @@ class ActivationControllerTests(unittest.TestCase):
         staged = json.loads(payloads[runner["source"]])
         active = json.loads(payloads[runner["active_source"]])
         broker = json.loads(payloads[execd["source"]])
+        active_broker = json.loads(payloads[execd["active_source"]])
 
         self.assertEqual((runner["target"], runner["install_mode"]), ("/etc/buzzci/runner-v2.json", "0600"))
         self.assertEqual((execd["target"], execd["install_mode"], execd["uid"], execd["gid"]), ("/etc/buzzci/execd-v2.json", "0600", 0, 0))
         self.assertEqual(staged, {"schema_version": 2, "controld_uid": 62002, "controld_gid": 62002, "mode": "dormant"})
         self.assertEqual((active["mode"], active["execd_socket"], active["execd_uid"], active["execd_gid"]), ("v2_proxy", "/run/buzzci/execd.sock", 0, 0))
-        self.assertEqual((broker["enabled_protocol"], broker["capacity"], activation_package.REGISTER_JOB_INTENT_OPERATION), (2, 1, 9))
+        self.assertEqual((broker["enabled_protocol"], broker["capacity"], active_broker["capacity"], activation_package.REGISTER_JOB_INTENT_OPERATION), (2, 0, 1, 9))
         self.assertEqual(broker["identities"]["access_group_members"], ["buzzci-ctl", "buzzci-runner"])
         self.assertEqual((broker["identities"]["control_uid"], broker["identities"]["job_uid"]), (62004, 62006))
+        self.assertEqual(
+            {key: broker["identities"][key] for key in (
+                "control_user", "control_group", "control_home", "control_shell", "control_supplementary_groups",
+            )},
+            {
+                "control_user": "buzzci-ctl", "control_group": "buzzci-ctl",
+                "control_home": "/var/lib/buzzci/ctl", "control_shell": "/usr/sbin/nologin",
+                "control_supplementary_groups": ["buzzci-execd"],
+            },
+        )
         self.assertEqual(broker["paths"]["intent_root"], activation_package.EXECD_INTENT_ROOT)
         self.assertEqual(broker["paths"]["executor_socket"], activation_package.EXECUTOR_SOCKET_PATH)
         self.assertEqual(active["lane_manifest_digest"], broker["lane_manifest_digest"])
         self.assertEqual(
             activation_package.lane_manifest_digest(broker["lane_manifest"]),
             "12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04",
+        )
+        qualification = next(item for item in manifest["components"] if item["name"] == "qualification")
+        qualification_entry = entries["qualification_binary"]
+        self.assertEqual(
+            (qualification["binary_path"], qualification["source_commit"], qualification_entry["target"], qualification_entry["install_mode"]),
+            (
+                "/usr/libexec/buzz-ci-production-qualification",
+                activation_package.QUALIFICATION_SOURCE_COMMIT,
+                "/usr/libexec/buzz-ci-production-qualification",
+                "0755",
+            ),
         )
         self.assertEqual(
             (activation_package.SECCOMP_PROFILE_PATH, activation_package.SECCOMP_PROFILE_DIGEST),
@@ -965,6 +1103,63 @@ class ActivationControllerTests(unittest.TestCase):
             ),
         )
 
+    def test_production_v2_request_is_post_freeze_persisted_and_closed(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        result = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["qualification"]
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        state = receipt["qualification"]
+        request_raw = base64.b64decode(state["request_base64"], validate=True)
+        request = json.loads(request_raw, object_pairs_hook=activation_package.reject_duplicates)
+        self.assertEqual(list(request), [
+            "schema_version", "request_id", "integrated_candidate_sha", "activation_package_digest",
+            "fixture_digest", "principal_digest", "lane_manifest_digest", "broker_build_identity_digest",
+            "host_profile_digest", "suite_digest", "isolation_profile_digest", "seccomp_profile_digest",
+            "executor_program_digest", "executor_provenance_digest", "nonce", "controller_generation",
+            "runner_generation", "lane_epoch", "admission_key_generation", "issued_at", "expires_at",
+        ])
+        self.assertEqual(request["schema_version"], CONTROLLER.QUALIFICATION_REQUEST_SCHEMA)
+        self.assertEqual((request["activation_package_digest"], request["fixture_digest"]), (manifest["package_digest"], self.fixture.binding["scenario_sha256"]))
+        self.assertEqual(request["expires_at"] - request["issued_at"], 60)
+        self.assertEqual(request["principal_digest"], CONTROLLER._qualification_principal_digest(manifest))
+        self.assertTrue(set(request).isdisjoint({"action", "program", "path", "argv", "environment"}))
+        self.assertEqual((state["status"], result["status"]), ("passed", "qualified_closed"))
+        before = request_raw
+        CONTROLLER.qualify(manifest, payloads, self.fixture.root, driver)
+        after = base64.b64decode(CONTROLLER._read_receipt(self.fixture.root)["qualification"]["request_base64"], validate=True)
+        self.assertEqual(after, before)
+
+    def test_production_v2_nonzero_exit_keeps_exact_pending_request(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        component = next(item for item in manifest["components"] if item["name"] == "qualification")
+        program = self.fixture.root / component["binary_path"].lstrip("/")
+        failure = b"#!/usr/bin/python3\nraise SystemExit(3)\n"
+        write_file(program, failure, 0o755)
+        component["binary_sha256"] = activation_package.digest(failure)
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        with self.assertRaisesRegex(ValueError, "failed with status 3"):
+            CONTROLLER._run_qualification(manifest, self.fixture.root, receipt)
+        persisted = CONTROLLER._read_receipt(self.fixture.root)["qualification"]
+        self.assertEqual(persisted["status"], "pending")
+        request = base64.b64decode(persisted["request_base64"], validate=True)
+        self.assertEqual(activation_package.digest(request), persisted["request_sha256"])
+
+    def test_receipt_verifier_stage_table_is_frozen_installed_and_rolled_back(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        entry = next(item for item in manifest["entries"] if item["role"] == "receipt_verifier_expected_stages")
+        self.assertEqual(
+            (entry["source_mode"], entry["install_mode"], entry["target"], entry["sha256"]),
+            (
+                "0400", "0644", "/usr/libexec/buzz-ci-acceptance-expected-stages.json",
+                activation_package.RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256,
+            ),
+        )
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        target = self.fixture.root / entry["target"].lstrip("/")
+        self.assertEqual((target.read_bytes(), stat.S_IMODE(target.stat().st_mode)), (payloads[entry["source"]], 0o644))
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertFalse(target.exists())
     def test_execd_contract_drift_is_rejected(self) -> None:
         mutations = (
             ("peer", lambda value: value["identities"].__setitem__("runner_uid", 62004), "peer and job identities"),
@@ -976,8 +1171,11 @@ class ActivationControllerTests(unittest.TestCase):
                 manifest, payloads, _driver = self.fixture.load()
                 entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
                 value = json.loads(payloads[entry["source"]])
+                active_value = json.loads(payloads[entry["active_source"]])
                 mutate(value)
+                mutate(active_value)
                 payloads[entry["source"]] = activation_package.canonical_json(value)
+                payloads[entry["active_source"]] = activation_package.canonical_json(active_value)
                 with self.assertRaisesRegex(ValueError, message):
                     CONTROLLER._validate_phase_configs(manifest, payloads)
 
@@ -986,7 +1184,10 @@ class ActivationControllerTests(unittest.TestCase):
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
         target = self.fixture.root / entry["target"].lstrip("/")
-        self.assertEqual((target.read_bytes(), stat.S_IMODE(target.stat().st_mode)), (payloads[entry["source"]], 0o600))
+        installed = json.loads(target.read_bytes())
+        self.assertEqual((installed["capacity"], installed["qualification"]["activation_package_digest"]), (0, manifest["package_digest"]))
+        self.assertEqual(installed["qualification"]["fixture_digest"], self.fixture.binding["scenario_sha256"])
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.fixture.root / "var/lib/buzzci").stat().st_mode), 0o711)
         for path, mode in (
             (activation_package.EXECD_INTENT_ROOT, 0o700),
@@ -994,6 +1195,7 @@ class ActivationControllerTests(unittest.TestCase):
             (activation_package.EXECD_EVIDENCE_ROOT, 0o700),
             (activation_package.EXECD_TEARDOWN_ROOT, 0o700),
             (activation_package.EXECD_ATTEMPT_ROOT, 0o711),
+            (activation_package.EXECD_QUALIFICATION_ROOT, 0o700),
         ):
             directory = self.fixture.root / path.lstrip("/")
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), mode)
@@ -1013,25 +1215,12 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual((target.read_bytes(), stat.S_IMODE(target.stat().st_mode)), (payloads[entry["source"]], 0o600))
 
     def test_qualification_process_is_hardened_and_manifest_principal_is_exact(self) -> None:
-        manifest, payloads, _driver = self.fixture.load()
-        component = next(item for item in manifest["components"] if item["name"] == "qualification")
-        program = self.fixture.root / component["binary_path"].lstrip("/")
-        script = b"""#!/usr/bin/python3
-import json
-import os
-status = open('/proc/self/status', encoding='utf-8').read().splitlines()
-no_new_privs = int(next(line.split()[1] for line in status if line.startswith('NoNewPrivs:')))
-print(json.dumps({'egid': os.getegid(), 'euid': os.geteuid(), 'leaked': os.getenv('ACTIVATION_TEST_LEAK'), 'no_new_privs': no_new_privs}, sort_keys=True, separators=(',', ':')))
-"""
-        write_file(program, script, 0o755)
-        component["binary_sha256"] = activation_package.digest(script)
-        expected = activation_package.canonical_json({
-            "egid": os.getegid(), "euid": os.geteuid(), "leaked": None, "no_new_privs": 1,
-        })
-        manifest["qualification"]["expected_response_sha256"] = activation_package.digest(expected)
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         os.environ["ACTIVATION_TEST_LEAK"] = "must-not-cross-exec"
         try:
-            self.assertEqual(CONTROLLER._run_qualification(manifest, payloads, self.fixture.root)["status"], "passed")
+            result = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["qualification"]
+            self.assertEqual(result["status"], "qualified_closed")
         finally:
             del os.environ["ACTIVATION_TEST_LEAK"]
         self.assertEqual(
@@ -1040,7 +1229,8 @@ print(json.dumps({'egid': os.getegid(), 'euid': os.geteuid(), 'leaked': os.geten
         )
 
     def test_qualification_timeout_kills_descendant_process_group(self) -> None:
-        manifest, payloads, _driver = self.fixture.load()
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         component = next(item for item in manifest["components"] if item["name"] == "qualification")
         program = self.fixture.root / component["binary_path"].lstrip("/")
         marker = self.fixture.temporary / "descendant.pid"
@@ -1062,8 +1252,9 @@ while True:
         write_file(program, script, 0o755)
         component["binary_sha256"] = activation_package.digest(script)
         manifest["qualification"]["timeout_seconds"] = 1
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
         with self.assertRaisesRegex(ValueError, "timed out"):
-            CONTROLLER._run_qualification(manifest, payloads, self.fixture.root)
+            CONTROLLER._run_qualification(manifest, self.fixture.root, receipt)
         descendant = int(marker.read_text())
         for _ in range(20):
             try:
@@ -1105,7 +1296,7 @@ while True:
             CONTROLLER._run_qualification = original_qualification
         self.assertEqual(
             stop_attempts,
-            ["buzz-ci-controld.service", *activation_package.STOP_ORDER, activation_package.PERSISTENT_UNIT],
+            [*activation_package.STOP_ORDER, activation_package.PERSISTENT_UNIT],
         )
         self.assertEqual(CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")["controld_config"], "staged")
         receipt = CONTROLLER._read_receipt(self.fixture.root)
@@ -1138,11 +1329,13 @@ while True:
 
     def test_qualification_executable_mode_drift_is_rejected(self) -> None:
         manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         qualification = next(item for item in manifest["components"] if item["name"] == "qualification")
         program = self.fixture.root / qualification["binary_path"].lstrip("/")
         program.chmod(0o700)
-        with self.assertRaisesRegex(ValueError, "target metadata drift"):
-            CONTROLLER.preflight(manifest, self.fixture.root, driver, require_dormant=True)
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        with self.assertRaisesRegex(ValueError, "executable metadata differs"):
+            CONTROLLER._run_qualification(manifest, self.fixture.root, receipt)
 
 
 class ActivationFreezerModeTests(unittest.TestCase):
@@ -1178,6 +1371,22 @@ class ActivationFreezerModeTests(unittest.TestCase):
             self.root, "receipt_verifier_binary", {}, {},
         )
         self.assertEqual((payload, actual_name), (source.read_bytes(), asset_name))
+
+    def test_receipt_verifier_expected_stages_accepts_private_nonexecutable_checkout(self) -> None:
+        role = "receipt_verifier_expected_stages"
+        relative, asset_name, git_mode, source_mode = FREEZER.TRACKED_REPO_SOURCES[role]
+        source = self.root / relative
+        payload = b'["capacity_zero_closed","prepare_capacity_zero"]\n'
+        write_file(source, payload, 0o600)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "core.sharedRepository", "true"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", str(relative)], check=True)
+        self.assertEqual(
+            (git_mode, source_mode, asset_name),
+            (0o100644, 0o400, "assets/buzz-ci-acceptance-expected-stages.json"),
+        )
+        observed, actual_name = FREEZER._static_payload(self.root, role, {}, {})
+        self.assertEqual((observed, actual_name), (payload, asset_name))
         installed = self.root / "installed-verifier"
         FREEZER._write_asset(installed, payload, 0o755)
         self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o755)

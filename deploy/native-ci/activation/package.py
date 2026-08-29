@@ -30,7 +30,7 @@ COMPONENTS = {
     "controld": ("/usr/libexec/buzz-ci-controld", "buzz-ci-controld.service"),
     "execd": ("/usr/libexec/buzz-ci-execd", "buzz-ci-execd.service"),
     "keyholder": ("/usr/libexec/buzz-ci-keyholder", "buzz-ci-keyholder.service"),
-    "qualification": ("/usr/libexec/buzz-ci-acceptance-ctl", None),
+    "qualification": ("/usr/libexec/buzz-ci-production-qualification", None),
     "executor": ("/usr/libexec/buzz-ci-executor", None),
     "acceptance_canary": ("/usr/libexec/buzz-ci-capacity-one-canary", None),
     "acceptance_driver": ("/usr/libexec/buzz-ci-capacity-one-driver", None),
@@ -39,6 +39,7 @@ COMPONENTS = {
 }
 
 INSTALLABLE_COMPONENT_ROLES = {
+    "qualification_binary": "qualification",
     "acceptance_canary_binary": "acceptance_canary",
     "acceptance_driver_binary": "acceptance_driver",
     "acceptance_control_binary": "acceptance_control",
@@ -48,6 +49,7 @@ TRACKED_INSTALL_ROLES = {
     "activation_controller": (0o500, 0o755),
     "activation_package_module": (0o500, 0o644),
     "receipt_verifier_binary": (0o500, 0o755),
+    "receipt_verifier_expected_stages": (0o400, 0o644),
 }
 
 IDENTITIES = {
@@ -121,10 +123,14 @@ EXECD_BINDING_ROOT = "/var/lib/buzzci/execd-v2/bindings"
 EXECD_EVIDENCE_ROOT = "/var/lib/buzzci/execd-v2/evidence"
 EXECD_TEARDOWN_ROOT = "/var/lib/buzzci/execd-v2/teardown"
 EXECD_ATTEMPT_ROOT = "/var/lib/buzzci/execd-v2/attempts"
+EXECD_QUALIFICATION_ROOT = "/var/lib/buzzci/execd-v2/qualification"
+EXECD_DYNAMIC_DIGEST_PLACEHOLDER = "0" * 64
 EXECUTOR_SOCKET_PATH = "/run/buzzci/executor.sock"
 RUNNER_REPLAY_JOURNAL = "/var/lib/buzzci/runner/v2-replay.json"
 SECCOMP_PROFILE_DIGEST = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 SECCOMP_PROFILE_PATH = f"/var/lib/buzzci/seccomp/v1/sha256/{SECCOMP_PROFILE_DIGEST}.json"
+RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "c8addbb42bace522e99fc8fe00603c9245db61ac8a599ef5762c2744267189cd"
+QUALIFICATION_SOURCE_COMMIT = "a86023a797aa6251001829aefcc30698b3580bc0"
 LANE_MANIFEST_DIGEST_DOMAIN = b"buzz-ci:lane-activation-manifest:v1\0"
 
 SOCKET_POLICY = {
@@ -182,6 +188,8 @@ STATIC_TARGETS = {
     "acceptance_driver_binary": COMPONENTS["acceptance_driver"][0],
     "acceptance_control_binary": COMPONENTS["acceptance_control"][0],
     "receipt_verifier_binary": COMPONENTS["receipt_verifier"][0],
+    "receipt_verifier_expected_stages": "/usr/libexec/buzz-ci-acceptance-expected-stages.json",
+    "qualification_binary": COMPONENTS["qualification"][0],
     "activation_controller": ACTIVATION_CONTROLLER_PATH,
     "activation_package_module": ACTIVATION_PACKAGE_MODULE_PATH,
     "execd_socket_dropin": "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",
@@ -359,7 +367,7 @@ def _validate_entry(value: object) -> dict[str, Any]:
     require_u32(value["uid"], f"entry {role} uid", allow_zero=True)
     require_u32(value["gid"], f"entry {role} gid", allow_zero=True)
     active = {"active_source", "active_source_mode", "active_sha256"}
-    if role in {"runner_config", "controld_config"}:
+    if role in {"runner_config", "execd_config", "controld_config"}:
         if not active <= set(value):
             raise ValueError(f"entry {role} requires a distinct active payload")
         require_asset(value["active_source"], f"entry {role} active source")
@@ -441,7 +449,11 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
     for role in STATIC_TARGETS:
         if entries_by_role[role]["uid"] != 0 or entries_by_role[role]["gid"] != 0:
             raise ValueError(f"static entry {role} must be root owned")
+    if entries_by_role["receipt_verifier_expected_stages"]["sha256"] != RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256:
+        raise ValueError("receipt verifier expected stages digest differs from the frozen contract")
     components_by_name = {item["name"]: item for item in validated_components}
+    if components_by_name["qualification"]["source_commit"] != QUALIFICATION_SOURCE_COMMIT:
+        raise ValueError("production-v2 qualification client source commit differs from the frozen ABI")
     for role, component_name in INSTALLABLE_COMPONENT_ROLES.items():
         entry = entries_by_role[role]
         component = components_by_name[component_name]
@@ -474,21 +486,19 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
         raise ValueError("qualification must be an object")
     require_keys(
         qualification,
-        {"program", "principal", "request_source", "request_sha256", "expected_response_sha256", "timeout_seconds", "terminate_grace_seconds"},
+        {"program", "principal", "request_validity_seconds", "timeout_seconds", "terminate_grace_seconds"},
         "qualification",
     )
     if qualification["program"] != COMPONENTS["qualification"][0] or qualification["principal"] != "qualification":
-        raise ValueError("qualification must use the fixed acceptance controller")
-    require_asset(qualification["request_source"], "qualification request")
-    for field in ("request_sha256", "expected_response_sha256"):
-        if not isinstance(qualification[field], str) or not SHA256.fullmatch(qualification[field]):
-            raise ValueError(f"qualification {field} is invalid")
+        raise ValueError("qualification must use the fixed production-v2 client")
+    if qualification["request_validity_seconds"] != 60:
+        raise ValueError("qualification request lifetime must be sixty seconds")
     timeout = qualification["timeout_seconds"]
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 300:
         raise ValueError("qualification timeout must be between 1 and 300 seconds")
     if qualification["terminate_grace_seconds"] != 2:
         raise ValueError("qualification termination grace must be two seconds")
-    all_sources = sources + [item["provenance_source"] for item in validated_components] + [qualification["request_source"]]
+    all_sources = sources + [item["provenance_source"] for item in validated_components]
     if len(all_sources) != len(set(all_sources)):
         raise ValueError("activation assets must not share source names")
 
@@ -729,22 +739,31 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         _positive_integer(runner_active[field], 9_007_199_254_740_991, f"runner {field}")
 
     execd = entries["execd_config"]
-    execd_value = _json_payload(payloads[execd["source"]], "execd v2 configuration")
+    if "active_source" not in execd:
+        raise ValueError("execd v2 configuration requires staged and active templates")
+    execd_staged = _json_payload(payloads[execd["source"]], "staged execd v2 configuration template")
+    execd_active = _json_payload(payloads[execd["active_source"]], "active execd v2 configuration template")
     execd_fields = {
         "schema_version", "enabled_protocol", "capacity", "identities", "paths",
-        "lane_manifest", "lane_manifest_digest", "executor",
+        "lane_manifest", "lane_manifest_digest", "executor", "qualification",
     }
-    if set(execd_value) != execd_fields:
+    if set(execd_staged) != execd_fields or set(execd_active) != execd_fields:
         raise ValueError("execd v2 configuration shape differs from production")
     if (
-        any(isinstance(execd_value[field], bool) for field in ("schema_version", "enabled_protocol", "capacity"))
-        or execd_value["schema_version"] != 2
-        or execd_value["enabled_protocol"] != EXECD_V2_PROTOCOL
-        or execd_value["capacity"] != 1
+        any(isinstance(value[field], bool) for value in (execd_staged, execd_active) for field in ("schema_version", "enabled_protocol", "capacity"))
+        or execd_staged["schema_version"] != 2
+        or execd_active["schema_version"] != 2
+        or execd_staged["enabled_protocol"] != EXECD_V2_PROTOCOL
+        or execd_active["enabled_protocol"] != EXECD_V2_PROTOCOL
+        or execd_staged["capacity"] != 0
+        or execd_active["capacity"] != 1
         or REGISTER_JOB_INTENT_OPERATION != 9
     ):
-        raise ValueError("execd configuration does not select capacity-one broker protocol v2")
-    identities = execd_value["identities"]
+        raise ValueError("execd configuration templates do not select closed-zero then capacity-one protocol v2")
+    for field in execd_fields - {"capacity"}:
+        if execd_staged[field] != execd_active[field]:
+            raise ValueError(f"execd configuration template field changes across capacity: {field}")
+    identities = execd_staged["identities"]
     expected_execd_identities = {
         "execd_uid": 0,
         "execd_gid": 0,
@@ -752,6 +771,11 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         "runner_gid": manifest["identities"]["runner"]["gid"],
         "control_uid": manifest["identities"]["qualification"]["uid"],
         "control_gid": manifest["identities"]["qualification"]["gid"],
+        "control_user": "buzzci-ctl",
+        "control_group": "buzzci-ctl",
+        "control_home": "/var/lib/buzzci/ctl",
+        "control_shell": "/usr/sbin/nologin",
+        "control_supplementary_groups": [ACCESS_GROUP_NAME],
         "job_uid": manifest["identities"]["job"]["uid"],
         "job_gid": manifest["identities"]["job"]["gid"],
         "access_group": ACCESS_GROUP_NAME,
@@ -766,14 +790,17 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         "evidence_root": EXECD_EVIDENCE_ROOT,
         "teardown_root": EXECD_TEARDOWN_ROOT,
         "attempt_root": EXECD_ATTEMPT_ROOT,
+        "qualification_root": EXECD_QUALIFICATION_ROOT,
         "executor_socket": EXECUTOR_SOCKET_PATH,
     }
-    if execd_value["paths"] != expected_paths:
+    if execd_staged["paths"] != expected_paths:
         raise ValueError("execd v2 intent, evidence, teardown, or executor path differs")
-    lane_digest = lane_manifest_digest(execd_value["lane_manifest"])
-    if execd_value["lane_manifest_digest"] != lane_digest:
+    lane_digest = lane_manifest_digest(execd_staged["lane_manifest"])
+    if execd_staged["lane_manifest_digest"] != lane_digest:
         raise ValueError("execd v2 lane manifest digest differs from the Rust contract")
     executor_component = next(item for item in manifest["components"] if item["name"] == "executor")
+    if executor_component["source_commit"] != manifest["source_commit"]:
+        raise ValueError("execd executor source commit differs from the integrated candidate")
     expected_executor = {
         "path": COMPONENTS["executor"][0],
         "sha256": executor_component["binary_sha256"],
@@ -782,9 +809,18 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         "gid": 0,
         "mode": 0o755,
     }
-    if execd_value["executor"] != expected_executor:
+    if execd_staged["executor"] != expected_executor:
         raise ValueError("execd v2 executor provenance differs from the packaged component")
-    lane_manifest = execd_value["lane_manifest"]
+    qualification_template = execd_staged["qualification"]
+    if qualification_template != {
+        "integrated_candidate_sha": manifest["source_commit"],
+        "activation_package_digest": EXECD_DYNAMIC_DIGEST_PLACEHOLDER,
+        "fixture_digest": EXECD_DYNAMIC_DIGEST_PLACEHOLDER,
+        "controller_generation": 1,
+        "runner_generation": 1,
+    }:
+        raise ValueError("execd qualification template is not the fixed post-freeze placeholder")
+    lane_manifest = execd_staged["lane_manifest"]
     if (
         runner_active["lane_manifest_digest"] != lane_digest
         or runner_active["lane_epoch"] != lane_manifest["lane_epoch"]
@@ -925,15 +961,12 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
     if SOCKET_POLICY["execd"]["path"].encode() in controld_encoded or COMPONENTS["execd"][0].encode() in controld_encoded:
         raise ValueError("controld configuration must not bypass the runner to reach execd")
 
-    if any(_contains_private_field(value) for value in (runner_staged, runner_active, execd_value, controld_staged, controld_active)):
+    if any(_contains_private_field(value) for value in (runner_staged, runner_active, execd_staged, execd_active, controld_staged, controld_active)):
         raise ValueError("activation packages cannot contain secrets or credentials")
 
 
 def validate_payloads(manifest: dict[str, Any], payloads: dict[str, bytes]) -> None:
     validate_phase_configs(manifest, payloads)
-    request_source = manifest["qualification"]["request_source"]
-    if len(payloads[request_source]) > 64 * 1024:
-        raise ValueError("qualification request exceeds 64 KiB")
 
 
 def rooted(root: Path, target: str) -> Path:
