@@ -682,6 +682,8 @@ def load_package(package: Path, *, live: bool) -> tuple[dict[str, Any], dict[str
             references[entry["active_source"]] = (activation_package.parse_mode(entry["active_source_mode"]), entry["active_sha256"])
     for component in manifest["components"]:
         references[component["provenance_source"]] = (0o400, component["provenance_sha256"])
+        if component["name"] == "controld":
+            references[component["package_manifest_source"]] = (0o400, component["package_manifest_sha256"])
     actual_assets = {f"assets/{item.name}" for item in (package / "assets").iterdir()}
     if actual_assets != set(references):
         raise ValueError("activation package has missing or extra assets")
@@ -711,6 +713,8 @@ def _package_references(manifest: dict[str, Any]) -> dict[str, int]:
             references[entry["active_source"]] = activation_package.parse_mode(entry["active_source_mode"])
     for component in manifest["components"]:
         references[component["provenance_source"]] = 0o400
+        if component["name"] == "controld":
+            references[component["package_manifest_source"]] = 0o400
     return references
 
 
@@ -845,14 +849,27 @@ class LiveSystemd:
             raise ValueError(f"incomplete systemd readback: {name}")
         return values
 
-    def fragment_path(self, name: str) -> str:
+    def effective_paths(self, name: str) -> dict[str, object]:
         if not activation_package.UNIT.fullmatch(name):
             raise ValueError("invalid systemd unit name")
-        result = self._run(SYSTEMCTL, ["show", "--no-pager", "--property=FragmentPath", name])
-        key, separator, value = result.stdout.decode("utf-8").strip().partition("=")
-        if key != "FragmentPath" or not separator:
-            raise ValueError(f"incomplete systemd fragment readback: {name}")
-        return value
+        result = self._run(
+            SYSTEMCTL,
+            ["show", "--no-pager", "--property=FragmentPath,DropInPaths", name],
+        )
+        values: dict[str, str] = {}
+        for line in result.stdout.decode("utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+        if set(values) != {"FragmentPath", "DropInPaths"}:
+            raise ValueError(f"incomplete systemd effective-path readback: {name}")
+        drop_ins = values["DropInPaths"].split() if values["DropInPaths"] else []
+        if len(drop_ins) != len(set(drop_ins)):
+            raise ValueError(f"duplicated systemd drop-in readback: {name}")
+        return {"fragment_path": values["FragmentPath"], "drop_in_paths": drop_ins}
+
+    def fragment_path(self, name: str) -> str:
+        return str(self.effective_paths(name)["fragment_path"])
 
     def process(self, name: str) -> dict[str, object]:
         if not activation_package.UNIT.fullmatch(name) or not name.endswith(".service"):
@@ -971,6 +988,7 @@ class FakeSystemd:
         identities: dict[str, object],
         access_group: dict[str, object],
         socket_policy: dict[str, object],
+        effective_systemd: list[dict[str, object]],
     ) -> None:
         if root == Path("/"):
             raise ValueError("fake systemd requires a non-root filesystem")
@@ -985,6 +1003,7 @@ class FakeSystemd:
         self.planned_identities = identities
         self.access_group = access_group
         self.socket_policy = socket_policy
+        self.effective_systemd = {item["unit"]: item for item in effective_systemd}
 
     def _read(self) -> dict[str, Any]:
         value, _raw, metadata = activation_package.parse_json(self.state_path)
@@ -1002,15 +1021,27 @@ class FakeSystemd:
         unit = state["units"].get(name)
         if not isinstance(unit, dict):
             return {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled"}
-        return dict(unit)
+        return {
+            key: str(unit[key])
+            for key in ("LoadState", "ActiveState", "SubState", "UnitFileState")
+        }
+
+    def effective_paths(self, name: str) -> dict[str, object]:
+        unit = self._read()["units"].get(name)
+        if not isinstance(unit, dict) or unit.get("LoadState") != "loaded":
+            return {"fragment_path": "", "drop_in_paths": []}
+        fragment_path = unit.get("FragmentPath")
+        drop_in_paths = unit.get("DropInPaths")
+        if not isinstance(fragment_path, str) or not isinstance(drop_in_paths, list):
+            raise ValueError(f"incomplete fake systemd effective-path readback: {name}")
+        if any(not isinstance(path, str) for path in drop_in_paths):
+            raise ValueError(f"invalid fake systemd drop-in path: {name}")
+        if len(drop_in_paths) != len(set(drop_in_paths)):
+            raise ValueError(f"duplicated systemd drop-in readback: {name}")
+        return {"fragment_path": fragment_path, "drop_in_paths": list(drop_in_paths)}
 
     def fragment_path(self, name: str) -> str:
-        role = activation_package.PACKAGE_UNIT_ROLES.get(name)
-        if self.unit(name)["LoadState"] != "loaded":
-            return ""
-        if role is not None:
-            return activation_package.STATIC_TARGETS[role]
-        return CAPACITY_ONE_FRAGMENT_PATHS.get(name, f"/etc/systemd/system/{name}")
+        return str(self.effective_paths(name)["fragment_path"])
 
     def process(self, name: str) -> dict[str, object]:
         unit = self._read()["units"].get(name)
@@ -1074,16 +1105,26 @@ class FakeSystemd:
 
     def daemon_reload(self) -> None:
         state = self._read()
-        for unit, role in activation_package.PACKAGE_UNIT_ROLES.items():
-            unit_path = activation_package.rooted(self.root, activation_package.STATIC_TARGETS[role])
+        for unit, effective in self.effective_systemd.items():
+            fragment_path = str(effective["fragment"]["path"])
+            unit_path = activation_package.rooted(self.root, fragment_path)
             if unit_path.exists():
                 state["units"].setdefault(unit, {
                     "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
                 })
                 state["units"][unit]["LoadState"] = "loaded"
+                state["units"][unit]["FragmentPath"] = fragment_path
+                drop_in_directory = activation_package.rooted(
+                    self.root, f"/etc/systemd/system/{unit}.d",
+                )
+                state["units"][unit]["DropInPaths"] = (
+                    [f"/etc/systemd/system/{unit}.d/{path.name}" for path in sorted(drop_in_directory.glob("*.conf"), key=lambda item: item.name.encode())]
+                    if drop_in_directory.is_dir() else []
+                )
             else:
                 state["units"][unit] = {
                     "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
+                    "FragmentPath": "", "DropInPaths": [],
                 }
         self._write(state)
 
@@ -1293,6 +1334,77 @@ def _unit_readback(driver: LiveSystemd | FakeSystemd, names: list[str]) -> dict[
     return {name: driver.unit(name) for name in names}
 
 
+def _systemd_file_digest(root: Path, record: dict[str, object], where: str) -> str:
+    opened = _read_target(root, str(record["path"]), activation_package.MAX_ASSET_BYTES)
+    if opened is None:
+        raise ValueError(f"effective systemd file is missing: {where}")
+    payload, _metadata = opened
+    observed = activation_package.digest(payload)
+    if observed != record["sha256"]:
+        raise ValueError(f"effective systemd file digest differs: {where}")
+    return observed
+
+
+def _effective_systemd_readback(
+    manifest: dict[str, Any],
+    root: Path,
+    driver: LiveSystemd | FakeSystemd,
+    *,
+    phase: str,
+    names: set[str] | None = None,
+) -> dict[str, dict[str, object]]:
+    if phase not in {"prior", "installed"}:
+        raise ValueError("effective systemd phase is invalid")
+    result: dict[str, dict[str, object]] = {}
+    inventory = {item["unit"]: item for item in manifest["effective_systemd"]}
+    selected = sorted(inventory if names is None else names)
+    if not set(selected) <= set(inventory):
+        raise ValueError("effective systemd readback names differ from the manifest")
+    for name in selected:
+        item = inventory[name]
+        fragment = item["fragment"]
+        state = driver.unit(name)
+        paths = driver.effective_paths(name)
+        expected_fragment = (
+            fragment
+            if phase == "installed" or fragment["owner"] != "activation" or state["LoadState"] == "loaded"
+            else None
+        )
+        expected_drop_ins = [
+            record for record in item["drop_ins"]
+            if (
+                phase == "installed"
+                or record["owner"] != "activation"
+                or _read_target(root, str(record["path"]), activation_package.MAX_ASSET_BYTES) is not None
+            )
+        ]
+        if expected_fragment is None:
+            if state["LoadState"] != "not-found" or paths != {"fragment_path": "", "drop_in_paths": []}:
+                raise ValueError(f"absent activation systemd unit has an effective path: {name}")
+            result[name] = {**state, "fragment_path": "", "fragment_sha256": None, "drop_in_paths": [], "drop_in_sha256": []}
+            continue
+        if state["LoadState"] != "loaded":
+            raise ValueError(f"effective systemd unit is not loaded: {name}")
+        expected_paths = [record["path"] for record in expected_drop_ins]
+        if paths["fragment_path"] != expected_fragment["path"]:
+            raise ValueError(f"effective systemd fragment is relocated: {name}")
+        if paths["drop_in_paths"] != expected_paths:
+            raise ValueError(f"effective systemd drop-in paths or order differ: {name}")
+        fragment_sha256 = _systemd_file_digest(root, expected_fragment, f"{name} fragment")
+        drop_in_sha256 = [
+            _systemd_file_digest(root, record, f"{name} drop-in {index}")
+            for index, record in enumerate(expected_drop_ins)
+        ]
+        result[name] = {
+            **state,
+            "fragment_path": paths["fragment_path"],
+            "fragment_sha256": fragment_sha256,
+            "drop_in_paths": list(paths["drop_in_paths"]),
+            "drop_in_sha256": drop_in_sha256,
+        }
+    return result
+
+
 def _preflight_units(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, str]]:
     names = sorted(set(activation_package.START_ORDER + activation_package.STOP_ORDER))
     result = _unit_readback(driver, names)
@@ -1332,15 +1444,15 @@ def _installed_unit_readback(
         state = driver.unit(unit)
         if state["LoadState"] != "loaded":
             raise ValueError(f"installed package-owned systemd unit is not loaded: {unit}")
-        fragment_path = driver.fragment_path(unit)
-        if fragment_path != entry["target"]:
-            raise ValueError(f"installed package-owned systemd fragment differs: {unit}")
-        result[unit] = {"fragment_path": fragment_path, "sha256": entry["sha256"], **state}
+        result[unit] = {"sha256": entry["sha256"], **state}
     for unit in activation_package.DEPENDENCY_UNITS:
         state = driver.unit(unit)
         if state["LoadState"] != "loaded":
             raise ValueError(f"required dependency systemd unit is not loaded after installation: {unit}")
         result[unit] = state
+    effective = _effective_systemd_readback(manifest, root, driver, phase="installed")
+    for unit, readback in effective.items():
+        result[unit] = {**result[unit], **readback}
     return result
 
 
@@ -1389,7 +1501,10 @@ def preflight(
     for role in ("runner_config", "controld_config"):
         if managed[role] != "staged":
             raise ValueError(f"frozen component config is absent before activation: {role}")
-    units = _preflight_units(driver) if require_dormant else {}
+    units: dict[str, dict[str, object]] = {}
+    if require_dormant:
+        _preflight_units(driver)
+        units = _effective_systemd_readback(manifest, root, driver, phase="prior")
     keyholder_config = _keyholder_config_readback(manifest, root, payloads)
     return {
         "activation_id": manifest["activation_id"],
@@ -1447,9 +1562,8 @@ def _new_receipt(
             "path": FIXED_PACKAGE_PATH,
             "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest)),
         },
-        "systemd_before": _unit_readback(
-            driver,
-            sorted(set(activation_package.START_ORDER + activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])),
+        "systemd_before": _effective_systemd_readback(
+            manifest, root, driver, phase="prior",
         ),
         "qualification": None,
         "capacity_one": None,
@@ -1734,20 +1848,25 @@ def _restore_systemd_prior_errors(
 
 
 def _systemd_prior_readback(
-    receipt: dict[str, Any], driver: LiveSystemd | FakeSystemd,
-) -> dict[str, dict[str, str]]:
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+) -> dict[str, dict[str, object]]:
     prior = receipt["systemd_before"]
-    observed = _unit_readback(driver, sorted(prior))
+    observed = _effective_systemd_readback(manifest, root, driver, phase="prior")
     for name, expected in prior.items():
-        for field in ("ActiveState", "UnitFileState"):
+        for field in (
+            "LoadState", "ActiveState", "UnitFileState", "fragment_path",
+            "fragment_sha256", "drop_in_paths", "drop_in_sha256",
+        ):
             if observed[name][field] != expected[field]:
                 raise ValueError(f"systemd prior readback differs for {name} {field}")
     return observed
 
 
-def _zero_readback(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, str]]:
+def _zero_readback(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+) -> dict[str, dict[str, object]]:
     names = sorted(set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT]))
-    result = _unit_readback(driver, names)
+    result = _effective_systemd_readback(manifest, root, driver, phase="installed", names=set(names))
     for name, state in result.items():
         if state["ActiveState"] != "inactive":
             raise ValueError(f"capacity-zero readback found active unit: {name}")
@@ -1758,10 +1877,10 @@ def _zero_readback(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, str
 
 
 def _staged_zero_readback(
-    manifest: dict[str, Any], driver: LiveSystemd | FakeSystemd,
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
     names = sorted(set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT]))
-    units = _unit_readback(driver, names)
+    units = _effective_systemd_readback(manifest, root, driver, phase="installed", names=set(names))
     staged = set(activation_package.STAGED_ZERO_UNITS)
     for name, state in units.items():
         wanted = "active" if name in staged else "inactive"
@@ -1777,10 +1896,10 @@ def _staged_zero_readback(
 
 
 def _staged_zero_convergence_readback(
-    manifest: dict[str, Any], driver: LiveSystemd | FakeSystemd,
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
     names = sorted(set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT]))
-    units = _unit_readback(driver, names)
+    units = _effective_systemd_readback(manifest, root, driver, phase="installed", names=set(names))
     staged = set(activation_package.STAGED_ZERO_UNITS)
     for name, state in units.items():
         if name in staged:
@@ -2153,6 +2272,7 @@ def _prepare_zero_readback(manifest: dict[str, Any], root: Path, driver: LiveSys
         raise ValueError("activation receipt is absent")
     _bind_receipt(receipt, manifest)
     _verify_generated(root, receipt["acceptance_generated"])
+    _effective_systemd_readback(manifest, root, driver, phase="installed")
     for unit in (
         "buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service",
         "buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service",
@@ -2165,7 +2285,10 @@ def _prepare_zero_readback(manifest: dict[str, Any], root: Path, driver: LiveSys
 def _finalized_zero_readback(manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd) -> dict[str, object]:
     managed_targets = _verify_phase(manifest, root, "staged")
     _verify_fixed_package(manifest, root)
-    units = _unit_readback(driver, sorted(set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT])))
+    units = _effective_systemd_readback(
+        manifest, root, driver, phase="installed",
+        names=set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT]),
+    )
     keep = {"buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service"}
     for name, state in units.items():
         wanted = "active" if name in keep else "inactive"
@@ -2410,7 +2533,7 @@ def _compensate_failed_stage(
         ("prior target readback", lambda: _prior_readback(receipt, manifest, root)),
         ("acceptance prior readback", lambda: _generated_prior_readback(receipt, root)),
         ("acceptance ledger prior readback", lambda: _acceptance_ledger_prior_readback(receipt, root)),
-        ("systemd prior readback", lambda: _systemd_prior_readback(receipt, driver)),
+        ("systemd prior readback", lambda: _systemd_prior_readback(receipt, manifest, root, driver)),
     ):
         try:
             readback()
@@ -2448,10 +2571,10 @@ def stage(
                     generated_readback = _verify_generated(root, existing["acceptance_generated"])
                     fixed_package = _verify_fixed_package(manifest, root)
                     installed_units = _installed_unit_readback(manifest, root, driver)
-                    _staged_zero_convergence_readback(manifest, driver)
+                    _staged_zero_convergence_readback(manifest, root, driver)
                     for unit in activation_package.STAGED_ZERO_UNITS:
                         driver.start(unit)
-                    staged_zero = _staged_zero_readback(manifest, driver)
+                    staged_zero = _staged_zero_readback(manifest, root, driver)
                     return {
                         "status": "unchanged",
                         "state": "staged_zero",
@@ -2489,7 +2612,7 @@ def stage(
         driver.daemon_reload()
         installed_units = _installed_unit_readback(manifest, root, driver)
         _stop_to_zero(driver)
-        _zero_readback(driver)
+        _zero_readback(manifest, root, driver)
         _remove_captured_ledger(root, receipt["acceptance_ledger_prior"])
         principals = _identity_readback(driver, manifest["identities"], allow_absent=False)
         access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=False)
@@ -2499,7 +2622,7 @@ def stage(
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         for unit in activation_package.STAGED_ZERO_UNITS:
             driver.start(unit)
-        staged_zero = _staged_zero_readback(manifest, driver)
+        staged_zero = _staged_zero_readback(manifest, root, driver)
         return {
             "status": "staged",
             "state": "staged_zero",
@@ -2963,7 +3086,7 @@ def _return_to_staged_zero(
     except BaseException as error:
         errors.append(f"acceptance generated readback: {error}")
     try:
-        staged_zero = _staged_zero_readback(manifest, driver)
+        staged_zero = _staged_zero_readback(manifest, root, driver)
     except BaseException as error:
         errors.append(f"capacity-zero readback: {error}")
     if errors:
@@ -3017,7 +3140,7 @@ def _set_capacity_one(
     _verify_phase(manifest, root, "staged")
     _verify_generated(root, receipt["acceptance_generated"], phase="staged")
     _keyholder_config_readback(manifest, root, payloads)
-    _staged_zero_readback(manifest, driver)
+    _staged_zero_readback(manifest, root, driver)
     processes_before = _process_snapshot(driver)
     _validate_staged_processes(driver, processes_before)
     state.update({
@@ -3098,7 +3221,7 @@ def activate(
             "capacity": 0,
             "managed_targets": _verify_phase(manifest, root, "staged"),
             "generated_targets": _verify_generated(root, receipt["acceptance_generated"], phase="staged"),
-            "staged_zero": _staged_zero_readback(manifest, driver),
+            "staged_zero": _staged_zero_readback(manifest, root, driver),
             "qualification": receipt["qualification"],
         }
     if receipt["state"] != "staged_zero":
@@ -3106,7 +3229,7 @@ def activate(
     _verify_phase(manifest, root, "staged")
     _verify_generated(root, receipt["acceptance_generated"], phase="staged")
     _keyholder_config_readback(manifest, root, payloads)
-    _staged_zero_readback(manifest, driver)
+    _staged_zero_readback(manifest, root, driver)
     receipt.update({"state": "activating", "updated_at": utc_now(), "last_error": None})
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     try:
@@ -3115,7 +3238,7 @@ def activate(
         qualification = _run_qualification(manifest, root, receipt)
         driver.stop("buzz-ci-execd.service")
         driver.stop("buzz-ci-execd.socket")
-        staged_zero = _staged_zero_readback(manifest, driver)
+        staged_zero = _staged_zero_readback(manifest, root, driver)
         _verify_phase(manifest, root, "staged")
         _verify_generated(root, receipt["acceptance_generated"], phase="staged")
         receipt.update({"state": "qualified_closed", "updated_at": utc_now(), "last_error": None})
@@ -3410,7 +3533,7 @@ def rollback(
             "acceptance_generated": _generated_prior_readback(receipt, root),
             "acceptance_ledger": _acceptance_ledger_prior_readback(receipt, root),
             "fixed_package": "absent",
-            "units": _systemd_prior_readback(receipt, driver),
+            "units": _systemd_prior_readback(receipt, manifest, root, driver),
         }
     if receipt["state"] not in {
         "preparing", "stage_failed", "staged_zero", "qualified_closed", "activating", "active_one", "preparing_zero", "rollback_failed",
@@ -3450,7 +3573,7 @@ def rollback(
         errors.append(f"prior target readback: {error}")
     try:
         errors.extend(_restore_systemd_prior_errors(receipt, driver))
-        units = _systemd_prior_readback(receipt, driver)
+        units = _systemd_prior_readback(receipt, manifest, root, driver)
     except BaseException as error:
         errors.append(f"systemd prior readback: {error}")
     generated_prior: dict[str, str] | None = None
@@ -3510,7 +3633,7 @@ def check_current(
             "principals": _identity_readback(driver, manifest["identities"], allow_absent=False),
             "access_group": _access_group_readback(driver, manifest["access_group"], allow_absent=False),
             "acceptance_generated": _verify_generated(root, receipt["acceptance_generated"]),
-            "staged_zero": _staged_zero_readback(manifest, driver),
+            "staged_zero": _staged_zero_readback(manifest, root, driver),
         }
     if receipt["state"] == "qualified_closed":
         return {
@@ -3521,7 +3644,7 @@ def check_current(
             "acceptance_generated": _verify_generated(root, receipt["acceptance_generated"]),
             "fixed_package": _verify_fixed_package(manifest, root),
             "qualification": receipt["qualification"],
-            "staged_zero": _staged_zero_readback(manifest, driver),
+            "staged_zero": _staged_zero_readback(manifest, root, driver),
         }
     if receipt["state"] == "active_one":
         action = receipt["capacity_one"]
@@ -3537,7 +3660,7 @@ def check_current(
             "status": "rollback_and_restage_required", "state": "qualification_uncertain", "capacity": 0,
             "managed_targets": _verify_phase(manifest, root, "staged"),
             "acceptance_generated": _verify_generated(root, receipt["acceptance_generated"]),
-            "staged_zero": _staged_zero_readback(manifest, driver),
+            "staged_zero": _staged_zero_readback(manifest, root, driver),
             "qualification": receipt["qualification"],
         }
     raise ValueError(f"activation receipt requires recovery: {receipt['state']}")
@@ -3546,7 +3669,10 @@ def check_current(
 def _driver(root: Path, fake_state: Path | None, manifest: dict[str, Any]) -> LiveSystemd | FakeSystemd:
     if fake_state is None:
         return LiveSystemd(root)
-    return FakeSystemd(root, fake_state, manifest["identities"], manifest["access_group"], manifest["socket_policy"])
+    return FakeSystemd(
+        root, fake_state, manifest["identities"], manifest["access_group"],
+        manifest["socket_policy"], manifest["effective_systemd"],
+    )
 
 
 def main() -> int:

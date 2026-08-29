@@ -15,6 +15,7 @@
     "components",
     "entries",
     "systemd",
+    "effective_systemd",
     "socket_policy",
     "qualification",
     "package_uid",
@@ -67,8 +68,8 @@
     },
     "entries": {
       "type": "array",
-      "minItems": 30,
-      "maxItems": 30,
+      "minItems": 29,
+      "maxItems": 29,
       "items": { "$ref": "#/$defs/entry" }
     },
     "systemd": {
@@ -101,6 +102,12 @@
         "stage_capacity": 0,
         "active_capacity": 1
       }
+    },
+    "effective_systemd": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": { "$ref": "#/$defs/effectiveUnit" }
     },
     "socket_policy": {
       "const": {
@@ -362,7 +369,45 @@
         "unit": {
           "type": ["string", "null"],
           "pattern": "^[a-z0-9][a-z0-9@_.-]+\\.service$"
+        },
+        "package_manifest_source": { "$ref": "#/$defs/asset" },
+        "package_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "package_digest": { "$ref": "#/$defs/sha256" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "name": { "const": "controld" } }, "required": ["name"] },
+          "then": { "required": ["package_manifest_source", "package_manifest_sha256", "package_digest"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["package_manifest_source"] },
+                { "required": ["package_manifest_sha256"] },
+                { "required": ["package_digest"] }
+              ]
+            }
+          }
         }
+      ]
+    },
+    "effectivePath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "path", "sha256"],
+      "properties": {
+        "owner": { "enum": ["activation", "runner", "controld", "keyholder"] },
+        "path": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "effectiveUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "fragment", "drop_ins"],
+      "properties": {
+        "unit": { "type": "string", "pattern": "^[a-z0-9][a-z0-9@_.-]+\\.(service|socket|target)$" },
+        "fragment": { "$ref": "#/$defs/effectivePath" },
+        "drop_ins": { "type": "array", "items": { "$ref": "#/$defs/effectivePath" } }
       }
     },
     "entry": {
@@ -387,7 +432,6 @@
             "sysusers",
             "tmpfiles",
             "capacity_target",
-            "controld_acceptance_socket",
             "acceptance_control_socket",
             "acceptance_control_service",
             "acceptance_tmpfiles",
@@ -424,7 +468,6 @@
             "/usr/lib/sysusers.d/buzzci-activation.conf",
             "/usr/lib/tmpfiles.d/buzzci-activation.conf",
             "/etc/systemd/system/buzz-ci-capacity-one.target",
-            "/etc/systemd/system/buzz-ci-controld-acceptance.socket",
             "/etc/systemd/system/buzz-ci-acceptance-control.socket",
             "/etc/systemd/system/buzz-ci-acceptance-control.service",
             "/usr/lib/tmpfiles.d/buzzci-acceptance.conf",

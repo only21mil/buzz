@@ -19,6 +19,12 @@ keyholder package solely owns
 reference, peer operations, selectors, origin, owner, and mode but never writes
 the file.
 
+The controld package solely owns
+`/etc/systemd/system/buzz-ci-controld-acceptance.socket`. Activation does not
+publish or roll back that path. Its manifest binds the canonical controld
+package-manifest digest and the exact controld service and acceptance-socket
+bytes.
+
 Live `stage`, `activate`, and `rollback` actions require root and use exact
 `/usr/bin/systemd-sysusers`, `/usr/bin/systemd-tmpfiles`, and
 `/usr/bin/systemctl` paths without a shell or sudo. Tests select the fake
@@ -63,6 +69,11 @@ services and sockets to be inactive. A pre-existing enabled and listening execd
 socket is captured as baseline state. Managed activation files must be absent or
 match the staged payload exactly. The runner and controld closed configs must
 already exist with their frozen staged bytes and metadata.
+For all 13 lifecycle units, the controller reads both `FragmentPath` and
+ordered `DropInPaths`. It independently hashes every returned fragment and
+drop-in. Dormant checks allow only manifest-bound dependencies and exact
+activation files captured as prior state. Every later phase rejects missing,
+extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
 
 1. `stage --scenario` validates the exact scenario, installs the generated
    sysusers, tmpfiles, acceptance binaries and units, target, drop-ins, and
@@ -273,11 +284,15 @@ directories never receive this exception.
 It renders exact numeric sysusers entries, copies the reviewed systemd files,
 checks all config and provenance digests, writes a canonical manifest, and
 binds the activation ID to its package digest.
+The draft's controld component names a mode-`0400` copy of the frozen controld
+`package-manifest.json` in `--asset-root`. The freezer checks its canonical
+package digest, source commit, and both controld unit entries.
 
-Clean-host preflight permits `not-found` only for the four units installed by
-this package. Every external dependency unit must already be loaded. After
-installation and `daemon-reload`, staging requires all four units loaded and
-re-reads each installed unit file's exact digest and metadata before starting
+Clean-host preflight permits `not-found` only for the seven fragments installed
+by this package. Every external dependency unit, including the controld
+acceptance socket, must already be loaded from its sole package owner. After
+installation and `daemon-reload`, staging requires all 13 lifecycle units
+loaded and re-reads 18 exact fragment/drop-in paths and digests before starting
 any staged service.
 
 Before using a package against `/`, transfer its root, `assets` directory,
@@ -329,3 +344,18 @@ python3 -m json.tool deploy/native-ci/activation/activation-manifest.schema.json
 systemd-analyze verify --recursive-errors=no \
   deploy/native-ci/activation/templates/buzz-ci-capacity-one.target
 ```
+
+Run the collision gate against the exact five final manifests before install:
+
+```bash
+deploy/native-ci/activation/check_package_inventory.py \
+  --runner /private/runner/package-manifest.json \
+  --controld /private/controld/package-manifest.json \
+  --keyholder /private/keyholder/package-manifest.json \
+  --execd /private/execd/package-manifest.json \
+  --activation /private/activation/activation-manifest.json
+```
+
+Only the byte-identical dormant runner and controld configs are modeled as
+shared targets. Every other duplicate fails, even with identical bytes. A
+modeled config share fails if its digest, mode, UID, or GID differs.

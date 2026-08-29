@@ -51,7 +51,9 @@ reads an evidence filesystem.
 The disabled `buzz-ci-controld-acceptance.socket` binds
 `/run/buzzci/controld-acceptance.sock` as root:`buzzci-ctl` mode `0620` and names
 the inherited descriptor `buzz-ci-controld-acceptance`. Installation does not
-enable or start it.
+enable or start it. The controld package is its sole package owner. Activation
+binds the canonical controld package-manifest digest and reads back this
+fragment's exact path and bytes, but never republishes or removes it.
 
 The service runs as the pre-existing `buzzci-controld` account. Its config is
 mode `0600` and owned by that account. Its store is mode `0700` and owned by the
