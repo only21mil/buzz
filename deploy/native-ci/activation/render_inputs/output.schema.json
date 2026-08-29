@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/activation-rendered-evidence-input-v1.json",
+  "oneOf": [
+    {"$ref": "#/$defs/draft"},
+    {"$ref": "../../acceptance/scenario.schema.json"},
+    {"$ref": "../tests/clean_host_e2e/contract.schema.json"},
+    {"$ref": "#/$defs/residue"},
+    {"$ref": "#/$defs/sealedFreeze"}
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$", "not": {"pattern": "^0+$"}},
+    "candidate": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"pattern": "^0+$"}},
+    "draft": {
+      "type": "object",
+      "required": ["schema", "source_commit", "default_state", "identities", "components", "entries", "access_group", "acceptance_template", "systemd", "socket_policy", "qualification", "package_uid", "package_gid"],
+      "properties": {
+        "schema": {"const": "buzz-ci-capacity-one-activation-draft-v1"},
+        "source_commit": {"$ref": "#/$defs/candidate"}
+      }
+    },
+    "claims": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protected_ci", "tier2"],
+      "properties": {"protected_ci": {"const": false}, "tier2": {"const": false}}
+    },
+    "proof": {
+      "type": "object", "additionalProperties": false,
+      "required": ["configs_sha256", "units_sha256", "sockets_absent", "processes_absent", "encrypted_credentials_absent", "relay_residue_absent"],
+      "properties": {
+        "configs_sha256": {"$ref": "#/$defs/sha"}, "units_sha256": {"$ref": "#/$defs/sha"},
+        "sockets_absent": {"const": true}, "processes_absent": {"const": true},
+        "encrypted_credentials_absent": {"const": true}, "relay_residue_absent": {"const": true}
+      }
+    },
+    "digestMap": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder", "execd", "activation"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/sha"}, "controld": {"$ref": "#/$defs/sha"},
+        "keyholder": {"$ref": "#/$defs/sha"}, "execd": {"$ref": "#/$defs/sha"},
+        "activation": {"$ref": "#/$defs/sha"}
+      }
+    },
+    "residue": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_sha", "claims", "contract_sha256", "dormant_proof", "evidence_manifest_sha256", "lifecycle_status", "receipt_sha256", "verifier_sha256"],
+      "properties": {
+        "schema_version": {"const": "buzz-ci-clean-host-residue-receipt-input/v1"},
+        "candidate_sha": {"$ref": "#/$defs/candidate"}, "claims": {"$ref": "#/$defs/claims"},
+        "contract_sha256": {"$ref": "#/$defs/sha"}, "dormant_proof": {"$ref": "#/$defs/proof"},
+        "evidence_manifest_sha256": {"$ref": "#/$defs/sha"}, "lifecycle_status": {"const": "verified_pass"},
+        "receipt_sha256": {"$ref": "#/$defs/sha"}, "verifier_sha256": {"$ref": "#/$defs/sha"}
+      }
+    },
+    "sealedFreeze": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_sha", "claims", "contract_sha256", "evidence_manifest_sha256", "lifecycle_status", "package_manifest_sha256", "package_tree_sha256", "public_binding_sha256", "receipt_sha256", "scenario_sha256", "verifier_sha256"],
+      "properties": {
+        "schema_version": {"const": "buzz-ci-sealed-freeze-receipt-input/v1"},
+        "candidate_sha": {"$ref": "#/$defs/candidate"}, "claims": {"$ref": "#/$defs/claims"},
+        "contract_sha256": {"$ref": "#/$defs/sha"}, "evidence_manifest_sha256": {"$ref": "#/$defs/sha"},
+        "lifecycle_status": {"const": "verified_pass"}, "package_manifest_sha256": {"$ref": "#/$defs/digestMap"},
+        "package_tree_sha256": {"$ref": "#/$defs/digestMap"}, "public_binding_sha256": {"$ref": "#/$defs/sha"},
+        "receipt_sha256": {"$ref": "#/$defs/sha"}, "scenario_sha256": {"$ref": "#/$defs/sha"},
+        "verifier_sha256": {"$ref": "#/$defs/sha"}
+      }
+    }
+  }
+}
