@@ -267,6 +267,97 @@ class KeyholderPackageTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
         self.assertEqual(INSTALLER.install(self.package, root)["status"], "unchanged")
 
+    def test_post_validation_package_swap_cannot_change_published_bytes(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        expected = self.binary.read_bytes()
+        original_parse = INSTALLER.parse_package
+
+        def swap_after_validation(package: Path, install_root: Path):
+            parsed = original_parse(package, install_root)
+            asset = package / "assets/buzz-ci-keyholder"
+            asset.unlink()
+            asset.write_bytes(b"caller-controlled substitute\n")
+            asset.chmod(0o500)
+            return parsed
+
+        with mock.patch.object(INSTALLER, "parse_package", side_effect=swap_after_validation):
+            INSTALLER.install(self.package, root)
+        self.assertEqual((root / "usr/libexec/buzz-ci-keyholder").read_bytes(), expected)
+
+    def test_publication_failure_restores_targets_and_removes_new_receipt(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        target = root / "usr/libexec/buzz-ci-keyholder"
+        target.parent.mkdir(mode=0o755)
+        target.parent.chmod(0o755)
+        prior = b"prior keyholder binary\n"
+        target.write_bytes(prior)
+        target.chmod(0o700)
+        original_publish = INSTALLER._atomic_publish
+        failed = False
+
+        def fail_after_first_publish(*args, **kwargs) -> None:
+            nonlocal failed
+            original_publish(*args, **kwargs)
+            if not failed:
+                failed = True
+                raise OSError("forced target readback failure")
+
+        with mock.patch.object(INSTALLER, "_atomic_publish", side_effect=fail_after_first_publish):
+            with self.assertRaisesRegex(OSError, "forced target readback failure"):
+                INSTALLER.install(self.package, root)
+        self.assertEqual(target.read_bytes(), prior)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+        receipt_directory = root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/")
+        self.assertFalse((receipt_directory / "receipt-v1.json").exists())
+        self.assertEqual(list(receipt_directory.glob("prior-*")) if receipt_directory.exists() else [], [])
+
+    def test_receipt_readback_failure_restores_all_targets_and_receipt_artifacts(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        target = root / "usr/libexec/buzz-ci-keyholder"
+        target.parent.mkdir(mode=0o755)
+        target.parent.chmod(0o755)
+        prior = b"prior keyholder binary\n"
+        target.write_bytes(prior)
+        target.chmod(0o700)
+        original_read = INSTALLER._read_receipt
+        present_reads = 0
+
+        def fail_final_readback(directory_fd: int, name: str, *, absent_ok: bool):
+            nonlocal present_reads
+            result = original_read(directory_fd, name, absent_ok=absent_ok)
+            if name == "receipt-v1.json" and not absent_ok:
+                present_reads += 1
+                if present_reads == 2:
+                    raise OSError("forced receipt readback failure")
+            return result
+
+        with mock.patch.object(INSTALLER, "_read_receipt", side_effect=fail_final_readback):
+            with self.assertRaisesRegex(OSError, "forced receipt readback failure"):
+                INSTALLER.install(self.package, root)
+        self.assertEqual(target.read_bytes(), prior)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+        receipt_directory = root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/")
+        self.assertFalse(receipt_directory.exists())
+
+    def test_existing_receipt_retry_completes_and_then_is_unchanged(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        INSTALLER.install(self.package, root)
+        target = root / "usr/libexec/buzz-ci-keyholder"
+        target.unlink()
+        retried = INSTALLER.install(self.package, root)
+        self.assertEqual(retried["status"], "installed")
+        self.assertEqual(retried["changed_targets"], ["/usr/libexec/buzz-ci-keyholder"])
+        self.assertEqual(target.read_bytes(), self.binary.read_bytes())
+        self.assertEqual(INSTALLER.install(self.package, root)["status"], "unchanged")
+
     def test_fresh_host_not_found_installs_exec_start_and_rollback_restores_absence(self) -> None:
         self.freeze()
         root = self.make_root()
@@ -363,6 +454,36 @@ class KeyholderPackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "package binding differs"):
             INSTALLER.install(self.package, root)
 
+    def test_credential_rejects_intermediate_symlink_and_path_replacement_race(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        credential = self.add_credential(root)
+        original_directory = credential.parents[1]
+        outside = self.base / "outside-credentials"
+        shutil.copytree(original_directory, outside)
+        shutil.rmtree(original_directory)
+        original_directory.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "path is unsafe"):
+            INSTALLER.validate_encrypted_credential(root)
+
+        original_directory.unlink()
+        shutil.copytree(outside, original_directory)
+        real_open = os.open
+        opens = 0
+
+        def replace_during_revalidation(path, flags, *args, **kwargs):
+            nonlocal opens
+            if path == "credstore.encrypted":
+                opens += 1
+                if opens == 2:
+                    original_directory.rename(root / "etc/credstore.encrypted-held")
+                    shutil.copytree(outside, original_directory)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(INSTALLER.os, "open", side_effect=replace_during_revalidation):
+            with self.assertRaisesRegex(ValueError, "path changed during validation"):
+                INSTALLER.validate_encrypted_credential(root)
+
     def test_parent_rename_during_publish_fails_exact_readback(self) -> None:
         self.freeze()
         root = self.make_root()
@@ -380,8 +501,11 @@ class KeyholderPackageTests(unittest.TestCase):
             return real_rename(source, destination, *args, **kwargs)
 
         with mock.patch.object(INSTALLER.os, "rename", side_effect=hostile_rename):
-            with self.assertRaisesRegex(ValueError, "readback differs"):
+            with self.assertRaisesRegex(ValueError, "directory changed"):
                 INSTALLER.install(self.package, root)
+        self.assertFalse((root / "usr/libexec-moved/buzz-ci-keyholder").exists())
+        self.assertFalse((root / "usr/libexec/buzz-ci-keyholder").exists())
+        self.assertFalse((root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/") / "receipt-v1.json").exists())
 
     def test_fresh_restrictive_umask_checkout_freezes_identically(self) -> None:
         clone = self.base / "clone"

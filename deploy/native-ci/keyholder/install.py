@@ -51,6 +51,7 @@ class Entry:
     gid: int
     sha256: str
     size: int
+    payload: bytes
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -292,7 +293,7 @@ def parse_package(package: Path, root: Path | None = None) -> tuple[dict[str, ob
                 or sha256(payload) != item["sha256"]
             ):
                 raise ValueError("package asset differs")
-            entries.append(Entry(role, source, str(item["target"]), source_mode, install_mode, int(item["uid"]), int(item["gid"]), str(item["sha256"]), int(item["size"])))
+            entries.append(Entry(role, source, str(item["target"]), source_mode, install_mode, int(item["uid"]), int(item["gid"]), str(item["sha256"]), int(item["size"]), payload))
         if {entry.role for entry in entries} != set(EXPECTED_TARGETS) or len({entry.source for entry in entries}) != len(entries):
             raise ValueError("package inventory is ambiguous")
         binary = next(entry for entry in entries if entry.role == "binary")
@@ -356,25 +357,73 @@ def validate_host(root: Path, manifest: dict[str, object]) -> None:
 
 
 def validate_encrypted_credential(root: Path) -> None:
-    path = rooted(root, str(freeze_package.CREDENTIAL_CONTRACT["encrypted_source"]))
+    target = str(freeze_package.CREDENTIAL_CONTRACT["encrypted_source"])
+    parts = Path(target.removeprefix("/")).parts
+    root_fd = _open_root(root)
+    descriptors: list[int] = []
+    current = os.dup(root_fd)
     try:
-        metadata = path.lstat()
-        parent_metadata = path.parent.lstat()
-    except FileNotFoundError as error:
-        raise ValueError("acceptance encrypted credential is unavailable") from error
-    if (
-        not stat.S_ISDIR(parent_metadata.st_mode)
-        or parent_metadata.st_uid != mapped_id(0, root)
-        or parent_metadata.st_gid != mapped_id(0, root, group=True)
-        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or metadata.st_uid != mapped_id(0, root)
-        or metadata.st_gid != mapped_id(0, root, group=True)
-        or stat.S_IMODE(metadata.st_mode) != 0o400
-        or not 1 <= metadata.st_size <= 64 * 1024
-    ):
-        raise ValueError("acceptance encrypted credential metadata is invalid")
+        try:
+            for index, component in enumerate(parts):
+                final = index == len(parts) - 1
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                if not final:
+                    flags |= os.O_DIRECTORY
+                child = os.open(component, flags, dir_fd=current)
+                metadata = os.fstat(child)
+                if final:
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                        or metadata.st_uid != mapped_id(0, root)
+                        or metadata.st_gid != mapped_id(0, root, group=True)
+                        or stat.S_IMODE(metadata.st_mode) != 0o400
+                        or not 1 <= metadata.st_size <= 64 * 1024
+                    ):
+                        os.close(child)
+                        raise ValueError("acceptance encrypted credential metadata is invalid")
+                elif (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != mapped_id(0, root)
+                    or metadata.st_gid != mapped_id(0, root, group=True)
+                    or metadata.st_mode & 0o022
+                    or (index == len(parts) - 2 and stat.S_IMODE(metadata.st_mode) != 0o700)
+                ):
+                    os.close(child)
+                    raise ValueError("acceptance encrypted credential path is unsafe")
+                descriptors.append(child)
+                os.close(current)
+                current = os.dup(child)
+        except FileNotFoundError as error:
+            raise ValueError("acceptance encrypted credential is unavailable") from error
+        except OSError as error:
+            raise ValueError("acceptance encrypted credential path is unsafe") from error
+
+        observed = os.dup(root_fd)
+        try:
+            for index, (component, expected) in enumerate(zip(parts, descriptors, strict=True)):
+                expected_metadata = os.fstat(expected)
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                if index != len(parts) - 1:
+                    flags |= os.O_DIRECTORY
+                child = os.open(component, flags, dir_fd=observed)
+                actual_metadata = os.fstat(child)
+                os.close(observed)
+                observed = child
+                if (actual_metadata.st_dev, actual_metadata.st_ino) != (
+                    expected_metadata.st_dev,
+                    expected_metadata.st_ino,
+                ):
+                    raise ValueError("acceptance encrypted credential path changed during validation")
+        except OSError as error:
+            raise ValueError("acceptance encrypted credential path changed during validation") from error
+        finally:
+            os.close(observed)
+    finally:
+        os.close(current)
+        for descriptor in descriptors:
+            os.close(descriptor)
+        os.close(root_fd)
 
 
 def _open_root(root: Path) -> int:
@@ -394,12 +443,20 @@ def _open_chain(root_fd: int, target: str, root: Path, *, create: bool, created:
                 if not create:
                     raise
                 mode = final_mode if index == len(parts) - 1 and final_mode is not None else 0o755
-                os.mkdir(component, mode, dir_fd=descriptor)
-                os.chown(component, mapped_id(0, root), mapped_id(0, root, group=True), dir_fd=descriptor, follow_symlinks=False)
-                os.chmod(component, mode, dir_fd=descriptor, follow_symlinks=False)
-                if created is not None:
-                    created.append(current)
+                made = False
+                try:
+                    os.mkdir(component, mode, dir_fd=descriptor)
+                    made = True
+                except FileExistsError:
+                    pass
                 child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=descriptor)
+                if made:
+                    os.fchown(child, mapped_id(0, root), mapped_id(0, root, group=True))
+                    os.fchmod(child, mode)
+                    os.fsync(child)
+                    os.fsync(descriptor)
+                    if created is not None:
+                        created.append(current)
             metadata = os.fstat(child)
             wanted_mode = final_mode if index == len(parts) - 1 else None
             if (
@@ -445,6 +502,65 @@ def _desired(root: Path, entry: Entry) -> dict[str, object]:
     }
 
 
+@dataclass(frozen=True)
+class _PriorTarget:
+    payload: bytes
+    mode: int
+    uid: int
+    gid: int
+
+    def state(self) -> dict[str, object]:
+        return {
+            "sha256": sha256(self.payload),
+            "size": len(self.payload),
+            "mode": self.mode,
+            "uid": self.uid,
+            "gid": self.gid,
+        }
+
+
+@dataclass
+class _TargetPlan:
+    entry: Entry
+    directory_fd: int
+    components: tuple[str, ...]
+    name: str
+    current: _PriorTarget | None
+
+
+def _prior_target_at(directory_fd: int, name: str) -> _PriorTarget | None:
+    try:
+        payload, metadata = _read_at(directory_fd, name)
+    except FileNotFoundError:
+        return None
+    return _PriorTarget(
+        payload,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _directory_binding_matches(root_fd: int, components: tuple[str, ...], expected_fd: int) -> bool:
+    current = os.dup(root_fd)
+    try:
+        for component in components:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = child
+        actual = os.fstat(current)
+        expected = os.fstat(expected_fd)
+        return (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+    except OSError:
+        return False
+    finally:
+        os.close(current)
+
+
 def _atomic_publish(parent_fd: int, name: str, payload: bytes, mode: int, uid: int, gid: int) -> None:
     temporary = f".{name}.{uuid.uuid4().hex}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode, dir_fd=parent_fd)
@@ -453,7 +569,10 @@ def _atomic_publish(parent_fd: int, name: str, payload: bytes, mode: int, uid: i
         os.fchown(descriptor, uid, gid)
         view = memoryview(payload)
         while view:
-            view = view[os.write(descriptor, view):]
+            written = os.write(descriptor, view)
+            if written == 0:
+                raise OSError("short write while publishing keyholder package")
+            view = view[written:]
         os.fsync(descriptor)
         metadata = os.fstat(descriptor)
         if metadata.st_uid != uid or metadata.st_gid != gid or stat.S_IMODE(metadata.st_mode) != mode or metadata.st_size != len(payload):
@@ -487,13 +606,13 @@ def _write_once(directory_fd: int, name: str, payload: bytes, mode: int, uid: in
     os.fsync(directory_fd)
 
 
-def _receipt_directory(root_fd: int, root: Path, *, create: bool) -> int:
+def _receipt_directory(root_fd: int, root: Path, *, create: bool, created: list[str] | None = None) -> int:
     modes = (("/var", 0o755), ("/var/lib", 0o755), ("/var/lib/buzzci", 0o711), (RECEIPT_DIRECTORY, 0o700))
     descriptor = -1
     for target, mode in modes:
         if descriptor >= 0:
             os.close(descriptor)
-        descriptor = _open_chain(root_fd, target, root, create=create, final_mode=mode)
+        descriptor = _open_chain(root_fd, target, root, create=create, created=created, final_mode=mode)
     return descriptor
 
 
@@ -552,45 +671,169 @@ def _validate_install_receipt(receipt: dict[str, object], manifest: dict[str, ob
             raise ValueError("keyholder install receipt change fields differ")
 
 
-def _package_payload(package: Path, entry: Entry) -> bytes:
-    assets_fd = _require_directory(package / "assets", package.lstat().st_uid, package.lstat().st_gid, 0o700)
-    try:
-        return _read_at(assets_fd, entry.source.removeprefix("assets/"))[0]
-    finally:
-        os.close(assets_fd)
-
-
-def _prepare_receipt(root: Path, root_fd: int, directory_fd: int, manifest: dict[str, object], entries: list[Entry], created: list[str]) -> dict[str, object]:
+def _prepare_receipt(root: Path, directory_fd: int, manifest: dict[str, object], plans: list[_TargetPlan], created: list[str]) -> dict[str, object]:
     changes: list[dict[str, object]] = []
-    for entry in entries:
-        state = _state(root_fd, root, entry)
+    written: list[str] = []
+    for plan in plans:
+        entry = plan.entry
+        state = None if plan.current is None else plan.current.state()
         if state == _desired(root, entry):
             continue
         record: dict[str, object] = {"target": entry.target, "existed": state is not None}
         if state is not None:
             record.update(state)
             record["backup"] = f"prior-{len(changes)}"
-            parent_fd, name = _open_parent(root_fd, entry.target, root)
-            try:
-                payload, _ = _read_at(parent_fd, name)
-            finally:
-                os.close(parent_fd)
-            _write_once(directory_fd, str(record["backup"]), payload, 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
         changes.append(record)
     receipt = {
         "schema": RECEIPT_SCHEMA, "package_id": manifest["package_id"], "package_digest": manifest["package_digest"],
         "source_commit": manifest["source_commit"], "binary_provenance_sha256": manifest["binary_provenance_sha256"],
-        "managed": [{"target": entry.target, "sha256": entry.sha256, "size": entry.size, "mode": entry.install_mode, "uid": entry.uid, "gid": entry.gid} for entry in entries],
+        "managed": [{"target": plan.entry.target, "sha256": plan.entry.sha256, "size": plan.entry.size, "mode": plan.entry.install_mode, "uid": plan.entry.uid, "gid": plan.entry.gid} for plan in plans],
         "changes": changes, "created_directories": created,
     }
-    _write_once(directory_fd, "receipt-v1.json", canonical_json(receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
-    return receipt
+    by_target = {plan.entry.target: plan for plan in plans}
+    try:
+        for record in changes:
+            if not record["existed"]:
+                continue
+            name = str(record["backup"])
+            prior = by_target[str(record["target"])].current
+            assert prior is not None
+            _write_once(directory_fd, name, prior.payload, 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
+            written.append(name)
+        _write_once(directory_fd, "receipt-v1.json", canonical_json(receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
+        written.append("receipt-v1.json")
+        pair = _read_receipt(directory_fd, "receipt-v1.json", absent_ok=False)
+        assert pair is not None
+        if pair[0] != receipt:
+            raise ValueError("keyholder install receipt readback differs")
+        return receipt
+    except BaseException:
+        for name in reversed(written):
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.fsync(directory_fd)
+        raise
 
 
 def _prior_state(record: dict[str, object]) -> dict[str, object] | None:
     if not record["existed"]:
         return None
     return {field: record[field] for field in ("sha256", "size", "mode", "uid", "gid")}
+
+
+def _open_target_plans(root_fd: int, root: Path, entries: list[Entry]) -> list[_TargetPlan]:
+    plans: list[_TargetPlan] = []
+    try:
+        for entry in entries:
+            directory_fd, name = _open_parent(root_fd, entry.target, root)
+            components = Path(entry.target).parent.parts[1:]
+            plan = _TargetPlan(
+                entry,
+                directory_fd,
+                components,
+                name,
+                _prior_target_at(directory_fd, name),
+            )
+            if not _directory_binding_matches(root_fd, components, directory_fd):
+                os.close(directory_fd)
+                raise ValueError(f"target directory changed during planning: {entry.target}")
+            plans.append(plan)
+        return plans
+    except BaseException:
+        for plan in plans:
+            os.close(plan.directory_fd)
+        raise
+
+
+def _receipt_priors(
+    root: Path,
+    directory_fd: int,
+    receipt: dict[str, object],
+) -> dict[str, _PriorTarget | None]:
+    priors: dict[str, _PriorTarget | None] = {}
+    for record in receipt["changes"]:
+        target = str(record["target"])
+        if not record["existed"]:
+            priors[target] = None
+            continue
+        payload, metadata = _read_at(directory_fd, str(record["backup"]))
+        if (
+            metadata.st_uid != mapped_id(0, root)
+            or metadata.st_gid != mapped_id(0, root, group=True)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or len(payload) != record["size"]
+            or sha256(payload) != record["sha256"]
+        ):
+            raise ValueError("keyholder install receipt backup differs")
+        priors[target] = _PriorTarget(
+            payload,
+            int(record["mode"]),
+            int(record["uid"]),
+            int(record["gid"]),
+        )
+    return priors
+
+
+def _restore_targets(plans: list[_TargetPlan], priors: dict[str, _PriorTarget | None]) -> None:
+    errors: list[BaseException] = []
+    by_target = {plan.entry.target: plan for plan in plans}
+    for target, prior in reversed(tuple(priors.items())):
+        plan = by_target[target]
+        try:
+            if prior is None:
+                try:
+                    os.unlink(plan.name, dir_fd=plan.directory_fd)
+                except FileNotFoundError:
+                    pass
+                os.fsync(plan.directory_fd)
+                if _prior_target_at(plan.directory_fd, plan.name) is not None:
+                    raise ValueError(f"new keyholder target remains after rollback: {target}")
+            else:
+                _atomic_publish(
+                    plan.directory_fd,
+                    plan.name,
+                    prior.payload,
+                    prior.mode,
+                    prior.uid,
+                    prior.gid,
+                )
+        except BaseException as error:
+            errors.append(error)
+    if errors:
+        raise RuntimeError("; ".join(str(error) for error in errors))
+
+
+def _remove_receipt_artifacts(directory_fd: int, receipt: dict[str, object]) -> None:
+    names = ["receipt-v1.json"] + [
+        str(record["backup"])
+        for record in receipt["changes"]
+        if record["existed"]
+    ]
+    for name in names:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+    os.fsync(directory_fd)
+    for name in names:
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise ValueError(f"keyholder receipt artifact remains after rollback: {name}")
+
+
+def _remove_created_directories(root_fd: int, root: Path, created: list[str]) -> None:
+    targets = sorted(set(created), key=lambda target: len(Path(target).parts), reverse=True)
+    for target in targets:
+        parent_fd, name = _open_parent(root_fd, target, root)
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
 
 
 def _result(status: str, manifest: dict[str, object], changed: list[str]) -> dict[str, object]:
@@ -646,6 +889,13 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             raise PermissionError("installation requires root")
         root_fd = _open_root(root)
         created: list[str] = []
+        receipt_created: list[str] = []
+        plans: list[_TargetPlan] = []
+        receipt_fd = -1
+        receipt: dict[str, object] | None = None
+        priors: dict[str, _PriorTarget | None] = {}
+        new_receipt = False
+        transaction_ready = False
         try:
             if dry_run:
                 changed = []
@@ -660,42 +910,90 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             for directory in manifest["directories"]:
                 descriptor = _open_chain(root_fd, str(directory["target"]), root, create=True, created=created)
                 os.close(descriptor)
-            receipt_fd = _receipt_directory(root_fd, root, create=True)
-            try:
-                if _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=True) is not None:
-                    raise ValueError("keyholder package was already rolled back")
-                receipt_pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=True)
-                if receipt_pair is None:
-                    receipt = _prepare_receipt(root, root_fd, receipt_fd, manifest, entries, created)
-                    new_receipt = True
-                else:
-                    receipt = receipt_pair[0]
-                    new_receipt = False
-                _validate_install_receipt(receipt, manifest, entries)
-                changes = {record["target"]: record for record in receipt["changes"]}
-                changed: list[str] = []
-                for entry in entries:
-                    current = _state(root_fd, root, entry)
-                    desired = _desired(root, entry)
-                    if current == desired:
-                        continue
-                    record = changes.get(entry.target)
-                    if record is None or current != _prior_state(record):
-                        raise ValueError(f"installed target drift blocks replay: {entry.target}")
-                    parent_fd, name = _open_parent(root_fd, entry.target, root)
-                    try:
-                        _atomic_publish(parent_fd, name, _package_payload(package, entry), entry.install_mode, mapped_id(entry.uid, root), mapped_id(entry.gid, root, group=True))
-                    finally:
-                        os.close(parent_fd)
-                    if _state(root_fd, root, entry) != desired:
-                        raise ValueError(f"installed target readback differs: {entry.target}")
-                    changed.append(entry.target)
-                if any(_state(root_fd, root, entry) != _desired(root, entry) for entry in entries):
+            plans = _open_target_plans(root_fd, root, entries)
+            receipt_fd = _receipt_directory(root_fd, root, create=True, created=receipt_created)
+            if _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=True) is not None:
+                raise ValueError("keyholder package was already rolled back")
+            receipt_pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=True)
+            if receipt_pair is None:
+                new_receipt = True
+                receipt = _prepare_receipt(root, receipt_fd, manifest, plans, created)
+            else:
+                receipt = receipt_pair[0]
+            _validate_install_receipt(receipt, manifest, entries)
+            priors = _receipt_priors(root, receipt_fd, receipt)
+            changes = {str(record["target"]): record for record in receipt["changes"]}
+            for plan in plans:
+                plan.current = _prior_target_at(plan.directory_fd, plan.name)
+                current = None if plan.current is None else plan.current.state()
+                desired = _desired(root, plan.entry)
+                record = changes.get(plan.entry.target)
+                if current != desired and (record is None or current != _prior_state(record)):
+                    raise ValueError(f"installed target drift blocks replay: {plan.entry.target}")
+                if not _directory_binding_matches(root_fd, plan.components, plan.directory_fd):
+                    raise ValueError(f"target directory changed during installation: {plan.entry.target}")
+            transaction_ready = True
+            changed: list[str] = []
+            for plan in plans:
+                desired = _desired(root, plan.entry)
+                current = _prior_target_at(plan.directory_fd, plan.name)
+                if current is not None and current.state() == desired:
+                    continue
+                _atomic_publish(
+                    plan.directory_fd,
+                    plan.name,
+                    plan.entry.payload,
+                    plan.entry.install_mode,
+                    mapped_id(plan.entry.uid, root),
+                    mapped_id(plan.entry.gid, root, group=True),
+                )
+                current = _prior_target_at(plan.directory_fd, plan.name)
+                if current is None or current.state() != desired:
+                    raise ValueError(f"installed target readback differs: {plan.entry.target}")
+                if not _directory_binding_matches(root_fd, plan.components, plan.directory_fd):
+                    raise ValueError(f"target directory changed during installation: {plan.entry.target}")
+                changed.append(plan.entry.target)
+            pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=False)
+            assert pair is not None
+            if pair[0] != receipt:
+                raise ValueError("keyholder install receipt readback differs")
+            for plan in plans:
+                current = _prior_target_at(plan.directory_fd, plan.name)
+                if current is None or current.state() != _desired(root, plan.entry):
                     raise ValueError("keyholder package exact readback differs")
-                return _result("installed" if changed or new_receipt else "unchanged", manifest, changed)
-            finally:
-                os.close(receipt_fd)
+                if not _directory_binding_matches(root_fd, plan.components, plan.directory_fd):
+                    raise ValueError("keyholder publication directory changed during installation")
+            receipt_components = Path(RECEIPT_DIRECTORY).parts[1:]
+            if not _directory_binding_matches(root_fd, receipt_components, receipt_fd):
+                raise ValueError("keyholder receipt directory changed during installation")
+            validate_encrypted_credential(root)
+            return _result("installed" if changed or new_receipt else "unchanged", manifest, changed)
+        except BaseException as error:
+            rollback_errors: list[BaseException] = []
+            if transaction_ready:
+                try:
+                    _restore_targets(plans, priors)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if new_receipt and receipt is not None and receipt_fd >= 0:
+                try:
+                    _remove_receipt_artifacts(receipt_fd, receipt)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if created or receipt_created:
+                try:
+                    _remove_created_directories(root_fd, root, created + receipt_created)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if rollback_errors:
+                detail = "; ".join(str(rollback_error) for rollback_error in rollback_errors)
+                raise RuntimeError(f"keyholder installation rollback failed: {detail}") from error
+            raise
         finally:
+            if receipt_fd >= 0:
+                os.close(receipt_fd)
+            for plan in plans:
+                os.close(plan.directory_fd)
             os.close(root_fd)
     finally:
         os.umask(previous_umask)
