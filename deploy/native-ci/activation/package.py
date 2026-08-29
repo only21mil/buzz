@@ -30,6 +30,15 @@ COMPONENTS = {
     "keyholder": ("/usr/libexec/buzz-ci-keyholder", "buzz-ci-keyholder.service"),
     "qualification": ("/usr/libexec/buzz-ci-acceptance-ctl", None),
     "executor": ("/usr/libexec/buzz-ci-executor", None),
+    "acceptance_canary": ("/usr/libexec/buzz-ci-capacity-one-canary", None),
+    "acceptance_driver": ("/usr/libexec/buzz-ci-capacity-one-driver", None),
+    "acceptance_control": ("/usr/libexec/buzz-ci-acceptance-control", "buzz-ci-acceptance-control.service"),
+}
+
+INSTALLABLE_COMPONENT_ROLES = {
+    "acceptance_canary_binary": "acceptance_canary",
+    "acceptance_driver_binary": "acceptance_driver",
+    "acceptance_control_binary": "acceptance_control",
 }
 
 IDENTITIES = {
@@ -46,6 +55,8 @@ IDENTITY_HOMES = {
 }
 ACCESS_GROUP_NAME = "buzzci-execd"
 ACCESS_GROUP_MEMBERS = ["buzzci-ctl", "buzzci-runner"]
+ACCEPTANCE_BINDING_PATH = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
+ACCEPTANCE_BINDING_SCHEMA = "buzz-ci-controld-acceptance-binding/v1"
 
 CONFIG_TARGETS = {
     "runner_config": "/etc/buzzci/runner-v1.json",
@@ -54,13 +65,19 @@ CONFIG_TARGETS = {
 }
 
 START_ORDER = [
+    "buzz-ci-controld-acceptance.socket",
+    "buzz-ci-acceptance-control.socket",
+    "buzz-ci-acceptance-control.service",
     "buzz-ci-keyholder.socket",
     "buzz-ci-execd.socket",
     "buzz-ci-runner.socket",
     "buzz-ci-controld.service",
 ]
 STOP_ORDER = [
+    "buzz-ci-controld-acceptance.socket",
     "buzz-ci-controld.service",
+    "buzz-ci-acceptance-control.socket",
+    "buzz-ci-acceptance-control.service",
     "buzz-ci-runner.service",
     "buzz-ci-runner.socket",
     "buzz-ci-execd.service",
@@ -68,9 +85,31 @@ STOP_ORDER = [
     "buzz-ci-keyholder.service",
     "buzz-ci-keyholder.socket",
 ]
+STAGED_ZERO_UNITS = [
+    "buzz-ci-controld-acceptance.socket",
+    "buzz-ci-controld.service",
+    "buzz-ci-acceptance-control.socket",
+    "buzz-ci-acceptance-control.service",
+]
 PERSISTENT_UNIT = "buzz-ci-capacity-one.target"
 
 SOCKET_POLICY = {
+    "acceptance_control": {
+        "unit": "buzz-ci-acceptance-control.socket",
+        "path": "/run/buzzci/acceptance-control.sock",
+        "descriptor_name": "buzz-ci-acceptance-control",
+        "user": "root",
+        "group": "buzzci-ctl",
+        "mode": "0620",
+    },
+    "controld_acceptance": {
+        "unit": "buzz-ci-controld-acceptance.socket",
+        "path": "/run/buzzci/controld-acceptance.sock",
+        "descriptor_name": "buzz-ci-controld-acceptance",
+        "user": "root",
+        "group": "buzzci-ctl",
+        "mode": "0620",
+    },
     "keyholder": {
         "unit": "buzz-ci-keyholder.socket",
         "path": "/run/buzzci/keyholder.sock",
@@ -101,6 +140,13 @@ STATIC_TARGETS = {
     "sysusers": "/usr/lib/sysusers.d/buzzci-activation.conf",
     "tmpfiles": "/usr/lib/tmpfiles.d/buzzci-activation.conf",
     "capacity_target": "/etc/systemd/system/buzz-ci-capacity-one.target",
+    "controld_acceptance_socket": "/etc/systemd/system/buzz-ci-controld-acceptance.socket",
+    "acceptance_control_socket": "/etc/systemd/system/buzz-ci-acceptance-control.socket",
+    "acceptance_control_service": "/etc/systemd/system/buzz-ci-acceptance-control.service",
+    "acceptance_tmpfiles": "/usr/lib/tmpfiles.d/buzzci-acceptance.conf",
+    "acceptance_canary_binary": COMPONENTS["acceptance_canary"][0],
+    "acceptance_driver_binary": COMPONENTS["acceptance_driver"][0],
+    "acceptance_control_binary": COMPONENTS["acceptance_control"][0],
     "execd_socket_dropin": "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",
     "runner_service_dropin": "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
     "controld_service_dropin": "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf",
@@ -357,6 +403,16 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
     for role in STATIC_TARGETS:
         if entries_by_role[role]["uid"] != 0 or entries_by_role[role]["gid"] != 0:
             raise ValueError(f"static entry {role} must be root owned")
+    components_by_name = {item["name"]: item for item in validated_components}
+    for role, component_name in INSTALLABLE_COMPONENT_ROLES.items():
+        entry = entries_by_role[role]
+        component = components_by_name[component_name]
+        if (
+            entry["sha256"] != component["binary_sha256"]
+            or parse_mode(entry["install_mode"]) != 0o755
+            or parse_mode(entry["source_mode"]) != 0o500
+        ):
+            raise ValueError(f"installable component entry differs from component provenance: {component_name}")
 
     systemd = manifest["systemd"]
     require_keys(systemd, {"start_order", "stop_order", "persistent_unit", "stage_capacity", "active_capacity"}, "systemd plan")
@@ -483,7 +539,8 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
     controld = entries["controld_config"]
     controld_staged = _json_payload(payloads[controld["source"]], "staged controld configuration")
     controld_active = _json_payload(payloads[controld["active_source"]], "active controld configuration")
-    if set(controld_staged) != {"schema_version", "capacity", "store_root"}:
+    staged_fields = {"schema_version", "capacity", "store_root", "acceptance_binding"}
+    if set(controld_staged) != staged_fields:
         raise ValueError("staged controld configuration differs from the frozen closed interface")
     if controld_staged.get("capacity") != 0 or controld_active.get("capacity") != 1:
         raise ValueError("controld configuration must flip from capacity zero to one")
@@ -494,10 +551,15 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
     active_fields = {
         "schema_version", "capacity", "store_root", "relay_url", "runner_socket", "keyholder_socket",
         "keyholder_uid", "keyholder_gid", "keyholder_selectors", "keyholder_timeout_millis",
-        "keyholder_transport_attempts",
+        "keyholder_transport_attempts", "acceptance_binding",
     }
     if set(controld_active) != active_fields:
         raise ValueError("active controld configuration differs from the strict interface")
+    if (
+        controld_staged["acceptance_binding"] != ACCEPTANCE_BINDING_PATH
+        or controld_active["acceptance_binding"] != ACCEPTANCE_BINDING_PATH
+    ):
+        raise ValueError("controld acceptance binding path differs from the fixed interface")
     if not isinstance(controld_active["relay_url"], str) or not controld_active["relay_url"].startswith("wss://"):
         raise ValueError("controld relay URL must use wss")
     if controld_active.get("runner_socket") != SOCKET_POLICY["runner"]["path"]:
