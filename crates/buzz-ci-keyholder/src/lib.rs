@@ -1,21 +1,38 @@
-//! Dependency-free protocol foundation for an isolated Buzz CI signing
-//! keyholder.
+//! Bounded protocol and fail-closed local service for an isolated Buzz CI
+//! signing keyholder.
 //!
-//! The crate defines bounded public messages and transport-neutral traits. It
-//! deliberately contains no secret discovery, raw-key loading, signing
-//! implementation, socket listener, or production wiring.
+//! Signing keys come only from fixed systemd credential names. Callers select
+//! an operation and expected generation, never a key path or arbitrary signing
+//! domain.
 
 #![forbid(unsafe_code)]
 
+mod backend;
 mod codec;
+mod config;
+mod ipc;
+mod selector;
+mod service;
 mod traits;
 mod types;
 
+pub use backend::{BackendError, Secp256k1Backend, SigningBackend};
 pub use codec::{
     decode_request, decode_response, encode_request, encode_response, DecodeError, EncodeError,
     EncodedFrame, FrameHeader, HEADER_SIZE, MAGIC, MAX_BODY_SIZE, MAX_FIELD_COUNT, MAX_FIELD_SIZE,
     MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
+pub use config::{ConfigError, KeyholderConfig, CONFIG_SCHEMA_VERSION};
+#[cfg(target_os = "linux")]
+pub use ipc::serve_connection;
+pub use ipc::{
+    read_request_frame, ConnectionError, IO_TIMEOUT, KEYHOLDER_SOCKET_PATH, SYSTEMD_FD_NAME,
+    SYSTEMD_LISTEN_FD,
+};
+#[cfg(target_os = "linux")]
+pub use ipc::{validate_systemd_environment, validate_systemd_listener, ActivationError};
+pub use selector::{KeySelector, SelectorSet};
+pub use service::{ProductionKeyholder, ServiceError, SigningPolicy};
 pub use traits::{KeyholderClient, KeyholderServer};
 pub use types::{
     CanonicalPayload, DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod,

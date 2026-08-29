@@ -1,0 +1,17 @@
+[Unit]
+Description=Buzz CI keyholder control socket
+Documentation=file:/usr/share/doc/buzz-ci-keyholder/README.md
+
+[Socket]
+ListenStream=/run/buzzci/keyholder.sock
+FileDescriptorName=buzz-ci-keyholder-control
+Accept=no
+SocketUser=buzzci-keyholder
+SocketGroup=buzzci-controld
+SocketMode=0620
+DirectoryMode=0711
+RemoveOnStop=yes
+Service=buzz-ci-keyholder.service
+
+[Install]
+WantedBy=sockets.target

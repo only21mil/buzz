@@ -1024,7 +1024,17 @@ dependencies = [
 name = "buzz-ci-keyholder"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "nix 0.31.3",
+ "nostr",
  "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
