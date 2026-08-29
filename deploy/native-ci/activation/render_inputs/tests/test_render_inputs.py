@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -94,6 +96,15 @@ def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> d
 
 
 class RendererTests(unittest.TestCase):
+    def output_root(self, root: Path) -> RENDER.DescriptorRoot:
+        descriptor = root / "descriptor.json"
+        descriptor.write_bytes(canonical({"unused": True}))
+        descriptor.chmod(0o600)
+        return RENDER.DescriptorRoot(descriptor)
+
+    def output_temporaries(self, root: Path) -> list[Path]:
+        return list(root.glob(".render-inputs-*.tmp"))
+
     def test_schema_documents_and_relative_references_are_valid(self) -> None:
         for schema_path in (ROOT / "descriptor.schema.json", ROOT / "output.schema.json"):
             schema = json.loads(schema_path.read_bytes())
@@ -175,6 +186,217 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(value["claims"], {"protected_ci": False, "tier2": False})
             self.assertEqual(value["lifecycle_status"], "verified_pass")
             self.assertEqual((root / "first.json").stat().st_mode & 0o7777, 0o600)
+
+    def test_output_publication_fsyncs_file_and_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            root = self.output_root(root_path)
+            real_fsync = os.fsync
+            fsync_kinds: list[str] = []
+
+            def record_fsync(fd: int) -> None:
+                fsync_kinds.append("directory" if os.path.isdir(f"/proc/self/fd/{fd}") else "file")
+                real_fsync(fd)
+
+            try:
+                with mock.patch.object(RENDER.os, "fsync", side_effect=record_fsync):
+                    RENDER.write_output(root, "output.json", b"complete\n")
+            finally:
+                root.close()
+            output = root_path / "output.json"
+            self.assertEqual(output.read_bytes(), b"complete\n")
+            self.assertEqual(output.stat().st_mode & 0o7777, 0o600)
+            self.assertEqual(output.stat().st_nlink, 1)
+            self.assertEqual(fsync_kinds, ["file", "directory"])
+            self.assertEqual(self.output_temporaries(root_path), [])
+
+    def test_concurrent_publication_has_one_no_clobber_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            roots = [self.output_root(root_path), self.output_root(root_path)]
+            barrier = threading.Barrier(2)
+            real_link = os.link
+            failures: list[BaseException] = []
+
+            def racing_link(*args: object, **kwargs: object) -> None:
+                barrier.wait(timeout=5)
+                real_link(*args, **kwargs)
+
+            def publish(root: RENDER.DescriptorRoot, payload: bytes) -> None:
+                try:
+                    RENDER.write_output(root, "output.json", payload)
+                except BaseException as error:
+                    failures.append(error)
+
+            threads = [
+                threading.Thread(target=publish, args=(root, payload))
+                for root, payload in zip(roots, (b"first\n", b"second\n"), strict=True)
+            ]
+            try:
+                with mock.patch.object(RENDER.os, "link", side_effect=racing_link):
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=10)
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+            finally:
+                for root in roots:
+                    root.close()
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], FileExistsError)
+            self.assertIn((root_path / "output.json").read_bytes(), (b"first\n", b"second\n"))
+            self.assertEqual((root_path / "output.json").stat().st_nlink, 1)
+            self.assertEqual(self.output_temporaries(root_path), [])
+
+    def test_partial_write_failure_cleans_up_and_retry_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            root = self.output_root(root_path)
+            real_write = os.write
+            writes = 0
+
+            def partial_then_enospc(fd: int, data: object) -> int:
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return real_write(fd, bytes(data)[:3])
+                raise OSError(errno.ENOSPC, "injected full filesystem")
+
+            try:
+                with mock.patch.object(RENDER.os, "write", side_effect=partial_then_enospc):
+                    with self.assertRaisesRegex(OSError, "injected full filesystem"):
+                        RENDER.write_output(root, "output.json", b"complete\n")
+                self.assertFalse((root_path / "output.json").exists())
+                self.assertEqual(self.output_temporaries(root_path), [])
+                RENDER.write_output(root, "output.json", b"complete\n")
+            finally:
+                root.close()
+            self.assertEqual((root_path / "output.json").read_bytes(), b"complete\n")
+
+    def test_prepublish_fsync_and_link_failures_clean_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            root = self.output_root(root_path)
+            try:
+                with mock.patch.object(RENDER.os, "fsync", side_effect=OSError(errno.EIO, "injected fsync")):
+                    with self.assertRaisesRegex(OSError, "injected fsync"):
+                        RENDER.write_output(root, "fsync.json", b"complete\n")
+                self.assertFalse((root_path / "fsync.json").exists())
+                self.assertEqual(self.output_temporaries(root_path), [])
+
+                with mock.patch.object(RENDER.os, "link", side_effect=OSError(errno.EIO, "injected link")):
+                    with self.assertRaisesRegex(OSError, "injected link"):
+                        RENDER.write_output(root, "link.json", b"complete\n")
+                self.assertFalse((root_path / "link.json").exists())
+                self.assertEqual(self.output_temporaries(root_path), [])
+
+                RENDER.write_output(root, "fsync.json", b"complete\n")
+                RENDER.write_output(root, "link.json", b"complete\n")
+            finally:
+                root.close()
+
+    def test_cleanup_survives_close_error_and_retries_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            root = self.output_root(root_path)
+            real_close = os.close
+            close_failed = False
+
+            def close_then_fail(fd: int) -> None:
+                nonlocal close_failed
+                is_file = not os.path.isdir(f"/proc/self/fd/{fd}")
+                real_close(fd)
+                if is_file and not close_failed:
+                    close_failed = True
+                    raise OSError(errno.EIO, "injected close")
+
+            try:
+                with mock.patch.object(RENDER.os, "close", side_effect=close_then_fail):
+                    with self.assertRaisesRegex(OSError, "injected close"):
+                        RENDER.write_output(root, "close.json", b"complete\n")
+                self.assertFalse((root_path / "close.json").exists())
+                self.assertEqual(self.output_temporaries(root_path), [])
+
+                real_unlink = os.unlink
+                unlinks = 0
+
+                def unlink_once_then_succeed(path: str, *, dir_fd: int) -> None:
+                    nonlocal unlinks
+                    unlinks += 1
+                    if unlinks == 1:
+                        raise OSError(errno.EIO, "injected unlink")
+                    real_unlink(path, dir_fd=dir_fd)
+
+                with mock.patch.object(RENDER.os, "unlink", side_effect=unlink_once_then_succeed):
+                    RENDER.write_output(root, "output.json", b"complete\n")
+                self.assertEqual(unlinks, 2)
+                self.assertEqual(self.output_temporaries(root_path), [])
+            finally:
+                root.close()
+
+    def test_directory_fsync_failure_leaves_only_complete_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            root = self.output_root(root_path)
+            real_fsync = os.fsync
+
+            def fail_directory_fsync(fd: int) -> None:
+                if os.path.isdir(f"/proc/self/fd/{fd}"):
+                    raise OSError(errno.EIO, "injected directory fsync")
+                real_fsync(fd)
+
+            try:
+                with mock.patch.object(RENDER.os, "fsync", side_effect=fail_directory_fsync):
+                    with self.assertRaisesRegex(OSError, "injected directory fsync"):
+                        RENDER.write_output(root, "output.json", b"complete\n")
+            finally:
+                root.close()
+            output = root_path / "output.json"
+            self.assertEqual(output.read_bytes(), b"complete\n")
+            self.assertEqual(output.stat().st_mode & 0o7777, 0o600)
+            self.assertEqual(self.output_temporaries(root_path), [])
+
+    def test_existing_target_and_symlink_are_never_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            existing = root_path / "existing.json"
+            existing.write_bytes(b"keep\n")
+            existing.chmod(0o400)
+            outside = root_path / "outside.json"
+            outside.write_bytes(b"outside\n")
+            symlink = root_path / "symlink.json"
+            symlink.symlink_to(outside)
+            root = self.output_root(root_path)
+            try:
+                with self.assertRaises(FileExistsError):
+                    RENDER.write_output(root, "existing.json", b"replace\n")
+                with self.assertRaises(FileExistsError):
+                    RENDER.write_output(root, "symlink.json", b"replace\n")
+            finally:
+                root.close()
+            self.assertEqual(existing.read_bytes(), b"keep\n")
+            self.assertEqual(existing.stat().st_mode & 0o7777, 0o400)
+            self.assertTrue(symlink.is_symlink())
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+            self.assertEqual(self.output_temporaries(root_path), [])
+
+    def test_colliding_temporary_symlink_is_not_followed_or_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            outside = root_path / "outside"
+            outside.write_bytes(b"outside\n")
+            collision = root_path / f".render-inputs-{'a' * 32}.tmp"
+            collision.symlink_to(outside)
+            root = self.output_root(root_path)
+            try:
+                with mock.patch.object(RENDER.secrets, "token_hex", side_effect=["a" * 32, "b" * 32]):
+                    RENDER.write_output(root, "output.json", b"complete\n")
+            finally:
+                root.close()
+            self.assertTrue(collision.is_symlink())
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+            self.assertEqual((root_path / "output.json").read_bytes(), b"complete\n")
+            self.assertFalse((root_path / f".render-inputs-{'b' * 32}.tmp").exists())
 
     def test_bound_lifecycle_mutation_fails_without_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
