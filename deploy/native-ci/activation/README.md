@@ -86,8 +86,15 @@ already exist with their frozen staged bytes and metadata.
    `buzzci-ctl` identity with sole `buzzci-execd` supplementary membership.
    Timeout cleanup TERM/KILLs and reaps the whole new process group. Only an
    exact `qualified_closed` production-v2 response passes. The client is frozen
-   at source commit `a86023a797aa6251001829aefcc30698b3580bc0`; neither the
+   at source commit `564e41fda889f25b094b79524b3fb409121794c7`; neither the
    legacy v1 client nor the full live canary is used for this gate.
+   An uncertain delivery may retry the exact persisted request at most three
+   times and only while `now < expires_at`. The server has no outcome-query
+   operation and rejects replay after expiry. An unresolved expiry therefore
+   moves the receipt to `qualification_uncertain`, preserves the request and
+   last transport error, returns to proven capacity zero, and permits only
+   rollback. Restaging must change the package, fixture, controller generation,
+   or runner generation before the controller creates a new request identity.
 4. Activation then stops execd, installs active runner, rendered execd, and
    controld configs, starts the fixed dependency order, and enables the target
    only after socket and health readback.
@@ -208,9 +215,21 @@ deploy/native-ci/activation/freeze_package.py \
 ```
 
 The freezer requires a clean activation source directory at the named commit.
+An owner-held Git worktree root may be mode `2775` only when it is the exact
+top-level worktree for `core.sharedRepository=all`, has setgid without sticky or
+world write, and its Git directory and tracked-input parents pass the same
+ownership and no-symlink checks. Tracked files still reject group/world write,
+hard links, irregular files, and executable-class drift. Asset and output
+directories never receive this exception.
 It renders exact numeric sysusers entries, copies the reviewed systemd files,
 checks all config and provenance digests, writes a canonical manifest, and
 binds the activation ID to its package digest.
+
+Clean-host preflight permits `not-found` only for the four units installed by
+this package. Every external dependency unit must already be loaded. After
+installation and `daemon-reload`, staging requires all four units loaded and
+re-reads each installed unit file's exact digest and metadata before starting
+any staged service.
 
 Before using a package against `/`, transfer its root, `assets` directory,
 manifest, and every asset to `root:root`. Both directories must be mode `0700`.

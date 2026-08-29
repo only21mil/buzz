@@ -68,14 +68,72 @@ def _git(source_root: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def _safe_input_directory(path: Path, where: str) -> Path:
+def _shared_repository_root(path: Path, metadata: os.stat_result, where: str) -> None:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if metadata.st_uid != os.geteuid() or metadata.st_gid not in {os.getegid(), *os.getgroups()}:
+        raise ValueError(f"{where} shared repository ownership differs")
+    if mode != 0o2775:
+        raise ValueError(f"{where} shared repository mode must be 2775")
+    if _git(path, "config", "--get", "core.sharedRepository") != "all":
+        raise ValueError(f"{where} group write requires core.sharedRepository=all")
+    if _git(path, "rev-parse", "--is-inside-work-tree") != "true":
+        raise ValueError(f"{where} is not a Git worktree")
+    top_level = Path(_git(path, "rev-parse", "--show-toplevel"))
+    if Path(os.path.realpath(top_level)) != path:
+        raise ValueError(f"{where} does not match the Git worktree root")
+    git_directory = Path(_git(path, "rev-parse", "--absolute-git-dir"))
+    git_metadata = git_directory.lstat()
+    if (
+        Path(os.path.realpath(git_directory)) != git_directory
+        or not stat.S_ISDIR(git_metadata.st_mode)
+        or git_metadata.st_uid != metadata.st_uid
+        or git_metadata.st_mode & (stat.S_IWOTH | stat.S_ISVTX)
+    ):
+        raise ValueError(f"{where} Git directory identity is unsafe")
+    if git_metadata.st_mode & stat.S_IWGRP and (
+        git_metadata.st_gid != metadata.st_gid or not git_metadata.st_mode & stat.S_ISGID
+    ):
+        raise ValueError(f"{where} Git directory shared access differs")
+
+
+def _safe_input_directory(
+    path: Path, where: str, *, allow_shared_repository: bool = False,
+) -> Path:
     absolute = Path(os.path.abspath(path))
     metadata = absolute.lstat()
     if Path(os.path.realpath(absolute)) != absolute or not stat.S_ISDIR(metadata.st_mode):
         raise ValueError(f"{where} must be a real directory")
-    if metadata.st_mode & 0o022:
+    if metadata.st_uid != os.geteuid():
+        raise ValueError(f"{where} ownership differs")
+    if metadata.st_mode & stat.S_IWOTH:
         raise ValueError(f"{where} must not be group or world writable")
+    if metadata.st_mode & stat.S_IWGRP:
+        if not allow_shared_repository:
+            raise ValueError(f"{where} must not be group or world writable")
+        _shared_repository_root(absolute, metadata, where)
     return absolute
+
+
+def _validate_tracked_parents(source_root: Path, relative: Path) -> None:
+    if relative.is_absolute() or relative != Path(*relative.parts) or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"tracked source path is not normalized: {relative}")
+    root_metadata = source_root.lstat()
+    shared = bool(root_metadata.st_mode & stat.S_IWGRP)
+    current = source_root
+    for part in relative.parts[:-1]:
+        current /= part
+        metadata = current.lstat()
+        if Path(os.path.realpath(current)) != current or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"tracked source parent is not a real directory: {relative}")
+        if metadata.st_uid != root_metadata.st_uid or metadata.st_mode & (stat.S_IWOTH | stat.S_ISVTX):
+            raise ValueError(f"tracked source parent access differs: {relative}")
+        if metadata.st_mode & stat.S_IWGRP and (
+            not shared
+            or metadata.st_gid != root_metadata.st_gid
+            or not metadata.st_mode & stat.S_ISGID
+            or stat.S_IMODE(metadata.st_mode) & 0o050 != 0o050
+        ):
+            raise ValueError(f"tracked source parent shared access differs: {relative}")
 
 
 def _git_file_mode(source_root: Path, relative: Path) -> int:
@@ -118,6 +176,7 @@ def _tracked_payload(
     expected_git_mode: int,
     limit: int = 64 * 1024,
 ) -> bytes:
+    _validate_tracked_parents(source_root, relative)
     path = source_root / relative
     absolute = Path(os.path.abspath(path))
     if Path(os.path.realpath(absolute)) != absolute:
@@ -208,7 +267,7 @@ def freeze_package(
     asset_root: Path,
     output: Path,
 ) -> dict[str, object]:
-    source_root = _safe_input_directory(source_root, "source root")
+    source_root = _safe_input_directory(source_root, "source root", allow_shared_repository=True)
     asset_root = _safe_input_directory(asset_root, "asset root")
     if not activation_package.GIT_OID.fullmatch(source_commit):
         raise ValueError("source commit must be a full lowercase Git object ID")

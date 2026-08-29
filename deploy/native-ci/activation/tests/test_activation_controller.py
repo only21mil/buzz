@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ACTIVATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTIVATION_ROOT))
@@ -465,11 +466,12 @@ class ActivationFixture:
     def _write_fake_systemd(self) -> None:
         units: dict[str, object] = {}
         for name in sorted(set(activation_package.START_ORDER + activation_package.STOP_ORDER)):
+            load_state = "not-found" if name in activation_package.PACKAGE_UNIT_ROLES else "loaded"
             units[name] = {
-                "LoadState": "loaded",
+                "LoadState": load_state,
                 "ActiveState": "inactive",
                 "SubState": "dead",
-                "UnitFileState": "disabled" if name.endswith(".socket") else "static",
+                "UnitFileState": "disabled" if load_state == "not-found" or name.endswith(".socket") else "static",
             }
         state = {"schema": "buzz-ci-fake-systemd-v1", "units": units, "identities": {}, "groups": {}, "sockets": {}}
         self.fake_state = self.root / "var/lib/buzzci/activation-controller/fake-systemd-v1.json"
@@ -545,6 +547,35 @@ class ActivationControllerTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), payloads[entry["source"]])
             else:
                 self.assertFalse(target.exists())
+
+    def test_clean_host_allows_only_package_units_absent_then_reads_back_exact_install(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        report = CONTROLLER.preflight(
+            manifest, self.fixture.root, driver, require_dormant=True, payloads=payloads,
+        )
+        for unit in activation_package.PACKAGE_UNIT_ROLES:
+            self.assertEqual(report["units"][unit]["LoadState"], "not-found")
+        for unit in activation_package.DEPENDENCY_UNITS:
+            self.assertEqual(report["units"][unit]["LoadState"], "loaded")
+
+        state = driver._read()
+        missing_dependency = activation_package.DEPENDENCY_UNITS[0]
+        state["units"][missing_dependency]["LoadState"] = "not-found"
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "required systemd unit is not loaded"):
+            CONTROLLER.preflight(
+                manifest, self.fixture.root, driver, require_dormant=True, payloads=payloads,
+            )
+        state = driver._read()
+        state["units"][missing_dependency]["LoadState"] = "loaded"
+        driver._write(state)
+
+        staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        for unit, role in activation_package.PACKAGE_UNIT_ROLES.items():
+            self.assertEqual(staged["installed_units"][unit]["LoadState"], "loaded")
+            self.assertEqual(staged["installed_units"][unit]["fragment_path"], entries[role]["target"])
+            self.assertEqual(staged["installed_units"][unit]["sha256"], entries[role]["sha256"])
 
     def test_stage_persists_staged_zero_before_starting_acceptance_control(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -657,7 +688,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "87f985d2cefa08b60f0fcb0283363e1be12dc7533b7dc385535ffd2ded3c6871",
+            "f69452a363c19e487e6c0f3cd383afadd7e699e6d70eb332726cc9afb74b133d",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1144,6 +1175,100 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(persisted["status"], "pending")
         request = base64.b64decode(persisted["request_base64"], validate=True)
         self.assertEqual(activation_package.digest(request), persisted["request_sha256"])
+        self.assertEqual(persisted["attempt_count"], 1)
+        self.assertIn("failed with status 3", persisted["last_error"])
+
+    def test_production_v2_retries_only_the_exact_valid_request_with_a_fixed_budget(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        component = next(item for item in manifest["components"] if item["name"] == "qualification")
+        program = self.fixture.root / component["binary_path"].lstrip("/")
+        failure = b"#!/usr/bin/python3\nraise SystemExit(3)\n"
+        write_file(program, failure, 0o755)
+        component["binary_sha256"] = activation_package.digest(failure)
+        with mock.patch.object(CONTROLLER.time, "time", return_value=1_000):
+            for attempt in range(1, CONTROLLER.QUALIFICATION_MAX_ATTEMPTS + 1):
+                receipt = CONTROLLER._read_receipt(self.fixture.root)
+                with self.assertRaisesRegex(ValueError, "failed with status 3"):
+                    CONTROLLER._run_qualification(manifest, self.fixture.root, receipt)
+                state = CONTROLLER._read_receipt(self.fixture.root)["qualification"]
+                self.assertEqual(state["attempt_count"], attempt)
+                request = base64.b64decode(state["request_base64"], validate=True)
+                if attempt == 1:
+                    exact_request = request
+                else:
+                    self.assertEqual(request, exact_request)
+            receipt = CONTROLLER._read_receipt(self.fixture.root)
+            with self.assertRaisesRegex(ValueError, "retry budget is exhausted"):
+                CONTROLLER._run_qualification(manifest, self.fixture.root, receipt)
+        state = CONTROLLER._read_receipt(self.fixture.root)["qualification"]
+        self.assertEqual(state["attempt_count"], CONTROLLER.QUALIFICATION_MAX_ATTEMPTS)
+        self.assertEqual(base64.b64decode(state["request_base64"], validate=True), exact_request)
+
+    def test_valid_uncertain_request_retries_exactly_and_resolves(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        component = next(item for item in manifest["components"] if item["name"] == "qualification")
+        program = self.fixture.root / component["binary_path"].lstrip("/")
+        failure = b"#!/usr/bin/python3\nraise SystemExit(3)\n"
+        write_file(program, failure, 0o755)
+        component["binary_sha256"] = activation_package.digest(failure)
+        with mock.patch.object(CONTROLLER.time, "time", return_value=1_000):
+            receipt = CONTROLLER._read_receipt(self.fixture.root)
+            with self.assertRaisesRegex(ValueError, "failed with status 3"):
+                CONTROLLER._run_qualification(manifest, self.fixture.root, receipt)
+        before = base64.b64decode(
+            CONTROLLER._read_receipt(self.fixture.root)["qualification"]["request_base64"], validate=True,
+        )
+        write_file(program, QUALIFICATION_SCRIPT, 0o755)
+        component["binary_sha256"] = activation_package.digest(QUALIFICATION_SCRIPT)
+        with mock.patch.object(CONTROLLER.time, "time", return_value=1_001):
+            result = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        state = CONTROLLER._read_receipt(self.fixture.root)["qualification"]
+        self.assertEqual((result["state"], state["status"], state["attempt_count"]), ("active_one", "passed", 2))
+        self.assertEqual(base64.b64decode(state["request_base64"], validate=True), before)
+
+    def test_expired_uncertain_qualification_requires_rollback_and_new_replay_binding(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        component = next(item for item in manifest["components"] if item["name"] == "qualification")
+        program = self.fixture.root / component["binary_path"].lstrip("/")
+        failure = b"#!/usr/bin/python3\nraise SystemExit(3)\n"
+        write_file(program, failure, 0o755)
+        component["binary_sha256"] = activation_package.digest(failure)
+        with mock.patch.object(CONTROLLER.time, "time", return_value=1_000):
+            receipt = CONTROLLER._read_receipt(self.fixture.root)
+            with self.assertRaisesRegex(ValueError, "failed with status 3"):
+                CONTROLLER._run_qualification(manifest, self.fixture.root, receipt)
+        write_file(program, QUALIFICATION_SCRIPT, 0o755)
+        component["binary_sha256"] = activation_package.digest(QUALIFICATION_SCRIPT)
+        pending_receipt = CONTROLLER._read_receipt(self.fixture.root)
+        self.assertEqual(pending_receipt["state"], "staged_zero")
+        pending = pending_receipt["qualification"]
+        exact_request = base64.b64decode(pending["request_base64"], validate=True)
+        self.assertIn("failed with status 3", pending["last_error"])
+
+        with mock.patch.object(CONTROLLER.time, "time", return_value=1_060):
+            with self.assertRaisesRegex(ValueError, "request expired"):
+                CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        uncertain_receipt = CONTROLLER._read_receipt(self.fixture.root)
+        uncertain = uncertain_receipt["qualification"]
+        self.assertEqual((uncertain_receipt["state"], uncertain["status"]), ("qualification_uncertain", "expired_uncertain"))
+        self.assertEqual(base64.b64decode(uncertain["request_base64"], validate=True), exact_request)
+        self.assertIn("failed with status 3", uncertain["last_error"])
+        self.assertIsNotNone(uncertain["expired_at"])
+        current = CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        self.assertEqual((current["status"], current["capacity"]), ("rollback_and_restage_required", 0))
+
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        with self.assertRaisesRegex(ValueError, "forbids request rotation under the same"):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+
+        scenario = copy.deepcopy(self.fixture.scenario)
+        scenario["fixture"]["controller_generation"] += 1
+        binding = CONTROLLER._acceptance_binding(manifest, scenario)
+        restaged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, binding)
+        self.assertEqual((restaged["state"], CONTROLLER._read_receipt(self.fixture.root)["qualification"]), ("staged_zero", None))
 
     def test_receipt_verifier_stage_table_is_frozen_installed_and_rolled_back(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -1351,6 +1476,28 @@ class ActivationFreezerModeTests(unittest.TestCase):
         write_file(path, b"payload\n", mode)
         return path.stat()
 
+    def _shared_worktree(self) -> tuple[Path, Path]:
+        repository = self.root / "shared-repository"
+        worktree = self.root / "shared-worktree"
+        relative = Path("deploy/native-ci/activation/templates/static.conf")
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.name", "Activation Test"], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.email", "activation@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "core.sharedRepository", "all"], check=True)
+        write_file(repository / relative, b"shared payload\n", 0o600)
+        subprocess.run(["git", "-C", str(repository), "add", str(relative)], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-qm", "seed"], check=True)
+        original_umask = os.umask(0o077)
+        try:
+            subprocess.run(
+                ["git", "-C", str(repository), "worktree", "add", "-q", "-b", "shared-test", str(worktree), "HEAD"],
+                check=True,
+            )
+        finally:
+            os.umask(original_umask)
+        worktree.chmod(0o2775)
+        return worktree, relative
+
     def test_private_checkout_modes_preserve_git_executable_intent(self) -> None:
         FREEZER._validate_checkout_metadata(
             self._metadata("nonexecuted", 0o600), 0o100644, os.geteuid(), "nonexecuted",
@@ -1428,6 +1575,53 @@ class ActivationFreezerModeTests(unittest.TestCase):
         source.symlink_to(target)
         with self.assertRaisesRegex(ValueError, "symbolic links"):
             FREEZER._tracked_payload(self.root, relative, 0o100644)
+
+    def test_real_shared_repository_worktree_accepts_private_checkout_modes(self) -> None:
+        worktree, relative = self._shared_worktree()
+        source = worktree / relative
+        self.assertEqual(stat.S_IMODE(worktree.stat().st_mode), 0o2775)
+        self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
+        self.assertEqual(
+            FREEZER._safe_input_directory(worktree, "source root", allow_shared_repository=True),
+            worktree,
+        )
+        self.assertEqual(FREEZER._tracked_payload(worktree, relative, 0o100644), b"shared payload\n")
+
+    def test_shared_repository_exception_rejects_malicious_write_and_shape_drift(self) -> None:
+        worktree, relative = self._shared_worktree()
+        source = worktree / relative
+        source.chmod(0o620)
+        with self.assertRaisesRegex(ValueError, "unsafe permissions"):
+            FREEZER._tracked_payload(worktree, relative, 0o100644)
+        source.chmod(0o600)
+
+        deploy = worktree / "deploy"
+        deploy.chmod(0o775)
+        with self.assertRaisesRegex(ValueError, "parent shared access differs"):
+            FREEZER._tracked_payload(worktree, relative, 0o100644)
+        deploy.chmod(0o755)
+
+        hardlink = worktree / "hardlink"
+        os.link(source, hardlink)
+        with self.assertRaisesRegex(ValueError, "unsafe regular file"):
+            FREEZER._tracked_payload(worktree, relative, 0o100644)
+        hardlink.unlink()
+
+        for mode, message in ((0o775, "mode must be 2775"), (0o3775, "mode must be 2775"), (0o2777, "must not be group or world writable")):
+            with self.subTest(mode=oct(mode)):
+                worktree.chmod(mode)
+                with self.assertRaisesRegex(ValueError, message):
+                    FREEZER._safe_input_directory(worktree, "source root", allow_shared_repository=True)
+        worktree.chmod(0o2775)
+        subprocess.run(["git", "-C", str(worktree), "config", "core.sharedRepository", "group"], check=True)
+        with self.assertRaisesRegex(ValueError, "core.sharedRepository=all"):
+            FREEZER._safe_input_directory(worktree, "source root", allow_shared_repository=True)
+
+        output_parent = self.root / "shared-output"
+        output_parent.mkdir(mode=0o700)
+        output_parent.chmod(0o2775)
+        with self.assertRaisesRegex(ValueError, "must not be group or world writable"):
+            FREEZER._safe_input_directory(output_parent, "output parent")
 
     def test_asset_writer_materializes_declared_modes_under_private_umask(self) -> None:
         original_umask = os.umask(0o077)
