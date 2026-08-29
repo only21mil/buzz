@@ -17,7 +17,7 @@ EXPECTED = {
     ),
     "templates/buzz-ci-execd.service": (
         "ExecStart=/usr/libexec/buzz-ci-execd --socket-activation",
-        "ReadOnlyPaths=/etc/buzzci/execd-v2.json /usr/libexec/buzz-ci-executor /usr/share/containers/seccomp.json",
+        "ReadOnlyPaths=/etc/buzzci/execd-v2.json /usr/libexec/buzz-ci-executor /usr/libexec/buzz-ci-capacity-one-fixture /usr/share/buzzci/execd-v2/fixture /usr/share/containers/seccomp.json",
         "ReadWritePaths=/var/lib/buzzci/execd-v2 /var/lib/buzzci/seccomp /var/lib/buzzci/activation/receipts",
         "RestrictAddressFamilies=AF_UNIX",
         "PrivateDevices=yes",
@@ -31,6 +31,22 @@ EXPECTED = {
         "User=buzzci-job",
         "Group=buzzci-job",
         "SupplementaryGroups=",
+        "DevicePolicy=closed",
+        "ProtectProc=invisible",
+        "ProcSubset=pid",
+        "ReadOnlyPaths=/usr/libexec/buzz-ci-executor /var/lib/buzzci/seccomp/v1/sha256/2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4.json",
+        "ReadWritePaths=/var/lib/buzzci/execd-v2/attempts",
+        "RestrictAddressFamilies=AF_UNIX",
+        "RestrictNamespaces=yes",
+        "CapabilityBoundingSet=",
+        "AmbientCapabilities=",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap",
+        "MemoryMax=134217728",
+        "TasksMax=16",
+        "LimitNPROC=16",
+        "LimitNOFILE=64",
+        "LimitFSIZE=65536",
         "StandardOutput=null",
         "StandardError=null",
     ),
@@ -71,6 +87,35 @@ def verify(source_root: Path) -> None:
     program = schema["$defs"]["program"]["properties"]
     if program["path"] != {"const": "/usr/libexec/buzz-ci-executor"} or program["mode"] != {"const": 493}:
         raise ValueError("executor provenance schema drift")
+    execution = schema["$defs"]["execution"]
+    expected_execution = {
+        "schema_version": {"const": 1},
+        "job_id": {"const": "capacity-one-fixture"},
+        "fixture_manifest_sha256": {"const": "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"},
+        "fixture_input_sha256": {"const": "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"},
+        "fixture_script_sha256": {"const": "f0f4fa8b4f47a2edf4d3a080b2f3e818c69647441376b927265572191655c9d6"},
+        "max_stdout_bytes": {"const": 32768},
+        "max_stderr_bytes": {"const": 32768},
+        "max_memory_bytes": {"const": 134217728},
+        "max_processes": {"const": 16},
+        "max_wall_seconds": {"const": 120},
+    }
+    if schema["properties"].get("execution") != {"$ref": "#/$defs/execution"}:
+        raise ValueError("static execution schema is not required")
+    if "execution" not in schema["required"]:
+        raise ValueError("static execution config is optional")
+    if any(execution["properties"].get(name) != value for name, value in expected_execution.items()):
+        raise ValueError("static execution limits or fixture provenance drift")
+    expected_artifact = {
+        "artifact_id": {"const": "result"},
+        "name": {"const": "result.json"},
+        "media_type": {"const": "application/json"},
+        "relative_name": {"const": "result.json"},
+        "max_bytes": {"const": 32768},
+    }
+    artifact = execution["properties"]["artifact"]
+    if any(artifact["properties"].get(name) != value for name, value in expected_artifact.items()):
+        raise ValueError("static artifact declaration drift")
     for relative, required in EXPECTED.items():
         lines = (root / relative).read_text().splitlines()
         missing = [line for line in required if line not in lines]
@@ -79,10 +124,10 @@ def verify(source_root: Path) -> None:
     tmpfiles = (root / "templates/buzzci-execd.tmpfiles").read_text().splitlines()
     retained = [
         "d /var/lib/buzzci 0711 root root - -",
-        "d /var/lib/buzzci/seccomp 0700 root root - -",
+        "d /var/lib/buzzci/seccomp 0711 root root - -",
         "d /var/lib/buzzci/activation 0700 root root - -",
         "d /var/lib/buzzci/activation/receipts 0700 root root - -",
-        "d /var/lib/buzzci/execd-v2 0700 root root - -",
+        "d /var/lib/buzzci/execd-v2 0711 root root - -",
         "d /var/lib/buzzci/execd-v2/intents 0700 root root - -",
         "d /var/lib/buzzci/execd-v2/bindings 0700 root root - -",
         "d /var/lib/buzzci/execd-v2/evidence 0700 root root - -",

@@ -38,6 +38,7 @@ const RECEIPT_COMPONENTS: [&str; 3] = ["buzzci", "activation", "receipts"];
 const OCI_RECEIPT_DIRECTORY: &str = "oci";
 const INSTALL_RECEIPT_NAME: &str = "seccomp.json";
 const RECEIPT_MODE: u32 = 0o600;
+const PRIVATE_RECEIPT_DIRECTORY_MODE: u32 = 0o700;
 
 /// Fixed host-wide receipt written after the installed profile passes readback.
 pub const SECCOMP_INSTALL_RECEIPT_PATH: &str = "/var/lib/buzzci/activation/receipts/seccomp.json";
@@ -531,8 +532,14 @@ fn install_owner(install: SeccompInstallReceipt) -> (u32, u32) {
 
 fn open_receipt_directory(root: &OwnedFd, owner: (u32, u32)) -> Result<OwnedFd, SeccompExecError> {
     let parent = open_existing_chain(root, &DESTINATION_PARENT_COMPONENTS, owner.0, owner.1)?;
-    let mut current = parent;
-    for component in RECEIPT_COMPONENTS {
+    let mut current = reopen_exact_directory(
+        &parent,
+        RECEIPT_COMPONENTS[0],
+        owner.0,
+        owner.1,
+        SECCOMP_DIRECTORY_MODE,
+    )?;
+    for component in &RECEIPT_COMPONENTS[1..] {
         current = ensure_receipt_directory(&current, component, owner.0, owner.1)?;
     }
     Ok(current)
@@ -547,7 +554,7 @@ fn ensure_receipt_directory(
     let created = match mkdirat(
         parent,
         name,
-        Mode::from_bits_truncate(SECCOMP_DIRECTORY_MODE),
+        Mode::from_bits_truncate(PRIVATE_RECEIPT_DIRECTORY_MODE),
     ) {
         Ok(()) => true,
         Err(Errno::EEXIST) => false,
@@ -566,7 +573,12 @@ fn ensure_receipt_directory(
             Some(Uid::from_raw(owner_uid)),
             Some(Gid::from_raw(owner_gid)),
         )
-        .and_then(|()| fchmod(&directory, Mode::from_bits_truncate(SECCOMP_DIRECTORY_MODE)))
+        .and_then(|()| {
+            fchmod(
+                &directory,
+                Mode::from_bits_truncate(PRIVATE_RECEIPT_DIRECTORY_MODE),
+            )
+        })
         .and_then(|()| fsync(&directory))
         .and_then(|()| fsync(parent))
         .map_err(|_| SeccompExecError::SyncReceiptDirectory)?;
@@ -575,7 +587,7 @@ fn ensure_receipt_directory(
     if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR
         || stat.st_uid != owner_uid
         || stat.st_gid != owner_gid
-        || stat.st_mode & 0o7777 != SECCOMP_DIRECTORY_MODE
+        || stat.st_mode & 0o7777 != PRIVATE_RECEIPT_DIRECTORY_MODE
     {
         return Err(SeccompExecError::InvalidReceiptDirectory);
     }
@@ -1065,18 +1077,21 @@ fn fresh_phase1_readback_from_root_with_installed_owner(
         RECEIPT_COMPONENTS[0],
         contract.owner_uid,
         contract.owner_gid,
+        SECCOMP_DIRECTORY_MODE,
     )?;
     let activation = reopen_exact_directory(
         &receipt_buzzci,
         RECEIPT_COMPONENTS[1],
         contract.owner_uid,
         contract.owner_gid,
+        PRIVATE_RECEIPT_DIRECTORY_MODE,
     )?;
     let receipts = reopen_exact_directory(
         &activation,
         RECEIPT_COMPONENTS[2],
         contract.owner_uid,
         contract.owner_gid,
+        PRIVATE_RECEIPT_DIRECTORY_MODE,
     )?;
     verify_descriptor_path(
         &receipts,
@@ -1107,7 +1122,7 @@ fn reopen_directory(
     owner_uid: u32,
     owner_gid: u32,
 ) -> Result<(OwnedFd, SeccompDirectoryReadback), SeccompExecError> {
-    let directory = reopen_exact_directory(parent, name, owner_uid, owner_gid)?;
+    let directory = reopen_exact_directory(parent, name, owner_uid, owner_gid, spec.mode())?;
     verify_descriptor_path(
         &directory,
         &rooted_path(root_path, spec.path()),
@@ -1133,10 +1148,11 @@ fn reopen_exact_directory(
     name: &str,
     owner_uid: u32,
     owner_gid: u32,
+    mode: u32,
 ) -> Result<OwnedFd, SeccompExecError> {
     let directory = open_directory_at(parent, name)
         .map_err(|_| SeccompExecError::InvalidDestinationDirectory)?;
-    validate_directory_exact(&directory, owner_uid, owner_gid, SECCOMP_DIRECTORY_MODE)?;
+    validate_directory_exact(&directory, owner_uid, owner_gid, mode)?;
     Ok(directory)
 }
 
@@ -1286,16 +1302,28 @@ fn ensure_destination_directory(
     owner_uid: u32,
     owner_gid: u32,
 ) -> Result<OwnedFd, SeccompExecError> {
-    match mkdirat(
+    let created = match mkdirat(
         parent,
         name,
         Mode::from_bits_truncate(SECCOMP_DIRECTORY_MODE),
     ) {
-        Ok(()) | Err(Errno::EEXIST) => {}
+        Ok(()) => true,
+        Err(Errno::EEXIST) => false,
         Err(_) => return Err(SeccompExecError::CreateDestinationDirectory),
-    }
+    };
     let directory = open_directory_at(parent, name)
         .map_err(|_| SeccompExecError::InvalidDestinationDirectory)?;
+    if created {
+        fchown(
+            &directory,
+            Some(Uid::from_raw(owner_uid)),
+            Some(Gid::from_raw(owner_gid)),
+        )
+        .and_then(|()| fchmod(&directory, Mode::from_bits_truncate(SECCOMP_DIRECTORY_MODE)))
+        .and_then(|()| fsync(&directory))
+        .and_then(|()| fsync(parent))
+        .map_err(|_| SeccompExecError::CreateDestinationDirectory)?;
+    }
     validate_directory_exact(&directory, owner_uid, owner_gid, SECCOMP_DIRECTORY_MODE)?;
     Ok(directory)
 }
@@ -1767,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn destination_chain_must_remain_root_private_mode_0700() {
+    fn immutable_profile_chain_requires_traverse_only_mode_0711() {
         let (root, contract) = fixture();
         let directory = root.path().join("var/lib/buzzci");
         fs::create_dir(&directory).unwrap();
@@ -1812,7 +1840,7 @@ mod tests {
         ] {
             assert_eq!(
                 fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
-                SECCOMP_DIRECTORY_MODE
+                PRIVATE_RECEIPT_DIRECTORY_MODE
             );
         }
     }
