@@ -59,10 +59,10 @@ class HarnessTests(unittest.TestCase):
             third = harness.sha256_tree(root)
             self.assertEqual(len({first, second, third}), 3)
 
-    def test_authoritative_parent_reports_exact_execd_package_gap(self) -> None:
+    def test_authoritative_parent_contains_complete_execd_package(self) -> None:
         candidate = HERE.parents[4]
         missing = [relative for relative in harness.REQUIRED_CANDIDATE_FILES if not (candidate / relative).is_file()]
-        self.assertEqual(missing, ["deploy/native-ci/execd/install.py"])
+        self.assertEqual(missing, [])
 
     def test_package_binding_rejects_activation_actor_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
