@@ -998,6 +998,7 @@ dependencies = [
  "buzz-ci-isolation-contract",
  "buzz-ci-materializer",
  "buzz-ci-policy-proxy",
+ "ed25519-dalek",
  "hex",
  "nix 0.31.3",
  "rustix 1.1.4",

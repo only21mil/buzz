@@ -14,10 +14,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use buzz_ci_broker_protocol::v2;
 use buzz_ci_broker_protocol::{
     decode_request, decode_request_header, encode_response, AdmitAttemptRequest, BrokerResponse,
     BrokerState, Conclusion, FrameHeader, Operation, QualificationRequest, Request, ResponseCode,
-    HEADER_SIZE, MAX_BODY_SIZE,
+    HEADER_SIZE, PROTOCOL_VERSION,
 };
 use nix::{
     sys::socket::{
@@ -203,6 +204,17 @@ pub trait QualificationAdmissionBoundary {
 pub trait ControlDispatch {
     /// Return exactly one bounded protocol response.
     fn dispatch(&mut self, header: FrameHeader, request: Request, now: u64) -> BrokerResponse;
+
+    /// Consume the frozen version 2 request contract. Existing dispatchers stay
+    /// fail-closed until they explicitly bind the v2 admission controller.
+    fn dispatch_v2(
+        &mut self,
+        _header: v2::FrameHeader,
+        _request: v2::Request,
+        now: u64,
+    ) -> v2::BrokerResponse {
+        crate::production_binding::empty_response(ResponseCode::NotProvisioned, now)
+    }
 
     /// Run traffic-independent lease maintenance at one trusted clock reading.
     fn maintenance(&mut self, _now: u64) {}
@@ -538,19 +550,63 @@ fn serve_verified_stream_mode<D: ControlDispatch>(
     dispatch: &mut D,
     require_write_shutdown: bool,
 ) -> Result<(), ControlError> {
-    let mut frame = [0_u8; HEADER_SIZE + MAX_BODY_SIZE];
+    let mut frame = [0_u8; HEADER_SIZE + v2::MAX_BODY_SIZE];
     read_exact_frame_part(&mut stream, &mut frame[..HEADER_SIZE], "short header")?;
-    let (header, body_size) = decode_request_header(&frame[..HEADER_SIZE])
-        .map_err(|_| ControlError::Frame("malformed header"))?;
-    if !role.permits(header.operation) {
+    let version = u16::from_be_bytes([frame[4], frame[5]]);
+    match version {
+        PROTOCOL_VERSION => {
+            let (header, body_size) = decode_request_header(&frame[..HEADER_SIZE])
+                .map_err(|_| ControlError::Frame("malformed header"))?;
+            authorize_and_read_body(
+                &mut stream,
+                role,
+                header.operation,
+                &mut frame,
+                body_size,
+                require_write_shutdown,
+            )?;
+            let frame_size = HEADER_SIZE + body_size;
+            let (decoded_header, request) = decode_request(&frame[..frame_size])
+                .map_err(|_| ControlError::Frame("malformed body"))?;
+            debug_assert_eq!(decoded_header, header);
+            let response = dispatch.dispatch(header, request, unix_now()?);
+            write_all_fd(&stream, encode_response(header, response).as_bytes())
+        }
+        v2::PROTOCOL_VERSION => {
+            let (header, body_size) = v2::decode_request_header(&frame[..HEADER_SIZE])
+                .map_err(|_| ControlError::Frame("malformed header"))?;
+            authorize_and_read_body(
+                &mut stream,
+                role,
+                header.operation,
+                &mut frame,
+                body_size,
+                require_write_shutdown,
+            )?;
+            let frame_size = HEADER_SIZE + body_size;
+            let (decoded_header, request) = v2::decode_request(&frame[..frame_size])
+                .map_err(|_| ControlError::Frame("malformed body"))?;
+            debug_assert_eq!(decoded_header, header);
+            let response = dispatch.dispatch_v2(header, request, unix_now()?);
+            write_all_fd(&stream, v2::encode_response(header, response).as_bytes())
+        }
+        _ => Err(ControlError::Frame("malformed header")),
+    }
+}
+
+fn authorize_and_read_body(
+    stream: &mut UnixStream,
+    role: PeerRole,
+    operation: Operation,
+    frame: &mut [u8],
+    body_size: usize,
+    require_write_shutdown: bool,
+) -> Result<(), ControlError> {
+    if !role.permits(operation) {
         return Err(ControlError::UnauthorizedOperation);
     }
     let frame_size = HEADER_SIZE + body_size;
-    read_exact_frame_part(
-        &mut stream,
-        &mut frame[HEADER_SIZE..frame_size],
-        "short body",
-    )?;
+    read_exact_frame_part(stream, &mut frame[HEADER_SIZE..frame_size], "short body")?;
     if require_write_shutdown {
         let mut trailing = [0_u8; 1];
         match stream.read(&mut trailing) {
@@ -562,16 +618,11 @@ fn serve_verified_stream_mode<D: ControlDispatch>(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                return Err(ControlError::Frame("missing write shutdown"))
+                return Err(ControlError::Frame("missing write shutdown"));
             }
             Err(error) => return Err(ControlError::Io(error)),
         }
     }
-    let (decoded_header, request) =
-        decode_request(&frame[..frame_size]).map_err(|_| ControlError::Frame("malformed body"))?;
-    debug_assert_eq!(decoded_header, header);
-    let response = dispatch.dispatch(header, request, unix_now()?);
-    write_all_fd(&stream, encode_response(header, response).as_bytes())?;
     Ok(())
 }
 
@@ -963,6 +1014,22 @@ mod tests {
         let (header, _) = decode_request(encoded.as_bytes()).unwrap();
         let decoded = decode_response(header, &response).unwrap();
         assert_eq!(decoded.code, ResponseCode::NotProvisioned);
+    }
+
+    #[test]
+    fn socketpair_consumes_version_two_without_reinterpreting_it_as_version_one() {
+        let encoded = v2::encode_request(
+            [31; 16],
+            v2::Request::Hello(HelloRequest {
+                controller_instance: [32; 32],
+                nonce: [33; 32],
+            }),
+        );
+        let response = round_trip(encoded.as_bytes()).unwrap();
+        let (header, _) = v2::decode_request(encoded.as_bytes()).unwrap();
+        let decoded = v2::decode_response(header, &response).unwrap();
+        assert_eq!(decoded.code, ResponseCode::NotProvisioned);
+        assert_eq!(decoded.execution_binding_digest, [0; 32]);
     }
 
     #[test]
