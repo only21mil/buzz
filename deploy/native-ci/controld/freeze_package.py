@@ -32,12 +32,15 @@ DAEMON_CONTRACT = {
     "service_user": "buzzci-controld",
     "config_path": "/etc/buzzci/controld-v1.json",
     "store_root": "/var/lib/buzzci/controld",
-    "capacity": 0,
-    "network": False,
-    "keyholder": False,
+    "default_capacity": 0,
+    "maximum_capacity": 1,
+    "providers_fail_closed": True,
+    "runner_protocol": 2,
+    "acceptance_socket": "/run/buzzci/controld-acceptance.sock",
 }
 STATIC_ASSETS = (
     ("service", "templates/buzz-ci-controld.service", "buzz-ci-controld.service", "/etc/systemd/system/buzz-ci-controld.service", 0o400, 0o644, 0, 0),
+    ("acceptance_socket", "templates/buzz-ci-controld-acceptance.socket", "buzz-ci-controld-acceptance.socket", "/etc/systemd/system/buzz-ci-controld-acceptance.socket", 0o400, 0o644, 0, 0),
     ("tmpfiles", "templates/buzzci-controld.tmpfiles", "buzzci-controld.conf", "/usr/lib/tmpfiles.d/buzzci-controld.conf", 0o400, 0o644, 0, 0),
     ("documentation", "README.md", "README.md", "/usr/share/doc/buzz-ci-controld/README.md", 0o400, 0o644, 0, 0),
 )

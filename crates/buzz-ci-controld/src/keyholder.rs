@@ -11,9 +11,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use buzz_ci_keyholder::{
     decode_response, encode_request, CanonicalPayload, DescribeRequest, DescribeResponse,
     ErrorCode, FrameHeader, HttpMethod as KeyholderHttpMethod, KeySelector, KeyholderClient,
-    Nip98AuthorizeRequest, OperationSet, PeerPolicy, PublicIdentity, Request, Response,
-    SelectorSet, SignCiEventRequest, SignManifestRequest, SignatureResponse, Url as KeyholderUrl,
-    HEADER_SIZE, KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
+    ManifestKind, Nip98AuthorizeRequest, OperationSet, PeerPolicy, PublicIdentity, Request,
+    Response, SelectorSet, SignCiEventRequest, SignManifestRequest, SignatureResponse,
+    Url as KeyholderUrl, HEADER_SIZE, KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
 };
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
 use nostr::{Event, Tag};
@@ -268,6 +268,40 @@ impl UnixKeyholderClient {
         }
         verify_signature(signature)?;
         Ok(signature)
+    }
+
+    /// Sign the exact version-2 admission message with the configured manifest
+    /// generation. The keyholder re-parses and policy-checks every field.
+    pub fn sign_admission_v2(
+        &mut self,
+        request: &mut buzz_ci_broker_protocol::v2::AdmitAttemptRequest,
+    ) -> Result<(), KeyholderError> {
+        use buzz_ci_broker_protocol::v2::{
+            admission_signature_message, AdmissionSignatureAlgorithm,
+        };
+
+        let identity = self.config.expected_identity(KeySelector::Manifest)?;
+        if request.admission_signature_algorithm
+            != AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256
+            || request.admission_key_generation != identity.generation
+        {
+            return Err(KeyholderError::InvalidInput);
+        }
+        request.admission_signature = [0; 64];
+        let message = admission_signature_message(request);
+        let digest: [u8; 32] = Sha256::digest(&message).into();
+        let response = self.signature_response(
+            Request::SignManifest(SignManifestRequest {
+                expected_generation: identity.generation,
+                manifest_kind: ManifestKind::JobIntentV2,
+                canonical_manifest: CanonicalPayload::new(message)
+                    .map_err(|_| KeyholderError::InvalidInput)?,
+            }),
+            KeySelector::Manifest,
+            digest,
+        )?;
+        request.admission_signature = response.signature;
+        Ok(())
     }
 }
 
