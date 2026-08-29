@@ -28,6 +28,10 @@ STATIC_SOURCES = {
     "controld_service_dropin": ("20-controld-capacity-one.conf", "assets/20-controld-capacity-one.conf"),
     "keyholder_socket_dropin": ("20-keyholder-capacity-one.conf", "assets/20-keyholder-capacity-one.conf"),
 }
+TRACKED_ROOT_SOURCES = {
+    "activation_controller": ("controller.py", "assets/buzz-ci-activation-controller", 0o100755, 0o500),
+    "activation_package_module": ("package.py", "assets/buzz_ci_activation_package.py", 0o100755, 0o500),
+}
 TRACKED_EXECUTABLES = (
     "controller.py",
     "freeze_package.py",
@@ -135,6 +139,10 @@ def _static_payload(
     identities: dict[str, object],
     access_group: dict[str, object],
 ) -> tuple[bytes, str]:
+    if role in TRACKED_ROOT_SOURCES:
+        source_name, asset_name, git_mode, _source_mode = TRACKED_ROOT_SOURCES[role]
+        payload = _tracked_payload(source_root, PACKAGE_RELATIVE / source_name, git_mode, 1024 * 1024)
+        return payload, asset_name
     template_name, asset_name = STATIC_SOURCES[role]
     payload = _tracked_payload(
         source_root,
@@ -198,7 +206,7 @@ def freeze_package(
     payloads: dict[str, tuple[bytes, int]] = {}
     for entry in draft["entries"]:
         role = entry["role"]
-        if role in STATIC_SOURCES:
+        if role in STATIC_SOURCES or role in TRACKED_ROOT_SOURCES:
             payload, expected_source = _static_payload(
                 source_root,
                 role,
@@ -208,8 +216,9 @@ def freeze_package(
             if entry["source"] != expected_source:
                 raise ValueError(f"static asset name differs for {role}")
             expected_mode = activation_package.parse_mode(entry["source_mode"])
-            if expected_mode != 0o400:
-                raise ValueError(f"static source mode must be 0400: {role}")
+            wanted_mode = TRACKED_ROOT_SOURCES.get(role, (None, None, None, 0o400))[3]
+            if expected_mode != wanted_mode:
+                raise ValueError(f"tracked source mode differs for {role}")
         else:
             expected_mode = activation_package.parse_mode(entry["source_mode"])
             payload = _external_payload(asset_root, entry["source"], expected_mode)
