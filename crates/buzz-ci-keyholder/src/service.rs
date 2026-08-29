@@ -846,7 +846,7 @@ const fn http_method(method: HttpMethod) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
 
     use buzz_ci_broker_protocol::v2::{
@@ -940,7 +940,7 @@ mod tests {
         .expect("service")
     }
 
-    fn acceptance_templates() -> [CanonicalPayload; 4] {
+    pub(crate) fn acceptance_templates() -> [CanonicalPayload; 4] {
         let actor = hex::encode([4; 32]);
         let channel = "123e4567-e89b-12d3-a456-426614174099";
         let mut run = CiRequestEnvelope {

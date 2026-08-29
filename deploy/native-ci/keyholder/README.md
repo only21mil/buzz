@@ -13,8 +13,8 @@ checks the operation against the exact policy in the public config.
 
 ## Public config
 
-`/etc/buzzci/keyholder-v1.json` contains only public values. The dormant shape
-is:
+`/etc/buzzci/keyholder-v1.json` is owned only by this package and contains
+only static public values. Its acceptance-enabled shape is:
 
 ```json
 {
@@ -26,7 +26,9 @@ is:
       "describe",
       "sign_ci_event",
       "nip98_authorize",
-      "sign_manifest"
+      "sign_manifest",
+      "describe_acceptance",
+      "sign_acceptance_mutation"
     ]
   },
   "selectors": {
@@ -34,7 +36,11 @@ is:
     "nip98": { "public_key": "64 lowercase hex", "generation": 1 },
     "manifest": { "public_key": "64 lowercase hex", "generation": 1 }
   },
-  "nip98_origin": "https://relay.example.invalid"
+  "nip98_origin": "https://relay.example.invalid",
+  "acceptance": {
+    "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
+    "credential_selector": "acceptance-actor.key"
+  }
 }
 ```
 
@@ -46,25 +52,40 @@ timestamp within 60 seconds of the keyholder clock. The three selector public
 keys must be distinct, so a configuration error cannot collapse the signing
 domains onto one credential.
 
-An acceptance package renders one active-only top-level `acceptance` object:
+The config never contains an activation package digest, scenario digest,
+acceptance actor identity, or event template. After the activation package and
+scenario are frozen, the root activation controller creates one public compact
+JSON receipt at the fixed path. Keyholder and controld independently read and
+validate the same bytes. The receipt has this declaration-order shape:
 
 ```json
 {
-  "actor": { "public_key": "64 lowercase hex", "generation": 1 },
+  "schema_version": "buzz-ci-activation-acceptance-binding/v1",
+  "activation_id": "activation id",
+  "activation_package_digest": "64 lowercase hex",
   "scenario_sha256": "64 lowercase hex",
-  "run_event": [0, "actor public key", 0, 46100, [], "canonical content"],
-  "grant_event": [0, "actor public key", 0, 46107, [], "canonical content"],
-  "rerun_event": [0, "actor public key", 0, 46100, [], "canonical content"],
-  "tombstone_event": [0, "actor public key", 0, 5, [], ""]
+  "peer_uid": 1201,
+  "peer_gid": 1201,
+  "timeout_millis": 1000,
+  "fixture": { "...": "capacity-one fixture" },
+  "acceptance": {
+    "actor": { "public_key": "64 lowercase hex", "generation": 1 },
+    "scenario_sha256": "same 64 lowercase hex",
+    "run_event": [0, "actor public key", 0, 46100, [], "canonical content"],
+    "grant_event": [0, "actor public key", 0, 46107, [], "canonical content"],
+    "rerun_event": [0, "actor public key", 0, 46100, [], "canonical content"],
+    "tombstone_event": [0, "actor public key", 0, 5, [], ""]
+  }
 }
 ```
 
-The rendered active peer operation list is exactly the four existing
-operations followed by `describe_acceptance` and
-`sign_acceptance_mutation`. The actor key is distinct from every existing
-selector. Event arrays remain literal JSON values; their event IDs are SHA-256
-over the compact JSON array bytes. The daemon performs the complete
-scenario/template validation before accepting a request.
+The receipt is root:root mode `0444`, a regular one-link file, with a root:root
+mode `0711` immediate parent. It has no whitespace or trailing newline. The
+daemon rejects missing, linked, replaced, noncanonical, loose-mode, or
+semantically drifted receipts on every start. It verifies the fixture package,
+candidate, scenario, peer, actor generation, grant identity, and all four event
+templates before constructing the existing closed operations 5 and 6 policy.
+The actor credential must be distinct from every existing selector.
 
 ## Credentials
 
@@ -102,9 +123,12 @@ approval-gated activation work.
 
 ## Freeze and inspect an acceptance package
 
-The input spec contains only the public peer, three existing selectors,
-NIP-98 origin, actor identity, scenario digest, and four unsigned event arrays.
-It cannot contain an operation list, path, credential selector, or secret.
+The input spec contains only the public peer, three existing selectors, NIP-98
+origin, and the exact fixed receipt path and acceptance credential selector.
+It cannot contain an activation package digest, scenario, actor identity,
+event template, operation list, arbitrary path, or secret. Therefore the
+keyholder package digest is independent of the post-freeze receipt and cannot
+participate in a package self-digest cycle.
 
 ```bash
 deploy/native-ci/keyholder/freeze_package.py \

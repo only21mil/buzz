@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the closed active keyholder config from public acceptance inputs."""
+"""Render the closed static keyholder config without activation-bound values."""
 
 from __future__ import annotations
 
@@ -25,15 +25,11 @@ SPEC_KEYS = {"schema_version", "peer", "selectors", "nip98_origin", "acceptance"
 PEER_KEYS = {"uid", "gid"}
 SELECTOR_KEYS = {"ci_event", "nip98", "manifest"}
 ACCEPTANCE_KEYS = {
-    "actor",
-    "scenario_sha256",
-    "run_event",
-    "grant_event",
-    "rerun_event",
-    "tombstone_event",
+    "binding_receipt_path",
+    "credential_selector",
 }
-EVENT_FIELDS = ("run_event", "grant_event", "rerun_event", "tombstone_event")
-EVENT_KINDS = (46100, 46107, 46100, 5)
+BINDING_RECEIPT_PATH = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
+ACCEPTANCE_CREDENTIAL_SELECTOR = "acceptance-actor.key"
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -72,18 +68,6 @@ def _identity(value: object, where: str) -> dict[str, object]:
     return {"public_key": public_key, "generation": generation}
 
 
-def _event(value: object, actor: str, kind: int, where: str) -> list[object]:
-    if not isinstance(value, list) or len(value) != 6:
-        raise ValueError(f"invalid {where} envelope")
-    if value[0] != 0 or value[1] != actor or isinstance(value[2], bool) or not isinstance(value[2], int) or value[2] < 0:
-        raise ValueError(f"invalid {where} identity")
-    if value[3] != kind or not isinstance(value[4], list) or not isinstance(value[5], str):
-        raise ValueError(f"invalid {where} event")
-    if len(canonical_json(value)) > 64 * 1024:
-        raise ValueError(f"oversized {where}")
-    return value
-
-
 def validate_spec(value: object) -> dict[str, object]:
     spec = _object(value, SPEC_KEYS, "keyholder spec")
     if spec["schema_version"] != 1:
@@ -101,18 +85,11 @@ def validate_spec(value: object) -> dict[str, object]:
     if parsed.scheme != "https" or not parsed.netloc or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username or parsed.password:
         raise ValueError("invalid NIP-98 origin")
     acceptance = _object(spec["acceptance"], ACCEPTANCE_KEYS, "acceptance")
-    actor = _identity(acceptance["actor"], "acceptance actor")
-    if actor["public_key"] in selector_keys:
-        raise ValueError("acceptance actor must be distinct from existing selectors")
-    scenario = acceptance["scenario_sha256"]
-    if not isinstance(scenario, str) or not HEX64.fullmatch(scenario) or scenario == "0" * 64:
-        raise ValueError("invalid acceptance scenario digest")
-    events = {
-        name: _event(acceptance[name], str(actor["public_key"]), kind, name)
-        for name, kind in zip(EVENT_FIELDS, EVENT_KINDS, strict=True)
-    }
-    if len({canonical_json(events[name]) for name in EVENT_FIELDS}) != 4:
-        raise ValueError("acceptance event templates must be distinct")
+    if acceptance != {
+        "binding_receipt_path": BINDING_RECEIPT_PATH,
+        "credential_selector": ACCEPTANCE_CREDENTIAL_SELECTOR,
+    }:
+        raise ValueError("acceptance binding contract differs")
     return {
         "schema_version": 1,
         "peer": {
@@ -122,11 +99,7 @@ def validate_spec(value: object) -> dict[str, object]:
         },
         "selectors": rendered_selectors,
         "nip98_origin": origin.removesuffix("/"),
-        "acceptance": {
-            "actor": actor,
-            "scenario_sha256": scenario,
-            **events,
-        },
+        "acceptance": acceptance,
     }
 
 
