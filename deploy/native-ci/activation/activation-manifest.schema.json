@@ -67,8 +67,8 @@
     },
     "entries": {
       "type": "array",
-      "minItems": 22,
-      "maxItems": 22,
+      "minItems": 30,
+      "maxItems": 30,
       "items": { "$ref": "#/$defs/entry" }
     },
     "systemd": {
@@ -78,6 +78,7 @@
           "buzz-ci-acceptance-control.socket",
           "buzz-ci-acceptance-control.service",
           "buzz-ci-keyholder.socket",
+          "buzz-ci-executor.socket",
           "buzz-ci-execd.socket",
           "buzz-ci-runner.socket",
           "buzz-ci-controld.service"
@@ -142,6 +143,14 @@
           "user": "buzzci-runner",
           "group": "buzzci-controld",
           "mode": "0620"
+        },
+        "executor": {
+          "unit": "buzz-ci-executor.socket",
+          "path": "/run/buzzci/executor.sock",
+          "descriptor_name": "buzz-ci-executor",
+          "user": "root",
+          "group": "root",
+          "mode": "0600"
         }
       }
     },
@@ -388,6 +397,14 @@
             "receipt_verifier_binary",
             "receipt_verifier_expected_stages",
             "qualification_binary",
+            "executor_binary",
+            "fixture_manifest",
+            "fixture_input",
+            "fixture_script",
+            "execd_service",
+            "execd_socket",
+            "executor_service",
+            "executor_socket",
             "activation_controller",
             "activation_package_module",
             "execd_socket_dropin",
@@ -417,6 +434,14 @@
             "/usr/libexec/buzz-ci-verify-acceptance-receipt",
             "/usr/libexec/buzz-ci-acceptance-expected-stages.json",
             "/usr/libexec/buzz-ci-production-qualification",
+            "/usr/libexec/buzz-ci-executor",
+            "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json",
+            "/usr/share/buzzci/execd-v2/fixture/input.txt",
+            "/usr/libexec/buzz-ci-capacity-one-fixture",
+            "/usr/lib/systemd/system/buzz-ci-execd.service",
+            "/usr/lib/systemd/system/buzz-ci-execd.socket",
+            "/usr/lib/systemd/system/buzz-ci-executor.service",
+            "/usr/lib/systemd/system/buzz-ci-executor.socket",
             "/usr/libexec/buzz-ci-activation-controller",
             "/usr/libexec/buzz_ci_activation_package.py",
             "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",

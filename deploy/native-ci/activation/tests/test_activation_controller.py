@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import unittest
 from unittest import mock
 
 ACTIVATION_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = ACTIVATION_ROOT.parents[2]
 sys.path.insert(0, str(ACTIVATION_ROOT))
 
 import package as activation_package
@@ -158,6 +160,7 @@ class ActivationFixture:
             "max_wall_timeout_seconds": 300,
         }
         lane_manifest_digest = activation_package.lane_manifest_digest(lane_manifest)
+        self.lane_manifest_digest = lane_manifest_digest
         runner_staged = activation_package.canonical_json({
             "schema_version": 2, "controld_uid": 62002, "controld_gid": 62002, "mode": "dormant",
         })
@@ -223,6 +226,25 @@ class ActivationFixture:
                 "fixture_digest": "0" * 64,
                 "controller_generation": 1,
                 "runner_generation": 1,
+            },
+            "execution": {
+                "schema_version": 1,
+                "declaration_digest": "0" * 64,
+                "workflow_id": "capacity-one",
+                "workflow_digest": "80" * 32,
+                "job_id": "capacity-one-fixture",
+                "artifact": {
+                    "artifact_id": "result", "name": "result.json", "media_type": "application/json",
+                    "relative_name": "result.json", "max_bytes": 32768,
+                },
+                "fixture_manifest_sha256": activation_package.FIXTURE_MANIFEST_SHA256,
+                "fixture_input_sha256": activation_package.FIXTURE_INPUT_SHA256,
+                "fixture_script_sha256": activation_package.FIXTURE_SCRIPT_SHA256,
+                "max_stdout_bytes": 32768,
+                "max_stderr_bytes": 32768,
+                "max_memory_bytes": 134217728,
+                "max_processes": 16,
+                "max_wall_seconds": 120,
             },
         }
         execd_template["qualification"]["integrated_candidate_sha"] = "a" * 40
@@ -299,6 +321,19 @@ class ActivationFixture:
         }
         for role, (name, payload) in source_map.items():
             self._asset_entry(role, activation_package.STATIC_TARGETS[role], name, payload, 0o644, 0, 0)
+        for role, relative, name, source_mode, install_mode in (
+            ("fixture_manifest", "deploy/native-ci/acceptance/fixtures/fixture-manifest.json", "buzz-ci-capacity-one-fixture-manifest.json", 0o400, 0o444),
+            ("fixture_input", "deploy/native-ci/acceptance/fixtures/input.txt", "buzz-ci-capacity-one-fixture-input.txt", 0o400, 0o444),
+            ("fixture_script", "deploy/native-ci/acceptance/fixtures/run-fixture.sh", "buzz-ci-capacity-one-fixture", 0o500, 0o555),
+            ("execd_service", "deploy/native-ci/execd/templates/buzz-ci-execd.service", "buzz-ci-execd.service", 0o400, 0o644),
+            ("execd_socket", "deploy/native-ci/execd/templates/buzz-ci-execd.socket", "buzz-ci-execd.socket", 0o400, 0o644),
+            ("executor_service", "deploy/native-ci/execd/templates/buzz-ci-executor.service", "buzz-ci-executor.service", 0o400, 0o644),
+            ("executor_socket", "deploy/native-ci/execd/templates/buzz-ci-executor.socket", "buzz-ci-executor.socket", 0o400, 0o644),
+        ):
+            payload = (REPO_ROOT / relative).read_bytes()
+            self._asset_entry(role, activation_package.STATIC_TARGETS[role], name, payload, install_mode, 0, 0)
+            self.entries[-1]["source_mode"] = f"{source_mode:04o}"
+            self.assets[self.entries[-1]["source"]] = (payload, source_mode)
         for role, name, path, install_mode in (
             ("activation_controller", "buzz-ci-activation-controller", ACTIVATION_ROOT / "controller.py", 0o755),
             ("activation_package_module", "buzz_ci_activation_package.py", ACTIVATION_ROOT / "package.py", 0o644),
@@ -373,7 +408,7 @@ class ActivationFixture:
                 "run_id": "1" * 32,
                 "job_id": "capacity-one-fixture",
                 "request_digest": "2" * 64,
-                "manifest_digest": "3" * 64,
+                "manifest_digest": self.lane_manifest_digest,
                 "source_oid": "a" * 40,
                 "approval_id": "4" * 32,
                 "grant_event_id": grant_event_id,
@@ -722,7 +757,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "c11e42ba16093b4ae45a896cb1d843acf5805efca63695c30dbb9b6d6d5d5a2f",
+            "cbace246eefc17033ff171a620d827933a09aace1992dbfb9c5c7144f1ac9b50",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1051,7 +1086,7 @@ class ActivationControllerTests(unittest.TestCase):
     def test_rollback_restores_enabled_listening_execd_baseline(self) -> None:
         state = json.loads(self.fixture.fake_state.read_bytes())
         state["units"]["buzz-ci-execd.socket"].update({
-            "ActiveState": "active", "SubState": "listening", "UnitFileState": "enabled",
+            "LoadState": "loaded", "ActiveState": "active", "SubState": "listening", "UnitFileState": "enabled",
         })
         write_file(self.fixture.fake_state, activation_package.canonical_json(state), 0o600)
         manifest, payloads, driver = self.fixture.load()
@@ -1479,6 +1514,7 @@ class ActivationControllerTests(unittest.TestCase):
             ("peer", lambda value: value["identities"].__setitem__("runner_uid", 62004), "peer and job identities"),
             ("intent", lambda value: value["paths"].__setitem__("intent_root", "/tmp/intents"), "intent, evidence, teardown"),
             ("lane", lambda value: value.__setitem__("lane_manifest_digest", "f" * 64), "Rust contract"),
+            ("execution", lambda value: value["execution"].__setitem__("workflow_id", "different"), "execution declaration differs"),
         )
         for label, mutate, message in mutations:
             with self.subTest(label=label):
@@ -1501,15 +1537,26 @@ class ActivationControllerTests(unittest.TestCase):
         installed = json.loads(target.read_bytes())
         self.assertEqual((installed["capacity"], installed["qualification"]["activation_package_digest"]), (0, manifest["package_digest"]))
         self.assertEqual(installed["qualification"]["fixture_digest"], self.fixture.binding["scenario_sha256"])
+        self.assertEqual(
+            installed["execution"]["declaration_digest"],
+            activation_package.execution_declaration_digest(
+                manifest["source_commit"], manifest["package_digest"], installed["lane_manifest"], installed["execution"],
+            ),
+        )
+        self.assertNotEqual(installed["execution"]["declaration_digest"], "0" * 64)
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.fixture.root / "var/lib/buzzci").stat().st_mode), 0o711)
         for path, mode in (
+            ("/var/lib/buzzci/execd-v2", 0o711),
             (activation_package.EXECD_INTENT_ROOT, 0o700),
             (activation_package.EXECD_BINDING_ROOT, 0o700),
             (activation_package.EXECD_EVIDENCE_ROOT, 0o700),
             (activation_package.EXECD_TEARDOWN_ROOT, 0o700),
             (activation_package.EXECD_ATTEMPT_ROOT, 0o711),
             (activation_package.EXECD_QUALIFICATION_ROOT, 0o700),
+            ("/var/lib/buzzci/seccomp", 0o711),
+            ("/var/lib/buzzci/seccomp/v1", 0o711),
+            ("/var/lib/buzzci/seccomp/v1/sha256", 0o711),
         ):
             directory = self.fixture.root / path.lstrip("/")
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), mode)
@@ -1518,6 +1565,174 @@ class ActivationControllerTests(unittest.TestCase):
         CONTROLLER.rollback(manifest, self.fixture.root, driver)
         self.assertFalse(target.exists())
         self.assertTrue((self.fixture.root / activation_package.EXECD_INTENT_ROOT.lstrip("/")).is_dir())
+
+    def test_execution_declaration_is_closed_bound_and_matches_controld(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+        template = json.loads(payloads[entry["source"]])
+        self.assertEqual(template["execution"]["declaration_digest"], "0" * 64)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        staged = json.loads((self.fixture.root / entry["target"].lstrip("/")).read_bytes())
+        execution = staged["execution"]
+        controld_entry = next(item for item in manifest["entries"] if item["role"] == "controld_config")
+        controld = json.loads(payloads[controld_entry["active_source"]])
+        self.assertEqual(
+            (execution["workflow_id"], execution["workflow_digest"], execution["job_id"], execution["artifact"]),
+            (controld["workflow_id"], controld["workflow_digest"], controld["jobs"][0]["job_id"], controld["jobs"][0]["artifacts"][0]),
+        )
+        active = CONTROLLER._render_execd_config(
+            manifest, payloads, entry, self.fixture.binding, capacity=1,
+        )
+        self.assertEqual(json.loads(active)["execution"], execution)
+        for field, changed in (
+            ("workflow_id", "x" * 65),
+            ("job_id", "other"),
+            ("fixture_input_sha256", "f" * 64),
+            ("max_processes", 17),
+        ):
+            with self.subTest(field=field):
+                mutated = copy.deepcopy(template["execution"])
+                mutated[field] = changed
+                with self.assertRaises(ValueError):
+                    activation_package.validate_execution_declaration(mutated, allow_placeholder=True)
+
+    def test_execution_digest_matches_frozen_rust_vector(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+        config = json.loads(payloads[entry["source"]])
+        self.assertEqual(
+            activation_package.lane_manifest_digest(config["lane_manifest"]),
+            "12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04",
+        )
+        self.assertEqual(
+            activation_package.execution_declaration_digest(
+                "aa" * 20, "70" * 32, config["lane_manifest"], config["execution"],
+            ),
+            "a0c535305d1e1f370c39aaaa077f0a01f88993d76fb743892d5d161e8411f438",
+        )
+
+    def test_every_execution_declaration_field_drift_is_rejected(self) -> None:
+        mutations = {
+            "schema_version": lambda value: value.__setitem__("schema_version", 2),
+            "declaration_digest": lambda value: value.__setitem__("declaration_digest", "1" * 64),
+            "workflow_id": lambda value: value.__setitem__("workflow_id", "different"),
+            "workflow_digest": lambda value: value.__setitem__("workflow_digest", "1" * 64),
+            "job_id": lambda value: value.__setitem__("job_id", "different"),
+            "artifact_id": lambda value: value["artifact"].__setitem__("artifact_id", "other"),
+            "artifact_name": lambda value: value["artifact"].__setitem__("name", "other.json"),
+            "artifact_media": lambda value: value["artifact"].__setitem__("media_type", "text/plain"),
+            "artifact_relative": lambda value: value["artifact"].__setitem__("relative_name", "other.json"),
+            "artifact_max": lambda value: value["artifact"].__setitem__("max_bytes", 32767),
+            "fixture_manifest": lambda value: value.__setitem__("fixture_manifest_sha256", "1" * 64),
+            "fixture_input": lambda value: value.__setitem__("fixture_input_sha256", "1" * 64),
+            "fixture_script": lambda value: value.__setitem__("fixture_script_sha256", "1" * 64),
+            "stdout": lambda value: value.__setitem__("max_stdout_bytes", 32767),
+            "stderr": lambda value: value.__setitem__("max_stderr_bytes", 32767),
+            "memory": lambda value: value.__setitem__("max_memory_bytes", 134217727),
+            "processes": lambda value: value.__setitem__("max_processes", 15),
+            "wall": lambda value: value.__setitem__("max_wall_seconds", 119),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(field=name):
+                manifest, payloads, _driver = self.fixture.load()
+                entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+                for source in (entry["source"], entry["active_source"]):
+                    config = json.loads(payloads[source])
+                    mutate(config["execution"])
+                    payloads[source] = activation_package.canonical_json(config)
+                with self.assertRaises(ValueError):
+                    CONTROLLER._validate_phase_configs(manifest, payloads)
+
+    def test_fixture_executor_and_units_are_installed_exact_and_rollback_owned(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        expected = {
+            "fixture_manifest": (0o444, activation_package.FIXTURE_MANIFEST_SHA256),
+            "fixture_input": (0o444, activation_package.FIXTURE_INPUT_SHA256),
+            "fixture_script": (0o555, activation_package.FIXTURE_SCRIPT_SHA256),
+            "executor_binary": (0o755, next(item for item in manifest["components"] if item["name"] == "executor")["binary_sha256"]),
+            "execd_service": (0o644, None), "execd_socket": (0o644, None),
+            "executor_service": (0o644, None), "executor_socket": (0o644, None),
+        }
+        entries = {item["role"]: item for item in manifest["entries"]}
+        for role, (mode, fixed_digest) in expected.items():
+            target = self.fixture.root / entries[role]["target"].lstrip("/")
+            self.assertEqual((stat.S_IMODE(target.stat().st_mode), activation_package.digest(target.read_bytes())), (mode, fixed_digest or entries[role]["sha256"]))
+        for unit in ("buzz-ci-execd.service", "buzz-ci-execd.socket", "buzz-ci-executor.service", "buzz-ci-executor.socket"):
+            self.assertEqual(staged["installed_units"][unit]["fragment_path"], entries[activation_package.PACKAGE_UNIT_ROLES[unit]]["target"])
+        drift = self.fixture.root / entries["fixture_input"]["target"].lstrip("/")
+        drift.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "readback failed"):
+            CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
+        drift.chmod(0o444)
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        for role in expected:
+            self.assertFalse((self.fixture.root / entries[role]["target"].lstrip("/")).exists())
+
+    def test_manifest_schema_inventory_matches_every_closed_role_and_target(self) -> None:
+        schema = json.loads((ACTIVATION_ROOT / "activation-manifest.schema.json").read_bytes())
+        entry = schema["$defs"]["entry"]["properties"]
+        self.assertEqual(
+            set(entry["role"]["enum"]),
+            set(activation_package.CONFIG_TARGETS) | set(activation_package.STATIC_TARGETS),
+        )
+        self.assertEqual(
+            set(entry["target"]["enum"]),
+            set(activation_package.CONFIG_TARGETS.values()) | set(activation_package.STATIC_TARGETS.values()),
+        )
+        self.assertEqual(
+            schema["properties"]["entries"]["minItems"],
+            len(activation_package.CONFIG_TARGETS) + len(activation_package.STATIC_TARGETS),
+        )
+        self.assertEqual(schema["properties"]["entries"]["minItems"], schema["properties"]["entries"]["maxItems"])
+
+    def test_executor_socket_is_required_for_capacity_one_readiness(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        _qualification, active = self.activate_one(manifest, payloads, driver)
+        self.assertEqual(active["state"], "active_one")
+        self.assertEqual(
+            driver.socket(manifest["socket_policy"]["executor"]),
+            {"path": "/run/buzzci/executor.sock", "mode": "0600", "uid": 0, "gid": 0},
+        )
+        driver.stop("buzz-ci-executor.socket")
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        with self.assertRaisesRegex(ValueError, "unit is not active"):
+            CONTROLLER._active_capacity_one_readback(
+                manifest, self.fixture.root, driver, receipt["capacity_one"]["processes_before"],
+            )
+
+    def test_job_principal_can_traverse_only_fixed_attempt_and_seccomp_paths(self) -> None:
+        unshare = shutil.which("unshare")
+        setpriv = shutil.which("setpriv")
+        if unshare is None or setpriv is None:
+            self.skipTest("user namespace DAC test requires unshare and setpriv")
+        script = r'''
+set -eu
+root=$1
+mkdir -p "$root/var/lib/buzzci/execd-v2/attempts/a/source" "$root/var/lib/buzzci/execd-v2/intents" "$root/var/lib/buzzci/seccomp/v1/sha256"
+chmod 0755 "$root" "$root/var" "$root/var/lib"
+chmod 0711 "$root/var/lib/buzzci" "$root/var/lib/buzzci/execd-v2" "$root/var/lib/buzzci/execd-v2/attempts" "$root/var/lib/buzzci/seccomp" "$root/var/lib/buzzci/seccomp/v1" "$root/var/lib/buzzci/seccomp/v1/sha256"
+chmod 0700 "$root/var/lib/buzzci/execd-v2/intents"
+chown 1:1 "$root/var/lib/buzzci/execd-v2/attempts/a" "$root/var/lib/buzzci/execd-v2/attempts/a/source"
+chmod 0500 "$root/var/lib/buzzci/execd-v2/attempts/a" "$root/var/lib/buzzci/execd-v2/attempts/a/source"
+printf input > "$root/var/lib/buzzci/execd-v2/attempts/a/source/input.txt"
+chown 1:1 "$root/var/lib/buzzci/execd-v2/attempts/a/source/input.txt"
+chmod 0400 "$root/var/lib/buzzci/execd-v2/attempts/a/source/input.txt"
+printf profile > "$root/var/lib/buzzci/seccomp/v1/sha256/profile.json"
+chmod 0444 "$root/var/lib/buzzci/seccomp/v1/sha256/profile.json"
+setpriv --reuid=1 --regid=1 --clear-groups sh -eu -c 'trap '\''chmod -R a+rwx "$1/var/lib/buzzci/execd-v2/attempts/a"'\'' EXIT; test "$(cat "$1/var/lib/buzzci/execd-v2/attempts/a/source/input.txt")" = input; test "$(cat "$1/var/lib/buzzci/seccomp/v1/sha256/profile.json")" = profile; ! test -r "$1/var/lib/buzzci/execd-v2/intents"' sh "$root"
+'''
+        with tempfile.TemporaryDirectory(prefix="buzz-activation-job-dac-", dir="/tmp") as temporary:
+            namespace_root = Path(temporary)
+            result = subprocess.run(
+                [
+                    unshare, "--user", "--map-users=0:1000:1", "--map-users=1:524288:65536",
+                    "--map-groups=0:1000:1", "--map-groups=1:524288:65536", "sh", "-eu", "-c", script, "sh", str(namespace_root),
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rollback_restores_preexisting_exact_execd_v2_config(self) -> None:
         manifest, payloads, driver = self.fixture.load()

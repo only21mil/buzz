@@ -45,6 +45,48 @@ TRACKED_REPO_SOURCES = {
         0o100644,
         0o400,
     ),
+    "fixture_manifest": (
+        Path("deploy/native-ci/acceptance/fixtures/fixture-manifest.json"),
+        "assets/buzz-ci-capacity-one-fixture-manifest.json",
+        0o100644,
+        0o400,
+    ),
+    "fixture_input": (
+        Path("deploy/native-ci/acceptance/fixtures/input.txt"),
+        "assets/buzz-ci-capacity-one-fixture-input.txt",
+        0o100644,
+        0o400,
+    ),
+    "fixture_script": (
+        Path("deploy/native-ci/acceptance/fixtures/run-fixture.sh"),
+        "assets/buzz-ci-capacity-one-fixture",
+        0o100755,
+        0o500,
+    ),
+    "execd_service": (
+        Path("deploy/native-ci/execd/templates/buzz-ci-execd.service"),
+        "assets/buzz-ci-execd.service",
+        0o100644,
+        0o400,
+    ),
+    "execd_socket": (
+        Path("deploy/native-ci/execd/templates/buzz-ci-execd.socket"),
+        "assets/buzz-ci-execd.socket",
+        0o100644,
+        0o400,
+    ),
+    "executor_service": (
+        Path("deploy/native-ci/execd/templates/buzz-ci-executor.service"),
+        "assets/buzz-ci-executor.service",
+        0o100644,
+        0o400,
+    ),
+    "executor_socket": (
+        Path("deploy/native-ci/execd/templates/buzz-ci-executor.socket"),
+        "assets/buzz-ci-executor.socket",
+        0o100644,
+        0o400,
+    ),
 }
 TRACKED_COMPONENT_PROVENANCE = {
     "receipt_verifier": "assets/receipt-verifier-provenance.json",

@@ -7,7 +7,9 @@ contain a frozen package, private key, credential, relay token, or enabled unit.
 The controller composes the frozen runner, controld, execd, keyholder,
 qualification, and runner-executor binaries. It also installs the three frozen
 capacity-one acceptance binaries and the tracked receipt verifier because no
-other package owns them. Every
+other package owns them. The same central package installs the exact executor
+binary, execd/executor unit fragments, and the three immutable fixture inputs;
+they are not assumed to exist on a clean host. Every
 binary has a full source commit, binary digest, and copied mode-`0400`
 provenance record. The staged and active runner, execd-template, and controld
 configs have separate digests. Execd's exact live configs are rendered only
@@ -48,6 +50,7 @@ memberships. Socket permissions grant only the required adjacent connection:
 | `/run/buzzci/execd.sock` | `root` | `buzzci-execd` | `0620` | runner and qualification controller |
 | `/run/buzzci/acceptance-control.sock` | `root` | `buzzci-ctl` | `0620` | qualification controller only |
 | `/run/buzzci/controld-acceptance.sock` | `root` | `buzzci-ctl` | `0620` | qualification controller only |
+| `/run/buzzci/executor.sock` | `root` | `root` | `0600` | execd only |
 
 Controld cannot connect to execd. Keyholder cannot execute jobs. Execd remains
 the sole privileged executor, and the runner still requires execd's UID 0 peer
@@ -104,9 +107,11 @@ already exist with their frozen staged bytes and metadata.
    scenario, and initial generation bindings. It stops the staged controld
    acceptance socket before controld, atomically swaps the active runner,
    rendered execd, and controld configs, reloads systemd, starts the exact
-   keyholder/execd/runner/controld dependency order, and enables the target only
+   keyholder/executor/execd/runner/controld dependency order, and enables the target only
    after config, FragmentPath, socket, process InvocationID, capacity-one, and
-   open-admission readback. Acceptance-control remains alive throughout and the
+   open-admission readback. The executor socket and service must be active at
+   their exact `/usr/lib/systemd/system` fragments before capacity one is
+   reported. Acceptance-control remains alive throughout and the
    controld acceptance socket is active when the action returns for canary
    sequence 2.
 6. Any failed capacity-one action attempts every stop, disable, config-restage, reload,
@@ -210,6 +215,16 @@ GID, `/var/lib/buzzci/ctl` home, `/usr/sbin/nologin` shell, sole
 accepted-request intent files are runtime state and are
 never frozen into the activation package.
 
+The templates also carry one closed `execution` declaration. Its digest is a
+domain-separated SHA-256 over the candidate OID, final package digest, lane and
+isolation digests, fixed workflow/job/artifact, the three fixture digests, and
+big-endian resource limits. The freezer accepts only a zero digest placeholder;
+the controller computes the nonzero declaration after the final package digest
+and scenario manifest binding are known. The installed immutable sources are
+`/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json` and `input.txt`
+root:root `0444`, plus `/usr/libexec/buzz-ci-capacity-one-fixture` root:root
+`0555`. No request can select a command, environment, executable, or path.
+
 The package also freezes the tracked Git-`100755` receipt verifier from
 `deploy/native-ci/acceptance/verify-receipt.py`, records its source commit and
 digest, and installs it only at
@@ -225,7 +240,10 @@ Its Git-`100644` expected-stage table is separately frozen at package mode
 argument or environment override for that path.
 
 The activation tmpfiles entry creates retained execd and seccomp parent
-directories only. The execd composition package owns the immutable seccomp
+directories only. `/var/lib/buzzci`, `execd-v2`, `execd-v2/attempts`, and the
+seccomp `{v1,sha256}` traversal chain are root:root `0711`; sensitive siblings
+remain `0700`. Per-attempt job-owned directories and files are created by execd
+with their narrower `0500`/`0400`/`0700`/`0600` contract. The execd composition package owns the immutable seccomp
 profile and receipt; stage and rollback neither create nor remove those files.
 Controld changes from capacity 0 to capacity 1 without changing its schema,
 store root, or fixed receipt path. Its active config carries the complete relay,

@@ -59,11 +59,15 @@ CAPACITY_ONE_FRAGMENT_PATHS = {
     "buzz-ci-capacity-one.target": "/etc/systemd/system/buzz-ci-capacity-one.target",
     "buzz-ci-controld.service": "/etc/systemd/system/buzz-ci-controld.service",
     "buzz-ci-runner.socket": "/etc/systemd/system/buzz-ci-runner.socket",
-    "buzz-ci-execd.socket": "/etc/systemd/system/buzz-ci-execd.socket",
+    "buzz-ci-execd.service": "/usr/lib/systemd/system/buzz-ci-execd.service",
+    "buzz-ci-execd.socket": "/usr/lib/systemd/system/buzz-ci-execd.socket",
+    "buzz-ci-executor.service": "/usr/lib/systemd/system/buzz-ci-executor.service",
+    "buzz-ci-executor.socket": "/usr/lib/systemd/system/buzz-ci-executor.socket",
     "buzz-ci-keyholder.socket": "/etc/systemd/system/buzz-ci-keyholder.socket",
 }
 CAPACITY_ONE_PROCESS_UNITS = (
     "buzz-ci-keyholder.service",
+    "buzz-ci-executor.service",
     "buzz-ci-execd.service",
     "buzz-ci-runner.service",
     "buzz-ci-controld.service",
@@ -71,6 +75,8 @@ CAPACITY_ONE_PROCESS_UNITS = (
 CAPACITY_ONE_START_ORDER = (
     "buzz-ci-keyholder.socket",
     "buzz-ci-keyholder.service",
+    "buzz-ci-executor.socket",
+    "buzz-ci-executor.service",
     "buzz-ci-execd.socket",
     "buzz-ci-execd.service",
     "buzz-ci-runner.socket",
@@ -487,6 +493,14 @@ def _render_execd_config(
         "controller_generation": fixture["controller_generation"],
         "runner_generation": fixture["runner_generation"],
     })
+    if fixture.get("manifest_digest") != rendered.get("lane_manifest_digest"):
+        raise ValueError("acceptance fixture manifest digest differs from the execd lane manifest")
+    execution = rendered.get("execution")
+    activation_package.validate_execution_declaration(execution, allow_placeholder=True)
+    execution["declaration_digest"] = activation_package.execution_declaration_digest(
+        manifest["source_commit"], manifest["package_digest"], rendered["lane_manifest"], execution,
+    )
+    activation_package.validate_execution_declaration(execution, allow_placeholder=False)
     return activation_package.canonical_json(rendered)
 
 
@@ -1040,10 +1054,12 @@ class FakeSystemd:
         acceptance.chmod(0o700)
         for target, mode in (
             ("/var/lib/buzzci", 0o711),
-            ("/var/lib/buzzci/seccomp", 0o700),
+            ("/var/lib/buzzci/seccomp", 0o711),
+            ("/var/lib/buzzci/seccomp/v1", 0o711),
+            ("/var/lib/buzzci/seccomp/v1/sha256", 0o711),
             ("/var/lib/buzzci/activation", 0o700),
             ("/var/lib/buzzci/activation/receipts", 0o700),
-            ("/var/lib/buzzci/execd-v2", 0o700),
+            ("/var/lib/buzzci/execd-v2", 0o711),
             (activation_package.EXECD_INTENT_ROOT, 0o700),
             (activation_package.EXECD_BINDING_ROOT, 0o700),
             (activation_package.EXECD_EVIDENCE_ROOT, 0o700),
@@ -1087,7 +1103,7 @@ class FakeSystemd:
         for policy in self.socket_policy.values():
             if policy["unit"] == name:
                 identity = self.identity(policy["user"]) if policy["user"] != "root" else {"uid": 0}
-                group = self.group(policy["group"])
+                group = self.group(policy["group"]) if policy["group"] != "root" else {"gid": 0}
                 state["sockets"][policy["path"]] = {
                     "path": policy["path"], "mode": policy["mode"], "uid": identity["uid"], "gid": group["gid"],
                 }
@@ -2091,6 +2107,7 @@ def _capacity_one_stop_errors(driver: LiveSystemd | FakeSystemd) -> list[str]:
         activation_package.PERSISTENT_UNIT,
         "buzz-ci-runner.service", "buzz-ci-runner.socket",
         "buzz-ci-execd.service", "buzz-ci-execd.socket",
+        "buzz-ci-executor.service", "buzz-ci-executor.socket",
         "buzz-ci-keyholder.service", "buzz-ci-keyholder.socket",
     )
     for unit in ordered:
@@ -2526,7 +2543,9 @@ def _socket_readback(
             if identity is None:
                 raise ValueError(f"socket user is not in the fixed plan: {policy['user']}")
             expected_uid = identity["uid"]
-        if policy["group"] == activation_package.ACCESS_GROUP_NAME:
+        if policy["group"] == "root":
+            expected_gid = 0
+        elif policy["group"] == activation_package.ACCESS_GROUP_NAME:
             expected_gid = manifest["access_group"]["gid"]
         else:
             identity = next((item for item in identities.values() if item["group"] == policy["group"]), None)
