@@ -602,6 +602,19 @@ class RendererTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDER.RenderError, "valid JSON"):
             RENDER.parse_public_binding_json(b'{"schema_version":\n')
 
+    def test_keyholder_manifest_must_bind_the_exact_external_public_binding(self) -> None:
+        raw = public_binding_bytes(public_binding())
+        valid = {"keyholder": {"public_binding_sha256": hashlib.sha256(raw).hexdigest()}}
+        RENDER.bind_keyholder_manifest_to_public_binding(valid, raw)
+        with self.assertRaisesRegex(RENDER.RenderError, "legacy keyholder package"):
+            RENDER.bind_keyholder_manifest_to_public_binding(
+                {"keyholder": {"public_binding_sha256": None}}, raw,
+            )
+        with self.assertRaisesRegex(RENDER.RenderError, "public binding digest differs"):
+            RENDER.bind_keyholder_manifest_to_public_binding(
+                {"keyholder": {"public_binding_sha256": "a" * 64}}, raw,
+            )
+
     def test_execd_preactivation_input_is_candidate_bound_and_canonical(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
@@ -633,6 +646,8 @@ class RendererTests(unittest.TestCase):
             for name in RENDER.PACKAGE_NAMES:
                 payload = name.encode()
                 manifest = minimal_manifest(name, f"assets/{name}", payload)
+                if name == "keyholder":
+                    manifest["public_binding_sha256"] = public_ref["sha256"]
                 if name == "activation":
                     unsigned = dict(manifest)
                     unsigned.pop("package_digest")

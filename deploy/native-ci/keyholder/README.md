@@ -135,7 +135,11 @@ pretty-printed, duplicate-key, extra-field, and truncated bindings fail closed.
 It projects `keyholder_public_spec` by removing only
 `peer.allowed_operations`, then validates the result as the existing lean
 acceptance-public spec. The package manifest binds both the original binding
-SHA-256 and the projected canonical spec SHA-256.
+SHA-256 and the projected canonical spec SHA-256. The package retains those
+exact original bytes as root package member `public-binding.json`, mode `0600`.
+The installer rehashes and reprojects that member against the manifest and
+runtime config. Activation rendering also requires its digest to match the
+exact prepared-state binding supplied to the descriptor.
 
 ```bash
 deploy/native-ci/keyholder/freeze_package.py \
@@ -155,7 +159,9 @@ deploy/native-ci/keyholder/install.py verify-package \
 `--public-binding` and `--public-spec` are mutually exclusive. The latter
 remains available only for an explicit legacy lean acceptance-public spec. A
 legacy package records `public_binding_sha256` as JSON `null` and still binds
-the canonical lean spec digest. Neither input may contain an activation
+the canonical lean spec digest. It omits `public-binding.json`; an unclaimed
+artifact fails installation, and a legacy package cannot enter the
+prepared-public-binding activation composition. Neither input may contain an activation
 package digest, scenario, event template, arbitrary path, or secret. The
 keyholder package digest therefore remains independent of the post-freeze
 receipt and cannot participate in a package self-digest cycle.

@@ -373,6 +373,29 @@ class BootstrapCompositionTests(unittest.TestCase):
             })
             rendered_draft = self._render("render-draft", draft_descriptor, "activation-draft.json")
             self.assertEqual(rendered_draft["source_commit"], candidate)
+            self.assertEqual(
+                (ceremony / "packages/keyholder/public-binding.json").read_bytes(),
+                public_path.read_bytes(),
+            )
+            tampered_keyholder = copy.deepcopy(ready["keyholder"])
+            tampered_keyholder["public_binding_sha256"] = "a" * 64
+            del tampered_keyholder["package_digest"]
+            tampered_keyholder["package_digest"] = hashlib.sha256(
+                canonical(tampered_keyholder),
+            ).hexdigest()
+            tampered_keyholder_path = ceremony / "tampered-keyholder-manifest.json"
+            write_file(tampered_keyholder_path, canonical(tampered_keyholder), 0o600)
+            tampered_descriptor = copy.deepcopy(json.loads(draft_descriptor.read_bytes()))
+            tampered_descriptor["package_manifests"]["keyholder"] = file_ref(
+                ceremony, tampered_keyholder_path,
+            )
+            tampered_descriptor_path = self._write_descriptor(
+                ceremony, "tampered-draft-descriptor.json", tampered_descriptor,
+            )
+            with self.assertRaisesRegex(RENDER.RenderError, "public binding digest differs"):
+                self._render(
+                    "render-draft", tampered_descriptor_path, "tampered-activation-draft.json",
+                )
             rendered_execd = next(item for item in rendered_draft["components"] if item["name"] == "execd")
             self.assertEqual(
                 (rendered_execd["binary_sha256"], rendered_execd["provenance_sha256"]),

@@ -206,7 +206,7 @@ def _validate_units(payloads: dict[str, bytes]) -> None:
         raise ValueError("acceptance binding receipt mount contract differs")
 
 
-def _read_public_binding(path: Path) -> tuple[dict[str, object], bytes]:
+def _read_public_binding(path: Path) -> bytes:
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         before = os.fstat(descriptor)
@@ -232,13 +232,7 @@ def _read_public_binding(path: Path) -> tuple[dict[str, object], bytes]:
     finally:
         os.close(descriptor)
     raw = b"".join(chunks)
-    try:
-        value = json.loads(raw, object_pairs_hook=render_keyholder_config.reject_duplicates)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("public binding is not valid JSON") from error
-    if not isinstance(value, dict):
-        raise ValueError("public binding is not a JSON object")
-    return value, raw
+    return raw
 
 
 def _closed_object(value: object, keys: set[str], where: str) -> dict[str, object]:
@@ -322,8 +316,15 @@ def canonical_public_binding(value: dict[str, object]) -> bytes:
     ).encode() + b"\n"
 
 
-def _project_public_binding(path: Path) -> tuple[bytes, bytes, str]:
-    binding, binding_raw = _read_public_binding(path)
+def project_public_binding_bytes(binding_raw: bytes) -> tuple[bytes, bytes]:
+    try:
+        binding = json.loads(
+            binding_raw, object_pairs_hook=render_keyholder_config.reject_duplicates,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("public binding is not valid JSON") from error
+    if not isinstance(binding, dict):
+        raise ValueError("public binding is not a JSON object")
     forbidden = ("secret", "private", "raw_key", "raw-key", "seed", "token")
     stack: list[object] = [binding]
     while stack:
@@ -364,13 +365,19 @@ def _project_public_binding(path: Path) -> tuple[bytes, bytes, str]:
     if projected_config != rendered:
         raise ValueError("projected public spec differs from the binding")
     projected_raw = canonical_json(projected)
-    return canonical_json(projected_config), projected_raw, digest(binding_raw)
+    return canonical_json(projected_config), projected_raw
+
+
+def _project_public_binding(path: Path) -> tuple[bytes, bytes, bytes]:
+    binding_raw = _read_public_binding(path)
+    config, projected = project_public_binding_bytes(binding_raw)
+    return config, projected, binding_raw
 
 
 def _prepare_public_config(
     public_spec: Path | None,
     public_binding: Path | None,
-) -> tuple[bytes, bytes, str | None]:
+) -> tuple[bytes, bytes, bytes | None]:
     if (public_spec is None) == (public_binding is None):
         raise ValueError("exactly one public binding or legacy public spec is required")
     if public_binding is not None:
@@ -415,8 +422,11 @@ def freeze_package(
             raise ValueError("service identities must use nonzero u32 values")
     if keyholder_uid == controld_uid or keyholder_gid == controld_gid:
         raise ValueError("keyholder and controld identities must be distinct")
-    config, projected_spec, public_binding_sha256 = _prepare_public_config(
+    config, projected_spec, public_binding_raw = _prepare_public_config(
         public_spec, public_binding,
+    )
+    public_binding_sha256 = (
+        digest(public_binding_raw) if public_binding_raw is not None else None
     )
     config_value = json.loads(config)
     if (config_value["peer"]["uid"], config_value["peer"]["gid"]) != (controld_uid, controld_gid):
@@ -482,6 +492,8 @@ def freeze_package(
         }
         manifest["package_digest"] = digest(canonical_json(manifest))
         _write(stage / "binary-provenance.json", provenance_raw, 0o600)
+        if public_binding_raw is not None:
+            _write(stage / "public-binding.json", public_binding_raw, 0o600)
         _write(stage / "package-manifest.json", canonical_json(manifest), 0o600)
         os.replace(stage, output)
         if stat.S_IMODE(output.lstat().st_mode) != 0o700:

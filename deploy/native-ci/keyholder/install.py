@@ -335,6 +335,31 @@ def parse_package(package: Path, root: Path | None = None) -> tuple[dict[str, ob
         render_keyholder_config.validate_spec(projected)
         if sha256(canonical_json(projected)) != manifest["acceptance_public_spec_sha256"]:
             raise ValueError("packaged config projected public spec binding differs")
+        try:
+            public_binding_raw, public_binding_metadata = _read_at(
+                package_fd, "public-binding.json", MAX_JSON_BYTES,
+            )
+        except FileNotFoundError:
+            if public_binding_sha256 is not None:
+                raise ValueError("claimed public binding artifact is absent") from None
+        else:
+            if public_binding_sha256 is None:
+                raise ValueError("legacy package contains an unclaimed public binding artifact")
+            if (
+                public_binding_metadata.st_uid != package_metadata.st_uid
+                or public_binding_metadata.st_gid != package_metadata.st_gid
+                or stat.S_IMODE(public_binding_metadata.st_mode) != 0o600
+                or sha256(public_binding_raw) != public_binding_sha256
+            ):
+                raise ValueError("public binding artifact metadata or digest differs")
+            bound_config, bound_projected = freeze_package.project_public_binding_bytes(
+                public_binding_raw,
+            )
+            if (
+                bound_config != config_raw
+                or sha256(bound_projected) != manifest["acceptance_public_spec_sha256"]
+            ):
+                raise ValueError("public binding artifact projection differs")
         payloads = {
             entry.role: _read_at(assets_fd, entry.source.removeprefix("assets/"))[0]
             for entry in entries if entry.role not in {"binary", "config"}

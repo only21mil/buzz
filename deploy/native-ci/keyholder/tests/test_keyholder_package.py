@@ -219,6 +219,10 @@ class KeyholderPackageTests(unittest.TestCase):
             package_schema["properties"]["public_binding_sha256"]["oneOf"][1],
             {"type": "null"},
         )
+        self.assertIn(
+            "public-binding.json",
+            package_schema["properties"]["public_binding_sha256"]["description"],
+        )
         self.assertFalse(provenance_schema["additionalProperties"])
         self.assertEqual(provenance_schema["properties"]["binary"]["const"], "buzz-ci-keyholder")
         self.assertEqual(package_schema["properties"]["credential_contract"]["const"], FREEZER.CREDENTIAL_CONTRACT)
@@ -271,6 +275,7 @@ class KeyholderPackageTests(unittest.TestCase):
     def test_package_contains_no_credential_and_binds_public_config(self) -> None:
         manifest = self.freeze()
         self.assertIsNone(manifest["public_binding_sha256"])
+        self.assertFalse((self.package / "public-binding.json").exists())
         self.assertEqual(
             manifest["acceptance_public_spec_sha256"],
             hashlib.sha256(RENDERER.canonical_json(public_spec())).hexdigest(),
@@ -309,6 +314,9 @@ class KeyholderPackageTests(unittest.TestCase):
             manifest["acceptance_public_spec_sha256"],
             hashlib.sha256(RENDERER.canonical_json(projected)).hexdigest(),
         )
+        retained = self.package / "public-binding.json"
+        self.assertEqual(retained.read_bytes(), binding_raw)
+        self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o600)
         config_entry = next(item for item in manifest["entries"] if item["role"] == "config")
         config_raw = (self.package / config_entry["source"]).read_bytes()
         self.assertEqual(config_raw, RENDERER.canonical_json(RENDERER.validate_spec(projected)))
@@ -328,11 +336,37 @@ class KeyholderPackageTests(unittest.TestCase):
         self.binding.chmod(0o600)
         self.binding.write_bytes(binding_raw)
         self.binding.chmod(0o444)
-        config, projected, binding_digest = FREEZER._project_public_binding(self.binding)
-        self.assertEqual(binding_digest, hashlib.sha256(binding_raw).hexdigest())
+        config, projected, retained = FREEZER._project_public_binding(self.binding)
+        self.assertEqual(retained, binding_raw)
         self.assertEqual(projected, lean_raw)
         expected_config = RENDERER.canonical_json(RENDERER.validate_spec(json.loads(lean_raw)))
         self.assertEqual(config, expected_config)
+
+    def test_installer_rejects_recomputed_manifest_with_false_public_binding_digest(self) -> None:
+        self.freeze_binding()
+        manifest_path = self.package / "package-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["public_binding_sha256"] = "a" * 64
+        del manifest["package_digest"]
+        manifest["package_digest"] = hashlib.sha256(FREEZER.canonical_json(manifest)).hexdigest()
+        manifest_path.write_bytes(FREEZER.canonical_json(manifest))
+        manifest_path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "public binding artifact metadata or digest differs"):
+            INSTALLER.parse_package(self.package, self.package)
+
+    def test_binding_claim_requires_artifact_and_legacy_package_rejects_unclaimed_artifact(self) -> None:
+        self.freeze_binding()
+        (self.package / "public-binding.json").unlink()
+        with self.assertRaisesRegex(ValueError, "claimed public binding artifact is absent"):
+            INSTALLER.parse_package(self.package, self.package)
+
+        self.package = self.base / "legacy-package"
+        self.freeze()
+        retained = self.package / "public-binding.json"
+        retained.write_bytes(self.binding.read_bytes())
+        retained.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "legacy package contains an unclaimed"):
+            INSTALLER.parse_package(self.package, self.package)
 
     def test_public_binding_rejects_closed_shape_identity_and_secret_drift(self) -> None:
         cases: list[tuple[str, dict[str, object], str]] = []

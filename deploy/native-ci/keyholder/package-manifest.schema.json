@@ -11,6 +11,7 @@
     "source_commit": { "$ref": "#/$defs/gitOid" },
     "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
     "public_binding_sha256": {
+      "description": "SHA-256 of the exact top-level mode-0600 public-binding.json retained in the package, or null only for a legacy --public-spec package where that artifact must be absent",
       "oneOf": [
         { "$ref": "#/$defs/sha256" },
         { "type": "null" }

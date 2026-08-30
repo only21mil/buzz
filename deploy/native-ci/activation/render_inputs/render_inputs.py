@@ -381,6 +381,20 @@ def load_manifests(root: DescriptorRoot, value: object, candidate: str, names: t
     return manifests, digests
 
 
+def bind_keyholder_manifest_to_public_binding(
+    manifests: dict[str, Any], public_binding_raw: bytes,
+) -> None:
+    keyholder = manifests.get("keyholder")
+    if not isinstance(keyholder, dict):
+        raise RenderError("keyholder package manifest is absent")
+    claimed = keyholder.get("public_binding_sha256")
+    if claimed is None:
+        raise RenderError("legacy keyholder package is not bound to the prepared public binding")
+    require_sha(claimed, "keyholder public binding")
+    if claimed != hashlib.sha256(public_binding_raw).hexdigest():
+        raise RenderError("keyholder package public binding digest differs")
+
+
 def validate_public_binding(value: dict[str, Any]) -> None:
     def ordered(item: object, keys: tuple[str, ...], where: str) -> dict[str, Any]:
         result = require_keys(item, set(keys), where)
@@ -547,6 +561,7 @@ def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], nam
     candidate = require_sha(descriptor["candidate_sha"], "candidate", git=True)
     public, public_raw, _ = root.public_binding_ref(descriptor["public_binding"])
     manifests, manifest_file_sha = load_manifests(root, descriptor["package_manifests"], candidate, names)
+    bind_keyholder_manifest_to_public_binding(manifests, public_raw)
     bindings = {
         "candidate_sha": candidate,
         "public_binding": public,
@@ -728,6 +743,17 @@ def validate_package_tree(root: DescriptorRoot, name: str, package: dict[str, An
         actual = record_map.get(source)
         if actual is None or hashlib.sha256(actual[1]).hexdigest() != manifest["binary_provenance_sha256"]:
             raise RenderError(f"{name} binary provenance differs")
+    if name == "keyholder" and manifest["public_binding_sha256"] is not None:
+        source = "public-binding.json"
+        expected.add(source)
+        actual = record_map.get(source)
+        if (
+            actual is None
+            or actual[0] != 0o600
+            or hashlib.sha256(actual[1]).hexdigest() != manifest["public_binding_sha256"]
+        ):
+            raise RenderError("keyholder retained public binding differs")
+        parse_public_binding_json(actual[1])
     if set(record_map) != expected:
         raise RenderError(f"{name} package tree has missing or extra members")
     return manifest, hashlib.sha256(manifest_raw).hexdigest(), tree_sha256(records)
@@ -742,7 +768,7 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
     os.close(state_fd)
     candidate_fd = root.open_directory(candidate_root, "candidate root")
     os.close(candidate_fd)
-    public, _public_raw, public_path = root.public_binding_ref(descriptor["public_binding"])
+    public, public_raw, public_path = root.public_binding_ref(descriptor["public_binding"])
     if public_path != f"{state}/public-binding.json":
         raise RenderError("public binding is not the prepared state binding")
     try:
@@ -769,6 +795,7 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
             raise RenderError(f"{name} package descriptor differs")
         manifests[name], _manifest_sha, tree_digests[name] = validate_package_tree(root, name, package_value, candidate)
         paths[name] = normalized(package_value["path"], f"{name} package path")
+    bind_keyholder_manifest_to_public_binding(manifests, public_raw)
     bindings = {"candidate_sha": candidate, "packages": manifests}
     validate_scenario(scenario, bindings)
     activation = manifests["activation"]
@@ -900,6 +927,7 @@ def record_sealed_freeze(root: DescriptorRoot, descriptor: dict[str, Any]) -> di
     if public_path != f"{contract['state']}/public-binding.json":
         raise RenderError("sealed-freeze public binding differs from the lifecycle state")
     manifests, manifest_file_sha = load_manifests(root, descriptor["package_manifests"], evidence["candidate_sha"], PACKAGE_NAMES)
+    bind_keyholder_manifest_to_public_binding(manifests, public_raw)
     package_refs = require_keys(descriptor["package_manifests"], set(PACKAGE_NAMES), "sealed-freeze manifests")
     for name in PACKAGE_NAMES:
         contract_package = contract["packages"][name]
