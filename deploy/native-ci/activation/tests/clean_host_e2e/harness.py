@@ -976,7 +976,10 @@ def raise_cleanup_failure(label: str, primary: BaseException | None, cleanup: Ba
     raise HarnessError(f"{label} failed and sanitization failed: {cleanup}") from primary
 
 
-def destroy_identified_directory(path: Path, expected: DirectoryIdentity, label: str) -> None:
+def destroy_identified_directory(
+    path: Path, expected: DirectoryIdentity, label: str,
+    verify_cleanup_authority: Callable[[int], None] | None = None,
+) -> None:
     directory_fd = open_absolute(path, directory=True)
     quarantine = path.with_name(f".{path.name}.tombstone-{os.urandom(16).hex()}")
     primary: BaseException | None = None
@@ -984,6 +987,8 @@ def destroy_identified_directory(path: Path, expected: DirectoryIdentity, label:
     try:
         if not identity_matches(os.fstat(directory_fd), expected):
             raise HarnessError(f"refusing to destroy a replaced {label}")
+        if verify_cleanup_authority is not None:
+            verify_cleanup_authority(directory_fd)
         try:
             rename_noreplace(path, quarantine)
             observed = quarantine.lstat()
@@ -1007,6 +1012,11 @@ def destroy_identified_directory(path: Path, expected: DirectoryIdentity, label:
             raise CleanupDurabilityError(
                 f"{label} tombstone durability failed: {durability_failure}",
             ) from primary
+        if verify_cleanup_authority is not None:
+            cleanup_checkpoint(
+                "before-owned-directory-sanitization", quarantine, directory_fd,
+            )
+            verify_cleanup_authority(directory_fd)
         try:
             sanitize_directory_fd(directory_fd)
         except BaseException as cleanup_error:
@@ -1456,14 +1466,16 @@ def verify_run_ownership_cleanup_authority(
 def destroy_run_state(
     state: Path, expected: StateIdentity, binding: dict[str, str],
 ) -> None:
-    directory_fd = open_absolute(state, directory=True)
-    try:
+    ownership = run_ownership_record(binding, expected)
+
+    def verify(directory_fd: int) -> None:
         verify_run_ownership_cleanup_authority(
-            directory_fd, run_ownership_record(binding, expected), expected,
+            directory_fd, ownership, expected,
         )
-    finally:
-        os.close(directory_fd)
-    destroy_state(state, expected)
+
+    destroy_identified_directory(
+        state, expected, "VM state directory", verify,
+    )
 
 
 def path_matches_identity(path: Path, expected: DirectoryIdentity) -> bool:
@@ -1476,8 +1488,11 @@ def path_matches_identity(path: Path, expected: DirectoryIdentity) -> bool:
 
 def sanitize_selected_state(
     state: Path, claimed: Path, expected: StateIdentity, directory_fd: int,
-    primary: BaseException,
+    primary: BaseException, ownership: dict[str, object],
 ) -> None:
+    def verify(candidate_fd: int) -> None:
+        verify_run_ownership_cleanup_authority(candidate_fd, ownership, expected)
+
     cleanup_errors: list[BaseException] = []
     located = False
     for path in (claimed, state):
@@ -1490,7 +1505,9 @@ def sanitize_selected_state(
             continue
         located = True
         try:
-            destroy_identified_directory(path, expected, "selected VM state directory")
+            destroy_identified_directory(
+                path, expected, "selected VM state directory", verify,
+            )
         except BaseException as error:
             cleanup_errors.append(error)
         break
@@ -1502,6 +1519,11 @@ def sanitize_selected_state(
                 ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                 dir_fd=directory_fd,
             )
+            cleanup_checkpoint(
+                "before-owned-directory-sanitization",
+                Path(f"/proc/self/fd/{fresh_fd}"), fresh_fd,
+            )
+            verify(fresh_fd)
             sanitize_directory_fd(fresh_fd)
         except BaseException as error:
             cleanup_errors.append(error)
@@ -1627,16 +1649,9 @@ def _claim_run_state_locked(
         return claimed, expected, ownership_existed or lost_acknowledgement
     except BaseException as claim_error:
         if cleanup_allowed:
-            try:
-                verify_run_ownership_cleanup_authority(
-                    directory_fd, ownership, expected,
-                )
-            except BaseException as authority_error:
-                detail = str(authority_error) or type(authority_error).__name__
-                raise HarnessError(
-                    f"terminal run cleanup authority failed: {detail}",
-                ) from claim_error
-            sanitize_selected_state(state, claimed, expected, directory_fd, claim_error)
+            sanitize_selected_state(
+                state, claimed, expected, directory_fd, claim_error, ownership,
+            )
         raise
     finally:
         os.close(directory_fd)

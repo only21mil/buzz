@@ -395,8 +395,10 @@ can rewrite an empty or partial matching pending record. A differently bound
 pending record, a stale canonical identity, or a legacy v1 record grants no
 cleanup authority and fails closed without changing the state. Cleanup moves
 the selected state to its identity-checked tombstone and fsyncs that namespace
-change before zeroing the ownership record, so a crash after zeroing leaves no
-public prepared or claimed state.
+change, then revalidates the held descriptor's state identity and exact v2
+ownership authority inside that quarantine immediately before sanitization.
+An ownership or state replacement remains quarantined and unmodified. A crash
+after zeroing leaves no public prepared or claimed state.
 
 Before using a package against `/`, transfer its root, `assets` directory,
 manifest, and every asset to `root:root`. Both directories must be mode `0700`.

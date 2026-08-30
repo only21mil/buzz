@@ -1584,11 +1584,172 @@ class InputTests(unittest.TestCase):
             with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
                 harness, "claim_checkpoint", side_effect=replace_authority,
             ):
-                with self.assertRaisesRegex(harness.HarnessError, "cleanup authority failed"):
+                with self.assertRaisesRegex(harness.HarnessError, "terminal run cleanup failed"):
                     harness.claim_run_state(binding)
             self.assertTrue(state.exists())
             self.assertFalse(Path(binding["claimed_state"]).exists())
             self.assertEqual(sentinel.read_text(), "preserve selected state")
+
+    def test_destroy_run_state_rechecks_authority_after_verifier_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, expected, _resumed = harness.claim_run_state(binding)
+            sentinel = claimed / "sentinel"
+            sentinel.write_text("preserve terminal state")
+            real_verify = harness.verify_run_ownership_cleanup_authority
+            replaced = False
+
+            def replace_after_verify(directory_fd, ownership, selected):
+                nonlocal replaced
+                real_verify(directory_fd, ownership, selected)
+                if replaced:
+                    return
+                replaced = True
+                authority = Path(f"/proc/self/fd/{directory_fd}") / harness.RUN_OWNERSHIP
+                value = json.loads(authority.read_bytes())
+                value["state_identity"]["marker_sha256"] = "f" * 64
+                authority.chmod(0o600)
+                authority.write_bytes(harness.canonical(value))
+                authority.chmod(0o400)
+
+            with mock.patch.object(
+                harness, "verify_run_ownership_cleanup_authority",
+                side_effect=replace_after_verify,
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "authority differs"):
+                    harness.destroy_run_state(claimed, expected, binding)
+            self.assertFalse(claimed.exists())
+            residue = [
+                path for path in root.iterdir()
+                if ".terminal-run.tombstone-" in path.name
+            ]
+            self.assertEqual(len(residue), 1)
+            self.assertEqual((residue[0] / "sentinel").read_text(), "preserve terminal state")
+            self.assertGreater((residue[0] / harness.RUN_OWNERSHIP).stat().st_size, 0)
+
+    def test_claim_failure_rechecks_authority_after_verifier_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            sentinel = state / "sentinel"
+            sentinel.write_text("preserve failed claim")
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            real_verify = harness.verify_run_ownership_cleanup_authority
+            replaced = False
+
+            def fail_after_claim(name, _path, _descriptor):
+                if name == "after-claim-rename":
+                    raise OSError("induced failure after claim rename")
+
+            def replace_after_verify(directory_fd, ownership, selected):
+                nonlocal replaced
+                real_verify(directory_fd, ownership, selected)
+                if replaced:
+                    return
+                replaced = True
+                authority = Path(f"/proc/self/fd/{directory_fd}") / harness.RUN_OWNERSHIP
+                value = json.loads(authority.read_bytes())
+                value["state_identity"]["marker_sha256"] = "f" * 64
+                authority.chmod(0o600)
+                authority.write_bytes(harness.canonical(value))
+                authority.chmod(0o400)
+
+            with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                harness, "claim_checkpoint", side_effect=fail_after_claim,
+            ), mock.patch.object(
+                harness, "verify_run_ownership_cleanup_authority",
+                side_effect=replace_after_verify,
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "terminal run cleanup failed"):
+                    harness.claim_run_state(binding)
+            self.assertFalse(state.exists())
+            self.assertFalse(Path(binding["claimed_state"]).exists())
+            residue = [
+                path for path in root.iterdir()
+                if ".terminal-run.tombstone-" in path.name
+            ]
+            self.assertEqual(len(residue), 1)
+            self.assertEqual((residue[0] / "sentinel").read_text(), "preserve failed claim")
+            self.assertGreater((residue[0] / harness.RUN_OWNERSHIP).stat().st_size, 0)
+
+    def test_destroy_run_state_rejects_noncooperating_marker_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, expected, _resumed = harness.claim_run_state(binding)
+            sentinel = claimed / "sentinel"
+            sentinel.write_text("preserve marker replacement")
+
+            def replace_marker(name, path, _descriptor):
+                if name != "before-owned-directory-sanitization":
+                    return
+                marker = harness.load_json(path / "state.json")
+                marker["challenge"] = "f" * 64
+                (path / "state.json").write_bytes(harness.canonical(marker))
+
+            with mock.patch.object(
+                harness, "cleanup_checkpoint", side_effect=replace_marker,
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "state identity differs"):
+                    harness.destroy_run_state(claimed, expected, binding)
+            self.assertFalse(claimed.exists())
+            residue = [
+                path for path in root.iterdir()
+                if ".terminal-run.tombstone-" in path.name
+            ]
+            self.assertEqual(len(residue), 1)
+            self.assertEqual(
+                (residue[0] / "sentinel").read_text(), "preserve marker replacement",
+            )
+            self.assertGreater((residue[0] / harness.RUN_OWNERSHIP).stat().st_size, 0)
+
+    def test_destroy_run_state_preserves_noncooperating_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, expected, _resumed = harness.claim_run_state(binding)
+            displaced = root / "displaced-selected-state"
+            real_verify = harness.verify_run_ownership_cleanup_authority
+            replaced = False
+
+            def replace_path_after_verify(directory_fd, ownership, selected):
+                nonlocal replaced
+                real_verify(directory_fd, ownership, selected)
+                if replaced:
+                    return
+                replaced = True
+                claimed.rename(displaced)
+                replacement = make_prepared_state(root)
+                sentinel = replacement / "sentinel"
+                sentinel.write_text("unrelated replacement")
+                replacement.rename(claimed)
+
+            with mock.patch.object(
+                harness, "verify_run_ownership_cleanup_authority",
+                side_effect=replace_path_after_verify,
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "replaced VM state"):
+                    harness.destroy_run_state(claimed, expected, binding)
+            self.assertFalse(claimed.exists())
+            replacement_residue = [
+                path for path in root.iterdir()
+                if ".terminal-run.tombstone-" in path.name
+                and (path / "sentinel").exists()
+            ]
+            self.assertEqual(len(replacement_residue), 1)
+            self.assertEqual(
+                (replacement_residue[0] / "sentinel").read_text(), "unrelated replacement",
+            )
+            self.assertTrue(displaced.exists())
+            displaced.chmod(0o700)
+            self.assertEqual((displaced / harness.RUN_OWNERSHIP).stat().st_size, 0)
 
     def test_post_first_file_restart_exposes_nothing_and_cleans_exact_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
