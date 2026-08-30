@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -880,7 +881,78 @@ def remove_output_temporary(parent: int, temporary: str) -> None:
         raise failure
 
 
+def output_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def accept_existing_output(parent: int, name: str, payload: bytes) -> bool:
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+            return False
+        raise
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size != len(payload)
+            or before.st_size > MAX_JSON
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_uid != os.geteuid()
+        ):
+            return False
+        try:
+            raw = DescriptorRoot._read_fd(fd, before.st_size, MAX_JSON, "existing output")
+            parse_canonical_json(raw, "existing output")
+        except RenderError:
+            return False
+        after = os.fstat(fd)
+        if output_identity(before) != output_identity(after):
+            return False
+        if hashlib.sha256(raw).digest() != hashlib.sha256(payload).digest() or raw != payload:
+            return False
+
+        try:
+            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.ENOENT, errno.ENOTDIR}:
+                return False
+            raise
+        if output_identity(after) != output_identity(named):
+            return False
+
+        os.fsync(parent)
+        try:
+            durable = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.ENOENT, errno.ENOTDIR}:
+                return False
+            raise
+        return output_identity(after) == output_identity(durable)
+    finally:
+        os.close(fd)
+
+
 def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
+    if len(payload) > MAX_JSON:
+        raise RenderError("output exceeds its fixed bound")
+    parse_canonical_json(payload, "output")
     output = normalized(relative, "output")
     parent, name = root._open_parent(output)
     fd: int | None = None
@@ -916,13 +988,20 @@ def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
         fd = None
         os.close(closed)
 
-        os.link(
-            temporary,
-            name,
-            src_dir_fd=parent,
-            dst_dir_fd=parent,
-            follow_symlinks=False,
-        )
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except FileExistsError as collision:
+            remove_output_temporary(parent, temporary)
+            temporary = None
+            if accept_existing_output(parent, name, payload):
+                return
+            raise collision
         remove_output_temporary(parent, temporary)
         temporary = None
         os.fsync(parent)

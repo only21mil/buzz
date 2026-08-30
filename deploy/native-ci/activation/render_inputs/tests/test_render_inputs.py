@@ -36,6 +36,9 @@ def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 
+OUTPUT = canonical({"complete": True})
+
+
 def write_json(root: Path, relative: str, value: object, mode: int = 0o600) -> dict[str, object]:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,11 +203,11 @@ class RendererTests(unittest.TestCase):
 
             try:
                 with mock.patch.object(RENDER.os, "fsync", side_effect=record_fsync):
-                    RENDER.write_output(root, "output.json", b"complete\n")
+                    RENDER.write_output(root, "output.json", OUTPUT)
             finally:
                 root.close()
             output = root_path / "output.json"
-            self.assertEqual(output.read_bytes(), b"complete\n")
+            self.assertEqual(output.read_bytes(), OUTPUT)
             self.assertEqual(output.stat().st_mode & 0o7777, 0o600)
             self.assertEqual(output.stat().st_nlink, 1)
             self.assertEqual(fsync_kinds, ["file", "directory"])
@@ -230,7 +233,11 @@ class RendererTests(unittest.TestCase):
 
             threads = [
                 threading.Thread(target=publish, args=(root, payload))
-                for root, payload in zip(roots, (b"first\n", b"second\n"), strict=True)
+                for root, payload in zip(
+                    roots,
+                    (canonical({"value": "first"}), canonical({"value": "second"})),
+                    strict=True,
+                )
             ]
             try:
                 with mock.patch.object(RENDER.os, "link", side_effect=racing_link):
@@ -244,7 +251,10 @@ class RendererTests(unittest.TestCase):
                     root.close()
             self.assertEqual(len(failures), 1)
             self.assertIsInstance(failures[0], FileExistsError)
-            self.assertIn((root_path / "output.json").read_bytes(), (b"first\n", b"second\n"))
+            self.assertIn(
+                (root_path / "output.json").read_bytes(),
+                (canonical({"value": "first"}), canonical({"value": "second"})),
+            )
             self.assertEqual((root_path / "output.json").stat().st_nlink, 1)
             self.assertEqual(self.output_temporaries(root_path), [])
 
@@ -265,13 +275,13 @@ class RendererTests(unittest.TestCase):
             try:
                 with mock.patch.object(RENDER.os, "write", side_effect=partial_then_enospc):
                     with self.assertRaisesRegex(OSError, "injected full filesystem"):
-                        RENDER.write_output(root, "output.json", b"complete\n")
+                        RENDER.write_output(root, "output.json", OUTPUT)
                 self.assertFalse((root_path / "output.json").exists())
                 self.assertEqual(self.output_temporaries(root_path), [])
-                RENDER.write_output(root, "output.json", b"complete\n")
+                RENDER.write_output(root, "output.json", OUTPUT)
             finally:
                 root.close()
-            self.assertEqual((root_path / "output.json").read_bytes(), b"complete\n")
+            self.assertEqual((root_path / "output.json").read_bytes(), OUTPUT)
 
     def test_prepublish_fsync_and_link_failures_clean_up(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -280,18 +290,18 @@ class RendererTests(unittest.TestCase):
             try:
                 with mock.patch.object(RENDER.os, "fsync", side_effect=OSError(errno.EIO, "injected fsync")):
                     with self.assertRaisesRegex(OSError, "injected fsync"):
-                        RENDER.write_output(root, "fsync.json", b"complete\n")
+                        RENDER.write_output(root, "fsync.json", OUTPUT)
                 self.assertFalse((root_path / "fsync.json").exists())
                 self.assertEqual(self.output_temporaries(root_path), [])
 
                 with mock.patch.object(RENDER.os, "link", side_effect=OSError(errno.EIO, "injected link")):
                     with self.assertRaisesRegex(OSError, "injected link"):
-                        RENDER.write_output(root, "link.json", b"complete\n")
+                        RENDER.write_output(root, "link.json", OUTPUT)
                 self.assertFalse((root_path / "link.json").exists())
                 self.assertEqual(self.output_temporaries(root_path), [])
 
-                RENDER.write_output(root, "fsync.json", b"complete\n")
-                RENDER.write_output(root, "link.json", b"complete\n")
+                RENDER.write_output(root, "fsync.json", OUTPUT)
+                RENDER.write_output(root, "link.json", OUTPUT)
             finally:
                 root.close()
 
@@ -313,7 +323,7 @@ class RendererTests(unittest.TestCase):
             try:
                 with mock.patch.object(RENDER.os, "close", side_effect=close_then_fail):
                     with self.assertRaisesRegex(OSError, "injected close"):
-                        RENDER.write_output(root, "close.json", b"complete\n")
+                        RENDER.write_output(root, "close.json", OUTPUT)
                 self.assertFalse((root_path / "close.json").exists())
                 self.assertEqual(self.output_temporaries(root_path), [])
 
@@ -328,13 +338,13 @@ class RendererTests(unittest.TestCase):
                     real_unlink(path, dir_fd=dir_fd)
 
                 with mock.patch.object(RENDER.os, "unlink", side_effect=unlink_once_then_succeed):
-                    RENDER.write_output(root, "output.json", b"complete\n")
+                    RENDER.write_output(root, "output.json", OUTPUT)
                 self.assertEqual(unlinks, 2)
                 self.assertEqual(self.output_temporaries(root_path), [])
             finally:
                 root.close()
 
-    def test_directory_fsync_failure_leaves_only_complete_publication(self) -> None:
+    def test_directory_fsync_failure_allows_only_an_exact_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
             root = self.output_root(root_path)
@@ -348,36 +358,90 @@ class RendererTests(unittest.TestCase):
             try:
                 with mock.patch.object(RENDER.os, "fsync", side_effect=fail_directory_fsync):
                     with self.assertRaisesRegex(OSError, "injected directory fsync"):
-                        RENDER.write_output(root, "output.json", b"complete\n")
+                        RENDER.write_output(root, "output.json", OUTPUT)
+                output = root_path / "output.json"
+                published_inode = output.stat().st_ino
+                RENDER.write_output(root, "output.json", OUTPUT)
+                self.assertEqual(output.stat().st_ino, published_inode)
+                with self.assertRaises(FileExistsError):
+                    RENDER.write_output(root, "output.json", canonical({"complete": False}))
             finally:
                 root.close()
             output = root_path / "output.json"
-            self.assertEqual(output.read_bytes(), b"complete\n")
+            self.assertEqual(output.read_bytes(), OUTPUT)
             self.assertEqual(output.stat().st_mode & 0o7777, 0o600)
             self.assertEqual(self.output_temporaries(root_path), [])
 
-    def test_existing_target_and_symlink_are_never_replaced(self) -> None:
+    def test_existing_unsafe_targets_are_never_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
-            existing = root_path / "existing.json"
-            existing.write_bytes(b"keep\n")
-            existing.chmod(0o400)
+            wrong_mode = root_path / "wrong-mode.json"
+            wrong_mode.write_bytes(OUTPUT)
+            wrong_mode.chmod(0o400)
+            truncated = root_path / "truncated.json"
+            truncated.write_bytes(OUTPUT[:-1])
+            truncated.chmod(0o600)
+            noncanonical = root_path / "noncanonical.json"
+            noncanonical.write_bytes(b'{"complete": true}\n')
+            noncanonical.chmod(0o600)
+            wrong_owner = root_path / "wrong-owner.json"
+            wrong_owner.write_bytes(OUTPUT)
+            wrong_owner.chmod(0o600)
             outside = root_path / "outside.json"
             outside.write_bytes(b"outside\n")
             symlink = root_path / "symlink.json"
             symlink.symlink_to(outside)
+            directory = root_path / "directory.json"
+            directory.mkdir()
             root = self.output_root(root_path)
             try:
-                with self.assertRaises(FileExistsError):
-                    RENDER.write_output(root, "existing.json", b"replace\n")
-                with self.assertRaises(FileExistsError):
-                    RENDER.write_output(root, "symlink.json", b"replace\n")
+                for name in ("wrong-mode.json", "truncated.json", "noncanonical.json", "symlink.json", "directory.json"):
+                    with self.subTest(name=name), self.assertRaises(FileExistsError):
+                        RENDER.write_output(root, name, OUTPUT)
+                with mock.patch.object(RENDER.os, "geteuid", return_value=os.geteuid() + 1):
+                    with self.assertRaises(FileExistsError):
+                        RENDER.write_output(root, "wrong-owner.json", OUTPUT)
             finally:
                 root.close()
-            self.assertEqual(existing.read_bytes(), b"keep\n")
-            self.assertEqual(existing.stat().st_mode & 0o7777, 0o400)
+            self.assertEqual(wrong_mode.read_bytes(), OUTPUT)
+            self.assertEqual(wrong_mode.stat().st_mode & 0o7777, 0o400)
+            self.assertEqual(truncated.read_bytes(), OUTPUT[:-1])
+            self.assertEqual(noncanonical.read_bytes(), b'{"complete": true}\n')
+            self.assertEqual(wrong_owner.read_bytes(), OUTPUT)
             self.assertTrue(symlink.is_symlink())
+            self.assertTrue(directory.is_dir())
             self.assertEqual(outside.read_bytes(), b"outside\n")
+            self.assertEqual(self.output_temporaries(root_path), [])
+
+    def test_existing_output_name_swap_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            output = root_path / "output.json"
+            replacement = root_path / "replacement.json"
+            output.write_bytes(OUTPUT)
+            output.chmod(0o600)
+            replacement.write_bytes(OUTPUT)
+            replacement.chmod(0o600)
+            original_inode = output.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+            root = self.output_root(root_path)
+            real_read_fd = RENDER.DescriptorRoot._read_fd
+
+            def read_then_swap(fd: int, size: int, maximum: int, where: str) -> bytes:
+                raw = real_read_fd(fd, size, maximum, where)
+                if where == "existing output":
+                    os.replace(replacement, output)
+                return raw
+
+            try:
+                with mock.patch.object(RENDER.DescriptorRoot, "_read_fd", side_effect=read_then_swap):
+                    with self.assertRaises(FileExistsError):
+                        RENDER.write_output(root, "output.json", OUTPUT)
+            finally:
+                root.close()
+            self.assertNotEqual(original_inode, replacement_inode)
+            self.assertEqual(output.stat().st_ino, replacement_inode)
+            self.assertEqual(output.read_bytes(), OUTPUT)
             self.assertEqual(self.output_temporaries(root_path), [])
 
     def test_colliding_temporary_symlink_is_not_followed_or_removed(self) -> None:
@@ -390,12 +454,12 @@ class RendererTests(unittest.TestCase):
             root = self.output_root(root_path)
             try:
                 with mock.patch.object(RENDER.secrets, "token_hex", side_effect=["a" * 32, "b" * 32]):
-                    RENDER.write_output(root, "output.json", b"complete\n")
+                    RENDER.write_output(root, "output.json", OUTPUT)
             finally:
                 root.close()
             self.assertTrue(collision.is_symlink())
             self.assertEqual(outside.read_bytes(), b"outside\n")
-            self.assertEqual((root_path / "output.json").read_bytes(), b"complete\n")
+            self.assertEqual((root_path / "output.json").read_bytes(), OUTPUT)
             self.assertFalse((root_path / f".render-inputs-{'b' * 32}.tmp").exists())
 
     def test_bound_lifecycle_mutation_fails_without_output(self) -> None:
