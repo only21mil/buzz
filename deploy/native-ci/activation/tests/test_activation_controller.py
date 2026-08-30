@@ -592,6 +592,52 @@ class ActivationControllerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def legacy_pre_fixed_boundaries(self, manifest: dict[str, object]) -> list[tuple[str, int]]:
+        targets = [entry for entry in manifest["entries"] if entry["role"] != "execd_config"]
+        return [("apply", cut) for cut in range(len(targets) + 1)] + [("provision", 0), ("tmpfiles", 0)]
+
+    def fail_stage_at_legacy_boundary(
+        self, fixture: ActivationFixture, manifest: dict[str, object], payloads: dict[str, bytes],
+        driver, binding: dict[str, object], boundary: tuple[str, int],
+    ) -> None:
+        phase, cut = boundary
+        if phase == "apply":
+            def partial_apply(
+                applied_manifest: dict[str, object], applied_payloads: dict[str, bytes],
+                root: Path, requested_phase: str,
+            ) -> None:
+                self.assertEqual(requested_phase, "staged")
+                targets = [entry for entry in applied_manifest["entries"] if entry["role"] != "execd_config"]
+                for entry in targets[:cut]:
+                    CONTROLLER._atomic_write(
+                        root, entry["target"], applied_payloads[entry["source"]],
+                        activation_package.parse_mode(entry["install_mode"]), entry["uid"], entry["gid"],
+                    )
+                raise OSError(f"injected legacy apply boundary {cut}")
+
+            context = mock.patch.object(CONTROLLER, "_apply_phase", side_effect=partial_apply)
+        else:
+            original = getattr(driver, phase)
+
+            def mutate_then_fail(*arguments) -> None:
+                original(*arguments)
+                raise OSError(f"injected legacy {phase} boundary")
+
+            context = mock.patch.object(driver, phase, side_effect=mutate_then_fail)
+        with context, self.assertRaisesRegex(OSError, "injected legacy"):
+            CONTROLLER.stage(manifest, payloads, fixture.root, driver, binding)
+
+    def fixed_rollback_cli(self, fixture: ActivationFixture) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                sys.executable, str(fixture.root / "usr/libexec/buzz-ci-activation-controller"),
+                "rollback", "--package", str(fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")),
+                "--root", str(fixture.root), "--fake-systemd-state", str(fixture.fake_state),
+            ],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+
     def zero_request(self, action: str, operation_digit: str = "d", **optional: object) -> tuple[dict[str, object], bytes]:
         binding = self.fixture.binding
         request: dict[str, object] = {
@@ -1056,7 +1102,7 @@ class ActivationControllerTests(unittest.TestCase):
             CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual(receipt["state"], "stage_failed")
-        self.assertFalse((self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")).exists())
+        self.assertTrue((self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")).exists())
         self.assertEqual(CONTROLLER._generated_prior_readback(receipt, self.fixture.root), {
             "controld_acceptance_binding": "absent",
             "acceptance_control_config": "absent",
@@ -1065,6 +1111,113 @@ class ActivationControllerTests(unittest.TestCase):
         })
         self.assertEqual(CONTROLLER._systemd_prior_readback(receipt, manifest, self.fixture.root, driver)["buzz-ci-acceptance-control.service"]["ActiveState"], "inactive")
         self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["state"], "rolled_back")
+        self.assertFalse((self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")).exists())
+
+    def test_every_legacy_pre_fixed_boundary_has_restart_safe_first_activation_rollback(self) -> None:
+        manifest, _payloads, _driver = self.fixture.load()
+        boundaries = self.legacy_pre_fixed_boundaries(manifest)
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                candidate, payloads, driver = fixture.load()
+                self.fail_stage_at_legacy_boundary(
+                    fixture, candidate, payloads, driver, fixture.binding, boundary,
+                )
+                receipt = CONTROLLER._read_receipt(fixture.root)
+                self.assertEqual(receipt["state"], "stage_failed")
+                self.assertEqual(
+                    CONTROLLER._verify_fixed_package(candidate, fixture.root)["status"], "exact",
+                )
+                installed_cli = fixture.root / "usr/libexec/buzz-ci-activation-controller"
+                installed_module = fixture.root / "usr/libexec/buzz_ci_activation_package.py"
+                self.assertTrue(installed_cli.exists())
+                self.assertTrue(installed_module.exists())
+                fixture.package.rename(fixture.temporary / "input-package-missing")
+                rolled_back = self.fixed_rollback_cli(fixture)
+                self.assertEqual(rolled_back.returncode, 0, rolled_back.stderr.decode())
+                self.assertEqual(json.loads(rolled_back.stdout)["state"], "rolled_back")
+                exact_retry = self.fixed_rollback_cli(fixture)
+                self.assertEqual(exact_retry.returncode, 0, exact_retry.stderr.decode())
+                self.assertEqual(json.loads(exact_retry.stdout)["status"], "unchanged")
+
+    def test_every_legacy_pre_fixed_boundary_has_restart_safe_second_activation_rollback(self) -> None:
+        manifest, _payloads, _driver = self.fixture.load()
+        boundaries = self.legacy_pre_fixed_boundaries(manifest)
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                first_manifest, first_payloads, driver = fixture.load()
+                CONTROLLER.stage(first_manifest, first_payloads, fixture.root, driver, fixture.binding)
+                CONTROLLER.rollback(first_manifest, fixture.root, driver)
+                first_marker = CONTROLLER._read_rollback_cleanup(fixture.root)
+                fixture.acceptance_template["actor"]["generation"] += 1
+                fixture.manifest = fixture._manifest()
+                fixture.scenario = fixture._scenario()
+                fixture.binding = CONTROLLER._acceptance_binding(fixture.manifest, fixture.scenario)
+                write_file(
+                    fixture.package / "activation-manifest.json",
+                    activation_package.canonical_json(fixture.manifest), 0o600,
+                )
+                candidate, payloads, driver = fixture.load()
+                self.fail_stage_at_legacy_boundary(
+                    fixture, candidate, payloads, driver, fixture.binding, boundary,
+                )
+                self.assertEqual(CONTROLLER._read_receipt(fixture.root)["state"], "stage_failed")
+                self.assertEqual(CONTROLLER._verify_fixed_package(candidate, fixture.root)["status"], "exact")
+                retirement = CONTROLLER._read_rollback_retirement(fixture.root)
+                self.assertEqual(retirement["marker"], first_marker)
+                fixture.package.rename(fixture.temporary / "input-package-missing")
+                rolled_back = self.fixed_rollback_cli(fixture)
+                self.assertEqual(rolled_back.returncode, 0, rolled_back.stderr.decode())
+                self.assertEqual(json.loads(rolled_back.stdout)["state"], "rolled_back")
+                current = CONTROLLER._read_rollback_cleanup(fixture.root)
+                self.assertEqual(current["activation_id"], candidate["activation_id"])
+                self.assertIsNone(CONTROLLER._read_rollback_retirement(fixture.root))
+                exact_retry = self.fixed_rollback_cli(fixture)
+                self.assertEqual(exact_retry.returncode, 0, exact_retry.stderr.decode())
+                self.assertEqual(json.loads(exact_retry.stdout)["status"], "unchanged")
+
+    def test_pre_fixed_failure_package_missing_drift_and_tamper_fail_closed_then_resume(self) -> None:
+        for hostile in ("missing", "asset-drift", "manifest-tamper"):
+            with self.subTest(hostile=hostile), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                manifest, payloads, driver = fixture.load()
+                self.fail_stage_at_legacy_boundary(
+                    fixture, manifest, payloads, driver, fixture.binding, ("apply", 0),
+                )
+                fixed = fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")
+                if hostile == "missing":
+                    CONTROLLER._remove_package_tree(
+                        fixture.root, CONTROLLER.FIXED_PACKAGE_PATH,
+                        expected_sources=set(CONTROLLER._package_references(manifest)),
+                    )
+                elif hostile == "asset-drift":
+                    source = next(iter(CONTROLLER._package_references(manifest)))
+                    asset = fixed / "assets" / Path(source).name
+                    original = asset.read_bytes()
+                    mode = stat.S_IMODE(asset.stat().st_mode)
+                    asset.chmod(0o600)
+                    write_file(asset, original + b"drift", mode)
+                else:
+                    package_manifest = fixed / "activation-manifest.json"
+                    value = json.loads(package_manifest.read_bytes())
+                    value["source_commit"] = "f" * 40
+                    package_manifest.write_bytes(activation_package.canonical_json(value))
+                rejected = self.fixed_rollback_cli(fixture)
+                self.assertEqual(rejected.returncode, 1)
+                self.assertNotEqual(CONTROLLER._read_receipt(fixture.root)["state"], "rolled_back")
+
+                if fixed.exists():
+                    CONTROLLER._remove_package_tree(
+                        fixture.root, CONTROLLER.FIXED_PACKAGE_PATH, expected_sources=None,
+                    )
+                CONTROLLER._install_fixed_package(manifest, payloads, fixture.root)
+                resumed = self.fixed_rollback_cli(fixture)
+                self.assertEqual(resumed.returncode, 0, resumed.stderr.decode())
+                self.assertEqual(json.loads(resumed.stdout)["state"], "rolled_back")
+                exact_retry = self.fixed_rollback_cli(fixture)
+                self.assertEqual(exact_retry.returncode, 0, exact_retry.stderr.decode())
+                self.assertEqual(json.loads(exact_retry.stdout)["status"], "unchanged")
 
     def test_staged_zero_resume_restarts_only_missing_staged_unit(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -1138,7 +1291,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "f73be403d35976ad4de8ef3eb07534f633a3d97137af0b51462f5a4bc47ec259",
+            "f5564f4354accce13d8d8dbb36b1ab06299e4825f453f59c573c860cf2eb0643",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")

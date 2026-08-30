@@ -1019,6 +1019,48 @@ def _verify_fixed_package(manifest: dict[str, Any], root: Path) -> dict[str, str
     return {"path": FIXED_PACKAGE_PATH, "status": "exact", "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest))}
 
 
+def _install_recovery_targets(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+) -> dict[str, str]:
+    installed, payloads = load_package(
+        activation_package.rooted(root, FIXED_PACKAGE_PATH), live=root == Path("/"),
+    )
+    if installed != manifest:
+        raise ValueError("fixed activation package manifest differs before recovery install")
+    records = _validate_receipt_targets(receipt, manifest)
+    entries = {entry["role"]: entry for entry in manifest["entries"]}
+    result: dict[str, str] = {}
+    for role in ("activation_package_module", "activation_controller"):
+        entry = entries[role]
+        opened = _read_target(root, entry["target"])
+        state = _entry_state(root, entry, opened)
+        if state != "staged":
+            prior = records[role]["prior"]
+            if opened is None:
+                if prior["exists"]:
+                    raise ValueError(f"recovery target absence differs: {entry['target']}")
+            else:
+                current, metadata = opened
+                if (
+                    not prior["exists"]
+                    or activation_package.digest(current) != prior["sha256"]
+                    or _metadata_dict(metadata) != {
+                        "mode": prior["mode"], "uid": prior["uid"], "gid": prior["gid"],
+                    }
+                ):
+                    raise ValueError(f"recovery target drift blocks install: {entry['target']}")
+            _atomic_write(
+                root, entry["target"], payloads[entry["source"]],
+                activation_package.parse_mode(entry["install_mode"]), entry["uid"], entry["gid"],
+            )
+        _verify_target_digest(root, entry["target"], {
+            "sha256": entry["sha256"], "mode": entry["install_mode"],
+            "uid": entry["uid"], "gid": entry["gid"],
+        }, activation_package.MAX_ASSET_BYTES)
+        result[role] = "exact"
+    return result
+
+
 def _remove_fixed_package(manifest: dict[str, Any], root: Path) -> None:
     if not _fixed_package_present(root):
         return
@@ -3222,8 +3264,15 @@ def _prove_qualification_zero(
 def _compensate_failed_stage(
     receipt: dict[str, Any], manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> list[str]:
-    errors = _stop_zero_errors(driver)
-    _restored, restore_errors = _restore_prior_best_effort(receipt, manifest, root)
+    errors: list[str] = []
+    try:
+        _install_recovery_targets(receipt, manifest, root)
+    except BaseException as error:
+        errors.append(f"install rollback recovery targets: {error}")
+    errors.extend(_stop_zero_errors(driver))
+    _restored, restore_errors = _restore_prior_best_effort(
+        receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
+    )
     errors.extend(restore_errors)
     _generated, generated_errors = _restore_generated_prior_best_effort(receipt, root)
     errors.extend(generated_errors)
@@ -3237,7 +3286,9 @@ def _compensate_failed_stage(
         errors.append(f"daemon-reload: {error}")
     errors.extend(_restore_systemd_prior_errors(receipt, driver))
     for label, readback in (
-        ("prior target readback", lambda: _prior_readback(receipt, manifest, root)),
+        ("prior target readback", lambda: _prior_readback(
+            receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
+        )),
         ("acceptance prior readback", lambda: _generated_prior_readback(receipt, root)),
         ("acceptance ledger prior readback", lambda: _acceptance_ledger_prior_readback(receipt, root)),
         ("systemd prior readback", lambda: _systemd_prior_readback(receipt, manifest, root, driver)),
@@ -3246,16 +3297,6 @@ def _compensate_failed_stage(
             readback()
         except BaseException as error:
             errors.append(f"{label}: {error}")
-    if not errors:
-        try:
-            if _fixed_package_present(root):
-                _verify_fixed_package(manifest, root)
-                current_marker = _read_rollback_cleanup(root)
-                if current_marker is None or current_marker == _rollback_cleanup_value(manifest):
-                    _write_rollback_cleanup(manifest, root)
-                    _remove_fixed_package_resumable(manifest, root)
-        except BaseException as error:
-            errors.append(f"remove fixed activation package: {error}")
     return errors
 
 
@@ -3322,15 +3363,16 @@ def _stage_unlocked(
                 return result
             raise ValueError(f"activation receipt requires rollback from {existing['state']}")
     report = preflight(manifest, root, driver, require_dormant=True, payloads=payloads)
+    fixed_package = _install_fixed_package(manifest, payloads, root)
     if rolled_back_receipt is not None:
         _prepare_rollback_retirement(rolled_back_receipt, manifest, root)
     receipt = _new_receipt(manifest, root, driver, generated)
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     try:
+        _install_recovery_targets(receipt, manifest, root)
         _apply_phase(manifest, payloads, root, "staged")
         driver.provision(manifest["identities"])
         driver.tmpfiles()
-        fixed_package = _install_fixed_package(manifest, payloads, root)
         _apply_generated(root, receipt["acceptance_generated"])
         driver.daemon_reload()
         installed_units = _installed_unit_readback(manifest, root, driver)
@@ -4499,6 +4541,7 @@ def _rollback_unlocked(
         _validate_receipt_targets(receipt, manifest)
         _restore_prior(receipt, manifest, root, apply=False)
         _validate_generated_records(receipt, root, apply=False)
+        _install_recovery_targets(receipt, manifest, root)
         execd_package_rollback = _execd_package_rollback_readback(
             manifest, root, receipt
         )
