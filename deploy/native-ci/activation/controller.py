@@ -37,6 +37,9 @@ except ModuleNotFoundError:
 
 RECEIPT_PATH = "/var/lib/buzzci/activation-controller/receipt-v1.json"
 OPERATOR_LOCK_PATH = "/var/lib/buzzci/activation-controller/operator.lock"
+ROLLBACK_CLEANUP_PATH = "/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json"
+ROLLBACK_CLEANUP_SCHEMA = "buzz-ci-activation-rollback-cleanup-v1"
+ROLLBACK_RECOVERY_ROLES = frozenset({"activation_controller", "activation_package_module"})
 ACCEPTANCE_BINDING_PATH = activation_package.ACCEPTANCE_BINDING_PATH
 CONTROLD_ACCEPTANCE_LEDGER_PATH = "/var/lib/buzzci/controld/acceptance-operation-ledger-v1.json"
 FIXED_PACKAGE_PATH = activation_package.FIXED_PACKAGE_PATH
@@ -1001,6 +1004,107 @@ def _remove_fixed_package(manifest: dict[str, Any], root: Path) -> None:
         return
     _verify_fixed_package(manifest, root)
     _remove_package_tree(root, FIXED_PACKAGE_PATH, expected_sources=set(_package_references(manifest)))
+
+
+def _rollback_cleanup_value(manifest: dict[str, Any]) -> dict[str, object]:
+    return {
+        "schema": ROLLBACK_CLEANUP_SCHEMA,
+        "activation_id": manifest["activation_id"],
+        "package_digest": manifest["package_digest"],
+        "source_commit": manifest["source_commit"],
+        "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest)),
+        "package_assets": sorted(Path(source).name for source in _package_references(manifest)),
+        "manifest": manifest,
+    }
+
+
+def _read_rollback_cleanup(root: Path) -> dict[str, Any] | None:
+    opened = _read_target(root, ROLLBACK_CLEANUP_PATH, activation_package.MAX_JSON_BYTES)
+    if opened is None:
+        return None
+    raw, metadata = opened
+    expected_uid, expected_gid = _physical_ids(root, 0, 0)
+    if _metadata_dict(metadata) != {"mode": 0o600, "uid": expected_uid, "gid": expected_gid}:
+        raise ValueError("rollback cleanup marker metadata is unsafe")
+    try:
+        value = json.loads(raw, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("rollback cleanup marker is invalid") from error
+    if not isinstance(value, dict) or activation_package.canonical_json(value) != raw:
+        raise ValueError("rollback cleanup marker is noncanonical")
+    manifest = value.get("manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("rollback cleanup marker lacks its manifest")
+    activation_package.validate_manifest(manifest)
+    if value != _rollback_cleanup_value(manifest):
+        raise ValueError("rollback cleanup marker binding differs")
+    return value
+
+
+def _write_rollback_cleanup(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
+    value = _rollback_cleanup_value(manifest)
+    existing = _read_rollback_cleanup(root)
+    if existing is not None:
+        if existing != value:
+            raise ValueError("rollback cleanup marker belongs to a different activation")
+        return existing
+    _atomic_write(root, ROLLBACK_CLEANUP_PATH, activation_package.canonical_json(value), 0o600, 0, 0)
+    readback = _read_rollback_cleanup(root)
+    if readback != value:
+        raise ValueError("rollback cleanup marker readback differs")
+    return value
+
+
+def _remove_fixed_package_resumable(manifest: dict[str, Any], root: Path) -> None:
+    expected_assets = {Path(source).name for source in _package_references(manifest)}
+    try:
+        parent_fd, name = activation_package.open_parent_fd(root, FIXED_PACKAGE_PATH)
+    except FileNotFoundError:
+        return
+    directory_fd = -1
+    assets_fd = -1
+    try:
+        try:
+            directory_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return
+        entries = set(os.listdir(directory_fd))
+        if not entries <= {"activation-manifest.json", "assets"}:
+            raise ValueError("fixed activation package contains unexpected entries during cleanup")
+        if "assets" in entries:
+            assets_fd = os.open(
+                "assets", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            assets = set(os.listdir(assets_fd))
+            if not assets <= expected_assets:
+                raise ValueError("fixed activation package assets differ during cleanup")
+            for asset in sorted(assets):
+                metadata = os.stat(asset, dir_fd=assets_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError("fixed activation package contains an unsafe cleanup asset")
+                os.unlink(asset, dir_fd=assets_fd)
+            os.close(assets_fd)
+            assets_fd = -1
+            os.rmdir("assets", dir_fd=directory_fd)
+        if "activation-manifest.json" in entries:
+            metadata = os.stat("activation-manifest.json", dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError("fixed activation manifest cleanup shape is unsafe")
+            os.unlink("activation-manifest.json", dir_fd=directory_fd)
+        os.close(directory_fd)
+        directory_fd = -1
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if assets_fd >= 0:
+            os.close(assets_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
 
 
 def _validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes]) -> None:
@@ -4054,12 +4158,15 @@ def _restore_prior(receipt: dict[str, Any], manifest: dict[str, Any], root: Path
     return restored
 
 
-def _restore_prior_best_effort(receipt: dict[str, Any], manifest: dict[str, Any], root: Path) -> tuple[list[str], list[str]]:
+def _restore_prior_best_effort(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    *, retain_roles: frozenset[str] = frozenset(),
+) -> tuple[list[str], list[str]]:
     records = _validate_receipt_targets(receipt, manifest)
     restored: list[str] = []
     errors: list[str] = []
     for entry in reversed(manifest["entries"]):
-        if entry["role"] == "execd_config":
+        if entry["role"] == "execd_config" or entry["role"] in retain_roles:
             continue
         record = records[entry["role"]]
         prior = record["prior"]
@@ -4076,12 +4183,20 @@ def _restore_prior_best_effort(receipt: dict[str, Any], manifest: dict[str, Any]
     return restored, errors
 
 
-def _prior_readback(receipt: dict[str, Any], manifest: dict[str, Any], root: Path) -> dict[str, str]:
+def _prior_readback(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    *, retain_roles: frozenset[str] = frozenset(),
+) -> dict[str, str]:
     records = _validate_receipt_targets(receipt, manifest)
     result: dict[str, str] = {}
     for entry in manifest["entries"]:
         if entry["role"] == "execd_config":
             continue
+        if entry["role"] in retain_roles:
+            opened = _read_target(root, entry["target"])
+            if _entry_state(root, entry, opened) == "staged":
+                result[entry["role"]] = "retained_recovery"
+                continue
         prior = records[entry["role"]]["prior"]
         opened = _read_target(root, entry["target"])
         if not prior["exists"]:
@@ -4100,6 +4215,61 @@ def _prior_readback(receipt: dict[str, Any], manifest: dict[str, Any], root: Pat
     return result
 
 
+def _rollback_terminal_response(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    driver: LiveSystemd | FakeSystemd, *, status: str,
+) -> dict[str, object]:
+    targets = _prior_readback(
+        receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
+    )
+    generated_prior = _generated_prior_readback(receipt, root)
+    ledger_prior = _acceptance_ledger_prior_readback(receipt, root)
+    units = _systemd_prior_readback(receipt, manifest, root, driver)
+    restored = [
+        entry["target"] for entry in reversed(manifest["entries"])
+        if entry["role"] != "execd_config" and entry["role"] not in ROLLBACK_RECOVERY_ROLES
+    ]
+    generated_restored = [record["target"] for record in reversed(receipt["acceptance_generated"])]
+    return {
+        "status": status,
+        "state": "rolled_back",
+        "capacity": 0,
+        "activation_id": manifest["activation_id"],
+        "restored_targets": restored,
+        "restored_acceptance_targets": generated_restored,
+        "managed_targets": targets,
+        "acceptance_generated": generated_prior,
+        "acceptance_ledger": ledger_prior,
+        "fixed_package": "absent",
+        "rollback_cleanup": ROLLBACK_CLEANUP_PATH,
+        "retained_principals": sorted(identity["user"] for identity in manifest["identities"].values()),
+        "units": units,
+    }
+
+
+def _finish_rollback_cleanup(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    driver: LiveSystemd | FakeSystemd,
+) -> dict[str, object]:
+    marker = _read_rollback_cleanup(root)
+    if marker != _rollback_cleanup_value(manifest):
+        raise ValueError("rollback cleanup marker is absent or differs")
+    if receipt["state"] not in {"rollback_cleanup", "rolled_back"}:
+        raise ValueError("rollback cleanup receipt state differs")
+    _rollback_terminal_response(receipt, manifest, root, driver, status="unchanged")
+    if receipt["state"] == "rolled_back":
+        if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
+            raise ValueError("fixed activation package remains after rollback")
+        return _rollback_terminal_response(receipt, manifest, root, driver, status="unchanged")
+    _remove_fixed_package_resumable(manifest, root)
+    if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
+        raise ValueError("fixed activation package cleanup is incomplete")
+    response = _rollback_terminal_response(receipt, manifest, root, driver, status="rolled_back")
+    receipt.update({"state": "rolled_back", "updated_at": utc_now(), "last_error": None})
+    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    return response
+
+
 def _rollback_unlocked(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
@@ -4107,19 +4277,8 @@ def _rollback_unlocked(
     if receipt is None:
         raise ValueError("rollback requires an activation receipt")
     _bind_receipt(receipt, manifest)
-    if receipt["state"] == "rolled_back":
-        if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
-            raise ValueError("fixed activation package remains after rollback")
-        return {
-            "status": "unchanged",
-            "state": "rolled_back",
-            "capacity": 0,
-            "managed_targets": _managed_readback(manifest, root, {"absent", "staged", "prior"}),
-            "acceptance_generated": _generated_prior_readback(receipt, root),
-            "acceptance_ledger": _acceptance_ledger_prior_readback(receipt, root),
-            "fixed_package": "absent",
-            "units": _systemd_prior_readback(receipt, manifest, root, driver),
-        }
+    if receipt["state"] in {"rollback_cleanup", "rolled_back"}:
+        return _finish_rollback_cleanup(receipt, manifest, root, driver)
     if receipt["state"] not in {
         "preparing", "stage_failed", "staged_zero", "qualified_closed", "activating", "active_one", "preparing_zero", "rollback_failed",
         "qualification_uncertain",
@@ -4137,7 +4296,9 @@ def _rollback_unlocked(
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         raise
     errors = _stop_zero_errors(driver)
-    restored, restore_errors = _restore_prior_best_effort(receipt, manifest, root)
+    restored, restore_errors = _restore_prior_best_effort(
+        receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
+    )
     errors.extend(restore_errors)
     generated_restored, generated_errors = _restore_generated_prior_best_effort(receipt, root)
     errors.extend(generated_errors)
@@ -4152,7 +4313,9 @@ def _rollback_unlocked(
     units: dict[str, dict[str, str]] | None = None
     targets: dict[str, str] | None = None
     try:
-        targets = _prior_readback(receipt, manifest, root)
+        targets = _prior_readback(
+            receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
+        )
     except BaseException as error:
         errors.append(f"prior target readback: {error}")
     if execd_package_rollback == "required":
@@ -4176,32 +4339,22 @@ def _rollback_unlocked(
         ledger_prior = _acceptance_ledger_prior_readback(receipt, root)
     except BaseException as error:
         errors.append(f"acceptance ledger prior readback: {error}")
-    if not errors:
-        try:
-            _remove_fixed_package(manifest, root)
-        except BaseException as error:
-            errors.append(f"remove fixed activation package: {error}")
     if errors:
         combined = "rollback failures: " + "; ".join(errors)
         receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": combined})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         raise ValueError(combined)
-    receipt.update({"state": "rolled_back", "updated_at": utc_now(), "last_error": None})
-    _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
-    return {
-        "status": "rolled_back",
-        "state": "rolled_back",
-        "capacity": 0,
-        "activation_id": manifest["activation_id"],
-        "restored_targets": restored,
-        "restored_acceptance_targets": generated_restored,
-        "managed_targets": targets,
-        "acceptance_generated": generated_prior,
-        "acceptance_ledger": ledger_prior,
-        "fixed_package": "absent",
-        "retained_principals": sorted(identity["user"] for identity in manifest["identities"].values()),
-        "units": units,
-    }
+    try:
+        if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
+            _verify_fixed_package(manifest, root)
+        _write_rollback_cleanup(manifest, root)
+        receipt.update({"state": "rollback_cleanup", "updated_at": utc_now(), "last_error": None})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    except BaseException as error:
+        receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": str(error)})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        raise
+    return _finish_rollback_cleanup(receipt, manifest, root, driver)
 
 
 def rollback(
@@ -4277,6 +4430,20 @@ def _driver(root: Path, fake_state: Path | None, manifest: dict[str, Any]) -> Li
         root, fake_state, manifest["identities"], manifest["access_group"],
         manifest["socket_policy"], manifest["effective_systemd"],
     )
+
+
+def _load_rollback_package_for_cli(
+    package: Path, root: Path, *, live: bool,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    receipt = _read_receipt(root)
+    if receipt is not None and receipt.get("state") in {"rollback_cleanup", "rolled_back"}:
+        expected = activation_package.rooted(root, FIXED_PACKAGE_PATH)
+        if Path(os.path.abspath(package)) == expected:
+            marker = _read_rollback_cleanup(root)
+            if marker is None:
+                raise ValueError("terminal rollback cleanup marker is absent")
+            return marker["manifest"], {}
+    return load_package(package, live=live)
 
 
 def main() -> int:
@@ -4360,7 +4527,10 @@ def main() -> int:
             raise ValueError(f"{arguments.action} requires --package")
         if arguments.acceptance_receipt is not None:
             raise ValueError("--acceptance-receipt is accepted only by persist-capacity-one")
-        manifest, payloads = load_package(arguments.package, live=live)
+        if arguments.action == "rollback":
+            manifest, payloads = _load_rollback_package_for_cli(arguments.package, root, live=live)
+        else:
+            manifest, payloads = load_package(arguments.package, live=live)
         driver = _driver(root, arguments.fake_systemd_state, manifest)
         if arguments.scenario is not None and arguments.action != "stage":
             raise ValueError("--scenario is accepted only by stage")

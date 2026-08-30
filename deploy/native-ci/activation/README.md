@@ -146,22 +146,32 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    prior bytes, metadata, and exact unit active/enable state. It restores or
    removes generated acceptance configs and restores the prior controld
    acceptance ledger. Service principals remain for audit and UID stability.
+   The installed activation controller and package module remain at their exact
+   staged bytes as the terminal recovery command.
    If the prior execd service or socket was active, rollback stops at a safe
    capacity-zero hold before restoring prior unit state while the standalone
    execd package receipt is active. The hold retains the fixed activation
-   package, including its controller and package module, across process restart.
-   Run the exact execd package's `install.py rollback`, then retry through the
-   retained fixed controller path:
+   package and installed recovery command across process restart. Run the exact
+   execd package's `install.py rollback`, then retry through the installed
+   controller:
 
    ```bash
-   /var/lib/buzzci/activation-controller/package/assets/buzz-ci-activation-controller rollback \
+   /usr/libexec/buzz-ci-activation-controller rollback \
      --package /var/lib/buzzci/activation-controller/package
    ```
 
    The retry accepts only a bound terminal execd rollback receipt and exact
    restored binary baseline before systemd may restart the prior execd unit.
-   It removes the fixed activation package only after the prior targets,
-   generated files, ledger, and systemd state all pass readback.
+   After the prior targets, generated files, ledger, and systemd state pass
+   readback, the controller writes root-owned mode-`0600`
+   `/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json` and durably
+   records `rollback_cleanup`. It then removes the fixed package with an
+   idempotent closed-inventory cleanup. Every asset unlink, directory removal,
+   and a missing fixed tree can resume from that marker. Only complete package
+   absence permits the final `rolled_back` receipt write. If that write or its
+   acknowledgement is lost, the installed controller loads the bound manifest
+   from the marker, completes the receipt, and returns `unchanged` on an exact
+   terminal retry.
 
 The production canary closes capacity through three root-only calls to the
 installed `/usr/libexec/buzz-ci-activation-controller`. Each call accepts only
@@ -396,7 +406,7 @@ receipt reports `rollback_failed`, or if independent readback is not exact, do
 not retry activation. Recover deterministically with the fixed package path:
 
 ```bash
-/var/lib/buzzci/activation-controller/package/assets/buzz-ci-activation-controller rollback \
+/usr/libexec/buzz-ci-activation-controller rollback \
   --package /var/lib/buzzci/activation-controller/package
 ```
 

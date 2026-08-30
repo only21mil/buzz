@@ -736,6 +736,8 @@ class ActivationControllerTests(unittest.TestCase):
             target = self.fixture.root / entry["target"].lstrip("/")
             if entry["role"] in {"runner_config", "controld_config"}:
                 self.assertEqual(target.read_bytes(), payloads[entry["source"]])
+            elif entry["role"] in CONTROLLER.ROLLBACK_RECOVERY_ROLES:
+                self.assertEqual(target.read_bytes(), payloads[entry["source"]])
             else:
                 self.assertFalse(target.exists())
 
@@ -1136,7 +1138,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "69b4305e9588333fe01f6b5e28c653ad0b1c89d602c8f0516dfbd935997f3fe9",
+            "0e0e3a336850be3c768bc7e431e3c7c25c0addbfb421ee71c7718169a38f0ca0",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1794,12 +1796,13 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertTrue(fixed_package.exists())
         fixed_cli = fixed_package / "assets/buzz-ci-activation-controller"
         self.assertTrue(fixed_cli.exists())
+        self.assertTrue(installed_cli.exists())
         self.assertEqual(driver.unit("buzz-ci-execd.socket")["ActiveState"], "inactive")
 
-        def retry_from_fixed_package() -> subprocess.CompletedProcess[bytes]:
+        def retry_from_installed_controller() -> subprocess.CompletedProcess[bytes]:
             return subprocess.run(
                 [
-                    sys.executable, str(fixed_cli), "rollback", "--package", str(fixed_package),
+                    sys.executable, str(installed_cli), "rollback", "--package", str(fixed_package),
                     "--root", str(self.fixture.root), "--fake-systemd-state", str(self.fixture.fake_state),
                 ],
                 check=False,
@@ -1808,7 +1811,7 @@ class ActivationControllerTests(unittest.TestCase):
                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
             )
 
-        exact_hold_retry = retry_from_fixed_package()
+        exact_hold_retry = retry_from_installed_controller()
         self.assertEqual(exact_hold_retry.returncode, 1)
         self.assertIn("execd package rollback is required", json.loads(exact_hold_retry.stderr)["error"])
         self.assertTrue(fixed_package.exists())
@@ -1827,7 +1830,7 @@ class ActivationControllerTests(unittest.TestCase):
             }),
             0o600,
         )
-        stale = retry_from_fixed_package()
+        stale = retry_from_installed_controller()
         self.assertEqual(stale.returncode, 1)
         self.assertIn("different candidate", json.loads(stale.stderr)["error"])
         self.assertTrue(fixed_package.exists())
@@ -1840,7 +1843,7 @@ class ActivationControllerTests(unittest.TestCase):
             }),
             0o600,
         )
-        drifted = retry_from_fixed_package()
+        drifted = retry_from_installed_controller()
         self.assertEqual(drifted.returncode, 1)
         self.assertIn("rolled-back execd baseline differs", json.loads(drifted.stderr)["error"])
         self.assertTrue(fixed_package.exists())
@@ -1849,7 +1852,7 @@ class ActivationControllerTests(unittest.TestCase):
             prior_binary,
             0o755,
         )
-        resumed = retry_from_fixed_package()
+        resumed = retry_from_installed_controller()
         self.assertEqual(resumed.returncode, 0, resumed.stderr.decode())
         rolled_back = json.loads(resumed.stdout)
         self.assertEqual(
@@ -1858,6 +1861,132 @@ class ActivationControllerTests(unittest.TestCase):
         )
         self.assertEqual(driver.socket(manifest["socket_policy"]["execd"])["path"], "/run/buzzci/execd.sock")
         self.assertFalse(fixed_package.exists())
+        self.assertTrue(installed_cli.exists())
+
+    def test_terminal_package_cleanup_resumes_after_every_unlink_and_rmdir(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        fixed_package = self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")
+        installed_cli = self.fixture.root / "usr/libexec/buzz-ci-activation-controller"
+        mutation_count = len(list((fixed_package / "assets").iterdir())) + 3
+        with mock.patch.object(
+            CONTROLLER, "_remove_fixed_package_resumable",
+            side_effect=OSError("injected cleanup pause"),
+        ), self.assertRaisesRegex(OSError, "injected cleanup pause"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rollback_cleanup")
+        self.assertTrue(installed_cli.exists())
+
+        original_unlink = CONTROLLER.os.unlink
+        original_rmdir = CONTROLLER.os.rmdir
+        mutations: list[str] = []
+        for _index in range(mutation_count):
+            fired = False
+
+            def unlink_then_interrupt(*args, **kwargs) -> None:
+                nonlocal fired
+                original_unlink(*args, **kwargs)
+                fired = True
+                mutations.append("unlink")
+                raise OSError("injected unlink acknowledgement loss")
+
+            def rmdir_then_interrupt(*args, **kwargs) -> None:
+                nonlocal fired
+                original_rmdir(*args, **kwargs)
+                fired = True
+                mutations.append("rmdir")
+                raise OSError("injected rmdir acknowledgement loss")
+
+            with mock.patch.object(CONTROLLER.os, "unlink", side_effect=unlink_then_interrupt), mock.patch.object(
+                CONTROLLER.os, "rmdir", side_effect=rmdir_then_interrupt,
+            ), self.assertRaisesRegex(OSError, "acknowledgement loss"):
+                CONTROLLER.rollback(manifest, self.fixture.root, driver)
+            self.assertTrue(fired)
+            self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rollback_cleanup")
+            self.assertTrue(installed_cli.exists())
+            self.assertIsNotNone(CONTROLLER._read_rollback_cleanup(self.fixture.root))
+            reloaded, reloaded_payloads = CONTROLLER._load_rollback_package_for_cli(
+                fixed_package, self.fixture.root, live=False,
+            )
+            self.assertEqual((reloaded, reloaded_payloads), (manifest, {}))
+
+        self.assertEqual((mutations.count("unlink"), mutations.count("rmdir")), (mutation_count - 2, 2))
+        self.assertFalse(fixed_package.exists())
+        completed = CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual((completed["status"], completed["state"]), ("rolled_back", "rolled_back"))
+        unchanged = CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual((unchanged["status"], unchanged["state"]), ("unchanged", "rolled_back"))
+
+    def test_final_receipt_failure_resumes_from_installed_cli_and_exact_retry_is_unchanged(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        fixed_package = self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")
+        installed_cli = self.fixture.root / "usr/libexec/buzz-ci-activation-controller"
+        original_write_receipt = CONTROLLER._write_receipt
+
+        def fail_terminal_receipt(root: Path, receipt: dict[str, object], controld_gid: int) -> None:
+            if receipt["state"] == "rolled_back":
+                raise OSError("injected terminal receipt failure")
+            original_write_receipt(root, receipt, controld_gid)
+
+        with mock.patch.object(
+            CONTROLLER, "_write_receipt", side_effect=fail_terminal_receipt,
+        ), self.assertRaisesRegex(OSError, "injected terminal receipt failure"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertFalse(fixed_package.exists())
+        self.assertTrue(installed_cli.exists())
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rollback_cleanup")
+
+        def retry_cli() -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [
+                    sys.executable, str(installed_cli), "rollback", "--package", str(fixed_package),
+                    "--root", str(self.fixture.root), "--fake-systemd-state", str(self.fixture.fake_state),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+
+        resumed = retry_cli()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr.decode())
+        self.assertEqual(json.loads(resumed.stdout)["status"], "rolled_back")
+        lost_ack_retry = retry_cli()
+        self.assertEqual(lost_ack_retry.returncode, 0, lost_ack_retry.stderr.decode())
+        self.assertEqual(json.loads(lost_ack_retry.stdout)["status"], "unchanged")
+
+    def test_lost_terminal_receipt_acknowledgement_retries_unchanged(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        fixed_package = self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")
+        installed_cli = self.fixture.root / "usr/libexec/buzz-ci-activation-controller"
+        original_write_receipt = CONTROLLER._write_receipt
+
+        def write_terminal_then_lose_ack(root: Path, receipt: dict[str, object], controld_gid: int) -> None:
+            original_write_receipt(root, receipt, controld_gid)
+            if receipt["state"] == "rolled_back":
+                raise OSError("injected terminal acknowledgement loss")
+
+        with mock.patch.object(
+            CONTROLLER, "_write_receipt", side_effect=write_terminal_then_lose_ack,
+        ), self.assertRaisesRegex(OSError, "injected terminal acknowledgement loss"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertFalse(fixed_package.exists())
+        self.assertTrue(installed_cli.exists())
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rolled_back")
+        retried = subprocess.run(
+            [
+                sys.executable, str(installed_cli), "rollback", "--package", str(fixed_package),
+                "--root", str(self.fixture.root), "--fake-systemd-state", str(self.fixture.fake_state),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        self.assertEqual(retried.returncode, 0, retried.stderr.decode())
+        self.assertEqual(json.loads(retried.stdout)["status"], "unchanged")
 
     def test_new_activation_replaces_and_rollback_restores_prior_controld_ledger(self) -> None:
         ledger = self.fixture.root / CONTROLLER.CONTROLD_ACCEPTANCE_LEDGER_PATH.lstrip("/")
