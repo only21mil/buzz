@@ -34,6 +34,7 @@ KEY_NAMES = ("ci-event", "nip98", "manifest", "acceptance-actor")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+VIRTIO_PORT_TARGET = re.compile(r"^\.\./(vport[0-9]+p[0-9]+)$")
 MAX_JSON = 1024 * 1024
 MAX_COMMAND = 4 * 1024 * 1024
 MAX_TREE_FILES = 1024
@@ -55,6 +56,20 @@ SOCKETS = (
     "/run/buzzci/acceptance-control.sock", "/run/buzzci/controld-acceptance.sock",
     "/run/buzzci/runner-control.sock", "/run/buzzci/execd.sock",
     "/run/buzzci/executor.sock", "/run/buzzci/keyholder.sock",
+)
+CA_BACKENDS = (
+    (
+        "update-ca-certificates",
+        Path("/usr/local/share/ca-certificates/buzzci-disposable-e2e.crt"),
+        ("update-ca-certificates",),
+        ("update-ca-certificates", "--fresh"),
+    ),
+    (
+        "update-ca-trust",
+        Path("/etc/pki/ca-trust/source/anchors/buzzci-disposable-e2e.crt"),
+        ("update-ca-trust", "extract"),
+        ("update-ca-trust", "extract"),
+    ),
 )
 
 
@@ -204,10 +219,11 @@ def require_guest() -> None:
         raise GuestError("guest entry requires root under systemd")
     for name in (
         "openssl", "pgrep", "python3", "systemctl", "systemd-creds",
-        "systemd-sysusers", "systemd-tmpfiles", "update-ca-certificates", "swapoff",
+        "systemd-sysusers", "systemd-tmpfiles", "swapoff",
     ):
         if shutil.which(name) is None:
             raise GuestError(f"guest prerequisite is absent: {name}")
+    ca_backend()
 
 
 def disable_swap() -> None:
@@ -217,16 +233,88 @@ def disable_swap() -> None:
         raise GuestError("guest swap remains enabled")
 
 
+def ca_backend() -> tuple[Path, tuple[str, ...], tuple[str, ...]]:
+    matches = [backend for backend in CA_BACKENDS if shutil.which(backend[0]) is not None]
+    if len(matches) != 1:
+        raise GuestError("guest CA backend is absent or ambiguous")
+    _tool, anchor, install, remove = matches[0]
+    if not anchor.parent.is_dir():
+        raise GuestError("guest CA anchor directory is absent")
+    return anchor, install, remove
+
+
+def evidence_device_present() -> bool:
+    try:
+        directory_fd = open_absolute(EVIDENCE_DEVICE.parent, directory=True)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            os.stat(EVIDENCE_DEVICE.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(directory_fd)
+
+
+def open_evidence_device() -> int:
+    try:
+        directory_fd = open_absolute(EVIDENCE_DEVICE.parent, directory=True)
+        try:
+            target = os.readlink(EVIDENCE_DEVICE.name, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as error:
+        raise GuestError("evidence transport link is unavailable") from error
+    match = VIRTIO_PORT_TARGET.fullmatch(target)
+    if match is None:
+        raise GuestError("evidence transport link target is unsafe")
+    try:
+        dev_fd = open_absolute(EVIDENCE_DEVICE.parent.parent, directory=True)
+        try:
+            fd = os.open(
+                match.group(1),
+                os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=dev_fd,
+            )
+        finally:
+            os.close(dev_fd)
+    except OSError as error:
+        raise GuestError("evidence transport target is unavailable") from error
+    try:
+        metadata = os.fstat(fd)
+    except OSError as error:
+        os.close(fd)
+        raise GuestError("evidence transport target metadata is unavailable") from error
+    if not stat.S_ISCHR(metadata.st_mode):
+        os.close(fd)
+        raise GuestError("evidence transport target is not a character device")
+    return fd
+
+
+def validate_evidence_device() -> None:
+    fd = open_evidence_device()
+    os.close(fd)
+
+
 def emit(value: dict[str, object]) -> None:
     value = {"schema_version": FRAME_SCHEMA, **value}
     payload = canonical(value)
+    if not payload or len(payload) > MAX_JSON:
+        raise GuestError("evidence frame exceeds bound")
     frame = struct.pack(">I", len(payload)) + payload + hashlib.sha256(payload).digest()
-    fd = os.open(EVIDENCE_DEVICE, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    fd = open_evidence_device()
     try:
         view = memoryview(frame)
         while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
+            try:
+                written = os.write(fd, view)
+            except OSError as error:
+                raise GuestError("evidence frame write failed") from error
+            if written <= 0:
+                raise GuestError("evidence frame write made no progress")
+            view = view[written:]
     finally:
         os.close(fd)
 
@@ -769,14 +857,14 @@ def relay_mapping_present() -> bool:
 
 
 def start_relay(public: dict[str, object]) -> None:
+    ca_target, ca_install, _ca_remove = ca_backend()
     hosts = Path("/etc/hosts")
     if not relay_mapping_present():
         with hosts.open("a") as handle:
             handle.write("127.0.0.1 relay.test.invalid\n")
-    ca_target = Path("/usr/local/share/ca-certificates/buzzci-disposable-e2e.crt")
     shutil.copyfile(STATE_ROOT / "ca.crt", ca_target)
     ca_target.chmod(0o644)
-    command(["update-ca-certificates"])
+    command(list(ca_install))
     config = STATE_ROOT / "relay-public.json"
     config.write_bytes(canonical({
         "origin": public["relay_http_origin"],
@@ -853,10 +941,10 @@ def cleanup(candidate: Path, activation_package: Path, attempted_stage: bool, ho
                 errors.append("relay host mapping residue remains")
         except BaseException:
             errors.append("relay host mapping removal failed")
-    ca_target = Path("/usr/local/share/ca-certificates/buzzci-disposable-e2e.crt")
     try:
+        ca_target, _ca_install, ca_remove = ca_backend()
         ca_target.unlink()
-        command(["update-ca-certificates", "--fresh"], timeout=30)
+        command(list(ca_remove), timeout=30)
     except FileNotFoundError:
         pass
     except GuestError:
@@ -1072,8 +1160,7 @@ def main(argv: list[str]) -> int:
         if phase.get("phase") == "ceremony":
             if set(phase) != {"schema_version", "phase", "challenge", "controld_uid", "controld_gid"}:
                 raise GuestError("ceremony phase fields differ")
-            if not EVIDENCE_DEVICE.exists() or not stat.S_ISCHR(EVIDENCE_DEVICE.stat().st_mode):
-                raise GuestError("ceremony evidence transport is absent")
+            validate_evidence_device()
             if TRANSFER_DEVICE.exists():
                 raise GuestError("ceremony must not have an evidence-transfer device")
             result = ceremony(phase)
@@ -1081,7 +1168,7 @@ def main(argv: list[str]) -> int:
         elif phase.get("phase") == "run":
             if set(phase) != {"schema_version", "phase", "challenge", "descriptor_sha256"}:
                 raise GuestError("candidate phase fields differ")
-            if EVIDENCE_DEVICE.exists():
+            if evidence_device_present():
                 raise GuestError("candidate execution must not have an evidence transport")
             transfer_fd = os.open(TRANSFER_DEVICE, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
             try:
@@ -1096,8 +1183,7 @@ def main(argv: list[str]) -> int:
                 "scenario_sha256", "trusted_verifier_sha256", "expected_stages_sha256",
             }:
                 raise GuestError("verification phase fields differ")
-            if not EVIDENCE_DEVICE.exists() or not stat.S_ISCHR(EVIDENCE_DEVICE.stat().st_mode):
-                raise GuestError("verification evidence transport is absent")
+            validate_evidence_device()
             transfer_fd = os.open(TRANSFER_DEVICE, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
             try:
                 transfer_capacity(transfer_fd)
