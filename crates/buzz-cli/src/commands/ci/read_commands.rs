@@ -527,4 +527,67 @@ mod tests {
         assert_eq!(value["attempt"], 2);
         assert_eq!(value["scope"], "job");
     }
+
+    #[test]
+    fn verdict_reason_is_frozen_to_infrastructure_failures() {
+        let mut failure = reduction(red::CiReducedState::InfrastructureFailure);
+        failure.reason = Some("terminal fact deadline expired".into());
+        let value = serde_json::to_value(verdict_output(failure)).expect("serialize verdict");
+        assert_eq!(value["verdict"], "infrastructure_failure");
+        assert_eq!(value["reason"], "terminal fact deadline expired");
+
+        let pending = reduction(red::CiReducedState::Pending);
+        let value = serde_json::to_value(verdict_output(pending)).expect("serialize verdict");
+        assert!(value.get("reason").is_none());
+
+        let green = reduction(red::CiReducedState::Green);
+        let value = serde_json::to_value(verdict_output(green)).expect("serialize verdict");
+        assert!(value.get("reason").is_none());
+    }
+
+    #[test]
+    fn request_envelopes_become_run_scope_watch_records() {
+        let request = buzz_core::ci::CiRequestEnvelope {
+            schema_version: buzz_core::ci::CI_SCHEMA_VERSION,
+            request_type: buzz_core::ci::CiRequestType::Run,
+            target_repo_a: format!("30617:{}:buzz", "a".repeat(64)),
+            pr_root_event_id: "11".repeat(32),
+            pr_update_event_id: None,
+            source_clone_url: "https://example.invalid/buzz.git".into(),
+            immutable_source_ref: format!("refs/nostr/{}", "11".repeat(32)),
+            tip_oid: "22".repeat(20),
+            source_branch: "feature/ci".into(),
+            base_ref: "refs/heads/main".into(),
+            base_oid: "33".repeat(20),
+            workflow_id: "ci".into(),
+            workflow_digest: "44".repeat(32),
+            job_ids: vec!["test".into()],
+            run_id: "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd45".into(),
+            attempt: 1,
+            parent_attempt: None,
+            parent_run_id: None,
+            trigger_event_id: "11".repeat(32),
+            actor: "55".repeat(64),
+            timeout_seconds: 300,
+            idempotency_key: "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd46".into(),
+            issued_at: 1_700_000_000,
+            expires_at: 1_700_000_600,
+        };
+        let accepted = AcceptedCiEnvelope {
+            event_id: "22".repeat(32),
+            watch_cursor: 41,
+            envelope: ValidatedCiEnvelope::Request(request.clone()),
+        };
+
+        let record = build_watch_record(&accepted, &request).expect("run-scope record");
+        assert_eq!(record.run_id, request.run_id);
+        assert_eq!(record.sha, request.tip_oid);
+        assert_eq!(record.attempt, request.attempt);
+        assert_eq!(record.timestamp, request.issued_at);
+        assert_eq!(record.scope, WatchScope::Run);
+        assert_eq!(record.job_id, None);
+        assert_eq!(record.state, None);
+        assert_eq!(record.watch_cursor, 41);
+        assert_eq!(record.event_id, "22".repeat(32));
+    }
 }
