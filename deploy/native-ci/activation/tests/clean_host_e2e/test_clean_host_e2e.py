@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import struct
 import sys
 import tempfile
@@ -320,6 +321,139 @@ class BoundaryTests(unittest.TestCase):
                         guest.disable_swap()
             finally:
                 guest.SWAPS_PATH = original
+
+    def test_guest_ca_backend_selects_debian_or_fedora_and_rejects_uncertainty(self) -> None:
+        cases = (
+            (
+                "update-ca-certificates",
+                Path("/usr/local/share/ca-certificates/buzzci-disposable-e2e.crt"),
+                ("update-ca-certificates",),
+                ("update-ca-certificates", "--fresh"),
+            ),
+            (
+                "update-ca-trust",
+                Path("/etc/pki/ca-trust/source/anchors/buzzci-disposable-e2e.crt"),
+                ("update-ca-trust", "extract"),
+                ("update-ca-trust", "extract"),
+            ),
+        )
+        with mock.patch.object(Path, "is_dir", return_value=True):
+            for tool, anchor, install, remove in cases:
+                with self.subTest(tool=tool), mock.patch.object(
+                    guest.shutil, "which", side_effect=lambda name, selected=tool: "/usr/bin/" + name if name == selected else None,
+                ):
+                    self.assertEqual(guest.ca_backend(), (anchor, install, remove))
+            for available in (set(), {case[0] for case in cases}):
+                with self.subTest(available=available), mock.patch.object(
+                    guest.shutil, "which", side_effect=lambda name, selected=available: "/usr/bin/" + name if name in selected else None,
+                ):
+                    with self.assertRaisesRegex(guest.GuestError, "absent or ambiguous"):
+                        guest.ca_backend()
+
+    def test_guest_ca_backend_rejects_missing_anchor_directory(self) -> None:
+        with mock.patch.object(
+            guest.shutil, "which", side_effect=lambda name: "/usr/bin/" + name if name == "update-ca-trust" else None,
+        ), mock.patch.object(Path, "is_dir", return_value=False):
+            with self.assertRaisesRegex(guest.GuestError, "anchor directory is absent"):
+                guest.ca_backend()
+
+    def test_evidence_device_accepts_only_safe_relative_udev_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dev = Path(temporary) / "dev"
+            ports = dev / "virtio-ports"
+            ports.mkdir(parents=True)
+            target = dev / "vport12p34"
+            target.write_bytes(b"")
+            link = ports / "buzzci.evidence"
+            link.symlink_to("../vport12p34")
+            original = guest.EVIDENCE_DEVICE
+            guest.EVIDENCE_DEVICE = link
+            real_open = os.open
+            opened: list[tuple[object, int, int | None]] = []
+
+            def recording_open(path, flags, *args, dir_fd=None, **kwargs):
+                opened.append((path, flags, dir_fd))
+                return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+            fake_character = os.stat_result((stat.S_IFCHR | 0o600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            try:
+                with mock.patch.object(guest.os, "open", side_effect=recording_open), mock.patch.object(
+                    guest.os, "fstat", return_value=fake_character,
+                ):
+                    fd = guest.open_evidence_device()
+                os.close(fd)
+            finally:
+                guest.EVIDENCE_DEVICE = original
+            target_opens = [call for call in opened if call[0] == "vport12p34"]
+            self.assertEqual(len(target_opens), 1)
+            self.assertIsNotNone(target_opens[0][2])
+            self.assertTrue(target_opens[0][1] & os.O_NOFOLLOW)
+
+    def test_evidence_device_rejects_unsafe_link_targets_and_non_character_device(self) -> None:
+        rejected = (
+            "/dev/vport0p1", "vport0p1", "../../vport0p1", "../vport0p1/extra",
+            "../vport0p", "../vportXpY", "../other0p1",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            dev = Path(temporary) / "dev"
+            ports = dev / "virtio-ports"
+            ports.mkdir(parents=True)
+            target = dev / "vport0p1"
+            target.write_bytes(b"not a device")
+            link = ports / "buzzci.evidence"
+            original = guest.EVIDENCE_DEVICE
+            guest.EVIDENCE_DEVICE = link
+            try:
+                for value in rejected:
+                    with self.subTest(target=value):
+                        link.unlink(missing_ok=True)
+                        link.symlink_to(value)
+                        with self.assertRaisesRegex(guest.GuestError, "link target is unsafe"):
+                            guest.open_evidence_device()
+                link.unlink()
+                link.symlink_to("../vport0p1")
+                with self.assertRaisesRegex(guest.GuestError, "not a character device"):
+                    guest.open_evidence_device()
+            finally:
+                guest.EVIDENCE_DEVICE = original
+
+    def test_emit_completes_partial_writes_without_fsyncing_character_device(self) -> None:
+        chunks: list[bytes] = []
+
+        def partial_write(_fd, view):
+            count = min(7, len(view))
+            chunks.append(bytes(view[:count]))
+            return count
+
+        value = {"phase": "verify", "outcome": "pass"}
+        payload = guest.canonical({"schema_version": guest.FRAME_SCHEMA, **value})
+        expected = struct.pack(">I", len(payload)) + payload + hashlib.sha256(payload).digest()
+        with mock.patch.object(guest, "open_evidence_device", return_value=91), mock.patch.object(
+            guest.os, "write", side_effect=partial_write,
+        ), mock.patch.object(guest.os, "close") as close, mock.patch.object(guest.os, "fsync") as fsync:
+            guest.emit(value)
+        self.assertEqual(b"".join(chunks), expected)
+        close.assert_called_once_with(91)
+        fsync.assert_not_called()
+
+    def test_emit_closes_device_on_zero_progress_or_write_error(self) -> None:
+        for result, message in ((0, "made no progress"), (OSError("write failed"), "write failed")):
+            with self.subTest(message=message), mock.patch.object(
+                guest, "open_evidence_device", return_value=92,
+            ), mock.patch.object(guest.os, "write") as write, mock.patch.object(guest.os, "close") as close:
+                if isinstance(result, BaseException):
+                    write.side_effect = result
+                else:
+                    write.return_value = result
+                with self.assertRaisesRegex(guest.GuestError, message):
+                    guest.emit({"phase": "verify", "outcome": "pass"})
+                close.assert_called_once_with(92)
+        with mock.patch.object(guest, "MAX_JSON", 1), mock.patch.object(
+            guest, "open_evidence_device",
+        ) as open_device:
+            with self.assertRaisesRegex(guest.GuestError, "frame exceeds bound"):
+                guest.emit({"phase": "verify", "outcome": "pass"})
+            open_device.assert_not_called()
 
     def test_systemd_readback_never_masks_driver_failure_as_absence(self) -> None:
         failed = __import__("subprocess").CompletedProcess(["systemctl"], 1, b"", b"")
