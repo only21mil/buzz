@@ -29,6 +29,25 @@ The service runs as the pre-existing `buzzci-controld` account. Its config is
 mode `0600` and owned by that account. Its store is mode `0700` and owned by the
 same account. Static files and installed directory roots remain root-owned.
 
+## CI status key provisioning
+
+The capacity-one activation provisions one CI status key file and names it in
+the key descriptor (`path`, `expected_owner_uid`, `expected_pubkey`). The key
+file must be UTF-8 plaintext text of exactly 64 lowercase hex characters —
+or an `nsec…` secret-key string — with surrounding whitespace tolerated. It
+is never 32 raw bytes; a raw 32-byte key fails the UTF-8 hex parser by
+design. Two metadata contracts are accepted, nothing else:
+
+- a directly referenced key file must be mode `0600`, owned by the
+  descriptor's `expected_owner_uid`, with exactly one link;
+- a key delivered through systemd `LoadCredentialEncrypted=` mounts the
+  decrypted plaintext read-only at mode `0400` under the unit's
+  `$CREDENTIALS_DIRECTORY`. The loader accepts mode `0400` only for paths
+  inside that directory and still enforces the same owner and link count.
+
+The loader never follows a final symlink and binds the expected public key;
+any mismatch fails closed without exposing the key material.
+
 ## Freeze a package
 
 Build `target/release/buzz-ci-controld` from one clean full source commit. The
