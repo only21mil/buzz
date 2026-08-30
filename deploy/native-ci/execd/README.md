@@ -220,12 +220,13 @@ different pre-activation tuple, overlapping ownership, and mismatched activation
 bindings. Installation does not reload, enable, or start a unit.
 
 If the activation receipt says the prior execd socket or service was active,
-activation rollback stops the capacity-one units and restores file state but
-holds before restoring prior systemd state while the candidate package receipt
-is active. Run the bound execd package rollback, then retry activation rollback.
-The retry verifies the execd terminal receipt and restored binary before it can
-restart the prior execd unit. This ordering prevents systemd from restarting
-the newly installed binary under the old unit state.
+activation rollback stops the capacity-one units and holds before restoring any
+activation-owned target, generated state, legacy identity, or prior systemd
+state while the candidate package receipt is active. Run the bound execd
+package rollback, then retry activation rollback. The retry verifies the execd
+terminal receipt and restored binary before any prior activation state is
+restored or the prior execd unit can restart. This ordering prevents systemd
+from restarting the newly installed binary under the old unit state.
 
 Run the local static checks with:
 

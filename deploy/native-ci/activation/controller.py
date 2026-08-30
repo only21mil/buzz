@@ -303,15 +303,6 @@ def _execd_package_rollback_readback(
     manifest: dict[str, Any], root: Path, activation_receipt: dict[str, Any]
 ) -> str:
     prior_systemd = activation_receipt.get("systemd_before")
-    legacy = activation_receipt.get("legacy_compatibility")
-    if (
-        isinstance(legacy, dict)
-        and legacy.get("state") == "legacy"
-        and isinstance(prior_systemd, dict)
-        and prior_systemd.get("buzz-ci-execd.socket", {}).get("ActiveState") == "active"
-        and prior_systemd.get("buzz-ci-execd.service", {}).get("ActiveState") == "inactive"
-    ):
-        return "not_required"
     if not isinstance(prior_systemd, dict) or not any(
         prior_systemd.get(unit, {}).get("ActiveState") == "active"
         for unit in ("buzz-ci-execd.socket", "buzz-ci-execd.service")
@@ -2461,7 +2452,9 @@ def _rollback_ownership_readback(
         all_records = driver.legacy_ownership
         if len({str(record["path"]) for record in all_records}) != len(all_records):
             raise ValueError("legacy ownership inventory contains duplicate paths")
-        observed_by_path = {str(record["path"]): record for record in all_records}
+        observed_by_path = {
+            str(record["path"]): _ownership_base(record) for record in all_records
+        }
     else:
         observed_by_path: dict[str, dict[str, object]] = {}
         for path in sealed:
@@ -2745,6 +2738,36 @@ def _apply_rollback_ownership_plan(
     ]
     if leftovers:
         raise ValueError(f"target-ID rollback ownership remains: {leftovers}")
+    _rollback_ownership_plan_readback(manifest, root, driver, plan)
+
+
+def _rollback_ownership_plan_readback(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    plan: dict[str, Any],
+) -> list[dict[str, object]]:
+    target_uid = int(plan["target_uid"])
+    target_gid = int(plan["target_gid"])
+    planned = {str(record["path"]): record for record in plan["records"]}
+    observed = _rollback_root_inventory(
+        manifest, root, driver, target_uid, target_gid, set(planned),
+    )
+    observed_by_path = {str(record["path"]): record for record in observed}
+    result: list[dict[str, object]] = []
+    for path, expected in planned.items():
+        current = observed_by_path.get(path)
+        if current is None:
+            raise ValueError(f"restored rollback ownership object is absent: {path}")
+        if (
+            any(
+                current[key] != expected[key]
+                for key in ("path", "kind", "mode", "device", "inode", "nlink")
+            )
+            or current["uid"] != expected["to_uid"]
+            or current["gid"] != expected["to_gid"]
+        ):
+            raise ValueError(f"restored rollback ownership object differs: {path}")
+        result.append(current)
+    return result
 
 
 def _legacy_compatibility_capture(
@@ -3729,6 +3752,10 @@ def _systemd_prior_readback(
             if observed[name][field] != expected[field]:
                 raise ValueError(f"systemd prior readback differs for {name} {field}")
     if receipt["legacy_compatibility"]["state"] == "legacy":
+        plan = receipt["legacy_rollback_ownership"]
+        if plan is None:
+            raise ValueError("legacy rollback ownership plan is absent")
+        _rollback_ownership_plan_readback(manifest, root, driver, plan)
         _legacy_runtime_socket_readback(
             manifest["legacy_compatibility"], driver, require_present=True,
         )
@@ -4260,18 +4287,22 @@ def _restore_legacy_compatibility(
         raise ValueError("legacy rollback ownership plan is absent")
     _apply_rollback_ownership_plan(manifest, root, driver, plan)
     _stage_restart_boundary("legacy_compatibility:restore_ownership")
+    _rollback_ownership_plan_readback(manifest, root, driver, plan)
     driver.set_supplementary_groups(
         legacy_identity["user"], legacy_identity["supplementary_groups"],
     )
     _stage_restart_boundary("legacy_compatibility:restore_groups")
+    _rollback_ownership_plan_readback(manifest, root, driver, plan)
     driver.set_group_gid(
         legacy_identity["group"], target_identity["gid"], legacy_identity["gid"],
     )
     _stage_restart_boundary("legacy_compatibility:restore_gid")
+    _rollback_ownership_plan_readback(manifest, root, driver, plan)
     driver.set_account(
         legacy_identity["user"], target_identity, legacy_identity,
     )
     _stage_restart_boundary("legacy_compatibility:restore_account")
+    _rollback_ownership_plan_readback(manifest, root, driver, plan)
     for index, record in enumerate(compatibility["files"]):
         opened = _read_target(root, record["path"], activation_package.MAX_ASSET_BYTES)
         if opened is None:
@@ -4789,7 +4820,23 @@ def _compensate_failed_stage(
         _install_recovery_targets(receipt, manifest, root)
     except BaseException as error:
         errors.append(f"install rollback recovery targets: {error}")
-    errors.extend(_stop_zero_errors(driver))
+    stop_errors = _stop_zero_errors(driver)
+    errors.extend(stop_errors)
+    component_errors: list[str] = []
+    if not stop_errors:
+        try:
+            execd_package_rollback = _execd_package_rollback_readback(
+                manifest, root, receipt,
+            )
+            if execd_package_rollback == "required":
+                component_errors.append(
+                    "execd package rollback is required before activation state restoration; "
+                    "run the bound execd package rollback and retry activation rollback"
+                )
+        except BaseException as error:
+            component_errors.append(f"execd package rollback readback: {error}")
+    if stop_errors or component_errors:
+        return [*errors, *component_errors]
     try:
         _prepare_legacy_rollback_ownership(receipt, manifest, root, driver)
     except BaseException as error:
@@ -6131,14 +6178,28 @@ def _rollback_unlocked(
         _restore_prior(receipt, manifest, root, apply=False)
         _validate_generated_records(receipt, root, apply=False)
         _install_recovery_targets(receipt, manifest, root)
-        execd_package_rollback = _execd_package_rollback_readback(
-            manifest, root, receipt
-        )
     except BaseException as error:
         receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": str(error)})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         raise
     errors = _stop_zero_errors(driver)
+    if not errors:
+        try:
+            execd_package_rollback = _execd_package_rollback_readback(
+                manifest, root, receipt,
+            )
+            if execd_package_rollback == "required":
+                errors.append(
+                    "execd package rollback is required before activation state restoration; "
+                    "run the bound execd package rollback and retry activation rollback"
+                )
+        except BaseException as error:
+            errors.append(f"execd package rollback readback: {error}")
+    if errors:
+        combined = "rollback failures: " + "; ".join(errors)
+        receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": combined})
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        raise ValueError(combined)
     try:
         _prepare_legacy_rollback_ownership(receipt, manifest, root, driver)
     except BaseException as error:
@@ -6169,17 +6230,11 @@ def _rollback_unlocked(
         )
     except BaseException as error:
         errors.append(f"prior target readback: {error}")
-    if execd_package_rollback == "required":
-        errors.append(
-            "execd package rollback is required before systemd prior restore; "
-            "run the bound execd package rollback and retry activation rollback"
-        )
-    else:
-        try:
-            errors.extend(_restore_systemd_prior_errors(receipt, driver))
-            units = _systemd_prior_readback(receipt, manifest, root, driver)
-        except BaseException as error:
-            errors.append(f"systemd prior readback: {error}")
+    try:
+        errors.extend(_restore_systemd_prior_errors(receipt, driver))
+        units = _systemd_prior_readback(receipt, manifest, root, driver)
+    except BaseException as error:
+        errors.append(f"systemd prior readback: {error}")
     generated_prior: dict[str, str] | None = None
     try:
         generated_prior = _generated_prior_readback(receipt, root)

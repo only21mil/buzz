@@ -155,16 +155,12 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    verifier output, zero receipt, operation, and final readback digests.
 8. `rollback` first validates every managed target against its prior, staged,
    or active digest. Unknown drift stops rollback before systemd or file
-   mutation. A valid rollback stops and disables the activation, restores exact
-   prior bytes, metadata, and exact unit active/enable state. It restores or
-   removes generated acceptance configs and restores the prior controld
-   acceptance ledger. Service principals remain for audit and UID stability.
-   The installed activation controller and package module remain at their exact
-   staged bytes as the terminal recovery command.
-   If the prior execd service or socket was active, rollback stops at a safe
-   capacity-zero hold before restoring prior unit state while the standalone
-   execd package receipt is active. The hold retains the fixed activation
-   package and installed recovery command across process restart. Run the exact
+   mutation. It then stops every activation unit and disables the persistent
+   target. If the prior execd service or socket was active, rollback enters a safe capacity-zero
+   hold before restoring any activation-owned target, generated state, legacy
+   identity, or prior unit state while the standalone execd package receipt is
+   active. The hold retains the fixed activation package and installed recovery
+   command across process restart. Run the exact
    execd package's `install.py rollback`, then retry through the installed
    controller:
 
@@ -177,7 +173,11 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    `live_target` must prove absence or bind the restored baseline's device,
    inode, digest, mode, UID, and GID to the candidate-bound install receipt.
    The controller independently reads the live name and requires that exact
-   proof before systemd may restart the prior execd unit.
+   proof before activation rollback restores prior bytes, metadata, generated
+   acceptance state, the prior controld acceptance ledger, legacy compatibility
+   state, or systemd topology. Service principals remain for audit and UID
+   stability. The installed activation controller and package module remain at
+   their exact staged bytes as the terminal recovery command.
    After the prior targets, generated files, ledger, and systemd state pass
    readback, the controller writes root-owned mode-`0600`
    `/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json` and durably

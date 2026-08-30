@@ -770,6 +770,26 @@ class ActivationFixture:
         )
         return manifest, payloads, driver
 
+    def install_execd_delivery_candidate(
+        self, prior_binary: bytes = b"recognized legacy execd binary\n",
+    ) -> tuple[str, str]:
+        package, seccomp_contract = execd_package_for_activation(self)
+        candidate_sha256 = next(
+            item["binary_sha256"] for item in self.manifest["components"]
+            if item["name"] == "execd"
+        )
+        target = self.root / CONTROLLER.EXECD_BINARY_PATH.lstrip("/")
+        write_file(target, prior_binary, 0o755)
+        installed = execd_install(package, self.root, seccomp_contract)
+        if installed["status"] != "installed":
+            raise AssertionError("execd delivery fixture did not install")
+        self.execd_delivery = (package, seccomp_contract)
+        return activation_package.digest(prior_binary), str(candidate_sha256)
+
+    def rollback_execd_delivery_candidate(self) -> dict[str, object]:
+        package, seccomp_contract = self.execd_delivery
+        return execd_rollback(package, self.root, seccomp_contract)
+
     def install_recognized_legacy_host(
         self, driver, *, global_policy: bool = False,
     ) -> None:
@@ -804,6 +824,15 @@ class ActivationFixture:
             "uid": runtime["uid"], "gid": runtime["gid"],
         }
         driver._write(state)
+
+    def install_recognized_legacy_delivery_host(
+        self, *, global_policy: bool = False,
+        prior_binary: bytes = b"recognized legacy execd binary\n",
+    ) -> tuple[dict[str, object], dict[str, bytes], CONTROLLER.FakeSystemd, str, str]:
+        digests = self.install_execd_delivery_candidate(prior_binary)
+        manifest, payloads, driver = self.load()
+        self.install_recognized_legacy_host(driver, global_policy=global_policy)
+        return manifest, payloads, driver, *digests
 
 
 class ActivationControllerTests(unittest.TestCase):
@@ -1355,20 +1384,82 @@ class ActivationControllerTests(unittest.TestCase):
         del draft["activation_id"]
         del draft["package_digest"]
         validator.validate(draft)
-        for mutate in (
-            lambda value: value.update({"unrecognized": True}),
-            lambda value: value["effective_systemd"][0].update({"unrecognized": True}),
-            lambda value: value["inherited_systemd"].update({"unrecognized": True}),
-            lambda value: value["legacy_compatibility"].update({"unrecognized": True}),
-            lambda value: value["legacy_compatibility"]["runtime_socket"].update({"mode": 0o660}),
+        mutations = {
+            "top extra": lambda value: value.update({"unrecognized": True}),
+            "effective extra": lambda value: value["effective_systemd"][0].update(
+                {"unrecognized": True}
+            ),
+            "effective unit": lambda value: value["effective_systemd"][0].update(
+                {"unit": "buzz-ci-mutated.service"}
+            ),
+            "effective owner": lambda value: value["effective_systemd"][0]["fragment"].update(
+                {"owner": "runner"}
+            ),
+            "effective path": lambda value: value["effective_systemd"][0]["fragment"].update(
+                {"path": "/etc/systemd/system/buzz-ci-mutated.service"}
+            ),
+            "effective digest": lambda value: value["effective_systemd"][0]["fragment"].update(
+                {"sha256": "f" * 64}
+            ),
+            "effective dropin digest": lambda value: value["effective_systemd"][4]["drop_ins"][0].update(
+                {"sha256": "f" * 64}
+            ),
+            "effective removed": lambda value: value["effective_systemd"].pop(),
+            "effective reordered": lambda value: value["effective_systemd"].reverse(),
+            "inherited extra": lambda value: value["inherited_systemd"].update(
+                {"unrecognized": True}
+            ),
+            "legacy extra": lambda value: value["legacy_compatibility"].update(
+                {"unrecognized": True}
+            ),
+            "runtime mode": lambda value: value["legacy_compatibility"]["runtime_socket"].update(
+                {"mode": 0o660}
+            ),
+        }
+        candidate_targets = {
+            record["path"]
+            for effective in draft["effective_systemd"]
+            for record in (effective["fragment"], *effective["drop_ins"])
+            if record["owner"] == "activation"
+        }
+        candidate_index = next(
+            index for index, entry in enumerate(draft["entries"])
+            if entry["target"] in candidate_targets
+        )
+        second_candidate = next(
+            entry for entry in draft["entries"]
+            if entry["target"] in candidate_targets
+            and entry["target"] != draft["entries"][candidate_index]["target"]
+        )
+        mutations["candidate entry duplicate substitution"] = (
+            lambda value: value["entries"].__setitem__(
+                candidate_index, copy.deepcopy(second_candidate),
+            )
+        )
+        for field, replacement in (
+            ("role", "mutated_systemd_role"),
+            ("source", "assets/mutated-systemd-unit"),
+            ("source_mode", "0600"),
+            ("sha256", "f" * 64),
+            ("target", "/etc/systemd/system/buzz-ci-mutated.service"),
+            ("install_mode", "0600"),
+            ("uid", 1),
+            ("gid", 1),
         ):
-            malformed = copy.deepcopy(draft)
-            mutate(malformed)
-            self.assertFalse(validator.is_valid(malformed))
+            mutations[f"candidate entry {field}"] = (
+                lambda value, field=field, replacement=replacement:
+                value["entries"][candidate_index].update({field: replacement})
+            )
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                malformed = copy.deepcopy(draft)
+                mutate(malformed)
+                self.assertFalse(validator.is_valid(malformed))
 
     def test_recognized_legacy_host_migrates_and_rollback_restores_exactly(self) -> None:
-        manifest, payloads, driver = self.fixture.load()
-        self.fixture.install_recognized_legacy_host(driver, global_policy=True)
+        manifest, payloads, driver, _prior_sha, _candidate_sha = (
+            self.fixture.install_recognized_legacy_delivery_host(global_policy=True)
+        )
         driver.legacy_ownership = [{
             "path": "/var/lib/buzzci/principals/ctl/state",
             "kind": "file", "mode": 0o600, "uid": 961, "gid": 961,
@@ -1396,6 +1487,7 @@ class ActivationControllerTests(unittest.TestCase):
                 "gid": manifest["identities"]["qualification"]["gid"],
             },
         ]
+        self.fixture.rollback_execd_delivery_candidate()
         rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
         self.assertEqual(rolled_back["state"], "rolled_back")
         self.assertEqual(driver.identity("buzzci-ctl"), activation_package.LEGACY_COMPATIBILITY["identity"])
@@ -1411,14 +1503,11 @@ class ActivationControllerTests(unittest.TestCase):
             ],
         })
         self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["status"], "unchanged")
-        retried = CONTROLLER.stage(
-            manifest, payloads, self.fixture.root, driver, self.fixture.binding,
-        )
-        self.assertEqual(retried["state"], "staged_zero")
 
     def test_live_shaped_legacy_socket_is_sealed_quiesced_and_restored(self) -> None:
-        manifest, payloads, driver = self.fixture.load()
-        self.fixture.install_recognized_legacy_host(driver, global_policy=True)
+        manifest, payloads, driver, prior_sha, candidate_sha = (
+            self.fixture.install_recognized_legacy_delivery_host(global_policy=True)
+        )
         runtime = activation_package.LEGACY_COMPATIBILITY["runtime_socket"]
         before = driver.socket_identity(runtime["path"])
         self.assertEqual(
@@ -1433,7 +1522,47 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(captured["inode"], before["inode"])
         self.assertIsNone(driver.socket_identity(runtime["path"]))
         self.assertEqual(driver.unit(runtime["unit"])["UnitFileState"], "disabled")
+        binary = self.fixture.root / CONTROLLER.EXECD_BINARY_PATH.lstrip("/")
+        self.assertEqual(activation_package.digest(binary.read_bytes()), candidate_sha)
 
+        with self.assertRaisesRegex(ValueError, "execd package rollback is required"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rollback_failed")
+        self.assertEqual(driver.unit(runtime["unit"])["ActiveState"], "inactive")
+        self.assertIsNone(driver.socket_identity(runtime["path"]))
+        self.assertEqual(
+            driver.identity("buzzci-ctl")["uid"],
+            manifest["identities"]["qualification"]["uid"],
+        )
+        for record in activation_package.LEGACY_COMPATIBILITY["files"]:
+            self.assertFalse((self.fixture.root / record["path"].lstrip("/")).exists())
+
+        install_receipt = (
+            self.fixture.root / CONTROLLER.EXECD_PACKAGE_RECEIPT_PATH.lstrip("/")
+        )
+        install_raw = install_receipt.read_bytes()
+        install_receipt.unlink()
+        with self.assertRaisesRegex(ValueError, "active execd baseline lacks package rollback evidence"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        write_file(install_receipt, install_raw, 0o600)
+        mismatched = json.loads(install_raw)
+        mismatched["activation_package_digest"] = "f" * 64
+        write_file(install_receipt, activation_package.canonical_json(mismatched), 0o600)
+        with self.assertRaisesRegex(ValueError, "different candidate"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        write_file(install_receipt, install_raw, 0o600)
+
+        component = self.fixture.rollback_execd_delivery_candidate()
+        self.assertEqual((component["state"], component["prior_state"]), ("rolled_back", "present"))
+        self.assertEqual(activation_package.digest(binary.read_bytes()), prior_sha)
+        self.assertFalse(install_receipt.exists())
+        self.assertFalse(
+            (self.fixture.root / CONTROLLER.EXECD_PACKAGE_PREIMAGE_PATH.lstrip("/")).exists()
+        )
+        terminal_path = self.fixture.root / CONTROLLER.EXECD_PACKAGE_ROLLBACK_PATH.lstrip("/")
+        terminal = json.loads(terminal_path.read_bytes())
+        self.assertEqual((terminal["state"], terminal["live_target"]["sha256"]),
+                         ("rolled_back", prior_sha))
         CONTROLLER.rollback(manifest, self.fixture.root, driver)
         restored = driver.socket_identity(runtime["path"])
         self.assertEqual(
@@ -1443,6 +1572,7 @@ class ActivationControllerTests(unittest.TestCase):
         )
         self.assertEqual(driver.unit(runtime["unit"]), runtime["unit_state"])
         self.assertNotEqual(restored["inode"], captured["inode"])
+        self.assertEqual(activation_package.digest(binary.read_bytes()), prior_sha)
 
     def test_legacy_runtime_socket_tuple_state_and_inventory_drift_fail_closed(self) -> None:
         cases = (
@@ -1481,8 +1611,9 @@ class ActivationControllerTests(unittest.TestCase):
                 self.assertIsNone(CONTROLLER._read_receipt(fixture.root))
 
     def test_rollback_discovers_and_restores_new_target_id_objects(self) -> None:
-        manifest, payloads, driver = self.fixture.load()
-        self.fixture.install_recognized_legacy_host(driver)
+        manifest, payloads, driver, _prior_sha, _candidate_sha = (
+            self.fixture.install_recognized_legacy_delivery_host()
+        )
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         target = manifest["identities"]["qualification"]
         new_records = [
@@ -1494,6 +1625,7 @@ class ActivationControllerTests(unittest.TestCase):
             *driver.legacy_ownership,
             *[{**record, "uid": target["uid"], "gid": target["gid"]} for record in new_records],
         ]
+        self.fixture.rollback_execd_delivery_candidate()
         CONTROLLER.rollback(manifest, self.fixture.root, driver)
         restored = {record["path"]: record for record in driver.legacy_ownership}
         for record in new_records:
@@ -1506,9 +1638,11 @@ class ActivationControllerTests(unittest.TestCase):
         for case in ("symlink", "hardlink", "inode", "new", "collision"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 fixture = ActivationFixture(Path(temporary))
-                manifest, payloads, driver = fixture.load()
-                fixture.install_recognized_legacy_host(driver)
+                manifest, payloads, driver, _prior_sha, _candidate_sha = (
+                    fixture.install_recognized_legacy_delivery_host()
+                )
                 CONTROLLER.stage(manifest, payloads, fixture.root, driver, fixture.binding)
+                fixture.rollback_execd_delivery_candidate()
                 target = manifest["identities"]["qualification"]
                 record = {
                     "path": "/var/lib/buzzci/ctl/raced", "kind": "file", "mode": 0o600,
@@ -1559,19 +1693,91 @@ class ActivationControllerTests(unittest.TestCase):
         ):
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
                 fixture = ActivationFixture(Path(temporary))
-                manifest, payloads, driver = fixture.load()
-                fixture.install_recognized_legacy_host(driver)
+                manifest, payloads, driver, _prior_sha, _candidate_sha = (
+                    fixture.install_recognized_legacy_delivery_host()
+                )
                 driver.legacy_ownership = [
                     {"path": f"/var/lib/buzzci/ctl/item-{index}", "kind": "file",
                      "mode": 0o600, "uid": 961, "gid": 961}
                     for index in range(2)
                 ]
                 CONTROLLER.stage(manifest, payloads, fixture.root, driver, fixture.binding)
+                fixture.rollback_execd_delivery_candidate()
                 self.cut_rollback_process_at(fixture, manifest, driver, boundary)
                 manifest, _payloads, driver = fixture.load()
                 CONTROLLER.rollback(manifest, fixture.root, driver)
                 self.assertEqual(driver.identity("buzzci-ctl")["uid"], 961)
                 self.assertTrue(all(record["uid"] == 961 and record["gid"] == 961 for record in driver.legacy_ownership))
+
+    def test_post_chown_path_continuity_races_hold_at_every_restart_boundary(self) -> None:
+        boundaries = (
+            "legacy_compatibility:rollback_ownership:0",
+            "legacy_compatibility:rollback_ownership:1",
+            "legacy_compatibility:restore_ownership",
+            "legacy_compatibility:restore_groups",
+            "legacy_compatibility:restore_gid",
+            "legacy_compatibility:restore_account",
+            "legacy_compatibility:restore_file:0",
+            "legacy_compatibility:restore_file:1",
+            "legacy_compatibility:restore_file:2",
+        )
+        for boundary in boundaries:
+            for case in ("replace", "remove", "mode", "link", "type"):
+                with self.subTest(boundary=boundary, case=case), tempfile.TemporaryDirectory() as temporary:
+                    fixture = ActivationFixture(Path(temporary))
+                    manifest, payloads, driver, _prior_sha, _candidate_sha = (
+                        fixture.install_recognized_legacy_delivery_host()
+                    )
+                    driver.legacy_ownership = [
+                        {"path": f"/var/lib/buzzci/ctl/item-{index}", "kind": "file",
+                         "mode": 0o600, "uid": 961, "gid": 961}
+                        for index in range(2)
+                    ]
+                    CONTROLLER.stage(manifest, payloads, fixture.root, driver, fixture.binding)
+                    fixture.rollback_execd_delivery_candidate()
+                    self.cut_rollback_process_at(fixture, manifest, driver, boundary)
+                    records = driver.legacy_ownership
+                    raced = next(
+                        record for record in records
+                        if record["path"] == "/var/lib/buzzci/ctl/item-0"
+                    )
+                    if case == "remove":
+                        records.remove(raced)
+                    else:
+                        raced.update({"uid": 961, "gid": 961})
+                        if case == "replace":
+                            raced["inode"] = CONTROLLER._fake_ownership_metadata(raced)["inode"] + 1
+                        elif case == "mode":
+                            raced["mode"] = 0o640
+                        elif case == "link":
+                            raced["nlink"] = 2
+                        else:
+                            raced["kind"] = "directory"
+                    driver.legacy_ownership = records
+                    target = manifest["identities"]["qualification"]
+                    unplanned_target = CONTROLLER._rollback_root_inventory(
+                        manifest, fixture.root, driver, target["uid"], target["gid"], set(),
+                    )
+                    self.assertFalse(any(
+                        record["path"] == "/var/lib/buzzci/ctl/item-0"
+                        for record in unplanned_target
+                    ))
+                    expected = (
+                        "(?:restored rollback ownership object differs|planned rollback ownership object raced)"
+                        if case == "replace"
+                        else "(?:legacy ownership rollback object differs|hard linked)"
+                    )
+                    with self.assertRaisesRegex(ValueError, expected):
+                        CONTROLLER.rollback(manifest, fixture.root, driver)
+                    receipt = CONTROLLER._read_receipt(fixture.root)
+                    self.assertNotEqual(receipt["state"], "rolled_back")
+                    if boundary not in {
+                        "legacy_compatibility:restore_account",
+                        "legacy_compatibility:restore_file:0",
+                        "legacy_compatibility:restore_file:1",
+                        "legacy_compatibility:restore_file:2",
+                    }:
+                        self.assertEqual(driver.identity("buzzci-ctl")["uid"], target["uid"])
 
     def test_legacy_tuple_collision_drift_process_and_ownership_hazards_fail_closed(self) -> None:
         file_cases = {
@@ -1640,8 +1846,9 @@ class ActivationControllerTests(unittest.TestCase):
         for case in ("id", "file"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 fixture = ActivationFixture(Path(temporary))
-                manifest, payloads, driver = fixture.load()
-                fixture.install_recognized_legacy_host(driver, global_policy=True)
+                manifest, payloads, driver, _prior_sha, _candidate_sha = (
+                    fixture.install_recognized_legacy_delivery_host(global_policy=True)
+                )
                 CONTROLLER.stage(manifest, payloads, fixture.root, driver, fixture.binding)
                 pristine = copy.deepcopy(driver._read())
                 if case == "id":
@@ -1685,8 +1892,9 @@ class ActivationControllerTests(unittest.TestCase):
         for boundary in boundaries:
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
                 fixture = ActivationFixture(Path(temporary))
-                manifest, payloads, driver = fixture.load()
-                fixture.install_recognized_legacy_host(driver, global_policy=True)
+                manifest, payloads, driver, _prior_sha, _candidate_sha = (
+                    fixture.install_recognized_legacy_delivery_host(global_policy=True)
+                )
                 driver.legacy_ownership = [{
                     "path": "/var/lib/buzzci/principals/ctl/state",
                     "kind": "file", "mode": 0o600, "uid": 961, "gid": 961,
@@ -1695,14 +1903,15 @@ class ActivationControllerTests(unittest.TestCase):
                     fixture, manifest, payloads, driver, fixture.binding, boundary,
                 )
                 self.assertEqual(CONTROLLER._read_receipt(fixture.root)["state"], "preparing")
+                fixture.rollback_execd_delivery_candidate()
                 rolled_back = self.fixed_rollback_cli(fixture)
                 self.assertEqual(rolled_back.returncode, 0, rolled_back.stderr.decode())
                 self.assertEqual(json.loads(rolled_back.stdout)["state"], "rolled_back")
                 manifest, payloads, driver = fixture.load()
-                retried = CONTROLLER.stage(
-                    manifest, payloads, fixture.root, driver, fixture.binding,
+                retried = CONTROLLER.rollback(
+                    manifest, fixture.root, driver,
                 )
-                self.assertEqual(retried["state"], "staged_zero")
+                self.assertEqual(retried["status"], "unchanged")
 
     def test_dependency_drop_in_rejects_missing_and_stale_bytes(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -2185,7 +2394,8 @@ class ActivationControllerTests(unittest.TestCase):
             CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual(receipt["state"], "rollback_failed")
-        self.assertIn("restore active state buzz-ci-runner.socket", receipt["last_error"])
+        self.assertIn("stop buzz-ci-runner.socket", receipt["last_error"])
+        self.assertNotIn("restore active state", receipt["last_error"])
 
     def test_manifest_schema_mirrors_fixed_package_counts_and_systemd_abi(self) -> None:
         schema = json.loads((ACTIVATION_ROOT / "activation-manifest.schema.json").read_bytes())
@@ -2219,7 +2429,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "a4e41e5c14f612d612fe77198daa42b6928d1abfb71c5d91db0fe229709e2501",
+            "f3dc10c849eee4efdb7b331ac6505066ffa309c8915d9af3dada7a6be0b7883e",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -2922,6 +3132,42 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(driver.socket(manifest["socket_policy"]["execd"])["path"], "/run/buzzci/execd.sock")
         self.assertFalse(fixed_package.exists())
         self.assertTrue(installed_cli.exists())
+
+    def test_execd_component_rollback_binding_covers_each_active_unit_baseline(self) -> None:
+        for active_socket, active_service in ((True, False), (False, True), (True, True)):
+            with self.subTest(
+                active_socket=active_socket, active_service=active_service,
+            ), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                prior_sha, candidate_sha = fixture.install_execd_delivery_candidate()
+                manifest, _payloads, _driver = fixture.load()
+                activation_receipt = {
+                    "systemd_before": {
+                        "buzz-ci-execd.socket": {
+                            "ActiveState": "active" if active_socket else "inactive",
+                        },
+                        "buzz-ci-execd.service": {
+                            "ActiveState": "active" if active_service else "inactive",
+                        },
+                    },
+                }
+                binary = fixture.root / CONTROLLER.EXECD_BINARY_PATH.lstrip("/")
+                self.assertEqual(activation_package.digest(binary.read_bytes()), candidate_sha)
+                self.assertEqual(
+                    CONTROLLER._execd_package_rollback_readback(
+                        manifest, fixture.root, activation_receipt,
+                    ),
+                    "required",
+                )
+                fixture.rollback_execd_delivery_candidate()
+                self.assertEqual(activation_package.digest(binary.read_bytes()), prior_sha)
+                self.assertEqual(
+                    CONTROLLER._execd_package_rollback_readback(
+                        manifest, fixture.root, activation_receipt,
+                    ),
+                    "rolled_back",
+                )
+                self.assertEqual(activation_package.digest(binary.read_bytes()), prior_sha)
 
     def test_rollback_accepts_real_execd_absent_baseline_receipt(self) -> None:
         execd_package, seccomp_contract = execd_package_for_activation(self.fixture)
@@ -4026,7 +4272,9 @@ while True:
         )
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual(receipt["state"], "rollback_failed")
-        self.assertIn("systemd prior readback", receipt["last_error"])
+        self.assertIn("stop buzz-ci-runner.socket", receipt["last_error"])
+        self.assertNotIn("systemd prior readback", receipt["last_error"])
+        self.assertEqual(driver.unit("buzz-ci-runner.socket")["ActiveState"], "active")
 
     def test_qualification_executable_mode_drift_is_rejected(self) -> None:
         manifest, payloads, driver = self.fixture.load()

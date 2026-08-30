@@ -21,11 +21,26 @@
         "default_state": {"$ref": "../activation-manifest.schema.json#/properties/default_state"},
         "identities": {"$ref": "../activation-manifest.schema.json#/properties/identities"},
         "components": {"$ref": "../activation-manifest.schema.json#/properties/components"},
-        "entries": {"$ref": "../activation-manifest.schema.json#/properties/entries"},
+        "entries": {
+          "allOf": [
+            {"$ref": "../activation-manifest.schema.json#/properties/entries"},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/0"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/1"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/2"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/3"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/4"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/5"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/6"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/7"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/8"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/9"}, "minContains": 1, "maxContains": 1},
+            {"contains": {"$ref": "#/$defs/candidateSystemdEntry/oneOf/10"}, "minContains": 1, "maxContains": 1}
+          ]
+        },
         "access_group": {"$ref": "../activation-manifest.schema.json#/properties/access_group"},
         "acceptance_template": {"$ref": "../activation-manifest.schema.json#/properties/acceptance_template"},
         "systemd": {"$ref": "../activation-manifest.schema.json#/properties/systemd"},
-        "effective_systemd": {"$ref": "../activation-manifest.schema.json#/properties/effective_systemd"},
+        "effective_systemd": {"$ref": "#/$defs/effectiveSystemd"},
         "inherited_systemd": {"$ref": "../activation-manifest.schema.json#/properties/inherited_systemd"},
         "legacy_compatibility": {"$ref": "../activation-manifest.schema.json#/properties/legacy_compatibility"},
         "socket_policy": {"$ref": "../activation-manifest.schema.json#/properties/socket_policy"},
@@ -33,6 +48,38 @@
         "package_uid": {"$ref": "../activation-manifest.schema.json#/properties/package_uid"},
         "package_gid": {"$ref": "../activation-manifest.schema.json#/properties/package_gid"}
       }
+    },
+    "candidateSystemdEntry": {
+      "oneOf": [
+        {"const": {"role":"capacity_target","source":"assets/buzz-ci-capacity-one.target","source_mode":"0400","sha256":"8754601432d0a211c89467dbcd1ad7be240486cbd5be64a76a3729aa58847ac0","target":"/etc/systemd/system/buzz-ci-capacity-one.target","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"acceptance_control_socket","source":"assets/buzz-ci-acceptance-control.socket","source_mode":"0400","sha256":"9ee5bd37e54d3d2c3150004bc96e7712b702ecee519df05fd9e2f3eaff022171","target":"/etc/systemd/system/buzz-ci-acceptance-control.socket","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"acceptance_control_service","source":"assets/buzz-ci-acceptance-control.service","source_mode":"0400","sha256":"6aec976aa873f42bbee9f36265d5e0e5a1c01b8772609f1f5d62b9eff847b01a","target":"/etc/systemd/system/buzz-ci-acceptance-control.service","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"execd_socket_dropin","source":"assets/20-execd-capacity-one.conf","source_mode":"0400","sha256":"e99fa6b3fa99654ad2f28d9321c711e78fa8a7908a09f1e9f7005ab9da2e8517","target":"/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"runner_service_dropin","source":"assets/20-runner-capacity-one.conf","source_mode":"0400","sha256":"d9ace3c70199a9973d17cd4d7c85deb9410cd7bc02291524bc66155a3a20c5c6","target":"/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"controld_service_dropin","source":"assets/20-controld-capacity-one.conf","source_mode":"0400","sha256":"9839216505c95f72c51f7f80a249f2fe45b81092cc571333610553f739c8f05c","target":"/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"keyholder_socket_dropin","source":"assets/20-keyholder-capacity-one.conf","source_mode":"0400","sha256":"630ccfd9b92d5d21a0d92502cafcf5e136924b14c1c1038d34128b30cf23bb05","target":"/etc/systemd/system/buzz-ci-keyholder.socket.d/20-capacity-one.conf","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"execd_service","source":"assets/buzz-ci-execd.service","source_mode":"0400","sha256":"f05501411dc3c140f5cb0429d67df54d0d31d49dcb797137c38a167a5c048303","target":"/usr/lib/systemd/system/buzz-ci-execd.service","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"execd_socket","source":"assets/buzz-ci-execd.socket","source_mode":"0400","sha256":"35fea45f037324d5ea0d2e2361ccdef95ee16ee72753168cb2284ec06aa0e043","target":"/usr/lib/systemd/system/buzz-ci-execd.socket","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"executor_service","source":"assets/buzz-ci-executor.service","source_mode":"0400","sha256":"3e9a880ba45eae847d90e3bb085fcfbded3b7a3540b773bafe8ab5ef0ea80d86","target":"/usr/lib/systemd/system/buzz-ci-executor.service","install_mode":"0644","uid":0,"gid":0}},
+        {"const": {"role":"executor_socket","source":"assets/buzz-ci-executor.socket","source_mode":"0400","sha256":"5fba65a1601346c7c09f60f026964a0ad5d0287d00349e49f38f701c5964291e","target":"/usr/lib/systemd/system/buzz-ci-executor.socket","install_mode":"0644","uid":0,"gid":0}}
+      ]
+    },
+    "effectiveSystemd": {
+      "const": [
+        {"unit":"buzz-ci-acceptance-control.service","fragment":{"owner":"activation","path":"/etc/systemd/system/buzz-ci-acceptance-control.service","sha256":"6aec976aa873f42bbee9f36265d5e0e5a1c01b8772609f1f5d62b9eff847b01a"},"drop_ins":[]},
+        {"unit":"buzz-ci-acceptance-control.socket","fragment":{"owner":"activation","path":"/etc/systemd/system/buzz-ci-acceptance-control.socket","sha256":"9ee5bd37e54d3d2c3150004bc96e7712b702ecee519df05fd9e2f3eaff022171"},"drop_ins":[]},
+        {"unit":"buzz-ci-capacity-one.target","fragment":{"owner":"activation","path":"/etc/systemd/system/buzz-ci-capacity-one.target","sha256":"8754601432d0a211c89467dbcd1ad7be240486cbd5be64a76a3729aa58847ac0"},"drop_ins":[]},
+        {"unit":"buzz-ci-controld-acceptance.socket","fragment":{"owner":"controld","path":"/etc/systemd/system/buzz-ci-controld-acceptance.socket","sha256":"4d2aa1802b2886b7773e3ad927bf7da3ca9462b6093d6b0be654ee73058d6bc8"},"drop_ins":[]},
+        {"unit":"buzz-ci-controld.service","fragment":{"owner":"controld","path":"/etc/systemd/system/buzz-ci-controld.service","sha256":"e9abc496925896415245ad9e9af615dee679aaffda59af6688167f7d57efbcd9"},"drop_ins":[{"owner":"activation","path":"/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf","sha256":"9839216505c95f72c51f7f80a249f2fe45b81092cc571333610553f739c8f05c"}]},
+        {"unit":"buzz-ci-execd.service","fragment":{"owner":"activation","path":"/usr/lib/systemd/system/buzz-ci-execd.service","sha256":"f05501411dc3c140f5cb0429d67df54d0d31d49dcb797137c38a167a5c048303"},"drop_ins":[]},
+        {"unit":"buzz-ci-execd.socket","fragment":{"owner":"activation","path":"/usr/lib/systemd/system/buzz-ci-execd.socket","sha256":"35fea45f037324d5ea0d2e2361ccdef95ee16ee72753168cb2284ec06aa0e043"},"drop_ins":[{"owner":"activation","path":"/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf","sha256":"e99fa6b3fa99654ad2f28d9321c711e78fa8a7908a09f1e9f7005ab9da2e8517"}]},
+        {"unit":"buzz-ci-executor.service","fragment":{"owner":"activation","path":"/usr/lib/systemd/system/buzz-ci-executor.service","sha256":"3e9a880ba45eae847d90e3bb085fcfbded3b7a3540b773bafe8ab5ef0ea80d86"},"drop_ins":[]},
+        {"unit":"buzz-ci-executor.socket","fragment":{"owner":"activation","path":"/usr/lib/systemd/system/buzz-ci-executor.socket","sha256":"5fba65a1601346c7c09f60f026964a0ad5d0287d00349e49f38f701c5964291e"},"drop_ins":[]},
+        {"unit":"buzz-ci-keyholder.service","fragment":{"owner":"keyholder","path":"/etc/systemd/system/buzz-ci-keyholder.service","sha256":"4e58b18b056924a11e490eaa4bb863a87559ceffad1234250083656fe0d01952"},"drop_ins":[{"owner":"keyholder","path":"/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf","sha256":"e99bd2be687cf6329110125966c34b85d2e286639238d0eaac5387c89fe2c85e"}]},
+        {"unit":"buzz-ci-keyholder.socket","fragment":{"owner":"keyholder","path":"/etc/systemd/system/buzz-ci-keyholder.socket","sha256":"f077eb7a21cf9786ed56a9f5e87a8ec6bc57d516c569ff1ed07e435b2120a482"},"drop_ins":[{"owner":"activation","path":"/etc/systemd/system/buzz-ci-keyholder.socket.d/20-capacity-one.conf","sha256":"630ccfd9b92d5d21a0d92502cafcf5e136924b14c1c1038d34128b30cf23bb05"}]},
+        {"unit":"buzz-ci-runner.service","fragment":{"owner":"runner","path":"/etc/systemd/system/buzz-ci-runner.service","sha256":"07b0d72a347095ecbb221e7dcb5a047bb9deeb03dc642162e0b75510157f2e5e"},"drop_ins":[{"owner":"activation","path":"/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf","sha256":"d9ace3c70199a9973d17cd4d7c85deb9410cd7bc02291524bc66155a3a20c5c6"}]},
+        {"unit":"buzz-ci-runner.socket","fragment":{"owner":"runner","path":"/etc/systemd/system/buzz-ci-runner.socket","sha256":"5e40a8ab1d880fcbf66ef3065f2cbd9a0e36c9024ed6d723591d13c2feb0d1d2"},"drop_ins":[]}
+      ]
     },
     "claims": {
       "type": "object", "additionalProperties": false,
