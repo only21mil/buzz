@@ -11,6 +11,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 RUNNER_DIR = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = RUNNER_DIR.parents[2]
@@ -29,6 +30,10 @@ def load_module(name: str, path: Path):
 RENDERER = load_module("render_runner_config", RUNNER_DIR / "render_runner_config.py")
 FREEZER = load_module("freeze_package", RUNNER_DIR / "freeze_package.py")
 INSTALLER = load_module("runner_install", RUNNER_DIR / "install.py")
+
+
+class SimulatedCrash(BaseException):
+    pass
 
 
 class RunnerInstallTests(unittest.TestCase):
@@ -162,6 +167,21 @@ class RunnerInstallTests(unittest.TestCase):
         )
         self.assertTrue(record["existed"])
         return root, installed, transaction, record
+
+    def transactions(self, root: Path) -> list[Path]:
+        backup_root = INSTALLER.backup_root_path(root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        return sorted(
+            path
+            for path in backup_root.iterdir()
+            if (path / "transaction.json").exists()
+        )
+
+    def crash_at(self, phase: str, target: str | None = None):
+        def boundary(observed_phase: str, observed_target: str | None = None) -> None:
+            if observed_phase == phase and (target is None or observed_target == target):
+                raise SimulatedCrash(f"{phase}:{target or ''}")
+
+        return mock.patch.object(INSTALLER, "_phase_boundary", side_effect=boundary)
 
     def test_config_renderer_is_canonical_closed_and_nofollow(self) -> None:
         output = self.base / "runner-v2.json"
@@ -325,9 +345,8 @@ class RunnerInstallTests(unittest.TestCase):
         self.assertFalse(installed["host_block"])
         self.assertEqual(installed["capacity"], 0)
         self.assertEqual(installed["peer_policy"], INSTALLER.PEER_POLICY)
-        unchanged = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
-        self.assertEqual(unchanged["status"], "unchanged")
-        self.assertEqual(unchanged["changed_targets"], [])
+        retried = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        self.assertEqual(retried, installed)
 
         preview = INSTALLER.rollback(
             self.package,
@@ -349,6 +368,245 @@ class RunnerInstallTests(unittest.TestCase):
         self.assertFalse((root / "etc/buzzci").exists())
         self.assertFalse((root / "usr/share/doc/buzz-ci-runner").exists())
 
+        repeated = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        self.assertEqual(repeated, rolled_back)
+
+    def test_transaction_is_durable_and_candidate_bound_before_target_mutation(self) -> None:
+        manifest = self.freeze()
+        root = self.make_root()
+        with self.crash_at("install_prepared"), self.assertRaises(SimulatedCrash):
+            INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+
+        [transaction] = self.transactions(root)
+        state_path = transaction / "transaction.json"
+        state = json.loads(state_path.read_text())
+        metadata = state_path.stat()
+        self.assertEqual(state["phase"], "install_prepared")
+        self.assertEqual(state["package_id"], manifest["package_id"])
+        self.assertEqual(state["package_digest"], manifest["package_digest"])
+        self.assertEqual(state["source_commit"], self.source_commit)
+        self.assertEqual(
+            state["transaction_digest"],
+            INSTALLER.transaction_digest(state),
+        )
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        self.assertEqual(metadata.st_uid, root.stat().st_uid)
+        self.assertEqual(metadata.st_gid, root.stat().st_gid)
+        self.assertFalse((transaction / "receipt.json").exists())
+        for target in INSTALLER.EXPECTED_TARGETS.values():
+            self.assertFalse(INSTALLER.rooted(root, target).exists())
+        for directory in INSTALLER.EXPECTED_DIRECTORIES:
+            self.assertFalse(INSTALLER.rooted(root, directory).exists())
+
+        resumed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        self.assertEqual(resumed["backup_id"], transaction.name)
+        self.assertEqual(json.loads(state_path.read_text())["phase"], "installed")
+
+    def test_install_restarts_at_phase_and_each_published_target_boundary(self) -> None:
+        self.freeze()
+        for phase in ("install_publishing", "installed_receipt_written", "installed"):
+            with self.subTest(phase=phase):
+                root = self.make_root(f"install-phase-{phase}")
+                with self.crash_at(phase), self.assertRaises(SimulatedCrash):
+                    INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                [transaction] = self.transactions(root)
+                resumed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                self.assertEqual(resumed["backup_id"], transaction.name)
+                self.assertEqual(resumed["status"], "installed")
+                self.assertEqual(json.loads((transaction / "transaction.json").read_text())["phase"], "installed")
+
+        for index, directory in enumerate(sorted(INSTALLER.EXPECTED_DIRECTORIES)):
+            with self.subTest(created_directory=directory):
+                root = self.make_root(f"install-directory-{index}")
+                with self.crash_at("install_directory_created", directory), self.assertRaises(SimulatedCrash):
+                    INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                [transaction] = self.transactions(root)
+                self.assertEqual(
+                    json.loads((transaction / "transaction.json").read_text())["phase"],
+                    "install_publishing",
+                )
+                resumed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                self.assertEqual(resumed["backup_id"], transaction.name)
+
+        for index, target in enumerate(sorted(INSTALLER.EXPECTED_TARGETS.values())):
+            with self.subTest(published_target=target):
+                root = self.make_root(f"install-target-{index}")
+                with self.crash_at("install_target_published", target), self.assertRaises(SimulatedCrash):
+                    INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                [transaction] = self.transactions(root)
+                state = json.loads((transaction / "transaction.json").read_text())
+                _manifest, entries = INSTALLER.parse_manifest(self.package, root)
+                classifications = INSTALLER.target_classifications(root, state, entries)
+                self.assertIn("candidate", classifications.values())
+                if target != sorted(INSTALLER.EXPECTED_TARGETS.values())[-1]:
+                    self.assertIn("prior", classifications.values())
+                resumed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                self.assertEqual(resumed["backup_id"], transaction.name)
+                self.assertEqual(
+                    set(INSTALLER.target_classifications(root, json.loads((transaction / "transaction.json").read_text()), entries).values()),
+                    {"candidate"},
+                )
+
+    def test_rollback_restarts_at_phase_target_and_directory_boundaries(self) -> None:
+        self.freeze()
+        for phase in (
+            "rollback_prepared",
+            "rollback_restoring",
+            "rolled_back_receipt_written",
+            "rolled_back",
+        ):
+            with self.subTest(phase=phase):
+                root = self.make_root(f"rollback-phase-{phase}")
+                installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                with self.crash_at(phase), self.assertRaises(SimulatedCrash):
+                    INSTALLER.rollback(
+                        self.package,
+                        root,
+                        INSTALLER.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    )
+                resumed = INSTALLER.rollback(
+                    self.package,
+                    root,
+                    INSTALLER.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+                repeated = INSTALLER.rollback(
+                    self.package,
+                    root,
+                    INSTALLER.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+                self.assertEqual(repeated, resumed)
+
+        rollback_order = list(reversed(sorted(INSTALLER.EXPECTED_TARGETS.values())))
+        for index, target in enumerate(rollback_order):
+            with self.subTest(restored_target=target):
+                root = self.make_root(f"rollback-target-{index}")
+                installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                with self.crash_at("rollback_target_restored", target), self.assertRaises(SimulatedCrash):
+                    INSTALLER.rollback(
+                        self.package,
+                        root,
+                        INSTALLER.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    )
+                transaction = self.transactions(root)[0]
+                state = json.loads((transaction / "transaction.json").read_text())
+                _manifest, entries = INSTALLER.parse_manifest(self.package, root)
+                classifications = INSTALLER.target_classifications(root, state, entries)
+                self.assertIn("prior", classifications.values())
+                if target != rollback_order[-1]:
+                    self.assertIn("candidate", classifications.values())
+                INSTALLER.rollback(
+                    self.package,
+                    root,
+                    INSTALLER.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+                for managed_target in INSTALLER.EXPECTED_TARGETS.values():
+                    self.assertFalse(INSTALLER.rooted(root, managed_target).exists())
+
+        for index, directory in enumerate(reversed(sorted(INSTALLER.EXPECTED_DIRECTORIES))):
+            with self.subTest(removed_directory=directory):
+                root = self.make_root(f"rollback-directory-{index}")
+                installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                with self.crash_at("rollback_directory_removed", directory), self.assertRaises(SimulatedCrash):
+                    INSTALLER.rollback(
+                        self.package,
+                        root,
+                        INSTALLER.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    )
+                INSTALLER.rollback(
+                    self.package,
+                    root,
+                    INSTALLER.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+                for managed_directory in INSTALLER.EXPECTED_DIRECTORIES:
+                    self.assertFalse(INSTALLER.rooted(root, managed_directory).exists())
+
+    def test_mixed_rollback_restores_present_and_absent_baselines_on_retry(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        prior_target = root / "usr/lib/tmpfiles.d/buzzci-runner.conf"
+        prior_target.write_bytes(b"operator prior tmpfiles\n")
+        prior_target.chmod(0o640)
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        first_target = list(reversed(sorted(INSTALLER.EXPECTED_TARGETS.values())))[2]
+        with self.crash_at("rollback_target_restored", first_target), self.assertRaises(SimulatedCrash):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            )
+        transaction = self.transactions(root)[0]
+        state = json.loads((transaction / "transaction.json").read_text())
+        _manifest, entries = INSTALLER.parse_manifest(self.package, root)
+        self.assertEqual(
+            set(INSTALLER.target_classifications(root, state, entries).values()),
+            {"candidate", "prior"},
+        )
+        INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        self.assertEqual(prior_target.read_bytes(), b"operator prior tmpfiles\n")
+        self.assertEqual(stat.S_IMODE(prior_target.stat().st_mode), 0o640)
+        for target in INSTALLER.EXPECTED_TARGETS.values():
+            if target != "/usr/lib/tmpfiles.d/buzzci-runner.conf":
+                self.assertFalse(INSTALLER.rooted(root, target).exists())
+
+    def test_receipt_state_mismatch_and_candidate_binding_refuse_recovery(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        [transaction] = self.transactions(root)
+        state = json.loads((transaction / "transaction.json").read_text())
+        receipt = INSTALLER.receipt_for(state, "rolled_back")
+        INSTALLER.atomic_write(
+            transaction / "receipt.json",
+            INSTALLER.canonical_json(receipt),
+            0o600,
+            root.stat().st_uid,
+            root.stat().st_gid,
+        )
+        with self.assertRaisesRegex(ValueError, "receipt/state mismatch"):
+            INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        with self.assertRaisesRegex(ValueError, "receipt/state mismatch"):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            )
+
+        root = self.make_root("candidate-binding-root")
+        with self.crash_at("install_prepared"), self.assertRaises(SimulatedCrash):
+            INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        [transaction] = self.transactions(root)
+        state = json.loads((transaction / "transaction.json").read_text())
+        state["package_digest"] = "f" * 64
+        state["transaction_digest"] = INSTALLER.transaction_digest(state)
+        INSTALLER.atomic_write(
+            transaction / "transaction.json",
+            INSTALLER.canonical_json(state),
+            0o600,
+            root.stat().st_uid,
+            root.stat().st_gid,
+        )
+        with self.assertRaisesRegex(ValueError, "bound to another candidate"):
+            INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+
     def test_install_refuses_target_symlink_and_rollback_refuses_drift(self) -> None:
         self.freeze()
         root = self.make_root()
@@ -365,6 +623,33 @@ class RunnerInstallTests(unittest.TestCase):
         target.write_text("drift")
         target.chmod(0o755)
         with self.assertRaisesRegex(ValueError, "drift blocks rollback"):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            )
+
+    def test_transaction_refuses_drift_in_target_that_was_already_candidate(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        _manifest, entries = INSTALLER.parse_manifest(self.package, root)
+        binary = next(entry for entry in entries if entry.role == "binary")
+        uid, gid, install_mode = INSTALLER.desired_metadata(root, binary)
+        INSTALLER.atomic_write(
+            INSTALLER.rooted(root, binary.target),
+            (self.package / binary.source).read_bytes(),
+            install_mode,
+            uid,
+            gid,
+        )
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        self.assertNotIn(binary.target, installed["changed_targets"])
+        INSTALLER.rooted(root, binary.target).write_bytes(b"unmanaged drift\n")
+        INSTALLER.rooted(root, binary.target).chmod(install_mode)
+        with self.assertRaisesRegex(ValueError, "unchanged package target drift"):
+            INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        with self.assertRaisesRegex(ValueError, "unchanged package target drift"):
             INSTALLER.rollback(
                 self.package,
                 root,
