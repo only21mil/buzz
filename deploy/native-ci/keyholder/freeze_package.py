@@ -13,6 +13,7 @@ import shutil
 import stat
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
 if str(NATIVE_CI_DIR) not in sys.path:
@@ -26,6 +27,7 @@ import render_keyholder_config
 
 SCHEMA = "buzz-ci-keyholder-acceptance-package-v1"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
+PUBLIC_BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v2"
 PACKAGE_RELATIVE = Path("deploy/native-ci/keyholder")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -59,6 +61,10 @@ STATIC_ASSETS = (
     ("acceptance_credential_dropin", "templates/20-acceptance-actor.conf", "20-acceptance-actor.conf", "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf"),
     ("documentation", "README.md", "README.md", "/usr/share/doc/buzz-ci-keyholder/README.md"),
 )
+PUBLIC_BINDING_KEYS = {
+    "schema_version", "relay_url", "relay_http_origin", "acceptance_actor",
+    "keyholder_public_spec",
+}
 
 
 def canonical_json(value: object) -> bytes:
@@ -200,17 +206,195 @@ def _validate_units(payloads: dict[str, bytes]) -> None:
         raise ValueError("acceptance binding receipt mount contract differs")
 
 
+def _read_public_binding(path: Path) -> tuple[dict[str, object], bytes]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) not in {0o400, 0o444, 0o600, 0o644}
+            or not 0 < before.st_size <= 256 * 1024
+        ):
+            raise ValueError("public binding metadata is invalid")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(descriptor, 64 * 1024):
+            size += len(chunk)
+            if size > 256 * 1024:
+                raise ValueError("public binding has invalid size")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        stable = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid", "st_size")
+        if any(getattr(before, field) != getattr(after, field) for field in stable):
+            raise ValueError("public binding changed during validation")
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    try:
+        value = json.loads(raw, object_pairs_hook=render_keyholder_config.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("public binding is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("public binding is not a JSON object")
+    return value, raw
+
+
+def _closed_object(value: object, keys: set[str], where: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"invalid {where} fields")
+    return value
+
+
+def _public_identity(value: object, where: str) -> dict[str, object]:
+    identity = _closed_object(value, {"public_key", "generation"}, where)
+    public_key = identity["public_key"]
+    if (
+        not isinstance(public_key, str)
+        or not DIGEST.fullmatch(public_key)
+        or public_key == "0" * 64
+        or isinstance(identity["generation"], bool)
+        or not isinstance(identity["generation"], int)
+        or identity["generation"] != 1
+    ):
+        raise ValueError(f"invalid {where}")
+    return identity
+
+
+def _canonical_origin(value: object, scheme: str, where: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"invalid {where}")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != scheme
+        or not parsed.netloc
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+        or parsed.hostname is None
+        or parsed.hostname != parsed.hostname.lower()
+        or value != f"{scheme}://{parsed.netloc}"
+    ):
+        raise ValueError(f"invalid {where}")
+    return parsed.netloc
+
+
+def canonical_public_binding(value: dict[str, object]) -> bytes:
+    actor = value["acceptance_actor"]
+    spec = value["keyholder_public_spec"]
+    peer = spec["peer"]
+    selectors = spec["selectors"]
+    acceptance = spec["acceptance"]
+    ordered = {
+        "schema_version": value["schema_version"],
+        "relay_url": value["relay_url"],
+        "relay_http_origin": value["relay_http_origin"],
+        "acceptance_actor": {
+            "public_key": actor["public_key"],
+            "generation": actor["generation"],
+        },
+        "keyholder_public_spec": {
+            "schema_version": spec["schema_version"],
+            "peer": {
+                "uid": peer["uid"],
+                "gid": peer["gid"],
+                "allowed_operations": peer["allowed_operations"],
+            },
+            "selectors": {
+                name: {
+                    "public_key": selectors[name]["public_key"],
+                    "generation": selectors[name]["generation"],
+                }
+                for name in ("ci_event", "nip98", "manifest")
+            },
+            "nip98_origin": spec["nip98_origin"],
+            "acceptance": {
+                "binding_receipt_path": acceptance["binding_receipt_path"],
+                "credential_selector": acceptance["credential_selector"],
+            },
+        },
+    }
+    return json.dumps(
+        ordered, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode() + b"\n"
+
+
+def _project_public_binding(path: Path) -> tuple[bytes, bytes, str]:
+    binding, binding_raw = _read_public_binding(path)
+    forbidden = ("secret", "private", "raw_key", "raw-key", "seed", "token")
+    stack: list[object] = [binding]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if any(any(word in key.lower() for word in forbidden) for key in item):
+                raise ValueError("public binding contains a raw or private key field")
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    _closed_object(binding, PUBLIC_BINDING_KEYS, "public binding")
+    if binding["schema_version"] != PUBLIC_BINDING_SCHEMA:
+        raise ValueError("public binding schema differs")
+    relay_netloc = _canonical_origin(binding["relay_url"], "wss", "relay URL")
+    http_netloc = _canonical_origin(binding["relay_http_origin"], "https", "relay HTTP origin")
+    if relay_netloc != http_netloc:
+        raise ValueError("public binding relay origins differ")
+    actor = _public_identity(binding["acceptance_actor"], "acceptance actor")
+    spec = _closed_object(
+        binding["keyholder_public_spec"],
+        render_keyholder_config.SPEC_KEYS,
+        "keyholder public spec",
+    )
+    if spec["nip98_origin"] != binding["relay_http_origin"]:
+        raise ValueError("public binding NIP-98 origin differs")
+    if isinstance(spec["schema_version"], bool) or spec["schema_version"] != 1:
+        raise ValueError("public binding keyholder schema differs")
+    rendered = render_keyholder_config.validate_config(spec)
+    selectors = rendered["selectors"]
+    if actor["public_key"] in {selector["public_key"] for selector in selectors.values()}:
+        raise ValueError("acceptance actor collides with a keyholder selector")
+    if canonical_public_binding(binding) != binding_raw:
+        raise ValueError("public binding is not canonical schema-order JSON plus LF")
+    projected = json.loads(json.dumps(spec))
+    projected["peer"] = dict(projected["peer"])
+    del projected["peer"]["allowed_operations"]
+    projected_config = render_keyholder_config.validate_spec(projected)
+    if projected_config != rendered:
+        raise ValueError("projected public spec differs from the binding")
+    projected_raw = canonical_json(projected)
+    return canonical_json(projected_config), projected_raw, digest(binding_raw)
+
+
+def _prepare_public_config(
+    public_spec: Path | None,
+    public_binding: Path | None,
+) -> tuple[bytes, bytes, str | None]:
+    if (public_spec is None) == (public_binding is None):
+        raise ValueError("exactly one public binding or legacy public spec is required")
+    if public_binding is not None:
+        return _project_public_binding(public_binding)
+    assert public_spec is not None
+    config = render_keyholder_config.config_bytes(public_spec)
+    projected = json.loads(config)
+    projected["peer"] = dict(projected["peer"])
+    del projected["peer"]["allowed_operations"]
+    return config, canonical_json(projected), None
+
+
 def freeze_package(
     source_root: Path,
     source_commit: str,
     binary: Path,
     provenance_path: Path,
-    public_spec: Path,
+    public_spec: Path | None,
     output: Path,
     keyholder_uid: int,
     keyholder_gid: int,
     controld_uid: int,
     controld_gid: int,
+    public_binding: Path | None = None,
 ) -> dict[str, object]:
     if not GIT_OID.fullmatch(source_commit):
         raise ValueError("source commit must be a full lowercase Git object id")
@@ -231,7 +415,9 @@ def freeze_package(
             raise ValueError("service identities must use nonzero u32 values")
     if keyholder_uid == controld_uid or keyholder_gid == controld_gid:
         raise ValueError("keyholder and controld identities must be distinct")
-    config = render_keyholder_config.config_bytes(public_spec)
+    config, projected_spec, public_binding_sha256 = _prepare_public_config(
+        public_spec, public_binding,
+    )
     config_value = json.loads(config)
     if (config_value["peer"]["uid"], config_value["peer"]["gid"]) != (controld_uid, controld_gid):
         raise ValueError("public spec peer identity differs from controld identity")
@@ -276,6 +462,8 @@ def freeze_package(
             "package_id": f"buzz-ci-keyholder-acceptance-{source_commit[:12]}-{digest(binary_payload + config)[:12]}",
             "source_commit": source_commit,
             "binary_provenance_sha256": digest(provenance_raw),
+            "public_binding_sha256": public_binding_sha256,
+            "acceptance_public_spec_sha256": digest(projected_spec),
             "package_uid": 0,
             "package_gid": 0,
             "identities": {
@@ -310,7 +498,9 @@ def main() -> int:
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--binary-provenance", dest="provenance_path", type=Path, required=True)
-    parser.add_argument("--public-spec", type=Path, required=True)
+    public_input = parser.add_mutually_exclusive_group(required=True)
+    public_input.add_argument("--public-binding", type=Path)
+    public_input.add_argument("--public-spec", type=Path, help="legacy explicit lean acceptance-public spec")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--keyholder-uid", type=int, required=True)
     parser.add_argument("--keyholder-gid", type=int, required=True)

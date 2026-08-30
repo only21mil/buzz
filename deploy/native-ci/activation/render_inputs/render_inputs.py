@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 from typing import Any
+from urllib.parse import urlsplit
 
 
 MAX_JSON = 1024 * 1024
@@ -39,7 +40,7 @@ PACKAGE_SCHEMAS = {
 PACKAGE_KEYS = {
     "runner": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "default_state", "peer_policy", "package_uid", "package_gid", "identities", "directories", "entries", "package_digest"},
     "controld": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "default_state", "daemon_contract", "package_uid", "package_gid", "identity", "directories", "entries", "package_digest"},
-    "keyholder": {"schema", "package_id", "source_commit", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"},
+    "keyholder": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "public_binding_sha256", "acceptance_public_spec_sha256", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"},
     "execd": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "default_state", "runtime_contract", "activation_owned_targets", "activation_binding", "seccomp_contract", "install_receipt", "package_uid", "package_gid", "directories", "entries", "package_digest"},
 }
 
@@ -203,6 +204,10 @@ class DescriptorRoot:
         raw, relative = self.read_ref(value, where, MAX_JSON)
         return parse_canonical_json(raw, where), raw, relative
 
+    def public_binding_ref(self, value: object) -> tuple[dict[str, Any], bytes, str]:
+        raw, relative = self.read_ref(value, "public binding", MAX_JSON)
+        return parse_public_binding_json(raw), raw, relative
+
     def open_directory(self, relative: object, where: str) -> int:
         path = normalized(relative, where)
         parent, name = self._open_parent(path)
@@ -300,6 +305,15 @@ def validate_manifest(manifest: dict[str, Any], candidate: str, name: str) -> No
         raise RenderError(f"{name} package manifest has missing or extra fields")
     if manifest.get("source_commit") != candidate:
         raise RenderError(f"{name} package candidate differs")
+    if name == "keyholder":
+        require_sha(manifest.get("binary_provenance_sha256"), "keyholder binary provenance")
+        binding_digest = manifest.get("public_binding_sha256")
+        if binding_digest is not None:
+            require_sha(binding_digest, "keyholder public binding")
+        require_sha(
+            manifest.get("acceptance_public_spec_sha256"),
+            "keyholder projected public spec",
+        )
     manifest_digest(manifest, name)
     entries = manifest.get("entries")
     if not isinstance(entries, list) or not entries:
@@ -308,7 +322,10 @@ def validate_manifest(manifest: dict[str, Any], candidate: str, name: str) -> No
     for item in entries:
         base_entry = {"role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"}
         active_entry = base_entry | {"active_source", "active_source_mode", "active_sha256"}
-        if not isinstance(item, dict) or frozenset(item) not in {frozenset(base_entry), frozenset(active_entry)}:
+        accepted_entries = {frozenset(base_entry), frozenset(active_entry)}
+        if name == "keyholder":
+            accepted_entries = {frozenset(base_entry | {"size"})}
+        if not isinstance(item, dict) or frozenset(item) not in accepted_entries:
             raise RenderError(f"{name} package entry shape differs")
         source = normalized(item["source"], f"{name} package source")
         if source in sources:
@@ -316,6 +333,12 @@ def validate_manifest(manifest: dict[str, Any], candidate: str, name: str) -> No
         sources.add(source)
         mode_value(item["source_mode"], f"{name} package source")
         require_sha(item["sha256"], f"{name} package source")
+        if "size" in item and (
+            isinstance(item["size"], bool)
+            or not isinstance(item["size"], int)
+            or not 0 < item["size"] <= MAX_FILE
+        ):
+            raise RenderError(f"{name} package source size is invalid")
         if "active_source" in item:
             required = {"active_source", "active_source_mode", "active_sha256"}
             if not required <= set(item):
@@ -359,18 +382,55 @@ def load_manifests(root: DescriptorRoot, value: object, candidate: str, names: t
 
 
 def validate_public_binding(value: dict[str, Any]) -> None:
-    require_keys(value, {"schema_version", "relay_url", "relay_http_origin", "acceptance_actor", "keyholder_public_spec"}, "public binding")
+    def ordered(item: object, keys: tuple[str, ...], where: str) -> dict[str, Any]:
+        result = require_keys(item, set(keys), where)
+        if tuple(result) != keys:
+            raise RenderError(f"{where} key order differs")
+        return result
+
+    value = ordered(
+        value,
+        ("schema_version", "relay_url", "relay_http_origin", "acceptance_actor", "keyholder_public_spec"),
+        "public binding",
+    )
     if value["schema_version"] != "buzz-ci-clean-host-e2e-public-binding/v2":
         raise RenderError("public binding schema differs")
-    actor = require_keys(value["acceptance_actor"], {"public_key", "generation"}, "acceptance actor")
+    def origin(item: object, scheme: str, where: str) -> str:
+        if not isinstance(item, str):
+            raise RenderError(f"{where} is invalid")
+        parsed = urlsplit(item)
+        if (
+            parsed.scheme != scheme
+            or not parsed.netloc
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+            or parsed.hostname is None
+            or parsed.hostname != parsed.hostname.lower()
+            or item != f"{scheme}://{parsed.netloc}"
+        ):
+            raise RenderError(f"{where} is invalid")
+        return parsed.netloc
+
+    relay_netloc = origin(value["relay_url"], "wss", "public binding relay URL")
+    http_netloc = origin(value["relay_http_origin"], "https", "public binding HTTP origin")
+    if relay_netloc != http_netloc:
+        raise RenderError("public binding relay origins differ")
+    actor = ordered(value["acceptance_actor"], ("public_key", "generation"), "acceptance actor")
     require_sha(actor["public_key"], "acceptance actor public key")
-    if actor["generation"] != 1:
+    if isinstance(actor["generation"], bool) or actor["generation"] != 1:
         raise RenderError("acceptance actor generation differs")
-    spec = require_keys(value["keyholder_public_spec"], {"schema_version", "peer", "selectors", "nip98_origin", "acceptance"}, "keyholder public spec")
-    if spec["schema_version"] != 1 or value["relay_http_origin"] != spec["nip98_origin"]:
+    spec = ordered(
+        value["keyholder_public_spec"],
+        ("schema_version", "peer", "selectors", "nip98_origin", "acceptance"),
+        "keyholder public spec",
+    )
+    if isinstance(spec["schema_version"], bool) or spec["schema_version"] != 1 or value["relay_http_origin"] != spec["nip98_origin"]:
         raise RenderError("public binding origin differs")
-    selectors = require_keys(spec["selectors"], {"ci_event", "nip98", "manifest"}, "keyholder selectors")
-    peer = require_keys(spec["peer"], {"uid", "gid", "allowed_operations"}, "keyholder public peer")
+    selectors = ordered(spec["selectors"], ("ci_event", "nip98", "manifest"), "keyholder selectors")
+    peer = ordered(spec["peer"], ("uid", "gid", "allowed_operations"), "keyholder public peer")
     if any(isinstance(peer[field], bool) or not isinstance(peer[field], int) or not 1 <= peer[field] <= 0xFFFFFFFF for field in ("uid", "gid")):
         raise RenderError("keyholder public peer identity differs")
     if peer["allowed_operations"] != [
@@ -378,16 +438,21 @@ def validate_public_binding(value: dict[str, Any]) -> None:
         "describe_acceptance", "sign_acceptance_mutation",
     ]:
         raise RenderError("keyholder public operations differ")
-    if spec["acceptance"] != {
+    acceptance = ordered(
+        spec["acceptance"],
+        ("binding_receipt_path", "credential_selector"),
+        "public acceptance selector",
+    )
+    if acceptance != {
         "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
         "credential_selector": "acceptance-actor.key",
     }:
         raise RenderError("public acceptance selector differs")
     keys = []
     for name, selector_value in selectors.items():
-        selector = require_keys(selector_value, {"public_key", "generation"}, f"{name} selector")
+        selector = ordered(selector_value, ("public_key", "generation"), f"{name} selector")
         keys.append(require_sha(selector["public_key"], f"{name} public key"))
-        if selector["generation"] != 1:
+        if isinstance(selector["generation"], bool) or selector["generation"] != 1:
             raise RenderError(f"{name} generation differs")
     if len(set(keys + [actor["public_key"]])) != 4:
         raise RenderError("public binding keys collide")
@@ -401,6 +466,22 @@ def validate_public_binding(value: dict[str, Any]) -> None:
             stack.extend(item.values())
         elif isinstance(item, list):
             stack.extend(item)
+
+
+def parse_public_binding_json(raw: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RenderError("public binding is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise RenderError("public binding is not a JSON object")
+    validate_public_binding(value)
+    encoded = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode() + b"\n"
+    if encoded != raw:
+        raise RenderError("public binding is not canonical schema-order JSON plus LF")
+    return value
 
 
 def copy_path(bindings: dict[str, Any], path: object) -> Any:
@@ -464,8 +545,7 @@ def resolve_template(template: dict[str, Any], kind: str, bindings: dict[str, An
 
 def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], names: tuple[str, ...]) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = require_sha(descriptor["candidate_sha"], "candidate", git=True)
-    public, public_raw, _ = root.json_ref(descriptor["public_binding"], "public binding")
-    validate_public_binding(public)
+    public, public_raw, _ = root.public_binding_ref(descriptor["public_binding"])
     manifests, manifest_file_sha = load_manifests(root, descriptor["package_manifests"], candidate, names)
     bindings = {
         "candidate_sha": candidate,
@@ -662,10 +742,9 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
     os.close(state_fd)
     candidate_fd = root.open_directory(candidate_root, "candidate root")
     os.close(candidate_fd)
-    public, _public_raw, public_path = root.json_ref(descriptor["public_binding"], "public binding")
+    public, _public_raw, public_path = root.public_binding_ref(descriptor["public_binding"])
     if public_path != f"{state}/public-binding.json":
         raise RenderError("public binding is not the prepared state binding")
-    validate_public_binding(public)
     try:
         resolved = subprocess.run(
             ["git", "-C", str(root.base / candidate_root), "rev-parse", "HEAD^{commit}"],
@@ -816,8 +895,7 @@ def record_residue(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str
 def record_sealed_freeze(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, Any]:
     require_keys(descriptor, {"schema_version", "candidate_sha", "lifecycle", "public_binding", "package_manifests"}, "sealed-freeze descriptor")
     evidence = lifecycle_evidence(root, descriptor)
-    public, public_raw, public_path = root.json_ref(descriptor["public_binding"], "public binding")
-    validate_public_binding(public)
+    public, public_raw, public_path = root.public_binding_ref(descriptor["public_binding"])
     contract = evidence["contract"]
     if public_path != f"{contract['state']}/public-binding.json":
         raise RenderError("sealed-freeze public binding differs from the lifecycle state")

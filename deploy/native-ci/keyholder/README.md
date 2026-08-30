@@ -125,12 +125,17 @@ approval-gated activation work.
 
 ## Freeze and inspect an acceptance package
 
-The input spec contains only the public peer, three existing selectors, NIP-98
-origin, and the exact fixed receipt path and acceptance credential selector.
-It cannot contain an activation package digest, scenario, actor identity,
-event template, operation list, arbitrary path, or secret. Therefore the
-keyholder package digest is independent of the post-freeze receipt and cannot
-participate in a package self-digest cycle.
+Use the canonical `public-binding.json` emitted by the clean-host `prepare`
+step. The freezer requires schema
+`buzz-ci-clean-host-e2e-public-binding/v2`, validates the complete closed
+document in the producer's exact declaration-order compact JSON plus LF,
+checks the controld UID and GID, rejects raw or private key fields, and verifies
+that the acceptance actor differs from all keyholder selectors. Reordered,
+pretty-printed, duplicate-key, extra-field, and truncated bindings fail closed.
+It projects `keyholder_public_spec` by removing only
+`peer.allowed_operations`, then validates the result as the existing lean
+acceptance-public spec. The package manifest binds both the original binding
+SHA-256 and the projected canonical spec SHA-256.
 
 ```bash
 deploy/native-ci/keyholder/freeze_package.py \
@@ -138,7 +143,7 @@ deploy/native-ci/keyholder/freeze_package.py \
   --source-commit "$(git rev-parse HEAD)" \
   --binary /private/path/buzz-ci-keyholder \
   --binary-provenance /private/path/binary-provenance.json \
-  --public-spec /private/path/acceptance-public.json \
+  --public-binding "$STATE/public-binding.json" \
   --output /private/path/keyholder-package \
   --keyholder-uid 1202 --keyholder-gid 1202 \
   --controld-uid 1201 --controld-gid 1201
@@ -146,6 +151,14 @@ deploy/native-ci/keyholder/freeze_package.py \
 deploy/native-ci/keyholder/install.py verify-package \
   --package /private/path/keyholder-package
 ```
+
+`--public-binding` and `--public-spec` are mutually exclusive. The latter
+remains available only for an explicit legacy lean acceptance-public spec. A
+legacy package records `public_binding_sha256` as JSON `null` and still binds
+the canonical lean spec digest. Neither input may contain an activation
+package digest, scenario, event template, arbitrary path, or secret. The
+keyholder package digest therefore remains independent of the post-freeze
+receipt and cannot participate in a package self-digest cycle.
 
 `install.py check` and `install.py install --dry-run` validate the host
 principals and external encrypted credential without mutation. `install`

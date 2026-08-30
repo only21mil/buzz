@@ -86,6 +86,26 @@ def public_binding() -> dict[str, object]:
     }
 
 
+def public_binding_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode() + b"\n"
+
+
+def write_public_binding(root: Path, value: object) -> dict[str, object]:
+    path = root / "state/public-binding.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = public_binding_bytes(value)
+    path.write_bytes(raw)
+    path.chmod(0o444)
+    return {
+        "path": "state/public-binding.json",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+        "mode": "0444",
+    }
+
+
 def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> dict[str, object]:
     unsigned: dict[str, object] = {
         "schema": f"test-{name}-package-v1",
@@ -561,6 +581,27 @@ class RendererTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDER.RenderError, "shape differs|private"):
             RENDER.validate_public_binding(binding)
 
+    def test_public_binding_parser_requires_prepare_order_and_exact_encoding(self) -> None:
+        binding = public_binding()
+        self.assertEqual(RENDER.parse_public_binding_json(public_binding_bytes(binding)), binding)
+        reordered = canonical(binding)
+        with self.assertRaisesRegex(RENDER.RenderError, "key order differs"):
+            RENDER.parse_public_binding_json(reordered)
+        pretty = json.dumps(binding, indent=2).encode() + b"\n"
+        with self.assertRaisesRegex(RENDER.RenderError, "canonical schema-order"):
+            RENDER.parse_public_binding_json(pretty)
+        duplicate = public_binding_bytes(binding).replace(
+            b'{"schema_version":', b'{"schema_version":"duplicate","schema_version":', 1,
+        )
+        with self.assertRaisesRegex(RENDER.RenderError, "duplicate JSON key"):
+            RENDER.parse_public_binding_json(duplicate)
+        extra = public_binding()
+        extra["unexpected"] = True
+        with self.assertRaisesRegex(RENDER.RenderError, "shape differs"):
+            RENDER.parse_public_binding_json(public_binding_bytes(extra))
+        with self.assertRaisesRegex(RENDER.RenderError, "valid JSON"):
+            RENDER.parse_public_binding_json(b'{"schema_version":\n')
+
     def test_execd_preactivation_input_is_candidate_bound_and_canonical(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
@@ -585,7 +626,7 @@ class RendererTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
             lifecycle = self.make_lifecycle(root_path)
-            public_ref = write_json(root_path, "state/public-binding.json", public_binding(), 0o444)
+            public_ref = write_public_binding(root_path, public_binding())
             refs: dict[str, object] = {}
             manifests: dict[str, object] = {}
             activation_digest = "a" * 64

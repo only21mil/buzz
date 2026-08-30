@@ -17,7 +17,9 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ACTIVATION_ROOT = REPO_ROOT / "deploy/native-ci/activation"
 EXECD_ROOT = REPO_ROOT / "deploy/native-ci/execd"
+KEYHOLDER_ROOT = REPO_ROOT / "deploy/native-ci/keyholder"
 sys.path.insert(0, str(ACTIVATION_ROOT))
+sys.path.insert(0, str(KEYHOLDER_ROOT))
 
 
 def load_module(name: str, path: Path):
@@ -33,6 +35,9 @@ ACTIVATION_FREEZER = load_module("bootstrap_activation_freezer", ACTIVATION_ROOT
 INVENTORY = load_module("bootstrap_inventory", ACTIVATION_ROOT / "check_package_inventory.py")
 RENDER = load_module("bootstrap_renderer", ACTIVATION_ROOT / "render_inputs/render_inputs.py")
 EXECD_FREEZER = load_module("bootstrap_execd_freezer", EXECD_ROOT / "freeze_package.py")
+KEYHOLDER_FREEZER = load_module(
+    "bootstrap_keyholder_freezer", KEYHOLDER_ROOT / "freeze_package.py",
+)
 ACTIVATION_TESTS = load_module(
     "bootstrap_activation_test_fixture", ACTIVATION_ROOT / "tests/test_activation_controller.py",
 )
@@ -158,9 +163,11 @@ class BootstrapCompositionTests(unittest.TestCase):
     def _ready_packages(
         self,
         ceremony: Path,
+        source_root: Path,
         draft: dict[str, object],
         fixture: object,
         candidate: str,
+        public_binding: Path,
     ) -> dict[str, dict[str, object]]:
         results: dict[str, dict[str, object]] = {}
         draft_entries = {item["role"]: item for item in draft["entries"]}
@@ -170,7 +177,7 @@ class BootstrapCompositionTests(unittest.TestCase):
             for record in (unit["fragment"], *unit["drop_ins"])
         ]
 
-        for name in ("runner", "controld", "keyholder"):
+        for name in ("runner", "controld"):
             package = ceremony / "packages" / name
             package.mkdir(parents=True, mode=0o700)
             package.chmod(0o700)
@@ -226,18 +233,13 @@ class BootstrapCompositionTests(unittest.TestCase):
                 base.update({
                     "default_state": {}, "daemon_contract": {}, "identity": {},
                 })
-            else:
-                base.update({
-                    "identities": {}, "runtime_contract": {}, "credential_contract": {},
-                })
-            if name in {"runner", "controld"}:
-                provenance = canonical({
-                    "binary": f"buzz-ci-{name}", "profile": "release",
-                    "schema": "buzz-ci-binary-provenance-v1",
-                    "sha256": hashlib.sha256(binary).hexdigest(), "source_commit": candidate,
-                })
-                base["binary_provenance_sha256"] = hashlib.sha256(provenance).hexdigest()
-                write_file(package / "binary-provenance.json", provenance, 0o600)
+            provenance = canonical({
+                "binary": f"buzz-ci-{name}", "profile": "release",
+                "schema": "buzz-ci-binary-provenance-v1",
+                "sha256": hashlib.sha256(binary).hexdigest(), "source_commit": candidate,
+            })
+            base["binary_provenance_sha256"] = hashlib.sha256(provenance).hexdigest()
+            write_file(package / "binary-provenance.json", provenance, 0o600)
 
             if name == "controld":
                 component = next(item for item in draft["components"] if item["name"] == "controld")
@@ -250,10 +252,36 @@ class BootstrapCompositionTests(unittest.TestCase):
             else:
                 base["package_digest"] = hashlib.sha256(canonical(base)).hexdigest()
 
-            for source, (payload, mode) in sources.items():
-                write_file(package / source, payload, mode)
+            for asset_source, (payload, mode) in sources.items():
+                write_file(package / asset_source, payload, mode)
             write_file(package / "package-manifest.json", canonical(base), 0o600)
             results[name] = base
+
+        keyholder_binary = ceremony / "buzz-ci-keyholder"
+        write_file(keyholder_binary, b"keyholder-binary\n", 0o755)
+        keyholder_provenance = ceremony / "keyholder-provenance.json"
+        write_file(keyholder_provenance, canonical({
+            "binary": "buzz-ci-keyholder", "profile": "release",
+            "schema": KEYHOLDER_FREEZER.PROVENANCE_SCHEMA,
+            "sha256": hashlib.sha256(keyholder_binary.read_bytes()).hexdigest(),
+            "source_commit": candidate,
+        }), 0o600)
+        identities = draft["identities"]
+        keyholder = identities["keyholder"]
+        controld = identities["controld"]
+        results["keyholder"] = KEYHOLDER_FREEZER.freeze_package(
+            source_root,
+            candidate,
+            keyholder_binary,
+            keyholder_provenance,
+            None,
+            ceremony / "packages/keyholder",
+            keyholder_uid=keyholder["uid"],
+            keyholder_gid=keyholder["gid"],
+            controld_uid=controld["uid"],
+            controld_gid=controld["gid"],
+            public_binding=public_binding,
+        )
         return results
 
     def _write_descriptor(self, ceremony: Path, name: str, value: object) -> Path:
@@ -271,14 +299,24 @@ class BootstrapCompositionTests(unittest.TestCase):
             root.close()
 
     def test_five_package_bootstrap_composes_without_a_vm(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as directory:
             ceremony = Path(directory)
             source, candidate = self._source_checkout(ceremony)
             fixture_root = ceremony / "fixture"
             fixture_root.mkdir(mode=0o700)
             fixture = ACTIVATION_TESTS.ActivationFixture(fixture_root)
             draft = self._retarget_draft(fixture, candidate)
-            ready = self._ready_packages(ceremony, draft, fixture, candidate)
+            public_path = ceremony / "state/public-binding.json"
+            write_file(
+                public_path,
+                KEYHOLDER_FREEZER.canonical_public_binding(
+                    self._public_binding(draft["acceptance_template"]["actor"]),
+                ),
+                0o444,
+            )
+            ready = self._ready_packages(
+                ceremony, source, draft, fixture, candidate, public_path,
+            )
 
             asset_root = ceremony / "activation-inputs"
             asset_root.mkdir(mode=0o700)
@@ -304,8 +342,6 @@ class BootstrapCompositionTests(unittest.TestCase):
                 source, candidate, execd_binary, execd_provenance, preactivation_path,
             )
 
-            public_path = ceremony / "state/public-binding.json"
-            write_file(public_path, canonical(self._public_binding(draft["acceptance_template"]["actor"])), 0o444)
             template_document = copy.deepcopy(draft)
             template_document["source_commit"] = {"$copy": "candidate_sha"}
             template_execd = next(

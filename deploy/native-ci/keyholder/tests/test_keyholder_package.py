@@ -15,6 +15,7 @@ from unittest import mock
 
 KEYHOLDER_DIR = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = KEYHOLDER_DIR.parents[2]
+FIXTURES = KEYHOLDER_DIR / "tests/fixtures"
 
 
 def load_module(name: str, path: Path):
@@ -53,6 +54,24 @@ def public_spec(uid: int = 1201, gid: int = 1201) -> dict[str, object]:
     }
 
 
+def public_binding(uid: int = 1201, gid: int = 1201) -> dict[str, object]:
+    keyholder_spec = public_spec(uid, gid)
+    keyholder_spec["peer"] = {
+        "uid": uid,
+        "gid": gid,
+        "allowed_operations": RENDERER.OPERATIONS,
+    }
+    return {
+        "schema_version": FREEZER.PUBLIC_BINDING_SCHEMA,
+        "relay_url": "wss://relay.example.test",
+        "relay_http_origin": "https://relay.example.test",
+        "acceptance_actor": identity(
+            "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13", 1,
+        ),
+        "keyholder_public_spec": keyholder_spec,
+    }
+
+
 class KeyholderPackageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=SOURCE_ROOT)
@@ -62,6 +81,9 @@ class KeyholderPackageTests(unittest.TestCase):
         self.spec = self.base / "public-spec.json"
         self.spec.write_bytes(RENDERER.canonical_json(public_spec()))
         self.spec.chmod(0o600)
+        self.binding = self.base / "public-binding.json"
+        self.binding.write_bytes(FREEZER.canonical_public_binding(public_binding()))
+        self.binding.chmod(0o444)
         self.package = self.base / "package"
         self.commit = subprocess.run(
             ["git", "-C", str(SOURCE_ROOT), "rev-parse", "HEAD"],
@@ -95,6 +117,33 @@ class KeyholderPackageTests(unittest.TestCase):
             controld_uid=1201,
             controld_gid=1201,
         )
+
+    def freeze_binding(self, source_root: Path = SOURCE_ROOT) -> dict[str, object]:
+        return FREEZER.freeze_package(
+            source_root,
+            self.commit,
+            self.binary,
+            self.provenance,
+            None,
+            self.package,
+            keyholder_uid=os.getuid(),
+            keyholder_gid=os.getgid(),
+            controld_uid=1201,
+            controld_gid=1201,
+            public_binding=self.binding,
+        )
+
+    def write_binding(self, value: object, *, canonical: bool = True) -> None:
+        payload = (
+            json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+            ).encode() + b"\n"
+            if canonical
+            else json.dumps(value, indent=2).encode() + b"\n"
+        )
+        self.binding.chmod(0o600)
+        self.binding.write_bytes(payload)
+        self.binding.chmod(0o444)
 
     def make_root(self) -> Path:
         root = self.base / "root"
@@ -164,6 +213,12 @@ class KeyholderPackageTests(unittest.TestCase):
         self.assertFalse(config_schema["properties"]["acceptance"]["additionalProperties"])
         self.assertEqual(config_schema["properties"]["peer"]["properties"]["allowed_operations"]["const"], RENDERER.OPERATIONS)
         self.assertFalse(package_schema["additionalProperties"])
+        self.assertIn("public_binding_sha256", package_schema["required"])
+        self.assertIn("acceptance_public_spec_sha256", package_schema["required"])
+        self.assertEqual(
+            package_schema["properties"]["public_binding_sha256"]["oneOf"][1],
+            {"type": "null"},
+        )
         self.assertFalse(provenance_schema["additionalProperties"])
         self.assertEqual(provenance_schema["properties"]["binary"]["const"], "buzz-ci-keyholder")
         self.assertEqual(package_schema["properties"]["credential_contract"]["const"], FREEZER.CREDENTIAL_CONTRACT)
@@ -215,6 +270,11 @@ class KeyholderPackageTests(unittest.TestCase):
 
     def test_package_contains_no_credential_and_binds_public_config(self) -> None:
         manifest = self.freeze()
+        self.assertIsNone(manifest["public_binding_sha256"])
+        self.assertEqual(
+            manifest["acceptance_public_spec_sha256"],
+            hashlib.sha256(RENDERER.canonical_json(public_spec())).hexdigest(),
+        )
         self.assertFalse(manifest["credential_contract"]["packaged"])
         self.assertFalse(any("credstore" in entry["source"] for entry in manifest["entries"]))
         self.assertEqual({entry["role"] for entry in manifest["entries"]}, set(INSTALLER.EXPECTED_TARGETS))
@@ -237,6 +297,97 @@ class KeyholderPackageTests(unittest.TestCase):
         asset_modes = {path.name: stat.S_IMODE(path.stat().st_mode) for path in (self.package / "assets").iterdir()}
         self.assertEqual(asset_modes.pop("buzz-ci-keyholder"), 0o500)
         self.assertEqual(set(asset_modes.values()), {0o400})
+
+    def test_public_binding_projects_exact_lean_spec_and_binds_both_digests(self) -> None:
+        manifest = self.freeze_binding()
+        binding_raw = self.binding.read_bytes()
+        projected = public_spec()
+        self.assertEqual(
+            manifest["public_binding_sha256"], hashlib.sha256(binding_raw).hexdigest(),
+        )
+        self.assertEqual(
+            manifest["acceptance_public_spec_sha256"],
+            hashlib.sha256(RENDERER.canonical_json(projected)).hexdigest(),
+        )
+        config_entry = next(item for item in manifest["entries"] if item["role"] == "config")
+        config_raw = (self.package / config_entry["source"]).read_bytes()
+        self.assertEqual(config_raw, RENDERER.canonical_json(RENDERER.validate_spec(projected)))
+        INSTALLER.parse_package(self.package, self.package)
+
+    def test_retained_prepare_binding_projects_byte_for_byte_to_audit_lean_spec(self) -> None:
+        binding_raw = (FIXTURES / "retained-public-binding.json").read_bytes()
+        lean_raw = (FIXTURES / "retained-acceptance-public.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(binding_raw).hexdigest(),
+            "9bcb090acaf8ffaf6d3aa72d43d9f804c1d1120f5889e6a90ddefaff4ce04ff3",
+        )
+        self.assertEqual(
+            hashlib.sha256(lean_raw).hexdigest(),
+            "4a2792043f83e4c6e6274b6ce9a33ba2eeccd5c14d63283f200c02646204eecd",
+        )
+        self.binding.chmod(0o600)
+        self.binding.write_bytes(binding_raw)
+        self.binding.chmod(0o444)
+        config, projected, binding_digest = FREEZER._project_public_binding(self.binding)
+        self.assertEqual(binding_digest, hashlib.sha256(binding_raw).hexdigest())
+        self.assertEqual(projected, lean_raw)
+        expected_config = RENDERER.canonical_json(RENDERER.validate_spec(json.loads(lean_raw)))
+        self.assertEqual(config, expected_config)
+
+    def test_public_binding_rejects_closed_shape_identity_and_secret_drift(self) -> None:
+        cases: list[tuple[str, dict[str, object], str]] = []
+        unknown = public_binding()
+        unknown["unexpected"] = True
+        cases.append(("unknown", unknown, "fields"))
+        missing = public_binding()
+        del missing["relay_url"]
+        cases.append(("missing", missing, "fields"))
+        schema = public_binding()
+        schema["schema_version"] = "buzz-ci-clean-host-e2e-public-binding/v1"
+        cases.append(("schema", schema, "schema"))
+        operations = public_binding()
+        operations["keyholder_public_spec"]["peer"]["allowed_operations"] = ["describe"]
+        cases.append(("operations", operations, "operation set"))
+        raw_key = public_binding()
+        raw_key["raw_key"] = "11" * 32
+        cases.append(("raw-key", raw_key, "raw or private key"))
+        collision = public_binding()
+        collision["acceptance_actor"]["public_key"] = collision["keyholder_public_spec"]["selectors"]["ci_event"]["public_key"]
+        cases.append(("collision", collision, "collides"))
+        wrong_gid = public_binding(gid=1202)
+        cases.append(("wrong-gid", wrong_gid, "peer identity"))
+        wrong_uid = public_binding(uid=1202)
+        cases.append(("wrong-uid", wrong_uid, "peer identity"))
+        for name, value, message in cases:
+            with self.subTest(name=name):
+                self.write_binding(value)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.freeze_binding()
+
+    def test_public_binding_rejects_noncanonical_duplicate_and_ambiguous_inputs(self) -> None:
+        self.write_binding(public_binding(), canonical=False)
+        with self.assertRaisesRegex(ValueError, "canonical schema-order JSON plus LF"):
+            self.freeze_binding()
+        self.binding.chmod(0o600)
+        self.binding.write_bytes(FREEZER.canonical_json(public_binding()))
+        self.binding.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "canonical schema-order JSON plus LF"):
+            self.freeze_binding()
+        self.binding.chmod(0o600)
+        self.binding.write_bytes(b'{"schema_version":"a","schema_version":"b"}\n')
+        self.binding.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
+            self.freeze_binding()
+        self.binding.chmod(0o600)
+        self.binding.write_bytes(b'{"schema_version":\n')
+        self.binding.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "valid JSON"):
+            self.freeze_binding()
+        self.write_binding(public_binding())
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            FREEZER._prepare_public_config(self.spec, self.binding)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            FREEZER._prepare_public_config(None, None)
 
     def test_fake_root_fails_closed_without_credential_or_with_loose_mode(self) -> None:
         self.freeze()

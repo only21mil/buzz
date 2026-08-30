@@ -208,6 +208,7 @@ def parse_package(package: Path, root: Path | None = None) -> tuple[dict[str, ob
             raise ValueError("package manifest metadata or encoding is unsafe")
         expected_keys = {
             "schema", "package_id", "source_commit", "binary_provenance_sha256",
+            "public_binding_sha256", "acceptance_public_spec_sha256",
             "package_uid", "package_gid", "identities", "runtime_contract",
             "credential_contract", "directories", "entries", "package_digest",
         }
@@ -219,6 +220,17 @@ def parse_package(package: Path, root: Path | None = None) -> tuple[dict[str, ob
             raise ValueError("invalid source commit")
         if not isinstance(manifest.get("binary_provenance_sha256"), str) or not DIGEST.fullmatch(str(manifest["binary_provenance_sha256"])):
             raise ValueError("invalid provenance digest")
+        public_binding_sha256 = manifest.get("public_binding_sha256")
+        if public_binding_sha256 is not None and (
+            not isinstance(public_binding_sha256, str)
+            or not DIGEST.fullmatch(public_binding_sha256)
+        ):
+            raise ValueError("invalid public binding digest")
+        if (
+            not isinstance(manifest.get("acceptance_public_spec_sha256"), str)
+            or not DIGEST.fullmatch(str(manifest["acceptance_public_spec_sha256"]))
+        ):
+            raise ValueError("invalid projected public spec digest")
         if (
             manifest.get("package_uid") != 0
             or manifest.get("package_gid") != 0
@@ -317,6 +329,12 @@ def parse_package(package: Path, root: Path | None = None) -> tuple[dict[str, ob
         render_keyholder_config.validate_config(config)
         if canonical_json(config) != config_raw or (config["peer"]["uid"], config["peer"]["gid"]) != (identities["controld_uid"], identities["controld_gid"]):
             raise ValueError("packaged config identity or canonical bytes differ")
+        projected = dict(config)
+        projected["peer"] = dict(config["peer"])
+        del projected["peer"]["allowed_operations"]
+        render_keyholder_config.validate_spec(projected)
+        if sha256(canonical_json(projected)) != manifest["acceptance_public_spec_sha256"]:
+            raise ValueError("packaged config projected public spec binding differs")
         payloads = {
             entry.role: _read_at(assets_fd, entry.source.removeprefix("assets/"))[0]
             for entry in entries if entry.role not in {"binary", "config"}

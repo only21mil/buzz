@@ -4,12 +4,19 @@
   "title": "Buzz CI acceptance keyholder provisioning package v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "package_id", "source_commit", "binary_provenance_sha256", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"],
+  "required": ["schema", "package_id", "source_commit", "binary_provenance_sha256", "public_binding_sha256", "acceptance_public_spec_sha256", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"],
   "properties": {
     "schema": { "const": "buzz-ci-keyholder-acceptance-package-v1" },
     "package_id": { "type": "string", "pattern": "^buzz-ci-keyholder-acceptance-[0-9a-f]{12}-[0-9a-f]{12}$" },
     "source_commit": { "$ref": "#/$defs/gitOid" },
     "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
+    "public_binding_sha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "acceptance_public_spec_sha256": { "$ref": "#/$defs/sha256" },
     "package_uid": { "const": 0 },
     "package_gid": { "const": 0 },
     "identities": {
