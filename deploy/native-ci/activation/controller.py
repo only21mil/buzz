@@ -77,6 +77,7 @@ TMPFILES = "/usr/bin/systemd-tmpfiles"
 USERMOD = "/usr/sbin/usermod"
 GROUPMOD = "/usr/sbin/groupmod"
 RPM = "/usr/bin/rpm"
+AT_EMPTY_PATH = 0x1000
 MAX_COMMAND_OUTPUT = 256 * 1024
 MAX_BINARY_BYTES = 128 * 1024 * 1024
 EXECD_BINARY_PATH = "/usr/libexec/buzz-ci-execd"
@@ -145,6 +146,57 @@ def _read_target(root: Path, target: str, limit: int = activation_package.MAX_AS
         return None
     finally:
         os.close(parent_fd)
+
+
+def _systemd_drop_in_files(root: Path, directory: str) -> list[str]:
+    try:
+        parent_fd, name = activation_package.open_parent_fd(root, directory)
+    except FileNotFoundError:
+        return []
+    try:
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        return []
+    finally:
+        os.close(parent_fd)
+    try:
+        result: list[str] = []
+        for child in sorted(os.listdir(directory_fd), key=os.fsencode):
+            if not child.endswith(".conf"):
+                continue
+            metadata = os.stat(child, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError(f"unsafe systemd drop-in: {directory}/{child}")
+            result.append(f"{directory}/{child}")
+        return result
+    finally:
+        os.close(directory_fd)
+
+
+def _resolved_systemd_drop_in_paths(root: Path, unit: str) -> list[str]:
+    winners: dict[str, tuple[tuple[int, int], str]] = {}
+    locations = (
+        (0, "/usr/lib/systemd/system"),
+        (1, "/run/systemd/system"),
+        (2, "/etc/systemd/system"),
+    )
+    for location_priority, base in locations:
+        if unit.endswith(".service"):
+            for path in _systemd_drop_in_files(root, f"{base}/service.d"):
+                basename = Path(path).name
+                priority = (0, location_priority)
+                if basename not in winners or priority > winners[basename][0]:
+                    winners[basename] = (priority, path)
+        for path in _systemd_drop_in_files(root, f"{base}/{unit}.d"):
+            basename = Path(path).name
+            priority = (1, location_priority)
+            if basename not in winners or priority > winners[basename][0]:
+                winners[basename] = (priority, path)
+    return [winners[name][1] for name in sorted(winners, key=os.fsencode)]
 
 
 def _physical_ids(root: Path, uid: int, gid: int) -> tuple[int, int]:
@@ -251,6 +303,15 @@ def _execd_package_rollback_readback(
     manifest: dict[str, Any], root: Path, activation_receipt: dict[str, Any]
 ) -> str:
     prior_systemd = activation_receipt.get("systemd_before")
+    legacy = activation_receipt.get("legacy_compatibility")
+    if (
+        isinstance(legacy, dict)
+        and legacy.get("state") == "legacy"
+        and isinstance(prior_systemd, dict)
+        and prior_systemd.get("buzz-ci-execd.socket", {}).get("ActiveState") == "active"
+        and prior_systemd.get("buzz-ci-execd.service", {}).get("ActiveState") == "inactive"
+    ):
+        return "not_required"
     if not isinstance(prior_systemd, dict) or not any(
         prior_systemd.get(unit, {}).get("ActiveState") == "active"
         for unit in ("buzz-ci-execd.socket", "buzz-ci-execd.service")
@@ -1724,6 +1785,24 @@ class LiveSystemd:
         }
 
     @staticmethod
+    def socket_identity(path: str) -> dict[str, object] | None:
+        try:
+            metadata = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        kind = "socket" if stat.S_ISSOCK(metadata.st_mode) else "unsafe"
+        return {
+            "path": path,
+            "kind": kind,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "nlink": metadata.st_nlink,
+        }
+
+    @staticmethod
     def socket_absent(policy: dict[str, object]) -> bool:
         try:
             os.stat(policy["path"], follow_symlinks=False)
@@ -1988,26 +2067,9 @@ class FakeSystemd:
                 })
                 state["units"][unit]["LoadState"] = "loaded"
                 state["units"][unit]["FragmentPath"] = fragment_path
-                drop_in_directory = activation_package.rooted(
-                    self.root, f"/etc/systemd/system/{unit}.d",
+                state["units"][unit]["DropInPaths"] = _resolved_systemd_drop_in_paths(
+                    self.root, unit,
                 )
-                drop_ins = (
-                    [f"/etc/systemd/system/{unit}.d/{path.name}" for path in sorted(drop_in_directory.glob("*.conf"), key=lambda item: item.name.encode())]
-                    if drop_in_directory.is_dir() else []
-                )
-                if unit.endswith(".service"):
-                    for global_directory in (
-                        "/etc/systemd/system/service.d",
-                        "/run/systemd/system/service.d",
-                        "/usr/lib/systemd/system/service.d",
-                    ):
-                        directory = activation_package.rooted(self.root, global_directory)
-                        if directory.is_dir():
-                            drop_ins.extend(
-                                f"{global_directory}/{path.name}"
-                                for path in sorted(directory.glob("*.conf"), key=lambda item: item.name.encode())
-                            )
-                state["units"][unit]["DropInPaths"] = drop_ins
             else:
                 state["units"][unit] = {
                     "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
@@ -2021,6 +2083,10 @@ class FakeSystemd:
         was_active = unit.get("ActiveState") == "active"
         unit.update({"LoadState": "loaded", "ActiveState": "active", "SubState": "listening" if name.endswith(".socket") else "running"})
         unit.setdefault("UnitFileState", "disabled")
+        socket_start_count = 0
+        if name.endswith(".socket") and not was_active:
+            socket_start_count = unit.get("StartCount", 0) + 1
+            unit["StartCount"] = socket_start_count
         if name.endswith(".service") and not was_active:
             start_count = unit.get("StartCount", 0) + 1
             unit.update({
@@ -2030,6 +2096,20 @@ class FakeSystemd:
             })
         for policy in self.socket_policy.values():
             if policy["unit"] == name:
+                legacy_runtime = activation_package.LEGACY_COMPATIBILITY["runtime_socket"]
+                if (
+                    name == legacy_runtime["unit"]
+                    and unit.get("FragmentPath") == f"/etc/systemd/system/{name}"
+                ):
+                    state["sockets"][legacy_runtime["path"]] = {
+                        "path": legacy_runtime["path"], "kind": "socket",
+                        "mode": f"{legacy_runtime['mode']:04o}",
+                        "uid": legacy_runtime["uid"], "gid": legacy_runtime["gid"],
+                        "inode": int.from_bytes(
+                            hashlib.sha256(legacy_runtime["path"].encode()).digest()[:8], "big",
+                        ) + socket_start_count,
+                    }
+                    continue
                 identity = self.identity(policy["user"]) if policy["user"] != "root" else {"uid": 0}
                 group = self.group(policy["group"]) if policy["group"] != "root" else {"gid": 0}
                 state["sockets"][policy["path"]] = {
@@ -2097,6 +2177,23 @@ class FakeSystemd:
             raise ValueError(f"fake socket is absent: {policy['path']}")
         return value
 
+    def socket_identity(self, path: str) -> dict[str, object] | None:
+        value = self._read()["sockets"].get(path)
+        if value is None:
+            return None
+        return {
+            "path": path,
+            "kind": value.get("kind", "socket"),
+            "mode": int(str(value["mode"]), 8),
+            "uid": value["uid"],
+            "gid": value["gid"],
+            "device": value.get("device", 1),
+            "inode": value.get(
+                "inode", int.from_bytes(hashlib.sha256(path.encode()).digest()[:8], "big"),
+            ),
+            "nlink": value.get("nlink", 1),
+        }
+
     def socket_absent(self, policy: dict[str, object]) -> bool:
         if policy["path"] in self._read()["sockets"]:
             raise ValueError(f"fake endpoint remains present: {policy['path']}")
@@ -2159,12 +2256,62 @@ def _path_is_within(path: str, roots: list[str]) -> bool:
     return any(path == root or path.startswith(f"{root}/") for root in roots)
 
 
+def _fake_ownership_metadata(record: dict[str, object]) -> dict[str, object]:
+    path = str(record["path"])
+    return {
+        "path": path,
+        "kind": record["kind"],
+        "mode": record["mode"],
+        "uid": record["uid"],
+        "gid": record["gid"],
+        "device": record.get("device", 1),
+        "inode": record.get(
+            "inode", int.from_bytes(hashlib.sha256(path.encode()).digest()[:8], "big"),
+        ),
+        "nlink": record.get("nlink", 1),
+    }
+
+
+def _ownership_base(record: dict[str, object]) -> dict[str, object]:
+    return {
+        key: record[key]
+        for key in ("path", "kind", "mode", "uid", "gid")
+    }
+
+
+def _legacy_runtime_socket_readback(
+    plan: dict[str, Any], driver: LiveSystemd | FakeSystemd, *, require_present: bool,
+) -> dict[str, object] | None:
+    expected = plan["runtime_socket"]
+    observed = driver.socket_identity(str(expected["path"]))
+    if observed is None:
+        if require_present:
+            raise ValueError("recognized legacy runtime socket is absent")
+        return None
+    expected_metadata = {
+        key: expected[key] for key in ("path", "mode", "uid", "gid")
+    }
+    if (
+        observed["kind"] != "socket"
+        or observed["nlink"] != 1
+        or {key: observed[key] for key in expected_metadata} != expected_metadata
+    ):
+        raise ValueError("recognized legacy runtime socket metadata differs")
+    unit = driver.unit(str(expected["unit"]))
+    if {
+        key: unit[key] for key in expected["unit_state"]
+    } != expected["unit_state"]:
+        raise ValueError("recognized legacy runtime socket unit state differs")
+    return {**observed, "unit": expected["unit"], "unit_state": dict(expected["unit_state"])}
+
+
 def _live_ownership_inventory(
     root: Path,
     uid: int,
     gid: int,
     scan_roots: list[str],
     ownership_roots: list[str],
+    exempt_paths: set[str],
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for logical_root in scan_roots:
@@ -2193,6 +2340,8 @@ def _live_ownership_inventory(
                 if metadata.st_dev != device or (metadata.st_uid != uid and metadata.st_gid != gid):
                     continue
                 logical = "/" + str(child.relative_to(root)) if root != Path("/") else str(child)
+                if logical in exempt_paths:
+                    continue
                 if not _path_is_within(logical, ownership_roots):
                     raise ValueError(f"legacy ownership escapes the sealed roots: {logical}")
                 if stat.S_ISREG(metadata.st_mode):
@@ -2216,12 +2365,14 @@ def _live_ownership_inventory(
 def _ownership_inventory(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
     uid: int, gid: int,
+    *, exempt_paths: set[str] | None = None,
 ) -> list[dict[str, object]]:
     compatibility = manifest["legacy_compatibility"]
     if isinstance(driver, FakeSystemd):
         records = [
-            dict(record) for record in driver.legacy_ownership
+            _ownership_base(record) for record in driver.legacy_ownership
             if record.get("uid") == uid or record.get("gid") == gid
+            if str(record.get("path")) not in (exempt_paths or set())
         ]
         for record in records:
             if (
@@ -2235,6 +2386,7 @@ def _ownership_inventory(
     return _live_ownership_inventory(
         root, uid, gid,
         compatibility["ownership_scan_roots"], compatibility["ownership_roots"],
+        exempt_paths or set(),
     )
 
 
@@ -2297,6 +2449,7 @@ def _rollback_ownership_readback(
     sealed = {str(record["path"]): record for record in compatibility["ownership"]}
     current_old = _ownership_inventory(
         manifest, root, driver, legacy_identity["uid"], legacy_identity["gid"],
+        exempt_paths={str(manifest["legacy_compatibility"]["runtime_socket"]["path"])},
     )
     unexpected_old = sorted(
         str(record["path"]) for record in current_old
@@ -2356,6 +2509,244 @@ def _rollback_ownership_readback(
     return sorted(result, key=lambda item: str(item["path"]).encode())
 
 
+def _ownership_object_kind(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "unsafe"
+
+
+def _rollback_root_inventory(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    target_uid: int, target_gid: int, include_paths: set[str],
+) -> list[dict[str, object]]:
+    roots = manifest["legacy_compatibility"]["ownership_roots"]
+    if isinstance(driver, FakeSystemd):
+        records: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for source in driver.legacy_ownership:
+            path = str(source.get("path"))
+            if not _path_is_within(path, roots):
+                continue
+            if path in seen:
+                raise ValueError("rollback ownership inventory contains duplicate paths")
+            seen.add(path)
+            metadata = _fake_ownership_metadata(source)
+            selected = (
+                metadata["uid"] == target_uid
+                or metadata["gid"] == target_gid
+                or path in include_paths
+            )
+            if metadata["kind"] == "symlink":
+                raise ValueError(f"rollback ownership root contains a symlink: {path}")
+            if not selected:
+                continue
+            if metadata["kind"] not in {"file", "directory", "socket"}:
+                raise ValueError(f"rollback ownership object has an unsafe type: {path}")
+            if metadata["kind"] in {"file", "socket"} and metadata["nlink"] != 1:
+                raise ValueError(f"rollback ownership object is hard linked: {path}")
+            records.append(metadata)
+        return sorted(records, key=lambda item: str(item["path"]).encode())
+
+    records = []
+
+    def visit(directory_fd: int, logical: str, device: int) -> None:
+        directory_metadata = os.fstat(directory_fd)
+        if directory_metadata.st_dev != device or not stat.S_ISDIR(directory_metadata.st_mode):
+            raise ValueError(f"rollback ownership directory changed: {logical}")
+        candidates = [(logical, directory_metadata)]
+        for name in sorted(os.listdir(directory_fd), key=os.fsencode):
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            path = f"{logical}/{name}"
+            kind = _ownership_object_kind(metadata.st_mode)
+            if kind == "symlink":
+                raise ValueError(f"rollback ownership root contains a symlink: {path}")
+            if kind == "directory":
+                if metadata.st_dev != device:
+                    raise ValueError(f"rollback ownership root crosses a device: {path}")
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        raise ValueError(f"rollback ownership directory raced: {path}")
+                    visit(child_fd, path, device)
+                finally:
+                    os.close(child_fd)
+                continue
+            candidates.append((path, metadata))
+        for path, metadata in candidates:
+            selected = (
+                metadata.st_uid == target_uid
+                or metadata.st_gid == target_gid
+                or path in include_paths
+            )
+            if not selected:
+                continue
+            kind = _ownership_object_kind(metadata.st_mode)
+            if kind not in {"file", "directory", "socket"}:
+                raise ValueError(f"rollback ownership object has an unsafe type: {path}")
+            if kind in {"file", "socket"} and metadata.st_nlink != 1:
+                raise ValueError(f"rollback ownership object is hard linked: {path}")
+            records.append({
+                "path": path,
+                "kind": kind,
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "nlink": metadata.st_nlink,
+            })
+
+    for logical_root in roots:
+        try:
+            parent_fd, name = activation_package.open_parent_fd(root, logical_root)
+        except FileNotFoundError:
+            continue
+        try:
+            directory_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            os.close(parent_fd)
+            raise ValueError(f"rollback ownership root is unsafe: {logical_root}") from error
+        os.close(parent_fd)
+        try:
+            visit(directory_fd, logical_root, os.fstat(directory_fd).st_dev)
+        finally:
+            os.close(directory_fd)
+    paths = [str(record["path"]) for record in records]
+    if len(paths) != len(set(paths)):
+        raise ValueError("rollback ownership roots overlap")
+    return sorted(records, key=lambda item: str(item["path"]).encode())
+
+
+def _build_rollback_ownership_plan(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    compatibility: dict[str, Any],
+) -> dict[str, object]:
+    legacy = compatibility["identity"]
+    target = manifest["identities"]["qualification"]
+    _rollback_ownership_readback(manifest, root, driver, compatibility, target)
+    sealed = {str(record["path"]): record for record in compatibility["ownership"]}
+    observed = _rollback_root_inventory(
+        manifest, root, driver, target["uid"], target["gid"], set(sealed),
+    )
+    by_path = {str(record["path"]): record for record in observed}
+    if not set(sealed) <= set(by_path):
+        raise ValueError("sealed rollback ownership object is absent")
+    records: list[dict[str, object]] = []
+    for path, current in by_path.items():
+        if current["uid"] != target["uid"] and current["gid"] != target["gid"] and path not in sealed:
+            continue
+        prior = sealed.get(path)
+        to_uid = (
+            prior["uid"] if prior is not None
+            else legacy["uid"] if current["uid"] == target["uid"] else current["uid"]
+        )
+        to_gid = (
+            prior["gid"] if prior is not None
+            else legacy["gid"] if current["gid"] == target["gid"] else current["gid"]
+        )
+        records.append({**current, "to_uid": to_uid, "to_gid": to_gid})
+    return {
+        "target_uid": target["uid"],
+        "target_gid": target["gid"],
+        "records": records,
+    }
+
+
+def _fchown_path_fd(fd: int, uid: int, gid: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.fchownat(fd, ctypes.c_char_p(b""), uid, gid, AT_EMPTY_PATH)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _apply_rollback_ownership_plan(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    plan: dict[str, Any],
+) -> None:
+    target_uid = int(plan["target_uid"])
+    target_gid = int(plan["target_gid"])
+    planned = {str(record["path"]): record for record in plan["records"]}
+    current = _rollback_root_inventory(
+        manifest, root, driver, target_uid, target_gid, set(planned),
+    )
+    current_by_path = {str(record["path"]): record for record in current}
+    unexpected = sorted(
+        path for path, record in current_by_path.items()
+        if (record["uid"] == target_uid or record["gid"] == target_gid)
+        and path not in planned
+    )
+    if unexpected:
+        raise ValueError(f"new target-ID rollback ownership objects appeared: {unexpected}")
+    for index, (path, expected) in enumerate(planned.items()):
+        observed = current_by_path.get(path)
+        if observed is None:
+            raise ValueError(f"planned rollback ownership object is absent: {path}")
+        identity_keys = ("path", "kind", "mode", "device", "inode", "nlink")
+        if any(observed[key] != expected[key] for key in identity_keys):
+            raise ValueError(f"planned rollback ownership object raced: {path}")
+        allowed_uid = {expected["uid"], expected["to_uid"]}
+        allowed_gid = {expected["gid"], expected["to_gid"]}
+        if observed["uid"] not in allowed_uid or observed["gid"] not in allowed_gid:
+            raise ValueError(f"planned rollback ownership IDs differ: {path}")
+        if isinstance(driver, FakeSystemd):
+            persisted = driver.legacy_ownership
+            matches = [record for record in persisted if record.get("path") == path]
+            if len(matches) != 1 or _fake_ownership_metadata(matches[0]) != observed:
+                raise ValueError(f"planned rollback ownership object raced: {path}")
+            matches[0]["uid"] = expected["to_uid"]
+            matches[0]["gid"] = expected["to_gid"]
+            driver.legacy_ownership = persisted
+        else:
+            parent_fd, name = activation_package.open_parent_fd(root, path)
+            try:
+                fd = os.open(name, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+            try:
+                metadata = os.fstat(fd)
+                if (
+                    _ownership_object_kind(metadata.st_mode) != expected["kind"]
+                    or stat.S_IMODE(metadata.st_mode) != expected["mode"]
+                    or (metadata.st_dev, metadata.st_ino, metadata.st_nlink)
+                    != (expected["device"], expected["inode"], expected["nlink"])
+                    or metadata.st_uid not in allowed_uid
+                    or metadata.st_gid not in allowed_gid
+                ):
+                    raise ValueError(f"planned rollback ownership object raced: {path}")
+                _fchown_path_fd(fd, int(expected["to_uid"]), int(expected["to_gid"]))
+                readback = os.fstat(fd)
+                if (readback.st_uid, readback.st_gid) != (expected["to_uid"], expected["to_gid"]):
+                    raise ValueError(f"planned rollback ownership chown differs: {path}")
+            finally:
+                os.close(fd)
+        _stage_restart_boundary(f"legacy_compatibility:rollback_ownership:{index}")
+    remaining = _rollback_root_inventory(
+        manifest, root, driver, target_uid, target_gid, set(),
+    )
+    leftovers = [
+        record["path"] for record in remaining
+        if record["uid"] == target_uid or record["gid"] == target_gid
+    ]
+    if leftovers:
+        raise ValueError(f"target-ID rollback ownership remains: {leftovers}")
+
+
 def _legacy_compatibility_capture(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, Any]:
@@ -2393,9 +2784,14 @@ def _legacy_compatibility_capture(
         })
     observed_identity = driver.identity(plan["identity"]["user"])
     if absent == len(plan["files"]):
+        if driver.socket_identity(str(plan["runtime_socket"]["path"])) is not None:
+            raise ValueError("clean host has an unrecognized legacy runtime socket")
         if observed_identity is not None and observed_identity != target_identity_readback:
             raise ValueError("clean host has an unrecognized buzzci-ctl identity")
-        return {"state": "clean", "files": [], "identity": None, "ownership": []}
+        return {
+            "state": "clean", "files": [], "identity": None,
+            "ownership": [], "runtime_socket": None,
+        }
     if absent != 0:
         raise ValueError("legacy systemd file set is partial")
     if observed_identity != plan["identity"]:
@@ -2406,14 +2802,17 @@ def _legacy_compatibility_capture(
     processes = driver.principal_processes(plan["identity"]["uid"])
     if processes:
         raise ValueError(f"legacy buzzci-ctl has active processes: {processes}")
+    runtime_socket = _legacy_runtime_socket_readback(plan, driver, require_present=True)
     ownership = _ownership_inventory(
         manifest, root, driver, plan["identity"]["uid"], plan["identity"]["gid"],
+        exempt_paths={str(plan["runtime_socket"]["path"])},
     )
     return {
         "state": "legacy",
         "files": observed_files,
         "identity": dict(plan["identity"]),
         "ownership": ownership,
+        "runtime_socket": runtime_socket,
     }
 
 
@@ -2422,6 +2821,9 @@ def _legacy_compatibility_summary(value: dict[str, Any]) -> dict[str, object]:
         "state": value["state"],
         "files": [record["path"] for record in value["files"]],
         "ownership": [record["path"] for record in value["ownership"]],
+        "runtime_socket": (
+            value["runtime_socket"]["path"] if value["runtime_socket"] is not None else None
+        ),
     }
 
 
@@ -2529,7 +2931,29 @@ def _inherited_systemd_drop_ins(
         if driver.rpm_package_owner(str(record["path"])) != record["rpm_package"]:
             raise ValueError(f"inherited global drop-in RPM provenance differs: {record['path']}")
         result.append(record)
+    observed_global = sorted(
+        path
+        for base in (
+            "/usr/lib/systemd/system/service.d",
+            "/run/systemd/system/service.d",
+            "/etc/systemd/system/service.d",
+        )
+        for path in _systemd_drop_in_files(root, base)
+    )
+    if observed_global != sorted(str(record["path"]) for record in result):
+        raise ValueError("global systemd service drop-in inventory differs")
     return result
+
+
+def _ordered_expected_drop_ins(
+    unit_specific: list[dict[str, object]], inherited: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    winners: dict[str, dict[str, object]] = {}
+    for record in inherited:
+        winners[Path(str(record["path"])).name] = record
+    for record in unit_specific:
+        winners[Path(str(record["path"])).name] = record
+    return [winners[name] for name in sorted(winners, key=os.fsencode)]
 
 
 def _effective_systemd_readback(
@@ -2583,7 +3007,10 @@ def _effective_systemd_readback(
         )
         if legacy_drop_in is not None:
             expected_drop_ins.insert(0, legacy_drop_in)
-        expected_drop_ins.extend(_inherited_systemd_drop_ins(manifest, root, driver, name))
+        expected_drop_ins = _ordered_expected_drop_ins(
+            expected_drop_ins,
+            _inherited_systemd_drop_ins(manifest, root, driver, name),
+        )
         if expected_fragment is None:
             if state["LoadState"] != "not-found" or paths != {"fragment_path": "", "drop_in_paths": []}:
                 raise ValueError(f"absent activation systemd unit has an effective path: {name}")
@@ -2805,6 +3232,7 @@ def _new_receipt(
         "updated_at": utc_now(),
         "principals_retained_on_rollback": True,
         "legacy_compatibility": legacy_compatibility,
+        "legacy_rollback_ownership": None,
         "targets": records,
         "acceptance_generated": _generated_records(root, generated),
         "acceptance_ledger_prior": _capture_acceptance_ledger(manifest, root),
@@ -2828,10 +3256,15 @@ def _new_receipt(
 def _validate_legacy_compatibility_receipt(
     value: object, manifest: dict[str, Any],
 ) -> None:
-    if not isinstance(value, dict) or set(value) != {"state", "files", "identity", "ownership"}:
+    if not isinstance(value, dict) or set(value) != {
+        "state", "files", "identity", "ownership", "runtime_socket",
+    }:
         raise ValueError("legacy compatibility receipt shape differs")
     if value["state"] == "clean":
-        if value != {"state": "clean", "files": [], "identity": None, "ownership": []}:
+        if value != {
+            "state": "clean", "files": [], "identity": None,
+            "ownership": [], "runtime_socket": None,
+        }:
             raise ValueError("clean legacy compatibility receipt differs")
         return
     if value["state"] != "legacy" or value["identity"] != manifest["legacy_compatibility"]["identity"]:
@@ -2870,12 +3303,110 @@ def _validate_legacy_compatibility_receipt(
         observed_paths.append(str(record["path"]))
     if observed_paths != sorted(set(observed_paths), key=str.encode):
         raise ValueError("legacy compatibility ownership receipt order differs")
+    runtime_socket = value["runtime_socket"]
+    expected_socket = manifest["legacy_compatibility"]["runtime_socket"]
+    if (
+        not isinstance(runtime_socket, dict)
+        or set(runtime_socket) != {
+            "path", "kind", "mode", "uid", "gid", "device", "inode", "nlink",
+            "unit", "unit_state",
+        }
+        or runtime_socket["kind"] != "socket"
+        or runtime_socket["nlink"] != 1
+        or runtime_socket["unit"] != expected_socket["unit"]
+        or runtime_socket["unit_state"] != expected_socket["unit_state"]
+        or {
+            key: runtime_socket[key] for key in ("path", "mode", "uid", "gid")
+        } != {
+            key: expected_socket[key] for key in ("path", "mode", "uid", "gid")
+        }
+        or any(
+            isinstance(runtime_socket[key], bool)
+            or not isinstance(runtime_socket[key], int)
+            or runtime_socket[key] < 1
+            for key in ("device", "inode")
+        )
+    ):
+        raise ValueError("legacy compatibility runtime socket receipt differs")
+
+
+def _validate_legacy_rollback_ownership(
+    value: object, receipt: dict[str, Any], manifest: dict[str, Any],
+) -> None:
+    compatibility = receipt["legacy_compatibility"]
+    if value is None:
+        return
+    target = manifest["identities"]["qualification"]
+    if compatibility["state"] != "legacy" or not isinstance(value, dict) or set(value) != {
+        "target_uid", "target_gid", "records",
+    }:
+        raise ValueError("legacy rollback ownership plan shape differs")
+    if (value["target_uid"], value["target_gid"]) != (target["uid"], target["gid"]):
+        raise ValueError("legacy rollback ownership target differs")
+    records = value["records"]
+    if not isinstance(records, list):
+        raise ValueError("legacy rollback ownership records differ")
+    paths: list[str] = []
+    roots = manifest["legacy_compatibility"]["ownership_roots"]
+    sealed = {
+        str(record["path"]): record for record in compatibility["ownership"]
+    }
+    legacy = compatibility["identity"]
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "path", "kind", "mode", "uid", "gid", "device", "inode", "nlink",
+            "to_uid", "to_gid",
+        }:
+            raise ValueError("legacy rollback ownership record shape differs")
+        path = str(record["path"])
+        prior = sealed.get(path)
+        if prior is None:
+            ids_are_expected = (
+                (record["uid"] == target["uid"] or record["gid"] == target["gid"])
+                and record["to_uid"]
+                == (legacy["uid"] if record["uid"] == target["uid"] else record["uid"])
+                and record["to_gid"]
+                == (legacy["gid"] if record["gid"] == target["gid"] else record["gid"])
+            )
+        else:
+            expected_uid = target["uid"] if prior["uid"] == legacy["uid"] else prior["uid"]
+            expected_gid = target["gid"] if prior["gid"] == legacy["gid"] else prior["gid"]
+            ids_are_expected = (
+                record["kind"] == prior["kind"]
+                and record["mode"] == prior["mode"]
+                and record["uid"] in {prior["uid"], expected_uid}
+                and record["gid"] in {prior["gid"], expected_gid}
+                and record["to_uid"] == prior["uid"]
+                and record["to_gid"] == prior["gid"]
+            )
+        if (
+            record["kind"] not in {"file", "directory", "socket"}
+            or not _path_is_within(path, roots)
+            or not ids_are_expected
+            or record["to_uid"] == target["uid"]
+            or record["to_gid"] == target["gid"]
+            or any(
+                isinstance(record[key], bool)
+                or not isinstance(record[key], int)
+                or record[key] < 0
+                for key in ("mode", "uid", "gid", "device", "inode", "nlink", "to_uid", "to_gid")
+            )
+            or record["device"] < 1
+            or record["inode"] < 1
+            or record["nlink"] < 1
+            or (record["kind"] in {"file", "socket"} and record["nlink"] != 1)
+        ):
+            raise ValueError("legacy rollback ownership record differs")
+        paths.append(path)
+    if paths != sorted(set(paths), key=str.encode):
+        raise ValueError("legacy rollback ownership record order differs")
 
 
 def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     expected_keys = {
         "schema", "activation_id", "package_digest", "source_commit", "state", "created_at", "updated_at",
-        "principals_retained_on_rollback", "legacy_compatibility", "targets", "acceptance_generated", "acceptance_ledger_prior",
+        "principals_retained_on_rollback", "legacy_compatibility", "legacy_rollback_ownership",
+        "targets", "acceptance_generated", "acceptance_ledger_prior",
         "fixed_package", "systemd_before", "qualification", "capacity_one", "persistent_authorization",
         "persistent_activation", "qualification_zero", "last_error",
     }
@@ -2899,6 +3430,9 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     }:
         raise ValueError("receipt fixed activation package binding differs")
     _validate_legacy_compatibility_receipt(receipt["legacy_compatibility"], manifest)
+    _validate_legacy_rollback_ownership(
+        receipt["legacy_rollback_ownership"], receipt, manifest,
+    )
     _validate_qualification_state(receipt["qualification"], receipt)
     _validate_capacity_one_state(receipt["capacity_one"], receipt)
     _validate_persistent_authorization(receipt["persistent_authorization"], receipt)
@@ -3194,6 +3728,10 @@ def _systemd_prior_readback(
         ):
             if observed[name][field] != expected[field]:
                 raise ValueError(f"systemd prior readback differs for {name} {field}")
+    if receipt["legacy_compatibility"]["state"] == "legacy":
+        _legacy_runtime_socket_readback(
+            manifest["legacy_compatibility"], driver, require_present=True,
+        )
     return observed
 
 
@@ -3648,6 +4186,23 @@ def _apply_legacy_compatibility(
     current = _legacy_compatibility_capture(manifest, root, driver)
     if current != compatibility:
         raise ValueError("legacy compatibility changed after receipt capture")
+    runtime = compatibility["runtime_socket"]
+    unit_name = str(runtime["unit"])
+    service_name = unit_name.removesuffix(".socket") + ".service"
+    driver.stop(service_name)
+    if driver.unit(service_name)["ActiveState"] != "inactive":
+        raise ValueError("legacy execd service did not quiesce")
+    _stage_restart_boundary("legacy_compatibility:runtime_service_stopped")
+    driver.stop(unit_name)
+    if driver.unit(unit_name)["ActiveState"] != "inactive":
+        raise ValueError("legacy execd socket unit did not quiesce")
+    if driver.socket_identity(str(runtime["path"])) is not None:
+        raise ValueError("legacy execd runtime socket remains after stop")
+    _stage_restart_boundary("legacy_compatibility:runtime_socket_stopped")
+    driver.disable(unit_name)
+    if driver.unit(unit_name)["UnitFileState"] != "disabled":
+        raise ValueError("legacy execd socket unit did not disable")
+    _stage_restart_boundary("legacy_compatibility:runtime_socket_disabled")
     for index, record in enumerate(compatibility["files"]):
         _unlink_target(root, record["path"])
         _stage_restart_boundary(f"legacy_compatibility:file:{index}")
@@ -3700,14 +4255,10 @@ def _restore_legacy_compatibility(
     processes = driver.principal_processes(target_identity["uid"])
     if processes:
         raise ValueError(f"sealed buzzci-ctl has active processes during rollback: {processes}")
-    current = _rollback_ownership_readback(
-        manifest, root, driver, compatibility, target_identity,
-    )
-    _change_ownership(
-        root, driver, current,
-        target_identity["uid"], target_identity["gid"],
-        legacy_identity["uid"], legacy_identity["gid"],
-    )
+    plan = receipt["legacy_rollback_ownership"]
+    if plan is None:
+        raise ValueError("legacy rollback ownership plan is absent")
+    _apply_rollback_ownership_plan(manifest, root, driver, plan)
     _stage_restart_boundary("legacy_compatibility:restore_ownership")
     driver.set_supplementary_groups(
         legacy_identity["user"], legacy_identity["supplementary_groups"],
@@ -3744,6 +4295,37 @@ def _restore_legacy_compatibility(
         raise ValueError("legacy identity rollback readback differs")
 
 
+def _prepare_legacy_rollback_ownership(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    driver: LiveSystemd | FakeSystemd,
+) -> None:
+    compatibility = receipt["legacy_compatibility"]
+    if compatibility["state"] == "clean":
+        if receipt["legacy_rollback_ownership"] is not None:
+            raise ValueError("clean rollback has a legacy ownership plan")
+        return
+    names = sorted(set(activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT]))
+    active = [name for name in names if driver.unit(name)["ActiveState"] != "inactive"]
+    if active:
+        raise ValueError(f"legacy rollback ownership requires stopped units: {active}")
+    target = manifest["identities"]["qualification"]
+    processes = driver.principal_processes(target["uid"])
+    if processes:
+        raise ValueError(f"sealed buzzci-ctl has active processes during rollback: {processes}")
+    runtime_path = str(manifest["legacy_compatibility"]["runtime_socket"]["path"])
+    if driver.socket_identity(runtime_path) is not None:
+        raise ValueError("legacy rollback ownership requires an absent runtime socket")
+    if receipt["legacy_rollback_ownership"] is None:
+        receipt["legacy_rollback_ownership"] = _build_rollback_ownership_plan(
+            manifest, root, driver, compatibility,
+        )
+        _validate_legacy_rollback_ownership(
+            receipt["legacy_rollback_ownership"], receipt, manifest,
+        )
+        _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+        _stage_restart_boundary("legacy_compatibility:rollback_ownership_plan")
+
+
 def _legacy_rollback_preflight(
     receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
     driver: LiveSystemd | FakeSystemd,
@@ -3772,6 +4354,35 @@ def _legacy_rollback_preflight(
         raise ValueError(f"legacy rollback UID is occupied: {numeric['user']}")
     if numeric["group"] not in {None, legacy_identity["group"]}:
         raise ValueError(f"legacy rollback GID is occupied: {numeric['group']}")
+    runtime_expected = manifest["legacy_compatibility"]["runtime_socket"]
+    runtime = driver.socket_identity(str(runtime_expected["path"]))
+    if runtime is not None:
+        legacy_metadata = {
+            key: runtime_expected[key] for key in ("path", "mode", "uid", "gid")
+        }
+        candidate_policy = manifest["socket_policy"]["execd"]
+        candidate_metadata = {
+            "path": candidate_policy["path"],
+            "mode": int(str(candidate_policy["mode"]), 8),
+            "uid": 0,
+            "gid": manifest["access_group"]["gid"],
+        }
+        observed_metadata = {
+            key: runtime[key] for key in ("path", "mode", "uid", "gid")
+        }
+        unit = driver.unit(str(runtime_expected["unit"]))
+        exact_legacy = (
+            observed_metadata == legacy_metadata
+            and {key: unit[key] for key in runtime_expected["unit_state"]}
+            == runtime_expected["unit_state"]
+        )
+        exact_candidate = (
+            observed_metadata == candidate_metadata
+            and unit["ActiveState"] == "active"
+            and unit["SubState"] == "listening"
+        )
+        if runtime["kind"] != "socket" or runtime["nlink"] != 1 or not (exact_legacy or exact_candidate):
+            raise ValueError("rollback runtime socket state differs")
     _rollback_ownership_readback(
         manifest, root, driver, compatibility, target_identity,
     )
@@ -4179,6 +4790,10 @@ def _compensate_failed_stage(
     except BaseException as error:
         errors.append(f"install rollback recovery targets: {error}")
     errors.extend(_stop_zero_errors(driver))
+    try:
+        _prepare_legacy_rollback_ownership(receipt, manifest, root, driver)
+    except BaseException as error:
+        errors.append(f"prepare legacy rollback ownership: {error}")
     _restored, restore_errors = _restore_prior_best_effort(
         receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
     )
@@ -5524,6 +6139,10 @@ def _rollback_unlocked(
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         raise
     errors = _stop_zero_errors(driver)
+    try:
+        _prepare_legacy_rollback_ownership(receipt, manifest, root, driver)
+    except BaseException as error:
+        errors.append(f"prepare legacy rollback ownership: {error}")
     restored, restore_errors = _restore_prior_best_effort(
         receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
     )

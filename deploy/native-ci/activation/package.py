@@ -102,6 +102,19 @@ LEGACY_COMPATIBILITY = {
         "/run/buzzci",
         "/var/lib/buzzci",
     ],
+    "runtime_socket": {
+        "unit": "buzz-ci-execd.socket",
+        "path": "/run/buzzci/execd.sock",
+        "mode": 0o600,
+        "uid": 961,
+        "gid": 961,
+        "unit_state": {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "listening",
+            "UnitFileState": "enabled",
+        },
+    },
     "files": [
         {
             "path": "/etc/systemd/system/buzz-ci-execd.service",

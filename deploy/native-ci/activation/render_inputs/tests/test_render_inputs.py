@@ -147,10 +147,26 @@ class RendererTests(unittest.TestCase):
                         re.compile(pattern)
                     reference = value.get("$ref")
                     if isinstance(reference, str) and not reference.startswith("#"):
-                        self.assertTrue((schema_path.parent / reference).resolve().is_file(), reference)
+                        referenced_file = reference.split("#", 1)[0]
+                        self.assertTrue((schema_path.parent / referenced_file).resolve().is_file(), reference)
                     stack.extend(value.values())
                 elif isinstance(value, list):
                     stack.extend(value)
+
+        output = json.loads((ROOT / "output.schema.json").read_bytes())
+        draft = output["$defs"]["draft"]
+        self.assertFalse(draft["additionalProperties"])
+        self.assertEqual(set(draft["required"]), set(draft["properties"]))
+        activation_schema = json.loads((ROOT.parent / "activation-manifest.schema.json").read_bytes())
+        for name, definition in draft["properties"].items():
+            reference = definition.get("$ref")
+            if reference is None or not reference.startswith("../activation-manifest.schema.json#/"):
+                continue
+            resolved: object = activation_schema
+            for token in reference.split("#/", 1)[1].split("/"):
+                self.assertIsInstance(resolved, dict)
+                resolved = resolved[token]
+            self.assertEqual(resolved, activation_schema["properties"][name])
 
     def make_candidate(self, root: Path) -> tuple[Path, str, dict[str, object]]:
         candidate_root = root / "candidate"
