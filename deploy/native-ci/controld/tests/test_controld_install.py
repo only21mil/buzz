@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 CONTROLD_DIR = Path(__file__).resolve().parents[1]
 
@@ -28,6 +29,10 @@ def load_module(name: str, path: Path):
 RENDERER = load_module("render_controld_config", CONTROLD_DIR / "render_controld_config.py")
 FREEZER = load_module("freeze_package", CONTROLD_DIR / "freeze_package.py")
 INSTALLER = load_module("controld_install", CONTROLD_DIR / "install.py")
+
+
+class SimulatedProcessExit(BaseException):
+    pass
 
 
 class ControldInstallTests(unittest.TestCase):
@@ -89,6 +94,12 @@ class ControldInstallTests(unittest.TestCase):
         (root / "etc/passwd").chmod(0o644)
         (root / "etc/group").chmod(0o644)
         return root
+
+    def restarted_installer(self, suffix: str):
+        return load_module(f"controld_install_restart_{suffix}", CONTROLD_DIR / "install.py")
+
+    def transaction(self, installer, root: Path, backup_id: str) -> Path:
+        return installer.backup_root_path(root, installer.DEFAULT_BACKUP_ROOT) / backup_id
 
     def test_renderer_is_canonical_capacity_zero_absolute_and_nofollow(self) -> None:
         output = self.base / "controld-v1.json"
@@ -299,6 +310,221 @@ class ControldInstallTests(unittest.TestCase):
         self.assertEqual(rolled_back["status"], "rolled_back")
         for target in INSTALLER.EXPECTED_TARGETS.values():
             self.assertFalse(INSTALLER.rooted(root, target).exists())
+
+    def test_install_resumes_after_restart_at_every_durable_phase_boundary(self) -> None:
+        boundaries = (
+            ("state", "preparing"),
+            ("state", "install_prepared"),
+            ("state", "installing"),
+            ("receipt", "installed"),
+            ("state", "installed"),
+        )
+        for index, (kind, phase) in enumerate(boundaries):
+            with self.subTest(kind=kind, phase=phase):
+                package = self.base / f"phase-package-{index}"
+                self.freeze(package=package)
+                root = self.make_root(f"phase-root-{index}")
+                installer = self.restarted_installer(f"install_phase_{index}_a")
+                original = installer.atomic_write
+                fired = False
+
+                def crash_after_write(target, payload, mode_value, uid, gid):
+                    nonlocal fired
+                    original(target, payload, mode_value, uid, gid)
+                    if fired or target.name != ("receipt.json" if kind == "receipt" else "state.json"):
+                        return
+                    document = json.loads(payload)
+                    marker = document.get("state") if kind == "receipt" else document.get("phase")
+                    if marker == phase:
+                        fired = True
+                        raise SimulatedProcessExit(f"restart after {kind} {phase}")
+
+                with mock.patch.object(installer, "atomic_write", side_effect=crash_after_write):
+                    with self.assertRaises(SimulatedProcessExit):
+                        installer.install(package, root, installer.DEFAULT_BACKUP_ROOT)
+                self.assertTrue(fired)
+
+                restarted = self.restarted_installer(f"install_phase_{index}_b")
+                retried = restarted.install(package, root, restarted.DEFAULT_BACKUP_ROOT)
+                expected_status = "unchanged" if kind == "state" and phase == "installed" else "installed"
+                self.assertEqual(retried["status"], expected_status)
+                for target in restarted.EXPECTED_TARGETS.values():
+                    self.assertTrue(restarted.rooted(root, target).is_file())
+
+    def test_install_resumes_mixed_candidate_and_absent_baseline(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installer = self.restarted_installer("mixed_install_a")
+        original = installer.atomic_write
+        fired = False
+
+        def crash_after_first_target(target, payload, mode_value, uid, gid):
+            nonlocal fired
+            original(target, payload, mode_value, uid, gid)
+            if not fired and str(target).startswith(str(root)) and str(target).removeprefix(str(root)) in installer.EXPECTED_TARGETS.values():
+                fired = True
+                raise SimulatedProcessExit("restart after first target publication")
+
+        with mock.patch.object(installer, "atomic_write", side_effect=crash_after_first_target):
+            with self.assertRaises(SimulatedProcessExit):
+                installer.install(self.package, root, installer.DEFAULT_BACKUP_ROOT)
+        self.assertTrue(fired)
+        present = [installer.rooted(root, target).exists() for target in installer.EXPECTED_TARGETS.values()]
+        self.assertIn(True, present)
+        self.assertIn(False, present)
+
+        restarted = self.restarted_installer("mixed_install_b")
+        retried = restarted.install(self.package, root, restarted.DEFAULT_BACKUP_ROOT)
+        self.assertEqual(retried["status"], "installed")
+        self.assertEqual(
+            restarted.install(self.package, root, restarted.DEFAULT_BACKUP_ROOT)["status"],
+            "unchanged",
+        )
+
+    def test_rollback_resumes_after_restart_at_every_durable_phase_boundary(self) -> None:
+        boundaries = ("rolling_back", "first_target", "rolled_back_receipt", "rolled_back_state")
+        for index, boundary in enumerate(boundaries):
+            with self.subTest(boundary=boundary):
+                package = self.base / f"rollback-package-{index}"
+                self.freeze(package=package)
+                root = self.make_root(f"rollback-root-{index}")
+                installer = self.restarted_installer(f"rollback_phase_{index}_a")
+                installed = installer.install(package, root, installer.DEFAULT_BACKUP_ROOT)
+                fired = False
+
+                if boundary == "first_target":
+                    original_unlink = installer.unlink_file
+
+                    def crash_after_unlink(path):
+                        nonlocal fired
+                        original_unlink(path)
+                        if not fired:
+                            fired = True
+                            raise SimulatedProcessExit("restart after first target restoration")
+
+                    patcher = mock.patch.object(installer, "unlink_file", side_effect=crash_after_unlink)
+                else:
+                    original_write = installer.atomic_write
+
+                    def crash_after_marker(target, payload, mode_value, uid, gid):
+                        nonlocal fired
+                        original_write(target, payload, mode_value, uid, gid)
+                        if fired:
+                            return
+                        document = json.loads(payload) if target.name in {"state.json", "receipt.json"} else {}
+                        matches = (
+                            boundary == "rolling_back" and target.name == "state.json" and document.get("phase") == "rolling_back"
+                        ) or (
+                            boundary == "rolled_back_receipt" and target.name == "receipt.json" and document.get("state") == "rolled_back"
+                        ) or (
+                            boundary == "rolled_back_state" and target.name == "state.json" and document.get("phase") == "rolled_back"
+                        )
+                        if matches:
+                            fired = True
+                            raise SimulatedProcessExit(f"restart after {boundary}")
+
+                    patcher = mock.patch.object(installer, "atomic_write", side_effect=crash_after_marker)
+
+                with patcher:
+                    with self.assertRaises(SimulatedProcessExit):
+                        installer.rollback(
+                            package,
+                            root,
+                            installer.DEFAULT_BACKUP_ROOT,
+                            str(installed["backup_id"]),
+                        )
+                self.assertTrue(fired)
+
+                restarted = self.restarted_installer(f"rollback_phase_{index}_b")
+                retried = restarted.rollback(
+                    package,
+                    root,
+                    restarted.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+                self.assertEqual(retried["status"], "rolled_back")
+                self.assertEqual(
+                    restarted.rollback(
+                        package,
+                        root,
+                        restarted.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    ),
+                    retried,
+                )
+                for target in restarted.EXPECTED_TARGETS.values():
+                    self.assertFalse(restarted.rooted(root, target).exists())
+
+    def test_rollback_resumes_mixed_present_and_candidate_targets(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        prior = root / "usr/lib/tmpfiles.d/buzzci-controld.conf"
+        prior.write_text("prior\n")
+        prior.chmod(0o640)
+        installer = self.restarted_installer("mixed_rollback_a")
+        installed = installer.install(self.package, root, installer.DEFAULT_BACKUP_ROOT)
+        original = installer.atomic_write
+        fired = False
+
+        def crash_after_prior_restore(target, payload, mode_value, uid, gid):
+            nonlocal fired
+            original(target, payload, mode_value, uid, gid)
+            if not fired and target == prior and payload == b"prior\n":
+                fired = True
+                raise SimulatedProcessExit("restart after present baseline restoration")
+
+        with mock.patch.object(installer, "atomic_write", side_effect=crash_after_prior_restore):
+            with self.assertRaises(SimulatedProcessExit):
+                installer.rollback(
+                    self.package,
+                    root,
+                    installer.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+        self.assertTrue(fired)
+        restarted = self.restarted_installer("mixed_rollback_b")
+        restarted.rollback(
+            self.package,
+            root,
+            restarted.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        self.assertEqual(prior.read_bytes(), b"prior\n")
+        self.assertEqual(stat.S_IMODE(prior.stat().st_mode), 0o640)
+
+    def test_rollback_refuses_receipt_state_and_package_mismatch(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        transaction = self.transaction(INSTALLER, root, str(installed["backup_id"]))
+        receipt_path = transaction / "receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["state"] = "rolled_back"
+        receipt_path.write_bytes(INSTALLER.canonical_json(receipt))
+        receipt_path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "receipt/state mismatch"):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            )
+
+        receipt["state"] = "installed"
+        receipt_path.write_bytes(INSTALLER.canonical_json(receipt))
+        receipt_path.chmod(0o600)
+        state_path = transaction / "state.json"
+        state = json.loads(state_path.read_text())
+        state["package_digest"] = "0" * 64
+        state_path.write_bytes(INSTALLER.canonical_json(state))
+        state_path.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "package or phase binding mismatch"):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            )
 
     def test_rollback_refuses_installed_target_drift(self) -> None:
         self.freeze()
