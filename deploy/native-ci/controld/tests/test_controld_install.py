@@ -101,6 +101,54 @@ class ControldInstallTests(unittest.TestCase):
     def transaction(self, installer, root: Path, backup_id: str) -> Path:
         return installer.backup_root_path(root, installer.DEFAULT_BACKUP_ROOT) / backup_id
 
+    def tree_digest(self, root: Path) -> str:
+        rows: list[object] = []
+
+        def metadata_row(relative: str, metadata: os.stat_result, payload_digest: str | None) -> list[object]:
+            return [
+                relative,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_atime_ns,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+                payload_digest,
+            ]
+
+        def visit(path: Path, relative: str) -> None:
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NOATIME", 0)
+                fd = os.open(path, flags)
+                try:
+                    names = sorted(os.listdir(fd), key=lambda name: name.encode())
+                    metadata = os.fstat(fd)
+                finally:
+                    os.close(fd)
+                rows.append(metadata_row(relative, metadata, None))
+                for name in names:
+                    visit(path / name, f"{relative}/{name}" if relative else name)
+            elif stat.S_ISREG(metadata.st_mode):
+                payload, metadata = INSTALLER.read_fd(path)
+                rows.append(metadata_row(relative, metadata, hashlib.sha256(payload).hexdigest()))
+            elif stat.S_ISLNK(metadata.st_mode):
+                rows.append(metadata_row(relative, metadata, os.readlink(path)))
+            else:
+                rows.append(metadata_row(relative, metadata, None))
+
+        visit(root, "")
+        return hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest()
+
+    def legacy_transaction(self, installer, package: Path, root: Path) -> tuple[dict[str, object], Path]:
+        installed = installer.install(package, root, installer.DEFAULT_BACKUP_ROOT)
+        transaction = self.transaction(installer, root, str(installed["backup_id"]))
+        (transaction / "state.json").unlink()
+        self.assertFalse((transaction / "state.json").exists())
+        return installed, transaction
+
     def test_renderer_is_canonical_capacity_zero_absolute_and_nofollow(self) -> None:
         output = self.base / "controld-v1.json"
         RENDERER.render(output)
@@ -491,6 +539,140 @@ class ControldInstallTests(unittest.TestCase):
         )
         self.assertEqual(prior.read_bytes(), b"prior\n")
         self.assertEqual(stat.S_IMODE(prior.stat().st_mode), 0o640)
+
+    def test_legacy_rollback_dry_run_preserves_complete_trees_and_timestamps(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installed, transaction = self.legacy_transaction(INSTALLER, self.package, root)
+        before = (self.tree_digest(self.package), self.tree_digest(root))
+
+        result = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+            dry_run=True,
+        )
+
+        self.assertEqual(result["status"], "rollback_dry_run")
+        self.assertEqual(result["restored_targets"], installed["changed_targets"])
+        self.assertEqual((self.tree_digest(self.package), self.tree_digest(root)), before)
+        self.assertFalse((transaction / "state.json").exists())
+        self.assertEqual(json.loads((transaction / "receipt.json").read_text())["state"], "installed")
+
+    def test_current_install_and_rollback_dry_runs_preserve_complete_trees(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        before_install_plan = (self.tree_digest(self.package), self.tree_digest(root))
+        install_plan = INSTALLER.install(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            dry_run=True,
+        )
+        self.assertEqual(install_plan["status"], "dry_run")
+        self.assertEqual((self.tree_digest(self.package), self.tree_digest(root)), before_install_plan)
+
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        before_rollback_plan = (self.tree_digest(self.package), self.tree_digest(root))
+        rollback_plan = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+            dry_run=True,
+        )
+        self.assertEqual(rollback_plan["status"], "rollback_dry_run")
+        self.assertEqual((self.tree_digest(self.package), self.tree_digest(root)), before_rollback_plan)
+
+    def test_tampered_legacy_dry_run_refuses_without_tree_mutation(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installed, transaction = self.legacy_transaction(INSTALLER, self.package, root)
+        receipt_path = transaction / "receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["inventory"][0]["target"] = receipt["inventory"][1]["target"]
+        receipt_path.write_bytes(INSTALLER.canonical_json(receipt))
+        receipt_path.chmod(0o600)
+        before = (self.tree_digest(self.package), self.tree_digest(root))
+
+        with self.assertRaisesRegex(ValueError, "inventory entry"):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+                dry_run=True,
+            )
+
+        self.assertEqual((self.tree_digest(self.package), self.tree_digest(root)), before)
+        self.assertFalse((transaction / "state.json").exists())
+
+    def test_real_legacy_rollback_persists_validated_migration(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        prior = root / "usr/lib/tmpfiles.d/buzzci-controld.conf"
+        prior.write_text("legacy prior\n")
+        prior.chmod(0o640)
+        installed, transaction = self.legacy_transaction(INSTALLER, self.package, root)
+
+        result = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+
+        self.assertEqual(result["status"], "rolled_back")
+        self.assertEqual(json.loads((transaction / "state.json").read_text())["phase"], "rolled_back")
+        self.assertEqual(json.loads((transaction / "receipt.json").read_text())["state"], "rolled_back")
+        self.assertEqual(prior.read_bytes(), b"legacy prior\n")
+        self.assertEqual(stat.S_IMODE(prior.stat().st_mode), 0o640)
+
+    def test_real_legacy_migration_interruption_retries_exactly(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installed, transaction = self.legacy_transaction(INSTALLER, self.package, root)
+        installer = self.restarted_installer("legacy_migration_a")
+        original = installer.write_transaction_state
+        fired = False
+
+        def crash_after_migration(path, state, install_root):
+            nonlocal fired
+            original(path, state, install_root)
+            if not fired and state["phase"] == "installed":
+                fired = True
+                raise SimulatedProcessExit("restart after validated legacy migration")
+
+        with mock.patch.object(installer, "write_transaction_state", side_effect=crash_after_migration):
+            with self.assertRaises(SimulatedProcessExit):
+                installer.rollback(
+                    self.package,
+                    root,
+                    installer.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+        self.assertTrue(fired)
+        self.assertEqual(json.loads((transaction / "state.json").read_text())["phase"], "installed")
+        self.assertEqual(json.loads((transaction / "receipt.json").read_text())["state"], "installed")
+
+        restarted = self.restarted_installer("legacy_migration_b")
+        result = restarted.rollback(
+            self.package,
+            root,
+            restarted.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        self.assertEqual(result["status"], "rolled_back")
+        self.assertEqual(
+            restarted.rollback(
+                self.package,
+                root,
+                restarted.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            ),
+            result,
+        )
 
     def test_rollback_refuses_receipt_state_and_package_mismatch(self) -> None:
         self.freeze()

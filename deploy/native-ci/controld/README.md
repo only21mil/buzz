@@ -136,6 +136,10 @@ interrupted operation while still refusing unrelated drift. A terminal
 rollback retry returns the same result after it verifies the prior targets and
 absent directory baseline. `receipt.json` is written only at an installed or
 rolled-back terminal point and must match `state.json` exactly.
+Rollback dry-run also validates legacy receipt-only backups, but it builds the
+migration state only in memory and leaves every file, directory, and timestamp
+unchanged. A real rollback persists that state only after the full rollback
+preflight passes.
 
 Neither installer action invokes systemd. Machine-readable default-state fields
 describe package behavior, not live systemd observation; a separate reviewed
