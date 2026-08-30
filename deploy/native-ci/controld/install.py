@@ -95,7 +95,11 @@ def sha256(payload: bytes) -> str:
 
 
 def read_fd(path: Path, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags | getattr(os, "O_NOATIME", 0))
+    except PermissionError:
+        fd = os.open(path, flags)
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
@@ -469,6 +473,14 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def open_read_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        return os.open(path, flags | getattr(os, "O_NOATIME", 0))
+    except PermissionError:
+        return os.open(path, flags)
+
+
 def unlink_file(path: Path) -> None:
     parent_fd = os.open(
         path.parent,
@@ -664,8 +676,8 @@ def load_transaction(
     entries: list[Entry],
     backup_id: str,
     *,
-    migrate_legacy: bool = False,
-) -> tuple[dict[str, object], dict[str, object] | None]:
+    allow_legacy: bool = False,
+) -> tuple[dict[str, object], dict[str, object] | None, bool]:
     require_directory(
         transaction,
         mapped_id(0, root),
@@ -674,8 +686,9 @@ def load_transaction(
     )
     state = read_optional_json(transaction / "state.json", root)
     receipt = read_optional_json(transaction / "receipt.json", root)
+    legacy = state is None
     if state is None:
-        if not migrate_legacy or receipt is None:
+        if not allow_legacy or receipt is None:
             raise ValueError("transaction state is missing")
         validate_receipt(receipt, manifest, entries)
         state = {
@@ -688,7 +701,6 @@ def load_transaction(
             "created_directories": receipt["created_directories"],
             "inventory": receipt["inventory"],
         }
-        write_transaction_state(transaction, state, root)
     validate_transaction_state(state, manifest, entries, backup_id)
     if receipt is not None:
         validate_receipt(receipt, manifest, entries)
@@ -709,7 +721,7 @@ def load_transaction(
             raise ValueError("transaction receipt/state mismatch")
     elif receipt["state"] not in allowed_receipt_states:
         raise ValueError("transaction receipt/state mismatch")
-    return state, receipt
+    return state, receipt, legacy
 
 
 def find_open_transaction(
@@ -747,14 +759,14 @@ def find_open_transaction(
                     raise ValueError(f"unrecoverable transaction without durable state: {item.name}")
                 continue
             if staged:
-                loaded_state, receipt = load_transaction(
+                loaded_state, receipt, legacy = load_transaction(
                     transaction,
                     root,
                     manifest,
                     entries,
                     backup_id,
                 )
-                if loaded_state["phase"] != "preparing" or receipt is not None:
+                if legacy or loaded_state["phase"] != "preparing" or receipt is not None:
                     raise ValueError("staged transaction is not preparing")
                 backup_base_fd = os.open(
                     backup_base,
@@ -775,13 +787,15 @@ def find_open_transaction(
                 continue
             if state.get("phase") not in OPEN_TRANSACTION_PHASES:
                 continue
-            loaded_state, receipt = load_transaction(
+            loaded_state, receipt, legacy = load_transaction(
                 transaction,
                 root,
                 manifest,
                 entries,
                 backup_id,
             )
+            if legacy:
+                raise ValueError("open transaction unexpectedly used a legacy receipt")
             open_transactions.append((transaction, loaded_state, receipt))
     if len(open_transactions) > 1:
         raise ValueError("multiple incomplete controld transactions")
@@ -992,7 +1006,7 @@ def validate_created_directories(
                 raise ValueError(f"created managed directory disappeared: {logical}")
             continue
         require_directory(path, mapped_id(0, root), mapped_id(0, root, group=True), 0o755)
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = open_read_directory(path)
         try:
             present = set(os.listdir(fd))
         finally:
@@ -1167,13 +1181,13 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
     transaction = backup_root_path(root, backup_root) / backup_id
     require_directory(transaction.parent, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
     require_directory(transaction, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
-    state, receipt = load_transaction(
+    state, receipt, legacy = load_transaction(
         transaction,
         root,
         manifest,
         entries,
         backup_id,
-        migrate_legacy=True,
+        allow_legacy=True,
     )
     by_target = {entry.target: entry for entry in entries}
     inventory = list(state["inventory"])
@@ -1199,8 +1213,10 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
         for directory in state["created_directories"]:
             if rooted(root, str(directory)).exists() or rooted(root, str(directory)).is_symlink():
                 raise ValueError(f"rolled-back directory remains: {directory}")
+        if not dry_run and legacy:
+            write_transaction_state(transaction, state, root)
         return {
-            "status": "rolled_back",
+            "status": "rollback_dry_run" if dry_run else "rolled_back",
             "package_id": manifest["package_id"],
             "backup_id": backup_id,
             "restored_targets": changed_targets,
@@ -1225,6 +1241,8 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
     if dry_run:
         return result
 
+    if legacy:
+        write_transaction_state(transaction, state, root)
     if state["phase"] != "rolling_back":
         state = {**state, "phase": "rolling_back"}
         write_transaction_state(transaction, state, root)
