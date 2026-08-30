@@ -12,9 +12,15 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
   edits and never promote a dirty checkout.
 - Bind every gate to one full 40-character commit. A branch name, abbreviated
   commit, local image tag, or passing run for another commit is not evidence.
-- Protected exact-head CI, required Tier 2 review, and approval are separate
-  gates. One never substitutes for another. A passing review does not authorize
-  a production action, and approval does not waive CI or required review.
+- Protected exact-head CI, required Tier 2 review, and approval are distinct
+  evidence and authority. Direct permission from Victor or Rachel to merge,
+  deploy, promote, or publish a named candidate may authorize bypassing its
+  protected-CI delivery gate when needed to complete that action. Ordinary
+  direct permission is enough; it needs no special exception wording. Record
+  the bypass and never describe missing or failed CI as passing. Required Tier
+  2 review and exact-candidate closure remain in force unless Victor or Rachel
+  also directly waives review. A passing review does not authorize a production
+  action.
 - The Buzz relay repository is authoritative. GitHub is the CI mirror. Landing
   is incomplete until the authoritative branch and mirror branch resolve to the
   same merge commit and the expected feature ref state is confirmed.
@@ -26,13 +32,16 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
 2. Run `scripts/pre-freeze.sh` with the intended base. Use `--full` and
    `--test` when the change or verification tier requires workspace-wide
    coverage. Retain the generated `pre-freeze-receipt.json`.
-3. The parent or operator independently reads the authenticated live repository
-   ruleset and exact-head workflow/check evidence, and confirms that every
-   protected requirement passed for the candidate. Retain a mode-safe
+3. Unless direct permission authorizes a protected-CI bypass, the parent or
+   operator independently reads the authenticated live repository ruleset and
+   exact-head workflow/check evidence, and confirms that every protected
+   requirement passed for the candidate. Retain a mode-safe
    `protected-ci-receipt.json` with `source: "protected-ci"`, `protected: true`,
    `full_exact_head: true`, the full candidate commit, and only passing checks.
    The repository currently has no maintained authenticated acquisition tool
-   that creates this receipt from the live provider.
+   that creates this receipt from the live provider. For an authorized bypass,
+   record the permission, exact candidate, and missing or failed CI truthfully.
+   Never fabricate or weaken a PASS receipt.
 4. Apply the current risk classifier. When Tier 2 is required, close review on
    the exact candidate before promotion. A review of an ancestor, tree-equivalent
    reconstruction, or later amended commit does not close the gate.
@@ -45,8 +54,9 @@ provider evidence, and it does not create approval.
 
 ## Landing
 
-Merge only the reviewed and CI-qualified candidate. Read back all of the
-following before calling the landing complete:
+Merge only the exact reviewed candidate. Require protected exact-head CI unless
+direct permission authorizes its bypass. Read back all of the following before
+calling the landing complete:
 
 - pull-request state, base, head, merge commit, ordered parents, and tree;
 - authoritative relay default branch at the merge commit;
