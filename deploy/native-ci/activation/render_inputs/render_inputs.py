@@ -334,11 +334,16 @@ def candidate_repository_locked_state(candidate_root: Path) -> tuple[str, bytes,
         candidate_checkpoint("locked-state-after-index-info", candidate_root)
         index_digest = candidate_index_digest(candidate_root)
         candidate_checkpoint("locked-state-after-index-digest", candidate_root)
+        candidate_checkpoint("locked-state-before-clean-sample", candidate_root)
         status = subprocess.run(
             [*command, "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=no"],
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, timeout=10,
         ).stdout
+        # The completed status read is the worktree-cleanliness sample. Raw
+        # worktree writes after it are outside the sample and cannot affect any
+        # candidate artifact bytes, which were read from immutable Git objects.
+        candidate_checkpoint("locked-state-after-clean-sample", candidate_root)
         candidate_checkpoint("locked-state-after-status", candidate_root)
         final_head = subprocess.run(
             [*command, "rev-parse", "HEAD^{commit}"], check=True,

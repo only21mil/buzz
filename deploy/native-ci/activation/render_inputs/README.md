@@ -73,19 +73,28 @@ candidate HEAD, exact index bytes and entries, and non-ignored worktree status.
 It freezes that repository identity through every candidate-blob read and rechecks it before
 output. The canonical output bytes are written, synced, and read back from a
 private staging inode. At finalization, maintained Git transactions hold the
-HEAD and index locks. A mode-`000` no-clobber hard link is pending, not accepted;
-the renderer checks its inode identity and repository status again while those
-locks remain. The locked check reads HEAD before the index and status, then
-rereads HEAD after status and requires both values to equal the candidate.
-Successful completion of that terminal HEAD read accepts the candidate snapshot
-for the exact pending inode. The renderer then changes its mode to `0600`, making
-the accepted output readable. Drift before the pending link rejects without an output.
+HEAD and index locks. Those locks cover cooperating Git ref and index writers;
+they do not synchronize arbitrary writes to worktree files. A mode-`000`
+no-clobber hard link is pending, not accepted. The renderer checks its inode
+identity and samples repository status again while the locks remain. Successful
+return of that final `git status` command is the precise worktree-cleanliness
+sample. A raw tracked or untracked write after the command returns is outside
+that sample, even if it occurs before the renderer returns.
+
+The locked check reads HEAD before the index and cleanliness sample, then
+rereads HEAD afterward and requires both values to equal the candidate. That
+later immutable-identity check does not extend or repeat the worktree sample.
+Every candidate asset in the output was already read from the named candidate
+Git object and bound by digest; the renderer reads no candidate worktree file
+after the clean sample. It then changes the exact pending inode to mode `0600`.
+Drift before the pending link rejects without an output.
 Drift after that link but before acceptance returns a distinct error and leaves
 only an unreadable mode-`000` artifact. No failure authorizes pathname deletion,
 so namespace replacement cannot cause removal of an unrelated file. The final
 verification and acceptance operation includes the pending link, inode check,
 final status read, and terminal HEAD reread before it returns. A raw candidate
-mutation after that terminal read is post candidate-acceptance.
+HEAD/ref mutation after the terminal read is post immutable-identity acceptance;
+a raw worktree mutation after the status result is post cleanliness-sample.
 If the no-clobber link finds an existing destination, the same Git locks remain
 held while the renderer opens that destination once and validates its exact
 canonical bytes, inode, owner, and mode. The descriptor stays open across the
@@ -102,6 +111,10 @@ execd-to-activation bindings. The resulting contract has
 the exact closed v3 shape accepted by preflight. Missing, extra, legacy v2, or
 independently drifted harness/timing fields fail before transfer or VM
 execution.
+
+Consumers must require renderer exit status zero and consume the exact canonical
+bound output. Ambient checkout cleanliness after the sampled point is not
+receipt evidence and must not replace the output contract.
 
 The two `record-*` commands run only after the clean-host result, contract,
 evidence manifest, acceptance receipt, and installed-verifier output form one

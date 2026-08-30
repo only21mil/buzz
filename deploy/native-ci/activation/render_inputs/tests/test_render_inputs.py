@@ -749,6 +749,39 @@ class RendererTests(unittest.TestCase):
 
             return checkpoint
 
+        def run_with_status_return_mutation(
+            root: Path, descriptor: dict[str, object], output: str,
+            mutation: object,
+        ) -> tuple[int, str]:
+            real_run = subprocess.run
+            locked_samples = 0
+            armed = False
+
+            def checkpoint(observed: str, candidate_root: Path) -> None:
+                nonlocal locked_samples, armed
+                if observed == "locked-state-before-clean-sample":
+                    locked_samples += 1
+                    if locked_samples == 2:
+                        armed = True
+
+            def run_then_mutate(*args: object, **kwargs: object) -> object:
+                nonlocal armed
+                result = real_run(*args, **kwargs)
+                command = args[0] if args else None
+                if (
+                    armed
+                    and isinstance(command, list)
+                    and "status" in command
+                ):
+                    armed = False
+                    mutation(root / "candidate")
+                return result
+
+            with mock.patch.object(RENDER.subprocess, "run", side_effect=run_then_mutate):
+                return self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, output, checkpoint,
+                )
+
         def drift_head(candidate_root: Path) -> None:
             subprocess.run(
                 ["/usr/bin/git", "-C", str(candidate_root), "commit", "-q", "--allow-empty", "-m", "drift"],
@@ -1104,6 +1137,112 @@ class RendererTests(unittest.TestCase):
                         ),
                         identity,
                     )
+                    assert_retry_cleanup(root)
+
+        def add_untracked(candidate_root: Path) -> None:
+            (candidate_root / "post-sample-untracked").write_text("drift\n")
+
+        def change_tracked(candidate_root: Path) -> None:
+            asset = (
+                candidate_root
+                / RENDER.HARNESS_ASSET_SOURCES["guest_entry.py"][0]
+            )
+            asset.write_bytes(asset.read_bytes() + b"\n# cleanliness sample drift\n")
+
+        sample_timings = (
+            ("immediately-before", "locked-state-before-clean-sample"),
+            ("status-return", None),
+            ("immediately-after", "locked-state-after-clean-sample"),
+        )
+        for mutation_name, mutation in (
+            ("untracked", add_untracked),
+            ("tracked", change_tracked),
+        ):
+            for timing, stage in sample_timings:
+                post_sample = timing != "immediately-before"
+                with self.subTest(
+                    fresh_clean_sample=timing, raw_mutation=mutation_name,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    lifecycle, candidate = self.make_lifecycle(root)
+                    descriptor = {
+                        "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                        "candidate_sha": candidate, "lifecycle": lifecycle,
+                    }
+                    baseline: bytes | None = None
+                    if post_sample:
+                        clean = self.run_cli(
+                            root, "record-residue", descriptor, "baseline.json",
+                        )
+                        self.assertEqual(clean.returncode, 0, clean.stderr)
+                        baseline = (root / "baseline.json").read_bytes()
+                    if stage is None:
+                        result, stderr = run_with_status_return_mutation(
+                            root, descriptor, "accepted.json", mutation,
+                        )
+                    else:
+                        result, stderr = self.run_main_with_checkpoint(
+                            root, "record-residue", descriptor,
+                            "accepted.json" if post_sample else "retained.json",
+                            mutate_on_occurrence(stage, 2, mutation),
+                        )
+                    if post_sample:
+                        self.assertEqual(result, 0, stderr)
+                        accepted_output = root / "accepted.json"
+                        self.assertEqual(accepted_output.stat().st_mode & 0o7777, 0o600)
+                        self.assertEqual(accepted_output.read_bytes(), baseline)
+                    else:
+                        self.assertEqual(result, 64, stderr)
+                        self.assertIn(
+                            "candidate changed before acceptance; unreadable output retained",
+                            stderr,
+                        )
+                        self.assertEqual(
+                            (root / "retained.json").stat().st_mode & 0o7777,
+                            0o000,
+                        )
+                    self.assertTrue(subprocess.check_output(
+                        [
+                            "/usr/bin/git", "-C", str(root / "candidate"),
+                            "status", "--porcelain", "--untracked-files=all",
+                        ],
+                    ))
+                    assert_retry_cleanup(root)
+
+                with self.subTest(
+                    retry_clean_sample=timing, raw_mutation=mutation_name,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    descriptor, _candidate, output, identity = make_existing_retry(root)
+                    if stage is None:
+                        result, stderr = run_with_status_return_mutation(
+                            root, descriptor, "existing.json", mutation,
+                        )
+                    else:
+                        result, stderr = self.run_main_with_checkpoint(
+                            root, "record-residue", descriptor, "existing.json",
+                            mutate_on_occurrence(stage, 2, mutation),
+                        )
+                    self.assertEqual(result, 0 if post_sample else 64, stderr)
+                    if not post_sample:
+                        self.assertIn(
+                            "candidate Git HEAD, index, or worktree changed",
+                            stderr,
+                        )
+                    self.assertEqual(
+                        (
+                            output.stat().st_ino,
+                            output.stat().st_mode & 0o7777,
+                            output.read_bytes(),
+                        ),
+                        identity,
+                    )
+                    self.assertTrue(subprocess.check_output(
+                        [
+                            "/usr/bin/git", "-C", str(root / "candidate"),
+                            "status", "--porcelain", "--untracked-files=all",
+                        ],
+                    ))
                     assert_retry_cleanup(root)
 
         for stage in (
