@@ -44,9 +44,17 @@ DEFAULT_STATE = {
     "capacity": 0,
     "providers_wired": False,
 }
+ACCEPTANCE_BINDING = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
+CONTROLD_CONFIG = {
+    "schema_version": 1,
+    "capacity": 0,
+    "store_root": "/var/lib/buzzci/controld",
+    "acceptance_binding": ACCEPTANCE_BINDING,
+}
 DAEMON_CONTRACT = {
     "service_user": "buzzci-controld",
     "config_path": "/etc/buzzci/controld-v1.json",
+    "acceptance_binding": ACCEPTANCE_BINDING,
     "store_root": "/var/lib/buzzci/controld",
     "default_capacity": 0,
     "maximum_capacity": 1,
@@ -270,6 +278,8 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
             or sha256(payload) != entry.sha256
         ):
             raise ValueError(f"package source metadata or digest mismatch: {source}")
+        if role == "config" and payload != canonical_json(CONTROLD_CONFIG):
+            raise ValueError("controld config is not the canonical acceptance-bound capacity zero config")
         if role == "binary" and entry.sha256 != provenance["sha256"]:
             raise ValueError("controld binary is not bound to provenance")
         entries.append(entry)
@@ -282,8 +292,8 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
 def validate_assets(package: Path, entries: list[Entry]) -> None:
     payloads = {entry.role: read_fd(package / entry.source)[0] for entry in entries}
     config = json.loads(payloads["config"], object_pairs_hook=reject_duplicates)
-    if config != {"capacity": 0, "schema_version": 1, "store_root": "/var/lib/buzzci/controld"}:
-        raise ValueError("controld config is not canonical and capacity-zero")
+    if config != CONTROLD_CONFIG or payloads["config"] != canonical_json(CONTROLD_CONFIG):
+        raise ValueError("controld config is not canonical, acceptance-bound, and capacity-zero")
     service = payloads["service"].decode()
     tmpfiles = payloads["tmpfiles"].decode()
     required_service = {

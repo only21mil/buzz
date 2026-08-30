@@ -42,22 +42,23 @@ def config_bytes(
     store_root: str = STORE_ROOT,
     capacity: int = CAPACITY,
     active: dict[str, object] | None = None,
-    acceptance_binding: str | None = None,
+    acceptance_binding: str = ACCEPTANCE_BINDING,
 ) -> bytes:
     validate_store_root(store_root)
     if isinstance(capacity, bool) or capacity not in {0, 1}:
         raise ValueError("controld capacity must be exactly zero or one")
     if capacity == 0 and active is not None:
         raise ValueError("capacity zero cannot contain provider bindings")
-    if acceptance_binding is not None and acceptance_binding != ACCEPTANCE_BINDING:
+    if acceptance_binding != ACCEPTANCE_BINDING:
         raise ValueError("acceptance binding differs from the fixed receipt")
     if capacity == 1:
         validate_active(active)
-        if acceptance_binding != ACCEPTANCE_BINDING:
-            raise ValueError("capacity one requires the post-freeze acceptance binding")
-    value = {"schema_version": 1, "capacity": capacity, "store_root": store_root}
-    if acceptance_binding is not None:
-        value["acceptance_binding"] = acceptance_binding
+    value = {
+        "schema_version": 1,
+        "capacity": capacity,
+        "store_root": store_root,
+        "acceptance_binding": acceptance_binding,
+    }
     if active is not None:
         value.update(active)
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"

@@ -16,10 +16,14 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ACTIVATION_ROOT = REPO_ROOT / "deploy/native-ci/activation"
+CONTROLD_ROOT = REPO_ROOT / "deploy/native-ci/controld"
 EXECD_ROOT = REPO_ROOT / "deploy/native-ci/execd"
 KEYHOLDER_ROOT = REPO_ROOT / "deploy/native-ci/keyholder"
+RUNNER_ROOT = REPO_ROOT / "deploy/native-ci/runner"
 sys.path.insert(0, str(ACTIVATION_ROOT))
+sys.path.insert(0, str(CONTROLD_ROOT))
 sys.path.insert(0, str(KEYHOLDER_ROOT))
+sys.path.insert(0, str(RUNNER_ROOT))
 
 
 def load_module(name: str, path: Path):
@@ -32,12 +36,14 @@ def load_module(name: str, path: Path):
 
 ACTIVATION_PACKAGE = load_module("bootstrap_activation_package", ACTIVATION_ROOT / "package.py")
 ACTIVATION_FREEZER = load_module("bootstrap_activation_freezer", ACTIVATION_ROOT / "freeze_package.py")
+CONTROLD_FREEZER = load_module("bootstrap_controld_freezer", CONTROLD_ROOT / "freeze_package.py")
 INVENTORY = load_module("bootstrap_inventory", ACTIVATION_ROOT / "check_package_inventory.py")
 RENDER = load_module("bootstrap_renderer", ACTIVATION_ROOT / "render_inputs/render_inputs.py")
 EXECD_FREEZER = load_module("bootstrap_execd_freezer", EXECD_ROOT / "freeze_package.py")
 KEYHOLDER_FREEZER = load_module(
     "bootstrap_keyholder_freezer", KEYHOLDER_ROOT / "freeze_package.py",
 )
+RUNNER_FREEZER = load_module("bootstrap_runner_freezer", RUNNER_ROOT / "freeze_package.py")
 ACTIVATION_TESTS = load_module(
     "bootstrap_activation_test_fixture", ACTIVATION_ROOT / "tests/test_activation_controller.py",
 )
@@ -171,91 +177,58 @@ class BootstrapCompositionTests(unittest.TestCase):
     ) -> dict[str, dict[str, object]]:
         results: dict[str, dict[str, object]] = {}
         draft_entries = {item["role"]: item for item in draft["entries"]}
-        effective = [
-            record
-            for unit in draft["effective_systemd"]
-            for record in (unit["fragment"], *unit["drop_ins"])
-        ]
-
-        for name in ("runner", "controld"):
-            package = ceremony / "packages" / name
-            package.mkdir(parents=True, mode=0o700)
-            package.chmod(0o700)
-            entries: list[dict[str, object]] = []
-            sources: dict[str, tuple[bytes, int]] = {}
-
-            def add(role: str, target: str, payload: bytes, mode: int = 0o400, install: str = "0644", uid: int = 0, gid: int = 0) -> None:
-                source = f"assets/{name}-{len(entries)}"
-                sources[source] = (payload, mode)
-                entries.append({
-                    "role": role,
-                    "source": source,
-                    "target": target,
-                    "source_mode": f"{mode:04o}",
-                    "install_mode": install,
-                    "uid": uid,
-                    "gid": gid,
-                    "sha256": hashlib.sha256(payload).hexdigest(),
-                })
-
-            for record in effective:
-                if record["owner"] != name:
-                    continue
-                payload = (REPO_ROOT / ACTIVATION_FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes()
-                add("socket" if record["path"].endswith(".socket") else "unit", record["path"], payload)
-
-            if name in {"runner", "controld"}:
-                role = f"{name}_config"
-                activation_entry = draft_entries[role]
-                payload = fixture.assets[activation_entry["source"]][0]
-                add(
-                    "config", activation_entry["target"], payload, 0o400,
-                    activation_entry["install_mode"], activation_entry["uid"], activation_entry["gid"],
-                )
-            binary = f"{name}-binary\n".encode()
-            add("binary", f"/usr/libexec/buzz-ci-{name}", binary, 0o500, "0755")
-            add("tmpfiles", f"/usr/lib/tmpfiles.d/buzzci-{name}.conf", f"{name}-tmpfiles\n".encode())
-
-            base: dict[str, object] = {
-                "schema": RENDER.PACKAGE_SCHEMAS[name],
-                "package_id": f"buzz-ci-{name}-{candidate[:12]}-{hashlib.sha256(binary).hexdigest()[:12]}",
+        identities = draft["identities"]
+        (ceremony / "packages").mkdir(mode=0o700)
+        frozen: dict[str, tuple[object, tuple[int, ...]]] = {
+            "runner": (
+                RUNNER_FREEZER,
+                (
+                    identities["runner"]["uid"], identities["runner"]["gid"],
+                    identities["controld"]["uid"], identities["controld"]["gid"],
+                ),
+            ),
+            "controld": (
+                CONTROLD_FREEZER,
+                (identities["controld"]["uid"], identities["controld"]["gid"]),
+            ),
+        }
+        for name, (freezer, identity_args) in frozen.items():
+            binary_payload = f"{name}-binary\n".encode()
+            binary = ceremony / f"buzz-ci-{name}"
+            write_file(binary, binary_payload, 0o755)
+            provenance = ceremony / f"{name}-provenance.json"
+            write_file(provenance, canonical({
+                "binary": f"buzz-ci-{name}",
+                "profile": "release",
+                "schema": freezer.PROVENANCE_SCHEMA,
+                "sha256": hashlib.sha256(binary_payload).hexdigest(),
                 "source_commit": candidate,
-                "package_uid": 0,
-                "package_gid": 0,
-                "directories": [],
-                "entries": entries,
-            }
-            if name == "runner":
-                base.update({
-                    "default_state": {}, "peer_policy": {}, "identities": {},
-                })
-            elif name == "controld":
-                base.update({
-                    "default_state": {}, "daemon_contract": {}, "identity": {},
-                })
-            provenance = canonical({
-                "binary": f"buzz-ci-{name}", "profile": "release",
-                "schema": "buzz-ci-binary-provenance-v1",
-                "sha256": hashlib.sha256(binary).hexdigest(), "source_commit": candidate,
-            })
-            base["binary_provenance_sha256"] = hashlib.sha256(provenance).hexdigest()
-            write_file(package / "binary-provenance.json", provenance, 0o600)
+            }), 0o600)
+            package = ceremony / "packages" / name
+            manifest = freezer.freeze_package(
+                source_root, candidate, binary, provenance, package, *identity_args,
+            )
+            repeated = freezer.freeze_package(
+                source_root, candidate, binary, provenance,
+                ceremony / "packages" / f"{name}-repeat", *identity_args,
+            )
+            self.assertEqual(repeated["package_digest"], manifest["package_digest"])
+            config_entry = next(item for item in manifest["entries"] if item["role"] == "config")
+            activation_entry = draft_entries[f"{name}_config"]
+            self.assertEqual(config_entry["target"], activation_entry["target"])
+            self.assertEqual(config_entry["sha256"], activation_entry["sha256"])
+            self.assertEqual(
+                (package / config_entry["source"]).read_bytes(),
+                fixture.assets[activation_entry["source"]][0],
+            )
+            results[name] = manifest
 
-            if name == "controld":
-                component = next(item for item in draft["components"] if item["name"] == "controld")
-                base["package_digest"] = hashlib.sha256(canonical(base)).hexdigest()
-                raw = canonical(base)
-                component["source_commit"] = candidate
-                component["package_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-                component["package_digest"] = base["package_digest"]
-                fixture.assets[component["package_manifest_source"]] = (raw, 0o400)
-            else:
-                base["package_digest"] = hashlib.sha256(canonical(base)).hexdigest()
-
-            for asset_source, (payload, mode) in sources.items():
-                write_file(package / asset_source, payload, mode)
-            write_file(package / "package-manifest.json", canonical(base), 0o600)
-            results[name] = base
+        component = next(item for item in draft["components"] if item["name"] == "controld")
+        controld_raw = (ceremony / "packages/controld/package-manifest.json").read_bytes()
+        component["source_commit"] = candidate
+        component["package_manifest_sha256"] = hashlib.sha256(controld_raw).hexdigest()
+        component["package_digest"] = results["controld"]["package_digest"]
+        fixture.assets[component["package_manifest_source"]] = (controld_raw, 0o400)
 
         keyholder_binary = ceremony / "buzz-ci-keyholder"
         write_file(keyholder_binary, b"keyholder-binary\n", 0o755)
@@ -281,6 +254,22 @@ class BootstrapCompositionTests(unittest.TestCase):
             controld_uid=controld["uid"],
             controld_gid=controld["gid"],
             public_binding=public_binding,
+        )
+        repeated_keyholder = KEYHOLDER_FREEZER.freeze_package(
+            source_root,
+            candidate,
+            keyholder_binary,
+            keyholder_provenance,
+            None,
+            ceremony / "packages/keyholder-repeat",
+            keyholder_uid=keyholder["uid"],
+            keyholder_gid=keyholder["gid"],
+            controld_uid=controld["uid"],
+            controld_gid=controld["gid"],
+            public_binding=public_binding,
+        )
+        self.assertEqual(
+            repeated_keyholder["package_digest"], results["keyholder"]["package_digest"],
         )
         return results
 
@@ -406,11 +395,31 @@ class BootstrapCompositionTests(unittest.TestCase):
             activation_manifest = ACTIVATION_FREEZER.freeze_package(
                 source, candidate, ceremony / "activation-draft.json", asset_root, activation_path,
             )
+            repeated_activation = ACTIVATION_FREEZER.freeze_package(
+                source,
+                candidate,
+                ceremony / "activation-draft.json",
+                asset_root,
+                ceremony / "packages/activation-repeat",
+            )
+            self.assertEqual(
+                repeated_activation["package_digest"], activation_manifest["package_digest"],
+            )
             execd_path = ceremony / "packages/execd"
             execd_manifest = EXECD_FREEZER.freeze_package(
                 source, candidate, execd_binary, execd_provenance, preactivation_path,
                 activation_path, execd_path,
             )
+            repeated_execd = EXECD_FREEZER.freeze_package(
+                source,
+                candidate,
+                execd_binary,
+                execd_provenance,
+                preactivation_path,
+                activation_path,
+                ceremony / "packages/execd-repeat",
+            )
+            self.assertEqual(repeated_execd["package_digest"], execd_manifest["package_digest"])
             self.assertEqual(
                 execd_manifest["activation_binding"]["preactivation_input_sha256"],
                 hashlib.sha256(preactivation_path.read_bytes()).hexdigest(),

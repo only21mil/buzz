@@ -15,8 +15,9 @@ permits only the network and local sockets needed after a separate activation.
 The installed default remains:
 
 - `buzz-ci-controld.service` present but static, disabled, and inactive;
-- `controld-v1.json` contains only schema version 1, capacity exactly `0`, and
-  absolute store root `/var/lib/buzzci/controld`;
+- `controld-v1.json` contains only schema version 1, capacity exactly `0`,
+  absolute store root `/var/lib/buzzci/controld`, and the fixed public
+  `acceptance_binding` receipt path;
 - no relay URL, key descriptor, keyholder, runner, broker, or polling
   configuration;
 - state reported as `enabled=false`, `active=false`, `provisioned=false`,
@@ -24,10 +25,12 @@ The installed default remains:
 
 In capacity zero the daemon opens only its owner-private durable control store,
 reports the unified `parked` readiness record, and parks without polling,
-dispatching, networking, or signing. An activation may add only the fixed
-post-freeze `acceptance_binding` receipt path while capacity remains zero. The
-central activation controller creates that receipt only after the package and
-scenario digests are final. Its exact schema is
+dispatching, networking, or signing. The frozen config always names the fixed
+post-freeze `acceptance_binding` receipt path. The package remains safe on a
+standalone host because both packaged units stay disabled and inactive. If an
+operator starts either unit before activation creates the receipt, controld
+fails closed. The central activation controller creates that receipt only after
+the package and scenario digests are final. Its exact schema is
 `buzz-ci-activation-acceptance-binding/v1`; the fixed path is
 `/var/lib/buzzci/activation-controller/controld-acceptance-v1.json`. The compact
 canonical JSON binds the activation, package, candidate, complete fixture,
@@ -35,8 +38,11 @@ scenario, peer identity, generations, timeout, acceptance actor, and the four
 public Run/Grant/Rerun/Tombstone event templates. The regular file is root:root
 mode `0444`, link count one, beneath the exact root:root mode `0711` activation
 controller directory. Both controld and keyholder validate this same public
-receipt. Frozen daemon configs contain only its path, so neither contains a
-digest of bytes that contribute to the package digest.
+receipt. The controld freezer is the sole source of the canonical staged config
+bytes. The config entry digest binds those bytes into its package manifest, and
+activation must freeze the same bytes for the shared installed path. Frozen
+daemon configs contain only the receipt path, so neither contains a digest of
+bytes that contribute to the package digest.
 
 Capacity one is accepted only with the complete relay authority, channel,
 authenticated runner identity and bounds, exact static lane, JobIntentV2 job

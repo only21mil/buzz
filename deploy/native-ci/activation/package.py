@@ -1284,6 +1284,12 @@ def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes
         or digest(canonical_json(unsigned)) != package_digest
     ):
         raise ValueError("controld package manifest digest or source differs")
+    daemon_contract = package.get("daemon_contract")
+    if (
+        not isinstance(daemon_contract, dict)
+        or daemon_contract.get("acceptance_binding") != ACCEPTANCE_BINDING_PATH
+    ):
+        raise ValueError("controld package acceptance binding contract differs")
     entries = package["entries"]
     if not isinstance(entries, list):
         raise ValueError("controld package entry inventory differs")
@@ -1294,6 +1300,24 @@ def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes
         if entry["target"] in by_target:
             raise ValueError("controld package target is duplicated")
         by_target[entry["target"]] = entry
+    activation_config = next(
+        item for item in manifest["entries"] if item["role"] == "controld_config"
+    )
+    packaged_config = by_target.get(CONFIG_TARGETS["controld_config"])
+    if (
+        not isinstance(packaged_config, dict)
+        or packaged_config.get("role") != "config"
+        or any(
+            packaged_config.get(package_field) != activation_config[activation_field]
+            for package_field, activation_field in (
+                ("sha256", "sha256"),
+                ("install_mode", "install_mode"),
+                ("uid", "uid"),
+                ("gid", "gid"),
+            )
+        )
+    ):
+        raise ValueError("controld package staged config binding differs")
     effective = {item["unit"]: item for item in manifest["effective_systemd"]}
     for unit in ("buzz-ci-controld.service", "buzz-ci-controld-acceptance.socket"):
         fragment = effective[unit]["fragment"]

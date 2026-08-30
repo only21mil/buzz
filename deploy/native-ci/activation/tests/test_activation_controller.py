@@ -239,6 +239,7 @@ class ActivationFixture:
         self.entries: list[dict[str, object]] = []
         self.components = self._add_components()
         self._add_configs()
+        self._bind_controld_package_config()
         self._add_static_assets()
         self.qualification = {
             "program": "/usr/libexec/buzz-ci-production-qualification",
@@ -547,6 +548,9 @@ class ActivationFixture:
                 package: dict[str, object] = {
                     "schema": "buzz-ci-controld-install-package-v1",
                     "source_commit": source_commit,
+                    "daemon_contract": {
+                        "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
+                    },
                     "entries": [],
                 }
                 for role, relative, target in (
@@ -569,6 +573,29 @@ class ActivationFixture:
                 })
             components.append(component)
         return components
+
+    def _bind_controld_package_config(self) -> None:
+        component = next(item for item in self.components if item["name"] == "controld")
+        source = component["package_manifest_source"]
+        package = json.loads(self.assets[source][0])
+        config = next(item for item in self.entries if item["role"] == "controld_config")
+        package["entries"].append({
+            "role": "config",
+            "target": config["target"],
+            "sha256": config["sha256"],
+            "install_mode": config["install_mode"],
+            "uid": config["uid"],
+            "gid": config["gid"],
+        })
+        package["package_digest"] = activation_package.digest(
+            activation_package.canonical_json({
+                key: value for key, value in package.items() if key != "package_digest"
+            })
+        )
+        raw = activation_package.canonical_json(package)
+        self.assets[source] = (raw, 0o400)
+        component["package_manifest_sha256"] = activation_package.digest(raw)
+        component["package_digest"] = package["package_digest"]
 
     def _effective_systemd(self) -> list[dict[str, object]]:
         entries = {entry["target"]: entry for entry in self.entries}
@@ -1220,6 +1247,27 @@ class ActivationControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "package manifest digest or source"):
             activation_package._validate_controld_package_manifest(changed, hostile)
 
+        package = json.loads(raw)
+        config = next(
+            item
+            for item in package["entries"]
+            if item["target"] == activation_package.CONFIG_TARGETS["controld_config"]
+        )
+        config["sha256"] = "f" * 64
+        unsigned = {key: value for key, value in package.items() if key != "package_digest"}
+        package["package_digest"] = activation_package.digest(
+            activation_package.canonical_json(unsigned)
+        )
+        hostile = activation_package.canonical_json(package)
+        changed = copy.deepcopy(manifest)
+        changed_component = next(
+            item for item in changed["components"] if item["name"] == "controld"
+        )
+        changed_component["package_manifest_sha256"] = activation_package.digest(hostile)
+        changed_component["package_digest"] = package["package_digest"]
+        with self.assertRaisesRegex(ValueError, "staged config binding differs"):
+            activation_package._validate_controld_package_manifest(changed, hostile)
+
     def test_static_five_package_inventory_is_collision_closed(self) -> None:
         activation = copy.deepcopy(self.fixture.manifest)
         activation_entries = {entry["target"]: entry for entry in activation["entries"]}
@@ -1603,7 +1651,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "d70fe36e1ba988733db969f3727de586da15f59ebc9f45d1c4feac387f92808d",
+            "77bc26b4850b0bcca8daa5746cecb79c1e2ebee4a9854327ba7a57ec0a058a10",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")

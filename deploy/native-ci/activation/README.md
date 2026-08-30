@@ -353,7 +353,12 @@ package digest, source commit, and both controld unit entries.
 Use one full candidate SHA for every step. This order removes the former cycle
 between the execd and activation packages:
 
-1. Freeze and verify the final runner, controld, and keyholder packages.
+1. Freeze and verify the final runner, controld, and keyholder packages. The
+   controld freezer's config entry is the canonical staged
+   `/etc/buzzci/controld-v1.json`: capacity zero plus the fixed public
+   acceptance receipt path. Use those exact bytes and digest as the activation
+   draft's staged controld config. Draft validation and final inventory reject
+   any missing, substituted, or divergent config.
 2. Run `deploy/native-ci/execd/freeze_package.py prepare-input` against the exact
    execd release binary and its canonical provenance. Keep those bytes fixed.
 3. Run `render_inputs.py render-draft`. Its descriptor names the three ready

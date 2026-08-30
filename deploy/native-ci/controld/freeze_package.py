@@ -31,6 +31,7 @@ DEFAULT_STATE = {"enabled": False, "active": False, "provisioned": False, "capac
 DAEMON_CONTRACT = {
     "service_user": "buzzci-controld",
     "config_path": "/etc/buzzci/controld-v1.json",
+    "acceptance_binding": render_controld_config.ACCEPTANCE_BINDING,
     "store_root": "/var/lib/buzzci/controld",
     "default_capacity": 0,
     "maximum_capacity": 1,

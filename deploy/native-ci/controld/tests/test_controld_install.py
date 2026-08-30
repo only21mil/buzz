@@ -79,6 +79,25 @@ class ControldInstallTests(unittest.TestCase):
             package or self.package, self.controld_uid, self.controld_gid,
         )
 
+    def replace_frozen_config(
+        self, package: Path, value: dict[str, object] | bytes,
+    ) -> None:
+        manifest_path = package / "package-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        entry = next(item for item in manifest["entries"] if item["role"] == "config")
+        payload = value if isinstance(value, bytes) else INSTALLER.canonical_json(value)
+        asset = package / entry["source"]
+        asset.chmod(0o600)
+        asset.write_bytes(payload)
+        asset.chmod(0o400)
+        entry["sha256"] = hashlib.sha256(payload).hexdigest()
+        del manifest["package_digest"]
+        manifest["package_digest"] = hashlib.sha256(
+            INSTALLER.canonical_json(manifest)
+        ).hexdigest()
+        manifest_path.write_bytes(INSTALLER.canonical_json(manifest))
+        manifest_path.chmod(0o600)
+
     def make_root(self, name: str = "root") -> Path:
         root = self.base / name
         root.mkdir(mode=0o700)
@@ -152,13 +171,24 @@ class ControldInstallTests(unittest.TestCase):
     def test_renderer_is_canonical_capacity_zero_absolute_and_nofollow(self) -> None:
         output = self.base / "controld-v1.json"
         RENDERER.render(output)
-        self.assertEqual(output.read_bytes(), b'{"capacity":0,"schema_version":1,"store_root":"/var/lib/buzzci/controld"}\n')
+        self.assertEqual(
+            output.read_bytes(),
+            b'{"acceptance_binding":"/var/lib/buzzci/activation-controller/controld-acceptance-v1.json","capacity":0,"schema_version":1,"store_root":"/var/lib/buzzci/controld"}\n',
+        )
+        self.assertEqual(
+            hashlib.sha256(output.read_bytes()).hexdigest(),
+            "13f194c8968a35782ed6c0ea4025f6f333850a6135f246dfda7c2ef683120d1e",
+        )
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
         RENDERER.check(output, expected_uid=self.controld_uid)
         with self.assertRaisesRegex(ValueError, "exact provider field set"):
             RENDERER.config_bytes(capacity=1)
         with self.assertRaisesRegex(ValueError, "absolute normalized"):
             RENDERER.config_bytes("relative/store")
+        with self.assertRaisesRegex(ValueError, "fixed receipt"):
+            RENDERER.config_bytes(acceptance_binding=None)
+        with self.assertRaisesRegex(ValueError, "fixed receipt"):
+            RENDERER.config_bytes(acceptance_binding="/var/lib/buzzci/controld/acceptance.json")
         linked = self.base / "linked.json"
         linked.symlink_to(output)
         with self.assertRaises(OSError):
@@ -256,6 +286,29 @@ class ControldInstallTests(unittest.TestCase):
                 entry.source_mode,
             )
 
+    def test_installer_rejects_missing_or_mismatched_acceptance_binding(self) -> None:
+        cases = {
+            "missing": {
+                "schema_version": 1,
+                "capacity": 0,
+                "store_root": RENDERER.STORE_ROOT,
+            },
+            "mismatched": {
+                "schema_version": 1,
+                "capacity": 0,
+                "store_root": RENDERER.STORE_ROOT,
+                "acceptance_binding": "/var/lib/buzzci/controld/acceptance.json",
+            },
+            "tampered": INSTALLER.canonical_json(INSTALLER.CONTROLD_CONFIG)[:-1] + b" \n",
+        }
+        for label, value in cases.items():
+            with self.subTest(label=label):
+                package = self.base / f"package-{label}"
+                self.freeze(package=package)
+                self.replace_frozen_config(package, value)
+                with self.assertRaisesRegex(ValueError, "canonical acceptance-bound"):
+                    INSTALLER.parse_manifest(package, self.base)
+
     def test_freeze_from_fresh_umask_0077_checkout_needs_no_source_chmod(self) -> None:
         checkout = self.base / "private-checkout"
         prior_umask = os.umask(0o077)
@@ -350,6 +403,11 @@ class ControldInstallTests(unittest.TestCase):
             self.assertTrue(INSTALLER.rooted(root, target).is_file())
         config = root / "etc/buzzci/controld-v1.json"
         self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(config.read_bytes()), INSTALLER.CONTROLD_CONFIG)
+        self.assertFalse(
+            (root / INSTALLER.ACCEPTANCE_BINDING.lstrip("/")).exists(),
+            "standalone dormant install must not synthesize an activation receipt",
+        )
         unchanged = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
         self.assertEqual(unchanged["status"], "unchanged")
         rolled_back = INSTALLER.rollback(
@@ -759,9 +817,15 @@ class ControldInstallTests(unittest.TestCase):
         for name in ("binary-provenance.schema.json", "package-manifest.schema.json"):
             schema = json.loads((CONTROLD_DIR / name).read_text())
             self.assertFalse(schema["additionalProperties"])
+        package_schema = json.loads((CONTROLD_DIR / "package-manifest.schema.json").read_text())
+        self.assertEqual(
+            package_schema["properties"]["daemon_contract"]["const"]["acceptance_binding"],
+            RENDERER.ACCEPTANCE_BINDING,
+        )
         config_schema = json.loads((CONTROLD_DIR / "controld-config.schema.json").read_text())
         self.assertEqual(config_schema["$defs"]["dormant"]["properties"]["capacity"]["const"], 0)
         self.assertEqual(config_schema["$defs"]["active"]["properties"]["capacity"]["const"], 1)
+        self.assertIn("acceptance_binding", config_schema["$defs"]["dormant"]["required"])
         self.assertFalse(config_schema["$defs"]["dormant"]["additionalProperties"])
         self.assertFalse(config_schema["$defs"]["active"]["additionalProperties"])
 

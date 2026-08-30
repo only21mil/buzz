@@ -47,7 +47,7 @@
     "dormant": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "capacity", "store_root"],
+      "required": ["schema_version", "capacity", "store_root", "acceptance_binding"],
       "properties": {
         "schema_version": { "const": 1 },
         "capacity": { "const": 0 },
