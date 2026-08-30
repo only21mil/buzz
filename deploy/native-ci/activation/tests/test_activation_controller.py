@@ -668,6 +668,8 @@ class ActivationFixture:
                 "active_capacity": 1,
             },
             "effective_systemd": self._effective_systemd(),
+            "inherited_systemd": activation_package.INHERITED_SYSTEMD,
+            "legacy_compatibility": activation_package.LEGACY_COMPATIBILITY,
             "socket_policy": activation_package.SOCKET_POLICY,
             "qualification": self.qualification,
             "package_uid": 0,
@@ -748,7 +750,14 @@ class ActivationFixture:
                     if record["owner"] != "activation"
                 ],
             }
-        state = {"schema": "buzz-ci-fake-systemd-v1", "units": units, "identities": {}, "groups": {}, "sockets": {}}
+        state = {
+            "schema": "buzz-ci-fake-systemd-v1",
+            "units": units,
+            "identities": {},
+            "groups": {},
+            "sockets": {},
+            "legacy_ownership": [],
+        }
         self.fake_state = self.root / "var/lib/buzzci/activation-controller/fake-systemd-v1.json"
         write_file(self.fake_state, activation_package.canonical_json(state), 0o600)
         self.fake_state.parent.chmod(0o700)
@@ -760,6 +769,32 @@ class ActivationFixture:
             manifest["socket_policy"], manifest["effective_systemd"],
         )
         return manifest, payloads, driver
+
+    def install_recognized_legacy_host(
+        self, driver, *, global_policy: bool = False,
+    ) -> None:
+        substrate = REPO_ROOT / "ci-acceptance/substrate"
+        sources = {
+            "/etc/systemd/system/buzz-ci-execd.service": substrate / "buzz-ci-execd.service",
+            "/etc/systemd/system/buzz-ci-execd.socket": substrate / "buzz-ci-execd.socket",
+            "/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf": (
+                substrate / "buzz-ci-execd.service.d/10-host-adapters.conf"
+            ),
+        }
+        for target, source in sources.items():
+            write_file(self.root / target.lstrip("/"), source.read_bytes(), 0o644)
+        if global_policy:
+            source = REPO_ROOT / "deploy/native-ci/activation/tests/fixtures/fedora/10-timeout-abort.conf"
+            write_file(
+                self.root / "usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+                source.read_bytes(), 0o644,
+            )
+        state = driver._read()
+        state["identities"]["buzzci-ctl"] = copy.deepcopy(
+            activation_package.LEGACY_COMPATIBILITY["identity"]
+        )
+        driver._write(state)
+        driver.daemon_reload()
 
 
 class ActivationControllerTests(unittest.TestCase):
@@ -1135,6 +1170,251 @@ class ActivationControllerTests(unittest.TestCase):
         drop_in.write_bytes(b"[Service]\nEnvironment=HOSTILE=1\n")
         with self.assertRaisesRegex(ValueError, "(?:file digest differs|staged readback failed)"):
             CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+    def test_clean_host_without_global_policy_stays_clean_and_exact(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        result = CONTROLLER.stage(
+            manifest, payloads, self.fixture.root, driver, self.fixture.binding,
+        )
+        self.assertEqual(result["preflight"]["legacy_compatibility"]["state"], "clean")
+        global_path = self.fixture.root / "usr/lib/systemd/system/service.d/10-timeout-abort.conf"
+        self.assertFalse(global_path.exists())
+        readback = CONTROLLER._effective_systemd_readback(
+            manifest, self.fixture.root, driver, phase="installed",
+        )
+        self.assertNotIn(
+            "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            readback["buzz-ci-execd.service"]["drop_in_paths"],
+        )
+
+    def test_recognized_global_policy_is_inherited_but_never_mutated(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        source = REPO_ROOT / "deploy/native-ci/activation/tests/fixtures/fedora/10-timeout-abort.conf"
+        target = self.fixture.root / "usr/lib/systemd/system/service.d/10-timeout-abort.conf"
+        write_file(target, source.read_bytes(), 0o644)
+        before = (target.read_bytes(), target.stat().st_mode)
+        driver.daemon_reload()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        readback = CONTROLLER._effective_systemd_readback(
+            manifest, self.fixture.root, driver, phase="installed",
+        )
+        for unit, state in readback.items():
+            if unit.endswith(".service"):
+                self.assertEqual(
+                    state["drop_in_paths"][-1],
+                    "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+                )
+                self.assertEqual(state["drop_in_sha256"][-1], activation_package.digest(source.read_bytes()))
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual((target.read_bytes(), target.stat().st_mode), before)
+
+    def test_global_policy_modified_or_extra_fails_before_receipt(self) -> None:
+        for case in ("modified", "metadata", "provenance", "extra"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                manifest, payloads, driver = fixture.load()
+                source = REPO_ROOT / "deploy/native-ci/activation/tests/fixtures/fedora/10-timeout-abort.conf"
+                target = fixture.root / "usr/lib/systemd/system/service.d/10-timeout-abort.conf"
+                write_file(target, source.read_bytes(), 0o644)
+                if case == "modified":
+                    target.write_bytes(source.read_bytes() + b"# modified\n")
+                    expected = "digest differs"
+                elif case == "metadata":
+                    target.chmod(0o600)
+                    expected = "metadata differs"
+                elif case == "provenance":
+                    driver.rpm_package_owners[str(activation_package.INHERITED_SYSTEMD[
+                        "optional_global_service_drop_ins"
+                    ][0]["path"])] = "unrecognized"
+                    expected = "RPM provenance differs"
+                else:
+                    write_file(
+                        fixture.root / "usr/lib/systemd/system/service.d/20-unrecognized.conf",
+                        b"[Service]\nTimeoutStopSec=99s\n", 0o644,
+                    )
+                    expected = "drop-in paths or order"
+                driver.daemon_reload()
+                with self.assertRaisesRegex(ValueError, expected):
+                    CONTROLLER.stage(manifest, payloads, fixture.root, driver, fixture.binding)
+                self.assertIsNone(CONTROLLER._read_receipt(fixture.root))
+
+    def test_recognized_legacy_host_migrates_and_rollback_restores_exactly(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        self.fixture.install_recognized_legacy_host(driver, global_policy=True)
+        driver.legacy_ownership = [{
+            "path": "/var/lib/buzzci/principals/ctl/state",
+            "kind": "file", "mode": 0o600, "uid": 961, "gid": 961,
+        }]
+        staged = CONTROLLER.stage(
+            manifest, payloads, self.fixture.root, driver, self.fixture.binding,
+        )
+        self.assertEqual(staged["preflight"]["legacy_compatibility"]["state"], "legacy")
+        self.assertEqual(driver.identity("buzzci-ctl")["uid"], manifest["identities"]["qualification"]["uid"])
+        self.assertEqual(driver.legacy_ownership[0]["uid"], manifest["identities"]["qualification"]["uid"])
+        for record in activation_package.LEGACY_COMPATIBILITY["files"]:
+            self.assertFalse((self.fixture.root / record["path"].lstrip("/")).exists())
+        installed = CONTROLLER._effective_systemd_readback(
+            manifest, self.fixture.root, driver, phase="installed",
+        )["buzz-ci-execd.service"]
+        self.assertEqual(installed["fragment_path"], "/usr/lib/systemd/system/buzz-ci-execd.service")
+        self.assertEqual(installed["drop_in_paths"], [
+            "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        ])
+        driver.legacy_ownership = [
+            *driver.legacy_ownership,
+            {
+                "path": "/run/buzzci/acceptance-control.sock",
+                "kind": "socket", "mode": 0o620, "uid": 0,
+                "gid": manifest["identities"]["qualification"]["gid"],
+            },
+        ]
+        rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(rolled_back["state"], "rolled_back")
+        self.assertEqual(driver.identity("buzzci-ctl"), activation_package.LEGACY_COMPATIBILITY["identity"])
+        self.assertEqual(driver.legacy_ownership[0]["uid"], 961)
+        for record in activation_package.LEGACY_COMPATIBILITY["files"]:
+            target = self.fixture.root / record["path"].lstrip("/")
+            self.assertEqual(activation_package.digest(target.read_bytes()), record["sha256"])
+        self.assertEqual(driver.effective_paths("buzz-ci-execd.service"), {
+            "fragment_path": "/etc/systemd/system/buzz-ci-execd.service",
+            "drop_in_paths": [
+                "/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf",
+                "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            ],
+        })
+        self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["status"], "unchanged")
+        retried = CONTROLLER.stage(
+            manifest, payloads, self.fixture.root, driver, self.fixture.binding,
+        )
+        self.assertEqual(retried["state"], "staged_zero")
+
+    def test_legacy_tuple_collision_drift_process_and_ownership_hazards_fail_closed(self) -> None:
+        file_cases = {
+            "service_modified": "/etc/systemd/system/buzz-ci-execd.service",
+            "socket_modified": "/etc/systemd/system/buzz-ci-execd.socket",
+            "dropin_modified": "/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf",
+        }
+        cases = (
+            "uid_collision", *file_cases, "dropin_mode", "partial", "identity_drift",
+            "process", "ownership_escape", "ownership_type",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                manifest, payloads, driver = fixture.load()
+                fixture.install_recognized_legacy_host(driver)
+                if case == "uid_collision":
+                    state = driver._read()
+                    target = manifest["identities"]["qualification"]
+                    state["identities"]["occupied"] = {
+                        "user": "occupied", "group": "occupied",
+                        "uid": target["uid"], "gid": target["gid"],
+                        "primary_gid": target["gid"], "home": "/var/empty",
+                        "shell": "/usr/sbin/nologin", "supplementary_groups": [],
+                    }
+                    driver._write(state)
+                    expected = "occupied"
+                elif case in file_cases:
+                    target = fixture.root / file_cases[case].lstrip("/")
+                    target.write_bytes(target.read_bytes() + b"# modified\n")
+                    expected = "legacy systemd file differs"
+                elif case == "dropin_mode":
+                    target = fixture.root / "etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf"
+                    target.chmod(0o600)
+                    expected = "legacy systemd file differs"
+                elif case == "partial":
+                    (fixture.root / "etc/systemd/system/buzz-ci-execd.socket").unlink()
+                    expected = "file set is partial"
+                elif case == "identity_drift":
+                    state = driver._read()
+                    state["identities"]["buzzci-ctl"]["home"] = "/unexpected"
+                    driver._write(state)
+                    expected = "exact legacy identity"
+                elif case == "process":
+                    driver.legacy_processes = [4242]
+                    expected = "active processes"
+                elif case == "ownership_escape":
+                    driver.legacy_ownership = [{
+                        "path": "/var/lib/buzzci/outside",
+                        "kind": "file", "mode": 0o600, "uid": 961, "gid": 961,
+                    }]
+                    expected = "ownership inventory is unsafe"
+                else:
+                    driver.legacy_ownership = [{
+                        "path": "/var/lib/buzzci/principals/ctl/socket",
+                        "kind": "socket", "mode": 0o600, "uid": 961, "gid": 961,
+                    }]
+                    expected = "ownership inventory is unsafe"
+                before_identity = copy.deepcopy(driver.identity("buzzci-ctl"))
+                with self.assertRaisesRegex(ValueError, expected):
+                    CONTROLLER.stage(manifest, payloads, fixture.root, driver, fixture.binding)
+                self.assertIsNone(CONTROLLER._read_receipt(fixture.root))
+                self.assertEqual(driver.identity("buzzci-ctl"), before_identity)
+
+    def test_legacy_rollback_refuses_new_id_or_file_collision_before_mutation(self) -> None:
+        for case in ("id", "file"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                manifest, payloads, driver = fixture.load()
+                fixture.install_recognized_legacy_host(driver, global_policy=True)
+                CONTROLLER.stage(manifest, payloads, fixture.root, driver, fixture.binding)
+                pristine = copy.deepcopy(driver._read())
+                if case == "id":
+                    state = driver._read()
+                    state["identities"]["occupied-old"] = {
+                        "user": "occupied-old", "group": "occupied-old",
+                        "uid": 961, "gid": 961, "primary_gid": 961,
+                        "home": "/var/empty", "shell": "/usr/sbin/nologin",
+                        "supplementary_groups": [],
+                    }
+                    driver._write(state)
+                    expected = "rollback UID is occupied"
+                else:
+                    write_file(
+                        fixture.root / "etc/systemd/system/buzz-ci-execd.service",
+                        b"[Unit]\nDescription=collision\n", 0o644,
+                    )
+                    expected = "rollback file collision"
+                before = copy.deepcopy(driver._read())
+                with self.assertRaisesRegex(ValueError, expected):
+                    CONTROLLER.rollback(manifest, fixture.root, driver)
+                after = driver._read()
+                self.assertEqual(after, before)
+                self.assertEqual(
+                    after["units"]["buzz-ci-execd.service"],
+                    pristine["units"]["buzz-ci-execd.service"],
+                )
+
+    def test_legacy_mutation_boundaries_rollback_and_retry(self) -> None:
+        boundaries = [
+            "legacy_compatibility:file:0",
+            "legacy_compatibility:file:1",
+            "legacy_compatibility:file:2",
+            "legacy_compatibility:group",
+            "legacy_compatibility:account",
+            "legacy_compatibility:ownership:0",
+        ]
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                fixture = ActivationFixture(Path(temporary))
+                manifest, payloads, driver = fixture.load()
+                fixture.install_recognized_legacy_host(driver, global_policy=True)
+                driver.legacy_ownership = [{
+                    "path": "/var/lib/buzzci/principals/ctl/state",
+                    "kind": "file", "mode": 0o600, "uid": 961, "gid": 961,
+                }]
+                self.cut_stage_process_at(
+                    fixture, manifest, payloads, driver, fixture.binding, boundary,
+                )
+                self.assertEqual(CONTROLLER._read_receipt(fixture.root)["state"], "preparing")
+                rolled_back = self.fixed_rollback_cli(fixture)
+                self.assertEqual(rolled_back.returncode, 0, rolled_back.stderr.decode())
+                self.assertEqual(json.loads(rolled_back.stdout)["state"], "rolled_back")
+                manifest, payloads, driver = fixture.load()
+                retried = CONTROLLER.stage(
+                    manifest, payloads, fixture.root, driver, fixture.binding,
+                )
+                self.assertEqual(retried["state"], "staged_zero")
 
     def test_dependency_drop_in_rejects_missing_and_stale_bytes(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -1651,7 +1931,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "77bc26b4850b0bcca8daa5746cecb79c1e2ebee4a9854327ba7a57ec0a058a10",
+            "1605bc195258773ff28ed4ed0869f28dfa497bb8e46495cf5cd86db18daa9e67",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")

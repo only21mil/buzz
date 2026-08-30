@@ -16,6 +16,8 @@
     "entries",
     "systemd",
     "effective_systemd",
+    "inherited_systemd",
+    "legacy_compatibility",
     "socket_policy",
     "qualification",
     "package_uid",
@@ -108,6 +110,66 @@
       "minItems": 13,
       "maxItems": 13,
       "items": { "$ref": "#/$defs/effectiveUnit" }
+    },
+    "inherited_systemd": {
+      "const": {
+        "optional_global_service_drop_ins": [
+          {
+            "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+            "mode": 420,
+            "uid": 0,
+            "gid": 0,
+            "rpm_package": "systemd"
+          }
+        ]
+      }
+    },
+    "legacy_compatibility": {
+      "const": {
+        "identity": {
+          "user": "buzzci-ctl",
+          "group": "buzzci-ctl",
+          "uid": 961,
+          "gid": 961,
+          "primary_gid": 961,
+          "home": "/var/lib/buzzci/principals/ctl",
+          "shell": "/usr/sbin/nologin",
+          "supplementary_groups": []
+        },
+        "ownership_roots": [
+          "/var/lib/buzzci/ctl",
+          "/var/lib/buzzci/principals/ctl"
+        ],
+        "ownership_scan_roots": [
+          "/etc/buzzci",
+          "/run/buzzci",
+          "/var/lib/buzzci"
+        ],
+        "files": [
+          {
+            "path": "/etc/systemd/system/buzz-ci-execd.service",
+            "sha256": "681adfc8ef9756f20909b34c6acd959558455e44bc1f1a6c14c937328f39eda8",
+            "mode": 420,
+            "uid": 0,
+            "gid": 0
+          },
+          {
+            "path": "/etc/systemd/system/buzz-ci-execd.socket",
+            "sha256": "afa9e9eef2dba23689410788914ce5baa91a8bcfbe9b1dcf7d1ada4f00fabae5",
+            "mode": 420,
+            "uid": 0,
+            "gid": 0
+          },
+          {
+            "path": "/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf",
+            "sha256": "2b9497c8f942156e3ef54167380dbaccf9ddba7ebc4982ab1932fd3bb8c79e04",
+            "mode": 420,
+            "uid": 0,
+            "gid": 0
+          }
+        ]
+      }
     },
     "socket_policy": {
       "const": {

@@ -13,7 +13,7 @@
     "candidate": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"pattern": "^0+$"}},
     "draft": {
       "type": "object",
-      "required": ["schema", "source_commit", "default_state", "identities", "components", "entries", "access_group", "acceptance_template", "systemd", "socket_policy", "qualification", "package_uid", "package_gid"],
+      "required": ["schema", "source_commit", "default_state", "identities", "components", "entries", "access_group", "acceptance_template", "systemd", "effective_systemd", "inherited_systemd", "legacy_compatibility", "socket_policy", "qualification", "package_uid", "package_gid"],
       "properties": {
         "schema": {"const": "buzz-ci-capacity-one-activation-draft-v1"},
         "source_commit": {"$ref": "#/$defs/candidate"}

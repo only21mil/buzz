@@ -74,6 +74,9 @@ MAX_SCENARIO_BYTES = 256 * 1024
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSUSERS = "/usr/bin/systemd-sysusers"
 TMPFILES = "/usr/bin/systemd-tmpfiles"
+USERMOD = "/usr/sbin/usermod"
+GROUPMOD = "/usr/sbin/groupmod"
+RPM = "/usr/bin/rpm"
 MAX_COMMAND_OUTPUT = 256 * 1024
 MAX_BINARY_BYTES = 128 * 1024 * 1024
 EXECD_BINARY_PATH = "/usr/libexec/buzz-ci-execd"
@@ -1513,6 +1516,131 @@ class LiveSystemd:
             raise ValueError(f"incomplete systemd process readback: {name}")
         return {"invocation_id": values["InvocationID"], "main_pid": int(values["MainPID"])}
 
+    @staticmethod
+    def principal_processes(uid: int) -> list[int]:
+        processes: list[int] = []
+        for candidate in sorted(Path("/proc").iterdir(), key=lambda item: item.name):
+            if not candidate.name.isdigit():
+                continue
+            try:
+                status = (candidate / "status").read_text()
+            except FileNotFoundError:
+                continue
+            uid_line = next((line for line in status.splitlines() if line.startswith("Uid:\t")), None)
+            if uid_line is None:
+                raise ValueError(f"process UID readback is incomplete: {candidate.name}")
+            values = uid_line.split()[1:]
+            if len(values) != 4 or any(not value.isdigit() for value in values):
+                raise ValueError(f"process UID readback is invalid: {candidate.name}")
+            if uid in {int(value) for value in values}:
+                processes.append(int(candidate.name))
+        return processes
+
+    @staticmethod
+    def rpm_package_owner(path: str) -> str:
+        result = LiveSystemd._run(RPM, ["-qf", "--qf", "%{NAME}\\n", path])
+        package = result.stdout.decode("utf-8").strip()
+        if not package or "\n" in package:
+            raise ValueError(f"RPM package owner readback is invalid: {path}")
+        return package
+
+    @staticmethod
+    def set_group_gid(name: str, expected_gid: int, target_gid: int) -> None:
+        try:
+            group = grp.getgrnam(name)
+        except KeyError as error:
+            raise ValueError(f"legacy group is absent: {name}") from error
+        if group.gr_gid == target_gid:
+            return
+        if group.gr_gid != expected_gid:
+            raise ValueError(f"legacy group state differs: {name}")
+        try:
+            collision = grp.getgrgid(target_gid).gr_name
+        except KeyError:
+            collision = None
+        if collision is not None:
+            raise ValueError(f"legacy group target GID is occupied: {collision}")
+        LiveSystemd._run(GROUPMOD, ["--gid", str(target_gid), name], mutation=True)
+        try:
+            readback_gid = grp.getgrnam(name).gr_gid
+        except KeyError as error:
+            raise ValueError(f"legacy group migration readback is absent: {name}") from error
+        if readback_gid != target_gid:
+            raise ValueError(f"legacy group migration readback differs: {name}")
+
+    @staticmethod
+    def set_account(
+        name: str,
+        expected: dict[str, object],
+        target: dict[str, object],
+    ) -> None:
+        try:
+            account = pwd.getpwnam(name)
+        except KeyError as error:
+            raise ValueError(f"legacy account is absent: {name}") from error
+        observed = {
+            "uid": account.pw_uid,
+            "primary_gid": account.pw_gid,
+            "home": account.pw_dir,
+            "shell": account.pw_shell,
+        }
+        wanted = {
+            "uid": target["uid"],
+            "primary_gid": target.get("primary_gid", target["gid"]),
+            "home": target["home"],
+            "shell": target["shell"],
+        }
+        if observed == wanted:
+            return
+        expected_account = {
+            "uid": expected["uid"],
+            "primary_gid": expected.get("primary_gid", expected["gid"]),
+            "home": expected["home"],
+            "shell": expected["shell"],
+        }
+        if observed != expected_account:
+            raise ValueError(f"legacy account state differs: {name}")
+        try:
+            collision = pwd.getpwuid(int(target["uid"])).pw_name
+        except KeyError:
+            collision = None
+        if collision is not None:
+            raise ValueError(f"legacy account target UID is occupied: {collision}")
+        LiveSystemd._run(
+            USERMOD,
+            [
+                "--uid", str(target["uid"]),
+                "--gid", str(wanted["primary_gid"]),
+                "--home", str(target["home"]),
+                "--shell", str(target["shell"]),
+                name,
+            ],
+            mutation=True,
+        )
+        try:
+            account = pwd.getpwnam(name)
+        except KeyError as error:
+            raise ValueError(f"legacy account migration readback is absent: {name}") from error
+        readback = {
+            "uid": account.pw_uid,
+            "primary_gid": account.pw_gid,
+            "home": account.pw_dir,
+            "shell": account.pw_shell,
+        }
+        if readback != wanted:
+            raise ValueError(f"legacy account migration readback differs: {name}")
+
+    @staticmethod
+    def set_supplementary_groups(name: str, groups: list[str]) -> None:
+        current = sorted(group.gr_name for group in grp.getgrall() if name in group.gr_mem)
+        wanted = sorted(groups)
+        if current == wanted:
+            return
+        LiveSystemd._run(USERMOD, ["--groups", ",".join(wanted), name], mutation=True)
+        readback = sorted(group.gr_name for group in grp.getgrall() if name in group.gr_mem)
+        if readback != wanted:
+            raise ValueError(f"legacy supplementary-group readback differs: {name}")
+
     def provision(self, _identities: dict[str, object]) -> None:
         self._run(SYSUSERS, [activation_package.STATIC_TARGETS["sysusers"]], mutation=True)
 
@@ -1630,17 +1758,29 @@ class FakeSystemd:
         self.access_group = access_group
         self.socket_policy = socket_policy
         self.effective_systemd = {item["unit"]: item for item in effective_systemd}
+        self.legacy_processes: list[int] = []
+        self.rpm_package_owners: dict[str, str] = {}
 
     def _read(self) -> dict[str, Any]:
         value, _raw, metadata = activation_package.parse_json(self.state_path)
         if stat.S_IMODE(metadata.st_mode) != 0o600:
             raise ValueError("fake systemd state must be mode 0600")
-        if set(value) != {"schema", "units", "identities", "groups", "sockets"} or value["schema"] != "buzz-ci-fake-systemd-v1":
+        if set(value) != {"schema", "units", "identities", "groups", "sockets", "legacy_ownership"} or value["schema"] != "buzz-ci-fake-systemd-v1":
             raise ValueError("fake systemd state schema is invalid")
         return value
 
     def _write(self, value: dict[str, object]) -> None:
         _atomic_write(self.root, "/var/lib/buzzci/activation-controller/fake-systemd-v1.json", activation_package.canonical_json(value), 0o600, os.geteuid(), os.getegid())
+
+    @property
+    def legacy_ownership(self) -> list[dict[str, object]]:
+        return [dict(record) for record in self._read()["legacy_ownership"]]
+
+    @legacy_ownership.setter
+    def legacy_ownership(self, records: list[dict[str, object]]) -> None:
+        state = self._read()
+        state["legacy_ownership"] = [dict(record) for record in records]
+        self._write(state)
 
     def unit(self, name: str) -> dict[str, str]:
         state = self._read()
@@ -1678,6 +1818,82 @@ class FakeSystemd:
             "main_pid": unit.get("MainPID", 0),
         }
 
+    def principal_processes(self, _uid: int) -> list[int]:
+        return list(self.legacy_processes)
+
+    def rpm_package_owner(self, path: str) -> str:
+        return self.rpm_package_owners.get(path, "systemd")
+
+    def set_group_gid(self, name: str, expected_gid: int, target_gid: int) -> None:
+        state = self._read()
+        identity = state["identities"].get(name)
+        if not isinstance(identity, dict):
+            raise ValueError(f"legacy group is absent: {name}")
+        current = identity["gid"]
+        if current == target_gid:
+            return
+        if current != expected_gid:
+            raise ValueError(f"legacy group state differs: {name}")
+        collision = self.numeric_group(target_gid)
+        if collision is not None:
+            raise ValueError(f"legacy group target GID is occupied: {collision}")
+        identity["gid"] = target_gid
+        self._write(state)
+
+    def set_account(
+        self,
+        name: str,
+        expected: dict[str, object],
+        target: dict[str, object],
+    ) -> None:
+        state = self._read()
+        identity = state["identities"].get(name)
+        if not isinstance(identity, dict):
+            raise ValueError(f"legacy account is absent: {name}")
+        keys = ("uid", "primary_gid", "home", "shell")
+        observed = {key: identity[key] for key in keys}
+        wanted = {
+            "uid": target["uid"],
+            "primary_gid": target.get("primary_gid", target["gid"]),
+            "home": target["home"],
+            "shell": target["shell"],
+        }
+        if observed == wanted:
+            return
+        expected_account = {
+            "uid": expected["uid"],
+            "primary_gid": expected.get("primary_gid", expected["gid"]),
+            "home": expected["home"],
+            "shell": expected["shell"],
+        }
+        if observed != expected_account:
+            raise ValueError(f"legacy account state differs: {name}")
+        collision = next(
+            (user for user, record in state["identities"].items() if user != name and record.get("uid") == target["uid"]),
+            None,
+        )
+        if collision is not None:
+            raise ValueError(f"legacy account target UID is occupied: {collision}")
+        identity.update(wanted)
+        self._write(state)
+
+    def set_supplementary_groups(self, name: str, groups: list[str]) -> None:
+        state = self._read()
+        identity = state["identities"].get(name)
+        if not isinstance(identity, dict):
+            raise ValueError(f"legacy account is absent: {name}")
+        identity["supplementary_groups"] = sorted(groups)
+        for group in state["groups"].values():
+            if not isinstance(group, dict) or not isinstance(group.get("members"), list):
+                continue
+            members = set(group["members"])
+            if group.get("group") in groups:
+                members.add(name)
+            else:
+                members.discard(name)
+            group["members"] = sorted(members)
+        self._write(state)
+
     def provision(self, identities: dict[str, object]) -> None:
         state = self._read()
         for role, identity in identities.items():
@@ -1688,7 +1904,20 @@ class FakeSystemd:
                 "supplementary_groups": identity["supplementary_groups"],
             }
             if existing is not None and existing != expected:
-                raise ValueError(f"fake principal drift: {role}")
+                migrated_qualification = (
+                    role == "qualification"
+                    and {
+                        key: value for key, value in existing.items()
+                        if key != "supplementary_groups"
+                    } == {
+                        key: value for key, value in expected.items()
+                        if key != "supplementary_groups"
+                    }
+                    and existing.get("supplementary_groups")
+                    == activation_package.LEGACY_COMPATIBILITY["identity"]["supplementary_groups"]
+                )
+                if not migrated_qualification:
+                    raise ValueError(f"fake principal drift: {role}")
             state["identities"][identity["user"]] = expected
         expected_group = {
             "group": self.access_group["group"],
@@ -1697,7 +1926,15 @@ class FakeSystemd:
         }
         existing_group = state["groups"].get(self.access_group["group"])
         if existing_group is not None and existing_group != expected_group:
-            raise ValueError("fake execd access group drift")
+            legacy_group = {
+                **expected_group,
+                "members": [
+                    member for member in expected_group["members"]
+                    if member != activation_package.LEGACY_COMPATIBILITY["identity"]["user"]
+                ],
+            }
+            if existing_group != legacy_group:
+                raise ValueError("fake execd access group drift")
         state["groups"][self.access_group["group"]] = expected_group
         self._write(state)
 
@@ -1733,6 +1970,17 @@ class FakeSystemd:
         state = self._read()
         for unit, effective in self.effective_systemd.items():
             fragment_path = str(effective["fragment"]["path"])
+            legacy_fragment = next(
+                (
+                    str(record["path"])
+                    for record in activation_package.LEGACY_COMPATIBILITY["files"]
+                    if record["path"] == f"/etc/systemd/system/{unit}"
+                    and activation_package.rooted(self.root, str(record["path"])).is_file()
+                ),
+                None,
+            )
+            if legacy_fragment is not None:
+                fragment_path = legacy_fragment
             unit_path = activation_package.rooted(self.root, fragment_path)
             if unit_path.exists():
                 state["units"].setdefault(unit, {
@@ -1743,10 +1991,23 @@ class FakeSystemd:
                 drop_in_directory = activation_package.rooted(
                     self.root, f"/etc/systemd/system/{unit}.d",
                 )
-                state["units"][unit]["DropInPaths"] = (
+                drop_ins = (
                     [f"/etc/systemd/system/{unit}.d/{path.name}" for path in sorted(drop_in_directory.glob("*.conf"), key=lambda item: item.name.encode())]
                     if drop_in_directory.is_dir() else []
                 )
+                if unit.endswith(".service"):
+                    for global_directory in (
+                        "/etc/systemd/system/service.d",
+                        "/run/systemd/system/service.d",
+                        "/usr/lib/systemd/system/service.d",
+                    ):
+                        directory = activation_package.rooted(self.root, global_directory)
+                        if directory.is_dir():
+                            drop_ins.extend(
+                                f"{global_directory}/{path.name}"
+                                for path in sorted(directory.glob("*.conf"), key=lambda item: item.name.encode())
+                            )
+                state["units"][unit]["DropInPaths"] = drop_ins
             else:
                 state["units"][unit] = {
                     "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
@@ -1894,6 +2155,276 @@ def _access_group_readback(
     return {"status": "exact", **observed}
 
 
+def _path_is_within(path: str, roots: list[str]) -> bool:
+    return any(path == root or path.startswith(f"{root}/") for root in roots)
+
+
+def _live_ownership_inventory(
+    root: Path,
+    uid: int,
+    gid: int,
+    scan_roots: list[str],
+    ownership_roots: list[str],
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for logical_root in scan_roots:
+        candidate = activation_package.rooted(root, logical_root)
+        try:
+            root_metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+            raise ValueError(f"unsafe legacy ownership scan root: {logical_root}")
+        device = root_metadata.st_dev
+        for directory, names, files in os.walk(candidate, topdown=True, followlinks=False):
+            directory_path = Path(directory)
+            kept: list[str] = []
+            for name in names:
+                child = directory_path / name
+                metadata = child.lstat()
+                if metadata.st_dev == device and not stat.S_ISLNK(metadata.st_mode):
+                    kept.append(name)
+                else:
+                    logical = "/" + str(child.relative_to(root)) if root != Path("/") else str(child)
+                    raise ValueError(f"unsafe legacy ownership object: {logical}")
+            names[:] = kept
+            for child in [directory_path, *(directory_path / name for name in files)]:
+                metadata = child.lstat()
+                if metadata.st_dev != device or (metadata.st_uid != uid and metadata.st_gid != gid):
+                    continue
+                logical = "/" + str(child.relative_to(root)) if root != Path("/") else str(child)
+                if not _path_is_within(logical, ownership_roots):
+                    raise ValueError(f"legacy ownership escapes the sealed roots: {logical}")
+                if stat.S_ISREG(metadata.st_mode):
+                    kind = "file"
+                    if metadata.st_nlink != 1:
+                        raise ValueError(f"hard-linked legacy ownership object is unsafe: {logical}")
+                elif stat.S_ISDIR(metadata.st_mode):
+                    kind = "directory"
+                else:
+                    raise ValueError(f"unsafe legacy ownership object: {logical}")
+                records.append({
+                    "path": logical,
+                    "kind": kind,
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                })
+    return sorted(records, key=lambda item: str(item["path"]).encode())
+
+
+def _ownership_inventory(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    uid: int, gid: int,
+) -> list[dict[str, object]]:
+    compatibility = manifest["legacy_compatibility"]
+    if isinstance(driver, FakeSystemd):
+        records = [
+            dict(record) for record in driver.legacy_ownership
+            if record.get("uid") == uid or record.get("gid") == gid
+        ]
+        for record in records:
+            if (
+                set(record) != {"path", "kind", "mode", "uid", "gid"}
+                or record["kind"] not in {"file", "directory"}
+                or not _path_is_within(str(record["path"]), compatibility["ownership_roots"])
+                or (record["uid"] != uid and record["gid"] != gid)
+            ):
+                raise ValueError("fake legacy ownership inventory is unsafe")
+        return sorted(records, key=lambda item: str(item["path"]).encode())
+    return _live_ownership_inventory(
+        root, uid, gid,
+        compatibility["ownership_scan_roots"], compatibility["ownership_roots"],
+    )
+
+
+def _change_ownership(
+    root: Path,
+    driver: LiveSystemd | FakeSystemd,
+    records: list[dict[str, object]],
+    from_uid: int,
+    from_gid: int,
+    to_uid: int,
+    to_gid: int,
+    *,
+    boundary_prefix: str | None = None,
+) -> None:
+    if isinstance(driver, FakeSystemd):
+        persisted = driver.legacy_ownership
+        if len({str(record["path"]) for record in persisted}) != len(persisted):
+            raise ValueError("legacy ownership inventory contains duplicate paths")
+        by_path = {str(record["path"]): record for record in persisted}
+        for index, expected in enumerate(records):
+            record = by_path.get(str(expected["path"]))
+            if record != expected:
+                raise ValueError(f"legacy ownership object changed: {expected['path']}")
+            if record["uid"] == from_uid:
+                record["uid"] = to_uid
+            if record["gid"] == from_gid:
+                record["gid"] = to_gid
+            driver.legacy_ownership = persisted
+            if boundary_prefix is not None:
+                _stage_restart_boundary(f"{boundary_prefix}:{index}")
+        return
+    for index, record in enumerate(records):
+        target = activation_package.rooted(root, str(record["path"]))
+        metadata = target.lstat()
+        kind = "file" if stat.S_ISREG(metadata.st_mode) else "directory" if stat.S_ISDIR(metadata.st_mode) else "unsafe"
+        expected_uid = to_uid if record["uid"] == from_uid else record["uid"]
+        expected_gid = to_gid if record["gid"] == from_gid else record["gid"]
+        if (
+            kind != record["kind"]
+            or stat.S_IMODE(metadata.st_mode) != record["mode"]
+            or metadata.st_uid not in {record["uid"], expected_uid}
+            or metadata.st_gid not in {record["gid"], expected_gid}
+        ):
+            raise ValueError(f"legacy ownership object changed: {record['path']}")
+        os.chown(
+            target,
+            expected_uid,
+            expected_gid,
+            follow_symlinks=False,
+        )
+        if boundary_prefix is not None:
+            _stage_restart_boundary(f"{boundary_prefix}:{index}")
+
+
+def _rollback_ownership_readback(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    compatibility: dict[str, Any], target_identity: dict[str, Any],
+) -> list[dict[str, object]]:
+    legacy_identity = compatibility["identity"]
+    sealed = {str(record["path"]): record for record in compatibility["ownership"]}
+    current_old = _ownership_inventory(
+        manifest, root, driver, legacy_identity["uid"], legacy_identity["gid"],
+    )
+    unexpected_old = sorted(
+        str(record["path"]) for record in current_old
+        if str(record["path"]) not in sealed
+    )
+    if unexpected_old:
+        raise ValueError(f"new legacy ownership objects appeared: {unexpected_old}")
+    if isinstance(driver, FakeSystemd):
+        all_records = driver.legacy_ownership
+        if len({str(record["path"]) for record in all_records}) != len(all_records):
+            raise ValueError("legacy ownership inventory contains duplicate paths")
+        observed_by_path = {str(record["path"]): record for record in all_records}
+    else:
+        observed_by_path: dict[str, dict[str, object]] = {}
+        for path in sealed:
+            target = activation_package.rooted(root, path)
+            try:
+                metadata = target.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                kind = "file"
+                if metadata.st_nlink != 1:
+                    raise ValueError(f"hard-linked legacy ownership object is unsafe: {path}")
+            elif stat.S_ISDIR(metadata.st_mode):
+                kind = "directory"
+            else:
+                kind = "unsafe"
+            observed_by_path[path] = {
+                "path": path,
+                "kind": kind,
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+            }
+    result: list[dict[str, object]] = []
+    for path, prior in sealed.items():
+        current = observed_by_path.get(path)
+        expected_uid = (
+            target_identity["uid"]
+            if prior["uid"] == legacy_identity["uid"] else prior["uid"]
+        )
+        expected_gid = (
+            target_identity["gid"]
+            if prior["gid"] == legacy_identity["gid"] else prior["gid"]
+        )
+        if (
+            current is None
+            or set(current) != {"path", "kind", "mode", "uid", "gid"}
+            or current["kind"] != prior["kind"]
+            or current["mode"] != prior["mode"]
+            or current["uid"] not in {prior["uid"], expected_uid}
+            or current["gid"] not in {prior["gid"], expected_gid}
+        ):
+            raise ValueError(f"legacy ownership rollback object differs: {path}")
+        result.append(current)
+    return sorted(result, key=lambda item: str(item["path"]).encode())
+
+
+def _legacy_compatibility_capture(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+) -> dict[str, Any]:
+    plan = manifest["legacy_compatibility"]
+    target_identity = manifest["identities"]["qualification"]
+    target_identity_readback = {
+        "user": target_identity["user"],
+        "group": target_identity["group"],
+        "uid": target_identity["uid"],
+        "gid": target_identity["gid"],
+        "primary_gid": target_identity["gid"],
+        "home": target_identity["home"],
+        "shell": target_identity["shell"],
+        "supplementary_groups": target_identity["supplementary_groups"],
+    }
+    observed_files: list[dict[str, object]] = []
+    absent = 0
+    for expected in plan["files"]:
+        opened = _read_target(root, expected["path"], activation_package.MAX_ASSET_BYTES)
+        if opened is None:
+            absent += 1
+            continue
+        payload, metadata = opened
+        expected_uid, expected_gid = _physical_ids(root, expected["uid"], expected["gid"])
+        if (
+            activation_package.digest(payload) != expected["sha256"]
+            or _metadata_dict(metadata) != {
+                "mode": expected["mode"], "uid": expected_uid, "gid": expected_gid,
+            }
+        ):
+            raise ValueError(f"legacy systemd file differs: {expected['path']}")
+        observed_files.append({
+            **expected,
+            "payload_base64": base64.b64encode(payload).decode("ascii"),
+        })
+    observed_identity = driver.identity(plan["identity"]["user"])
+    if absent == len(plan["files"]):
+        if observed_identity is not None and observed_identity != target_identity_readback:
+            raise ValueError("clean host has an unrecognized buzzci-ctl identity")
+        return {"state": "clean", "files": [], "identity": None, "ownership": []}
+    if absent != 0:
+        raise ValueError("legacy systemd file set is partial")
+    if observed_identity != plan["identity"]:
+        raise ValueError("legacy systemd files require the exact legacy identity")
+    target_numeric = driver.numeric_identity(target_identity["uid"], target_identity["gid"])
+    if target_numeric != {"user": None, "group": None}:
+        raise ValueError("sealed buzzci-ctl UID or GID is occupied")
+    processes = driver.principal_processes(plan["identity"]["uid"])
+    if processes:
+        raise ValueError(f"legacy buzzci-ctl has active processes: {processes}")
+    ownership = _ownership_inventory(
+        manifest, root, driver, plan["identity"]["uid"], plan["identity"]["gid"],
+    )
+    return {
+        "state": "legacy",
+        "files": observed_files,
+        "identity": dict(plan["identity"]),
+        "ownership": ownership,
+    }
+
+
+def _legacy_compatibility_summary(value: dict[str, Any]) -> dict[str, object]:
+    return {
+        "state": value["state"],
+        "files": [record["path"] for record in value["files"]],
+        "ownership": [record["path"] for record in value["ownership"]],
+    }
+
+
 def _component_readback(
     manifest: dict[str, Any], root: Path, *, allow_installable_absent: bool = False,
 ) -> dict[str, object]:
@@ -1971,11 +2502,34 @@ def _systemd_file_digest(root: Path, record: dict[str, object], where: str) -> s
     opened = _read_target(root, str(record["path"]), activation_package.MAX_ASSET_BYTES)
     if opened is None:
         raise ValueError(f"effective systemd file is missing: {where}")
-    payload, _metadata = opened
+    payload, metadata = opened
     observed = activation_package.digest(payload)
     if observed != record["sha256"]:
         raise ValueError(f"effective systemd file digest differs: {where}")
+    if {"mode", "uid", "gid"} <= set(record):
+        expected_uid, expected_gid = _physical_ids(root, int(record["uid"]), int(record["gid"]))
+        if _metadata_dict(metadata) != {
+            "mode": int(record["mode"]), "uid": expected_uid, "gid": expected_gid,
+        }:
+            raise ValueError(f"effective systemd file metadata differs: {where}")
     return observed
+
+
+def _inherited_systemd_drop_ins(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd, unit: str,
+) -> list[dict[str, object]]:
+    if not unit.endswith(".service"):
+        return []
+    result: list[dict[str, object]] = []
+    for record in manifest["inherited_systemd"]["optional_global_service_drop_ins"]:
+        opened = _read_target(root, str(record["path"]), activation_package.MAX_ASSET_BYTES)
+        if opened is None:
+            continue
+        _systemd_file_digest(root, record, f"inherited global drop-in {record['path']}")
+        if driver.rpm_package_owner(str(record["path"])) != record["rpm_package"]:
+            raise ValueError(f"inherited global drop-in RPM provenance differs: {record['path']}")
+        result.append(record)
+    return result
 
 
 def _effective_systemd_readback(
@@ -1985,6 +2539,7 @@ def _effective_systemd_readback(
     *,
     phase: str,
     names: set[str] | None = None,
+    legacy_compatibility: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, object]]:
     if phase not in {"prior", "installed"}:
         raise ValueError("effective systemd phase is invalid")
@@ -1996,11 +2551,23 @@ def _effective_systemd_readback(
     for name in selected:
         item = inventory[name]
         fragment = item["fragment"]
+        legacy_files = {
+            record["path"]: record
+            for record in (legacy_compatibility or {}).get("files", [])
+        }
+        legacy_fragment = legacy_files.get(f"/etc/systemd/system/{name}")
+        if legacy_fragment is not None:
+            fragment = legacy_fragment
         state = driver.unit(name)
         paths = driver.effective_paths(name)
         expected_fragment = (
             fragment
-            if phase == "installed" or fragment["owner"] != "activation" or state["LoadState"] == "loaded"
+            if (
+                legacy_fragment is not None
+                or phase == "installed"
+                or fragment["owner"] != "activation"
+                or state["LoadState"] == "loaded"
+            )
             else None
         )
         expected_drop_ins = [
@@ -2011,6 +2578,12 @@ def _effective_systemd_readback(
                 or _read_target(root, str(record["path"]), activation_package.MAX_ASSET_BYTES) is not None
             )
         ]
+        legacy_drop_in = legacy_files.get(
+            f"/etc/systemd/system/{name}.d/10-host-adapters.conf"
+        )
+        if legacy_drop_in is not None:
+            expected_drop_ins.insert(0, legacy_drop_in)
+        expected_drop_ins.extend(_inherited_systemd_drop_ins(manifest, root, driver, name))
         if expected_fragment is None:
             if state["LoadState"] != "not-found" or paths != {"fragment_path": "", "drop_in_paths": []}:
                 raise ValueError(f"absent activation systemd unit has an effective path: {name}")
@@ -2128,9 +2701,39 @@ def preflight(
     payloads: dict[str, bytes] | None = None,
     allow_recovery_upgrade: bool = False,
 ) -> dict[str, object]:
+    legacy_compatibility = _legacy_compatibility_capture(manifest, root, driver)
     components = _component_readback(manifest, root, allow_installable_absent=True)
-    principals = _identity_readback(driver, manifest["identities"], allow_absent=True)
-    access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=True)
+    if legacy_compatibility["state"] == "legacy":
+        identities = {
+            role: identity for role, identity in manifest["identities"].items()
+            if role != "qualification"
+        }
+        principals = _identity_readback(driver, identities, allow_absent=True)
+        principals["qualification"] = {
+            "status": "recognized_legacy", **legacy_compatibility["identity"],
+        }
+    else:
+        principals = _identity_readback(driver, manifest["identities"], allow_absent=True)
+    if legacy_compatibility["state"] == "legacy":
+        observed_access = driver.group(manifest["access_group"]["group"])
+        legacy_access = {
+            "group": manifest["access_group"]["group"],
+            "gid": manifest["access_group"]["gid"],
+            "members": [
+                member for member in manifest["access_group"]["members"]
+                if member != legacy_compatibility["identity"]["user"]
+            ],
+        }
+        if observed_access is None:
+            if driver.numeric_group(manifest["access_group"]["gid"]) is not None:
+                raise ValueError("planned execd access group GID is already occupied")
+            access_group = {"status": "absent"}
+        elif observed_access == legacy_access:
+            access_group = {"status": "recognized_legacy", **observed_access}
+        else:
+            raise ValueError("legacy execd access group drift")
+    else:
+        access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=True)
     managed = _managed_readback(
         manifest, root, {"absent", "staged", "prior"},
         allow_recovery_upgrade=allow_recovery_upgrade,
@@ -2141,7 +2744,10 @@ def preflight(
     units: dict[str, dict[str, object]] = {}
     if require_dormant:
         _preflight_units(driver)
-        units = _effective_systemd_readback(manifest, root, driver, phase="prior")
+        units = _effective_systemd_readback(
+            manifest, root, driver, phase="prior",
+            legacy_compatibility=legacy_compatibility,
+        )
     keyholder_config = _keyholder_config_readback(manifest, root, payloads)
     return {
         "activation_id": manifest["activation_id"],
@@ -2150,6 +2756,7 @@ def preflight(
         "components": components,
         "keyholder_config": keyholder_config,
         "principals": principals,
+        "legacy_compatibility": _legacy_compatibility_summary(legacy_compatibility),
         "access_group": access_group,
         "managed_targets": managed,
         "units": units,
@@ -2161,6 +2768,7 @@ def _new_receipt(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
     generated: list[dict[str, object]],
 ) -> dict[str, object]:
+    legacy_compatibility = _legacy_compatibility_capture(manifest, root, driver)
     records: list[dict[str, object]] = []
     for entry in manifest["entries"]:
         opened = _read_target(root, entry["target"])
@@ -2196,6 +2804,7 @@ def _new_receipt(
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "principals_retained_on_rollback": True,
+        "legacy_compatibility": legacy_compatibility,
         "targets": records,
         "acceptance_generated": _generated_records(root, generated),
         "acceptance_ledger_prior": _capture_acceptance_ledger(manifest, root),
@@ -2205,6 +2814,7 @@ def _new_receipt(
         },
         "systemd_before": _effective_systemd_readback(
             manifest, root, driver, phase="prior",
+            legacy_compatibility=legacy_compatibility,
         ),
         "qualification": None,
         "capacity_one": None,
@@ -2215,10 +2825,57 @@ def _new_receipt(
     }
 
 
+def _validate_legacy_compatibility_receipt(
+    value: object, manifest: dict[str, Any],
+) -> None:
+    if not isinstance(value, dict) or set(value) != {"state", "files", "identity", "ownership"}:
+        raise ValueError("legacy compatibility receipt shape differs")
+    if value["state"] == "clean":
+        if value != {"state": "clean", "files": [], "identity": None, "ownership": []}:
+            raise ValueError("clean legacy compatibility receipt differs")
+        return
+    if value["state"] != "legacy" or value["identity"] != manifest["legacy_compatibility"]["identity"]:
+        raise ValueError("legacy compatibility receipt identity differs")
+    files = value["files"]
+    expected_files = manifest["legacy_compatibility"]["files"]
+    if not isinstance(files, list) or len(files) != len(expected_files):
+        raise ValueError("legacy compatibility receipt files differ")
+    for record, expected in zip(files, expected_files, strict=True):
+        if not isinstance(record, dict) or set(record) != set(expected) | {"payload_base64"}:
+            raise ValueError("legacy compatibility receipt file shape differs")
+        payload = base64.b64decode(record["payload_base64"], validate=True)
+        if (
+            {key: record[key] for key in expected} != expected
+            or activation_package.digest(payload) != expected["sha256"]
+        ):
+            raise ValueError("legacy compatibility receipt file binding differs")
+    ownership = value["ownership"]
+    if not isinstance(ownership, list):
+        raise ValueError("legacy compatibility ownership receipt differs")
+    observed_paths: list[str] = []
+    for record in ownership:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "kind", "mode", "uid", "gid"}
+            or record["kind"] not in {"file", "directory"}
+            or not _path_is_within(
+                str(record["path"]), manifest["legacy_compatibility"]["ownership_roots"],
+            )
+            or (
+                record["uid"] != value["identity"]["uid"]
+                and record["gid"] != value["identity"]["gid"]
+            )
+        ):
+            raise ValueError("legacy compatibility ownership receipt is unsafe")
+        observed_paths.append(str(record["path"]))
+    if observed_paths != sorted(set(observed_paths), key=str.encode):
+        raise ValueError("legacy compatibility ownership receipt order differs")
+
+
 def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
     expected_keys = {
         "schema", "activation_id", "package_digest", "source_commit", "state", "created_at", "updated_at",
-        "principals_retained_on_rollback", "targets", "acceptance_generated", "acceptance_ledger_prior",
+        "principals_retained_on_rollback", "legacy_compatibility", "targets", "acceptance_generated", "acceptance_ledger_prior",
         "fixed_package", "systemd_before", "qualification", "capacity_one", "persistent_authorization",
         "persistent_activation", "qualification_zero", "last_error",
     }
@@ -2241,6 +2898,7 @@ def _bind_receipt(receipt: dict[str, Any], manifest: dict[str, Any]) -> None:
         "manifest_sha256": activation_package.digest(activation_package.canonical_json(manifest)),
     }:
         raise ValueError("receipt fixed activation package binding differs")
+    _validate_legacy_compatibility_receipt(receipt["legacy_compatibility"], manifest)
     _validate_qualification_state(receipt["qualification"], receipt)
     _validate_capacity_one_state(receipt["capacity_one"], receipt)
     _validate_persistent_authorization(receipt["persistent_authorization"], receipt)
@@ -2525,7 +3183,10 @@ def _systemd_prior_readback(
     receipt: dict[str, Any], manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, dict[str, object]]:
     prior = receipt["systemd_before"]
-    observed = _effective_systemd_readback(manifest, root, driver, phase="prior")
+    observed = _effective_systemd_readback(
+        manifest, root, driver, phase="prior",
+        legacy_compatibility=receipt["legacy_compatibility"],
+    )
     for name, expected in prior.items():
         for field in (
             "LoadState", "ActiveState", "UnitFileState", "fragment_path",
@@ -2976,6 +3637,146 @@ def _capacity_one_fragment_readback(driver: LiveSystemd | FakeSystemd) -> dict[s
     return result
 
 
+def _apply_legacy_compatibility(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    driver: LiveSystemd | FakeSystemd,
+) -> None:
+    compatibility = receipt["legacy_compatibility"]
+    _validate_legacy_compatibility_receipt(compatibility, manifest)
+    if compatibility["state"] == "clean":
+        return
+    current = _legacy_compatibility_capture(manifest, root, driver)
+    if current != compatibility:
+        raise ValueError("legacy compatibility changed after receipt capture")
+    for index, record in enumerate(compatibility["files"]):
+        _unlink_target(root, record["path"])
+        _stage_restart_boundary(f"legacy_compatibility:file:{index}")
+    legacy_identity = compatibility["identity"]
+    target_identity = manifest["identities"]["qualification"]
+    driver.set_group_gid(
+        legacy_identity["group"], legacy_identity["gid"], target_identity["gid"],
+    )
+    _stage_restart_boundary("legacy_compatibility:group")
+    driver.set_account(
+        legacy_identity["user"], legacy_identity, target_identity,
+    )
+    _stage_restart_boundary("legacy_compatibility:account")
+    _change_ownership(
+        root, driver, compatibility["ownership"],
+        legacy_identity["uid"], legacy_identity["gid"],
+        target_identity["uid"], target_identity["gid"],
+        boundary_prefix="legacy_compatibility:ownership",
+    )
+
+
+def _restore_legacy_compatibility(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    driver: LiveSystemd | FakeSystemd,
+) -> None:
+    compatibility = receipt["legacy_compatibility"]
+    _validate_legacy_compatibility_receipt(compatibility, manifest)
+    if compatibility["state"] == "clean":
+        return
+    legacy_identity = compatibility["identity"]
+    target_identity = manifest["identities"]["qualification"]
+    for record in compatibility["files"]:
+        opened = _read_target(root, record["path"], activation_package.MAX_ASSET_BYTES)
+        if opened is None:
+            continue
+        payload, metadata = opened
+        expected_uid, expected_gid = _physical_ids(root, record["uid"], record["gid"])
+        if (
+            activation_package.digest(payload) != record["sha256"]
+            or _metadata_dict(metadata) != {
+                "mode": record["mode"], "uid": expected_uid, "gid": expected_gid,
+            }
+        ):
+            raise ValueError(f"legacy rollback file collision: {record['path']}")
+    numeric = driver.numeric_identity(legacy_identity["uid"], legacy_identity["gid"])
+    if numeric["user"] not in {None, legacy_identity["user"]}:
+        raise ValueError(f"legacy rollback UID is occupied: {numeric['user']}")
+    if numeric["group"] not in {None, legacy_identity["group"]}:
+        raise ValueError(f"legacy rollback GID is occupied: {numeric['group']}")
+    processes = driver.principal_processes(target_identity["uid"])
+    if processes:
+        raise ValueError(f"sealed buzzci-ctl has active processes during rollback: {processes}")
+    current = _rollback_ownership_readback(
+        manifest, root, driver, compatibility, target_identity,
+    )
+    _change_ownership(
+        root, driver, current,
+        target_identity["uid"], target_identity["gid"],
+        legacy_identity["uid"], legacy_identity["gid"],
+    )
+    _stage_restart_boundary("legacy_compatibility:restore_ownership")
+    driver.set_supplementary_groups(
+        legacy_identity["user"], legacy_identity["supplementary_groups"],
+    )
+    _stage_restart_boundary("legacy_compatibility:restore_groups")
+    driver.set_group_gid(
+        legacy_identity["group"], target_identity["gid"], legacy_identity["gid"],
+    )
+    _stage_restart_boundary("legacy_compatibility:restore_gid")
+    driver.set_account(
+        legacy_identity["user"], target_identity, legacy_identity,
+    )
+    _stage_restart_boundary("legacy_compatibility:restore_account")
+    for index, record in enumerate(compatibility["files"]):
+        opened = _read_target(root, record["path"], activation_package.MAX_ASSET_BYTES)
+        if opened is None:
+            _atomic_write(
+                root, record["path"],
+                base64.b64decode(record["payload_base64"], validate=True),
+                record["mode"], record["uid"], record["gid"],
+            )
+        else:
+            payload, metadata = opened
+            expected_uid, expected_gid = _physical_ids(root, record["uid"], record["gid"])
+            if (
+                activation_package.digest(payload) != record["sha256"]
+                or _metadata_dict(metadata) != {
+                    "mode": record["mode"], "uid": expected_uid, "gid": expected_gid,
+                }
+            ):
+                raise ValueError(f"legacy rollback file collision: {record['path']}")
+        _stage_restart_boundary(f"legacy_compatibility:restore_file:{index}")
+    if driver.identity(legacy_identity["user"]) != legacy_identity:
+        raise ValueError("legacy identity rollback readback differs")
+
+
+def _legacy_rollback_preflight(
+    receipt: dict[str, Any], manifest: dict[str, Any], root: Path,
+    driver: LiveSystemd | FakeSystemd,
+) -> None:
+    compatibility = receipt["legacy_compatibility"]
+    _validate_legacy_compatibility_receipt(compatibility, manifest)
+    if compatibility["state"] == "clean":
+        return
+    legacy_identity = compatibility["identity"]
+    target_identity = manifest["identities"]["qualification"]
+    for record in compatibility["files"]:
+        opened = _read_target(root, record["path"], activation_package.MAX_ASSET_BYTES)
+        if opened is None:
+            continue
+        payload, metadata = opened
+        expected_uid, expected_gid = _physical_ids(root, record["uid"], record["gid"])
+        if (
+            activation_package.digest(payload) != record["sha256"]
+            or _metadata_dict(metadata) != {
+                "mode": record["mode"], "uid": expected_uid, "gid": expected_gid,
+            }
+        ):
+            raise ValueError(f"legacy rollback file collision: {record['path']}")
+    numeric = driver.numeric_identity(legacy_identity["uid"], legacy_identity["gid"])
+    if numeric["user"] not in {None, legacy_identity["user"]}:
+        raise ValueError(f"legacy rollback UID is occupied: {numeric['user']}")
+    if numeric["group"] not in {None, legacy_identity["group"]}:
+        raise ValueError(f"legacy rollback GID is occupied: {numeric['group']}")
+    _rollback_ownership_readback(
+        manifest, root, driver, compatibility, target_identity,
+    )
+
+
 def _active_capacity_one_readback(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
     processes_before: dict[str, dict[str, object]],
@@ -3389,6 +4190,10 @@ def _compensate_failed_stage(
     except BaseException as error:
         errors.append(f"restore controld acceptance ledger: {error}")
     try:
+        _restore_legacy_compatibility(receipt, manifest, root, driver)
+    except BaseException as error:
+        errors.append(f"restore legacy compatibility: {error}")
+    try:
         driver.daemon_reload()
     except BaseException as error:
         errors.append(f"daemon-reload: {error}")
@@ -3519,6 +4324,7 @@ def _stage_unlocked(
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     _stage_restart_boundary("preparing_receipt:readback")
     try:
+        _apply_legacy_compatibility(receipt, manifest, root, driver)
         _apply_phase(manifest, payloads, root, "staged")
         driver.provision(manifest["identities"])
         driver.tmpfiles()
@@ -3611,7 +4417,10 @@ def _socket_readback(
     return result
 
 
-def _active_health(manifest: dict[str, Any], driver: LiveSystemd | FakeSystemd, *, require_enabled: bool) -> dict[str, object]:
+def _active_health(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+    *, require_enabled: bool,
+) -> dict[str, object]:
     names = activation_package.START_ORDER + [activation_package.PERSISTENT_UNIT]
     units = _unit_readback(driver, names)
     for name, state in units.items():
@@ -3619,7 +4428,13 @@ def _active_health(manifest: dict[str, Any], driver: LiveSystemd | FakeSystemd, 
             raise ValueError(f"activation health failed for unit: {name}")
     if require_enabled and units[activation_package.PERSISTENT_UNIT]["UnitFileState"] != "enabled":
         raise ValueError("capacity-one target enablement readback failed")
-    return {"units": units, "sockets": _socket_readback(manifest, driver)}
+    return {
+        "units": units,
+        "effective_systemd": _effective_systemd_readback(
+            manifest, root, driver, phase="installed",
+        ),
+        "sockets": _socket_readback(manifest, driver),
+    }
 
 
 def _limit_output() -> None:
@@ -4362,9 +5177,9 @@ def _qualify_unlocked(
     _verify_phase(manifest, root, "active")
     _verify_generated(root, receipt["acceptance_generated"], phase="active")
     try:
-        before = _active_health(manifest, driver, require_enabled=True)
+        before = _active_health(manifest, root, driver, require_enabled=True)
         result = _run_qualification(manifest, root, receipt)
-        after = _active_health(manifest, driver, require_enabled=True)
+        after = _active_health(manifest, root, driver, require_enabled=True)
         receipt.update({"updated_at": utc_now()})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         return {"status": "qualified", "state": "active_one", "before": before, "qualification": result, "after": after}
@@ -4632,6 +5447,11 @@ def _rollback_terminal_response(
         if entry["role"] != "execd_config" and entry["role"] not in ROLLBACK_RECOVERY_ROLES
     ]
     generated_restored = [record["target"] for record in reversed(receipt["acceptance_generated"])]
+    legacy_principal = (
+        receipt["legacy_compatibility"]["identity"]["user"]
+        if receipt["legacy_compatibility"]["state"] == "legacy"
+        else None
+    )
     return {
         "status": status,
         "state": "rolled_back",
@@ -4644,7 +5464,11 @@ def _rollback_terminal_response(
         "acceptance_ledger": ledger_prior,
         "fixed_package": "absent",
         "rollback_cleanup": ROLLBACK_CLEANUP_PATH,
-        "retained_principals": sorted(identity["user"] for identity in manifest["identities"].values()),
+        "retained_principals": sorted(
+            identity["user"] for identity in manifest["identities"].values()
+            if identity["user"] != legacy_principal
+        ),
+        "restored_legacy_principal": legacy_principal,
         "units": units,
     }
 
@@ -4688,6 +5512,7 @@ def _rollback_unlocked(
         raise ValueError(f"rollback cannot start from receipt state {receipt['state']}")
     try:
         _validate_receipt_targets(receipt, manifest)
+        _legacy_rollback_preflight(receipt, manifest, root, driver)
         _restore_prior(receipt, manifest, root, apply=False)
         _validate_generated_records(receipt, root, apply=False)
         _install_recovery_targets(receipt, manifest, root)
@@ -4709,6 +5534,10 @@ def _rollback_unlocked(
         _restore_acceptance_ledger(receipt, manifest, root)
     except BaseException as error:
         errors.append(f"restore controld acceptance ledger: {error}")
+    try:
+        _restore_legacy_compatibility(receipt, manifest, root, driver)
+    except BaseException as error:
+        errors.append(f"restore legacy compatibility: {error}")
     try:
         driver.daemon_reload()
     except BaseException as error:

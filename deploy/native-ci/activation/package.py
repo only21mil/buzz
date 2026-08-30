@@ -82,6 +82,64 @@ ACTIVATION_CONTROLLER_PATH = "/usr/libexec/buzz-ci-activation-controller"
 ACTIVATION_PACKAGE_MODULE_PATH = "/usr/libexec/buzz_ci_activation_package.py"
 FIXED_PACKAGE_PATH = "/var/lib/buzzci/activation-controller/package"
 
+LEGACY_COMPATIBILITY = {
+    "identity": {
+        "user": "buzzci-ctl",
+        "group": "buzzci-ctl",
+        "uid": 961,
+        "gid": 961,
+        "primary_gid": 961,
+        "home": "/var/lib/buzzci/principals/ctl",
+        "shell": "/usr/sbin/nologin",
+        "supplementary_groups": [],
+    },
+    "ownership_roots": [
+        "/var/lib/buzzci/ctl",
+        "/var/lib/buzzci/principals/ctl",
+    ],
+    "ownership_scan_roots": [
+        "/etc/buzzci",
+        "/run/buzzci",
+        "/var/lib/buzzci",
+    ],
+    "files": [
+        {
+            "path": "/etc/systemd/system/buzz-ci-execd.service",
+            "sha256": "681adfc8ef9756f20909b34c6acd959558455e44bc1f1a6c14c937328f39eda8",
+            "mode": 0o644,
+            "uid": 0,
+            "gid": 0,
+        },
+        {
+            "path": "/etc/systemd/system/buzz-ci-execd.socket",
+            "sha256": "afa9e9eef2dba23689410788914ce5baa91a8bcfbe9b1dcf7d1ada4f00fabae5",
+            "mode": 0o644,
+            "uid": 0,
+            "gid": 0,
+        },
+        {
+            "path": "/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf",
+            "sha256": "2b9497c8f942156e3ef54167380dbaccf9ddba7ebc4982ab1932fd3bb8c79e04",
+            "mode": 0o644,
+            "uid": 0,
+            "gid": 0,
+        },
+    ],
+}
+
+INHERITED_SYSTEMD = {
+    "optional_global_service_drop_ins": [
+        {
+            "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+            "mode": 0o644,
+            "uid": 0,
+            "gid": 0,
+            "rpm_package": "systemd",
+        },
+    ],
+}
+
 CONFIG_TARGETS = {
     "runner_config": "/etc/buzzci/runner-v2.json",
     "execd_config": "/etc/buzzci/execd-v2.json",
@@ -562,7 +620,8 @@ def _validate_entry(value: object) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) -> dict[str, Any]:
     expected = {
         "schema", "activation_id", "source_commit", "default_state", "identities", "components", "entries",
-        "access_group", "acceptance_template", "systemd", "effective_systemd", "socket_policy", "qualification", "package_uid",
+        "access_group", "acceptance_template", "systemd", "effective_systemd", "inherited_systemd",
+        "legacy_compatibility", "socket_policy", "qualification", "package_uid",
         "package_gid", "package_digest",
     }
     if not require_digest:
@@ -662,6 +721,10 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
                     raise ValueError(f"activation effective systemd bytes differ: {record['path']}")
             elif role is not None:
                 raise ValueError(f"non-activation systemd path is activation-owned: {record['path']}")
+    if manifest["inherited_systemd"] != INHERITED_SYSTEMD:
+        raise ValueError("inherited systemd compatibility differs from the fixed plan")
+    if manifest["legacy_compatibility"] != LEGACY_COMPATIBILITY:
+        raise ValueError("legacy host compatibility differs from the fixed plan")
 
     systemd = manifest["systemd"]
     require_keys(systemd, {"start_order", "stop_order", "persistent_unit", "stage_capacity", "active_capacity"}, "systemd plan")
