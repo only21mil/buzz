@@ -581,6 +581,71 @@ class KeyholderPackageTests(unittest.TestCase):
         self.assertEqual(target.readlink(), outside)
         self.assertEqual(outside.read_bytes(), b"outside\n")
 
+    def test_failed_exchange_preserves_second_writer_cleans_temps_and_retries_exactly(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        target = root / "usr/libexec/buzz-ci-keyholder"
+        target.parent.mkdir(mode=0o755)
+        target.parent.chmod(0o755)
+        target.write_bytes(b"baseline-a\n")
+        target.chmod(0o640)
+        writer_one = b"external-writer-one\n"
+        writer_two = b"external-writer-two\n"
+        real_renameat2 = INSTALLER._renameat2
+        real_prior = INSTALLER._prior_target_at
+        exchanged = False
+        injected_one = False
+        injected_two = False
+
+        def exchange_after_first_writer(source_fd, source, destination_fd, destination, flags):
+            nonlocal exchanged, injected_one
+            initial_exchange = flags == INSTALLER.RENAME_EXCHANGE and destination == target.name and not injected_one
+            if initial_exchange:
+                injected_one = True
+                substitute = target.with_name(f".{target.name}.writer-one")
+                substitute.write_bytes(writer_one)
+                substitute.chmod(0o600)
+                os.replace(substitute, target)
+            result = real_renameat2(source_fd, source, destination_fd, destination, flags)
+            if initial_exchange:
+                exchanged = True
+            return result
+
+        def second_writer_before_displaced_validation(directory_fd, name):
+            nonlocal injected_two
+            if exchanged and name.startswith(f".{target.name}.") and not injected_two:
+                injected_two = True
+                substitute = target.with_name(f".{target.name}.writer-two")
+                substitute.write_bytes(writer_two)
+                substitute.chmod(0o620)
+                os.replace(substitute, target)
+            return real_prior(directory_fd, name)
+
+        with (
+            mock.patch.object(INSTALLER, "_renameat2", side_effect=exchange_after_first_writer),
+            mock.patch.object(INSTALLER, "_prior_target_at", side_effect=second_writer_before_displaced_validation),
+        ):
+            with self.assertRaisesRegex(INSTALLER.ConcurrentMutation, "compare-and-swap"):
+                INSTALLER.install(self.package, root)
+        self.assertTrue(injected_one)
+        self.assertTrue(injected_two)
+        self.assertEqual(target.read_bytes(), writer_two)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o620)
+        self.assertEqual(list(target.parent.glob(f".{target.name}.*")), [])
+        receipt_directory = root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/")
+        self.assertFalse(receipt_directory.exists())
+
+        retried = INSTALLER.install(self.package, root)
+        self.assertEqual(retried["status"], "installed")
+        receipt = json.loads((receipt_directory / "receipt-v1.json").read_bytes())
+        record = next(record for record in receipt["changes"] if record["target"] == "/usr/libexec/buzz-ci-keyholder")
+        self.assertEqual((receipt_directory / record["backup"]).read_bytes(), writer_two)
+        self.assertEqual(INSTALLER.rollback(self.package, root)["status"], "rolled_back")
+        self.assertEqual(target.read_bytes(), writer_two)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o620)
+        self.assertEqual(INSTALLER.rollback(self.package, root)["status"], "unchanged")
+
     def test_partial_multi_target_failure_restores_every_distinct_baseline(self) -> None:
         self.freeze()
         root = self.make_root()

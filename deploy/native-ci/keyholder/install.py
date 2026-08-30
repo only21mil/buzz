@@ -657,9 +657,58 @@ def _stage_file(parent_fd: int, name: str, payload: bytes, mode: int, uid: int, 
         raise
 
 
-def _restore_failed_exchange(parent_fd: int, name: str, temporary: str) -> None:
-    _renameat2(parent_fd, temporary, parent_fd, name, RENAME_EXCHANGE)
+def _unlink_task_temporaries(parent_fd: int, *names: str) -> None:
+    for temporary in names:
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
     os.fsync(parent_fd)
+
+
+def _restore_displaced_without_overwriting_latest(parent_fd: int, name: str, temporary: str) -> None:
+    try:
+        _renameat2(parent_fd, temporary, parent_fd, name, RENAME_NOREPLACE)
+    except FileExistsError:
+        _unlink_task_temporaries(parent_fd, temporary)
+    except FileNotFoundError:
+        os.fsync(parent_fd)
+    else:
+        os.fsync(parent_fd)
+
+
+def _recover_failed_exchange(
+    parent_fd: int,
+    name: str,
+    temporary: str,
+    staged: _PriorTarget,
+) -> None:
+    probe = f".{name}.{uuid.uuid4().hex}"
+    probe_present = False
+    try:
+        try:
+            _renameat2(parent_fd, name, parent_fd, probe, RENAME_NOREPLACE)
+        except FileNotFoundError:
+            _unlink_task_temporaries(parent_fd, temporary)
+            return
+        probe_present = True
+        os.fsync(parent_fd)
+        try:
+            probe_snapshot = _prior_target_at(parent_fd, probe)
+        except BaseException:
+            probe_snapshot = None
+        probe_is_staged = _same_snapshot(probe_snapshot, staged)
+        source = temporary if probe_is_staged else probe
+        try:
+            _renameat2(parent_fd, source, parent_fd, name, RENAME_NOREPLACE)
+        except (FileExistsError, FileNotFoundError):
+            pass
+        else:
+            if source == probe:
+                probe_present = False
+    finally:
+        cleanup = (temporary, probe) if probe_present else (temporary,)
+        _unlink_task_temporaries(parent_fd, *cleanup)
 
 
 def _cas_publish(
@@ -677,13 +726,11 @@ def _cas_publish(
         try:
             displaced = _prior_target_at(parent_fd, temporary)
         except BaseException:
-            _renameat2(parent_fd, temporary, parent_fd, name, RENAME_NOREPLACE)
-            os.fsync(parent_fd)
+            _restore_displaced_without_overwriting_latest(parent_fd, name, temporary)
             raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
         if not _same_snapshot(displaced, expected):
             if displaced is not None:
-                _renameat2(parent_fd, temporary, parent_fd, name, RENAME_NOREPLACE)
-                os.fsync(parent_fd)
+                _restore_displaced_without_overwriting_latest(parent_fd, name, temporary)
             raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
         os.unlink(temporary, dir_fd=parent_fd)
         os.fsync(parent_fd)
@@ -712,15 +759,21 @@ def _cas_publish(
             try:
                 displaced = _prior_target_at(parent_fd, temporary)
             except BaseException:
-                _restore_failed_exchange(parent_fd, name, temporary)
-                temporary_owned = True
+                _recover_failed_exchange(parent_fd, name, temporary, staged)
+                temporary_present = False
                 raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
             if not _same_snapshot(displaced, expected):
-                _restore_failed_exchange(parent_fd, name, temporary)
-                temporary_owned = True
+                _recover_failed_exchange(parent_fd, name, temporary, staged)
+                temporary_present = False
                 raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
         os.fsync(parent_fd)
-        installed = _prior_target_at(parent_fd, name)
+        try:
+            installed = _prior_target_at(parent_fd, name)
+        except BaseException:
+            if expected is not None:
+                _recover_failed_exchange(parent_fd, name, temporary, staged)
+                temporary_present = False
+            raise
         if not _same_snapshot(installed, staged):
             if expected is None:
                 current = _prior_target_at(parent_fd, name)
@@ -729,10 +782,8 @@ def _cas_publish(
                     temporary_present = True
                     os.fsync(parent_fd)
             else:
-                current = _prior_target_at(parent_fd, name)
-                if _same_snapshot(current, staged):
-                    _restore_failed_exchange(parent_fd, name, temporary)
-                    temporary_owned = True
+                _recover_failed_exchange(parent_fd, name, temporary, staged)
+                temporary_present = False
             raise OSError("atomic compare-and-swap readback differs")
         if expected is not None:
             os.unlink(temporary, dir_fd=parent_fd)
