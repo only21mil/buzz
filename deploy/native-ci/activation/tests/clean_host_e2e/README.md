@@ -93,17 +93,24 @@ digests, guest prerequisites, package bindings, or immutable staging differ.
 `preflight` never consumes prepared state. A successful `prepare` also retains
 that state for package freezing and preflight. At `run`, the harness validates
 the contract envelope and the prepared-state marker, then atomically moves that
-exact directory to an unpredictable run-owned name. Every later validation and
-setup exit has terminal cleanup ownership. A symbolic, unrecognized, replaced,
-or filesystem-identity-mismatched state path is never removed.
+exact directory to a run-owned name. Cleanup holds directory descriptors,
+moves selected directories and members to unpredictable quarantine names, and
+checks their device/inode identity after each move before removal. Every later
+validation and setup exit has terminal cleanup ownership. A symbolic,
+unrecognized, replaced, or filesystem-identity-mismatched path is never
+removed.
 All subprocesses have fixed time and output bounds. Every process group is
 unconditionally killed, reaped, and checked for absence on success, failure,
 timeout, and interruption. The private state is removed on every terminal
 `run` path, including setup failure. Results are retained only after successful
 state cleanup. The harness writes all three evidence files to one private
 sibling directory, revalidates their receipt, verifier, manifest, and contract
-bindings, records the complete set as ready, destroys the selected VM state,
-and atomically renames the directory to the requested results path. The public
+bindings, and replays the exact digest-bound frozen receipt verifier against
+the scenario and receipt. The publication journal binds the staging
+directory's device/inode identity. After destroying selected VM state, the
+harness holds that directory descriptor through a quarantine move, validation,
+and atomic no-replace rename to the requested results path, with immediate
+destination identity readback. The public
 path therefore exposes either the exact three-file set or nothing. A retry uses
 the contract-bound ownership and publication records to remove an interrupted
 partial set, finish a ready publication after cleanup, or return the already
