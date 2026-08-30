@@ -861,7 +861,7 @@ class ExecdPackageTests(unittest.TestCase):
 
                 receipt.write_bytes(original_receipt)
                 receipt.chmod(0o600)
-                with self.assertRaisesRegex(ValueError, "install receipt differs"):
+                with self.assertRaisesRegex(ValueError, "(install receipt|identity) differs"):
                     INSTALL.rollback(other, root)
                 self.assertEqual(target.read_bytes(), b"candidate one\n")
 
@@ -920,18 +920,13 @@ class ExecdPackageTests(unittest.TestCase):
                 target.chmod(0o750)
                 INSTALL.install(package, root)
                 custody = root / "var/lib/buzzci/execd-v2/package"
-                install_receipt = json.loads((custody / "receipt-v1.json").read_bytes())
-                write_file = custody / "rollback-v1.json"
-                write_file.write_bytes(INSTALL.canonical_json({
-                    "schema": "buzz-ci-execd-package-rollback-receipt-v1",
-                    "state": "rolling_back",
-                    "install_receipt": install_receipt,
-                }))
-                write_file.chmod(0o600)
-                target.write_bytes(prior)
-                target.chmod(0o750)
-                (custody / "receipt-v1.json").unlink()
-                (custody / "preimage-v1.bin").unlink()
+                self.assertEqual(
+                    _forced_exit_at(
+                        "rollback_exchanged",
+                        lambda: INSTALL.rollback(package, root),
+                    ),
+                    91,
+                )
 
                 result = INSTALL.rollback(package, root)
                 self.assertEqual((result["status"], result["prior_state"]), ("rolled_back", "present"))
@@ -944,6 +939,7 @@ class ExecdPackageTests(unittest.TestCase):
             "preimage_captured",
             "prepared",
             "candidate_staged",
+            "candidate_identity",
             "candidate_exchanged",
             "candidate_published",
             "published",
@@ -991,6 +987,7 @@ class ExecdPackageTests(unittest.TestCase):
             "intent",
             "prepared",
             "candidate_staged",
+            "candidate_identity",
             "candidate_exchanged",
             "candidate_published",
             "published",
@@ -1029,6 +1026,7 @@ class ExecdPackageTests(unittest.TestCase):
             "preimage_captured",
             "prepared",
             "candidate_staged",
+            "candidate_identity",
             "candidate_exchanged",
             "candidate_published",
             "published",
@@ -1190,6 +1188,140 @@ class ExecdPackageTests(unittest.TestCase):
                     self.assertFalse((custody / "preimage-v1.bin").exists())
                     self.assertFalse((custody / "install-transaction-v1.json").exists())
 
+    def test_matching_external_candidate_is_replaced_and_never_adopted(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"byte-identical candidate\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            package, root = _manual_install_fixture(base, candidate, seccomp)
+            target = root / "usr/libexec/buzz-ci-execd"
+            target.parent.mkdir(mode=0o755)
+            target.parent.chmod(0o755)
+            target.write_bytes(candidate)
+            target.chmod(0o755)
+            external_inode = target.stat().st_ino
+
+            INSTALL.install(package, root)
+            owned_inode = target.stat().st_ino
+            self.assertNotEqual(owned_inode, external_inode)
+            custody = root / "var/lib/buzzci/execd-v2/package"
+            identity = json.loads(
+                (custody / "candidate-identity-v1.json").read_bytes()
+            )
+            self.assertEqual(identity["inode"], owned_inode)
+            identity_path = custody / "candidate-identity-v1.json"
+            identity_bytes = identity_path.read_bytes()
+            identity["inode"] += 1
+            identity_path.write_bytes(INSTALL.canonical_json(identity))
+            identity_path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "candidate ownership differs"):
+                INSTALL.install(package, root)
+            with self.assertRaisesRegex(ValueError, "candidate ownership differs"):
+                INSTALL.inspect(package, root)
+            identity_path.write_bytes(identity_bytes)
+            identity_path.chmod(0o600)
+
+            held = target.parent / "owned-candidate-held"
+            target.rename(held)
+            target.write_bytes(candidate)
+            target.chmod(0o755)
+            replacement_inode = target.stat().st_ino
+            self.assertNotEqual(replacement_inode, owned_inode)
+            with self.assertRaisesRegex(ValueError, "binary drift blocks rollback"):
+                INSTALL.rollback(package, root)
+            self.assertEqual(target.stat().st_ino, replacement_inode)
+            target.unlink()
+            held.rename(target)
+            self.assertEqual(INSTALL.rollback(package, root)["status"], "rolled_back")
+            self.assertEqual(target.read_bytes(), candidate)
+
+    def test_rollback_cas_preserves_postvalidation_regular_and_symlink_replacements(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"rollback owned candidate\n"
+        cases = (
+            ("present", "regular"),
+            ("present", "symlink"),
+            ("absent", "regular"),
+            ("absent", "symlink"),
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, (baseline_state, replacement_kind) in enumerate(cases):
+                with self.subTest(
+                    baseline=baseline_state, replacement=replacement_kind
+                ):
+                    lane = base / str(index)
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    if baseline_state == "present":
+                        target.parent.mkdir(mode=0o755)
+                        target.parent.chmod(0o755)
+                        target.write_bytes(b"prior baseline\n")
+                        target.chmod(0o750)
+                    INSTALL.install(package, root)
+                    owned_inode = target.stat().st_ino
+                    held = target.parent / "owned-candidate-held"
+                    hostile = root / "hostile-rollback-target"
+                    original_rename = INSTALL._renameat2_at
+                    raced = False
+
+                    def replace_at_rollback_mutation(
+                        directory_fd: int, source: str, name: str, flags: int
+                    ) -> None:
+                        nonlocal raced
+                        if not raced and INSTALL.ROLLBACK_STAGE_NAME in {source, name}:
+                            raced = True
+                            target.rename(held)
+                            if replacement_kind == "regular":
+                                target.write_bytes(b"operator replacement B\n")
+                                target.chmod(0o701)
+                            else:
+                                hostile.write_bytes(b"do not follow\n")
+                                hostile.chmod(0o700)
+                                target.symlink_to(hostile)
+                        original_rename(directory_fd, source, name, flags)
+
+                    with mock.patch.object(
+                        INSTALL,
+                        "_renameat2_at",
+                        side_effect=replace_at_rollback_mutation,
+                    ):
+                        with self.assertRaisesRegex(ValueError, "changed at rollback"):
+                            INSTALL.rollback(package, root)
+                    self.assertEqual(held.stat().st_ino, owned_inode)
+                    if replacement_kind == "regular":
+                        self.assertEqual(
+                            (target.read_bytes(), _mode(target)),
+                            (b"operator replacement B\n", 0o701),
+                        )
+                    else:
+                        self.assertTrue(target.is_symlink())
+                        self.assertEqual(hostile.read_bytes(), b"do not follow\n")
+                    custody = root / "var/lib/buzzci/execd-v2/package"
+                    self.assertTrue((custody / "receipt-v1.json").exists())
+                    self.assertFalse((custody / "rollback-v1.json").exists())
+                    self.assertFalse((custody / "rollback-stage-identity-v1.json").exists())
+                    self.assertFalse(
+                        (target.parent / INSTALL.ROLLBACK_STAGE_NAME).exists()
+                    )
+
+                    target.unlink()
+                    held.rename(target)
+                    self.assertEqual(
+                        INSTALL.rollback(package, root)["status"], "rolled_back"
+                    )
+                    if baseline_state == "present":
+                        self.assertEqual(target.read_bytes(), b"prior baseline\n")
+                    else:
+                        self.assertFalse(target.exists())
+
     def test_publication_cas_preserves_a_symlink_name_swap(self) -> None:
         seccomp = b"test immutable seccomp\n"
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
@@ -1292,6 +1424,8 @@ class ExecdPackageTests(unittest.TestCase):
     def test_rollback_recovers_every_durable_phase(self) -> None:
         phases = (
             "rollback_intent",
+            "rollback_stage_identity",
+            "rollback_exchanged",
             "rollback_restored",
             "rollback_released",
             "rollback_complete",

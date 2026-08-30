@@ -148,14 +148,18 @@ An absent baseline uses atomic no-replace publication. A present baseline uses
 an atomic name exchange and verifies that the exchanged inode is the captured
 baseline before it discards that name. If a replacement wins the final race,
 the installer exchanges it back and aborts. This includes a byte-identical new
-inode or an absent-baseline name that appeared. Candidate staging and every
-transaction phase are fsynced. A retry resumes after a process exit between
-intent, preimage custody, staging, exchange, publication, receipt publication,
-or transaction release. Rollback first completes a bound interrupted install,
-then follows the normal verified rollback protocol. Receipt, transaction,
-candidate-stage, or preimage tamper fails closed. All custody and live-name
-operations remain no-follow and descriptor-relative. Execd startup remains the
-only owner of the content-addressed runtime profile and runtime receipt.
+inode or an absent-baseline name that appeared. Before either publication, the
+installer writes `candidate-identity-v1.json`. It binds the package, digest,
+metadata, device, and inode of the private candidate stage. The final receipt
+is valid only while the live name resolves to that exact installer-owned inode;
+matching external bytes and metadata are never adopted. Candidate staging and
+every transaction phase are fsynced. A retry resumes after a process exit
+between intent, preimage custody, candidate identity, staging, exchange,
+publication, receipt publication, or transaction release. Receipt,
+transaction, candidate-identity, candidate-stage, or preimage tamper fails
+closed. All custody and live-name operations remain no-follow and
+descriptor-relative. Execd startup remains the only owner of the
+content-addressed runtime profile and runtime receipt.
 
 `install.py rollback` checks the current candidate binary, active receipt,
 preimage, ownership, modes, and directory bindings before mutation. It restores
@@ -166,6 +170,14 @@ package, a swapped preimage, or a prior terminal receipt from another candidate
 fails closed. A failed rollback compensates to the fully installed candidate;
 the operator can retry the same command. An exact retry after success returns
 `unchanged` only after rechecking the restored baseline and terminal receipt.
+Rollback verifies the live candidate against `candidate-identity-v1.json`
+immediately before mutation. A present baseline uses an inode-bound private
+stage and atomic exchange; an absent baseline atomically moves the candidate to
+a retained rollback stage. Rollback verifies the exchanged or moved inode
+before it releases active custody. A last-instant regular file or symbolic link
+is moved back to the live name and left untouched. Until the terminal receipt
+is durable, compensation exchanges the retained original candidate inode back
+into place, so a retry does not adopt a copied candidate.
 
 Prepare the activation input, then freeze and install the final package with:
 
