@@ -183,6 +183,25 @@ class RunnerInstallTests(unittest.TestCase):
 
         return mock.patch.object(INSTALLER, "_phase_boundary", side_effect=boundary)
 
+    def make_legacy_receipt_only(
+        self,
+        root: Path,
+        backup_id: str,
+        terminal_state: str,
+    ) -> Path:
+        transaction = INSTALLER.backup_root_path(root, INSTALLER.DEFAULT_BACKUP_ROOT) / backup_id
+        state = json.loads((transaction / "transaction.json").read_text())
+        legacy = INSTALLER.legacy_receipt_for(state, terminal_state)
+        INSTALLER.atomic_write(
+            transaction / "receipt.json",
+            INSTALLER.canonical_json(legacy),
+            0o600,
+            root.stat().st_uid,
+            root.stat().st_gid,
+        )
+        (transaction / "transaction.json").unlink()
+        return transaction
+
     def test_config_renderer_is_canonical_closed_and_nofollow(self) -> None:
         output = self.base / "runner-v2.json"
         RENDERER.render(output, self.runner_uid, self.runner_gid)
@@ -375,6 +394,187 @@ class RunnerInstallTests(unittest.TestCase):
             str(installed["backup_id"]),
         )
         self.assertEqual(repeated, rolled_back)
+
+    def test_legacy_v1_dry_run_is_read_only_then_real_rollback_migrates(self) -> None:
+        self.freeze()
+        root, installed, transaction, _record = self.install_with_prior_tmpfiles("legacy-root")
+        transaction = self.make_legacy_receipt_only(root, str(installed["backup_id"]), "installed")
+        before = self.target_receipt_snapshot(root, transaction)
+
+        preview = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+            dry_run=True,
+        )
+        self.assertEqual(preview["status"], "rollback_dry_run")
+        self.assertFalse((transaction / "transaction.json").exists())
+        self.assertEqual(self.target_receipt_snapshot(root, transaction), before)
+
+        rolled_back = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        self.assertEqual(rolled_back["status"], "rolled_back")
+        self.assertEqual(json.loads((transaction / "transaction.json").read_text())["phase"], "rolled_back")
+        receipt = json.loads((transaction / "receipt.json").read_text())
+        self.assertEqual((receipt["schema"], receipt["state"]), (INSTALLER.RECEIPT_SCHEMA, "rolled_back"))
+        tmpfiles = root / "usr/lib/tmpfiles.d/buzzci-runner.conf"
+        self.assertEqual(tmpfiles.read_bytes(), b"prior tmpfiles payload\n")
+        self.assertEqual(
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            ),
+            rolled_back,
+        )
+
+    def test_legacy_v1_migration_and_mixed_rollback_restart_exactly(self) -> None:
+        self.freeze()
+        boundaries = (
+            ("legacy_transaction_persisted", None),
+            ("legacy_receipt_migrated", None),
+            ("rollback_target_restored", sorted(INSTALLER.EXPECTED_TARGETS.values())[-1]),
+        )
+        for index, (phase, target) in enumerate(boundaries):
+            with self.subTest(phase=phase, target=target):
+                root = self.make_root(f"legacy-restart-{index}")
+                installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+                transaction = self.make_legacy_receipt_only(
+                    root,
+                    str(installed["backup_id"]),
+                    "installed",
+                )
+                with self.crash_at(phase, target), self.assertRaises(SimulatedCrash):
+                    INSTALLER.rollback(
+                        self.package,
+                        root,
+                        INSTALLER.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    )
+                self.assertTrue((transaction / "transaction.json").exists())
+                resumed = INSTALLER.rollback(
+                    self.package,
+                    root,
+                    INSTALLER.DEFAULT_BACKUP_ROOT,
+                    str(installed["backup_id"]),
+                )
+                self.assertEqual(resumed["status"], "rolled_back")
+                self.assertEqual(
+                    json.loads((transaction / "transaction.json").read_text())["phase"],
+                    "rolled_back",
+                )
+                for managed_target in INSTALLER.EXPECTED_TARGETS.values():
+                    self.assertFalse(INSTALLER.rooted(root, managed_target).exists())
+
+    def test_legacy_v1_receipt_only_mixed_state_resumes_old_rollback(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        transaction = self.make_legacy_receipt_only(
+            root,
+            str(installed["backup_id"]),
+            "installed",
+        )
+        restored_target = sorted(INSTALLER.EXPECTED_TARGETS.values())[-1]
+        INSTALLER.unlink_target(INSTALLER.rooted(root, restored_target))
+
+        preview = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+            dry_run=True,
+        )
+        self.assertEqual(preview["status"], "rollback_dry_run")
+        self.assertFalse((transaction / "transaction.json").exists())
+
+        with self.crash_at("legacy_transaction_persisted"), self.assertRaises(SimulatedCrash):
+            INSTALLER.rollback(
+                self.package,
+                root,
+                INSTALLER.DEFAULT_BACKUP_ROOT,
+                str(installed["backup_id"]),
+            )
+        state = json.loads((transaction / "transaction.json").read_text())
+        self.assertEqual(state["phase"], "rollback_restoring")
+        self.assertEqual(json.loads((transaction / "receipt.json").read_text())["schema"], INSTALLER.LEGACY_RECEIPT_SCHEMA)
+
+        resumed = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        self.assertEqual(resumed["status"], "rolled_back")
+        for managed_target in INSTALLER.EXPECTED_TARGETS.values():
+            self.assertFalse(INSTALLER.rooted(root, managed_target).exists())
+
+    def test_legacy_v1_terminal_retry_stays_read_only(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        installed = INSTALLER.install(self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT)
+        rolled_back = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        transaction = self.make_legacy_receipt_only(root, str(installed["backup_id"]), "rolled_back")
+        before = self.target_receipt_snapshot(root, transaction)
+        repeated = INSTALLER.rollback(
+            self.package,
+            root,
+            INSTALLER.DEFAULT_BACKUP_ROOT,
+            str(installed["backup_id"]),
+        )
+        self.assertEqual(repeated, rolled_back)
+        self.assertFalse((transaction / "transaction.json").exists())
+        self.assertEqual(self.target_receipt_snapshot(root, transaction), before)
+
+    def test_legacy_v1_tamper_and_absent_evidence_refuse_without_migration(self) -> None:
+        self.freeze()
+        cases = ("receipt-tamper", "target-drift", "missing-backup", "missing-receipt")
+        for case in cases:
+            with self.subTest(case=case):
+                root, installed, transaction, record = self.install_with_prior_tmpfiles(f"legacy-{case}")
+                transaction = self.make_legacy_receipt_only(
+                    root,
+                    str(installed["backup_id"]),
+                    "installed",
+                )
+                if case == "receipt-tamper":
+                    receipt = json.loads((transaction / "receipt.json").read_text())
+                    receipt["changed_targets"] = list(reversed(receipt["changed_targets"]))
+                    INSTALLER.atomic_write(
+                        transaction / "receipt.json",
+                        INSTALLER.canonical_json(receipt),
+                        0o600,
+                        root.stat().st_uid,
+                        root.stat().st_gid,
+                    )
+                elif case == "target-drift":
+                    target = INSTALLER.rooted(root, str(record["target"]))
+                    target.write_bytes(b"candidate drift\n")
+                    target.chmod(0o644)
+                elif case == "missing-backup":
+                    (transaction / str(record["backup"])).unlink()
+                else:
+                    (transaction / "receipt.json").unlink()
+
+                with self.assertRaises((OSError, ValueError)):
+                    INSTALLER.rollback(
+                        self.package,
+                        root,
+                        INSTALLER.DEFAULT_BACKUP_ROOT,
+                        str(installed["backup_id"]),
+                    )
+                self.assertFalse((transaction / "transaction.json").exists())
 
     def test_transaction_is_durable_and_candidate_bound_before_target_mutation(self) -> None:
         manifest = self.freeze()

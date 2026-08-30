@@ -137,7 +137,19 @@ only an exact mix of candidate and recorded prior states and restores the rest.
 `rolled_back` is terminal, and repeating the same rollback returns the same
 result without another mutation. A receipt/transaction mismatch, package
 mismatch, unexpected target state, or directory drift blocks rollback. The
-machine-readable check and install results include the exact runner-control and
+installer also accepts an exact parent-era v1 receipt-only backup. A legacy
+dry-run validates the receipt, package, candidate targets, unchanged package
+targets, prior-state inventory, backup files, and created directories without
+writing `transaction.json` or changing the receipt. A real rollback persists
+the synthesized transaction first, upgrades the matching receipt to v2, and
+then enters the same restartable rollback phases. An exact legacy
+`installed` receipt may contain an exact candidate/prior mix left by an
+interrupted v1 rollback; migration records `rollback_restoring` and continues
+from that point. An exact legacy `rolled_back` receipt is an idempotent
+read-only terminal retry. Missing, ambiguous, third-state, or tampered legacy
+evidence is refused before migration.
+
+The machine-readable check and install results include the exact runner-control and
 broker peer policy plus the disabled, inactive, unprovisioned capacity-zero
 state. Those fields describe what this package leaves unchanged; they are not a
 substitute for the separate activation procedure's live systemd readback.
