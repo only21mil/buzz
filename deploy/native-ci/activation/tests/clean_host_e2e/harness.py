@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -52,10 +55,129 @@ REQUIRED_CANDIDATE = (
     "deploy/native-ci/activation/controller.py",
     "deploy/native-ci/activation/package.py",
 )
+RUN_OWNERSHIP = "run-ownership.json"
+PUBLICATION_SCHEMA = "buzz-ci-clean-host-e2e-publication/v1"
 
 
 class HarnessError(RuntimeError):
     """Fail-closed harness rejection."""
+
+
+@dataclass(frozen=True)
+class StateIdentity:
+    """Filesystem identity of the exact prepared state selected for a run."""
+
+    device: int
+    inode: int
+    marker_sha256: str
+
+
+def publication_checkpoint(_name: str, _staging: Path, _results: Path) -> None:
+    """Test seam for result-publication interruption checkpoints."""
+
+
+def run_binding(contract: dict[str, object], results: Path) -> dict[str, str]:
+    original = Path(os.path.abspath(Path(contract["state"])))
+    final = Path(os.path.abspath(results))
+    claimed = original.with_name(f".{original.name}.terminal-run")
+    staging = final.with_name(f".{final.name}.clean-host-staging")
+    journal = final.with_name(f".{final.name}.clean-host-publication.json")
+    if any(
+        left == right or left.is_relative_to(right) or right.is_relative_to(left)
+        for left in (final, staging, journal)
+        for right in (original, claimed)
+    ):
+        raise HarnessError("result publication path overlaps VM state")
+    return {
+        "contract_sha256": hashlib.sha256(canonical(contract)).hexdigest(),
+        "original_state": str(original),
+        "claimed_state": str(claimed),
+        "results": str(final),
+        "staging": str(staging),
+        "journal": str(journal),
+    }
+
+
+def publication_record(binding: dict[str, str], phase: str, outcome: dict[str, object] | None = None) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema_version": PUBLICATION_SCHEMA,
+        "phase": phase,
+        **binding,
+    }
+    if outcome is not None:
+        value["outcome"] = outcome
+    return value
+
+
+def write_new_private_json(path: Path, value: object) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o400)
+    try:
+        raw = canonical(value)
+        offset = 0
+        while offset < len(raw):
+            written = os.write(fd, raw[offset:])
+            if written <= 0:
+                raise HarnessError(f"private record write was incomplete: {path.name}")
+            offset += written
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_parent(path)
+
+
+def fsync_parent(path: Path) -> None:
+    parent_fd = open_absolute(path.parent, directory=True)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def rename_noreplace(source: Path, target: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise HarnessError("atomic no-replace rename is unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
+        number = ctypes.get_errno()
+        if number == errno.ENOSYS:
+            raise HarnessError("atomic no-replace rename is unavailable")
+        raise OSError(number, os.strerror(number), str(target))
+
+
+def replace_private_json(path: Path, value: object) -> None:
+    temporary = path.with_name(f".{path.name}.new-{os.urandom(8).hex()}")
+    write_new_private_json(temporary, value)
+    try:
+        os.replace(temporary, path)
+        fsync_parent(path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_publication(binding: dict[str, str]) -> dict[str, object] | None:
+    journal = Path(binding["journal"])
+    try:
+        journal.lstat()
+    except FileNotFoundError:
+        return None
+    value = load_json(journal)
+    common = publication_record(binding, "running")
+    if not isinstance(value, dict) or value.get("schema_version") != PUBLICATION_SCHEMA:
+        raise HarnessError("result publication journal differs")
+    if any(value.get(name) != item for name, item in common.items() if name != "phase"):
+        raise HarnessError("result publication binding differs")
+    if value.get("phase") == "running" and set(value) == set(common):
+        return value
+    ready = publication_record(binding, "ready", value.get("outcome"))
+    if value.get("phase") == "ready" and isinstance(value.get("outcome"), dict) and set(value) == set(ready):
+        return value
+    raise HarnessError("result publication phase differs")
 
 
 def canonical(value: object) -> bytes:
@@ -642,13 +764,29 @@ def clean_transient(state: Path) -> None:
             pass
 
 
-def destroy_state(state: Path) -> None:
+def state_identity(state: Path) -> StateIdentity:
+    state = safe_directory(state)
+    metadata = state.lstat()
+    marker_raw = read_regular(state / "state.json", MAX_JSON)
+    return StateIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        marker_sha256=hashlib.sha256(marker_raw).hexdigest(),
+    )
+
+
+def destroy_state(state: Path, expected: StateIdentity | None = None) -> None:
     marker = state / "state.json"
-    if not state.exists():
+    try:
+        state.lstat()
+    except FileNotFoundError:
         return
     state = safe_directory(state)
     if not marker.is_file():
         raise HarnessError("refusing to destroy an unrecognized state directory")
+    observed = state_identity(state)
+    if expected is not None and observed != expected:
+        raise HarnessError("refusing to destroy a replaced VM state directory")
     value = load_json(marker)
     if (
         not isinstance(value, dict)
@@ -668,8 +806,15 @@ def destroy_state(state: Path) -> None:
         or not isinstance(value.get("harness_asset_sha256"), dict) or set(value["harness_asset_sha256"]) != set(FROZEN_ASSETS)
     ):
         raise HarnessError("refusing to destroy an unrecognized state directory")
+    metadata = state.lstat()
+    if expected is not None and (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode):
+        raise HarnessError("refusing to destroy a replaced VM state directory")
     shutil.rmtree(state)
-    if state.exists():
+    try:
+        state.lstat()
+    except FileNotFoundError:
+        return
+    else:
         raise HarnessError("VM state remains after cleanup")
 
 
@@ -784,19 +929,32 @@ def validate_prepared_state(state: Path) -> dict[str, object]:
     return state_record
 
 
-def validate_contract(
-    path: Path,
+def validate_contract_envelope(value: object) -> dict[str, object]:
+    required = {"schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"}
+    if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA:
+        raise HarnessError("run contract shape differs")
+    if not isinstance(value.get("state"), str) or not value["state"]:
+        raise HarnessError("run contract state path differs")
+    if not isinstance(value.get("candidate_sha"), str) or HEX40.fullmatch(value["candidate_sha"]) is None:
+        raise HarnessError("candidate SHA is invalid")
+    return value
+
+
+def validate_contract_value(
+    value: dict[str, object], *, selected_state: Path | None = None,
 ) -> tuple[
     dict[str, object], Path, dict[str, list[tuple[str, int, bytes]]], bytes, bytes,
 ]:
-    value = load_json(path)
-    required = {"schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"}
-    if not isinstance(value, dict) or set(value) != required or value["schema_version"] != SCHEMA:
-        raise HarnessError("run contract shape differs")
-    if not isinstance(value["candidate_sha"], str) or HEX40.fullmatch(value["candidate_sha"]) is None:
-        raise HarnessError("candidate SHA is invalid")
-    state = safe_directory(Path(str(value["state"])))
+    validate_contract_envelope(value)
+    state = selected_state if selected_state is not None else safe_directory(Path(value["state"]))
     validate_prepared_state(state)
+    if selected_state is None:
+        try:
+            (state / RUN_OWNERSHIP).lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise HarnessError("VM state is already owned by a terminal run")
     candidate = safe_input_directory(Path(str(value["candidate_root"])))
     resolved = bounded(["/usr/bin/git", "-C", str(candidate), "rev-parse", f"{value['candidate_sha']}^{{commit}}"] ).decode().strip()
     if resolved != value["candidate_sha"]:
@@ -829,6 +987,307 @@ def validate_contract(
     if hashlib.sha256(seccomp_raw).hexdigest() != SECCOMP_SHA256:
         raise HarnessError("seccomp source digest differs")
     return value, state, records, scenario_raw, seccomp_raw
+
+
+def validate_contract(
+    path: Path,
+) -> tuple[
+    dict[str, object], Path, dict[str, list[tuple[str, int, bytes]]], bytes, bytes,
+]:
+    return validate_contract_value(validate_contract_envelope(load_json(path)))
+
+
+def claim_run_state(binding: dict[str, str]) -> tuple[Path, StateIdentity, bool]:
+    """Claim or resume the exact contract-bound prepared state."""
+    state = Path(binding["original_state"])
+    claimed = Path(binding["claimed_state"])
+    state_present = False
+    claimed_present = False
+    try:
+        state.lstat()
+        state_present = True
+    except FileNotFoundError:
+        pass
+    try:
+        claimed.lstat()
+        claimed_present = True
+    except FileNotFoundError:
+        pass
+    if state_present and claimed_present:
+        raise HarnessError("original and claimed VM state both exist")
+    if not state_present and not claimed_present:
+        raise FileNotFoundError(state)
+    selected = safe_directory(claimed if claimed_present else state)
+    validate_prepared_state(selected)
+    ownership = publication_record(binding, "running")
+    ownership.pop("schema_version")
+    ownership.pop("phase")
+    ownership["schema_version"] = "buzz-ci-clean-host-e2e-run-ownership/v1"
+    ownership_path = selected / RUN_OWNERSHIP
+    if claimed_present:
+        if load_json(ownership_path) != ownership:
+            raise HarnessError("claimed VM state ownership differs")
+        return selected, state_identity(selected), True
+    ownership_existed = False
+    try:
+        ownership_path.lstat()
+    except FileNotFoundError:
+        write_new_private_json(ownership_path, ownership)
+    else:
+        ownership_existed = True
+        if load_json(ownership_path) != ownership:
+            raise HarnessError("prepared VM state ownership differs")
+    expected = state_identity(state)
+    parent_fd = open_absolute(state.parent, directory=True)
+    renamed = False
+    try:
+        current = os.stat(state.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (expected.device, expected.inode):
+            raise HarnessError("prepared VM state changed before run ownership")
+        rename_noreplace(state, claimed)
+        os.fsync(parent_fd)
+        renamed = True
+    finally:
+        os.close(parent_fd)
+    try:
+        if state.exists():
+            raise HarnessError("prepared VM state remained after run ownership transfer")
+        observed = state_identity(claimed)
+        if observed != expected:
+            raise HarnessError("prepared VM state changed during run ownership transfer")
+    except BaseException as claim_error:
+        if renamed:
+            try:
+                destroy_state(claimed, expected)
+            except BaseException as cleanup_error:
+                detail = str(cleanup_error) or type(cleanup_error).__name__
+                raise HarnessError(f"terminal run cleanup failed: {detail}") from claim_error
+        raise
+    return claimed, expected, ownership_existed
+
+
+def terminal_run(contract_path: Path, results: Path) -> dict[str, object]:
+    """Own cleanup from prepared-state selection through terminal run exit."""
+    value = validate_contract_envelope(load_json(contract_path))
+    binding = run_binding(value, results)
+    publication = load_publication(binding)
+    try:
+        claimed, expected, resumed = claim_run_state(binding)
+    except FileNotFoundError:
+        if publication is not None and publication.get("phase") == "ready":
+            return finish_publication(value, binding, publication["outcome"])
+        if publication is not None:
+            cleanup_publication(binding)
+            raise HarnessError("interrupted terminal run had no remaining VM state")
+        try:
+            Path(binding["results"]).lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            return validate_result_set(value, Path(binding["results"]))
+        raise
+    if resumed and publication is not None:
+        cleanup_errors: list[BaseException] = []
+        try:
+            destroy_state(claimed, expected)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if publication.get("phase") != "ready" or cleanup_errors:
+            try:
+                cleanup_publication(binding)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            detail = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
+            raise HarnessError(f"terminal run cleanup failed: {detail}")
+        if publication.get("phase") == "ready":
+            return finish_publication(value, binding, publication["outcome"])
+        raise HarnessError("interrupted terminal result staging was cleaned")
+    handed_to_run = False
+    try:
+        contract, state, records, scenario_raw, seccomp_raw = validate_contract_value(
+            value, selected_state=claimed,
+        )
+        handed_to_run = True
+        return run_vm(
+            contract, state, records, scenario_raw, seccomp_raw, results,
+            expected_state=expected, binding=binding, resumed=resumed,
+        )
+    except BaseException as run_error:
+        if handed_to_run:
+            raise
+        cleanup_errors: list[BaseException] = []
+        try:
+            destroy_state(claimed, expected)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if publication is not None or resumed:
+            try:
+                cleanup_publication(binding)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            detail = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
+            raise HarnessError(f"terminal run cleanup failed: {detail}") from run_error
+        raise
+
+
+def cleanup_publication(binding: dict[str, str]) -> None:
+    staging = Path(binding["staging"])
+    journal = Path(binding["journal"])
+    try:
+        staging.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        staging = safe_directory(staging)
+        shutil.rmtree(staging)
+        try:
+            staging.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise HarnessError("private result staging remains after cleanup")
+    try:
+        journal.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def start_publication(binding: dict[str, str], resumed: bool) -> tuple[Path, dict[str, object] | None]:
+    final = Path(binding["results"])
+    staging = Path(binding["staging"])
+    publication = load_publication(binding)
+    try:
+        final.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if publication is not None and publication.get("phase") == "ready":
+            return final, publication["outcome"]
+        raise FileExistsError(final)
+    if publication is not None:
+        if not resumed:
+            raise HarnessError("result publication journal exists without resumed state")
+        try:
+            staging.lstat()
+        except FileNotFoundError as error:
+            raise HarnessError("result publication staging is missing") from error
+        staging = safe_directory(staging)
+        if publication.get("phase") == "ready":
+            return staging, publication["outcome"]
+        raise HarnessError("interrupted terminal result staging requires cleanup")
+    try:
+        staging.lstat()
+    except FileNotFoundError:
+        staging = safe_directory(staging, create=True)
+    else:
+        if resumed:
+            staging = safe_directory(staging)
+            raise HarnessError("interrupted unjournaled result staging requires cleanup")
+        raise FileExistsError(staging)
+    write_new_private_json(Path(binding["journal"]), publication_record(binding, "running"))
+    return staging, None
+
+
+def validate_result_set(
+    contract: dict[str, object], directory: Path, outcome: dict[str, object] | None = None,
+) -> dict[str, object]:
+    directory = safe_directory(directory)
+    expected_names = {"acceptance-receipt.json", "verifier.json", "evidence-manifest.json"}
+    if {entry.name for entry in os.scandir(directory)} != expected_names:
+        raise HarnessError("result publication file set differs")
+    receipt_raw = read_regular(directory / "acceptance-receipt.json", MAX_JSON)
+    verifier_raw = read_regular(directory / "verifier.json", MAX_JSON)
+    evidence_raw = read_regular(directory / "evidence-manifest.json", MAX_JSON)
+    evidence = load_json(directory / "evidence-manifest.json")
+    if canonical(evidence) != evidence_raw:
+        raise HarnessError("evidence manifest encoding differs")
+    expected_manifest = {
+        "schema_version", "candidate_sha", "image_sha256", "tool_sha256",
+        "harness_asset_sha256", "package_tree_sha256", "scenario_sha256",
+        "seccomp_source_sha256", "transfer_bytes", "transfer_sha256",
+        "receipt_sha256", "verifier_sha256", "dormant_proof",
+    }
+    packages = contract.get("packages")
+    expected_packages = (
+        {name: packages[name]["tree_sha256"] for name in PACKAGE_NAMES}
+        if isinstance(packages, dict) and set(packages) == set(PACKAGE_NAMES)
+        else evidence.get("package_tree_sha256") if isinstance(evidence, dict) else None
+    )
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != expected_manifest
+        or evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v2"
+        or evidence.get("candidate_sha") != contract["candidate_sha"]
+        or evidence.get("scenario_sha256") != contract["scenario"]["sha256"]
+        or evidence.get("seccomp_source_sha256") != SECCOMP_SHA256
+        or evidence.get("transfer_bytes") != TRANSFER_SIZE
+        or not isinstance(evidence.get("image_sha256"), str)
+        or HEX64.fullmatch(evidence["image_sha256"]) is None
+        or not isinstance(evidence.get("transfer_sha256"), str)
+        or HEX64.fullmatch(evidence["transfer_sha256"]) is None
+        or not isinstance(evidence.get("tool_sha256"), dict)
+        or set(evidence["tool_sha256"]) != set(TOOLS)
+        or any(not isinstance(digest, str) or HEX64.fullmatch(digest) is None for digest in evidence["tool_sha256"].values())
+        or not isinstance(evidence.get("harness_asset_sha256"), dict)
+        or set(evidence["harness_asset_sha256"]) != set(FROZEN_ASSETS)
+        or any(not isinstance(digest, str) or HEX64.fullmatch(digest) is None for digest in evidence["harness_asset_sha256"].values())
+        or evidence.get("package_tree_sha256") != expected_packages
+        or evidence.get("receipt_sha256") != hashlib.sha256(receipt_raw).hexdigest()
+        or evidence.get("verifier_sha256") != hashlib.sha256(verifier_raw).hexdigest()
+    ):
+        raise HarnessError("evidence manifest binding differs")
+    frame = {
+        "schema_version": FRAME_SCHEMA,
+        "phase": "run",
+        "challenge": "0" * 64,
+        "outcome": "pass",
+        "receipt_base64": base64.b64encode(receipt_raw).decode(),
+        "verifier_base64": base64.b64encode(verifier_raw).decode(),
+        "dormant_proof": evidence["dormant_proof"],
+    }
+    validate_final_frame(frame, contract, "0" * 64)
+    expected_outcome = {
+        "status": "pass",
+        "candidate_sha": contract["candidate_sha"],
+        "receipt_sha256": evidence["receipt_sha256"],
+        "verifier_sha256": evidence["verifier_sha256"],
+        "evidence_manifest_sha256": hashlib.sha256(evidence_raw).hexdigest(),
+        "dormant_proof": evidence["dormant_proof"],
+        "vm_state_absent": True,
+    }
+    if outcome is not None and outcome != expected_outcome:
+        raise HarnessError("result publication outcome differs")
+    return expected_outcome
+
+
+def finish_publication(
+    contract: dict[str, object], binding: dict[str, str], outcome: dict[str, object],
+) -> dict[str, object]:
+    final = Path(binding["results"])
+    staging = Path(binding["staging"])
+    try:
+        final.lstat()
+    except FileNotFoundError:
+        validate_result_set(contract, staging, outcome)
+        rename_noreplace(staging, final)
+        fsync_parent(final)
+    else:
+        try:
+            staging.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise HarnessError("published and staged result sets both exist")
+        validate_result_set(contract, final, outcome)
+    try:
+        Path(binding["journal"]).unlink()
+    except FileNotFoundError:
+        pass
+    else:
+        fsync_parent(Path(binding["journal"]))
+    return outcome
 
 
 def create_run_stage(
@@ -948,89 +1407,101 @@ def validate_final_frame(frame: dict[str, object], contract: dict[str, object], 
 def run_vm(
     contract: dict[str, object], state: Path, records: dict[str, list[tuple[str, int, bytes]]],
     scenario_raw: bytes, seccomp_raw: bytes, results_arg: Path,
+    *, expected_state: StateIdentity | None = None,
+    binding: dict[str, str] | None = None, resumed: bool = False,
 ) -> dict[str, object]:
+    if expected_state is None:
+        expected_state = state_identity(state)
+    if binding is None:
+        binding = run_binding({**contract, "state": str(state)}, results_arg)
     results: Path | None = None
     outcome: dict[str, object] | None = None
     run_error: BaseException | None = None
     try:
-        results = safe_directory(results_arg, create=True)
-        challenge = str(load_json(state / "state.json")["challenge"])
-        if any((state / name).exists() for name in ("candidate.qcow2", "verifier.qcow2", "transfer.raw")):
-            raise HarnessError("prior VM run residue exists")
-        qemu_img_create(state, "candidate.qcow2", "trusted.qcow2")
-        create_transfer(state)
-        create_run_stage(contract, state, records, scenario_raw, seccomp_raw)
-        boot(
-            state, RUN_TIMEOUT, overlay="candidate.qcow2",
-            evidence_expected=False, transfer="read-write",
-        )
-        (state / "candidate.qcow2").unlink()
-        if (state / "candidate.qcow2").exists():
-            raise HarnessError("candidate VM overlay remains before evidence transfer")
-        if (state / "evidence.bin").exists():
-            raise HarnessError("candidate VM reached verifier evidence storage")
-        validate_transfer(state)
-        validate_prepared_state(state)
-        qemu_img_create(state, "verifier.qcow2", "trusted.qcow2")
-        create_verify_stage(contract, state, scenario_raw)
-        validate_prepared_state(state)
-        frame = boot(
-            state, 180, overlay="verifier.qcow2",
-            evidence_expected=True, transfer="read-only",
-        )
-        if frame is None:
-            raise HarnessError("verification guest returned no evidence")
-        validate_transfer(state)
-        receipt_raw, verifier_raw, proof = validate_final_frame(frame, contract, challenge)
-        receipt_path = results / "acceptance-receipt.json"
-        verifier_path = results / "verifier.json"
-        state_record = load_json(state / "state.json")
-        receipt_digest = hashlib.sha256(receipt_raw).hexdigest()
-        verifier_digest = hashlib.sha256(verifier_raw).hexdigest()
-        evidence_manifest = {
-            "schema_version": "buzz-ci-clean-host-e2e-evidence/v2",
-            "candidate_sha": contract["candidate_sha"],
-            "image_sha256": state_record["image_sha256"],
-            "tool_sha256": state_record["tool_sha256"],
-            "harness_asset_sha256": state_record["harness_asset_sha256"],
-            "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
-            "scenario_sha256": contract["scenario"]["sha256"],
-            "seccomp_source_sha256": SECCOMP_SHA256,
-            "transfer_bytes": TRANSFER_SIZE,
-            "transfer_sha256": file_sha256(state / "transfer.raw"),
-            "receipt_sha256": receipt_digest,
-            "verifier_sha256": verifier_digest,
-            "dormant_proof": proof,
-        }
-        evidence_path = results / "evidence-manifest.json"
-        receipt_path.write_bytes(receipt_raw)
-        verifier_path.write_bytes(verifier_raw)
-        evidence_path.write_bytes(canonical(evidence_manifest))
-        receipt_path.chmod(0o400)
-        verifier_path.chmod(0o400)
-        evidence_path.chmod(0o400)
-        outcome = {
-            "status": "pass", "candidate_sha": contract["candidate_sha"],
-            "receipt_sha256": receipt_digest, "verifier_sha256": verifier_digest,
-            "evidence_manifest_sha256": hashlib.sha256(canonical(evidence_manifest)).hexdigest(),
-            "dormant_proof": proof, "vm_state_absent": True,
-        }
+        results, recovered = start_publication(binding, resumed)
+        if recovered is not None:
+            outcome = recovered
+        else:
+            challenge = str(load_json(state / "state.json")["challenge"])
+            if any((state / name).exists() for name in ("candidate.qcow2", "verifier.qcow2", "transfer.raw")):
+                raise HarnessError("prior VM run residue exists")
+            qemu_img_create(state, "candidate.qcow2", "trusted.qcow2")
+            create_transfer(state)
+            create_run_stage(contract, state, records, scenario_raw, seccomp_raw)
+            boot(
+                state, RUN_TIMEOUT, overlay="candidate.qcow2",
+                evidence_expected=False, transfer="read-write",
+            )
+            (state / "candidate.qcow2").unlink()
+            if (state / "candidate.qcow2").exists():
+                raise HarnessError("candidate VM overlay remains before evidence transfer")
+            if (state / "evidence.bin").exists():
+                raise HarnessError("candidate VM reached verifier evidence storage")
+            validate_transfer(state)
+            validate_prepared_state(state)
+            qemu_img_create(state, "verifier.qcow2", "trusted.qcow2")
+            create_verify_stage(contract, state, scenario_raw)
+            validate_prepared_state(state)
+            frame = boot(
+                state, 180, overlay="verifier.qcow2",
+                evidence_expected=True, transfer="read-only",
+            )
+            if frame is None:
+                raise HarnessError("verification guest returned no evidence")
+            validate_transfer(state)
+            receipt_raw, verifier_raw, proof = validate_final_frame(frame, contract, challenge)
+            receipt_path = results / "acceptance-receipt.json"
+            verifier_path = results / "verifier.json"
+            state_record = load_json(state / "state.json")
+            receipt_digest = hashlib.sha256(receipt_raw).hexdigest()
+            verifier_digest = hashlib.sha256(verifier_raw).hexdigest()
+            evidence_manifest = {
+                "schema_version": "buzz-ci-clean-host-e2e-evidence/v2",
+                "candidate_sha": contract["candidate_sha"],
+                "image_sha256": state_record["image_sha256"],
+                "tool_sha256": state_record["tool_sha256"],
+                "harness_asset_sha256": state_record["harness_asset_sha256"],
+                "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
+                "scenario_sha256": contract["scenario"]["sha256"],
+                "seccomp_source_sha256": SECCOMP_SHA256,
+                "transfer_bytes": TRANSFER_SIZE,
+                "transfer_sha256": file_sha256(state / "transfer.raw"),
+                "receipt_sha256": receipt_digest,
+                "verifier_sha256": verifier_digest,
+                "dormant_proof": proof,
+            }
+            evidence_path = results / "evidence-manifest.json"
+            receipt_path.write_bytes(receipt_raw)
+            receipt_path.chmod(0o400)
+            publication_checkpoint("after-first-file", results, Path(binding["results"]))
+            verifier_path.write_bytes(verifier_raw)
+            verifier_path.chmod(0o400)
+            evidence_path.write_bytes(canonical(evidence_manifest))
+            evidence_path.chmod(0o400)
+            outcome = {
+                "status": "pass", "candidate_sha": contract["candidate_sha"],
+                "receipt_sha256": receipt_digest, "verifier_sha256": verifier_digest,
+                "evidence_manifest_sha256": hashlib.sha256(canonical(evidence_manifest)).hexdigest(),
+                "dormant_proof": proof, "vm_state_absent": True,
+            }
+            publication_checkpoint("after-third-file", results, Path(binding["results"]))
+            validate_result_set(contract, results, outcome)
+            replace_private_json(
+                Path(binding["journal"]), publication_record(binding, "ready", outcome),
+            )
     except BaseException as error:
         run_error = error
 
     cleanup_errors: list[BaseException] = []
     try:
-        destroy_state(state)
+        destroy_state(state, expected_state)
     except BaseException as error:
         cleanup_errors.append(error)
     if run_error is not None or cleanup_errors:
-        if results is not None:
-            try:
-                shutil.rmtree(results)
-                if results.exists():
-                    raise HarnessError("run results remain after cleanup")
-            except BaseException as error:
-                cleanup_errors.append(error)
+        try:
+            cleanup_publication(binding)
+        except BaseException as error:
+            cleanup_errors.append(error)
     if cleanup_errors:
         detail = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
         raise HarnessError(f"terminal run cleanup failed: {detail}") from run_error
@@ -1038,7 +1509,7 @@ def run_vm(
         raise run_error.with_traceback(run_error.__traceback__)
     if outcome is None:
         raise HarnessError("terminal run produced no outcome")
-    return outcome
+    return finish_publication(contract, binding, outcome)
 
 
 def main() -> int:
@@ -1065,10 +1536,11 @@ def main() -> int:
         elif arguments.action == "prepare":
             result = prepare(arguments)
         else:
-            contract, state, records, scenario_raw, seccomp_raw = validate_contract(arguments.contract)
-            result = {"status": "ready", "candidate_sha": contract["candidate_sha"], "boundary": "bubblewrap+qemu-kvm"}
             if arguments.action == "run":
-                result = run_vm(contract, state, records, scenario_raw, seccomp_raw, arguments.results)
+                result = terminal_run(arguments.contract, arguments.results)
+            else:
+                contract, _state, _records, _scenario_raw, _seccomp_raw = validate_contract(arguments.contract)
+                result = {"status": "ready", "candidate_sha": contract["candidate_sha"], "boundary": "bubblewrap+qemu-kvm"}
         sys.stdout.buffer.write(canonical(result))
         return 0
     except (OSError, ValueError, HarnessError, subprocess.SubprocessError) as error:

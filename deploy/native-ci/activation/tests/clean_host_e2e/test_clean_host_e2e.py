@@ -82,6 +82,73 @@ def make_prepared_state(parent: Path) -> Path:
     return state
 
 
+def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object], str]:
+    candidate = HERE.parents[4]
+    candidate_sha = harness.bounded([
+        "/usr/bin/git", "-C", str(candidate), "rev-parse", "HEAD^{commit}",
+    ]).decode().strip()
+    packages = {}
+    for name in harness.PACKAGE_NAMES:
+        package = parent / f"package-{name}"
+        package.mkdir(mode=0o700)
+        (package / "payload").write_bytes(name.encode())
+        packages[name] = {
+            "path": str(package),
+            "tree_sha256": harness.tree_digest(harness.tree_records(package)),
+        }
+    scenario = parent / "scenario.json"
+    scenario.write_bytes(b"{}\n")
+    seccomp = parent / "seccomp.json"
+    seccomp.write_bytes(b'{"defaultAction":"SCMP_ACT_ERRNO"}\n')
+    seccomp_sha = harness.file_sha256(seccomp)
+    value = {
+        "schema_version": harness.SCHEMA,
+        "state": str(state),
+        "candidate_root": str(candidate),
+        "candidate_sha": candidate_sha,
+        "scenario": {"path": str(scenario), "sha256": harness.file_sha256(scenario)},
+        "seccomp_source": {"path": str(seccomp), "sha256": seccomp_sha},
+        "packages": packages,
+    }
+    contract = parent / "contract.json"
+    contract.write_bytes(harness.canonical(value))
+    return contract, value, seccomp_sha
+
+
+def rewrite_contract(path: Path, value: dict[str, object]) -> None:
+    path.write_bytes(harness.canonical(value))
+
+
+def passing_frame(contract: dict[str, object]) -> dict[str, object]:
+    proof = {
+        "configs_sha256": "5" * 64,
+        "units_sha256": "6" * 64,
+        "sockets_absent": True,
+        "processes_absent": True,
+        "encrypted_credentials_absent": True,
+        "relay_residue_absent": True,
+    }
+    receipt = {
+        "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2",
+        "outcome": "pass",
+        "scenario_sha256": contract["scenario"]["sha256"],
+        "integrated_candidate_sha": contract["candidate_sha"],
+        "run_id": "4" * 32,
+        "checks": [],
+        "zero_transition": {},
+    }
+    verifier = {"outcome": "pass", "status": "verified"}
+    return {
+        "schema_version": harness.FRAME_SCHEMA,
+        "phase": "run",
+        "challenge": "1" * 64,
+        "outcome": "pass",
+        "receipt_base64": base64.b64encode(harness.canonical(receipt)).decode(),
+        "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
+        "dormant_proof": proof,
+    }
+
+
 def mount_pairs(command: list[str], option: str) -> list[tuple[str, str]]:
     return [
         (command[index + 1], command[index + 2])
@@ -481,6 +548,275 @@ class InputTests(unittest.TestCase):
             harness.destroy_state(state)
             self.assertFalse(state.exists())
 
+    def test_terminal_run_rejects_malicious_state_paths_without_destroying_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            contract, value, _seccomp_sha = make_run_contract(root, state)
+            linked = root / "linked-state"
+            linked.symlink_to(state, target_is_directory=True)
+            value["state"] = str(linked)
+            rewrite_contract(contract, value)
+            with self.assertRaises(harness.HarnessError):
+                harness.terminal_run(contract, root / "results")
+            self.assertTrue(state.exists())
+            self.assertTrue(linked.is_symlink())
+
+    def test_contract_envelope_failures_do_not_select_or_destroy_state(self) -> None:
+        mutations = (
+            lambda value: value.update(schema_version="wrong"),
+            lambda value: value.update(candidate_sha="not-a-commit"),
+            lambda value: value.update(state=["not", "a", "path"]),
+            lambda value: value.update(extra="rejected"),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = make_prepared_state(root)
+                contract, value, _seccomp_sha = make_run_contract(root, state)
+                mutate(value)
+                rewrite_contract(contract, value)
+                with self.assertRaises(harness.HarnessError):
+                    harness.terminal_run(contract, root / "results")
+                self.assertTrue(state.exists())
+
+    def test_every_post_selection_validation_boundary_destroys_state(self) -> None:
+        def candidate_failure(value):
+            value["candidate_root"] = "/definitely/absent/candidate"
+
+        def package_set_failure(value):
+            value["packages"].pop("runner")
+
+        def package_descriptor_failure(value):
+            value["packages"]["runner"]["tree_sha256"] = "0" * 64
+
+        def package_path_failure(value):
+            value["packages"]["runner"]["path"] = "/definitely/absent/package"
+
+        def scenario_descriptor_failure(value):
+            value["scenario"]["sha256"] = "0" * 64
+
+        def scenario_path_failure(value):
+            value["scenario"]["path"] = "/definitely/absent/scenario"
+
+        def seccomp_descriptor_failure(value):
+            value["seccomp_source"]["sha256"] = "0" * 64
+
+        def seccomp_path_failure(value):
+            value["seccomp_source"]["path"] = "/definitely/absent/seccomp"
+
+        mutations = (
+            candidate_failure, package_set_failure, package_descriptor_failure,
+            package_path_failure, scenario_descriptor_failure, scenario_path_failure,
+            seccomp_descriptor_failure, seccomp_path_failure,
+        )
+        for mutate in mutations:
+            with self.subTest(boundary=mutate.__name__), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = make_prepared_state(root)
+                contract, value, seccomp_sha = make_run_contract(root, state)
+                mutate(value)
+                rewrite_contract(contract, value)
+                with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
+                    harness, "validate_flat_qcow2",
+                ):
+                    with self.assertRaises((OSError, harness.HarnessError, __import__("subprocess").SubprocessError)):
+                        harness.terminal_run(contract, root / "results")
+                self.assertFalse(state.exists())
+                self.assertFalse(any(path.name.startswith(".state.terminal-") for path in root.iterdir()))
+
+    def test_concurrent_run_state_replacement_is_preserved_and_cleanup_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            contract, _value, seccomp_sha = make_run_contract(root, state)
+            stolen = root / "stolen-selected-state"
+            replacement = None
+
+            def replace_then_fail(selected, _name, _backing):
+                nonlocal replacement
+                selected.rename(stolen)
+                selected.mkdir(mode=0o700)
+                marker = state_record()
+                marker["challenge"] = "2" * 64
+                (selected / "state.json").write_bytes(harness.canonical(marker))
+                replacement = selected
+                raise harness.HarnessError("simulated setup failure after replacement")
+
+            with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
+                harness, "validate_flat_qcow2",
+            ), mock.patch.object(harness, "qemu_img_create", side_effect=replace_then_fail):
+                with self.assertRaisesRegex(harness.HarnessError, "terminal run cleanup failed") as caught:
+                    harness.terminal_run(contract, root / "results")
+            self.assertIn("setup failure", str(caught.exception.__cause__))
+            self.assertIsNotNone(replacement)
+            self.assertTrue(replacement.exists())
+            self.assertTrue(stolen.exists())
+            self.assertFalse((root / "results").exists())
+            harness.destroy_state(replacement)
+            harness.destroy_state(stolen)
+
+    def test_early_run_setup_failure_destroys_state_and_partial_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            contract, _value, seccomp_sha = make_run_contract(root, state)
+            with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
+                harness, "validate_flat_qcow2",
+            ), mock.patch.object(
+                harness, "qemu_img_create", side_effect=harness.HarnessError("simulated setup failure"),
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "setup failure"):
+                    harness.terminal_run(contract, root / "results")
+            self.assertFalse(state.exists())
+            self.assertFalse((root / "results").exists())
+            self.assertFalse(any(path.name.startswith(".state.terminal-") for path in root.iterdir()))
+
+    def test_post_first_file_restart_exposes_nothing_and_cleans_exact_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            contract_path, contract, seccomp_sha = make_run_contract(root, state)
+            results = root / "results"
+            binding = harness.run_binding(contract, results)
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, _expected, _resumed = harness.claim_run_state(binding)
+            staging = harness.safe_directory(Path(binding["staging"]), create=True)
+            (staging / "acceptance-receipt.json").write_bytes(b"private partial evidence")
+            harness.write_new_private_json(
+                Path(binding["journal"]), harness.publication_record(binding, "running"),
+            )
+            self.assertFalse(results.exists())
+            self.assertEqual({path.name for path in staging.iterdir()}, {"acceptance-receipt.json"})
+            with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
+                harness, "validate_flat_qcow2",
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "interrupted terminal result staging"):
+                    harness.terminal_run(contract_path, results)
+                with self.assertRaises(FileNotFoundError):
+                    harness.terminal_run(contract_path, results)
+            self.assertFalse(results.exists())
+            self.assertFalse(staging.exists())
+            self.assertFalse(Path(binding["journal"]).exists())
+            self.assertFalse(claimed.exists())
+
+    def test_post_third_file_ready_retry_cleans_state_then_atomically_publishes_exact_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            contract_path, contract, seccomp_sha = make_run_contract(root, state)
+            results = root / "results"
+            frame = passing_frame(contract)
+            checkpoints = []
+
+            def create_image(image_state, name, _backing):
+                (image_state / name).write_bytes(b"overlay")
+
+            def boot(_state, _timeout, *, overlay, **_kwargs):
+                return frame if overlay == "verifier.qcow2" else None
+
+            def checkpoint(name, staging, final):
+                checkpoints.append(name)
+                self.assertFalse(final.exists())
+                expected_count = 1 if name == "after-first-file" else 3
+                self.assertEqual(len(tuple(staging.iterdir())), expected_count)
+
+            with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
+                harness, "validate_flat_qcow2",
+            ), mock.patch.object(harness, "qemu_img_create", side_effect=create_image), mock.patch.object(
+                harness, "create_run_stage",
+            ), mock.patch.object(harness, "create_verify_stage"), mock.patch.object(
+                harness, "boot", side_effect=boot,
+            ), mock.patch.object(harness, "publication_checkpoint", side_effect=checkpoint):
+                outcome = harness.terminal_run(contract_path, results)
+            self.assertEqual(checkpoints, ["after-first-file", "after-third-file"])
+            published = {path.name: path.read_bytes() for path in results.iterdir()}
+            self.assertEqual(set(published), {
+                "acceptance-receipt.json", "verifier.json", "evidence-manifest.json",
+            })
+
+            state = make_prepared_state(root)
+            binding = harness.run_binding(contract, results)
+            staging = Path(binding["staging"])
+            results.rename(staging)
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, _expected, _resumed = harness.claim_run_state(binding)
+            harness.write_new_private_json(
+                Path(binding["journal"]), harness.publication_record(binding, "ready", outcome),
+            )
+            self.assertFalse(results.exists())
+            self.assertTrue(claimed.exists())
+            with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
+                harness, "validate_flat_qcow2",
+            ):
+                recovered = harness.terminal_run(contract_path, results)
+                recovered_again = harness.terminal_run(contract_path, results)
+            self.assertEqual(recovered, outcome)
+            self.assertEqual(recovered_again, outcome)
+            self.assertFalse(claimed.exists())
+            self.assertFalse(staging.exists())
+            self.assertFalse(Path(binding["journal"]).exists())
+            self.assertEqual({path.name: path.read_bytes() for path in results.iterdir()}, published)
+
+    def test_state_cleanup_retry_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = make_destroyable_state(Path(temporary))
+            expected = harness.state_identity(state)
+            harness.destroy_state(state, expected)
+            harness.destroy_state(state, expected)
+            self.assertFalse(state.exists())
+
+    def test_prepare_failure_cleans_state_and_success_intentionally_retains_it(self) -> None:
+        for succeeds in (False, True):
+            with self.subTest(succeeds=succeeds), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                image = root / "base.qcow2"
+                image.write_bytes(b"base image")
+                state = root / "state"
+                tool_sha = {name: harness.file_sha256(Path(path)) for name, path in harness.TOOLS.items()}
+                arguments = __import__("argparse").Namespace(
+                    state=state,
+                    image=image,
+                    image_sha256=harness.file_sha256(image),
+                    qemu_sha256=tool_sha["qemu"],
+                    qemu_img_sha256=tool_sha["qemu_img"],
+                    controld_uid=1201,
+                    controld_gid=1201,
+                )
+                proof = {"qemu_version": "test", "tool_sha256": tool_sha}
+                frame = {
+                    "schema_version": harness.FRAME_SCHEMA,
+                    "phase": "ceremony",
+                    "challenge": "unused",
+                    "outcome": "pass",
+                    "public_binding": {},
+                    "raw_key_absence": True,
+                }
+
+                def boot(_state, _timeout, **_kwargs):
+                    if not succeeds:
+                        raise harness.HarnessError("simulated prepare failure")
+                    marker = harness.load_json(state / "state.json")
+                    return {**frame, "challenge": marker["challenge"]}
+
+                def create_image(image_state, name, _backing):
+                    (image_state / name).write_bytes(b"overlay")
+
+                with mock.patch.object(harness, "capabilities", return_value=proof), mock.patch.object(
+                    harness, "validate_flat_qcow2",
+                ), mock.patch.object(harness, "qemu_img_create", side_effect=create_image), mock.patch.object(
+                    harness, "make_iso",
+                ), mock.patch.object(harness, "make_seed"), mock.patch.object(
+                    harness, "boot", side_effect=boot,
+                ), mock.patch.object(harness, "flatten_ceremony", return_value="3" * 64):
+                    if succeeds:
+                        outcome = harness.prepare(arguments)
+                        self.assertEqual(outcome["status"], "prepared")
+                    else:
+                        with self.assertRaisesRegex(harness.HarnessError, "prepare failure"):
+                            harness.prepare(arguments)
+                self.assertEqual(state.exists(), succeeds)
+
     def test_post_candidate_drift_blocks_verifier_and_destroys_state(self) -> None:
         cases = (
             ("frozen-assets/receipt_verifier.py", "frozen harness asset"),
@@ -519,13 +855,17 @@ class InputTests(unittest.TestCase):
     def test_existing_results_setup_failure_destroys_state_but_preserves_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            state = make_destroyable_state(root)
+            state = make_prepared_state(root)
+            contract, _value, seccomp_sha = make_run_contract(root, state)
             results = root / "results"
             results.mkdir(mode=0o700)
             sentinel = results / "owned-by-caller"
             sentinel.write_text("keep")
-            with self.assertRaises(FileExistsError):
-                harness.run_vm({}, state, {}, b"", b"", results)
+            with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
+                harness, "validate_flat_qcow2",
+            ):
+                with self.assertRaises(FileExistsError):
+                    harness.terminal_run(contract, results)
             self.assertFalse(state.exists())
             self.assertEqual(sentinel.read_text(), "keep")
 
