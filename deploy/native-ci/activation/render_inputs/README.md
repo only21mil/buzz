@@ -9,7 +9,10 @@ The descriptor must be mode `0600`. Every file reference supplies its relative
 path, SHA-256, byte count, and mode. The renderer anchors references at the
 descriptor directory, opens every component with `O_NOFOLLOW`, rejects hard
 links, and detects reads that change underneath it. Outputs are new mode-`0600`
-files. Existing outputs are never replaced.
+files. Existing outputs are never replaced. A retry may accept an existing
+output only when it is the same owner-controlled mode-`0600` regular file with
+the exact complete canonical bytes. The retry fsyncs the output directory again
+before it succeeds; every mismatch keeps the no-clobber failure.
 
 ## Commands
 
