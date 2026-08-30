@@ -111,7 +111,9 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
             "tree_sha256": harness.tree_digest(harness.tree_records(package)),
         }
     scenario = parent / "scenario.json"
-    scenario.write_bytes(b"{}\n")
+    scenario.write_bytes(harness.canonical({
+        "driver": {"timeout_seconds": harness.TIMING_CONTRACT["leaf_seconds"]["driver_operation"]},
+    }))
     seccomp = parent / "seccomp.json"
     seccomp.write_bytes(b'{"defaultAction":"SCMP_ACT_ERRNO"}\n')
     seccomp_sha = harness.file_sha256(seccomp)
@@ -580,30 +582,42 @@ class BoundaryTests(unittest.TestCase):
 
 
 class TimingAndProgressTests(unittest.TestCase):
-    def test_watchdogs_cover_every_sequential_phase_and_slow_cleanup(self) -> None:
+    def test_timing_source_recursively_matches_actual_leaf_counts(self) -> None:
         harness.validate_timing_contract()
-        phases = harness.TIMING_CONTRACT["phase_timeout_seconds"]
-        candidate = (
-            phases["boot_cloud_init"] + phases["install"] + phases["controller_check"]
-            + phases["controller_stage"] + phases["controller_activate"]
-            + phases["canary"] + phases["receipt_verifier"] + phases["rollback"]
-            + phases["cleanup"] + phases["poweroff"]
-        )
-        self.assertEqual(candidate, 1830)
-        self.assertEqual(harness.watchdog_seconds("candidate"), candidate)
-        self.assertGreater(candidate, 900)
-        self.assertGreaterEqual(candidate, phases["canary"] + phases["cleanup"])
-        self.assertEqual(
-            harness.watchdog_seconds("verifier"),
-            phases["boot_cloud_init"] + phases["verifier"] + phases["poweroff"],
-        )
-        self.assertEqual(
-            harness.watchdog_seconds("ceremony"),
-            phases["boot_cloud_init"] + phases["ceremony"] + phases["poweroff"],
-        )
+        timing = harness.TIMING_CONTRACT
+        terms = timing["phase_terms"]
+        expected_stages = json.loads((HERE.parents[2] / "acceptance/expected-stages.json").read_bytes())
+        acceptance_source = (HERE.parents[4] / "crates/buzz-ci-acceptance-ctl/src/acceptance.rs").read_text()
+        scenario = json.loads((HERE.parents[2] / "acceptance/scenario.template.json").read_bytes())
+        self.assertIn("for _ in 0..2", acceptance_source)
+        self.assertEqual(terms["canary"]["driver_operation"], len(expected_stages) + 2)
+        self.assertEqual(timing["leaf_seconds"]["driver_operation"], scenario["driver"]["timeout_seconds"])
+        self.assertEqual(terms["ceremony"]["command_default"], len(guest.KEY_NAMES) * 4 + 5)
+        self.assertEqual(terms["install"]["command_default"], 3 + len(guest.UNITS) * 2 + 1 + 5)
+        self.assertEqual(terms["controller_stage"]["command_default"], len(guest.UNITS))
+        self.assertEqual(terms["cleanup"]["unit_stop"], len(guest.UNITS) + 1)
+        self.assertEqual(terms["cleanup"]["command_default"], len(guest.UNITS) + 4)
+        self.assertEqual(terms["cleanup"]["guest_command_reap"], len(guest.UNITS) * 2 + 5)
+        self.assertEqual(json.loads((HERE / "timing-contract.json").read_bytes()), timing)
         schema = json.loads((HERE / "contract.schema.json").read_bytes())
-        self.assertEqual(schema["properties"]["timing"]["const"], harness.TIMING_CONTRACT)
-        self.assertEqual(guest.TIMING_CONTRACT, harness.TIMING_CONTRACT)
+        self.assertEqual(schema["properties"]["timing"]["const"], timing)
+        self.assertEqual(guest.TIMING_CONTRACT, timing)
+
+    def test_watchdog_boundaries_cover_legal_sequences_cleanup_poweroff_and_reap(self) -> None:
+        expected = {"ceremony": 1130, "candidate": 5712, "verifier": 320}
+        for role, phases in harness.TIMING_CONTRACT["role_phases"].items():
+            legal_boundary = sum(harness.phase_seconds(phase) for phase in phases)
+            complete_boundary = legal_boundary + harness.REAP_TIMEOUT
+            self.assertEqual(harness.watchdog_seconds(role), complete_boundary)
+            self.assertLess(harness.watchdog_seconds(role) - 1, complete_boundary)
+            self.assertEqual(harness.watchdog_seconds(role), expected[role])
+        canary_inner = 15 * harness.TIMING_CONTRACT["leaf_seconds"]["driver_operation"]
+        self.assertEqual(guest.canary_command_seconds(), canary_inner + 30)
+        self.assertGreater(harness.phase_seconds("canary"), guest.canary_command_seconds() + 10)
+        self.assertGreater(harness.phase_seconds("ceremony"), 21 * 30 + 21 * 10)
+        self.assertGreater(harness.phase_seconds("install"), 35 * 30 + 36 * 10 + 12)
+        self.assertGreater(harness.phase_seconds("controller_stage"), 120 + 13 * 30 + 14 * 10)
+        self.assertGreater(harness.phase_seconds("cleanup"), 17 * 30 + 14 * 10 + 31 * 10)
 
     def test_inner_timeout_is_recorded_before_rollback_and_cleanup(self) -> None:
         events: list[tuple[str, str]] = []
@@ -612,7 +626,7 @@ class TimingAndProgressTests(unittest.TestCase):
         ), mock.patch.object(
             guest, "emit_progress", side_effect=lambda phase, event="start": events.append((phase, event)),
         ), mock.patch.object(
-            guest.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 611.0, 611.0, 611.0]
+            guest.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 1831.0, 1831.0, 1831.0]
         ), mock.patch.object(guest.subprocess, "Popen") as popen, mock.patch.object(
             guest, "reap_process_group",
         ):
@@ -622,7 +636,10 @@ class TimingAndProgressTests(unittest.TestCase):
             guest._PHASE_DEADLINE = None
             guest.begin_phase("canary")
             with self.assertRaisesRegex(guest.GuestError, "timed out"):
-                guest.command(["/usr/libexec/buzz-ci-capacity-one-canary"], timeout=600)
+                guest.command(
+                    ["/usr/libexec/buzz-ci-capacity-one-canary"],
+                    timeout=guest.canary_command_seconds(),
+                )
             guest.begin_phase("rollback")
             guest.begin_phase("cleanup")
         self.assertEqual(

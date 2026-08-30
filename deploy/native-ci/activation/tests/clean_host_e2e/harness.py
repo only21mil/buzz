@@ -37,31 +37,8 @@ MAX_FRAME = 4 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
 MAX_TREE_FILES = 1024
 TRANSFER_SIZE = 8 * 1024 * 1024
-REAP_TIMEOUT = 10
-TIMING_CONTRACT = {
-    "schema_version": "buzz-ci-clean-host-e2e-timing/v1",
-    "phase_timeout_seconds": {
-        "boot_cloud_init": 180,
-        "ceremony": 180,
-        "install": 300,
-        "controller_check": 70,
-        "controller_stage": 130,
-        "controller_activate": 130,
-        "canary": 610,
-        "receipt_verifier": 70,
-        "rollback": 70,
-        "cleanup": 240,
-        "verifier": 60,
-        "poweroff": 30,
-    },
-    "watchdog_seconds": {
-        "ceremony": 390,
-        "candidate": 1830,
-        "verifier": 270,
-    },
-    "guest_command_reap_seconds": 10,
-    "host_reap_seconds": REAP_TIMEOUT,
-}
+TIMING_PATH = Path(__file__).with_name("timing-contract.json")
+TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
 PROGRESS_PHASES = (
     "guest_started", "ceremony", "install", "controller_check",
     "controller_stage", "controller_activate", "canary", "receipt_verifier",
@@ -69,15 +46,6 @@ PROGRESS_PHASES = (
 )
 PROGRESS_EVENTS = ("start", "timeout", "complete")
 PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
-WATCHDOG_PHASES = {
-    "ceremony": ("boot_cloud_init", "ceremony", "poweroff"),
-    "candidate": (
-        "boot_cloud_init", "install", "controller_check", "controller_stage",
-        "controller_activate", "canary", "receipt_verifier", "rollback",
-        "cleanup", "poweroff",
-    ),
-    "verifier": ("boot_cloud_init", "verifier", "poweroff"),
-}
 MAX_PROGRESS_RECORDS = 32
 MAX_PROGRESS = 16 * 1024
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
@@ -89,8 +57,8 @@ TOOLS = {
     "cloud_localds": "/usr/bin/cloud-localds",
 }
 FROZEN_ASSETS = (
-    "harness.py", "guest_entry.py", "local_tls_relay.py", "receipt_verifier.py",
-    "expected-stages.json",
+    "harness.py", "guest_entry.py", "timing-contract.json", "local_tls_relay.py",
+    "receipt_verifier.py", "expected-stages.json",
 )
 GUEST_ASSETS = tuple(name for name in FROZEN_ASSETS if name != "harness.py")
 REQUIRED_CANDIDATE = (
@@ -283,37 +251,82 @@ def timing_sha256() -> str:
     return hashlib.sha256(canonical(TIMING_CONTRACT)).hexdigest()
 
 
+def timing_terms_seconds(terms: object) -> int:
+    leaves = TIMING_CONTRACT.get("leaf_seconds")
+    if (
+        not isinstance(leaves, dict)
+        or not isinstance(terms, dict)
+        or any(
+            name not in leaves
+            or not isinstance(count, int) or isinstance(count, bool) or count <= 0
+            for name, count in terms.items()
+        )
+    ):
+        raise HarnessError("frozen VM timing terms differ")
+    return sum(int(leaves[name]) * count for name, count in terms.items())
+
+
+def phase_seconds(phase: str) -> int:
+    phases = TIMING_CONTRACT.get("phase_terms")
+    if not isinstance(phases, dict) or phase not in phases:
+        raise HarnessError("unknown VM timing phase")
+    return timing_terms_seconds(phases[phase])
+
+
 def validate_timing_contract() -> None:
-    phases = TIMING_CONTRACT.get("phase_timeout_seconds")
-    declared = TIMING_CONTRACT.get("watchdog_seconds")
+    leaves = TIMING_CONTRACT.get("leaf_seconds")
+    phases = TIMING_CONTRACT.get("phase_terms")
+    roles = TIMING_CONTRACT.get("role_phases")
+    expected_phases = {
+        "boot_cloud_init", "ceremony", "install", "controller_check",
+        "controller_stage", "controller_activate", "canary", "receipt_verifier",
+        "rollback", "cleanup", "verifier", "poweroff",
+    }
+    expected_roles = {
+        "ceremony": ["boot_cloud_init", "ceremony", "poweroff"],
+        "candidate": [
+            "boot_cloud_init", "install", "controller_check", "controller_stage",
+            "controller_activate", "canary", "receipt_verifier", "rollback",
+            "cleanup", "poweroff",
+        ],
+        "verifier": ["boot_cloud_init", "verifier", "poweroff"],
+    }
     if (
         set(TIMING_CONTRACT) != {
-            "schema_version", "phase_timeout_seconds", "watchdog_seconds",
-            "guest_command_reap_seconds", "host_reap_seconds",
+            "schema_version", "leaf_seconds", "phase_terms", "role_phases",
         }
-        or TIMING_CONTRACT.get("schema_version") != "buzz-ci-clean-host-e2e-timing/v1"
+        or TIMING_CONTRACT.get("schema_version") != "buzz-ci-clean-host-e2e-timing/v2"
+        or not isinstance(leaves, dict)
+        or set(leaves) != {
+            "cloud_init_margin", "command_default", "controller_check",
+            "controller_stage", "controller_activate", "driver_operation",
+            "canary_orchestration_margin", "receipt_verifier", "rollback",
+            "unit_stop", "relay_ready_window", "relay_probe", "phase_margin",
+            "verifier_local_work", "guest_command_reap", "poweroff", "host_reap",
+        }
+        or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in leaves.values())
         or not isinstance(phases, dict)
-        or set(phases) != {phase for values in WATCHDOG_PHASES.values() for phase in values}
-        or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in phases.values())
-        or not isinstance(declared, dict)
-        or set(declared) != set(WATCHDOG_PHASES)
-        or any(declared[role] != sum(phases[phase] for phase in phase_names) for role, phase_names in WATCHDOG_PHASES.items())
-        or TIMING_CONTRACT.get("guest_command_reap_seconds") != 10
-        or TIMING_CONTRACT.get("host_reap_seconds") != REAP_TIMEOUT
+        or set(phases) != expected_phases
+        or roles != expected_roles
     ):
         raise HarnessError("frozen VM timing contract is internally inconsistent")
+    for terms in phases.values():
+        timing_terms_seconds(terms)
+
+
+REAP_TIMEOUT = int(TIMING_CONTRACT["leaf_seconds"]["host_reap"])
 
 
 def watchdog_seconds(boot_role: str) -> int:
     validate_timing_contract()
-    value = TIMING_CONTRACT["watchdog_seconds"]
-    if not isinstance(value, dict) or boot_role not in value or not isinstance(value[boot_role], int):
+    roles = TIMING_CONTRACT["role_phases"]
+    if not isinstance(roles, dict) or boot_role not in roles:
         raise HarnessError("unknown VM boot timing role")
-    return value[boot_role]
+    return sum(phase_seconds(phase) for phase in roles[boot_role]) + REAP_TIMEOUT
 
 
 def asset_source(here: Path, name: str) -> Path:
-    if name in {"harness.py", "guest_entry.py", "local_tls_relay.py"}:
+    if name in {"harness.py", "guest_entry.py", "timing-contract.json", "local_tls_relay.py"}:
         return here / name
     if name == "receipt_verifier.py":
         return here.parents[2] / "acceptance" / "verify-receipt.py"
@@ -835,14 +848,14 @@ def make_seed(state: Path, instance_id: str) -> None:
     seed = state / "seed-source"
     seed.mkdir(mode=0o700)
     (seed / "meta-data").write_text(f"instance-id: {instance_id}\nlocal-hostname: buzzci-e2e\n")
-    user_data = """#cloud-config
+    user_data = f"""#cloud-config
 mounts:
   - [LABEL=BUZZCI_STAGE, /mnt/buzzci-stage, iso9660, 'ro,nosuid,nodev,noexec', '0', '0']
 runcmd:
   - [python3, /mnt/buzzci-stage/guest_entry.py, /mnt/buzzci-stage/phase.json]
 power_state:
   mode: poweroff
-  timeout: 30
+  timeout: {phase_seconds("poweroff")}
   condition: true
 """
     (seed / "user-data").write_text(user_data)
@@ -1483,6 +1496,13 @@ def validate_contract_value(
     scenario_raw = read_regular(safe_input_file(Path(str(scenario["path"]))), MAX_JSON)
     if hashlib.sha256(scenario_raw).hexdigest() != scenario["sha256"]:
         raise HarnessError("scenario digest differs")
+    scenario_value = decode_result_json(scenario_raw, "scenario.json")
+    driver = scenario_value.get("driver") if isinstance(scenario_value, dict) else None
+    if (
+        not isinstance(driver, dict)
+        or driver.get("timeout_seconds") != TIMING_CONTRACT["leaf_seconds"]["driver_operation"]
+    ):
+        raise HarnessError("scenario driver timeout differs from frozen timing contract")
     seccomp = value["seccomp_source"]
     if not isinstance(seccomp, dict) or set(seccomp) != {"path", "sha256"} or seccomp.get("sha256") != SECCOMP_SHA256:
         raise HarnessError("seccomp source descriptor differs")

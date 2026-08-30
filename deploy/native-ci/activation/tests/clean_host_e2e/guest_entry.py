@@ -73,26 +73,8 @@ CA_BACKENDS = (
         ("update-ca-trust", "extract"),
     ),
 )
-TIMING_CONTRACT = {
-    "schema_version": "buzz-ci-clean-host-e2e-timing/v1",
-    "phase_timeout_seconds": {
-        "boot_cloud_init": 180,
-        "ceremony": 180,
-        "install": 300,
-        "controller_check": 70,
-        "controller_stage": 130,
-        "controller_activate": 130,
-        "canary": 610,
-        "receipt_verifier": 70,
-        "rollback": 70,
-        "cleanup": 240,
-        "verifier": 60,
-        "poweroff": 30,
-    },
-    "watchdog_seconds": {"ceremony": 390, "candidate": 1830, "verifier": 270},
-    "guest_command_reap_seconds": 10,
-    "host_reap_seconds": 10,
-}
+TIMING_PATH = Path(__file__).with_name("timing-contract.json")
+TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
 _PROGRESS_BOOT: str | None = None
 _PROGRESS_SEQUENCE = 0
 _PROGRESS_STARTED = 0.0
@@ -110,6 +92,38 @@ def canonical(value: object) -> bytes:
 
 def timing_sha256() -> str:
     return hashlib.sha256(canonical(TIMING_CONTRACT)).hexdigest()
+
+
+def timing_leaf(name: str) -> int:
+    leaves = TIMING_CONTRACT.get("leaf_seconds")
+    value = leaves.get(name) if isinstance(leaves, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise GuestError("guest timing leaf differs")
+    return value
+
+
+def timing_terms_seconds(terms: object) -> int:
+    if not isinstance(terms, dict) or any(
+        not isinstance(name, str)
+        or not isinstance(count, int) or isinstance(count, bool) or count <= 0
+        for name, count in terms.items()
+    ):
+        raise GuestError("guest timing terms differ")
+    return sum(timing_leaf(name) * count for name, count in terms.items())
+
+
+def phase_seconds(phase: str) -> int:
+    phases = TIMING_CONTRACT.get("phase_terms")
+    if not isinstance(phases, dict) or phase not in phases:
+        raise GuestError("guest timing phase differs")
+    return timing_terms_seconds(phases[phase])
+
+
+def canary_command_seconds() -> int:
+    terms = TIMING_CONTRACT.get("phase_terms", {}).get("canary", {})
+    if not isinstance(terms, dict):
+        raise GuestError("guest canary timing differs")
+    return timing_leaf("driver_operation") * int(terms.get("driver_operation", 0)) + timing_leaf("canary_orchestration_margin")
 
 
 def open_progress_device() -> int:
@@ -173,11 +187,8 @@ def emit_progress(phase: str, event: str = "start") -> None:
 
 def begin_phase(phase: str) -> None:
     global _ACTIVE_PHASE, _PHASE_DEADLINE
-    phase_timeouts = TIMING_CONTRACT["phase_timeout_seconds"]
-    if not isinstance(phase_timeouts, dict) or not isinstance(phase_timeouts.get(phase), int):
-        raise GuestError("guest timing phase differs")
     _ACTIVE_PHASE = phase
-    _PHASE_DEADLINE = time.monotonic() + phase_timeouts[phase]
+    _PHASE_DEADLINE = time.monotonic() + phase_seconds(phase)
     emit_progress(phase)
 
 
@@ -287,9 +298,11 @@ def reap_process_group(process: subprocess.Popen[bytes], *, wait_seconds: float 
     raise GuestError("guest process group remains after reap")
 
 
-def command(argv: list[str], *, stdin: bytes | None = None, timeout: int = 30, allow_failure: bool = False) -> subprocess.CompletedProcess[bytes]:
+def command(argv: list[str], *, stdin: bytes | None = None, timeout: int | None = None, allow_failure: bool = False) -> subprocess.CompletedProcess[bytes]:
+    if timeout is None:
+        timeout = timing_leaf("command_default")
     phase_deadline = _PHASE_DEADLINE
-    guest_reap = int(TIMING_CONTRACT["guest_command_reap_seconds"])
+    guest_reap = timing_leaf("guest_command_reap")
     if phase_deadline is not None and time.monotonic() >= phase_deadline - guest_reap:
         if _ACTIVE_PHASE is not None:
             emit_progress(_ACTIVE_PHASE, "timeout")
@@ -798,8 +811,11 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         raise GuestError("execd package differs from activation package")
     scenario = json.loads(scenario_raw, object_pairs_hook=reject_duplicates)
     fixture = scenario.get("fixture") if isinstance(scenario, dict) else None
+    driver = scenario.get("driver") if isinstance(scenario, dict) else None
     if (
         not isinstance(fixture, dict)
+        or not isinstance(driver, dict)
+        or driver.get("timeout_seconds") != timing_leaf("driver_operation")
         or fixture.get("integrated_candidate_sha") != candidate_sha
         or fixture.get("activation_package_digest") != activation_digest
         or fixture.get("activation_id") != activation_id
@@ -1014,9 +1030,9 @@ def start_relay(public: dict[str, object]) -> None:
     unit.chmod(0o444)
     command(["systemctl", "daemon-reload"])
     command(["systemctl", "start", "buzzci-e2e-relay.service"])
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + timing_leaf("relay_ready_window")
     while time.monotonic() < deadline:
-        probe = command(["openssl", "s_client", "-connect", "relay.test.invalid:3443", "-servername", "relay.test.invalid", "-CAfile", str(STATE_ROOT / "ca.crt"), "-brief"], stdin=b"", timeout=2, allow_failure=True)
+        probe = command(["openssl", "s_client", "-connect", "relay.test.invalid:3443", "-servername", "relay.test.invalid", "-CAfile", str(STATE_ROOT / "ca.crt"), "-brief"], stdin=b"", timeout=timing_leaf("relay_probe"), allow_failure=True)
         if probe.returncode == 0:
             return
         time.sleep(0.1)
@@ -1030,18 +1046,18 @@ def cleanup(candidate: Path, activation_package: Path, attempted_stage: bool, ho
         try:
             installed = Path("/usr/libexec/buzz-ci-activation-controller")
             controller = installed if installed.is_file() else candidate / "deploy/native-ci/activation/controller.py"
-            if command([str(controller), "rollback", "--package", str(activation_package)], timeout=60, allow_failure=True).returncode != 0:
+            if command([str(controller), "rollback", "--package", str(activation_package)], timeout=timing_leaf("rollback"), allow_failure=True).returncode != 0:
                 errors.append("controller rollback failed")
         except BaseException:
             errors.append("controller rollback could not run")
     begin_phase("cleanup")
     for unit in UNITS:
         try:
-            command(["systemctl", "stop", unit], timeout=10, allow_failure=True)
+            command(["systemctl", "stop", unit], timeout=timing_leaf("unit_stop"), allow_failure=True)
         except BaseException:
             errors.append(f"unit stop could not run: {unit}")
     try:
-        command(["systemctl", "stop", "buzzci-e2e-relay.service"], timeout=10, allow_failure=True)
+        command(["systemctl", "stop", "buzzci-e2e-relay.service"], timeout=timing_leaf("unit_stop"), allow_failure=True)
     except BaseException:
         errors.append("relay stop could not run")
     for root in (Path("/etc/credstore.encrypted/buzzci-keyholder"), Path("/etc/credstore.encrypted/buzzci-e2e-relay")):
@@ -1072,7 +1088,7 @@ def cleanup(candidate: Path, activation_package: Path, attempted_stage: bool, ho
     try:
         ca_target, _ca_install, ca_remove = ca_backend()
         ca_target.unlink()
-        command(list(ca_remove), timeout=30)
+        command(list(ca_remove), timeout=timing_leaf("command_default"))
     except FileNotFoundError:
         pass
     except GuestError:
@@ -1158,20 +1174,20 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         units = prove_installed_units(component_units)
         controller = candidate / "deploy/native-ci/activation/controller.py"
         begin_phase("controller_check")
-        command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=60)
+        command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=timing_leaf("controller_check"))
         attempted_stage = True
         begin_phase("controller_stage")
-        command(["python3", str(controller), "stage", "--package", str(activation_package), "--scenario", str(inputs / "scenario.json")], timeout=120)
+        command(["python3", str(controller), "stage", "--package", str(activation_package), "--scenario", str(inputs / "scenario.json")], timeout=timing_leaf("controller_stage"))
         prove_installed_units(expected_units)
         begin_phase("controller_activate")
-        command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=120)
+        command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=timing_leaf("controller_activate"))
         begin_phase("canary")
-        receipt_raw = command(["/usr/libexec/buzz-ci-capacity-one-canary"], stdin=read_file(inputs / "scenario.json"), timeout=600).stdout
+        receipt_raw = command(["/usr/libexec/buzz-ci-capacity-one-canary"], stdin=read_file(inputs / "scenario.json"), timeout=canary_command_seconds()).stdout
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)
         receipt_path.chmod(0o400)
         begin_phase("receipt_verifier")
-        verifier_raw = command(["/usr/libexec/buzz-ci-verify-acceptance-receipt", str(inputs / "scenario.json"), str(receipt_path)], timeout=60).stdout
+        verifier_raw = command(["/usr/libexec/buzz-ci-verify-acceptance-receipt", str(inputs / "scenario.json"), str(receipt_path)], timeout=timing_leaf("receipt_verifier")).stdout
         parse_verdict(verifier_raw)
     except BaseException as error:
         primary = error

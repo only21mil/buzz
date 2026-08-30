@@ -92,14 +92,20 @@ same values in `state.json`. Preflight rejects a state prepared by any other
 tracked harness bytes do not match. Any harness change makes an unused older
 prepared state stale by design.
 
-The frozen timing table computes each QEMU watchdog from the sequential phase
-ceilings. The candidate watchdog is 1,830 seconds: 180 for boot and cloud-init,
-1,620 for install, controller check/stage/activate, canary, receipt verifier,
-rollback, and cleanup, then 30 for guest poweroff. Ceremony is 390 seconds and
-the verifier is 270 seconds. Host process-group reaping has its own 10-second
-bound after any exit or watchdog. Each guest command phase reserves another
-10 seconds inside its phase ceiling to kill and reap a timed-out command before
-the next phase. A terminal error names the boot and last
+The frozen `timing-contract.json` is the single timing source. It records leaf
+command limits and worst-case call counts; the guest derives phase deadlines
+and the host derives each QEMU watchdog from those terms. The 5,712-second
+candidate watchdog covers a 220-second boot/cloud-init envelope, 1,452 seconds
+for install, 100 for controller check, 680 for controller stage and its 13-unit
+readback, 160 for activation, 1,870 for the canary's maximum 15 sequential
+120-second driver operations, 100 for receipt verification, 100 for rollback,
+990 for cleanup and dormant proof, 30 for guest poweroff, and 10 for host reap.
+Ceremony is 1,130 seconds (including all 21 bounded ceremony commands) and the
+verifier is 320 seconds. Every command count includes its 10-second process-
+group reap allowance, and command-heavy phases add a 30-second local
+orchestration margin. The run scenario's driver timeout must equal the frozen
+120-second leaf; a different scenario cannot silently invalidate the budget.
+A terminal error names the boot and last
 validated fixed-enum phase, for example `candidate canary watchdog timeout` or
 `candidate cleanup watchdog timeout`. The diagnostic summary contains no guest
 output, paths, credentials, or caller-provided fields, and the host emits it
