@@ -69,8 +69,14 @@ match its maintained clean-host assets. It also checks their digests against
 the prepared state's mode-`0400` `state.json`, including the frozen guest-entry
 asset. It then emits the harness digest, raw timing-asset digest, decoded timing
 object, and harness-semantic timing digest. The renderer also checks the
-candidate HEAD, the prepared state's exact `public-binding.json`, the scenario,
-seccomp source, and execd-to-activation bindings. The resulting contract has
+candidate HEAD, clean index, and non-ignored worktree status. It freezes that
+repository identity through every candidate-blob read and rechecks it before
+output, immediately after the no-clobber publication link, and after directory
+sync. A concurrent HEAD, index, or worktree change rejects the render; a change
+detected after publication removes the newly linked output. Ignored build
+artifacts do not change the repository identity. The renderer also checks the
+prepared state's exact `public-binding.json`, the scenario, seccomp source, and
+execd-to-activation bindings. The resulting contract has
 the exact closed v3 shape accepted by preflight. Missing, extra, legacy v2, or
 independently drifted harness/timing fields fail before transfer or VM
 execution.
@@ -86,7 +92,8 @@ caller rewrite cannot substitute any frozen asset. `record-residue` requires
 the four absence booleans and destroyed VM state. `record-sealed-freeze` also
 binds the exact public binding and five package manifests. Both outputs set
 `protected_ci` and `tier2` to `false`; a later controller must supply those
-independent gates.
+independent gates. Both recorders use the same repository snapshot and
+rollback-on-drift publication boundary as `render-clean-host`.
 
 `descriptor.schema.json` defines the five input contracts. `output.schema.json`
 links the existing activation draft, scenario, clean-host v3 contract schemas

@@ -15,7 +15,7 @@ import secrets
 import stat
 import subprocess
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 
@@ -66,6 +66,69 @@ DESCRIPTOR_SCHEMAS = {
 
 class RenderError(RuntimeError):
     """Fail-closed input rejection."""
+
+
+class CandidateSnapshot(NamedTuple):
+    root: Path
+    candidate: str
+    index_tree: str
+    status: bytes
+
+
+def candidate_checkpoint(stage: str, candidate_root: Path) -> None:
+    """Deterministic no-op checkpoint for repository-drift regression tests."""
+
+
+def candidate_repository_state(candidate_root: Path) -> tuple[str, str, bytes]:
+    command = ["/usr/bin/git", "--no-optional-locks", "-C", str(candidate_root)]
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    try:
+        head = subprocess.run(
+            [*command, "rev-parse", "HEAD^{commit}"], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=10,
+        ).stdout.decode().strip()
+        index_tree = subprocess.run(
+            [*command, "write-tree"], check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=environment, timeout=10,
+        ).stdout.decode().strip()
+        status = subprocess.run(
+            [*command, "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=no"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=10,
+        ).stdout
+        final_head = subprocess.run(
+            [*command, "rev-parse", "HEAD^{commit}"], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=10,
+        ).stdout.decode().strip()
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+        raise RenderError("candidate Git state could not be verified") from error
+    if head != final_head or HEX40.fullmatch(head) is None or HEX40.fullmatch(index_tree) is None:
+        raise RenderError("candidate Git state changed while inspected")
+    return head, index_tree, status
+
+
+def begin_candidate_snapshot(candidate_root: Path, candidate: str) -> CandidateSnapshot:
+    head, index_tree, status = candidate_repository_state(candidate_root)
+    if head != candidate:
+        raise RenderError("candidate root HEAD differs")
+    if status:
+        raise RenderError("candidate Git index or worktree is not clean")
+    snapshot = CandidateSnapshot(candidate_root, candidate, index_tree, status)
+    candidate_checkpoint("after-initial-head-check", candidate_root)
+    verify_candidate_snapshot(snapshot)
+    return snapshot
+
+
+def verify_candidate_snapshot(snapshot: CandidateSnapshot) -> None:
+    head, index_tree, status = candidate_repository_state(snapshot.root)
+    if (
+        head != snapshot.candidate
+        or index_tree != snapshot.index_tree
+        or status != snapshot.status
+    ):
+        raise RenderError("candidate Git HEAD, index, or worktree changed")
 
 
 def canonical(value: object) -> bytes:
@@ -140,12 +203,19 @@ def candidate_blob(
     return raw
 
 
-def candidate_clean_host_bindings(candidate_root: Path, candidate: str) -> dict[str, Any]:
+def candidate_clean_host_bindings(
+    candidate_root: Path, candidate: str,
+    snapshot: CandidateSnapshot | None = None,
+) -> dict[str, Any]:
     """Derive the closed v3 fields from immutable candidate Git objects."""
-    assets = {
-        name: candidate_blob(candidate_root, candidate, relative, git_mode, maximum)
-        for name, (relative, git_mode, maximum) in HARNESS_ASSET_SOURCES.items()
-    }
+    assets: dict[str, bytes] = {}
+    for name, (relative, git_mode, maximum) in HARNESS_ASSET_SOURCES.items():
+        assets[name] = candidate_blob(
+            candidate_root, candidate, relative, git_mode, maximum,
+        )
+        candidate_checkpoint(f"after-blob-read:{name}", candidate_root)
+        if snapshot is not None:
+            verify_candidate_snapshot(snapshot)
     for name, raw in assets.items():
         local = (
             CLEAN_HOST_ASSET_ROOT / name
@@ -176,19 +246,6 @@ def candidate_clean_host_bindings(candidate_root: Path, candidate: str) -> dict[
         "timing": timing,
         "timing_sha256": hashlib.sha256(harness_canonical(timing)).hexdigest(),
     }
-
-
-def verify_candidate_head(candidate_root: Path, candidate: str) -> None:
-    try:
-        resolved = subprocess.run(
-            ["/usr/bin/git", "-C", str(candidate_root), "rev-parse", "HEAD^{commit}"],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=10,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RenderError("candidate Git identity could not be verified") from error
-    if resolved != candidate:
-        raise RenderError("candidate root HEAD differs")
 
 
 def normalized(value: object, where: str) -> str:
@@ -225,6 +282,7 @@ class DescriptorRoot:
             os.close(descriptor_fd)
         self.descriptor = parse_canonical_json(raw, "descriptor")
         self.base = absolute.parent
+        self.candidate_snapshot: CandidateSnapshot | None = None
         self.base_fd = os.open(self.base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
         base_metadata = os.fstat(self.base_fd)
         if base_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
@@ -893,8 +951,12 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
     public, public_raw, public_path = root.public_binding_ref(descriptor["public_binding"])
     if public_path != f"{state}/public-binding.json":
         raise RenderError("public binding is not the prepared state binding")
-    verify_candidate_head(root.base / candidate_root, candidate)
-    clean_host_bindings = candidate_clean_host_bindings(root.base / candidate_root, candidate)
+    root.candidate_snapshot = begin_candidate_snapshot(
+        root.base / candidate_root, candidate,
+    )
+    clean_host_bindings = candidate_clean_host_bindings(
+        root.base / candidate_root, candidate, root.candidate_snapshot,
+    )
     state_record = root.fixed_json(f"{state}/state.json", "prepared state record", 0o400)
     require_keys(state_record, {
         "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
@@ -1000,9 +1062,11 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     lifecycle_candidate_root = normalized(
         contract["candidate_root"], "lifecycle candidate root",
     )
-    verify_candidate_head(root.base / lifecycle_candidate_root, candidate)
-    candidate_bindings = candidate_clean_host_bindings(
+    root.candidate_snapshot = begin_candidate_snapshot(
         root.base / lifecycle_candidate_root, candidate,
+    )
+    candidate_bindings = candidate_clean_host_bindings(
+        root.base / lifecycle_candidate_root, candidate, root.candidate_snapshot,
     )
     contract_scenario = require_keys(contract["scenario"], {"path", "sha256"}, "lifecycle scenario")
     normalized(contract_scenario["path"], "lifecycle scenario")
@@ -1200,6 +1264,18 @@ def output_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def rollback_output_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
 def accept_existing_output(parent: int, name: str, payload: bytes) -> bool:
     try:
         fd = os.open(
@@ -1254,7 +1330,15 @@ def accept_existing_output(parent: int, name: str, payload: bytes) -> bool:
         os.close(fd)
 
 
-def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
+def write_output(
+    root: DescriptorRoot, relative: str, payload: bytes,
+    candidate_snapshot: CandidateSnapshot | None = None,
+) -> None:
+    if candidate_snapshot is None:
+        candidate_snapshot = root.candidate_snapshot
+    if candidate_snapshot is not None:
+        candidate_checkpoint("before-write", candidate_snapshot.root)
+        verify_candidate_snapshot(candidate_snapshot)
     if len(payload) > MAX_JSON:
         raise RenderError("output exceeds its fixed bound")
     parse_canonical_json(payload, "output")
@@ -1262,6 +1346,9 @@ def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
     parent, name = root._open_parent(output)
     fd: int | None = None
     temporary: str | None = None
+    published = False
+    candidate_drift = False
+    published_identity: tuple[int, ...] | None = None
     try:
         for _ in range(TEMP_CREATE_ATTEMPTS):
             candidate = f".render-inputs-{secrets.token_hex(16)}.tmp"
@@ -1289,6 +1376,7 @@ def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
         os.fsync(fd)
         if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
             raise RenderError("output mode differs")
+        published_identity = rollback_output_identity(os.fstat(fd))
         closed = fd
         fd = None
         os.close(closed)
@@ -1305,11 +1393,52 @@ def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
             remove_output_temporary(parent, temporary)
             temporary = None
             if accept_existing_output(parent, name, payload):
+                if candidate_snapshot is not None:
+                    candidate_checkpoint(
+                        "after-existing-publication", candidate_snapshot.root,
+                    )
+                    verify_candidate_snapshot(candidate_snapshot)
                 return
             raise collision
+        published = True
+        if candidate_snapshot is not None:
+            try:
+                candidate_checkpoint(
+                    "after-temporary-publication", candidate_snapshot.root,
+                )
+                verify_candidate_snapshot(candidate_snapshot)
+            except RenderError:
+                candidate_drift = True
+                raise
         remove_output_temporary(parent, temporary)
         temporary = None
         os.fsync(parent)
+        if candidate_snapshot is not None:
+            try:
+                candidate_checkpoint("after-publication", candidate_snapshot.root)
+                verify_candidate_snapshot(candidate_snapshot)
+            except RenderError:
+                candidate_drift = True
+                raise
+    except BaseException:
+        if published and candidate_drift:
+            try:
+                named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if (
+                    published_identity is None
+                    or rollback_output_identity(named) != published_identity
+                ):
+                    raise RenderError("candidate drift output identity changed")
+                os.unlink(name, dir_fd=parent)
+                os.fsync(parent)
+                published = False
+            except RenderError:
+                raise
+            except OSError as rollback_error:
+                raise RenderError(
+                    "candidate drift output rollback failed"
+                ) from rollback_error
+        raise
     finally:
         primary_failure = sys.exc_info()[0] is not None
         cleanup_failure: OSError | None = None
@@ -1343,7 +1472,9 @@ def main() -> int:
     try:
         root = DescriptorRoot(arguments.descriptor)
         value = render(arguments.action, root)
-        write_output(root, arguments.output, canonical(value))
+        write_output(
+            root, arguments.output, canonical(value), root.candidate_snapshot,
+        )
         return 0
     except (OSError, RenderError) as error:
         print(f"render_inputs: {error}", file=sys.stderr)

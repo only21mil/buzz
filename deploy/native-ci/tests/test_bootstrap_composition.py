@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -641,6 +642,34 @@ class BootstrapCompositionTests(unittest.TestCase):
                     source, candidate, execd_binary, execd_provenance, tampered,
                     activation_path, ceremony / "packages/rejected-tampered",
                 )
+
+            drifted = False
+
+            def drift_clean_host_head(stage: str, candidate_root: Path) -> None:
+                nonlocal drifted
+                if stage == "after-initial-head-check" and not drifted:
+                    drifted = True
+                    subprocess.run(
+                        [
+                            "/usr/bin/git", "-C", str(candidate_root), "commit", "-q",
+                            "--allow-empty", "-m", "injected clean-host drift",
+                        ],
+                        check=True,
+                    )
+
+            with (
+                mock.patch.object(
+                    RENDER, "candidate_checkpoint", side_effect=drift_clean_host_head,
+                ),
+                self.assertRaisesRegex(
+                    RENDER.RenderError, "candidate Git HEAD, index, or worktree changed",
+                ),
+            ):
+                self._render(
+                    "render-clean-host", clean_descriptor,
+                    "rejected-drift-contract.json",
+                )
+            self.assertFalse((ceremony / "rejected-drift-contract.json").exists())
 
 
 if __name__ == "__main__":

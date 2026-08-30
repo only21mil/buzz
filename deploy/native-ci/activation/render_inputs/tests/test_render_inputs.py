@@ -6,15 +6,18 @@ from __future__ import annotations
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from unittest import mock
 
 
@@ -163,6 +166,7 @@ class RendererTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             target.chmod(git_mode & 0o777)
+        (candidate_root / ".gitignore").write_text(".ignored-build/\n")
         subprocess.run(["/usr/bin/git", "init", "-q", str(candidate_root)], check=True)
         subprocess.run([
             "/usr/bin/git", "-C", str(candidate_root), "config", "user.name", "Test",
@@ -294,6 +298,24 @@ class RendererTests(unittest.TestCase):
             ["python3", str(SCRIPT), action, "--descriptor", str(root / descriptor_ref["path"]), "--output", output],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
+
+    def run_main_with_checkpoint(
+        self, root: Path, action: str, descriptor: dict[str, object], output: str,
+        checkpoint: object,
+    ) -> tuple[int, str]:
+        descriptor_ref = write_json(root, "descriptor.json", descriptor)
+        arguments = [
+            str(SCRIPT), action, "--descriptor", str(root / descriptor_ref["path"]),
+            "--output", output,
+        ]
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.object(RENDER, "candidate_checkpoint", side_effect=checkpoint),
+            redirect_stderr(stderr),
+        ):
+            result = RENDER.main()
+        return result, stderr.getvalue()
 
     def test_residue_is_reproducible_and_disclaims_external_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -697,6 +719,107 @@ class RendererTests(unittest.TestCase):
                 self.assertIn(message, process.stderr)
                 self.assertFalse((root / "rejected.json").exists())
 
+        def mutate_once(stage: str, mutation: object) -> object:
+            fired = False
+
+            def checkpoint(observed: str, candidate_root: Path) -> None:
+                nonlocal fired
+                if observed == stage and not fired:
+                    fired = True
+                    mutation(candidate_root)
+
+            return checkpoint
+
+        def drift_head(candidate_root: Path) -> None:
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(candidate_root), "commit", "-q", "--allow-empty", "-m", "drift"],
+                check=True,
+            )
+
+        for stage in (
+            "after-initial-head-check", "after-blob-read:harness.py",
+            "after-temporary-publication",
+        ):
+            with self.subTest(head_drift=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                lifecycle, candidate = self.make_lifecycle(root)
+                descriptor = {
+                    "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                    "candidate_sha": candidate, "lifecycle": lifecycle,
+                }
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "rejected.json",
+                    mutate_once(stage, drift_head),
+                )
+                self.assertEqual(result, 64, stderr)
+                self.assertIn("candidate Git HEAD, index, or worktree changed", stderr)
+                self.assertFalse((root / "rejected.json").exists())
+                self.assertEqual(self.output_temporaries(root), [])
+
+        for asset_name, (relative, _git_mode, _maximum) in RENDER.HARNESS_ASSET_SOURCES.items():
+            def mutate_asset(candidate_root: Path, path: str = relative) -> None:
+                asset = candidate_root / path
+                asset.write_bytes(asset.read_bytes() + b"\n# injected drift\n")
+
+            with self.subTest(asset_worktree_drift=asset_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                lifecycle, candidate = self.make_lifecycle(root)
+                descriptor = {
+                    "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                    "candidate_sha": candidate, "lifecycle": lifecycle,
+                }
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "rejected.json",
+                    mutate_once(f"after-blob-read:{asset_name}", mutate_asset),
+                )
+                self.assertEqual(result, 64, stderr)
+                self.assertIn("candidate Git HEAD, index, or worktree changed", stderr)
+                self.assertFalse((root / "rejected.json").exists())
+
+        with self.subTest(index_drift="before-write"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+
+            def drift_index(candidate_root: Path) -> None:
+                ignore = candidate_root / ".gitignore"
+                ignore.write_text(ignore.read_text() + "another-ignored-path/\n")
+                subprocess.run(
+                    ["/usr/bin/git", "-C", str(candidate_root), "add", ".gitignore"],
+                    check=True,
+                )
+
+            result, stderr = self.run_main_with_checkpoint(
+                root, "record-residue", descriptor, "rejected.json",
+                mutate_once("before-write", drift_index),
+            )
+            self.assertEqual(result, 64, stderr)
+            self.assertIn("candidate Git HEAD, index, or worktree changed", stderr)
+            self.assertFalse((root / "rejected.json").exists())
+
+        with self.subTest(ignored_artifact="allowed"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+
+            def add_ignored_artifact(candidate_root: Path) -> None:
+                artifact = candidate_root / ".ignored-build/cache.bin"
+                artifact.parent.mkdir()
+                artifact.write_bytes(b"ignored build output\n")
+
+            result, stderr = self.run_main_with_checkpoint(
+                root, "record-residue", descriptor, "accepted.json",
+                mutate_once("after-blob-read:harness.py", add_ignored_artifact),
+            )
+            self.assertEqual(result, 0, stderr)
+            self.assertTrue((root / "accepted.json").is_file())
+
     def test_symlinked_reference_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -886,6 +1009,16 @@ class RendererTests(unittest.TestCase):
                     output = RENDER.record_sealed_freeze(root, descriptor)
                 self.assertEqual(output["claims"], {"protected_ci": False, "tier2": False})
                 self.assertEqual(set(output["package_manifest_sha256"]), set(RENDER.PACKAGE_NAMES))
+                guest = (
+                    root_path / "candidate"
+                    / RENDER.HARNESS_ASSET_SOURCES["guest_entry.py"][0]
+                )
+                guest.write_bytes(guest.read_bytes() + b"\n# sealed drift\n")
+                with self.assertRaisesRegex(
+                    RENDER.RenderError, "candidate Git HEAD, index, or worktree changed",
+                ):
+                    RENDER.write_output(root, "rejected-sealed.json", canonical(output))
+                self.assertFalse((root_path / "rejected-sealed.json").exists())
             finally:
                 root.close()
 
