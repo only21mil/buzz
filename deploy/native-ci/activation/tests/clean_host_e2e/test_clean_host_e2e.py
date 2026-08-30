@@ -522,6 +522,58 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(harness.HarnessError):
                 harness.parse_frame(malformed)
 
+    def test_self_consistent_but_semantically_invalid_receipt_fails_frozen_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = root / "results"
+            results.mkdir(mode=0o700)
+            scenario = root / "scenario.json"
+            scenario.write_bytes(b"{}\n")
+            candidate = "1" * 40
+            scenario_sha = harness.file_sha256(scenario)
+            receipt = {
+                "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2",
+                "outcome": "pass", "scenario_sha256": scenario_sha,
+                "integrated_candidate_sha": candidate, "run_id": "2" * 32,
+                "checks": [], "zero_transition": {},
+            }
+            verifier = {"outcome": "pass", "status": "verified"}
+            proof = {
+                "configs_sha256": "3" * 64, "units_sha256": "4" * 64,
+                "sockets_absent": True, "processes_absent": True,
+                "encrypted_credentials_absent": True, "relay_residue_absent": True,
+            }
+            receipt_raw = harness.canonical(receipt)
+            verifier_raw = harness.canonical(verifier)
+            here = Path(harness.__file__).resolve().parent
+            assets = {
+                name: harness.file_sha256(harness.asset_source(here, name))
+                for name in harness.FROZEN_ASSETS
+            }
+            evidence = {
+                "schema_version": "buzz-ci-clean-host-e2e-evidence/v2",
+                "candidate_sha": candidate, "image_sha256": "5" * 64,
+                "tool_sha256": {name: "6" * 64 for name in harness.TOOLS},
+                "harness_asset_sha256": assets, "package_tree_sha256": {},
+                "scenario_sha256": scenario_sha,
+                "seccomp_source_sha256": harness.SECCOMP_SHA256,
+                "transfer_bytes": harness.TRANSFER_SIZE, "transfer_sha256": "7" * 64,
+                "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
+                "verifier_sha256": hashlib.sha256(verifier_raw).hexdigest(),
+                "dormant_proof": proof,
+            }
+            (results / "acceptance-receipt.json").write_bytes(receipt_raw)
+            (results / "verifier.json").write_bytes(verifier_raw)
+            (results / "evidence-manifest.json").write_bytes(harness.canonical(evidence))
+            for path in results.iterdir():
+                path.chmod(0o400)
+            contract = {
+                "state": str(root / "state"), "candidate_sha": candidate,
+                "scenario": {"path": str(scenario), "sha256": scenario_sha},
+            }
+            with self.assertRaisesRegex(harness.HarnessError, "frozen receipt verifier rejected"):
+                harness.validate_result_set(contract, results)
+
     def test_state_cleanup_requires_marker_and_proves_absence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
@@ -656,6 +708,93 @@ class InputTests(unittest.TestCase):
             harness.destroy_state(replacement)
             harness.destroy_state(stolen)
 
+    def test_state_cleanup_quarantine_never_deletes_a_swapped_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_destroyable_state(root)
+            expected = harness.state_identity(state)
+            stolen = root / "stolen-state"
+            replacement = root / "replacement"
+            replacement.mkdir(mode=0o700)
+            (replacement / "sentinel").write_text("unrelated")
+            real_rename = harness.rename_noreplace
+
+            def swap_before_quarantine(source, target):
+                if source == state:
+                    state.rename(stolen)
+                    replacement.rename(state)
+                return real_rename(source, target)
+
+            with mock.patch.object(harness, "rename_noreplace", side_effect=swap_before_quarantine):
+                with self.assertRaisesRegex(harness.HarnessError, "replaced VM state"):
+                    harness.destroy_state(state, expected)
+            quarantined = [path for path in root.iterdir() if ".state.delete-" in path.name]
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual((quarantined[0] / "sentinel").read_text(), "unrelated")
+            self.assertTrue((stolen / "state.json").is_file())
+
+    def test_descriptor_cleanup_never_unlinks_a_swapped_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owned = root / "owned"
+            owned.mkdir(mode=0o700)
+            (owned / "member").write_text("selected")
+            identity = harness.directory_identity(owned)
+            real_rename_at = harness.rename_noreplace_at
+
+            def swap_member(source_fd, source, target_fd, target, label):
+                if source == b"member":
+                    os.rename("member", "stolen", src_dir_fd=source_fd, dst_dir_fd=source_fd)
+                    descriptor = os.open(
+                        "member", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                        dir_fd=source_fd,
+                    )
+                    os.write(descriptor, b"unrelated")
+                    os.close(descriptor)
+                return real_rename_at(source_fd, source, target_fd, target, label)
+
+            with mock.patch.object(harness, "rename_noreplace_at", side_effect=swap_member):
+                with self.assertRaisesRegex(harness.HarnessError, "cleanup file was replaced"):
+                    harness.destroy_identified_directory(owned, identity, "owned directory")
+            quarantined = [path for path in root.iterdir() if ".owned.delete-" in path.name]
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual((quarantined[0] / "stolen").read_text(), "selected")
+            replacements = [path for path in quarantined[0].iterdir() if path.name.startswith(".delete-")]
+            self.assertEqual(len(replacements), 1)
+            self.assertEqual(replacements[0].read_text(), "unrelated")
+
+    def test_publication_cleanup_quarantine_never_deletes_swapped_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contract = {"state": str(root / "state")}
+            binding = harness.run_binding(contract, root / "results")
+            staging = harness.safe_directory(Path(binding["staging"]), create=True)
+            (staging / "owned").write_text("owned")
+            identity = harness.directory_identity(staging)
+            harness.write_new_private_json(
+                Path(binding["journal"]),
+                harness.publication_record(binding, "running", staging_identity=identity),
+            )
+            stolen = root / "stolen-staging"
+            replacement = root / "replacement-staging"
+            replacement.mkdir(mode=0o700)
+            (replacement / "sentinel").write_text("unrelated")
+            real_rename = harness.rename_noreplace
+
+            def swap_before_quarantine(source, target):
+                if source == staging:
+                    staging.rename(stolen)
+                    replacement.rename(staging)
+                return real_rename(source, target)
+
+            with mock.patch.object(harness, "rename_noreplace", side_effect=swap_before_quarantine):
+                with self.assertRaisesRegex(harness.HarnessError, "replaced private result staging"):
+                    harness.cleanup_publication(binding)
+            quarantined = [path for path in root.iterdir() if ".clean-host-staging.delete-" in path.name]
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual((quarantined[0] / "sentinel").read_text(), "unrelated")
+            self.assertEqual((stolen / "owned").read_text(), "owned")
+
     def test_early_run_setup_failure_destroys_state_and_partial_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -684,7 +823,9 @@ class InputTests(unittest.TestCase):
             staging = harness.safe_directory(Path(binding["staging"]), create=True)
             (staging / "acceptance-receipt.json").write_bytes(b"private partial evidence")
             harness.write_new_private_json(
-                Path(binding["journal"]), harness.publication_record(binding, "running"),
+                Path(binding["journal"]), harness.publication_record(
+                    binding, "running", staging_identity=harness.directory_identity(staging),
+                ),
             )
             self.assertFalse(results.exists())
             self.assertEqual({path.name for path in staging.iterdir()}, {"acceptance-receipt.json"})
@@ -727,7 +868,9 @@ class InputTests(unittest.TestCase):
                 harness, "create_run_stage",
             ), mock.patch.object(harness, "create_verify_stage"), mock.patch.object(
                 harness, "boot", side_effect=boot,
-            ), mock.patch.object(harness, "publication_checkpoint", side_effect=checkpoint):
+            ), mock.patch.object(harness, "publication_checkpoint", side_effect=checkpoint), mock.patch.object(
+                harness, "replay_frozen_verifier",
+            ):
                 outcome = harness.terminal_run(contract_path, results)
             self.assertEqual(checkpoints, ["after-first-file", "after-third-file"])
             published = {path.name: path.read_bytes() for path in results.iterdir()}
@@ -742,13 +885,15 @@ class InputTests(unittest.TestCase):
             with mock.patch.object(harness, "validate_flat_qcow2"):
                 claimed, _expected, _resumed = harness.claim_run_state(binding)
             harness.write_new_private_json(
-                Path(binding["journal"]), harness.publication_record(binding, "ready", outcome),
+                Path(binding["journal"]), harness.publication_record(
+                    binding, "ready", outcome, harness.directory_identity(staging),
+                ),
             )
             self.assertFalse(results.exists())
             self.assertTrue(claimed.exists())
             with mock.patch.object(harness, "SECCOMP_SHA256", seccomp_sha), mock.patch.object(
                 harness, "validate_flat_qcow2",
-            ):
+            ), mock.patch.object(harness, "replay_frozen_verifier"):
                 recovered = harness.terminal_run(contract_path, results)
                 recovered_again = harness.terminal_run(contract_path, results)
             self.assertEqual(recovered, outcome)
@@ -757,6 +902,43 @@ class InputTests(unittest.TestCase):
             self.assertFalse(staging.exists())
             self.assertFalse(Path(binding["journal"]).exists())
             self.assertEqual({path.name: path.read_bytes() for path in results.iterdir()}, published)
+
+    def test_publish_swap_after_validation_never_exposes_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = root / "results"
+            contract = {"state": str(root / "state")}
+            binding = harness.run_binding(contract, results)
+            staging = harness.safe_directory(Path(binding["staging"]), create=True)
+            (staging / "validated").write_text("validated")
+            identity = harness.directory_identity(staging)
+            outcome = {"status": "pass"}
+            harness.write_new_private_json(
+                Path(binding["journal"]),
+                harness.publication_record(binding, "ready", outcome, identity),
+            )
+            stolen = root / "stolen-validated"
+            replacement = root / "replacement-publication"
+            replacement.mkdir(mode=0o700)
+            (replacement / "sentinel").write_text("unrelated")
+            real_rename = harness.rename_noreplace
+
+            def swap_before_publication(source, target):
+                if ".publish-" in source.name and target == results:
+                    source.rename(stolen)
+                    replacement.rename(source)
+                return real_rename(source, target)
+
+            with mock.patch.object(harness, "validate_result_set_fd", return_value=outcome), mock.patch.object(
+                harness, "rename_noreplace", side_effect=swap_before_publication,
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "published result identity differs"):
+                    harness.finish_publication(contract, binding, outcome)
+            self.assertFalse(results.exists())
+            self.assertEqual((stolen / "validated").read_text(), "validated")
+            rejected = [path for path in root.iterdir() if ".results.rejected-" in path.name]
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual((rejected[0] / "sentinel").read_text(), "unrelated")
 
     def test_state_cleanup_retry_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -816,6 +998,48 @@ class InputTests(unittest.TestCase):
                         with self.assertRaisesRegex(harness.HarnessError, "prepare failure"):
                             harness.prepare(arguments)
                 self.assertEqual(state.exists(), succeeds)
+
+    def test_prepare_create_write_and_marker_chmod_failures_leave_no_state(self) -> None:
+        for boundary in ("create", "write", "chmod"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                image = root / "base.qcow2"
+                image.write_bytes(b"base image")
+                state = root / "state"
+                tool_sha = {name: harness.file_sha256(Path(path)) for name, path in harness.TOOLS.items()}
+                arguments = __import__("argparse").Namespace(
+                    state=state, image=image, image_sha256=harness.file_sha256(image),
+                    qemu_sha256=tool_sha["qemu"], qemu_img_sha256=tool_sha["qemu_img"],
+                    controld_uid=1201, controld_gid=1201,
+                )
+                proof = {"qemu_version": "test", "tool_sha256": tool_sha}
+                real_mkdir = Path.mkdir
+                real_write = Path.write_bytes
+                real_chmod = Path.chmod
+
+                def mkdir(path, *args, **kwargs):
+                    if boundary == "create" and path == state:
+                        raise OSError("simulated directory creation failure")
+                    return real_mkdir(path, *args, **kwargs)
+
+                def write(path, raw):
+                    if boundary == "write" and path == state / "state.json":
+                        raise OSError("simulated marker write failure")
+                    return real_write(path, raw)
+
+                def chmod(path, mode, *args, **kwargs):
+                    if boundary == "chmod" and path == state / "state.json" and mode == 0o400:
+                        raise OSError("simulated marker chmod failure")
+                    return real_chmod(path, mode, *args, **kwargs)
+
+                with mock.patch.object(harness, "capabilities", return_value=proof), mock.patch.object(
+                    Path, "mkdir", autospec=True, side_effect=mkdir,
+                ), mock.patch.object(Path, "write_bytes", autospec=True, side_effect=write), mock.patch.object(
+                    Path, "chmod", autospec=True, side_effect=chmod,
+                ):
+                    with self.assertRaisesRegex(OSError, "simulated"):
+                        harness.prepare(arguments)
+                self.assertFalse(state.exists())
 
     def test_post_candidate_drift_blocks_verifier_and_destroys_state(self) -> None:
         cases = (
@@ -926,7 +1150,9 @@ class InputTests(unittest.TestCase):
                 harness, "create_run_stage",
             ), mock.patch.object(harness, "create_verify_stage"), mock.patch.object(
                 harness, "validate_prepared_state", return_value=state_record(),
-            ), mock.patch.object(harness, "boot", side_effect=boot):
+            ), mock.patch.object(harness, "boot", side_effect=boot), mock.patch.object(
+                harness, "replay_frozen_verifier",
+            ):
                 outcome = harness.run_vm(contract, state, records, b"{}\n", b"{}\n", results)
             self.assertEqual(outcome["status"], "pass")
             self.assertTrue(outcome["vm_state_absent"])

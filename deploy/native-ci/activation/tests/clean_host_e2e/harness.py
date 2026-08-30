@@ -64,11 +64,15 @@ class HarnessError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class StateIdentity:
-    """Filesystem identity of the exact prepared state selected for a run."""
-
+class DirectoryIdentity:
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class StateIdentity(DirectoryIdentity):
+    """Filesystem identity of the exact prepared state selected for a run."""
+
     marker_sha256: str
 
 
@@ -98,15 +102,36 @@ def run_binding(contract: dict[str, object], results: Path) -> dict[str, str]:
     }
 
 
-def publication_record(binding: dict[str, str], phase: str, outcome: dict[str, object] | None = None) -> dict[str, object]:
+def publication_record(
+    binding: dict[str, str], phase: str, outcome: dict[str, object] | None = None,
+    staging_identity: DirectoryIdentity | None = None,
+) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_version": PUBLICATION_SCHEMA,
         "phase": phase,
         **binding,
     }
+    if staging_identity is not None:
+        value["staging_identity"] = {
+            "device": staging_identity.device,
+            "inode": staging_identity.inode,
+        }
     if outcome is not None:
         value["outcome"] = outcome
     return value
+
+
+def parse_directory_identity(value: object) -> DirectoryIdentity:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"device", "inode"}
+        or not isinstance(value.get("device"), int)
+        or not isinstance(value.get("inode"), int)
+        or value["device"] < 0
+        or value["inode"] <= 0
+    ):
+        raise HarnessError("directory identity record differs")
+    return DirectoryIdentity(value["device"], value["inode"])
 
 
 def write_new_private_json(path: Path, value: object) -> None:
@@ -134,17 +159,23 @@ def fsync_parent(path: Path) -> None:
 
 
 def rename_noreplace(source: Path, target: Path) -> None:
+    rename_noreplace_at(-100, os.fsencode(source), -100, os.fsencode(target), str(target))
+
+
+def rename_noreplace_at(
+    source_fd: int, source: bytes, target_fd: int, target: bytes, target_label: str,
+) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
         raise HarnessError("atomic no-replace rename is unavailable")
     renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     renameat2.restype = ctypes.c_int
-    if renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
+    if renameat2(source_fd, source, target_fd, target, 1) != 0:
         number = ctypes.get_errno()
         if number == errno.ENOSYS:
             raise HarnessError("atomic no-replace rename is unavailable")
-        raise OSError(number, os.strerror(number), str(target))
+        raise OSError(number, os.strerror(number), target_label)
 
 
 def replace_private_json(path: Path, value: object) -> None:
@@ -167,14 +198,15 @@ def load_publication(binding: dict[str, str]) -> dict[str, object] | None:
     except FileNotFoundError:
         return None
     value = load_json(journal)
-    common = publication_record(binding, "running")
     if not isinstance(value, dict) or value.get("schema_version") != PUBLICATION_SCHEMA:
         raise HarnessError("result publication journal differs")
+    identity = parse_directory_identity(value.get("staging_identity"))
+    common = publication_record(binding, "running", staging_identity=identity)
     if any(value.get(name) != item for name, item in common.items() if name != "phase"):
         raise HarnessError("result publication binding differs")
     if value.get("phase") == "running" and set(value) == set(common):
         return value
-    ready = publication_record(binding, "ready", value.get("outcome"))
+    ready = publication_record(binding, "ready", value.get("outcome"), identity)
     if value.get("phase") == "ready" and isinstance(value.get("outcome"), dict) and set(value) == set(ready):
         return value
     raise HarnessError("result publication phase differs")
@@ -279,6 +311,33 @@ def safe_directory(path: Path, *, create: bool = False) -> Path:
     ):
         raise HarnessError("private directory identity or mode differs")
     return absolute
+
+
+def create_prepare_directory(path: Path) -> tuple[Path, DirectoryIdentity]:
+    absolute = Path(os.path.abspath(path))
+    parent = absolute.parent
+    parent_metadata = parent.lstat()
+    if (
+        Path(os.path.realpath(parent)) != parent
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise HarnessError("private directory parent is unsafe")
+    absolute.mkdir(mode=0o700, exist_ok=False)
+    metadata = absolute.lstat()
+    identity = DirectoryIdentity(metadata.st_dev, metadata.st_ino)
+    try:
+        if (
+            Path(os.path.realpath(absolute)) != absolute
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise HarnessError("private directory identity or mode differs")
+        return absolute, identity
+    except BaseException:
+        destroy_identified_directory(absolute, identity, "new prepare state directory")
+        raise
 
 
 def safe_input_directory(path: Path) -> Path:
@@ -775,6 +834,80 @@ def state_identity(state: Path) -> StateIdentity:
     )
 
 
+def directory_identity(path: Path) -> DirectoryIdentity:
+    metadata = safe_directory(path).lstat()
+    return DirectoryIdentity(metadata.st_dev, metadata.st_ino)
+
+
+def identity_matches(metadata: os.stat_result, expected: DirectoryIdentity) -> bool:
+    return (metadata.st_dev, metadata.st_ino) == (expected.device, expected.inode)
+
+
+def clear_directory_fd(directory_fd: int) -> None:
+    with os.scandir(directory_fd) as iterator:
+        names = sorted(entry.name for entry in iterator)
+    for name in names:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        quarantine = f".delete-{os.urandom(16).hex()}"
+        if stat.S_ISDIR(before.st_mode):
+            child_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                if not identity_matches(os.fstat(child_fd), DirectoryIdentity(before.st_dev, before.st_ino)):
+                    raise HarnessError("cleanup directory changed before descriptor acquisition")
+                rename_noreplace_at(
+                    directory_fd, os.fsencode(name), directory_fd, os.fsencode(quarantine), quarantine,
+                )
+                moved = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+                if not identity_matches(moved, DirectoryIdentity(before.st_dev, before.st_ino)):
+                    raise HarnessError("cleanup directory changed during quarantine")
+                clear_directory_fd(child_fd)
+                current = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+                if not identity_matches(current, DirectoryIdentity(before.st_dev, before.st_ino)):
+                    raise HarnessError("cleanup directory was replaced")
+                os.rmdir(quarantine, dir_fd=directory_fd)
+            finally:
+                os.close(child_fd)
+        else:
+            flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
+            item_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                held = os.fstat(item_fd)
+                if not identity_matches(held, DirectoryIdentity(before.st_dev, before.st_ino)):
+                    raise HarnessError("cleanup file changed before descriptor acquisition")
+                rename_noreplace_at(
+                    directory_fd, os.fsencode(name), directory_fd, os.fsencode(quarantine), quarantine,
+                )
+                current = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+                if not identity_matches(current, DirectoryIdentity(before.st_dev, before.st_ino)):
+                    raise HarnessError("cleanup file was replaced")
+                os.unlink(quarantine, dir_fd=directory_fd)
+            finally:
+                os.close(item_fd)
+
+
+def destroy_identified_directory(path: Path, expected: DirectoryIdentity, label: str) -> None:
+    directory_fd = open_absolute(path, directory=True)
+    quarantine = path.with_name(f".{path.name}.delete-{os.urandom(16).hex()}")
+    try:
+        if not identity_matches(os.fstat(directory_fd), expected):
+            raise HarnessError(f"refusing to destroy a replaced {label}")
+        rename_noreplace(path, quarantine)
+        observed = quarantine.lstat()
+        if not identity_matches(observed, expected) or not identity_matches(os.fstat(directory_fd), expected):
+            raise HarnessError(f"refusing to destroy a replaced {label}")
+        clear_directory_fd(directory_fd)
+        current = quarantine.lstat()
+        if not identity_matches(current, expected):
+            raise HarnessError(f"refusing to remove a replaced {label} quarantine")
+        os.rmdir(quarantine)
+        fsync_parent(quarantine)
+    finally:
+        os.close(directory_fd)
+
+
 def destroy_state(state: Path, expected: StateIdentity | None = None) -> None:
     marker = state / "state.json"
     try:
@@ -806,16 +939,8 @@ def destroy_state(state: Path, expected: StateIdentity | None = None) -> None:
         or not isinstance(value.get("harness_asset_sha256"), dict) or set(value["harness_asset_sha256"]) != set(FROZEN_ASSETS)
     ):
         raise HarnessError("refusing to destroy an unrecognized state directory")
-    metadata = state.lstat()
-    if expected is not None and (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode):
-        raise HarnessError("refusing to destroy a replaced VM state directory")
-    shutil.rmtree(state)
-    try:
-        state.lstat()
-    except FileNotFoundError:
-        return
-    else:
-        raise HarnessError("VM state remains after cleanup")
+    identity = expected or observed
+    destroy_identified_directory(state, identity, "VM state directory")
 
 
 def prepare(arguments: argparse.Namespace) -> dict[str, object]:
@@ -831,22 +956,22 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         raise HarnessError("base image path must not contain symbolic links")
     here = Path(__file__).resolve().parent
     asset_digests = {name: file_sha256(asset_source(here, name)) for name in FROZEN_ASSETS}
-    state = safe_directory(arguments.state, create=True)
-    challenge = os.urandom(32).hex()
-    state_record = {
-        "schema_version": STATE_SCHEMA,
-        "challenge": challenge,
-        "image_sha256": arguments.image_sha256,
-        "qemu_sha256": arguments.qemu_sha256,
-        "qemu_img_sha256": arguments.qemu_img_sha256,
-        "qemu_version": proof["qemu_version"],
-        "tool_sha256": proof["tool_sha256"],
-        "harness_asset_sha256": asset_digests,
-        "trusted_image_sha256": None,
-    }
-    (state / "state.json").write_bytes(canonical(state_record))
-    (state / "state.json").chmod(0o400)
+    state, created_identity = create_prepare_directory(arguments.state)
     try:
+        challenge = os.urandom(32).hex()
+        state_record = {
+            "schema_version": STATE_SCHEMA,
+            "challenge": challenge,
+            "image_sha256": arguments.image_sha256,
+            "qemu_sha256": arguments.qemu_sha256,
+            "qemu_img_sha256": arguments.qemu_img_sha256,
+            "qemu_version": proof["qemu_version"],
+            "tool_sha256": proof["tool_sha256"],
+            "harness_asset_sha256": asset_digests,
+            "trusted_image_sha256": None,
+        }
+        (state / "state.json").write_bytes(canonical(state_record))
+        (state / "state.json").chmod(0o400)
         frozen = state / "frozen-assets"
         frozen.mkdir(mode=0o700)
         for name, digest in asset_digests.items():
@@ -882,7 +1007,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         marker.chmod(0o400)
         return {"status": "prepared", "state": str(state), "public_binding": str(public_path), "raw_key_absence": True}
     except BaseException:
-        destroy_state(state)
+        destroy_identified_directory(state, created_identity, "new prepare state directory")
         raise
 
 
@@ -1132,29 +1257,48 @@ def terminal_run(contract_path: Path, results: Path) -> dict[str, object]:
         raise
 
 
+def unlink_identified_file(path: Path) -> None:
+    descriptor = open_absolute(path)
+    quarantine = path.with_name(f".{path.name}.delete-{os.urandom(16).hex()}")
+    try:
+        expected = os.fstat(descriptor)
+        rename_noreplace(path, quarantine)
+        observed = quarantine.lstat()
+        if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino):
+            raise HarnessError("private record was replaced before cleanup")
+        os.unlink(quarantine)
+        fsync_parent(quarantine)
+    finally:
+        os.close(descriptor)
+
+
 def cleanup_publication(binding: dict[str, str]) -> None:
     staging = Path(binding["staging"])
     journal = Path(binding["journal"])
+    publication = load_publication(binding)
     try:
         staging.lstat()
     except FileNotFoundError:
         pass
     else:
-        staging = safe_directory(staging)
-        shutil.rmtree(staging)
-        try:
-            staging.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            raise HarnessError("private result staging remains after cleanup")
+        if publication is None:
+            raise HarnessError("refusing to remove unjournaled result staging")
+        destroy_identified_directory(
+            staging,
+            parse_directory_identity(publication["staging_identity"]),
+            "private result staging directory",
+        )
     try:
-        journal.unlink()
+        journal.lstat()
     except FileNotFoundError:
         pass
+    else:
+        unlink_identified_file(journal)
 
 
-def start_publication(binding: dict[str, str], resumed: bool) -> tuple[Path, dict[str, object] | None]:
+def start_publication(
+    binding: dict[str, str], resumed: bool,
+) -> tuple[Path, dict[str, object] | None, DirectoryIdentity]:
     final = Path(binding["results"])
     staging = Path(binding["staging"])
     publication = load_publication(binding)
@@ -1164,7 +1308,7 @@ def start_publication(binding: dict[str, str], resumed: bool) -> tuple[Path, dic
         pass
     else:
         if publication is not None and publication.get("phase") == "ready":
-            return final, publication["outcome"]
+            return final, publication["outcome"], parse_directory_identity(publication["staging_identity"])
         raise FileExistsError(final)
     if publication is not None:
         if not resumed:
@@ -1174,8 +1318,11 @@ def start_publication(binding: dict[str, str], resumed: bool) -> tuple[Path, dic
         except FileNotFoundError as error:
             raise HarnessError("result publication staging is missing") from error
         staging = safe_directory(staging)
+        identity = parse_directory_identity(publication["staging_identity"])
+        if directory_identity(staging) != identity:
+            raise HarnessError("result publication staging identity differs")
         if publication.get("phase") == "ready":
-            return staging, publication["outcome"]
+            return staging, publication["outcome"], identity
         raise HarnessError("interrupted terminal result staging requires cleanup")
     try:
         staging.lstat()
@@ -1186,21 +1333,54 @@ def start_publication(binding: dict[str, str], resumed: bool) -> tuple[Path, dic
             staging = safe_directory(staging)
             raise HarnessError("interrupted unjournaled result staging requires cleanup")
         raise FileExistsError(staging)
-    write_new_private_json(Path(binding["journal"]), publication_record(binding, "running"))
-    return staging, None
+    identity = directory_identity(staging)
+    write_new_private_json(
+        Path(binding["journal"]),
+        publication_record(binding, "running", staging_identity=identity),
+    )
+    return staging, None, identity
 
 
 def validate_result_set(
     contract: dict[str, object], directory: Path, outcome: dict[str, object] | None = None,
+    expected_identity: DirectoryIdentity | None = None,
 ) -> dict[str, object]:
     directory = safe_directory(directory)
+    directory_fd = open_absolute(directory, directory=True)
+    try:
+        held_identity = DirectoryIdentity(os.fstat(directory_fd).st_dev, os.fstat(directory_fd).st_ino)
+        if expected_identity is not None and held_identity != expected_identity:
+            raise HarnessError("result publication directory identity differs")
+        return validate_result_set_fd(contract, directory_fd, outcome)
+    finally:
+        os.close(directory_fd)
+
+
+def read_result_member(directory_fd: int, name: str) -> bytes:
+    descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        return read_fd(descriptor, name, MAX_JSON)
+    finally:
+        os.close(descriptor)
+
+
+def decode_result_json(raw: bytes, name: str) -> object:
+    try:
+        return json.loads(raw, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as error:
+        raise HarnessError(f"invalid result JSON: {name}") from error
+
+
+def validate_result_set_fd(
+    contract: dict[str, object], directory_fd: int, outcome: dict[str, object] | None,
+) -> dict[str, object]:
     expected_names = {"acceptance-receipt.json", "verifier.json", "evidence-manifest.json"}
-    if {entry.name for entry in os.scandir(directory)} != expected_names:
+    if {entry.name for entry in os.scandir(directory_fd)} != expected_names:
         raise HarnessError("result publication file set differs")
-    receipt_raw = read_regular(directory / "acceptance-receipt.json", MAX_JSON)
-    verifier_raw = read_regular(directory / "verifier.json", MAX_JSON)
-    evidence_raw = read_regular(directory / "evidence-manifest.json", MAX_JSON)
-    evidence = load_json(directory / "evidence-manifest.json")
+    receipt_raw = read_result_member(directory_fd, "acceptance-receipt.json")
+    verifier_raw = read_result_member(directory_fd, "verifier.json")
+    evidence_raw = read_result_member(directory_fd, "evidence-manifest.json")
+    evidence = decode_result_json(evidence_raw, "evidence-manifest.json")
     if canonical(evidence) != evidence_raw:
         raise HarnessError("evidence manifest encoding differs")
     expected_manifest = {
@@ -1248,6 +1428,7 @@ def validate_result_set(
         "dormant_proof": evidence["dormant_proof"],
     }
     validate_final_frame(frame, contract, "0" * 64)
+    replay_frozen_verifier(contract, receipt_raw, evidence)
     expected_outcome = {
         "status": "pass",
         "candidate_sha": contract["candidate_sha"],
@@ -1262,17 +1443,75 @@ def validate_result_set(
     return expected_outcome
 
 
+def replay_frozen_verifier(
+    contract: dict[str, object], receipt_raw: bytes, evidence: dict[str, object],
+) -> None:
+    here = Path(__file__).resolve().parent
+    verifier_path = asset_source(here, "receipt_verifier.py")
+    stages_path = asset_source(here, "expected-stages.json")
+    verifier_raw = read_regular(verifier_path, MAX_FILE)
+    stages_raw = read_regular(stages_path, MAX_JSON)
+    asset_digests = evidence["harness_asset_sha256"]
+    if (
+        hashlib.sha256(verifier_raw).hexdigest() != asset_digests["receipt_verifier.py"]
+        or hashlib.sha256(stages_raw).hexdigest() != asset_digests["expected-stages.json"]
+    ):
+        raise HarnessError("frozen receipt verifier assets differ")
+    scenario_descriptor = contract.get("scenario")
+    if not isinstance(scenario_descriptor, dict) or set(scenario_descriptor) != {"path", "sha256"}:
+        raise HarnessError("scenario descriptor differs during verifier replay")
+    scenario_raw = read_regular(safe_input_file(Path(str(scenario_descriptor["path"]))), MAX_JSON)
+    if hashlib.sha256(scenario_raw).hexdigest() != scenario_descriptor["sha256"]:
+        raise HarnessError("scenario differs during verifier replay")
+    scenario = decode_result_json(scenario_raw, "scenario.json")
+    receipt = decode_result_json(receipt_raw, "acceptance-receipt.json")
+    stages = decode_result_json(stages_raw, "expected-stages.json")
+    namespace: dict[str, object] = {"__name__": "frozen_receipt_verifier", "__file__": str(verifier_path)}
+    try:
+        exec(compile(verifier_raw, str(verifier_path), "exec"), namespace)
+        namespace["verify"](receipt, scenario, stages)
+    except Exception as error:
+        raise HarnessError("frozen receipt verifier rejected result set") from error
+
+
 def finish_publication(
     contract: dict[str, object], binding: dict[str, str], outcome: dict[str, object],
 ) -> dict[str, object]:
     final = Path(binding["results"])
     staging = Path(binding["staging"])
+    publication = load_publication(binding)
+    if publication is None or publication.get("phase") != "ready":
+        raise HarnessError("ready result publication journal is missing")
+    expected = parse_directory_identity(publication["staging_identity"])
     try:
         final.lstat()
     except FileNotFoundError:
-        validate_result_set(contract, staging, outcome)
-        rename_noreplace(staging, final)
-        fsync_parent(final)
+        directory_fd = open_absolute(staging, directory=True)
+        quarantine = staging.with_name(f".{staging.name}.publish-{os.urandom(16).hex()}")
+        try:
+            if not identity_matches(os.fstat(directory_fd), expected):
+                raise HarnessError("result staging changed before publication")
+            rename_noreplace(staging, quarantine)
+            if (
+                not identity_matches(quarantine.lstat(), expected)
+                or not identity_matches(os.fstat(directory_fd), expected)
+            ):
+                raise HarnessError("result staging changed during publication quarantine")
+            validate_result_set_fd(contract, directory_fd, outcome)
+            rename_noreplace(quarantine, final)
+            if (
+                not identity_matches(final.lstat(), expected)
+                or not identity_matches(os.fstat(directory_fd), expected)
+            ):
+                rejected = final.with_name(f".{final.name}.rejected-{os.urandom(16).hex()}")
+                try:
+                    rename_noreplace(final, rejected)
+                except BaseException:
+                    pass
+                raise HarnessError("published result identity differs")
+            fsync_parent(final)
+        finally:
+            os.close(directory_fd)
     else:
         try:
             staging.lstat()
@@ -1280,13 +1519,13 @@ def finish_publication(
             pass
         else:
             raise HarnessError("published and staged result sets both exist")
-        validate_result_set(contract, final, outcome)
+        validate_result_set(contract, final, outcome, expected)
     try:
-        Path(binding["journal"]).unlink()
+        Path(binding["journal"]).lstat()
     except FileNotFoundError:
         pass
     else:
-        fsync_parent(Path(binding["journal"]))
+        unlink_identified_file(Path(binding["journal"]))
     return outcome
 
 
@@ -1418,7 +1657,7 @@ def run_vm(
     outcome: dict[str, object] | None = None
     run_error: BaseException | None = None
     try:
-        results, recovered = start_publication(binding, resumed)
+        results, recovered, results_identity = start_publication(binding, resumed)
         if recovered is not None:
             outcome = recovered
         else:
@@ -1485,9 +1724,10 @@ def run_vm(
                 "dormant_proof": proof, "vm_state_absent": True,
             }
             publication_checkpoint("after-third-file", results, Path(binding["results"]))
-            validate_result_set(contract, results, outcome)
+            validate_result_set(contract, results, outcome, results_identity)
             replace_private_json(
-                Path(binding["journal"]), publication_record(binding, "ready", outcome),
+                Path(binding["journal"]),
+                publication_record(binding, "ready", outcome, results_identity),
             )
     except BaseException as error:
         run_error = error
