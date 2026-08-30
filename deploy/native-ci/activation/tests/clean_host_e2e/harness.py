@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 
 SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v2"
 STATE_SCHEMA = "buzz-ci-clean-host-e2e-vm-state/v2"
@@ -82,6 +83,10 @@ def publication_checkpoint(_name: str, _staging: Path, _results: Path) -> None:
 
 def cleanup_checkpoint(_name: str, _path: Path, _descriptor: int) -> None:
     """Test seam for cleanup namespace-race checkpoints."""
+
+
+def claim_checkpoint(_name: str, _path: Path, _descriptor: int) -> None:
+    """Test seam for run-state claim interruption checkpoints."""
 
 
 def run_binding(contract: dict[str, object], results: Path) -> dict[str, str]:
@@ -838,6 +843,22 @@ def state_identity(state: Path) -> StateIdentity:
     )
 
 
+def state_identity_fd(directory_fd: int) -> StateIdentity:
+    metadata = os.fstat(directory_fd)
+    marker_fd = os.open(
+        "state.json", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd,
+    )
+    try:
+        marker_raw = read_fd(marker_fd, "state.json", MAX_JSON)
+    finally:
+        os.close(marker_fd)
+    return StateIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        marker_sha256=hashlib.sha256(marker_raw).hexdigest(),
+    )
+
+
 def directory_identity(path: Path) -> DirectoryIdentity:
     metadata = safe_directory(path).lstat()
     return DirectoryIdentity(metadata.st_dev, metadata.st_ino)
@@ -1189,6 +1210,119 @@ def validate_contract(
     return validate_contract_value(validate_contract_envelope(load_json(path)))
 
 
+def run_ownership_record(binding: dict[str, str]) -> dict[str, object]:
+    ownership = publication_record(binding, "running")
+    ownership.pop("schema_version")
+    ownership.pop("phase")
+    ownership["schema_version"] = "buzz-ci-clean-host-e2e-run-ownership/v1"
+    return ownership
+
+
+def read_run_ownership(directory_fd: int) -> object:
+    descriptor = os.open(
+        RUN_OWNERSHIP, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        raw = read_fd(descriptor, RUN_OWNERSHIP, MAX_JSON)
+    finally:
+        os.close(descriptor)
+    try:
+        return json.loads(raw, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as error:
+        raise HarnessError(f"invalid JSON: {RUN_OWNERSHIP}") from error
+
+
+def write_run_ownership(
+    directory_fd: int, ownership: dict[str, object], acquired: Callable[[], None],
+) -> None:
+    descriptor = os.open(
+        RUN_OWNERSHIP,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o400,
+        dir_fd=directory_fd,
+    )
+    acquired()
+    try:
+        raw = canonical(ownership)
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise HarnessError(f"private record write was incomplete: {RUN_OWNERSHIP}")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def path_matches_identity(path: Path, expected: DirectoryIdentity) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return identity_matches(metadata, expected)
+
+
+def zero_run_ownership_fd(directory_fd: int) -> None:
+    try:
+        descriptor = os.open(
+            RUN_OWNERSHIP, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise HarnessError("run ownership record is not a regular file")
+        os.fchmod(descriptor, 0o600)
+        writable = os.open(f"/proc/self/fd/{descriptor}", os.O_WRONLY | os.O_CLOEXEC)
+        try:
+            os.ftruncate(writable, 0)
+            os.fsync(writable)
+        finally:
+            os.close(writable)
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def sanitize_selected_state(
+    state: Path, claimed: Path, expected: StateIdentity, directory_fd: int,
+    primary: BaseException,
+) -> None:
+    cleanup_errors: list[BaseException] = []
+    try:
+        zero_run_ownership_fd(directory_fd)
+    except BaseException as error:
+        cleanup_errors.append(error)
+    located = False
+    for path in (claimed, state):
+        try:
+            matches = path_matches_identity(path, expected)
+        except BaseException as error:
+            cleanup_errors.append(error)
+            continue
+        if not matches:
+            continue
+        located = True
+        try:
+            destroy_identified_directory(path, expected, "selected VM state directory")
+        except BaseException as error:
+            cleanup_errors.append(error)
+        break
+    if not located or cleanup_errors:
+        try:
+            sanitize_directory_fd(directory_fd)
+        except BaseException as error:
+            cleanup_errors.append(error)
+    if cleanup_errors:
+        detail = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
+        raise HarnessError(f"terminal run cleanup failed: {detail}") from primary
+
+
 def claim_run_state(binding: dict[str, str]) -> tuple[Path, StateIdentity, bool]:
     """Claim or resume the exact contract-bound prepared state."""
     state = Path(binding["original_state"])
@@ -1211,51 +1345,99 @@ def claim_run_state(binding: dict[str, str]) -> tuple[Path, StateIdentity, bool]
         raise FileNotFoundError(state)
     selected = safe_directory(claimed if claimed_present else state)
     validate_prepared_state(selected)
-    ownership = publication_record(binding, "running")
-    ownership.pop("schema_version")
-    ownership.pop("phase")
-    ownership["schema_version"] = "buzz-ci-clean-host-e2e-run-ownership/v1"
-    ownership_path = selected / RUN_OWNERSHIP
-    if claimed_present:
-        if load_json(ownership_path) != ownership:
-            raise HarnessError("claimed VM state ownership differs")
-        return selected, state_identity(selected), True
-    ownership_existed = False
+    directory_fd = open_absolute(selected, directory=True)
+    cleanup_allowed = False
     try:
-        ownership_path.lstat()
-    except FileNotFoundError:
-        write_new_private_json(ownership_path, ownership)
-    else:
-        ownership_existed = True
-        if load_json(ownership_path) != ownership:
-            raise HarnessError("prepared VM state ownership differs")
-    expected = state_identity(state)
-    parent_fd = open_absolute(state.parent, directory=True)
-    renamed = False
-    try:
-        current = os.stat(state.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (expected.device, expected.inode):
-            raise HarnessError("prepared VM state changed before run ownership")
-        rename_noreplace(state, claimed)
-        os.fsync(parent_fd)
-        renamed = True
-    finally:
-        os.close(parent_fd)
-    try:
-        if state.exists():
-            raise HarnessError("prepared VM state remained after run ownership transfer")
-        observed = state_identity(claimed)
-        if observed != expected:
-            raise HarnessError("prepared VM state changed during run ownership transfer")
-    except BaseException as claim_error:
-        if renamed:
+        expected = state_identity_fd(directory_fd)
+        if state_identity(selected) != expected:
+            raise HarnessError("prepared VM state changed during selection")
+        ownership = run_ownership_record(binding)
+        ownership_existed = False
+        try:
+            os.stat(RUN_OWNERSHIP, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            def acquired() -> None:
+                nonlocal cleanup_allowed
+                cleanup_allowed = True
+
             try:
-                destroy_state(claimed, expected)
-            except BaseException as cleanup_error:
-                detail = str(cleanup_error) or type(cleanup_error).__name__
-                raise HarnessError(f"terminal run cleanup failed: {detail}") from claim_error
+                write_run_ownership(directory_fd, ownership, acquired)
+            except BaseException:
+                if not cleanup_allowed:
+                    try:
+                        os.stat(RUN_OWNERSHIP, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        cleanup_allowed = True
+                    else:
+                        try:
+                            cleanup_allowed = read_run_ownership(directory_fd) == ownership
+                        except BaseException:
+                            cleanup_allowed = False
+                raise
+        else:
+            ownership_existed = True
+            if read_run_ownership(directory_fd) != ownership:
+                message = (
+                    "claimed VM state ownership differs"
+                    if claimed_present else "prepared VM state ownership differs"
+                )
+                raise HarnessError(message)
+            cleanup_allowed = True
+        if claimed_present:
+            claim_checkpoint("resumed-claim", claimed, directory_fd)
+            validate_prepared_state(claimed)
+            if state_identity(claimed) != expected:
+                raise HarnessError("claimed VM state changed during resume")
+            return claimed, expected, True
+
+        parent_fd = open_absolute(state.parent, directory=True)
+        lost_acknowledgement = False
+        try:
+            current = os.stat(state.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not identity_matches(current, expected):
+                raise HarnessError("prepared VM state changed before run ownership")
+            claim_checkpoint("before-claim-rename", state, directory_fd)
+            current = os.stat(state.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not identity_matches(current, expected):
+                raise HarnessError("prepared VM state changed before run ownership")
+            try:
+                rename_noreplace_at(
+                    parent_fd, os.fsencode(state.name), parent_fd, os.fsencode(claimed.name),
+                    str(claimed),
+                )
+            except BaseException:
+                try:
+                    original_missing = not path_matches_identity(state, expected) and not state.exists()
+                    claim_is_selected = path_matches_identity(claimed, expected)
+                except BaseException:
+                    raise
+                if not original_missing or not claim_is_selected:
+                    raise
+                lost_acknowledgement = True
+            os.fsync(parent_fd)
+            claim_checkpoint("after-claim-rename", claimed, directory_fd)
+            try:
+                state_metadata = state.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if identity_matches(state_metadata, expected):
+                    raise HarnessError("prepared VM state remained after run ownership transfer")
+                raise HarnessError("prepared VM state path was replaced during run ownership transfer")
+            if not path_matches_identity(claimed, expected):
+                raise HarnessError("prepared VM state changed during run ownership transfer")
+            validate_prepared_state(claimed)
+            if state_identity(claimed) != expected or state_identity_fd(directory_fd) != expected:
+                raise HarnessError("prepared VM state changed during run ownership transfer")
+        finally:
+            os.close(parent_fd)
+        return claimed, expected, ownership_existed or lost_acknowledgement
+    except BaseException as claim_error:
+        if cleanup_allowed:
+            sanitize_selected_state(state, claimed, expected, directory_fd, claim_error)
         raise
-    return claimed, expected, ownership_existed
+    finally:
+        os.close(directory_fd)
 
 
 def terminal_run(contract_path: Path, results: Path) -> dict[str, object]:

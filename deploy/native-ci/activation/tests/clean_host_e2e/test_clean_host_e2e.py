@@ -1046,6 +1046,217 @@ class InputTests(unittest.TestCase):
             self.assertFalse((root / "results").exists())
             self.assertFalse(any(path.name.startswith(".state.terminal-") for path in root.iterdir()))
 
+    def test_claim_ownership_open_write_and_fsync_failures_sanitize_selected_state(self) -> None:
+        boundaries = ("open", "partial-write", "file-fsync", "directory-fsync")
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = make_prepared_state(root)
+                binding = harness.run_binding({"state": str(state)}, root / "results")
+                real_writer = harness.write_run_ownership
+                real_fsync = os.fsync
+                failed = False
+
+                def writer(directory_fd, ownership, acquired):
+                    if boundary == "open":
+                        raise PermissionError("simulated ownership open failure")
+                    if boundary == "partial-write":
+                        descriptor = os.open(
+                            harness.RUN_OWNERSHIP,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                            0o400,
+                            dir_fd=directory_fd,
+                        )
+                        acquired()
+                        try:
+                            os.write(descriptor, b'{"schema_version":')
+                        finally:
+                            os.close(descriptor)
+                        raise OSError("simulated ownership partial write")
+                    return real_writer(directory_fd, ownership, acquired)
+
+                def fsync(descriptor):
+                    nonlocal failed
+                    mode = os.fstat(descriptor).st_mode
+                    selected = stat.S_ISREG(mode) if boundary == "file-fsync" else stat.S_ISDIR(mode)
+                    if boundary.endswith("fsync") and selected and not failed:
+                        failed = True
+                        raise OSError(f"simulated ownership {boundary}")
+                    return real_fsync(descriptor)
+
+                with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                    harness, "write_run_ownership", side_effect=writer,
+                ), mock.patch.object(harness.os, "fsync", side_effect=fsync):
+                    with self.assertRaises((OSError, PermissionError)):
+                        harness.claim_run_state(binding)
+                self.assertFalse(state.exists())
+                residue = [path for path in root.iterdir() if ".state.tombstone-" in path.name]
+                self.assertEqual(len(residue), 1)
+                residue[0].chmod(0o700)
+                ownership = residue[0] / harness.RUN_OWNERSHIP
+                if ownership.exists():
+                    self.assertEqual(ownership.stat().st_size, 0)
+
+    def test_claim_rename_rejects_every_oserror_class_and_cleans_exact_state(self) -> None:
+        failures = (
+            PermissionError("simulated rename permission failure"),
+            FileExistsError("simulated rename collision"),
+            OSError("simulated rename I/O failure"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = make_prepared_state(root)
+                binding = harness.run_binding({"state": str(state)}, root / "results")
+                claimed = Path(binding["claimed_state"])
+                real_rename = harness.rename_noreplace_at
+
+                def fail_claim(source_fd, source, target_fd, target, target_label):
+                    if target_label == str(claimed):
+                        raise failure
+                    return real_rename(source_fd, source, target_fd, target, target_label)
+
+                with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                    harness, "rename_noreplace_at", side_effect=fail_claim,
+                ):
+                    with self.assertRaises(type(failure)):
+                        harness.claim_run_state(binding)
+                self.assertFalse(state.exists())
+                self.assertFalse(claimed.exists())
+
+    def test_claim_lost_rename_acknowledgement_resumes_durable_exact_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            claimed = Path(binding["claimed_state"])
+            real_rename = harness.rename_noreplace_at
+            lost = False
+
+            def lose_ack(source_fd, source, target_fd, target, target_label):
+                nonlocal lost
+                result = real_rename(source_fd, source, target_fd, target, target_label)
+                if target_label == str(claimed) and not lost:
+                    lost = True
+                    raise OSError("simulated lost rename acknowledgement")
+                return result
+
+            with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                harness, "rename_noreplace_at", side_effect=lose_ack,
+            ):
+                selected, expected, resumed = harness.claim_run_state(binding)
+            self.assertEqual(selected, claimed)
+            self.assertTrue(resumed)
+            self.assertFalse(state.exists())
+            self.assertEqual(harness.load_json(claimed / harness.RUN_OWNERSHIP), harness.run_ownership_record(binding))
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                retried, retried_expected, retried_resumed = harness.claim_run_state(binding)
+            self.assertEqual((retried, retried_expected, retried_resumed), (claimed, expected, True))
+            harness.destroy_state(claimed, expected)
+
+    def test_claim_state_replacement_before_during_and_after_rename_preserves_replacement(self) -> None:
+        for boundary in ("before", "during", "after"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = make_prepared_state(root)
+                replacement_parent = root / "replacement-parent"
+                replacement_parent.mkdir(mode=0o700)
+                replacement = make_prepared_state(replacement_parent)
+                (replacement / "sentinel").write_text("unrelated")
+                binding = harness.run_binding({"state": str(state)}, root / "results")
+                claimed = Path(binding["claimed_state"])
+                stolen = root / "selected-stolen"
+                real_rename = harness.rename_noreplace_at
+
+                def checkpoint(name, _path, _descriptor):
+                    if name == "before-claim-rename" and boundary == "before":
+                        state.rename(stolen)
+                        replacement.rename(state)
+                    elif name == "after-claim-rename" and boundary == "after":
+                        claimed.rename(stolen)
+                        replacement.rename(claimed)
+
+                def rename_with_swap(source_fd, source, target_fd, target, target_label):
+                    if target_label == str(claimed) and boundary == "during":
+                        state.rename(stolen)
+                        replacement.rename(state)
+                    return real_rename(source_fd, source, target_fd, target, target_label)
+
+                with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                    harness, "claim_checkpoint", side_effect=checkpoint,
+                ), mock.patch.object(harness, "rename_noreplace_at", side_effect=rename_with_swap):
+                    with self.assertRaisesRegex(harness.HarnessError, "prepared VM state"):
+                        harness.claim_run_state(binding)
+                replacement_path = state if boundary == "before" else claimed
+                self.assertEqual((replacement_path / "sentinel").read_text(), "unrelated")
+                self.assertFalse((replacement_path / harness.RUN_OWNERSHIP).exists())
+                stolen.chmod(0o700)
+                self.assertEqual((stolen / harness.RUN_OWNERSHIP).stat().st_size, 0)
+
+    def test_claim_post_validation_failure_cleans_selected_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            real_validate = harness.validate_prepared_state
+            calls = 0
+
+            def validate(path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated post-claim validation failure")
+                return real_validate(path)
+
+            with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                harness, "validate_prepared_state", side_effect=validate,
+            ):
+                with self.assertRaisesRegex(OSError, "post-claim validation"):
+                    harness.claim_run_state(binding)
+            self.assertFalse(state.exists())
+            self.assertFalse(Path(binding["claimed_state"]).exists())
+
+    def test_claim_cleanup_failure_reports_failure_after_zeroing_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            claimed = Path(binding["claimed_state"])
+            real_rename = harness.rename_noreplace_at
+
+            def fail_claim(source_fd, source, target_fd, target, target_label):
+                if target_label == str(claimed):
+                    raise OSError("simulated claim failure")
+                return real_rename(source_fd, source, target_fd, target, target_label)
+
+            def cleanup_failure(name, _path, _descriptor):
+                if name == "before-directory-tombstone-retention":
+                    raise OSError("simulated cleanup acknowledgement failure")
+
+            with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                harness, "rename_noreplace_at", side_effect=fail_claim,
+            ), mock.patch.object(harness, "cleanup_checkpoint", side_effect=cleanup_failure):
+                with self.assertRaisesRegex(harness.HarnessError, "terminal run cleanup failed"):
+                    harness.claim_run_state(binding)
+            residue = [path for path in root.iterdir() if ".state.tombstone-" in path.name]
+            self.assertEqual(len(residue), 1)
+            residue[0].chmod(0o700)
+            self.assertEqual((residue[0] / harness.RUN_OWNERSHIP).stat().st_size, 0)
+
+    def test_claim_mismatched_ownership_is_preserved_unmodified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            ownership = state / harness.RUN_OWNERSHIP
+            harness.write_new_private_json(ownership, {"schema_version": "unrelated/v1"})
+            before = ownership.read_bytes()
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                with self.assertRaisesRegex(harness.HarnessError, "ownership differs"):
+                    harness.claim_run_state(binding)
+            self.assertTrue(state.exists())
+            self.assertEqual(ownership.read_bytes(), before)
+
     def test_post_first_file_restart_exposes_nothing_and_cleans_exact_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
