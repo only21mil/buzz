@@ -116,11 +116,27 @@ deploy/native-ci/runner/install.py rollback \
 
 `check` validates an operator-owned sealed package, host identities, target
 parents, and exact changed paths without writing or requiring root. `dry-run`
-revalidates installation ownership before reporting the same plan. `install` uses
-descriptor-verified sources, atomic replacements, exact metadata readback, and
-a root-private backup receipt. Reinstalling the same package returns
-`unchanged`. Rollback requires the same package and backup ID and refuses any
-installed-target drift before restoring prior bytes and metadata. The
+revalidates installation ownership before reporting the same plan. `install`
+uses descriptor-verified sources, descriptor-relative atomic replacements, and
+exact metadata readback. Before it creates a managed directory or publishes a
+target, it durably records a root-private `transaction.json` with the package
+ID, package digest, source commit, candidate metadata, complete prior-state
+inventory, backup digests, and transaction digest. Its explicit phases are
+`install_prepared`, `install_publishing`, and `installed`.
+
+Repeating `install` for an installed transaction returns the same terminal
+result and backup ID. If the prior process stopped while publishing, the retry
+accepts only an exact mix of recorded prior and candidate states, then finishes
+the same transaction. Any third state is drift and blocks recovery. The
+terminal `receipt.json` must match the transaction binding.
+
+Rollback requires the same package and backup ID. It validates every backup,
+target, and removable directory before recording `rollback_prepared`, then
+records `rollback_restoring` before its first target mutation. A restart accepts
+only an exact mix of candidate and recorded prior states and restores the rest.
+`rolled_back` is terminal, and repeating the same rollback returns the same
+result without another mutation. A receipt/transaction mismatch, package
+mismatch, unexpected target state, or directory drift blocks rollback. The
 machine-readable check and install results include the exact runner-control and
 broker peer policy plus the disabled, inactive, unprovisioned capacity-zero
 state. Those fields describe what this package leaves unchanged; they are not a
