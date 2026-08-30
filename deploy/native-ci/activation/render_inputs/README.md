@@ -69,8 +69,8 @@ match its maintained clean-host assets. It also checks their digests against
 the prepared state's mode-`0400` `state.json`, including the frozen guest-entry
 asset. It then emits the harness digest, raw timing-asset digest, decoded timing
 object, and harness-semantic timing digest. The renderer also checks the
-candidate HEAD, clean index, and non-ignored worktree status. It freezes that
-repository identity through every candidate-blob read and rechecks it before
+candidate HEAD, exact index bytes and entries, and non-ignored worktree status.
+It freezes that repository identity through every candidate-blob read and rechecks it before
 output. The canonical output bytes are written, synced, and read back from a
 private staging inode. At finalization, maintained Git transactions hold the
 HEAD and index locks. A mode-`000` no-clobber hard link is pending, not accepted;
@@ -84,6 +84,12 @@ so namespace replacement cannot cause removal of an unrelated file. The final
 verification and acceptance operation includes the pending link, inode check,
 and final status read before it returns. A mutation injected after the final
 status read is post-acceptance.
+If the no-clobber link finds an existing destination, the same Git locks remain
+held while the renderer validates its exact canonical bytes, inode, owner, and
+mode, performs the final candidate status read, and validates the destination
+again. Only an exact match is accepted. Candidate drift or a destination
+mismatch rejects and removes only the private temporary. The renderer never
+overwrites, changes the mode of, or removes the pre-existing destination.
 Ignored build artifacts do not change the repository identity. The renderer
 also checks the
 prepared state's exact `public-binding.json`, the scenario, seccomp source, and

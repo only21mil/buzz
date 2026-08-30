@@ -74,11 +74,16 @@ class PublishedOutputRetainedError(RenderError):
     """Publication linearized, but later namespace identity no longer matches."""
 
 
+class ExistingOutputAccepted(Exception):
+    """Internal signal that an exact pre-existing destination was accepted."""
+
+
 class CandidateSnapshot(NamedTuple):
     root: Path
     candidate: str
     index_tree: str
     index_info: bytes
+    index_digest: str
     status: bytes
 
 
@@ -251,7 +256,31 @@ def candidate_checkpoint(stage: str, candidate_root: Path) -> None:
     """Deterministic no-op checkpoint for repository-drift regression tests."""
 
 
-def candidate_repository_state(candidate_root: Path) -> tuple[str, str, bytes, bytes]:
+def candidate_index_digest(candidate_root: Path) -> str:
+    command = ["/usr/bin/git", "--no-optional-locks", "-C", str(candidate_root)]
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    try:
+        index_value = subprocess.run(
+            [*command, "rev-parse", "--git-path", "index"], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=10,
+        ).stdout.decode().strip()
+        index = Path(index_value)
+        if not index.is_absolute():
+            index = candidate_root / index
+        digest = subprocess.run(
+            [*command, "hash-object", "--no-filters", "--", str(index)], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=10,
+        ).stdout.decode().strip()
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+        raise RenderError("candidate Git index bytes could not be verified") from error
+    if HEX40.fullmatch(digest) is None:
+        raise RenderError("candidate Git index digest differs")
+    return digest
+
+
+def candidate_repository_state(candidate_root: Path) -> tuple[str, str, bytes, str, bytes]:
     command = ["/usr/bin/git", "--no-optional-locks", "-C", str(candidate_root)]
     environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
     try:
@@ -269,6 +298,7 @@ def candidate_repository_state(candidate_root: Path) -> tuple[str, str, bytes, b
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, timeout=10,
         ).stdout
+        index_digest = candidate_index_digest(candidate_root)
         status = subprocess.run(
             [*command, "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=no"],
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -283,10 +313,10 @@ def candidate_repository_state(candidate_root: Path) -> tuple[str, str, bytes, b
         raise RenderError("candidate Git state could not be verified") from error
     if head != final_head or HEX40.fullmatch(head) is None or HEX40.fullmatch(index_tree) is None:
         raise RenderError("candidate Git state changed while inspected")
-    return head, index_tree, index_info, status
+    return head, index_tree, index_info, index_digest, status
 
 
-def candidate_repository_locked_state(candidate_root: Path) -> tuple[str, bytes, bytes]:
+def candidate_repository_locked_state(candidate_root: Path) -> tuple[str, bytes, str, bytes]:
     command = ["/usr/bin/git", "--no-optional-locks", "-C", str(candidate_root)]
     environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
     try:
@@ -300,6 +330,7 @@ def candidate_repository_locked_state(candidate_root: Path) -> tuple[str, bytes,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, timeout=10,
         ).stdout
+        index_digest = candidate_index_digest(candidate_root)
         status = subprocess.run(
             [*command, "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=no"],
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -309,17 +340,17 @@ def candidate_repository_locked_state(candidate_root: Path) -> tuple[str, bytes,
         raise RenderError("locked candidate Git state could not be verified") from error
     if HEX40.fullmatch(head) is None:
         raise RenderError("locked candidate Git HEAD differs")
-    return head, index_info, status
+    return head, index_info, index_digest, status
 
 
 def begin_candidate_snapshot(candidate_root: Path, candidate: str) -> CandidateSnapshot:
-    head, index_tree, index_info, status = candidate_repository_state(candidate_root)
+    head, index_tree, index_info, index_digest, status = candidate_repository_state(candidate_root)
     if head != candidate:
         raise RenderError("candidate root HEAD differs")
     if status:
         raise RenderError("candidate Git index or worktree is not clean")
     snapshot = CandidateSnapshot(
-        candidate_root, candidate, index_tree, index_info, status,
+        candidate_root, candidate, index_tree, index_info, index_digest, status,
     )
     candidate_checkpoint("after-initial-head-check", candidate_root)
     verify_candidate_snapshot(snapshot)
@@ -328,14 +359,15 @@ def begin_candidate_snapshot(candidate_root: Path, candidate: str) -> CandidateS
 
 def verify_candidate_snapshot(
     snapshot: CandidateSnapshot,
-    publication: tuple[int, int, str, str] | None = None,
+    publication: tuple[int, int, str, str, bytes] | None = None,
 ) -> None:
     def check() -> None:
-        head, index_tree, index_info, status = candidate_repository_state(snapshot.root)
+        head, index_tree, index_info, index_digest, status = candidate_repository_state(snapshot.root)
         if (
             head != snapshot.candidate
             or index_tree != snapshot.index_tree
             or index_info != snapshot.index_info
+            or index_digest != snapshot.index_digest
             or status != snapshot.status
         ):
             raise RenderError("candidate Git HEAD, index, or worktree changed")
@@ -344,30 +376,41 @@ def verify_candidate_snapshot(
         check()
         return
 
-    fd, parent, temporary, name = publication
+    fd, parent, temporary, name, payload = publication
     check()
     locks = CandidateGitLocks.acquire(snapshot)
     linked = False
     accepted = False
 
     def check_locked() -> None:
-        head, index_info, status = candidate_repository_locked_state(snapshot.root)
+        head, index_info, index_digest, status = candidate_repository_locked_state(snapshot.root)
         if (
             head != snapshot.candidate
             or index_info != snapshot.index_info
+            or index_digest != snapshot.index_digest
             or status != snapshot.status
         ):
             raise RenderError("candidate Git HEAD, index, or worktree changed")
 
     try:
         check_locked()
-        os.link(
-            temporary,
-            name,
-            src_dir_fd=parent,
-            dst_dir_fd=parent,
-            follow_symlinks=False,
-        )
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except FileExistsError as collision:
+            candidate_checkpoint("before-existing-output-check", snapshot.root)
+            if not accept_existing_output(parent, name, payload):
+                raise collision
+            candidate_checkpoint("after-existing-output-check", snapshot.root)
+            check_locked()
+            if not accept_existing_output(parent, name, payload):
+                raise collision
+            raise ExistingOutputAccepted
         linked = True
         candidate_checkpoint("after-pending-publication", snapshot.root)
         try:
@@ -397,7 +440,7 @@ def verify_candidate_snapshot(
         accepted = True
         os.fchmod(fd, 0o600)
         candidate_checkpoint("after-acceptance-mode", snapshot.root)
-    except (OSError, RenderError) as error:
+    except (OSError, RenderError, subprocess.SubprocessError) as error:
         if linked and not accepted:
             try:
                 os.fchmod(fd, 0o000)
@@ -409,6 +452,8 @@ def verify_candidate_snapshot(
                 raise PublishedOutputRetainedError(
                     "candidate changed before acceptance; unreadable output retained"
                 ) from error
+        if isinstance(error, subprocess.SubprocessError):
+            raise RenderError("candidate acceptance subprocess failed") from error
         raise
     finally:
         locks.release()
@@ -1670,12 +1715,16 @@ def write_output(
                 )
             else:
                 verify_candidate_snapshot(
-                    candidate_snapshot, (fd, parent, temporary, name),
+                    candidate_snapshot, (fd, parent, temporary, name, payload),
                 )
+        except ExistingOutputAccepted:
+            remove_output_temporary(parent, temporary)
+            temporary = None
+            return
         except FileExistsError as collision:
             remove_output_temporary(parent, temporary)
             temporary = None
-            if accept_existing_output(parent, name, payload):
+            if candidate_snapshot is None and accept_existing_output(parent, name, payload):
                 return
             raise collision
         if candidate_snapshot is not None:

@@ -741,6 +741,202 @@ class RendererTests(unittest.TestCase):
                 check=True,
             )
 
+        def make_existing_retry(
+            root: Path,
+        ) -> tuple[dict[str, object], str, Path, tuple[int, int, bytes]]:
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+            first = self.run_cli(root, "record-residue", descriptor, "existing.json")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            output = root / "existing.json"
+            identity = (output.stat().st_ino, output.stat().st_mode & 0o7777, output.read_bytes())
+            return descriptor, candidate, output, identity
+
+        def assert_retry_cleanup(root: Path) -> None:
+            self.assertEqual(self.output_temporaries(root), [])
+            self.assertEqual(list((root / "candidate/.git").rglob("*.lock")), [])
+
+        with self.subTest(existing_retry="exact-match"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor, _candidate, output, identity = make_existing_retry(root)
+            retry = self.run_cli(root, "record-residue", descriptor, "existing.json")
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+            self.assertEqual(
+                (output.stat().st_ino, output.stat().st_mode & 0o7777, output.read_bytes()),
+                identity,
+            )
+            assert_retry_cleanup(root)
+
+        with self.subTest(existing_retry="reviewer-head-commit"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor, candidate, output, identity = make_existing_retry(root)
+            real_accept = RENDER.accept_existing_output
+            attempts: list[subprocess.CompletedProcess[str]] = []
+
+            def commit_before_existing_check(parent: int, name: str, payload: bytes) -> bool:
+                if not attempts:
+                    attempts.append(subprocess.run(
+                        [
+                            "/usr/bin/git", "-C", str(root / "candidate"), "commit",
+                            "-q", "--allow-empty", "-m", "blocked retry drift",
+                        ],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        check=False,
+                    ))
+                    if attempts[0].returncode != 0:
+                        raise subprocess.CalledProcessError(
+                            attempts[0].returncode, attempts[0].args,
+                            output=attempts[0].stdout, stderr=attempts[0].stderr,
+                        )
+                return real_accept(parent, name, payload)
+
+            with mock.patch.object(
+                RENDER, "accept_existing_output", side_effect=commit_before_existing_check,
+            ):
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "existing.json",
+                    lambda _stage, _candidate_root: None,
+                )
+            self.assertEqual(result, 64, stderr)
+            self.assertIn("candidate acceptance subprocess failed", stderr)
+            self.assertEqual(len(attempts), 1)
+            self.assertNotEqual(attempts[0].returncode, 0)
+            self.assertIn("lock", attempts[0].stderr.lower())
+            self.assertEqual(
+                subprocess.check_output(
+                    ["/usr/bin/git", "-C", str(root / "candidate"), "rev-parse", "HEAD"],
+                    text=True,
+                ).strip(),
+                candidate,
+            )
+            self.assertEqual(
+                (output.stat().st_ino, output.stat().st_mode & 0o7777, output.read_bytes()),
+                identity,
+            )
+            assert_retry_cleanup(root)
+
+        with self.subTest(existing_retry="raw-head-drift"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor, candidate, output, identity = make_existing_retry(root)
+            candidate_root = root / "candidate"
+            tree = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(candidate_root), "rev-parse", "HEAD^{tree}"],
+                text=True,
+            ).strip()
+            drift = subprocess.run(
+                [
+                    "/usr/bin/git", "-C", str(candidate_root), "commit-tree", tree,
+                    "-p", candidate,
+                ],
+                input="raw retry drift\n", text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=True,
+            ).stdout.strip()
+            real_accept = RENDER.accept_existing_output
+            drifted = False
+
+            def drift_head_before_existing_check(parent: int, name: str, payload: bytes) -> bool:
+                nonlocal drifted
+                if not drifted:
+                    drifted = True
+                    (candidate_root / ".git/HEAD").write_text(drift + "\n")
+                return real_accept(parent, name, payload)
+
+            with mock.patch.object(
+                RENDER, "accept_existing_output", side_effect=drift_head_before_existing_check,
+            ):
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "existing.json",
+                    lambda _stage, _candidate_root: None,
+                )
+            self.assertEqual(result, 64, stderr)
+            self.assertTrue(drifted)
+            self.assertIn("candidate Git HEAD, index, or worktree changed", stderr)
+            self.assertEqual(
+                (output.stat().st_ino, output.stat().st_mode & 0o7777, output.read_bytes()),
+                identity,
+            )
+            assert_retry_cleanup(root)
+
+        with self.subTest(existing_retry="raw-index-drift"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor, _candidate, output, identity = make_existing_retry(root)
+            index = root / "candidate/.git/index"
+            real_accept = RENDER.accept_existing_output
+            drifted = False
+
+            def drift_index_before_existing_check(parent: int, name: str, payload: bytes) -> bool:
+                nonlocal drifted
+                if not drifted:
+                    drifted = True
+                    raw = bytearray(index.read_bytes())
+                    raw[-1] ^= 1
+                    index.write_bytes(raw)
+                return real_accept(parent, name, payload)
+
+            with mock.patch.object(
+                RENDER, "accept_existing_output", side_effect=drift_index_before_existing_check,
+            ):
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "existing.json",
+                    lambda _stage, _candidate_root: None,
+                )
+            self.assertEqual(result, 64, stderr)
+            self.assertTrue(drifted)
+            self.assertIn("candidate", stderr)
+            self.assertEqual(
+                (output.stat().st_ino, output.stat().st_mode & 0o7777, output.read_bytes()),
+                identity,
+            )
+            assert_retry_cleanup(root)
+
+        existing_status_mutations = {
+            "untracked-status": lambda candidate_root: (
+                candidate_root / "untracked-retry-drift"
+            ).write_text("drift\n"),
+            **{
+                f"asset:{asset_name}": (
+                    lambda candidate_root, path=relative: (
+                        candidate_root / path
+                    ).write_bytes((candidate_root / path).read_bytes() + b"\n# retry drift\n")
+                )
+                for asset_name, (relative, _git_mode, _maximum)
+                in RENDER.HARNESS_ASSET_SOURCES.items()
+            },
+        }
+        for mutation_name, mutation in existing_status_mutations.items():
+            with self.subTest(existing_retry=mutation_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                descriptor, _candidate, output, identity = make_existing_retry(root)
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "existing.json",
+                    mutate_once("after-existing-output-check", mutation),
+                )
+                self.assertEqual(result, 64, stderr)
+                self.assertIn("candidate Git HEAD, index, or worktree changed", stderr)
+                self.assertEqual(
+                    (output.stat().st_ino, output.stat().st_mode & 0o7777, output.read_bytes()),
+                    identity,
+                )
+                assert_retry_cleanup(root)
+
+        for mismatch_name, mutate_output, expected_mode in (
+            ("byte-mismatch", lambda output: output.write_bytes(b'{"different":true}\n'), 0o600),
+            ("mode-mismatch", lambda output: output.chmod(0o400), 0o400),
+        ):
+            with self.subTest(existing_retry=mismatch_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                descriptor, _candidate, output, _identity = make_existing_retry(root)
+                mutate_output(output)
+                retained = (output.stat().st_ino, output.read_bytes())
+                retry = self.run_cli(root, "record-residue", descriptor, "existing.json")
+                self.assertEqual(retry.returncode, 64, retry.stderr)
+                self.assertEqual((output.stat().st_ino, output.read_bytes()), retained)
+                self.assertEqual(output.stat().st_mode & 0o7777, expected_mode)
+                assert_retry_cleanup(root)
+
         for stage in (
             "after-initial-head-check", "after-blob-read:harness.py",
             "immediately-pre-publication",
@@ -787,7 +983,7 @@ class RendererTests(unittest.TestCase):
 
             def verify_then_drift(
                 snapshot: object,
-                publication: tuple[int, int, str, str] | None = None,
+                publication: tuple[int, int, str, str, bytes] | None = None,
             ) -> None:
                 nonlocal drifted
                 real_verify(snapshot, publication)
