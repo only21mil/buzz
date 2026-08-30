@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -17,6 +17,8 @@ use crate::production::{CiSigner, SignedCiEvent};
 use crate::source::{HttpMethod, Nip98Authorizer, Nip98Binding};
 
 const KEY_MODE: u32 = 0o600;
+const SYSTEMD_CREDENTIAL_MODE: u32 = 0o400;
+const SYSTEMD_CREDENTIALS_ENV: &str = "CREDENTIALS_DIRECTORY";
 const MAX_KEY_BYTES: u64 = 256;
 
 /// Immutable descriptor for one dedicated CI status key.
@@ -86,15 +88,31 @@ impl fmt::Debug for KeyholderSigner {
 
 impl KeyholderSigner {
     /// Load one bounded key without following a final symlink.
+    ///
+    /// A descriptor path inside systemd's `$CREDENTIALS_DIRECTORY` is treated
+    /// as a `LoadCredential(Encrypted)=` plaintext mount and must be mode
+    /// `0400`; any other path must be the operator-managed `0600`.
     #[cfg(target_os = "linux")]
     pub fn load(descriptor: &KeyDescriptor) -> Result<Self, KeyholderError> {
+        let credentials_root = std::env::var_os(SYSTEMD_CREDENTIALS_ENV);
+        Self::load_with_credentials_root(descriptor, credentials_root.as_deref())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_with_credentials_root(
+        descriptor: &KeyDescriptor,
+        credentials_root: Option<&std::ffi::OsStr>,
+    ) -> Result<Self, KeyholderError> {
         use nix::fcntl::{open, OFlag};
         use nix::sys::stat::Mode;
 
         descriptor.validate()?;
+        let systemd_managed = credentials_root
+            .map(|roots| is_within_roots(&descriptor.path, roots))
+            .unwrap_or(false);
         let before =
             fs::symlink_metadata(&descriptor.path).map_err(|_| KeyholderError::Unavailable)?;
-        validate_metadata(&before, descriptor.expected_owner_uid)?;
+        validate_metadata(&before, descriptor.expected_owner_uid, systemd_managed)?;
         if fs::canonicalize(&descriptor.path).map_err(|_| KeyholderError::Unavailable)?
             != descriptor.path
         {
@@ -109,7 +127,7 @@ impl KeyholderSigner {
         .map_err(|_| KeyholderError::Unavailable)?;
         let file = File::from(descriptor_fd);
         let opened = file.metadata().map_err(|_| KeyholderError::Unavailable)?;
-        validate_metadata(&opened, descriptor.expected_owner_uid)?;
+        validate_metadata(&opened, descriptor.expected_owner_uid, systemd_managed)?;
         if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
             return Err(KeyholderError::ReplacedFile);
         }
@@ -213,18 +231,36 @@ impl Nip98Authorizer for KeyholderSigner {
     }
 }
 
+/// Validate key-file metadata against the provisioning contract.
+///
+/// `systemd_managed` marks a path under `$CREDENTIALS_DIRECTORY`, where
+/// `LoadCredentialEncrypted=` mounts the decrypted plaintext read-only at
+/// mode `0400` owned by the service user. Everywhere else the key file must
+/// be the operator-managed `0600`.
 fn validate_metadata(
     metadata: &fs::Metadata,
     expected_owner_uid: u32,
+    systemd_managed: bool,
 ) -> Result<(), KeyholderError> {
+    let expected_mode = if systemd_managed {
+        SYSTEMD_CREDENTIAL_MODE
+    } else {
+        KEY_MODE
+    };
     if !metadata.file_type().is_file()
-        || metadata.permissions().mode() & 0o7777 != KEY_MODE
+        || metadata.permissions().mode() & 0o7777 != expected_mode
         || metadata.uid() != expected_owner_uid
         || metadata.nlink() != 1
     {
         return Err(KeyholderError::InsecureFile);
     }
     Ok(())
+}
+
+fn is_within_roots(path: &Path, roots: &std::ffi::OsStr) -> bool {
+    std::env::split_paths(roots)
+        .filter(|root| !root.as_os_str().is_empty())
+        .any(|root| path.starts_with(root))
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -294,6 +330,91 @@ mod tests {
         assert!(tags.contains(&serde_json::json!(["u", binding.url.as_str()])));
         assert!(tags.contains(&serde_json::json!(["method", "POST"])));
         assert!(tags.contains(&serde_json::json!(["payload", "22".repeat(32)])));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_at_mode(mode: u32) -> (tempfile::TempDir, KeyDescriptor, String) {
+        let (directory, mut descriptor, secret) = fixture();
+        fs::set_permissions(&descriptor.path, fs::Permissions::from_mode(mode))
+            .expect("set key mode");
+        descriptor.expected_owner_uid = fs::metadata(&descriptor.path).expect("metadata").uid();
+        (directory, descriptor, secret)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_credential_plaintext_loads_at_mode_0400() {
+        let (directory, descriptor, _secret) = fixture_at_mode(0o400);
+        let mut signer = KeyholderSigner::load_with_credentials_root(
+            &descriptor,
+            Some(directory.path().as_os_str()),
+        )
+        .expect("load systemd-managed credential");
+        let signed = signer
+            .sign(46101, "{}", serde_json::json!([]))
+            .expect("sign CI event");
+        let event: nostr::Event =
+            serde_json::from_value(signed.signed_event).expect("signed event");
+        event.verify().expect("valid signature");
+        assert_eq!(event.pubkey.to_hex(), descriptor.expected_pubkey);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_credential_mode_and_owner_stay_fail_closed() {
+        let (directory, descriptor, _secret) = fixture_at_mode(0o600);
+        assert_eq!(
+            KeyholderSigner::load_with_credentials_root(
+                &descriptor,
+                Some(directory.path().as_os_str()),
+            )
+            .unwrap_err(),
+            KeyholderError::InsecureFile
+        );
+
+        let (directory, mut descriptor, _secret) = fixture_at_mode(0o400);
+        descriptor.expected_owner_uid = descriptor.expected_owner_uid.saturating_add(1);
+        assert_eq!(
+            KeyholderSigner::load_with_credentials_root(
+                &descriptor,
+                Some(directory.path().as_os_str()),
+            )
+            .unwrap_err(),
+            KeyholderError::InsecureFile
+        );
+
+        let (_directory, descriptor, _secret) = fixture_at_mode(0o400);
+        let sibling = format!("{}x", directory.path().display());
+        assert_eq!(
+            KeyholderSigner::load_with_credentials_root(&descriptor, Some(sibling.as_ref()))
+                .unwrap_err(),
+            KeyholderError::InsecureFile
+        );
+
+        let (_directory, descriptor, _secret) = fixture_at_mode(0o400);
+        assert_eq!(
+            KeyholderSigner::load_with_credentials_root(&descriptor, None).unwrap_err(),
+            KeyholderError::InsecureFile
+        );
+    }
+
+    #[test]
+    fn credentials_root_match_requires_exact_prefix_components() {
+        let path = Path::new("/run/credentials/buzz-ci-controld.service/ci-status.key");
+        assert!(is_within_roots(
+            path,
+            std::ffi::OsStr::new("/run/credentials/buzz-ci-controld.service")
+        ));
+        assert!(is_within_roots(
+            path,
+            std::ffi::OsStr::new("/opt/other:/run/credentials/buzz-ci-controld.service:")
+        ));
+        assert!(!is_within_roots(
+            path,
+            std::ffi::OsStr::new("/run/credentials/buzz-ci-controld.service-extra")
+        ));
+        assert!(!is_within_roots(path, std::ffi::OsStr::new(":")));
+        assert!(!is_within_roots(path, std::ffi::OsStr::new("")));
     }
 
     #[test]
