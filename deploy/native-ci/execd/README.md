@@ -179,8 +179,13 @@ immediately before mutation. A present baseline uses an inode-bound private
 stage and atomic exchange; an absent baseline atomically moves the candidate to
 a retained rollback stage. Rollback verifies the exchanged or moved inode
 before it releases active custody, then descriptor-reads the live name again
-immediately before the terminal receipt. That final proof requires the exact
-installer-owned baseline-stage inode, digest, and metadata, or exact absence.
+immediately before the terminal receipt. The terminal receipt is prebuilt and
+fsynced before that proof, then published by the adjacent descriptor-relative
+rename with no intervening blocking or fsync work. Its `live_target` binds the
+exact installer-owned baseline-stage inode, digest, and metadata, or exact
+absence. Active receipt and preimage custody remain available through terminal
+publication and its immediate live-name readback, so a lost acknowledgement is
+deterministically recoverable rather than trusting the terminal receipt alone.
 If a regular file or symbolic link replaces the live name after the exchange,
 rollback restores active receipt and preimage custody, retains the candidate,
 and durably records a recoverable `holding` state instead of reporting success.
