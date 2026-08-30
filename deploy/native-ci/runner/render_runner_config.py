@@ -11,14 +11,77 @@ import stat
 import tempfile
 
 MAX_UID = (1 << 32) - 1
+BROKER_SOCKET = "/run/buzzci/execd.sock"
+BROKER_UID = 0
+EVIDENCE_DIRECTORY = "/var/lib/buzzci/runner/evidence"
+JOURNAL_DIRECTORY = "/var/lib/buzzci/runner/journal"
+HOST_FIELDS = {
+    "owner_pubkey",
+    "manifest_verification_key",
+    "relay_signer",
+    "broker_socket",
+    "broker_uid",
+    "executor_program",
+    "evidence_directory",
+    "journal_directory",
+    "max_argv_items",
+    "max_argv_bytes",
+    "max_environment_items",
+    "max_environment_bytes",
+    "max_output_bytes",
+}
 
 
-def config_bytes(controld_uid: int) -> bytes:
+def _bounded_integer(value: object, minimum: int, maximum: int) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and minimum <= value <= maximum
+
+
+def _lower_hex_64(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_host(host: dict[str, object]) -> None:
+    if set(host) != HOST_FIELDS:
+        raise ValueError("runner host fields are incomplete or unknown")
+    if not all(
+        _lower_hex_64(host[field])
+        for field in ("owner_pubkey", "manifest_verification_key", "relay_signer")
+    ):
+        raise ValueError("runner host public identities are invalid")
+    if host["broker_socket"] != BROKER_SOCKET or host["broker_uid"] != BROKER_UID:
+        raise ValueError("runner broker peer policy must bind the root execd socket")
+    executor = host["executor_program"]
+    if not isinstance(executor, str) or not executor.startswith("/") or "\0" in executor:
+        raise ValueError("runner executor path is invalid")
+    if (
+        host["evidence_directory"] != EVIDENCE_DIRECTORY
+        or host["journal_directory"] != JOURNAL_DIRECTORY
+    ):
+        raise ValueError("runner state paths are invalid")
+    for field, maximum in (
+        ("max_argv_items", 256),
+        ("max_argv_bytes", 65_536),
+        ("max_environment_items", 256),
+        ("max_environment_bytes", 65_536),
+        ("max_output_bytes", 16_777_216),
+    ):
+        if not _bounded_integer(host[field], 1, maximum):
+            raise ValueError(f"runner host bound is invalid: {field}")
+
+
+def config_bytes(controld_uid: int, host: dict[str, object] | None = None) -> bytes:
     if not 1 <= controld_uid <= MAX_UID:
         raise ValueError("controld UID must be a nonzero u32")
-    # Host is deliberately absent. The runner therefore returns
-    # backend_unavailable and exposes no execution capacity.
     value = {"schema_version": 1, "controld_uid": controld_uid}
+    if host is not None:
+        validate_host(host)
+        value["host"] = host
+    # The package freezer and CLI never pass a host. Their installed config
+    # therefore returns backend_unavailable and exposes no execution capacity.
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 

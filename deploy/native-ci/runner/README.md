@@ -10,7 +10,8 @@ The installed default stays closed:
 - `runner-v1.json` contains only `schema_version` and `controld_uid`. It has no
   `host` block.
 - The runner returns `backend_unavailable` when someone starts the dormant unit
-  manually. The package records `provisioned=false` and `capacity=0`.
+  manually. The package records `enabled=false`, `active=false`,
+  `provisioned=false`, `host_block=false`, and `capacity=0`.
 
 Provisioning a host block and enabling the socket require a separate reviewed
 activation package. This installer does neither.
@@ -18,8 +19,17 @@ activation package. This installer does neither.
 ## Fixed resources
 
 The runner listens only on `/run/buzzci/runner-control.sock`. Systemd names its
-single inherited descriptor `buzz-ci-runner-control`. The privileged broker
-socket remains `/run/buzzci/execd.sock`; this package does not create or own it.
+single inherited descriptor `buzz-ci-runner-control`. The socket is statically
+bound to `buzzci-runner:buzzci-controld` mode `0620`: the runner owns the
+listening endpoint and only the distinct controld group may connect. The sealed
+package manifest and every `check`, `dry-run`, and install readback report that
+identity contract together with the dormant state.
+
+The privileged broker socket remains `/run/buzzci/execd.sock`; this package
+does not create or own it. A provisioned `host` block must bind `broker_uid`
+to exact UID `0`, matching the reviewed root `buzz-ci-execd` peer. The checked-in
+schema and renderer accept that exact value and reject a different broker UID.
+The package still never emits a `host` block itself.
 
 Runner-owned evidence and journal data live under `/var/lib/buzzci/runner`.
 The controld handoff root remains `/var/lib/buzzci/runner-output`; this package
@@ -31,9 +41,17 @@ The host must already have these dedicated principals:
 - `buzzci-controld`, the group allowed to connect to the runner socket
 
 The numeric `buzzci-runner` UID and GID and the numeric `buzzci-controld` UID
-are frozen into each package. The ordinary config is mode `0600` and owned by
-the runner UID and GID. The binary, units, tmpfiles file, documentation, and
-their installed directory roots are root-owned.
+are frozen into each package and must be numerically distinct. The ordinary
+config is mode `0600` and owned by the runner UID and GID. The binary, units,
+tmpfiles file, documentation, and their installed directory roots are
+root-owned.
+
+The current execd deployment contract owns `/run/buzzci/execd.sock` as
+`buzzci-ctl:buzzci-ctl` mode `0600`. That socket is not reachable by the
+distinct `buzzci-runner` account. A separate reviewed control-plane change must
+resolve the execd socket ownership/mode dependency while preserving exact root
+peer authentication before any activation package may add a `host` block.
+This dormant runner package deliberately does not weaken or modify that socket.
 
 ## Freeze a package
 
@@ -101,7 +119,11 @@ revalidates installation ownership before reporting the same plan. `install` use
 descriptor-verified sources, atomic replacements, exact metadata readback, and
 a root-private backup receipt. Reinstalling the same package returns
 `unchanged`. Rollback requires the same package and backup ID and refuses any
-installed-target drift before restoring prior bytes and metadata.
+installed-target drift before restoring prior bytes and metadata. The
+machine-readable check and install results include the exact runner-control and
+broker peer policy plus the disabled, inactive, unprovisioned capacity-zero
+state. Those fields describe what this package leaves unchanged; they are not a
+substitute for the separate activation procedure's live systemd readback.
 
 Neither install nor rollback calls systemd. An operator must separately run the
 reviewed reload or activation procedure. Installation alone leaves the socket

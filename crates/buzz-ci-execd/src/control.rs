@@ -16,8 +16,8 @@ use std::{
 
 use buzz_ci_broker_protocol::{
     decode_request, decode_request_header, encode_response, AdmitAttemptRequest, BrokerResponse,
-    BrokerState, Conclusion, FrameHeader, QualificationRequest, Request, ResponseCode, HEADER_SIZE,
-    MAX_BODY_SIZE,
+    BrokerState, Conclusion, FrameHeader, Operation, QualificationRequest, Request, ResponseCode,
+    HEADER_SIZE, MAX_BODY_SIZE,
 };
 use nix::{
     sys::socket::{
@@ -40,6 +40,8 @@ const CONTROL_ACCOUNT: &str = "buzzci-ctl";
 const CONTROL_ACCOUNT_UID: u32 = 961;
 const CONTROL_ACCOUNT_HOME: &str = "/var/lib/buzzci/principals/ctl";
 const CONTROL_ACCOUNT_SHELL: &str = "/usr/sbin/nologin";
+const RUNNER_ACCOUNT: &str = "buzzci-runner";
+const RUNNER_ACCOUNT_SHELL: &str = "/usr/sbin/nologin";
 const SYSTEMD_FD_NAME: &str = "buzz-ci-execd";
 pub const EXECD_SOCKET_PATH: &str = "/run/buzzci/execd.sock";
 const PASSWD_PATH: &str = "/etc/passwd";
@@ -58,6 +60,9 @@ pub enum ControlError {
     /// The connected process does not own the dedicated control UID.
     #[error("peer UID refused")]
     UnauthorizedPeer,
+    /// The authenticated peer is not authorized for the requested operation.
+    #[error("operation refused for peer UID")]
+    UnauthorizedOperation,
     /// The peer did not send exactly one canonical fixed-width frame.
     #[error("request frame refused: {0}")]
     Frame(&'static str),
@@ -67,6 +72,60 @@ pub enum ControlError {
     /// Local Unix-socket I/O failed or timed out.
     #[error("control I/O failed: {0}")]
     Io(#[from] io::Error),
+}
+
+/// Exact service identities allowed to use the broker control socket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerUidPolicy {
+    control_uid: u32,
+    runner_uid: u32,
+}
+
+impl PeerUidPolicy {
+    /// Bind the qualification and ordinary operation families to distinct non-root peers.
+    pub fn new(control_uid: u32, runner_uid: u32) -> Result<Self, ControlError> {
+        if control_uid == 0 || runner_uid == 0 || control_uid == runner_uid {
+            return Err(ControlError::Account(
+                "control and runner UIDs must be distinct and nonzero",
+            ));
+        }
+        Ok(Self {
+            control_uid,
+            runner_uid,
+        })
+    }
+
+    fn role_for_uid(self, peer_uid: u32) -> Result<PeerRole, ControlError> {
+        if peer_uid == self.control_uid {
+            Ok(PeerRole::Control)
+        } else if peer_uid == self.runner_uid {
+            Ok(PeerRole::Runner)
+        } else {
+            Err(ControlError::UnauthorizedPeer)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerRole {
+    Control,
+    Runner,
+}
+
+impl PeerRole {
+    const fn permits(self, operation: Operation) -> bool {
+        match self {
+            Self::Control => matches!(operation, Operation::AdmitQualification),
+            Self::Runner => matches!(
+                operation,
+                Operation::Hello
+                    | Operation::AdmitAttempt
+                    | Operation::CancelAttempt
+                    | Operation::GetAttempt
+                    | Operation::CompleteAttempt
+            ),
+        }
+    }
 }
 
 /// Result of the service-owned signature and activation-coordinate boundary.
@@ -274,17 +333,17 @@ impl ControlDispatch for ClosedDispatch {
 /// Single-threaded control server over one inherited listener.
 pub struct ControlServer<D> {
     listener: UnixListener,
-    expected_peer_uid: u32,
+    peer_policy: PeerUidPolicy,
     dispatch: D,
     io_timeout: Duration,
 }
 
 impl<D: ControlDispatch> ControlServer<D> {
     /// Construct a server over a previously validated listener.
-    pub fn new(listener: UnixListener, expected_peer_uid: u32, dispatch: D) -> Self {
+    pub fn new(listener: UnixListener, peer_policy: PeerUidPolicy, dispatch: D) -> Self {
         Self {
             listener,
-            expected_peer_uid,
+            peer_policy,
             dispatch,
             io_timeout: IO_TIMEOUT,
         }
@@ -293,11 +352,11 @@ impl<D: ControlDispatch> ControlServer<D> {
     /// Construct the production polling server used for timer maintenance.
     pub fn new_polling(
         listener: UnixListener,
-        expected_peer_uid: u32,
+        peer_policy: PeerUidPolicy,
         dispatch: D,
     ) -> Result<Self, ControlError> {
         listener.set_nonblocking(true).map_err(ControlError::Io)?;
-        Ok(Self::new(listener, expected_peer_uid, dispatch))
+        Ok(Self::new(listener, peer_policy, dispatch))
     }
 
     /// Accept and process one connection. The caller owns loop policy.
@@ -305,7 +364,7 @@ impl<D: ControlDispatch> ControlServer<D> {
         let (stream, _) = self.listener.accept().map_err(ControlError::Accept)?;
         serve_stream(
             stream,
-            self.expected_peer_uid,
+            self.peer_policy,
             self.io_timeout,
             &mut self.dispatch,
         )
@@ -321,7 +380,7 @@ impl<D: ControlDispatch> ControlServer<D> {
         };
         serve_stream(
             stream,
-            self.expected_peer_uid,
+            self.peer_policy,
             self.io_timeout,
             &mut self.dispatch,
         )
@@ -369,6 +428,17 @@ pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener,
 
 /// Resolve the fixed service account used for control-plane peer checks.
 pub fn control_account_uid() -> Result<u32, ControlError> {
+    let text = read_account_database()?;
+    parse_control_account(&text)
+}
+
+/// Resolve both dedicated service accounts into the exact socket peer policy.
+pub fn peer_uid_policy() -> Result<PeerUidPolicy, ControlError> {
+    let text = read_account_database()?;
+    PeerUidPolicy::new(parse_control_account(&text)?, parse_runner_account(&text)?)
+}
+
+fn read_account_database() -> Result<String, ControlError> {
     let file = File::open(PASSWD_PATH)
         .map_err(|_| ControlError::Account("local account database is unavailable"))?;
     let mut bytes = Vec::new();
@@ -378,9 +448,8 @@ pub fn control_account_uid() -> Result<u32, ControlError> {
     if bytes.len() as u64 > MAX_PASSWD_BYTES {
         return Err(ControlError::Account("local account database is oversized"));
     }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| ControlError::Account("local account database is not UTF-8"))?;
-    parse_control_account(text)
+    String::from_utf8(bytes)
+        .map_err(|_| ControlError::Account("local account database is not UTF-8"))
 }
 
 fn parse_control_account(text: &str) -> Result<u32, ControlError> {
@@ -412,28 +481,60 @@ fn parse_control_account(text: &str) -> Result<u32, ControlError> {
     Ok(uid)
 }
 
+fn parse_runner_account(text: &str) -> Result<u32, ControlError> {
+    let mut matches = text
+        .lines()
+        .filter(|line| line.split(':').next() == Some(RUNNER_ACCOUNT));
+    let line = matches
+        .next()
+        .ok_or(ControlError::Account("buzzci-runner account is absent"))?;
+    if matches.next().is_some() {
+        return Err(ControlError::Account("buzzci-runner account is duplicated"));
+    }
+    let fields: Vec<_> = line.split(':').collect();
+    if fields.len() != 7 {
+        return Err(ControlError::Account(
+            "buzzci-runner account shape is invalid",
+        ));
+    }
+    let uid = parse_canonical_u32(fields[2])
+        .filter(|uid| *uid != 0)
+        .ok_or(ControlError::Account("buzzci-runner UID is invalid"))?;
+    parse_canonical_u32(fields[3])
+        .filter(|gid| *gid != 0)
+        .ok_or(ControlError::Account("buzzci-runner GID is invalid"))?;
+    if fields[6] != RUNNER_ACCOUNT_SHELL {
+        return Err(ControlError::Account(
+            "buzzci-runner login posture is invalid",
+        ));
+    }
+    Ok(uid)
+}
+
 fn serve_stream<D: ControlDispatch>(
     stream: UnixStream,
-    expected_peer_uid: u32,
+    peer_policy: PeerUidPolicy,
     timeout: Duration,
     dispatch: &mut D,
 ) -> Result<(), ControlError> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let peer_uid = getsockopt(&stream, PeerCredentials).map_err(nix_io)?.uid();
-    authorize_peer_uid(peer_uid, expected_peer_uid)?;
-    serve_verified_stream(stream, dispatch)
+    let role = peer_policy.role_for_uid(peer_uid)?;
+    serve_verified_stream(stream, role, dispatch)
 }
 
 fn serve_verified_stream<D: ControlDispatch>(
     stream: UnixStream,
+    role: PeerRole,
     dispatch: &mut D,
 ) -> Result<(), ControlError> {
-    serve_verified_stream_mode(stream, dispatch, true)
+    serve_verified_stream_mode(stream, role, dispatch, true)
 }
 
 fn serve_verified_stream_mode<D: ControlDispatch>(
     mut stream: UnixStream,
+    role: PeerRole,
     dispatch: &mut D,
     require_write_shutdown: bool,
 ) -> Result<(), ControlError> {
@@ -441,6 +542,9 @@ fn serve_verified_stream_mode<D: ControlDispatch>(
     read_exact_frame_part(&mut stream, &mut frame[..HEADER_SIZE], "short header")?;
     let (header, body_size) = decode_request_header(&frame[..HEADER_SIZE])
         .map_err(|_| ControlError::Frame("malformed header"))?;
+    if !role.permits(header.operation) {
+        return Err(ControlError::UnauthorizedOperation);
+    }
     let frame_size = HEADER_SIZE + body_size;
     read_exact_frame_part(
         &mut stream,
@@ -469,14 +573,6 @@ fn serve_verified_stream_mode<D: ControlDispatch>(
     let response = dispatch.dispatch(header, request, unix_now()?);
     write_all_fd(&stream, encode_response(header, response).as_bytes())?;
     Ok(())
-}
-
-fn authorize_peer_uid(peer_uid: u32, expected_peer_uid: u32) -> Result<(), ControlError> {
-    if peer_uid == expected_peer_uid {
-        Ok(())
-    } else {
-        Err(ControlError::UnauthorizedPeer)
-    }
 }
 
 fn write_all_fd(fd: &impl std::os::fd::AsFd, mut input: &[u8]) -> Result<(), ControlError> {
@@ -810,7 +906,8 @@ mod tests {
         // This sandbox denies `shutdown(Write)` on socketpairs. Production
         // always calls `serve_verified_stream`, which requires EOF; this
         // parser/dispatch test bypasses only that kernel operation.
-        let result = serve_verified_stream_mode(server, &mut ClosedDispatch::new(), false);
+        let result =
+            serve_verified_stream_mode(server, PeerRole::Runner, &mut ClosedDispatch::new(), false);
         result?;
         let mut response = Vec::new();
         client.read_to_end(&mut response).expect("read response");
@@ -821,7 +918,7 @@ mod tests {
         let (client, server) = UnixStream::pair().expect("socketpair");
         write_all_fd(&client, bytes).expect("write request");
         drop(client);
-        serve_verified_stream(server, &mut ClosedDispatch::new()).unwrap_err()
+        serve_verified_stream(server, PeerRole::Runner, &mut ClosedDispatch::new()).unwrap_err()
     }
 
     fn hello() -> buzz_ci_broker_protocol::EncodedFrame {
@@ -877,9 +974,12 @@ mod tests {
             Err(error) => panic!("unexpected listener bind failure: {error}"),
         };
         let observed = Rc::new(Cell::new(0));
-        let mut server =
-            ControlServer::new_polling(listener, 961, MaintenanceCounter(Rc::clone(&observed)))
-                .unwrap();
+        let mut server = ControlServer::new_polling(
+            listener,
+            PeerUidPolicy::new(961, 962).unwrap(),
+            MaintenanceCounter(Rc::clone(&observed)),
+        )
+        .unwrap();
 
         server.serve_tick(42).unwrap();
 
@@ -888,23 +988,31 @@ mod tests {
 
     #[test]
     fn peer_uid_is_checked_before_request_bytes() {
-        let error = authorize_peer_uid(1_000, 1_001).unwrap_err();
-        assert!(matches!(error, ControlError::UnauthorizedPeer));
-
         let (_client, server) = UnixStream::pair().expect("socketpair");
         match getsockopt(&server, PeerCredentials) {
             Ok(credentials) => {
-                let refused_uid = credentials.uid() ^ 1;
-                let error = authorize_peer_uid(credentials.uid(), refused_uid).unwrap_err();
-                assert!(matches!(error, ControlError::UnauthorizedPeer));
+                let peer_uid = credentials.uid();
+                let control_uid = if peer_uid == 1 { 2 } else { 1 };
+                let runner_uid = if peer_uid == 2 { 3 } else { 2 };
+                let policy = PeerUidPolicy::new(control_uid, runner_uid).unwrap();
+                assert!(matches!(
+                    serve_stream(
+                        server,
+                        policy,
+                        Duration::from_secs(1),
+                        &mut ClosedDispatch::new()
+                    ),
+                    Err(ControlError::UnauthorizedPeer)
+                ));
             }
             Err(nix::errno::Errno::EPERM) => {
                 // Some test sandboxes deny SO_PEERCRED. Production treats this
                 // exact failure as an I/O refusal before reading any bytes.
+                let policy = PeerUidPolicy::new(1_001, 1_002).unwrap();
                 assert!(matches!(
                     serve_stream(
                         server,
-                        1_001,
+                        policy,
                         Duration::from_secs(1),
                         &mut ClosedDispatch::new()
                     ),
@@ -913,6 +1021,48 @@ mod tests {
             }
             Err(error) => panic!("unexpected SO_PEERCRED failure: {error}"),
         }
+    }
+
+    #[test]
+    fn peer_policy_requires_distinct_nonroot_uids() {
+        assert!(PeerUidPolicy::new(961, 962).is_ok());
+        for invalid in [(0, 962), (961, 0), (961, 961)] {
+            assert!(matches!(
+                PeerUidPolicy::new(invalid.0, invalid.1),
+                Err(ControlError::Account(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn peer_roles_are_bound_to_disjoint_operation_families() {
+        for operation in [
+            Operation::Hello,
+            Operation::AdmitAttempt,
+            Operation::CancelAttempt,
+            Operation::GetAttempt,
+            Operation::CompleteAttempt,
+        ] {
+            assert!(PeerRole::Runner.permits(operation));
+            assert!(!PeerRole::Control.permits(operation));
+        }
+        assert!(PeerRole::Control.permits(Operation::AdmitQualification));
+        assert!(!PeerRole::Runner.permits(Operation::AdmitQualification));
+    }
+
+    #[test]
+    fn unauthorized_operation_is_refused_after_header_before_body() {
+        let encoded = admit();
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &encoded.as_bytes()[..HEADER_SIZE]).expect("write header");
+        let error = serve_verified_stream_mode(
+            server,
+            PeerRole::Control,
+            &mut ClosedDispatch::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ControlError::UnauthorizedOperation));
     }
 
     #[test]
@@ -938,6 +1088,71 @@ mod tests {
         ] {
             assert!(parse_control_account(&drift).is_err());
         }
+    }
+
+    #[test]
+    fn runner_account_must_be_unique_nonroot_and_nologin() {
+        let exact = "root:x:0:0:root:/root:/bin/bash\nbuzzci-runner:x:972:973::/nonexistent:/usr/sbin/nologin\n";
+        assert_eq!(parse_runner_account(exact).unwrap(), 972);
+        for drift in [
+            exact.replace(":972:973:", ":0:973:"),
+            exact.replace(":972:973:", ":972:0:"),
+            exact.replace("/usr/sbin/nologin", "/bin/bash"),
+            format!("{exact}buzzci-runner:x:972:973::/nonexistent:/usr/sbin/nologin\n"),
+        ] {
+            assert!(parse_runner_account(&drift).is_err());
+        }
+    }
+
+    #[test]
+    fn runner_account_database_drift_is_refused() {
+        let line = "buzzci-runner:x:972:973::/nonexistent:/usr/sbin/nologin";
+        let passwd = format!("root:x:0:0:root:/root:/bin/bash\n{line}\n");
+        assert_eq!(parse_runner_account(&passwd).unwrap(), 972);
+
+        assert!(parse_runner_account("root:x:0:0:root:/root:/bin/bash\n").is_err());
+
+        let six_fields = "root:x:0:0:root:/root:/bin/bash\nbuzzci-runner:x:972:973:/nonexistent:/usr/sbin/nologin\n".to_string();
+        assert!(parse_runner_account(&six_fields).is_err());
+
+        for uid_drift in [":0972:973:", ":+972:973:", ":99999999999:973:"] {
+            assert!(parse_runner_account(&passwd.replace(":972:973:", uid_drift)).is_err());
+        }
+    }
+
+    #[test]
+    fn runner_role_cannot_reach_the_qualification_family() {
+        let frame = hello();
+        let mut bytes = frame.as_bytes().to_vec();
+        bytes[6..8].copy_from_slice(&(Operation::AdmitQualification as u16).to_be_bytes());
+        bytes[12..16].copy_from_slice(
+            &(buzz_ci_broker_protocol::ADMIT_QUALIFICATION_BODY_SIZE as u32).to_be_bytes(),
+        );
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &bytes[..HEADER_SIZE]).expect("write header");
+        let error =
+            serve_verified_stream_mode(server, PeerRole::Runner, &mut ClosedDispatch::new(), false)
+                .unwrap_err();
+        assert!(matches!(error, ControlError::UnauthorizedOperation));
+    }
+
+    #[test]
+    fn control_role_cannot_reach_runner_operations() {
+        let mut bytes = hello().as_bytes().to_vec();
+        bytes[6..8].copy_from_slice(&(Operation::CompleteAttempt as u16).to_be_bytes());
+        bytes[12..16].copy_from_slice(
+            &(buzz_ci_broker_protocol::COMPLETE_ATTEMPT_BODY_SIZE as u32).to_be_bytes(),
+        );
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &bytes[..HEADER_SIZE]).expect("write header");
+        let error = serve_verified_stream_mode(
+            server,
+            PeerRole::Control,
+            &mut ClosedDispatch::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ControlError::UnauthorizedOperation));
     }
 
     #[test]
