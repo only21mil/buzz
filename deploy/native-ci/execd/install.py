@@ -34,6 +34,7 @@ INSTALL_LOCK_NAME = "install.lock"
 CANDIDATE_STAGE_NAME = ".buzz-ci-execd.install-v1"
 CANDIDATE_IDENTITY_NAME = "candidate-identity-v1.json"
 ROLLBACK_STAGE_NAME = ".buzz-ci-execd.rollback-v1"
+COMPENSATION_STAGE_NAME = ".buzz-ci-execd.compensate-v1"
 ROLLBACK_STAGE_IDENTITY_NAME = "rollback-stage-identity-v1.json"
 INSTALL_TRANSACTION_SCHEMA = "buzz-ci-execd-package-install-transaction-v1"
 CANDIDATE_IDENTITY_SCHEMA = "buzz-ci-execd-package-candidate-identity-v1"
@@ -52,6 +53,10 @@ class Entry:
     gid: int
     sha256: str
     payload: bytes
+
+
+class _RollbackHoldError(ValueError):
+    pass
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1397,26 +1402,105 @@ def _remove_install_transaction_at(directory_fd: int) -> None:
     _remove_if_present_at(directory_fd, INSTALL_TRANSACTION_NAME)
 
 
-def _restore_transaction_prior_at(
+def _compensate_installed_candidate_cas_at(
     binary_directory: int,
     name: str,
     prior: _PriorTarget | None,
+    candidate_identity: dict[str, object],
 ) -> None:
+    if not _absent_at(binary_directory, COMPENSATION_STAGE_NAME):
+        if not _identity_matches_at(
+            binary_directory, COMPENSATION_STAGE_NAME, candidate_identity
+        ):
+            raise ValueError("execd compensation stage ownership differs")
+        if not _target_matches_prior_at(binary_directory, name, prior):
+            raise ValueError("execd install compensation is in recoverable hold")
+        _remove_if_present_at(binary_directory, COMPENSATION_STAGE_NAME)
+        return
+
     if prior is None:
+        if not _identity_matches_at(binary_directory, name, candidate_identity):
+            raise ValueError("execd candidate changed before install compensation")
         try:
-            os.unlink(name, dir_fd=binary_directory)
-        except FileNotFoundError:
-            pass
+            _renameat2_at(
+                binary_directory,
+                name,
+                COMPENSATION_STAGE_NAME,
+                RENAME_NOREPLACE,
+            )
+        except FileExistsError as error:
+            raise ValueError(
+                "execd compensation stage appeared during mutation"
+            ) from error
         os.fsync(binary_directory)
+        _durable_phase("install_compensation_exchanged")
+        if not _identity_matches_at(
+            binary_directory, COMPENSATION_STAGE_NAME, candidate_identity
+        ):
+            _renameat2_at(
+                binary_directory,
+                COMPENSATION_STAGE_NAME,
+                name,
+                RENAME_NOREPLACE,
+            )
+            os.fsync(binary_directory)
+            raise ValueError("execd candidate changed at install compensation")
+        if not _absent_at(binary_directory, name):
+            raise ValueError("execd install compensation is in recoverable hold")
     else:
-        _atomic_replace_at(
+        if not _absent_at(binary_directory, COMPENSATION_STAGE_NAME):
+            raise ValueError("execd compensation stage is occupied")
+        if not _publish_create_once(
             binary_directory,
-            name,
+            COMPENSATION_STAGE_NAME,
             prior.payload,
             prior.mode,
             prior.uid,
             prior.gid,
+            temporary_stem=name,
+        ):
+            raise ValueError("execd compensation stage appeared during publication")
+        prior_payload, prior_metadata = _read_regular_at(
+            binary_directory, COMPENSATION_STAGE_NAME
         )
+        prior_identity = _file_identity_value(
+            "execd-install-compensation-stage-v1",
+            "",
+            "",
+            "",
+            name,
+            prior_payload,
+            prior_metadata,
+        )
+        if not _identity_matches_at(binary_directory, name, candidate_identity):
+            _remove_if_present_at(binary_directory, COMPENSATION_STAGE_NAME)
+            raise ValueError("execd candidate changed before install compensation")
+        _renameat2_at(
+            binary_directory,
+            COMPENSATION_STAGE_NAME,
+            name,
+            RENAME_EXCHANGE,
+        )
+        os.fsync(binary_directory)
+        _durable_phase("install_compensation_exchanged")
+        if not _identity_matches_at(
+            binary_directory, COMPENSATION_STAGE_NAME, candidate_identity
+        ):
+            _renameat2_at(
+                binary_directory,
+                COMPENSATION_STAGE_NAME,
+                name,
+                RENAME_EXCHANGE,
+            )
+            os.fsync(binary_directory)
+            if _identity_matches_at(
+                binary_directory, COMPENSATION_STAGE_NAME, prior_identity
+            ):
+                _remove_if_present_at(binary_directory, COMPENSATION_STAGE_NAME)
+            raise ValueError("execd candidate changed at install compensation")
+        if not _identity_matches_at(binary_directory, name, prior_identity):
+            raise ValueError("execd install compensation is in recoverable hold")
+    _remove_if_present_at(binary_directory, COMPENSATION_STAGE_NAME)
     if not _target_matches_prior_at(binary_directory, name, prior):
         raise ValueError("prior execd binary rollback readback differs")
 
@@ -1441,7 +1525,15 @@ def _compensate_install_transaction_at(
     if candidate_identity is not None and _identity_matches_at(
         binary_directory, name, candidate_identity
     ):
-        _restore_transaction_prior_at(binary_directory, name, prior)
+        _compensate_installed_candidate_cas_at(
+            binary_directory, name, prior, candidate_identity
+        )
+    elif candidate_identity is not None and not _absent_at(
+        binary_directory, COMPENSATION_STAGE_NAME
+    ):
+        _compensate_installed_candidate_cas_at(
+            binary_directory, name, prior, candidate_identity
+        )
     elif not _baseline_matches_identity_at(binary_directory, name, identity):
         # A concurrent replacement owns the live name. Preserve it and release
         # only this transaction's private custody.
@@ -1922,7 +2014,7 @@ def _rollback_receipt_bytes(
     gid: int,
     state: str,
 ) -> bytes:
-    if state not in {"rolling_back", "rolled_back"}:
+    if state not in {"rolling_back", "holding", "rolled_back"}:
         raise ValueError("invalid execd rollback receipt state")
     return canonical_json({
         "schema": "buzz-ci-execd-package-rollback-receipt-v1",
@@ -1974,7 +2066,7 @@ def _read_rollback_receipt_at(
         not isinstance(value, dict)
         or set(value) != {"schema", "state", "install_receipt"}
         or value.get("schema") != "buzz-ci-execd-package-rollback-receipt-v1"
-        or value.get("state") not in {"rolling_back", "rolled_back"}
+        or value.get("state") not in {"rolling_back", "holding", "rolled_back"}
         or not isinstance(value.get("install_receipt"), dict)
         or canonical_json(value) != payload
         or metadata.st_uid != uid
@@ -2291,6 +2383,102 @@ def _remove_rollback_managed_at(directory_fd: int, prior: _PriorTarget | None) -
     os.fsync(directory_fd)
 
 
+def _rollback_live_matches_intended_at(
+    binary_directory: int,
+    entry: Entry,
+    prior: _PriorTarget | None,
+    rollback_identity: dict[str, object] | None,
+) -> bool:
+    name = Path(entry.target).name
+    if prior is None:
+        return _absent_at(binary_directory, name)
+    assert rollback_identity is not None
+    return _identity_matches_at(binary_directory, name, rollback_identity)
+
+
+def _restore_active_rollback_custody_at(
+    receipt_directory: int,
+    manifest: dict[str, object],
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+) -> None:
+    if prior is not None:
+        expected_preimage = prior.payload
+        try:
+            payload, metadata = _read_regular_at(receipt_directory, PREIMAGE_NAME)
+        except FileNotFoundError:
+            if not _publish_create_once(
+                receipt_directory,
+                PREIMAGE_NAME,
+                expected_preimage,
+                0o600,
+                uid,
+                gid,
+            ):
+                raise ValueError("execd rollback preimage appeared during hold")
+        else:
+            if (
+                payload != expected_preimage
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != uid
+                or metadata.st_gid != gid
+            ):
+                raise ValueError("execd rollback preimage differs during hold")
+    elif not _absent_at(receipt_directory, PREIMAGE_NAME):
+        raise ValueError("absent execd baseline has an unexpected preimage")
+
+    expected_receipt = _receipt_bytes(manifest, prior, uid, gid)
+    try:
+        payload, metadata = _read_regular_at(
+            receipt_directory, RECEIPT_NAME, MAX_JSON_BYTES
+        )
+    except FileNotFoundError:
+        if not _publish_create_once(
+            receipt_directory,
+            RECEIPT_NAME,
+            expected_receipt,
+            0o600,
+            uid,
+            gid,
+        ):
+            raise ValueError("execd install receipt appeared during rollback hold")
+    else:
+        if (
+            payload != expected_receipt
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+        ):
+            raise ValueError("execd install receipt differs during rollback hold")
+    _verify_receipt_at(receipt_directory, manifest, uid, gid)
+
+
+def _enter_rollback_hold_at(
+    receipt_directory: int,
+    manifest: dict[str, object],
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+) -> None:
+    _restore_active_rollback_custody_at(
+        receipt_directory, manifest, prior, uid, gid
+    )
+    _atomic_replace_at(
+        receipt_directory,
+        ROLLBACK_RECEIPT_NAME,
+        _rollback_receipt_bytes(manifest, prior, uid, gid, "holding"),
+        0o600,
+        uid,
+        gid,
+    )
+    state, _, _ = _read_rollback_receipt_at(
+        receipt_directory, manifest, uid, gid
+    )
+    if state != "holding":
+        raise ValueError("execd rollback hold readback differs")
+
+
 def _compensate_rollback(
     receipt_directory: int,
     binary_directory: int,
@@ -2503,7 +2691,7 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 "restored_target": entry.target,
                 "prior_state": prior_record["state"],
             }
-        if marker_state == "rolling_back":
+        if marker_state in {"rolling_back", "holding"}:
             assert marker_receipt is not None
             prior = _resume_prior_at(
                 receipt_directory,
@@ -2519,10 +2707,15 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 Path(entry.target).name,
                 candidate_identity,
             )
+            candidate_retained = _identity_matches_at(
+                binary_directory,
+                ROLLBACK_STAGE_NAME,
+                candidate_identity,
+            )
             prior_current = _target_matches_prior_at(
                 binary_directory, Path(entry.target).name, prior
             )
-            if not candidate_current and not prior_current:
+            if not candidate_current and not prior_current and not candidate_retained:
                 raise ValueError("rolling-back execd binary differs from candidate and baseline")
             try:
                 active_prior = _verify_receipt_at(
@@ -2531,7 +2724,9 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 if active_prior != prior:
                     raise ValueError("rolling-back execd active custody differs")
             except FileNotFoundError:
-                if not prior_current:
+                if marker_state == "holding" or (
+                    not prior_current and not candidate_retained
+                ):
                     raise ValueError(
                         "rolling-back execd candidate lacks active custody"
                     ) from None
@@ -2561,16 +2756,41 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             ):
                 raise ValueError("execd rollback receipt appeared during publication")
             _durable_phase("rollback_intent")
-        rollback_identity = _ensure_rollback_stage_identity_at(
-            receipt_directory,
+        candidate_retained = _identity_matches_at(
             binary_directory,
-            manifest,
-            entry,
-            prior,
-            uid,
-            gid,
+            ROLLBACK_STAGE_NAME,
+            candidate_identity,
         )
+        if marker_state in {"rolling_back", "holding"} and candidate_retained:
+            if prior is None:
+                rollback_identity = None
+                if not _absent_at(
+                    receipt_directory, ROLLBACK_STAGE_IDENTITY_NAME
+                ):
+                    raise ValueError(
+                        "absent execd baseline has a rollback stage identity"
+                    )
+            else:
+                rollback_identity = _read_rollback_stage_identity_at(
+                    receipt_directory, manifest, entry, prior, uid, gid
+                )
+        else:
+            rollback_identity = _ensure_rollback_stage_identity_at(
+                receipt_directory,
+                binary_directory,
+                manifest,
+                entry,
+                prior,
+                uid,
+                gid,
+            )
         try:
+            if candidate_retained and not _rollback_live_matches_intended_at(
+                binary_directory, entry, prior, rollback_identity
+            ):
+                raise _RollbackHoldError(
+                    "execd rollback is in recoverable hold: live target changed"
+                )
             _rollback_candidate_cas_at(
                 binary_directory,
                 entry,
@@ -2583,6 +2803,12 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 raise ValueError("execd binary directory changed during rollback")
             _remove_rollback_managed_at(receipt_directory, prior)
             _durable_phase("rollback_released")
+            if not _rollback_live_matches_intended_at(
+                binary_directory, entry, prior, rollback_identity
+            ):
+                raise _RollbackHoldError(
+                    "execd rollback is in recoverable hold: live target changed"
+                )
             _atomic_replace_at(
                 receipt_directory,
                 ROLLBACK_RECEIPT_NAME,
@@ -2602,6 +2828,16 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             _finalize_rollback_stages_at(
                 receipt_directory, binary_directory, candidate_identity
             )
+        except _RollbackHoldError as rollback_error:
+            _enter_rollback_hold_at(
+                receipt_directory,
+                manifest,
+                prior,
+                uid,
+                gid,
+            )
+            _durable_phase("rollback_holding")
+            raise ValueError(str(rollback_error)) from rollback_error
         except BaseException as rollback_error:
             try:
                 _compensate_rollback(
