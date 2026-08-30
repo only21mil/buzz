@@ -296,17 +296,17 @@ class KeyholderPackageTests(unittest.TestCase):
         prior = b"prior keyholder binary\n"
         target.write_bytes(prior)
         target.chmod(0o700)
-        original_publish = INSTALLER._atomic_publish
-        failed = False
+        original_validate = INSTALLER._validate_receipt_artifacts
+        validations = 0
 
         def fail_after_first_publish(*args, **kwargs) -> None:
-            nonlocal failed
-            original_publish(*args, **kwargs)
-            if not failed:
-                failed = True
+            nonlocal validations
+            original_validate(*args, **kwargs)
+            validations += 1
+            if validations == 3:
                 raise OSError("forced target readback failure")
 
-        with mock.patch.object(INSTALLER, "_atomic_publish", side_effect=fail_after_first_publish):
+        with mock.patch.object(INSTALLER, "_validate_receipt_artifacts", side_effect=fail_after_first_publish):
             with self.assertRaisesRegex(OSError, "forced target readback failure"):
                 INSTALLER.install(self.package, root)
         self.assertEqual(target.read_bytes(), prior)
@@ -489,23 +489,284 @@ class KeyholderPackageTests(unittest.TestCase):
         root = self.make_root()
         self.add_credential(root)
         real_rename = os.rename
+        real_renameat2 = INSTALLER._renameat2
         moved = False
 
-        def hostile_rename(source, destination, *args, **kwargs):
+        def hostile_rename(source_fd, source, destination_fd, destination, flags):
             nonlocal moved
             if destination == "buzz-ci-keyholder" and not moved:
                 moved = True
                 real_rename(root / "usr/libexec", root / "usr/libexec-moved")
                 (root / "usr/libexec").mkdir(mode=0o755)
                 (root / "usr/libexec").chmod(0o755)
-            return real_rename(source, destination, *args, **kwargs)
+            return real_renameat2(source_fd, source, destination_fd, destination, flags)
 
-        with mock.patch.object(INSTALLER.os, "rename", side_effect=hostile_rename):
+        with mock.patch.object(INSTALLER, "_renameat2", side_effect=hostile_rename):
             with self.assertRaisesRegex(ValueError, "directory changed"):
                 INSTALLER.install(self.package, root)
         self.assertFalse((root / "usr/libexec-moved/buzz-ci-keyholder").exists())
         self.assertFalse((root / "usr/libexec/buzz-ci-keyholder").exists())
         self.assertFalse((root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/") / "receipt-v1.json").exists())
+
+    def test_compare_and_swap_preserves_concurrent_present_and_absent_targets_for_every_role(self) -> None:
+        self.freeze()
+        real_renameat2 = INSTALLER._renameat2
+        for baseline_present in (False, True):
+            for role, target_name in INSTALLER.EXPECTED_TARGETS.items():
+                with self.subTest(role=role, baseline_present=baseline_present):
+                    root = self.base / f"race-{baseline_present}-{role}"
+                    original_base = self.base
+                    self.base = root.parent / f"fixture-{baseline_present}-{role}"
+                    self.base.mkdir(mode=0o700)
+                    try:
+                        root = self.make_root()
+                    finally:
+                        self.base = original_base
+                    self.add_credential(root)
+                    target = INSTALLER.rooted(root, target_name)
+                    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                    target.parent.chmod(0o755)
+                    if baseline_present:
+                        target.write_bytes(f"baseline-{role}\n".encode())
+                        target.chmod(0o640)
+                    concurrent = f"concurrent-{role}-{baseline_present}\n".encode()
+                    injected = False
+
+                    def inject_concurrent(source_fd, source, destination_fd, destination, flags):
+                        nonlocal injected
+                        if destination == target.name and not injected:
+                            injected = True
+                            substitute = target.with_name(f".{target.name}.concurrent")
+                            substitute.write_bytes(concurrent)
+                            substitute.chmod(0o600)
+                            os.replace(substitute, target)
+                        return real_renameat2(source_fd, source, destination_fd, destination, flags)
+
+                    with mock.patch.object(INSTALLER, "_renameat2", side_effect=inject_concurrent):
+                        with self.assertRaisesRegex(INSTALLER.ConcurrentMutation, "compare-and-swap"):
+                            INSTALLER.install(self.package, root)
+                    self.assertTrue(injected)
+                    self.assertEqual(target.read_bytes(), concurrent)
+                    self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                    for other_role, other_target in INSTALLER.EXPECTED_TARGETS.items():
+                        if other_role != role:
+                            self.assertFalse(INSTALLER.rooted(root, other_target).exists())
+
+    def test_symlink_name_swap_is_restored_without_touching_referent(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        target = root / "usr/libexec/buzz-ci-keyholder"
+        target.parent.mkdir(mode=0o755)
+        target.parent.chmod(0o755)
+        target.write_bytes(b"baseline\n")
+        target.chmod(0o600)
+        outside = self.base / "outside-race"
+        outside.write_bytes(b"outside\n")
+        real_renameat2 = INSTALLER._renameat2
+        injected = False
+
+        def inject_symlink(source_fd, source, destination_fd, destination, flags):
+            nonlocal injected
+            if destination == target.name and not injected:
+                injected = True
+                target.unlink()
+                target.symlink_to(outside)
+            return real_renameat2(source_fd, source, destination_fd, destination, flags)
+
+        with mock.patch.object(INSTALLER, "_renameat2", side_effect=inject_symlink):
+            with self.assertRaisesRegex(INSTALLER.ConcurrentMutation, "compare-and-swap"):
+                INSTALLER.install(self.package, root)
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(target.readlink(), outside)
+        self.assertEqual(outside.read_bytes(), b"outside\n")
+
+    def test_partial_multi_target_failure_restores_every_distinct_baseline(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        baselines: dict[str, tuple[bytes, int]] = {}
+        for index, target_name in enumerate(INSTALLER.EXPECTED_TARGETS.values()):
+            target = INSTALLER.rooted(root, target_name)
+            target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            target.parent.chmod(0o755)
+            payload = f"baseline-{index}\n".encode()
+            mode = 0o600 + index
+            target.write_bytes(payload)
+            target.chmod(mode)
+            baselines[target_name] = (payload, mode)
+        original_validate = INSTALLER._validate_receipt_artifacts
+        validations = 0
+
+        def fail_after_three_publications(*args, **kwargs):
+            nonlocal validations
+            original_validate(*args, **kwargs)
+            validations += 1
+            if validations == 7:
+                raise OSError("forced partial publication cut")
+
+        with mock.patch.object(INSTALLER, "_validate_receipt_artifacts", side_effect=fail_after_three_publications):
+            with self.assertRaisesRegex(OSError, "partial publication cut"):
+                INSTALLER.install(self.package, root)
+        for target_name, (payload, mode) in baselines.items():
+            target = INSTALLER.rooted(root, target_name)
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), mode)
+
+    def test_receipt_and_backup_swaps_block_publication_and_preserve_hostile_bytes(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        target = root / "usr/libexec/buzz-ci-keyholder"
+        target.parent.mkdir(mode=0o755)
+        target.parent.chmod(0o755)
+        target.write_bytes(b"baseline\n")
+        target.chmod(0o600)
+        receipt_directory = root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/")
+        (root / "var").mkdir(mode=0o755)
+        (root / "var").chmod(0o755)
+        (root / "var/lib").mkdir(mode=0o755)
+        (root / "var/lib").chmod(0o755)
+        (root / "var/lib/buzzci").mkdir(mode=0o711)
+        (root / "var/lib/buzzci").chmod(0o711)
+        receipt_directory.mkdir(mode=0o700)
+        receipt_directory.chmod(0o700)
+        original_validate = INSTALLER._validate_receipt_artifacts
+        validations = 0
+
+        def tamper_backup(*args, **kwargs):
+            nonlocal validations
+            original_validate(*args, **kwargs)
+            validations += 1
+            if validations == 2:
+                backup_name = next(name for name in args[1] if name.startswith("prior-"))
+                backup = receipt_directory / backup_name
+                backup.unlink()
+                backup.write_bytes(b"hostile-backup\n")
+                backup.chmod(0o600)
+
+        with mock.patch.object(INSTALLER, "_validate_receipt_artifacts", side_effect=tamper_backup):
+            with self.assertRaisesRegex(ValueError, "artifact changed"):
+                INSTALLER.install(self.package, root)
+        self.assertEqual(target.read_bytes(), b"baseline\n")
+        retained_backups = list(receipt_directory.glob("prior-*"))
+        self.assertEqual(len(retained_backups), 1)
+        self.assertEqual(retained_backups[0].read_bytes(), b"hostile-backup\n")
+        self.assertFalse((receipt_directory / "receipt-v1.json").exists())
+
+    def test_descriptor_lock_contention_aborts_cleanly_and_exact_retry_succeeds(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        root_fd = INSTALLER._open_root(root)
+        receipt_fd = INSTALLER._receipt_directory(root_fd, root, create=True)
+        INSTALLER._lock_directory(receipt_fd)
+        try:
+            with self.assertRaisesRegex(ValueError, "already locked"):
+                INSTALLER.install(self.package, root)
+            for target in INSTALLER.EXPECTED_TARGETS.values():
+                self.assertFalse(INSTALLER.rooted(root, target).exists())
+        finally:
+            os.close(receipt_fd)
+            os.close(root_fd)
+        result = INSTALLER.install(self.package, root)
+        self.assertEqual(result["status"], "installed")
+        self.assertEqual(INSTALLER.install(self.package, root)["status"], "unchanged")
+
+    def test_fresh_rollback_resumes_after_every_target_and_directory_checkpoint(self) -> None:
+        self.freeze()
+        checkpoints = len(INSTALLER.EXPECTED_TARGETS) + len(FREEZER.DIRECTORIES)
+        for cut in range(1, checkpoints + 1):
+            with self.subTest(cut=cut):
+                original_base = self.base
+                self.base = original_base / f"rollback-cut-{cut}"
+                self.base.mkdir(mode=0o700)
+                try:
+                    root = self.make_root()
+                    self.add_credential(root)
+                finally:
+                    self.base = original_base
+                INSTALLER.install(self.package, root)
+                original_publish_state = INSTALLER._publish_rollback_state
+                progress = 0
+
+                def lose_checkpoint_ack(*args, **kwargs):
+                    nonlocal progress
+                    snapshot = original_publish_state(*args, **kwargs)
+                    value = args[3]
+                    if value["restored_targets"] or value["removed_directories"]:
+                        progress += 1
+                        if progress == cut:
+                            raise OSError("forced rollback checkpoint cut")
+                    return snapshot
+
+                with mock.patch.object(INSTALLER, "_publish_rollback_state", side_effect=lose_checkpoint_ack):
+                    with self.assertRaisesRegex(OSError, "checkpoint cut"):
+                        INSTALLER.rollback(self.package, root)
+                resumed = INSTALLER.rollback(self.package, root)
+                self.assertEqual(resumed["status"], "rolled_back")
+                for target in INSTALLER.EXPECTED_TARGETS.values():
+                    self.assertFalse(INSTALLER.rooted(root, target).exists())
+                for directory in FREEZER.DIRECTORIES:
+                    self.assertFalse(INSTALLER.rooted(root, directory).exists())
+                terminal_retry = INSTALLER.rollback(self.package, root)
+                self.assertEqual(terminal_retry["status"], "unchanged")
+                self.assertEqual(terminal_retry["changed_targets"], INSTALLER._rollback_targets(
+                    json.loads((root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/") / "receipt-v1.json").read_bytes())
+                ))
+
+    def test_fresh_rollback_post_target_restore_cut_resumes_to_terminal_marker(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        INSTALLER.install(self.package, root)
+        original_publish_state = INSTALLER._publish_rollback_state
+        failed = False
+
+        def fail_after_all_targets(*args, **kwargs):
+            nonlocal failed
+            snapshot = original_publish_state(*args, **kwargs)
+            value = args[3]
+            if len(value["restored_targets"]) == len(INSTALLER.EXPECTED_TARGETS) and not value["removed_directories"] and not failed:
+                failed = True
+                raise OSError("forced post-target restore cut")
+            return snapshot
+
+        with mock.patch.object(INSTALLER, "_publish_rollback_state", side_effect=fail_after_all_targets):
+            with self.assertRaisesRegex(OSError, "post-target restore cut"):
+                INSTALLER.rollback(self.package, root)
+        for target in INSTALLER.EXPECTED_TARGETS.values():
+            self.assertFalse(INSTALLER.rooted(root, target).exists())
+        self.assertFalse((root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/") / "rollback-v1.json").exists())
+        with self.assertRaisesRegex(ValueError, "rollback is in progress"):
+            INSTALLER.install(self.package, root)
+        self.assertEqual(INSTALLER.rollback(self.package, root)["status"], "rolled_back")
+
+    def test_fresh_rollback_post_marker_lost_ack_returns_unchanged_on_retry(self) -> None:
+        self.freeze()
+        root = self.make_root()
+        self.add_credential(root)
+        INSTALLER.install(self.package, root)
+        original_validate = INSTALLER._validate_receipt_artifacts
+        failed = False
+
+        def lose_marker_ack(directory_fd, artifacts):
+            nonlocal failed
+            original_validate(directory_fd, artifacts)
+            if "rollback-v1.json" in artifacts and not failed:
+                failed = True
+                raise OSError("forced post-marker lost acknowledgement")
+
+        with mock.patch.object(INSTALLER, "_validate_receipt_artifacts", side_effect=lose_marker_ack):
+            with self.assertRaisesRegex(OSError, "post-marker lost acknowledgement"):
+                INSTALLER.rollback(self.package, root)
+        marker = root / INSTALLER.RECEIPT_DIRECTORY.removeprefix("/") / "rollback-v1.json"
+        self.assertTrue(marker.is_file())
+        retry = INSTALLER.rollback(self.package, root)
+        self.assertEqual(retry["status"], "unchanged")
+        self.assertEqual(retry["changed_targets"], INSTALLER._rollback_targets(
+            json.loads((marker.parent / "receipt-v1.json").read_bytes())
+        ))
 
     def test_fresh_restrictive_umask_checkout_freezes_identically(self) -> None:
         clone = self.base / "clone"

@@ -153,11 +153,18 @@ copies the public config and static units with exact ownership and modes, but
 does not call systemd. It also installs the provenance-bound release binary,
 publishes every target through descriptor-relative no-follow operations, and
 records one immutable receipt under `/var/lib/buzzci/keyholder-package`.
-Replays accept only the exact receipt and installed bytes. Drift or another
-candidate is refused. `install.py rollback` verifies every installed target and
-backup before restoring the prior file or prior absence, then writes a
-create-once rollback receipt. Use `--root` only for a controlled fake root or
-an explicitly approved installation.
+The installer locks the receipt and target directory descriptors for the full
+transaction. Linux `renameat2` no-replace and exchange operations compare the
+live inode and digest at publication, so a target that changes after planning
+is restored without overwriting the concurrent file. Replays accept only the
+exact receipt and installed bytes. Drift or another candidate is refused.
+`install.py rollback` verifies every installed target and backup before
+restoring the prior file or prior absence. It checkpoints each restored target
+and removed install-created directory in `rollback-state-v1.json`, then writes
+the create-once `rollback-v1.json` terminal marker. A restart resumes from the
+last exact checkpoint. A retry after terminal marker publication returns
+`unchanged`. Use `--root` only for a controlled fake root or an explicitly
+approved installation.
 
 ## Targeted checks
 
