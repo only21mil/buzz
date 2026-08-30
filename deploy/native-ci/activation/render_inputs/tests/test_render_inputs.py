@@ -735,11 +735,57 @@ class RendererTests(unittest.TestCase):
 
             return checkpoint
 
+        def mutate_on_occurrence(
+            stage: str, occurrence: int, mutation: object,
+        ) -> object:
+            observed_count = 0
+
+            def checkpoint(observed: str, candidate_root: Path) -> None:
+                nonlocal observed_count
+                if observed == stage:
+                    observed_count += 1
+                    if observed_count == occurrence:
+                        mutation(candidate_root)
+
+            return checkpoint
+
         def drift_head(candidate_root: Path) -> None:
             subprocess.run(
                 ["/usr/bin/git", "-C", str(candidate_root), "commit", "-q", "--allow-empty", "-m", "drift"],
                 check=True,
             )
+
+        def same_tree_commit(candidate_root: Path, candidate: str) -> str:
+            tree = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(candidate_root), "rev-parse", "HEAD^{tree}"],
+                text=True,
+            ).strip()
+            return subprocess.run(
+                [
+                    "/usr/bin/git", "-C", str(candidate_root), "commit-tree", tree,
+                    "-p", candidate,
+                ],
+                input="same-tree locked-state drift\n", text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+            ).stdout.strip()
+
+        def raw_head_mutation(
+            candidate_root: Path, candidate: str, *, ref: bool,
+        ) -> object:
+            drift = same_tree_commit(candidate_root, candidate)
+            if ref:
+                reference = subprocess.check_output(
+                    ["/usr/bin/git", "-C", str(candidate_root), "symbolic-ref", "HEAD"],
+                    text=True,
+                ).strip()
+                target = candidate_root / ".git" / reference
+            else:
+                target = candidate_root / ".git/HEAD"
+
+            def mutate(_candidate_root: Path) -> None:
+                target.write_text(drift + "\n")
+
+            return mutate
 
         def make_existing_retry(
             root: Path,
@@ -989,6 +1035,76 @@ class RendererTests(unittest.TestCase):
                 self.assertEqual((output.stat().st_ino, output.read_bytes()), retained)
                 self.assertEqual(output.stat().st_mode & 0o7777, expected_mode)
                 assert_retry_cleanup(root)
+
+        locked_state_gaps = (
+            "locked-state-after-head",
+            "locked-state-after-index-info",
+            "locked-state-after-index-digest",
+            "locked-state-after-status",
+        )
+        for gap in locked_state_gaps:
+            for mutation_name, mutate_ref in (("HEAD", False), ("ref", True)):
+                with self.subTest(
+                    fresh_locked_state_gap=gap, raw_mutation=mutation_name,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    lifecycle, candidate = self.make_lifecycle(root)
+                    candidate_root = root / "candidate"
+                    descriptor = {
+                        "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                        "candidate_sha": candidate, "lifecycle": lifecycle,
+                    }
+                    result, stderr = self.run_main_with_checkpoint(
+                        root, "record-residue", descriptor, "retained.json",
+                        mutate_on_occurrence(
+                            gap, 2,
+                            raw_head_mutation(
+                                candidate_root, candidate, ref=mutate_ref,
+                            ),
+                        ),
+                    )
+                    self.assertEqual(result, 64, stderr)
+                    self.assertIn(
+                        "candidate changed before acceptance; unreadable output retained",
+                        stderr,
+                    )
+                    self.assertEqual(
+                        (root / "retained.json").stat().st_mode & 0o7777,
+                        0o000,
+                    )
+                    with self.assertRaises(PermissionError):
+                        (root / "retained.json").read_bytes()
+                    assert_retry_cleanup(root)
+
+                with self.subTest(
+                    retry_locked_state_gap=gap, raw_mutation=mutation_name,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    descriptor, candidate, output, identity = make_existing_retry(root)
+                    candidate_root = root / "candidate"
+                    result, stderr = self.run_main_with_checkpoint(
+                        root, "record-residue", descriptor, "existing.json",
+                        mutate_on_occurrence(
+                            gap, 2,
+                            raw_head_mutation(
+                                candidate_root, candidate, ref=mutate_ref,
+                            ),
+                        ),
+                    )
+                    self.assertEqual(result, 64, stderr)
+                    self.assertIn(
+                        "locked candidate Git HEAD changed while inspected",
+                        stderr,
+                    )
+                    self.assertEqual(
+                        (
+                            output.stat().st_ino,
+                            output.stat().st_mode & 0o7777,
+                            output.read_bytes(),
+                        ),
+                        identity,
+                    )
+                    assert_retry_cleanup(root)
 
         for stage in (
             "after-initial-head-check", "after-blob-read:harness.py",

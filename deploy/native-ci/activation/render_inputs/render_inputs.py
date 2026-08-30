@@ -325,21 +325,30 @@ def candidate_repository_locked_state(candidate_root: Path) -> tuple[str, bytes,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, timeout=10,
         ).stdout.decode().strip()
+        candidate_checkpoint("locked-state-after-head", candidate_root)
         index_info = subprocess.run(
             [*command, "ls-files", "--stage", "-z"], check=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, timeout=10,
         ).stdout
+        candidate_checkpoint("locked-state-after-index-info", candidate_root)
         index_digest = candidate_index_digest(candidate_root)
+        candidate_checkpoint("locked-state-after-index-digest", candidate_root)
         status = subprocess.run(
             [*command, "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=no"],
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, timeout=10,
         ).stdout
+        candidate_checkpoint("locked-state-after-status", candidate_root)
+        final_head = subprocess.run(
+            [*command, "rev-parse", "HEAD^{commit}"], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=10,
+        ).stdout.decode().strip()
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
         raise RenderError("locked candidate Git state could not be verified") from error
-    if HEX40.fullmatch(head) is None:
-        raise RenderError("locked candidate Git HEAD differs")
+    if head != final_head or HEX40.fullmatch(head) is None:
+        raise RenderError("locked candidate Git HEAD changed while inspected")
     return head, index_info, index_digest, status
 
 

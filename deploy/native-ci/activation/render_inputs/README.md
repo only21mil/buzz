@@ -75,19 +75,21 @@ output. The canonical output bytes are written, synced, and read back from a
 private staging inode. At finalization, maintained Git transactions hold the
 HEAD and index locks. A mode-`000` no-clobber hard link is pending, not accepted;
 the renderer checks its inode identity and repository status again while those
-locks remain. Successful completion of the final status read accepts that exact
-pending inode. The renderer then changes its mode to `0600`, making the accepted
-output readable. Drift before the pending link rejects without an output.
+locks remain. The locked check reads HEAD before the index and status, then
+rereads HEAD after status and requires both values to equal the candidate.
+Successful completion of that terminal HEAD read accepts the candidate snapshot
+for the exact pending inode. The renderer then changes its mode to `0600`, making
+the accepted output readable. Drift before the pending link rejects without an output.
 Drift after that link but before acceptance returns a distinct error and leaves
 only an unreadable mode-`000` artifact. No failure authorizes pathname deletion,
 so namespace replacement cannot cause removal of an unrelated file. The final
 verification and acceptance operation includes the pending link, inode check,
-and final status read before it returns. A mutation injected after the final
-status read is post-acceptance.
+final status read, and terminal HEAD reread before it returns. A raw candidate
+mutation after that terminal read is post candidate-acceptance.
 If the no-clobber link finds an existing destination, the same Git locks remain
 held while the renderer opens that destination once and validates its exact
 canonical bytes, inode, owner, and mode. The descriptor stays open across the
-final candidate status read. Acceptance is the final durable pathname check,
+final bracketed candidate read. Object acceptance is the final durable pathname check,
 which must still resolve to that same unchanged open inode. Replacement before
 that check rejects and removes only the private temporary, even when the new
 inode has identical bytes and mode. Namespace changes after that final check
