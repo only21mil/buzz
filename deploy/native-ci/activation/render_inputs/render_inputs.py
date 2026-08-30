@@ -68,6 +68,10 @@ class RenderError(RuntimeError):
     """Fail-closed input rejection."""
 
 
+class PublishedOutputRetainedError(RenderError):
+    """Publication linearized, but later namespace identity no longer matches."""
+
+
 class CandidateSnapshot(NamedTuple):
     root: Path
     candidate: str
@@ -1264,18 +1268,6 @@ def output_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def rollback_output_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_mode,
-        metadata.st_uid,
-        metadata.st_gid,
-    )
-
-
 def accept_existing_output(parent: int, name: str, payload: bytes) -> bool:
     try:
         fd = os.open(
@@ -1346,16 +1338,13 @@ def write_output(
     parent, name = root._open_parent(output)
     fd: int | None = None
     temporary: str | None = None
-    published = False
-    candidate_drift = False
-    published_identity: tuple[int, ...] | None = None
     try:
         for _ in range(TEMP_CREATE_ATTEMPTS):
             candidate = f".render-inputs-{secrets.token_hex(16)}.tmp"
             try:
                 fd = os.open(
                     candidate,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
                     0o600,
                     dir_fd=parent,
                 )
@@ -1374,12 +1363,21 @@ def write_output(
                 raise OSError("output write made no progress")
             view = view[written:]
         os.fsync(fd)
-        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+        staged_metadata = os.fstat(fd)
+        if stat.S_IMODE(staged_metadata.st_mode) != 0o600:
             raise RenderError("output mode differs")
-        published_identity = rollback_output_identity(os.fstat(fd))
-        closed = fd
-        fd = None
-        os.close(closed)
+        os.lseek(fd, 0, os.SEEK_SET)
+        staged = DescriptorRoot._read_fd(
+            fd, staged_metadata.st_size, MAX_JSON, "staged output",
+        )
+        if staged != payload:
+            raise RenderError("staged output bytes differ")
+
+        if candidate_snapshot is not None:
+            candidate_checkpoint(
+                "immediately-pre-publication", candidate_snapshot.root,
+            )
+            verify_candidate_snapshot(candidate_snapshot)
 
         try:
             os.link(
@@ -1393,52 +1391,39 @@ def write_output(
             remove_output_temporary(parent, temporary)
             temporary = None
             if accept_existing_output(parent, name, payload):
-                if candidate_snapshot is not None:
-                    candidate_checkpoint(
-                        "after-existing-publication", candidate_snapshot.root,
-                    )
-                    verify_candidate_snapshot(candidate_snapshot)
                 return
             raise collision
-        published = True
         if candidate_snapshot is not None:
-            try:
-                candidate_checkpoint(
-                    "after-temporary-publication", candidate_snapshot.root,
+            candidate_checkpoint("after-publication", candidate_snapshot.root)
+        try:
+            published_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+        except OSError as error:
+            raise PublishedOutputRetainedError(
+                "published output namespace changed; no rollback performed"
+            ) from error
+        try:
+            staging_now = os.fstat(fd)
+            published_now = os.fstat(published_fd)
+            if (
+                not stat.S_ISREG(published_now.st_mode)
+                or (published_now.st_dev, published_now.st_ino)
+                != (staging_now.st_dev, staging_now.st_ino)
+            ):
+                raise PublishedOutputRetainedError(
+                    "published output namespace changed; no rollback performed"
                 )
-                verify_candidate_snapshot(candidate_snapshot)
-            except RenderError:
-                candidate_drift = True
-                raise
+        finally:
+            os.close(published_fd)
         remove_output_temporary(parent, temporary)
         temporary = None
+        closed = fd
+        fd = None
+        os.close(closed)
         os.fsync(parent)
-        if candidate_snapshot is not None:
-            try:
-                candidate_checkpoint("after-publication", candidate_snapshot.root)
-                verify_candidate_snapshot(candidate_snapshot)
-            except RenderError:
-                candidate_drift = True
-                raise
-    except BaseException:
-        if published and candidate_drift:
-            try:
-                named = os.stat(name, dir_fd=parent, follow_symlinks=False)
-                if (
-                    published_identity is None
-                    or rollback_output_identity(named) != published_identity
-                ):
-                    raise RenderError("candidate drift output identity changed")
-                os.unlink(name, dir_fd=parent)
-                os.fsync(parent)
-                published = False
-            except RenderError:
-                raise
-            except OSError as rollback_error:
-                raise RenderError(
-                    "candidate drift output rollback failed"
-                ) from rollback_error
-        raise
     finally:
         primary_failure = sys.exc_info()[0] is not None
         cleanup_failure: OSError | None = None

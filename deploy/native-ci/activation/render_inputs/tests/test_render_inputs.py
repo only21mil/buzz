@@ -473,8 +473,9 @@ class RendererTests(unittest.TestCase):
                 with mock.patch.object(RENDER.os, "close", side_effect=close_then_fail):
                     with self.assertRaisesRegex(OSError, "injected close"):
                         RENDER.write_output(root, "close.json", OUTPUT)
-                self.assertFalse((root_path / "close.json").exists())
+                self.assertEqual((root_path / "close.json").read_bytes(), OUTPUT)
                 self.assertEqual(self.output_temporaries(root_path), [])
+                RENDER.write_output(root, "close.json", OUTPUT)
 
                 real_unlink = os.unlink
                 unlinks = 0
@@ -738,7 +739,7 @@ class RendererTests(unittest.TestCase):
 
         for stage in (
             "after-initial-head-check", "after-blob-read:harness.py",
-            "after-temporary-publication",
+            "immediately-pre-publication",
         ):
             with self.subTest(head_drift=stage), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -755,6 +756,103 @@ class RendererTests(unittest.TestCase):
                 self.assertIn("candidate Git HEAD, index, or worktree changed", stderr)
                 self.assertFalse((root / "rejected.json").exists())
                 self.assertEqual(self.output_temporaries(root), [])
+
+        with self.subTest(head_drift="after-publication"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+            result, stderr = self.run_main_with_checkpoint(
+                root, "record-residue", descriptor, "accepted.json",
+                mutate_once("after-publication", drift_head),
+            )
+            self.assertEqual(result, 0, stderr)
+            self.assertTrue((root / "accepted.json").is_file())
+
+        with self.subTest(replacement="immediately-pre-publication"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+            unrelated = b"unrelated prepublication content\n"
+
+            def occupy_output(_candidate_root: Path) -> None:
+                target = root / "retained.json"
+                target.write_bytes(unrelated)
+                target.chmod(0o600)
+
+            result, stderr = self.run_main_with_checkpoint(
+                root, "record-residue", descriptor, "retained.json",
+                mutate_once("immediately-pre-publication", occupy_output),
+            )
+            self.assertEqual(result, 64, stderr)
+            self.assertEqual((root / "retained.json").read_bytes(), unrelated)
+
+        with self.subTest(replacement="before-former-metadata-check"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+            unrelated = b"unrelated postpublication content\n"
+
+            def replace_after_publication(_candidate_root: Path) -> None:
+                replacement = root / "replacement.json"
+                replacement.write_bytes(unrelated)
+                replacement.chmod(0o600)
+                os.replace(replacement, root / "retained.json")
+
+            result, stderr = self.run_main_with_checkpoint(
+                root, "record-residue", descriptor, "retained.json",
+                mutate_once("after-publication", replace_after_publication),
+            )
+            self.assertEqual(result, 64, stderr)
+            self.assertIn(
+                "published output namespace changed; no rollback performed", stderr,
+            )
+            self.assertEqual((root / "retained.json").read_bytes(), unrelated)
+
+        with self.subTest(replacement="between-former-check-delete"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+            unrelated = b"unrelated during temporary cleanup\n"
+            real_unlink = os.unlink
+            replaced = False
+
+            def replace_before_temporary_unlink(path: object, *, dir_fd: int) -> None:
+                nonlocal replaced
+                if (
+                    isinstance(path, str)
+                    and path.startswith(".render-inputs-")
+                    and (root / "retained.json").exists()
+                    and not replaced
+                ):
+                    replaced = True
+                    replacement = root / "replacement.json"
+                    replacement.write_bytes(unrelated)
+                    replacement.chmod(0o600)
+                    os.replace(replacement, root / "retained.json")
+                real_unlink(path, dir_fd=dir_fd)
+
+            with mock.patch.object(
+                RENDER.os, "unlink", side_effect=replace_before_temporary_unlink,
+            ):
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "retained.json",
+                    lambda _stage, _candidate_root: None,
+                )
+            self.assertEqual(result, 0, stderr)
+            self.assertTrue(replaced)
+            self.assertEqual((root / "retained.json").read_bytes(), unrelated)
 
         for asset_name, (relative, _git_mode, _maximum) in RENDER.HARNESS_ASSET_SOURCES.items():
             def mutate_asset(candidate_root: Path, path: str = relative) -> None:
