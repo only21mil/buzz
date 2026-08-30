@@ -75,17 +75,21 @@ drop-in. Dormant checks allow only manifest-bound dependencies and exact
 activation files captured as prior state. Every later phase rejects missing,
 extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
 
-1. `stage --scenario` validates the exact scenario, installs the generated
-   sysusers, tmpfiles, acceptance binaries and units, target, drop-ins, and
-   capacity-zero configs. After the package digest is known, it atomically
+1. `stage --scenario` validates the exact scenario and atomically installs and
+   reopens the complete package at the fixed root-owned mode-`0700`
+   `/var/lib/buzzci/activation-controller/package` before its first receipt,
+   marker, managed-file, identity, tmpfiles, or systemd mutation. It installs
+   and reads back the package module and controller from that durable source
+   before applying the remaining generated sysusers, tmpfiles, acceptance
+   binaries and units, target, drop-ins, and capacity-zero configs. After the
+   package digest is known, it atomically
    writes the shared acceptance binding receipt, the two acceptance adapter
    configs, and the rendered capacity-zero execd-v2 config. It persists the
    truthful `staged_zero` receipt before starting any receipt-consuming staged
    service. A startup/readback failure triggers complete compensation and
-   independent prior-state readback.
-   It also installs the controller and its package module, then copies the
-   validated package to the fixed root-owned mode-`0700`
-   `/var/lib/buzzci/activation-controller/package`. Only the two acceptance
+   independent prior-state readback while retaining the exact fixed package,
+   package module, and controller until explicit rollback reaches its durable
+   cleanup phase. Only the two acceptance
    sockets and their services remain active. Ordinary CI units and the
    capacity-one target remain inactive and disabled.
 2. `activate` first starts execd with its rendered capacity-zero config while
