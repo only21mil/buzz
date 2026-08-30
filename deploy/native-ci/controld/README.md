@@ -120,9 +120,22 @@ deploy/native-ci/controld/install.py rollback \
 `check` is read-only and validates the sealed package, host identity, target
 parents, exact changed paths, and closed metadata without requiring root.
 `dry-run` revalidates install ownership. `install` uses descriptor-verified
-sources, atomic replacement, exact metadata readback, and a root-private backup
-receipt. Rollback refuses installed-target or backup drift before restoring
-prior bytes and metadata.
+sources, descriptor-relative atomic replacement, exact metadata readback, and a
+root-private transaction directory. Before it creates a managed directory or
+publishes a target, it writes `state.json` with the exact package ID and digest,
+full changed-target inventory, absent or present directory baseline, and prior
+target metadata. Present prior targets also have digest-checked backups before
+publication starts.
+
+The transaction phases are `preparing`, `install_prepared`, `installing`,
+`installed`, `rolling_back`, and `rolled_back`. Repeating `install` resumes the
+single package-bound nonterminal install. Repeating `rollback` with the exact
+backup ID resumes restoration and accepts only the candidate or the recorded
+prior state for each target. This permits the precise mixed state created by an
+interrupted operation while still refusing unrelated drift. A terminal
+rollback retry returns the same result after it verifies the prior targets and
+absent directory baseline. `receipt.json` is written only at an installed or
+rolled-back terminal point and must match `state.json` exactly.
 
 Neither installer action invokes systemd. Machine-readable default-state fields
 describe package behavior, not live systemd observation; a separate reviewed
