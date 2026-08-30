@@ -770,6 +770,59 @@ class RendererTests(unittest.TestCase):
             )
             assert_retry_cleanup(root)
 
+        with self.subTest(existing_retry="identical-inode-replacement"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor, _candidate, output, identity = make_existing_retry(root)
+            original_fd = os.open(output, os.O_RDONLY | os.O_CLOEXEC)
+            replacement = root / "replacement.json"
+            replacement.write_bytes(identity[2])
+            replacement.chmod(0o600)
+            replacement_inode = replacement.stat().st_ino
+
+            def replace_existing(_candidate_root: Path) -> None:
+                os.replace(replacement, output)
+
+            try:
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "existing.json",
+                    mutate_once("after-existing-output-check", replace_existing),
+                )
+                self.assertEqual(result, 64, stderr)
+                self.assertEqual(output.stat().st_ino, replacement_inode)
+                self.assertNotEqual(output.stat().st_ino, identity[0])
+                self.assertEqual(output.stat().st_mode & 0o7777, 0o600)
+                self.assertEqual(output.read_bytes(), identity[2])
+                original = os.fstat(original_fd)
+                self.assertEqual(original.st_ino, identity[0])
+                self.assertEqual(original.st_mode & 0o7777, 0o600)
+                os.lseek(original_fd, 0, os.SEEK_SET)
+                self.assertEqual(os.read(original_fd, len(identity[2]) + 1), identity[2])
+            finally:
+                os.close(original_fd)
+            assert_retry_cleanup(root)
+
+        with self.subTest(existing_retry="post-acceptance-replacement"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor, _candidate, output, identity = make_existing_retry(root)
+            replacement = root / "replacement.json"
+            replacement.write_bytes(identity[2])
+            replacement.chmod(0o600)
+            replacement_inode = replacement.stat().st_ino
+
+            def replace_after_acceptance(_candidate_root: Path) -> None:
+                os.replace(replacement, output)
+
+            result, stderr = self.run_main_with_checkpoint(
+                root, "record-residue", descriptor, "existing.json",
+                mutate_once("after-existing-output-acceptance", replace_after_acceptance),
+            )
+            self.assertEqual(result, 0, stderr)
+            self.assertEqual(output.stat().st_ino, replacement_inode)
+            self.assertNotEqual(output.stat().st_ino, identity[0])
+            self.assertEqual(output.stat().st_mode & 0o7777, 0o600)
+            self.assertEqual(output.read_bytes(), identity[2])
+            assert_retry_cleanup(root)
+
         with self.subTest(existing_retry="reviewer-head-commit"), tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             descriptor, candidate, output, identity = make_existing_retry(root)

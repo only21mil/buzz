@@ -404,13 +404,18 @@ def verify_candidate_snapshot(
             )
         except FileExistsError as collision:
             candidate_checkpoint("before-existing-output-check", snapshot.root)
-            if not accept_existing_output(parent, name, payload):
+            existing = accept_existing_output(parent, name, payload)
+            if existing is None:
                 raise collision
-            candidate_checkpoint("after-existing-output-check", snapshot.root)
-            check_locked()
-            if not accept_existing_output(parent, name, payload):
-                raise collision
-            raise ExistingOutputAccepted
+            try:
+                candidate_checkpoint("after-existing-output-check", snapshot.root)
+                check_locked()
+                if not recheck_existing_output(parent, name, payload, existing):
+                    raise collision
+                candidate_checkpoint("after-existing-output-acceptance", snapshot.root)
+                raise ExistingOutputAccepted
+            finally:
+                os.close(existing.fd)
         linked = True
         candidate_checkpoint("after-pending-publication", snapshot.root)
         try:
@@ -1592,7 +1597,65 @@ def output_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def accept_existing_output(parent: int, name: str, payload: bytes) -> bool:
+class ExistingOutput(NamedTuple):
+    fd: int
+    identity: tuple[int, ...]
+
+
+def recheck_existing_output(
+    parent: int, name: str, payload: bytes, existing: ExistingOutput,
+) -> bool:
+    fd = existing.fd
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        before = os.fstat(fd)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.ENOENT, errno.ENOTDIR}:
+            return False
+        raise
+    if (
+        output_identity(before) != existing.identity
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size != len(payload)
+        or before.st_size > MAX_JSON
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_uid != os.geteuid()
+    ):
+        return False
+    try:
+        raw = DescriptorRoot._read_fd(fd, before.st_size, MAX_JSON, "existing output")
+        parse_canonical_json(raw, "existing output")
+    except RenderError:
+        return False
+    after = os.fstat(fd)
+    if output_identity(before) != output_identity(after):
+        return False
+    if hashlib.sha256(raw).digest() != hashlib.sha256(payload).digest() or raw != payload:
+        return False
+
+    try:
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.ENOENT, errno.ENOTDIR}:
+            return False
+        raise
+    if output_identity(after) != output_identity(named):
+        return False
+
+    os.fsync(parent)
+    try:
+        durable = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.ENOENT, errno.ENOTDIR}:
+            return False
+        raise
+    return output_identity(after) == output_identity(durable)
+
+
+def accept_existing_output(
+    parent: int, name: str, payload: bytes,
+) -> ExistingOutput | None:
     try:
         fd = os.open(
             name,
@@ -1601,49 +1664,17 @@ def accept_existing_output(parent: int, name: str, payload: bytes) -> bool:
         )
     except OSError as error:
         if error.errno in {errno.EACCES, errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
-            return False
+            return None
         raise
+    existing = ExistingOutput(fd, output_identity(os.fstat(fd)))
     try:
-        before = os.fstat(fd)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_size != len(payload)
-            or before.st_size > MAX_JSON
-            or stat.S_IMODE(before.st_mode) != 0o600
-            or before.st_uid != os.geteuid()
-        ):
-            return False
-        try:
-            raw = DescriptorRoot._read_fd(fd, before.st_size, MAX_JSON, "existing output")
-            parse_canonical_json(raw, "existing output")
-        except RenderError:
-            return False
-        after = os.fstat(fd)
-        if output_identity(before) != output_identity(after):
-            return False
-        if hashlib.sha256(raw).digest() != hashlib.sha256(payload).digest() or raw != payload:
-            return False
-
-        try:
-            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.ENOENT, errno.ENOTDIR}:
-                return False
-            raise
-        if output_identity(after) != output_identity(named):
-            return False
-
-        os.fsync(parent)
-        try:
-            durable = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.ENOENT, errno.ENOTDIR}:
-                return False
-            raise
-        return output_identity(after) == output_identity(durable)
-    finally:
+        if recheck_existing_output(parent, name, payload, existing):
+            return existing
+    except BaseException:
         os.close(fd)
+        raise
+    os.close(fd)
+    return None
 
 
 def write_output(
@@ -1724,8 +1755,11 @@ def write_output(
         except FileExistsError as collision:
             remove_output_temporary(parent, temporary)
             temporary = None
-            if candidate_snapshot is None and accept_existing_output(parent, name, payload):
-                return
+            if candidate_snapshot is None:
+                existing = accept_existing_output(parent, name, payload)
+                if existing is not None:
+                    os.close(existing.fd)
+                    return
             raise collision
         if candidate_snapshot is not None:
             candidate_checkpoint("after-publication", candidate_snapshot.root)

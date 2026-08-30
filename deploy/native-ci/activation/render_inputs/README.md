@@ -85,11 +85,14 @@ verification and acceptance operation includes the pending link, inode check,
 and final status read before it returns. A mutation injected after the final
 status read is post-acceptance.
 If the no-clobber link finds an existing destination, the same Git locks remain
-held while the renderer validates its exact canonical bytes, inode, owner, and
-mode, performs the final candidate status read, and validates the destination
-again. Only an exact match is accepted. Candidate drift or a destination
-mismatch rejects and removes only the private temporary. The renderer never
-overwrites, changes the mode of, or removes the pre-existing destination.
+held while the renderer opens that destination once and validates its exact
+canonical bytes, inode, owner, and mode. The descriptor stays open across the
+final candidate status read. Acceptance is the final durable pathname check,
+which must still resolve to that same unchanged open inode. Replacement before
+that check rejects and removes only the private temporary, even when the new
+inode has identical bytes and mode. Namespace changes after that final check
+are post-acceptance. The renderer never overwrites, changes the mode of, or
+removes either pre-existing object.
 Ignored build artifacts do not change the repository identity. The renderer
 also checks the
 prepared state's exact `public-binding.json`, the scenario, seccomp source, and
