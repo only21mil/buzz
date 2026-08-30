@@ -1639,6 +1639,221 @@ class ExecdPackageTests(unittest.TestCase):
             )
             self.assertEqual(INSTALL.rollback(package, root)["status"], "unchanged")
 
+    def test_terminal_receipt_races_enter_hold_and_resume_exactly(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"terminal receipt race candidate\n"
+        timings = (
+            "temp_fsync",
+            "before_publish",
+            "after_publish",
+            "after_publish_lost_ack",
+        )
+        baselines = ("present", "absent")
+        replacements = ("regular", "symlink")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            index = 0
+            for timing in timings:
+                for baseline_state in baselines:
+                    for replacement_kind in replacements:
+                        with self.subTest(
+                            timing=timing,
+                            baseline=baseline_state,
+                            replacement=replacement_kind,
+                        ):
+                            lane = base / f"terminal-race-{index}"
+                            index += 1
+                            lane.mkdir(mode=0o700)
+                            package, root = _manual_install_fixture(
+                                lane, candidate, seccomp
+                            )
+                            target = root / "usr/libexec/buzz-ci-execd"
+                            if baseline_state == "present":
+                                target.parent.mkdir(mode=0o755)
+                                target.parent.chmod(0o755)
+                                target.write_bytes(b"terminal race prior\n")
+                                target.chmod(0o750)
+                            INSTALL.install(package, root)
+                            held_prior = target.parent / "terminal-exact-prior-held"
+                            hostile = root / "hostile-terminal-target"
+                            target_phase = (
+                                "after_publish"
+                                if timing == "after_publish_lost_ack"
+                                else timing
+                            )
+                            raced = False
+
+                            def replace_live() -> None:
+                                nonlocal raced
+                                if raced:
+                                    return
+                                raced = True
+                                if baseline_state == "present":
+                                    target.rename(held_prior)
+                                if replacement_kind == "regular":
+                                    target.write_bytes(b"terminal operator B\n")
+                                    target.chmod(0o701)
+                                else:
+                                    hostile.write_bytes(b"do not follow\n")
+                                    hostile.chmod(0o700)
+                                    target.symlink_to(hostile)
+                                if timing == "after_publish_lost_ack":
+                                    os._exit(91)
+
+                            def replace_at_terminal(phase: str) -> None:
+                                if phase == target_phase:
+                                    replace_live()
+
+                            original_fsync = os.fsync
+
+                            def replace_during_terminal_temp_fsync(
+                                descriptor: int,
+                            ) -> None:
+                                try:
+                                    descriptor_name = Path(
+                                        os.readlink(f"/proc/self/fd/{descriptor}")
+                                    ).name
+                                except OSError:
+                                    descriptor_name = ""
+                                if (
+                                    descriptor_name.startswith(
+                                        ".rollback-terminal-v1.json."
+                                    )
+                                    and (
+                                        target.parent
+                                        / INSTALL.ROLLBACK_STAGE_NAME
+                                    ).exists()
+                                ):
+                                    replace_live()
+                                original_fsync(descriptor)
+
+                            custody = root / "var/lib/buzzci/execd-v2/package"
+                            if timing == "after_publish_lost_ack":
+                                pid = os.fork()
+                                if pid == 0:
+                                    try:
+                                        with mock.patch.object(
+                                            INSTALL,
+                                            "_rollback_terminal_race",
+                                            side_effect=replace_at_terminal,
+                                        ):
+                                            INSTALL.rollback(package, root)
+                                    except BaseException:
+                                        os._exit(92)
+                                    os._exit(93)
+                                _, status = os.waitpid(pid, 0)
+                                self.assertEqual(os.waitstatus_to_exitcode(status), 91)
+                                lost_marker = json.loads(
+                                    (custody / "rollback-v1.json").read_bytes()
+                                )
+                                self.assertEqual(lost_marker["state"], "rolled_back")
+                                self.assertTrue(
+                                    (custody / "receipt-v1.json").exists()
+                                )
+                                with self.assertRaisesRegex(
+                                    ValueError, "recoverable hold"
+                                ):
+                                    INSTALL.rollback(package, root)
+                            else:
+                                if timing == "temp_fsync":
+                                    patcher = mock.patch.object(
+                                        INSTALL.os,
+                                        "fsync",
+                                        side_effect=replace_during_terminal_temp_fsync,
+                                    )
+                                else:
+                                    patcher = mock.patch.object(
+                                        INSTALL,
+                                        "_rollback_terminal_race",
+                                        side_effect=replace_at_terminal,
+                                    )
+                                with patcher, self.assertRaisesRegex(
+                                    ValueError, "recoverable hold"
+                                ):
+                                    INSTALL.rollback(package, root)
+                                self.assertTrue(raced)
+
+                            if replacement_kind == "regular":
+                                self.assertEqual(
+                                    (target.read_bytes(), _mode(target)),
+                                    (b"terminal operator B\n", 0o701),
+                                )
+                            else:
+                                self.assertTrue(target.is_symlink())
+                                self.assertEqual(
+                                    hostile.read_bytes(), b"do not follow\n"
+                                )
+                            marker = json.loads(
+                                (custody / "rollback-v1.json").read_bytes()
+                            )
+                            self.assertEqual(marker["state"], "holding")
+                            self.assertEqual(
+                                marker["live_target"]["state"], baseline_state
+                            )
+                            self.assertTrue((custody / "receipt-v1.json").exists())
+                            self.assertEqual(
+                                (custody / "preimage-v1.bin").exists(),
+                                baseline_state == "present",
+                            )
+                            self.assertEqual(
+                                list(custody.glob(".rollback-v1.json.*")), []
+                            )
+                            with self.assertRaisesRegex(
+                                ValueError, "recoverable hold"
+                            ):
+                                INSTALL.rollback(package, root)
+
+                            target.unlink()
+                            if baseline_state == "present":
+                                held_prior.rename(target)
+                            self.assertEqual(
+                                INSTALL.rollback(package, root)["status"],
+                                "rolled_back",
+                            )
+                            terminal_held = (
+                                target.parent / "terminal-committed-prior-held"
+                            )
+                            if baseline_state == "present":
+                                target.rename(terminal_held)
+                            if replacement_kind == "regular":
+                                target.write_bytes(b"post-terminal operator B\n")
+                                target.chmod(0o701)
+                            else:
+                                target.symlink_to(hostile)
+                            with self.assertRaisesRegex(
+                                ValueError, "live binding differs"
+                            ):
+                                INSTALL.rollback(package, root)
+                            target.unlink()
+                            if baseline_state == "present":
+                                terminal_held.rename(target)
+                            self.assertEqual(
+                                INSTALL.rollback(package, root)["status"],
+                                "unchanged",
+                            )
+                            self.assertFalse(
+                                (custody / "receipt-v1.json").exists()
+                            )
+                            self.assertFalse(
+                                (custody / "preimage-v1.bin").exists()
+                            )
+                            self.assertFalse(
+                                (
+                                    custody
+                                    / INSTALL.ROLLBACK_TERMINAL_STAGE_NAME
+                                ).exists()
+                            )
+                            if baseline_state == "present":
+                                self.assertEqual(
+                                    (target.read_bytes(), _mode(target)),
+                                    (b"terminal race prior\n", 0o750),
+                                )
+                            else:
+                                self.assertFalse(target.exists())
+
     def test_publication_cas_preserves_a_symlink_name_swap(self) -> None:
         seccomp = b"test immutable seccomp\n"
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
@@ -1744,6 +1959,8 @@ class ExecdPackageTests(unittest.TestCase):
             "rollback_stage_identity",
             "rollback_exchanged",
             "rollback_restored",
+            "rollback_terminal_prepared",
+            "rollback_terminal_committed",
             "rollback_released",
             "rollback_complete",
         )
@@ -1775,6 +1992,13 @@ class ExecdPackageTests(unittest.TestCase):
                         {"rolled_back", "unchanged"},
                     )
                     self.assertEqual((target.read_bytes(), _mode(target)), (prior, 0o751))
+                    self.assertFalse(
+                        (
+                            root
+                            / "var/lib/buzzci/execd-v2/package"
+                            / INSTALL.ROLLBACK_TERMINAL_STAGE_NAME
+                        ).exists()
+                    )
 
 
 if __name__ == "__main__":

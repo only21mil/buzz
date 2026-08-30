@@ -29,6 +29,7 @@ DIGEST = re.compile(r"^[0-9a-f]{64}$")
 RECEIPT_NAME = "receipt-v1.json"
 PREIMAGE_NAME = "preimage-v1.bin"
 ROLLBACK_RECEIPT_NAME = "rollback-v1.json"
+ROLLBACK_TERMINAL_STAGE_NAME = "rollback-terminal-v1.json"
 INSTALL_TRANSACTION_NAME = "install-transaction-v1.json"
 INSTALL_LOCK_NAME = "install.lock"
 CANDIDATE_STAGE_NAME = ".buzz-ci-execd.install-v1"
@@ -2007,19 +2008,48 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
         os.close(root_fd)
 
 
+def _rollback_live_target_value(
+    prior: _PriorTarget | None,
+    state: str,
+    rollback_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if prior is None:
+        if rollback_identity is not None:
+            raise ValueError("absent execd baseline has a live identity")
+        return {"state": "absent"}
+    elif rollback_identity is None:
+        if state != "rolling_back":
+            raise ValueError("execd rollback receipt lacks a live identity")
+        return {"state": "pending"}
+    return {
+        "state": "present",
+        "device": rollback_identity["device"],
+        "inode": rollback_identity["inode"],
+        "sha256": rollback_identity["sha256"],
+        "mode": rollback_identity["mode"],
+        "uid": rollback_identity["uid"],
+        "gid": rollback_identity["gid"],
+    }
+
+
 def _rollback_receipt_bytes(
     manifest: dict[str, object],
     prior: _PriorTarget | None,
     uid: int,
     gid: int,
     state: str,
+    rollback_identity: dict[str, object] | None = None,
 ) -> bytes:
     if state not in {"rolling_back", "holding", "rolled_back"}:
         raise ValueError("invalid execd rollback receipt state")
+    live_target = _rollback_live_target_value(
+        prior, state, rollback_identity
+    )
     return canonical_json({
         "schema": "buzz-ci-execd-package-rollback-receipt-v1",
         "state": state,
         "install_receipt": _receipt_value(manifest, prior, uid, gid),
+        "live_target": live_target,
     })
 
 
@@ -2049,12 +2079,92 @@ def _atomic_replace_at(
                 pass
 
 
+def _rollback_terminal_race(_phase: str) -> None:
+    """Test seam around the nonblocking terminal publication sequence."""
+
+
+def _publish_rollback_terminal_at(
+    receipt_directory: int,
+    binary_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    prior: _PriorTarget | None,
+    rollback_identity: dict[str, object] | None,
+    uid: int,
+    gid: int,
+) -> None:
+    expected = _rollback_receipt_bytes(
+        manifest,
+        prior,
+        uid,
+        gid,
+        "rolled_back",
+        rollback_identity,
+    )
+    _publish_create_once(
+        receipt_directory,
+        ROLLBACK_TERMINAL_STAGE_NAME,
+        expected,
+        0o600,
+        uid,
+        gid,
+    )
+    payload, metadata = _read_regular_at(
+        receipt_directory,
+        ROLLBACK_TERMINAL_STAGE_NAME,
+        MAX_JSON_BYTES,
+    )
+    if (
+        payload != expected
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+    ):
+        raise ValueError("execd rollback terminal stage differs")
+    _rollback_terminal_race("temp_fsynced")
+    _durable_phase("rollback_terminal_prepared")
+    _rollback_terminal_race("before_publish")
+    if not _rollback_live_matches_intended_at(
+        binary_directory, entry, prior, rollback_identity
+    ):
+        raise _RollbackHoldError(
+            "execd rollback is in recoverable hold: live target changed"
+        )
+    os.replace(
+        ROLLBACK_TERMINAL_STAGE_NAME,
+        ROLLBACK_RECEIPT_NAME,
+        src_dir_fd=receipt_directory,
+        dst_dir_fd=receipt_directory,
+    )
+    _rollback_terminal_race("after_publish")
+    if not _rollback_live_matches_intended_at(
+        binary_directory, entry, prior, rollback_identity
+    ):
+        raise _RollbackHoldError(
+            "execd rollback is in recoverable hold: live target changed"
+        )
+    os.fsync(receipt_directory)
+    _durable_phase("rollback_terminal_committed")
+    _rollback_terminal_race("after_commit")
+    if not _rollback_live_matches_intended_at(
+        binary_directory, entry, prior, rollback_identity
+    ):
+        raise _RollbackHoldError(
+            "execd rollback is in recoverable hold: live target changed"
+        )
+
+
 def _read_rollback_receipt_at(
     directory_fd: int,
     manifest: dict[str, object],
     uid: int,
     gid: int,
-) -> tuple[str, _PriorTarget | None, dict[str, object]]:
+) -> tuple[
+    str,
+    _PriorTarget | None,
+    dict[str, object],
+    dict[str, object],
+]:
     payload, metadata = _read_regular_at(
         directory_fd, ROLLBACK_RECEIPT_NAME, MAX_JSON_BYTES
     )
@@ -2064,7 +2174,7 @@ def _read_rollback_receipt_at(
         raise ValueError("execd package rollback receipt is invalid") from error
     if (
         not isinstance(value, dict)
-        or set(value) != {"schema", "state", "install_receipt"}
+        or set(value) != {"schema", "state", "install_receipt", "live_target"}
         or value.get("schema") != "buzz-ci-execd-package-rollback-receipt-v1"
         or value.get("state") not in {"rolling_back", "holding", "rolled_back"}
         or not isinstance(value.get("install_receipt"), dict)
@@ -2076,7 +2186,33 @@ def _read_rollback_receipt_at(
         raise ValueError("execd package rollback receipt differs")
     install_receipt = value["install_receipt"]
     prior = _receipt_prior(install_receipt, manifest, uid, gid)
-    return str(value["state"]), prior, install_receipt
+    live_target = value.get("live_target")
+    if prior is None:
+        live_valid = live_target == {"state": "absent"}
+    elif live_target == {"state": "pending"}:
+        live_valid = value["state"] == "rolling_back"
+    else:
+        prior_record = install_receipt["prior"]["binary"]
+        live_valid = (
+            isinstance(live_target, dict)
+            and set(live_target)
+            == {"state", "device", "inode", "sha256", "mode", "uid", "gid"}
+            and live_target.get("state") == "present"
+            and not isinstance(live_target.get("device"), bool)
+            and isinstance(live_target.get("device"), int)
+            and int(live_target["device"]) >= 0
+            and not isinstance(live_target.get("inode"), bool)
+            and isinstance(live_target.get("inode"), int)
+            and int(live_target["inode"]) > 0
+            and live_target.get("sha256") == prior_record["sha256"]
+            and live_target.get("mode") == prior_record["mode"]
+            and live_target.get("uid") == prior_record["uid"]
+            and live_target.get("gid") == prior_record["gid"]
+        )
+    if not live_valid:
+        raise ValueError("execd package rollback live binding differs")
+    assert isinstance(live_target, dict)
+    return str(value["state"]), prior, install_receipt, live_target
 
 
 def _resume_prior_at(
@@ -2396,6 +2532,20 @@ def _rollback_live_matches_intended_at(
     return _identity_matches_at(binary_directory, name, rollback_identity)
 
 
+def _rollback_live_matches_binding_at(
+    binary_directory: int,
+    entry: Entry,
+    live_target: dict[str, object],
+) -> bool:
+    if live_target == {"state": "absent"}:
+        return _absent_at(binary_directory, Path(entry.target).name)
+    if live_target.get("state") != "present":
+        return False
+    return _identity_matches_at(
+        binary_directory, Path(entry.target).name, live_target
+    )
+
+
 def _restore_active_rollback_custody_at(
     receipt_directory: int,
     manifest: dict[str, object],
@@ -2458,6 +2608,7 @@ def _enter_rollback_hold_at(
     receipt_directory: int,
     manifest: dict[str, object],
     prior: _PriorTarget | None,
+    rollback_identity: dict[str, object] | None,
     uid: int,
     gid: int,
 ) -> None:
@@ -2467,12 +2618,19 @@ def _enter_rollback_hold_at(
     _atomic_replace_at(
         receipt_directory,
         ROLLBACK_RECEIPT_NAME,
-        _rollback_receipt_bytes(manifest, prior, uid, gid, "holding"),
+        _rollback_receipt_bytes(
+            manifest,
+            prior,
+            uid,
+            gid,
+            "holding",
+            rollback_identity,
+        ),
         0o600,
         uid,
         gid,
     )
-    state, _, _ = _read_rollback_receipt_at(
+    state, _, _, _ = _read_rollback_receipt_at(
         receipt_directory, manifest, uid, gid
     )
     if state != "holding":
@@ -2490,6 +2648,30 @@ def _compensate_rollback(
     uid: int,
     gid: int,
 ) -> None:
+    if not _absent_at(receipt_directory, ROLLBACK_TERMINAL_STAGE_NAME):
+        payload, metadata = _read_regular_at(
+            receipt_directory,
+            ROLLBACK_TERMINAL_STAGE_NAME,
+            MAX_JSON_BYTES,
+        )
+        if (
+            payload
+            != _rollback_receipt_bytes(
+                manifest,
+                prior,
+                uid,
+                gid,
+                "rolled_back",
+                rollback_identity,
+            )
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+        ):
+            raise ValueError("execd rollback terminal stage differs")
+        _remove_if_present_at(
+            receipt_directory, ROLLBACK_TERMINAL_STAGE_NAME
+        )
     _compensate_rollback_publication_at(
         binary_directory,
         entry,
@@ -2649,40 +2831,73 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             receipt_directory, manifest, entry, uid, gid
         )
         try:
-            marker_state, marker_prior, marker_receipt = _read_rollback_receipt_at(
-                receipt_directory, manifest, uid, gid
-            )
+            (
+                marker_state,
+                marker_prior,
+                marker_receipt,
+                marker_live_target,
+            ) = _read_rollback_receipt_at(receipt_directory, manifest, uid, gid)
         except FileNotFoundError:
             marker_state = "absent"
             marker_prior = None
             marker_receipt = None
+            marker_live_target = None
         if marker_state == "rolled_back":
-            if not _absent_at(receipt_directory, RECEIPT_NAME) or not _absent_at(
-                receipt_directory, PREIMAGE_NAME
+            assert marker_receipt is not None
+            assert marker_live_target is not None
+            prior_record = marker_receipt["prior"]
+            active_custody = not _absent_at(receipt_directory, RECEIPT_NAME)
+            if active_custody:
+                active_prior = _verify_receipt_at(
+                    receipt_directory, manifest, uid, gid
+                )
+                if (active_prior is None) != (marker_prior is None) or (
+                    active_prior is not None
+                    and marker_prior is not None
+                    and (
+                        active_prior.mode != marker_prior.mode
+                        or active_prior.uid != marker_prior.uid
+                        or active_prior.gid != marker_prior.gid
+                    )
+                ):
+                    raise ValueError("rolled-back execd active custody differs")
+            else:
+                active_prior = None
+                if not _absent_at(receipt_directory, PREIMAGE_NAME):
+                    raise ValueError("rolled-back execd package retains a preimage")
+            if not _rollback_live_matches_binding_at(
+                binary_directory, entry, marker_live_target
             ):
-                raise ValueError("rolled-back execd package retains active custody")
+                candidate_retained = _identity_matches_at(
+                    binary_directory,
+                    ROLLBACK_STAGE_NAME,
+                    candidate_identity,
+                )
+                if active_custody and candidate_retained:
+                    rollback_identity = (
+                        None
+                        if marker_prior is None
+                        else marker_live_target
+                    )
+                    _enter_rollback_hold_at(
+                        receipt_directory,
+                        manifest,
+                        active_prior,
+                        rollback_identity,
+                        uid,
+                        gid,
+                    )
+                    _durable_phase("rollback_holding")
+                    raise ValueError(
+                        "execd rollback is in recoverable hold: "
+                        "terminal live target changed"
+                    )
+                raise ValueError("rolled-back execd live binding differs")
+            if active_custody:
+                _remove_rollback_managed_at(receipt_directory, active_prior)
             _finalize_rollback_stages_at(
                 receipt_directory, binary_directory, candidate_identity
             )
-            assert marker_receipt is not None
-            prior_record = marker_receipt["prior"]
-            if marker_prior is not None:
-                marker_prior = _PriorTarget(
-                    b"",
-                    marker_prior.mode,
-                    marker_prior.uid,
-                    marker_prior.gid,
-                )
-                payload, metadata = _read_regular_at(binary_directory, Path(entry.target).name)
-                if (
-                    sha256(payload) != prior_record["binary"]["sha256"]
-                    or stat.S_IMODE(metadata.st_mode) != marker_prior.mode
-                    or metadata.st_uid != marker_prior.uid
-                    or metadata.st_gid != marker_prior.gid
-                ):
-                    raise ValueError("rolled-back execd binary baseline differs")
-            elif not _absent_at(binary_directory, Path(entry.target).name):
-                raise ValueError("rolled-back absent execd baseline differs")
             return {
                 "status": "unchanged",
                 "state": "rolled_back",
@@ -2693,6 +2908,7 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             }
         if marker_state in {"rolling_back", "holding"}:
             assert marker_receipt is not None
+            assert marker_live_target is not None
             prior = _resume_prior_at(
                 receipt_directory,
                 binary_directory,
@@ -2784,6 +3000,10 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 uid,
                 gid,
             )
+        if marker_state == "holding" and marker_live_target != (
+            _rollback_live_target_value(prior, "holding", rollback_identity)
+        ):
+            raise ValueError("execd rollback hold live binding differs")
         try:
             if candidate_retained and not _rollback_live_matches_intended_at(
                 binary_directory, entry, prior, rollback_identity
@@ -2801,6 +3021,30 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             _durable_phase("rollback_restored")
             if not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory):
                 raise ValueError("execd binary directory changed during rollback")
+            _publish_rollback_terminal_at(
+                receipt_directory,
+                binary_directory,
+                manifest,
+                entry,
+                prior,
+                rollback_identity,
+                uid,
+                gid,
+            )
+            state, _, _, live_target = _read_rollback_receipt_at(
+                receipt_directory, manifest, uid, gid
+            )
+            if (
+                state != "rolled_back"
+                or live_target
+                != _rollback_live_target_value(
+                    prior, "rolled_back", rollback_identity
+                )
+                or not _rollback_live_matches_intended_at(
+                    binary_directory, entry, prior, rollback_identity
+                )
+            ):
+                raise ValueError("execd rollback terminal readback differs")
             _remove_rollback_managed_at(receipt_directory, prior)
             _durable_phase("rollback_released")
             if not _rollback_live_matches_intended_at(
@@ -2809,21 +3053,6 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 raise _RollbackHoldError(
                     "execd rollback is in recoverable hold: live target changed"
                 )
-            _atomic_replace_at(
-                receipt_directory,
-                ROLLBACK_RECEIPT_NAME,
-                _rollback_receipt_bytes(manifest, prior, uid, gid, "rolled_back"),
-                0o600,
-                uid,
-                gid,
-            )
-            state, _, _ = _read_rollback_receipt_at(
-                receipt_directory, manifest, uid, gid
-            )
-            if state != "rolled_back" or not _absent_at(
-                receipt_directory, RECEIPT_NAME
-            ) or not _absent_at(receipt_directory, PREIMAGE_NAME):
-                raise ValueError("execd rollback terminal readback differs")
             _durable_phase("rollback_complete")
             _finalize_rollback_stages_at(
                 receipt_directory, binary_directory, candidate_identity
@@ -2833,6 +3062,7 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 receipt_directory,
                 manifest,
                 prior,
+                rollback_identity,
                 uid,
                 gid,
             )
