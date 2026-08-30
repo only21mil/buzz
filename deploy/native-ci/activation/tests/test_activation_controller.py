@@ -1138,7 +1138,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "0e0e3a336850be3c768bc7e431e3c7c25c0addbfb421ee71c7718169a38f0ca0",
+            "f73be403d35976ad4de8ef3eb07534f633a3d97137af0b51462f5a4bc47ec259",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1987,6 +1987,180 @@ class ActivationControllerTests(unittest.TestCase):
         )
         self.assertEqual(retried.returncode, 0, retried.stderr.decode())
         self.assertEqual(json.loads(retried.stdout)["status"], "unchanged")
+
+    def test_rollback_rejects_fixed_package_missing_before_first_cleanup_marker(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER._remove_package_tree(
+            self.fixture.root, CONTROLLER.FIXED_PACKAGE_PATH,
+            expected_sources=set(CONTROLLER._package_references(manifest)),
+        )
+        with self.assertRaises(FileNotFoundError):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rollback_failed")
+        self.assertIsNone(CONTROLLER._read_rollback_cleanup(self.fixture.root))
+
+    def test_rollback_and_terminal_retry_reject_broken_fixed_package_symlink(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER._remove_package_tree(
+            self.fixture.root, CONTROLLER.FIXED_PACKAGE_PATH,
+            expected_sources=set(CONTROLLER._package_references(manifest)),
+        )
+        fixed_package = self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")
+        fixed_package.symlink_to("missing-package", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "root must be real|not a directory"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertIsNone(CONTROLLER._read_rollback_cleanup(self.fixture.root))
+        fixed_package.unlink()
+
+        CONTROLLER._install_fixed_package(manifest, payloads, self.fixture.root)
+        self.assertEqual(CONTROLLER.rollback(manifest, self.fixture.root, driver)["state"], "rolled_back")
+        fixed_package.symlink_to("missing-package", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "not a directory"):
+            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+
+    def test_two_activation_rollback_cycles_archive_and_replace_current_marker(self) -> None:
+        first_manifest, first_payloads, driver = self.fixture.load()
+        CONTROLLER.stage(first_manifest, first_payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.rollback(first_manifest, self.fixture.root, driver)
+        first_marker = CONTROLLER._read_rollback_cleanup(self.fixture.root)
+        self.assertIsNotNone(first_marker)
+
+        self.fixture.acceptance_template["actor"]["generation"] += 1
+        self.fixture.manifest = self.fixture._manifest()
+        self.fixture.scenario = self.fixture._scenario()
+        self.fixture.binding = CONTROLLER._acceptance_binding(self.fixture.manifest, self.fixture.scenario)
+        write_file(
+            self.fixture.package / "activation-manifest.json",
+            activation_package.canonical_json(self.fixture.manifest), 0o600,
+        )
+        second_manifest, second_payloads, driver = self.fixture.load()
+        self.assertNotEqual(second_manifest["activation_id"], first_manifest["activation_id"])
+        CONTROLLER.stage(second_manifest, second_payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertIsNone(CONTROLLER._read_rollback_cleanup(self.fixture.root))
+        self.assertIsNone(CONTROLLER._read_rollback_retirement(self.fixture.root))
+        archives = list((self.fixture.root / CONTROLLER.ROLLBACK_ARCHIVE_ROOT.lstrip("/")).iterdir())
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(json.loads(archives[0].read_bytes())["marker"], first_marker)
+
+        CONTROLLER.rollback(second_manifest, self.fixture.root, driver)
+        second_marker = CONTROLLER._read_rollback_cleanup(self.fixture.root)
+        self.assertEqual(second_marker["activation_id"], second_manifest["activation_id"])
+        self.assertEqual(CONTROLLER.rollback(second_manifest, self.fixture.root, driver)["status"], "unchanged")
+
+    def test_retirement_archive_write_lost_ack_tamper_and_exact_retry(self) -> None:
+        first_manifest, first_payloads, driver = self.fixture.load()
+        CONTROLLER.stage(first_manifest, first_payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.rollback(first_manifest, self.fixture.root, driver)
+        self.fixture.acceptance_template["actor"]["generation"] += 1
+        self.fixture.manifest = self.fixture._manifest()
+        self.fixture.scenario = self.fixture._scenario()
+        self.fixture.binding = CONTROLLER._acceptance_binding(self.fixture.manifest, self.fixture.scenario)
+        write_file(
+            self.fixture.package / "activation-manifest.json",
+            activation_package.canonical_json(self.fixture.manifest), 0o600,
+        )
+        manifest, payloads, driver = self.fixture.load()
+        original_write = CONTROLLER._atomic_write
+
+        def write_archive_then_lose_ack(root: Path, target: str, *arguments) -> None:
+            original_write(root, target, *arguments)
+            if target.startswith(CONTROLLER.ROLLBACK_ARCHIVE_ROOT + "/"):
+                raise OSError("injected archive acknowledgement loss")
+
+        with mock.patch.object(CONTROLLER, "_atomic_write", side_effect=write_archive_then_lose_ack), self.assertRaisesRegex(
+            OSError, "archive acknowledgement loss",
+        ):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        retirement = CONTROLLER._read_rollback_retirement(self.fixture.root)
+        archive_path = self.fixture.root / retirement["archive_path"].lstrip("/")
+        archive = json.loads(archive_path.read_bytes())
+        archive["retired_by_source_commit"] = "f" * 40
+        write_file(archive_path, activation_package.canonical_json(archive), 0o600)
+        with self.assertRaisesRegex(ValueError, "archive binding differs"):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        write_file(
+            archive_path,
+            activation_package.canonical_json(CONTROLLER._rollback_archive_value(retirement)),
+            0o600,
+        )
+        resumed = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertEqual(resumed["status"], "unchanged")
+        exact_retry = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertEqual(exact_retry["status"], "unchanged")
+
+    def test_retirement_unlink_interruptions_resume_deterministically(self) -> None:
+        first_manifest, first_payloads, driver = self.fixture.load()
+        CONTROLLER.stage(first_manifest, first_payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.rollback(first_manifest, self.fixture.root, driver)
+        self.fixture.acceptance_template["actor"]["generation"] += 1
+        self.fixture.manifest = self.fixture._manifest()
+        self.fixture.scenario = self.fixture._scenario()
+        self.fixture.binding = CONTROLLER._acceptance_binding(self.fixture.manifest, self.fixture.scenario)
+        write_file(
+            self.fixture.package / "activation-manifest.json",
+            activation_package.canonical_json(self.fixture.manifest), 0o600,
+        )
+        manifest, payloads, driver = self.fixture.load()
+        original_write = CONTROLLER._atomic_write
+
+        def write_retirement_then_lose_ack(root: Path, target: str, *arguments) -> None:
+            original_write(root, target, *arguments)
+            if target == CONTROLLER.ROLLBACK_RETIREMENT_PATH:
+                raise OSError("injected retirement marker acknowledgement loss")
+
+        with mock.patch.object(
+            CONTROLLER, "_atomic_write", side_effect=write_retirement_then_lose_ack,
+        ), self.assertRaisesRegex(OSError, "retirement marker acknowledgement loss"):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rolled_back")
+        self.assertIsNotNone(CONTROLLER._read_rollback_retirement(self.fixture.root))
+        original_unlink = CONTROLLER._unlink_target
+        interrupted: set[str] = set()
+
+        def unlink_then_lose_ack(root: Path, target: str) -> None:
+            original_unlink(root, target)
+            if target not in interrupted:
+                interrupted.add(target)
+                raise OSError(f"injected retirement unlink acknowledgement loss: {target}")
+
+        with mock.patch.object(CONTROLLER, "_unlink_target", side_effect=unlink_then_lose_ack), self.assertRaisesRegex(
+            OSError, "rollback-cleanup-v1",
+        ):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        with mock.patch.object(CONTROLLER, "_unlink_target", side_effect=unlink_then_lose_ack), self.assertRaisesRegex(
+            OSError, "rollback-retirement-v1",
+        ):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        resumed = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertEqual(resumed["status"], "unchanged")
+        self.assertEqual(interrupted, {CONTROLLER.ROLLBACK_CLEANUP_PATH, CONTROLLER.ROLLBACK_RETIREMENT_PATH})
+        self.assertIsNone(CONTROLLER._read_rollback_cleanup(self.fixture.root))
+        self.assertIsNone(CONTROLLER._read_rollback_retirement(self.fixture.root))
+
+    def test_retirement_marker_tamper_fails_closed(self) -> None:
+        first_manifest, first_payloads, driver = self.fixture.load()
+        CONTROLLER.stage(first_manifest, first_payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.rollback(first_manifest, self.fixture.root, driver)
+        self.fixture.acceptance_template["actor"]["generation"] += 1
+        self.fixture.manifest = self.fixture._manifest()
+        self.fixture.scenario = self.fixture._scenario()
+        self.fixture.binding = CONTROLLER._acceptance_binding(self.fixture.manifest, self.fixture.scenario)
+        write_file(
+            self.fixture.package / "activation-manifest.json",
+            activation_package.canonical_json(self.fixture.manifest), 0o600,
+        )
+        manifest, payloads, driver = self.fixture.load()
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        retirement = CONTROLLER._prepare_rollback_retirement(receipt, manifest, self.fixture.root)
+        retirement["next_source_commit"] = "f" * 40
+        write_file(
+            self.fixture.root / CONTROLLER.ROLLBACK_RETIREMENT_PATH.lstrip("/"),
+            activation_package.canonical_json(retirement), 0o600,
+        )
+        with self.assertRaisesRegex(ValueError, "different staged activation"):
+            CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
 
     def test_new_activation_replaces_and_rollback_restores_prior_controld_ledger(self) -> None:
         ledger = self.fixture.root / CONTROLLER.CONTROLD_ACCEPTANCE_LEDGER_PATH.lstrip("/")
