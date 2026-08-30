@@ -40,7 +40,7 @@ TRANSFER_SIZE = 8 * 1024 * 1024
 TIMING_PATH = Path(__file__).with_name("timing-contract.json")
 TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
 PROGRESS_PHASES = (
-    "guest_started", "ceremony", "install", "controller_check",
+    "boot_cloud_init", "guest_started", "ceremony", "install", "controller_check",
     "controller_stage", "controller_activate", "canary", "receipt_verifier",
     "rollback", "cleanup", "verifier", "complete",
 )
@@ -268,14 +268,16 @@ def timing_terms_seconds(terms: object) -> int:
 
 def phase_seconds(phase: str) -> int:
     phases = TIMING_CONTRACT.get("phase_terms")
-    if not isinstance(phases, dict) or phase not in phases:
+    inventory = TIMING_CONTRACT.get("command_inventory")
+    if not isinstance(phases, dict) or not isinstance(inventory, dict) or phase not in phases or phase not in inventory:
         raise HarnessError("unknown VM timing phase")
-    return timing_terms_seconds(phases[phase])
+    return timing_terms_seconds(phases[phase]) + timing_terms_seconds(inventory[phase])
 
 
 def validate_timing_contract() -> None:
     leaves = TIMING_CONTRACT.get("leaf_seconds")
     phases = TIMING_CONTRACT.get("phase_terms")
+    inventory = TIMING_CONTRACT.get("command_inventory")
     roles = TIMING_CONTRACT.get("role_phases")
     expected_phases = {
         "boot_cloud_init", "ceremony", "install", "controller_check",
@@ -293,7 +295,8 @@ def validate_timing_contract() -> None:
     }
     if (
         set(TIMING_CONTRACT) != {
-            "schema_version", "leaf_seconds", "phase_terms", "role_phases",
+            "schema_version", "leaf_seconds", "phase_terms", "command_inventory",
+            "role_phases",
         }
         or TIMING_CONTRACT.get("schema_version") != "buzz-ci-clean-host-e2e-timing/v2"
         or not isinstance(leaves, dict)
@@ -307,10 +310,14 @@ def validate_timing_contract() -> None:
         or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in leaves.values())
         or not isinstance(phases, dict)
         or set(phases) != expected_phases
+        or not isinstance(inventory, dict)
+        or set(inventory) != expected_phases
         or roles != expected_roles
     ):
         raise HarnessError("frozen VM timing contract is internally inconsistent")
     for terms in phases.values():
+        timing_terms_seconds(terms)
+    for terms in inventory.values():
         timing_terms_seconds(terms)
 
 
@@ -626,6 +633,10 @@ def current_harness_sha256() -> str:
     return file_sha256(Path(__file__).resolve())
 
 
+def timing_asset_sha256() -> str:
+    return file_sha256(TIMING_PATH.resolve())
+
+
 def capabilities() -> dict[str, object]:
     missing = [path for path in TOOLS.values() if not Path(path).is_file()]
     kvm = Path("/dev/kvm")
@@ -653,6 +664,7 @@ def capabilities() -> dict[str, object]:
         "qemu_version": qemu_version,
         "tool_sha256": {name: file_sha256(Path(path)) for name, path in TOOLS.items()},
         "harness_sha256": current_harness_sha256(),
+        "timing_asset_sha256": timing_asset_sha256(),
         "timing": TIMING_CONTRACT,
         "timing_sha256": timing_sha256(),
     }
@@ -935,13 +947,13 @@ def parse_progress(raw: bytes, boot_role: str) -> dict[str, object]:
             "records": records,
         }
     allowed = {
-        "ceremony": {"guest_started", "ceremony", "complete"},
+        "ceremony": {"boot_cloud_init", "guest_started", "ceremony", "complete"},
         "candidate": {
-            "guest_started", "install", "controller_check", "controller_stage",
+            "boot_cloud_init", "guest_started", "install", "controller_check", "controller_stage",
             "controller_activate", "canary", "receipt_verifier", "rollback",
             "cleanup", "complete",
         },
-        "verifier": {"guest_started", "verifier", "complete"},
+        "verifier": {"boot_cloud_init", "guest_started", "verifier", "complete"},
     }
     if boot_role not in allowed or any(str(record["phase"]) not in allowed[boot_role] for record in records):
         return {"status": "invalid", "reason": "boot-phase", "records": records}
@@ -1278,7 +1290,7 @@ def destroy_state(state: Path, expected: StateIdentity | None = None) -> None:
         or set(value) != {
             "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
             "qemu_version", "tool_sha256", "harness_sha256", "harness_asset_sha256",
-            "timing", "timing_sha256", "trusted_image_sha256",
+            "timing_asset_sha256", "timing", "timing_sha256", "trusted_image_sha256",
         }
         or value.get("schema_version") != STATE_SCHEMA
         or not isinstance(value.get("challenge"), str) or HEX64.fullmatch(value["challenge"]) is None
@@ -1291,6 +1303,7 @@ def destroy_state(state: Path, expected: StateIdentity | None = None) -> None:
         or not isinstance(value.get("tool_sha256"), dict) or set(value["tool_sha256"]) != set(TOOLS)
         or not isinstance(value.get("harness_asset_sha256"), dict) or set(value["harness_asset_sha256"]) != set(FROZEN_ASSETS)
         or not isinstance(value.get("harness_sha256"), str) or HEX64.fullmatch(value["harness_sha256"]) is None
+        or value.get("timing_asset_sha256") != value["harness_asset_sha256"].get("timing-contract.json")
         or value.get("timing") != TIMING_CONTRACT
         or value.get("timing_sha256") != timing_sha256()
     ):
@@ -1325,6 +1338,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
             "tool_sha256": proof["tool_sha256"],
             "harness_sha256": proof["harness_sha256"],
             "harness_asset_sha256": asset_digests,
+            "timing_asset_sha256": proof["timing_asset_sha256"],
             "timing": TIMING_CONTRACT,
             "timing_sha256": proof["timing_sha256"],
             "trusted_image_sha256": None,
@@ -1368,6 +1382,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         return {
             "status": "prepared", "state": str(state), "public_binding": str(public_path),
             "raw_key_absence": True, "harness_sha256": proof["harness_sha256"],
+            "timing_asset_sha256": proof["timing_asset_sha256"],
             "timing_sha256": proof["timing_sha256"], "timing": TIMING_CONTRACT,
         }
     except BaseException:
@@ -1384,7 +1399,7 @@ def validate_prepared_state(state: Path) -> dict[str, object]:
         or set(state_record) != {
             "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
             "qemu_version", "tool_sha256", "harness_sha256", "harness_asset_sha256",
-            "timing", "timing_sha256", "trusted_image_sha256",
+            "timing_asset_sha256", "timing", "timing_sha256", "trusted_image_sha256",
         }
         or state_record.get("schema_version") != STATE_SCHEMA
     ):
@@ -1404,6 +1419,7 @@ def validate_prepared_state(state: Path) -> dict[str, object]:
         raise HarnessError("VM harness tool changed after key ceremony")
     if (
         state_record.get("harness_sha256") != current_harness_sha256()
+        or state_record.get("timing_asset_sha256") != timing_asset_sha256()
         or state_record.get("timing") != TIMING_CONTRACT
         or state_record.get("timing_sha256") != timing_sha256()
     ):
@@ -1428,7 +1444,7 @@ def validate_prepared_state(state: Path) -> dict[str, object]:
 def validate_contract_envelope(value: object) -> dict[str, object]:
     required = {
         "schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256",
-        "timing", "timing_sha256", "scenario", "seccomp_source", "packages",
+        "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages",
     }
     if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA:
         raise HarnessError("run contract shape differs")
@@ -1438,6 +1454,7 @@ def validate_contract_envelope(value: object) -> dict[str, object]:
         raise HarnessError("candidate SHA is invalid")
     if (
         value.get("harness_sha256") != current_harness_sha256()
+        or value.get("timing_asset_sha256") != timing_asset_sha256()
         or value.get("timing") != TIMING_CONTRACT
         or value.get("timing_sha256") != timing_sha256()
     ):
@@ -1455,6 +1472,7 @@ def validate_contract_value(
     state_record = validate_prepared_state(state)
     if (
         state_record["harness_sha256"] != value["harness_sha256"]
+        or state_record["timing_asset_sha256"] != value["timing_asset_sha256"]
         or state_record["timing_sha256"] != value["timing_sha256"]
     ):
         raise HarnessError("prepared state differs from run contract harness binding")
@@ -1475,6 +1493,19 @@ def validate_contract_value(
     ], maximum=2 * 1024 * 1024)
     if hashlib.sha256(candidate_harness).hexdigest() != value["harness_sha256"]:
         raise HarnessError("candidate commit harness binding differs")
+    candidate_timing = bounded([
+        "/usr/bin/git", "-C", str(candidate), "show",
+        f"{value['candidate_sha']}:deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
+    ], maximum=MAX_JSON)
+    try:
+        candidate_timing_value = json.loads(candidate_timing, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as error:
+        raise HarnessError("candidate commit timing asset JSON differs") from error
+    if (
+        hashlib.sha256(candidate_timing).hexdigest() != value["timing_asset_sha256"]
+        or candidate_timing_value != TIMING_CONTRACT
+    ):
+        raise HarnessError("candidate commit timing asset binding differs")
     for relative in REQUIRED_CANDIDATE:
         if not bounded(["/usr/bin/git", "-C", str(candidate), "cat-file", "-e", f"{value['candidate_sha']}:{relative}"], maximum=1024) == b"":
             raise HarnessError("candidate prerequisite probe returned output")
@@ -2165,7 +2196,8 @@ def validate_result_set_fd(
         raise HarnessError("evidence manifest encoding differs")
     expected_manifest = {
         "schema_version", "candidate_sha", "image_sha256", "tool_sha256",
-        "harness_sha256", "harness_asset_sha256", "timing", "timing_sha256",
+        "harness_sha256", "harness_asset_sha256", "timing_asset_sha256",
+        "timing", "timing_sha256",
         "package_tree_sha256", "scenario_sha256",
         "seccomp_source_sha256", "transfer_bytes", "transfer_sha256",
         "receipt_sha256", "verifier_sha256", "dormant_proof",
@@ -2182,6 +2214,7 @@ def validate_result_set_fd(
         or evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v3"
         or evidence.get("candidate_sha") != contract["candidate_sha"]
         or evidence.get("harness_sha256") != contract["harness_sha256"]
+        or evidence.get("timing_asset_sha256") != contract["timing_asset_sha256"]
         or evidence.get("timing") != TIMING_CONTRACT
         or evidence.get("timing_sha256") != contract["timing_sha256"]
         or evidence.get("scenario_sha256") != contract["scenario"]["sha256"]
@@ -2198,6 +2231,7 @@ def validate_result_set_fd(
         or set(evidence["harness_asset_sha256"]) != set(FROZEN_ASSETS)
         or any(not isinstance(digest, str) or HEX64.fullmatch(digest) is None for digest in evidence["harness_asset_sha256"].values())
         or evidence["harness_asset_sha256"].get("harness.py") != evidence.get("harness_sha256")
+        or evidence["harness_asset_sha256"].get("timing-contract.json") != evidence.get("timing_asset_sha256")
         or evidence.get("package_tree_sha256") != expected_packages
         or evidence.get("receipt_sha256") != hashlib.sha256(receipt_raw).hexdigest()
         or evidence.get("verifier_sha256") != hashlib.sha256(verifier_raw).hexdigest()
@@ -2218,6 +2252,7 @@ def validate_result_set_fd(
         "status": "pass",
         "candidate_sha": contract["candidate_sha"],
         "harness_sha256": evidence["harness_sha256"],
+        "timing_asset_sha256": evidence["timing_asset_sha256"],
         "timing_sha256": evidence["timing_sha256"],
         "receipt_sha256": evidence["receipt_sha256"],
         "verifier_sha256": evidence["verifier_sha256"],
@@ -2343,6 +2378,7 @@ def create_run_stage(
         "schema_version": "buzz-ci-clean-host-e2e-stage/v2",
         "candidate_sha": contract["candidate_sha"],
         "harness_sha256": contract["harness_sha256"],
+        "timing_asset_sha256": contract["timing_asset_sha256"],
         "timing_sha256": contract["timing_sha256"],
         "candidate_tar_sha256": file_sha256(candidate_tar),
         "scenario_sha256": contract["scenario"]["sha256"],
@@ -2490,6 +2526,7 @@ def run_vm(
                 "schema_version": "buzz-ci-clean-host-e2e-evidence/v3",
                 "candidate_sha": contract["candidate_sha"],
                 "harness_sha256": state_record["harness_sha256"],
+                "timing_asset_sha256": state_record["timing_asset_sha256"],
                 "image_sha256": state_record["image_sha256"],
                 "tool_sha256": state_record["tool_sha256"],
                 "harness_asset_sha256": state_record["harness_asset_sha256"],
@@ -2515,6 +2552,7 @@ def run_vm(
             outcome = {
                 "status": "pass", "candidate_sha": contract["candidate_sha"],
                 "harness_sha256": state_record["harness_sha256"],
+                "timing_asset_sha256": state_record["timing_asset_sha256"],
                 "timing_sha256": state_record["timing_sha256"],
                 "receipt_sha256": receipt_digest, "verifier_sha256": verifier_digest,
                 "evidence_manifest_sha256": hashlib.sha256(canonical(evidence_manifest)).hexdigest(),
@@ -2584,6 +2622,7 @@ def main() -> int:
                     "status": "ready", "candidate_sha": contract["candidate_sha"],
                     "boundary": "bubblewrap+qemu-kvm",
                     "harness_sha256": contract["harness_sha256"],
+                    "timing_asset_sha256": contract["timing_asset_sha256"],
                     "timing": contract["timing"], "timing_sha256": contract["timing_sha256"],
                 }
         sys.stdout.buffer.write(canonical(result))

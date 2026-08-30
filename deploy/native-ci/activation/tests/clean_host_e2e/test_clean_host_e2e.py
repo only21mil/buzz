@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import struct
 import sys
@@ -38,6 +39,7 @@ def state_record(trusted_digest: str = "1" * 64) -> dict[str, object]:
     digest = "1" * 64
     assets = {name: digest for name in harness.FROZEN_ASSETS}
     assets["harness.py"] = harness.current_harness_sha256()
+    assets["timing-contract.json"] = harness.timing_asset_sha256()
     return {
         "schema_version": harness.STATE_SCHEMA,
         "challenge": digest,
@@ -48,6 +50,7 @@ def state_record(trusted_digest: str = "1" * 64) -> dict[str, object]:
         "tool_sha256": {name: digest for name in harness.TOOLS},
         "harness_sha256": harness.current_harness_sha256(),
         "harness_asset_sha256": assets,
+        "timing_asset_sha256": harness.timing_asset_sha256(),
         "timing": harness.TIMING_CONTRACT,
         "timing_sha256": harness.timing_sha256(),
         "trusted_image_sha256": trusted_digest,
@@ -70,7 +73,9 @@ def make_prepared_state(parent: Path) -> Path:
         path = frozen / name
         path.write_bytes(
             Path(harness.__file__).read_bytes()
-            if name == "harness.py" else ("trusted-" + name).encode()
+            if name == "harness.py" else
+            (HERE / "timing-contract.json").read_bytes()
+            if name == "timing-contract.json" else ("trusted-" + name).encode()
         )
         asset_digests[name] = harness.file_sha256(path)
     trusted = state / "trusted.qcow2"
@@ -87,6 +92,7 @@ def make_prepared_state(parent: Path) -> Path:
         "tool_sha256": tool_digests,
         "harness_sha256": harness.current_harness_sha256(),
         "harness_asset_sha256": asset_digests,
+        "timing_asset_sha256": harness.timing_asset_sha256(),
     })
     (state / "state.json").write_bytes(harness.canonical(record))
     return state
@@ -123,6 +129,7 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
         "candidate_root": str(candidate),
         "candidate_sha": candidate_sha,
         "harness_sha256": harness.current_harness_sha256(),
+        "timing_asset_sha256": harness.timing_asset_sha256(),
         "timing": harness.TIMING_CONTRACT,
         "timing_sha256": harness.timing_sha256(),
         "scenario": {"path": str(scenario), "sha256": harness.file_sha256(scenario)},
@@ -403,7 +410,8 @@ class BoundaryTests(unittest.TestCase):
             module.time, "sleep", side_effect=KeyboardInterrupt,
         ):
             with self.assertRaises(KeyboardInterrupt):
-                function(["/usr/bin/sleep", "30"], timeout=10)
+                keywords = {"inventory": False} if module is guest else {}
+                function(["/usr/bin/sleep", "30"], timeout=10, **keywords)
         self.assertEqual(len(spawned), 1)
         self.assertIsNotNone(spawned[0].poll())
         with self.assertRaises(ProcessLookupError):
@@ -586,22 +594,60 @@ class TimingAndProgressTests(unittest.TestCase):
         harness.validate_timing_contract()
         timing = harness.TIMING_CONTRACT
         terms = timing["phase_terms"]
+        inventory = timing["command_inventory"]
         expected_stages = json.loads((HERE.parents[2] / "acceptance/expected-stages.json").read_bytes())
         acceptance_source = (HERE.parents[4] / "crates/buzz-ci-acceptance-ctl/src/acceptance.rs").read_text()
         scenario = json.loads((HERE.parents[2] / "acceptance/scenario.template.json").read_bytes())
-        self.assertIn("for _ in 0..2", acceptance_source)
-        self.assertEqual(terms["canary"]["driver_operation"], len(expected_stages) + 2)
+        zero_attempts = re.findall(r"for _ in 0\.\.(\d+) \{\s*zero_attempts \+= 1", acceptance_source)
+        self.assertEqual(zero_attempts, ["2"])
+        self.assertEqual(terms["canary"]["driver_operation"], len(expected_stages) + int(zero_attempts[0]))
         self.assertEqual(timing["leaf_seconds"]["driver_operation"], scenario["driver"]["timeout_seconds"])
-        self.assertEqual(terms["ceremony"]["command_default"], len(guest.KEY_NAMES) * 4 + 5)
-        self.assertEqual(terms["install"]["command_default"], 3 + len(guest.UNITS) * 2 + 1 + 5)
-        self.assertEqual(terms["controller_stage"]["command_default"], len(guest.UNITS))
-        self.assertEqual(terms["cleanup"]["unit_stop"], len(guest.UNITS) + 1)
-        self.assertEqual(terms["cleanup"]["command_default"], len(guest.UNITS) + 4)
-        self.assertEqual(terms["cleanup"]["guest_command_reap"], len(guest.UNITS) * 2 + 5)
+        self.assertEqual(inventory["ceremony"]["command_default"], len(guest.KEY_NAMES) * 4 + 5)
+        self.assertEqual(inventory["install"]["command_default"], 3 + len(guest.UNITS) * 2 + 1 + 5)
+        self.assertEqual(inventory["controller_stage"]["command_default"], len(guest.UNITS))
+        self.assertEqual(inventory["cleanup"]["unit_stop"], len(guest.UNITS) + 1)
+        self.assertEqual(inventory["cleanup"]["command_default"], len(guest.UNITS) + 4)
+        self.assertEqual(inventory["cleanup"]["guest_command_reap"], len(guest.UNITS) * 2 + 5)
         self.assertEqual(json.loads((HERE / "timing-contract.json").read_bytes()), timing)
         schema = json.loads((HERE / "contract.schema.json").read_bytes())
         self.assertEqual(schema["properties"]["timing"]["const"], timing)
         self.assertEqual(guest.TIMING_CONTRACT, timing)
+
+    def test_command_call_mutations_fail_exact_phase_inventory(self) -> None:
+        source = Path(guest.__file__).read_text()
+        self.assertEqual(source.count("inventory=False"), 1)
+        self.assertIn('"openssl", "s_client"', source)
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            guest, "SCRATCH_ROOT", Path(temporary),
+        ), mock.patch.object(guest.subprocess, "Popen") as popen, mock.patch.object(
+            guest, "reap_process_group",
+        ):
+            popen.return_value.poll.return_value = 0
+            for phase in ("ceremony", "install", "controller_stage", "cleanup"):
+                with self.subTest(phase=phase):
+                    guest._ACTIVE_PHASE = phase
+                    guest._PHASE_DEADLINE = None
+                    guest._OBSERVED_COMMAND_TERMS = dict(
+                        guest.TIMING_CONTRACT["command_inventory"][phase],
+                    )
+                    guest.command(["/usr/bin/true"], allow_failure=True)
+                    with self.assertRaisesRegex(guest.GuestError, f"inventory differs: {phase}"):
+                        guest.verify_command_inventory()
+        guest.abandon_command_inventory()
+
+    def test_canary_stage_and_zero_attempt_mutations_change_nested_bound(self) -> None:
+        source = (HERE.parents[4] / "crates/buzz-ci-acceptance-ctl/src/acceptance.rs").read_text()
+        stages = json.loads((HERE.parents[2] / "acceptance/expected-stages.json").read_bytes())
+
+        def operations(candidate_stages: list[str], candidate_source: str) -> int:
+            matches = re.findall(r"for _ in 0\.\.(\d+) \{\s*zero_attempts \+= 1", candidate_source)
+            self.assertEqual(len(matches), 1)
+            return len(candidate_stages) + int(matches[0])
+
+        declared = harness.TIMING_CONTRACT["phase_terms"]["canary"]["driver_operation"]
+        self.assertEqual(operations(stages, source), declared)
+        self.assertNotEqual(operations([*stages, "mutated_stage"], source), declared)
+        self.assertNotEqual(operations(stages, source.replace("for _ in 0..2", "for _ in 0..3", 1)), declared)
 
     def test_watchdog_boundaries_cover_legal_sequences_cleanup_poweroff_and_reap(self) -> None:
         expected = {"ceremony": 1130, "candidate": 5712, "verifier": 320}
@@ -640,7 +686,9 @@ class TimingAndProgressTests(unittest.TestCase):
                     ["/usr/libexec/buzz-ci-capacity-one-canary"],
                     timeout=guest.canary_command_seconds(),
                 )
+            guest.abandon_command_inventory()
             guest.begin_phase("rollback")
+            guest.record_command_timing({"rollback": 1})
             guest.begin_phase("cleanup")
         self.assertEqual(
             events,
@@ -698,6 +746,33 @@ class TimingAndProgressTests(unittest.TestCase):
             with mock.patch.object(harness, "current_harness_sha256", return_value="f" * 64):
                 with self.assertRaisesRegex(harness.HarnessError, "prepared harness"):
                     harness.validate_prepared_state(state)
+
+    def test_candidate_timing_asset_only_drift_fails_before_vm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            contract_path, _contract, _seccomp = make_run_contract(root, state)
+            real_bounded = harness.bounded
+            timing_probes = 0
+
+            def bounded(argv, **keywords):
+                nonlocal timing_probes
+                if argv[:4] == ["/usr/bin/git", "-C", str(HERE.parents[4]), "show"] and str(argv[4]).endswith("timing-contract.json"):
+                    timing_probes += 1
+                    mutated = json.loads((HERE / "timing-contract.json").read_bytes())
+                    mutated["leaf_seconds"]["phase_margin"] += 1
+                    return harness.canonical(mutated)
+                return real_bounded(argv, **keywords)
+
+            with mock.patch.object(harness, "bounded", side_effect=bounded), mock.patch.object(
+                harness, "validate_flat_qcow2",
+            ), mock.patch.object(
+                harness, "boot",
+            ) as boot:
+                with self.assertRaisesRegex(harness.HarnessError, "candidate commit timing asset binding"):
+                    harness.validate_contract(contract_path)
+            self.assertEqual(timing_probes, 1)
+            boot.assert_not_called()
 
     def test_seed_contract_uses_distinct_instances_stage_mount_and_poweroff(self) -> None:
         observed: list[tuple[str, str]] = []
@@ -905,6 +980,7 @@ class InputTests(unittest.TestCase):
                 "candidate_sha": candidate, "image_sha256": "5" * 64,
                 "tool_sha256": {name: "6" * 64 for name in harness.TOOLS},
                 "harness_sha256": assets["harness.py"],
+                "timing_asset_sha256": assets["timing-contract.json"],
                 "harness_asset_sha256": assets, "package_tree_sha256": {},
                 "timing": harness.TIMING_CONTRACT,
                 "timing_sha256": harness.timing_sha256(),
@@ -923,6 +999,7 @@ class InputTests(unittest.TestCase):
             contract = {
                 "state": str(root / "state"), "candidate_sha": candidate,
                 "harness_sha256": assets["harness.py"],
+                "timing_asset_sha256": assets["timing-contract.json"],
                 "timing": harness.TIMING_CONTRACT,
                 "timing_sha256": harness.timing_sha256(),
                 "scenario": {"path": str(scenario), "sha256": scenario_sha},
@@ -951,6 +1028,7 @@ class InputTests(unittest.TestCase):
                 "tool_sha256": {name: digest for name in harness.TOOLS},
                 "harness_sha256": harness.current_harness_sha256(),
                 "harness_asset_sha256": {name: digest for name in harness.FROZEN_ASSETS},
+                "timing_asset_sha256": digest,
                 "timing": harness.TIMING_CONTRACT,
                 "timing_sha256": harness.timing_sha256(),
                 "trusted_image_sha256": digest,
@@ -2140,6 +2218,7 @@ class InputTests(unittest.TestCase):
                 proof = {
                     "qemu_version": "test", "tool_sha256": tool_sha,
                     "harness_sha256": harness.current_harness_sha256(),
+                    "timing_asset_sha256": harness.timing_asset_sha256(),
                     "timing": harness.TIMING_CONTRACT,
                     "timing_sha256": harness.timing_sha256(),
                 }
@@ -2192,6 +2271,7 @@ class InputTests(unittest.TestCase):
                 proof = {
                     "qemu_version": "test", "tool_sha256": tool_sha,
                     "harness_sha256": harness.current_harness_sha256(),
+                    "timing_asset_sha256": harness.timing_asset_sha256(),
                     "timing": harness.TIMING_CONTRACT,
                     "timing_sha256": harness.timing_sha256(),
                 }
@@ -2300,6 +2380,7 @@ class InputTests(unittest.TestCase):
             contract = {
                 "candidate_sha": candidate_sha, "scenario": {"sha256": scenario_sha},
                 "harness_sha256": harness.current_harness_sha256(),
+                "timing_asset_sha256": harness.timing_asset_sha256(),
                 "timing": harness.TIMING_CONTRACT,
                 "timing_sha256": harness.timing_sha256(),
             }
@@ -2352,6 +2433,8 @@ class InputTests(unittest.TestCase):
             manifest = json.loads((results / "evidence-manifest.json").read_bytes())
             self.assertEqual(manifest["harness_sha256"], harness.current_harness_sha256())
             self.assertEqual(manifest["harness_asset_sha256"]["harness.py"], manifest["harness_sha256"])
+            self.assertEqual(manifest["timing_asset_sha256"], harness.timing_asset_sha256())
+            self.assertEqual(manifest["harness_asset_sha256"]["timing-contract.json"], manifest["timing_asset_sha256"])
             self.assertEqual(manifest["timing"], harness.TIMING_CONTRACT)
             self.assertEqual(manifest["timing_sha256"], harness.timing_sha256())
 

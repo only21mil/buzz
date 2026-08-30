@@ -80,6 +80,7 @@ _PROGRESS_SEQUENCE = 0
 _PROGRESS_STARTED = 0.0
 _ACTIVE_PHASE: str | None = None
 _PHASE_DEADLINE: float | None = None
+_OBSERVED_COMMAND_TERMS: dict[str, int] = {}
 
 
 class GuestError(RuntimeError):
@@ -114,9 +115,10 @@ def timing_terms_seconds(terms: object) -> int:
 
 def phase_seconds(phase: str) -> int:
     phases = TIMING_CONTRACT.get("phase_terms")
-    if not isinstance(phases, dict) or phase not in phases:
+    inventory = TIMING_CONTRACT.get("command_inventory")
+    if not isinstance(phases, dict) or not isinstance(inventory, dict) or phase not in phases or phase not in inventory:
         raise GuestError("guest timing phase differs")
-    return timing_terms_seconds(phases[phase])
+    return timing_terms_seconds(phases[phase]) + timing_terms_seconds(inventory[phase])
 
 
 def canary_command_seconds() -> int:
@@ -185,17 +187,49 @@ def emit_progress(phase: str, event: str = "start") -> None:
     _PROGRESS_SEQUENCE += 1
 
 
-def begin_phase(phase: str) -> None:
-    global _ACTIVE_PHASE, _PHASE_DEADLINE
+def verify_command_inventory() -> None:
+    if _ACTIVE_PHASE is None:
+        return
+    inventory = TIMING_CONTRACT.get("command_inventory")
+    expected = inventory.get(_ACTIVE_PHASE) if isinstance(inventory, dict) else None
+    if not isinstance(expected, dict) or _OBSERVED_COMMAND_TERMS != expected:
+        raise GuestError(f"guest command inventory differs: {_ACTIVE_PHASE}")
+
+
+def abandon_command_inventory() -> None:
+    global _ACTIVE_PHASE, _PHASE_DEADLINE, _OBSERVED_COMMAND_TERMS
+    _ACTIVE_PHASE = None
+    _PHASE_DEADLINE = None
+    _OBSERVED_COMMAND_TERMS = {}
+
+
+def record_command_timing(terms: dict[str, int] | None = None) -> None:
+    if _ACTIVE_PHASE is None:
+        raise GuestError("guest command has no active timing phase")
+    values = {"command_default": 1} if terms is None else terms
+    for name, count in {**values, "guest_command_reap": values.get("guest_command_reap", 0) + 1}.items():
+        if count <= 0:
+            continue
+        timing_leaf(name)
+        _OBSERVED_COMMAND_TERMS[name] = _OBSERVED_COMMAND_TERMS.get(name, 0) + count
+
+
+def begin_phase(phase: str, *, emit_event: bool = True) -> None:
+    global _ACTIVE_PHASE, _PHASE_DEADLINE, _OBSERVED_COMMAND_TERMS
+    verify_command_inventory()
     _ACTIVE_PHASE = phase
     _PHASE_DEADLINE = time.monotonic() + phase_seconds(phase)
-    emit_progress(phase)
+    _OBSERVED_COMMAND_TERMS = {}
+    if emit_event:
+        emit_progress(phase)
 
 
 def complete_progress() -> None:
-    global _ACTIVE_PHASE, _PHASE_DEADLINE
+    global _ACTIVE_PHASE, _PHASE_DEADLINE, _OBSERVED_COMMAND_TERMS
+    verify_command_inventory()
     _ACTIVE_PHASE = "complete"
     _PHASE_DEADLINE = None
+    _OBSERVED_COMMAND_TERMS = {}
     emit_progress("complete", "complete")
 
 
@@ -298,9 +332,15 @@ def reap_process_group(process: subprocess.Popen[bytes], *, wait_seconds: float 
     raise GuestError("guest process group remains after reap")
 
 
-def command(argv: list[str], *, stdin: bytes | None = None, timeout: int | None = None, allow_failure: bool = False) -> subprocess.CompletedProcess[bytes]:
+def command(
+    argv: list[str], *, stdin: bytes | None = None, timeout: int | None = None,
+    allow_failure: bool = False, timing_terms: dict[str, int] | None = None,
+    inventory: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
     if timeout is None:
         timeout = timing_leaf("command_default")
+    if inventory:
+        record_command_timing(timing_terms)
     phase_deadline = _PHASE_DEADLINE
     guest_reap = timing_leaf("guest_command_reap")
     if phase_deadline is not None and time.monotonic() >= phase_deadline - guest_reap:
@@ -790,6 +830,20 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
     )
     if hashlib.sha256(candidate_harness).hexdigest() != descriptor.get("harness_sha256"):
         raise GuestError("candidate harness digest differs inside guest")
+    candidate_timing = read_file(
+        candidate / "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
+        MAX_JSON,
+    )
+    try:
+        candidate_timing_value = json.loads(candidate_timing, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as error:
+        raise GuestError("candidate timing asset JSON differs inside guest") from error
+    if (
+        hashlib.sha256(candidate_timing).hexdigest() != descriptor.get("timing_asset_sha256")
+        or hashlib.sha256(read_file(TIMING_PATH, MAX_JSON)).hexdigest() != descriptor.get("timing_asset_sha256")
+        or candidate_timing_value != TIMING_CONTRACT
+    ):
+        raise GuestError("candidate timing asset binding differs inside guest")
     candidate_sha = descriptor.get("candidate_sha")
     if not isinstance(candidate_sha, str) or HEX40.fullmatch(candidate_sha) is None:
         raise GuestError("candidate binding differs")
@@ -1031,8 +1085,9 @@ def start_relay(public: dict[str, object]) -> None:
     command(["systemctl", "daemon-reload"])
     command(["systemctl", "start", "buzzci-e2e-relay.service"])
     deadline = time.monotonic() + timing_leaf("relay_ready_window")
+    record_command_timing({})
     while time.monotonic() < deadline:
-        probe = command(["openssl", "s_client", "-connect", "relay.test.invalid:3443", "-servername", "relay.test.invalid", "-CAfile", str(STATE_ROOT / "ca.crt"), "-brief"], stdin=b"", timeout=timing_leaf("relay_probe"), allow_failure=True)
+        probe = command(["openssl", "s_client", "-connect", "relay.test.invalid:3443", "-servername", "relay.test.invalid", "-CAfile", str(STATE_ROOT / "ca.crt"), "-brief"], stdin=b"", timeout=timing_leaf("relay_probe"), allow_failure=True, inventory=False)
         if probe.returncode == 0:
             return
         time.sleep(0.1)
@@ -1043,21 +1098,25 @@ def cleanup(candidate: Path, activation_package: Path, attempted_stage: bool, ho
     errors: list[str] = []
     if attempted_stage:
         begin_phase("rollback")
+        rollback_inventory_complete = True
         try:
             installed = Path("/usr/libexec/buzz-ci-activation-controller")
             controller = installed if installed.is_file() else candidate / "deploy/native-ci/activation/controller.py"
-            if command([str(controller), "rollback", "--package", str(activation_package)], timeout=timing_leaf("rollback"), allow_failure=True).returncode != 0:
+            if command([str(controller), "rollback", "--package", str(activation_package)], timeout=timing_leaf("rollback"), allow_failure=True, timing_terms={"rollback": 1}).returncode != 0:
                 errors.append("controller rollback failed")
         except BaseException:
             errors.append("controller rollback could not run")
+            rollback_inventory_complete = False
+        if not rollback_inventory_complete:
+            abandon_command_inventory()
     begin_phase("cleanup")
     for unit in UNITS:
         try:
-            command(["systemctl", "stop", unit], timeout=timing_leaf("unit_stop"), allow_failure=True)
+            command(["systemctl", "stop", unit], timeout=timing_leaf("unit_stop"), allow_failure=True, timing_terms={"unit_stop": 1})
         except BaseException:
             errors.append(f"unit stop could not run: {unit}")
     try:
-        command(["systemctl", "stop", "buzzci-e2e-relay.service"], timeout=timing_leaf("unit_stop"), allow_failure=True)
+        command(["systemctl", "stop", "buzzci-e2e-relay.service"], timeout=timing_leaf("unit_stop"), allow_failure=True, timing_terms={"unit_stop": 1})
     except BaseException:
         errors.append("relay stop could not run")
     for root in (Path("/etc/credstore.encrypted/buzzci-keyholder"), Path("/etc/credstore.encrypted/buzzci-e2e-relay")):
@@ -1088,7 +1147,7 @@ def cleanup(candidate: Path, activation_package: Path, attempted_stage: bool, ho
     try:
         ca_target, _ca_install, ca_remove = ca_backend()
         ca_target.unlink()
-        command(list(ca_remove), timeout=timing_leaf("command_default"))
+        command(list(ca_remove))
     except FileNotFoundError:
         pass
     except GuestError:
@@ -1130,7 +1189,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     if (
         not isinstance(descriptor, dict)
         or set(descriptor) != {
-            "schema_version", "candidate_sha", "harness_sha256", "timing_sha256",
+            "schema_version", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256",
             "candidate_tar_sha256", "scenario_sha256", "seccomp_source_sha256",
             "public_binding_sha256", "package_tree_sha256",
         }
@@ -1138,6 +1197,8 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         or descriptor.get("timing_sha256") != phase.get("timing_sha256")
         or not isinstance(descriptor.get("harness_sha256"), str)
         or HEX64.fullmatch(descriptor["harness_sha256"]) is None
+        or not isinstance(descriptor.get("timing_asset_sha256"), str)
+        or HEX64.fullmatch(descriptor["timing_asset_sha256"]) is None
     ):
         raise GuestError("stage descriptor schema differs")
     if hashlib.sha256(canonical(descriptor)).hexdigest() != phase.get("descriptor_sha256"):
@@ -1174,23 +1235,24 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         units = prove_installed_units(component_units)
         controller = candidate / "deploy/native-ci/activation/controller.py"
         begin_phase("controller_check")
-        command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=timing_leaf("controller_check"))
+        command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=timing_leaf("controller_check"), timing_terms={"controller_check": 1})
         attempted_stage = True
         begin_phase("controller_stage")
-        command(["python3", str(controller), "stage", "--package", str(activation_package), "--scenario", str(inputs / "scenario.json")], timeout=timing_leaf("controller_stage"))
+        command(["python3", str(controller), "stage", "--package", str(activation_package), "--scenario", str(inputs / "scenario.json")], timeout=timing_leaf("controller_stage"), timing_terms={"controller_stage": 1})
         prove_installed_units(expected_units)
         begin_phase("controller_activate")
-        command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=timing_leaf("controller_activate"))
+        command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=timing_leaf("controller_activate"), timing_terms={"controller_activate": 1})
         begin_phase("canary")
-        receipt_raw = command(["/usr/libexec/buzz-ci-capacity-one-canary"], stdin=read_file(inputs / "scenario.json"), timeout=canary_command_seconds()).stdout
+        receipt_raw = command(["/usr/libexec/buzz-ci-capacity-one-canary"], stdin=read_file(inputs / "scenario.json"), timeout=canary_command_seconds(), timing_terms={}).stdout
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)
         receipt_path.chmod(0o400)
         begin_phase("receipt_verifier")
-        verifier_raw = command(["/usr/libexec/buzz-ci-verify-acceptance-receipt", str(inputs / "scenario.json"), str(receipt_path)], timeout=timing_leaf("receipt_verifier")).stdout
+        verifier_raw = command(["/usr/libexec/buzz-ci-verify-acceptance-receipt", str(inputs / "scenario.json"), str(receipt_path)], timeout=timing_leaf("receipt_verifier"), timing_terms={"receipt_verifier": 1}).stdout
         parse_verdict(verifier_raw)
     except BaseException as error:
         primary = error
+        abandon_command_inventory()
     cleanup_errors = cleanup(candidate, activation_package, attempted_stage, hosts_added)
     proof: dict[str, object] | None = None
     if configs is not None and units is not None:
@@ -1328,6 +1390,7 @@ def main(argv: list[str]) -> int:
             raise GuestError("guest phase differs")
         _PROGRESS_SEQUENCE = 0
         _PROGRESS_STARTED = time.monotonic()
+        begin_phase("boot_cloud_init", emit_event=False)
         require_guest()
         disable_swap()
         emit_progress("guest_started")

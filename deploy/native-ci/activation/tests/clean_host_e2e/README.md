@@ -92,8 +92,15 @@ same values in `state.json`. Preflight rejects a state prepared by any other
 tracked harness bytes do not match. Any harness change makes an unused older
 prepared state stale by design.
 
+The exact `timing-contract.json` blob has a separate SHA-256 binding in the
+prepare result, state, run contract, candidate stage descriptor, final evidence,
+and terminal outcome. Preflight reads that path from the candidate Git object,
+then requires both its byte digest and decoded closed object to equal the frozen
+asset before any VM can start. The guest repeats the same check against the
+candidate archive and its staged frozen timing asset.
+
 The frozen `timing-contract.json` is the single timing source. It records leaf
-command limits and worst-case call counts; the guest derives phase deadlines
+command limits and an exact per-phase command inventory; the guest derives phase deadlines
 and the host derives each QEMU watchdog from those terms. The 5,712-second
 candidate watchdog covers a 220-second boot/cloud-init envelope, 1,452 seconds
 for install, 100 for controller check, 680 for controller stage and its 13-unit
@@ -105,6 +112,11 @@ verifier is 320 seconds. Every command count includes its 10-second process-
 group reap allowance, and command-heavy phases add a 30-second local
 orchestration margin. The run scenario's driver timeout must equal the frozen
 120-second leaf; a different scenario cannot silently invalidate the budget.
+Every guest command records its leaf category and reap term. A successful phase
+transition requires the observed inventory to equal the frozen plan, so adding
+a ceremony, install, controller-stage, or cleanup command without updating the
+bound fails closed. The relay readiness probe is the sole exemption because its
+repeated calls are bounded as one fixed window plus one probe-and-reap tail.
 A terminal error names the boot and last
 validated fixed-enum phase, for example `candidate canary watchdog timeout` or
 `candidate cleanup watchdog timeout`. The diagnostic summary contains no guest
