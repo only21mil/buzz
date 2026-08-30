@@ -28,12 +28,24 @@ from typing import Any
 if __name__ == "__main__":
     sys.dont_write_bytecode = True
 
-try:
-    import buzz_ci_activation_package as activation_package
-except ModuleNotFoundError:
-    if Path(__file__).name != "controller.py":
-        raise
+controller_path = Path(__file__).resolve()
+if controller_path.name == "controller.py":
     import package as activation_package
+elif controller_path.name == "buzz-ci-activation-controller":
+    if (
+        controller_path.parent.name == "assets"
+        and controller_path.parent.parent.name == "package"
+    ):
+        fixed_assets = controller_path.parent
+    else:
+        fixed_assets = (
+            controller_path.parents[2]
+            / "var/lib/buzzci/activation-controller/package/assets"
+        )
+    sys.path.insert(0, str(fixed_assets))
+    import buzz_ci_activation_package as activation_package
+else:
+    raise ModuleNotFoundError("activation package module path is not fixed")
 
 RECEIPT_PATH = "/var/lib/buzzci/activation-controller/receipt-v1.json"
 OPERATOR_LOCK_PATH = "/var/lib/buzzci/activation-controller/operator.lock"
@@ -249,28 +261,50 @@ def _execd_package_rollback_readback(
         _bind_execd_install_receipt(manifest, root, active)
         return "required"
     if (
-        set(terminal) != {"schema", "state", "install_receipt"}
+        set(terminal) != {"schema", "state", "install_receipt", "live_target"}
         or terminal.get("schema") != "buzz-ci-execd-package-rollback-receipt-v1"
         or terminal.get("state") != "rolled_back"
         or not isinstance(terminal.get("install_receipt"), dict)
+        or not isinstance(terminal.get("live_target"), dict)
         or active is not None
         or _read_target(root, EXECD_PACKAGE_PREIMAGE_PATH) is not None
     ):
         raise ValueError("execd package rollback receipt differs")
     prior = _bind_execd_install_receipt(manifest, root, terminal["install_receipt"])
+    live_target = terminal["live_target"]
     target = _read_target(root, EXECD_BINARY_PATH, MAX_BINARY_BYTES)
     if prior["state"] == "absent":
+        if live_target != {"state": "absent"}:
+            raise ValueError("execd package rollback live binding differs")
         if target is not None:
             raise ValueError("rolled-back absent execd baseline differs")
     else:
+        binary = prior["binary"]
+        if (
+            set(live_target)
+            != {"state", "device", "inode", "sha256", "mode", "uid", "gid"}
+            or live_target.get("state") != "present"
+            or isinstance(live_target.get("device"), bool)
+            or not isinstance(live_target.get("device"), int)
+            or live_target["device"] < 0
+            or isinstance(live_target.get("inode"), bool)
+            or not isinstance(live_target.get("inode"), int)
+            or live_target["inode"] <= 0
+            or live_target.get("sha256") != binary["sha256"]
+            or live_target.get("mode") != binary["mode"]
+            or live_target.get("uid") != binary["uid"]
+            or live_target.get("gid") != binary["gid"]
+        ):
+            raise ValueError("execd package rollback live binding differs")
         if target is None:
             raise ValueError("rolled-back execd baseline is absent")
         payload, metadata = target
-        binary = prior["binary"]
         expected_uid, expected_gid = _physical_ids(root, binary["uid"], binary["gid"])
         if (
-            activation_package.digest(payload) != binary["sha256"]
-            or stat.S_IMODE(metadata.st_mode) != binary["mode"]
+            metadata.st_dev != live_target["device"]
+            or metadata.st_ino != live_target["inode"]
+            or activation_package.digest(payload) != live_target["sha256"]
+            or stat.S_IMODE(metadata.st_mode) != live_target["mode"]
             or metadata.st_uid != expected_uid
             or metadata.st_gid != expected_gid
         ):
@@ -316,37 +350,94 @@ def _verify_target_digest(root: Path, target: str, expected: dict[str, object], 
         os.close(fd)
 
 
-def _atomic_write(root: Path, target: str, payload: bytes, mode: int, uid: int, gid: int) -> None:
+def _stage_restart_boundary(_phase: str) -> None:
+    """Test seam after restart-relevant durable filesystem boundaries."""
+
+
+def _atomic_write(
+    root: Path, target: str, payload: bytes, mode: int, uid: int, gid: int,
+    *, restart_phase: str | None = None,
+) -> None:
     parent_fd, name = activation_package.open_parent_fd(root, target, create=True)
-    temporary_name = f".{name}.activation-{os.getpid()}-{os.urandom(8).hex()}"
+    temporary_name = (
+        f".{name}.activation-recovery-v1"
+        if restart_phase is not None
+        else f".{name}.activation-{os.getpid()}-{os.urandom(8).hex()}"
+    )
     fd = -1
+    cleanup_temporary = True
     try:
-        fd = os.open(
-            temporary_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=parent_fd,
-        )
-        os.fchmod(fd, mode)
-        if os.geteuid() == 0:
-            os.fchown(fd, uid, gid)
-        elif root == Path("/"):
-            raise PermissionError("live writes require the requested UID and GID")
-        view = memoryview(payload)
-        while view:
-            view = view[os.write(fd, view):]
+        created = False
+        try:
+            fd = os.open(
+                temporary_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            created = True
+        except FileExistsError:
+            if restart_phase is None:
+                raise
+            cleanup_temporary = False
+            fd = os.open(
+                temporary_name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        if created:
+            os.fchmod(fd, mode)
+            if os.geteuid() == 0:
+                os.fchown(fd, uid, gid)
+            elif root == Path("/"):
+                raise PermissionError("live writes require the requested UID and GID")
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(fd, view):]
+        metadata = os.fstat(fd)
+        expected_uid, expected_gid = _physical_ids(root, uid, gid)
+        os.lseek(fd, 0, os.SEEK_SET)
+        observed = bytearray()
+        while len(observed) <= len(payload):
+            chunk = os.read(fd, min(1024 * 1024, len(payload) + 1 - len(observed)))
+            if not chunk:
+                break
+            observed.extend(chunk)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != mode
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or bytes(observed) != payload
+        ):
+            raise ValueError(f"recovery write stage differs: {target}")
+        cleanup_temporary = True
         os.fsync(fd)
         os.close(fd)
         fd = -1
+        if restart_phase is not None:
+            _stage_restart_boundary(f"{restart_phase}:temp")
+            named = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(named.st_mode)
+                or named.st_dev != metadata.st_dev
+                or named.st_ino != metadata.st_ino
+            ):
+                cleanup_temporary = False
+                raise ValueError(f"recovery write stage identity differs: {target}")
         os.rename(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
+        if restart_phase is not None:
+            _stage_restart_boundary(f"{restart_phase}:published")
     finally:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(temporary_name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            pass
+        if cleanup_temporary:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
         os.close(parent_fd)
 
 
@@ -1030,7 +1121,7 @@ def _install_recovery_targets(
     records = _validate_receipt_targets(receipt, manifest)
     entries = {entry["role"]: entry for entry in manifest["entries"]}
     result: dict[str, str] = {}
-    for role in ("activation_package_module", "activation_controller"):
+    for role in ("activation_controller", "activation_package_module"):
         entry = entries[role]
         opened = _read_target(root, entry["target"])
         state = _entry_state(root, entry, opened)
@@ -1052,11 +1143,13 @@ def _install_recovery_targets(
             _atomic_write(
                 root, entry["target"], payloads[entry["source"]],
                 activation_package.parse_mode(entry["install_mode"]), entry["uid"], entry["gid"],
+                restart_phase=f"recovery:{role}",
             )
         _verify_target_digest(root, entry["target"], {
             "sha256": entry["sha256"], "mode": entry["install_mode"],
             "uid": entry["uid"], "gid": entry["gid"],
         }, activation_package.MAX_ASSET_BYTES)
+        _stage_restart_boundary(f"recovery:{role}:readback")
         result[role] = "exact"
     return result
 
@@ -1853,11 +1946,18 @@ def _entry_state(root: Path, entry: dict[str, object], opened: tuple[bytes, os.s
     return "drift"
 
 
-def _managed_readback(manifest: dict[str, Any], root: Path, allowed: set[str]) -> dict[str, str]:
+def _managed_readback(
+    manifest: dict[str, Any], root: Path, allowed: set[str],
+    *, allow_recovery_upgrade: bool = False,
+) -> dict[str, str]:
     result: dict[str, str] = {}
     for entry in manifest["entries"]:
         state = _entry_state(root, entry, _read_target(root, entry["target"]))
-        if state not in allowed:
+        if state not in allowed and not (
+            allow_recovery_upgrade
+            and entry["role"] in ROLLBACK_RECOVERY_ROLES
+            and state == "drift"
+        ):
             raise ValueError(f"managed target drift: {entry['target']} ({state})")
         result[entry["role"]] = state
     return result
@@ -2026,11 +2126,15 @@ def preflight(
     *,
     require_dormant: bool,
     payloads: dict[str, bytes] | None = None,
+    allow_recovery_upgrade: bool = False,
 ) -> dict[str, object]:
     components = _component_readback(manifest, root, allow_installable_absent=True)
     principals = _identity_readback(driver, manifest["identities"], allow_absent=True)
     access_group = _access_group_readback(driver, manifest["access_group"], allow_absent=True)
-    managed = _managed_readback(manifest, root, {"absent", "staged", "prior"})
+    managed = _managed_readback(
+        manifest, root, {"absent", "staged", "prior"},
+        allow_recovery_upgrade=allow_recovery_upgrade,
+    )
     for role in ("runner_config", "controld_config"):
         if managed[role] != "staged":
             raise ValueError(f"frozen component config is absent before activation: {role}")
@@ -2064,7 +2168,11 @@ def _new_receipt(
             prior: dict[str, object] = {"exists": False}
         else:
             payload, metadata = opened
-            if entry["role"] != "execd_config" and _entry_state(root, entry, opened) != "staged":
+            if (
+                entry["role"] != "execd_config"
+                and entry["role"] not in ROLLBACK_RECOVERY_ROLES
+                and _entry_state(root, entry, opened) != "staged"
+            ):
                 raise ValueError(f"staging refuses existing target drift: {entry['target']}")
             prior = {
                 "exists": True,
@@ -3300,6 +3408,39 @@ def _compensate_failed_stage(
     return errors
 
 
+def _retained_recovery_targets_readback(
+    receipt: dict[str, Any], next_manifest: dict[str, Any], root: Path,
+) -> dict[str, str]:
+    marker = _read_rollback_cleanup(root)
+    if marker is None:
+        raise ValueError("rolled-back receipt lacks current rollback cleanup marker")
+    prior_manifest = marker["manifest"]
+    _bind_receipt(receipt, prior_manifest)
+    prior_entries = {entry["role"]: entry for entry in prior_manifest["entries"]}
+    next_entries = {entry["role"]: entry for entry in next_manifest["entries"]}
+    result: dict[str, str] = {}
+    for role in ROLLBACK_RECOVERY_ROLES:
+        entry = prior_entries[role]
+        try:
+            _verify_target_digest(root, entry["target"], {
+                "sha256": entry["sha256"],
+                "mode": entry["install_mode"],
+                "uid": entry["uid"],
+                "gid": entry["gid"],
+            }, activation_package.MAX_ASSET_BYTES)
+            result[role] = "prior"
+        except ValueError:
+            entry = next_entries[role]
+            _verify_target_digest(root, entry["target"], {
+                "sha256": entry["sha256"],
+                "mode": entry["install_mode"],
+                "uid": entry["uid"],
+                "gid": entry["gid"],
+            }, activation_package.MAX_ASSET_BYTES)
+            result[role] = "next"
+    return result
+
+
 def _stage_unlocked(
     manifest: dict[str, Any],
     payloads: dict[str, bytes],
@@ -3313,6 +3454,7 @@ def _stage_unlocked(
     if existing is not None:
         if existing.get("state") == "rolled_back":
             rolled_back_receipt = existing
+            _retained_recovery_targets_readback(existing, manifest, root)
             prior_scope = _qualification_replay_scope(existing.get("qualification"), existing)
             if prior_scope is not None and prior_scope == _generated_qualification_replay_scope(manifest, generated):
                 raise ValueError(
@@ -3362,14 +3504,21 @@ def _stage_unlocked(
                 _complete_rollback_retirement(manifest, root)
                 return result
             raise ValueError(f"activation receipt requires rollback from {existing['state']}")
-    report = preflight(manifest, root, driver, require_dormant=True, payloads=payloads)
+    report = preflight(
+        manifest, root, driver, require_dormant=True, payloads=payloads,
+        allow_recovery_upgrade=rolled_back_receipt is not None,
+    )
     fixed_package = _install_fixed_package(manifest, payloads, root)
+    _verify_fixed_package(manifest, root)
+    _stage_restart_boundary("fixed_package:readback")
+    receipt = _new_receipt(manifest, root, driver, generated)
+    _install_recovery_targets(receipt, manifest, root)
     if rolled_back_receipt is not None:
         _prepare_rollback_retirement(rolled_back_receipt, manifest, root)
-    receipt = _new_receipt(manifest, root, driver, generated)
+        _stage_restart_boundary("rollback_retirement:readback")
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
+    _stage_restart_boundary("preparing_receipt:readback")
     try:
-        _install_recovery_targets(receipt, manifest, root)
         _apply_phase(manifest, payloads, root, "staged")
         driver.provision(manifest["identities"])
         driver.tmpfiles()

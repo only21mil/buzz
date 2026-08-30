@@ -79,8 +79,17 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    reopens the complete package at the fixed root-owned mode-`0700`
    `/var/lib/buzzci/activation-controller/package` before its first receipt,
    marker, managed-file, identity, tmpfiles, or systemd mutation. It installs
-   and reads back the package module and controller from that durable source
-   before applying the remaining generated sysusers, tmpfiles, acceptance
+   the controller first and the package module second from that durable source,
+   using deterministic resumable temporary names, and reads back both before
+   writing a `preparing` receipt or rollback-retirement marker. Before the
+   installed controller is published, the controller asset in the exact fixed
+   package is the restart command. After publication, the installed controller
+   can load the fixed package's module until the module target is published.
+   A later activation accepts each retained recovery target only when it matches
+   the prior rolled-back manifest or the exact successor manifest. It then
+   completes the remaining recovery target before advancing durable state.
+   Only after this restart anchor is exact does it apply the remaining
+   generated sysusers, tmpfiles, acceptance
    binaries and units, target, drop-ins, and capacity-zero configs. After the
    package digest is known, it atomically
    writes the shared acceptance binding receipt, the two acceptance adapter
@@ -164,8 +173,11 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
      --package /var/lib/buzzci/activation-controller/package
    ```
 
-   The retry accepts only a bound terminal execd rollback receipt and exact
-   restored binary baseline before systemd may restart the prior execd unit.
+   The retry accepts only the exact current terminal execd rollback schema. Its
+   `live_target` must prove absence or bind the restored baseline's device,
+   inode, digest, mode, UID, and GID to the candidate-bound install receipt.
+   The controller independently reads the live name and requires that exact
+   proof before systemd may restart the prior execd unit.
    After the prior targets, generated files, ledger, and systemd state pass
    readback, the controller writes root-owned mode-`0600`
    `/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json` and durably
