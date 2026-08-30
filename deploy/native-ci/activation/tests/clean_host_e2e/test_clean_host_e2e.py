@@ -1115,7 +1115,7 @@ class InputTests(unittest.TestCase):
                 state = make_prepared_state(root)
                 binding = harness.run_binding({"state": str(state)}, root / "results")
                 expected = harness.state_identity(state)
-                ownership = harness.run_ownership_record(binding)
+                ownership = harness.run_ownership_record(binding, expected)
                 pending = state / harness.run_ownership_pending_name(ownership, expected)
                 pending.write_bytes(raw)
                 pending.chmod(0o600)
@@ -1137,7 +1137,7 @@ class InputTests(unittest.TestCase):
             second = harness.run_binding({"state": str(state)}, root / "second-results")
             expected = harness.state_identity(state)
             pending = state / harness.run_ownership_pending_name(
-                harness.run_ownership_record(first), expected,
+                harness.run_ownership_record(first, expected), expected,
             )
             pending.write_bytes(b"partial foreign transaction")
             pending.chmod(0o600)
@@ -1352,7 +1352,10 @@ class InputTests(unittest.TestCase):
             self.assertEqual(selected, claimed)
             self.assertTrue(resumed)
             self.assertFalse(state.exists())
-            self.assertEqual(harness.load_json(claimed / harness.RUN_OWNERSHIP), harness.run_ownership_record(binding))
+            self.assertEqual(
+                harness.load_json(claimed / harness.RUN_OWNERSHIP),
+                harness.run_ownership_record(binding, expected),
+            )
             with mock.patch.object(harness, "validate_flat_qcow2"):
                 retried, retried_expected, retried_resumed = harness.claim_run_state(binding)
             self.assertEqual((retried, retried_expected, retried_resumed), (claimed, expected, True))
@@ -1467,7 +1470,10 @@ class InputTests(unittest.TestCase):
             state = make_prepared_state(root)
             binding = harness.run_binding({"state": str(state)}, root / "results")
             ownership = state / harness.RUN_OWNERSHIP
-            raw = json.dumps(harness.run_ownership_record(binding), indent=2).encode() + b"\n"
+            expected = harness.state_identity(state)
+            raw = json.dumps(
+                harness.run_ownership_record(binding, expected), indent=2,
+            ).encode() + b"\n"
             ownership.write_bytes(raw)
             ownership.chmod(0o400)
             with mock.patch.object(harness, "validate_flat_qcow2"):
@@ -1475,6 +1481,114 @@ class InputTests(unittest.TestCase):
                     harness.claim_run_state(binding)
             self.assertTrue(state.exists())
             self.assertEqual(ownership.read_bytes(), raw)
+
+    def test_claim_stale_canonical_identity_never_authorizes_replacement_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, old_identity, _resumed = harness.claim_run_state(binding)
+            stale_ownership = (claimed / harness.RUN_OWNERSHIP).read_bytes()
+            harness.destroy_state(claimed, old_identity)
+
+            replacement = make_prepared_state(root)
+            sentinel = replacement / "sentinel"
+            sentinel.write_text("unrelated replacement")
+            new_identity = harness.state_identity(replacement)
+            self.assertNotEqual(new_identity.inode, old_identity.inode)
+            self.assertEqual(new_identity.marker_sha256, old_identity.marker_sha256)
+            ownership = replacement / harness.RUN_OWNERSHIP
+            ownership.write_bytes(stale_ownership)
+            ownership.chmod(0o400)
+            checkpoints = []
+
+            def fail_if_claimed(name, _path, _descriptor):
+                checkpoints.append(name)
+                if name == "after-claim-rename":
+                    raise OSError("stale ownership reached cleanup authority")
+
+            with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                harness, "claim_checkpoint", side_effect=fail_if_claimed,
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "ownership differs"):
+                    harness.claim_run_state(binding)
+            self.assertNotIn("after-claim-rename", checkpoints)
+            self.assertTrue(replacement.exists())
+            self.assertFalse(Path(binding["claimed_state"]).exists())
+            self.assertEqual(sentinel.read_text(), "unrelated replacement")
+            self.assertEqual(ownership.read_bytes(), stale_ownership)
+
+    def test_claim_canonical_marker_mismatch_preserves_same_inode_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            original_identity = harness.state_identity(state)
+            ownership = state / harness.RUN_OWNERSHIP
+            ownership.write_bytes(harness.canonical(
+                harness.run_ownership_record(binding, original_identity),
+            ))
+            ownership.chmod(0o400)
+            record = harness.load_json(state / "state.json")
+            record["challenge"] = "f" * 64
+            (state / "state.json").write_bytes(harness.canonical(record))
+            changed_identity = harness.state_identity(state)
+            self.assertEqual(changed_identity.inode, original_identity.inode)
+            self.assertNotEqual(changed_identity.marker_sha256, original_identity.marker_sha256)
+            before = ownership.read_bytes()
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                with self.assertRaisesRegex(harness.HarnessError, "ownership differs"):
+                    harness.claim_run_state(binding)
+            self.assertTrue(state.exists())
+            self.assertEqual(ownership.read_bytes(), before)
+
+    def test_claim_legacy_canonical_ownership_is_preserved_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            legacy = harness.publication_record(binding, "running")
+            legacy.pop("schema_version")
+            legacy.pop("phase")
+            legacy["schema_version"] = "buzz-ci-clean-host-e2e-run-ownership/v1"
+            ownership = state / harness.RUN_OWNERSHIP
+            ownership.write_bytes(harness.canonical(legacy))
+            ownership.chmod(0o400)
+            before = ownership.read_bytes()
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                with self.assertRaisesRegex(harness.HarnessError, "ownership differs"):
+                    harness.claim_run_state(binding)
+            self.assertTrue(state.exists())
+            self.assertEqual(ownership.read_bytes(), before)
+
+    def test_claim_rechecks_canonical_identity_before_failure_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            sentinel = state / "sentinel"
+            sentinel.write_text("preserve selected state")
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            ownership = state / harness.RUN_OWNERSHIP
+
+            def replace_authority(name, _path, _descriptor):
+                if name != "before-claim-rename":
+                    return
+                value = harness.load_json(ownership)
+                value["state_identity"]["inode"] += 1
+                ownership.chmod(0o600)
+                ownership.write_bytes(harness.canonical(value))
+                ownership.chmod(0o400)
+                raise OSError("induced failure after authority replacement")
+
+            with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                harness, "claim_checkpoint", side_effect=replace_authority,
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "cleanup authority failed"):
+                    harness.claim_run_state(binding)
+            self.assertTrue(state.exists())
+            self.assertFalse(Path(binding["claimed_state"]).exists())
+            self.assertEqual(sentinel.read_text(), "preserve selected state")
 
     def test_post_first_file_restart_exposes_nothing_and_cleans_exact_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

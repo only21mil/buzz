@@ -1235,11 +1235,22 @@ def validate_contract(
     return validate_contract_value(validate_contract_envelope(load_json(path)))
 
 
-def run_ownership_record(binding: dict[str, str]) -> dict[str, object]:
+def state_identity_record(expected: StateIdentity) -> dict[str, object]:
+    return {
+        "device": expected.device,
+        "inode": expected.inode,
+        "marker_sha256": expected.marker_sha256,
+    }
+
+
+def run_ownership_record(
+    binding: dict[str, str], expected: StateIdentity,
+) -> dict[str, object]:
     ownership = publication_record(binding, "running")
     ownership.pop("schema_version")
     ownership.pop("phase")
-    ownership["schema_version"] = "buzz-ci-clean-host-e2e-run-ownership/v1"
+    ownership["schema_version"] = "buzz-ci-clean-host-e2e-run-ownership/v2"
+    ownership["state_identity"] = state_identity_record(expected)
     return ownership
 
 
@@ -1264,12 +1275,9 @@ def read_run_ownership(directory_fd: int) -> object:
 def run_ownership_pending_name(
     ownership: dict[str, object], expected: StateIdentity,
 ) -> str:
-    identity = {
-        "device": expected.device,
-        "inode": expected.inode,
-        "marker_sha256": expected.marker_sha256,
-    }
-    digest = hashlib.sha256(canonical(ownership) + canonical(identity)).hexdigest()
+    digest = hashlib.sha256(
+        canonical(ownership) + canonical(state_identity_record(expected)),
+    ).hexdigest()
     return f"{RUN_OWNERSHIP_PENDING_PREFIX}{digest}{RUN_OWNERSHIP_PENDING_SUFFIX}"
 
 
@@ -1373,6 +1381,8 @@ def publish_run_ownership(
     directory_fd: int, ownership: dict[str, object], expected: StateIdentity,
     acquired: Callable[[], None],
 ) -> bool:
+    if state_identity_fd(directory_fd) != expected:
+        raise HarnessError("run ownership state identity differs")
     pending_name = run_ownership_pending_name(ownership, expected)
     pending_names = run_ownership_pending_names(directory_fd)
     foreign = pending_names - {pending_name}
@@ -1392,7 +1402,7 @@ def publish_run_ownership(
         except BaseException:
             try:
                 acknowledged = (
-                    read_run_ownership(directory_fd) == ownership
+                    canonical(read_run_ownership(directory_fd)) == canonical(ownership)
                     and pending_name not in run_ownership_pending_names(directory_fd)
                 )
             except BaseException:
@@ -1401,12 +1411,59 @@ def publish_run_ownership(
                 raise
         os.fsync(directory_fd)
         return pending_existed
-    if read_run_ownership(directory_fd) != ownership:
+    if canonical(read_run_ownership(directory_fd)) != canonical(ownership):
         raise HarnessError("VM state ownership differs")
     acquired()
     if pending_name in pending_names:
         discard_pending_run_ownership(directory_fd, pending_name)
     return True
+
+
+def verify_run_ownership_cleanup_authority(
+    directory_fd: int, ownership: dict[str, object], expected: StateIdentity,
+) -> None:
+    if state_identity_fd(directory_fd) != expected:
+        raise HarnessError("run ownership cleanup state identity differs")
+    pending_name = run_ownership_pending_name(ownership, expected)
+    pending_names = run_ownership_pending_names(directory_fd)
+    if pending_names - {pending_name}:
+        raise HarnessError("run ownership cleanup pending transaction differs")
+    try:
+        canonical_ownership = canonical(read_run_ownership(directory_fd))
+    except FileNotFoundError:
+        if pending_names != {pending_name}:
+            raise HarnessError("run ownership cleanup authority is absent")
+        descriptor = os.open(
+            pending_name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) not in {0, 0o400, 0o600}
+            ):
+                raise HarnessError("run ownership cleanup pending record differs")
+        finally:
+            os.close(descriptor)
+        return
+    if canonical_ownership != canonical(ownership):
+        raise HarnessError("run ownership cleanup authority differs")
+
+
+def destroy_run_state(
+    state: Path, expected: StateIdentity, binding: dict[str, str],
+) -> None:
+    directory_fd = open_absolute(state, directory=True)
+    try:
+        verify_run_ownership_cleanup_authority(
+            directory_fd, run_ownership_record(binding, expected), expected,
+        )
+    finally:
+        os.close(directory_fd)
+    destroy_state(state, expected)
 
 
 def path_matches_identity(path: Path, expected: DirectoryIdentity) -> bool:
@@ -1513,9 +1570,11 @@ def _claim_run_state_locked(
         expected = state_identity_fd(directory_fd)
         if state_identity(selected) != expected:
             raise HarnessError("prepared VM state changed during selection")
-        ownership = run_ownership_record(binding)
+        ownership = run_ownership_record(binding, expected)
         def acquired() -> None:
             nonlocal cleanup_allowed
+            if state_identity_fd(directory_fd) != expected:
+                raise HarnessError("run ownership state identity differs")
             cleanup_allowed = True
 
         ownership_existed = publish_run_ownership(
@@ -1568,6 +1627,15 @@ def _claim_run_state_locked(
         return claimed, expected, ownership_existed or lost_acknowledgement
     except BaseException as claim_error:
         if cleanup_allowed:
+            try:
+                verify_run_ownership_cleanup_authority(
+                    directory_fd, ownership, expected,
+                )
+            except BaseException as authority_error:
+                detail = str(authority_error) or type(authority_error).__name__
+                raise HarnessError(
+                    f"terminal run cleanup authority failed: {detail}",
+                ) from claim_error
             sanitize_selected_state(state, claimed, expected, directory_fd, claim_error)
         raise
     finally:
@@ -1615,7 +1683,7 @@ def _terminal_run_locked(
     if resumed and publication is not None:
         cleanup_errors: list[BaseException] = []
         try:
-            destroy_state(claimed, expected)
+            destroy_run_state(claimed, expected, binding)
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
         if publication.get("phase") != "ready" or cleanup_errors:
@@ -1644,7 +1712,7 @@ def _terminal_run_locked(
             raise
         cleanup_errors: list[BaseException] = []
         try:
-            destroy_state(claimed, expected)
+            destroy_run_state(claimed, expected, binding)
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
         if publication is not None or resumed:
@@ -2073,6 +2141,7 @@ def run_vm(
 ) -> dict[str, object]:
     if expected_state is None:
         expected_state = state_identity(state)
+    owned_state = binding is not None
     if binding is None:
         binding = run_binding({**contract, "state": str(state)}, results_arg)
     results: Path | None = None
@@ -2156,7 +2225,10 @@ def run_vm(
 
     cleanup_errors: list[BaseException] = []
     try:
-        destroy_state(state, expected_state)
+        if owned_state:
+            destroy_run_state(state, expected_state, binding)
+        else:
+            destroy_state(state, expected_state)
     except BaseException as error:
         cleanup_errors.append(error)
     if run_error is not None or cleanup_errors:

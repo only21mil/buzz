@@ -388,12 +388,15 @@ through claim, VM execution, result publication, and every cleanup path. Run
 ownership is first written to a recoverable pending name bound to the canonical
 ownership bytes and the selected state's device, inode, and marker digest. The
 harness fsyncs that complete record and atomically renames it to
-`run-ownership.json`. An exact retry can rewrite an empty or partial matching
-pending record. A differently bound pending record grants no cleanup authority
-and fails closed without changing the state. Cleanup moves the selected state
-to its identity-checked tombstone and fsyncs that namespace change before
-zeroing the ownership record, so a crash after zeroing leaves no public
-prepared or claimed state.
+`run-ownership.json`. The canonical v2 record repeats that complete state
+identity. Every resume or cleanup-authority decision compares its exact bytes
+with a record derived from the currently held state descriptor. An exact retry
+can rewrite an empty or partial matching pending record. A differently bound
+pending record, a stale canonical identity, or a legacy v1 record grants no
+cleanup authority and fails closed without changing the state. Cleanup moves
+the selected state to its identity-checked tombstone and fsyncs that namespace
+change before zeroing the ownership record, so a crash after zeroing leaves no
+public prepared or claimed state.
 
 Before using a package against `/`, transfer its root, `assets` directory,
 manifest, and every asset to `root:root`. Both directories must be mode `0700`.
