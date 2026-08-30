@@ -11,6 +11,10 @@ repository.workspace = true
 name = "buzz_ci_controld"
 path = "src/lib.rs"
 
+[[bin]]
+name = "buzz-ci-controld"
+path = "src/main.rs"
+
 [dependencies]
 base64 = { workspace = true }
 buzz-core = { workspace = true }
@@ -26,7 +30,7 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 
 [dev-dependencies]
 tempfile = "3"
