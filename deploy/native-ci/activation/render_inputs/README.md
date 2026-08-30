@@ -36,7 +36,7 @@ python3 "$RENDER" record-sealed-freeze \
 ```
 
 `--output` and every descriptor path are relative to the descriptor directory.
-The clean-host contract preserves those relative paths. Run the v2 harness from
+The clean-host contract preserves those relative paths. Run the v3 harness from
 that same directory when consuming the contract.
 
 `render-draft` consumes the final runner, controld, and keyholder package
@@ -61,10 +61,19 @@ directives, and reference cycles fail. The draft descriptor's
 file emitted by `execd/freeze_package.py prepare-input`.
 
 `render-clean-host` computes the same path, mode, and content tree hash as the
-v2 clean-host harness. It checks every package member against the package
-manifest and rejects missing or extra files. It also checks the candidate HEAD,
-the prepared state's exact `public-binding.json`, the scenario, seccomp source,
-and execd-to-activation bindings.
+v3 clean-host harness. It checks every package member against the package
+manifest and rejects missing or extra files. It reads `harness.py`,
+`guest_entry.py`, and `timing-contract.json` from the exact candidate Git
+object, not from caller-supplied digests. The renderer requires those blobs to
+match its maintained clean-host assets. It also checks their digests against
+the prepared state's mode-`0400` `state.json`, including the frozen guest-entry
+asset. It then emits the harness digest, raw timing-asset digest, decoded timing
+object, and harness-semantic timing digest. The renderer also checks the
+candidate HEAD, the prepared state's exact `public-binding.json`, the scenario,
+seccomp source, and execd-to-activation bindings. The resulting contract has
+the exact closed v3 shape accepted by preflight. Missing, extra, legacy v2, or
+independently drifted harness/timing fields fail before transfer or VM
+execution.
 
 The two `record-*` commands run only after the clean-host result, contract,
 evidence manifest, acceptance receipt, and installed-verifier output form one
@@ -75,5 +84,5 @@ also binds the exact public binding and five package manifests. Both outputs set
 independent gates.
 
 `descriptor.schema.json` defines the five input contracts. `output.schema.json`
-links the existing activation draft, scenario, clean-host v2 contract schemas
+links the existing activation draft, scenario, clean-host v3 contract schemas
 and defines the two evidence-input records.

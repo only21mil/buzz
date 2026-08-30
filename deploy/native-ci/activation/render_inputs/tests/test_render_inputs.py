@@ -152,9 +152,18 @@ class RendererTests(unittest.TestCase):
             "encrypted_credentials_absent": True, "relay_residue_absent": True,
         }
         trees = {name: digit * 64 for name, digit in zip(RENDER.PACKAGE_NAMES, "89abc", strict=True)}
+        timing = json.loads(
+            (RENDER.CLEAN_HOST_ASSET_ROOT / "timing-contract.json").read_bytes(),
+        )
+        harness_sha = "4" * 64
+        timing_asset_sha = "5" * 64
+        timing_sha = hashlib.sha256(RENDER.harness_canonical(timing)).hexdigest()
         contract = {
-            "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v2", "candidate_sha": CANDIDATE,
+            "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3", "candidate_sha": CANDIDATE,
             "state": "state", "candidate_root": "candidate",
+            "harness_sha256": harness_sha,
+            "timing_asset_sha256": timing_asset_sha,
+            "timing": timing, "timing_sha256": timing_sha,
             "scenario": {"path": "scenario.json", "sha256": HEX["scenario"]},
             "seccomp_source": {"path": "seccomp.json", "sha256": RENDER.SECCOMP_SHA256},
             "packages": {name: {"path": name, "tree_sha256": trees[name]} for name in RENDER.PACKAGE_NAMES},
@@ -164,11 +173,21 @@ class RendererTests(unittest.TestCase):
         receipt_ref = write_json(root, "evidence/acceptance-receipt.json", receipt, 0o400)
         verifier_ref = write_json(root, "evidence/verifier.json", verifier, 0o400)
         evidence = {
-            "schema_version": "buzz-ci-clean-host-e2e-evidence/v2", "candidate_sha": CANDIDATE,
+            "schema_version": "buzz-ci-clean-host-e2e-evidence/v3", "candidate_sha": CANDIDATE,
             "image_sha256": "d" * 64, "tool_sha256": {"qemu": "e" * 64},
-            "harness_asset_sha256": {"guest_entry.py": "f" * 64},
+            "harness_sha256": harness_sha,
+            "harness_asset_sha256": {
+                name: (
+                    harness_sha if name == "harness.py" else
+                    timing_asset_sha if name == "timing-contract.json" else "f" * 64
+                )
+                for name in RENDER.HARNESS_ASSET_NAMES
+            },
+            "timing_asset_sha256": timing_asset_sha,
+            "timing": timing, "timing_sha256": timing_sha,
             "package_tree_sha256": trees, "scenario_sha256": HEX["scenario"],
             "seccomp_source_sha256": RENDER.SECCOMP_SHA256,
+            "transfer_bytes": 8 * 1024 * 1024, "transfer_sha256": "7" * 64,
             "receipt_sha256": receipt_ref["sha256"], "verifier_sha256": verifier_ref["sha256"],
             "dormant_proof": proof,
         }
@@ -176,6 +195,8 @@ class RendererTests(unittest.TestCase):
         contract_ref = write_json(root, "evidence/contract.json", contract, 0o400)
         result = {
             "status": "pass", "candidate_sha": CANDIDATE, "vm_state_absent": True,
+            "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
+            "timing_sha256": timing_sha,
             "receipt_sha256": receipt_ref["sha256"], "verifier_sha256": verifier_ref["sha256"],
             "evidence_manifest_sha256": evidence_ref["sha256"], "dormant_proof": proof,
         }
@@ -504,6 +525,44 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(process.returncode, 64)
             self.assertIn("digest differs", process.stderr)
             self.assertFalse((root / "rejected.json").exists())
+
+        mutations = (
+            (
+                "contract", lambda value: value.update(
+                    schema_version="buzz-ci-clean-host-e2e-vm-contract/v2",
+                ), "lifecycle contract candidate differs",
+            ),
+            (
+                "evidence_manifest", lambda value: value.update(
+                    schema_version="buzz-ci-clean-host-e2e-evidence/v2",
+                ), "lifecycle evidence candidate differs",
+            ),
+            (
+                "evidence_manifest", lambda value: value.update(harness_sha256="a" * 64),
+                "lifecycle harness or timing binding differs",
+            ),
+            (
+                "result", lambda value: value.update(timing_sha256="b" * 64),
+                "lifecycle harness or timing binding differs",
+            ),
+        )
+        for member, mutate, message in mutations:
+            with self.subTest(member=member, message=message), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                lifecycle = self.make_lifecycle(root)
+                path = root / str(lifecycle[member]["path"])
+                value = json.loads(path.read_bytes())
+                mutate(value)
+                path.chmod(0o600)
+                lifecycle[member] = write_json(root, str(lifecycle[member]["path"]), value, 0o400)
+                descriptor = {
+                    "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                    "candidate_sha": CANDIDATE, "lifecycle": lifecycle,
+                }
+                process = self.run_cli(root, "record-residue", descriptor, "rejected.json")
+                self.assertEqual(process.returncode, 64)
+                self.assertIn(message, process.stderr)
+                self.assertFalse((root / "rejected.json").exists())
 
     def test_symlinked_reference_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -85,12 +85,14 @@ python3 "$HARNESS" run \
   --results /protected/e2e-results
 ```
 
-The closed v3 contract includes `harness_sha256`, `timing`, and
-`timing_sha256`. Copy these values from `capabilities`; `prepare` records the
-same values in `state.json`. Preflight rejects a state prepared by any other
-`harness.py`, a contract with another timing table, or a candidate commit whose
-tracked harness bytes do not match. Any harness change makes an unused older
-prepared state stale by design.
+The closed v3 contract includes `harness_sha256`, `timing_asset_sha256`,
+`timing`, and `timing_sha256`. The maintained final renderer derives them from
+the exact candidate Git object. For a manually assembled contract, copy the
+same values from `capabilities`; `prepare` records them in `state.json`.
+Preflight rejects a state prepared by any other `harness.py`, a contract with
+another timing asset or timing table, or a candidate commit whose tracked
+harness bytes do not match. Any harness change makes an unused older prepared
+state stale by design.
 
 The exact `timing-contract.json` blob has a separate SHA-256 binding in the
 prepare result, state, run contract, candidate stage descriptor, final evidence,

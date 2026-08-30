@@ -30,7 +30,12 @@ def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     return module
 
 
@@ -39,6 +44,9 @@ ACTIVATION_FREEZER = load_module("bootstrap_activation_freezer", ACTIVATION_ROOT
 CONTROLD_FREEZER = load_module("bootstrap_controld_freezer", CONTROLD_ROOT / "freeze_package.py")
 INVENTORY = load_module("bootstrap_inventory", ACTIVATION_ROOT / "check_package_inventory.py")
 RENDER = load_module("bootstrap_renderer", ACTIVATION_ROOT / "render_inputs/render_inputs.py")
+HARNESS = load_module(
+    "bootstrap_clean_host_harness", ACTIVATION_ROOT / "tests/clean_host_e2e/harness.py",
+)
 EXECD_FREEZER = load_module("bootstrap_execd_freezer", EXECD_ROOT / "freeze_package.py")
 KEYHOLDER_FREEZER = load_module(
     "bootstrap_keyholder_freezer", KEYHOLDER_ROOT / "freeze_package.py",
@@ -287,6 +295,56 @@ class BootstrapCompositionTests(unittest.TestCase):
         finally:
             root.close()
 
+    def _complete_prepared_state(self, ceremony: Path) -> dict[str, object]:
+        state = ceremony / "state"
+        state.chmod(0o700)
+        frozen = state / "frozen-assets"
+        frozen.mkdir(mode=0o700)
+        asset_digests: dict[str, str] = {}
+        harness_root = Path(HARNESS.__file__).resolve().parent
+        for name in HARNESS.FROZEN_ASSETS:
+            source = HARNESS.asset_source(harness_root, name)
+            payload = source.read_bytes()
+            write_file(frozen / name, payload, 0o400)
+            asset_digests[name] = hashlib.sha256(payload).hexdigest()
+        trusted = state / "trusted.qcow2"
+        subprocess.run(
+            [HARNESS.TOOLS["qemu_img"], "create", "-q", "-f", "qcow2", str(trusted), "1M"],
+            check=True,
+        )
+        trusted.chmod(0o400)
+        tool_digests = {
+            name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for name, path in HARNESS.TOOLS.items()
+        }
+        record = {
+            "schema_version": HARNESS.STATE_SCHEMA,
+            "challenge": "1" * 64,
+            "image_sha256": "2" * 64,
+            "qemu_sha256": tool_digests["qemu"],
+            "qemu_img_sha256": tool_digests["qemu_img"],
+            "qemu_version": "composition-test",
+            "tool_sha256": tool_digests,
+            "harness_sha256": asset_digests["harness.py"],
+            "harness_asset_sha256": asset_digests,
+            "timing_asset_sha256": asset_digests["timing-contract.json"],
+            "timing": HARNESS.TIMING_CONTRACT,
+            "timing_sha256": HARNESS.timing_sha256(),
+            "trusted_image_sha256": hashlib.sha256(trusted.read_bytes()).hexdigest(),
+        }
+        write_file(state / "state.json", HARNESS.canonical(record), 0o400)
+        return record
+
+    def _harness_preflight(self, ceremony: Path, contract_name: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable, str(Path(HARNESS.__file__).resolve()), "preflight",
+                "--contract", contract_name,
+            ],
+            cwd=ceremony, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False,
+        )
+
     def test_five_package_bootstrap_composes_without_a_vm(self) -> None:
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as directory:
             ceremony = Path(directory)
@@ -466,6 +524,7 @@ class BootstrapCompositionTests(unittest.TestCase):
 
             seccomp_path = ceremony / "seccomp.json"
             write_file(seccomp_path, Path("/usr/share/containers/seccomp.json").read_bytes(), 0o644)
+            state_record = self._complete_prepared_state(ceremony)
             clean_descriptor = self._write_descriptor(ceremony, "clean-descriptor.json", {
                 "schema_version": "buzz-ci-clean-host-contract-render-input/v1",
                 "candidate_sha": candidate,
@@ -496,8 +555,72 @@ class BootstrapCompositionTests(unittest.TestCase):
             clean_contract = self._render(
                 "render-clean-host", clean_descriptor, "clean-host-contract.json",
             )
+            expected_contract_keys = {
+                "schema_version", "state", "candidate_root", "candidate_sha",
+                "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256",
+                "scenario", "seccomp_source", "packages",
+            }
+            self.assertEqual(set(clean_contract), expected_contract_keys)
+            self.assertEqual(clean_contract["schema_version"], HARNESS.SCHEMA)
+            candidate_bindings = RENDER.candidate_clean_host_bindings(source, candidate)
+            self.assertEqual(
+                {
+                    key: clean_contract[key]
+                    for key in ("harness_sha256", "timing_asset_sha256", "timing", "timing_sha256")
+                },
+                {
+                    key: candidate_bindings[key]
+                    for key in ("harness_sha256", "timing_asset_sha256", "timing", "timing_sha256")
+                },
+            )
+            candidate_guest = subprocess.check_output([
+                "/usr/bin/git", "-C", str(source), "show",
+                f"{candidate}:deploy/native-ci/activation/tests/clean_host_e2e/guest_entry.py",
+            ])
+            self.assertEqual(
+                candidate_bindings["guest_entry_sha256"],
+                hashlib.sha256(candidate_guest).hexdigest(),
+            )
             self.assertEqual(set(clean_contract["packages"]), set(RENDER.PACKAGE_NAMES))
             self.assertEqual(INVENTORY.check_inventory(manifests)["status"], "pass")
+
+            drifted_state = copy.deepcopy(state_record)
+            drifted_state["harness_asset_sha256"]["guest_entry.py"] = "f" * 64
+            write_file(ceremony / "state/state.json", HARNESS.canonical(drifted_state), 0o400)
+            with self.assertRaisesRegex(
+                RENDER.RenderError, "prepared state differs from candidate clean-host assets",
+            ):
+                self._render(
+                    "render-clean-host", clean_descriptor, "rejected-state-contract.json",
+                )
+            self.assertFalse((ceremony / "rejected-state-contract.json").exists())
+            write_file(ceremony / "state/state.json", HARNESS.canonical(state_record), 0o400)
+
+            self.assertEqual(clean_contract["harness_sha256"], state_record["harness_sha256"])
+            self.assertEqual(
+                clean_contract["timing_asset_sha256"], state_record["timing_asset_sha256"],
+            )
+            preflight = self._harness_preflight(ceremony, "clean-host-contract.json")
+            self.assertEqual(preflight.returncode, 0, preflight.stderr)
+            self.assertEqual(json.loads(preflight.stdout)["status"], "ready")
+
+            rejected_contracts = {
+                "stale-v2": {**clean_contract, "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v2"},
+                "missing": {key: value for key, value in clean_contract.items() if key != "timing_sha256"},
+                "extra": {**clean_contract, "unexpected": True},
+                "timing-only": {
+                    **clean_contract,
+                    "timing": {**clean_contract["timing"], "schema_version": "stale"},
+                },
+                "harness-only": {**clean_contract, "harness_sha256": "f" * 64},
+            }
+            for label, rejected in rejected_contracts.items():
+                contract_path = ceremony / f"rejected-{label}.json"
+                write_file(contract_path, HARNESS.canonical(rejected), 0o600)
+                process = self._harness_preflight(ceremony, contract_path.name)
+                with self.subTest(contract=label):
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertIn("run contract", json.loads(process.stderr)["error"])
 
             rejected_inputs = {
                 "mismatched": {**preactivation, "binary_sha256": "d" * 64},

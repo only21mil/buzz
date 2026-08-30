@@ -370,7 +370,9 @@ between the execd and activation packages:
    binary, provenance, and pre-activation input plus the final activation
    package. Any changed or replayed tuple fails.
 6. Run `render-scenario`, then `render-clean-host`, with all five final package
-   manifests and trees.
+   manifests and trees. The final renderer derives the closed v3 harness and
+   timing bindings from the exact candidate Git object and rejects a renderer
+   checkout whose harness, guest entry, or timing asset differs.
 7. Run `check_package_inventory.py` against those same five manifests before
    installation.
 
