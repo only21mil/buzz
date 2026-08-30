@@ -32,7 +32,12 @@ ROLLBACK_RECEIPT_NAME = "rollback-v1.json"
 INSTALL_TRANSACTION_NAME = "install-transaction-v1.json"
 INSTALL_LOCK_NAME = "install.lock"
 CANDIDATE_STAGE_NAME = ".buzz-ci-execd.install-v1"
+CANDIDATE_IDENTITY_NAME = "candidate-identity-v1.json"
+ROLLBACK_STAGE_NAME = ".buzz-ci-execd.rollback-v1"
+ROLLBACK_STAGE_IDENTITY_NAME = "rollback-stage-identity-v1.json"
 INSTALL_TRANSACTION_SCHEMA = "buzz-ci-execd-package-install-transaction-v1"
+CANDIDATE_IDENTITY_SCHEMA = "buzz-ci-execd-package-candidate-identity-v1"
+ROLLBACK_STAGE_IDENTITY_SCHEMA = "buzz-ci-execd-package-rollback-stage-identity-v1"
 RENAME_NOREPLACE = 1
 RENAME_EXCHANGE = 2
 
@@ -561,6 +566,52 @@ def _verify_install_receipt(root: Path, manifest: dict[str, object], *, absent_o
     return True
 
 
+def _verify_installed_candidate_identity(
+    root: Path,
+    manifest: dict[str, object],
+    entry: Entry,
+) -> None:
+    uid = mapped_id(0, root)
+    gid = mapped_id(0, root, group=True)
+    root_fd = _open_root(root)
+    binary_directory = -1
+    receipt_directory = -1
+    try:
+        binary_directory = _open_directory_chain(
+            root_fd,
+            (("usr", None), ("libexec", 0o755)),
+            uid,
+            gid,
+            create=False,
+        )
+        receipt_directory = _open_directory_chain(
+            root_fd,
+            (
+                ("var", 0o755),
+                ("lib", 0o755),
+                ("buzzci", 0o711),
+                ("execd-v2", 0o711),
+                ("package", 0o700),
+            ),
+            uid,
+            gid,
+            create=False,
+        )
+        identity = _read_candidate_identity_at(
+            receipt_directory, manifest, entry, uid, gid
+        )
+        if not _identity_matches_at(
+            binary_directory, Path(entry.target).name, identity
+        ):
+            raise ValueError("installed execd candidate ownership differs")
+    finally:
+        if receipt_directory >= 0:
+            os.close(receipt_directory)
+        if binary_directory >= 0:
+            os.close(binary_directory)
+        os.close(root_fd)
+
+
 def _target_matches(root: Path, entry: Entry) -> bool:
     target = rooted(root, entry.target)
     try:
@@ -857,6 +908,98 @@ def _baseline_identity(prior: _PriorTarget | None) -> dict[str, object]:
     }
 
 
+def _file_identity_value(
+    schema: str,
+    package_id: object,
+    package_digest: object,
+    source_commit: object,
+    target: str,
+    payload: bytes,
+    metadata: os.stat_result,
+) -> dict[str, object]:
+    return {
+        "schema": schema,
+        "package_id": package_id,
+        "package_digest": package_digest,
+        "source_commit": source_commit,
+        "target": target,
+        "sha256": sha256(payload),
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+    }
+
+
+def _read_identity_at(
+    directory_fd: int,
+    name: str,
+    schema: str,
+    manifest: dict[str, object],
+    target: str,
+    expected_sha256: str,
+    expected_mode: int,
+    expected_uid: int,
+    expected_gid: int,
+    identity_uid: int | None = None,
+    identity_gid: int | None = None,
+) -> dict[str, object]:
+    payload, metadata = _read_regular_at(directory_fd, name, MAX_JSON_BYTES)
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"execd package identity is invalid: {name}") from error
+    expected_keys = {
+        "schema", "package_id", "package_digest", "source_commit", "target",
+        "sha256", "mode", "uid", "gid", "device", "inode",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_keys
+        or value.get("schema") != schema
+        or value.get("package_id") != manifest["package_id"]
+        or value.get("package_digest") != manifest["package_digest"]
+        or value.get("source_commit") != manifest["source_commit"]
+        or value.get("target") != target
+        or value.get("sha256") != expected_sha256
+        or value.get("mode") != expected_mode
+        or value.get("uid") != expected_uid
+        or value.get("gid") != expected_gid
+        or isinstance(value.get("device"), bool)
+        or not isinstance(value.get("device"), int)
+        or int(value["device"]) < 0
+        or isinstance(value.get("inode"), bool)
+        or not isinstance(value.get("inode"), int)
+        or int(value["inode"]) <= 0
+        or canonical_json(value) != payload
+        or metadata.st_uid != (expected_uid if identity_uid is None else identity_uid)
+        or metadata.st_gid != (expected_gid if identity_gid is None else identity_gid)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError(f"execd package identity differs: {name}")
+    return value
+
+
+def _identity_matches_at(
+    directory_fd: int,
+    name: str,
+    identity: dict[str, object],
+) -> bool:
+    try:
+        payload, metadata = _read_regular_at(directory_fd, name)
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    return (
+        metadata.st_dev == identity["device"]
+        and metadata.st_ino == identity["inode"]
+        and sha256(payload) == identity["sha256"]
+        and stat.S_IMODE(metadata.st_mode) == identity["mode"]
+        and metadata.st_uid == identity["uid"]
+        and metadata.st_gid == identity["gid"]
+    )
+
+
 def _install_transaction_value(
     manifest: dict[str, object],
     entry: Entry,
@@ -879,6 +1022,7 @@ def _install_transaction_value(
             "uid": uid,
             "gid": gid,
             "stage_name": CANDIDATE_STAGE_NAME,
+            "identity_name": CANDIDATE_IDENTITY_NAME,
         },
     }
 
@@ -913,6 +1057,7 @@ def _read_install_transaction_at(
             "uid": uid,
             "gid": gid,
             "stage_name": CANDIDATE_STAGE_NAME,
+            "identity_name": CANDIDATE_IDENTITY_NAME,
         }
         or canonical_json(value) != payload
         or metadata.st_uid != uid
@@ -1077,6 +1222,72 @@ def _ensure_candidate_stage_at(
         raise ValueError("execd candidate stage differs")
 
 
+def _read_candidate_identity_at(
+    receipt_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    uid: int,
+    gid: int,
+) -> dict[str, object]:
+    return _read_identity_at(
+        receipt_directory,
+        CANDIDATE_IDENTITY_NAME,
+        CANDIDATE_IDENTITY_SCHEMA,
+        manifest,
+        entry.target,
+        entry.sha256,
+        entry.install_mode,
+        uid,
+        gid,
+    )
+
+
+def _ensure_candidate_identity_at(
+    receipt_directory: int,
+    binary_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    uid: int,
+    gid: int,
+) -> dict[str, object]:
+    _ensure_candidate_stage_at(binary_directory, entry, uid, gid)
+    try:
+        identity = _read_candidate_identity_at(
+            receipt_directory, manifest, entry, uid, gid
+        )
+    except FileNotFoundError:
+        payload, metadata = _read_regular_at(
+            binary_directory, CANDIDATE_STAGE_NAME
+        )
+        identity = _file_identity_value(
+            CANDIDATE_IDENTITY_SCHEMA,
+            manifest["package_id"],
+            manifest["package_digest"],
+            manifest["source_commit"],
+            entry.target,
+            payload,
+            metadata,
+        )
+        if not _publish_create_once(
+            receipt_directory,
+            CANDIDATE_IDENTITY_NAME,
+            canonical_json(identity),
+            0o600,
+            uid,
+            gid,
+        ):
+            raise ValueError("execd candidate identity appeared during installation")
+        _durable_phase("candidate_identity")
+        identity = _read_candidate_identity_at(
+            receipt_directory, manifest, entry, uid, gid
+        )
+    if not _identity_matches_at(
+        binary_directory, CANDIDATE_STAGE_NAME, identity
+    ):
+        raise ValueError("execd candidate stage ownership differs")
+    return identity
+
+
 def _renameat2_at(directory_fd: int, source: str, target: str, flags: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
@@ -1105,20 +1316,21 @@ def _renameat2_at(directory_fd: int, source: str, target: str, flags: int) -> No
 def _publish_candidate_cas_at(
     binary_directory: int,
     entry: Entry,
-    identity: dict[str, object],
+    baseline_identity: dict[str, object],
+    candidate_identity: dict[str, object],
     uid: int,
     gid: int,
 ) -> None:
     name = Path(entry.target).name
-    if _binary_matches_at(binary_directory, entry, uid, gid):
+    if _identity_matches_at(binary_directory, name, candidate_identity):
         if _absent_at(binary_directory, CANDIDATE_STAGE_NAME):
             return
-        if identity != {"state": "absent"} and _baseline_matches_identity_at(
-            binary_directory, CANDIDATE_STAGE_NAME, identity
+        if baseline_identity != {"state": "absent"} and _baseline_matches_identity_at(
+            binary_directory, CANDIDATE_STAGE_NAME, baseline_identity
         ):
             _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
             return
-        if identity != {"state": "absent"}:
+        if baseline_identity != {"state": "absent"}:
             _renameat2_at(
                 binary_directory,
                 CANDIDATE_STAGE_NAME,
@@ -1128,10 +1340,13 @@ def _publish_candidate_cas_at(
             os.fsync(binary_directory)
             raise ValueError("execd baseline changed at publication")
         raise ValueError("absent-baseline execd candidate retains a stage")
-    _ensure_candidate_stage_at(binary_directory, entry, uid, gid)
-    if not _baseline_matches_identity_at(binary_directory, name, identity):
+    if not _identity_matches_at(
+        binary_directory, CANDIDATE_STAGE_NAME, candidate_identity
+    ):
+        raise ValueError("execd candidate stage ownership differs")
+    if not _baseline_matches_identity_at(binary_directory, name, baseline_identity):
         raise ValueError("execd baseline changed before publication")
-    if identity == {"state": "absent"}:
+    if baseline_identity == {"state": "absent"}:
         try:
             _renameat2_at(
                 binary_directory,
@@ -1150,9 +1365,9 @@ def _publish_candidate_cas_at(
         )
     os.fsync(binary_directory)
     _durable_phase("candidate_exchanged")
-    if identity != {"state": "absent"}:
+    if baseline_identity != {"state": "absent"}:
         if not _baseline_matches_identity_at(
-            binary_directory, CANDIDATE_STAGE_NAME, identity
+            binary_directory, CANDIDATE_STAGE_NAME, baseline_identity
         ):
             _renameat2_at(
                 binary_directory,
@@ -1166,8 +1381,8 @@ def _publish_candidate_cas_at(
             raise ValueError("execd baseline changed at publication")
         _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
     _durable_phase("candidate_published")
-    if not _binary_matches_at(binary_directory, entry, uid, gid):
-        raise ValueError("installed execd binary readback differs")
+    if not _identity_matches_at(binary_directory, name, candidate_identity):
+        raise ValueError("installed execd candidate ownership differs")
 
 
 def _remove_if_present_at(directory_fd: int, name: str) -> None:
@@ -1187,7 +1402,23 @@ def _restore_transaction_prior_at(
     name: str,
     prior: _PriorTarget | None,
 ) -> None:
-    _restore_prior_at(binary_directory, name, prior)
+    if prior is None:
+        try:
+            os.unlink(name, dir_fd=binary_directory)
+        except FileNotFoundError:
+            pass
+        os.fsync(binary_directory)
+    else:
+        _atomic_replace_at(
+            binary_directory,
+            name,
+            prior.payload,
+            prior.mode,
+            prior.uid,
+            prior.gid,
+        )
+    if not _target_matches_prior_at(binary_directory, name, prior):
+        raise ValueError("prior execd binary rollback readback differs")
 
 
 def _compensate_install_transaction_at(
@@ -1201,7 +1432,15 @@ def _compensate_install_transaction_at(
     gid: int,
 ) -> None:
     name = Path(entry.target).name
-    if _binary_matches_at(binary_directory, entry, uid, gid):
+    try:
+        candidate_identity = _read_candidate_identity_at(
+            receipt_directory, manifest, entry, uid, gid
+        )
+    except FileNotFoundError:
+        candidate_identity = None
+    if candidate_identity is not None and _identity_matches_at(
+        binary_directory, name, candidate_identity
+    ):
         _restore_transaction_prior_at(binary_directory, name, prior)
     elif not _baseline_matches_identity_at(binary_directory, name, identity):
         # A concurrent replacement owns the live name. Preserve it and release
@@ -1219,7 +1458,29 @@ def _compensate_install_transaction_at(
         ):
             raise ValueError("execd package receipt differs during compensation")
         _remove_created_receipt(receipt_directory)
-    _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+    if not _absent_at(binary_directory, CANDIDATE_STAGE_NAME):
+        if candidate_identity is not None:
+            stage_owned = _identity_matches_at(
+                binary_directory, CANDIDATE_STAGE_NAME, candidate_identity
+            )
+        else:
+            try:
+                stage_payload, stage_metadata = _read_regular_at(
+                    binary_directory, CANDIDATE_STAGE_NAME
+                )
+            except (ValueError, OSError) as error:
+                raise ValueError("execd candidate stage differs") from error
+            stage_owned = (
+                sha256(stage_payload) == entry.sha256
+                and stat.S_IMODE(stage_metadata.st_mode) == entry.install_mode
+                and stage_metadata.st_uid == uid
+                and stage_metadata.st_gid == gid
+            )
+        if not stage_owned:
+            raise ValueError("execd candidate stage ownership differs")
+        _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+    if candidate_identity is not None:
+        _remove_if_present_at(receipt_directory, CANDIDATE_IDENTITY_NAME)
     if prior is not None:
         _remove_if_present_at(receipt_directory, PREIMAGE_NAME)
     _remove_install_transaction_at(receipt_directory)
@@ -1344,6 +1605,8 @@ def inspect(package: Path, root: Path) -> dict[str, object]:
     _verify_external_seccomp(root)
     activation_receipt = _activation_receipt_state(root, manifest)
     receipt = _verify_install_receipt(root, manifest, absent_ok=True)
+    if receipt:
+        _verify_installed_candidate_identity(root, manifest, entry)
     changed = [] if _target_matches(root, entry) else [entry.target]
     return {
         "status": "checked",
@@ -1371,14 +1634,26 @@ def _complete_install_transaction_at(
 ) -> None:
     name = Path(entry.target).name
     if phase == "receipted":
+        candidate_identity = _read_candidate_identity_at(
+            receipt_directory, manifest, entry, uid, gid
+        )
         _verify_receipt_at(receipt_directory, manifest, uid, gid)
-        if not _binary_matches_at(binary_directory, entry, uid, gid):
-            raise ValueError("receipted execd candidate differs")
-        _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+        if not _identity_matches_at(binary_directory, name, candidate_identity):
+            raise ValueError("receipted execd candidate ownership differs")
+        if not _absent_at(binary_directory, CANDIDATE_STAGE_NAME):
+            raise ValueError("receipted execd candidate retains a stage")
         _remove_install_transaction_at(receipt_directory)
         _durable_phase("install_complete")
         return
     value = _install_transaction_value(manifest, entry, prior, uid, gid, phase)
+    if phase == "intent":
+        candidate_identity = _ensure_candidate_identity_at(
+            receipt_directory, binary_directory, manifest, entry, uid, gid
+        )
+    else:
+        candidate_identity = _read_candidate_identity_at(
+            receipt_directory, manifest, entry, uid, gid
+        )
 
     if phase == "intent":
         if _baseline_matches_identity_at(binary_directory, name, identity):
@@ -1386,24 +1661,28 @@ def _complete_install_transaction_at(
                 receipt_directory, value, "prepared", uid, gid
             )
             phase = "prepared"
-        elif _binary_matches_at(binary_directory, entry, uid, gid):
-            value = _set_install_transaction_phase_at(
-                receipt_directory, value, "published", uid, gid
-            )
-            phase = "published"
         else:
             raise ValueError("execd baseline changed before publication")
 
     if phase == "prepared":
-        _publish_candidate_cas_at(binary_directory, entry, identity, uid, gid)
+        _publish_candidate_cas_at(
+            binary_directory,
+            entry,
+            identity,
+            candidate_identity,
+            uid,
+            gid,
+        )
         value = _set_install_transaction_phase_at(
             receipt_directory, value, "published", uid, gid
         )
         phase = "published"
 
-    if phase != "published" or not _binary_matches_at(
-        binary_directory, entry, uid, gid
+    if phase != "published" or not _identity_matches_at(
+        binary_directory, name, candidate_identity
     ):
+        raise ValueError("installed execd candidate ownership differs")
+    if not _binary_matches_at(binary_directory, entry, uid, gid):
         raise ValueError("installed execd binary readback differs")
     receipt_created = _publish_receipt(
         receipt_directory, manifest, prior, uid, gid
@@ -1417,9 +1696,12 @@ def _complete_install_transaction_at(
         receipt_directory, value, "receipted", uid, gid
     )
     _verify_receipt_at(receipt_directory, manifest, uid, gid)
+    if not _identity_matches_at(binary_directory, name, candidate_identity):
+        raise ValueError("installed execd candidate ownership differs")
     if not _binary_matches_at(binary_directory, entry, uid, gid):
         raise ValueError("installed execd binary readback differs")
-    _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+    if not _absent_at(binary_directory, CANDIDATE_STAGE_NAME):
+        raise ValueError("installed execd candidate retains a stage")
     _remove_install_transaction_at(receipt_directory)
     _durable_phase("install_complete")
 
@@ -1503,14 +1785,27 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             else:
                 receipt_present = True
             if receipt_present:
-                if not _binary_matches_at(binary_directory, entry, uid, gid):
-                    raise ValueError("installed execd binary drift blocks replacement")
+                candidate_identity = _read_candidate_identity_at(
+                    receipt_directory, manifest, entry, uid, gid
+                )
+                if not _identity_matches_at(
+                    binary_directory,
+                    Path(entry.target).name,
+                    candidate_identity,
+                ):
+                    raise ValueError(
+                        "installed execd candidate ownership differs"
+                    )
                 result["status"] = "unchanged"
                 result["changed_targets"] = []
                 result["install_receipt"] = "verified"
                 return result
             if not _absent_at(receipt_directory, PREIMAGE_NAME):
                 raise ValueError("unreceipted execd package preimage blocks installation")
+            if not _absent_at(receipt_directory, CANDIDATE_IDENTITY_NAME):
+                raise ValueError(
+                    "unreceipted execd candidate identity blocks installation"
+                )
             if not _absent_at(binary_directory, CANDIDATE_STAGE_NAME):
                 raise ValueError("unreceipted execd candidate stage blocks installation")
             prior = _prior_target_at(binary_directory, Path(entry.target).name)
@@ -1759,46 +2054,228 @@ def _target_matches_prior_at(
     )
 
 
-def _restore_prior_at(
-    directory_fd: int,
-    name: str,
+def _read_rollback_stage_identity_at(
+    receipt_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    prior: _PriorTarget,
+    uid: int,
+    gid: int,
+) -> dict[str, object]:
+    return _read_identity_at(
+        receipt_directory,
+        ROLLBACK_STAGE_IDENTITY_NAME,
+        ROLLBACK_STAGE_IDENTITY_SCHEMA,
+        manifest,
+        entry.target,
+        sha256(prior.payload),
+        prior.mode,
+        prior.uid,
+        prior.gid,
+        identity_uid=uid,
+        identity_gid=gid,
+    )
+
+
+def _ensure_rollback_stage_identity_at(
+    receipt_directory: int,
+    binary_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
     prior: _PriorTarget | None,
-) -> None:
+    uid: int,
+    gid: int,
+) -> dict[str, object] | None:
     if prior is None:
-        try:
-            os.unlink(name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-        os.fsync(directory_fd)
-    else:
-        _atomic_replace_at(
-            directory_fd,
-            name,
+        if not _absent_at(receipt_directory, ROLLBACK_STAGE_IDENTITY_NAME):
+            raise ValueError("absent execd baseline has a rollback stage identity")
+        return None
+    try:
+        identity = _read_rollback_stage_identity_at(
+            receipt_directory, manifest, entry, prior, uid, gid
+        )
+    except FileNotFoundError:
+        if not _absent_at(binary_directory, ROLLBACK_STAGE_NAME):
+            raise ValueError("unbound execd rollback stage blocks rollback")
+        if not _publish_create_once(
+            binary_directory,
+            ROLLBACK_STAGE_NAME,
             prior.payload,
             prior.mode,
             prior.uid,
             prior.gid,
+            temporary_stem=Path(entry.target).name,
+        ):
+            raise ValueError("execd rollback stage appeared during publication")
+        payload, metadata = _read_regular_at(binary_directory, ROLLBACK_STAGE_NAME)
+        identity = _file_identity_value(
+            ROLLBACK_STAGE_IDENTITY_SCHEMA,
+            manifest["package_id"],
+            manifest["package_digest"],
+            manifest["source_commit"],
+            entry.target,
+            payload,
+            metadata,
         )
-    if not _target_matches_prior_at(directory_fd, name, prior):
-        raise ValueError("prior execd binary rollback readback differs")
+        if not _publish_create_once(
+            receipt_directory,
+            ROLLBACK_STAGE_IDENTITY_NAME,
+            canonical_json(identity),
+            0o600,
+            uid,
+            gid,
+        ):
+            raise ValueError("execd rollback stage identity appeared during publication")
+        _durable_phase("rollback_stage_identity")
+        identity = _read_rollback_stage_identity_at(
+            receipt_directory, manifest, entry, prior, uid, gid
+        )
+    if not (
+        _identity_matches_at(binary_directory, ROLLBACK_STAGE_NAME, identity)
+        or _identity_matches_at(
+            binary_directory, Path(entry.target).name, identity
+        )
+    ):
+        raise ValueError("execd rollback stage ownership differs")
+    return identity
 
 
-def _restore_candidate_at(
-    directory_fd: int,
+def _rollback_candidate_cas_at(
+    binary_directory: int,
     entry: Entry,
-    uid: int,
-    gid: int,
+    prior: _PriorTarget | None,
+    candidate_identity: dict[str, object],
+    rollback_identity: dict[str, object] | None,
 ) -> None:
-    _atomic_replace_at(
-        directory_fd,
-        Path(entry.target).name,
-        entry.payload,
-        entry.install_mode,
-        uid,
-        gid,
+    name = Path(entry.target).name
+    candidate_live = _identity_matches_at(
+        binary_directory, name, candidate_identity
     )
-    if not _binary_matches_at(directory_fd, entry, uid, gid):
-        raise ValueError("execd candidate compensation readback differs")
+    candidate_stage = _identity_matches_at(
+        binary_directory, ROLLBACK_STAGE_NAME, candidate_identity
+    )
+    if prior is None:
+        if _absent_at(binary_directory, name) and candidate_stage:
+            return
+        if not candidate_live:
+            raise ValueError("installed execd candidate ownership changed before rollback")
+        if not _absent_at(binary_directory, ROLLBACK_STAGE_NAME):
+            raise ValueError("execd rollback stage is occupied")
+        try:
+            _renameat2_at(
+                binary_directory,
+                name,
+                ROLLBACK_STAGE_NAME,
+                RENAME_NOREPLACE,
+            )
+        except FileExistsError as error:
+            raise ValueError("execd rollback stage appeared during mutation") from error
+        os.fsync(binary_directory)
+        _durable_phase("rollback_exchanged")
+        if not _identity_matches_at(
+            binary_directory, ROLLBACK_STAGE_NAME, candidate_identity
+        ):
+            _renameat2_at(
+                binary_directory,
+                ROLLBACK_STAGE_NAME,
+                name,
+                RENAME_NOREPLACE,
+            )
+            os.fsync(binary_directory)
+            raise ValueError("execd candidate changed at rollback mutation")
+        return
+
+    assert rollback_identity is not None
+    prior_live = _identity_matches_at(binary_directory, name, rollback_identity)
+    prior_stage = _identity_matches_at(
+        binary_directory, ROLLBACK_STAGE_NAME, rollback_identity
+    )
+    if prior_live:
+        if candidate_stage:
+            return
+        if not _absent_at(binary_directory, ROLLBACK_STAGE_NAME):
+            _renameat2_at(
+                binary_directory,
+                ROLLBACK_STAGE_NAME,
+                name,
+                RENAME_EXCHANGE,
+            )
+            os.fsync(binary_directory)
+            raise ValueError("execd candidate changed at rollback mutation")
+        raise ValueError("rolling-back execd candidate custody is absent")
+    if not candidate_live or not prior_stage:
+        raise ValueError("installed execd candidate ownership changed before rollback")
+    _renameat2_at(
+        binary_directory,
+        ROLLBACK_STAGE_NAME,
+        name,
+        RENAME_EXCHANGE,
+    )
+    os.fsync(binary_directory)
+    _durable_phase("rollback_exchanged")
+    if not _identity_matches_at(
+        binary_directory, ROLLBACK_STAGE_NAME, candidate_identity
+    ):
+        _renameat2_at(
+            binary_directory,
+            ROLLBACK_STAGE_NAME,
+            name,
+            RENAME_EXCHANGE,
+        )
+        os.fsync(binary_directory)
+        raise ValueError("execd candidate changed at rollback mutation")
+
+
+def _compensate_rollback_publication_at(
+    binary_directory: int,
+    entry: Entry,
+    prior: _PriorTarget | None,
+    candidate_identity: dict[str, object],
+    rollback_identity: dict[str, object] | None,
+) -> None:
+    name = Path(entry.target).name
+    if _identity_matches_at(binary_directory, name, candidate_identity):
+        return
+    if not _identity_matches_at(
+        binary_directory, ROLLBACK_STAGE_NAME, candidate_identity
+    ):
+        return
+    if prior is None:
+        if not _absent_at(binary_directory, name):
+            return
+        _renameat2_at(
+            binary_directory,
+            ROLLBACK_STAGE_NAME,
+            name,
+            RENAME_NOREPLACE,
+        )
+    else:
+        assert rollback_identity is not None
+        if not _identity_matches_at(binary_directory, name, rollback_identity):
+            return
+        _renameat2_at(
+            binary_directory,
+            ROLLBACK_STAGE_NAME,
+            name,
+            RENAME_EXCHANGE,
+        )
+    os.fsync(binary_directory)
+    if not _identity_matches_at(binary_directory, name, candidate_identity):
+        raise ValueError("execd rollback candidate compensation differs")
+
+
+def _finalize_rollback_stages_at(
+    receipt_directory: int,
+    binary_directory: int,
+    candidate_identity: dict[str, object],
+) -> None:
+    if not _absent_at(binary_directory, ROLLBACK_STAGE_NAME):
+        if not _identity_matches_at(
+            binary_directory, ROLLBACK_STAGE_NAME, candidate_identity
+        ):
+            raise ValueError("terminal execd rollback stage ownership differs")
+        _remove_if_present_at(binary_directory, ROLLBACK_STAGE_NAME)
+    _remove_if_present_at(receipt_directory, ROLLBACK_STAGE_IDENTITY_NAME)
 
 
 def _remove_rollback_managed_at(directory_fd: int, prior: _PriorTarget | None) -> None:
@@ -1820,10 +2297,18 @@ def _compensate_rollback(
     manifest: dict[str, object],
     entry: Entry,
     prior: _PriorTarget | None,
+    candidate_identity: dict[str, object],
+    rollback_identity: dict[str, object] | None,
     uid: int,
     gid: int,
 ) -> None:
-    _restore_candidate_at(binary_directory, entry, uid, gid)
+    _compensate_rollback_publication_at(
+        binary_directory,
+        entry,
+        prior,
+        candidate_identity,
+        rollback_identity,
+    )
     if prior is not None:
         _atomic_replace_at(
             receipt_directory,
@@ -1847,6 +2332,13 @@ def _compensate_rollback(
         os.unlink(ROLLBACK_RECEIPT_NAME, dir_fd=receipt_directory)
     except FileNotFoundError:
         pass
+    if not _absent_at(binary_directory, ROLLBACK_STAGE_NAME):
+        if rollback_identity is None or not _identity_matches_at(
+            binary_directory, ROLLBACK_STAGE_NAME, rollback_identity
+        ):
+            raise ValueError("execd rollback compensation stage differs")
+        _remove_if_present_at(binary_directory, ROLLBACK_STAGE_NAME)
+    _remove_if_present_at(receipt_directory, ROLLBACK_STAGE_IDENTITY_NAME)
     os.fsync(receipt_directory)
     _verify_receipt_at(receipt_directory, manifest, uid, gid)
 
@@ -1965,6 +2457,9 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                         f"{compensation_error}"
                     ) from install_recovery_error
                 raise
+        candidate_identity = _read_candidate_identity_at(
+            receipt_directory, manifest, entry, uid, gid
+        )
         try:
             marker_state, marker_prior, marker_receipt = _read_rollback_receipt_at(
                 receipt_directory, manifest, uid, gid
@@ -1978,6 +2473,9 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 receipt_directory, PREIMAGE_NAME
             ):
                 raise ValueError("rolled-back execd package retains active custody")
+            _finalize_rollback_stages_at(
+                receipt_directory, binary_directory, candidate_identity
+            )
             assert marker_receipt is not None
             prior_record = marker_receipt["prior"]
             if marker_prior is not None:
@@ -2016,7 +2514,11 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 uid,
                 gid,
             )
-            candidate_current = _binary_matches_at(binary_directory, entry, uid, gid)
+            candidate_current = _identity_matches_at(
+                binary_directory,
+                Path(entry.target).name,
+                candidate_identity,
+            )
             prior_current = _target_matches_prior_at(
                 binary_directory, Path(entry.target).name, prior
             )
@@ -2035,8 +2537,15 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                     ) from None
         else:
             prior = _verify_receipt_at(receipt_directory, manifest, uid, gid)
-            if not _binary_matches_at(binary_directory, entry, uid, gid):
-                raise ValueError("installed execd binary drift blocks rollback")
+            if not _identity_matches_at(
+                binary_directory,
+                Path(entry.target).name,
+                candidate_identity,
+            ):
+                raise ValueError(
+                    "installed execd binary drift blocks rollback: "
+                    "candidate ownership changed"
+                )
             if not _absent_at(receipt_directory, ROLLBACK_RECEIPT_NAME):
                 raise ValueError("execd rollback receipt appeared during validation")
             rolling = _rollback_receipt_bytes(
@@ -2052,8 +2561,23 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             ):
                 raise ValueError("execd rollback receipt appeared during publication")
             _durable_phase("rollback_intent")
+        rollback_identity = _ensure_rollback_stage_identity_at(
+            receipt_directory,
+            binary_directory,
+            manifest,
+            entry,
+            prior,
+            uid,
+            gid,
+        )
         try:
-            _restore_prior_at(binary_directory, Path(entry.target).name, prior)
+            _rollback_candidate_cas_at(
+                binary_directory,
+                entry,
+                prior,
+                candidate_identity,
+                rollback_identity,
+            )
             _durable_phase("rollback_restored")
             if not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory):
                 raise ValueError("execd binary directory changed during rollback")
@@ -2075,6 +2599,9 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             ) or not _absent_at(receipt_directory, PREIMAGE_NAME):
                 raise ValueError("execd rollback terminal readback differs")
             _durable_phase("rollback_complete")
+            _finalize_rollback_stages_at(
+                receipt_directory, binary_directory, candidate_identity
+            )
         except BaseException as rollback_error:
             try:
                 _compensate_rollback(
@@ -2083,6 +2610,8 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                     manifest,
                     entry,
                     prior,
+                    candidate_identity,
+                    rollback_identity,
                     uid,
                     gid,
                 )
