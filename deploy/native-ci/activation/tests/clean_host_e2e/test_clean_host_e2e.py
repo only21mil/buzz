@@ -36,6 +36,8 @@ guest = load("guest_entry")
 
 def state_record(trusted_digest: str = "1" * 64) -> dict[str, object]:
     digest = "1" * 64
+    assets = {name: digest for name in harness.FROZEN_ASSETS}
+    assets["harness.py"] = harness.current_harness_sha256()
     return {
         "schema_version": harness.STATE_SCHEMA,
         "challenge": digest,
@@ -44,7 +46,10 @@ def state_record(trusted_digest: str = "1" * 64) -> dict[str, object]:
         "qemu_img_sha256": digest,
         "qemu_version": "test",
         "tool_sha256": {name: digest for name in harness.TOOLS},
-        "harness_asset_sha256": {name: digest for name in harness.FROZEN_ASSETS},
+        "harness_sha256": harness.current_harness_sha256(),
+        "harness_asset_sha256": assets,
+        "timing": harness.TIMING_CONTRACT,
+        "timing_sha256": harness.timing_sha256(),
         "trusted_image_sha256": trusted_digest,
     }
 
@@ -63,7 +68,10 @@ def make_prepared_state(parent: Path) -> Path:
     asset_digests = {}
     for name in harness.FROZEN_ASSETS:
         path = frozen / name
-        path.write_bytes(("trusted-" + name).encode())
+        path.write_bytes(
+            Path(harness.__file__).read_bytes()
+            if name == "harness.py" else ("trusted-" + name).encode()
+        )
         asset_digests[name] = harness.file_sha256(path)
     trusted = state / "trusted.qcow2"
     trusted.write_bytes(b"trusted-image")
@@ -77,6 +85,7 @@ def make_prepared_state(parent: Path) -> Path:
         "qemu_sha256": tool_digests["qemu"],
         "qemu_img_sha256": tool_digests["qemu_img"],
         "tool_sha256": tool_digests,
+        "harness_sha256": harness.current_harness_sha256(),
         "harness_asset_sha256": asset_digests,
     })
     (state / "state.json").write_bytes(harness.canonical(record))
@@ -86,8 +95,12 @@ def make_prepared_state(parent: Path) -> Path:
 def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object], str]:
     candidate = HERE.parents[4]
     candidate_sha = harness.bounded([
-        "/usr/bin/git", "-C", str(candidate), "rev-parse", "HEAD^{commit}",
+        "/usr/bin/git", "-C", str(candidate), "stash", "create", "clean-host-unit-test",
     ]).decode().strip()
+    if not candidate_sha:
+        candidate_sha = harness.bounded([
+            "/usr/bin/git", "-C", str(candidate), "rev-parse", "HEAD^{commit}",
+        ]).decode().strip()
     packages = {}
     for name in harness.PACKAGE_NAMES:
         package = parent / f"package-{name}"
@@ -107,6 +120,9 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
         "state": str(state),
         "candidate_root": str(candidate),
         "candidate_sha": candidate_sha,
+        "harness_sha256": harness.current_harness_sha256(),
+        "timing": harness.TIMING_CONTRACT,
+        "timing_sha256": harness.timing_sha256(),
         "scenario": {"path": str(scenario), "sha256": harness.file_sha256(scenario)},
         "seccomp_source": {"path": str(seccomp), "sha256": seccomp_sha},
         "packages": packages,
@@ -148,6 +164,23 @@ def passing_frame(contract: dict[str, object]) -> dict[str, object]:
         "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
         "dormant_proof": proof,
     }
+
+
+def progress_frame(
+    boot: str, sequence: int, phase: str, event: str, elapsed_ms: int,
+    **extra: object,
+) -> bytes:
+    value = {
+        "schema_version": harness.PROGRESS_SCHEMA,
+        "boot": boot,
+        "sequence": sequence,
+        "phase": phase,
+        "event": event,
+        "elapsed_ms": elapsed_ms,
+        **extra,
+    }
+    payload = harness.canonical(value)
+    return struct.pack(">I", len(payload)) + payload + hashlib.sha256(payload).digest()
 
 
 def mount_pairs(command: list[str], option: str) -> list[tuple[str, str]]:
@@ -222,7 +255,8 @@ class BoundaryTests(unittest.TestCase):
             evidence=True, transfer="read-only",
         ))
         self.assertNotIn("evidence.bin", candidate_command)
-        self.assertNotIn("virtserialport", candidate_command)
+        self.assertIn("name=buzzci.progress", candidate_command)
+        self.assertNotIn("name=buzzci.evidence", candidate_command)
         self.assertIn("candidate.qcow2", candidate_command)
         self.assertNotIn("verifier.qcow2", candidate_command)
         self.assertIn("verifier.qcow2", verifier_command)
@@ -242,6 +276,7 @@ class BoundaryTests(unittest.TestCase):
             mount_pairs(candidate, "--bind"),
             [
                 (str(state / "candidate.qcow2"), "/work/candidate.qcow2"),
+                (str(state / "progress.bin"), "/work/progress.bin"),
                 (str(state / "transfer.raw"), "/work/transfer.raw"),
             ],
         )
@@ -249,6 +284,7 @@ class BoundaryTests(unittest.TestCase):
             mount_pairs(verifier, "--bind"),
             [
                 (str(state / "verifier.qcow2"), "/work/verifier.qcow2"),
+                (str(state / "progress.bin"), "/work/progress.bin"),
                 (str(state / "evidence.bin"), "/work/evidence.bin"),
             ],
         )
@@ -300,7 +336,10 @@ class BoundaryTests(unittest.TestCase):
 
             with mock.patch.object(harness, "qemu_command", side_effect=command):
                 with self.assertRaisesRegex(harness.HarnessError, "truncated"):
-                    harness.boot(state, 1, overlay="verifier.qcow2", evidence_expected=True)
+                    harness.boot(
+                        state, harness.watchdog_seconds("verifier"),
+                        overlay="verifier.qcow2", evidence_expected=True,
+                    )
 
     def test_hostile_candidate_persistence_has_no_verifier_overlay_or_evidence_path(self) -> None:
         candidate = " ".join(harness.qemu_command(
@@ -540,6 +579,165 @@ class BoundaryTests(unittest.TestCase):
                 guest.parse_verdict(guest.canonical(value))
 
 
+class TimingAndProgressTests(unittest.TestCase):
+    def test_watchdogs_cover_every_sequential_phase_and_slow_cleanup(self) -> None:
+        harness.validate_timing_contract()
+        phases = harness.TIMING_CONTRACT["phase_timeout_seconds"]
+        candidate = (
+            phases["boot_cloud_init"] + phases["install"] + phases["controller_check"]
+            + phases["controller_stage"] + phases["controller_activate"]
+            + phases["canary"] + phases["receipt_verifier"] + phases["rollback"]
+            + phases["cleanup"] + phases["poweroff"]
+        )
+        self.assertEqual(candidate, 1830)
+        self.assertEqual(harness.watchdog_seconds("candidate"), candidate)
+        self.assertGreater(candidate, 900)
+        self.assertGreaterEqual(candidate, phases["canary"] + phases["cleanup"])
+        self.assertEqual(
+            harness.watchdog_seconds("verifier"),
+            phases["boot_cloud_init"] + phases["verifier"] + phases["poweroff"],
+        )
+        self.assertEqual(
+            harness.watchdog_seconds("ceremony"),
+            phases["boot_cloud_init"] + phases["ceremony"] + phases["poweroff"],
+        )
+        schema = json.loads((HERE / "contract.schema.json").read_bytes())
+        self.assertEqual(schema["properties"]["timing"]["const"], harness.TIMING_CONTRACT)
+        self.assertEqual(guest.TIMING_CONTRACT, harness.TIMING_CONTRACT)
+
+    def test_inner_timeout_is_recorded_before_rollback_and_cleanup(self) -> None:
+        events: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            guest, "SCRATCH_ROOT", Path(temporary),
+        ), mock.patch.object(
+            guest, "emit_progress", side_effect=lambda phase, event="start": events.append((phase, event)),
+        ), mock.patch.object(
+            guest.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 611.0, 611.0, 611.0]
+        ), mock.patch.object(guest.subprocess, "Popen") as popen, mock.patch.object(
+            guest, "reap_process_group",
+        ):
+            process = popen.return_value
+            process.poll.return_value = None
+            guest._ACTIVE_PHASE = None
+            guest._PHASE_DEADLINE = None
+            guest.begin_phase("canary")
+            with self.assertRaisesRegex(guest.GuestError, "timed out"):
+                guest.command(["/usr/libexec/buzz-ci-capacity-one-canary"], timeout=600)
+            guest.begin_phase("rollback")
+            guest.begin_phase("cleanup")
+        self.assertEqual(
+            events,
+            [("canary", "start"), ("canary", "timeout"), ("rollback", "start"), ("cleanup", "start")],
+        )
+
+    def test_progress_schema_order_caps_truncation_and_secret_fields(self) -> None:
+        valid = b"".join((
+            progress_frame("candidate", 0, "guest_started", "start", 1),
+            progress_frame("candidate", 1, "install", "start", 2),
+            progress_frame("candidate", 2, "canary", "start", 3),
+            progress_frame("candidate", 3, "canary", "timeout", 613_000),
+            progress_frame("candidate", 4, "rollback", "start", 613_001),
+            progress_frame("candidate", 5, "cleanup", "start", 613_002),
+        ))
+        parsed = harness.parse_progress(valid, "candidate")
+        self.assertEqual(parsed["status"], "valid")
+        self.assertEqual(len(parsed["records"]), 6)
+        self.assertEqual(harness.parse_progress(b"", "candidate")["status"], "missing")
+        self.assertEqual(harness.parse_progress(valid[:-1], "candidate")["status"], "invalid")
+        tampered = bytearray(valid)
+        tampered[-1] ^= 1
+        self.assertEqual(harness.parse_progress(bytes(tampered), "candidate")["status"], "invalid")
+        stale = progress_frame("candidate", 0, "canary", "start", 5) + progress_frame(
+            "candidate", 1, "install", "start", 6,
+        )
+        self.assertEqual(harness.parse_progress(stale, "candidate")["status"], "invalid")
+        secret = progress_frame("candidate", 0, "guest_started", "start", 1, private_key="forbidden")
+        self.assertEqual(harness.parse_progress(secret, "candidate")["status"], "invalid")
+        too_many = b"".join(
+            progress_frame("candidate", sequence, "install", "start", sequence)
+            for sequence in range(harness.MAX_PROGRESS_RECORDS + 1)
+        )
+        self.assertEqual(harness.parse_progress(too_many, "candidate")["status"], "invalid")
+
+    def test_host_error_names_boot_inner_and_cleanup_timeouts(self) -> None:
+        missing = harness.progress_failure(
+            "verifier", {"status": "missing", "records": []}, timed_out=True,
+        )
+        self.assertIn("verifier boot_cloud_init watchdog timeout", str(missing))
+        for phase in (
+            "install", "controller_stage", "canary", "receipt_verifier", "rollback", "cleanup",
+        ):
+            raw = progress_frame("candidate", 0, phase, "start", 1) + progress_frame(
+                "candidate", 1, phase, "timeout", 2,
+            )
+            error = harness.progress_failure(
+                "candidate", harness.parse_progress(raw, "candidate"), timed_out=False,
+            )
+            self.assertIn(f"candidate {phase} inner timeout", str(error))
+
+    def test_prepared_harness_drift_fails_before_vm_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = make_prepared_state(Path(temporary))
+            with mock.patch.object(harness, "current_harness_sha256", return_value="f" * 64):
+                with self.assertRaisesRegex(harness.HarnessError, "prepared harness"):
+                    harness.validate_prepared_state(state)
+
+    def test_seed_contract_uses_distinct_instances_stage_mount_and_poweroff(self) -> None:
+        observed: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+
+            def cloud_localds(_argv, **_kwargs):
+                observed.append((
+                    (state / "seed-source/meta-data").read_text(),
+                    (state / "seed-source/user-data").read_text(),
+                ))
+                (state / "seed.iso").write_bytes(b"seed")
+                return b""
+
+            with mock.patch.object(harness, "bounded", side_effect=cloud_localds):
+                for instance_id in ("buzzci-ceremony-a", "buzzci-run-a", "buzzci-verify-a"):
+                    harness.make_seed(state, instance_id)
+                    (state / "seed.iso").unlink()
+        self.assertEqual(
+            [metadata.splitlines()[0] for metadata, _user_data in observed],
+            [
+                "instance-id: buzzci-ceremony-a", "instance-id: buzzci-run-a",
+                "instance-id: buzzci-verify-a",
+            ],
+        )
+        for _metadata, user_data in observed:
+            self.assertIn("LABEL=BUZZCI_STAGE, /mnt/buzzci-stage, iso9660", user_data)
+            self.assertIn("python3, /mnt/buzzci-stage/guest_entry.py", user_data)
+            self.assertIn("mode: poweroff", user_data)
+            self.assertIn("timeout: 30", user_data)
+        candidate = " ".join(harness.qemu_command(
+            Path("/state"), overlay="candidate.qcow2", evidence=False, transfer="read-write",
+        ))
+        self.assertIn("serial=buzzci-transfer", candidate)
+        self.assertIn("file=/work/transfer.raw", candidate)
+
+    def test_candidate_timeout_still_destroys_state_and_partial_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_destroyable_state(root)
+            results = root / "results"
+
+            def create_image(image_state, name, _backing):
+                (image_state / name).write_bytes(b"overlay")
+
+            with mock.patch.object(harness, "qemu_img_create", side_effect=create_image), mock.patch.object(
+                harness, "create_run_stage",
+            ), mock.patch.object(
+                harness, "boot", side_effect=harness.HarnessError("candidate canary watchdog timeout"),
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "candidate canary watchdog timeout"):
+                    harness.run_vm({}, state, {}, b"", b"", results)
+            self.assertFalse(state.exists())
+            self.assertFalse(results.exists())
+            self.assertFalse(results.with_name(f".{results.name}.clean-host-staging").exists())
+
+
 class InputTests(unittest.TestCase):
     def test_created_private_path_rejects_symbolic_parent_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -562,8 +760,9 @@ class InputTests(unittest.TestCase):
             for name in harness.FROZEN_ASSETS:
                 (frozen / name).write_bytes(("frozen-" + name).encode())
             harness.stage_common(state, stage, {"phase": "test"})
-            for name in harness.FROZEN_ASSETS:
+            for name in harness.GUEST_ASSETS:
                 self.assertEqual((stage / name).read_bytes(), ("frozen-" + name).encode())
+            self.assertFalse((stage / "harness.py").exists())
 
     def test_tree_digest_rejects_links_and_binds_mode_name_and_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -685,10 +884,13 @@ class InputTests(unittest.TestCase):
                 for name in harness.FROZEN_ASSETS
             }
             evidence = {
-                "schema_version": "buzz-ci-clean-host-e2e-evidence/v2",
+                "schema_version": "buzz-ci-clean-host-e2e-evidence/v3",
                 "candidate_sha": candidate, "image_sha256": "5" * 64,
                 "tool_sha256": {name: "6" * 64 for name in harness.TOOLS},
+                "harness_sha256": assets["harness.py"],
                 "harness_asset_sha256": assets, "package_tree_sha256": {},
+                "timing": harness.TIMING_CONTRACT,
+                "timing_sha256": harness.timing_sha256(),
                 "scenario_sha256": scenario_sha,
                 "seccomp_source_sha256": harness.SECCOMP_SHA256,
                 "transfer_bytes": harness.TRANSFER_SIZE, "transfer_sha256": "7" * 64,
@@ -703,6 +905,9 @@ class InputTests(unittest.TestCase):
                 path.chmod(0o400)
             contract = {
                 "state": str(root / "state"), "candidate_sha": candidate,
+                "harness_sha256": assets["harness.py"],
+                "timing": harness.TIMING_CONTRACT,
+                "timing_sha256": harness.timing_sha256(),
                 "scenario": {"path": str(scenario), "sha256": scenario_sha},
             }
             with self.assertRaisesRegex(harness.HarnessError, "frozen receipt verifier rejected"):
@@ -727,7 +932,10 @@ class InputTests(unittest.TestCase):
                 "qemu_img_sha256": digest,
                 "qemu_version": "test",
                 "tool_sha256": {name: digest for name in harness.TOOLS},
+                "harness_sha256": harness.current_harness_sha256(),
                 "harness_asset_sha256": {name: digest for name in harness.FROZEN_ASSETS},
+                "timing": harness.TIMING_CONTRACT,
+                "timing_sha256": harness.timing_sha256(),
                 "trusted_image_sha256": digest,
             }))
             (state / "candidate.qcow2").write_bytes(b"ephemeral")
@@ -1912,7 +2120,12 @@ class InputTests(unittest.TestCase):
                     controld_uid=1201,
                     controld_gid=1201,
                 )
-                proof = {"qemu_version": "test", "tool_sha256": tool_sha}
+                proof = {
+                    "qemu_version": "test", "tool_sha256": tool_sha,
+                    "harness_sha256": harness.current_harness_sha256(),
+                    "timing": harness.TIMING_CONTRACT,
+                    "timing_sha256": harness.timing_sha256(),
+                }
                 frame = {
                     "schema_version": harness.FRAME_SCHEMA,
                     "phase": "ceremony",
@@ -1959,7 +2172,12 @@ class InputTests(unittest.TestCase):
                     qemu_sha256=tool_sha["qemu"], qemu_img_sha256=tool_sha["qemu_img"],
                     controld_uid=1201, controld_gid=1201,
                 )
-                proof = {"qemu_version": "test", "tool_sha256": tool_sha}
+                proof = {
+                    "qemu_version": "test", "tool_sha256": tool_sha,
+                    "harness_sha256": harness.current_harness_sha256(),
+                    "timing": harness.TIMING_CONTRACT,
+                    "timing_sha256": harness.timing_sha256(),
+                }
                 real_mkdir = Path.mkdir
                 real_write = Path.write_bytes
                 real_chmod = Path.chmod
@@ -2062,7 +2280,12 @@ class InputTests(unittest.TestCase):
             results = root / "results"
             candidate_sha = "2" * 40
             scenario_sha = "3" * 64
-            contract = {"candidate_sha": candidate_sha, "scenario": {"sha256": scenario_sha}}
+            contract = {
+                "candidate_sha": candidate_sha, "scenario": {"sha256": scenario_sha},
+                "harness_sha256": harness.current_harness_sha256(),
+                "timing": harness.TIMING_CONTRACT,
+                "timing_sha256": harness.timing_sha256(),
+            }
             records = {
                 name: [("payload", 0o400, name.encode())]
                 for name in harness.PACKAGE_NAMES
@@ -2109,6 +2332,11 @@ class InputTests(unittest.TestCase):
                 {"acceptance-receipt.json", "verifier.json", "evidence-manifest.json"},
             )
             self.assertEqual((results / "acceptance-receipt.json").read_bytes(), harness.canonical(receipt))
+            manifest = json.loads((results / "evidence-manifest.json").read_bytes())
+            self.assertEqual(manifest["harness_sha256"], harness.current_harness_sha256())
+            self.assertEqual(manifest["harness_asset_sha256"]["harness.py"], manifest["harness_sha256"])
+            self.assertEqual(manifest["timing"], harness.TIMING_CONTRACT)
+            self.assertEqual(manifest["timing_sha256"], harness.timing_sha256())
 
     def test_backed_or_external_data_qcow2_is_rejected(self) -> None:
         base = {"format": "qcow2", "virtual-size": 1024 * 1024, "backing-filename": "parent.qcow2"}

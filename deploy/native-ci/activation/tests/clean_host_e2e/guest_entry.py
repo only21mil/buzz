@@ -23,12 +23,14 @@ import tarfile
 import tempfile
 import time
 
-PHASE_SCHEMA = "buzz-ci-clean-host-e2e-guest-phase/v2"
+PHASE_SCHEMA = "buzz-ci-clean-host-e2e-guest-phase/v3"
 FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
+PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
 BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v2"
 STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v2"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
 EVIDENCE_DEVICE = Path("/dev/virtio-ports/buzzci.evidence")
+PROGRESS_DEVICE = Path("/dev/virtio-ports/buzzci.progress")
 TRANSFER_DEVICE = Path("/dev/vdb")
 KEY_NAMES = ("ci-event", "nip98", "manifest", "acceptance-actor")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
@@ -71,6 +73,31 @@ CA_BACKENDS = (
         ("update-ca-trust", "extract"),
     ),
 )
+TIMING_CONTRACT = {
+    "schema_version": "buzz-ci-clean-host-e2e-timing/v1",
+    "phase_timeout_seconds": {
+        "boot_cloud_init": 180,
+        "ceremony": 180,
+        "install": 300,
+        "controller_check": 70,
+        "controller_stage": 130,
+        "controller_activate": 130,
+        "canary": 610,
+        "receipt_verifier": 70,
+        "rollback": 70,
+        "cleanup": 240,
+        "verifier": 60,
+        "poweroff": 30,
+    },
+    "watchdog_seconds": {"ceremony": 390, "candidate": 1830, "verifier": 270},
+    "guest_command_reap_seconds": 10,
+    "host_reap_seconds": 10,
+}
+_PROGRESS_BOOT: str | None = None
+_PROGRESS_SEQUENCE = 0
+_PROGRESS_STARTED = 0.0
+_ACTIVE_PHASE: str | None = None
+_PHASE_DEADLINE: float | None = None
 
 
 class GuestError(RuntimeError):
@@ -79,6 +106,86 @@ class GuestError(RuntimeError):
 
 def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+
+
+def timing_sha256() -> str:
+    return hashlib.sha256(canonical(TIMING_CONTRACT)).hexdigest()
+
+
+def open_progress_device() -> int:
+    try:
+        directory_fd = open_absolute(PROGRESS_DEVICE.parent, directory=True)
+        try:
+            target = os.readlink(PROGRESS_DEVICE.name, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        match = VIRTIO_PORT_TARGET.fullmatch(target)
+        if match is None:
+            raise GuestError("progress transport link target is unsafe")
+        dev_fd = open_absolute(PROGRESS_DEVICE.parent.parent, directory=True)
+        try:
+            descriptor = os.open(
+                match.group(1), os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=dev_fd,
+            )
+        finally:
+            os.close(dev_fd)
+        if not stat.S_ISCHR(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise GuestError("progress transport target is not a character device")
+        return descriptor
+    except OSError as error:
+        raise GuestError("progress transport is unavailable") from error
+
+
+def emit_progress(phase: str, event: str = "start") -> None:
+    """Best-effort diagnostic signal. Acceptance never depends on this channel."""
+    global _PROGRESS_SEQUENCE
+    if _PROGRESS_BOOT is None:
+        return
+    value = {
+        "schema_version": PROGRESS_SCHEMA,
+        "boot": _PROGRESS_BOOT,
+        "sequence": _PROGRESS_SEQUENCE,
+        "phase": phase,
+        "event": event,
+        "elapsed_ms": max(0, int((time.monotonic() - _PROGRESS_STARTED) * 1000)),
+    }
+    payload = canonical(value)
+    if len(payload) > 512:
+        return
+    frame = struct.pack(">I", len(payload)) + payload + hashlib.sha256(payload).digest()
+    try:
+        descriptor = open_progress_device()
+        try:
+            view = memoryview(frame)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    return
+                view = view[written:]
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        return
+    _PROGRESS_SEQUENCE += 1
+
+
+def begin_phase(phase: str) -> None:
+    global _ACTIVE_PHASE, _PHASE_DEADLINE
+    phase_timeouts = TIMING_CONTRACT["phase_timeout_seconds"]
+    if not isinstance(phase_timeouts, dict) or not isinstance(phase_timeouts.get(phase), int):
+        raise GuestError("guest timing phase differs")
+    _ACTIVE_PHASE = phase
+    _PHASE_DEADLINE = time.monotonic() + phase_timeouts[phase]
+    emit_progress(phase)
+
+
+def complete_progress() -> None:
+    global _ACTIVE_PHASE, _PHASE_DEADLINE
+    _ACTIVE_PHASE = "complete"
+    _PHASE_DEADLINE = None
+    emit_progress("complete", "complete")
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -181,6 +288,12 @@ def reap_process_group(process: subprocess.Popen[bytes], *, wait_seconds: float 
 
 
 def command(argv: list[str], *, stdin: bytes | None = None, timeout: int = 30, allow_failure: bool = False) -> subprocess.CompletedProcess[bytes]:
+    phase_deadline = _PHASE_DEADLINE
+    guest_reap = int(TIMING_CONTRACT["guest_command_reap_seconds"])
+    if phase_deadline is not None and time.monotonic() >= phase_deadline - guest_reap:
+        if _ACTIVE_PHASE is not None:
+            emit_progress(_ACTIVE_PHASE, "timeout")
+        raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
     with (
         tempfile.TemporaryFile(dir=SCRATCH_ROOT) as input_file,
         tempfile.TemporaryFile(dir=SCRATCH_ROOT) as stdout,
@@ -196,17 +309,21 @@ def command(argv: list[str], *, stdin: bytes | None = None, timeout: int = 30, a
         )
         try:
             deadline = time.monotonic() + timeout
+            if phase_deadline is not None:
+                deadline = min(deadline, phase_deadline - guest_reap)
             while process.poll() is None:
                 if stdout.tell() > MAX_COMMAND or stderr.tell() > MAX_COMMAND:
                     raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
                 if time.monotonic() >= deadline:
+                    if _ACTIVE_PHASE is not None:
+                        emit_progress(_ACTIVE_PHASE, "timeout")
                     raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
                 time.sleep(0.01)
             stdout.seek(0)
             stderr.seek(0)
             result = subprocess.CompletedProcess(argv, process.returncode, stdout.read(MAX_COMMAND + 1), stderr.read(MAX_COMMAND + 1))
         finally:
-            reap_process_group(process)
+            reap_process_group(process, wait_seconds=guest_reap)
     if len(result.stdout) > MAX_COMMAND or len(result.stderr) > MAX_COMMAND:
         raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
     if result.returncode != 0 and not allow_failure:
@@ -438,6 +555,7 @@ def encrypt(source: Path, name: str, target_root: Path) -> None:
 
 
 def ceremony(phase: dict[str, object]) -> dict[str, object]:
+    begin_phase("ceremony")
     uid = phase.get("controld_uid")
     gid = phase.get("controld_gid")
     if not isinstance(uid, int) or isinstance(uid, bool) or not 1 <= uid <= 0xFFFFFFFF:
@@ -505,10 +623,12 @@ def ceremony(phase: dict[str, object]) -> dict[str, object]:
     binding_path = STATE_ROOT / "public-binding.json"
     binding_path.write_bytes(canonical(binding))
     binding_path.chmod(0o444)
-    return {
+    result = {
         "phase": "ceremony", "challenge": phase["challenge"], "outcome": "pass",
         "public_binding": binding, "raw_key_absence": True,
     }
+    complete_progress()
+    return result
 
 
 def normalized(relative: Path) -> str:
@@ -651,6 +771,12 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         raise GuestError("public binding differs from key ceremony")
     candidate = STATE_ROOT / "candidate"
     extract_candidate(candidate_raw, candidate)
+    candidate_harness = read_file(
+        candidate / "deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
+        2 * 1024 * 1024,
+    )
+    if hashlib.sha256(candidate_harness).hexdigest() != descriptor.get("harness_sha256"):
+        raise GuestError("candidate harness digest differs inside guest")
     candidate_sha = descriptor.get("candidate_sha")
     if not isinstance(candidate_sha, str) or HEX40.fullmatch(candidate_sha) is None:
         raise GuestError("candidate binding differs")
@@ -900,6 +1026,7 @@ def start_relay(public: dict[str, object]) -> None:
 def cleanup(candidate: Path, activation_package: Path, attempted_stage: bool, hosts_added: bool) -> list[str]:
     errors: list[str] = []
     if attempted_stage:
+        begin_phase("rollback")
         try:
             installed = Path("/usr/libexec/buzz-ci-activation-controller")
             controller = installed if installed.is_file() else candidate / "deploy/native-ci/activation/controller.py"
@@ -907,6 +1034,7 @@ def cleanup(candidate: Path, activation_package: Path, attempted_stage: bool, ho
                 errors.append("controller rollback failed")
         except BaseException:
             errors.append("controller rollback could not run")
+    begin_phase("cleanup")
     for unit in UNITS:
         try:
             command(["systemctl", "stop", unit], timeout=10, allow_failure=True)
@@ -981,8 +1109,20 @@ def dormant_proof(configs: dict[str, dict[str, object]], units: dict[str, dict[s
 
 
 def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
+    begin_phase("install")
     descriptor = load_json(stage / "descriptor.json")
-    if not isinstance(descriptor, dict) or descriptor.get("schema_version") != STAGE_SCHEMA:
+    if (
+        not isinstance(descriptor, dict)
+        or set(descriptor) != {
+            "schema_version", "candidate_sha", "harness_sha256", "timing_sha256",
+            "candidate_tar_sha256", "scenario_sha256", "seccomp_source_sha256",
+            "public_binding_sha256", "package_tree_sha256",
+        }
+        or descriptor.get("schema_version") != STAGE_SCHEMA
+        or descriptor.get("timing_sha256") != phase.get("timing_sha256")
+        or not isinstance(descriptor.get("harness_sha256"), str)
+        or HEX64.fullmatch(descriptor["harness_sha256"]) is None
+    ):
         raise GuestError("stage descriptor schema differs")
     if hashlib.sha256(canonical(descriptor)).hexdigest() != phase.get("descriptor_sha256"):
         raise GuestError("stage descriptor digest differs")
@@ -1017,15 +1157,20 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         configs = tree_state(Path("/etc/buzzci"))
         units = prove_installed_units(component_units)
         controller = candidate / "deploy/native-ci/activation/controller.py"
+        begin_phase("controller_check")
         command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=60)
         attempted_stage = True
+        begin_phase("controller_stage")
         command(["python3", str(controller), "stage", "--package", str(activation_package), "--scenario", str(inputs / "scenario.json")], timeout=120)
         prove_installed_units(expected_units)
+        begin_phase("controller_activate")
         command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=120)
+        begin_phase("canary")
         receipt_raw = command(["/usr/libexec/buzz-ci-capacity-one-canary"], stdin=read_file(inputs / "scenario.json"), timeout=600).stdout
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)
         receipt_path.chmod(0o400)
+        begin_phase("receipt_verifier")
         verifier_raw = command(["/usr/libexec/buzz-ci-verify-acceptance-receipt", str(inputs / "scenario.json"), str(receipt_path)], timeout=60).stdout
         parse_verdict(verifier_raw)
     except BaseException as error:
@@ -1057,10 +1202,12 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         "dormant_proof": proof,
     }
     write_transfer(pending)
+    complete_progress()
     return pending
 
 
 def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
+    begin_phase("verifier")
     pending = read_transfer()
     if (
         not isinstance(pending, dict)
@@ -1138,15 +1285,18 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
     receipt_path.unlink()
     trusted_binary.unlink()
     stages_path.unlink()
-    return {
+    result = {
         "phase": "run", "challenge": phase["challenge"], "outcome": "pass",
         "receipt_base64": base64.b64encode(canonical(receipt)).decode(),
         "verifier_base64": base64.b64encode(canonical({"outcome": "pass", "status": "verified"})).decode(),
         "dormant_proof": pending["dormant_proof"],
     }
+    complete_progress()
+    return result
 
 
 def main(argv: list[str]) -> int:
+    global _PROGRESS_BOOT, _PROGRESS_SEQUENCE, _PROGRESS_STARTED
     if len(argv) != 1:
         return 2
     try:
@@ -1155,10 +1305,21 @@ def main(argv: list[str]) -> int:
             raise GuestError("guest phase schema differs")
         if not isinstance(phase.get("challenge"), str) or HEX64.fullmatch(phase["challenge"]) is None:
             raise GuestError("guest challenge differs")
+        if phase.get("timing") != TIMING_CONTRACT or phase.get("timing_sha256") != timing_sha256():
+            raise GuestError("guest timing contract differs")
+        _PROGRESS_BOOT = {"ceremony": "ceremony", "run": "candidate", "verify": "verifier"}.get(str(phase.get("phase")))
+        if _PROGRESS_BOOT is None:
+            raise GuestError("guest phase differs")
+        _PROGRESS_SEQUENCE = 0
+        _PROGRESS_STARTED = time.monotonic()
         require_guest()
         disable_swap()
+        emit_progress("guest_started")
         if phase.get("phase") == "ceremony":
-            if set(phase) != {"schema_version", "phase", "challenge", "controld_uid", "controld_gid"}:
+            if set(phase) != {
+                "schema_version", "phase", "challenge", "controld_uid", "controld_gid",
+                "timing", "timing_sha256",
+            }:
                 raise GuestError("ceremony phase fields differ")
             validate_evidence_device()
             if TRANSFER_DEVICE.exists():
@@ -1166,7 +1327,10 @@ def main(argv: list[str]) -> int:
             result = ceremony(phase)
             emit(result)
         elif phase.get("phase") == "run":
-            if set(phase) != {"schema_version", "phase", "challenge", "descriptor_sha256"}:
+            if set(phase) != {
+                "schema_version", "phase", "challenge", "descriptor_sha256",
+                "timing", "timing_sha256",
+            }:
                 raise GuestError("candidate phase fields differ")
             if evidence_device_present():
                 raise GuestError("candidate execution must not have an evidence transport")
@@ -1181,6 +1345,7 @@ def main(argv: list[str]) -> int:
             if set(phase) != {
                 "schema_version", "phase", "challenge", "candidate_sha",
                 "scenario_sha256", "trusted_verifier_sha256", "expected_stages_sha256",
+                "timing", "timing_sha256",
             }:
                 raise GuestError("verification phase fields differ")
             validate_evidence_device()

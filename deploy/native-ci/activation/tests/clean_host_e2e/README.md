@@ -31,6 +31,11 @@ The flow has two user-visible phases and three isolated boots:
    capacity-one, the frozen fixture, all 13 acceptance stages, finalize/prove
    zero, strict installed verification, and rollback. It can write only a
    digest-framed pending record to the fixed-capacity raw transfer device.
+   A second virtio-serial port carries only digest-framed progress records with
+   a fixed boot, phase, event, sequence, and elapsed-millisecond schema. This
+   stream is diagnostic and cannot make a run pass or fail. Missing, malformed,
+   stale, oversized, or truncated progress changes only the sanitized timeout
+   detail returned by the host.
    The host kills and reaps the QEMU process group, proves it absent, and
    deletes the candidate overlay before continuing.
 4. A fresh verifier overlay over the same frozen ceremony image receives the
@@ -80,6 +85,26 @@ python3 "$HARNESS" run \
   --results /protected/e2e-results
 ```
 
+The closed v3 contract includes `harness_sha256`, `timing`, and
+`timing_sha256`. Copy these values from `capabilities`; `prepare` records the
+same values in `state.json`. Preflight rejects a state prepared by any other
+`harness.py`, a contract with another timing table, or a candidate commit whose
+tracked harness bytes do not match. Any harness change makes an unused older
+prepared state stale by design.
+
+The frozen timing table computes each QEMU watchdog from the sequential phase
+ceilings. The candidate watchdog is 1,830 seconds: 180 for boot and cloud-init,
+1,620 for install, controller check/stage/activate, canary, receipt verifier,
+rollback, and cleanup, then 30 for guest poweroff. Ceremony is 390 seconds and
+the verifier is 270 seconds. Host process-group reaping has its own 10-second
+bound after any exit or watchdog. Each guest command phase reserves another
+10 seconds inside its phase ceiling to kill and reap a timed-out command before
+the next phase. A terminal error names the boot and last
+validated fixed-enum phase, for example `candidate canary watchdog timeout` or
+`candidate cleanup watchdog timeout`. The diagnostic summary contains no guest
+output, paths, credentials, or caller-provided fields, and the host emits it
+only after terminal state cleanup.
+
 The run contract also supplies the external `/usr/share/containers/seccomp.json`
 source with the fixed SHA-256
 `2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4`.
@@ -105,13 +130,15 @@ Retries do not create more tombstones. Every later validation and setup exit
 has terminal cleanup ownership. A symbolic, unrecognized, replaced, or
 filesystem-identity-mismatched path is never deleted; a replacement displaced
 by the atomic quarantine move remains intact.
-All subprocesses have fixed time and output bounds. Every process group is
+All subprocesses have fixed time and output bounds. Guest commands also use
+the remaining bound for their current frozen phase. Every process group is
 unconditionally killed, reaped, and checked for absence on success, failure,
 timeout, and interruption. The private state is removed on every terminal
 `run` path, including setup failure. Results are retained only after successful
 state cleanup. The harness writes all three evidence files to one private
 sibling directory, revalidates their receipt, verifier, manifest, and contract
-bindings, and replays the exact digest-bound frozen receipt verifier against
+bindings, including the exact host harness and timing table, and replays the
+exact digest-bound frozen receipt verifier against
 the scenario and receipt. The publication journal binds the staging
 directory's device/inode identity. After sanitizing selected VM state, the
 harness holds the result-staging directory descriptor through a quarantine

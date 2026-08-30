@@ -25,9 +25,10 @@ import tempfile
 import time
 from collections.abc import Callable
 
-SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v2"
-STATE_SCHEMA = "buzz-ci-clean-host-e2e-vm-state/v2"
+SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v3"
+STATE_SCHEMA = "buzz-ci-clean-host-e2e-vm-state/v3"
 FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
+PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -36,8 +37,49 @@ MAX_FRAME = 4 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
 MAX_TREE_FILES = 1024
 TRANSFER_SIZE = 8 * 1024 * 1024
-PREPARE_TIMEOUT = 180
-RUN_TIMEOUT = 900
+REAP_TIMEOUT = 10
+TIMING_CONTRACT = {
+    "schema_version": "buzz-ci-clean-host-e2e-timing/v1",
+    "phase_timeout_seconds": {
+        "boot_cloud_init": 180,
+        "ceremony": 180,
+        "install": 300,
+        "controller_check": 70,
+        "controller_stage": 130,
+        "controller_activate": 130,
+        "canary": 610,
+        "receipt_verifier": 70,
+        "rollback": 70,
+        "cleanup": 240,
+        "verifier": 60,
+        "poweroff": 30,
+    },
+    "watchdog_seconds": {
+        "ceremony": 390,
+        "candidate": 1830,
+        "verifier": 270,
+    },
+    "guest_command_reap_seconds": 10,
+    "host_reap_seconds": REAP_TIMEOUT,
+}
+PROGRESS_PHASES = (
+    "guest_started", "ceremony", "install", "controller_check",
+    "controller_stage", "controller_activate", "canary", "receipt_verifier",
+    "rollback", "cleanup", "verifier", "complete",
+)
+PROGRESS_EVENTS = ("start", "timeout", "complete")
+PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
+WATCHDOG_PHASES = {
+    "ceremony": ("boot_cloud_init", "ceremony", "poweroff"),
+    "candidate": (
+        "boot_cloud_init", "install", "controller_check", "controller_stage",
+        "controller_activate", "canary", "receipt_verifier", "rollback",
+        "cleanup", "poweroff",
+    ),
+    "verifier": ("boot_cloud_init", "verifier", "poweroff"),
+}
+MAX_PROGRESS_RECORDS = 32
+MAX_PROGRESS = 16 * 1024
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 TOOLS = {
     "qemu": "/usr/bin/qemu-system-x86_64",
@@ -47,8 +89,10 @@ TOOLS = {
     "cloud_localds": "/usr/bin/cloud-localds",
 }
 FROZEN_ASSETS = (
-    "guest_entry.py", "local_tls_relay.py", "receipt_verifier.py", "expected-stages.json",
+    "harness.py", "guest_entry.py", "local_tls_relay.py", "receipt_verifier.py",
+    "expected-stages.json",
 )
+GUEST_ASSETS = tuple(name for name in FROZEN_ASSETS if name != "harness.py")
 REQUIRED_CANDIDATE = (
     "deploy/native-ci/runner/install.py",
     "deploy/native-ci/controld/install.py",
@@ -234,8 +278,42 @@ def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode() + b"\n"
 
 
+def timing_sha256() -> str:
+    validate_timing_contract()
+    return hashlib.sha256(canonical(TIMING_CONTRACT)).hexdigest()
+
+
+def validate_timing_contract() -> None:
+    phases = TIMING_CONTRACT.get("phase_timeout_seconds")
+    declared = TIMING_CONTRACT.get("watchdog_seconds")
+    if (
+        set(TIMING_CONTRACT) != {
+            "schema_version", "phase_timeout_seconds", "watchdog_seconds",
+            "guest_command_reap_seconds", "host_reap_seconds",
+        }
+        or TIMING_CONTRACT.get("schema_version") != "buzz-ci-clean-host-e2e-timing/v1"
+        or not isinstance(phases, dict)
+        or set(phases) != {phase for values in WATCHDOG_PHASES.values() for phase in values}
+        or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in phases.values())
+        or not isinstance(declared, dict)
+        or set(declared) != set(WATCHDOG_PHASES)
+        or any(declared[role] != sum(phases[phase] for phase in phase_names) for role, phase_names in WATCHDOG_PHASES.items())
+        or TIMING_CONTRACT.get("guest_command_reap_seconds") != 10
+        or TIMING_CONTRACT.get("host_reap_seconds") != REAP_TIMEOUT
+    ):
+        raise HarnessError("frozen VM timing contract is internally inconsistent")
+
+
+def watchdog_seconds(boot_role: str) -> int:
+    validate_timing_contract()
+    value = TIMING_CONTRACT["watchdog_seconds"]
+    if not isinstance(value, dict) or boot_role not in value or not isinstance(value[boot_role], int):
+        raise HarnessError("unknown VM boot timing role")
+    return value[boot_role]
+
+
 def asset_source(here: Path, name: str) -> Path:
-    if name in {"guest_entry.py", "local_tls_relay.py"}:
+    if name in {"harness.py", "guest_entry.py", "local_tls_relay.py"}:
         return here / name
     if name == "receipt_verifier.py":
         return here.parents[2] / "acceptance" / "verify-receipt.py"
@@ -531,6 +609,10 @@ def file_sha256(path: Path) -> str:
         os.close(fd)
 
 
+def current_harness_sha256() -> str:
+    return file_sha256(Path(__file__).resolve())
+
+
 def capabilities() -> dict[str, object]:
     missing = [path for path in TOOLS.values() if not Path(path).is_file()]
     kvm = Path("/dev/kvm")
@@ -557,6 +639,9 @@ def capabilities() -> dict[str, object]:
         "network": "unshared-and-no-nic",
         "qemu_version": qemu_version,
         "tool_sha256": {name: file_sha256(Path(path)) for name, path in TOOLS.items()},
+        "harness_sha256": current_harness_sha256(),
+        "timing": TIMING_CONTRACT,
+        "timing_sha256": timing_sha256(),
     }
 
 
@@ -592,7 +677,7 @@ def copy_bound(source: Path, target: Path, expected_sha256: str) -> None:
 def bwrap_prefix(state: Path, *, writable_files: tuple[str, ...] = ()) -> list[str]:
     allowed_writable = {
         "ceremony.qcow2", "candidate.qcow2", "verifier.qcow2",
-        "transfer.raw", "evidence.bin",
+        "transfer.raw", "evidence.bin", "progress.bin",
     }
     if len(set(writable_files)) != len(writable_files) or any(name not in allowed_writable for name in writable_files):
         raise HarnessError("Bubblewrap writable-file allowlist differs")
@@ -620,7 +705,7 @@ def qemu_command(
         raise HarnessError("unknown VM overlay")
     if transfer not in {None, "read-write", "read-only"}:
         raise HarnessError("unknown evidence-transfer mode")
-    writable_files = [overlay]
+    writable_files = [overlay, "progress.bin"]
     if transfer == "read-write":
         writable_files.append("transfer.raw")
     if evidence:
@@ -633,6 +718,9 @@ def qemu_command(
         "-drive", f"file=/work/{overlay},if=virtio,format=qcow2,cache=none",
         "-drive", "file=/work/stage.iso,media=cdrom,readonly=on",
         "-drive", "file=/work/seed.iso,media=cdrom,readonly=on",
+        "-device", "virtio-serial-pci",
+        "-chardev", "file,id=progress,path=/work/progress.bin",
+        "-device", "virtserialport,chardev=progress,name=buzzci.progress",
     ]
     if transfer is not None:
         readonly = ",readonly=on" if transfer == "read-only" else ""
@@ -642,7 +730,6 @@ def qemu_command(
         ])
     if evidence:
         command.extend([
-            "-device", "virtio-serial-pci",
             "-chardev", "file,id=evidence,path=/work/evidence.bin",
             "-device", "virtserialport,chardev=evidence,name=buzzci.evidence",
         ])
@@ -765,7 +852,7 @@ power_state:
 
 
 def stage_common(state: Path, stage: Path, phase: dict[str, object]) -> None:
-    for name in FROZEN_ASSETS:
+    for name in GUEST_ASSETS:
         raw = read_regular(state / "frozen-assets" / name, 2 * 1024 * 1024)
         target = stage / name
         target.write_bytes(raw)
@@ -774,11 +861,129 @@ def stage_common(state: Path, stage: Path, phase: dict[str, object]) -> None:
     (stage / "phase.json").chmod(0o444)
 
 
+def parse_progress(raw: bytes, boot_role: str) -> dict[str, object]:
+    if not raw:
+        return {"status": "missing", "records": []}
+    if len(raw) > MAX_PROGRESS:
+        return {"status": "invalid", "reason": "oversize", "records": []}
+    records: list[dict[str, object]] = []
+    offset = 0
+    last_elapsed = -1
+    last_order = -1
+    try:
+        while offset < len(raw):
+            if len(raw) - offset < 36:
+                raise HarnessError("truncated")
+            length = struct.unpack(">I", raw[offset:offset + 4])[0]
+            if length <= 0 or length > 512 or offset + 4 + length + 32 > len(raw):
+                raise HarnessError("frame-length")
+            payload_start = offset + 4
+            payload = raw[payload_start:payload_start + length]
+            digest = raw[payload_start + length:payload_start + length + 32]
+            if hashlib.sha256(payload).digest() != digest:
+                raise HarnessError("digest")
+            value = json.loads(payload, object_pairs_hook=reject_duplicates)
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"schema_version", "boot", "sequence", "phase", "event", "elapsed_ms"}
+                or value.get("schema_version") != PROGRESS_SCHEMA
+                or value.get("boot") != boot_role
+                or not isinstance(value.get("sequence"), int)
+                or isinstance(value.get("sequence"), bool)
+                or value.get("sequence") != len(records)
+                or value.get("phase") not in PROGRESS_ORDER
+                or value.get("event") not in PROGRESS_EVENTS
+                or not isinstance(value.get("elapsed_ms"), int)
+                or isinstance(value.get("elapsed_ms"), bool)
+                or value["elapsed_ms"] < 0
+                or value["elapsed_ms"] > watchdog_seconds(boot_role) * 1000
+                or value["elapsed_ms"] < last_elapsed
+                or canonical(value) != payload
+            ):
+                raise HarnessError("record")
+            order = PROGRESS_ORDER[str(value["phase"])]
+            if (
+                order < last_order
+                or value["event"] == "complete" and value["phase"] != "complete"
+                or value["phase"] == "complete" and value["event"] != "complete"
+            ):
+                raise HarnessError("order")
+            if value["event"] == "timeout" and order != last_order:
+                raise HarnessError("stale-timeout")
+            records.append(value)
+            if len(records) > MAX_PROGRESS_RECORDS:
+                raise HarnessError("record-cap")
+            last_elapsed = int(value["elapsed_ms"])
+            last_order = order
+            offset = payload_start + length + 32
+    except (HarnessError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        return {
+            "status": "invalid", "reason": str(error) or type(error).__name__,
+            "records": records,
+        }
+    allowed = {
+        "ceremony": {"guest_started", "ceremony", "complete"},
+        "candidate": {
+            "guest_started", "install", "controller_check", "controller_stage",
+            "controller_activate", "canary", "receipt_verifier", "rollback",
+            "cleanup", "complete",
+        },
+        "verifier": {"guest_started", "verifier", "complete"},
+    }
+    if boot_role not in allowed or any(str(record["phase"]) not in allowed[boot_role] for record in records):
+        return {"status": "invalid", "reason": "boot-phase", "records": records}
+    return {"status": "valid", "records": records}
+
+
+def progress_snapshot(path: Path, boot_role: str) -> dict[str, object]:
+    try:
+        metadata = path.stat()
+        if metadata.st_size > MAX_PROGRESS:
+            return {"status": "invalid", "reason": "oversize", "records": []}
+        return parse_progress(read_regular(path, MAX_PROGRESS), boot_role)
+    except FileNotFoundError:
+        return {"status": "missing", "reason": "absent", "records": []}
+    except (HarnessError, OSError):
+        return {"status": "invalid", "reason": "unreadable", "records": []}
+
+
+def progress_failure(boot_role: str, progress: dict[str, object], *, timed_out: bool) -> HarnessError:
+    records = progress.get("records")
+    safe_records = records if isinstance(records, list) else []
+    timeout_record = next(
+        (record for record in reversed(safe_records) if isinstance(record, dict) and record.get("event") == "timeout"),
+        None,
+    )
+    latest = safe_records[-1] if safe_records and isinstance(safe_records[-1], dict) else None
+    phase = str((timeout_record or latest or {}).get("phase", "boot_cloud_init"))
+    if phase == "guest_started":
+        phase = "boot_cloud_init"
+    detail = {
+        "status": progress.get("status", "invalid"),
+        "phase": phase,
+        "records": len(safe_records),
+        "last_sequence": latest.get("sequence") if latest else None,
+        "last_elapsed_ms": latest.get("elapsed_ms") if latest else None,
+    }
+    if progress.get("status") == "invalid":
+        detail["reason"] = progress.get("reason", "invalid")
+    failure = "watchdog timeout" if timed_out else "inner timeout" if timeout_record is not None else "guest failure"
+    return HarnessError(f"{boot_role} {phase} {failure}; progress={canonical(detail).decode().strip()}")
+
+
 def boot(
     state: Path, timeout: int, *, overlay: str,
     evidence_expected: bool, transfer: str | None = None,
 ) -> dict[str, object] | None:
+    boot_role = {
+        "ceremony.qcow2": "ceremony",
+        "candidate.qcow2": "candidate",
+        "verifier.qcow2": "verifier",
+    }[overlay]
+    if timeout != watchdog_seconds(boot_role):
+        raise HarnessError("VM watchdog differs from frozen timing contract")
     evidence = state / "evidence.bin"
+    progress_path = state / "progress.bin"
     try:
         evidence.unlink()
     except FileNotFoundError:
@@ -790,23 +995,34 @@ def boot(
             0o600,
         )
         os.close(evidence_fd)
+    progress_fd = os.open(
+        progress_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    os.close(progress_fd)
     process = subprocess.Popen(
         qemu_command(state, overlay=overlay, evidence=evidence_expected, transfer=transfer), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
     )
     try:
         deadline = time.monotonic() + timeout
+        timed_out = False
         while process.poll() is None:
             if evidence_expected and evidence.exists() and evidence.stat().st_size > MAX_FRAME + 36:
                 raise HarnessError("guest evidence exceeded its bound")
             if time.monotonic() >= deadline:
-                raise HarnessError("guest watchdog expired")
+                timed_out = True
+                break
             time.sleep(0.05)
-        code = process.returncode
+        progress = progress_snapshot(progress_path, boot_role)
+        code = process.poll()
     finally:
-        reap_process_group(process)
+        reap_process_group(process, wait_seconds=REAP_TIMEOUT)
+    if timed_out:
+        raise progress_failure(boot_role, progress, timed_out=True)
     if code != 0:
-        raise HarnessError("isolated guest exited without accepted evidence")
+        raise progress_failure(boot_role, progress, timed_out=False)
     if not evidence_expected:
         if evidence.exists():
             raise HarnessError("candidate phase unexpectedly reached an evidence channel")
@@ -834,7 +1050,7 @@ def parse_frame(raw: bytes) -> dict[str, object]:
 
 
 def clean_transient(state: Path) -> None:
-    for name in ("stage.iso", "seed.iso", "evidence.bin"):
+    for name in ("stage.iso", "seed.iso", "evidence.bin", "progress.bin"):
         try:
             (state / name).unlink()
         except FileNotFoundError:
@@ -1048,7 +1264,8 @@ def destroy_state(state: Path, expected: StateIdentity | None = None) -> None:
         not isinstance(value, dict)
         or set(value) != {
             "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
-            "qemu_version", "tool_sha256", "harness_asset_sha256", "trusted_image_sha256",
+            "qemu_version", "tool_sha256", "harness_sha256", "harness_asset_sha256",
+            "timing", "timing_sha256", "trusted_image_sha256",
         }
         or value.get("schema_version") != STATE_SCHEMA
         or not isinstance(value.get("challenge"), str) or HEX64.fullmatch(value["challenge"]) is None
@@ -1060,6 +1277,9 @@ def destroy_state(state: Path, expected: StateIdentity | None = None) -> None:
         or not isinstance(value.get("qemu_version"), str) or not value["qemu_version"]
         or not isinstance(value.get("tool_sha256"), dict) or set(value["tool_sha256"]) != set(TOOLS)
         or not isinstance(value.get("harness_asset_sha256"), dict) or set(value["harness_asset_sha256"]) != set(FROZEN_ASSETS)
+        or not isinstance(value.get("harness_sha256"), str) or HEX64.fullmatch(value["harness_sha256"]) is None
+        or value.get("timing") != TIMING_CONTRACT
+        or value.get("timing_sha256") != timing_sha256()
     ):
         raise HarnessError("refusing to destroy an unrecognized state directory")
     identity = expected or observed
@@ -1090,7 +1310,10 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
             "qemu_img_sha256": arguments.qemu_img_sha256,
             "qemu_version": proof["qemu_version"],
             "tool_sha256": proof["tool_sha256"],
+            "harness_sha256": proof["harness_sha256"],
             "harness_asset_sha256": asset_digests,
+            "timing": TIMING_CONTRACT,
+            "timing_sha256": proof["timing_sha256"],
             "trusted_image_sha256": None,
         }
         (state / "state.json").write_bytes(canonical(state_record))
@@ -1105,14 +1328,15 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         stage = state / "stage"
         stage.mkdir(mode=0o700)
         stage_common(state, stage, {
-            "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v2",
+            "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v3",
             "phase": "ceremony", "challenge": challenge,
             "controld_uid": arguments.controld_uid, "controld_gid": arguments.controld_gid,
+            "timing": TIMING_CONTRACT, "timing_sha256": timing_sha256(),
         })
         make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
         shutil.rmtree(stage)
         make_seed(state, "buzzci-ceremony-" + challenge[:16])
-        frame = boot(state, PREPARE_TIMEOUT, overlay="ceremony.qcow2", evidence_expected=True)
+        frame = boot(state, watchdog_seconds("ceremony"), overlay="ceremony.qcow2", evidence_expected=True)
         expected = {"schema_version", "phase", "challenge", "outcome", "public_binding", "raw_key_absence"}
         if set(frame) != expected or frame["phase"] != "ceremony" or frame["challenge"] != challenge or frame["outcome"] != "pass":
             raise HarnessError("key ceremony evidence differs")
@@ -1128,7 +1352,11 @@ def prepare(arguments: argparse.Namespace) -> dict[str, object]:
         marker.chmod(0o600)
         marker.write_bytes(canonical(state_record))
         marker.chmod(0o400)
-        return {"status": "prepared", "state": str(state), "public_binding": str(public_path), "raw_key_absence": True}
+        return {
+            "status": "prepared", "state": str(state), "public_binding": str(public_path),
+            "raw_key_absence": True, "harness_sha256": proof["harness_sha256"],
+            "timing_sha256": proof["timing_sha256"], "timing": TIMING_CONTRACT,
+        }
     except BaseException:
         destroy_identified_directory(state, created_identity, "new prepare state directory")
         raise
@@ -1142,7 +1370,8 @@ def validate_prepared_state(state: Path) -> dict[str, object]:
         not isinstance(state_record, dict)
         or set(state_record) != {
             "schema_version", "challenge", "image_sha256", "qemu_sha256", "qemu_img_sha256",
-            "qemu_version", "tool_sha256", "harness_asset_sha256", "trusted_image_sha256",
+            "qemu_version", "tool_sha256", "harness_sha256", "harness_asset_sha256",
+            "timing", "timing_sha256", "trusted_image_sha256",
         }
         or state_record.get("schema_version") != STATE_SCHEMA
     ):
@@ -1160,6 +1389,12 @@ def validate_prepared_state(state: Path) -> dict[str, object]:
         raise HarnessError("VM harness tool binding differs")
     if any(file_sha256(Path(TOOLS[name])) != digest for name, digest in tool_digests.items()):
         raise HarnessError("VM harness tool changed after key ceremony")
+    if (
+        state_record.get("harness_sha256") != current_harness_sha256()
+        or state_record.get("timing") != TIMING_CONTRACT
+        or state_record.get("timing_sha256") != timing_sha256()
+    ):
+        raise HarnessError("prepared harness or timing contract changed after key ceremony")
     asset_digests = state_record.get("harness_asset_sha256")
     if (
         not isinstance(asset_digests, dict)
@@ -1178,13 +1413,22 @@ def validate_prepared_state(state: Path) -> dict[str, object]:
 
 
 def validate_contract_envelope(value: object) -> dict[str, object]:
-    required = {"schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"}
+    required = {
+        "schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256",
+        "timing", "timing_sha256", "scenario", "seccomp_source", "packages",
+    }
     if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA:
         raise HarnessError("run contract shape differs")
     if not isinstance(value.get("state"), str) or not value["state"]:
         raise HarnessError("run contract state path differs")
     if not isinstance(value.get("candidate_sha"), str) or HEX40.fullmatch(value["candidate_sha"]) is None:
         raise HarnessError("candidate SHA is invalid")
+    if (
+        value.get("harness_sha256") != current_harness_sha256()
+        or value.get("timing") != TIMING_CONTRACT
+        or value.get("timing_sha256") != timing_sha256()
+    ):
+        raise HarnessError("run contract harness or timing binding differs")
     return value
 
 
@@ -1195,7 +1439,12 @@ def validate_contract_value(
 ]:
     validate_contract_envelope(value)
     state = selected_state if selected_state is not None else safe_directory(Path(value["state"]))
-    validate_prepared_state(state)
+    state_record = validate_prepared_state(state)
+    if (
+        state_record["harness_sha256"] != value["harness_sha256"]
+        or state_record["timing_sha256"] != value["timing_sha256"]
+    ):
+        raise HarnessError("prepared state differs from run contract harness binding")
     if selected_state is None:
         try:
             (state / RUN_OWNERSHIP).lstat()
@@ -1207,6 +1456,12 @@ def validate_contract_value(
     resolved = bounded(["/usr/bin/git", "-C", str(candidate), "rev-parse", f"{value['candidate_sha']}^{{commit}}"] ).decode().strip()
     if resolved != value["candidate_sha"]:
         raise HarnessError("candidate commit object differs")
+    candidate_harness = bounded([
+        "/usr/bin/git", "-C", str(candidate), "show",
+        f"{value['candidate_sha']}:deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
+    ], maximum=2 * 1024 * 1024)
+    if hashlib.sha256(candidate_harness).hexdigest() != value["harness_sha256"]:
+        raise HarnessError("candidate commit harness binding differs")
     for relative in REQUIRED_CANDIDATE:
         if not bounded(["/usr/bin/git", "-C", str(candidate), "cat-file", "-e", f"{value['candidate_sha']}:{relative}"], maximum=1024) == b"":
             raise HarnessError("candidate prerequisite probe returned output")
@@ -1890,7 +2145,8 @@ def validate_result_set_fd(
         raise HarnessError("evidence manifest encoding differs")
     expected_manifest = {
         "schema_version", "candidate_sha", "image_sha256", "tool_sha256",
-        "harness_asset_sha256", "package_tree_sha256", "scenario_sha256",
+        "harness_sha256", "harness_asset_sha256", "timing", "timing_sha256",
+        "package_tree_sha256", "scenario_sha256",
         "seccomp_source_sha256", "transfer_bytes", "transfer_sha256",
         "receipt_sha256", "verifier_sha256", "dormant_proof",
     }
@@ -1903,8 +2159,11 @@ def validate_result_set_fd(
     if (
         not isinstance(evidence, dict)
         or set(evidence) != expected_manifest
-        or evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v2"
+        or evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v3"
         or evidence.get("candidate_sha") != contract["candidate_sha"]
+        or evidence.get("harness_sha256") != contract["harness_sha256"]
+        or evidence.get("timing") != TIMING_CONTRACT
+        or evidence.get("timing_sha256") != contract["timing_sha256"]
         or evidence.get("scenario_sha256") != contract["scenario"]["sha256"]
         or evidence.get("seccomp_source_sha256") != SECCOMP_SHA256
         or evidence.get("transfer_bytes") != TRANSFER_SIZE
@@ -1918,6 +2177,7 @@ def validate_result_set_fd(
         or not isinstance(evidence.get("harness_asset_sha256"), dict)
         or set(evidence["harness_asset_sha256"]) != set(FROZEN_ASSETS)
         or any(not isinstance(digest, str) or HEX64.fullmatch(digest) is None for digest in evidence["harness_asset_sha256"].values())
+        or evidence["harness_asset_sha256"].get("harness.py") != evidence.get("harness_sha256")
         or evidence.get("package_tree_sha256") != expected_packages
         or evidence.get("receipt_sha256") != hashlib.sha256(receipt_raw).hexdigest()
         or evidence.get("verifier_sha256") != hashlib.sha256(verifier_raw).hexdigest()
@@ -1937,6 +2197,8 @@ def validate_result_set_fd(
     expected_outcome = {
         "status": "pass",
         "candidate_sha": contract["candidate_sha"],
+        "harness_sha256": evidence["harness_sha256"],
+        "timing_sha256": evidence["timing_sha256"],
         "receipt_sha256": evidence["receipt_sha256"],
         "verifier_sha256": evidence["verifier_sha256"],
         "evidence_manifest_sha256": hashlib.sha256(evidence_raw).hexdigest(),
@@ -2060,6 +2322,8 @@ def create_run_stage(
     descriptor = {
         "schema_version": "buzz-ci-clean-host-e2e-stage/v2",
         "candidate_sha": contract["candidate_sha"],
+        "harness_sha256": contract["harness_sha256"],
+        "timing_sha256": contract["timing_sha256"],
         "candidate_tar_sha256": file_sha256(candidate_tar),
         "scenario_sha256": contract["scenario"]["sha256"],
         "seccomp_source_sha256": SECCOMP_SHA256,
@@ -2070,9 +2334,10 @@ def create_run_stage(
     (stage / "descriptor.json").chmod(0o444)
     state_record = load_json(state / "state.json")
     stage_common(state, stage, {
-        "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v2",
+        "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v3",
         "phase": "run", "challenge": state_record["challenge"],
         "descriptor_sha256": hashlib.sha256(canonical(descriptor)).hexdigest(),
+        "timing": TIMING_CONTRACT, "timing_sha256": timing_sha256(),
     })
     make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
     shutil.rmtree(stage)
@@ -2092,12 +2357,13 @@ def create_verify_stage(
     state_record = load_json(state / "state.json")
     assets = state_record["harness_asset_sha256"]
     stage_common(state, stage, {
-        "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v2",
+        "schema_version": "buzz-ci-clean-host-e2e-guest-phase/v3",
         "phase": "verify", "challenge": state_record["challenge"],
         "candidate_sha": contract["candidate_sha"],
         "scenario_sha256": contract["scenario"]["sha256"],
         "trusted_verifier_sha256": assets["receipt_verifier.py"],
         "expected_stages_sha256": assets["expected-stages.json"],
+        "timing": TIMING_CONTRACT, "timing_sha256": timing_sha256(),
     })
     make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
     shutil.rmtree(stage)
@@ -2174,7 +2440,7 @@ def run_vm(
             create_transfer(state)
             create_run_stage(contract, state, records, scenario_raw, seccomp_raw)
             boot(
-                state, RUN_TIMEOUT, overlay="candidate.qcow2",
+                state, watchdog_seconds("candidate"), overlay="candidate.qcow2",
                 evidence_expected=False, transfer="read-write",
             )
             (state / "candidate.qcow2").unlink()
@@ -2188,7 +2454,7 @@ def run_vm(
             create_verify_stage(contract, state, scenario_raw)
             validate_prepared_state(state)
             frame = boot(
-                state, 180, overlay="verifier.qcow2",
+                state, watchdog_seconds("verifier"), overlay="verifier.qcow2",
                 evidence_expected=True, transfer="read-only",
             )
             if frame is None:
@@ -2201,11 +2467,14 @@ def run_vm(
             receipt_digest = hashlib.sha256(receipt_raw).hexdigest()
             verifier_digest = hashlib.sha256(verifier_raw).hexdigest()
             evidence_manifest = {
-                "schema_version": "buzz-ci-clean-host-e2e-evidence/v2",
+                "schema_version": "buzz-ci-clean-host-e2e-evidence/v3",
                 "candidate_sha": contract["candidate_sha"],
+                "harness_sha256": state_record["harness_sha256"],
                 "image_sha256": state_record["image_sha256"],
                 "tool_sha256": state_record["tool_sha256"],
                 "harness_asset_sha256": state_record["harness_asset_sha256"],
+                "timing": state_record["timing"],
+                "timing_sha256": state_record["timing_sha256"],
                 "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
                 "scenario_sha256": contract["scenario"]["sha256"],
                 "seccomp_source_sha256": SECCOMP_SHA256,
@@ -2225,6 +2494,8 @@ def run_vm(
             evidence_path.chmod(0o400)
             outcome = {
                 "status": "pass", "candidate_sha": contract["candidate_sha"],
+                "harness_sha256": state_record["harness_sha256"],
+                "timing_sha256": state_record["timing_sha256"],
                 "receipt_sha256": receipt_digest, "verifier_sha256": verifier_digest,
                 "evidence_manifest_sha256": hashlib.sha256(canonical(evidence_manifest)).hexdigest(),
                 "dormant_proof": proof, "vm_state_absent": True,
@@ -2289,7 +2560,12 @@ def main() -> int:
                 result = terminal_run(arguments.contract, arguments.results)
             else:
                 contract, _state, _records, _scenario_raw, _seccomp_raw = validate_contract(arguments.contract)
-                result = {"status": "ready", "candidate_sha": contract["candidate_sha"], "boundary": "bubblewrap+qemu-kvm"}
+                result = {
+                    "status": "ready", "candidate_sha": contract["candidate_sha"],
+                    "boundary": "bubblewrap+qemu-kvm",
+                    "harness_sha256": contract["harness_sha256"],
+                    "timing": contract["timing"], "timing_sha256": contract["timing_sha256"],
+                }
         sys.stdout.buffer.write(canonical(result))
         return 0
     except (OSError, ValueError, HarnessError, subprocess.SubprocessError) as error:
