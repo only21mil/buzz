@@ -167,11 +167,19 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    `/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json` and durably
    records `rollback_cleanup`. It then removes the fixed package with an
    idempotent closed-inventory cleanup. Every asset unlink, directory removal,
-   and a missing fixed tree can resume from that marker. Only complete package
-   absence permits the final `rolled_back` receipt write. If that write or its
-   acknowledgement is lost, the installed controller loads the bound manifest
-   from the marker, completes the receipt, and returns `unchanged` on an exact
-   terminal retry.
+   and a missing fixed tree can resume only from that exact marker. Before the
+   first marker write, the fixed path must be a real directory and the complete
+   package must validate; a missing path, symlink, or other node fails closed.
+   Only complete package absence permits the final `rolled_back` receipt write.
+   If that write or its acknowledgement is lost, the installed controller loads
+   the bound manifest from the marker, completes the receipt, and returns
+   `unchanged` on an exact terminal retry. A later activation first binds the
+   current marker to a root-owned retirement record. After the new `staged_zero` receipt and
+   readback are durable, it archives the old marker under
+   `/var/lib/buzzci/activation-controller/rollback-archive/`, then removes the
+   current and retirement markers. Each archive write and marker unlink is
+   independently replayable after interruption; the archive remains audit
+   evidence while the new activation can create its own strictly bound marker.
 
 The production canary closes capacity through three root-only calls to the
 installed `/usr/libexec/buzz-ci-activation-controller`. Each call accepts only

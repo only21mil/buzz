@@ -39,6 +39,10 @@ RECEIPT_PATH = "/var/lib/buzzci/activation-controller/receipt-v1.json"
 OPERATOR_LOCK_PATH = "/var/lib/buzzci/activation-controller/operator.lock"
 ROLLBACK_CLEANUP_PATH = "/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json"
 ROLLBACK_CLEANUP_SCHEMA = "buzz-ci-activation-rollback-cleanup-v1"
+ROLLBACK_RETIREMENT_PATH = "/var/lib/buzzci/activation-controller/rollback-retirement-v1.json"
+ROLLBACK_RETIREMENT_SCHEMA = "buzz-ci-activation-rollback-retirement-v1"
+ROLLBACK_ARCHIVE_ROOT = "/var/lib/buzzci/activation-controller/rollback-archive"
+ROLLBACK_ARCHIVE_SCHEMA = "buzz-ci-activation-rollback-archive-v1"
 ROLLBACK_RECOVERY_ROLES = frozenset({"activation_controller", "activation_package_module"})
 ACCEPTANCE_BINDING_PATH = activation_package.ACCEPTANCE_BINDING_PATH
 CONTROLD_ACCEPTANCE_LEDGER_PATH = "/var/lib/buzzci/controld/acceptance-operation-ledger-v1.json"
@@ -911,6 +915,23 @@ def _package_references(manifest: dict[str, Any]) -> dict[str, int]:
     return references
 
 
+def _fixed_package_present(root: Path) -> bool:
+    try:
+        parent_fd, name = activation_package.open_parent_fd(root, FIXED_PACKAGE_PATH)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("fixed activation package path is not a directory")
+        return True
+    finally:
+        os.close(parent_fd)
+
+
 def _remove_package_tree(root: Path, target: str, *, expected_sources: set[str] | None) -> None:
     parent_fd, name = activation_package.open_parent_fd(root, target)
     directory_fd = -1
@@ -953,9 +974,9 @@ def _remove_package_tree(root: Path, target: str, *, expected_sources: set[str] 
 def _install_fixed_package(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
 ) -> dict[str, str]:
-    target = activation_package.rooted(root, FIXED_PACKAGE_PATH)
     live = root == Path("/")
-    if target.exists():
+    if _fixed_package_present(root):
+        target = activation_package.rooted(root, FIXED_PACKAGE_PATH)
         installed_manifest, installed_payloads = load_package(target, live=live)
         if installed_manifest != manifest or installed_payloads != payloads:
             raise ValueError("fixed activation package belongs to a different package")
@@ -999,8 +1020,7 @@ def _verify_fixed_package(manifest: dict[str, Any], root: Path) -> dict[str, str
 
 
 def _remove_fixed_package(manifest: dict[str, Any], root: Path) -> None:
-    target = activation_package.rooted(root, FIXED_PACKAGE_PATH)
-    if not target.exists():
+    if not _fixed_package_present(root):
         return
     _verify_fixed_package(manifest, root)
     _remove_package_tree(root, FIXED_PACKAGE_PATH, expected_sources=set(_package_references(manifest)))
@@ -1053,6 +1073,183 @@ def _write_rollback_cleanup(manifest: dict[str, Any], root: Path) -> dict[str, A
     if readback != value:
         raise ValueError("rollback cleanup marker readback differs")
     return value
+
+
+def _read_private_json(root: Path, target: str, *, label: str) -> dict[str, Any] | None:
+    opened = _read_target(root, target, activation_package.MAX_JSON_BYTES)
+    if opened is None:
+        return None
+    raw, metadata = opened
+    expected_uid, expected_gid = _physical_ids(root, 0, 0)
+    if _metadata_dict(metadata) != {"mode": 0o600, "uid": expected_uid, "gid": expected_gid}:
+        raise ValueError(f"{label} metadata is unsafe")
+    try:
+        value = json.loads(raw, object_pairs_hook=activation_package.reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is invalid") from error
+    if not isinstance(value, dict) or activation_package.canonical_json(value) != raw:
+        raise ValueError(f"{label} is noncanonical")
+    return value
+
+
+def _rollback_marker_sha256(marker: dict[str, Any]) -> str:
+    return activation_package.digest(activation_package.canonical_json(marker))
+
+
+def _rollback_archive_path(marker: dict[str, Any], next_manifest: dict[str, Any]) -> str:
+    marker_sha256 = _rollback_marker_sha256(marker)
+    return (
+        f"{ROLLBACK_ARCHIVE_ROOT}/{marker_sha256}-"
+        f"{next_manifest['activation_id']}.json"
+    )
+
+
+def _rollback_retirement_value(
+    marker: dict[str, Any], next_manifest: dict[str, Any],
+) -> dict[str, object]:
+    return {
+        "schema": ROLLBACK_RETIREMENT_SCHEMA,
+        "marker_sha256": _rollback_marker_sha256(marker),
+        "archive_path": _rollback_archive_path(marker, next_manifest),
+        "next_activation_id": next_manifest["activation_id"],
+        "next_package_digest": next_manifest["package_digest"],
+        "next_source_commit": next_manifest["source_commit"],
+        "marker": marker,
+    }
+
+
+def _rollback_archive_value(retirement: dict[str, Any]) -> dict[str, object]:
+    return {
+        "schema": ROLLBACK_ARCHIVE_SCHEMA,
+        "marker_sha256": retirement["marker_sha256"],
+        "retired_by_activation_id": retirement["next_activation_id"],
+        "retired_by_package_digest": retirement["next_package_digest"],
+        "retired_by_source_commit": retirement["next_source_commit"],
+        "marker": retirement["marker"],
+    }
+
+
+def _validate_rollback_retirement(value: dict[str, Any]) -> None:
+    if set(value) != {
+        "schema", "marker_sha256", "archive_path", "next_activation_id",
+        "next_package_digest", "next_source_commit", "marker",
+    } or value.get("schema") != ROLLBACK_RETIREMENT_SCHEMA:
+        raise ValueError("rollback retirement marker shape differs")
+    marker = value.get("marker")
+    if not isinstance(marker, dict):
+        raise ValueError("rollback retirement marker lacks cleanup marker")
+    manifest = marker.get("manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("rollback retirement cleanup marker lacks its manifest")
+    activation_package.validate_manifest(manifest)
+    if marker != _rollback_cleanup_value(manifest):
+        raise ValueError("rollback retirement cleanup marker binding differs")
+    if value.get("marker_sha256") != _rollback_marker_sha256(marker):
+        raise ValueError("rollback retirement marker digest differs")
+    next_binding = {
+        "activation_id": value.get("next_activation_id"),
+        "package_digest": value.get("next_package_digest"),
+        "source_commit": value.get("next_source_commit"),
+    }
+    if not all(isinstance(item, str) for item in next_binding.values()):
+        raise ValueError("rollback retirement next activation binding differs")
+    expected_path = (
+        f"{ROLLBACK_ARCHIVE_ROOT}/{value['marker_sha256']}-"
+        f"{value['next_activation_id']}.json"
+    )
+    if value.get("archive_path") != expected_path:
+        raise ValueError("rollback retirement archive path differs")
+
+
+def _read_rollback_retirement(root: Path) -> dict[str, Any] | None:
+    value = _read_private_json(root, ROLLBACK_RETIREMENT_PATH, label="rollback retirement marker")
+    if value is not None:
+        _validate_rollback_retirement(value)
+    return value
+
+
+def _read_rollback_archive(root: Path, retirement: dict[str, Any]) -> dict[str, Any] | None:
+    value = _read_private_json(root, retirement["archive_path"], label="rollback archive")
+    if value is not None and value != _rollback_archive_value(retirement):
+        raise ValueError("rollback archive binding differs")
+    return value
+
+
+def _ensure_rollback_archive_root(root: Path) -> None:
+    directory_fd, _name = activation_package.open_parent_fd(
+        root, f"{ROLLBACK_ARCHIVE_ROOT}/archive", create=True,
+    )
+    try:
+        metadata = os.fstat(directory_fd)
+        expected_uid, expected_gid = _physical_ids(root, 0, 0)
+        if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
+            raise ValueError("rollback archive directory ownership is unsafe")
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.fchmod(directory_fd, 0o700)
+            os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _prepare_rollback_retirement(
+    receipt: dict[str, Any], next_manifest: dict[str, Any], root: Path,
+) -> dict[str, Any]:
+    if receipt.get("state") != "rolled_back":
+        raise ValueError("rollback marker retirement requires rolled-back receipt")
+    marker = _read_rollback_cleanup(root)
+    if marker is None:
+        raise ValueError("rolled-back receipt lacks current rollback cleanup marker")
+    _bind_receipt(receipt, marker["manifest"])
+    expected = _rollback_retirement_value(marker, next_manifest)
+    existing = _read_rollback_retirement(root)
+    if existing is not None and existing != expected:
+        raise ValueError("rollback retirement marker belongs to a different staged activation")
+    if existing != expected:
+        _atomic_write(
+            root, ROLLBACK_RETIREMENT_PATH,
+            activation_package.canonical_json(expected), 0o600, 0, 0,
+        )
+    readback = _read_rollback_retirement(root)
+    if readback != expected:
+        raise ValueError("rollback retirement marker readback differs")
+    return expected
+
+
+def _complete_rollback_retirement(next_manifest: dict[str, Any], root: Path) -> None:
+    retirement = _read_rollback_retirement(root)
+    if retirement is None:
+        if _read_rollback_cleanup(root) is not None:
+            raise ValueError("current rollback cleanup marker lacks retirement authorization")
+        return
+    if (
+        retirement["next_activation_id"] != next_manifest["activation_id"]
+        or retirement["next_package_digest"] != next_manifest["package_digest"]
+        or retirement["next_source_commit"] != next_manifest["source_commit"]
+    ):
+        raise ValueError("rollback retirement marker belongs to a different staged activation")
+    archive = _rollback_archive_value(retirement)
+    existing_archive = _read_rollback_archive(root, retirement)
+    if existing_archive is None:
+        _ensure_rollback_archive_root(root)
+        _atomic_write(
+            root, retirement["archive_path"],
+            activation_package.canonical_json(archive), 0o600, 0, 0,
+        )
+    if _read_rollback_archive(root, retirement) != archive:
+        raise ValueError("rollback archive readback differs")
+    current = _read_rollback_cleanup(root)
+    if current is not None:
+        if current != retirement["marker"]:
+            raise ValueError("current rollback cleanup marker differs during retirement")
+        _unlink_target(root, ROLLBACK_CLEANUP_PATH)
+    if _read_rollback_cleanup(root) is not None:
+        raise ValueError("current rollback cleanup marker retirement is incomplete")
+    if _read_rollback_retirement(root) is not None:
+        _unlink_target(root, ROLLBACK_RETIREMENT_PATH)
+    if _read_rollback_retirement(root) is not None:
+        raise ValueError("rollback retirement marker removal is incomplete")
+    if _read_rollback_archive(root, retirement) != archive:
+        raise ValueError("rollback archive changed after retirement")
 
 
 def _remove_fixed_package_resumable(manifest: dict[str, Any], root: Path) -> None:
@@ -3031,10 +3228,6 @@ def _compensate_failed_stage(
     _generated, generated_errors = _restore_generated_prior_best_effort(receipt, root)
     errors.extend(generated_errors)
     try:
-        _remove_fixed_package(manifest, root)
-    except BaseException as error:
-        errors.append(f"remove fixed activation package: {error}")
-    try:
         _restore_acceptance_ledger(receipt, manifest, root)
     except BaseException as error:
         errors.append(f"restore controld acceptance ledger: {error}")
@@ -3053,6 +3246,16 @@ def _compensate_failed_stage(
             readback()
         except BaseException as error:
             errors.append(f"{label}: {error}")
+    if not errors:
+        try:
+            if _fixed_package_present(root):
+                _verify_fixed_package(manifest, root)
+                current_marker = _read_rollback_cleanup(root)
+                if current_marker is None or current_marker == _rollback_cleanup_value(manifest):
+                    _write_rollback_cleanup(manifest, root)
+                    _remove_fixed_package_resumable(manifest, root)
+        except BaseException as error:
+            errors.append(f"remove fixed activation package: {error}")
     return errors
 
 
@@ -3065,8 +3268,10 @@ def _stage_unlocked(
 ) -> dict[str, object]:
     generated = _generated_acceptance_files(manifest, payloads, binding)
     existing = _read_receipt(root)
+    rolled_back_receipt: dict[str, Any] | None = None
     if existing is not None:
         if existing.get("state") == "rolled_back":
+            rolled_back_receipt = existing
             prior_scope = _qualification_replay_scope(existing.get("qualification"), existing)
             if prior_scope is not None and prior_scope == _generated_qualification_replay_scope(manifest, generated):
                 raise ValueError(
@@ -3089,7 +3294,7 @@ def _stage_unlocked(
                     for unit in activation_package.STAGED_ZERO_UNITS:
                         driver.start(unit)
                     staged_zero = _staged_zero_readback(manifest, root, driver)
-                    return {
+                    result = {
                         "status": "unchanged",
                         "state": "staged_zero",
                         "capacity": 0,
@@ -3113,8 +3318,12 @@ def _stage_unlocked(
                     if compensation_errors:
                         raise ValueError(last_error) from error
                     raise
+                _complete_rollback_retirement(manifest, root)
+                return result
             raise ValueError(f"activation receipt requires rollback from {existing['state']}")
     report = preflight(manifest, root, driver, require_dormant=True, payloads=payloads)
+    if rolled_back_receipt is not None:
+        _prepare_rollback_retirement(rolled_back_receipt, manifest, root)
     receipt = _new_receipt(manifest, root, driver, generated)
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     try:
@@ -3137,7 +3346,7 @@ def _stage_unlocked(
         for unit in activation_package.STAGED_ZERO_UNITS:
             driver.start(unit)
         staged_zero = _staged_zero_readback(manifest, root, driver)
-        return {
+        result = {
             "status": "staged",
             "state": "staged_zero",
             "capacity": 0,
@@ -3163,6 +3372,8 @@ def _stage_unlocked(
         if compensation_errors:
             raise ValueError(last_error) from error
         raise
+    _complete_rollback_retirement(manifest, root)
+    return result
 
 
 def stage(
@@ -4258,11 +4469,11 @@ def _finish_rollback_cleanup(
         raise ValueError("rollback cleanup receipt state differs")
     _rollback_terminal_response(receipt, manifest, root, driver, status="unchanged")
     if receipt["state"] == "rolled_back":
-        if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
+        if _fixed_package_present(root):
             raise ValueError("fixed activation package remains after rollback")
         return _rollback_terminal_response(receipt, manifest, root, driver, status="unchanged")
     _remove_fixed_package_resumable(manifest, root)
-    if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
+    if _fixed_package_present(root):
         raise ValueError("fixed activation package cleanup is incomplete")
     response = _rollback_terminal_response(receipt, manifest, root, driver, status="rolled_back")
     receipt.update({"state": "rolled_back", "updated_at": utc_now(), "last_error": None})
@@ -4345,9 +4556,26 @@ def _rollback_unlocked(
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         raise ValueError(combined)
     try:
-        if activation_package.rooted(root, FIXED_PACKAGE_PATH).exists():
+        cleanup_marker = _read_rollback_cleanup(root)
+        expected_marker = _rollback_cleanup_value(manifest)
+        if cleanup_marker is not None and cleanup_marker != expected_marker:
+            retirement = _read_rollback_retirement(root)
+            if (
+                retirement is None
+                or retirement["marker"] != cleanup_marker
+                or retirement["next_activation_id"] != manifest["activation_id"]
+                or retirement["next_package_digest"] != manifest["package_digest"]
+                or retirement["next_source_commit"] != manifest["source_commit"]
+            ):
+                raise ValueError("rollback cleanup marker belongs to a different activation")
             _verify_fixed_package(manifest, root)
-        _write_rollback_cleanup(manifest, root)
+            _complete_rollback_retirement(manifest, root)
+            cleanup_marker = None
+        if cleanup_marker is None:
+            _verify_fixed_package(manifest, root)
+            _write_rollback_cleanup(manifest, root)
+        elif _fixed_package_present(root):
+            _verify_fixed_package(manifest, root)
         receipt.update({"state": "rollback_cleanup", "updated_at": utc_now(), "last_error": None})
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
     except BaseException as error:
