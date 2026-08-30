@@ -17,6 +17,7 @@ import uuid
 
 SCHEMA = "buzz-ci-runner-install-package-v1"
 RECEIPT_SCHEMA = "buzz-ci-runner-install-receipt-v2"
+LEGACY_RECEIPT_SCHEMA = "buzz-ci-runner-install-receipt-v1"
 TRANSACTION_SCHEMA = "buzz-ci-runner-install-transaction-v1"
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
@@ -645,6 +646,20 @@ def receipt_for(state: dict[str, object], terminal_state: str) -> dict[str, obje
     }
 
 
+def legacy_receipt_for(state: dict[str, object], terminal_state: str) -> dict[str, object]:
+    if terminal_state not in {"installed", "rolled_back"}:
+        raise ValueError("invalid legacy receipt state")
+    return {
+        "schema": LEGACY_RECEIPT_SCHEMA,
+        "state": terminal_state,
+        "package_id": state["package_id"],
+        "package_digest": state["package_digest"],
+        "changed_targets": state["changed_targets"],
+        "created_directories": state["created_directories"],
+        "inventory": state["inventory"],
+    }
+
+
 def write_receipt(root: Path, transaction: Path, state: dict[str, object], terminal_state: str) -> dict[str, object]:
     receipt = receipt_for(state, terminal_state)
     atomic_write(
@@ -804,7 +819,16 @@ def read_transaction(
     receipt: dict[str, object] | None = None
     if receipt_path.exists() or receipt_path.is_symlink():
         receipt, _, receipt_meta = parse_json_file(receipt_path)
-        expected = receipt_for(state, str(receipt.get("state"))) if receipt.get("state") in {"installed", "rolled_back"} else None
+        receipt_state_value = receipt.get("state")
+        expected: dict[str, object] | None = None
+        if receipt.get("schema") == RECEIPT_SCHEMA and receipt_state_value in {"installed", "rolled_back"}:
+            expected = receipt_for(state, str(receipt_state_value))
+        elif (
+            receipt.get("schema") == LEGACY_RECEIPT_SCHEMA
+            and state.get("phase") in {"installed", "rollback_restoring"}
+            and receipt_state_value == "installed"
+        ):
+            expected = legacy_receipt_for(state, "installed")
         if (
             receipt_meta.st_uid != mapped_id(0, root)
             or receipt_meta.st_gid != mapped_id(0, root, group=True)
@@ -916,6 +940,113 @@ def validate_rollback_directories(
             os.close(fd)
         if present != expected_present:
             raise ValueError(f"rollback directory removal is blocked: {logical}")
+
+
+def read_legacy_receipt(
+    root: Path,
+    transaction: Path,
+    manifest: dict[str, object],
+    entries: list[Entry],
+) -> tuple[dict[str, object], dict[str, bytes | None], dict[str, object]]:
+    require_directory(transaction, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
+    receipt, _, metadata = parse_json_file(transaction / "receipt.json")
+    expected_keys = {
+        "schema",
+        "state",
+        "package_id",
+        "package_digest",
+        "changed_targets",
+        "created_directories",
+        "inventory",
+    }
+    if (
+        metadata.st_uid != mapped_id(0, root)
+        or metadata.st_gid != mapped_id(0, root, group=True)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or set(receipt) != expected_keys
+        or receipt.get("schema") != LEGACY_RECEIPT_SCHEMA
+        or receipt.get("state") not in {"installed", "rolled_back"}
+        or receipt.get("package_id") != manifest["package_id"]
+        or receipt.get("package_digest") != manifest["package_digest"]
+        or not transaction.name.startswith(f"{manifest['package_id']}-")
+    ):
+        raise ValueError("legacy backup receipt is invalid or bound to another candidate")
+
+    changed_targets = receipt.get("changed_targets")
+    created_directories = receipt.get("created_directories")
+    by_target = {entry.target: entry for entry in entries}
+    if (
+        not isinstance(changed_targets, list)
+        or not changed_targets
+        or any(not isinstance(target, str) or target not in by_target for target in changed_targets)
+        or changed_targets != sorted(changed_targets, key=str.encode)
+        or not isinstance(created_directories, list)
+        or any(
+            not isinstance(directory, str) or directory not in EXPECTED_DIRECTORIES
+            for directory in created_directories
+        )
+        or len(set(created_directories)) != len(created_directories)
+        or created_directories
+        != [
+            str(item["target"])
+            for item in manifest["directories"]
+            if item["target"] in set(created_directories)
+        ]
+    ):
+        raise ValueError("legacy backup receipt inventory is ambiguous")
+
+    candidate: list[dict[str, object]] = []
+    for target in changed_targets:
+        entry = by_target[target]
+        uid, gid, install_mode = desired_metadata(root, entry)
+        candidate.append(
+            {
+                "target": target,
+                "sha256": entry.sha256,
+                "mode": install_mode,
+                "uid": uid,
+                "gid": gid,
+            }
+        )
+    state = {
+        "schema": TRANSACTION_SCHEMA,
+        "transaction_id": transaction.name,
+        "package_id": manifest["package_id"],
+        "package_digest": manifest["package_digest"],
+        "source_commit": manifest["source_commit"],
+        "phase": str(receipt["state"]),
+        "changed_targets": changed_targets,
+        "created_directories": created_directories,
+        "inventory": receipt["inventory"],
+        "candidate": candidate,
+    }
+    state["transaction_digest"] = transaction_digest(state)
+    if receipt != legacy_receipt_for(state, str(receipt["state"])):
+        raise ValueError("legacy backup receipt binding is invalid")
+    prior_payloads = validate_inventory(root, transaction, state, entries)
+    validate_unchanged_targets(root, state, entries)
+    for record, desired in zip(state["inventory"], candidate, strict=True):
+        if record["existed"] and (
+            record["sha256"], record["mode"], record["uid"], record["gid"]
+        ) == (desired["sha256"], desired["mode"], desired["uid"], desired["gid"]):
+            raise ValueError("legacy backup prior state is indistinguishable from the candidate")
+
+    classifications = target_classifications(root, state, entries)
+    if receipt["state"] == "installed":
+        require_classifications(classifications, {"candidate", "prior"}, "legacy installed backup")
+        validate_rollback_directories(root, state, classifications)
+        if set(classifications.values()) != {"candidate"}:
+            state["phase"] = "rollback_restoring"
+            state["transaction_digest"] = transaction_digest(state)
+    else:
+        require_classifications(classifications, {"prior"}, "legacy rolled-back backup")
+        validate_rollback_directories(root, state, classifications)
+        if any(
+            rooted(root, str(logical)).exists() or rooted(root, str(logical)).is_symlink()
+            for logical in state["created_directories"]
+        ):
+            raise ValueError("legacy rolled-back directory evidence is ambiguous")
+    return state, prior_payloads, receipt
 
 
 def result_for_install(manifest: dict[str, object], state: dict[str, object]) -> dict[str, object]:
@@ -1152,7 +1283,25 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
         raise ValueError("invalid backup id")
     transaction = backup_root_path(root, backup_root) / backup_id
     require_directory(transaction.parent, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
-    state, prior_payloads, receipt = read_transaction(package, root, transaction, manifest, entries)
+    state_path = transaction / "transaction.json"
+    if not state_path.exists() and not state_path.is_symlink():
+        state, prior_payloads, receipt = read_legacy_receipt(root, transaction, manifest, entries)
+        if state["phase"] == "rolled_back" or dry_run:
+            return result_for_rollback(manifest, state, dry_run=dry_run)
+        state = write_transaction_state(root, transaction, state, str(state["phase"]))
+        _phase_boundary("legacy_transaction_persisted")
+        receipt = write_receipt(root, transaction, state, "installed")
+        _phase_boundary("legacy_receipt_migrated")
+    else:
+        state, prior_payloads, receipt = read_transaction(package, root, transaction, manifest, entries)
+        if (
+            not dry_run
+            and state["phase"] in {"installed", "rollback_restoring"}
+            and receipt is not None
+            and receipt.get("schema") == LEGACY_RECEIPT_SCHEMA
+        ):
+            receipt = write_receipt(root, transaction, state, "installed")
+            _phase_boundary("legacy_receipt_migrated")
     phase = str(state["phase"])
     if phase in {"install_prepared", "install_publishing"}:
         raise ValueError("install transaction is incomplete; retry install before rollback")
