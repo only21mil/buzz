@@ -1046,25 +1046,25 @@ class InputTests(unittest.TestCase):
             self.assertFalse((root / "results").exists())
             self.assertFalse(any(path.name.startswith(".state.terminal-") for path in root.iterdir()))
 
-    def test_claim_ownership_open_write_and_fsync_failures_sanitize_selected_state(self) -> None:
+    def test_claim_ownership_open_write_and_fsync_failures_are_restart_safe(self) -> None:
         boundaries = ("open", "partial-write", "file-fsync", "directory-fsync")
         for boundary in boundaries:
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 state = make_prepared_state(root)
                 binding = harness.run_binding({"state": str(state)}, root / "results")
-                real_writer = harness.write_run_ownership
+                real_writer = harness.write_pending_run_ownership
                 real_fsync = os.fsync
                 failed = False
 
-                def writer(directory_fd, ownership, acquired):
+                def writer(directory_fd, pending_name, ownership, acquired):
                     if boundary == "open":
                         raise PermissionError("simulated ownership open failure")
                     if boundary == "partial-write":
                         descriptor = os.open(
-                            harness.RUN_OWNERSHIP,
-                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-                            0o400,
+                            pending_name,
+                            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                            0o600,
                             dir_fd=directory_fd,
                         )
                         acquired()
@@ -1073,7 +1073,7 @@ class InputTests(unittest.TestCase):
                         finally:
                             os.close(descriptor)
                         raise OSError("simulated ownership partial write")
-                    return real_writer(directory_fd, ownership, acquired)
+                    return real_writer(directory_fd, pending_name, ownership, acquired)
 
                 def fsync(descriptor):
                     nonlocal failed
@@ -1085,10 +1085,21 @@ class InputTests(unittest.TestCase):
                     return real_fsync(descriptor)
 
                 with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
-                    harness, "write_run_ownership", side_effect=writer,
+                    harness, "write_pending_run_ownership", side_effect=writer,
                 ), mock.patch.object(harness.os, "fsync", side_effect=fsync):
                     with self.assertRaises((OSError, PermissionError)):
                         harness.claim_run_state(binding)
+                if boundary == "open":
+                    self.assertTrue(state.exists())
+                    self.assertFalse((state / harness.RUN_OWNERSHIP).exists())
+                    self.assertFalse(any(
+                        path.name.startswith(harness.RUN_OWNERSHIP_PENDING_PREFIX)
+                        for path in state.iterdir()
+                    ))
+                    with mock.patch.object(harness, "validate_flat_qcow2"):
+                        claimed, expected, _resumed = harness.claim_run_state(binding)
+                    harness.destroy_state(claimed, expected)
+                    continue
                 self.assertFalse(state.exists())
                 residue = [path for path in root.iterdir() if ".state.tombstone-" in path.name]
                 self.assertEqual(len(residue), 1)
@@ -1096,6 +1107,199 @@ class InputTests(unittest.TestCase):
                 ownership = residue[0] / harness.RUN_OWNERSHIP
                 if ownership.exists():
                     self.assertEqual(ownership.stat().st_size, 0)
+
+    def test_claim_recovers_exact_empty_and_partial_pending_publications(self) -> None:
+        for raw in (b"", b'{"schema_version":'):
+            with self.subTest(bytes=len(raw)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = make_prepared_state(root)
+                binding = harness.run_binding({"state": str(state)}, root / "results")
+                expected = harness.state_identity(state)
+                ownership = harness.run_ownership_record(binding)
+                pending = state / harness.run_ownership_pending_name(ownership, expected)
+                pending.write_bytes(raw)
+                pending.chmod(0o600)
+                with mock.patch.object(harness, "validate_flat_qcow2"):
+                    claimed, observed, resumed = harness.claim_run_state(binding)
+                self.assertEqual(observed, expected)
+                self.assertTrue(resumed)
+                self.assertFalse(pending.exists())
+                self.assertEqual(
+                    (claimed / harness.RUN_OWNERSHIP).read_bytes(), harness.canonical(ownership),
+                )
+                harness.destroy_state(claimed, expected)
+
+    def test_claim_foreign_pending_transaction_never_authorizes_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            first = harness.run_binding({"state": str(state)}, root / "first-results")
+            second = harness.run_binding({"state": str(state)}, root / "second-results")
+            expected = harness.state_identity(state)
+            pending = state / harness.run_ownership_pending_name(
+                harness.run_ownership_record(first), expected,
+            )
+            pending.write_bytes(b"partial foreign transaction")
+            pending.chmod(0o600)
+            before = pending.read_bytes()
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                with self.assertRaisesRegex(harness.HarnessError, "pending transaction differs"):
+                    harness.claim_run_state(second)
+            self.assertTrue(state.exists())
+            self.assertEqual(pending.read_bytes(), before)
+            self.assertFalse((state / harness.RUN_OWNERSHIP).exists())
+
+            state.rename(root / "prior-state")
+            replacement = make_prepared_state(root)
+            replaced_pending = replacement / pending.name
+            replaced_pending.write_bytes(before)
+            replaced_pending.chmod(0o600)
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                with self.assertRaisesRegex(harness.HarnessError, "pending transaction differs"):
+                    harness.claim_run_state(first)
+            self.assertTrue(replacement.exists())
+            self.assertEqual(replaced_pending.read_bytes(), before)
+
+    def test_claim_lock_serializes_overlapping_same_binding_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            claimed = Path(binding["claimed_state"])
+            paused = root / "a-paused"
+            release = root / "release-a"
+            b_started = root / "b-started"
+            a_result = root / "a-result"
+            b_result = root / "b-result"
+
+            def run_child(role, result):
+                try:
+                    def checkpoint(name, _path, _descriptor):
+                        if role == "A" and name == "before-claim-rename":
+                            paused.write_text("paused")
+                            deadline = time.monotonic() + 5
+                            while not release.exists():
+                                if time.monotonic() >= deadline:
+                                    raise RuntimeError("claim overlap release timed out")
+                                time.sleep(0.01)
+
+                    if role == "B":
+                        b_started.write_text("started")
+                    with mock.patch.object(harness, "validate_flat_qcow2"), mock.patch.object(
+                        harness, "claim_checkpoint", side_effect=checkpoint,
+                    ):
+                        selected, _expected, resumed = harness.claim_run_state(binding)
+                    result.write_text(f"return:{selected}:{resumed}")
+                    os._exit(0)
+                except BaseException as error:
+                    result.write_text(f"error:{type(error).__name__}:{error}")
+                    os._exit(1)
+
+            a_pid = os.fork()
+            if a_pid == 0:
+                run_child("A", a_result)
+            deadline = time.monotonic() + 5
+            while not paused.exists():
+                if time.monotonic() >= deadline:
+                    os.kill(a_pid, 9)
+                    self.fail("first claimant did not pause")
+                time.sleep(0.01)
+            b_pid = os.fork()
+            if b_pid == 0:
+                run_child("B", b_result)
+            deadline = time.monotonic() + 5
+            while not b_started.exists():
+                if time.monotonic() >= deadline:
+                    os.kill(a_pid, 9)
+                    os.kill(b_pid, 9)
+                    self.fail("second claimant did not start")
+                time.sleep(0.01)
+            time.sleep(0.1)
+            self.assertFalse(b_result.exists())
+            release.write_text("release")
+            a_status = os.waitpid(a_pid, 0)[1]
+            b_status = os.waitpid(b_pid, 0)[1]
+            self.assertEqual((a_status, b_status), (0, 0))
+            self.assertTrue(a_result.read_text().startswith(f"return:{claimed}:"))
+            self.assertTrue(b_result.read_text().startswith(f"return:{claimed}:True"))
+            self.assertFalse(state.exists())
+            self.assertTrue(claimed.exists())
+            harness.destroy_state(claimed, harness.state_identity(claimed))
+
+    def test_claim_lock_timeout_is_finite_and_crash_releases_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            held = harness.acquire_claim_lock(binding)
+            try:
+                with mock.patch.object(harness, "CLAIM_LOCK_TIMEOUT", 0.05), mock.patch.object(
+                    harness, "CLAIM_LOCK_POLL", 0.005,
+                ), mock.patch.object(harness, "validate_flat_qcow2"):
+                    with self.assertRaisesRegex(harness.HarnessError, "timed out waiting"):
+                        harness.claim_run_state(binding)
+            finally:
+                harness.release_claim_lock(held)
+            crash_pid = os.fork()
+            if crash_pid == 0:
+                def crash_after_lock(name, _path, _descriptor):
+                    if name == "after-claim-lock":
+                        os._exit(73)
+
+                with mock.patch.object(harness, "claim_checkpoint", side_effect=crash_after_lock):
+                    harness.claim_run_state(binding)
+                os._exit(1)
+            crash_status = os.waitpid(crash_pid, 0)[1]
+            self.assertEqual(os.waitstatus_to_exitcode(crash_status), 73)
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, expected, _resumed = harness.claim_run_state(binding)
+            harness.destroy_state(claimed, expected)
+
+    def test_cleanup_crash_after_ownership_zero_has_no_public_prepared_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, expected, _resumed = harness.claim_run_state(binding)
+            crash_pid = os.fork()
+            if crash_pid == 0:
+                def crash_after_zero(name, _path, _descriptor):
+                    if name == "after-run-ownership-zero":
+                        os._exit(74)
+
+                with mock.patch.object(harness, "cleanup_checkpoint", side_effect=crash_after_zero):
+                    harness.destroy_state(claimed, expected)
+                os._exit(1)
+            crash_status = os.waitpid(crash_pid, 0)[1]
+            self.assertEqual(os.waitstatus_to_exitcode(crash_status), 74)
+            self.assertFalse(state.exists())
+            self.assertFalse(claimed.exists())
+            residue = [path for path in root.iterdir() if ".terminal-run.tombstone-" in path.name]
+            self.assertEqual(len(residue), 1)
+            ownership = residue[0] / harness.RUN_OWNERSHIP
+            self.assertEqual(ownership.stat().st_size, 0)
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                with self.assertRaises(FileNotFoundError):
+                    harness.claim_run_state(binding)
+
+    def test_cleanup_never_zeroes_ownership_before_tombstone_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                claimed, expected, _resumed = harness.claim_run_state(binding)
+            ownership_before = (claimed / harness.RUN_OWNERSHIP).read_bytes()
+            with mock.patch.object(
+                harness, "fsync_parent", side_effect=OSError("simulated tombstone fsync failure"),
+            ):
+                with self.assertRaisesRegex(harness.CleanupDurabilityError, "durability failed"):
+                    harness.destroy_state(claimed, expected)
+            self.assertFalse(claimed.exists())
+            residue = [path for path in root.iterdir() if ".terminal-run.tombstone-" in path.name]
+            self.assertEqual(len(residue), 1)
+            self.assertEqual((residue[0] / harness.RUN_OWNERSHIP).read_bytes(), ownership_before)
 
     def test_claim_rename_rejects_every_oserror_class_and_cleans_exact_state(self) -> None:
         failures = (
@@ -1256,6 +1460,21 @@ class InputTests(unittest.TestCase):
                     harness.claim_run_state(binding)
             self.assertTrue(state.exists())
             self.assertEqual(ownership.read_bytes(), before)
+
+    def test_claim_noncanonical_matching_ownership_is_not_cleanup_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_prepared_state(root)
+            binding = harness.run_binding({"state": str(state)}, root / "results")
+            ownership = state / harness.RUN_OWNERSHIP
+            raw = json.dumps(harness.run_ownership_record(binding), indent=2).encode() + b"\n"
+            ownership.write_bytes(raw)
+            ownership.chmod(0o400)
+            with mock.patch.object(harness, "validate_flat_qcow2"):
+                with self.assertRaisesRegex(harness.HarnessError, "encoding differs"):
+                    harness.claim_run_state(binding)
+            self.assertTrue(state.exists())
+            self.assertEqual(ownership.read_bytes(), raw)
 
     def test_post_first_file_restart_exposes_nothing_and_cleans_exact_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

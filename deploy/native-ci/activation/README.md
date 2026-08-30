@@ -381,6 +381,20 @@ installation and `daemon-reload`, staging requires all 13 lifecycle units
 loaded and re-reads 18 exact fragment/drop-in paths and digests before starting
 any staged service.
 
+A clean-host terminal run takes an exclusive advisory lock through a no-follow
+descriptor for the prepared state's parent directory. Contention waits at most
+30 seconds, then fails before state selection. The same lock remains held
+through claim, VM execution, result publication, and every cleanup path. Run
+ownership is first written to a recoverable pending name bound to the canonical
+ownership bytes and the selected state's device, inode, and marker digest. The
+harness fsyncs that complete record and atomically renames it to
+`run-ownership.json`. An exact retry can rewrite an empty or partial matching
+pending record. A differently bound pending record grants no cleanup authority
+and fails closed without changing the state. Cleanup moves the selected state
+to its identity-checked tombstone and fsyncs that namespace change before
+zeroing the ownership record, so a crash after zeroing leaves no public
+prepared or claimed state.
+
 Before using a package against `/`, transfer its root, `assets` directory,
 manifest, and every asset to `root:root`. Both directories must be mode `0700`.
 The manifest must be mode `0600`, provenance and config sources mode `0400`,
