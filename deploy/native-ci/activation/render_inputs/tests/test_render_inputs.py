@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -106,10 +107,13 @@ def write_public_binding(root: Path, value: object) -> dict[str, object]:
     }
 
 
-def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> dict[str, object]:
+def minimal_manifest(
+    name: str, source: str, raw: bytes, mode: int = 0o400,
+    candidate: str = CANDIDATE,
+) -> dict[str, object]:
     unsigned: dict[str, object] = {
         "schema": f"test-{name}-package-v1",
-        "source_commit": CANDIDATE,
+        "source_commit": candidate,
         "entries": [{
             "role": "payload", "source": source, "source_mode": f"{mode:04o}",
             "sha256": hashlib.sha256(raw).hexdigest(),
@@ -145,21 +149,52 @@ class RendererTests(unittest.TestCase):
                 elif isinstance(value, list):
                     stack.extend(value)
 
-    def make_lifecycle(self, root: Path) -> dict[str, object]:
+    def make_candidate(self, root: Path) -> tuple[Path, str, dict[str, object]]:
+        candidate_root = root / "candidate"
+        for name, (relative, git_mode, _maximum) in RENDER.HARNESS_ASSET_SOURCES.items():
+            source = (
+                RENDER.CLEAN_HOST_ASSET_ROOT / name
+                if name not in {"receipt_verifier.py", "expected-stages.json"}
+                else ROOT.parents[1] / "acceptance" / (
+                    "verify-receipt.py" if name == "receipt_verifier.py" else name
+                )
+            )
+            target = candidate_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(git_mode & 0o777)
+        subprocess.run(["/usr/bin/git", "init", "-q", str(candidate_root)], check=True)
+        subprocess.run([
+            "/usr/bin/git", "-C", str(candidate_root), "config", "user.name", "Test",
+        ], check=True)
+        subprocess.run([
+            "/usr/bin/git", "-C", str(candidate_root), "config", "user.email",
+            "test@example.invalid",
+        ], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(candidate_root), "add", "."], check=True)
+        subprocess.run([
+            "/usr/bin/git", "-C", str(candidate_root), "commit", "-q", "-m", "candidate",
+        ], check=True)
+        candidate = subprocess.check_output([
+            "/usr/bin/git", "-C", str(candidate_root), "rev-parse", "HEAD^{commit}",
+        ], text=True).strip()
+        bindings = RENDER.candidate_clean_host_bindings(candidate_root, candidate)
+        return candidate_root, candidate, bindings
+
+    def make_lifecycle(self, root: Path) -> tuple[dict[str, object], str]:
+        _candidate_root, candidate, bindings = self.make_candidate(root)
         proof = {
             "configs_sha256": HEX["config"], "units_sha256": HEX["units"],
             "sockets_absent": True, "processes_absent": True,
             "encrypted_credentials_absent": True, "relay_residue_absent": True,
         }
         trees = {name: digit * 64 for name, digit in zip(RENDER.PACKAGE_NAMES, "89abc", strict=True)}
-        timing = json.loads(
-            (RENDER.CLEAN_HOST_ASSET_ROOT / "timing-contract.json").read_bytes(),
-        )
-        harness_sha = "4" * 64
-        timing_asset_sha = "5" * 64
-        timing_sha = hashlib.sha256(RENDER.harness_canonical(timing)).hexdigest()
+        timing = bindings["timing"]
+        harness_sha = bindings["harness_sha256"]
+        timing_asset_sha = bindings["timing_asset_sha256"]
+        timing_sha = bindings["timing_sha256"]
         contract = {
-            "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3", "candidate_sha": CANDIDATE,
+            "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3", "candidate_sha": candidate,
             "state": "state", "candidate_root": "candidate",
             "harness_sha256": harness_sha,
             "timing_asset_sha256": timing_asset_sha,
@@ -168,21 +203,39 @@ class RendererTests(unittest.TestCase):
             "seccomp_source": {"path": "seccomp.json", "sha256": RENDER.SECCOMP_SHA256},
             "packages": {name: {"path": name, "tree_sha256": trees[name]} for name in RENDER.PACKAGE_NAMES},
         }
-        receipt = {"outcome": "pass", "integrated_candidate_sha": CANDIDATE, "scenario_sha256": HEX["scenario"]}
-        verifier = {"status": "pass"}
+        expected_stages = json.loads(
+            (ROOT.parents[1] / "acceptance/expected-stages.json").read_bytes(),
+        )
+        checks = [
+            {
+                "sequence": sequence, "stage": stage, "outcome": "pass",
+                "evidence_sha256": f"{sequence:x}" * 64, "snapshot": {},
+                **({"export": {}} if sequence == 7 else {}),
+            }
+            for sequence, stage in enumerate(expected_stages, start=1)
+        ]
+        receipt = {
+            "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2",
+            "outcome": "pass", "scenario_sha256": HEX["scenario"],
+            "integrated_candidate_sha": candidate, "run_id": "1" * 32,
+            "checks": checks,
+            "zero_transition": {
+                "schema_version": "buzz-ci-capacity-one-zero-transition/v1",
+                "outcome": "pass", "attempts": 1, "phases": [], "zero_proof": {},
+            },
+        }
+        verifier = {"outcome": "pass", "status": "verified"}
         receipt_ref = write_json(root, "evidence/acceptance-receipt.json", receipt, 0o400)
         verifier_ref = write_json(root, "evidence/verifier.json", verifier, 0o400)
         evidence = {
-            "schema_version": "buzz-ci-clean-host-e2e-evidence/v3", "candidate_sha": CANDIDATE,
-            "image_sha256": "d" * 64, "tool_sha256": {"qemu": "e" * 64},
-            "harness_sha256": harness_sha,
-            "harness_asset_sha256": {
-                name: (
-                    harness_sha if name == "harness.py" else
-                    timing_asset_sha if name == "timing-contract.json" else "f" * 64
-                )
-                for name in RENDER.HARNESS_ASSET_NAMES
+            "schema_version": "buzz-ci-clean-host-e2e-evidence/v3", "candidate_sha": candidate,
+            "image_sha256": "d" * 64,
+            "tool_sha256": {
+                "qemu": "e" * 64, "qemu_img": "d" * 64, "bwrap": "c" * 64,
+                "xorriso": "b" * 64, "cloud_localds": "a" * 64,
             },
+            "harness_sha256": harness_sha,
+            "harness_asset_sha256": bindings["asset_sha256"],
             "timing_asset_sha256": timing_asset_sha,
             "timing": timing, "timing_sha256": timing_sha,
             "package_tree_sha256": trees, "scenario_sha256": HEX["scenario"],
@@ -194,7 +247,7 @@ class RendererTests(unittest.TestCase):
         evidence_ref = write_json(root, "evidence/evidence-manifest.json", evidence, 0o400)
         contract_ref = write_json(root, "evidence/contract.json", contract, 0o400)
         result = {
-            "status": "pass", "candidate_sha": CANDIDATE, "vm_state_absent": True,
+            "status": "pass", "candidate_sha": candidate, "vm_state_absent": True,
             "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
             "timing_sha256": timing_sha,
             "receipt_sha256": receipt_ref["sha256"], "verifier_sha256": verifier_ref["sha256"],
@@ -204,7 +257,36 @@ class RendererTests(unittest.TestCase):
         return {
             "result": result_ref, "contract": contract_ref, "evidence_manifest": evidence_ref,
             "acceptance_receipt": receipt_ref, "verifier": verifier_ref,
-        }
+        }, candidate
+
+    def rewrite_lifecycle_member(
+        self, root: Path, lifecycle: dict[str, object], name: str, value: object,
+    ) -> None:
+        reference = lifecycle[name]
+        assert isinstance(reference, dict)
+        (root / str(reference["path"])).chmod(0o600)
+        lifecycle[name] = write_json(root, str(reference["path"]), value, 0o400)
+        if name == "verifier":
+            verifier_sha = lifecycle[name]["sha256"]
+            for dependent in ("evidence_manifest", "result"):
+                dependent_ref = lifecycle[dependent]
+                assert isinstance(dependent_ref, dict)
+                dependent_value = json.loads((root / str(dependent_ref["path"])).read_bytes())
+                dependent_value["verifier_sha256"] = verifier_sha
+                (root / str(dependent_ref["path"])).chmod(0o600)
+                lifecycle[dependent] = write_json(
+                    root, str(dependent_ref["path"]), dependent_value, 0o400,
+                )
+        if name in {"verifier", "evidence_manifest"}:
+            result_ref = lifecycle["result"]
+            evidence_ref = lifecycle["evidence_manifest"]
+            assert isinstance(result_ref, dict) and isinstance(evidence_ref, dict)
+            result_value = json.loads((root / str(result_ref["path"])).read_bytes())
+            result_value["evidence_manifest_sha256"] = evidence_ref["sha256"]
+            (root / str(result_ref["path"])).chmod(0o600)
+            lifecycle["result"] = write_json(
+                root, str(result_ref["path"]), result_value, 0o400,
+            )
 
     def run_cli(self, root: Path, action: str, descriptor: dict[str, object], output: str) -> subprocess.CompletedProcess[str]:
         descriptor_ref = write_json(root, "descriptor.json", descriptor)
@@ -216,10 +298,10 @@ class RendererTests(unittest.TestCase):
     def test_residue_is_reproducible_and_disclaims_external_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            lifecycle = self.make_lifecycle(root)
+            lifecycle, candidate = self.make_lifecycle(root)
             descriptor = {
                 "schema_version": "buzz-ci-residue-receipt-render-input/v1",
-                "candidate_sha": CANDIDATE, "lifecycle": lifecycle,
+                "candidate_sha": candidate, "lifecycle": lifecycle,
             }
             first = self.run_cli(root, "record-residue", descriptor, "first.json")
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -229,6 +311,10 @@ class RendererTests(unittest.TestCase):
             value = json.loads((root / "first.json").read_bytes())
             self.assertEqual(value["claims"], {"protected_ci": False, "tier2": False})
             self.assertEqual(value["lifecycle_status"], "verified_pass")
+            self.assertEqual(
+                (root / "evidence/verifier.json").read_bytes(),
+                b'{"outcome":"pass","status":"verified"}\n',
+            )
             self.assertEqual((root / "first.json").stat().st_mode & 0o7777, 0o600)
 
     def test_output_publication_fsyncs_file_and_directory(self) -> None:
@@ -506,10 +592,10 @@ class RendererTests(unittest.TestCase):
     def test_bound_lifecycle_mutation_fails_without_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            lifecycle = self.make_lifecycle(root)
+            lifecycle, candidate = self.make_lifecycle(root)
             descriptor = {
                 "schema_version": "buzz-ci-residue-receipt-render-input/v1",
-                "candidate_sha": CANDIDATE, "lifecycle": lifecycle,
+                "candidate_sha": candidate, "lifecycle": lifecycle,
             }
             write_json(root, "descriptor.json", descriptor)
             evidence = root / "evidence/evidence-manifest.json"
@@ -539,17 +625,17 @@ class RendererTests(unittest.TestCase):
             ),
             (
                 "evidence_manifest", lambda value: value.update(harness_sha256="a" * 64),
-                "lifecycle harness or timing binding differs",
+                "lifecycle frozen asset or timing binding differs",
             ),
             (
                 "result", lambda value: value.update(timing_sha256="b" * 64),
-                "lifecycle harness or timing binding differs",
+                "lifecycle frozen asset or timing binding differs",
             ),
         )
         for member, mutate, message in mutations:
             with self.subTest(member=member, message=message), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                lifecycle = self.make_lifecycle(root)
+                lifecycle, candidate = self.make_lifecycle(root)
                 path = root / str(lifecycle[member]["path"])
                 value = json.loads(path.read_bytes())
                 mutate(value)
@@ -557,17 +643,64 @@ class RendererTests(unittest.TestCase):
                 lifecycle[member] = write_json(root, str(lifecycle[member]["path"]), value, 0o400)
                 descriptor = {
                     "schema_version": "buzz-ci-residue-receipt-render-input/v1",
-                    "candidate_sha": CANDIDATE, "lifecycle": lifecycle,
+                    "candidate_sha": candidate, "lifecycle": lifecycle,
                 }
                 process = self.run_cli(root, "record-residue", descriptor, "rejected.json")
                 self.assertEqual(process.returncode, 64)
                 self.assertIn(message, process.stderr)
                 self.assertFalse((root / "rejected.json").exists())
 
+        for asset_name in RENDER.HARNESS_ASSET_NAMES:
+            with self.subTest(asset=asset_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                lifecycle, candidate = self.make_lifecycle(root)
+                evidence_ref = lifecycle["evidence_manifest"]
+                assert isinstance(evidence_ref, dict)
+                evidence_value = json.loads((root / str(evidence_ref["path"])).read_bytes())
+                current = evidence_value["harness_asset_sha256"][asset_name]
+                evidence_value["harness_asset_sha256"][asset_name] = (
+                    "a" * 64 if current != "a" * 64 else "b" * 64
+                )
+                self.rewrite_lifecycle_member(
+                    root, lifecycle, "evidence_manifest", evidence_value,
+                )
+                descriptor = {
+                    "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                    "candidate_sha": candidate, "lifecycle": lifecycle,
+                }
+                process = self.run_cli(root, "record-residue", descriptor, "rejected.json")
+                self.assertEqual(process.returncode, 64, process.stderr)
+                self.assertIn("lifecycle frozen asset or timing binding differs", process.stderr)
+                self.assertFalse((root / "rejected.json").exists())
+
+        verifier_mutations = (
+            ({"status": "pass"}, "installed verifier output shape differs"),
+            ({"outcome": "pass", "status": "pass"}, "installed verifier lifecycle output did not pass"),
+            ({"outcome": "pass"}, "installed verifier output shape differs"),
+            (
+                {"outcome": "pass", "status": "verified", "detail": "tampered"},
+                "installed verifier output shape differs",
+            ),
+            ({"outcome": "failure", "status": "verified"}, "installed verifier lifecycle output did not pass"),
+        )
+        for verifier_value, message in verifier_mutations:
+            with self.subTest(verifier=verifier_value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                lifecycle, candidate = self.make_lifecycle(root)
+                self.rewrite_lifecycle_member(root, lifecycle, "verifier", verifier_value)
+                descriptor = {
+                    "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                    "candidate_sha": candidate, "lifecycle": lifecycle,
+                }
+                process = self.run_cli(root, "record-residue", descriptor, "rejected.json")
+                self.assertEqual(process.returncode, 64, process.stderr)
+                self.assertIn(message, process.stderr)
+                self.assertFalse((root / "rejected.json").exists())
+
     def test_symlinked_reference_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            lifecycle = self.make_lifecycle(root)
+            lifecycle, candidate = self.make_lifecycle(root)
             target = root / "evidence/verifier.json"
             link = root / "verifier-link.json"
             link.symlink_to(target)
@@ -576,7 +709,7 @@ class RendererTests(unittest.TestCase):
             }
             descriptor = {
                 "schema_version": "buzz-ci-residue-receipt-render-input/v1",
-                "candidate_sha": CANDIDATE, "lifecycle": lifecycle,
+                "candidate_sha": candidate, "lifecycle": lifecycle,
             }
             process = self.run_cli(root, "record-residue", descriptor, "rejected.json")
             self.assertEqual(process.returncode, 64)
@@ -697,14 +830,14 @@ class RendererTests(unittest.TestCase):
     def test_sealed_freeze_requires_cross_bound_manifests(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
-            lifecycle = self.make_lifecycle(root_path)
+            lifecycle, candidate = self.make_lifecycle(root_path)
             public_ref = write_public_binding(root_path, public_binding())
             refs: dict[str, object] = {}
             manifests: dict[str, object] = {}
             activation_digest = "a" * 64
             for name in RENDER.PACKAGE_NAMES:
                 payload = name.encode()
-                manifest = minimal_manifest(name, f"assets/{name}", payload)
+                manifest = minimal_manifest(name, f"assets/{name}", payload, candidate=candidate)
                 if name == "keyholder":
                     manifest["public_binding_sha256"] = public_ref["sha256"]
                 if name == "activation":
@@ -714,7 +847,7 @@ class RendererTests(unittest.TestCase):
                     activation_digest = hashlib.sha256(canonical(unsigned)).hexdigest()
                     manifest = {
                         **unsigned, "schema": "buzz-ci-capacity-one-activation-package-v1",
-                        "activation_id": f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{activation_digest[:12]}",
+                        "activation_id": f"buzz-ci-capacity-one-{candidate[:12]}-{activation_digest[:12]}",
                         "package_digest": activation_digest,
                     }
                 manifest_name = "activation-manifest.json" if name == "activation" else "package-manifest.json"
@@ -724,15 +857,15 @@ class RendererTests(unittest.TestCase):
             unsigned_execd = dict(execd)
             unsigned_execd.pop("package_digest")
             unsigned_execd["activation_binding"] = {
-                "source_commit": CANDIDATE, "package_digest": activation_digest,
-                "activation_id": f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{activation_digest[:12]}",
+                "source_commit": candidate, "package_digest": activation_digest,
+                "activation_id": f"buzz-ci-capacity-one-{candidate[:12]}-{activation_digest[:12]}",
             }
             execd = {**unsigned_execd, "package_digest": hashlib.sha256(canonical(unsigned_execd)).hexdigest()}
             (root_path / "execd/package-manifest.json").chmod(0o600)
             refs["execd"] = write_json(root_path, "execd/package-manifest.json", execd, 0o400)
             manifests["execd"] = execd
             descriptor = {
-                "schema_version": "buzz-ci-sealed-freeze-receipt-render-input/v1", "candidate_sha": CANDIDATE,
+                "schema_version": "buzz-ci-sealed-freeze-receipt-render-input/v1", "candidate_sha": candidate,
                 "lifecycle": lifecycle, "public_binding": public_ref, "package_manifests": refs,
             }
             descriptor_path = root_path / "descriptor.json"

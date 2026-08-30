@@ -77,9 +77,14 @@ execution.
 
 The two `record-*` commands run only after the clean-host result, contract,
 evidence manifest, acceptance receipt, and installed-verifier output form one
-verified passing lifecycle. They bind those exact bytes. `record-residue`
-requires the four absence booleans and destroyed VM state. `record-sealed-freeze`
-also binds the exact public binding and five package manifests. Both outputs set
+verified passing lifecycle. They require the verifier's exact real output,
+`{"outcome":"pass","status":"verified"}`, and bind its digest through both the
+evidence manifest and result. They derive and compare every evidence asset
+digest—harness, guest entry, timing contract, local TLS relay, receipt verifier,
+and expected stages—against the exact candidate Git blobs, so a self-consistent
+caller rewrite cannot substitute any frozen asset. `record-residue` requires
+the four absence booleans and destroyed VM state. `record-sealed-freeze` also
+binds the exact public binding and five package manifests. Both outputs set
 `protected_ci` and `tier2` to `false`; a later controller must supply those
 independent gates.
 

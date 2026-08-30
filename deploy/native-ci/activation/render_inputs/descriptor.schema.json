@@ -71,8 +71,15 @@
       "required": ["result", "contract", "evidence_manifest", "acceptance_receipt", "verifier"],
       "properties": {
         "result": {"$ref": "#/$defs/file"}, "contract": {"$ref": "#/$defs/file"},
-        "evidence_manifest": {"$ref": "#/$defs/file"}, "acceptance_receipt": {"$ref": "#/$defs/file"},
-        "verifier": {"$ref": "#/$defs/file"}
+        "evidence_manifest": {
+          "description": "Evidence whose six frozen asset digests are bound to exact candidate Git blobs.",
+          "$ref": "#/$defs/file"
+        },
+        "acceptance_receipt": {"$ref": "#/$defs/file"},
+        "verifier": {
+          "description": "Canonical verifier output with exact outcome pass and status verified.",
+          "$ref": "#/$defs/file"
+        }
       }
     },
     "draft": {

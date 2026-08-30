@@ -30,12 +30,17 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MODE = re.compile(r"^[0-7]{4}$")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 PRE_ACTIVATION_PACKAGE_NAMES = PACKAGE_NAMES[:3]
-HARNESS_ASSET_NAMES = (
-    "harness.py", "guest_entry.py", "timing-contract.json", "local_tls_relay.py",
-    "receipt_verifier.py", "expected-stages.json",
-)
 CLEAN_HOST_ASSET_ROOT = Path(__file__).resolve().parents[1] / "tests/clean_host_e2e"
 CLEAN_HOST_GIT_ROOT = "deploy/native-ci/activation/tests/clean_host_e2e"
+HARNESS_ASSET_SOURCES = {
+    "harness.py": (f"{CLEAN_HOST_GIT_ROOT}/harness.py", 0o100755, 2 * 1024 * 1024),
+    "guest_entry.py": (f"{CLEAN_HOST_GIT_ROOT}/guest_entry.py", 0o100755, 2 * 1024 * 1024),
+    "timing-contract.json": (f"{CLEAN_HOST_GIT_ROOT}/timing-contract.json", 0o100644, MAX_JSON),
+    "local_tls_relay.py": (f"{CLEAN_HOST_GIT_ROOT}/local_tls_relay.py", 0o100755, 2 * 1024 * 1024),
+    "receipt_verifier.py": ("deploy/native-ci/acceptance/verify-receipt.py", 0o100755, 2 * 1024 * 1024),
+    "expected-stages.json": ("deploy/native-ci/acceptance/expected-stages.json", 0o100644, MAX_JSON),
+}
+HARNESS_ASSET_NAMES = tuple(HARNESS_ASSET_SOURCES)
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 PACKAGE_SCHEMAS = {
     "runner": "buzz-ci-runner-install-package-v1",
@@ -110,7 +115,7 @@ def require_sha(value: object, where: str, *, git: bool = False) -> str:
 
 
 def candidate_blob(
-    candidate_root: Path, candidate: str, relative: str, maximum: int,
+    candidate_root: Path, candidate: str, relative: str, git_mode: int, maximum: int,
 ) -> bytes:
     """Read one regular blob from the exact candidate commit."""
     try:
@@ -120,7 +125,7 @@ def candidate_blob(
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=10,
         ).stdout
         expected_suffix = f"\t{relative}\0".encode()
-        expected_mode = b"100644" if relative.endswith(".json") else b"100755"
+        expected_mode = f"{git_mode:o}".encode()
         if not tree.startswith(expected_mode + b" blob ") or not tree.endswith(expected_suffix) or tree.count(b"\0") != 1:
             raise RenderError(f"candidate clean-host asset mode differs: {relative}")
         raw = subprocess.run(
@@ -138,14 +143,17 @@ def candidate_blob(
 def candidate_clean_host_bindings(candidate_root: Path, candidate: str) -> dict[str, Any]:
     """Derive the closed v3 fields from immutable candidate Git objects."""
     assets = {
-        name: candidate_blob(
-            candidate_root, candidate, f"{CLEAN_HOST_GIT_ROOT}/{name}",
-            MAX_JSON if name == "timing-contract.json" else 2 * 1024 * 1024,
-        )
-        for name in ("harness.py", "guest_entry.py", "timing-contract.json")
+        name: candidate_blob(candidate_root, candidate, relative, git_mode, maximum)
+        for name, (relative, git_mode, maximum) in HARNESS_ASSET_SOURCES.items()
     }
     for name, raw in assets.items():
-        local = CLEAN_HOST_ASSET_ROOT / name
+        local = (
+            CLEAN_HOST_ASSET_ROOT / name
+            if name not in {"receipt_verifier.py", "expected-stages.json"}
+            else Path(__file__).resolve().parents[2] / "acceptance" / (
+                "verify-receipt.py" if name == "receipt_verifier.py" else name
+            )
+        )
         if local.is_symlink() or not local.is_file() or local.read_bytes() != raw:
             raise RenderError(f"candidate clean-host asset differs from renderer checkout: {name}")
     try:
@@ -159,13 +167,28 @@ def candidate_clean_host_bindings(candidate_root: Path, candidate: str) -> dict[
         raise RenderError("candidate timing asset is not strict JSON") from error
     if not isinstance(timing, dict):
         raise RenderError("candidate timing asset is not a JSON object")
+    asset_sha256 = {name: hashlib.sha256(raw).hexdigest() for name, raw in assets.items()}
     return {
-        "harness_sha256": hashlib.sha256(assets["harness.py"]).hexdigest(),
-        "guest_entry_sha256": hashlib.sha256(assets["guest_entry.py"]).hexdigest(),
-        "timing_asset_sha256": hashlib.sha256(assets["timing-contract.json"]).hexdigest(),
+        "asset_sha256": asset_sha256,
+        "harness_sha256": asset_sha256["harness.py"],
+        "guest_entry_sha256": asset_sha256["guest_entry.py"],
+        "timing_asset_sha256": asset_sha256["timing-contract.json"],
         "timing": timing,
         "timing_sha256": hashlib.sha256(harness_canonical(timing)).hexdigest(),
     }
+
+
+def verify_candidate_head(candidate_root: Path, candidate: str) -> None:
+    try:
+        resolved = subprocess.run(
+            ["/usr/bin/git", "-C", str(candidate_root), "rev-parse", "HEAD^{commit}"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RenderError("candidate Git identity could not be verified") from error
+    if resolved != candidate:
+        raise RenderError("candidate root HEAD differs")
 
 
 def normalized(value: object, where: str) -> str:
@@ -870,16 +893,7 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
     public, public_raw, public_path = root.public_binding_ref(descriptor["public_binding"])
     if public_path != f"{state}/public-binding.json":
         raise RenderError("public binding is not the prepared state binding")
-    try:
-        resolved = subprocess.run(
-            ["git", "-C", str(root.base / candidate_root), "rev-parse", "HEAD^{commit}"],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=10,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RenderError("candidate Git identity could not be verified") from error
-    if resolved != candidate:
-        raise RenderError("candidate root HEAD differs")
+    verify_candidate_head(root.base / candidate_root, candidate)
     clean_host_bindings = candidate_clean_host_bindings(root.base / candidate_root, candidate)
     state_record = root.fixed_json(f"{state}/state.json", "prepared state record", 0o400)
     require_keys(state_record, {
@@ -899,9 +913,7 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
         or state_record.get("timing_asset_sha256") != clean_host_bindings["timing_asset_sha256"]
         or state_record.get("timing") != clean_host_bindings["timing"]
         or state_record.get("timing_sha256") != clean_host_bindings["timing_sha256"]
-        or state_assets.get("harness.py") != clean_host_bindings["harness_sha256"]
-        or state_assets.get("guest_entry.py") != clean_host_bindings["guest_entry_sha256"]
-        or state_assets.get("timing-contract.json") != clean_host_bindings["timing_asset_sha256"]
+        or state_assets != clean_host_bindings["asset_sha256"]
     ):
         raise RenderError("prepared state differs from candidate clean-host assets")
     scenario, scenario_raw, scenario_path = root.json_ref(descriptor["scenario"], "scenario")
@@ -971,7 +983,11 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
         "timing_sha256", "receipt_sha256", "verifier_sha256",
         "evidence_manifest_sha256", "dormant_proof", "vm_state_absent",
     }, "lifecycle result")
-    require_keys(verifier, {"status"}, "installed verifier output")
+    require_keys(receipt, {
+        "schema_version", "outcome", "scenario_sha256", "integrated_candidate_sha",
+        "run_id", "checks", "zero_transition",
+    }, "acceptance lifecycle receipt")
+    require_keys(verifier, {"outcome", "status"}, "installed verifier output")
     if contract.get("schema_version") != "buzz-ci-clean-host-e2e-vm-contract/v3" or contract.get("candidate_sha") != candidate:
         raise RenderError("lifecycle contract candidate differs")
     harness_sha = require_sha(contract["harness_sha256"], "lifecycle harness")
@@ -981,7 +997,13 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     if not isinstance(timing, dict):
         raise RenderError("lifecycle timing object differs")
     normalized(contract["state"], "lifecycle state")
-    normalized(contract["candidate_root"], "lifecycle candidate root")
+    lifecycle_candidate_root = normalized(
+        contract["candidate_root"], "lifecycle candidate root",
+    )
+    verify_candidate_head(root.base / lifecycle_candidate_root, candidate)
+    candidate_bindings = candidate_clean_host_bindings(
+        root.base / lifecycle_candidate_root, candidate,
+    )
     contract_scenario = require_keys(contract["scenario"], {"path", "sha256"}, "lifecycle scenario")
     normalized(contract_scenario["path"], "lifecycle scenario")
     require_sha(contract_scenario["sha256"], "lifecycle scenario")
@@ -1004,17 +1026,20 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     if set(harness_assets) != set(HARNESS_ASSET_NAMES):
         raise RenderError("lifecycle harness asset set differs")
     if (
-        evidence.get("harness_sha256") != harness_sha
-        or evidence.get("timing_asset_sha256") != timing_asset_sha
-        or evidence.get("timing") != timing
-        or evidence.get("timing_sha256") != timing_sha
-        or harness_assets.get("harness.py") != harness_sha
-        or harness_assets.get("timing-contract.json") != timing_asset_sha
+        harness_sha != candidate_bindings["harness_sha256"]
+        or timing_asset_sha != candidate_bindings["timing_asset_sha256"]
+        or timing != candidate_bindings["timing"]
+        or timing_sha != candidate_bindings["timing_sha256"]
+        or evidence.get("harness_sha256") != candidate_bindings["harness_sha256"]
+        or evidence.get("timing_asset_sha256") != candidate_bindings["timing_asset_sha256"]
+        or evidence.get("timing") != candidate_bindings["timing"]
+        or evidence.get("timing_sha256") != candidate_bindings["timing_sha256"]
+        or harness_assets != candidate_bindings["asset_sha256"]
         or result.get("harness_sha256") != harness_sha
         or result.get("timing_asset_sha256") != timing_asset_sha
         or result.get("timing_sha256") != timing_sha
     ):
-        raise RenderError("lifecycle harness or timing binding differs")
+        raise RenderError("lifecycle frozen asset or timing binding differs")
     if evidence.get("transfer_bytes") != 8 * 1024 * 1024:
         raise RenderError("lifecycle transfer size differs")
     require_sha(evidence["transfer_sha256"], "lifecycle transfer")
@@ -1022,9 +1047,18 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
         raise RenderError("lifecycle evidence seccomp source differs")
     if result.get("status") != "pass" or result.get("candidate_sha") != candidate or result.get("vm_state_absent") is not True:
         raise RenderError("clean-host lifecycle did not return verified pass with absent state")
-    if receipt.get("outcome") != "pass" or receipt.get("integrated_candidate_sha") != candidate:
+    if (
+        receipt.get("schema_version") != "buzz-ci-capacity-one-acceptance-receipt/v2"
+        or receipt.get("outcome") != "pass"
+        or receipt.get("integrated_candidate_sha") != candidate
+        or not isinstance(receipt.get("run_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", receipt["run_id"]) is None
+        or not isinstance(receipt.get("checks"), list)
+        or len(receipt["checks"]) != 13
+        or not isinstance(receipt.get("zero_transition"), dict)
+    ):
         raise RenderError("acceptance lifecycle receipt did not pass for the candidate")
-    if verifier.get("status") != "pass":
+    if verifier.get("outcome") != "pass" or verifier.get("status") != "verified":
         raise RenderError("installed verifier lifecycle output did not pass")
     scenario_sha = contract.get("scenario", {}).get("sha256") if isinstance(contract.get("scenario"), dict) else None
     if not isinstance(scenario_sha, str) or any(item.get("scenario_sha256") != scenario_sha for item in (evidence, receipt)):
