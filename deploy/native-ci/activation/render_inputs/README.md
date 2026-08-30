@@ -72,15 +72,20 @@ object, and harness-semantic timing digest. The renderer also checks the
 candidate HEAD, clean index, and non-ignored worktree status. It freezes that
 repository identity through every candidate-blob read and rechecks it before
 output. The canonical output bytes are written, synced, and read back from a
-private staging inode. Immediately after the final repository check, one
-atomic no-clobber hard link is the publication acceptance point. Drift before
-that point rejects without an output. The renderer performs no repository
-recheck and authorizes no pathname deletion after that point; later repository
-drift or namespace replacement cannot cause it to remove an unrelated file.
-It reopens the published name only to distinguish an immediately retained
-namespace replacement, which returns an explicit no-rollback error and leaves
-the replacement untouched. Ignored build artifacts do not change the
-repository identity. The renderer also checks the
+private staging inode. At finalization, maintained Git transactions hold the
+HEAD and index locks. A mode-`000` no-clobber hard link is pending, not accepted;
+the renderer checks its inode identity and repository status again while those
+locks remain. Successful completion of the final status read accepts that exact
+pending inode. The renderer then changes its mode to `0600`, making the accepted
+output readable. Drift before the pending link rejects without an output.
+Drift after that link but before acceptance returns a distinct error and leaves
+only an unreadable mode-`000` artifact. No failure authorizes pathname deletion,
+so namespace replacement cannot cause removal of an unrelated file. The final
+verification and acceptance operation includes the pending link, inode check,
+and final status read before it returns. A mutation injected after the final
+status read is post-acceptance.
+Ignored build artifacts do not change the repository identity. The renderer
+also checks the
 prepared state's exact `public-binding.json`, the scenario, seccomp source, and
 execd-to-activation bindings. The resulting contract has
 the exact closed v3 shape accepted by preflight. Missing, extra, legacy v2, or
@@ -99,7 +104,7 @@ the four absence booleans and destroyed VM state. `record-sealed-freeze` also
 binds the exact public binding and five package manifests. Both outputs set
 `protected_ci` and `tier2` to `false`; a later controller must supply those
 independent gates. Both recorders use the same repository snapshot and
-pre-publication linearization boundary as `render-clean-host`.
+pending-link acceptance boundary as `render-clean-host`.
 
 `descriptor.schema.json` defines the five input contracts. `output.schema.json`
 links the existing activation draft, scenario, clean-host v3 contract schemas

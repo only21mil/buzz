@@ -325,6 +325,8 @@ class RendererTests(unittest.TestCase):
                 "schema_version": "buzz-ci-residue-receipt-render-input/v1",
                 "candidate_sha": candidate, "lifecycle": lifecycle,
             }
+            index = root / "candidate/.git/index"
+            index_before = hashlib.sha256(index.read_bytes()).hexdigest()
             first = self.run_cli(root, "record-residue", descriptor, "first.json")
             self.assertEqual(first.returncode, 0, first.stderr)
             second = self.run_cli(root, "record-residue", descriptor, "second.json")
@@ -337,6 +339,8 @@ class RendererTests(unittest.TestCase):
                 (root / "evidence/verifier.json").read_bytes(),
                 b'{"outcome":"pass","status":"verified"}\n',
             )
+            self.assertEqual(hashlib.sha256(index.read_bytes()).hexdigest(), index_before)
+            self.assertFalse((root / "candidate/.git/index.lock").exists())
             self.assertEqual((root / "first.json").stat().st_mode & 0o7777, 0o600)
 
     def test_output_publication_fsyncs_file_and_directory(self) -> None:
@@ -770,6 +774,145 @@ class RendererTests(unittest.TestCase):
             )
             self.assertEqual(result, 0, stderr)
             self.assertTrue((root / "accepted.json").is_file())
+
+        with self.subTest(head_drift="reviewer-final-verify-wrapper"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+            real_verify = RENDER.verify_candidate_snapshot
+            drifted = False
+
+            def verify_then_drift(
+                snapshot: object,
+                publication: tuple[int, int, str, str] | None = None,
+            ) -> None:
+                nonlocal drifted
+                real_verify(snapshot, publication)
+                if publication is not None and not drifted:
+                    drifted = True
+                    drift_head(root / "candidate")
+
+            with mock.patch.object(
+                RENDER, "verify_candidate_snapshot", side_effect=verify_then_drift,
+            ):
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "accepted.json",
+                    lambda _stage, _candidate_root: None,
+                )
+            self.assertEqual(result, 0, stderr)
+            self.assertTrue(drifted)
+            self.assertEqual((root / "accepted.json").stat().st_mode & 0o7777, 0o600)
+            self.assertEqual(self.output_temporaries(root), [])
+            observed_head = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(root / "candidate"), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            self.assertNotEqual(observed_head, candidate)
+
+        for mutation_name, command in (
+            (
+                "head-lock",
+                lambda candidate_root: [
+                    "/usr/bin/git", "-C", str(candidate_root), "commit", "-q",
+                    "--allow-empty", "-m", "blocked drift",
+                ],
+            ),
+            (
+                "index-lock",
+                lambda candidate_root: [
+                    "/usr/bin/git", "-C", str(candidate_root), "add", ".gitignore",
+                ],
+            ),
+        ):
+            with self.subTest(acceptance_lock=mutation_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                lifecycle, candidate = self.make_lifecycle(root)
+                descriptor = {
+                    "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                    "candidate_sha": candidate, "lifecycle": lifecycle,
+                }
+                real_link = os.link
+                attempted: list[subprocess.CompletedProcess[str]] = []
+
+                def attempt_git_mutation_then_link(*args: object, **kwargs: object) -> None:
+                    candidate_root = root / "candidate"
+                    attempted.append(subprocess.run(
+                        command(candidate_root), text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, check=False,
+                    ))
+                    real_link(*args, **kwargs)
+
+                with mock.patch.object(
+                    RENDER.os, "link", side_effect=attempt_git_mutation_then_link,
+                ):
+                    result, stderr = self.run_main_with_checkpoint(
+                        root, "record-residue", descriptor, "accepted.json",
+                        lambda _stage, _candidate_root: None,
+                    )
+                self.assertEqual(result, 0, stderr)
+                self.assertEqual(len(attempted), 1)
+                self.assertEqual(attempted[0].returncode, 128)
+                self.assertIn("lock", attempted[0].stderr.lower())
+                self.assertEqual((root / "accepted.json").stat().st_mode & 0o7777, 0o600)
+                self.assertEqual(self.output_temporaries(root), [])
+
+        with self.subTest(worktree_drift="inside-pending-link"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+            real_link = os.link
+
+            def mutate_asset_then_link(*args: object, **kwargs: object) -> None:
+                asset = (
+                    root / "candidate"
+                    / RENDER.HARNESS_ASSET_SOURCES["guest_entry.py"][0]
+                )
+                asset.write_bytes(asset.read_bytes() + b"\n# acceptance gap drift\n")
+                real_link(*args, **kwargs)
+
+            with mock.patch.object(RENDER.os, "link", side_effect=mutate_asset_then_link):
+                result, stderr = self.run_main_with_checkpoint(
+                    root, "record-residue", descriptor, "retained.json",
+                    lambda _stage, _candidate_root: None,
+                )
+            self.assertEqual(result, 64, stderr)
+            self.assertIn(
+                "candidate changed before acceptance; unreadable output retained",
+                stderr,
+            )
+            self.assertEqual((root / "retained.json").stat().st_mode & 0o7777, 0o000)
+            with self.assertRaises(PermissionError):
+                (root / "retained.json").read_bytes()
+            self.assertEqual(self.output_temporaries(root), [])
+
+        with self.subTest(worktree_drift="after-acceptance-mode"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lifecycle, candidate = self.make_lifecycle(root)
+            descriptor = {
+                "schema_version": "buzz-ci-residue-receipt-render-input/v1",
+                "candidate_sha": candidate, "lifecycle": lifecycle,
+            }
+
+            def mutate_asset_after_mode(candidate_root: Path) -> None:
+                asset = (
+                    candidate_root
+                    / RENDER.HARNESS_ASSET_SOURCES["guest_entry.py"][0]
+                )
+                asset.write_bytes(asset.read_bytes() + b"\n# final acceptance drift\n")
+
+            result, stderr = self.run_main_with_checkpoint(
+                root, "record-residue", descriptor, "accepted.json",
+                mutate_once("after-acceptance-mode", mutate_asset_after_mode),
+            )
+            self.assertEqual(result, 0, stderr)
+            self.assertEqual((root / "accepted.json").stat().st_mode & 0o7777, 0o600)
+            self.assertEqual(self.output_temporaries(root), [])
 
         with self.subTest(replacement="immediately-pre-publication"), tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
