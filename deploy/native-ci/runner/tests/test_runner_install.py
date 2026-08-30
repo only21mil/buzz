@@ -232,6 +232,57 @@ class RunnerInstallTests(unittest.TestCase):
                 self.runner_gid,
             )
 
+    def test_render_runner_config_validates_host_fields(self) -> None:
+        host = self.host_config()
+        RENDERER.validate_host(host)
+
+        def assert_invalid(value: dict[str, object], message: str) -> None:
+            with self.subTest(value=value, message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    RENDERER.validate_host(value)
+
+        missing = dict(host)
+        missing.pop("owner_pubkey")
+        assert_invalid(missing, "incomplete or unknown")
+        assert_invalid({**host, "extra": 1}, "incomplete or unknown")
+
+        for field in ("owner_pubkey", "manifest_verification_key", "relay_signer"):
+            for drift in ("", "ZZ" * 32, "11" * 31):
+                broken = dict(host)
+                broken[field] = drift
+                assert_invalid(broken, "public identities are invalid")
+
+        for socket in ("", "buzzci/execd.sock", "/run/buzzci/other.sock"):
+            broken = dict(host)
+            broken["broker_socket"] = socket
+            assert_invalid(broken, "root execd socket")
+
+        for field in ("evidence_directory", "journal_directory"):
+            broken = dict(host)
+            broken[field] = "/tmp/state"
+            assert_invalid(broken, "state paths are invalid")
+
+        for executor in ("usr/libexec/buzz-ci-executor", "/usr/libexec/buzz-ci-executor\0"):
+            broken = dict(host)
+            broken["executor_program"] = executor
+            assert_invalid(broken, "executor path is invalid")
+
+        bounds = {
+            "max_argv_items": 256,
+            "max_argv_bytes": 65_536,
+            "max_environment_items": 256,
+            "max_environment_bytes": 65_536,
+            "max_output_bytes": 16_777_216,
+        }
+        for field, maximum in bounds.items():
+            for value in (0, maximum + 1, True):
+                broken = dict(host)
+                broken[field] = value
+                assert_invalid(broken, f"bound is invalid: {field}")
+
+        saturated = dict(host, **{field: maximum for field, maximum in bounds.items()})
+        RENDERER.validate_host(saturated)
+
     def test_check_rejects_linked_asset_and_binary_provenance_drift(self) -> None:
         self.freeze()
         binary_asset = self.package / "assets/buzz-ci-runner"
