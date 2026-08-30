@@ -1105,6 +1105,57 @@ mod tests {
     }
 
     #[test]
+    fn runner_account_database_drift_is_refused() {
+        let line = "buzzci-runner:x:972:973::/nonexistent:/usr/sbin/nologin";
+        let passwd = format!("root:x:0:0:root:/root:/bin/bash\n{line}\n");
+        assert_eq!(parse_runner_account(&passwd).unwrap(), 972);
+
+        assert!(parse_runner_account("root:x:0:0:root:/root:/bin/bash\n").is_err());
+
+        let six_fields = "root:x:0:0:root:/root:/bin/bash\nbuzzci-runner:x:972:973:/nonexistent:/usr/sbin/nologin\n".to_string();
+        assert!(parse_runner_account(&six_fields).is_err());
+
+        for uid_drift in [":0972:973:", ":+972:973:", ":99999999999:973:"] {
+            assert!(parse_runner_account(&passwd.replace(":972:973:", uid_drift)).is_err());
+        }
+    }
+
+    #[test]
+    fn runner_role_cannot_reach_the_qualification_family() {
+        let frame = hello();
+        let mut bytes = frame.as_bytes().to_vec();
+        bytes[6..8].copy_from_slice(&(Operation::AdmitQualification as u16).to_be_bytes());
+        bytes[12..16].copy_from_slice(
+            &(buzz_ci_broker_protocol::ADMIT_QUALIFICATION_BODY_SIZE as u32).to_be_bytes(),
+        );
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &bytes[..HEADER_SIZE]).expect("write header");
+        let error =
+            serve_verified_stream_mode(server, PeerRole::Runner, &mut ClosedDispatch::new(), false)
+                .unwrap_err();
+        assert!(matches!(error, ControlError::UnauthorizedOperation));
+    }
+
+    #[test]
+    fn control_role_cannot_reach_runner_operations() {
+        let mut bytes = hello().as_bytes().to_vec();
+        bytes[6..8].copy_from_slice(&(Operation::CompleteAttempt as u16).to_be_bytes());
+        bytes[12..16].copy_from_slice(
+            &(buzz_ci_broker_protocol::COMPLETE_ATTEMPT_BODY_SIZE as u32).to_be_bytes(),
+        );
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &bytes[..HEADER_SIZE]).expect("write header");
+        let error = serve_verified_stream_mode(
+            server,
+            PeerRole::Control,
+            &mut ClosedDispatch::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ControlError::UnauthorizedOperation));
+    }
+
+    #[test]
     fn short_and_malformed_frames_are_rejected() {
         let short = rejected(b"BZCI");
         assert!(matches!(short, ControlError::Frame("short header")));

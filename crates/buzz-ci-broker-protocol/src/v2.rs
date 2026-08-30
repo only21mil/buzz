@@ -944,6 +944,351 @@ mod tests {
         output
     }
 
+    fn header_bytes(operation: u16, declared_body_size: u32) -> [u8; HEADER_SIZE] {
+        let mut header = [0_u8; HEADER_SIZE];
+        header[..4].copy_from_slice(&MAGIC);
+        put_u16(&mut header, 4, PROTOCOL_VERSION);
+        put_u16(&mut header, 6, operation);
+        put_u32(&mut header, 12, declared_body_size);
+        header
+    }
+
+    #[test]
+    fn request_headers_reject_version_magic_operation_and_length_drift() {
+        let exact = header_bytes(Operation::GetAttempt as u16, GET_ATTEMPT_BODY_SIZE as u32);
+        assert_eq!(
+            decode_request_header(&exact),
+            Ok((
+                FrameHeader {
+                    operation: Operation::GetAttempt,
+                    request_id: [0; 16]
+                },
+                GET_ATTEMPT_BODY_SIZE
+            ))
+        );
+
+        let mut bad_magic = header_bytes(Operation::Hello as u16, 64_u32);
+        bad_magic[0] = b'X';
+        assert_eq!(
+            decode_request_header(&bad_magic),
+            Err(DecodeError::BadMagic)
+        );
+
+        for version in [0_u16, 1, 3] {
+            let mut drifted = header_bytes(Operation::Hello as u16, 64_u32);
+            put_u16(&mut drifted, 4, version);
+            assert_eq!(
+                decode_request_header(&drifted),
+                Err(DecodeError::UnsupportedVersion)
+            );
+        }
+
+        for operation in [0_u16, 7, Operation::Hello as u16 | OP_RESPONSE_BIT] {
+            let header = header_bytes(operation, 64_u32);
+            assert_eq!(
+                decode_request_header(&header),
+                Err(DecodeError::UnknownOperation)
+            );
+        }
+
+        let mut flagged = header_bytes(Operation::Hello as u16, 64_u32);
+        put_u32(&mut flagged, 8, 1);
+        assert_eq!(
+            decode_request_header(&flagged),
+            Err(DecodeError::NonZeroFlags)
+        );
+
+        for (operation, declared) in [
+            (Operation::Hello, super::super::HELLO_BODY_SIZE + 1),
+            // The version 1 admit body size is never a version 2 body length.
+            (Operation::AdmitAttempt, 376),
+            (Operation::CancelAttempt, CANCEL_ATTEMPT_BODY_SIZE - 1),
+            (Operation::GetAttempt, 0),
+            (
+                Operation::AdmitQualification,
+                super::super::ADMIT_QUALIFICATION_BODY_SIZE - 1,
+            ),
+            (Operation::CompleteAttempt, COMPLETE_ATTEMPT_BODY_SIZE + 1),
+        ] {
+            let header = header_bytes(operation as u16, declared as u32);
+            assert_eq!(
+                decode_request_header(&header),
+                Err(DecodeError::WrongBodyLength)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_and_overlong_frames_never_decode() {
+        let encoded = encode_request([7; 16], Request::GetAttempt(get()));
+        let bytes = encoded.as_bytes();
+        assert_eq!(
+            decode_request(&bytes[..HEADER_SIZE - 1]),
+            Err(DecodeError::FrameTooShort)
+        );
+        assert_eq!(
+            decode_request(&bytes[..HEADER_SIZE]),
+            Err(DecodeError::WrongBodyLength)
+        );
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert_eq!(decode_request(&trailing), Err(DecodeError::TrailingBytes));
+    }
+
+    #[test]
+    fn admit_deadlines_lineage_and_closed_enums_are_enforced() {
+        let encoded = encode_request([1; 16], Request::AdmitAttempt(admit()));
+        let at = |offset: usize| HEADER_SIZE + offset;
+
+        for expires_at in [100_u64, 99] {
+            let mut frame = encoded.as_bytes().to_vec();
+            put_u64(&mut frame, at(442), expires_at);
+            assert_eq!(decode_request(&frame), Err(DecodeError::InvalidDeadline));
+        }
+
+        let mut zero_timeout = encoded.as_bytes().to_vec();
+        put_u32(&mut zero_timeout, at(458), 0);
+        assert_eq!(
+            decode_request(&zero_timeout),
+            Err(DecodeError::InvalidDeadline)
+        );
+
+        let drift = |attempt: u32, parent_attempt: u32| {
+            let mut frame = encoded.as_bytes().to_vec();
+            put_u32(&mut frame, at(462), attempt);
+            put_u32(&mut frame, at(466), parent_attempt);
+            decode_request(&frame).map(|(_, request)| request)
+        };
+        assert_eq!(drift(0, 0), Err(DecodeError::InvalidAttemptLineage));
+        assert_eq!(drift(1, 1), Err(DecodeError::InvalidAttemptLineage));
+        assert_eq!(
+            drift(u32::MAX, u32::MAX - 1),
+            Ok(Request::AdmitAttempt(AdmitAttemptRequest {
+                attempt: u32::MAX,
+                parent_attempt: u32::MAX - 1,
+                ..admit()
+            }))
+        );
+
+        for offset in [434, 442, 450] {
+            let mut unsafe_time = encoded.as_bytes().to_vec();
+            put_u64(
+                &mut unsafe_time,
+                at(offset),
+                super::super::MAX_SAFE_INTEGER + 1,
+            );
+            assert_eq!(
+                decode_request(&unsafe_time),
+                Err(DecodeError::UnsafeInteger)
+            );
+        }
+
+        let mut unknown_trust = encoded.as_bytes().to_vec();
+        unknown_trust[at(470)] = 7;
+        assert_eq!(
+            decode_request(&unknown_trust),
+            Err(DecodeError::UnknownEnum)
+        );
+
+        // OIDs stay canonical: unknown algorithms and padded Sha1 digests drift.
+        let mut unknown_oid = encoded.as_bytes().to_vec();
+        unknown_oid[at(368)] = 3;
+        assert_eq!(
+            decode_request(&unknown_oid),
+            Err(DecodeError::UnknownOidAlgorithm)
+        );
+        let mut padded_oid = encoded.as_bytes().to_vec();
+        padded_oid[at(389)] = 1;
+        assert_eq!(
+            decode_request(&padded_oid),
+            Err(DecodeError::NonCanonicalOid)
+        );
+    }
+
+    #[test]
+    fn cancel_get_and_complete_field_drift_is_rejected() {
+        let cancel_encoded = encode_request([1; 16], Request::CancelAttempt(cancel()));
+        let mut frame = cancel_encoded.as_bytes().to_vec();
+        put_u64(&mut frame, HEADER_SIZE + 128, 0);
+        assert_eq!(decode_request(&frame), Err(DecodeError::ZeroField));
+
+        let mut equal_deadline = cancel_encoded.as_bytes().to_vec();
+        put_u64(&mut equal_deadline, HEADER_SIZE + 120, 100);
+        assert_eq!(
+            decode_request(&equal_deadline),
+            Err(DecodeError::InvalidDeadline)
+        );
+
+        let mut unsafe_time = cancel_encoded.as_bytes().to_vec();
+        put_u64(
+            &mut unsafe_time,
+            HEADER_SIZE + 112,
+            super::super::MAX_SAFE_INTEGER + 1,
+        );
+        assert_eq!(
+            decode_request(&unsafe_time),
+            Err(DecodeError::UnsafeInteger)
+        );
+
+        let mut cancel_reserved = cancel_encoded.as_bytes().to_vec();
+        cancel_reserved[HEADER_SIZE + 138] = 1;
+        assert_eq!(
+            decode_request(&cancel_reserved),
+            Err(DecodeError::NonZeroReserved)
+        );
+
+        let get_encoded = encode_request([1; 16], Request::GetAttempt(get()));
+        let mut get_reserved = get_encoded.as_bytes().to_vec();
+        get_reserved[HEADER_SIZE + 48] = 1;
+        assert_eq!(
+            decode_request(&get_reserved),
+            Err(DecodeError::NonZeroReserved)
+        );
+
+        let mut zero_attempt_id = get_encoded.as_bytes().to_vec();
+        zero_attempt_id[HEADER_SIZE..HEADER_SIZE + 16].fill(0);
+        assert_eq!(
+            decode_request(&zero_attempt_id),
+            Err(DecodeError::ZeroField)
+        );
+
+        let complete_encoded = encode_request([1; 16], Request::CompleteAttempt(complete()));
+        let complete_bytes = complete_encoded.as_bytes();
+        let mut zero_attempt = complete_bytes.to_vec();
+        put_u32(&mut zero_attempt, HEADER_SIZE + 80, 0);
+        assert_eq!(decode_request(&zero_attempt), Err(DecodeError::ZeroField));
+
+        let mut zero_generation = complete_bytes.to_vec();
+        put_u64(&mut zero_generation, HEADER_SIZE + 100, 0);
+        assert_eq!(
+            decode_request(&zero_generation),
+            Err(DecodeError::ZeroField)
+        );
+
+        let mut zero_terminal = complete_bytes.to_vec();
+        put_u64(&mut zero_terminal, HEADER_SIZE + 173, 0);
+        assert_eq!(decode_request(&zero_terminal), Err(DecodeError::ZeroField));
+
+        let mut blank_evidence = complete_bytes.to_vec();
+        blank_evidence[HEADER_SIZE + 140] = 0;
+        assert_eq!(decode_request(&blank_evidence), Err(DecodeError::ZeroField));
+
+        let mut unknown_conclusion = complete_bytes.to_vec();
+        unknown_conclusion[HEADER_SIZE + 140] = 9;
+        assert_eq!(
+            decode_request(&unknown_conclusion),
+            Err(DecodeError::UnknownEnum)
+        );
+
+        let mut unsafe_terminal = complete_bytes.to_vec();
+        put_u64(
+            &mut unsafe_terminal,
+            HEADER_SIZE + 173,
+            super::super::MAX_SAFE_INTEGER + 1,
+        );
+        assert_eq!(
+            decode_request(&unsafe_terminal),
+            Err(DecodeError::UnsafeInteger)
+        );
+
+        let mut complete_reserved = complete_bytes.to_vec();
+        complete_reserved[HEADER_SIZE + 181] = 1;
+        assert_eq!(
+            decode_request(&complete_reserved),
+            Err(DecodeError::NonZeroReserved)
+        );
+    }
+
+    #[test]
+    fn responses_decode_only_for_the_exact_bound_header() {
+        let header = FrameHeader {
+            operation: Operation::CancelAttempt,
+            request_id: [9; 16],
+        };
+        let encoded = encode_response(header, response());
+        let bytes = encoded.as_bytes();
+
+        let drifted_id = FrameHeader {
+            operation: header.operation,
+            request_id: [10; 16],
+        };
+        assert_eq!(
+            decode_response(drifted_id, bytes),
+            Err(DecodeError::UnknownOperation)
+        );
+        let drifted_operation = FrameHeader {
+            operation: Operation::GetAttempt,
+            request_id: header.request_id,
+        };
+        assert_eq!(
+            decode_response(drifted_operation, bytes),
+            Err(DecodeError::UnknownOperation)
+        );
+
+        // A response frame with the response bit cleared is not a response.
+        let mut unmarked = bytes.to_vec();
+        put_u16(&mut unmarked, 6, header.operation as u16);
+        assert_eq!(
+            decode_response(header, &unmarked),
+            Err(DecodeError::UnknownOperation)
+        );
+
+        assert_eq!(
+            decode_response(header, &bytes[..bytes.len() - 1]),
+            Err(DecodeError::WrongBodyLength)
+        );
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            decode_response(header, &trailing),
+            Err(DecodeError::TrailingBytes)
+        );
+
+        let body = HEADER_SIZE;
+        let mut invalid_code = bytes.to_vec();
+        put_u16(&mut invalid_code, body, 0xFFFF);
+        assert_eq!(
+            decode_response(header, &invalid_code),
+            Err(DecodeError::UnknownEnum)
+        );
+        let mut unknown_state = bytes.to_vec();
+        unknown_state[body + 167] = 0;
+        assert_eq!(
+            decode_response(header, &unknown_state),
+            Err(DecodeError::UnknownEnum)
+        );
+        let mut unknown_conclusion = bytes.to_vec();
+        unknown_conclusion[body + 168] = 6;
+        assert_eq!(
+            decode_response(header, &unknown_conclusion),
+            Err(DecodeError::UnknownEnum)
+        );
+        let mut unknown_oid = bytes.to_vec();
+        unknown_oid[body + 134] = 3;
+        assert_eq!(
+            decode_response(header, &unknown_oid),
+            Err(DecodeError::UnknownOidAlgorithm)
+        );
+        for offset in [179, 187] {
+            let mut unsafe_time = bytes.to_vec();
+            put_u64(
+                &mut unsafe_time,
+                body + offset,
+                super::super::MAX_SAFE_INTEGER + 1,
+            );
+            assert_eq!(
+                decode_response(header, &unsafe_time),
+                Err(DecodeError::UnsafeInteger)
+            );
+        }
+        let mut reserved = bytes.to_vec();
+        reserved[body + 280] = 1;
+        assert_eq!(
+            decode_response(header, &reserved),
+            Err(DecodeError::NonZeroReserved)
+        );
+    }
+
     proptest! {
         #[test]
         fn arbitrary_version_two_frames_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..1024)) {
@@ -959,6 +1304,43 @@ mod tests {
                 request_id: [1; 16],
             };
             let _ = decode_response(expected, &bytes);
+        }
+
+        #[test]
+        fn truncated_admit_frames_are_never_accepted(
+            len in 0..(HEADER_SIZE + ADMIT_ATTEMPT_BODY_SIZE),
+        ) {
+            let encoded = encode_request([7; 16], Request::AdmitAttempt(admit()));
+            let truncated = &encoded.as_bytes()[..len];
+            match decode_request(truncated) {
+                Err(DecodeError::FrameTooShort | DecodeError::WrongBodyLength) => {}
+                other => panic!("truncated frame decoded as {other:?}"),
+            }
+        }
+
+        #[test]
+        fn arbitrary_admit_lineage_and_timing_round_trip(
+            request_id in prop::array::uniform16(any::<u8>()),
+            attempt in 1_u32..,
+            issued_at in 0_u64..=9_007_199_254_740_991_u64 - 65_536,
+            wall_timeout_seconds in 1_u32..=65_535,
+            lane_epoch in 1_u64..=1_048_576,
+            tag in prop::array::uniform32(any::<u8>()),
+        ) {
+            let mut request = admit();
+            request.attempt = attempt;
+            request.parent_attempt = if attempt == 1 { 0 } else { attempt - 1 };
+            request.issued_at = issued_at;
+            request.expires_at = issued_at + u64::from(wall_timeout_seconds);
+            request.wall_timeout_seconds = wall_timeout_seconds;
+            request.lane_epoch = lane_epoch;
+            request.job_intent_digest = tag.map(|byte| byte | 1);
+
+            let encoded = encode_request(request_id, Request::AdmitAttempt(request));
+            let (header, decoded) = decode_request(encoded.as_bytes())
+                .unwrap_or_else(|error| panic!("round trip failed: {error:?}"));
+            prop_assert_eq!(header.request_id, request_id);
+            prop_assert_eq!(decoded, Request::AdmitAttempt(request));
         }
     }
 }
