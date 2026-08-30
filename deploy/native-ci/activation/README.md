@@ -148,10 +148,20 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    acceptance ledger. Service principals remain for audit and UID stability.
    If the prior execd service or socket was active, rollback stops at a safe
    capacity-zero hold before restoring prior unit state while the standalone
-   execd package receipt is active. Run the exact execd package's
-   `install.py rollback`, then retry activation rollback. The retry accepts only
-   a bound terminal execd rollback receipt and exact restored binary baseline
-   before systemd may restart the prior execd unit.
+   execd package receipt is active. The hold retains the fixed activation
+   package, including its controller and package module, across process restart.
+   Run the exact execd package's `install.py rollback`, then retry through the
+   retained fixed controller path:
+
+   ```bash
+   /var/lib/buzzci/activation-controller/package/assets/buzz-ci-activation-controller rollback \
+     --package /var/lib/buzzci/activation-controller/package
+   ```
+
+   The retry accepts only a bound terminal execd rollback receipt and exact
+   restored binary baseline before systemd may restart the prior execd unit.
+   It removes the fixed activation package only after the prior targets,
+   generated files, ledger, and systemd state all pass readback.
 
 The production canary closes capacity through three root-only calls to the
 installed `/usr/libexec/buzz-ci-activation-controller`. Each call accepts only
@@ -374,9 +384,11 @@ The command accepts no package, root, or fake-state override. Both evidence
 files must be regular, singly linked, non-writable by group or other, and
 root-owned on the live host. An exact repeat is read-only and returns the same
 terminal receipt. Changed, stale, mismatched, or differently bound evidence
-fails closed. A root-owned nonblocking operator lock serializes persistent
-cutover and rejects concurrent attempts before evidence verification or state
-mutation.
+fails closed. One root-owned nonblocking operator lock serializes `stage`,
+`activate`, `qualify`, `set-capacity-one`, `prepare-qualification-zero`,
+`finalize-qualification-zero`, `persist-capacity-one`, and `rollback`. A
+concurrent mutator fails before state mutation. `check` and
+`prove-qualification-zero` remain read-only.
 
 If cutover fails but compensation proves staged capacity zero, rerun the exact
 command. It reuses the same operation ID for at most three attempts. If the
@@ -384,7 +396,7 @@ receipt reports `rollback_failed`, or if independent readback is not exact, do
 not retry activation. Recover deterministically with the fixed package path:
 
 ```bash
-/usr/libexec/buzz-ci-activation-controller rollback \
+/var/lib/buzzci/activation-controller/package/assets/buzz-ci-activation-controller rollback \
   --package /var/lib/buzzci/activation-controller/package
 ```
 

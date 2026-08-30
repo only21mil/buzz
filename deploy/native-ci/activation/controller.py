@@ -22,7 +22,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from typing import Any
+
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
 
 try:
     import buzz_ci_activation_package as activation_package
@@ -371,15 +375,26 @@ def _acquire_operator_lock(root: Path, controld_gid: int) -> int:
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_uid != expected_uid or metadata.st_gid != expected_gid
         ):
-            raise ValueError("persistent activation operator lock metadata is unsafe")
+            raise ValueError("activation operator lock metadata is unsafe")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise ValueError("another persistent activation operation is active") from error
+            raise ValueError("another activation operator operation is active") from error
         return fd
     except BaseException:
         os.close(fd)
         raise
+
+
+def _run_operator_locked(
+    manifest: dict[str, Any], root: Path, operation: Callable[[], dict[str, object]],
+) -> dict[str, object]:
+    lock_fd = _acquire_operator_lock(root, manifest["identities"]["controld"]["gid"])
+    try:
+        return operation()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def _read_receipt(root: Path) -> dict[str, Any] | None:
@@ -2722,7 +2737,7 @@ def _binding_prior_readback(receipt: dict[str, Any] | None, root: Path) -> str:
     return "restored"
 
 
-def _prepare_qualification_zero(
+def _prepare_qualification_zero_unlocked(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
     driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
 ) -> dict[str, object]:
@@ -2767,6 +2782,18 @@ def _prepare_qualification_zero(
     return _zero_response(request, root)
 
 
+def _prepare_qualification_zero(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
+) -> dict[str, object]:
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _prepare_qualification_zero_unlocked(
+            manifest, payloads, root, driver, request, request_sha256,
+        ),
+    )
+
+
 def _qualification_finalize_stop_errors(driver: LiveSystemd | FakeSystemd) -> list[str]:
     errors: list[str] = []
     keep = {"buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service"}
@@ -2793,7 +2820,7 @@ def _qualification_finalize_stop_errors(driver: LiveSystemd | FakeSystemd) -> li
     return errors
 
 
-def _finalize_qualification_zero(
+def _finalize_qualification_zero_unlocked(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
     request: dict[str, Any], request_sha256: str,
 ) -> dict[str, object]:
@@ -2858,6 +2885,18 @@ def _finalize_qualification_zero(
     return _zero_response(request, root)
 
 
+def _finalize_qualification_zero(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
+) -> dict[str, object]:
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _finalize_qualification_zero_unlocked(
+            manifest, payloads, root, driver, request, request_sha256,
+        ),
+    )
+
+
 def _prove_qualification_zero(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd, request: dict[str, Any],
 ) -> dict[str, object]:
@@ -2913,7 +2952,7 @@ def _compensate_failed_stage(
     return errors
 
 
-def stage(
+def _stage_unlocked(
     manifest: dict[str, Any],
     payloads: dict[str, bytes],
     root: Path,
@@ -3020,6 +3059,19 @@ def stage(
         if compensation_errors:
             raise ValueError(last_error) from error
         raise
+
+
+def stage(
+    manifest: dict[str, Any],
+    payloads: dict[str, bytes],
+    root: Path,
+    driver: LiveSystemd | FakeSystemd,
+    binding: dict[str, object],
+) -> dict[str, object]:
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _stage_unlocked(manifest, payloads, root, driver, binding),
+    )
 
 
 def _socket_readback(
@@ -3465,7 +3517,7 @@ def _return_to_staged_zero(
     return {"managed_targets": targets, "staged_zero": staged_zero}
 
 
-def _set_capacity_one(
+def _set_capacity_one_unlocked(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
     driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
     *, state_field: str = "capacity_one",
@@ -3571,6 +3623,20 @@ def _set_capacity_one(
         raise
 
 
+def _set_capacity_one(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd, request: dict[str, Any], request_sha256: str,
+    *, state_field: str = "capacity_one",
+) -> dict[str, object]:
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _set_capacity_one_unlocked(
+            manifest, payloads, root, driver, request, request_sha256,
+            state_field=state_field,
+        ),
+    )
+
+
 def _restore_finalized_zero_after_persistent_prepare(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
     driver: LiveSystemd | FakeSystemd, receipt: dict[str, Any],
@@ -3660,7 +3726,7 @@ def _persist_capacity_one_locked(
         raise ValueError("activation receipt disappeared before persistent cutover")
     _bind_receipt(receipt, manifest)
     request, request_sha256 = _persistent_capacity_one_request(authorization, receipt)
-    response = _set_capacity_one(
+    response = _set_capacity_one_unlocked(
         manifest, payloads, root, driver, request, request_sha256,
         state_field="persistent_activation",
     )
@@ -3688,17 +3754,15 @@ def persist_capacity_one(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
     driver: LiveSystemd | FakeSystemd, scenario_path: Path, acceptance_receipt_path: Path,
 ) -> dict[str, object]:
-    lock_fd = _acquire_operator_lock(root, manifest["identities"]["controld"]["gid"])
-    try:
-        return _persist_capacity_one_locked(
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _persist_capacity_one_locked(
             manifest, payloads, root, driver, scenario_path, acceptance_receipt_path,
-        )
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        ),
+    )
 
 
-def activate(
+def _activate_unlocked(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
     receipt = _read_receipt(root)
@@ -3770,7 +3834,17 @@ def activate(
         raise
 
 
-def qualify(
+def activate(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd,
+) -> dict[str, object]:
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _activate_unlocked(manifest, payloads, root, driver),
+    )
+
+
+def _qualify_unlocked(
     manifest: dict[str, Any], payloads: dict[str, bytes], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
     receipt = _read_receipt(root)
@@ -3801,6 +3875,16 @@ def qualify(
         })
         _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
         raise
+
+
+def qualify(
+    manifest: dict[str, Any], payloads: dict[str, bytes], root: Path,
+    driver: LiveSystemd | FakeSystemd,
+) -> dict[str, object]:
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _qualify_unlocked(manifest, payloads, root, driver),
+    )
 
 
 def _validate_receipt_targets(receipt: dict[str, Any], manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -4016,7 +4100,7 @@ def _prior_readback(receipt: dict[str, Any], manifest: dict[str, Any], root: Pat
     return result
 
 
-def rollback(
+def _rollback_unlocked(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
     receipt = _read_receipt(root)
@@ -4058,10 +4142,6 @@ def rollback(
     generated_restored, generated_errors = _restore_generated_prior_best_effort(receipt, root)
     errors.extend(generated_errors)
     try:
-        _remove_fixed_package(manifest, root)
-    except BaseException as error:
-        errors.append(f"remove fixed activation package: {error}")
-    try:
         _restore_acceptance_ledger(receipt, manifest, root)
     except BaseException as error:
         errors.append(f"restore controld acceptance ledger: {error}")
@@ -4096,6 +4176,11 @@ def rollback(
         ledger_prior = _acceptance_ledger_prior_readback(receipt, root)
     except BaseException as error:
         errors.append(f"acceptance ledger prior readback: {error}")
+    if not errors:
+        try:
+            _remove_fixed_package(manifest, root)
+        except BaseException as error:
+            errors.append(f"remove fixed activation package: {error}")
     if errors:
         combined = "rollback failures: " + "; ".join(errors)
         receipt.update({"state": "rollback_failed", "updated_at": utc_now(), "last_error": combined})
@@ -4117,6 +4202,15 @@ def rollback(
         "retained_principals": sorted(identity["user"] for identity in manifest["identities"].values()),
         "units": units,
     }
+
+
+def rollback(
+    manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
+) -> dict[str, object]:
+    return _run_operator_locked(
+        manifest, root,
+        lambda: _rollback_unlocked(manifest, root, driver),
+    )
 
 
 def check_current(

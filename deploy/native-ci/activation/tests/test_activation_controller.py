@@ -1136,7 +1136,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "975fd0739d595f8c0b5fc4dc8e30170cbd9b621af9728bf1bbac2210c12c4429",
+            "69b4305e9588333fe01f6b5e28c653ad0b1c89d602c8f0516dfbd935997f3fe9",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1477,7 +1477,7 @@ class ActivationControllerTests(unittest.TestCase):
             self.fixture.root, manifest["identities"]["controld"]["gid"],
         )
         try:
-            with self.assertRaisesRegex(ValueError, "another persistent activation operation"):
+            with self.assertRaisesRegex(ValueError, "another activation operator operation"):
                 CONTROLLER.persist_capacity_one(
                     manifest, payloads, self.fixture.root, driver, scenario, acceptance,
                 )
@@ -1534,6 +1534,87 @@ class ActivationControllerTests(unittest.TestCase):
             CONTROLLER.persist_capacity_one(
                 manifest, payloads, self.fixture.root, driver, scenario, acceptance,
             )
+
+    def test_global_operator_lock_rejects_every_mutating_controller_path(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+
+        def assert_locked(label: str, operation) -> None:
+            receipt_path = self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")
+            receipt_before = receipt_path.read_bytes() if receipt_path.exists() else None
+            systemd_before = self.fixture.fake_state.read_bytes()
+            lock_fd = CONTROLLER._acquire_operator_lock(
+                self.fixture.root, manifest["identities"]["controld"]["gid"],
+            )
+            try:
+                with self.subTest(action=label), self.assertRaisesRegex(
+                    ValueError, "another activation operator operation",
+                ):
+                    operation()
+            finally:
+                CONTROLLER.fcntl.flock(lock_fd, CONTROLLER.fcntl.LOCK_UN)
+                os.close(lock_fd)
+            self.assertEqual(self.fixture.fake_state.read_bytes(), systemd_before)
+            self.assertEqual(receipt_path.read_bytes() if receipt_path.exists() else None, receipt_before)
+
+        assert_locked(
+            "stage",
+            lambda: CONTROLLER.stage(
+                manifest, payloads, self.fixture.root, driver, self.fixture.binding,
+            ),
+        )
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        assert_locked(
+            "activate",
+            lambda: CONTROLLER.activate(manifest, payloads, self.fixture.root, driver),
+        )
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        _request, raw = self.capacity_one_request("b")
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        parsed, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, receipt)
+        assert_locked(
+            "set-capacity-one",
+            lambda: CONTROLLER._set_capacity_one(
+                manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+            ),
+        )
+        CONTROLLER._set_capacity_one(
+            manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+        )
+        assert_locked(
+            "qualify",
+            lambda: CONTROLLER.qualify(manifest, payloads, self.fixture.root, driver),
+        )
+        prepare, prepare_sha = self.parsed_zero_request("prepare-qualification-zero", "c")
+        assert_locked(
+            "prepare-qualification-zero",
+            lambda: CONTROLLER._prepare_qualification_zero(
+                manifest, payloads, self.fixture.root, driver, prepare, prepare_sha,
+            ),
+        )
+        CONTROLLER._prepare_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, prepare, prepare_sha,
+        )
+        finalize, finalize_sha = self.parsed_zero_request("finalize-qualification-zero", "d")
+        assert_locked(
+            "finalize-qualification-zero",
+            lambda: CONTROLLER._finalize_qualification_zero(
+                manifest, payloads, self.fixture.root, driver, finalize, finalize_sha,
+            ),
+        )
+        CONTROLLER._finalize_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, finalize, finalize_sha,
+        )
+        missing = self.fixture.temporary / "must-not-be-read-under-lock.json"
+        assert_locked(
+            "persist-capacity-one",
+            lambda: CONTROLLER.persist_capacity_one(
+                manifest, payloads, self.fixture.root, driver, missing, missing,
+            ),
+        )
+        assert_locked(
+            "rollback",
+            lambda: CONTROLLER.rollback(manifest, self.fixture.root, driver),
+        )
 
     def test_persistent_activation_compensates_partial_failure_and_exact_retry_succeeds(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -1696,19 +1777,62 @@ class ActivationControllerTests(unittest.TestCase):
             (persistent["status"], persistent["state"], persistent["capacity"]),
             ("persistent_active", "active_one", 1),
         )
-        with self.assertRaisesRegex(ValueError, "execd package rollback is required"):
-            CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        fixed_package = self.fixture.root / CONTROLLER.FIXED_PACKAGE_PATH.lstrip("/")
+        installed_cli = self.fixture.root / "usr/libexec/buzz-ci-activation-controller"
+        first = subprocess.run(
+            [
+                sys.executable, str(installed_cli), "rollback", "--package", str(fixed_package),
+                "--root", str(self.fixture.root), "--fake-systemd-state", str(self.fixture.fake_state),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("execd package rollback is required", json.loads(first.stderr)["error"])
+        self.assertTrue(fixed_package.exists())
+        fixed_cli = fixed_package / "assets/buzz-ci-activation-controller"
+        self.assertTrue(fixed_cli.exists())
         self.assertEqual(driver.unit("buzz-ci-execd.socket")["ActiveState"], "inactive")
 
-        write_file(
-            self.fixture.root / CONTROLLER.EXECD_BINARY_PATH.lstrip("/"),
-            prior_binary,
-            0o755,
-        )
+        def retry_from_fixed_package() -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [
+                    sys.executable, str(fixed_cli), "rollback", "--package", str(fixed_package),
+                    "--root", str(self.fixture.root), "--fake-systemd-state", str(self.fixture.fake_state),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+
+        exact_hold_retry = retry_from_fixed_package()
+        self.assertEqual(exact_hold_retry.returncode, 1)
+        self.assertIn("execd package rollback is required", json.loads(exact_hold_retry.stderr)["error"])
+        self.assertTrue(fixed_package.exists())
+
         package_receipt.unlink()
         package_preimage.unlink()
+        terminal_path = self.fixture.root / CONTROLLER.EXECD_PACKAGE_ROLLBACK_PATH.lstrip("/")
+        stale_install_receipt = copy.deepcopy(install_receipt)
+        stale_install_receipt["activation_package_digest"] = "f" * 64
         write_file(
-            self.fixture.root / CONTROLLER.EXECD_PACKAGE_ROLLBACK_PATH.lstrip("/"),
+            terminal_path,
+            activation_package.canonical_json({
+                "schema": "buzz-ci-execd-package-rollback-receipt-v1",
+                "state": "rolled_back",
+                "install_receipt": stale_install_receipt,
+            }),
+            0o600,
+        )
+        stale = retry_from_fixed_package()
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("different candidate", json.loads(stale.stderr)["error"])
+        self.assertTrue(fixed_package.exists())
+        write_file(
+            terminal_path,
             activation_package.canonical_json({
                 "schema": "buzz-ci-execd-package-rollback-receipt-v1",
                 "state": "rolled_back",
@@ -1716,12 +1840,24 @@ class ActivationControllerTests(unittest.TestCase):
             }),
             0o600,
         )
-        rolled_back = CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        drifted = retry_from_fixed_package()
+        self.assertEqual(drifted.returncode, 1)
+        self.assertIn("rolled-back execd baseline differs", json.loads(drifted.stderr)["error"])
+        self.assertTrue(fixed_package.exists())
+        write_file(
+            self.fixture.root / CONTROLLER.EXECD_BINARY_PATH.lstrip("/"),
+            prior_binary,
+            0o755,
+        )
+        resumed = retry_from_fixed_package()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr.decode())
+        rolled_back = json.loads(resumed.stdout)
         self.assertEqual(
             (rolled_back["units"]["buzz-ci-execd.socket"]["ActiveState"], rolled_back["units"]["buzz-ci-execd.socket"]["UnitFileState"]),
             ("active", "enabled"),
         )
         self.assertEqual(driver.socket(manifest["socket_policy"]["execd"])["path"], "/run/buzzci/execd.sock")
+        self.assertFalse(fixed_package.exists())
 
     def test_new_activation_replaces_and_rollback_restores_prior_controld_ledger(self) -> None:
         ledger = self.fixture.root / CONTROLLER.CONTROLD_ACCEPTANCE_LEDGER_PATH.lstrip("/")
