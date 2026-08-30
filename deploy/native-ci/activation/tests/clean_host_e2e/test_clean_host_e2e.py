@@ -862,40 +862,140 @@ class InputTests(unittest.TestCase):
             with mock.patch.object(harness, "rename_noreplace", side_effect=swap_before_quarantine):
                 with self.assertRaisesRegex(harness.HarnessError, "replaced VM state"):
                     harness.destroy_state(state, expected)
-            quarantined = [path for path in root.iterdir() if ".state.delete-" in path.name]
+            quarantined = [path for path in root.iterdir() if ".state.tombstone-" in path.name]
             self.assertEqual(len(quarantined), 1)
             self.assertEqual((quarantined[0] / "sentinel").read_text(), "unrelated")
-            self.assertTrue((stolen / "state.json").is_file())
+            stolen.chmod(0o700)
+            self.assertEqual((stolen / "state.json").stat().st_size, 0)
 
-    def test_descriptor_cleanup_never_unlinks_a_swapped_member(self) -> None:
+    def test_clear_directory_swap_sanitizes_selected_member_and_preserves_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             owned = root / "owned"
             owned.mkdir(mode=0o700)
             (owned / "member").write_text("selected")
             identity = harness.directory_identity(owned)
-            real_rename_at = harness.rename_noreplace_at
+            swapped = False
 
-            def swap_member(source_fd, source, target_fd, target, label):
-                if source == b"member":
-                    os.rename("member", "stolen", src_dir_fd=source_fd, dst_dir_fd=source_fd)
-                    descriptor = os.open(
-                        "member", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
-                        dir_fd=source_fd,
-                    )
-                    os.write(descriptor, b"unrelated")
-                    os.close(descriptor)
-                return real_rename_at(source_fd, source, target_fd, target, label)
+            def swap_member(name, path, _descriptor):
+                nonlocal swapped
+                if name == "clear-directory-member" and not swapped:
+                    path.rename(path.with_name("stolen"))
+                    path.write_text("unrelated")
+                    swapped = True
 
-            with mock.patch.object(harness, "rename_noreplace_at", side_effect=swap_member):
-                with self.assertRaisesRegex(harness.HarnessError, "cleanup file was replaced"):
+            with mock.patch.object(harness, "cleanup_checkpoint", side_effect=swap_member), mock.patch.object(
+                harness.os, "unlink", side_effect=AssertionError("cleanup must not unlink by name"),
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "cleanup member was replaced"):
                     harness.destroy_identified_directory(owned, identity, "owned directory")
-            quarantined = [path for path in root.iterdir() if ".owned.delete-" in path.name]
+            quarantined = [path for path in root.iterdir() if ".owned.tombstone-" in path.name]
             self.assertEqual(len(quarantined), 1)
-            self.assertEqual((quarantined[0] / "stolen").read_text(), "selected")
-            replacements = [path for path in quarantined[0].iterdir() if path.name.startswith(".delete-")]
-            self.assertEqual(len(replacements), 1)
-            self.assertEqual(replacements[0].read_text(), "unrelated")
+            quarantined[0].chmod(0o700)
+            self.assertEqual((quarantined[0] / "stolen").stat().st_size, 0)
+            self.assertEqual(stat.S_IMODE((quarantined[0] / "stolen").stat().st_mode), 0)
+            self.assertEqual((quarantined[0] / "member").read_text(), "unrelated")
+
+    def test_clear_directory_swap_retains_nested_replacement_and_erases_selected_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owned = root / "owned"
+            child = owned / "child"
+            child.mkdir(parents=True, mode=0o700)
+            (child / "secret").write_text("selected")
+            identity = harness.directory_identity(owned)
+            swapped = False
+
+            def swap_directory(name, path, descriptor):
+                nonlocal swapped
+                if (
+                    name == "clear-directory-member"
+                    and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    and not swapped
+                ):
+                    path.rename(path.with_name("stolen-child"))
+                    path.mkdir(mode=0o700)
+                    (path / "sentinel").write_text("unrelated")
+                    swapped = True
+
+            with mock.patch.object(
+                harness, "cleanup_checkpoint", side_effect=swap_directory,
+            ), mock.patch.object(
+                harness.os, "rmdir", side_effect=AssertionError("cleanup must not rmdir by name"),
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "cleanup member was replaced"):
+                    harness.destroy_identified_directory(owned, identity, "owned directory")
+            tombstones = [path for path in root.iterdir() if ".owned.tombstone-" in path.name]
+            self.assertEqual(len(tombstones), 1)
+            tombstones[0].chmod(0o700)
+            selected = tombstones[0] / "stolen-child"
+            selected.chmod(0o700)
+            self.assertEqual((selected / "secret").stat().st_size, 0)
+            self.assertEqual(stat.S_IMODE((selected / "secret").stat().st_mode), 0)
+            self.assertEqual((tombstones[0] / "child" / "sentinel").read_text(), "unrelated")
+
+    def test_final_rmdir_swap_retains_replacement_and_erases_selected_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = make_destroyable_state(root)
+            expected = harness.state_identity(state)
+            stolen = root / "stolen-selected-state"
+            swapped_path = None
+
+            def swap_at_final_boundary(name, path, _descriptor):
+                nonlocal swapped_path
+                if name == "before-directory-tombstone-retention":
+                    path.rename(stolen)
+                    path.mkdir(mode=0o700)
+                    (path / "sentinel").write_text("unrelated")
+                    swapped_path = path
+
+            with mock.patch.object(
+                harness, "cleanup_checkpoint", side_effect=swap_at_final_boundary,
+            ), mock.patch.object(
+                harness.os, "rmdir", side_effect=AssertionError("cleanup must not rmdir by name"),
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "tombstone was replaced"):
+                    harness.destroy_state(state, expected)
+            self.assertIsNotNone(swapped_path)
+            self.assertEqual((swapped_path / "sentinel").read_text(), "unrelated")
+            stolen.chmod(0o700)
+            self.assertEqual((stolen / "state.json").stat().st_size, 0)
+            self.assertEqual(stat.S_IMODE((stolen / "state.json").stat().st_mode), 0)
+            residue = sorted(path.name for path in root.iterdir())
+            harness.destroy_state(state, expected)
+            self.assertEqual(sorted(path.name for path in root.iterdir()), residue)
+
+    def test_final_unlink_swap_retains_replacement_and_erases_selected_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = root / "publication.json"
+            journal.write_text("sensitive")
+            journal.chmod(0o400)
+            stolen = root / "stolen-selected-record"
+            swapped_path = None
+
+            def swap_at_final_boundary(name, path, _descriptor):
+                nonlocal swapped_path
+                if name == "before-file-tombstone-retention":
+                    path.rename(stolen)
+                    path.write_text("unrelated")
+                    swapped_path = path
+
+            with mock.patch.object(
+                harness, "cleanup_checkpoint", side_effect=swap_at_final_boundary,
+            ), mock.patch.object(
+                harness.os, "unlink", side_effect=AssertionError("cleanup must not unlink by name"),
+            ):
+                with self.assertRaisesRegex(harness.HarnessError, "tombstone was replaced"):
+                    harness.unlink_identified_file(journal)
+            self.assertIsNotNone(swapped_path)
+            self.assertEqual(swapped_path.read_text(), "unrelated")
+            self.assertEqual(stolen.stat().st_size, 0)
+            self.assertEqual(stat.S_IMODE(stolen.stat().st_mode), 0)
+            residue = sorted(path.name for path in root.iterdir())
+            harness.unlink_identified_file(journal)
+            self.assertEqual(sorted(path.name for path in root.iterdir()), residue)
 
     def test_publication_cleanup_quarantine_never_deletes_swapped_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -924,10 +1024,11 @@ class InputTests(unittest.TestCase):
             with mock.patch.object(harness, "rename_noreplace", side_effect=swap_before_quarantine):
                 with self.assertRaisesRegex(harness.HarnessError, "replaced private result staging"):
                     harness.cleanup_publication(binding)
-            quarantined = [path for path in root.iterdir() if ".clean-host-staging.delete-" in path.name]
+            quarantined = [path for path in root.iterdir() if ".clean-host-staging.tombstone-" in path.name]
             self.assertEqual(len(quarantined), 1)
             self.assertEqual((quarantined[0] / "sentinel").read_text(), "unrelated")
-            self.assertEqual((stolen / "owned").read_text(), "owned")
+            stolen.chmod(0o700)
+            self.assertEqual((stolen / "owned").stat().st_size, 0)
 
     def test_early_run_setup_failure_destroys_state_and_partial_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1076,11 +1177,18 @@ class InputTests(unittest.TestCase):
 
     def test_state_cleanup_retry_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            state = make_destroyable_state(Path(temporary))
+            root = Path(temporary)
+            state = make_destroyable_state(root)
             expected = harness.state_identity(state)
             harness.destroy_state(state, expected)
+            residue = [path for path in root.iterdir() if ".state.tombstone-" in path.name]
+            self.assertEqual(len(residue), 1)
+            residue[0].chmod(0o700)
+            self.assertTrue(all(path.stat().st_size == 0 for path in residue[0].iterdir()))
+            names = sorted(path.name for path in root.iterdir())
             harness.destroy_state(state, expected)
             self.assertFalse(state.exists())
+            self.assertEqual(sorted(path.name for path in root.iterdir()), names)
 
     def test_prepare_failure_cleans_state_and_success_intentionally_retains_it(self) -> None:
         for succeeds in (False, True):

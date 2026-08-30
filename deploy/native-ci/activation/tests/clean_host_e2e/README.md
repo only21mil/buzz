@@ -94,11 +94,17 @@ digests, guest prerequisites, package bindings, or immutable staging differ.
 that state for package freezing and preflight. At `run`, the harness validates
 the contract envelope and the prepared-state marker, then atomically moves that
 exact directory to a run-owned name. Cleanup holds directory descriptors,
-moves selected directories and members to unpredictable quarantine names, and
-checks their device/inode identity after each move before removal. Every later
-validation and setup exit has terminal cleanup ownership. A symbolic,
-unrecognized, replaced, or filesystem-identity-mismatched path is never
-removed.
+moves a selected directory to an unpredictable private tombstone with an atomic
+no-replace rename, and checks its device/inode identity immediately after the
+move. Cleanup then truncates regular-file payloads and removes permissions
+through held descriptors. It never calls path-based unlink or rmdir for a
+selected object. Linux has no atomic identity-bound delete for these names, so
+the harness retains at most one mode-`000` sanitized tombstone tree per selected
+directory and one zero-byte mode-`000` tombstone per selected private record.
+Retries do not create more tombstones. Every later validation and setup exit
+has terminal cleanup ownership. A symbolic, unrecognized, replaced, or
+filesystem-identity-mismatched path is never deleted; a replacement displaced
+by the atomic quarantine move remains intact.
 All subprocesses have fixed time and output bounds. Every process group is
 unconditionally killed, reaped, and checked for absence on success, failure,
 timeout, and interruption. The private state is removed on every terminal
@@ -107,10 +113,10 @@ state cleanup. The harness writes all three evidence files to one private
 sibling directory, revalidates their receipt, verifier, manifest, and contract
 bindings, and replays the exact digest-bound frozen receipt verifier against
 the scenario and receipt. The publication journal binds the staging
-directory's device/inode identity. After destroying selected VM state, the
-harness holds that directory descriptor through a quarantine move, validation,
-and atomic no-replace rename to the requested results path, with immediate
-destination identity readback. The public
+directory's device/inode identity. After sanitizing selected VM state, the
+harness holds the result-staging directory descriptor through a quarantine
+move, validation, and atomic no-replace rename to the requested results path,
+with immediate destination identity readback. The public
 path therefore exposes either the exact three-file set or nothing. A retry uses
 the contract-bound ownership and publication records to remove an interrupted
 partial set, finish a ready publication after cleanup, or return the already

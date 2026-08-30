@@ -80,6 +80,10 @@ def publication_checkpoint(_name: str, _staging: Path, _results: Path) -> None:
     """Test seam for result-publication interruption checkpoints."""
 
 
+def cleanup_checkpoint(_name: str, _path: Path, _descriptor: int) -> None:
+    """Test seam for cleanup namespace-race checkpoints."""
+
+
 def run_binding(contract: dict[str, object], results: Path) -> dict[str, str]:
     original = Path(os.path.abspath(Path(contract["state"])))
     final = Path(os.path.abspath(results))
@@ -843,67 +847,130 @@ def identity_matches(metadata: os.stat_result, expected: DirectoryIdentity) -> b
     return (metadata.st_dev, metadata.st_ino) == (expected.device, expected.inode)
 
 
+def sanitize_regular_fd(descriptor: int) -> None:
+    held = os.fstat(descriptor)
+    if not stat.S_ISREG(held.st_mode):
+        return
+    os.fchmod(descriptor, 0o600)
+    writable = os.open(f"/proc/self/fd/{descriptor}", os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        current = os.fstat(writable)
+        if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+            raise HarnessError("cleanup file descriptor identity changed")
+        os.fchmod(writable, 0o600)
+        os.ftruncate(writable, 0)
+        os.fsync(writable)
+        os.fchmod(writable, 0)
+        os.fsync(writable)
+    finally:
+        os.close(writable)
+
+
 def clear_directory_fd(directory_fd: int) -> None:
     with os.scandir(directory_fd) as iterator:
         names = sorted(entry.name for entry in iterator)
+    first_error: BaseException | None = None
     for name in names:
-        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        quarantine = f".delete-{os.urandom(16).hex()}"
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
         if stat.S_ISDIR(before.st_mode):
-            child_fd = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=directory_fd,
-            )
-            try:
-                if not identity_matches(os.fstat(child_fd), DirectoryIdentity(before.st_dev, before.st_ino)):
-                    raise HarnessError("cleanup directory changed before descriptor acquisition")
-                rename_noreplace_at(
-                    directory_fd, os.fsencode(name), directory_fd, os.fsencode(quarantine), quarantine,
-                )
-                moved = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
-                if not identity_matches(moved, DirectoryIdentity(before.st_dev, before.st_ino)):
-                    raise HarnessError("cleanup directory changed during quarantine")
-                clear_directory_fd(child_fd)
-                current = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
-                if not identity_matches(current, DirectoryIdentity(before.st_dev, before.st_ino)):
-                    raise HarnessError("cleanup directory was replaced")
-                os.rmdir(quarantine, dir_fd=directory_fd)
-            finally:
-                os.close(child_fd)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        elif stat.S_ISREG(before.st_mode):
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         else:
             flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
             item_fd = os.open(name, flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            continue
+        try:
+            held = os.fstat(item_fd)
+            if not identity_matches(held, DirectoryIdentity(before.st_dev, before.st_ino)):
+                raise HarnessError("cleanup member changed before descriptor acquisition")
+            cleanup_checkpoint(
+                "clear-directory-member", Path(f"/proc/self/fd/{directory_fd}") / name, item_fd,
+            )
             try:
-                held = os.fstat(item_fd)
-                if not identity_matches(held, DirectoryIdentity(before.st_dev, before.st_ino)):
-                    raise HarnessError("cleanup file changed before descriptor acquisition")
-                rename_noreplace_at(
-                    directory_fd, os.fsencode(name), directory_fd, os.fsencode(quarantine), quarantine,
-                )
-                current = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
-                if not identity_matches(current, DirectoryIdentity(before.st_dev, before.st_ino)):
-                    raise HarnessError("cleanup file was replaced")
-                os.unlink(quarantine, dir_fd=directory_fd)
-            finally:
-                os.close(item_fd)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                member_error: BaseException | None = HarnessError("cleanup member was displaced")
+            else:
+                member_error = None
+                if not identity_matches(current, DirectoryIdentity(held.st_dev, held.st_ino)):
+                    member_error = HarnessError("cleanup member was replaced")
+            try:
+                if stat.S_ISDIR(held.st_mode):
+                    sanitize_directory_fd(item_fd)
+                elif stat.S_ISREG(held.st_mode):
+                    sanitize_regular_fd(item_fd)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            if member_error is not None and first_error is None:
+                first_error = member_error
+        finally:
+            os.close(item_fd)
+    if first_error is not None:
+        raise first_error
+
+
+def sanitize_directory_fd(directory_fd: int) -> None:
+    primary: BaseException | None = None
+    try:
+        clear_directory_fd(directory_fd)
+    except BaseException as error:
+        primary = error
+    try:
+        os.fsync(directory_fd)
+        os.fchmod(directory_fd, 0)
+        os.fsync(directory_fd)
+    except BaseException as error:
+        if primary is None:
+            raise
+        raise HarnessError(f"directory sanitization failed: {error}") from primary
+    if primary is not None:
+        raise primary
+
+
+def raise_cleanup_failure(label: str, primary: BaseException | None, cleanup: BaseException) -> None:
+    if primary is None:
+        raise HarnessError(f"{label} sanitization failed: {cleanup}") from cleanup
+    raise HarnessError(f"{label} failed and sanitization failed: {cleanup}") from primary
 
 
 def destroy_identified_directory(path: Path, expected: DirectoryIdentity, label: str) -> None:
     directory_fd = open_absolute(path, directory=True)
-    quarantine = path.with_name(f".{path.name}.delete-{os.urandom(16).hex()}")
+    quarantine = path.with_name(f".{path.name}.tombstone-{os.urandom(16).hex()}")
+    primary: BaseException | None = None
     try:
         if not identity_matches(os.fstat(directory_fd), expected):
             raise HarnessError(f"refusing to destroy a replaced {label}")
-        rename_noreplace(path, quarantine)
-        observed = quarantine.lstat()
-        if not identity_matches(observed, expected) or not identity_matches(os.fstat(directory_fd), expected):
-            raise HarnessError(f"refusing to destroy a replaced {label}")
-        clear_directory_fd(directory_fd)
-        current = quarantine.lstat()
-        if not identity_matches(current, expected):
-            raise HarnessError(f"refusing to remove a replaced {label} quarantine")
-        os.rmdir(quarantine)
-        fsync_parent(quarantine)
+        try:
+            rename_noreplace(path, quarantine)
+            observed = quarantine.lstat()
+            if (
+                not identity_matches(observed, expected)
+                or not identity_matches(os.fstat(directory_fd), expected)
+            ):
+                raise HarnessError(f"refusing to destroy a replaced {label}")
+            cleanup_checkpoint("before-directory-tombstone-retention", quarantine, directory_fd)
+            current = quarantine.lstat()
+            if not identity_matches(current, expected):
+                raise HarnessError(f"{label} tombstone was replaced")
+        except BaseException as error:
+            primary = error
+        try:
+            sanitize_directory_fd(directory_fd)
+        except BaseException as cleanup_error:
+            raise_cleanup_failure(label, primary, cleanup_error)
+        try:
+            fsync_parent(path)
+        except BaseException as cleanup_error:
+            raise_cleanup_failure(label, primary, cleanup_error)
+        if primary is not None:
+            raise primary
     finally:
         os.close(directory_fd)
 
@@ -1258,16 +1325,37 @@ def terminal_run(contract_path: Path, results: Path) -> dict[str, object]:
 
 
 def unlink_identified_file(path: Path) -> None:
-    descriptor = open_absolute(path)
-    quarantine = path.with_name(f".{path.name}.delete-{os.urandom(16).hex()}")
+    try:
+        descriptor = open_absolute(path)
+    except FileNotFoundError:
+        return
+    quarantine = path.with_name(f".{path.name}.tombstone-{os.urandom(16).hex()}")
+    primary: BaseException | None = None
     try:
         expected = os.fstat(descriptor)
-        rename_noreplace(path, quarantine)
-        observed = quarantine.lstat()
-        if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino):
-            raise HarnessError("private record was replaced before cleanup")
-        os.unlink(quarantine)
-        fsync_parent(quarantine)
+        if not stat.S_ISREG(expected.st_mode):
+            raise HarnessError("private record is not a regular file")
+        try:
+            rename_noreplace(path, quarantine)
+            observed = quarantine.lstat()
+            if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino):
+                raise HarnessError("private record was replaced before cleanup")
+            cleanup_checkpoint("before-file-tombstone-retention", quarantine, descriptor)
+            current = quarantine.lstat()
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise HarnessError("private record tombstone was replaced")
+        except BaseException as error:
+            primary = error
+        try:
+            sanitize_regular_fd(descriptor)
+        except BaseException as cleanup_error:
+            raise_cleanup_failure("private record cleanup", primary, cleanup_error)
+        try:
+            fsync_parent(path)
+        except BaseException as cleanup_error:
+            raise_cleanup_failure("private record cleanup", primary, cleanup_error)
+        if primary is not None:
+            raise primary
     finally:
         os.close(descriptor)
 
