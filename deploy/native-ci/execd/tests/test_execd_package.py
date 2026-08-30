@@ -1322,6 +1322,323 @@ class ExecdPackageTests(unittest.TestCase):
                     else:
                         self.assertFalse(target.exists())
 
+    def test_install_compensation_cas_preserves_postvalidation_replacements(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"compensation owned candidate\n"
+        cases = (
+            ("present", "regular"),
+            ("present", "symlink"),
+            ("absent", "regular"),
+            ("absent", "symlink"),
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, (baseline_state, replacement_kind) in enumerate(cases):
+                with self.subTest(
+                    baseline=baseline_state, replacement=replacement_kind
+                ):
+                    lane = base / f"install-compensation-{index}"
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    if baseline_state == "present":
+                        target.parent.mkdir(mode=0o755)
+                        target.parent.chmod(0o755)
+                        target.write_bytes(b"compensation prior\n")
+                        target.chmod(0o750)
+                    held = target.parent / "owned-candidate-held"
+                    hostile = root / "hostile-compensation-target"
+                    original_rename = INSTALL._renameat2_at
+                    raced = False
+                    owned_inode = 0
+
+                    def replace_at_compensation_mutation(
+                        directory_fd: int, source: str, name: str, flags: int
+                    ) -> None:
+                        nonlocal raced, owned_inode
+                        if (
+                            not raced
+                            and INSTALL.COMPENSATION_STAGE_NAME in {source, name}
+                        ):
+                            raced = True
+                            owned_inode = target.stat().st_ino
+                            target.rename(held)
+                            if replacement_kind == "regular":
+                                target.write_bytes(b"operator compensation B\n")
+                                target.chmod(0o701)
+                            else:
+                                hostile.write_bytes(b"do not follow\n")
+                                hostile.chmod(0o700)
+                                target.symlink_to(hostile)
+                        original_rename(directory_fd, source, name, flags)
+
+                    with mock.patch.object(
+                        INSTALL,
+                        "_publish_receipt",
+                        side_effect=OSError("forced receipt failure"),
+                    ), mock.patch.object(
+                        INSTALL,
+                        "_renameat2_at",
+                        side_effect=replace_at_compensation_mutation,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "installation compensation failed"
+                        ):
+                            INSTALL.install(package, root)
+                    self.assertTrue(raced)
+                    self.assertEqual(held.stat().st_ino, owned_inode)
+                    if replacement_kind == "regular":
+                        self.assertEqual(
+                            (target.read_bytes(), _mode(target)),
+                            (b"operator compensation B\n", 0o701),
+                        )
+                    else:
+                        self.assertTrue(target.is_symlink())
+                        self.assertEqual(hostile.read_bytes(), b"do not follow\n")
+                    custody = root / "var/lib/buzzci/execd-v2/package"
+                    self.assertTrue(
+                        (custody / "install-transaction-v1.json").exists()
+                    )
+                    self.assertTrue(
+                        (custody / "candidate-identity-v1.json").exists()
+                    )
+                    self.assertFalse(
+                        (target.parent / INSTALL.COMPENSATION_STAGE_NAME).exists()
+                    )
+
+                    target.unlink()
+                    held.rename(target)
+                    self.assertEqual(
+                        INSTALL.install(package, root)["status"], "installed"
+                    )
+                    self.assertFalse(
+                        (custody / "install-transaction-v1.json").exists()
+                    )
+                    self.assertEqual(
+                        INSTALL.rollback(package, root)["status"], "rolled_back"
+                    )
+                    if baseline_state == "present":
+                        self.assertEqual(
+                            (target.read_bytes(), _mode(target)),
+                            (b"compensation prior\n", 0o750),
+                        )
+                    else:
+                        self.assertFalse(target.exists())
+
+    def test_install_compensation_exchange_recovers_after_forced_exit(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"forced compensation candidate\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, baseline_state in enumerate(("present", "absent")):
+                with self.subTest(baseline=baseline_state):
+                    lane = base / f"forced-compensation-{index}"
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    if baseline_state == "present":
+                        target.parent.mkdir(mode=0o755)
+                        target.parent.chmod(0o755)
+                        target.write_bytes(b"forced compensation prior\n")
+                        target.chmod(0o750)
+
+                    def fail_after_publication() -> None:
+                        with mock.patch.object(
+                            INSTALL,
+                            "_publish_receipt",
+                            side_effect=OSError("forced receipt failure"),
+                        ):
+                            INSTALL.install(package, root)
+
+                    self.assertEqual(
+                        _forced_exit_at(
+                            "install_compensation_exchanged",
+                            fail_after_publication,
+                        ),
+                        91,
+                    )
+                    self.assertTrue(
+                        (target.parent / INSTALL.COMPENSATION_STAGE_NAME).exists()
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "candidate ownership differs"
+                    ):
+                        INSTALL.install(package, root)
+                    self.assertFalse(
+                        (target.parent / INSTALL.COMPENSATION_STAGE_NAME).exists()
+                    )
+                    if baseline_state == "present":
+                        self.assertEqual(
+                            (target.read_bytes(), _mode(target)),
+                            (b"forced compensation prior\n", 0o750),
+                        )
+                    else:
+                        self.assertFalse(target.exists())
+                    self.assertEqual(INSTALL.install(package, root)["status"], "installed")
+                    self.assertEqual(
+                        INSTALL.rollback(package, root)["status"], "rolled_back"
+                    )
+
+    def test_rollback_hold_preserves_postexchange_replacements_until_exact_resume(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"rollback hold candidate\n"
+        cases = (
+            ("present", "regular"),
+            ("present", "symlink"),
+            ("absent", "regular"),
+            ("absent", "symlink"),
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, (baseline_state, replacement_kind) in enumerate(cases):
+                with self.subTest(
+                    baseline=baseline_state, replacement=replacement_kind
+                ):
+                    lane = base / f"rollback-hold-{index}"
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    if baseline_state == "present":
+                        target.parent.mkdir(mode=0o755)
+                        target.parent.chmod(0o755)
+                        target.write_bytes(b"rollback hold prior\n")
+                        target.chmod(0o750)
+                    INSTALL.install(package, root)
+                    held_prior = target.parent / "exact-prior-held"
+                    hostile = root / "hostile-hold-target"
+                    raced = False
+
+                    def replace_after_exchange(phase: str) -> None:
+                        nonlocal raced
+                        if phase != "rollback_exchanged" or raced:
+                            return
+                        raced = True
+                        if baseline_state == "present":
+                            target.rename(held_prior)
+                        if replacement_kind == "regular":
+                            target.write_bytes(b"operator rollback B\n")
+                            target.chmod(0o701)
+                        else:
+                            hostile.write_bytes(b"do not follow\n")
+                            hostile.chmod(0o700)
+                            target.symlink_to(hostile)
+
+                    with mock.patch.object(
+                        INSTALL, "_durable_phase", side_effect=replace_after_exchange
+                    ):
+                        with self.assertRaisesRegex(ValueError, "recoverable hold"):
+                            INSTALL.rollback(package, root)
+                    self.assertTrue(raced)
+                    if replacement_kind == "regular":
+                        self.assertEqual(
+                            (target.read_bytes(), _mode(target)),
+                            (b"operator rollback B\n", 0o701),
+                        )
+                    else:
+                        self.assertTrue(target.is_symlink())
+                        self.assertEqual(hostile.read_bytes(), b"do not follow\n")
+                    custody = root / "var/lib/buzzci/execd-v2/package"
+                    marker = json.loads((custody / "rollback-v1.json").read_bytes())
+                    self.assertEqual(marker["state"], "holding")
+                    self.assertTrue((custody / "receipt-v1.json").exists())
+                    self.assertEqual(
+                        (custody / "preimage-v1.bin").exists(),
+                        baseline_state == "present",
+                    )
+                    retained = target.parent / INSTALL.ROLLBACK_STAGE_NAME
+                    candidate_identity = json.loads(
+                        (custody / "candidate-identity-v1.json").read_bytes()
+                    )
+                    self.assertEqual(
+                        retained.stat().st_ino, candidate_identity["inode"]
+                    )
+                    with self.assertRaisesRegex(ValueError, "recoverable hold"):
+                        INSTALL.rollback(package, root)
+
+                    target.unlink()
+                    if baseline_state == "present":
+                        held_prior.rename(target)
+                    self.assertEqual(
+                        INSTALL.rollback(package, root)["status"], "rolled_back"
+                    )
+                    self.assertEqual(
+                        INSTALL.rollback(package, root)["status"], "unchanged"
+                    )
+                    self.assertFalse(retained.exists())
+                    self.assertFalse(
+                        (custody / "rollback-stage-identity-v1.json").exists()
+                    )
+                    if baseline_state == "present":
+                        self.assertEqual(
+                            (target.read_bytes(), _mode(target)),
+                            (b"rollback hold prior\n", 0o750),
+                        )
+                    else:
+                        self.assertFalse(target.exists())
+
+    def test_rollback_hold_marker_recovers_after_forced_exit(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            package, root = _manual_install_fixture(
+                base, b"forced rollback hold candidate\n", seccomp
+            )
+            target = root / "usr/libexec/buzz-ci-execd"
+            target.parent.mkdir(mode=0o755)
+            target.parent.chmod(0o755)
+            target.write_bytes(b"forced rollback hold prior\n")
+            target.chmod(0o750)
+            INSTALL.install(package, root)
+            held_prior = target.parent / "forced-exact-prior-held"
+
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    def checkpoint(phase: str) -> None:
+                        if phase == "rollback_exchanged":
+                            target.rename(held_prior)
+                            target.write_bytes(b"forced operator B\n")
+                            target.chmod(0o701)
+                        elif phase == "rollback_holding":
+                            os._exit(91)
+
+                    with mock.patch.object(
+                        INSTALL, "_durable_phase", side_effect=checkpoint
+                    ):
+                        INSTALL.rollback(package, root)
+                except BaseException:
+                    os._exit(92)
+                os._exit(93)
+            _, status = os.waitpid(pid, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 91)
+            custody = root / "var/lib/buzzci/execd-v2/package"
+            marker = json.loads((custody / "rollback-v1.json").read_bytes())
+            self.assertEqual(marker["state"], "holding")
+            self.assertEqual(
+                (target.read_bytes(), _mode(target)),
+                (b"forced operator B\n", 0o701),
+            )
+            with self.assertRaisesRegex(ValueError, "recoverable hold"):
+                INSTALL.rollback(package, root)
+            target.unlink()
+            held_prior.rename(target)
+            self.assertEqual(
+                INSTALL.rollback(package, root)["status"], "rolled_back"
+            )
+            self.assertEqual(INSTALL.rollback(package, root)["status"], "unchanged")
+
     def test_publication_cas_preserves_a_symlink_name_swap(self) -> None:
         seccomp = b"test immutable seccomp\n"
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(

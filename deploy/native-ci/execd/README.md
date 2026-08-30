@@ -158,8 +158,12 @@ between intent, preimage custody, candidate identity, staging, exchange,
 publication, receipt publication, or transaction release. Receipt,
 transaction, candidate-identity, candidate-stage, or preimage tamper fails
 closed. All custody and live-name operations remain no-follow and
-descriptor-relative. Execd startup remains the only owner of the
-content-addressed runtime profile and runtime receipt.
+descriptor-relative. Install compensation also moves or exchanges only the
+exact inode bound by `candidate-identity-v1.json`. If a regular file or symbolic
+link replaces the live name after compensation validation, the CAS restores
+that replacement to the live name, leaves the transaction recoverable, and
+does not report successful compensation. Execd startup remains the only owner
+of the content-addressed runtime profile and runtime receipt.
 
 `install.py rollback` checks the current candidate binary, active receipt,
 preimage, ownership, modes, and directory bindings before mutation. It restores
@@ -174,10 +178,17 @@ Rollback verifies the live candidate against `candidate-identity-v1.json`
 immediately before mutation. A present baseline uses an inode-bound private
 stage and atomic exchange; an absent baseline atomically moves the candidate to
 a retained rollback stage. Rollback verifies the exchanged or moved inode
-before it releases active custody. A last-instant regular file or symbolic link
-is moved back to the live name and left untouched. Until the terminal receipt
-is durable, compensation exchanges the retained original candidate inode back
-into place, so a retry does not adopt a copied candidate.
+before it releases active custody, then descriptor-reads the live name again
+immediately before the terminal receipt. That final proof requires the exact
+installer-owned baseline-stage inode, digest, and metadata, or exact absence.
+If a regular file or symbolic link replaces the live name after the exchange,
+rollback restores active receipt and preimage custody, retains the candidate,
+and durably records a recoverable `holding` state instead of reporting success.
+Exact retries preserve the replacement until the bound baseline inode (or
+absence) is restored, then finish and clean up idempotently. Until the terminal
+receipt is durable, ordinary rollback failure compensation exchanges the
+retained original candidate inode back into place, so a retry does not adopt a
+copied candidate.
 
 Prepare the activation input, then freeze and install the final package with:
 
