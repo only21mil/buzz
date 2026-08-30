@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -24,6 +27,7 @@ import render_keyholder_config
 SCHEMA = freeze_package.SCHEMA
 RECEIPT_SCHEMA = "buzz-ci-keyholder-install-receipt-v1"
 ROLLBACK_SCHEMA = "buzz-ci-keyholder-rollback-receipt-v1"
+ROLLBACK_STATE_SCHEMA = "buzz-ci-keyholder-rollback-state-v1"
 RECEIPT_DIRECTORY = "/var/lib/buzzci/keyholder-package"
 MAX_JSON_BYTES = 1024 * 1024
 PACKAGE_ID = re.compile(r"^buzz-ci-keyholder-acceptance-[0-9a-f]{12}-[0-9a-f]{12}$")
@@ -38,6 +42,14 @@ EXPECTED_TARGETS = {
     "acceptance_credential_dropin": "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf",
     "documentation": "/usr/share/doc/buzz-ci-keyholder/README.md",
 }
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+
+
+class ConcurrentMutation(ValueError):
+    """A descriptor-relative compare-and-swap found a different live file."""
 
 
 @dataclass(frozen=True)
@@ -508,6 +520,8 @@ class _PriorTarget:
     mode: int
     uid: int
     gid: int
+    dev: int | None = None
+    ino: int | None = None
 
     def state(self) -> dict[str, object]:
         return {
@@ -528,6 +542,13 @@ class _TargetPlan:
     current: _PriorTarget | None
 
 
+@dataclass(frozen=True)
+class _Mutation:
+    plan: _TargetPlan
+    before: _PriorTarget | None
+    after: _PriorTarget | None
+
+
 def _prior_target_at(directory_fd: int, name: str) -> _PriorTarget | None:
     try:
         payload, metadata = _read_at(directory_fd, name)
@@ -538,7 +559,56 @@ def _prior_target_at(directory_fd: int, name: str) -> _PriorTarget | None:
         stat.S_IMODE(metadata.st_mode),
         metadata.st_uid,
         metadata.st_gid,
+        metadata.st_dev,
+        metadata.st_ino,
     )
+
+
+def _same_snapshot(actual: _PriorTarget | None, expected: _PriorTarget | None) -> bool:
+    if actual is None or expected is None:
+        return actual is expected
+    return (
+        actual.state() == expected.state()
+        and expected.dev is not None
+        and expected.ino is not None
+        and (actual.dev, actual.ino) == (expected.dev, expected.ino)
+    )
+
+
+def _renameat2(old_directory_fd: int, old_name: str, new_directory_fd: int, new_name: str, flags: int) -> None:
+    if _LIBC_RENAMEAT2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is required for race-safe keyholder publication")
+    while True:
+        result = _LIBC_RENAMEAT2(
+            old_directory_fd,
+            os.fsencode(old_name),
+            new_directory_fd,
+            os.fsencode(new_name),
+            flags,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number != errno.EINTR:
+            raise OSError(error_number, os.strerror(error_number), old_name, new_name)
+
+
+def _lock_directory(directory_fd: int) -> None:
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise ValueError("keyholder installation is already locked") from error
+
+
+def _lock_target_directories(plans: list[_TargetPlan]) -> None:
+    locked: set[tuple[int, int]] = set()
+    for plan in sorted(plans, key=lambda value: value.entry.target):
+        metadata = os.fstat(plan.directory_fd)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in locked:
+            continue
+        _lock_directory(plan.directory_fd)
+        locked.add(identity)
 
 
 def _directory_binding_matches(root_fd: int, components: tuple[str, ...], expected_fd: int) -> bool:
@@ -561,7 +631,7 @@ def _directory_binding_matches(root_fd: int, components: tuple[str, ...], expect
         os.close(current)
 
 
-def _atomic_publish(parent_fd: int, name: str, payload: bytes, mode: int, uid: int, gid: int) -> None:
+def _stage_file(parent_fd: int, name: str, payload: bytes, mode: int, uid: int, gid: int) -> tuple[str, int, _PriorTarget]:
     temporary = f".{name}.{uuid.uuid4().hex}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode, dir_fd=parent_fd)
     try:
@@ -577,22 +647,108 @@ def _atomic_publish(parent_fd: int, name: str, payload: bytes, mode: int, uid: i
         metadata = os.fstat(descriptor)
         if metadata.st_uid != uid or metadata.st_gid != gid or stat.S_IMODE(metadata.st_mode) != mode or metadata.st_size != len(payload):
             raise OSError("temporary target metadata differs")
-        os.rename(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        temporary = ""
+        return temporary, descriptor, _PriorTarget(payload, mode, uid, gid, metadata.st_dev, metadata.st_ino)
+    except BaseException:
+        os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _restore_failed_exchange(parent_fd: int, name: str, temporary: str) -> None:
+    _renameat2(parent_fd, temporary, parent_fd, name, RENAME_EXCHANGE)
+    os.fsync(parent_fd)
+
+
+def _cas_publish(
+    parent_fd: int,
+    name: str,
+    expected: _PriorTarget | None,
+    replacement: _PriorTarget | None,
+) -> _PriorTarget | None:
+    if replacement is None:
+        if expected is None:
+            return None
+        temporary = f".{name}.{uuid.uuid4().hex}"
+        _renameat2(parent_fd, name, parent_fd, temporary, RENAME_NOREPLACE)
         os.fsync(parent_fd)
-        installed, installed_metadata = _read_at(parent_fd, name)
-        if installed != payload or installed_metadata.st_uid != uid or installed_metadata.st_gid != gid or stat.S_IMODE(installed_metadata.st_mode) != mode:
-            raise OSError("atomic publish readback differs")
+        try:
+            displaced = _prior_target_at(parent_fd, temporary)
+        except BaseException:
+            _renameat2(parent_fd, temporary, parent_fd, name, RENAME_NOREPLACE)
+            os.fsync(parent_fd)
+            raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
+        if not _same_snapshot(displaced, expected):
+            if displaced is not None:
+                _renameat2(parent_fd, temporary, parent_fd, name, RENAME_NOREPLACE)
+                os.fsync(parent_fd)
+            raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
+        os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        return None
+
+    temporary, descriptor, staged = _stage_file(
+        parent_fd,
+        name,
+        replacement.payload,
+        replacement.mode,
+        replacement.uid,
+        replacement.gid,
+    )
+    temporary_present = True
+    temporary_owned = True
+    try:
+        if expected is None:
+            try:
+                _renameat2(parent_fd, temporary, parent_fd, name, RENAME_NOREPLACE)
+            except FileExistsError as error:
+                raise ConcurrentMutation(f"target appeared before compare-and-swap: {name}") from error
+            temporary_present = False
+        else:
+            _renameat2(parent_fd, temporary, parent_fd, name, RENAME_EXCHANGE)
+            temporary_owned = False
+            try:
+                displaced = _prior_target_at(parent_fd, temporary)
+            except BaseException:
+                _restore_failed_exchange(parent_fd, name, temporary)
+                temporary_owned = True
+                raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
+            if not _same_snapshot(displaced, expected):
+                _restore_failed_exchange(parent_fd, name, temporary)
+                temporary_owned = True
+                raise ConcurrentMutation(f"target changed before compare-and-swap: {name}")
+        os.fsync(parent_fd)
+        installed = _prior_target_at(parent_fd, name)
+        if not _same_snapshot(installed, staged):
+            if expected is None:
+                current = _prior_target_at(parent_fd, name)
+                if _same_snapshot(current, staged):
+                    _renameat2(parent_fd, name, parent_fd, temporary, RENAME_NOREPLACE)
+                    temporary_present = True
+                    os.fsync(parent_fd)
+            else:
+                current = _prior_target_at(parent_fd, name)
+                if _same_snapshot(current, staged):
+                    _restore_failed_exchange(parent_fd, name, temporary)
+                    temporary_owned = True
+            raise OSError("atomic compare-and-swap readback differs")
+        if expected is not None:
+            os.unlink(temporary, dir_fd=parent_fd)
+            temporary_present = False
+            os.fsync(parent_fd)
+        return installed
     finally:
         os.close(descriptor)
-        if temporary:
-            try:
+        if temporary_present and temporary_owned:
+            current_temporary = _prior_target_at(parent_fd, temporary)
+            if _same_snapshot(current_temporary, staged):
                 os.unlink(temporary, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
+                os.fsync(parent_fd)
 
 
-def _write_once(directory_fd: int, name: str, payload: bytes, mode: int, uid: int, gid: int) -> None:
+def _write_once(directory_fd: int, name: str, payload: bytes, mode: int, uid: int, gid: int) -> _PriorTarget:
     descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode, dir_fd=directory_fd)
     try:
         os.fchmod(descriptor, mode)
@@ -604,6 +760,16 @@ def _write_once(directory_fd: int, name: str, payload: bytes, mode: int, uid: in
     finally:
         os.close(descriptor)
     os.fsync(directory_fd)
+    written = _prior_target_at(directory_fd, name)
+    if written is None or written.payload != payload or written.state() != {
+        "sha256": sha256(payload),
+        "size": len(payload),
+        "mode": mode,
+        "uid": uid,
+        "gid": gid,
+    }:
+        raise OSError(f"create-once readback differs: {name}")
+    return written
 
 
 def _receipt_directory(root_fd: int, root: Path, *, create: bool, created: list[str] | None = None) -> int:
@@ -671,9 +837,15 @@ def _validate_install_receipt(receipt: dict[str, object], manifest: dict[str, ob
             raise ValueError("keyholder install receipt change fields differ")
 
 
-def _prepare_receipt(root: Path, directory_fd: int, manifest: dict[str, object], plans: list[_TargetPlan], created: list[str]) -> dict[str, object]:
+def _prepare_receipt(
+    root: Path,
+    directory_fd: int,
+    manifest: dict[str, object],
+    plans: list[_TargetPlan],
+    created: list[str],
+) -> tuple[dict[str, object], dict[str, _PriorTarget]]:
     changes: list[dict[str, object]] = []
-    written: list[str] = []
+    written: dict[str, _PriorTarget] = {}
     for plan in plans:
         entry = plan.entry
         state = None if plan.current is None else plan.current.state()
@@ -698,20 +870,25 @@ def _prepare_receipt(root: Path, directory_fd: int, manifest: dict[str, object],
             name = str(record["backup"])
             prior = by_target[str(record["target"])].current
             assert prior is not None
-            _write_once(directory_fd, name, prior.payload, 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
-            written.append(name)
-        _write_once(directory_fd, "receipt-v1.json", canonical_json(receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
-        written.append("receipt-v1.json")
+            written[name] = _write_once(directory_fd, name, prior.payload, 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
+        written["receipt-v1.json"] = _write_once(
+            directory_fd,
+            "receipt-v1.json",
+            canonical_json(receipt),
+            0o600,
+            mapped_id(0, root),
+            mapped_id(0, root, group=True),
+        )
         pair = _read_receipt(directory_fd, "receipt-v1.json", absent_ok=False)
         assert pair is not None
         if pair[0] != receipt:
             raise ValueError("keyholder install receipt readback differs")
-        return receipt
+        return receipt, written
     except BaseException:
-        for name in reversed(written):
+        for name, expected in reversed(tuple(written.items())):
             try:
-                os.unlink(name, dir_fd=directory_fd)
-            except FileNotFoundError:
+                _cas_publish(directory_fd, name, expected, None)
+            except (FileNotFoundError, ConcurrentMutation):
                 pass
         os.fsync(directory_fd)
         raise
@@ -751,8 +928,13 @@ def _receipt_priors(
     root: Path,
     directory_fd: int,
     receipt: dict[str, object],
-) -> dict[str, _PriorTarget | None]:
+) -> tuple[dict[str, _PriorTarget | None], dict[str, _PriorTarget]]:
     priors: dict[str, _PriorTarget | None] = {}
+    artifacts: dict[str, _PriorTarget] = {}
+    receipt_snapshot = _prior_target_at(directory_fd, "receipt-v1.json")
+    if receipt_snapshot is None or receipt_snapshot.payload != canonical_json(receipt):
+        raise ValueError("keyholder install receipt changed during validation")
+    artifacts["receipt-v1.json"] = receipt_snapshot
     for record in receipt["changes"]:
         target = str(record["target"])
         if not record["existed"]:
@@ -767,62 +949,165 @@ def _receipt_priors(
             or sha256(payload) != record["sha256"]
         ):
             raise ValueError("keyholder install receipt backup differs")
+        backup_snapshot = _prior_target_at(directory_fd, str(record["backup"]))
+        if backup_snapshot is None or backup_snapshot.payload != payload:
+            raise ValueError("keyholder install receipt backup changed during validation")
+        artifacts[str(record["backup"])] = backup_snapshot
         priors[target] = _PriorTarget(
             payload,
             int(record["mode"]),
             int(record["uid"]),
             int(record["gid"]),
         )
-    return priors
+    return priors, artifacts
 
 
-def _restore_targets(plans: list[_TargetPlan], priors: dict[str, _PriorTarget | None]) -> None:
-    errors: list[BaseException] = []
-    by_target = {plan.entry.target: plan for plan in plans}
-    for target, prior in reversed(tuple(priors.items())):
-        plan = by_target[target]
+def _validate_receipt_artifacts(directory_fd: int, artifacts: dict[str, _PriorTarget]) -> None:
+    for name, expected in artifacts.items():
+        if not _same_snapshot(_prior_target_at(directory_fd, name), expected):
+            raise ValueError(f"keyholder receipt artifact changed during publication: {name}")
+
+
+def _rollback_targets(receipt: dict[str, object]) -> list[str]:
+    return [str(record["target"]) for record in reversed(receipt["changes"])]
+
+
+def _rollback_directories(receipt: dict[str, object]) -> list[str]:
+    return sorted(
+        (str(directory) for directory in receipt["created_directories"]),
+        key=lambda value: (len(Path(value).parts), value),
+        reverse=True,
+    )
+
+
+def _validate_rollback_marker(
+    marker: dict[str, object],
+    manifest: dict[str, object],
+    receipt_raw: bytes,
+    receipt: dict[str, object],
+) -> None:
+    if marker != {
+        "schema": ROLLBACK_SCHEMA,
+        "package_id": manifest["package_id"],
+        "package_digest": manifest["package_digest"],
+        "install_receipt_sha256": sha256(receipt_raw),
+        "restored_targets": _rollback_targets(receipt),
+    }:
+        raise ValueError("keyholder rollback receipt differs")
+
+
+def _rollback_state_value(
+    manifest: dict[str, object],
+    receipt_raw: bytes,
+    restored_targets: list[str],
+    removed_directories: list[str],
+) -> dict[str, object]:
+    return {
+        "schema": ROLLBACK_STATE_SCHEMA,
+        "package_id": manifest["package_id"],
+        "package_digest": manifest["package_digest"],
+        "install_receipt_sha256": sha256(receipt_raw),
+        "restored_targets": restored_targets,
+        "removed_directories": removed_directories,
+    }
+
+
+def _validate_rollback_state(
+    state: dict[str, object],
+    manifest: dict[str, object],
+    receipt_raw: bytes,
+    receipt: dict[str, object],
+) -> None:
+    restored = state.get("restored_targets")
+    removed = state.get("removed_directories")
+    expected_targets = _rollback_targets(receipt)
+    expected_directories = _rollback_directories(receipt)
+    if (
+        not isinstance(restored, list)
+        or not isinstance(removed, list)
+        or restored != expected_targets[:len(restored)]
+        or removed != expected_directories[:len(removed)]
+        or state != _rollback_state_value(manifest, receipt_raw, restored, removed)
+    ):
+        raise ValueError("keyholder rollback state differs")
+
+
+def _publish_rollback_state(
+    directory_fd: int,
+    root: Path,
+    previous: _PriorTarget | None,
+    value: dict[str, object],
+) -> _PriorTarget:
+    raw = canonical_json(value)
+    if previous is None:
+        return _write_once(
+            directory_fd,
+            "rollback-state-v1.json",
+            raw,
+            0o600,
+            mapped_id(0, root),
+            mapped_id(0, root, group=True),
+        )
+    published = _cas_publish(
+        directory_fd,
+        "rollback-state-v1.json",
+        previous,
+        _PriorTarget(raw, 0o600, mapped_id(0, root), mapped_id(0, root, group=True)),
+    )
+    assert published is not None
+    return published
+
+
+def _validate_terminal_rollback(
+    root_fd: int,
+    root: Path,
+    receipt: dict[str, object],
+    entries: list[Entry],
+) -> None:
+    records = {str(record["target"]): record for record in receipt["changes"]}
+    for entry in entries:
         try:
-            if prior is None:
-                try:
-                    os.unlink(plan.name, dir_fd=plan.directory_fd)
-                except FileNotFoundError:
-                    pass
-                os.fsync(plan.directory_fd)
-                if _prior_target_at(plan.directory_fd, plan.name) is not None:
-                    raise ValueError(f"new keyholder target remains after rollback: {target}")
-            else:
-                _atomic_publish(
-                    plan.directory_fd,
-                    plan.name,
-                    prior.payload,
-                    prior.mode,
-                    prior.uid,
-                    prior.gid,
-                )
+            current = _state(root_fd, root, entry)
+        except FileNotFoundError:
+            current = None
+        record = records.get(entry.target)
+        expected = _desired(root, entry) if record is None else _prior_state(record)
+        if current != expected:
+            raise ValueError(f"terminal rollback target drift: {entry.target}")
+    for directory in receipt["created_directories"]:
+        try:
+            descriptor = _open_chain(root_fd, str(directory), root, create=False)
+        except FileNotFoundError:
+            continue
+        os.close(descriptor)
+        raise ValueError(f"terminal rollback directory remains: {directory}")
+
+
+def _restore_targets(mutations: list[_Mutation]) -> None:
+    errors: list[BaseException] = []
+    for mutation in reversed(mutations):
+        plan = mutation.plan
+        try:
+            _cas_publish(plan.directory_fd, plan.name, mutation.after, mutation.before)
+        except ConcurrentMutation:
+            # A later writer has already displaced our candidate. Preserve it.
+            continue
         except BaseException as error:
             errors.append(error)
     if errors:
         raise RuntimeError("; ".join(str(error) for error in errors))
 
 
-def _remove_receipt_artifacts(directory_fd: int, receipt: dict[str, object]) -> None:
-    names = ["receipt-v1.json"] + [
-        str(record["backup"])
-        for record in receipt["changes"]
-        if record["existed"]
-    ]
-    for name in names:
+def _remove_receipt_artifacts(directory_fd: int, artifacts: dict[str, _PriorTarget]) -> None:
+    for name, expected in reversed(tuple(artifacts.items())):
         try:
-            os.unlink(name, dir_fd=directory_fd)
-        except FileNotFoundError:
+            _cas_publish(directory_fd, name, expected, None)
+        except ConcurrentMutation:
             pass
     os.fsync(directory_fd)
-    for name in names:
-        try:
-            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        raise ValueError(f"keyholder receipt artifact remains after rollback: {name}")
+    for name, expected in artifacts.items():
+        if _same_snapshot(_prior_target_at(directory_fd, name), expected):
+            raise ValueError(f"keyholder receipt artifact remains after rollback: {name}")
 
 
 def _remove_created_directories(root_fd: int, root: Path, created: list[str]) -> None:
@@ -894,6 +1179,8 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
         receipt_fd = -1
         receipt: dict[str, object] | None = None
         priors: dict[str, _PriorTarget | None] = {}
+        receipt_artifacts: dict[str, _PriorTarget] = {}
+        mutations: list[_Mutation] = []
         new_receipt = False
         transaction_ready = False
         try:
@@ -910,48 +1197,76 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             for directory in manifest["directories"]:
                 descriptor = _open_chain(root_fd, str(directory["target"]), root, create=True, created=created)
                 os.close(descriptor)
-            plans = _open_target_plans(root_fd, root, entries)
             receipt_fd = _receipt_directory(root_fd, root, create=True, created=receipt_created)
+            _lock_directory(receipt_fd)
+            receipt_components = Path(RECEIPT_DIRECTORY).parts[1:]
+            if not _directory_binding_matches(root_fd, receipt_components, receipt_fd):
+                raise ValueError("keyholder receipt directory changed before locking")
+            plans = _open_target_plans(root_fd, root, entries)
+            _lock_target_directories(plans)
             if _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=True) is not None:
                 raise ValueError("keyholder package was already rolled back")
+            if _read_receipt(receipt_fd, "rollback-state-v1.json", absent_ok=True) is not None:
+                raise ValueError("keyholder package rollback is in progress")
             receipt_pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=True)
             if receipt_pair is None:
                 new_receipt = True
-                receipt = _prepare_receipt(root, receipt_fd, manifest, plans, created)
+                receipt, receipt_artifacts = _prepare_receipt(root, receipt_fd, manifest, plans, created)
             else:
                 receipt = receipt_pair[0]
             _validate_install_receipt(receipt, manifest, entries)
-            priors = _receipt_priors(root, receipt_fd, receipt)
+            priors, observed_artifacts = _receipt_priors(root, receipt_fd, receipt)
+            if receipt_artifacts and any(
+                not _same_snapshot(observed_artifacts.get(name), expected)
+                for name, expected in receipt_artifacts.items()
+            ):
+                raise ValueError("new keyholder receipt changed before publication")
+            receipt_artifacts = observed_artifacts
             changes = {str(record["target"]): record for record in receipt["changes"]}
             for plan in plans:
-                plan.current = _prior_target_at(plan.directory_fd, plan.name)
-                current = None if plan.current is None else plan.current.state()
+                baseline = plan.current
+                observed = _prior_target_at(plan.directory_fd, plan.name)
+                if new_receipt and not _same_snapshot(observed, baseline):
+                    raise ConcurrentMutation(f"target changed after receipt snapshot: {plan.entry.target}")
+                plan.current = observed
+                current = None if observed is None else observed.state()
                 desired = _desired(root, plan.entry)
                 record = changes.get(plan.entry.target)
                 if current != desired and (record is None or current != _prior_state(record)):
                     raise ValueError(f"installed target drift blocks replay: {plan.entry.target}")
                 if not _directory_binding_matches(root_fd, plan.components, plan.directory_fd):
                     raise ValueError(f"target directory changed during installation: {plan.entry.target}")
+            _validate_receipt_artifacts(receipt_fd, receipt_artifacts)
             transaction_ready = True
             changed: list[str] = []
             for plan in plans:
                 desired = _desired(root, plan.entry)
-                current = _prior_target_at(plan.directory_fd, plan.name)
-                if current is not None and current.state() == desired:
+                if plan.current is not None and plan.current.state() == desired:
                     continue
-                _atomic_publish(
-                    plan.directory_fd,
-                    plan.name,
+                _validate_receipt_artifacts(receipt_fd, receipt_artifacts)
+                replacement = _PriorTarget(
                     plan.entry.payload,
                     plan.entry.install_mode,
                     mapped_id(plan.entry.uid, root),
                     mapped_id(plan.entry.gid, root, group=True),
                 )
+                installed = _cas_publish(
+                    plan.directory_fd,
+                    plan.name,
+                    plan.current,
+                    replacement,
+                )
+                mutation = _Mutation(plan, plan.current, installed)
+                mutations.append(mutation)
+                plan.current = installed
                 current = _prior_target_at(plan.directory_fd, plan.name)
-                if current is None or current.state() != desired:
+                if not _same_snapshot(current, installed) or current is None or current.state() != desired:
                     raise ValueError(f"installed target readback differs: {plan.entry.target}")
                 if not _directory_binding_matches(root_fd, plan.components, plan.directory_fd):
                     raise ValueError(f"target directory changed during installation: {plan.entry.target}")
+                if not _directory_binding_matches(root_fd, receipt_components, receipt_fd):
+                    raise ValueError("keyholder receipt directory changed during installation")
+                _validate_receipt_artifacts(receipt_fd, receipt_artifacts)
                 changed.append(plan.entry.target)
             pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=False)
             assert pair is not None
@@ -963,7 +1278,6 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
                     raise ValueError("keyholder package exact readback differs")
                 if not _directory_binding_matches(root_fd, plan.components, plan.directory_fd):
                     raise ValueError("keyholder publication directory changed during installation")
-            receipt_components = Path(RECEIPT_DIRECTORY).parts[1:]
             if not _directory_binding_matches(root_fd, receipt_components, receipt_fd):
                 raise ValueError("keyholder receipt directory changed during installation")
             validate_encrypted_credential(root)
@@ -972,12 +1286,12 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             rollback_errors: list[BaseException] = []
             if transaction_ready:
                 try:
-                    _restore_targets(plans, priors)
+                    _restore_targets(mutations)
                 except BaseException as rollback_error:
                     rollback_errors.append(rollback_error)
-            if new_receipt and receipt is not None and receipt_fd >= 0:
+            if new_receipt and receipt_artifacts and receipt_fd >= 0:
                 try:
-                    _remove_receipt_artifacts(receipt_fd, receipt)
+                    _remove_receipt_artifacts(receipt_fd, receipt_artifacts)
                 except BaseException as rollback_error:
                     rollback_errors.append(rollback_error)
             if created or receipt_created:
@@ -1007,82 +1321,161 @@ def rollback(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, o
         if root == Path("/") and os.geteuid() != 0:
             raise PermissionError("rollback requires root")
         root_fd = _open_root(root)
+        receipt_fd = -1
+        plans: list[_TargetPlan] = []
         try:
             receipt_fd = _receipt_directory(root_fd, root, create=False)
-            try:
-                receipt_pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=False)
-                assert receipt_pair is not None
-                receipt, receipt_raw = receipt_pair
-                _validate_install_receipt(receipt, manifest, entries)
-                if _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=True) is not None:
-                    raise ValueError("keyholder package rollback was already completed")
-                by_target = {entry.target: entry for entry in entries}
-                plan: list[tuple[dict[str, object], Entry, bytes | None]] = []
-                for record in receipt["changes"]:
-                    entry = by_target[str(record["target"])]
-                    current = _state(root_fd, root, entry)
-                    if current not in (_desired(root, entry), _prior_state(record)):
-                        raise ValueError(f"installed target drift blocks rollback: {entry.target}")
-                    backup: bytes | None = None
-                    if record["existed"]:
-                        backup, metadata = _read_at(receipt_fd, str(record["backup"]))
-                        if metadata.st_uid != mapped_id(0, root) or metadata.st_gid != mapped_id(0, root, group=True) or stat.S_IMODE(metadata.st_mode) != 0o600 or sha256(backup) != record["sha256"] or len(backup) != record["size"]:
-                            raise ValueError("keyholder rollback backup differs")
-                    plan.append((record, entry, backup))
-                removal_plan: list[tuple[int, str]] = []
-                created_directories = set(receipt["created_directories"])
-                absent_targets = {
-                    entry.target for record, entry, _ in plan if not record["existed"]
-                }
-                for directory in receipt["created_directories"]:
-                    directory_fd = _open_chain(root_fd, str(directory), root, create=False)
-                    present = set(os.listdir(directory_fd))
-                    expected = {
-                        Path(target).name for target in absent_targets
-                        if str(Path(target).parent) == directory
-                    } | {
-                        Path(child).name for child in created_directories
-                        if str(Path(child).parent) == directory
-                    }
-                    os.close(directory_fd)
-                    if present != expected:
-                        raise ValueError(f"rollback directory content drift: {directory}")
-                    parent_fd, name = _open_parent(root_fd, str(directory), root)
-                    removal_plan.append((parent_fd, name))
-                if dry_run:
-                    for parent_fd, _ in removal_plan:
-                        os.close(parent_fd)
-                    return _result("rollback_dry_run", manifest, [entry.target for _, entry, _ in plan])
-                for record, entry, backup in reversed(plan):
-                    if _state(root_fd, root, entry) == _prior_state(record):
-                        continue
-                    parent_fd, name = _open_parent(root_fd, entry.target, root)
+            _lock_directory(receipt_fd)
+            receipt_components = Path(RECEIPT_DIRECTORY).parts[1:]
+            if not _directory_binding_matches(root_fd, receipt_components, receipt_fd):
+                raise ValueError("keyholder receipt directory changed before rollback locking")
+            receipt_pair = _read_receipt(receipt_fd, "receipt-v1.json", absent_ok=False)
+            assert receipt_pair is not None
+            receipt, receipt_raw = receipt_pair
+            _validate_install_receipt(receipt, manifest, entries)
+            priors, receipt_artifacts = _receipt_priors(root, receipt_fd, receipt)
+            marker_pair = _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=True)
+            if marker_pair is not None:
+                _validate_rollback_marker(marker_pair[0], manifest, receipt_raw, receipt)
+                _validate_terminal_rollback(root_fd, root, receipt, entries)
+                status = "rollback_dry_run" if dry_run else "unchanged"
+                return _result(status, manifest, _rollback_targets(receipt))
+            state_pair = _read_receipt(receipt_fd, "rollback-state-v1.json", absent_ok=True)
+            state_snapshot: _PriorTarget | None = None
+            if state_pair is None:
+                state = _rollback_state_value(manifest, receipt_raw, [], [])
+            else:
+                state = state_pair[0]
+                _validate_rollback_state(state, manifest, receipt_raw, receipt)
+                state_snapshot = _prior_target_at(receipt_fd, "rollback-state-v1.json")
+                if state_snapshot is None or state_snapshot.payload != state_pair[1]:
+                    raise ValueError("keyholder rollback state changed during validation")
+                receipt_artifacts["rollback-state-v1.json"] = state_snapshot
+
+            created_directories = set(str(value) for value in receipt["created_directories"])
+            removed_directories = set(str(value) for value in state["removed_directories"])
+            checkpointed_targets = set(str(value) for value in state["restored_targets"])
+            for entry in entries:
+                try:
+                    directory_fd, name = _open_parent(root_fd, entry.target, root)
+                except FileNotFoundError:
+                    parent = str(Path(entry.target).parent)
+                    under_created = any(
+                        parent == directory or parent.startswith(f"{directory}/")
+                        for directory in created_directories
+                    )
+                    if entry.target not in checkpointed_targets or not under_created:
+                        raise ValueError(f"rollback target parent is unexpectedly absent: {entry.target}")
+                    continue
+                components = Path(entry.target).parent.parts[1:]
+                plans.append(_TargetPlan(entry, directory_fd, components, name, _prior_target_at(directory_fd, name)))
+            _lock_target_directories(plans)
+            by_target = {plan.entry.target: plan for plan in plans}
+            records = {str(record["target"]): record for record in receipt["changes"]}
+            restored_targets = list(str(value) for value in state["restored_targets"])
+            for target in restored_targets:
+                plan = by_target.get(target)
+                if plan is None:
+                    continue
+                current = None if plan.current is None else plan.current.state()
+                if current != _prior_state(records[target]):
+                    raise ValueError(f"checkpointed rollback target drift: {target}")
+            for target in _rollback_targets(receipt)[len(restored_targets):]:
+                plan = by_target.get(target)
+                if plan is None:
+                    raise ValueError(f"pending rollback target parent is absent: {target}")
+                current = None if plan.current is None else plan.current.state()
+                if current not in (_desired(root, plan.entry), _prior_state(records[target])):
+                    raise ValueError(f"installed target drift blocks rollback: {target}")
+            if dry_run:
+                return _result("rollback_dry_run", manifest, _rollback_targets(receipt))
+            if state_snapshot is None:
+                state_snapshot = _publish_rollback_state(receipt_fd, root, None, state)
+                receipt_artifacts["rollback-state-v1.json"] = state_snapshot
+
+            for target in _rollback_targets(receipt)[len(restored_targets):]:
+                plan = by_target[target]
+                record = records[target]
+                prior = priors[target]
+                prior_state = _prior_state(record)
+                current_state = None if plan.current is None else plan.current.state()
+                if current_state != prior_state:
+                    _validate_receipt_artifacts(receipt_fd, receipt_artifacts)
+                    plan.current = _cas_publish(plan.directory_fd, plan.name, plan.current, prior)
+                    if not _directory_binding_matches(root_fd, plan.components, plan.directory_fd):
+                        raise ValueError(f"target directory changed during rollback: {target}")
+                restored_targets.append(target)
+                state = _rollback_state_value(
+                    manifest,
+                    receipt_raw,
+                    restored_targets.copy(),
+                    list(str(value) for value in state["removed_directories"]),
+                )
+                state_snapshot = _publish_rollback_state(receipt_fd, root, state_snapshot, state)
+                receipt_artifacts["rollback-state-v1.json"] = state_snapshot
+                _validate_receipt_artifacts(receipt_fd, receipt_artifacts)
+
+            removed = list(str(value) for value in state["removed_directories"])
+            directory_order = _rollback_directories(receipt)
+            for directory in directory_order[len(removed):]:
+                try:
+                    directory_fd = _open_chain(root_fd, directory, root, create=False)
+                except FileNotFoundError:
+                    directory_fd = -1
+                if directory_fd >= 0:
                     try:
-                        if backup is None:
-                            os.unlink(name, dir_fd=parent_fd)
-                            os.fsync(parent_fd)
-                        else:
-                            _atomic_publish(parent_fd, name, backup, int(record["mode"]), int(record["uid"]), int(record["gid"]))
+                        present = set(os.listdir(directory_fd))
                     finally:
-                        os.close(parent_fd)
-                for record, entry, _ in plan:
-                    if _state(root_fd, root, entry) != _prior_state(record):
-                        raise ValueError(f"rollback readback differs: {entry.target}")
-                for parent_fd, name in reversed(removal_plan):
+                        os.close(directory_fd)
+                    if present:
+                        raise ValueError(f"rollback directory content drift: {directory}")
+                    parent_fd, name = _open_parent(root_fd, directory, root)
                     try:
                         os.rmdir(name, dir_fd=parent_fd)
                         os.fsync(parent_fd)
                     finally:
                         os.close(parent_fd)
-                rollback_receipt = {
-                    "schema": ROLLBACK_SCHEMA, "package_id": manifest["package_id"], "package_digest": manifest["package_digest"],
-                    "install_receipt_sha256": sha256(receipt_raw), "restored_targets": [entry.target for _, entry, _ in plan],
-                }
-                _write_once(receipt_fd, "rollback-v1.json", canonical_json(rollback_receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
-                return _result("rolled_back", manifest, rollback_receipt["restored_targets"])
-            finally:
-                os.close(receipt_fd)
+                removed.append(directory)
+                state = _rollback_state_value(manifest, receipt_raw, restored_targets.copy(), removed.copy())
+                state_snapshot = _publish_rollback_state(receipt_fd, root, state_snapshot, state)
+                receipt_artifacts["rollback-state-v1.json"] = state_snapshot
+                _validate_receipt_artifacts(receipt_fd, receipt_artifacts)
+
+            _validate_terminal_rollback(root_fd, root, receipt, entries)
+            _validate_receipt_artifacts(receipt_fd, receipt_artifacts)
+            if not _directory_binding_matches(root_fd, receipt_components, receipt_fd):
+                raise ValueError("keyholder receipt directory changed during rollback")
+            rollback_receipt = {
+                "schema": ROLLBACK_SCHEMA,
+                "package_id": manifest["package_id"],
+                "package_digest": manifest["package_digest"],
+                "install_receipt_sha256": sha256(receipt_raw),
+                "restored_targets": _rollback_targets(receipt),
+            }
+            try:
+                marker_snapshot = _write_once(
+                    receipt_fd,
+                    "rollback-v1.json",
+                    canonical_json(rollback_receipt),
+                    0o600,
+                    mapped_id(0, root),
+                    mapped_id(0, root, group=True),
+                )
+            except FileExistsError:
+                marker_pair = _read_receipt(receipt_fd, "rollback-v1.json", absent_ok=False)
+                assert marker_pair is not None
+                _validate_rollback_marker(marker_pair[0], manifest, receipt_raw, receipt)
+                return _result("unchanged", manifest, _rollback_targets(receipt))
+            _validate_receipt_artifacts(
+                receipt_fd,
+                receipt_artifacts | {"rollback-v1.json": marker_snapshot},
+            )
+            return _result("rolled_back", manifest, _rollback_targets(receipt))
         finally:
+            if receipt_fd >= 0:
+                os.close(receipt_fd)
+            for plan in plans:
+                os.close(plan.directory_fd)
             os.close(root_fd)
     finally:
         os.umask(previous_umask)
