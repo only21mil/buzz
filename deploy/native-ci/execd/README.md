@@ -130,15 +130,32 @@ the exact package, source, fixed-manifest, and managed-target binding.
 The standalone package does not bundle the distribution seccomp profile. It
 checks `/usr/share/containers/seccomp.json` against the compiled digest. Before
 replacing `/usr/libexec/buzz-ci-execd`, the installer captures the exact prior
-binary bytes and metadata. A present baseline is held at
+binary bytes, metadata, device, and inode. It publishes a canonical mode-`0600`
+`install-transaction-v1.json` before it creates private custody or changes the
+live name. The transaction binds the package, candidate, baseline identity,
+expected preimage, and final install receipt. A present baseline is held at
 `/var/lib/buzzci/execd-v2/package/preimage-v1.bin`; an absent baseline is
 recorded explicitly. The root-owned mode-`0600` install receipt at
 `/var/lib/buzzci/execd-v2/package/receipt-v1.json` binds that baseline and
 preimage to the execd package digest, source commit, binary digest, and fixed
-activation package. The package directory is root-owned mode `0700`, and all
-custody reads and writes use no-follow, descriptor-relative operations. Execd
-startup remains the only owner of the content-addressed runtime profile and
-runtime receipt.
+activation package.
+
+Install and rollback hold the same root-owned mode-`0600` `install.lock` under
+the root-owned mode-`0700` package directory. At the publication cut, install
+reopens the live name relative to the already-open `/usr/libexec` descriptor
+and compares absence or the captured device, inode, digest, mode, UID, and GID.
+An absent baseline uses atomic no-replace publication. A present baseline uses
+an atomic name exchange and verifies that the exchanged inode is the captured
+baseline before it discards that name. If a replacement wins the final race,
+the installer exchanges it back and aborts. This includes a byte-identical new
+inode or an absent-baseline name that appeared. Candidate staging and every
+transaction phase are fsynced. A retry resumes after a process exit between
+intent, preimage custody, staging, exchange, publication, receipt publication,
+or transaction release. Rollback first completes a bound interrupted install,
+then follows the normal verified rollback protocol. Receipt, transaction,
+candidate-stage, or preimage tamper fails closed. All custody and live-name
+operations remain no-follow and descriptor-relative. Execd startup remains the
+only owner of the content-addressed runtime profile and runtime receipt.
 
 `install.py rollback` checks the current candidate binary, active receipt,
 preimage, ownership, modes, and directory bindings before mutation. It restores

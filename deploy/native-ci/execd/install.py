@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
@@ -27,6 +29,12 @@ DIGEST = re.compile(r"^[0-9a-f]{64}$")
 RECEIPT_NAME = "receipt-v1.json"
 PREIMAGE_NAME = "preimage-v1.bin"
 ROLLBACK_RECEIPT_NAME = "rollback-v1.json"
+INSTALL_TRANSACTION_NAME = "install-transaction-v1.json"
+INSTALL_LOCK_NAME = "install.lock"
+CANDIDATE_STAGE_NAME = ".buzz-ci-execd.install-v1"
+INSTALL_TRANSACTION_SCHEMA = "buzz-ci-execd-package-install-transaction-v1"
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
 
 
 @dataclass(frozen=True)
@@ -573,14 +581,8 @@ class _PriorTarget:
     mode: int
     uid: int
     gid: int
-
-
-@dataclass
-class _Publication:
-    directory_fd: int
-    name: str
-    rollback_name: str | None
-    prior: _PriorTarget | None
+    device: int | None = None
+    inode: int | None = None
 
 
 def _open_root(root: Path) -> int:
@@ -778,118 +780,9 @@ def _prior_target_at(directory_fd: int, name: str) -> _PriorTarget | None:
         mode=stat.S_IMODE(metadata.st_mode),
         uid=metadata.st_uid,
         gid=metadata.st_gid,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
     )
-
-
-def _assert_prior_restored(publication: _Publication) -> None:
-    if publication.prior is None:
-        try:
-            os.stat(publication.name, dir_fd=publication.directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        raise ValueError("new execd binary remains after rollback")
-    payload, metadata = _read_regular_at(publication.directory_fd, publication.name)
-    if (
-        payload != publication.prior.payload
-        or stat.S_IMODE(metadata.st_mode) != publication.prior.mode
-        or metadata.st_uid != publication.prior.uid
-        or metadata.st_gid != publication.prior.gid
-    ):
-        raise ValueError("prior execd binary restore differs")
-
-
-def _restore_publication(publication: _Publication) -> None:
-    if publication.prior is None:
-        try:
-            os.unlink(publication.name, dir_fd=publication.directory_fd)
-        except FileNotFoundError:
-            pass
-    else:
-        restored = False
-        if publication.rollback_name is not None:
-            try:
-                os.replace(
-                    publication.rollback_name,
-                    publication.name,
-                    src_dir_fd=publication.directory_fd,
-                    dst_dir_fd=publication.directory_fd,
-                )
-                restored = True
-            except FileNotFoundError:
-                pass
-        if not restored:
-            temporary = _write_temporary_at(
-                publication.directory_fd,
-                publication.name,
-                publication.prior.payload,
-                publication.prior.mode,
-                publication.prior.uid,
-                publication.prior.gid,
-            )
-            os.replace(
-                temporary,
-                publication.name,
-                src_dir_fd=publication.directory_fd,
-                dst_dir_fd=publication.directory_fd,
-            )
-    os.fsync(publication.directory_fd)
-    _assert_prior_restored(publication)
-
-
-def _publish_binary(directory_fd: int, entry: Entry, uid: int, gid: int) -> _Publication:
-    name = Path(entry.target).name
-    prior = _prior_target_at(directory_fd, name)
-    temporary = _write_temporary_at(
-        directory_fd,
-        name,
-        entry.payload,
-        entry.install_mode,
-        uid,
-        gid,
-    )
-    rollback_name: str | None = None
-    prior_moved = False
-    published = False
-    publication = _Publication(directory_fd, name, None, prior)
-    try:
-        if prior is not None:
-            rollback_name = _temporary_name(directory_fd, f"{name}.rollback")
-            os.replace(
-                name,
-                rollback_name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
-            prior_moved = True
-            publication.rollback_name = rollback_name
-        os.replace(
-            temporary,
-            name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        published = True
-        temporary = ""
-        os.fsync(directory_fd)
-        if not _binary_matches_at(directory_fd, entry, uid, gid):
-            raise ValueError("installed execd binary readback differs")
-        return publication
-    except BaseException:
-        if temporary:
-            try:
-                os.unlink(temporary, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-        if published or prior_moved:
-            _restore_publication(publication)
-        raise
-
-
-def _discard_rollback(publication: _Publication) -> None:
-    if publication.rollback_name is None:
-        return
-    os.unlink(publication.rollback_name, dir_fd=publication.directory_fd)
-    os.fsync(publication.directory_fd)
 
 
 def _absent_at(directory_fd: int, name: str) -> bool:
@@ -898,6 +791,438 @@ def _absent_at(directory_fd: int, name: str) -> bool:
     except FileNotFoundError:
         return True
     return False
+
+
+def _durable_phase(_phase: str) -> None:
+    """Test seam reached only after the named state is durable."""
+
+
+def _acquire_install_lock_at(directory_fd: int, uid: int, gid: int) -> int:
+    created = False
+    try:
+        descriptor = os.open(
+            INSTALL_LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(
+            INSTALL_LOCK_NAME,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    try:
+        if created:
+            os.fchown(descriptor, uid, gid)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(directory_fd)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ValueError("execd package install lock metadata is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        bound = os.stat(
+            INSTALL_LOCK_NAME, dir_fd=directory_fd, follow_symlinks=False
+        )
+        current = os.fstat(descriptor)
+        if (bound.st_dev, bound.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError("execd package install lock binding changed")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _baseline_identity(prior: _PriorTarget | None) -> dict[str, object]:
+    if prior is None:
+        return {"state": "absent"}
+    if prior.device is None or prior.inode is None:
+        raise ValueError("execd baseline identity is unavailable")
+    return {
+        "state": "present",
+        "device": prior.device,
+        "inode": prior.inode,
+        "sha256": sha256(prior.payload),
+        "mode": prior.mode,
+        "uid": prior.uid,
+        "gid": prior.gid,
+    }
+
+
+def _install_transaction_value(
+    manifest: dict[str, object],
+    entry: Entry,
+    prior: _PriorTarget | None,
+    uid: int,
+    gid: int,
+    phase: str,
+) -> dict[str, object]:
+    if phase not in {"intent", "prepared", "published", "receipted"}:
+        raise ValueError("invalid execd install transaction phase")
+    return {
+        "schema": INSTALL_TRANSACTION_SCHEMA,
+        "phase": phase,
+        "install_receipt": _receipt_value(manifest, prior, uid, gid),
+        "baseline_identity": _baseline_identity(prior),
+        "candidate": {
+            "target": entry.target,
+            "sha256": entry.sha256,
+            "mode": entry.install_mode,
+            "uid": uid,
+            "gid": gid,
+            "stage_name": CANDIDATE_STAGE_NAME,
+        },
+    }
+
+
+def _read_install_transaction_at(
+    directory_fd: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    uid: int,
+    gid: int,
+) -> tuple[str, _PriorTarget | None, dict[str, object], dict[str, object]]:
+    payload, metadata = _read_regular_at(
+        directory_fd, INSTALL_TRANSACTION_NAME, MAX_JSON_BYTES
+    )
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("execd package install transaction is invalid") from error
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {"schema", "phase", "install_receipt", "baseline_identity", "candidate"}
+        or value.get("schema") != INSTALL_TRANSACTION_SCHEMA
+        or value.get("phase") not in {"intent", "prepared", "published", "receipted"}
+        or not isinstance(value.get("install_receipt"), dict)
+        or not isinstance(value.get("baseline_identity"), dict)
+        or value.get("candidate")
+        != {
+            "target": entry.target,
+            "sha256": entry.sha256,
+            "mode": entry.install_mode,
+            "uid": uid,
+            "gid": gid,
+            "stage_name": CANDIDATE_STAGE_NAME,
+        }
+        or canonical_json(value) != payload
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError("execd package install transaction differs")
+    receipt = value["install_receipt"]
+    prior = _receipt_prior(receipt, manifest, uid, gid)
+    identity = value["baseline_identity"]
+    if prior is None:
+        if identity != {"state": "absent"}:
+            raise ValueError("execd package absent baseline identity differs")
+    else:
+        record = receipt["prior"]["binary"]
+        if (
+            set(identity) != {"state", "device", "inode", "sha256", "mode", "uid", "gid"}
+            or identity.get("state") != "present"
+            or identity.get("sha256") != record["sha256"]
+            or identity.get("mode") != record["mode"]
+            or identity.get("uid") != record["uid"]
+            or identity.get("gid") != record["gid"]
+            or isinstance(identity.get("device"), bool)
+            or not isinstance(identity.get("device"), int)
+            or int(identity["device"]) < 0
+            or isinstance(identity.get("inode"), bool)
+            or not isinstance(identity.get("inode"), int)
+            or int(identity["inode"]) <= 0
+        ):
+            raise ValueError("execd package baseline identity differs")
+    return str(value["phase"]), prior, identity, receipt
+
+
+def _baseline_matches_identity_at(
+    directory_fd: int,
+    name: str,
+    identity: dict[str, object],
+) -> bool:
+    if identity == {"state": "absent"}:
+        return _absent_at(directory_fd, name)
+    try:
+        payload, metadata = _read_regular_at(directory_fd, name)
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    return (
+        metadata.st_dev == identity["device"]
+        and metadata.st_ino == identity["inode"]
+        and sha256(payload) == identity["sha256"]
+        and stat.S_IMODE(metadata.st_mode) == identity["mode"]
+        and metadata.st_uid == identity["uid"]
+        and metadata.st_gid == identity["gid"]
+    )
+
+
+def _load_transaction_prior_at(
+    receipt_directory: int,
+    binary_directory: int,
+    name: str,
+    prior: _PriorTarget | None,
+    identity: dict[str, object],
+    receipt: dict[str, object],
+    uid: int,
+    gid: int,
+    *,
+    create_preimage: bool,
+) -> _PriorTarget | None:
+    if prior is None:
+        if not _absent_at(receipt_directory, PREIMAGE_NAME):
+            raise ValueError("absent execd baseline has an unexpected preimage")
+        return None
+    try:
+        payload, metadata = _read_regular_at(receipt_directory, PREIMAGE_NAME)
+    except FileNotFoundError:
+        if not create_preimage or not _baseline_matches_identity_at(
+            binary_directory, name, identity
+        ):
+            raise ValueError("execd package durable preimage is absent") from None
+        current = _prior_target_at(binary_directory, name)
+        if current is None:
+            raise ValueError("execd package baseline disappeared before custody")
+        if not _publish_create_once(
+            receipt_directory, PREIMAGE_NAME, current.payload, 0o600, uid, gid
+        ):
+            raise ValueError("execd package preimage appeared during installation")
+        _durable_phase("preimage_captured")
+        payload, metadata = _read_regular_at(receipt_directory, PREIMAGE_NAME)
+    record = receipt["prior"]["binary"]
+    if (
+        sha256(payload) != record["sha256"]
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+    ):
+        raise ValueError("execd package preimage differs")
+    return _PriorTarget(
+        payload,
+        int(record["mode"]),
+        int(record["uid"]),
+        int(record["gid"]),
+        int(identity["device"]),
+        int(identity["inode"]),
+    )
+
+
+def _write_install_transaction_at(
+    directory_fd: int,
+    value: dict[str, object],
+    uid: int,
+    gid: int,
+) -> None:
+    _atomic_replace_at(
+        directory_fd,
+        INSTALL_TRANSACTION_NAME,
+        canonical_json(value),
+        0o600,
+        uid,
+        gid,
+    )
+    _durable_phase(str(value["phase"]))
+
+
+def _set_install_transaction_phase_at(
+    directory_fd: int,
+    value: dict[str, object],
+    phase: str,
+    uid: int,
+    gid: int,
+) -> dict[str, object]:
+    updated = dict(value)
+    updated["phase"] = phase
+    _write_install_transaction_at(directory_fd, updated, uid, gid)
+    return updated
+
+
+def _ensure_candidate_stage_at(
+    binary_directory: int,
+    entry: Entry,
+    uid: int,
+    gid: int,
+) -> None:
+    try:
+        payload, metadata = _read_regular_at(binary_directory, CANDIDATE_STAGE_NAME)
+    except FileNotFoundError:
+        if not _publish_create_once(
+            binary_directory,
+            CANDIDATE_STAGE_NAME,
+            entry.payload,
+            entry.install_mode,
+            uid,
+            gid,
+            temporary_stem=Path(entry.target).name,
+        ):
+            raise ValueError("execd candidate stage appeared during installation")
+        _durable_phase("candidate_staged")
+        payload, metadata = _read_regular_at(binary_directory, CANDIDATE_STAGE_NAME)
+    if (
+        sha256(payload) != entry.sha256
+        or stat.S_IMODE(metadata.st_mode) != entry.install_mode
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+    ):
+        raise ValueError("execd candidate stage differs")
+
+
+def _renameat2_at(directory_fd: int, source: str, target: str, flags: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError("renameat2 is unavailable for execd publication")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(target),
+        flags,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), target)
+
+
+def _publish_candidate_cas_at(
+    binary_directory: int,
+    entry: Entry,
+    identity: dict[str, object],
+    uid: int,
+    gid: int,
+) -> None:
+    name = Path(entry.target).name
+    if _binary_matches_at(binary_directory, entry, uid, gid):
+        if _absent_at(binary_directory, CANDIDATE_STAGE_NAME):
+            return
+        if identity != {"state": "absent"} and _baseline_matches_identity_at(
+            binary_directory, CANDIDATE_STAGE_NAME, identity
+        ):
+            _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+            return
+        if identity != {"state": "absent"}:
+            _renameat2_at(
+                binary_directory,
+                CANDIDATE_STAGE_NAME,
+                name,
+                RENAME_EXCHANGE,
+            )
+            os.fsync(binary_directory)
+            raise ValueError("execd baseline changed at publication")
+        raise ValueError("absent-baseline execd candidate retains a stage")
+    _ensure_candidate_stage_at(binary_directory, entry, uid, gid)
+    if not _baseline_matches_identity_at(binary_directory, name, identity):
+        raise ValueError("execd baseline changed before publication")
+    if identity == {"state": "absent"}:
+        try:
+            _renameat2_at(
+                binary_directory,
+                CANDIDATE_STAGE_NAME,
+                name,
+                RENAME_NOREPLACE,
+            )
+        except FileExistsError as error:
+            raise ValueError("execd baseline changed before publication") from error
+    else:
+        _renameat2_at(
+            binary_directory,
+            CANDIDATE_STAGE_NAME,
+            name,
+            RENAME_EXCHANGE,
+        )
+    os.fsync(binary_directory)
+    _durable_phase("candidate_exchanged")
+    if identity != {"state": "absent"}:
+        if not _baseline_matches_identity_at(
+            binary_directory, CANDIDATE_STAGE_NAME, identity
+        ):
+            _renameat2_at(
+                binary_directory,
+                CANDIDATE_STAGE_NAME,
+                name,
+                RENAME_EXCHANGE,
+            )
+            os.fsync(binary_directory)
+            if _binary_matches_at(binary_directory, entry, uid, gid):
+                raise ValueError("execd replacement restore differs")
+            raise ValueError("execd baseline changed at publication")
+        _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+    _durable_phase("candidate_published")
+    if not _binary_matches_at(binary_directory, entry, uid, gid):
+        raise ValueError("installed execd binary readback differs")
+
+
+def _remove_if_present_at(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return
+    os.fsync(directory_fd)
+
+
+def _remove_install_transaction_at(directory_fd: int) -> None:
+    _remove_if_present_at(directory_fd, INSTALL_TRANSACTION_NAME)
+
+
+def _restore_transaction_prior_at(
+    binary_directory: int,
+    name: str,
+    prior: _PriorTarget | None,
+) -> None:
+    _restore_prior_at(binary_directory, name, prior)
+
+
+def _compensate_install_transaction_at(
+    receipt_directory: int,
+    binary_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    prior: _PriorTarget | None,
+    identity: dict[str, object],
+    uid: int,
+    gid: int,
+) -> None:
+    name = Path(entry.target).name
+    if _binary_matches_at(binary_directory, entry, uid, gid):
+        _restore_transaction_prior_at(binary_directory, name, prior)
+    elif not _baseline_matches_identity_at(binary_directory, name, identity):
+        # A concurrent replacement owns the live name. Preserve it and release
+        # only this transaction's private custody.
+        pass
+    if not _absent_at(receipt_directory, RECEIPT_NAME):
+        payload, metadata = _read_regular_at(
+            receipt_directory, RECEIPT_NAME, MAX_JSON_BYTES
+        )
+        if (
+            payload != _receipt_bytes(manifest, prior, uid, gid)
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ValueError("execd package receipt differs during compensation")
+        _remove_created_receipt(receipt_directory)
+    _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+    if prior is not None:
+        _remove_if_present_at(receipt_directory, PREIMAGE_NAME)
+    _remove_install_transaction_at(receipt_directory)
 
 
 def _verify_receipt_at(
@@ -942,8 +1267,12 @@ def _publish_create_once(
     mode: int,
     uid: int,
     gid: int,
+    *,
+    temporary_stem: str | None = None,
 ) -> bool:
-    temporary = _write_temporary_at(directory_fd, name, payload, mode, uid, gid)
+    temporary = _write_temporary_at(
+        directory_fd, temporary_stem or name, payload, mode, uid, gid
+    )
     created = False
     try:
         try:
@@ -1029,6 +1358,72 @@ def inspect(package: Path, root: Path) -> dict[str, object]:
     }
 
 
+def _complete_install_transaction_at(
+    receipt_directory: int,
+    binary_directory: int,
+    manifest: dict[str, object],
+    entry: Entry,
+    phase: str,
+    prior: _PriorTarget | None,
+    identity: dict[str, object],
+    uid: int,
+    gid: int,
+) -> None:
+    name = Path(entry.target).name
+    if phase == "receipted":
+        _verify_receipt_at(receipt_directory, manifest, uid, gid)
+        if not _binary_matches_at(binary_directory, entry, uid, gid):
+            raise ValueError("receipted execd candidate differs")
+        _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+        _remove_install_transaction_at(receipt_directory)
+        _durable_phase("install_complete")
+        return
+    value = _install_transaction_value(manifest, entry, prior, uid, gid, phase)
+
+    if phase == "intent":
+        if _baseline_matches_identity_at(binary_directory, name, identity):
+            value = _set_install_transaction_phase_at(
+                receipt_directory, value, "prepared", uid, gid
+            )
+            phase = "prepared"
+        elif _binary_matches_at(binary_directory, entry, uid, gid):
+            value = _set_install_transaction_phase_at(
+                receipt_directory, value, "published", uid, gid
+            )
+            phase = "published"
+        else:
+            raise ValueError("execd baseline changed before publication")
+
+    if phase == "prepared":
+        _publish_candidate_cas_at(binary_directory, entry, identity, uid, gid)
+        value = _set_install_transaction_phase_at(
+            receipt_directory, value, "published", uid, gid
+        )
+        phase = "published"
+
+    if phase != "published" or not _binary_matches_at(
+        binary_directory, entry, uid, gid
+    ):
+        raise ValueError("installed execd binary readback differs")
+    receipt_created = _publish_receipt(
+        receipt_directory, manifest, prior, uid, gid
+    )
+    if receipt_created:
+        _durable_phase("receipt_published")
+    else:
+        _verify_receipt_at(receipt_directory, manifest, uid, gid)
+    _verify_receipt_at(receipt_directory, manifest, uid, gid)
+    value = _set_install_transaction_phase_at(
+        receipt_directory, value, "receipted", uid, gid
+    )
+    _verify_receipt_at(receipt_directory, manifest, uid, gid)
+    if not _binary_matches_at(binary_directory, entry, uid, gid):
+        raise ValueError("installed execd binary readback differs")
+    _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+    _remove_install_transaction_at(receipt_directory)
+    _durable_phase("install_complete")
+
+
 def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, object]:
     root = _safe_root(root)
     manifest, entry = parse_package(package)
@@ -1057,9 +1452,10 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
     root_fd = _open_root(root)
     binary_directory = -1
     receipt_directory = -1
-    publication: _Publication | None = None
-    receipt_created = False
-    preimage_created = False
+    lock_fd = -1
+    transaction_active = False
+    compensation_prior: _PriorTarget | None = None
+    compensation_identity: dict[str, object] | None = None
     try:
         binary_directory = _open_directory_chain(
             root_fd,
@@ -1079,54 +1475,103 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             uid,
             gid,
         )
+        lock_fd = _acquire_install_lock_at(receipt_directory, uid, gid)
         if not _absent_at(receipt_directory, ROLLBACK_RECEIPT_NAME):
             raise ValueError("execd package rollback receipt blocks install replay")
-        changed = not _binary_matches_at(binary_directory, entry, uid, gid)
-        receipt_prior: _PriorTarget | None = None
+
         try:
-            receipt_prior = _verify_receipt_at(receipt_directory, manifest, uid, gid)
-            receipt_present = True
+            phase, prior_stub, identity, transaction_receipt = (
+                _read_install_transaction_at(
+                    receipt_directory, manifest, entry, uid, gid
+                )
+            )
+            transaction_active = True
         except FileNotFoundError:
-            receipt_present = False
+            phase = ""
+            prior_stub = None
+            identity = {}
+            transaction_receipt = {}
+
+        if not transaction_active:
+            try:
+                receipt_prior = _verify_receipt_at(
+                    receipt_directory, manifest, uid, gid
+                )
+            except FileNotFoundError:
+                receipt_prior = None
+                receipt_present = False
+            else:
+                receipt_present = True
+            if receipt_present:
+                if not _binary_matches_at(binary_directory, entry, uid, gid):
+                    raise ValueError("installed execd binary drift blocks replacement")
+                result["status"] = "unchanged"
+                result["changed_targets"] = []
+                result["install_receipt"] = "verified"
+                return result
             if not _absent_at(receipt_directory, PREIMAGE_NAME):
                 raise ValueError("unreceipted execd package preimage blocks installation")
-        if receipt_present and changed:
-            raise ValueError("installed execd binary drift blocks replacement")
-        result["status"] = "installed" if changed or not receipt_present else "unchanged"
-        result["changed_targets"] = ([entry.target] if changed else []) + (
-            [] if receipt_present else [str(freeze_package.INSTALL_RECEIPT["path"])]
-        )
-        result["install_receipt"] = "pending" if changed or not receipt_present else "verified"
-
-        prior = receipt_prior if receipt_present else _prior_target_at(
-            binary_directory, Path(entry.target).name
-        )
-        if not receipt_present and prior is not None:
-            preimage_created = _publish_create_once(
+            if not _absent_at(binary_directory, CANDIDATE_STAGE_NAME):
+                raise ValueError("unreceipted execd candidate stage blocks installation")
+            prior = _prior_target_at(binary_directory, Path(entry.target).name)
+            transaction = _install_transaction_value(
+                manifest, entry, prior, uid, gid, "intent"
+            )
+            if not _publish_create_once(
                 receipt_directory,
-                PREIMAGE_NAME,
-                prior.payload,
+                INSTALL_TRANSACTION_NAME,
+                canonical_json(transaction),
                 0o600,
                 uid,
                 gid,
+            ):
+                raise ValueError("execd install transaction appeared during publication")
+            _durable_phase("intent")
+            phase = "intent"
+            prior_stub = prior
+            identity = transaction["baseline_identity"]
+            transaction_receipt = transaction["install_receipt"]
+            transaction_active = True
+
+        if phase == "receipted":
+            prior = _verify_receipt_at(receipt_directory, manifest, uid, gid)
+        else:
+            if (
+                phase == "intent"
+                and prior_stub is not None
+                and _absent_at(receipt_directory, PREIMAGE_NAME)
+                and not _baseline_matches_identity_at(
+                    binary_directory, Path(entry.target).name, identity
+                )
+            ):
+                _remove_if_present_at(binary_directory, CANDIDATE_STAGE_NAME)
+                _remove_install_transaction_at(receipt_directory)
+                transaction_active = False
+                raise ValueError("execd baseline changed before preimage custody")
+            prior = _load_transaction_prior_at(
+                receipt_directory,
+                binary_directory,
+                Path(entry.target).name,
+                prior_stub,
+                identity,
+                transaction_receipt,
+                uid,
+                gid,
+                create_preimage=phase == "intent",
             )
-            if not preimage_created:
-                raise ValueError("execd package preimage appeared during installation")
-        if changed:
-            publication = _publish_binary(binary_directory, entry, uid, gid)
-        if not _binary_matches_at(binary_directory, entry, uid, gid):
-            raise ValueError("installed execd binary readback differs")
-        if not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory):
-            raise ValueError("execd binary directory changed during installation")
-        if not receipt_present:
-            receipt_created = _publish_receipt(
-                receipt_directory, manifest, prior, uid, gid
-            )
-            if not receipt_created:
-                raise ValueError("execd package receipt appeared during installation")
-        _verify_receipt_at(receipt_directory, manifest, uid, gid)
-        if not _binary_matches_at(binary_directory, entry, uid, gid):
-            raise ValueError("installed execd binary readback differs")
+        compensation_prior = prior
+        compensation_identity = identity
+        _complete_install_transaction_at(
+            receipt_directory,
+            binary_directory,
+            manifest,
+            entry,
+            phase,
+            prior,
+            identity,
+            uid,
+            gid,
+        )
         if (
             not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory)
             or not _directory_binding_matches(
@@ -1136,33 +1581,38 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
             )
         ):
             raise ValueError("execd publication directory changed during installation")
-        if publication is not None:
-            _discard_rollback(publication)
+        transaction_active = False
+        result["status"] = "installed"
+        result["changed_targets"] = [entry.target, str(freeze_package.INSTALL_RECEIPT["path"])]
         result["install_receipt"] = "verified"
         return result
     except BaseException as install_error:
-        rollback_errors: list[BaseException] = []
-        if receipt_created and receipt_directory >= 0:
+        if (
+            transaction_active
+            and compensation_identity is not None
+            and receipt_directory >= 0
+            and binary_directory >= 0
+        ):
             try:
-                _remove_created_receipt(receipt_directory)
-            except BaseException as error:
-                rollback_errors.append(error)
-        if publication is not None:
-            try:
-                _restore_publication(publication)
-            except BaseException as error:
-                rollback_errors.append(error)
-        if preimage_created and receipt_directory >= 0:
-            try:
-                os.unlink(PREIMAGE_NAME, dir_fd=receipt_directory)
-                os.fsync(receipt_directory)
-            except BaseException as error:
-                rollback_errors.append(error)
-        if rollback_errors:
-            detail = "; ".join(str(error) for error in rollback_errors)
-            raise RuntimeError(f"execd installation rollback failed: {detail}") from install_error
+                _compensate_install_transaction_at(
+                    receipt_directory,
+                    binary_directory,
+                    manifest,
+                    entry,
+                    compensation_prior,
+                    compensation_identity,
+                    uid,
+                    gid,
+                )
+            except BaseException as compensation_error:
+                raise RuntimeError(
+                    f"execd installation compensation failed: {compensation_error}"
+                ) from install_error
         raise
     finally:
+        if lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         if receipt_directory >= 0:
             os.close(receipt_directory)
         if binary_directory >= 0:
@@ -1411,6 +1861,7 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
     root_fd = _open_root(root)
     binary_directory = -1
     receipt_directory = -1
+    lock_fd = -1
     try:
         binary_directory = _open_directory_chain(
             root_fd,
@@ -1432,6 +1883,7 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             gid,
             create=False,
         )
+        lock_fd = _acquire_install_lock_at(receipt_directory, uid, gid)
         if (
             not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory)
             or not _directory_binding_matches(
@@ -1441,6 +1893,78 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             )
         ):
             raise ValueError("execd rollback directory binding differs")
+        try:
+            install_phase, install_prior_stub, install_identity, install_receipt = (
+                _read_install_transaction_at(
+                    receipt_directory, manifest, entry, uid, gid
+                )
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if install_phase == "receipted":
+                install_prior = _verify_receipt_at(
+                    receipt_directory, manifest, uid, gid
+                )
+            else:
+                if (
+                    install_phase == "intent"
+                    and install_prior_stub is not None
+                    and _absent_at(receipt_directory, PREIMAGE_NAME)
+                    and not _baseline_matches_identity_at(
+                        binary_directory,
+                        Path(entry.target).name,
+                        install_identity,
+                    )
+                ):
+                    _remove_if_present_at(
+                        binary_directory, CANDIDATE_STAGE_NAME
+                    )
+                    _remove_install_transaction_at(receipt_directory)
+                    raise ValueError(
+                        "execd baseline changed before preimage custody"
+                    )
+                install_prior = _load_transaction_prior_at(
+                    receipt_directory,
+                    binary_directory,
+                    Path(entry.target).name,
+                    install_prior_stub,
+                    install_identity,
+                    install_receipt,
+                    uid,
+                    gid,
+                    create_preimage=install_phase == "intent",
+                )
+            try:
+                _complete_install_transaction_at(
+                    receipt_directory,
+                    binary_directory,
+                    manifest,
+                    entry,
+                    install_phase,
+                    install_prior,
+                    install_identity,
+                    uid,
+                    gid,
+                )
+            except BaseException as install_recovery_error:
+                try:
+                    _compensate_install_transaction_at(
+                        receipt_directory,
+                        binary_directory,
+                        manifest,
+                        entry,
+                        install_prior,
+                        install_identity,
+                        uid,
+                        gid,
+                    )
+                except BaseException as compensation_error:
+                    raise RuntimeError(
+                        "execd interrupted-install compensation failed: "
+                        f"{compensation_error}"
+                    ) from install_recovery_error
+                raise
         try:
             marker_state, marker_prior, marker_receipt = _read_rollback_receipt_at(
                 receipt_directory, manifest, uid, gid
@@ -1527,11 +2051,14 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 gid,
             ):
                 raise ValueError("execd rollback receipt appeared during publication")
+            _durable_phase("rollback_intent")
         try:
             _restore_prior_at(binary_directory, Path(entry.target).name, prior)
+            _durable_phase("rollback_restored")
             if not _directory_binding_matches(root_fd, ("usr", "libexec"), binary_directory):
                 raise ValueError("execd binary directory changed during rollback")
             _remove_rollback_managed_at(receipt_directory, prior)
+            _durable_phase("rollback_released")
             _atomic_replace_at(
                 receipt_directory,
                 ROLLBACK_RECEIPT_NAME,
@@ -1547,6 +2074,7 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
                 receipt_directory, RECEIPT_NAME
             ) or not _absent_at(receipt_directory, PREIMAGE_NAME):
                 raise ValueError("execd rollback terminal readback differs")
+            _durable_phase("rollback_complete")
         except BaseException as rollback_error:
             try:
                 _compensate_rollback(
@@ -1572,6 +2100,9 @@ def rollback(package: Path, root: Path) -> dict[str, object]:
             "prior_state": "absent" if prior is None else "present",
         }
     finally:
+        if lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         if receipt_directory >= 0:
             os.close(receipt_directory)
         if binary_directory >= 0:

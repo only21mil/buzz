@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Callable
 import hashlib
 import io
 import json
@@ -180,6 +181,23 @@ def _manual_install_fixture(base: Path, binary: bytes, seccomp: bytes) -> tuple[
     seccomp_path.write_bytes(seccomp)
     seccomp_path.chmod(0o644)
     return package, root
+
+
+def _forced_exit_at(phase: str, operation: Callable[[], object]) -> int:
+    pid = os.fork()
+    if pid == 0:
+        try:
+            def checkpoint(observed: str) -> None:
+                if observed == phase:
+                    os._exit(91)
+
+            with mock.patch.object(INSTALL, "_durable_phase", side_effect=checkpoint):
+                operation()
+        except BaseException:
+            os._exit(92)
+        os._exit(93)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
 
 
 class ExecdPackageTests(unittest.TestCase):
@@ -919,6 +937,393 @@ class ExecdPackageTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["prior_state"]), ("rolled_back", "present"))
                 self.assertEqual((target.read_bytes(), _mode(target)), (prior, 0o750))
                 self.assertEqual(INSTALL.rollback(package, root)["status"], "unchanged")
+
+    def test_install_recovers_every_durable_phase_with_a_present_baseline(self) -> None:
+        phases = (
+            "intent",
+            "preimage_captured",
+            "prepared",
+            "candidate_staged",
+            "candidate_exchanged",
+            "candidate_published",
+            "published",
+            "receipt_published",
+            "receipted",
+            "install_complete",
+        )
+        seccomp = b"test immutable seccomp\n"
+        prior = b"phase exact prior\n"
+        candidate = b"phase exact candidate\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, phase in enumerate(phases):
+                with self.subTest(phase=phase):
+                    lane = base / str(index)
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    target.parent.mkdir(mode=0o755)
+                    target.parent.chmod(0o755)
+                    target.write_bytes(prior)
+                    target.chmod(0o751)
+                    self.assertEqual(
+                        _forced_exit_at(phase, lambda: INSTALL.install(package, root)),
+                        91,
+                    )
+                    self.assertIn(
+                        INSTALL.install(package, root)["status"],
+                        {"installed", "unchanged"},
+                    )
+                    custody = root / "var/lib/buzzci/execd-v2/package"
+                    self.assertEqual((target.read_bytes(), _mode(target)), (candidate, 0o755))
+                    self.assertTrue((custody / "receipt-v1.json").is_file())
+                    self.assertEqual((custody / "preimage-v1.bin").read_bytes(), prior)
+                    self.assertFalse((custody / "install-transaction-v1.json").exists())
+                    self.assertFalse((target.parent / ".buzz-ci-execd.install-v1").exists())
+                    self.assertEqual(INSTALL.rollback(package, root)["status"], "rolled_back")
+                    self.assertEqual((target.read_bytes(), _mode(target)), (prior, 0o751))
+
+    def test_install_recovers_every_absent_baseline_phase(self) -> None:
+        phases = (
+            "intent",
+            "prepared",
+            "candidate_staged",
+            "candidate_exchanged",
+            "candidate_published",
+            "published",
+            "receipt_published",
+            "receipted",
+            "install_complete",
+        )
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"absent phase candidate\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, phase in enumerate(phases):
+                with self.subTest(phase=phase):
+                    lane = base / str(index)
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    self.assertEqual(
+                        _forced_exit_at(phase, lambda: INSTALL.install(package, root)),
+                        91,
+                    )
+                    INSTALL.install(package, root)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    custody = root / "var/lib/buzzci/execd-v2/package"
+                    self.assertEqual(target.read_bytes(), candidate)
+                    self.assertFalse((custody / "preimage-v1.bin").exists())
+                    self.assertFalse((custody / "install-transaction-v1.json").exists())
+                    self.assertEqual(INSTALL.rollback(package, root)["prior_state"], "absent")
+                    self.assertFalse(target.exists())
+
+    def test_rollback_recovers_each_interrupted_install_phase(self) -> None:
+        phases = (
+            "intent",
+            "preimage_captured",
+            "prepared",
+            "candidate_staged",
+            "candidate_exchanged",
+            "candidate_published",
+            "published",
+            "receipt_published",
+            "receipted",
+            "install_complete",
+        )
+        seccomp = b"test immutable seccomp\n"
+        prior = b"rollback interrupted-install prior\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, phase in enumerate(phases):
+                with self.subTest(phase=phase):
+                    lane = base / str(index)
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(
+                        lane, b"candidate\n", seccomp
+                    )
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    target.parent.mkdir(mode=0o755)
+                    target.parent.chmod(0o755)
+                    target.write_bytes(prior)
+                    target.chmod(0o751)
+                    self.assertEqual(
+                        _forced_exit_at(phase, lambda: INSTALL.install(package, root)),
+                        91,
+                    )
+                    self.assertEqual(
+                        INSTALL.rollback(package, root)["state"], "rolled_back"
+                    )
+                    self.assertEqual((target.read_bytes(), _mode(target)), (prior, 0o751))
+
+    def test_publication_cas_preserves_replacement_and_absent_baselines(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        candidate = b"candidate bytes\n"
+        cases = (
+            (b"baseline A\n", b"baseline B\n"),
+            (b"same bytes new inode\n", b"same bytes new inode\n"),
+            (None, b"appeared baseline B\n"),
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, (baseline, replacement) in enumerate(cases):
+                with self.subTest(index=index):
+                    lane = base / str(index)
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    target.parent.mkdir(mode=0o755)
+                    target.parent.chmod(0o755)
+                    original_inode = None
+                    if baseline is not None:
+                        target.write_bytes(baseline)
+                        target.chmod(0o750)
+                        original_inode = target.stat().st_ino
+                    original_stage = INSTALL._ensure_candidate_stage_at
+
+                    def replace_before_cas(*args: object) -> None:
+                        original_stage(*args)
+                        substitute = target.parent / "operator-replacement"
+                        substitute.write_bytes(replacement)
+                        substitute.chmod(0o701)
+                        os.replace(substitute, target)
+
+                    with mock.patch.object(
+                        INSTALL,
+                        "_ensure_candidate_stage_at",
+                        side_effect=replace_before_cas,
+                    ):
+                        with self.assertRaisesRegex(ValueError, "baseline changed"):
+                            INSTALL.install(package, root)
+                    self.assertEqual((target.read_bytes(), _mode(target)), (replacement, 0o701))
+                    if original_inode is not None:
+                        self.assertNotEqual(target.stat().st_ino, original_inode)
+                    custody = root / "var/lib/buzzci/execd-v2/package"
+                    self.assertFalse((custody / "receipt-v1.json").exists())
+                    self.assertFalse((custody / "preimage-v1.bin").exists())
+                    self.assertFalse((custody / "install-transaction-v1.json").exists())
+
+    def test_intent_recovery_preserves_replacement_before_preimage_custody(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            package, root = _manual_install_fixture(base, b"candidate\n", seccomp)
+            target = root / "usr/libexec/buzz-ci-execd"
+            target.parent.mkdir(mode=0o755)
+            target.parent.chmod(0o755)
+            target.write_bytes(b"baseline A\n")
+            target.chmod(0o750)
+            self.assertEqual(
+                _forced_exit_at("intent", lambda: INSTALL.install(package, root)), 91
+            )
+            substitute = target.parent / "baseline-b"
+            substitute.write_bytes(b"baseline B\n")
+            substitute.chmod(0o701)
+            os.replace(substitute, target)
+            with self.assertRaisesRegex(ValueError, "before preimage custody"):
+                INSTALL.install(package, root)
+            self.assertEqual((target.read_bytes(), _mode(target)), (b"baseline B\n", 0o701))
+            custody = root / "var/lib/buzzci/execd-v2/package"
+            self.assertFalse((custody / "preimage-v1.bin").exists())
+            self.assertFalse((custody / "install-transaction-v1.json").exists())
+
+    def test_atomic_publication_exchange_restores_a_last_instant_replacement(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, baseline in enumerate((b"baseline A\n", None)):
+                with self.subTest(baseline=baseline):
+                    lane = base / str(index)
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(
+                        lane, b"candidate\n", seccomp
+                    )
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    target.parent.mkdir(mode=0o755)
+                    target.parent.chmod(0o755)
+                    if baseline is not None:
+                        target.write_bytes(baseline)
+                        target.chmod(0o750)
+                    original_rename = INSTALL._renameat2_at
+                    raced = False
+
+                    def replace_at_exchange(
+                        directory_fd: int, source: str, name: str, flags: int
+                    ) -> None:
+                        nonlocal raced
+                        if not raced:
+                            raced = True
+                            replacement = target.parent / "last-instant-b"
+                            replacement.write_bytes(b"baseline B\n")
+                            replacement.chmod(0o701)
+                            os.replace(replacement, target)
+                        original_rename(directory_fd, source, name, flags)
+
+                    with mock.patch.object(
+                        INSTALL, "_renameat2_at", side_effect=replace_at_exchange
+                    ):
+                        with self.assertRaisesRegex(ValueError, "baseline changed"):
+                            INSTALL.install(package, root)
+                    self.assertEqual(
+                        (target.read_bytes(), _mode(target)),
+                        (b"baseline B\n", 0o701),
+                    )
+                    custody = root / "var/lib/buzzci/execd-v2/package"
+                    self.assertFalse((custody / "receipt-v1.json").exists())
+                    self.assertFalse((custody / "preimage-v1.bin").exists())
+                    self.assertFalse((custody / "install-transaction-v1.json").exists())
+
+    def test_publication_cas_preserves_a_symlink_name_swap(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            package, root = _manual_install_fixture(base, b"candidate\n", seccomp)
+            target = root / "usr/libexec/buzz-ci-execd"
+            target.parent.mkdir(mode=0o755)
+            target.parent.chmod(0o755)
+            target.write_bytes(b"baseline\n")
+            target.chmod(0o755)
+            hostile = root / "hostile-binary"
+            hostile.write_bytes(b"do not follow\n")
+            hostile.chmod(0o700)
+            original_stage = INSTALL._ensure_candidate_stage_at
+
+            def symlink_before_cas(*args: object) -> None:
+                original_stage(*args)
+                target.unlink()
+                target.symlink_to(hostile)
+
+            with mock.patch.object(
+                INSTALL, "_ensure_candidate_stage_at", side_effect=symlink_before_cas
+            ):
+                with self.assertRaisesRegex(ValueError, "baseline changed"):
+                    INSTALL.install(package, root)
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(hostile.read_bytes(), b"do not follow\n")
+
+    def test_install_transaction_rejects_preimage_receipt_and_package_tamper(self) -> None:
+        seccomp = b"test immutable seccomp\n"
+        prior = b"tamper prior\n"
+        candidate = b"tamper candidate\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+
+            preimage_lane = base / "preimage"
+            preimage_lane.mkdir(mode=0o700)
+            package, root = _manual_install_fixture(preimage_lane, candidate, seccomp)
+            target = root / "usr/libexec/buzz-ci-execd"
+            target.parent.mkdir(mode=0o755)
+            target.parent.chmod(0o755)
+            target.write_bytes(prior)
+            target.chmod(0o750)
+            self.assertEqual(
+                _forced_exit_at("prepared", lambda: INSTALL.install(package, root)), 91
+            )
+            custody = root / "var/lib/buzzci/execd-v2/package"
+            preimage = custody / "preimage-v1.bin"
+            preimage.write_bytes(b"tampered preimage\n")
+            preimage.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "preimage differs"):
+                INSTALL.install(package, root)
+            with self.assertRaisesRegex(ValueError, "preimage differs"):
+                INSTALL.rollback(package, root)
+            self.assertEqual(target.read_bytes(), prior)
+
+            receipt_lane = base / "receipt"
+            receipt_lane.mkdir(mode=0o700)
+            package, root = _manual_install_fixture(receipt_lane, candidate, seccomp)
+            target = root / "usr/libexec/buzz-ci-execd"
+            target.parent.mkdir(mode=0o755)
+            target.parent.chmod(0o755)
+            target.write_bytes(prior)
+            target.chmod(0o750)
+            self.assertEqual(
+                _forced_exit_at("intent", lambda: INSTALL.install(package, root)), 91
+            )
+            transaction = root / "var/lib/buzzci/execd-v2/package/install-transaction-v1.json"
+            value = json.loads(transaction.read_bytes())
+            value["install_receipt"]["package_id"] = "buzz-ci-execd-bbbbbbbbbbbb-cccccccccccc"
+            transaction.write_bytes(INSTALL.canonical_json(value))
+            transaction.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "install receipt differs"):
+                INSTALL.install(package, root)
+            self.assertEqual(target.read_bytes(), prior)
+
+            replay_lane = base / "replay"
+            replay_lane.mkdir(mode=0o700)
+            package, root = _manual_install_fixture(replay_lane, candidate, seccomp)
+            target = root / "usr/libexec/buzz-ci-execd"
+            target.parent.mkdir(mode=0o755)
+            target.parent.chmod(0o755)
+            target.write_bytes(prior)
+            target.chmod(0o750)
+            self.assertEqual(
+                _forced_exit_at("prepared", lambda: INSTALL.install(package, root)), 91
+            )
+            other = replay_lane / "other-package"
+            _manual_execd_package(other, b"other candidate\n")
+            with self.assertRaisesRegex(ValueError, "install transaction differs"):
+                INSTALL.install(other, root)
+            self.assertEqual(INSTALL.install(package, root)["status"], "installed")
+
+    def test_rollback_recovers_every_durable_phase(self) -> None:
+        phases = (
+            "rollback_intent",
+            "rollback_restored",
+            "rollback_released",
+            "rollback_complete",
+        )
+        seccomp = b"test immutable seccomp\n"
+        prior = b"rollback phase prior\n"
+        candidate = b"rollback phase candidate\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            FREEZER.SECCOMP_CONTRACT,
+            {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+        ):
+            base = Path(directory)
+            for index, phase in enumerate(phases):
+                with self.subTest(phase=phase):
+                    lane = base / str(index)
+                    lane.mkdir(mode=0o700)
+                    package, root = _manual_install_fixture(lane, candidate, seccomp)
+                    target = root / "usr/libexec/buzz-ci-execd"
+                    target.parent.mkdir(mode=0o755)
+                    target.parent.chmod(0o755)
+                    target.write_bytes(prior)
+                    target.chmod(0o751)
+                    INSTALL.install(package, root)
+                    self.assertEqual(
+                        _forced_exit_at(phase, lambda: INSTALL.rollback(package, root)),
+                        91,
+                    )
+                    self.assertIn(
+                        INSTALL.rollback(package, root)["status"],
+                        {"rolled_back", "unchanged"},
+                    )
+                    self.assertEqual((target.read_bytes(), _mode(target)), (prior, 0o751))
 
 
 if __name__ == "__main__":
