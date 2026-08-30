@@ -3287,6 +3287,115 @@ mod tests {
             path
         }
 
+        /// Store a signed request plus two accepted job-status transitions for
+        /// a fresh run, mirroring the CI ingest contract (`store_ci_event`).
+        /// Returns `(run_id, request_event_id)`.
+        async fn seed_run_history(&self) -> (String, String) {
+            use buzz_core::ci::{
+                job_status_tags, request_tags, validate_signed_ci_event, CiJobState,
+                CiJobStatusEnvelope, CiRequestEnvelope, CiRequestType, CiSkipPolicy,
+                CI_SCHEMA_VERSION,
+            };
+
+            let channel_id = uuid::Uuid::parse_str(TEST_CHANNEL).expect("test channel");
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().timestamp() as u64;
+            let signer = self.owner.public_key().to_hex();
+
+            let request = CiRequestEnvelope {
+                schema_version: CI_SCHEMA_VERSION,
+                request_type: CiRequestType::Run,
+                target_repo_a: self.repo_a(),
+                pr_root_event_id: "11".repeat(32),
+                pr_update_event_id: None,
+                source_clone_url: "https://example.com/test-repo.git".to_owned(),
+                immutable_source_ref: "refs/buzz/objects/test-repo".to_owned(),
+                tip_oid: "22".repeat(20),
+                source_branch: "feature".to_owned(),
+                base_ref: "refs/heads/main".to_owned(),
+                base_oid: "33".repeat(20),
+                workflow_id: "ci".to_owned(),
+                workflow_digest: "44".repeat(32),
+                job_ids: vec!["test_job".to_owned()],
+                run_id: run_id.clone(),
+                attempt: 1,
+                parent_attempt: None,
+                parent_run_id: None,
+                trigger_event_id: "11".repeat(32),
+                actor: signer.clone(),
+                timeout_seconds: 300,
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                issued_at: now,
+                expires_at: now + 600,
+            };
+            let request_event = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_CI_REQUEST as u16),
+                serde_json::to_string(&request).expect("serialize CI request"),
+            )
+            .tags(request_tags(TEST_CHANNEL, &request).expect("CI request tags"))
+            .sign_with_keys(&self.owner)
+            .expect("sign CI request");
+            let validated = validate_signed_ci_event(
+                &request_event,
+                TEST_CHANNEL,
+                &std::collections::HashSet::from([signer.clone()]),
+            )
+            .expect("validate CI request");
+            self.state
+                .db
+                .store_ci_event(self.community, channel_id, &request_event, &validated)
+                .await
+                .expect("store CI request fixture");
+
+            for (sequence, state) in [(1, CiJobState::Queued), (2, CiJobState::Running)] {
+                let status = CiJobStatusEnvelope {
+                    schema_version: CI_SCHEMA_VERSION,
+                    request_event_id: request_event.id.to_hex(),
+                    run_id: run_id.clone(),
+                    workflow_id: request.workflow_id.clone(),
+                    target_repo_a: request.target_repo_a.clone(),
+                    tip_oid: request.tip_oid.clone(),
+                    base_oid: request.base_oid.clone(),
+                    job_id: "test_job".to_owned(),
+                    name: "test_job".to_owned(),
+                    attempt: 1,
+                    parent_attempt: None,
+                    sequence,
+                    state,
+                    conclusion: None,
+                    reason: None,
+                    required: true,
+                    skip_policy: CiSkipPolicy::Forbid,
+                    selected_job_instance: "test_job".to_owned(),
+                    also_reruns: Vec::new(),
+                    started_at: (sequence >= 2).then_some(now),
+                    finished_at: None,
+                    log_ref: None,
+                    artifact_refs: Vec::new(),
+                    relay_signer: signer.clone(),
+                };
+                let event = EventBuilder::new(
+                    nostr::Kind::Custom(KIND_CI_JOB_STATUS as u16),
+                    serde_json::to_string(&status).expect("serialize job status"),
+                )
+                .tags(job_status_tags(TEST_CHANNEL, &status).expect("job status tags"))
+                .sign_with_keys(&self.owner)
+                .expect("sign job status");
+                let validated = validate_signed_ci_event(
+                    &event,
+                    TEST_CHANNEL,
+                    &std::collections::HashSet::from([signer.clone()]),
+                )
+                .expect("validate job status");
+                self.state
+                    .db
+                    .store_ci_event(self.community, channel_id, &event, &validated)
+                    .await
+                    .expect("store CI job status fixture");
+            }
+            (run_id, request_event.id.to_hex())
+        }
+
         async fn make_state(
             pool: sqlx::PgPool,
             ci_signer: &nostr::Keys,
@@ -4327,5 +4436,186 @@ jobs:
                 .await
                 .is_none()
         );
+    }
+
+    // ── CI run read exporters (route-bearing, scratch Postgres) ────────────
+
+    async fn ci_run_response(
+        state: std::sync::Arc<AppState>,
+        host: &str,
+        keys: &nostr::Keys,
+        path_with_query: &str,
+    ) -> axum::response::Response {
+        let signed = format!("https://{host}{path_with_query}");
+        crate::router::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path_with_query)
+                    .header(header::HOST, host)
+                    .header(header::AUTHORIZATION, nip98_get_auth(keys, &signed))
+                    .body(Body::empty())
+                    .expect("CI run request"),
+            )
+            .await
+            .expect("CI run response")
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 262_144)
+            .await
+            .expect("read CI run body");
+        serde_json::from_slice(&body)
+            .unwrap_or_else(|_error| panic!("CI run body must be JSON ({status}): {body:?}"))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch Postgres and CI evidence storage"]
+    async fn route_ci_run_request_exports_the_immutable_request() {
+        if !preflight_scratch_env_ready() {
+            return;
+        }
+        let harness = TestHarness::connect().await;
+        let (run_id, request_event_id) = harness.seed_run_history().await;
+
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &format!("/ci/runs/{run_id}/request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        assert_eq!(value["run_id"], run_id);
+        assert_eq!(value["request_event_id"], request_event_id);
+        assert_eq!(value["watch_cursor"], 1);
+        assert_eq!(value["event"]["id"], request_event_id);
+        assert!(value["accepted_at"].is_string());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch Postgres and CI evidence storage"]
+    async fn route_ci_run_events_pages_by_durable_cursor() {
+        if !preflight_scratch_env_ready() {
+            return;
+        }
+        let harness = TestHarness::connect().await;
+        let (run_id, request_event_id) = harness.seed_run_history().await;
+
+        let first = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &format!("/ci/runs/{run_id}/events?after=0&limit=2"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let value = response_json(first).await;
+        assert_eq!(value["run_id"], run_id);
+        assert_eq!(value["request_event_id"], request_event_id);
+        assert_eq!(value["next_cursor"], 2);
+        assert_eq!(
+            value["events"]
+                .as_array()
+                .expect("events array")
+                .iter()
+                .map(|event| event["watch_cursor"].as_u64().expect("cursor"))
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(value["events"][0]["event"]["id"], request_event_id);
+
+        let second = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &format!("/ci/runs/{run_id}/events?after=2&limit=1000"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let value = response_json(second).await;
+        assert_eq!(value["events"].as_array().expect("events array").len(), 1);
+        assert_eq!(value["events"][0]["watch_cursor"], 3);
+        assert_eq!(value["next_cursor"], 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch Postgres and CI evidence storage"]
+    async fn route_ci_run_reads_fail_closed_for_non_members_and_unknown_runs() {
+        if !preflight_scratch_env_ready() {
+            return;
+        }
+        let harness = TestHarness::connect().await;
+        let (run_id, _) = harness.seed_run_history().await;
+        let _stranger = nostr::Keys::generate();
+
+        // A non-member with valid authentication sees the same 404 as an
+        // unknown run — run existence stays hidden.
+        for path in [
+            format!("/ci/runs/{run_id}/request"),
+            format!("/ci/runs/{run_id}/events?after=0&limit=1"),
+        ] {
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &nostr::Keys::generate(),
+                &path,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let value = response_json(response).await;
+            assert_eq!(value["error"], "CI run not found");
+        }
+
+        // A member asking for an unknown (but well-formed) run is also hidden.
+        for path in [
+            format!("/ci/runs/{}/request", uuid::Uuid::new_v4()),
+            format!("/ci/runs/{}/events?after=0&limit=1", uuid::Uuid::new_v4()),
+        ] {
+            let response =
+                ci_run_response(harness.state.clone(), &harness.host, &harness.owner, &path).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        // A malformed run ID never leaks run existence either.
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            "/ci/runs/not-a-uuid/request",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch Postgres and CI evidence storage"]
+    async fn route_ci_run_events_query_is_exact_and_bounded() {
+        if !preflight_scratch_env_ready() {
+            return;
+        }
+        let harness = TestHarness::connect().await;
+        let (run_id, _) = harness.seed_run_history().await;
+
+        for invalid in [
+            "after=0&limit=0",
+            "after=0&limit=1001",
+            "after=0&limit=1&repo=1",
+        ] {
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!("/ci/runs/{run_id}/events?{invalid}"),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "invalid query must fail closed: {invalid}"
+            );
+        }
     }
 }
