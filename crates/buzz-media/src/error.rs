@@ -36,6 +36,9 @@ pub enum MediaError {
     TimestampOutOfWindow,
     #[error("storage error: {0}")]
     StorageError(String),
+    /// Stored bytes do not match the caller's immutable size and SHA-256 identity.
+    #[error("stored object integrity mismatch")]
+    StoredObjectIntegrityMismatch,
     #[error("internal error")]
     Internal,
     #[error("not found")]
@@ -151,7 +154,10 @@ impl IntoResponse for MediaError {
             | Self::InvalidVideo
             | Self::InvalidImage
             | Self::MetadataForbidden => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
-            Self::Io(_) | Self::StorageError(_) | Self::Internal => {
+            Self::Io(_)
+            | Self::StorageError(_)
+            | Self::StoredObjectIntegrityMismatch
+            | Self::Internal => {
                 tracing::error!(error = %self, "media storage error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
@@ -192,6 +198,23 @@ mod tests {
             assert_eq!(
                 error.into_response().status(),
                 StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+    }
+
+    #[test]
+    fn storage_failures_map_to_500() {
+        for error in [
+            MediaError::Io("disk".to_string()),
+            MediaError::StorageError("unavailable".to_string()),
+            MediaError::StoredObjectIntegrityMismatch,
+            MediaError::Internal,
+        ] {
+            let debug = format!("{error:?}");
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected status for {debug}"
             );
         }
     }
