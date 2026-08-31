@@ -241,7 +241,8 @@ platform_id=${prior_id}
 new_id=sha256:2222222222222222222222222222222222222222222222222222222222222222
 mismatch_id=sha256:9999999999999999999999999999999999999999999999999999999999999999
 case "${TEST_SCENARIO}" in
-  prior_index_platform_survives|post_swap_failure_idxplat|platform_digest_untaggable)
+  prior_index_platform_survives|post_swap_failure_idxplat|platform_digest_untaggable|\
+    prior_ref_index_digest_mismatch)
     prior_id=sha256:4444444444444444444444444444444444444444444444444444444444444444
     platform_id=sha256:5555555555555555555555555555555555555555555555555555555555555555
     ;;
@@ -287,7 +288,8 @@ case "${args}" in
     printf '%s\n' "${prior_id}"
     ;;
   *" image tag "*)
-    if [[ ${TEST_SCENARIO} == platform_digest_untaggable && ${3:-} == "${platform_id}" ]]; then
+    if [[ (${TEST_SCENARIO} == platform_digest_untaggable || \
+      ${TEST_SCENARIO} == prior_ref_index_digest_mismatch) && ${3:-} == "${platform_id}" ]]; then
       exit 1
     fi
     exit 0
@@ -315,9 +317,11 @@ case "${args}" in
       *)
         create_count=$(cat "${TEST_VERIFY_CREATE_COUNT}")
         case "${TEST_SCENARIO}:${create_count}" in
-          prior_ref_platform_mismatch:*|explicit_platform_mismatch:*|post_create_validation_failure:*|rollback_revalidation_mismatch:2)
+          prior_ref_platform_mismatch:*|explicit_platform_mismatch:*|post_create_validation_failure:*|\
+            rollback_revalidation_mismatch:2|prior_ref_index_digest_mismatch:*)
             printf '%s\n' "${mismatch_id}"
             ;;
+          platform_digest_untaggable:*) printf '%s\n' "${prior_id}" ;;
           *) printf '%s\n' "${platform_id}" ;;
         esac
         ;;
@@ -1071,7 +1075,22 @@ untaggable_resolution=$(rg --files "${scratch}/platform_digest_untaggable/logs" 
   grep '/rollback-source-resolution[.]txt$')
 assert_contains "${untaggable_source}" '^localhost/buzz-relay:old$'
 assert_contains "${untaggable_resolution}" '^prior-image-ref$'
+assert_contains "${scratch}/platform_digest_untaggable/output" \
+  'Index-digest binding for name-based rollback reference localhost/buzz-relay:rollback-.* resolves to prior image index sha256:4444'
 assert_contains "${scratch}/platform_digest_untaggable/output" 'DEPLOY SUCCEEDED'
+
+run_case prior_ref_index_digest_mismatch failure
+assert_contains "${scratch}/prior_ref_index_digest_mismatch/commands.log" \
+  'image tag localhost/buzz-relay:old localhost/buzz-relay:rollback-'
+assert_contains "${scratch}/prior_ref_index_digest_mismatch/output" \
+  'resolves to platform image sha256:999999.*expected prior platform image sha256:555555'
+index_mismatch_resolution=$(rg --files "${scratch}/prior_ref_index_digest_mismatch/logs" | \
+  grep '/rollback-source-resolution[.]txt$')
+assert_contains "${index_mismatch_resolution}" '^prior-image-ref$'
+assert_not_contains "${scratch}/prior_ref_index_digest_mismatch/commands.log" \
+  'exec -T postgres sh -euc.*pg_dump'
+assert_not_contains "${scratch}/prior_ref_index_digest_mismatch/commands.log" \
+  ' up -d --no-deps --force-recreate relay'
 
 for bad_prior in prior_ref_platform_mismatch prior_ref_revision_mismatch prior_image_unavailable; do
   run_case "${bad_prior}" failure
