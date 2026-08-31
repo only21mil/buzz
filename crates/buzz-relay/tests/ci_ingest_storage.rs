@@ -1051,3 +1051,161 @@ async fn stale_fanout_rerun_is_rejected_without_poisoning_selected_graph() {
         vec![("build".into(), 2), ("test".into(), 3)]
     );
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn run_read_exports_bind_membership_channel_and_cursor_bounds() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let db = buzz_db::Db::from_pool(pool.clone());
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let authorized_status_signers = HashSet::from([control.public_key().to_hex()]);
+
+    // Membership fixtures: a standing member, a removed member, and one
+    // pubkey that was never a member.
+    let member: Vec<u8> = (0..32).collect();
+    let removed_member: Vec<u8> = (32..64).collect();
+    let stranger: Vec<u8> = (200..232).collect();
+    for (pubkey, role) in [
+        (member.clone(), "owner"),
+        (removed_member.clone(), "member"),
+    ] {
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+             VALUES ($1, $2, $3, $4::member_role)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(&pubkey)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .expect("insert channel member fixture");
+    }
+    sqlx::query(
+        "UPDATE channel_members SET removed_at = now() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(&removed_member)
+    .execute(&pool)
+    .await
+    .expect("remove member fixture");
+
+    let (request_envelope, request_event) = new_stored_request(
+        &pool,
+        community_id,
+        channel_id,
+        &actor,
+        &authorized_status_signers,
+    )
+    .await;
+    let run_id = Uuid::parse_str(&request_envelope.run_id).expect("run uuid");
+    store_terminal_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &request_envelope,
+        &request_event,
+        &authorized_status_signers,
+    )
+    .await;
+
+    // The Db-level read surface resolves the run's channel only for a
+    // current channel member.
+    let member_channel = db
+        .get_ci_run_member_channel(community_id, run_id, &member)
+        .await
+        .expect("member channel query");
+    assert_eq!(member_channel, Some(channel_id));
+
+    for stranger_pk in [&removed_member[..], stranger.as_slice()] {
+        assert_eq!(
+            db.get_ci_run_member_channel(community_id, run_id, stranger_pk)
+                .await
+                .expect("membership query"),
+            None,
+            "removed and non-members must not resolve the run"
+        );
+    }
+    assert_eq!(
+        db.get_ci_run_member_channel(community_id, Uuid::new_v4(), &member)
+            .await
+            .expect("unknown run query"),
+        None,
+        "an unknown run must not resolve"
+    );
+    let (other_community, _) = tenant_channel(&pool).await;
+    assert_eq!(
+        db.get_ci_run_member_channel(other_community, run_id, &member)
+            .await
+            .expect("cross-community query"),
+        None
+    );
+
+    // The request read is bound to the run's own channel.
+    assert!(
+        db.get_ci_run_request(community_id, Uuid::new_v4(), run_id)
+            .await
+            .expect("request query")
+            .is_none(),
+        "a foreign channel must not read another channel's run"
+    );
+
+    // Durable event pages are exclusive of the checkpoint cursor and ordered.
+    let page = db
+        .list_ci_run_events(community_id, channel_id, run_id, 0, 2)
+        .await
+        .expect("first page");
+    assert_eq!(
+        page.iter()
+            .map(|stored| stored.watch_cursor)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let after = page.last().expect("page").watch_cursor;
+    let rest = db
+        .list_ci_run_events(community_id, channel_id, run_id, after, 1_000)
+        .await
+        .expect("remaining page");
+    assert_eq!(
+        rest.iter()
+            .map(|stored| stored.watch_cursor)
+            .collect::<Vec<_>>(),
+        (3..=7).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        db.get_ci_run_request(community_id, channel_id, run_id)
+            .await
+            .expect("request read")
+            .expect("stored request")
+            .stored_event
+            .event,
+        request_event,
+    );
+
+    // Cursors outside the safe integer range fail closed.
+    assert!(matches!(
+        db.list_ci_run_events(community_id, channel_id, run_id, -1, 10)
+            .await,
+        Err(buzz_db::DbError::InvalidData(_))
+    ));
+
+    // A soft-deleted channel hides its runs from member resolution.
+    sqlx::query("UPDATE channels SET deleted_at = now() WHERE community_id=$1 AND id=$2")
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .execute(&pool)
+        .await
+        .expect("soft-delete channel");
+    assert_eq!(
+        db.get_ci_run_member_channel(community_id, run_id, &member)
+            .await
+            .expect("deleted channel query"),
+        None,
+        "deleted channels must not resolve runs"
+    );
+}

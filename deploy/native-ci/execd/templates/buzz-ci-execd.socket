@@ -1,0 +1,16 @@
+[Unit]
+Description=Buzz CI execution broker control socket
+Documentation=file:/usr/share/doc/buzz-ci-execd/README.md
+
+[Socket]
+ListenStream=/run/buzzci/execd.sock
+FileDescriptorName=buzz-ci-execd
+Accept=no
+SocketUser=root
+SocketGroup=root
+SocketMode=0666
+RemoveOnStop=yes
+Service=buzz-ci-execd.service
+
+[Install]
+WantedBy=sockets.target

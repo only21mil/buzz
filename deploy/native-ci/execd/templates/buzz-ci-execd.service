@@ -1,0 +1,11 @@
+[Unit]
+Description=Buzz CI privileged execution broker
+Documentation=file:/usr/share/doc/buzz-ci-execd/README.md
+Requires=buzz-ci-execd.socket systemd-tmpfiles-setup.service
+After=local-fs.target buzz-ci-execd.socket systemd-tmpfiles-setup.service
+
+[Service]
+Type=exec
+UMask=0077
+ExecStart=/usr/libexec/buzz-ci-execd --socket-activation
+Restart=no

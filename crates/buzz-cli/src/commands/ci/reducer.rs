@@ -1400,4 +1400,39 @@ mod tests {
         events.retain(|event| event.event_id != id(20));
         assert_eq!(reduce(&events).state, CiReducedState::InfrastructureFailure);
     }
+
+    #[test]
+    fn accepted_run_validation_accepts_a_consistent_history() {
+        let events = green_events(1, CiJobState::Success, CiSkipPolicy::Forbid);
+        validate_accepted_run(&id(REQUEST_ID), &request(), &events)
+            .expect("a consistent stream must validate");
+    }
+
+    #[test]
+    fn accepted_run_validation_rejects_conflicting_requests_and_cursor_collisions() {
+        let events = green_events(1, CiJobState::Success, CiSkipPolicy::Forbid);
+
+        let mut conflicting = events.clone();
+        conflicting.push(accepted(999, 999, ValidatedCiEnvelope::Request(request())));
+        let reason = validate_accepted_run(&id(REQUEST_ID), &request(), &conflicting)
+            .expect_err("a second request event must fail validation");
+        assert!(reason.contains("conflicting request"));
+
+        let mut colliding = events.clone();
+        colliding.push(accepted(
+            999,
+            colliding[0].watch_cursor,
+            ValidatedCiEnvelope::JobStatus(job_status(
+                "lint",
+                1,
+                3,
+                CiJobState::Success,
+                CiSkipPolicy::Forbid,
+                None,
+            )),
+        ));
+        let reason = validate_accepted_run(&id(REQUEST_ID), &request(), &colliding)
+            .expect_err("a shared watch cursor must fail validation");
+        assert!(reason.contains("is shared by events"), "{reason}");
+    }
 }

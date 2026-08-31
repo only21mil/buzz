@@ -201,4 +201,21 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn storage_failures_map_to_500() {
+        for error in [
+            MediaError::Io("disk".to_string()),
+            MediaError::StorageError("unavailable".to_string()),
+            MediaError::StoredObjectIntegrityMismatch,
+            MediaError::Internal,
+        ] {
+            let debug = format!("{error:?}");
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected status for {debug}"
+            );
+        }
+    }
 }

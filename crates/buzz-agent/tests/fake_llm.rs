@@ -8,13 +8,14 @@
 
 use std::collections::VecDeque;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 async fn spawn_fake_llm(responses: Vec<Value>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -77,11 +78,39 @@ async fn spawn_capturing_fake_llm(responses: Vec<Value>) -> (String, Arc<Mutex<V
 async fn spawn_capturing_fake_llm_with_statuses(
     responses: Vec<CannedResponse>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_capturing_fake_llm_gated_inner(responses, None).await
+}
+
+/// Like `spawn_capturing_fake_llm` but the response to the *first* provider
+/// request is withheld until `release.notify_one()`. A test injects mid-turn
+/// input (e.g. a steer) with a guaranteed before-next-round-boundary ordering:
+/// the agent acks a steer only after queueing it, and the run loop drains the
+/// queue at each round boundary, so releasing on the ack makes the fold into
+/// the following round deterministic instead of racing the round-1 round trip.
+async fn spawn_capturing_fake_llm_gated(
+    responses: Vec<Value>,
+    release: Arc<Notify>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_capturing_fake_llm_gated_inner(
+        responses
+            .into_iter()
+            .map(|body| CannedResponse { status: 200, body })
+            .collect(),
+        Some(release),
+    )
+    .await
+}
+
+async fn spawn_capturing_fake_llm_gated_inner(
+    responses: Vec<CannedResponse>,
+    release: Option<Arc<Notify>>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
     let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let captures_clone = captures.clone();
+    let first_unreleased = Arc::new(AtomicBool::new(true));
     tokio::spawn(async move {
         loop {
             let (mut sock, _) = match listener.accept().await {
@@ -90,6 +119,8 @@ async fn spawn_capturing_fake_llm_with_statuses(
             };
             let queue = queue.clone();
             let captures = captures_clone.clone();
+            let first_unreleased = first_unreleased.clone();
+            let release = release.clone();
             tokio::spawn(async move {
                 // Read headers.
                 let mut buf = Vec::new();
@@ -136,6 +167,13 @@ async fn spawn_capturing_fake_llm_with_statuses(
                     serde_json::from_slice::<Value>(&body_buf[..content_length.min(body_buf.len())])
                 {
                     captures.lock().await.push(parsed);
+                }
+
+                // Hold the first response until the test releases the gate.
+                if let Some(release) = &release {
+                    if first_unreleased.swap(false, Ordering::SeqCst) {
+                        release.notified().await;
+                    }
                 }
 
                 // Send canned response.
@@ -779,10 +817,18 @@ async fn steer_folds_into_active_turn_without_cancelling() {
     // A two-round turn (tool call → text). A steer sent once the run is live
     // must (a) be accepted with the matching runId, (b) NOT cancel the turn —
     // it still ends with end_turn — and (c) reach the provider as a user turn.
-    let (url, captures) = spawn_capturing_fake_llm(vec![
-        openai_tool_call("call_steer", "fake__noop", json!({})),
-        openai_text("acknowledged the steer"),
-    ])
+    // Round 1's response is gate-held so the steer (which the agent folds at
+    // the next round boundary) cannot race the round-1 round trip and arrive
+    // after the final round was already dispatched — under concurrent test
+    // load that race silently dropped the steer before the turn ended.
+    let release = Arc::new(Notify::new());
+    let (url, captures) = spawn_capturing_fake_llm_gated(
+        vec![
+            openai_tool_call("call_steer", "fake__noop", json!({})),
+            openai_text("acknowledged the steer"),
+        ],
+        release.clone(),
+    )
     .await;
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
@@ -811,35 +857,27 @@ async fn steer_folds_into_active_turn_without_cancelling() {
         )
         .await;
 
-    // Steer is accepted and echoes the run id it landed in.
-    let mut steer_ok = false;
-    let mut end_turn = false;
-    for _ in 0..40 {
-        let v = h.recv().await;
-        if v["id"] == json!(s_id) {
-            assert_eq!(
-                v["result"]["runId"],
-                json!(run_id),
-                "steer ran into the live turn"
-            );
-            assert!(
-                v["result"]["messageId"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with("steer_")),
-                "steer reply carries a messageId"
-            );
-            steer_ok = true;
-        } else if v["id"] == json!(p_id) {
-            // The turn was NOT cancelled — it completed normally.
-            assert_eq!(v["result"]["stopReason"], "end_turn");
-            end_turn = true;
-        }
-        if steer_ok && end_turn {
-            break;
-        }
-    }
-    assert!(steer_ok, "steer request was not accepted");
-    assert!(end_turn, "turn did not complete with end_turn after steer");
+    // Steer is accepted and echoes the run id it landed in. The agent sends
+    // this ack only after queueing the steer onto the live run, and the run
+    // loop drains that queue at each round boundary — so releasing the gate
+    // here guarantees the steer folds into round 2.
+    let ack = h.recv_until(|v| v["id"] == json!(s_id)).await;
+    assert_eq!(
+        ack["result"]["runId"],
+        json!(run_id),
+        "steer ran into the live turn"
+    );
+    assert!(
+        ack["result"]["messageId"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("steer_")),
+        "steer reply carries a messageId"
+    );
+    release.notify_one();
+
+    // The turn was NOT cancelled — it completed normally.
+    let end = h.recv_until(|v| v["id"] == json!(p_id)).await;
+    assert_eq!(end["result"]["stopReason"], "end_turn");
 
     // The steered text reached the provider as a user message in some round.
     let reqs = captures.lock().await;
