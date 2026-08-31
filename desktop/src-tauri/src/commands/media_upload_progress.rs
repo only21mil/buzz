@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use tauri::Emitter;
@@ -10,6 +11,28 @@ use crate::{app_state::AppState, relay::classify_request_error};
 
 static MEDIA_UPLOAD_CANCELLATIONS: LazyLock<Mutex<HashMap<String, CancellationToken>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const MEDIA_UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct UploadProgressCadence {
+    last_emitted_at: Option<Instant>,
+}
+
+impl UploadProgressCadence {
+    fn should_emit(&mut self, sent: u64, total: u64, now: Instant) -> bool {
+        let is_final = sent >= total;
+        let interval_elapsed = self.last_emitted_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= MEDIA_UPLOAD_PROGRESS_INTERVAL
+        });
+        if !is_final && !interval_elapsed {
+            return false;
+        }
+
+        self.last_emitted_at = Some(now);
+        true
+    }
+}
 
 pub(super) fn begin_media_upload(progress_id: Option<&str>) -> Option<CancellationToken> {
     let progress_id = progress_id?;
@@ -74,15 +97,18 @@ pub(super) async fn send_upload_attempt(
         let chunk_size = 64 * 1024;
         let chunk_count = body.len().div_ceil(chunk_size);
         let mut sent: u64 = 0;
+        let mut progress_cadence = UploadProgressCadence::default();
         let stream = futures_util::stream::iter((0..chunk_count).map(move |i| {
             let start = i * chunk_size;
             let end = usize::min(start + chunk_size, body.len());
             let chunk = body.slice(start..end);
             sent += chunk.len() as u64;
-            let _ = app.emit(
-                "media-upload-progress",
-                serde_json::json!({ "id": progress_id, "sent": sent, "total": total }),
-            );
+            if progress_cadence.should_emit(sent, total, Instant::now()) {
+                let _ = app.emit(
+                    "media-upload-progress",
+                    serde_json::json!({ "id": progress_id, "sent": sent, "total": total }),
+                );
+            }
             Ok::<bytes::Bytes, std::io::Error>(chunk)
         }));
         let request = req
@@ -123,4 +149,38 @@ pub(super) fn emit_media_upload_phase(
         "media-upload-phase",
         serde_json::json!({ "id": id, "phase": phase }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_cadence_bounds_intermediate_updates_and_keeps_final_update() {
+        let started_at = Instant::now();
+        let total = 1_000;
+        let mut cadence = UploadProgressCadence::default();
+        let mut emitted = Vec::new();
+
+        for sent in 1..=total {
+            let now = started_at + Duration::from_millis(sent - 1);
+            if cadence.should_emit(sent, total, now) {
+                emitted.push(sent);
+            }
+        }
+
+        assert_eq!(emitted.first(), Some(&1));
+        assert_eq!(emitted.last(), Some(&total));
+        assert!(emitted.len() <= 11, "emitted {emitted:?}");
+    }
+
+    #[test]
+    fn final_update_bypasses_the_cadence_window() {
+        let started_at = Instant::now();
+        let mut cadence = UploadProgressCadence::default();
+
+        assert!(cadence.should_emit(64, 128, started_at));
+        assert!(!cadence.should_emit(96, 128, started_at + Duration::from_millis(1)));
+        assert!(cadence.should_emit(128, 128, started_at + Duration::from_millis(2)));
+    }
 }

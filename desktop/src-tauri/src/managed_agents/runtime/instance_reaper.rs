@@ -6,10 +6,18 @@ const DESKTOP_BINARY_NAMES: &[&str] = &[
     "Buzz",
     "buzz-desktop",
     "buzz_desktop",
+    "buzz-desktop.bin",
     // Linux limits /proc/<pid>/comm to 15 visible bytes, truncating the
     // AppImage shim's real executable name, `buzz-desktop.bin`.
     "buzz-desktop.bi",
 ];
+
+/// The release identifier baked into `tauri.conf.json`. Unlike `tauri dev`, a
+/// packaged launch does not carry its identifier in argv.
+const RELEASE_INSTANCE_ID: &str = "xyz.block.buzz.app";
+const APPIMAGE_COMM: &str = "buzz-desktop.bi";
+const APPIMAGE_EXECUTABLE: &str = "buzz-desktop.bin";
+const APPIMAGE_ARGV0: &[u8] = b"buzz-desktop";
 
 /// Check if a process name matches a known Buzz desktop binary.
 pub(super) fn is_desktop_binary(name: &str) -> bool {
@@ -39,6 +47,44 @@ pub(super) fn buffer_contains_identifier(buf: &[u8], id: &[u8]) -> bool {
             }
         }
     })
+}
+
+/// Return the basename of argv[0] from Linux's NUL-delimited cmdline buffer.
+fn cmdline_argv0_basename(cmdline: &[u8]) -> &[u8] {
+    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    argv0
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or_default()
+}
+
+/// Decide whether one same-UID Linux process owns `instance_id`.
+///
+/// Development launches carry the identifier in argv via Tauri's config JSON.
+/// The signed AppImage does not: its launcher uses `exec -a buzz-desktop` while
+/// executing `buzz-desktop.bin`, whose `/proc/<pid>/comm` value is truncated.
+/// Accept that exact three-part identity only for the release instance. Checking
+/// `/proc/<pid>/exe` and argv[0] as well as comm prevents a recycled PID or an
+/// unrelated process with a Buzz-looking comm value from preserving dead agents.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_desktop_owns_instance(
+    instance_id: &str,
+    comm: &str,
+    executable_name: &str,
+    cmdline: &[u8],
+) -> bool {
+    if !is_desktop_binary(comm) || !is_desktop_binary(executable_name) {
+        return false;
+    }
+
+    if buffer_contains_identifier(cmdline, instance_id.as_bytes()) {
+        return true;
+    }
+
+    instance_id == RELEASE_INSTANCE_ID
+        && comm == APPIMAGE_COMM
+        && executable_name == APPIMAGE_EXECUTABLE
+        && cmdline_argv0_basename(cmdline) == APPIMAGE_ARGV0
 }
 
 /// Extract the `BUZZ_MANAGED_AGENT` value from a process's environment.
@@ -199,18 +245,21 @@ fn desktop_is_alive_for_instance(instance_id: &str) -> bool {
         if meta.uid() != my_uid {
             continue;
         }
-        // Check binary name via /proc/<pid>/comm.
+        // Check the live process identity. AppImage argv has no bundle ID, so
+        // the pure classifier also verifies the executable behind the PID.
         let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
             continue;
         };
-        if !is_desktop_binary(comm.trim()) {
+        let Ok(executable) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
             continue;
-        }
-        // Check cmdline for the identifier with boundary anchoring.
+        };
+        let Some(executable_name) = executable.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
         let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             continue;
         };
-        if buffer_contains_identifier(&cmdline, instance_id.as_bytes()) {
+        if linux_desktop_owns_instance(instance_id, comm.trim(), executable_name, &cmdline) {
             return true;
         }
     }
@@ -357,3 +406,53 @@ pub(crate) fn reap_dead_instance_agents(our_instance_id: &str, skip_pids: &[u32]
 
 #[cfg(not(unix))]
 pub(crate) fn reap_dead_instance_agents(_our_instance_id: &str, _skip_pids: &[u32]) {}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod linux_tests {
+    use super::linux_desktop_owns_instance;
+
+    #[test]
+    fn live_appimage_without_bundle_id_owns_release_agents() {
+        let cmdline = b"buzz-desktop\0--safe-rendering\0";
+
+        assert!(linux_desktop_owns_instance(
+            "xyz.block.buzz.app",
+            "buzz-desktop.bi",
+            "buzz-desktop.bin",
+            cmdline,
+        ));
+        assert!(!cmdline
+            .windows(b"xyz.block.buzz.app".len())
+            .any(|window| window == b"xyz.block.buzz.app"));
+    }
+
+    #[test]
+    fn dead_or_reused_pid_with_stale_buzz_comm_is_rejected() {
+        assert!(!linux_desktop_owns_instance(
+            "xyz.block.buzz.app",
+            "buzz-desktop.bi",
+            "sleep",
+            b"buzz-desktop\0",
+        ));
+    }
+
+    #[test]
+    fn non_buzz_process_is_rejected_even_if_cmdline_mentions_identifier() {
+        assert!(!linux_desktop_owns_instance(
+            "xyz.block.buzz.app",
+            "python3",
+            "python3.12",
+            b"python3\0xyz.block.buzz.app\0",
+        ));
+    }
+
+    #[test]
+    fn appimage_fallback_never_claims_a_dev_instance() {
+        assert!(!linux_desktop_owns_instance(
+            "xyz.block.buzz.app.dev",
+            "buzz-desktop.bi",
+            "buzz-desktop.bin",
+            b"buzz-desktop\0",
+        ));
+    }
+}

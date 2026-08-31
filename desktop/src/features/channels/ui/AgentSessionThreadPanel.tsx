@@ -28,7 +28,6 @@ import { cancelManagedAgentTurn } from "@/shared/api/agentControl";
 import type { Channel } from "@/shared/api/types";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
-import { useNow } from "@/shared/lib/useNow";
 import { AuxiliaryPanel } from "@/shared/layout/AuxiliaryPanel";
 import { AuxiliaryPanelBody } from "@/shared/layout/AuxiliaryPanel";
 import {
@@ -61,6 +60,7 @@ import { useLoadArchivedObserverEvents } from "@/features/agents/ui/useObserverE
 import { useLoadOlderOnScroll } from "@/features/messages/ui/useLoadOlderOnScroll";
 import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { AgentSessionRecencyLabel } from "./AgentSessionRecencyLabel";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
@@ -111,7 +111,6 @@ export function AgentSessionThreadPanel({
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const contentRef = React.useRef<HTMLDivElement>(null);
   const topSentinelRef = React.useRef<HTMLDivElement>(null);
-  const now = useNow(1000);
   const { connectionState, events } = useObserverEvents(isLive, agent.pubkey);
   const scopedEvents = React.useMemo(
     () => scopeByChannel(events, sessionChannelId),
@@ -132,12 +131,6 @@ export function AgentSessionThreadPanel({
     () => getLatestActivityTimestamp(combinedHeaderEvents),
     [combinedHeaderEvents],
   );
-  const lastUpdatedLabel = formatLastUpdatedLabel(latestActivityAt, now);
-  const lastUpdatedTitle =
-    latestActivityAt === null
-      ? undefined
-      : `Last updated ${new Date(latestActivityAt).toLocaleString()}`;
-
   const { fetchOlderArchived, hasOlderArchived } =
     useLoadArchivedObserverEvents(
       // Archive history must load regardless of live status — an idle agent's
@@ -452,13 +445,7 @@ export function AgentSessionThreadPanel({
             <span aria-hidden="true" className="shrink-0">
               ·
             </span>
-            <span
-              className="shrink-0"
-              data-testid="agent-session-recency-label"
-              title={lastUpdatedTitle}
-            >
-              {lastUpdatedLabel}
-            </span>
+            <AgentSessionRecencyLabel latestActivityAt={latestActivityAt} />
           </div>
         </div>
       </AuxiliaryPanelHeaderGroup>
@@ -533,39 +520,4 @@ function getLatestActivityTimestamp(
   }
 
   return latest;
-}
-
-function formatLastUpdatedLabel(timestamp: number | null, now: number): string {
-  if (timestamp === null) {
-    return "No updates yet";
-  }
-
-  return `Last updated ${formatRelativeActivityTime(timestamp, now)}`;
-}
-
-function formatRelativeActivityTime(timestamp: number, now: number): string {
-  const elapsedMs = Math.max(0, now - timestamp);
-  const totalSeconds = Math.floor(elapsedMs / 1_000);
-
-  if (totalSeconds < 60) {
-    return "just now";
-  }
-
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  if (totalMinutes < 60) {
-    return `${totalMinutes}m ago`;
-  }
-
-  const totalHours = Math.floor(totalMinutes / 60);
-  if (totalHours < 24) {
-    return `${totalHours}h ago`;
-  }
-
-  const totalDays = Math.floor(totalHours / 24);
-  if (totalDays < 7) {
-    return `${totalDays}d ago`;
-  }
-
-  const totalWeeks = Math.floor(totalDays / 7);
-  return `${totalWeeks}w ago`;
 }
