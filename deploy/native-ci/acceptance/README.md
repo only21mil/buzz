@@ -37,9 +37,15 @@ receipt never authorizes activation.
 
 Start from [scenario.template.json](scenario.template.json), but replace every
 identity and command with values from the frozen activation package. In
-particular, replace the template candidate SHA and placeholder approval values
-after the final integrated commit exists. Adapter programs must be absolute
-paths. Do not put secrets in `args`.
+particular, bind `integrated_candidate_sha`, `activation_id`, and
+`activation_package_digest` after the final integrated commit exists. The
+activation ID must derive from the candidate and package digest prefixes.
+Adapter programs must be absolute paths. Do not put secrets in `args`.
+
+Stage the activation package at its declared default capacity zero before this
+run. Do not start its persistent capacity-one target first. Check 2 opens the
+single slot through the control adapter, and check 13 closes it. A later
+persistent activation is a separate approved operation.
 
 The checked-in fixture runs
 [`fixtures/run-fixture.sh`](fixtures/run-fixture.sh). It verifies the source
@@ -76,7 +82,9 @@ target/release/buzz-ci-capacity-one-canary \
 
 The binary returns `0` only after all 13 checks pass. It returns `1` with a
 failure receipt for a driver or evidence failure, and `2` for invalid input.
-It copies no raw adapter output or stderr into the receipt.
+Each check records the normalized snapshot used by the state machine. Check 7
+also records the normalized authenticated export. Adapter stderr is never
+copied into the receipt.
 
 Validate and inspect the receipt:
 
@@ -85,18 +93,16 @@ check-jsonschema \
   --schemafile deploy/native-ci/acceptance/receipt.schema.json \
   /protected/path/capacity-one-receipt.json
 
-jq -e '
-  .outcome == "pass" and
-  (.checks | length) == 13 and
-  .checks[12].stage == "return_capacity_zero" and
-  .checks[12].outcome == "pass"
-' /protected/path/capacity-one-receipt.json
+/usr/libexec/buzz-ci-verify-acceptance-receipt \
+  /protected/path/capacity-one-scenario.json \
+  /protected/path/capacity-one-receipt.json
 ```
 
-A passing receipt is acceptance evidence for its exact scenario digest and
-candidate SHA. It is not a deployment receipt and does not activate capacity.
-Keep capacity zero until the separate activation decision and its approval are
-recorded.
+The independent verifier checks the scenario digest, candidate and run
+bindings, exact 13-stage vector, every normalized driver-response digest, the
+full state progression, and final closed capacity zero. A passing receipt is
+not a deployment receipt and does not leave capacity active. Keep capacity
+zero until the separate activation decision and its approval are recorded.
 
 ## Failure and recovery
 

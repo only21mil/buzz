@@ -1,9 +1,11 @@
 use std::fmt;
 
 use crate::types::{
-    CanonicalPayload, DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod,
-    ManifestKind, Nip98AuthorizeRequest, Operation, OperationSet, PeerPolicy, PublicIdentity,
-    Request, Response, SignCiEventRequest, SignManifestRequest, SignatureResponse, Url, ValueError,
+    AcceptanceMutation, CanonicalPayload, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
+    DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, ManifestKind,
+    Nip98AuthorizeRequest, Operation, OperationSet, PeerPolicy, PublicIdentity, Request, Response,
+    SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest, SignatureResponse, Url,
+    ValueError,
 };
 
 /// Keyholder frame magic.
@@ -148,9 +150,11 @@ pub fn encode_request(
     let mut body = BodyEncoder::new();
     match request {
         Request::Describe(_) => {}
+        Request::DescribeAcceptance(_) => {}
         Request::SignCiEvent(value) => encode_sign_ci_event(&mut body, value)?,
         Request::Nip98Authorize(value) => encode_nip98(&mut body, value)?,
         Request::SignManifest(value) => encode_sign_manifest(&mut body, value)?,
+        Request::SignAcceptanceMutation(value) => encode_acceptance_mutation(&mut body, value)?,
     }
     encode_frame(
         REQUEST_KIND,
@@ -176,9 +180,16 @@ pub fn decode_request(frame: &[u8]) -> Result<(FrameHeader, Request), DecodeErro
             expect_tags(&fields, &[])?;
             Request::Describe(DescribeRequest)
         }
+        Operation::DescribeAcceptance => {
+            expect_tags(&fields, &[])?;
+            Request::DescribeAcceptance(DescribeAcceptanceRequest)
+        }
         Operation::SignCiEvent => Request::SignCiEvent(decode_sign_ci_event(&fields)?),
         Operation::Nip98Authorize => Request::Nip98Authorize(decode_nip98(&fields)?),
         Operation::SignManifest => Request::SignManifest(decode_sign_manifest(&fields)?),
+        Operation::SignAcceptanceMutation => {
+            Request::SignAcceptanceMutation(decode_acceptance_mutation(&fields)?)
+        }
     };
     Ok((decoded.header, request))
 }
@@ -198,9 +209,14 @@ pub fn encode_response(
             encode_describe(&mut body, value)?;
             0
         }
+        Response::DescribeAcceptance(value) => {
+            encode_describe_acceptance(&mut body, value)?;
+            0
+        }
         Response::SignCiEvent(value)
         | Response::Nip98Authorize(value)
-        | Response::SignManifest(value) => {
+        | Response::SignManifest(value)
+        | Response::SignAcceptanceMutation(value) => {
             encode_signature(&mut body, value)?;
             0
         }
@@ -245,10 +261,40 @@ pub fn decode_response(expected: FrameHeader, frame: &[u8]) -> Result<Response, 
     }
     match expected.operation {
         Operation::Describe => decode_describe(&fields).map(Response::Describe),
+        Operation::DescribeAcceptance => {
+            decode_describe_acceptance(&fields).map(Response::DescribeAcceptance)
+        }
         Operation::SignCiEvent => decode_signature(&fields).map(Response::SignCiEvent),
         Operation::Nip98Authorize => decode_signature(&fields).map(Response::Nip98Authorize),
         Operation::SignManifest => decode_signature(&fields).map(Response::SignManifest),
+        Operation::SignAcceptanceMutation => {
+            decode_signature(&fields).map(Response::SignAcceptanceMutation)
+        }
     }
+}
+
+fn encode_acceptance_mutation(
+    body: &mut BodyEncoder,
+    value: &SignAcceptanceMutationRequest,
+) -> Result<(), EncodeError> {
+    require_nonzero_number(value.expected_generation)?;
+    require_nonzero(&value.scenario_sha256)?;
+    body.field(1, &value.expected_generation.to_be_bytes())?;
+    body.field(2, &value.scenario_sha256)?;
+    body.field(3, &[value.mutation as u8])
+}
+
+fn decode_acceptance_mutation(
+    fields: &[Field<'_>],
+) -> Result<SignAcceptanceMutationRequest, DecodeError> {
+    expect_tags(fields, &[1, 2, 3])?;
+    let mutation = AcceptanceMutation::try_from(read_u8(fields[2].value)?)
+        .map_err(|_| DecodeError::UnknownEnum)?;
+    Ok(SignAcceptanceMutationRequest {
+        expected_generation: nonzero_u64(fields[0].value)?,
+        scenario_sha256: nonzero_array(fields[1].value)?,
+        mutation,
+    })
 }
 
 fn encode_sign_ci_event(
@@ -357,6 +403,36 @@ fn decode_describe(fields: &[Field<'_>]) -> Result<DescribeResponse, DecodeError
             gid: read_u32(fields[7].value)?,
             allowed_operations: operations,
         },
+    })
+}
+
+fn encode_describe_acceptance(
+    body: &mut BodyEncoder,
+    value: &DescribeAcceptanceResponse,
+) -> Result<(), EncodeError> {
+    encode_public_identity(body, 1, 2, value.actor)?;
+    require_nonzero(&value.scenario_sha256)?;
+    body.field(3, &value.scenario_sha256)?;
+    for (tag, event_id) in (4_u16..=7).zip(value.event_ids) {
+        require_nonzero(&event_id)?;
+        body.field(tag, &event_id)?;
+    }
+    Ok(())
+}
+
+fn decode_describe_acceptance(
+    fields: &[Field<'_>],
+) -> Result<DescribeAcceptanceResponse, DecodeError> {
+    expect_tags(fields, &[1, 2, 3, 4, 5, 6, 7])?;
+    Ok(DescribeAcceptanceResponse {
+        actor: decode_public_identity(fields[0].value, fields[1].value)?,
+        scenario_sha256: nonzero_array(fields[2].value)?,
+        event_ids: [
+            nonzero_array(fields[3].value)?,
+            nonzero_array(fields[4].value)?,
+            nonzero_array(fields[5].value)?,
+            nonzero_array(fields[6].value)?,
+        ],
     })
 }
 

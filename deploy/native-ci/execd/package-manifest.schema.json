@@ -1,90 +1,75 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/execd-package-v1.json",
-  "title": "Buzz CI dormant execd install package v1",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "schema",
-    "package_id",
-    "source_commit",
-    "binary_provenance_sha256",
-    "default_state",
-    "daemon_contract",
-    "package_uid",
-    "package_gid",
-    "directories",
-    "entries",
-    "package_digest"
-  ],
-  "properties": {
-    "schema": { "const": "buzz-ci-execd-install-package-v1" },
-    "package_id": { "type": "string", "pattern": "^buzz-ci-execd-[0-9a-f]{12}-[0-9a-f]{12}$" },
-    "source_commit": { "$ref": "#/$defs/gitOid" },
-    "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
-    "default_state": {
-      "const": {
-        "enabled": false,
-        "active": false,
-        "provisioned": false,
-        "capacity": 0
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "title":"Buzz CI execd binary install package v1",
+  "type":"object",
+  "additionalProperties":false,
+  "required":["schema","package_id","source_commit","binary_provenance_sha256","default_state","runtime_contract","activation_owned_targets","activation_binding","seccomp_contract","install_receipt","package_uid","package_gid","directories","entries","package_digest"],
+  "properties":{
+    "schema":{"const":"buzz-ci-execd-install-package-v1"},
+    "package_id":{"pattern":"^buzz-ci-execd-[0-9a-f]{12}-[0-9a-f]{12}$","type":"string"},
+    "source_commit":{"$ref":"#/$defs/git_oid"},
+    "binary_provenance_sha256":{"$ref":"#/$defs/sha256"},
+    "default_state":{"const":{"active":false,"capacity":0,"enabled":false}},
+    "runtime_contract":{"const":{"binary":"/usr/libexec/buzz-ci-execd","gid":0,"mode":"0755","uid":0}},
+    "activation_owned_targets":{"const":["/usr/lib/systemd/system/buzz-ci-execd.service","/usr/lib/systemd/system/buzz-ci-execd.socket","/usr/lib/systemd/system/buzz-ci-executor.service","/usr/lib/systemd/system/buzz-ci-executor.socket","/usr/libexec/buzz-ci-capacity-one-fixture","/usr/libexec/buzz-ci-executor","/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json","/usr/share/buzzci/execd-v2/fixture/input.txt"]},
+    "activation_binding":{
+      "type":"object",
+      "additionalProperties":false,
+      "required":["activation_id","package_digest","manifest_sha256","source_commit","execd_binary_sha256","execd_provenance_sha256","preactivation_input_sha256","owned_entries_sha256","owned_target_sha256","receipt_path","receipt_schema"],
+      "properties":{
+        "activation_id":{"pattern":"^buzz-ci-capacity-one-[0-9a-f]{12}-[0-9a-f]{12}$","type":"string"},
+        "package_digest":{"$ref":"#/$defs/sha256"},
+        "manifest_sha256":{"$ref":"#/$defs/sha256"},
+        "source_commit":{"$ref":"#/$defs/git_oid"},
+        "execd_binary_sha256":{"$ref":"#/$defs/sha256"},
+        "execd_provenance_sha256":{"$ref":"#/$defs/sha256"},
+        "preactivation_input_sha256":{"$ref":"#/$defs/sha256"},
+        "owned_entries_sha256":{"$ref":"#/$defs/sha256"},
+        "owned_target_sha256":{
+          "type":"array",
+          "minItems":8,
+          "maxItems":8,
+          "items":{
+            "type":"object",
+            "additionalProperties":false,
+            "required":["target","sha256"],
+            "properties":{"target":{"type":"string"},"sha256":{"$ref":"#/$defs/sha256"}}
+          }
+        },
+        "receipt_path":{"const":"/var/lib/buzzci/activation-controller/receipt-v1.json"},
+        "receipt_schema":{"const":"buzz-ci-capacity-one-activation-receipt-v1"}
       }
     },
-    "daemon_contract": {
-      "const": {
-        "capacity": 0,
-        "descriptor_name": "buzz-ci-execd",
-        "peer_accounts": ["buzzci-ctl", "buzzci-runner"],
-        "service_user": "root",
-        "socket_mode": "0666",
-        "socket_path": "/run/buzzci/execd.sock"
-      }
+    "seccomp_contract":{"const":{"installed_mode":"0444","installed_path":"/var/lib/buzzci/seccomp/v1/sha256/2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4.json","packaged_bytes":false,"runtime_receipt":"/var/lib/buzzci/activation/receipts/seccomp.json","source_mode":"0644","source_path":"/usr/share/containers/seccomp.json","source_sha256":"2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"}},
+    "install_receipt":{"const":{"gid":0,"mode":"0600","path":"/var/lib/buzzci/execd-v2/package/receipt-v1.json","schema":"buzz-ci-execd-install-receipt-v1","uid":0}},
+    "package_uid":{"const":0},
+    "package_gid":{"const":0},
+    "directories":{"const":[{"gid":0,"mode":"0755","target":"/usr/libexec","uid":0}]},
+    "entries":{
+      "type":"array",
+      "minItems":1,
+      "maxItems":1,
+      "prefixItems":[{
+        "type":"object",
+        "additionalProperties":false,
+        "required":["role","source","target","source_mode","install_mode","uid","gid","sha256"],
+        "properties":{
+          "role":{"const":"binary"},
+          "source":{"const":"assets/buzz-ci-execd"},
+          "target":{"const":"/usr/libexec/buzz-ci-execd"},
+          "source_mode":{"const":"0500"},
+          "install_mode":{"const":"0755"},
+          "uid":{"const":0},
+          "gid":{"const":0},
+          "sha256":{"$ref":"#/$defs/sha256"}
+        }
+      }],
+      "items":false
     },
-    "package_uid": { "const": 0 },
-    "package_gid": { "const": 0 },
-    "directories": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 1,
-      "items": { "$ref": "#/$defs/directory" }
-    },
-    "entries": {
-      "type": "array",
-      "minItems": 5,
-      "maxItems": 5,
-      "items": { "$ref": "#/$defs/entry" }
-    },
-    "package_digest": { "$ref": "#/$defs/sha256" }
+    "package_digest":{"$ref":"#/$defs/sha256"}
   },
-  "$defs": {
-    "gitOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "mode": { "type": "string", "pattern": "^0[4567][0-7]{2}$" },
-    "directory": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["target", "mode", "uid", "gid"],
-      "properties": {
-        "target": { "const": "/usr/share/doc/buzz-ci-execd" },
-        "mode": { "const": "0755" },
-        "uid": { "const": 0 },
-        "gid": { "const": 0 }
-      }
-    },
-    "entry": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"],
-      "properties": {
-        "role": { "enum": ["binary", "service", "socket", "tmpfiles", "documentation"] },
-        "source": { "type": "string", "pattern": "^assets/[A-Za-z0-9._-]+$" },
-        "target": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
-        "source_mode": { "$ref": "#/$defs/mode" },
-        "install_mode": { "$ref": "#/$defs/mode" },
-        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-        "sha256": { "$ref": "#/$defs/sha256" }
-      }
-    }
+  "$defs":{
+    "sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},
+    "git_oid":{"pattern":"^[0-9a-f]{40}$","type":"string"}
   }
 }

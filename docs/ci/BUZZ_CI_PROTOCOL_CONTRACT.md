@@ -247,7 +247,7 @@ buzz ci status  --run <run-id>
 buzz ci logs    --run <run-id> --job <job-id> [--attempt <n>] [--raw]
 buzz ci rerun   --run <run-id> --job <job-id>
 buzz ci verdict --run <run-id> --expect-sha <full-oid>
-buzz ci watch   --run <run-id>
+buzz ci watch   --run <run-id> --timeout-seconds <fixed-bound>
 ```
 
 Success output is one JSON object on stdout, except `logs --raw` (raw scrubbed bytes) and `watch` (one JSON object per transition, then exit on run-terminal). Diagnostics and machine-readable error objects go to stderr; stdout is empty on failure except the explicitly typed infrastructure verdict below. Exit codes remain `0` success, `1` usage/validation/refusal, `2` network/relay, `3` auth, `4` infrastructure/other.

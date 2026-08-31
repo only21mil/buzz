@@ -12,5 +12,29 @@ publish = false
 name = "buzz_ci_keyholder"
 path = "src/lib.rs"
 
+[[bin]]
+name = "buzz-ci-keyholder"
+path = "src/main.rs"
+
+[dependencies]
+buzz-ci-acceptance-ctl = { path = "../buzz-ci-acceptance-ctl" }
+buzz-ci-broker-protocol = { workspace = true }
+buzz-core = { workspace = true }
+hex = { workspace = true }
+nostr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+rustix = { workspace = true, features = ["mm", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs", "process", "socket", "user"] }
+
 [dev-dependencies]
+buzz-ci-acceptance-ctl = { path = "../buzz-ci-acceptance-ctl", features = ["test-support"] }
 proptest.workspace = true
+tempfile = "3"

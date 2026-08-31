@@ -45,10 +45,11 @@ class RunnerInstallTests(unittest.TestCase):
             copied,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
+        shutil.copy2(SOURCE_ROOT / "deploy/native-ci/package_source.py", copied.parent / "package_source.py")
         subprocess.run(["git", "init", "-q", str(self.source_root)], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.name", "Runner test"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.email", "runner@test.invalid"], check=True)
-        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci/runner"], check=True)
+        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "commit", "-qm", "fixture"], check=True)
         self.source_commit = FREEZER.git_output(self.source_root, "rev-parse", "HEAD")
         self.binary = self.base / "buzz-ci-runner"
