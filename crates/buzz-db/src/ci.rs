@@ -467,6 +467,25 @@ async fn prepare_request(
             "CI rerun changed immutable run coordinates".into(),
         ));
     }
+    let finalized: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM ci_run_events
+            WHERE community_id=$1 AND run_id=$2 AND event_kind IN ($3,$4)
+        )
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(KIND_CI_EVIDENCE_FINALIZED as i32)
+    .bind(KIND_CI_TEARDOWN_ATTESTATION as i32)
+    .fetch_one(&mut **tx)
+    .await?;
+    if finalized {
+        return Err(DbError::Conflict(
+            "CI run is already bound to terminal evidence and cannot be rerun".into(),
+        ));
+    }
     let initial = load_initial_request_tx(tx, community_id, run_id).await?;
     let job_id = &request.job_ids[0];
     if !initial.job_ids.contains(job_id) {
@@ -613,21 +632,29 @@ async fn validate_evidence_finalized(
     run_id: Uuid,
     evidence: &CiEvidenceFinalizedEnvelope,
 ) -> Result<()> {
-    let (request_event_id, request) =
+    let (initial_request_event_id, initial_request) =
         load_initial_request_identity_tx(tx, community_id, run_id).await?;
-    if evidence.request_event_id != request_event_id
-        || evidence.run_id != request.run_id
-        || evidence.workflow_id != request.workflow_id
-        || evidence.target_repo_a != request.target_repo_a
-        || evidence.tip_oid != request.tip_oid
+    let (final_request_event_id, final_request) =
+        load_final_request_identity_tx(tx, community_id, run_id).await?;
+    if evidence.request_event_id != final_request_event_id
+        || evidence.run_id != final_request.run_id
+        || evidence.workflow_id != final_request.workflow_id
+        || evidence.target_repo_a != final_request.target_repo_a
+        || evidence.tip_oid != final_request.tip_oid
     {
         return Err(DbError::InvalidData(
-            "CI evidence provenance does not match the accepted run".into(),
+            "CI evidence provenance does not match the final accepted request".into(),
         ));
     }
 
-    let selected =
-        load_selected_terminal_jobs(tx, community_id, run_id, &request_event_id, &request).await?;
+    let selected = load_selected_terminal_jobs(
+        tx,
+        community_id,
+        run_id,
+        &initial_request_event_id,
+        &initial_request,
+    )
+    .await?;
     let max_attempt = selected
         .iter()
         .map(|status| status.attempt)
@@ -688,16 +715,24 @@ async fn validate_teardown_attestation(
     run_id: Uuid,
     teardown: &CiTeardownAttestationEnvelope,
 ) -> Result<()> {
-    let (request_event_id, request) =
+    let (initial_request_event_id, initial_request) =
         load_initial_request_identity_tx(tx, community_id, run_id).await?;
-    let selected =
-        load_selected_terminal_jobs(tx, community_id, run_id, &request_event_id, &request).await?;
+    let (final_request_event_id, final_request) =
+        load_final_request_identity_tx(tx, community_id, run_id).await?;
+    let selected = load_selected_terminal_jobs(
+        tx,
+        community_id,
+        run_id,
+        &initial_request_event_id,
+        &initial_request,
+    )
+    .await?;
     let selected_attempts = selected
         .into_iter()
         .map(|status| (status.job_id, status.attempt))
         .collect::<Vec<_>>();
     teardown
-        .validate_context(&request_event_id, &request, &selected_attempts)
+        .validate_context(&final_request_event_id, &final_request, &selected_attempts)
         .map_err(|error| DbError::InvalidData(format!("invalid CI teardown binding: {error}")))
 }
 
@@ -1108,6 +1143,36 @@ async fn load_initial_request_identity_tx(
     let content: String = row.try_get("content")?;
     let request = serde_json::from_str(&content)
         .map_err(|_| DbError::InvalidData("stored CI request content is invalid".into()))?;
+    Ok((request_event_id, request))
+}
+
+async fn load_final_request_identity_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+) -> Result<(String, CiRequestEnvelope)> {
+    let row = sqlx::query(
+        r#"
+        SELECT encode(index.event_id, 'hex') AS request_event_id,stored.content
+        FROM ci_run_events AS index
+        JOIN events AS stored
+          ON stored.community_id=index.community_id
+         AND stored.created_at=index.event_created_at
+         AND stored.id=index.event_id
+        WHERE index.community_id=$1 AND index.run_id=$2 AND index.event_kind=$3
+        ORDER BY index.watch_cursor DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(KIND_CI_REQUEST as i32)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| DbError::NotFound("CI final request".into()))?;
+    let request_event_id = row.try_get("request_event_id")?;
+    let request = serde_json::from_str(row.try_get("content")?)
+        .map_err(|_| DbError::InvalidData("stored CI final request content is invalid".into()))?;
     Ok((request_event_id, request))
 }
 

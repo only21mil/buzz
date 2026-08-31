@@ -69,9 +69,12 @@ pub async fn dispatch(cmd: CiCmd, client: &BuzzClient) -> Result<(), CliError> {
             let trusted = resolve_required_trusted_context()?;
             super::read_commands::cmd_verdict(client, &run, &expect_sha, &trusted).await
         }
-        CiCmd::Watch { run } => {
+        CiCmd::Watch {
+            run,
+            timeout_seconds,
+        } => {
             let trusted = resolve_required_trusted_context()?;
-            super::read_commands::cmd_watch(client, &run, &trusted).await
+            super::read_commands::cmd_watch(client, &run, timeout_seconds, &trusted).await
         }
     }
 }
