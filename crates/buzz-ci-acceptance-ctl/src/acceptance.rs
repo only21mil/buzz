@@ -59,6 +59,8 @@ pub struct EvidenceObject {
 #[serde(deny_unknown_fields)]
 pub struct FixtureSpec {
     pub integrated_candidate_sha: String,
+    pub activation_id: String,
+    pub activation_package_digest: String,
     pub run_id: String,
     pub request_digest: String,
     pub manifest_digest: String,
@@ -278,6 +280,9 @@ pub struct StageReceipt {
     pub stage: Stage,
     pub outcome: Outcome,
     pub evidence_sha256: String,
+    pub snapshot: SystemSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<ExportSnapshot>,
 }
 
 /// Stable failure detail without raw driver output.
@@ -630,6 +635,8 @@ where
             stage,
             outcome: Outcome::Fail,
             evidence_sha256,
+            snapshot: response.snapshot.clone(),
+            export: response.export.clone(),
         });
         return Err((
             stage,
@@ -643,6 +650,8 @@ where
                 stage,
                 outcome: Outcome::Pass,
                 evidence_sha256,
+                snapshot: response.snapshot.clone(),
+                export: response.export.clone(),
             });
             Ok(response.snapshot)
         }
@@ -652,6 +661,8 @@ where
                 stage,
                 outcome: Outcome::Fail,
                 evidence_sha256,
+                snapshot: response.snapshot.clone(),
+                export: response.export.clone(),
             });
             Err((stage, error))
         }
@@ -1396,6 +1407,19 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
         &[40, 64],
         "fixture.integrated_candidate_sha",
     )?;
+    validate_hex_field(
+        &fixture.activation_package_digest,
+        &[64],
+        "fixture.activation_package_digest",
+    )?;
+    let expected_activation_id = format!(
+        "buzz-ci-capacity-one-{}-{}",
+        &fixture.integrated_candidate_sha[..12],
+        &fixture.activation_package_digest[..12]
+    );
+    if fixture.activation_id != expected_activation_id {
+        return Err(ScenarioError::InvalidField("fixture.activation_id"));
+    }
     for (value, field, lengths) in [
         (&fixture.run_id, "fixture.run_id", &[32][..]),
         (&fixture.request_digest, "fixture.request_digest", &[64][..]),
@@ -1684,6 +1708,8 @@ mod tests {
             schema_version: SCENARIO_VERSION.to_owned(),
             fixture: FixtureSpec {
                 integrated_candidate_sha: hex('a', 40),
+                activation_id: format!("buzz-ci-capacity-one-{}-{}", hex('a', 12), hex('8', 12)),
+                activation_package_digest: hex('8', 64),
                 run_id: hex('b', 32),
                 request_digest: hex('c', 64),
                 manifest_digest: hex('d', 64),
@@ -2001,15 +2027,52 @@ mod tests {
     fn complete_capacity_one_sequence_passes_and_returns_to_zero() {
         let scenario = scenario();
         validate_scenario(&scenario).unwrap();
+        let responses = passing_responses(&scenario);
         let mut driver = ScriptedDriver {
-            responses: passing_responses(&scenario),
+            responses: responses.clone(),
             index: 0,
         };
         let receipt = run_acceptance(&scenario, &mut driver);
+        let stages = [
+            Stage::CapacityZeroClosed,
+            Stage::CapacityOneOpen,
+            Stage::ManifestIdentity,
+            Stage::ApprovalGrant,
+            Stage::GrantResume,
+            Stage::FirstAttemptTerminal,
+            Stage::AuthenticatedExport,
+            Stage::RerunSeparation,
+            Stage::CancellationTerminal,
+            Stage::TombstoneFolding,
+            Stage::ControllerRestartRecovery,
+            Stage::RunnerRestartRecovery,
+            Stage::ReturnCapacityZero,
+        ];
         assert_eq!(receipt.outcome, Outcome::Pass);
         assert_eq!(receipt.checks.len(), 13);
         assert!(receipt.failure.is_none());
         assert_eq!(driver.index, 13);
+        for (index, ((check, response), stage)) in receipt
+            .checks
+            .iter()
+            .zip(&responses)
+            .zip(stages)
+            .enumerate()
+        {
+            assert_eq!(check.sequence as usize, index + 1);
+            assert_eq!(check.stage, stage);
+            assert_eq!(check.outcome, Outcome::Pass);
+            assert_eq!(check.evidence_sha256, digest_json(response).unwrap());
+            assert_eq!(check.snapshot, response.snapshot);
+            assert_eq!(check.export, response.export);
+        }
+        assert_eq!(receipt.checks[0].snapshot.capacity, 0);
+        assert_eq!(receipt.checks[1].snapshot.capacity, 1);
+        assert_eq!(receipt.checks[12].snapshot.capacity, 0);
+        assert_eq!(
+            receipt.checks[12].snapshot.admission,
+            AdmissionState::Closed
+        );
     }
 
     #[test]

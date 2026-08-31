@@ -1,1 +1,11 @@
-d /run/buzzci 0711 root root -
+d /var/lib/buzzci 0711 root root - -
+d /var/lib/buzzci/seccomp 0711 root root - -
+d /var/lib/buzzci/activation 0700 root root - -
+d /var/lib/buzzci/activation/receipts 0700 root root - -
+d /var/lib/buzzci/execd-v2 0711 root root - -
+d /var/lib/buzzci/execd-v2/intents 0700 root root - -
+d /var/lib/buzzci/execd-v2/bindings 0700 root root - -
+d /var/lib/buzzci/execd-v2/evidence 0700 root root - -
+d /var/lib/buzzci/execd-v2/teardown 0700 root root - -
+d /var/lib/buzzci/execd-v2/attempts 0711 root root - -
+d /var/lib/buzzci/execd-v2/qualification 0700 root root - -
