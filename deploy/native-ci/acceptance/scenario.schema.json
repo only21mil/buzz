@@ -52,6 +52,8 @@
       "additionalProperties": false,
       "required": [
         "integrated_candidate_sha",
+        "activation_id",
+        "activation_package_digest",
         "run_id",
         "request_digest",
         "manifest_digest",
@@ -66,6 +68,11 @@
       ],
       "properties": {
         "integrated_candidate_sha": { "$ref": "#/$defs/gitOid" },
+        "activation_id": {
+          "type": "string",
+          "pattern": "^buzz-ci-capacity-one-[0-9a-f]{12}-[0-9a-f]{12}$"
+        },
+        "activation_package_digest": { "$ref": "#/$defs/hex64" },
         "run_id": { "$ref": "#/$defs/hex32" },
         "request_digest": { "$ref": "#/$defs/hex64" },
         "manifest_digest": { "$ref": "#/$defs/hex64" },
