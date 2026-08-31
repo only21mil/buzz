@@ -92,7 +92,9 @@ receipt is written.
 6. Run the deliberate-red candidate. The protected check must conclude
    failure, the merge must remain blocked, and a duplicate request must return
    the same single terminal run. Retain its canonical signed request, full
-   status history, finalization, teardown and decoded log evidence.
+   status, log, artifact and decoded-log history. A failed run must not publish
+   kind 46105 or 46106; those terminal facts are reserved for a terminal-good
+   selected job graph.
 7. After explicit deployment approval, record dump completion before swap,
    exact image/binary/revision/migration identities, readiness, NIP-11 and
    authenticated log results. Rehearse both rollback cases: a compatible
@@ -109,7 +111,15 @@ inputs and the same epoch produce identical bytes.
 Populate all three signed-event sections from the relay configuration used by
 the collection commands. The utility maps `ws` to `http` and `wss` to `https`,
 removes a trailing slash and default port, and refuses credentials, paths,
-queries, fragments or an origin that conflicts with retained evidence.
+queries, fragments or an origin that conflicts with retained evidence. It also
+removes the guide-only `_usage` and `_role` template annotations recursively;
+any other underscore-prefixed annotation is refused instead of silently
+discarded.
+
+Every `evidence_files` entry is an exact `{path, sha256}` descriptor. When the
+collector writes a private collection-manifest sidecar, include it as the
+optional `collection_manifest` descriptor so the readiness receipt binds its
+digest.
 
 ```bash
 : "${BUZZ_RELAY_URL:?set the trusted relay used to collect this evidence}"

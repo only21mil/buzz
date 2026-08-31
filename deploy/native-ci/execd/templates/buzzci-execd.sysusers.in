@@ -1,0 +1,5 @@
+g buzzci-execd @EXECD_ACCESS_GID@
+g buzzci-job @JOB_GID@
+u buzzci-job @JOB_UID@:buzzci-job "Buzz CI isolated job" /var/empty /usr/sbin/nologin
+m buzzci-runner buzzci-execd
+m buzzci-ctl buzzci-execd

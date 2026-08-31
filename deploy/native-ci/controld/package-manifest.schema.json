@@ -39,7 +39,8 @@
         "store_root": "/var/lib/buzzci/controld",
         "capacity": 0,
         "network": false,
-        "keyholder": false
+        "keyholder": false,
+        "acceptance_binding": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
       }
     },
     "package_uid": { "const": 0 },
@@ -63,8 +64,8 @@
     },
     "entries": {
       "type": "array",
-      "minItems": 5,
-      "maxItems": 5,
+      "minItems": 6,
+      "maxItems": 6,
       "items": { "$ref": "#/$defs/entry" }
     },
     "package_digest": { "$ref": "#/$defs/sha256" }
@@ -89,7 +90,7 @@
       "additionalProperties": false,
       "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"],
       "properties": {
-        "role": { "enum": ["binary", "config", "service", "tmpfiles", "documentation"] },
+        "role": { "enum": ["binary", "config", "service", "acceptance_socket", "tmpfiles", "documentation"] },
         "source": { "type": "string", "pattern": "^assets/[A-Za-z0-9._-]+$" },
         "target": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
         "source_mode": { "$ref": "#/$defs/mode" },

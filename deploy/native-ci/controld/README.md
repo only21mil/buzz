@@ -13,9 +13,12 @@ runner or broker, or grant execution capacity.
 The installed default remains:
 
 - `buzz-ci-controld.service` present but static, disabled, and inactive;
-- `controld-v1.json` contains only schema version 1, capacity exactly `0`, and
-  absolute store root `/var/lib/buzzci/controld`;
-- no relay URL, key descriptor, keyholder, runner, broker, socket, or polling
+- `controld-v1.json` contains only schema version 1, capacity exactly `0`, the
+  absolute store root `/var/lib/buzzci/controld`, and the fixed public
+  acceptance-binding receipt path;
+- `buzz-ci-controld-acceptance.socket` is packaged but remains static, disabled,
+  and inactive until the activation controller explicitly starts it;
+- no relay URL, key descriptor, keyholder, runner, broker, or polling
   configuration;
 - state reported as `enabled=false`, `active=false`, `provisioned=false`,
   `providers_wired=false`, and `capacity=0`.
@@ -78,8 +81,10 @@ deploy/native-ci/controld/freeze_package.py \
 
 The freezer binds the supplied binary digest and provenance, exact commit,
 every payload and destination, identity, mode, capacity-zero config, daemon
-contract, and default state. It refuses dirty package sources, links, broad
-modes, provenance mismatch, and pre-existing output.
+contract, and default state. It binds tracked sources to their Git executable
+class: Git `100644` may materialize as `0600` or `0644`, and Git `100755` as
+`0700` or `0755`; other or unsafe modes are refused. It also refuses dirty
+package sources, links, provenance mismatch, and pre-existing output.
 
 Before any install against `/`, the package root and assets directory must be
 root-owned mode `0700`. Manifest and provenance files must be root-owned mode

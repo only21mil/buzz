@@ -1,0 +1,14 @@
+[Unit]
+Description=Buzz CI root-only executor handoff
+
+[Socket]
+ListenStream=/run/buzzci/executor.sock
+FileDescriptorName=buzz-ci-executor
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0711
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
