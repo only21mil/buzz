@@ -1,6 +1,22 @@
 import type { VListHandle } from "virtua";
 
 /**
+ * A fresh timeline lets Virtua mount only its visible range and buffer. The
+ * first scroll settle populates the normal retention window around the reader.
+ */
+export function initialRetainedTimelineKeys(): ReadonlySet<string> {
+  return new Set();
+}
+
+export function retainedTimelineIndices(
+  keys: readonly string[],
+  retainedKeys: ReadonlySet<string>,
+): number[] {
+  if (retainedKeys.size === 0) return [];
+  return keys.flatMap((key, index) => (retainedKeys.has(key) ? [index] : []));
+}
+
+/**
  * Keep a wide ID-keyed neighborhood around the reader plus the visual tail.
  * The wider eviction band adds hysteresis, so small direction changes do not
  * churn mounted rows. Virtua continues to own measured sizes and spacer math.

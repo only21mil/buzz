@@ -4,6 +4,7 @@ import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import {
   syncAgentTurnsFromEvents,
   syncActiveAgentTurnsFromObserver,
+  syncActiveAgentTurnsFromObserverBatch,
   getActiveTurnsForAgent,
   getActiveTurnsByChannel,
   resetActiveAgentTurnsStore,
@@ -17,6 +18,8 @@ import {
   injectObserverEventsForE2E,
   getAgentObserverSnapshot,
   resetAgentObserverStore,
+  subscribeAgentObserverEventBatches,
+  subscribeAgentObserverStore,
 } from "./observerRelayStore.ts";
 import { formatElapsed } from "./ui/agentSessionUtils.ts";
 
@@ -1619,6 +1622,122 @@ describe("observer → active-turns bridge sync", () => {
       0,
       "derived liveness must clear when the raw feed shows turn_completed",
     );
+  });
+
+  it("processes only the accepted event for its agent and ignores duplicates", () => {
+    const agents = [
+      { pubkey: AGENT, status: "deployed" },
+      { pubkey: AGENT_2, status: "running" },
+    ];
+    injectObserverEventsForE2E(AGENT, [
+      makeEvent({ seq: 1, turnId: "turn-a", channelId: "chan-a" }),
+    ]);
+    injectObserverEventsForE2E(AGENT_2, [
+      makeEvent({ seq: 1, turnId: "turn-b", channelId: "chan-b" }),
+    ]);
+    syncActiveAgentTurnsFromObserver(agents);
+
+    let deliveredBatchCount = 0;
+    let processedEventCount = 0;
+    let observerNotificationCount = 0;
+    let activeTurnNotificationCount = 0;
+    const unsubscribeObserver = subscribeAgentObserverStore(() => {
+      observerNotificationCount += 1;
+    });
+    const unsubscribeActiveTurns = subscribeActiveAgentTurns(() => {
+      activeTurnNotificationCount += 1;
+    });
+    const unsubscribeDeltas = subscribeAgentObserverEventBatches((batch) => {
+      deliveredBatchCount += 1;
+      assert.equal(batch.length, 1);
+      assert.equal(batch[0]?.agentPubkey, AGENT);
+      processedEventCount += syncActiveAgentTurnsFromObserverBatch(
+        agents,
+        batch,
+      );
+    });
+
+    const completion = makeEvent({
+      seq: 2,
+      kind: "turn_completed",
+      turnId: "turn-a",
+      channelId: "chan-a",
+      timestamp: "2024-01-01T00:00:05Z",
+    });
+    try {
+      injectObserverEventsForE2E(AGENT, [completion]);
+
+      assert.equal(deliveredBatchCount, 1);
+      assert.equal(processedEventCount, 1);
+      assert.equal(observerNotificationCount, 1);
+      assert.equal(activeTurnNotificationCount, 1);
+      assert.equal(getActiveTurnsForAgent(AGENT).length, 0);
+      assert.ok(
+        channelIdsOf(getActiveTurnsForAgent(AGENT_2)).has("chan-b"),
+        "an event for agent A must not revisit or disturb agent B",
+      );
+
+      injectObserverEventsForE2E(AGENT, [completion]);
+
+      assert.equal(deliveredBatchCount, 1, "duplicates must publish no delta");
+      assert.equal(
+        processedEventCount,
+        1,
+        "duplicates must do no derived work",
+      );
+      assert.equal(
+        observerNotificationCount,
+        1,
+        "duplicates must not notify raw-store subscribers",
+      );
+      assert.equal(
+        activeTurnNotificationCount,
+        1,
+        "duplicates must not notify derived-store subscribers",
+      );
+    } finally {
+      unsubscribeDeltas();
+      unsubscribeActiveTurns();
+      unsubscribeObserver();
+    }
+  });
+
+  it("delivers accepted batches in observer order", () => {
+    const agents = [{ pubkey: AGENT, status: "deployed" }];
+    let deliveredSeqs = [];
+    let processedEventCount = 0;
+    const unsubscribeDeltas = subscribeAgentObserverEventBatches((batch) => {
+      deliveredSeqs = batch.map(({ event }) => event.seq);
+      processedEventCount += syncActiveAgentTurnsFromObserverBatch(
+        agents,
+        batch,
+      );
+    });
+
+    try {
+      injectObserverEventsForE2E(AGENT, [
+        makeEvent({
+          seq: 2,
+          kind: "turn_completed",
+          timestamp: "2024-01-01T00:00:05Z",
+        }),
+        makeEvent({
+          seq: 1,
+          kind: "turn_started",
+          timestamp: "2024-01-01T00:00:00Z",
+        }),
+      ]);
+
+      assert.deepEqual(deliveredSeqs, [1, 2]);
+      assert.equal(
+        processedEventCount,
+        2,
+        "a newer event must not make an earlier event in the same batch stale",
+      );
+      assert.equal(getActiveTurnsForAgent(AGENT).length, 0);
+    } finally {
+      unsubscribeDeltas();
+    }
   });
 
   it("skips agents that are neither running nor deployed", () => {

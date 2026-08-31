@@ -16,7 +16,7 @@ import {
   stripImetaMediaLines,
 } from "@/features/messages/lib/imetaMediaMarkdown";
 import { useAttachmentEditing } from "@/features/messages/lib/useAttachmentEditing";
-import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
+import type { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
 import {
   cancelBackgroundMediaUploads,
   saveQueuedAttachmentsForDraft,
@@ -58,7 +58,8 @@ import { useComposerContentState } from "./useComposerContentState";
 import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
 import { submitMessageEdit } from "./submitMessageEdit";
 import { useComposerLinkPreviews } from "./useComposerLinkPreviews";
-import type { MessageComposerProps } from "./MessageComposer.types";
+import * as ownership from "./MessageComposerMediaOwnership";
+
 function MessageComposerImpl({
   audienceContext = null,
   channelId = null,
@@ -84,13 +85,14 @@ function MessageComposerImpl({
   placeholder,
   profiles,
   replyTarget = null,
-  mediaController,
+  mediaController: media,
+  ownsMediaController,
   showBackgroundUploadProgress = true,
   showTopBorder = false,
   toolbarExtraActions,
   typingParentEventId = null,
   typingRootEventId = null,
-}: MessageComposerProps) {
+}: ownership.ImplProps) {
   const {
     contentRef,
     isContentEmpty,
@@ -148,8 +150,6 @@ function MessageComposerImpl({
     typingParentEventId,
     typingRootEventId,
   );
-  const internalMedia = useMediaUpload({ deferUploadsUntilSend: true });
-  const media = mediaController ?? internalMedia;
   const [isDeferredEditPending, setDeferredEditPending] = React.useState(false);
   const composerDisabled = disabled || isDeferredEditPending;
   const isEditSubmissionLocked =
@@ -159,7 +159,7 @@ function MessageComposerImpl({
     contentRef.current.trim().length === 0 &&
     media.pendingImetaRef.current.length === 0 &&
     media.queuedAttachmentsRef.current.length === 0;
-  const ownsDropZone = mediaController === undefined;
+  const ownsDropZone = ownsMediaController;
   const backgroundUpload = useBackgroundMediaUpload();
   // Restore/persist drafts at a key boundary; the hook handles StrictMode.
   useDraftPersistLifecycle({
@@ -1015,4 +1015,4 @@ function MessageComposerImpl({
   );
 }
 
-export const MessageComposer = React.memo(MessageComposerImpl);
+export const MessageComposer = ownership.withOwnedMedia(MessageComposerImpl);

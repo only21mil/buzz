@@ -3,7 +3,14 @@ import test from "node:test";
 
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { clearMarkdownNodeCache, renderCachedMarkdown } from "./nodeCache.ts";
+import {
+  clearMarkdownNodeCache,
+  getMarkdownNodeCacheSizeForTests,
+  getMarkdownNodeCacheWeightForTests,
+  getMarkdownNodeCacheWeightLimitForTests,
+  getMarkdownParseCount,
+  renderCachedMarkdown,
+} from "./nodeCache.ts";
 
 // The whole point of the cache is element-identity reuse across the message
 // timeline's per-channel-switch remount: same parse inputs must return the
@@ -101,17 +108,123 @@ test("crafted values cannot forge key-segment boundaries", () => {
   assert.notEqual(inMentions, inChannels);
 });
 
-test("oversized content bypasses the cache", () => {
+test("cache holds exactly 1000 entries and evicts the least recently used", () => {
   clearMarkdownNodeCache();
-  const huge = { ...BASE, content: "a".repeat(40_000) };
-  const first = renderCachedMarkdown(huge);
-  const second = renderCachedMarkdown(huge);
-  assert.notEqual(first, second);
+  const entries = Array.from({ length: 1000 }, (_, index) =>
+    renderCachedMarkdown({ ...BASE, content: `entry-${index}` }),
+  );
+  assert.equal(getMarkdownNodeCacheSizeForTests(), 1000);
+
+  // Refresh entry 0. Entry 1 is now the least recently used entry.
+  assert.equal(
+    renderCachedMarkdown({ ...BASE, content: "entry-0" }),
+    entries[0],
+  );
+
+  renderCachedMarkdown({ ...BASE, content: "entry-1000" });
+  assert.equal(getMarkdownNodeCacheSizeForTests(), 1000);
+  assert.equal(
+    renderCachedMarkdown({ ...BASE, content: "entry-0" }),
+    entries[0],
+    "a cache hit must refresh recency",
+  );
+  assert.notEqual(
+    renderCachedMarkdown({ ...BASE, content: "entry-1" }),
+    entries[1],
+    "the untouched least-recently-used entry must be evicted",
+  );
+  assert.equal(getMarkdownNodeCacheSizeForTests(), 1000);
 });
 
-test("active search queries bypass the cache", () => {
+test("cache evicts large parses by retained weight before the count ceiling", () => {
   clearMarkdownNodeCache();
-  const first = renderCachedMarkdown({ ...BASE, searchQuery: "bold" });
-  const second = renderCachedMarkdown({ ...BASE, searchQuery: "bold" });
-  assert.notEqual(first, second);
+  const entries = Array.from({ length: 40 }, (_, index) =>
+    renderCachedMarkdown({
+      ...BASE,
+      content: `${index}:`.padEnd(31_000, "x"),
+    }),
+  );
+
+  assert.ok(
+    getMarkdownNodeCacheSizeForTests() < entries.length,
+    "large entries must hit the weight ceiling before the 1000-entry ceiling",
+  );
+  assert.ok(
+    getMarkdownNodeCacheWeightForTests() <=
+      getMarkdownNodeCacheWeightLimitForTests(),
+    "retained weight must never exceed its configured budget",
+  );
+
+  const weightBeforeHit = getMarkdownNodeCacheWeightForTests();
+  assert.equal(
+    renderCachedMarkdown({
+      ...BASE,
+      content: "39:".padEnd(31_000, "x"),
+    }),
+    entries[39],
+    "the newest large entry must remain cached",
+  );
+  assert.equal(
+    getMarkdownNodeCacheWeightForTests(),
+    weightBeforeHit,
+    "refreshing LRU recency must not change retained-weight accounting",
+  );
+  assert.notEqual(
+    renderCachedMarkdown({
+      ...BASE,
+      content: "0:".padEnd(31_000, "x"),
+    }),
+    entries[0],
+    "the oldest large entry must be evicted by retained weight",
+  );
+  assert.ok(
+    getMarkdownNodeCacheWeightForTests() <=
+      getMarkdownNodeCacheWeightLimitForTests(),
+  );
+
+  clearMarkdownNodeCache();
+  assert.equal(getMarkdownNodeCacheSizeForTests(), 0);
+  assert.equal(
+    getMarkdownNodeCacheWeightForTests(),
+    0,
+    "clearing the cache must reset retained-weight accounting exactly",
+  );
+});
+
+test("oversized content and active searches parse fresh without entering the cache", () => {
+  clearMarkdownNodeCache();
+  const sentinel = renderCachedMarkdown({ ...BASE, content: "sentinel" });
+  const sizeBefore = getMarkdownNodeCacheSizeForTests();
+  const weightBefore = getMarkdownNodeCacheWeightForTests();
+  const parseCountBefore = getMarkdownParseCount();
+
+  const huge = { ...BASE, content: "a".repeat(40_000) };
+  const hugeFirst = renderCachedMarkdown(huge);
+  const hugeSecond = renderCachedMarkdown(huge);
+  assert.notEqual(hugeFirst, hugeSecond);
+
+  const searchFirst = renderCachedMarkdown({ ...BASE, searchQuery: "bold" });
+  const searchSecond = renderCachedMarkdown({ ...BASE, searchQuery: "bold" });
+  assert.notEqual(searchFirst, searchSecond);
+
+  assert.equal(
+    getMarkdownParseCount() - parseCountBefore,
+    4,
+    "every bypassed render must perform a fresh parse",
+  );
+  assert.equal(
+    getMarkdownNodeCacheSizeForTests(),
+    sizeBefore,
+    "non-cacheable parses must not consume cache capacity",
+  );
+  assert.equal(
+    getMarkdownNodeCacheWeightForTests(),
+    weightBefore,
+    "non-cacheable parses must not consume retained-weight capacity",
+  );
+  assert.equal(
+    renderCachedMarkdown({ ...BASE, content: "sentinel" }),
+    sentinel,
+    "non-cacheable parses must not evict an existing cache entry",
+  );
 });

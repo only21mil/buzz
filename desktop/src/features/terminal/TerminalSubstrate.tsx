@@ -41,6 +41,7 @@ type TerminalSubstrateProps = {
   channelName: string | null;
   frame?: TerminalFrame;
   sessionFrames?: readonly { sessionId: string; frame: TerminalFrame }[];
+  liveSessionIds?: readonly string[];
   sessions: readonly TerminalSessionTab[];
   bracketedPaste: boolean;
   focusReportingEnabled: boolean;
@@ -80,6 +81,7 @@ const SPLASH_DURATION_MS = 2_500;
 export function TerminalSubstrate({
   frame,
   sessionFrames,
+  liveSessionIds,
   sessions,
   bracketedPaste,
   focusReportingEnabled,
@@ -121,6 +123,10 @@ export function TerminalSubstrate({
   const scrollBySessionRef = React.useRef(new Map<string, number>());
   const activeSession = sessions.find((session) => session.active);
   const activeSessionId = activeSession?.id ?? null;
+  const retainedSessionIds = React.useMemo(
+    () => new Set(liveSessionIds ?? sessions.map((session) => session.id)),
+    [liveSessionIds, sessions],
+  );
   const frames = React.useMemo(
     () =>
       sessionFrames ??
@@ -441,7 +447,16 @@ export function TerminalSubstrate({
   // Effect Event, so the dependency analyzer cannot see those reads.
   // biome-ignore lint/correctness/useExhaustiveDependencies: visual-only inputs intentionally trigger this paint effect.
   React.useEffect(() => {
+    for (const sessionId of gridsRef.current.keys()) {
+      if (!retainedSessionIds.has(sessionId))
+        gridsRef.current.delete(sessionId);
+    }
+    for (const sessionId of scrollBySessionRef.current.keys()) {
+      if (!retainedSessionIds.has(sessionId))
+        scrollBySessionRef.current.delete(sessionId);
+    }
     for (const delivered of frames) {
+      if (!retainedSessionIds.has(delivered.sessionId)) continue;
       if (appliedFramesRef.current.has(delivered.frame)) continue;
       appliedFramesRef.current.add(delivered.frame);
       let grid = gridsRef.current.get(delivered.sessionId);
@@ -464,7 +479,13 @@ export function TerminalSubstrate({
     setSelectionRows(gridRef.current?.selectionRows() ?? []);
 
     paintTerminal();
-  }, [activeSessionId, cursorPainted, frames, terminalPalette]);
+  }, [
+    activeSessionId,
+    cursorPainted,
+    frames,
+    retainedSessionIds,
+    terminalPalette,
+  ]);
 
   const runTabAction = (action: () => void) => {
     action();

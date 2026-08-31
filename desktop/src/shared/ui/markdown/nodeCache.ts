@@ -32,20 +32,40 @@ import { buzzDeepLinkUrlTransform } from "./utils";
  * `getMarkdownComponents`) — the map itself is deliberately not part of the
  * cache key.
  *
- * Recency-ordered via Map insertion order; capacity comfortably covers two
- * window-ceiling channels' worth of rows.
+ * Recency-ordered via Map insertion order. The count ceiling comfortably
+ * covers two window-ceiling channels' worth of ordinary rows, while the
+ * weight ceiling prevents a smaller set of large parses from retaining an
+ * outsized share of a desktop renderer's heap.
  */
 const MARKDOWN_NODE_CACHE_LIMIT = 1000;
+/**
+ * Conservative deterministic retention budget. JavaScript strings commonly
+ * occupy two bytes per code unit; parsed markdown additionally retains a tree
+ * of elements, props, and text. We charge each entry its key bytes, sixteen
+ * bytes per source code unit for that tree, and 4 KiB of structural overhead.
+ * This caps near-32K messages at roughly 28 entries while still allowing the
+ * full 1000-entry ceiling for typical short chat messages.
+ */
+const MARKDOWN_NODE_CACHE_WEIGHT_LIMIT = 16 * 1024 * 1024;
+const MARKDOWN_NODE_CACHE_ENTRY_OVERHEAD = 4 * 1024;
+const MARKDOWN_NODE_CACHE_TREE_BYTES_PER_CODE_UNIT = 16;
 /** Oversized messages (large agent pastes) bypass the cache: they rarely
  * repeat enough to benefit, and each entry would retain the full content in
  * both the key and the element tree. Mirrors the searchQuery bypass. */
 const MARKDOWN_NODE_CACHE_MAX_CONTENT_LENGTH = 32_000;
-const markdownNodeCache = new Map<string, React.ReactElement>();
+type MarkdownNodeCacheEntry = {
+  element: React.ReactElement;
+  weight: number;
+};
+
+const markdownNodeCache = new Map<string, MarkdownNodeCacheEntry>();
+let markdownNodeCacheWeight = 0;
 
 /** Community switches swap relays; drop parses keyed against the old
  * community's mention/channel-name space (see `resetCommunityState`). */
 export function clearMarkdownNodeCache() {
   markdownNodeCache.clear();
+  markdownNodeCacheWeight = 0;
 }
 
 let markdownParseCount = 0;
@@ -55,6 +75,21 @@ let markdownParseCount = 0;
  * channel switches are pure cache hits (zero fresh parses). */
 export function getMarkdownParseCount(): number {
   return markdownParseCount;
+}
+
+/** Test-only observability for the cache's bounded-memory contract. */
+export function getMarkdownNodeCacheSizeForTests(): number {
+  return markdownNodeCache.size;
+}
+
+/** Test-only observability for exact weight-accounting assertions. */
+export function getMarkdownNodeCacheWeightForTests(): number {
+  return markdownNodeCacheWeight;
+}
+
+/** Test-only observability for the configured retention ceiling. */
+export function getMarkdownNodeCacheWeightLimitForTests(): number {
+  return MARKDOWN_NODE_CACHE_WEIGHT_LIMIT;
 }
 
 /** Inputs that fully determine the parsed element tree. `variant` identifies
@@ -109,6 +144,42 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
   });
 }
 
+function markdownNodeCacheEntryWeight(key: string, content: string): number {
+  return (
+    MARKDOWN_NODE_CACHE_ENTRY_OVERHEAD +
+    key.length * 2 +
+    content.length * MARKDOWN_NODE_CACHE_TREE_BYTES_PER_CODE_UNIT
+  );
+}
+
+function deleteMarkdownNodeCacheEntry(key: string): boolean {
+  const entry = markdownNodeCache.get(key);
+  if (!entry) return false;
+  markdownNodeCache.delete(key);
+  markdownNodeCacheWeight -= entry.weight;
+  return true;
+}
+
+function setMarkdownNodeCacheEntry(
+  key: string,
+  entry: MarkdownNodeCacheEntry,
+): void {
+  // Replacement is not expected on the normal miss path, but accounting it
+  // here keeps this primitive correct if insertion policy changes later.
+  deleteMarkdownNodeCacheEntry(key);
+  markdownNodeCache.set(key, entry);
+  markdownNodeCacheWeight += entry.weight;
+
+  while (
+    markdownNodeCache.size > MARKDOWN_NODE_CACHE_LIMIT ||
+    markdownNodeCacheWeight > MARKDOWN_NODE_CACHE_WEIGHT_LIMIT
+  ) {
+    const oldest = markdownNodeCache.keys().next().value;
+    if (oldest === undefined) break;
+    deleteMarkdownNodeCacheEntry(oldest);
+  }
+}
+
 /** Return the parsed element tree for the given inputs, reusing a cached
  * tree when an identical parse has been done before. See the module doc
  * comment for why this is safe. */
@@ -142,17 +213,18 @@ export function renderCachedMarkdown(
 
   const hit = markdownNodeCache.get(key);
   if (hit) {
-    markdownNodeCache.delete(key);
-    markdownNodeCache.set(key, hit);
-    return hit;
+    // Replacing the entry refreshes Map insertion order and exercises the
+    // same subtract-then-add accounting used by any future replacement.
+    setMarkdownNodeCacheEntry(key, hit);
+    return hit.element;
   }
   const element = buildMarkdownElement(input);
-  markdownNodeCache.set(key, element);
-  if (markdownNodeCache.size > MARKDOWN_NODE_CACHE_LIMIT) {
-    const oldest = markdownNodeCache.keys().next().value;
-    if (oldest !== undefined) {
-      markdownNodeCache.delete(oldest);
-    }
+  const weight = markdownNodeCacheEntryWeight(key, input.content);
+  // Pathological metadata can make the key itself exceed the whole budget
+  // even when content is short. Parse it once, but preserve existing entries
+  // instead of inserting an entry that would immediately evict everything.
+  if (weight <= MARKDOWN_NODE_CACHE_WEIGHT_LIMIT) {
+    setMarkdownNodeCacheEntry(key, { element, weight });
   }
   return element;
 }

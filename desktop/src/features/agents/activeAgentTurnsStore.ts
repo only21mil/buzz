@@ -1,7 +1,8 @@
 import * as React from "react";
 
 import {
-  subscribeAgentObserverStore,
+  type AgentObserverEventDelta,
+  subscribeAgentObserverEventBatches,
   getAgentObserverSnapshot,
   compareObserverEvents,
 } from "@/features/agents/observerRelayStore";
@@ -355,7 +356,12 @@ function pruneExpired() {
 // INVARIANT: events must be sorted by (timestamp, seq) ascending.
 // syncAgentTurnsFromEvents receives sorted arrays from observerRelayStore.
 // Calling with unsorted events will cause silent data loss.
-function processEvent(agentPubkey: string, event: ObserverEvent) {
+type ProcessEventResult = "ignored" | "processed" | "changed";
+
+function processEvent(
+  agentPubkey: string,
+  event: ObserverEvent,
+): ProcessEventResult {
   const key = normalizePubkey(agentPubkey);
 
   // Gate every event kind on its (agent, channel) watermark uniformly:
@@ -381,7 +387,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
   let agentWatermarks = lastProcessed.get(key);
   const last = agentWatermarks?.get(channelKey);
   if (last && compareObserverEvents(event, last) <= 0) {
-    return;
+    return "ignored";
   }
   if (!agentWatermarks) {
     agentWatermarks = new Map();
@@ -403,8 +409,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
           event.turnId ?? `seq-${event.seq}`,
           event.timestamp,
         );
-        notifyListeners();
-        return;
+        return "changed";
       }
       break;
     case "turn_completed":
@@ -416,8 +421,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
         event.channelId ?? null,
         Date.parse(event.timestamp),
       );
-      notifyListeners();
-      return;
+      return "changed";
     case "acp_read":
     case "acp_write":
     // turn_liveness keeps a quiet-but-alive turn from being pruned; same
@@ -428,16 +432,13 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
     case "turn_liveness": {
       const refreshed = recordActivity(agentPubkey, event.turnId ?? null);
       if (!refreshed && resurrectTurn(agentPubkey, event)) {
-        notifyListeners();
-        return;
+        return "changed";
       }
       break;
     }
   }
 
-  if (offsetChanged) {
-    notifyListeners();
-  }
+  return offsetChanged ? "changed" : "processed";
 }
 
 function ensurePruneInterval() {
@@ -563,8 +564,14 @@ export function syncAgentTurnsFromEvents(
   agentPubkey: string,
   events: ObserverEvent[],
 ) {
+  let changed = false;
   for (const event of events) {
-    processEvent(agentPubkey, event);
+    if (processEvent(agentPubkey, event) === "changed") {
+      changed = true;
+    }
+  }
+  if (changed) {
+    notifyListeners();
   }
 }
 
@@ -610,6 +617,49 @@ export function syncActiveAgentTurnsFromObserver(
   }
 }
 
+function activeAgentKeys(
+  agents: readonly { pubkey: string; status: string }[],
+): Set<string> {
+  return new Set(
+    agents
+      .filter(
+        (agent) => agent.status === "running" || agent.status === "deployed",
+      )
+      .map((agent) => normalizePubkey(agent.pubkey)),
+  );
+}
+
+function syncActiveAgentTurnsFromAcceptedBatch(
+  activeKeys: ReadonlySet<string>,
+  batch: readonly AgentObserverEventDelta[],
+): number {
+  let processedCount = 0;
+  let changed = false;
+  for (const { agentPubkey, event } of batch) {
+    if (!activeKeys.has(normalizePubkey(agentPubkey))) continue;
+    const result = processEvent(agentPubkey, event);
+    if (result === "ignored") continue;
+    processedCount += 1;
+    if (result === "changed") changed = true;
+  }
+  if (changed) {
+    notifyListeners();
+  }
+  return processedCount;
+}
+
+/**
+ * Apply one accepted observer batch without revisiting retained snapshots.
+ * The return value is the number of fresh active-agent events processed and is
+ * useful for deterministic regression coverage of the incremental path.
+ */
+export function syncActiveAgentTurnsFromObserverBatch(
+  agents: readonly { pubkey: string; status: string }[],
+  batch: readonly AgentObserverEventDelta[],
+): number {
+  return syncActiveAgentTurnsFromAcceptedBatch(activeAgentKeys(agents), batch);
+}
+
 /**
  * Bridge hook: processes observer events into the active-turns store.
  * Should be called by a parent component that has access to the observer events.
@@ -618,12 +668,14 @@ export function useActiveAgentTurnsBridge(
   agents: readonly { pubkey: string; status: string }[],
 ) {
   React.useEffect(() => {
-    function syncAll() {
-      syncActiveAgentTurnsFromObserver(agents);
-    }
-
-    syncAll();
-    return subscribeAgentObserverStore(syncAll);
+    // Hydrate once for events accepted before this bridge mounted. Subsequent
+    // deliveries carry only newly accepted events, so a frame for one agent no
+    // longer replays every retained buffer for every agent.
+    syncActiveAgentTurnsFromObserver(agents);
+    const activeKeys = activeAgentKeys(agents);
+    return subscribeAgentObserverEventBatches((batch) => {
+      syncActiveAgentTurnsFromAcceptedBatch(activeKeys, batch);
+    });
   }, [agents]);
 }
 

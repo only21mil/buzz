@@ -11,10 +11,7 @@ import {
   hasNestedThreadBranches,
   type MainTimelineEntry,
 } from "@/features/messages/lib/threadPanel";
-import {
-  hasSameMessageAuthor,
-  isWithinGroupingWindow,
-} from "@/features/messages/lib/messageGrouping";
+import { buildMessageThreadPanelRenderItems } from "@/features/messages/lib/messageThreadPanelRenderItems";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import { canManageMessageForCurrentUser } from "@/features/messages/lib/canManageMessage";
 import type { TimelineMessage } from "@/features/messages/types";
@@ -133,57 +130,6 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
 
 const EMPTY_THREAD_REPLIES: MainTimelineEntry[] = [];
 const THREAD_PANEL_SUMMARY_INDENT_OFFSET_REM = 0;
-
-function hasLaterVisibleSibling(
-  entries: readonly MainTimelineEntry[],
-  entryIndex: number,
-): boolean {
-  const depth = entries[entryIndex]?.message.depth;
-  if (depth == null) {
-    return false;
-  }
-
-  for (let index = entryIndex + 1; index < entries.length; index += 1) {
-    const nextDepth = entries[index].message.depth;
-    if (nextDepth <= depth) {
-      return nextDepth === depth;
-    }
-  }
-
-  return false;
-}
-
-function getActiveContinuationDepths({
-  ancestors,
-  entries,
-  index,
-  message,
-}: {
-  ancestors: readonly { index: number; message: TimelineMessage }[];
-  entries: readonly MainTimelineEntry[];
-  index: number;
-  message: TimelineMessage;
-}): number[] {
-  const depths: number[] = [];
-
-  for (const ancestor of ancestors) {
-    if (ancestor.message.depth === 0) {
-      continue;
-    }
-
-    const childDepth = ancestor.message.depth + 1;
-    const pathChild =
-      message.depth === childDepth
-        ? { index, message }
-        : ancestors.find((candidate) => candidate.message.depth === childDepth);
-
-    if (pathChild && hasLaterVisibleSibling(entries, pathChild.index)) {
-      depths.push(ancestor.message.depth);
-    }
-  }
-
-  return depths;
-}
 
 export function MessageThreadPanel({
   channel,
@@ -420,79 +366,15 @@ export function MessageThreadPanel({
     if (!threadHead) {
       return [];
     }
-
-    const ancestorStack: { index: number; message: TimelineMessage }[] = [
-      { index: -1, message: threadHead },
-    ];
-    let previousGroupMessage: TimelineMessage | null = threadHead;
-
-    return deferredThreadReplies.map((entry, index) => {
-      while (
-        ancestorStack.length > 0 &&
-        ancestorStack[ancestorStack.length - 1].message.depth >=
-          entry.message.depth
-      ) {
-        ancestorStack.pop();
-      }
-
-      const ancestors = [...ancestorStack];
-      const continuationDepths = getActiveContinuationDepths({
-        ancestors,
-        entries: deferredThreadReplies,
-        index,
-        message: entry.message,
-      });
-      const collapseDepthGuideAncestors = ancestors.filter((ancestor) =>
-        continuationDepths.includes(ancestor.message.depth),
-      );
-      const collapseDepthGuideActions: ThreadDepthGuideAction[] | undefined =
-        collapseDepthGuideAncestors.length > 0
-          ? collapseDepthGuideAncestors.map((ancestor) => ({
-              active:
-                hoveredCollapseBranchId === ancestor.message.id &&
-                entry.message.depth === ancestor.message.depth + 1,
-              depth: ancestor.message.depth,
-              label:
-                ancestor.message.id === threadHead.id
-                  ? "Collapse thread"
-                  : "Collapse replies",
-              message: ancestor.message,
-            }))
-          : undefined;
-      const nextEntry = deferredThreadReplies[index + 1];
-      const connectsToVisibleChild =
-        nextEntry != null && nextEntry.message.depth > entry.message.depth;
-      const startsUnreadSection =
-        index > 0 && entry.message.id === firstUnreadReplyId;
-      const isContinuation =
-        !isHuddleTranscript &&
-        !startsUnreadSection &&
-        entry.summary === null &&
-        hasSameMessageAuthor(previousGroupMessage, entry.message) &&
-        isWithinGroupingWindow(
-          previousGroupMessage?.createdAt,
-          entry.message.createdAt,
-        );
-
-      if (connectsToVisibleChild && !entry.summary) {
-        ancestorStack.push({ index, message: entry.message });
-      }
-
-      previousGroupMessage = entry.summary !== null ? null : entry.message;
-
-      return {
-        collapseDepthGuideActions,
-        connectsToVisibleChild,
-        continuationDepths,
-        entry,
-        index,
-        isContinuation,
-      };
+    return buildMessageThreadPanelRenderItems({
+      entries: deferredThreadReplies,
+      firstUnreadReplyId,
+      isHuddleTranscript,
+      threadHead,
     });
   }, [
     deferredThreadReplies,
     firstUnreadReplyId,
-    hoveredCollapseBranchId,
     isHuddleTranscript,
     threadHead,
   ]);
@@ -674,13 +556,29 @@ export function MessageThreadPanel({
               >
                 {threadReplyRenderItems.map((item) => {
                   const {
-                    collapseDepthGuideActions,
+                    collapseDepthGuideAncestors,
                     connectsToVisibleChild,
                     continuationDepths,
                     entry,
                     index,
                     isContinuation,
                   } = item;
+                  const collapseDepthGuideActions:
+                    | ThreadDepthGuideAction[]
+                    | undefined =
+                    collapseDepthGuideAncestors.length > 0
+                      ? collapseDepthGuideAncestors.map((ancestor) => ({
+                          active:
+                            hoveredCollapseBranchId === ancestor.id &&
+                            entry.message.depth === ancestor.depth + 1,
+                          depth: ancestor.depth,
+                          label:
+                            ancestor.id === threadHead.id
+                              ? "Collapse thread"
+                              : "Collapse replies",
+                          message: ancestor,
+                        }))
+                      : undefined;
                   const showUnreadDivider =
                     index > 0 && entry.message.id === firstUnreadReplyId;
                   const isHighlightedBranchOwner =
