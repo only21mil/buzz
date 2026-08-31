@@ -137,6 +137,7 @@ prior_binary_sha=
 rollback_tag=
 rollback_source=
 rollback_source_image_id=
+rollback_source_resolution=
 relay_platform=
 verification_container=
 verification_cleanup_target=
@@ -1041,11 +1042,18 @@ verify_image_platform_binding() {
 capture_rollback_reference() {
   rollback_source=${prior_platform_image_id}
   rollback_source_image_id=${prior_platform_image_id}
+  rollback_source_resolution=platform-image-id
   if [[ ${prior_image_id} != "${prior_platform_image_id}" ]]; then
     printf 'Prior container image index %s differs from runnable platform image %s; preserving the index as evidence and retaining the platform image\n' \
       "${prior_image_id}" "${prior_platform_image_id}"
   fi
-  docker image tag "${rollback_source}" "${rollback_tag}"
+  if ! docker image tag "${rollback_source}" "${rollback_tag}"; then
+    printf 'Platform image %s is not taggable in the image store; falling back to prior image reference %s\n' \
+      "${rollback_source}" "${prior_image_ref}"
+    rollback_source=${prior_image_ref}
+    rollback_source_resolution=prior-image-ref
+    docker image tag "${rollback_source}" "${rollback_tag}"
+  fi
   verify_image_platform_binding "${rollback_tag}"
 }
 
@@ -1630,6 +1638,7 @@ rollback_tag=${rollback_tag:0:127}
 capture_rollback_reference
 printf '%s\n' "${rollback_source}" >"${deploy_dir}/rollback-source.txt"
 printf '%s\n' "${rollback_source_image_id}" >"${deploy_dir}/rollback-source-image-id.txt"
+printf '%s\n' "${rollback_source_resolution}" >"${deploy_dir}/rollback-source-resolution.txt"
 printf '%s\n' "${rollback_tag}" >"${deploy_dir}/rollback-image-tag.txt"
 
 dump_file=${deploy_dir}/buzz-prod-before-${timestamp}.dump

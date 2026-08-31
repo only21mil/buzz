@@ -241,7 +241,7 @@ platform_id=${prior_id}
 new_id=sha256:2222222222222222222222222222222222222222222222222222222222222222
 mismatch_id=sha256:9999999999999999999999999999999999999999999999999999999999999999
 case "${TEST_SCENARIO}" in
-  prior_index_platform_survives|post_swap_failure_idxplat)
+  prior_index_platform_survives|post_swap_failure_idxplat|platform_digest_untaggable)
     prior_id=sha256:4444444444444444444444444444444444444444444444444444444444444444
     platform_id=sha256:5555555555555555555555555555555555555555555555555555555555555555
     ;;
@@ -286,7 +286,12 @@ case "${args}" in
     esac
     printf '%s\n' "${prior_id}"
     ;;
-  *" image tag "*) exit 0 ;;
+  *" image tag "*)
+    if [[ ${TEST_SCENARIO} == platform_digest_untaggable && ${3:-} == "${platform_id}" ]]; then
+      exit 1
+    fi
+    exit 0
+    ;;
   *"org.opencontainers.image.revision"*)
     target=${!#}
     if [[ ${TEST_SCENARIO} == prior_ref_revision_mismatch && ${target} != relay-old ]]; then
@@ -1048,7 +1053,25 @@ assert_contains "${index_evidence}" \
   '^sha256:4444444444444444444444444444444444444444444444444444444444444444$'
 assert_contains "${platform_evidence}" \
   '^sha256:5555555555555555555555555555555555555555555555555555555555555555$'
+index_resolution=$(rg --files "${scratch}/prior_index_platform_survives/logs" | \
+  grep '/rollback-source-resolution[.]txt$')
+assert_contains "${index_resolution}" '^platform-image-id$'
 assert_contains "${scratch}/prior_index_platform_survives/output" 'DEPLOY SUCCEEDED'
+
+run_case platform_digest_untaggable success
+assert_contains "${scratch}/platform_digest_untaggable/commands.log" \
+  'image tag sha256:5555555555555555555555555555555555555555555555555555555555555555 localhost/buzz-relay:rollback-'
+assert_contains "${scratch}/platform_digest_untaggable/commands.log" \
+  'image tag localhost/buzz-relay:old localhost/buzz-relay:rollback-'
+assert_contains "${scratch}/platform_digest_untaggable/output" \
+  'not taggable in the image store; falling back to prior image reference localhost/buzz-relay:old'
+untaggable_source=$(rg --files "${scratch}/platform_digest_untaggable/logs" | \
+  grep '/rollback-source[.]txt$')
+untaggable_resolution=$(rg --files "${scratch}/platform_digest_untaggable/logs" | \
+  grep '/rollback-source-resolution[.]txt$')
+assert_contains "${untaggable_source}" '^localhost/buzz-relay:old$'
+assert_contains "${untaggable_resolution}" '^prior-image-ref$'
+assert_contains "${scratch}/platform_digest_untaggable/output" 'DEPLOY SUCCEEDED'
 
 for bad_prior in prior_ref_platform_mismatch prior_ref_revision_mismatch prior_image_unavailable; do
   run_case "${bad_prior}" failure
