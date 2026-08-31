@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/capacity-one-acceptance-receipt-v1.json",
+  "title": "Buzz native CI capacity-one acceptance receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "outcome",
+    "scenario_sha256",
+    "integrated_candidate_sha",
+    "run_id",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "buzz-ci-capacity-one-acceptance-receipt/v1"
+    },
+    "outcome": { "enum": ["pass", "fail"] },
+    "scenario_sha256": { "$ref": "#/$defs/hex64" },
+    "integrated_candidate_sha": { "$ref": "#/$defs/gitOid" },
+    "run_id": { "$ref": "#/$defs/hex32" },
+    "checks": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 13,
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "failure": { "$ref": "#/$defs/failure" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "outcome": { "const": "pass" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": { "checks": { "minItems": 13, "maxItems": 13 } },
+        "not": { "required": ["failure"] }
+      },
+      "else": { "required": ["failure"] }
+    }
+  ],
+  "$defs": {
+    "hex32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "not": { "pattern": "^0+$" }
+    },
+    "hex64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": { "pattern": "^0+$" }
+    },
+    "gitOid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+      "not": { "pattern": "^0+$" }
+    },
+    "stage": {
+      "enum": [
+        "capacity_zero_closed",
+        "capacity_one_open",
+        "manifest_identity",
+        "approval_grant",
+        "grant_resume",
+        "first_attempt_terminal",
+        "authenticated_export",
+        "rerun_separation",
+        "cancellation_terminal",
+        "tombstone_folding",
+        "controller_restart_recovery",
+        "runner_restart_recovery",
+        "return_capacity_zero"
+      ]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "stage", "outcome", "evidence_sha256"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 13 },
+        "stage": { "$ref": "#/$defs/stage" },
+        "outcome": { "enum": ["pass", "fail"] },
+        "evidence_sha256": { "$ref": "#/$defs/hex64" }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "code", "message"],
+      "properties": {
+        "stage": { "$ref": "#/$defs/stage" },
+        "code": {
+          "enum": [
+            "driver_failure",
+            "driver_binding_mismatch",
+            "missing_evidence",
+            "ambiguous_evidence",
+            "identity_mismatch",
+            "invalid_transition",
+            "integrity_mismatch"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
