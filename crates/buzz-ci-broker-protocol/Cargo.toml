@@ -7,10 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+sha2 = { workspace = true }
+
 [lib]
 name = "buzz_ci_broker_protocol"
 path = "src/lib.rs"
 
 [dev-dependencies]
 proptest = { workspace = true }
-sha2 = { workspace = true }

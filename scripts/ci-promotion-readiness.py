@@ -472,6 +472,7 @@ def validate_named_receipt(
     now: int,
     max_age: int,
 ) -> tuple[str, dict[str, Any]]:
+    exact_fields(descriptor, {"path", "sha256"}, set(), label)
     path = Path(text(field(descriptor, "path", label), f"{label}.path"))
     expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
     secure_regular_file(path, label)
@@ -505,6 +506,7 @@ def validate_acceptance_verdict(
     descriptor: dict[str, Any], candidate: str
 ) -> tuple[str, dict[str, Any]]:
     label = "evidence_files.acceptance_verdict"
+    exact_fields(descriptor, {"path", "sha256"}, set(), label)
     path = Path(text(field(descriptor, "path", label), f"{label}.path"))
     expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
     secure_regular_file(path, label)
@@ -528,6 +530,7 @@ def validate_acceptance_records(
     descriptor: dict[str, Any], candidate: str
 ) -> str:
     label = "evidence_files.acceptance_records"
+    exact_fields(descriptor, {"path", "sha256"}, set(), label)
     path = Path(text(field(descriptor, "path", label), f"{label}.path"))
     expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
     secure_regular_file(path, label)
@@ -968,12 +971,18 @@ def validate_ci_event_evidence(
     expect(set(obj(field(section, "decoded_logs", path), f"{path}.decoded_logs")) == set(log_events),
            f"{path}.decoded_logs does not exactly match signed log events")
     expect(cursors == list(range(1, len(cursors) + 1)), f"{path}.events watch cursors are not gap-free")
-    expect(observed_kinds == CI_EVENT_KINDS,
-           f"{path}.events kind coverage must deduplicate to 46101 through 46106")
     expect(len(observed_signers) == 1, f"{path}.events must bind one relay signer")
     relay_signer = next(iter(observed_signers))
-    expect(finalized is not None and teardown is not None,
-           f"{path}.events must contain one kind 46105 and one kind 46106 fact")
+    if expected_run_state == "success":
+        expect(observed_kinds == CI_EVENT_KINDS,
+               f"{path}.events successful kind coverage must deduplicate to 46101 through 46106")
+        expect(finalized is not None and teardown is not None,
+               f"{path}.events must contain one kind 46105 and one kind 46106 fact")
+    else:
+        expect(observed_kinds == CI_EVENT_KINDS - {46105, 46106},
+               f"{path}.events deliberate-red kind coverage must deduplicate to 46101 through 46104")
+        expect(finalized is None and teardown is None,
+               f"{path}.events deliberate-red history must not contain terminal evidence facts")
 
     selected_attempts: dict[str, int] = {}
     job_attempt_ranges: dict[str, list[int]] = {}
@@ -1103,6 +1112,34 @@ def validate_ci_event_evidence(
         expect(any(content["state"] == "failure" for content in final_job_states.values()),
                f"{path} deliberate-red evidence has no failed final job")
 
+    validated_result = {
+        "request_event_id": request_order[-1],
+        "initial_request_event_id": initial_request_id,
+        "request_event_ids": request_order,
+        "rerun_request_event_ids": request_order[1:],
+        "run_id": run_id,
+        "actor": actor,
+        "relay_signer": relay_signer,
+        "target_repo_a": target_repo_a,
+        "workflow_id": workflow_id,
+        "workflow_digest": workflow_digest,
+        "job_ids": selected_jobs,
+        "selected_job_attempts": selected_attempts,
+        "tip_oid": tip_oid,
+        "base_oid": base_oid,
+        "attempts": sorted({requests[request_id]["attempt"] for request_id in request_order}),
+        "job_attempts": {
+            job: job_attempt_ranges[job] for job in sorted(job_attempt_ranges)
+        },
+        "terminal_events": 1,
+        "log_digests": sorted(
+            sha256(json.loads(event["content"])["log_sha256"], f"{path}.log_digest")
+            for event in raw_events if event["kind"] == 46103
+        ),
+    }
+    if expected_run_state == "failure":
+        return validated_result
+
     finalized_cursor, finalized_content = finalized
     expect(finalized_content["request_event_id"] == request_order[-1],
            f"{path} kind 46105 is not bound to the final signed request")
@@ -1139,9 +1176,18 @@ def validate_ci_event_evidence(
                    f"{entry_path}.artifact_refs was not stored before finalization")
             used_artifacts.add(ref)
     expect(finalized_graph == selected_attempts, f"{path} kind 46105 selected job-attempt graph mismatch")
-    expect(used_logs == set(log_events), f"{path} kind 46105 does not bind every log event exactly once")
-    expect(used_artifacts == set(artifact_events),
-           f"{path} kind 46105 does not bind every artifact event exactly once")
+    selected_logs = {
+        event_id_value for event_id_value, (job, attempt, _) in log_events.items()
+        if selected_attempts.get(job) == attempt
+    }
+    selected_artifacts = {
+        event_id_value for event_id_value, (job, attempt, _) in artifact_events.items()
+        if selected_attempts.get(job) == attempt
+    }
+    expect(used_logs == selected_logs,
+           f"{path} kind 46105 does not bind every selected log event exactly once")
+    expect(used_artifacts == selected_artifacts,
+           f"{path} kind 46105 does not bind every selected artifact event exactly once")
 
     teardown_cursor, teardown_content = teardown
     expect(teardown_content["request_event_id"] == request_order[-1],
@@ -1173,31 +1219,7 @@ def validate_ci_event_evidence(
     teardown_at = integer(teardown_content["teardown_at"], f"{path}.kind46106.teardown_at")
     expect(finished_at >= finalized_at and finished_at >= teardown_at,
            f"{path} terminal run timestamp precedes evidence or teardown")
-    return {
-        "request_event_id": request_event_id,
-        "initial_request_event_id": initial_request_id,
-        "request_event_ids": request_order,
-        "rerun_request_event_ids": request_order[1:],
-        "run_id": run_id,
-        "actor": actor,
-        "relay_signer": relay_signer,
-        "target_repo_a": target_repo_a,
-        "workflow_id": workflow_id,
-        "workflow_digest": workflow_digest,
-        "job_ids": selected_jobs,
-        "selected_job_attempts": selected_attempts,
-        "tip_oid": tip_oid,
-        "base_oid": base_oid,
-        "attempts": sorted({requests[request_id]["attempt"] for request_id in request_order}),
-        "job_attempts": {
-            job: job_attempt_ranges[job] for job in sorted(job_attempt_ranges)
-        },
-        "terminal_events": 1,
-        "log_digests": sorted(
-            sha256(json.loads(event["content"])["log_sha256"], f"{path}.log_digest")
-            for event in raw_events if event["kind"] == 46103
-        ),
-    }
+    return validated_result
 
 
 def validate_staging(section: dict[str, Any], candidate: str, base: str) -> dict[str, Any]:
@@ -1436,6 +1458,12 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
     candidate, base, tree = validate_source(bundle, candidate_dir)
 
     evidence_files = obj(field(bundle, "evidence_files", "evidence"), "evidence.evidence_files")
+    exact_fields(
+        evidence_files,
+        {"pre_freeze", "protected_ci", "acceptance_verdict", "acceptance_records"},
+        {"collection_manifest"},
+        "evidence.evidence_files",
+    )
     pre_digest, _ = validate_named_receipt(
         obj(field(evidence_files, "pre_freeze", "evidence.evidence_files"), "evidence_files.pre_freeze"),
         "evidence_files.pre_freeze", "pre-freeze", candidate, base, now, max_age,
@@ -1452,6 +1480,27 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
         obj(field(evidence_files, "acceptance_records", "evidence.evidence_files"),
             "evidence_files.acceptance_records"), candidate,
     )
+    collection_manifest_digest = None
+    if "collection_manifest" in evidence_files:
+        descriptor = obj(
+            evidence_files["collection_manifest"], "evidence_files.collection_manifest"
+        )
+        exact_fields(
+            descriptor,
+            {"path", "sha256"},
+            set(),
+            "evidence_files.collection_manifest",
+        )
+        manifest_path = Path(text(
+            descriptor["path"], "evidence_files.collection_manifest.path"
+        ))
+        secure_regular_file(manifest_path, "evidence_files.collection_manifest")
+        collection_manifest_digest = file_sha256(manifest_path)
+        expect(
+            collection_manifest_digest
+            == sha256(descriptor["sha256"], "evidence_files.collection_manifest.sha256"),
+            "collection manifest digest does not match retained sidecar",
+        )
     contexts = validate_protected_ci(obj(field(bundle, "protected_ci", "evidence"), "protected_ci"), candidate)
     tier2 = validate_tier2(obj(field(bundle, "tier2", "evidence"), "tier2"), candidate, now)
     artifacts = validate_artifacts(obj(field(bundle, "artifacts", "evidence"), "artifacts"), candidate)
@@ -1513,6 +1562,10 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
             "protected_ci_sha256": ci_digest,
             "acceptance_verdict_sha256": acceptance_digest,
             "acceptance_records_sha256": acceptance_records_digest,
+            **(
+                {"collection_manifest_sha256": collection_manifest_digest}
+                if collection_manifest_digest is not None else {}
+            ),
             "dump_sha256": deploy_rollback["dump_sha256"],
         },
     }

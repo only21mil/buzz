@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 CONTROLD_DIR = Path(__file__).resolve().parents[1]
+NATIVE_CI_DIR = CONTROLD_DIR.parent
 
 
 def load_module(name: str, path: Path):
@@ -40,10 +41,11 @@ class ControldInstallTests(unittest.TestCase):
         copied = self.source_root / "deploy/native-ci/controld"
         copied.parent.mkdir(mode=0o700, parents=True)
         shutil.copytree(CONTROLD_DIR, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy2(NATIVE_CI_DIR / "package_source.py", copied.parent / "package_source.py")
         subprocess.run(["git", "init", "-q", str(self.source_root)], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.name", "Controld test"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.email", "controld@test.invalid"], check=True)
-        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci/controld"], check=True)
+        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "commit", "-qm", "fixture"], check=True)
         self.source_commit = FREEZER.git_output(self.source_root, "rev-parse", "HEAD")
         self.binary = self.base / "buzz-ci-controld"
@@ -89,13 +91,18 @@ class ControldInstallTests(unittest.TestCase):
     def test_renderer_is_canonical_capacity_zero_absolute_and_nofollow(self) -> None:
         output = self.base / "controld-v1.json"
         RENDERER.render(output)
-        self.assertEqual(output.read_bytes(), b'{"capacity":0,"schema_version":1,"store_root":"/var/lib/buzzci/controld"}\n')
+        self.assertEqual(
+            output.read_bytes(),
+            b'{"acceptance_binding":"/var/lib/buzzci/activation-controller/controld-acceptance-v1.json","capacity":0,"schema_version":1,"store_root":"/var/lib/buzzci/controld"}\n',
+        )
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
         RENDERER.check(output, expected_uid=self.controld_uid)
         with self.assertRaisesRegex(ValueError, "capacity exactly zero"):
             RENDERER.config_bytes(capacity=1)
         with self.assertRaisesRegex(ValueError, "absolute normalized"):
             RENDERER.config_bytes("relative/store")
+        with self.assertRaisesRegex(ValueError, "fixed receipt path"):
+            RENDERER.config_bytes(acceptance_binding="/var/lib/buzzci/other.json")
         linked = self.base / "linked.json"
         linked.symlink_to(output)
         with self.assertRaises(OSError):
@@ -111,7 +118,11 @@ class ControldInstallTests(unittest.TestCase):
         self.assertEqual({entry.role for entry in entries}, set(INSTALLER.EXPECTED_TARGETS))
         binary = next(entry for entry in entries if entry.role == "binary")
         self.assertEqual(binary.sha256, hashlib.sha256(self.binary.read_bytes()).hexdigest())
-        self.assertNotIn("socket", {entry.role for entry in entries})
+        socket = next(entry for entry in entries if entry.role == "acceptance_socket")
+        self.assertEqual(
+            socket.target,
+            "/etc/systemd/system/buzz-ci-controld-acceptance.socket",
+        )
 
     def test_package_refuses_symlink_and_provenance_drift(self) -> None:
         self.freeze()
@@ -209,12 +220,19 @@ class ControldInstallTests(unittest.TestCase):
 
     def test_templates_are_static_networkless_and_keyless(self) -> None:
         service = (CONTROLD_DIR / "templates/buzz-ci-controld.service").read_text()
+        acceptance_socket = (
+            CONTROLD_DIR / "templates/buzz-ci-controld-acceptance.socket"
+        ).read_text()
         tmpfiles = (CONTROLD_DIR / "templates/buzzci-controld.tmpfiles").read_text()
         self.assertNotIn("[Install]", service)
         self.assertIn("PrivateNetwork=yes", service)
         self.assertIn("RestrictAddressFamilies=AF_UNIX", service)
         self.assertIn("Restart=no", service)
         self.assertNotIn("ListenStream", service)
+        self.assertIn("ListenStream=/run/buzzci/controld-acceptance.sock", acceptance_socket)
+        self.assertIn("DirectoryMode=0711", acceptance_socket)
+        self.assertIn("Service=buzz-ci-controld.service", acceptance_socket)
+        self.assertNotIn("[Install]", acceptance_socket)
         for token in ("keyholder", "relay", "runner", "execd", "systemctl"):
             self.assertNotIn(token, (service + tmpfiles).lower())
         self.assertEqual(
@@ -229,6 +247,10 @@ class ControldInstallTests(unittest.TestCase):
         config_schema = json.loads((CONTROLD_DIR / "controld-config.schema.json").read_text())
         self.assertEqual(config_schema["properties"]["capacity"]["const"], 0)
         self.assertEqual(config_schema["properties"]["store_root"]["const"], "/var/lib/buzzci/controld")
+        self.assertEqual(
+            config_schema["properties"]["acceptance_binding"]["const"],
+            RENDERER.ACCEPTANCE_BINDING,
+        )
 
 
 if __name__ == "__main__":

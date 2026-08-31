@@ -1,0 +1,8 @@
+[Unit]
+Description=Buzz CI capacity-one activation
+Requires=buzz-ci-controld-acceptance.socket buzz-ci-acceptance-control.socket buzz-ci-acceptance-control.service buzz-ci-keyholder.socket buzz-ci-executor.socket buzz-ci-execd.socket buzz-ci-runner.socket buzz-ci-controld.service
+After=network-online.target buzz-ci-controld-acceptance.socket buzz-ci-acceptance-control.socket buzz-ci-acceptance-control.service buzz-ci-keyholder.socket buzz-ci-executor.socket buzz-ci-execd.socket buzz-ci-runner.socket
+Wants=network-online.target
+
+[Install]
+WantedBy=multi-user.target

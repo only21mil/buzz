@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/keyholder-config-v1.json",
+  "title": "Buzz CI static keyholder config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "peer", "selectors", "nip98_origin", "acceptance"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "peer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uid", "gid", "allowed_operations"],
+      "properties": {
+        "uid": { "$ref": "#/$defs/nonzeroU32" },
+        "gid": { "$ref": "#/$defs/nonzeroU32" },
+        "allowed_operations": {
+          "const": [
+            "describe",
+            "sign_ci_event",
+            "nip98_authorize",
+            "sign_manifest",
+            "describe_acceptance",
+            "sign_acceptance_mutation"
+          ]
+        }
+      }
+    },
+    "selectors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ci_event", "nip98", "manifest"],
+      "properties": {
+        "ci_event": { "$ref": "#/$defs/identity" },
+        "nip98": { "$ref": "#/$defs/identity" },
+        "manifest": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "nip98_origin": { "type": "string", "pattern": "^https://[^/?#]+$", "maxLength": 2048 },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding_receipt_path", "credential_selector"],
+      "properties": {
+        "binding_receipt_path": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json" },
+        "credential_selector": { "const": "acceptance-actor.key" }
+      }
+    }
+  },
+  "$defs": {
+    "nonzeroU32": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 },
+    "lowerHex64": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_key", "generation"],
+      "properties": {
+        "public_key": { "$ref": "#/$defs/lowerHex64" },
+        "generation": { "$ref": "#/$defs/generation" }
+      }
+    }
+  }
+}

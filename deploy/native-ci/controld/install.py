@@ -39,11 +39,13 @@ DAEMON_CONTRACT = {
     "capacity": 0,
     "network": False,
     "keyholder": False,
+    "acceptance_binding": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
 }
 EXPECTED_TARGETS = {
     "binary": "/usr/libexec/buzz-ci-controld",
     "config": "/etc/buzzci/controld-v1.json",
     "service": "/etc/systemd/system/buzz-ci-controld.service",
+    "acceptance_socket": "/etc/systemd/system/buzz-ci-controld-acceptance.socket",
     "tmpfiles": "/usr/lib/tmpfiles.d/buzzci-controld.conf",
     "documentation": "/usr/share/doc/buzz-ci-controld/README.md",
 }
@@ -263,9 +265,15 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
 def validate_assets(package: Path, entries: list[Entry]) -> None:
     payloads = {entry.role: read_fd(package / entry.source)[0] for entry in entries}
     config = json.loads(payloads["config"], object_pairs_hook=reject_duplicates)
-    if config != {"capacity": 0, "schema_version": 1, "store_root": "/var/lib/buzzci/controld"}:
+    if config != {
+        "acceptance_binding": DAEMON_CONTRACT["acceptance_binding"],
+        "capacity": 0,
+        "schema_version": 1,
+        "store_root": "/var/lib/buzzci/controld",
+    }:
         raise ValueError("controld config is not canonical and capacity-zero")
     service = payloads["service"].decode()
+    acceptance_socket = payloads["acceptance_socket"].decode()
     tmpfiles = payloads["tmpfiles"].decode()
     required_service = {
         "ExecStart=/usr/libexec/buzz-ci-controld /etc/buzzci/controld-v1.json",
@@ -280,6 +288,24 @@ def validate_assets(package: Path, entries: list[Entry]) -> None:
     service_lines = service.splitlines()
     if not all(line in service_lines for line in required_service) or "[Install]" in service_lines:
         raise ValueError("controld service dormant contract mismatch")
+    expected_socket = [
+        "[Unit]",
+        "Description=Buzz CI controld acceptance control socket",
+        "",
+        "[Socket]",
+        "ListenStream=/run/buzzci/controld-acceptance.sock",
+        "FileDescriptorName=buzz-ci-controld-acceptance",
+        "SocketUser=root",
+        "SocketGroup=buzzci-ctl",
+        "SocketMode=0620",
+        "DirectoryMode=0711",
+        "RemoveOnStop=yes",
+        "Accept=no",
+        "Service=buzz-ci-controld.service",
+    ]
+    socket_lines = acceptance_socket.splitlines()
+    if socket_lines != expected_socket:
+        raise ValueError("controld acceptance socket contract mismatch")
     forbidden = ("keyholder", "relay", "runner", "execd", "ListenStream", "Socket")
     if any(token.lower() in (service + tmpfiles).lower() for token in forbidden):
         raise ValueError("controld package crosses a forbidden subsystem boundary")

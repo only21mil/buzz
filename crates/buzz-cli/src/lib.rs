@@ -2244,7 +2244,16 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
         ])
         .is_ok());
-        assert!(Cli::try_parse_from(["buzz", "ci", "watch", "--run", "run-id"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "ci",
+            "watch",
+            "--run",
+            "run-id",
+            "--timeout-seconds",
+            "600",
+        ])
+        .is_ok());
     }
 
     #[test]
