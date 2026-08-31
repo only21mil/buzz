@@ -603,9 +603,10 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         raise RenderError("capacity-one scenario cross-binding differs")
     required = {
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
-        "request_digest", "manifest_digest", "source_oid", "approval_id", "grant_digest",
-        "approved_by", "export_subject", "export_authorization_digest", "expected_log",
-        "expected_artifacts",
+        "job_id", "request_digest", "manifest_digest", "source_oid", "approval_id",
+        "grant_event_id", "grant_digest", "approved_by", "export_subject",
+        "export_authorization_digest", "controller_generation", "runner_generation",
+        "expected_log", "expected_artifacts",
     }
     require_keys(fixture, required, "capacity-one fixture")
     try:

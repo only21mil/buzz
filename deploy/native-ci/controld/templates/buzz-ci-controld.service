@@ -1,5 +1,5 @@
 [Unit]
-Description=Buzz CI capacity-zero control daemon
+Description=Buzz CI capacity-one control daemon
 Documentation=file:/usr/share/doc/buzz-ci-controld/README.md
 Requires=systemd-tmpfiles-setup.service
 After=local-fs.target systemd-tmpfiles-setup.service
@@ -12,15 +12,16 @@ UMask=0077
 ExecStart=/usr/libexec/buzz-ci-controld /etc/buzzci/controld-v1.json
 NoNewPrivileges=yes
 PrivateDevices=yes
-PrivateNetwork=yes
+PrivateNetwork=no
 PrivateTmp=yes
 ProtectControlGroups=yes
 ProtectHome=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
-ReadOnlyPaths=/etc/buzzci/controld-v1.json
+ReadOnlyPaths=/etc/buzzci/controld-v1.json -/var/lib/buzzci/activation-controller/controld-acceptance-v1.json -/run/buzzci/runner-control.sock -/run/buzzci/keyholder.sock
 ReadWritePaths=/var/lib/buzzci/controld
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=yes
-Restart=no
+Restart=on-failure
+RestartSec=5s

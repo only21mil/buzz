@@ -11,5 +11,5 @@
   "tombstone_folding",
   "controller_restart_recovery",
   "runner_restart_recovery",
-  "return_capacity_zero"
+  "prepare_capacity_zero"
 ]

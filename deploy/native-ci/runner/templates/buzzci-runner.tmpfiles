@@ -1,4 +1,2 @@
 d /run/buzzci 0711 root root -
 d /var/lib/buzzci/runner 0700 buzzci-runner buzzci-runner -
-d /var/lib/buzzci/runner/evidence 0700 buzzci-runner buzzci-runner -
-d /var/lib/buzzci/runner/journal 0700 buzzci-runner buzzci-runner -
