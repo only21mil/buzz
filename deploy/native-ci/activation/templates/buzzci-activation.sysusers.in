@@ -1,0 +1,13 @@
+g buzzci-runner @RUNNER_GID@
+u buzzci-runner @RUNNER_UID@:@RUNNER_GID@ "Buzz CI runner" /var/lib/buzzci/runner /usr/sbin/nologin
+g buzzci-execd @EXECD_ACCESS_GID@
+g buzzci-controld @CONTROLD_GID@
+u buzzci-controld @CONTROLD_UID@:@CONTROLD_GID@ "Buzz CI controller" /var/lib/buzzci/controld /usr/sbin/nologin
+g buzzci-keyholder @KEYHOLDER_GID@
+u buzzci-keyholder @KEYHOLDER_UID@:@KEYHOLDER_GID@ "Buzz CI keyholder" /var/lib/buzzci/keyholder /usr/sbin/nologin
+g buzzci-ctl @QUALIFICATION_GID@
+u buzzci-ctl @QUALIFICATION_UID@:@QUALIFICATION_GID@ "Buzz CI qualification controller" /var/lib/buzzci/ctl /usr/sbin/nologin
+g buzzci-job @JOB_GID@
+u buzzci-job @JOB_UID@:buzzci-job "Buzz CI isolated job" /var/empty /usr/sbin/nologin
+m buzzci-runner buzzci-execd
+m buzzci-ctl buzzci-execd

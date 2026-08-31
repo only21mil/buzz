@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/clean-host-e2e-vm-contract-v2.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"],
+  "properties": {
+    "schema_version": {"const": "buzz-ci-clean-host-e2e-vm-contract/v2"},
+    "state": {"type": "string", "minLength": 1},
+    "candidate_root": {"type": "string", "minLength": 1},
+    "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"pattern": "^0+$"}},
+    "scenario": {"$ref": "#/$defs/file"},
+    "seccomp_source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"const": "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"}
+      }
+    },
+    "packages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder", "execd", "activation"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/tree"},
+        "controld": {"$ref": "#/$defs/tree"},
+        "keyholder": {"$ref": "#/$defs/tree"},
+        "execd": {"$ref": "#/$defs/tree"},
+        "activation": {"$ref": "#/$defs/tree"}
+      }
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha"}}
+    },
+    "tree": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "tree_sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "tree_sha256": {"$ref": "#/$defs/sha"}}
+    },
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$", "not": {"pattern": "^0+$"}}
+  }
+}
