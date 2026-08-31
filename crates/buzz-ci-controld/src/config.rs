@@ -11,6 +11,8 @@ use thiserror::Error;
 const CONFIG_MODE: u32 = 0o600;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const SCHEMA_VERSION: u32 = 1;
+pub(crate) const ACCEPTANCE_BINDING: &str =
+    "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json";
 
 /// Validated local-only service configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -19,6 +21,7 @@ pub(crate) struct DaemonConfig {
     schema_version: u32,
     capacity: u32,
     store_root: PathBuf,
+    acceptance_binding: PathBuf,
 }
 
 impl DaemonConfig {
@@ -74,6 +77,10 @@ impl DaemonConfig {
             return Err(ConfigError::InvalidSchema);
         }
         validate_absolute_path(&self.store_root)?;
+        validate_absolute_path(&self.acceptance_binding)?;
+        if self.acceptance_binding != Path::new(ACCEPTANCE_BINDING) {
+            return Err(ConfigError::InvalidAcceptanceBinding);
+        }
         if self.capacity != 0 {
             return Err(ConfigError::ProvidersUnavailable);
         }
@@ -109,6 +116,8 @@ pub(crate) enum ConfigError {
     InvalidSchema,
     #[error("capacity above zero requires production provider and keyholder wiring")]
     ProvidersUnavailable,
+    #[error("controld acceptance binding path is unsupported")]
+    InvalidAcceptanceBinding,
 }
 
 fn validate_absolute_path(path: &Path) -> Result<(), ConfigError> {
@@ -159,8 +168,9 @@ mod tests {
     fn loads_exact_capacity_zero_configuration() {
         let store = tempfile::tempdir().expect("store directory");
         let json = format!(
-            r#"{{"schema_version":1,"capacity":0,"store_root":"{}"}}"#,
-            store.path().display()
+            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","acceptance_binding":"{}"}}"#,
+            store.path().display(),
+            ACCEPTANCE_BINDING
         );
         let (_root, path, owner_uid) = fixture(&json);
 
@@ -174,8 +184,9 @@ mod tests {
     fn rejects_capacity_one_until_providers_are_wired() {
         let store = tempfile::tempdir().expect("store directory");
         let json = format!(
-            r#"{{"schema_version":1,"capacity":1,"store_root":"{}"}}"#,
-            store.path().display()
+            r#"{{"schema_version":1,"capacity":1,"store_root":"{}","acceptance_binding":"{}"}}"#,
+            store.path().display(),
+            ACCEPTANCE_BINDING
         );
         let (_root, path, owner_uid) = fixture(&json);
 
@@ -186,11 +197,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_noncanonical_acceptance_binding() {
+        let store = tempfile::tempdir().expect("store directory");
+        let json = format!(
+            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","acceptance_binding":"/var/lib/buzzci/other.json"}}"#,
+            store.path().display()
+        );
+        let (_root, path, owner_uid) = fixture(&json);
+
+        assert_eq!(
+            DaemonConfig::load(&path, owner_uid),
+            Err(ConfigError::InvalidAcceptanceBinding)
+        );
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_insecure_mode() {
         let store = tempfile::tempdir().expect("store directory");
         let json = format!(
-            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","relay_url":"https://example.invalid"}}"#,
-            store.path().display()
+            r#"{{"schema_version":1,"capacity":0,"store_root":"{}","acceptance_binding":"{}","relay_url":"https://example.invalid"}}"#,
+            store.path().display(),
+            ACCEPTANCE_BINDING
         );
         let (_root, path, owner_uid) = fixture(&json);
         assert_eq!(

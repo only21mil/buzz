@@ -12,6 +12,7 @@ import tempfile
 
 CAPACITY = 0
 STORE_ROOT = "/var/lib/buzzci/controld"
+ACCEPTANCE_BINDING = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
 MAX_CONFIG_BYTES = 16 * 1024
 
 
@@ -25,11 +26,23 @@ def validate_store_root(store_root: str) -> None:
         raise ValueError("controld store root must be an absolute normalized path")
 
 
-def config_bytes(store_root: str = STORE_ROOT, capacity: int = CAPACITY) -> bytes:
+def config_bytes(
+    store_root: str = STORE_ROOT,
+    capacity: int = CAPACITY,
+    acceptance_binding: str = ACCEPTANCE_BINDING,
+) -> bytes:
     validate_store_root(store_root)
+    validate_store_root(acceptance_binding)
+    if acceptance_binding != ACCEPTANCE_BINDING:
+        raise ValueError("controld acceptance binding must use the fixed receipt path")
     if isinstance(capacity, bool) or capacity != CAPACITY:
         raise ValueError("controld package supports capacity exactly zero")
-    value = {"schema_version": 1, "capacity": capacity, "store_root": store_root}
+    value = {
+        "schema_version": 1,
+        "capacity": capacity,
+        "store_root": store_root,
+        "acceptance_binding": acceptance_binding,
+    }
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 

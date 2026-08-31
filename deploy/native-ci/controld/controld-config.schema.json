@@ -4,10 +4,11 @@
   "title": "Buzz CI capacity-zero controld configuration v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "capacity", "store_root"],
+  "required": ["schema_version", "capacity", "store_root", "acceptance_binding"],
   "properties": {
     "schema_version": { "const": 1 },
     "capacity": { "const": 0 },
-    "store_root": { "const": "/var/lib/buzzci/controld" }
+    "store_root": { "const": "/var/lib/buzzci/controld" },
+    "acceptance_binding": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json" }
   }
 }

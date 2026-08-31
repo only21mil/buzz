@@ -4,6 +4,10 @@
 //! claims bound into the request, never proof that a signer authenticated.
 
 pub mod acceptance;
+pub mod acceptance_binding;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod acceptance_binding_test_support;
 
 use std::{
     fmt,

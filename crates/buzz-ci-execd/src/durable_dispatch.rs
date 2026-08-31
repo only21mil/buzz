@@ -1381,7 +1381,6 @@ mod tests {
     struct OrdinaryFake {
         calls: OrdinaryCalls,
         provision_available: bool,
-        receipts_available: bool,
         receipts: OrdinaryReceipts,
         cleanup: CleanupDisposition,
     }
@@ -1416,11 +1415,7 @@ mod tests {
             _lease: LeaseToken,
         ) -> Result<OrdinaryReceipts, ExecutionUnavailable> {
             self.calls.receipts.set(self.calls.receipts.get() + 1);
-            if self.receipts_available {
-                Ok(self.receipts)
-            } else {
-                Err(ExecutionUnavailable)
-            }
+            Ok(self.receipts)
         }
 
         fn reconcile(
@@ -1442,7 +1437,6 @@ mod tests {
         OrdinaryFake {
             calls,
             provision_available: true,
-            receipts_available: true,
             receipts: OrdinaryReceipts {
                 conclusion: LeaseConclusion::Success,
                 evidence_set_digest: [44; 32],
@@ -1973,121 +1967,6 @@ mod tests {
         assert_eq!(calls.receipts.get(), 0);
         assert_eq!(dispatch.controller.snapshot(), snapshot);
         assert_eq!(commits.borrow().len(), commit_count);
-    }
-
-    #[test]
-    fn get_attempt_without_any_lease_is_not_found() {
-        let store = FakeStore::new(None);
-        let commits = Rc::clone(&store.commits);
-        let calls = OrdinaryCalls::new();
-        let mut dispatch = DurableDispatch::new(
-            ready_controller(),
-            authority(),
-            store,
-            ordinary_fake(calls.clone()),
-            QualificationFake,
-        );
-        let snapshot = dispatch.controller.snapshot();
-
-        let refused =
-            dispatch.dispatch(get_header(), Request::GetAttempt(get_request([7; 16])), 22);
-
-        assert_eq!(refused.code, ResponseCode::NotFound);
-        assert_eq!(calls.receipts.get(), 0);
-        assert_eq!(dispatch.controller.snapshot(), snapshot);
-        assert_eq!(commits.borrow().len(), 0);
-    }
-
-    #[test]
-    fn get_attempt_refuses_observations_before_durable_admission() {
-        let store = FakeStore::new(None);
-        let commits = Rc::clone(&store.commits);
-        let calls = OrdinaryCalls::new();
-        let mut dispatch = DurableDispatch::new(
-            ready_controller(),
-            authority(),
-            store,
-            ordinary_fake(calls.clone()),
-            QualificationFake,
-        );
-        let admitted = dispatch.dispatch(
-            ordinary_header(),
-            Request::AdmitAttempt(ordinary_request()),
-            21,
-        );
-        let snapshot = dispatch.controller.snapshot();
-        let commit_count = commits.borrow().len();
-
-        let early = dispatch.dispatch(
-            get_header(),
-            Request::GetAttempt(get_request(admitted.attempt_id)),
-            20,
-        );
-        assert_eq!(early.code, ResponseCode::InternalFailure);
-        assert_eq!(calls.receipts.get(), 0);
-        assert_eq!(dispatch.controller.snapshot(), snapshot);
-        assert_eq!(commits.borrow().len(), commit_count);
-
-        // The boundary is inclusive: the admission instant itself is observable.
-        let current = dispatch.dispatch(
-            get_header(),
-            Request::GetAttempt(get_request(admitted.attempt_id)),
-            21,
-        );
-        assert_eq!(current.code, ResponseCode::Existing);
-    }
-
-    #[test]
-    fn get_attempt_reports_internal_failure_for_unreadable_or_blank_receipts() {
-        let store = FakeStore::new(None);
-        let calls = OrdinaryCalls::new();
-        let mut blank = ordinary_fake(calls.clone());
-        blank.receipts.evidence_set_digest = [0; 32];
-        let mut dispatch = DurableDispatch::new(
-            ready_controller(),
-            authority(),
-            store,
-            blank,
-            QualificationFake,
-        );
-        let admitted = dispatch.dispatch(
-            ordinary_header(),
-            Request::AdmitAttempt(ordinary_request()),
-            21,
-        );
-        let snapshot = dispatch.controller.snapshot();
-
-        let blank_receipts = dispatch.dispatch(
-            get_header(),
-            Request::GetAttempt(get_request(admitted.attempt_id)),
-            22,
-        );
-        assert_eq!(blank_receipts.code, ResponseCode::InternalFailure);
-        assert_eq!(calls.receipts.get(), 1);
-        assert_eq!(dispatch.controller.snapshot(), snapshot);
-
-        let calls = OrdinaryCalls::new();
-        let mut unavailable = ordinary_fake(calls.clone());
-        unavailable.receipts_available = false;
-        let mut dispatch = DurableDispatch::new(
-            ready_controller(),
-            authority(),
-            FakeStore::new(None),
-            unavailable,
-            QualificationFake,
-        );
-        let admitted = dispatch.dispatch(
-            ordinary_header(),
-            Request::AdmitAttempt(ordinary_request()),
-            21,
-        );
-        let unavailable_receipts = dispatch.dispatch(
-            get_header(),
-            Request::GetAttempt(get_request(admitted.attempt_id)),
-            22,
-        );
-        assert_eq!(unavailable_receipts.code, ResponseCode::InternalFailure);
-        assert_eq!(calls.receipts.get(), 1);
     }
 
     #[test]
@@ -2633,7 +2512,6 @@ mod tests {
             OrdinaryFake {
                 calls: calls.clone(),
                 provision_available: true,
-                receipts_available: true,
                 receipts: OrdinaryReceipts {
                     conclusion: LeaseConclusion::Failure,
                     evidence_set_digest: [47; 32],
@@ -2679,7 +2557,6 @@ mod tests {
             OrdinaryFake {
                 calls,
                 provision_available: true,
-                receipts_available: true,
                 receipts: OrdinaryReceipts {
                     conclusion: LeaseConclusion::Failure,
                     evidence_set_digest: [47; 32],

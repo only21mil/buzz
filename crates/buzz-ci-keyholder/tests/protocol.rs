@@ -1,10 +1,11 @@
 use buzz_ci_keyholder::{
-    decode_request, decode_response, encode_request, encode_response, CanonicalPayload,
-    DecodeError, DescribeRequest, DescribeResponse, EncodeError, ErrorCode, ErrorResponse,
-    FrameHeader, HttpMethod, KeyholderClient, KeyholderServer, ManifestKind, Nip98AuthorizeRequest,
-    Operation, OperationSet, PeerIdentity, PeerPolicy, PublicIdentity, Request, Response,
-    SignCiEventRequest, SignManifestRequest, SignatureResponse, Url, HEADER_SIZE, MAX_BODY_SIZE,
-    MAX_CANONICAL_PAYLOAD_SIZE, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    decode_request, decode_response, encode_request, encode_response, AcceptanceMutation,
+    CanonicalPayload, DecodeError, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
+    DescribeRequest, DescribeResponse, EncodeError, ErrorCode, ErrorResponse, FrameHeader,
+    HttpMethod, KeyholderClient, KeyholderServer, ManifestKind, Nip98AuthorizeRequest, Operation,
+    OperationSet, PeerIdentity, PeerPolicy, PublicIdentity, Request, Response,
+    SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest, SignatureResponse, Url,
+    HEADER_SIZE, MAX_BODY_SIZE, MAX_CANONICAL_PAYLOAD_SIZE, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use proptest::prelude::*;
 
@@ -34,6 +35,7 @@ fn signature(byte: u8, generation: u64) -> SignatureResponse {
 fn requests() -> Vec<Request> {
     vec![
         Request::Describe(DescribeRequest),
+        Request::DescribeAcceptance(DescribeAcceptanceRequest),
         Request::SignCiEvent(SignCiEventRequest {
             expected_generation: 7,
             event_kind: 46_100,
@@ -51,6 +53,11 @@ fn requests() -> Vec<Request> {
             expected_generation: 9,
             manifest_kind: ManifestKind::JobIntentV2,
             canonical_manifest: payload(4),
+        }),
+        Request::SignAcceptanceMutation(SignAcceptanceMutationRequest {
+            expected_generation: 10,
+            scenario_sha256: [5; 32],
+            mutation: AcceptanceMutation::Run,
         }),
     ]
 }
@@ -95,9 +102,15 @@ fn every_request_has_one_canonical_round_trip() {
 fn successful_and_error_responses_round_trip_and_bind_the_request() {
     let responses = [
         Response::Describe(describe_response()),
+        Response::DescribeAcceptance(DescribeAcceptanceResponse {
+            actor: identity(4, 10),
+            scenario_sha256: [5; 32],
+            event_ids: [[6; 32], [7; 32], [8; 32], [9; 32]],
+        }),
         Response::SignCiEvent(signature(4, 7)),
         Response::Nip98Authorize(signature(7, 8)),
         Response::SignManifest(signature(10, 9)),
+        Response::SignAcceptanceMutation(signature(13, 10)),
     ];
     for response in responses {
         let header = FrameHeader {
@@ -271,7 +284,7 @@ fn peer_policy_requires_exact_credentials_and_closed_operation_bits() {
         },
         Operation::SignCiEvent
     ));
-    assert!(OperationSet::from_bits(0b1_0000).is_none());
+    assert!(OperationSet::from_bits(0b100_0000).is_none());
 }
 
 #[test]
