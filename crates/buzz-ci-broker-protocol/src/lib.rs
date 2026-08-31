@@ -39,6 +39,9 @@ pub enum Operation {
     GetAttempt = 4,
     AdmitQualification = 5,
     CompleteAttempt = 6,
+    DescribeAttemptEvidence = 7,
+    ReadAttemptEvidence = 8,
+    RegisterJobIntent = 9,
 }
 
 impl Operation {
@@ -54,6 +57,15 @@ impl Operation {
         }
     }
 
+    pub(crate) fn from_u16_v2(value: u16) -> Result<Self, DecodeError> {
+        match value {
+            7 => Ok(Self::DescribeAttemptEvidence),
+            8 => Ok(Self::ReadAttemptEvidence),
+            9 => Ok(Self::RegisterJobIntent),
+            _ => Self::from_u16(value),
+        }
+    }
+
     const fn body_size(self) -> usize {
         match self {
             Self::Hello => HELLO_BODY_SIZE,
@@ -62,6 +74,9 @@ impl Operation {
             Self::GetAttempt => GET_ATTEMPT_BODY_SIZE,
             Self::AdmitQualification => ADMIT_QUALIFICATION_BODY_SIZE,
             Self::CompleteAttempt => COMPLETE_ATTEMPT_BODY_SIZE,
+            Self::DescribeAttemptEvidence | Self::ReadAttemptEvidence | Self::RegisterJobIntent => {
+                0
+            }
         }
     }
 }
@@ -557,6 +572,9 @@ pub fn decode_request(frame: &[u8]) -> Result<(FrameHeader, Request), DecodeErro
         }
         Operation::AdmitQualification => Request::AdmitQualification(decode_qualification(body)?),
         Operation::CompleteAttempt => Request::CompleteAttempt(decode_complete(body)?),
+        Operation::DescribeAttemptEvidence
+        | Operation::ReadAttemptEvidence
+        | Operation::RegisterJobIntent => return Err(DecodeError::UnknownOperation),
     };
     Ok((header, request))
 }

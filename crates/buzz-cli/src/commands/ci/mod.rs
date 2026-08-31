@@ -76,5 +76,8 @@ pub enum CiCmd {
         /// CI run ID
         #[arg(long)]
         run: String,
+        /// Hard deadline for the complete watch, in seconds
+        #[arg(long)]
+        timeout_seconds: u64,
     },
 }

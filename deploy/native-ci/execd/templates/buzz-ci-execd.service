@@ -1,11 +1,40 @@
 [Unit]
 Description=Buzz CI privileged execution broker
-Documentation=file:/usr/share/doc/buzz-ci-execd/README.md
-Requires=buzz-ci-execd.socket systemd-tmpfiles-setup.service
-After=local-fs.target buzz-ci-execd.socket systemd-tmpfiles-setup.service
+Requires=buzz-ci-execd.socket buzz-ci-executor.socket
+After=buzz-ci-executor.socket
 
 [Service]
-Type=exec
-UMask=0077
+Type=simple
 ExecStart=/usr/libexec/buzz-ci-execd --socket-activation
-Restart=no
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ReadOnlyPaths=/etc/buzzci/execd-v2.json /usr/libexec/buzz-ci-executor /usr/libexec/buzz-ci-capacity-one-fixture /usr/share/buzzci/execd-v2/fixture /usr/share/containers/seccomp.json
+ReadWritePaths=/var/lib/buzzci/execd-v2 /var/lib/buzzci/seccomp /var/lib/buzzci/activation/receipts
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=buzz-ci-capacity-one.target

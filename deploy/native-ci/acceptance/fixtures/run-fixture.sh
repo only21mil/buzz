@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 if [ "$#" -ne 1 ]; then
   printf '%s\n' 'usage: run-fixture.sh ARTIFACT_DIRECTORY' >&2

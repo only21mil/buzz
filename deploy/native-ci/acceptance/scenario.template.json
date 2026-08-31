@@ -2,6 +2,8 @@
   "schema_version": "buzz-ci-capacity-one-scenario/v1",
   "fixture": {
     "integrated_candidate_sha": "edf07d62cfdfa65a8352d04503e08ca21c7371db",
+    "activation_id": "buzz-ci-capacity-one-edf07d62cfdf-888888888888",
+    "activation_package_digest": "8888888888888888888888888888888888888888888888888888888888888888",
     "run_id": "11111111111111111111111111111111",
     "request_digest": "2222222222222222222222222222222222222222222222222222222222222222",
     "manifest_digest": "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23",
