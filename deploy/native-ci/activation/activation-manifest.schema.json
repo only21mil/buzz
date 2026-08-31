@@ -1,0 +1,505 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/capacity-one-activation-v1.json",
+  "title": "Buzz CI capacity-one activation package v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "activation_id",
+    "source_commit",
+    "default_state",
+    "identities",
+    "access_group",
+    "acceptance_template",
+    "components",
+    "entries",
+    "systemd",
+    "effective_systemd",
+    "socket_policy",
+    "qualification",
+    "package_uid",
+    "package_gid",
+    "package_digest"
+  ],
+  "properties": {
+    "schema": { "const": "buzz-ci-capacity-one-activation-package-v1" },
+    "activation_id": {
+      "type": "string",
+      "pattern": "^buzz-ci-capacity-one-[0-9a-f]{12}-[0-9a-f]{12}$"
+    },
+    "source_commit": { "$ref": "#/$defs/gitOid" },
+    "default_state": {
+      "const": {
+        "capacity": 0,
+        "enabled": false,
+        "active": false,
+        "provisioned": false
+      }
+    },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder", "qualification", "job"],
+      "properties": {
+        "runner": { "$ref": "#/$defs/runnerIdentity" },
+        "controld": { "$ref": "#/$defs/controldIdentity" },
+        "keyholder": { "$ref": "#/$defs/keyholderIdentity" },
+        "qualification": { "$ref": "#/$defs/qualificationIdentity" },
+        "job": { "$ref": "#/$defs/jobIdentity" }
+      }
+    },
+    "access_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group", "gid", "members"],
+      "properties": {
+        "group": { "const": "buzzci-execd" },
+        "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "members": { "const": ["buzzci-ctl", "buzzci-runner"] }
+      }
+    },
+    "acceptance_template": { "$ref": "#/$defs/acceptanceTemplate" },
+    "components": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": { "$ref": "#/$defs/component" }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 29,
+      "maxItems": 29,
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "systemd": {
+      "const": {
+        "start_order": [
+          "buzz-ci-controld-acceptance.socket",
+          "buzz-ci-acceptance-control.socket",
+          "buzz-ci-acceptance-control.service",
+          "buzz-ci-keyholder.socket",
+          "buzz-ci-executor.socket",
+          "buzz-ci-execd.socket",
+          "buzz-ci-runner.socket",
+          "buzz-ci-controld.service"
+        ],
+        "stop_order": [
+          "buzz-ci-controld-acceptance.socket",
+          "buzz-ci-controld.service",
+          "buzz-ci-acceptance-control.socket",
+          "buzz-ci-acceptance-control.service",
+          "buzz-ci-runner.service",
+          "buzz-ci-runner.socket",
+          "buzz-ci-execd.service",
+          "buzz-ci-execd.socket",
+          "buzz-ci-executor.service",
+          "buzz-ci-executor.socket",
+          "buzz-ci-keyholder.service",
+          "buzz-ci-keyholder.socket"
+        ],
+        "persistent_unit": "buzz-ci-capacity-one.target",
+        "stage_capacity": 0,
+        "active_capacity": 1
+      }
+    },
+    "effective_systemd": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": { "$ref": "#/$defs/effectiveUnit" }
+    },
+    "socket_policy": {
+      "const": {
+        "acceptance_control": {
+          "unit": "buzz-ci-acceptance-control.socket",
+          "path": "/run/buzzci/acceptance-control.sock",
+          "descriptor_name": "buzz-ci-acceptance-control",
+          "user": "root",
+          "group": "buzzci-ctl",
+          "mode": "0620"
+        },
+        "controld_acceptance": {
+          "unit": "buzz-ci-controld-acceptance.socket",
+          "path": "/run/buzzci/controld-acceptance.sock",
+          "descriptor_name": "buzz-ci-controld-acceptance",
+          "user": "root",
+          "group": "buzzci-ctl",
+          "mode": "0620"
+        },
+        "keyholder": {
+          "unit": "buzz-ci-keyholder.socket",
+          "path": "/run/buzzci/keyholder.sock",
+          "descriptor_name": "buzz-ci-keyholder-control",
+          "user": "buzzci-keyholder",
+          "group": "buzzci-controld",
+          "mode": "0620"
+        },
+        "execd": {
+          "unit": "buzz-ci-execd.socket",
+          "path": "/run/buzzci/execd.sock",
+          "descriptor_name": "buzz-ci-execd",
+          "user": "root",
+          "group": "buzzci-execd",
+          "mode": "0620"
+        },
+        "runner": {
+          "unit": "buzz-ci-runner.socket",
+          "path": "/run/buzzci/runner-control.sock",
+          "descriptor_name": "buzz-ci-runner-control",
+          "user": "buzzci-runner",
+          "group": "buzzci-controld",
+          "mode": "0620"
+        },
+        "executor": {
+          "unit": "buzz-ci-executor.socket",
+          "path": "/run/buzzci/executor.sock",
+          "descriptor_name": "buzz-ci-executor",
+          "user": "root",
+          "group": "root",
+          "mode": "0600"
+        }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "principal",
+        "request_validity_seconds",
+        "timeout_seconds",
+        "terminate_grace_seconds"
+      ],
+      "properties": {
+        "program": { "const": "/usr/libexec/buzz-ci-production-qualification" },
+        "principal": { "const": "qualification" },
+        "request_validity_seconds": { "const": 60 },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
+        "terminate_grace_seconds": { "const": 2 }
+      }
+    },
+    "package_uid": { "const": 0 },
+    "package_gid": { "const": 0 },
+    "package_digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "acceptanceTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor", "run_event", "grant_event", "rerun_event", "tombstone_event"],
+      "properties": {
+        "actor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["public_key", "generation"],
+          "properties": {
+            "public_key": { "$ref": "#/$defs/sha256" },
+            "generation": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 }
+          }
+        },
+        "run_event": { "$ref": "#/$defs/runEvent" },
+        "grant_event": { "$ref": "#/$defs/grantEvent" },
+        "rerun_event": { "$ref": "#/$defs/runEvent" },
+        "tombstone_event": { "$ref": "#/$defs/tombstoneEvent" }
+      }
+    },
+    "runEvent": { "$ref": "#/$defs/event46100" },
+    "grantEvent": { "$ref": "#/$defs/event46107" },
+    "tombstoneEvent": { "$ref": "#/$defs/event5" },
+    "event46100": {
+      "allOf": [
+        { "$ref": "#/$defs/acceptanceEvent" },
+        { "prefixItems": [{}, {}, {}, { "const": 46100 }] }
+      ]
+    },
+    "event46107": {
+      "allOf": [
+        { "$ref": "#/$defs/acceptanceEvent" },
+        { "prefixItems": [{}, {}, {}, { "const": 46107 }] }
+      ]
+    },
+    "event5": {
+      "allOf": [
+        { "$ref": "#/$defs/acceptanceEvent" },
+        { "prefixItems": [{}, {}, {}, { "const": 5 }] }
+      ]
+    },
+    "acceptanceEvent": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        { "const": 0 },
+        { "$ref": "#/$defs/sha256" },
+        { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+        { "type": "integer", "minimum": 0, "maximum": 46107 },
+        { "type": "array" },
+        { "type": "string" }
+      ]
+    },
+    "gitOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "mode": { "type": "string", "pattern": "^0[4567][0-7]{2}$" },
+    "asset": {
+      "type": "string",
+      "pattern": "^assets/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "identityBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user", "group", "uid", "gid", "home", "shell", "supplementary_groups"],
+      "properties": {
+        "user": { "type": "string" },
+        "group": { "type": "string" },
+        "uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "home": { "type": "string" },
+        "shell": { "const": "/usr/sbin/nologin" },
+        "supplementary_groups": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "runnerIdentity": {
+      "allOf": [
+        { "$ref": "#/$defs/identityBase" },
+        {
+          "properties": {
+            "user": { "const": "buzzci-runner" },
+            "group": { "const": "buzzci-runner" },
+            "home": { "const": "/var/lib/buzzci/runner" },
+            "supplementary_groups": { "const": ["buzzci-execd"] }
+          }
+        }
+      ]
+    },
+    "controldIdentity": {
+      "allOf": [
+        { "$ref": "#/$defs/identityBase" },
+        {
+          "properties": {
+            "user": { "const": "buzzci-controld" },
+            "group": { "const": "buzzci-controld" },
+            "home": { "const": "/var/lib/buzzci/controld" },
+            "supplementary_groups": { "const": [] }
+          }
+        }
+      ]
+    },
+    "keyholderIdentity": {
+      "allOf": [
+        { "$ref": "#/$defs/identityBase" },
+        {
+          "properties": {
+            "user": { "const": "buzzci-keyholder" },
+            "group": { "const": "buzzci-keyholder" },
+            "home": { "const": "/var/lib/buzzci/keyholder" },
+            "supplementary_groups": { "const": [] }
+          }
+        }
+      ]
+    },
+    "qualificationIdentity": {
+      "allOf": [
+        { "$ref": "#/$defs/identityBase" },
+        {
+          "properties": {
+            "user": { "const": "buzzci-ctl" },
+            "group": { "const": "buzzci-ctl" },
+            "home": { "const": "/var/lib/buzzci/ctl" },
+            "supplementary_groups": { "const": ["buzzci-execd"] }
+          }
+        }
+      ]
+    },
+    "jobIdentity": {
+      "allOf": [
+        { "$ref": "#/$defs/identityBase" },
+        {
+          "properties": {
+            "user": { "const": "buzzci-job" },
+            "group": { "const": "buzzci-job" },
+            "home": { "const": "/var/empty" },
+            "supplementary_groups": { "const": [] }
+          }
+        }
+      ]
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "binary_path",
+        "binary_sha256",
+        "source_commit",
+        "provenance_source",
+        "provenance_sha256",
+        "uid",
+        "gid",
+        "mode",
+        "unit"
+      ],
+      "properties": {
+        "name": { "enum": ["runner", "controld", "execd", "keyholder", "qualification", "executor", "acceptance_canary", "acceptance_driver", "acceptance_control", "receipt_verifier"] },
+        "binary_path": {
+          "enum": [
+            "/usr/libexec/buzz-ci-runner",
+            "/usr/libexec/buzz-ci-controld",
+            "/usr/libexec/buzz-ci-execd",
+            "/usr/libexec/buzz-ci-keyholder",
+            "/usr/libexec/buzz-ci-production-qualification",
+            "/usr/libexec/buzz-ci-executor",
+            "/usr/libexec/buzz-ci-capacity-one-canary",
+            "/usr/libexec/buzz-ci-capacity-one-driver",
+            "/usr/libexec/buzz-ci-acceptance-control",
+            "/usr/libexec/buzz-ci-verify-acceptance-receipt"
+          ]
+        },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "source_commit": { "$ref": "#/$defs/gitOid" },
+        "provenance_source": { "$ref": "#/$defs/asset" },
+        "provenance_sha256": { "$ref": "#/$defs/sha256" },
+        "uid": { "const": 0 },
+        "gid": { "const": 0 },
+        "mode": { "const": "0755" },
+        "unit": {
+          "type": ["string", "null"],
+          "pattern": "^[a-z0-9][a-z0-9@_.-]+\\.service$"
+        },
+        "package_manifest_source": { "$ref": "#/$defs/asset" },
+        "package_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "package_digest": { "$ref": "#/$defs/sha256" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "name": { "const": "controld" } }, "required": ["name"] },
+          "then": { "required": ["package_manifest_source", "package_manifest_sha256", "package_digest"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["package_manifest_source"] },
+                { "required": ["package_manifest_sha256"] },
+                { "required": ["package_digest"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "effectivePath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "path", "sha256"],
+      "properties": {
+        "owner": { "enum": ["activation", "runner", "controld", "keyholder"] },
+        "path": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "effectiveUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "fragment", "drop_ins"],
+      "properties": {
+        "unit": { "type": "string", "pattern": "^[a-z0-9][a-z0-9@_.-]+\\.(service|socket|target)$" },
+        "fragment": { "$ref": "#/$defs/effectivePath" },
+        "drop_ins": { "type": "array", "items": { "$ref": "#/$defs/effectivePath" } }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "source",
+        "source_mode",
+        "sha256",
+        "target",
+        "install_mode",
+        "uid",
+        "gid"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "runner_config",
+            "execd_config",
+            "controld_config",
+            "sysusers",
+            "tmpfiles",
+            "capacity_target",
+            "acceptance_control_socket",
+            "acceptance_control_service",
+            "acceptance_tmpfiles",
+            "acceptance_canary_binary",
+            "acceptance_driver_binary",
+            "acceptance_control_binary",
+            "receipt_verifier_binary",
+            "receipt_verifier_expected_stages",
+            "qualification_binary",
+            "executor_binary",
+            "fixture_manifest",
+            "fixture_input",
+            "fixture_script",
+            "execd_service",
+            "execd_socket",
+            "executor_service",
+            "executor_socket",
+            "activation_controller",
+            "activation_package_module",
+            "execd_socket_dropin",
+            "runner_service_dropin",
+            "controld_service_dropin",
+            "keyholder_socket_dropin"
+          ]
+        },
+        "source": { "$ref": "#/$defs/asset" },
+        "source_mode": { "$ref": "#/$defs/mode" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "target": {
+          "enum": [
+            "/etc/buzzci/runner-v2.json",
+            "/etc/buzzci/execd-v2.json",
+            "/etc/buzzci/controld-v1.json",
+            "/usr/lib/sysusers.d/buzzci-activation.conf",
+            "/usr/lib/tmpfiles.d/buzzci-activation.conf",
+            "/etc/systemd/system/buzz-ci-capacity-one.target",
+            "/etc/systemd/system/buzz-ci-acceptance-control.socket",
+            "/etc/systemd/system/buzz-ci-acceptance-control.service",
+            "/usr/lib/tmpfiles.d/buzzci-acceptance.conf",
+            "/usr/libexec/buzz-ci-capacity-one-canary",
+            "/usr/libexec/buzz-ci-capacity-one-driver",
+            "/usr/libexec/buzz-ci-acceptance-control",
+            "/usr/libexec/buzz-ci-verify-acceptance-receipt",
+            "/usr/libexec/buzz-ci-acceptance-expected-stages.json",
+            "/usr/libexec/buzz-ci-production-qualification",
+            "/usr/libexec/buzz-ci-executor",
+            "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json",
+            "/usr/share/buzzci/execd-v2/fixture/input.txt",
+            "/usr/libexec/buzz-ci-capacity-one-fixture",
+            "/usr/lib/systemd/system/buzz-ci-execd.service",
+            "/usr/lib/systemd/system/buzz-ci-execd.socket",
+            "/usr/lib/systemd/system/buzz-ci-executor.service",
+            "/usr/lib/systemd/system/buzz-ci-executor.socket",
+            "/usr/libexec/buzz-ci-activation-controller",
+            "/usr/libexec/buzz_ci_activation_package.py",
+            "/etc/systemd/system/buzz-ci-execd.socket.d/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-keyholder.socket.d/20-capacity-one.conf"
+          ]
+        },
+        "install_mode": { "$ref": "#/$defs/mode" },
+        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "active_source": { "$ref": "#/$defs/asset" },
+        "active_source_mode": { "$ref": "#/$defs/mode" },
+        "active_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
