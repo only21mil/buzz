@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 use buzz_terminal::context::{context_vars, GuiContext};
@@ -307,8 +307,39 @@ impl Session {
     }
 }
 
+struct LiveSessions<T>(Vec<T>);
+
+impl<T> Default for LiveSessions<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> LiveSessions<T> {
+    fn take(&mut self, predicate: impl FnMut(&T) -> bool) -> Option<T> {
+        self.0
+            .iter()
+            .position(predicate)
+            .map(|index| self.0.remove(index))
+    }
+}
+
+impl<T> std::ops::Deref for LiveSessions<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for LiveSessions<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 #[derive(Default)]
-pub(crate) struct TerminalSessions(Mutex<Vec<Session>>);
+pub(crate) struct TerminalSessions(Arc<Mutex<LiveSessions<Session>>>);
 
 impl TerminalSessions {
     fn with_session<T>(&self, id: &str, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
@@ -327,10 +358,17 @@ impl TerminalSessions {
             .lock()
             .map(|mut sessions| std::mem::take(&mut *sessions))
             .unwrap_or_default();
-        for session in sessions {
+        for session in sessions.0 {
             session.shutdown();
         }
     }
+}
+
+fn take_ended_session(sessions: &Mutex<LiveSessions<Session>>, id: Uuid) -> Option<Session> {
+    sessions
+        .lock()
+        .ok()
+        .and_then(|mut sessions| sessions.take(|session| session.id == id))
 }
 
 fn size(columns: u16, rows: u16) -> Result<Size> {
@@ -502,8 +540,10 @@ pub(crate) fn terminal_attach(
     let reader_terminal = Arc::clone(&terminal);
     let reader_publisher = Arc::clone(&publisher);
     let reader_channel = Arc::clone(&channel);
+    let reader_sessions = Arc::clone(&state.0);
     let reader_stopping = Arc::new(AtomicBool::new(false));
     let thread_stopping = Arc::clone(&reader_stopping);
+    let (registered_tx, registered_rx) = mpsc::channel();
     let reader_handle = std::thread::spawn(move || {
         let mut buffer = [0u8; 16 * 1024];
         let mut encoder = buzz_terminal::damage::Encoder::new();
@@ -559,10 +599,23 @@ pub(crate) fn terminal_attach(
                 }
             }
         }
+        // A very short-lived shell can reach EOF before its Session is
+        // inserted. Wait for registration before publishing Exit or reaping,
+        // otherwise a synchronous close callback could miss the session.
+        let _ = registered_rx.recv();
+        // Claim ownership before invoking the channel callback. A callback
+        // that synchronously closes now observes an already-closed session
+        // instead of trying to join this reader while it is still in send().
+        let ended_session = take_ended_session(&reader_sessions, id);
         let _ = reader_channel
             .lock()
             .ok()
             .and_then(|channel| channel.as_ref()?.send(TerminalMessage::Exit).ok());
+        if let Some(session) = ended_session {
+            // shutdown joins this reader, so transfer teardown only after the
+            // callback has returned and without holding the registry lock.
+            std::thread::spawn(move || session.shutdown());
+        }
     });
 
     let subscription = SubscriptionId::new();
@@ -590,6 +643,7 @@ pub(crate) fn terminal_attach(
     };
     session.publish(bootstrap);
     sessions.push(session);
+    let _ = registered_tx.send(());
     Ok(AttachResponse {
         session_id: id.to_string(),
         subscription_id: subscription.to_string(),
@@ -625,13 +679,11 @@ pub(crate) fn terminal_close(
     let id = Uuid::parse_str(&session_id).map_err(|_| "invalid terminal session id".to_string())?;
     let session = {
         let mut sessions = state.0.lock().map_err(|e| e.to_string())?;
-        let index = sessions
-            .iter()
-            .position(|session| session.id == id)
-            .ok_or_else(|| "terminal session not found".to_string())?;
-        sessions.remove(index)
+        sessions.take(|session| session.id == id)
     };
-    session.shutdown();
+    if let Some(session) = session {
+        session.shutdown();
+    }
     Ok(())
 }
 
@@ -812,186 +864,5 @@ pub(crate) fn terminal_focus(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use buzz_terminal::damage::{CursorFrame, RowFrame, Span};
-
-    fn publication(spans: Vec<Span>) -> Publication {
-        Publication {
-            subscription_id: SubscriptionId::new(),
-            sequence: 7,
-            frame: buzz_terminal::damage::Frame {
-                rows: vec![RowFrame {
-                    line: 3,
-                    wrapped: true,
-                    spans,
-                }],
-                cursor: CursorFrame {
-                    line: 1,
-                    column: 2,
-                    visible: true,
-                },
-                cursor_changed: true,
-                full: true,
-                viewport: Viewport {
-                    generation: 4,
-                    columns: 80,
-                    screen_lines: 24,
-                },
-            },
-        }
-    }
-
-    fn style() -> Style {
-        Style {
-            fg: 1,
-            bg: 2,
-            flags: 3,
-        }
-    }
-
-    fn marker_frame(marker: usize, full: bool) -> Frame {
-        Frame {
-            rows: vec![RowFrame {
-                line: marker,
-                wrapped: false,
-                spans: Vec::new(),
-            }],
-            cursor: CursorFrame {
-                line: 0,
-                column: 0,
-                visible: true,
-            },
-            cursor_changed: true,
-            full,
-            viewport: Viewport {
-                generation: 0,
-                columns: 80,
-                screen_lines: 24,
-            },
-        }
-    }
-
-    fn assert_post_snapshot_capture_survives_attach(mut publisher: FramePublisher) {
-        assert!(!publisher.requires_snapshot());
-        let bootstrap = marker_frame(1, true);
-        let post_snapshot_incremental = marker_frame(42, false);
-        let subscription = SubscriptionId::new();
-        publisher.attach(subscription, bootstrap).unwrap();
-        let publisher = Mutex::new(publisher);
-
-        assert_eq!(
-            offer_capture(&publisher, post_snapshot_incremental, || marker_frame(
-                42, true
-            )),
-            None
-        );
-
-        let successor = publisher
-            .lock()
-            .unwrap()
-            .acknowledge(subscription, 1)
-            .expect("post-snapshot PTY output was lost");
-        assert_eq!(successor.frame.rows[0].line, 42);
-        assert!(successor.frame.full);
-    }
-
-    #[test]
-    fn reader_pumps_a_deferred_tail_without_an_external_event() {
-        let (terminal, _actions) = Terminal::new(Size::default(), Fences::ALL);
-        let terminal = SharedTerminal::new(terminal);
-        let payload = "\u{1b}c".repeat(2_102_714);
-
-        assert!(
-            feed_and_drain(&terminal, payload.as_bytes()),
-            "fixture must defer parser work before the runtime pumps it"
-        );
-
-        let terminal = terminal.lock();
-        assert_eq!(terminal.pending_bytes(), 0);
-        assert_eq!(terminal.stats().completed_units, 2_102_714);
-    }
-
-    #[test]
-    fn initial_attach_retains_output_captured_after_its_bootstrap_snapshot() {
-        let viewport = marker_frame(0, true).viewport;
-        let publisher = FramePublisher::new(viewport);
-        assert_post_snapshot_capture_survives_attach(publisher);
-    }
-
-    #[test]
-    fn reattach_retains_output_captured_after_its_bootstrap_snapshot() {
-        let viewport = marker_frame(0, true).viewport;
-        let mut publisher = FramePublisher::new(viewport);
-        let old = SubscriptionId::new();
-        publisher.attach(old, marker_frame(0, true)).unwrap();
-        assert!(publisher.acknowledge(old, 1).is_none());
-        assert_post_snapshot_capture_survives_attach(publisher);
-    }
-
-    #[test]
-    fn mapper_preserves_soft_wrap_metadata() {
-        let message = wire_publication(publication(Vec::new())).unwrap();
-        assert!(message.rows[0].wrapped);
-    }
-
-    #[test]
-    fn mapper_expands_ascii_runs_without_unicode_classification() {
-        let message = wire_publication(publication(vec![Span {
-            column: 4,
-            text: "abc".into(),
-            width: 1,
-            cluster_count: 3,
-            style: style(),
-        }]))
-        .unwrap();
-        let clusters = &message.rows[0].spans[0].clusters;
-        assert_eq!(
-            clusters
-                .iter()
-                .map(|cluster| (cluster.column, cluster.text.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(4, "a"), (5, "b"), (6, "c")]
-        );
-    }
-
-    #[test]
-    fn mapper_keeps_a_multi_char_cluster_atomic() {
-        let message = wire_publication(publication(vec![Span {
-            column: 9,
-            text: "1\u{fe0f}\u{20e3}".into(),
-            width: 2,
-            cluster_count: 1,
-            style: style(),
-        }]))
-        .unwrap();
-        let clusters = &message.rows[0].spans[0].clusters;
-        assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].column, 9);
-        assert_eq!(clusters[0].text, "1\u{fe0f}\u{20e3}");
-        assert_eq!(clusters[0].width, 2);
-    }
-
-    #[test]
-    fn mapper_rejects_an_inconsistent_engine_span() {
-        let result = wire_publication(publication(vec![Span {
-            column: 0,
-            text: "ab".into(),
-            width: 1,
-            cluster_count: 3,
-            style: style(),
-        }]));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn dimensions_reject_zero_and_preserve_scrollback_default() {
-        assert!(size(0, 24).is_err());
-        assert!(size(80, 0).is_err());
-        let size = size(100, 40).unwrap();
-        assert_eq!(
-            (size.columns, size.screen_lines, size.scrollback),
-            (100, 40, 10_000)
-        );
-    }
-}
+#[path = "terminal_runtime_tests.rs"]
+mod tests;

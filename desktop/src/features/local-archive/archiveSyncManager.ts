@@ -13,10 +13,17 @@ import {
 
 const FLUSH_BATCH_SIZE = 25;
 const FLUSH_IDLE_MS = 2_000;
+const MAX_BUFFERED_EVENTS = 1_000;
+const RETRY_DELAY_MS = 2_000;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /** Dependency injection interface — production uses module singletons; tests inject fakes. */
+type ArchiveCandidate = {
+  rawEventJson: string;
+  matchedScope: { scopeType: ScopeType; scopeValue: string };
+};
+
 export interface ArchiveSyncDeps {
   relayClient: {
     subscribeLive: (
@@ -25,15 +32,12 @@ export interface ArchiveSyncDeps {
     ) => Promise<() => Promise<void>>;
   };
   listSaveSubscriptions: () => Promise<SaveSubscription[]>;
-  archiveEvents: (
-    candidates: Array<{
-      rawEventJson: string;
-      matchedScope: { scopeType: ScopeType; scopeValue: string };
-    }>,
-  ) => Promise<unknown>;
+  archiveEvents: (candidates: ArchiveCandidate[]) => Promise<unknown>;
   onSubscriptionChange: (listener: () => void) => () => void;
   flushBatchSize?: number;
   flushIdleMs?: number;
+  maxBufferedEvents?: number;
+  retryDelayMs?: number;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -79,10 +83,15 @@ function scopeKey(scopeType: ScopeType, scopeValue: string): string {
  */
 export class ArchiveSyncManager {
   private readonly deps: Required<
-    Omit<ArchiveSyncDeps, "flushBatchSize" | "flushIdleMs">
+    Omit<
+      ArchiveSyncDeps,
+      "flushBatchSize" | "flushIdleMs" | "maxBufferedEvents" | "retryDelayMs"
+    >
   >;
   private readonly flushBatchSize: number;
   private readonly flushIdleMs: number;
+  private readonly maxBufferedEvents: number;
+  private readonly retryDelayMs: number;
 
   // full subKey (scope+kinds) → unsub
   private active = new Map<string, () => Promise<void>>();
@@ -93,11 +102,12 @@ export class ArchiveSyncManager {
   // eliminating all interleaving defects without per-boundary guards.
   private reloading = false;
   private reloadPending = false;
-  private buffer: Array<{
-    rawEventJson: string;
-    matchedScope: { scopeType: ScopeType; scopeValue: string };
-  }> = [];
+  private buffer: ArchiveCandidate[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private resolveRetryDelay: ((shouldRetry: boolean) => void) | null = null;
+  private draining = false;
+  private overflowDrops = 0;
   private destroyed = false;
   private offSubscriptionChange: (() => void) | null = null;
 
@@ -110,8 +120,13 @@ export class ArchiveSyncManager {
       onSubscriptionChange:
         deps?.onSubscriptionChange ?? defaultOnSubscriptionChange,
     };
-    this.flushBatchSize = deps?.flushBatchSize ?? FLUSH_BATCH_SIZE;
-    this.flushIdleMs = deps?.flushIdleMs ?? FLUSH_IDLE_MS;
+    this.flushBatchSize = Math.max(1, deps?.flushBatchSize ?? FLUSH_BATCH_SIZE);
+    this.flushIdleMs = Math.max(0, deps?.flushIdleMs ?? FLUSH_IDLE_MS);
+    this.maxBufferedEvents = Math.max(
+      this.flushBatchSize,
+      deps?.maxBufferedEvents ?? MAX_BUFFERED_EVENTS,
+    );
+    this.retryDelayMs = Math.max(0, deps?.retryDelayMs ?? RETRY_DELAY_MS);
   }
 
   async start(): Promise<void> {
@@ -130,15 +145,13 @@ export class ArchiveSyncManager {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    this.cancelRetryDelay();
     this.offSubscriptionChange?.();
     this.offSubscriptionChange = null;
-    // Flush any buffered events before tearing down.
-    if (this.buffer.length > 0) {
-      const toFlush = this.buffer.splice(0);
-      void this.deps.archiveEvents(toFlush).catch((err: unknown) => {
-        console.warn("[archiveSyncManager] flush on destroy failed:", err);
-      });
-    }
+    // Finish the bounded queue through the existing single-flight drain. A
+    // failure after teardown drops the remaining queue explicitly rather than
+    // retaining this manager forever in a retry loop.
+    this.requestDrain();
     for (const [, unsub] of this.active) {
       void unsub();
     }
@@ -266,12 +279,17 @@ export class ArchiveSyncManager {
     scopeValue: string,
   ): void {
     if (this.destroyed) return;
+    if (this.buffer.length >= this.maxBufferedEvents) {
+      this.recordOverflowDrop();
+      return;
+    }
     this.buffer.push({
       rawEventJson: JSON.stringify(event),
       matchedScope: { scopeType, scopeValue },
     });
+    if (this.draining) return;
     if (this.buffer.length >= this.flushBatchSize) {
-      this.flush();
+      this.requestDrain();
     } else {
       this.scheduleFlush();
     }
@@ -281,20 +299,111 @@ export class ArchiveSyncManager {
     if (this.flushTimer !== null) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.flush();
+      this.requestDrain();
     }, this.flushIdleMs);
   }
 
-  private flush(): void {
+  private clearFlushTimer(): void {
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    if (this.buffer.length === 0) return;
-    const batch = this.buffer.splice(0);
-    void this.deps.archiveEvents(batch).catch((err: unknown) => {
-      console.warn("[archiveSyncManager] archive_events failed:", err);
+  }
+
+  private requestDrain(): void {
+    this.clearFlushTimer();
+    if (this.draining || this.buffer.length === 0) return;
+    void this.runDrainLoop();
+  }
+
+  /**
+   * Persist the queue in arrival order with one native call in flight. The
+   * oldest batch remains in `buffer` until it succeeds, so a retry cannot be
+   * overtaken by newer events. Each call receives at most `flushBatchSize`
+   * candidates, including the final partial batch.
+   */
+  private async runDrainLoop(): Promise<void> {
+    this.draining = true;
+    try {
+      while (this.buffer.length > 0) {
+        const batch = this.buffer.slice(0, this.flushBatchSize);
+        try {
+          await this.deps.archiveEvents(batch);
+          this.buffer.splice(0, batch.length);
+          this.reportOverflowDrops();
+        } catch (err) {
+          if (this.destroyed) {
+            console.warn(
+              `[archiveSyncManager] flush on destroy failed; dropping ${this.buffer.length} queued event(s):`,
+              err,
+            );
+            this.buffer.splice(0);
+            this.reportOverflowDrops();
+            break;
+          }
+          console.warn(
+            "[archiveSyncManager] archive_events failed; retrying oldest batch:",
+            err,
+          );
+          if (!(await this.waitBeforeRetry())) {
+            console.warn(
+              `[archiveSyncManager] destroyed during retry delay; dropping ${this.buffer.length} queued event(s)`,
+            );
+            this.buffer.splice(0);
+            this.reportOverflowDrops();
+            break;
+          }
+        }
+      }
+    } finally {
+      this.draining = false;
+      // No await separates the loop's empty check from this finally block, but
+      // keep the handoff explicit for callers that enqueue from a promise job.
+      if (this.buffer.length > 0 && !this.destroyed) {
+        this.requestDrain();
+      }
+    }
+  }
+
+  private waitBeforeRetry(): Promise<boolean> {
+    if (this.destroyed) return Promise.resolve(false);
+
+    return new Promise<boolean>((resolve) => {
+      this.resolveRetryDelay = resolve;
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        this.resolveRetryDelay = null;
+        resolve(!this.destroyed);
+      }, this.retryDelayMs);
     });
+  }
+
+  private cancelRetryDelay(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    const resolve = this.resolveRetryDelay;
+    this.resolveRetryDelay = null;
+    resolve?.(false);
+  }
+
+  /** Drop newest arrivals when the queue is full, preserving its FIFO prefix. */
+  private recordOverflowDrop(): void {
+    this.overflowDrops += 1;
+    if (this.overflowDrops === 1) {
+      console.warn(
+        `[archiveSyncManager] backlog reached ${this.maxBufferedEvents} events; dropping newest arrivals until capacity returns`,
+      );
+    }
+  }
+
+  private reportOverflowDrops(): void {
+    if (this.overflowDrops === 0) return;
+    console.warn(
+      `[archiveSyncManager] dropped ${this.overflowDrops} newest event(s) while the backlog was full`,
+    );
+    this.overflowDrops = 0;
   }
 }
 

@@ -36,6 +36,14 @@ type Session = {
   context: TerminalContext;
 };
 
+function sessionSubscriptionId(session: Session): string | null {
+  return (
+    session.connection?.subscriptionId ??
+    session.delivery?.frame.subscriptionId ??
+    null
+  );
+}
+
 const INITIAL_SIZE: TerminalViewportSize = {
   columns: 80,
   rows: 24,
@@ -173,6 +181,13 @@ export function TerminalBootstrap({
   }, []);
 
   const removeSession = React.useCallback((key: string) => {
+    const removedSession = sessionsRef.current.find(
+      (session) => session.key === key,
+    );
+    const subscriptionId = removedSession
+      ? sessionSubscriptionId(removedSession)
+      : null;
+    if (subscriptionId) acknowledgedSequenceRef.current.delete(subscriptionId);
     setSessions((current) => current.filter((session) => session.key !== key));
     setActiveKey((current) => {
       if (current !== key) return current;
@@ -182,6 +197,40 @@ export function TerminalBootstrap({
       return remaining.at(-1)?.key ?? null;
     });
   }, []);
+
+  const closeSession = React.useCallback(
+    (key: string) => {
+      const session = sessionsRef.current.find(
+        (candidate) => candidate.key === key,
+      );
+      const subscriptionId = session ? sessionSubscriptionId(session) : null;
+      if (subscriptionId)
+        acknowledgedSequenceRef.current.delete(subscriptionId);
+      setSessions((current) =>
+        current.map((session) =>
+          session.key === key ? { ...session, closing: true } : session,
+        ),
+      );
+      const connection = session?.connection;
+      if (!connection) {
+        // Exit can arrive through TerminalConnection's pending-message queue
+        // before attach() resolves. Remember the intent so the eventual native
+        // session is closed as soon as its backend id becomes available.
+        closedSessionKeysRef.current.add(key);
+        removeSession(key);
+        return;
+      }
+      // Marking the session closing removes its tab and renderer caches while
+      // retaining the state entry until native shutdown settles. That prevents
+      // the open panel from auto-spawning a replacement during the bounded
+      // process-shutdown grace period.
+      void connection
+        .close()
+        .then(() => removeSession(key))
+        .catch(fail);
+    },
+    [fail, removeSession],
+  );
 
   const createSession = React.useCallback(() => {
     const spawnContext = contextRef.current;
@@ -211,7 +260,7 @@ export function TerminalBootstrap({
       message: Exclude<TerminalMessage, { type: "frame" }>,
     ) => {
       if (message.type === "exit") {
-        removeSession(key);
+        closeSession(key);
       } else if (message.type === "title") {
         update((session) => ({
           ...session,
@@ -261,7 +310,7 @@ export function TerminalBootstrap({
         removeSession(key);
         fail(error);
       });
-  }, [available, fail, removeSession]);
+  }, [available, closeSession, fail, removeSession]);
 
   const contextChannelId = context?.channelId ?? null;
   const channelSessions = React.useMemo(
@@ -273,6 +322,31 @@ export function TerminalBootstrap({
         : [],
     [contextChannelId, sessions],
   );
+  const liveSessionIds = React.useMemo(
+    () =>
+      sessions
+        .filter((session) => !session.closing)
+        .map((session) => session.key),
+    [sessions],
+  );
+  const liveSubscriptionIds = React.useMemo(
+    () =>
+      new Set(
+        sessions.flatMap((session) => {
+          const subscriptionId = sessionSubscriptionId(session);
+          return !session.closing && subscriptionId ? [subscriptionId] : [];
+        }),
+      ),
+    [sessions],
+  );
+
+  React.useEffect(() => {
+    for (const subscriptionId of acknowledgedSequenceRef.current.keys()) {
+      if (!liveSubscriptionIds.has(subscriptionId)) {
+        acknowledgedSequenceRef.current.delete(subscriptionId);
+      }
+    }
+  }, [liveSubscriptionIds]);
 
   React.useEffect(() => {
     setTerminalSessionChannels(
@@ -373,28 +447,13 @@ export function TerminalBootstrap({
       viewportReportingEnabled={viewportReportingEnabled}
       showSplash={splashPending && Boolean(active?.frame)}
       onSplashStarted={handleSplashStarted}
+      liveSessionIds={liveSessionIds}
       sessionFrames={channelSessions.flatMap((session) =>
-        session.frame ? [{ sessionId: session.key, frame: session.frame }] : [],
+        !session.closing && session.frame
+          ? [{ sessionId: session.key, frame: session.frame }]
+          : [],
       )}
-      onCloseSession={(key) => {
-        setSessions((current) =>
-          current.map((session) =>
-            session.key === key ? { ...session, closing: true } : session,
-          ),
-        );
-        const connection = sessionsRef.current.find(
-          (session) => session.key === key,
-        )?.connection;
-        if (!connection) {
-          closedSessionKeysRef.current.add(key);
-          removeSession(key);
-          return;
-        }
-        void connection
-          .close()
-          .then(() => removeSession(key))
-          .catch(fail);
-      }}
+      onCloseSession={closeSession}
       onFrameConsumed={(frame) => {
         const delivery = sessionsRef.current.find(
           (session) => session.delivery?.frame === frame,
@@ -409,10 +468,19 @@ export function TerminalBootstrap({
           if (
             acknowledgedSequenceRef.current.get(subscriptionId) === sequence
           ) {
-            acknowledgedSequenceRef.current.set(
-              subscriptionId,
-              lastAcknowledged,
+            const subscriptionStillLive = sessionsRef.current.some(
+              (session) =>
+                !session.closing &&
+                sessionSubscriptionId(session) === subscriptionId,
             );
+            if (subscriptionStillLive) {
+              acknowledgedSequenceRef.current.set(
+                subscriptionId,
+                lastAcknowledged,
+              );
+            } else {
+              acknowledgedSequenceRef.current.delete(subscriptionId);
+            }
           }
           fail(error);
         });

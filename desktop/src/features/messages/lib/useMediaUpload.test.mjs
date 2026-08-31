@@ -1,12 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-// shortHash is a simple utility: str.slice(0, 4)
-// Inline it here to avoid importing from useMediaUpload.ts which has
-// unresolvable @/shared path aliases outside the bundler.
-function shortHash(hex) {
-  return hex.slice(0, 4);
-}
+import { applyUploadingPreviewProgress, shortHash } from "./useMediaUpload.ts";
 
 // ── shortHash ─────────────────────────────────────────────────────────
 
@@ -24,6 +19,47 @@ test("shortHash returns empty string for empty input", () => {
 
 test("shortHash returns partial for short input", () => {
   assert.equal(shortHash("ab"), "ab");
+});
+
+// ── Native progress routing ──────────────────────────────────────────
+
+test("unrelated native progress keeps the exact preview state", () => {
+  const current = [{ id: 7, progress: 25 }];
+
+  const next = applyUploadingPreviewProgress(current, {
+    id: "composer-upload-99",
+    sent: 50,
+    total: 100,
+  });
+
+  assert.strictEqual(next, current);
+});
+
+test("matching native progress updates only its preview", () => {
+  const untouched = { id: 8, progress: 10 };
+  const current = [{ id: 7, progress: 25 }, untouched];
+
+  const next = applyUploadingPreviewProgress(current, {
+    id: "composer-upload-7",
+    sent: 75,
+    total: 100,
+  });
+
+  assert.notStrictEqual(next, current);
+  assert.deepEqual(next[0], { id: 7, progress: 75 });
+  assert.strictEqual(next[1], untouched);
+});
+
+test("duplicate native progress keeps the exact preview state", () => {
+  const current = [{ id: 7, progress: 75 }];
+
+  const next = applyUploadingPreviewProgress(current, {
+    id: "composer-upload-7",
+    sent: 750,
+    total: 1_000,
+  });
+
+  assert.strictEqual(next, current);
 });
 
 // ── Upload slot ordering (pure state-update logic) ────────────────────
