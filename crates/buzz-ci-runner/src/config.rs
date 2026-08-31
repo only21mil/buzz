@@ -1,7 +1,8 @@
 //! Secure loading for runner-owned configuration.
 //!
-//! The version-1 contract always supplies the peer UID. A complete optional
-//! host block selects the reviewed concrete adapters; omission stays closed.
+//! Configuration selects either a closed listener or the broker-v2 proxy.
+//! Legacy host composition is rejected so production cannot fall back from
+//! broker v2 to local execution.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -14,22 +15,56 @@ use thiserror::Error;
 
 const CONFIG_MODE: u32 = 0o600;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
+const MAX_TIMEOUT_MILLIS: u64 = 30_000;
+const MAX_TRANSPORT_ATTEMPTS: u8 = 5;
+const MAX_RETRY_DELAY_MILLIS: u64 = 5_000;
+
+/// Fixed production execd endpoint. The runner never accepts an endpoint from
+/// controld request bytes.
+pub const EXECD_SOCKET_PATH: &str = "/run/buzzci/execd.sock";
+/// Fixed durable replay map owned by the unprivileged runner account.
+pub const V2_REPLAY_JOURNAL_PATH: &str = "/var/lib/buzzci/runner/v2-replay.json";
 
 /// Contract-independent runner configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
-    /// Configuration schema. Version 1 is the only accepted value.
+    /// Configuration schema. Version 2 is the only accepted value.
     pub schema_version: u32,
     /// Dedicated controld account accepted by `SO_PEERCRED`.
     pub controld_uid: u32,
-    /// Complete concrete host composition. Omission keeps the runner closed.
-    #[serde(default)]
-    pub host: Option<RunnerHostConfig>,
+    /// Dedicated controld primary group accepted by `SO_PEERCRED`.
+    pub controld_gid: u32,
+    #[serde(flatten)]
+    pub mode: RunnerMode,
 }
 
+/// Strict production mode. Dormant stays closed; v2 proxy has no legacy host
+/// or executable configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunnerMode {
+    Dormant,
+    V2Proxy {
+        execd_socket: PathBuf,
+        execd_uid: u32,
+        execd_gid: u32,
+        replay_journal: PathBuf,
+        connect_timeout_millis: u64,
+        io_timeout_millis: u64,
+        transport_attempts: u8,
+        retry_delay_millis: u64,
+        lane_manifest_digest: String,
+        lane_epoch: u64,
+        admission_key_generation: u64,
+        isolation_profile_digest: String,
+        audience_digest: String,
+    },
+}
+
+/// Test-only shape retained for the closed legacy host unit tests. Production
+/// configuration cannot deserialize this shape and the binary cannot compose it.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunnerHostConfig {
     pub owner_pubkey: String,
     pub manifest_verification_key: String,
@@ -59,10 +94,14 @@ pub enum ConfigError {
     InvalidJson(#[source] serde_json::Error),
     #[error("runner configuration schema is unsupported")]
     UnsupportedSchema,
+    #[error("runner configuration contains unknown fields")]
+    UnknownFields,
     #[error("runner controld UID must be nonzero")]
     InvalidPeerUid,
-    #[error("runner host configuration is invalid")]
-    InvalidHost,
+    #[error("runner controld GID must be nonzero")]
+    InvalidPeerGid,
+    #[error("runner v2 proxy configuration is invalid")]
+    InvalidV2Proxy,
 }
 
 impl RunnerConfig {
@@ -106,42 +145,106 @@ impl RunnerConfig {
         if bytes.len() as u64 > MAX_CONFIG_BYTES {
             return Err(ConfigError::Oversized);
         }
+        validate_config_fields(&bytes)?;
         let config: Self = serde_json::from_slice(&bytes).map_err(ConfigError::InvalidJson)?;
-        if config.schema_version != 1 {
+        if config.schema_version != 2 {
             return Err(ConfigError::UnsupportedSchema);
         }
         if config.controld_uid == 0 {
             return Err(ConfigError::InvalidPeerUid);
         }
-        if config.host.as_ref().is_some_and(|host| !host.is_valid()) {
-            return Err(ConfigError::InvalidHost);
+        if config.controld_gid == 0 {
+            return Err(ConfigError::InvalidPeerGid);
+        }
+        if let RunnerMode::V2Proxy {
+            execd_socket,
+            execd_uid,
+            execd_gid,
+            replay_journal,
+            connect_timeout_millis,
+            io_timeout_millis,
+            transport_attempts,
+            retry_delay_millis,
+            lane_manifest_digest,
+            lane_epoch,
+            admission_key_generation,
+            isolation_profile_digest,
+            audience_digest,
+        } = &config.mode
+        {
+            if execd_socket != Path::new(EXECD_SOCKET_PATH)
+                || *execd_uid != 0
+                || *execd_gid != 0
+                || replay_journal != Path::new(V2_REPLAY_JOURNAL_PATH)
+                || !(1..=MAX_TIMEOUT_MILLIS).contains(connect_timeout_millis)
+                || !(1..=MAX_TIMEOUT_MILLIS).contains(io_timeout_millis)
+                || !(1..=MAX_TRANSPORT_ATTEMPTS).contains(transport_attempts)
+                || *retry_delay_millis > MAX_RETRY_DELAY_MILLIS
+                || !digest(lane_manifest_digest)
+                || *lane_epoch == 0
+                || *admission_key_generation == 0
+                || !digest(isolation_profile_digest)
+                || !digest(audience_digest)
+            {
+                return Err(ConfigError::InvalidV2Proxy);
+            }
         }
         Ok(config)
     }
 }
 
-impl RunnerHostConfig {
-    fn is_valid(&self) -> bool {
-        is_lower_hex(&self.owner_pubkey, 64)
-            && is_lower_hex(&self.manifest_verification_key, 64)
-            && is_lower_hex(&self.relay_signer, 64)
-            && self.broker_socket.is_absolute()
-            && self.executor_program.is_absolute()
-            && self.evidence_directory.is_absolute()
-            && self.journal_directory.is_absolute()
-            && (1..=256).contains(&self.max_argv_items)
-            && (1..=65_536).contains(&self.max_argv_bytes)
-            && (1..=256).contains(&self.max_environment_items)
-            && (1..=65_536).contains(&self.max_environment_bytes)
-            && (1..=16_777_216).contains(&self.max_output_bytes)
+fn validate_config_fields(bytes: &[u8]) -> Result<(), ConfigError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(ConfigError::InvalidJson)?;
+    let object = value.as_object().ok_or(ConfigError::UnknownFields)?;
+    let expected: &[&str] = match object.get("mode").and_then(serde_json::Value::as_str) {
+        Some("dormant") => &["schema_version", "controld_uid", "controld_gid", "mode"],
+        Some("v2_proxy") => &[
+            "schema_version",
+            "controld_uid",
+            "controld_gid",
+            "mode",
+            "execd_socket",
+            "execd_uid",
+            "execd_gid",
+            "replay_journal",
+            "connect_timeout_millis",
+            "io_timeout_millis",
+            "transport_attempts",
+            "retry_delay_millis",
+            "lane_manifest_digest",
+            "lane_epoch",
+            "admission_key_generation",
+            "isolation_profile_digest",
+            "audience_digest",
+        ],
+        _ => return Ok(()),
+    };
+    if object.len() != expected.len() || object.keys().any(|key| !expected.contains(&key.as_str()))
+    {
+        return Err(ConfigError::UnknownFields);
     }
+    Ok(())
 }
 
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
+fn digest(value: &str) -> bool {
+    value.len() == 64
+        && value != "0".repeat(64)
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+pub(crate) fn validate_private_directory(path: &Path) -> Result<(), ()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -159,28 +262,77 @@ mod tests {
     }
 
     #[test]
-    fn loads_exact_mode_0600_version_one_config() {
+    fn loads_exact_mode_0600_dormant_config() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("runner.json");
-        write_config(&path, br#"{"schema_version":1,"controld_uid":962}"#, 0o600);
+        write_config(
+            &path,
+            br#"{"schema_version":2,"controld_uid":962,"controld_gid":963,"mode":"dormant"}"#,
+            0o600,
+        );
 
         assert_eq!(
             RunnerConfig::load(&path).expect("valid config"),
             RunnerConfig {
-                schema_version: 1,
+                schema_version: 2,
                 controld_uid: 962,
-                host: None,
+                controld_gid: 963,
+                mode: RunnerMode::Dormant,
             }
         );
     }
 
     #[test]
-    fn host_composition_is_all_or_nothing() {
+    fn loads_only_fixed_v2_proxy_coordinates() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("runner.json");
+        let value = serde_json::json!({
+            "schema_version": 2,
+            "controld_uid": 962,
+            "controld_gid": 963,
+            "mode": "v2_proxy",
+            "execd_socket": EXECD_SOCKET_PATH,
+            "execd_uid": 0,
+            "execd_gid": 0,
+            "replay_journal": V2_REPLAY_JOURNAL_PATH,
+            "connect_timeout_millis": 1000,
+            "io_timeout_millis": 5000,
+            "transport_attempts": 3,
+            "retry_delay_millis": 100,
+            "lane_manifest_digest": "11".repeat(32),
+            "lane_epoch": 4,
+            "admission_key_generation": 9,
+            "isolation_profile_digest": "22".repeat(32),
+            "audience_digest": "33".repeat(32),
+        });
+        write_config(&path, &serde_json::to_vec(&value).unwrap(), 0o600);
+        assert!(matches!(
+            RunnerConfig::load(&path).expect("valid proxy config").mode,
+            RunnerMode::V2Proxy { .. }
+        ));
+
+        let mut drifted = value;
+        drifted["execd_socket"] = serde_json::json!("/tmp/execd.sock");
+        write_config(
+            &directory.path().join("drifted.json"),
+            &serde_json::to_vec(&drifted).unwrap(),
+            0o600,
+        );
+        assert!(matches!(
+            RunnerConfig::load(&directory.path().join("drifted.json")),
+            Err(ConfigError::InvalidV2Proxy)
+        ));
+    }
+
+    #[test]
+    fn legacy_host_composition_is_rejected() {
         let directory = tempdir().expect("tempdir");
         let complete = directory.path().join("complete.json");
         let value = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "controld_uid": 962,
+            "controld_gid": 963,
+            "mode": "dormant",
             "host": {
                 "owner_pubkey": "11".repeat(32),
                 "manifest_verification_key": "22".repeat(32),
@@ -198,18 +350,20 @@ mod tests {
             }
         });
         write_config(&complete, &serde_json::to_vec(&value).unwrap(), 0o600);
-        let loaded = RunnerConfig::load(&complete).unwrap();
-        assert_eq!(loaded.host.as_ref().unwrap().broker_uid, 0);
+        assert!(matches!(
+            RunnerConfig::load(&complete),
+            Err(ConfigError::UnknownFields)
+        ));
 
         let partial = directory.path().join("partial.json");
         write_config(
             &partial,
-            br#"{"schema_version":1,"controld_uid":962,"host":{"owner_pubkey":"11"}}"#,
+            br#"{"schema_version":2,"controld_uid":962,"controld_gid":963,"mode":"dormant","host":{"owner_pubkey":"11"}}"#,
             0o600,
         );
         assert!(matches!(
             RunnerConfig::load(&partial),
-            Err(ConfigError::InvalidJson(_))
+            Err(ConfigError::UnknownFields)
         ));
     }
 
@@ -217,7 +371,11 @@ mod tests {
     fn rejects_broad_mode_symlink_and_unknown_fields() {
         let directory = tempdir().expect("tempdir");
         let broad = directory.path().join("broad.json");
-        write_config(&broad, br#"{"schema_version":1,"controld_uid":962}"#, 0o640);
+        write_config(
+            &broad,
+            br#"{"schema_version":2,"controld_uid":962,"controld_gid":963,"mode":"dormant"}"#,
+            0o640,
+        );
         assert!(matches!(
             RunnerConfig::load(&broad),
             Err(ConfigError::InsecureFile)
@@ -227,7 +385,7 @@ mod tests {
         let linked = directory.path().join("linked.json");
         write_config(
             &target,
-            br#"{"schema_version":1,"controld_uid":962}"#,
+            br#"{"schema_version":2,"controld_uid":962,"controld_gid":963,"mode":"dormant"}"#,
             0o600,
         );
         symlink(&target, &linked).expect("create fixture symlink");
@@ -239,16 +397,20 @@ mod tests {
         let unknown = directory.path().join("unknown.json");
         write_config(
             &unknown,
-            br#"{"schema_version":1,"controld_uid":962,"runner_socket":"unfrozen"}"#,
+            br#"{"schema_version":2,"controld_uid":962,"controld_gid":963,"mode":"dormant","runner_socket":"unfrozen"}"#,
             0o600,
         );
         assert!(matches!(
             RunnerConfig::load(&unknown),
-            Err(ConfigError::InvalidJson(_))
+            Err(ConfigError::UnknownFields)
         ));
 
         let root = directory.path().join("root.json");
-        write_config(&root, br#"{"schema_version":1,"controld_uid":0}"#, 0o600);
+        write_config(
+            &root,
+            br#"{"schema_version":2,"controld_uid":0,"controld_gid":963,"mode":"dormant"}"#,
+            0o600,
+        );
         assert!(matches!(
             RunnerConfig::load(&root),
             Err(ConfigError::InvalidPeerUid)

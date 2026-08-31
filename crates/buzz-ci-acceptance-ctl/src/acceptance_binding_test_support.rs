@@ -10,12 +10,6 @@ use crate::acceptance_binding::{
     ACCEPTANCE_BINDING_SCHEMA,
 };
 
-/// Distinct client identities mirrored by the activation cross-language fixture.
-pub const CANONICAL_CONTROLD_UID: u32 = 62_002;
-pub const CANONICAL_CONTROLD_GID: u32 = 62_002;
-pub const CANONICAL_QUALIFICATION_UID: u32 = 961;
-pub const CANONICAL_QUALIFICATION_GID: u32 = 961;
-
 /// One named invalid receipt encoding consumed by both daemons' tests.
 pub struct AcceptanceBindingMutation {
     pub name: &'static str,
@@ -101,28 +95,32 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
         ""
     ]);
     let request_digest = event_id(&run_event);
-    let grant_digest = event_id(&grant_event);
+    let grant_event_id = event_id(&grant_event);
     AcceptanceBindingReceipt {
         schema_version: ACCEPTANCE_BINDING_SCHEMA.to_owned(),
-        activation_id: "buzz-ci-capacity-one-111111111111-121212121212".to_owned(),
+        activation_id: "activation-1".to_owned(),
         activation_package_digest: "12".repeat(32),
         scenario_sha256: "09".repeat(32),
-        peer_uid: CANONICAL_CONTROLD_UID,
-        peer_gid: CANONICAL_CONTROLD_GID,
+        peer_uid: 1201,
+        peer_gid: 1201,
         timeout_millis: 1_000,
         fixture: FixtureSpec {
             integrated_candidate_sha: "11".repeat(20),
-            activation_id: "buzz-ci-capacity-one-111111111111-121212121212".to_owned(),
+            activation_id: "activation-1".to_owned(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
+            job_id: "test".to_owned(),
             request_digest,
             manifest_digest: "15".repeat(32),
             source_oid: "16".repeat(20),
             approval_id: "17".repeat(16),
-            grant_digest,
+            grant_event_id,
+            grant_digest: "19".repeat(32),
             approved_by: actor.to_owned(),
             export_subject: "1b".repeat(32),
             export_authorization_digest: "1c".repeat(32),
+            controller_generation: 7,
+            runner_generation: 9,
             expected_log: EvidenceObject {
                 name: "job.log".to_owned(),
                 sha256: "1d".repeat(32),
@@ -177,10 +175,10 @@ pub fn acceptance_binding_mutation_corpus() -> Vec<AcceptanceBindingMutation> {
         receipt.schema_version.push_str("-drift")
     });
     push_receipt_mutation(&mut cases, "activation", |receipt| {
-        receipt.activation_id.clear()
+        receipt.activation_id = "other-activation".to_owned()
     });
     push_receipt_mutation(&mut cases, "package", |receipt| {
-        receipt.activation_package_digest = "00".repeat(32)
+        receipt.activation_package_digest = "23".repeat(32)
     });
     push_receipt_mutation(&mut cases, "candidate", |receipt| {
         receipt.fixture.integrated_candidate_sha = "not-a-candidate".to_owned()
@@ -201,7 +199,7 @@ pub fn acceptance_binding_mutation_corpus() -> Vec<AcceptanceBindingMutation> {
         receipt.fixture.request_digest = "26".repeat(32)
     });
     push_receipt_mutation(&mut cases, "grant_id", |receipt| {
-        receipt.fixture.grant_digest = "27".repeat(32)
+        receipt.fixture.grant_event_id = "27".repeat(32)
     });
     push_receipt_mutation(&mut cases, "run_actor", |receipt| {
         receipt.acceptance.run_event[1] = serde_json::json!("28".repeat(32))
