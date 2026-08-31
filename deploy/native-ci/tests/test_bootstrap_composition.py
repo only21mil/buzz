@@ -16,6 +16,8 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ACTIVATION_ROOT = REPO_ROOT / "deploy/native-ci/activation"
+RUNNER_ROOT = REPO_ROOT / "deploy/native-ci/runner"
+CONTROLD_ROOT = REPO_ROOT / "deploy/native-ci/controld"
 EXECD_ROOT = REPO_ROOT / "deploy/native-ci/execd"
 sys.path.insert(0, str(ACTIVATION_ROOT))
 
@@ -24,6 +26,7 @@ def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -36,6 +39,10 @@ EXECD_FREEZER = load_module("bootstrap_execd_freezer", EXECD_ROOT / "freeze_pack
 ACTIVATION_TESTS = load_module(
     "bootstrap_activation_test_fixture", ACTIVATION_ROOT / "tests/test_activation_controller.py",
 )
+load_module("render_runner_config", RUNNER_ROOT / "render_runner_config.py")
+RUNNER_FREEZER = load_module("bootstrap_runner_freezer", RUNNER_ROOT / "freeze_package.py")
+load_module("render_controld_config", CONTROLD_ROOT / "render_controld_config.py")
+CONTROLD_FREEZER = load_module("bootstrap_controld_freezer", CONTROLD_ROOT / "freeze_package.py")
 
 
 def canonical(value: object) -> bytes:
@@ -158,19 +165,75 @@ class BootstrapCompositionTests(unittest.TestCase):
     def _ready_packages(
         self,
         ceremony: Path,
+        source: Path,
         draft: dict[str, object],
         fixture: object,
         candidate: str,
     ) -> dict[str, dict[str, object]]:
         results: dict[str, dict[str, object]] = {}
-        draft_entries = {item["role"]: item for item in draft["entries"]}
         effective = [
             record
             for unit in draft["effective_systemd"]
             for record in (unit["fragment"], *unit["drop_ins"])
         ]
+        identities = draft["identities"]
+        packages_root = ceremony / "packages"
+        packages_root.mkdir(mode=0o700)
+        packages_root.chmod(0o700)
+        inputs = ceremony / "component-inputs"
+        inputs.mkdir(mode=0o700)
 
-        for name in ("runner", "controld", "keyholder"):
+        for name, freezer in (("runner", RUNNER_FREEZER), ("controld", CONTROLD_FREEZER)):
+            component = next(item for item in draft["components"] if item["name"] == name)
+            binary = inputs / f"buzz-ci-{name}"
+            binary_payload = f"{name}-binary\n".encode()
+            write_file(binary, binary_payload, 0o755)
+            self.assertEqual(
+                hashlib.sha256(binary_payload).hexdigest(),
+                component["binary_sha256"],
+            )
+            provenance = inputs / f"buzz-ci-{name}.provenance.json"
+            write_file(
+                provenance,
+                canonical({
+                    "binary": f"buzz-ci-{name}",
+                    "profile": "release",
+                    "schema": "buzz-ci-binary-provenance-v1",
+                    "sha256": component["binary_sha256"],
+                    "source_commit": candidate,
+                }),
+                0o600,
+            )
+            output = packages_root / name
+            if name == "runner":
+                manifest = freezer.freeze_package(
+                    source,
+                    candidate,
+                    binary,
+                    provenance,
+                    output,
+                    identities["runner"]["uid"],
+                    identities["runner"]["gid"],
+                    identities["controld"]["uid"],
+                    identities["controld"]["gid"],
+                )
+            else:
+                manifest = freezer.freeze_package(
+                    source,
+                    candidate,
+                    binary,
+                    provenance,
+                    output,
+                    identities["controld"]["uid"],
+                    identities["controld"]["gid"],
+                )
+                raw = (output / "package-manifest.json").read_bytes()
+                component["package_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+                component["package_digest"] = manifest["package_digest"]
+                fixture.assets[component["package_manifest_source"]] = (raw, 0o400)
+            results[name] = manifest
+
+        for name in ("keyholder",):
             package = ceremony / "packages" / name
             package.mkdir(parents=True, mode=0o700)
             package.chmod(0o700)
@@ -197,14 +260,6 @@ class BootstrapCompositionTests(unittest.TestCase):
                 payload = (REPO_ROOT / ACTIVATION_FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes()
                 add("socket" if record["path"].endswith(".socket") else "unit", record["path"], payload)
 
-            if name in {"runner", "controld"}:
-                role = f"{name}_config"
-                activation_entry = draft_entries[role]
-                payload = fixture.assets[activation_entry["source"]][0]
-                add(
-                    "config", activation_entry["target"], payload, 0o400,
-                    activation_entry["install_mode"], activation_entry["uid"], activation_entry["gid"],
-                )
             binary = f"{name}-binary\n".encode()
             add("binary", f"/usr/libexec/buzz-ci-{name}", binary, 0o500, "0755")
             add("tmpfiles", f"/usr/lib/tmpfiles.d/buzzci-{name}.conf", f"{name}-tmpfiles\n".encode())
@@ -218,47 +273,16 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "directories": [],
                 "entries": entries,
             }
-            if name == "runner":
-                base.update({
-                    "default_state": {}, "peer_policy": {}, "identities": {},
-                })
-            elif name == "controld":
-                base.update({
-                    "default_state": {},
-                    "daemon_contract": {
-                        "acceptance_binding": ACTIVATION_PACKAGE.ACCEPTANCE_BINDING_PATH,
-                    },
-                    "identity": {},
-                })
-            else:
-                base.update({
-                    "identities": {
-                        "keyholder_uid": draft["identities"]["keyholder"]["uid"],
-                        "keyholder_gid": draft["identities"]["keyholder"]["gid"],
-                        "controld_uid": draft["identities"]["controld"]["uid"],
-                        "controld_gid": draft["identities"]["controld"]["gid"],
-                    },
-                    "runtime_contract": {}, "credential_contract": {},
-                })
-            if name in {"runner", "controld"}:
-                provenance = canonical({
-                    "binary": f"buzz-ci-{name}", "profile": "release",
-                    "schema": "buzz-ci-binary-provenance-v1",
-                    "sha256": hashlib.sha256(binary).hexdigest(), "source_commit": candidate,
-                })
-                base["binary_provenance_sha256"] = hashlib.sha256(provenance).hexdigest()
-                write_file(package / "binary-provenance.json", provenance, 0o600)
-
-            if name == "controld":
-                component = next(item for item in draft["components"] if item["name"] == "controld")
-                base["package_digest"] = hashlib.sha256(canonical(base)).hexdigest()
-                raw = canonical(base)
-                component["source_commit"] = candidate
-                component["package_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-                component["package_digest"] = base["package_digest"]
-                fixture.assets[component["package_manifest_source"]] = (raw, 0o400)
-            else:
-                base["package_digest"] = hashlib.sha256(canonical(base)).hexdigest()
+            base.update({
+                "identities": {
+                    "keyholder_uid": draft["identities"]["keyholder"]["uid"],
+                    "keyholder_gid": draft["identities"]["keyholder"]["gid"],
+                    "controld_uid": draft["identities"]["controld"]["uid"],
+                    "controld_gid": draft["identities"]["controld"]["gid"],
+                },
+                "runtime_contract": {}, "credential_contract": {},
+            })
+            base["package_digest"] = hashlib.sha256(canonical(base)).hexdigest()
 
             for source, (payload, mode) in sources.items():
                 write_file(package / source, payload, mode)
@@ -288,7 +312,26 @@ class BootstrapCompositionTests(unittest.TestCase):
             fixture_root.mkdir(mode=0o700)
             fixture = ACTIVATION_TESTS.ActivationFixture(fixture_root)
             draft = self._retarget_draft(fixture, candidate)
-            ready = self._ready_packages(ceremony, draft, fixture, candidate)
+            ready = self._ready_packages(ceremony, source, draft, fixture, candidate)
+            runner_targets = {item["target"] for item in ready["runner"]["entries"]}
+            self.assertIn("/etc/buzzci/runner-v1.json", runner_targets)
+            self.assertNotIn("/etc/buzzci/runner-v2.json", runner_targets)
+            controld_targets = {item["target"] for item in ready["controld"]["entries"]}
+            self.assertIn("/etc/buzzci/controld-v1.json", controld_targets)
+            self.assertIn(INVENTORY.CONTROLD_ACCEPTANCE_TARGET, controld_targets)
+            for name, schema in (
+                ("runner", RUNNER_ROOT / "package-manifest.schema.json"),
+                ("controld", CONTROLD_ROOT / "package-manifest.schema.json"),
+            ):
+                subprocess.run(
+                    [
+                        "check-jsonschema",
+                        "--schemafile",
+                        str(schema),
+                        str(ceremony / f"packages/{name}/package-manifest.json"),
+                    ],
+                    check=True,
+                )
 
             asset_root = ceremony / "activation-inputs"
             asset_root.mkdir(mode=0o700)
@@ -365,6 +408,10 @@ class BootstrapCompositionTests(unittest.TestCase):
             activation_manifest = ACTIVATION_FREEZER.freeze_package(
                 source, candidate, ceremony / "activation-draft.json", asset_root, activation_path,
             )
+            loaded_manifest, _loaded_payloads = ACTIVATION_TESTS.CONTROLLER.load_package(
+                activation_path, live=False,
+            )
+            self.assertEqual(loaded_manifest, activation_manifest)
             execd_path = ceremony / "packages/execd"
             execd_manifest = EXECD_FREEZER.freeze_package(
                 source, candidate, execd_binary, execd_provenance, preactivation_path,

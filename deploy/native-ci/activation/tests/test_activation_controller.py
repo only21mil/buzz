@@ -1293,8 +1293,8 @@ class ActivationControllerTests(unittest.TestCase):
                         continue
                     payload = (REPO_ROOT / FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes()
                     owned.append(entry("socket" if record["path"].endswith(".socket") else "unit", record["path"], payload))
-            if owner in {"runner", "controld"}:
-                target = f"/etc/buzzci/{'runner-v2' if owner == 'runner' else 'controld-v1'}.json"
+            if owner == "controld":
+                target = "/etc/buzzci/controld-v1.json"
                 shared = activation_entries[target]
                 owned.append({
                     "role": "config", "target": target, "sha256": shared["sha256"],
@@ -1319,9 +1319,21 @@ class ActivationControllerTests(unittest.TestCase):
         for category in ("binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt"):
             self.assertGreater(report["categories"].get(category, 0), 0, category)
 
+        self.assertFalse(any(
+            item["target"] == "/etc/buzzci/runner-v2.json"
+            for item in packages["runner"]["entries"]
+        ))
+        self.assertTrue(any(
+            item["target"] == "/etc/buzzci/runner-v2.json"
+            for item in packages["activation"]["entries"]
+        ))
+
         divergent = copy.deepcopy(packages)
-        runner_config = next(item for item in divergent["runner"]["entries"] if item["target"] == "/etc/buzzci/runner-v2.json")
-        runner_config["sha256"] = "0" * 64
+        controld_config = next(
+            item for item in divergent["controld"]["entries"]
+            if item["target"] == "/etc/buzzci/controld-v1.json"
+        )
+        controld_config["sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "divergent explicitly shared"):
             INVENTORY.check_inventory(divergent)
 

@@ -13,9 +13,12 @@ runner or broker, or grant execution capacity.
 The installed default remains:
 
 - `buzz-ci-controld.service` present but static, disabled, and inactive;
-- `controld-v1.json` contains only schema version 1, capacity exactly `0`, and
-  absolute store root `/var/lib/buzzci/controld`;
-- no relay URL, key descriptor, keyholder, runner, broker, socket, or polling
+- `controld-v1.json` contains only schema version 1, capacity exactly `0`, the
+  absolute store root `/var/lib/buzzci/controld`, and the fixed public
+  acceptance-binding receipt path;
+- `buzz-ci-controld-acceptance.socket` is packaged but remains static, disabled,
+  and inactive until the activation controller explicitly starts it;
+- no relay URL, key descriptor, keyholder, runner, broker, or polling
   configuration;
 - state reported as `enabled=false`, `active=false`, `provisioned=false`,
   `providers_wired=false`, and `capacity=0`.

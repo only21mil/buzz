@@ -74,8 +74,9 @@ credential.
 `check` starts from installed component packages and requires activation-owned
 services and sockets to be inactive. A pre-existing enabled and listening execd
 socket is captured as baseline state. Managed activation files must be absent or
-match the staged payload exactly. The runner and controld closed configs must
-already exist with their frozen staged bytes and metadata.
+match the staged payload exactly. The controld closed config must already exist
+with its frozen staged bytes and metadata. The component-owned runner-v1 config
+remains in place; activation solely stages and later swaps runner-v2.
 For all 13 lifecycle units, the controller reads both `FragmentPath` and
 ordered `DropInPaths`. It independently hashes every returned fragment and
 drop-in. Dormant checks allow only manifest-bound dependencies and exact
@@ -510,9 +511,11 @@ deploy/native-ci/activation/check_package_inventory.py \
   --activation /private/activation/activation-manifest.json
 ```
 
-Only the byte-identical dormant runner and controld configs are modeled as
-shared targets. Every other duplicate fails, even with identical bytes. A
-modeled config share fails if its digest, mode, UID, or GID differs. The gate
+Only the byte-identical dormant controld config is modeled as a shared target.
+The runner package owns its runner-v1 config, while activation solely owns the
+staged and active runner-v2 target. Every other duplicate fails, even with
+identical bytes. The modeled config share fails if its digest, mode, UID, or
+GID differs. The gate
 also checks the source tree and rejects any second
 `buzz-ci-controld-acceptance.socket` template. Its only source and package
 owner is controld.

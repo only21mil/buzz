@@ -34,9 +34,11 @@ DAEMON_CONTRACT = {
     "capacity": 0,
     "network": False,
     "keyholder": False,
+    "acceptance_binding": render_controld_config.ACCEPTANCE_BINDING,
 }
 STATIC_ASSETS = (
     ("service", "templates/buzz-ci-controld.service", "buzz-ci-controld.service", "/etc/systemd/system/buzz-ci-controld.service", 0o400, 0o644, 0, 0),
+    ("acceptance_socket", "templates/buzz-ci-controld-acceptance.socket", "buzz-ci-controld-acceptance.socket", "/etc/systemd/system/buzz-ci-controld-acceptance.socket", 0o400, 0o644, 0, 0),
     ("tmpfiles", "templates/buzzci-controld.tmpfiles", "buzzci-controld.conf", "/usr/lib/tmpfiles.d/buzzci-controld.conf", 0o400, 0o644, 0, 0),
     ("documentation", "README.md", "README.md", "/usr/share/doc/buzz-ci-controld/README.md", 0o400, 0o644, 0, 0),
 )
