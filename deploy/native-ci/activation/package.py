@@ -14,8 +14,8 @@ from typing import Any
 from urllib.parse import urlsplit
 import uuid
 
-MANIFEST_SCHEMA = "buzz-ci-capacity-one-activation-package-v1"
-DRAFT_SCHEMA = "buzz-ci-capacity-one-activation-draft-v1"
+MANIFEST_SCHEMA = "buzz-ci-capacity-one-activation-package-v2"
+DRAFT_SCHEMA = "buzz-ci-capacity-one-activation-draft-v2"
 RECEIPT_SCHEMA = "buzz-ci-capacity-one-activation-receipt-v1"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
 MAX_JSON_BYTES = 1024 * 1024
@@ -78,8 +78,8 @@ QUALIFICATION_UID = 961
 QUALIFICATION_GID = 961
 ACCESS_GROUP_NAME = "buzzci-execd"
 ACCESS_GROUP_MEMBERS = ["buzzci-ctl", "buzzci-runner"]
-ACCEPTANCE_BINDING_PATH = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
-ACCEPTANCE_BINDING_SCHEMA = "buzz-ci-activation-acceptance-binding/v1"
+ACCEPTANCE_BINDING_PATH = "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json"
+ACCEPTANCE_BINDING_SCHEMA = "buzz-ci-activation-acceptance-binding/v2"
 ACTIVATION_CONTROLLER_PATH = "/usr/libexec/buzz-ci-activation-controller"
 ACTIVATION_PACKAGE_MODULE_PATH = "/usr/libexec/buzz_ci_activation_package.py"
 FIXED_PACKAGE_PATH = "/var/lib/buzzci/activation-controller/package"
@@ -87,9 +87,9 @@ FIXED_PACKAGE_PATH = "/var/lib/buzzci/activation-controller/package"
 CONFIG_TARGETS = {
     "runner_config": "/etc/buzzci/runner-v2.json",
     "execd_config": "/etc/buzzci/execd-v2.json",
-    "controld_config": "/etc/buzzci/controld-v1.json",
+    "controld_config": "/etc/buzzci/controld-v2.json",
 }
-KEYHOLDER_CONFIG_PATH = "/etc/buzzci/keyholder-v1.json"
+KEYHOLDER_CONFIG_PATH = "/etc/buzzci/keyholder-v2.json"
 KEYHOLDER_ALLOWED_OPERATIONS = [
     "describe", "sign_ci_event", "nip98_authorize", "sign_manifest",
     "describe_acceptance", "sign_acceptance_mutation",
@@ -148,7 +148,7 @@ EXECUTOR_SOCKET_PATH = "/run/buzzci/executor.sock"
 RUNNER_REPLAY_JOURNAL = "/var/lib/buzzci/runner/v2-replay.json"
 SECCOMP_PROFILE_DIGEST = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 SECCOMP_PROFILE_PATH = f"/var/lib/buzzci/seccomp/v1/sha256/{SECCOMP_PROFILE_DIGEST}.json"
-RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "a41c84589521d3ca02cf944be8c6c80d29bbb4b1fdf18982b44d0f550cf58785"
+RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "c8addbb42bace522e99fc8fe00603c9245db61ac8a599ef5762c2744267189cd"
 QUALIFICATION_SOURCE_COMMIT = "564e41fda889f25b094b79524b3fb409121794c7"
 LANE_MANIFEST_DIGEST_DOMAIN = b"buzz-ci:lane-activation-manifest:v1\0"
 
@@ -797,7 +797,7 @@ def validate_external_keyholder_config(
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"schema_version", "peer", "selectors", "nip98_origin", "acceptance"}:
         raise ValueError("external keyholder configuration shape differs")
-    if isinstance(value["schema_version"], bool) or value["schema_version"] != 1:
+    if isinstance(value["schema_version"], bool) or value["schema_version"] != 2:
         raise ValueError("external keyholder configuration schema differs")
     peer = value["peer"]
     expected_peer = {
@@ -1144,8 +1144,8 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
     if (
         isinstance(controld_staged.get("schema_version"), bool)
         or isinstance(controld_active.get("schema_version"), bool)
-        or controld_staged.get("schema_version") != 1
-        or controld_active.get("schema_version") != 1
+        or controld_staged.get("schema_version") != 2
+        or controld_active.get("schema_version") != 2
     ):
         raise ValueError("controld schema changes during activation")
     if controld_staged.get("store_root") != "/var/lib/buzzci/controld" or controld_active.get("store_root") != "/var/lib/buzzci/controld":
@@ -1279,7 +1279,7 @@ def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes
     if canonical_json(package) != payload:
         raise ValueError("controld package manifest is not canonical")
     required = {"schema", "source_commit", "entries", "package_digest"}
-    if not required <= set(package) or package["schema"] != "buzz-ci-controld-install-package-v1":
+    if not required <= set(package) or package["schema"] != "buzz-ci-controld-install-package-v2":
         raise ValueError("controld package manifest identity differs")
     package_digest = package["package_digest"]
     unsigned = dict(package)

@@ -88,12 +88,12 @@ class BootstrapCompositionTests(unittest.TestCase):
 
     def _public_binding(self, actor: dict[str, object]) -> dict[str, object]:
         return {
-            "schema_version": "buzz-ci-clean-host-e2e-public-binding/v2",
+            "schema_version": "buzz-ci-clean-host-e2e-public-binding/v3",
             "relay_url": "wss://relay.example.invalid",
             "relay_http_origin": "https://relay.example.invalid",
             "acceptance_actor": actor,
             "keyholder_public_spec": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "peer": {
                     "uid": 62002,
                     "gid": 62002,
@@ -109,7 +109,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                 },
                 "nip98_origin": "https://relay.example.invalid",
                 "acceptance": {
-                    "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
+                    "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json",
                     "credential_selector": "acceptance-actor.key",
                 },
             },
@@ -315,10 +315,10 @@ class BootstrapCompositionTests(unittest.TestCase):
             draft = self._retarget_draft(fixture, candidate)
             ready = self._ready_packages(ceremony, source, draft, fixture, candidate)
             runner_targets = {item["target"] for item in ready["runner"]["entries"]}
-            self.assertIn("/etc/buzzci/runner-v1.json", runner_targets)
-            self.assertNotIn("/etc/buzzci/runner-v2.json", runner_targets)
+            self.assertIn("/etc/buzzci/runner-v2.json", runner_targets)
+            self.assertNotIn("/etc/buzzci/runner-v1.json", runner_targets)
             controld_targets = {item["target"] for item in ready["controld"]["entries"]}
-            self.assertIn("/etc/buzzci/controld-v1.json", controld_targets)
+            self.assertIn("/etc/buzzci/controld-v2.json", controld_targets)
             self.assertIn(INVENTORY.CONTROLD_ACCEPTANCE_TARGET, controld_targets)
             for name, schema in (
                 ("runner", RUNNER_ROOT / "package-manifest.schema.json"),

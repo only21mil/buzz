@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import importlib.util
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -680,6 +682,160 @@ class TimingAndProgressTests(unittest.TestCase):
                     with self.assertRaisesRegex(guest.GuestError, f"inventory differs: {phase}"):
                         guest.verify_command_inventory()
         guest.abandon_command_inventory()
+
+    def test_canary_command_forwards_exact_qualification_credentials(self) -> None:
+        activation = {"manifest": "exact"}
+        scenario = b'{"scenario":"exact"}'
+        completed = subprocess.CompletedProcess(
+            ["/usr/libexec/buzz-ci-capacity-one-canary"], 0, b"receipt", b"",
+        )
+        with mock.patch.object(
+            guest, "assert_live_acceptance_roles", return_value=(961, 961, [62005]),
+        ) as credentials, mock.patch.object(
+            guest, "command", return_value=completed,
+        ) as command:
+            self.assertEqual(
+                guest.run_capacity_one_canary(activation, scenario),
+                b"receipt",
+            )
+        credentials.assert_called_once_with(activation)
+        command.assert_called_once_with(
+            ["/usr/libexec/buzz-ci-capacity-one-canary"],
+            stdin=scenario,
+            timeout=guest.canary_command_seconds(),
+            timing_terms={},
+            uid=961,
+            gid=961,
+            supplementary_gids=[62005],
+        )
+
+    def test_qualification_credentials_are_exact_and_minimal(self) -> None:
+        activation = {
+            "identities": {
+                "qualification": {
+                    "uid": 961,
+                    "gid": 961,
+                    "supplementary_groups": ["buzzci-execd"],
+                },
+            },
+            "access_group": {
+                "group": "buzzci-execd",
+                "gid": 62005,
+                "members": ["buzzci-ctl", "buzzci-runner"],
+            },
+        }
+        self.assertEqual(guest.qualification_credentials(activation), (961, 961, [62005]))
+        identity_mutations = (
+            ("uid", 0),
+            ("gid", 0),
+            ("supplementary_groups", []),
+            ("supplementary_groups", ["buzzci-execd", "extra"]),
+        )
+        for field, value in identity_mutations:
+            changed = copy.deepcopy(activation)
+            changed["identities"]["qualification"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                guest.GuestError, "qualification credentials differ",
+            ):
+                guest.qualification_credentials(changed)
+        for field, value in (
+            ("group", "wrong"),
+            ("gid", 0),
+            ("gid", True),
+            ("members", ["buzzci-ctl"]),
+        ):
+            changed = copy.deepcopy(activation)
+            changed["access_group"][field] = value
+            with self.subTest(access_group=field), self.assertRaisesRegex(
+                guest.GuestError, "qualification credentials differ",
+            ):
+                guest.qualification_credentials(changed)
+
+    def assert_live_acceptance_roles_for_status(
+        self, status: str,
+    ) -> tuple[int, int, list[int]]:
+        activation = {
+            "identities": {
+                "controld": {
+                    "uid": 62002,
+                    "gid": 62002,
+                    "supplementary_groups": [],
+                },
+                "qualification": {
+                    "uid": 961,
+                    "gid": 961,
+                    "supplementary_groups": ["buzzci-execd"],
+                },
+            },
+            "access_group": {
+                "group": "buzzci-execd",
+                "gid": 62005,
+                "members": ["buzzci-ctl", "buzzci-runner"],
+            },
+        }
+        accounts = {
+            "buzzci-controld": mock.Mock(pw_uid=62002, pw_gid=62002),
+            "buzzci-ctl": mock.Mock(pw_uid=961, pw_gid=961),
+        }
+        binding = {
+            "schema_version": "buzz-ci-activation-acceptance-binding/v2",
+            "keyholder_peer_uid": 62002,
+            "keyholder_peer_gid": 62002,
+            "acceptance_peer_uid": 961,
+            "acceptance_peer_gid": 961,
+        }
+        keyholder = {"peer": {"uid": 62002, "gid": 62002}}
+        socket_metadata = mock.Mock(
+            st_mode=stat.S_IFSOCK | 0o620,
+            st_uid=0,
+            st_gid=961,
+        )
+        socket_path = mock.Mock()
+        socket_path.lstat.return_value = socket_metadata
+        real_path = Path
+        with tempfile.TemporaryDirectory() as temporary:
+            proc_root = Path(temporary) / "proc"
+            process_root = proc_root / "123"
+            process_root.mkdir(parents=True)
+            (process_root / "exe").symlink_to("/usr/libexec/buzz-ci-controld")
+            (process_root / "status").write_text(status)
+
+            def mapped_path(value: object) -> object:
+                if str(value) == "/proc":
+                    return proc_root
+                if str(value) == "/run/buzzci/controld-acceptance.sock":
+                    return socket_path
+                return real_path(value)
+
+            with mock.patch.object(guest, "Path", side_effect=mapped_path), mock.patch.object(
+                guest.pwd, "getpwnam", side_effect=accounts.__getitem__,
+            ), mock.patch.object(guest, "load_json", side_effect=(binding, keyholder)):
+                return guest.assert_live_acceptance_roles(activation)
+
+    def test_live_acceptance_roles_accepts_explicit_empty_groups_record(self) -> None:
+        self.assertEqual(
+            self.assert_live_acceptance_roles_for_status(
+                "Uid:\t62002\t62002\t62002\t62002\n"
+                "Gid:\t62002\t62002\t62002\t62002\n"
+                "Groups:\t\n",
+            ),
+            (961, 961, [62005]),
+        )
+
+    def test_live_acceptance_roles_rejects_nonempty_groups_record(self) -> None:
+        with self.assertRaisesRegex(guest.GuestError, "live controld credentials differ"):
+            self.assert_live_acceptance_roles_for_status(
+                "Uid:\t62002\t62002\t62002\t62002\n"
+                "Gid:\t62002\t62002\t62002\t62002\n"
+                "Groups:\t62005\n",
+            )
+
+    def test_live_acceptance_roles_rejects_missing_groups_record(self) -> None:
+        with self.assertRaisesRegex(guest.GuestError, "live controld credentials differ"):
+            self.assert_live_acceptance_roles_for_status(
+                "Uid:\t62002\t62002\t62002\t62002\n"
+                "Gid:\t62002\t62002\t62002\t62002\n",
+            )
 
     def test_canary_stage_mutations_change_nested_bound(self) -> None:
         stages = json.loads((HERE.parents[2] / "acceptance/expected-stages.json").read_bytes())

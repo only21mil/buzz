@@ -1,7 +1,8 @@
 # Acceptance driver protocol
 
-Each configured endpoint is an absolute executable path plus a bounded argument
-list. The harness starts it directly. No shell parses the program or arguments.
+Each endpoint is the manifest-bound
+`/usr/libexec/buzz-ci-capacity-one-driver` with no arguments. The harness starts
+it directly. No shell parses the program or arguments.
 The harness writes one JSON request to stdin and accepts one JSON response from
 stdout. Each command has a 1 MiB output limit and the scenario timeout, capped
 at 300 seconds. A nonzero exit, timeout, malformed response, wrong sequence,
@@ -17,8 +18,13 @@ The five endpoint classes are:
 | `controller_process` | `restart_controller` |
 | `runner_process` | `restart_runner` |
 
-The process endpoints must perform a real bounded restart and read back state
-after recovery. A response synthesized from the request is not evidence.
+The driver first calls `/run/buzzci/acceptance-control.sock` for a fresh host
+readback. That root-owned helper accepts only readback, capacity changes, and
+the two fixed restart actions. It verifies the root activation receipt and an
+exact `buzzci-ctl` peer. The driver then sends the operation and host readback
+to `/run/buzzci/controld-acceptance.sock`. Controld owns every relay, signer,
+durable-run, and evidence operation. A response synthesized from the request is
+not evidence.
 
 ## Request
 
@@ -26,7 +32,8 @@ Every request has this shape:
 
 ```json
 {
-  "schema_version": "buzz-ci-capacity-one-driver/v1",
+  "schema_version": "buzz-ci-capacity-one-driver/v2",
+  "scenario_sha256": "64-lowercase-hex",
   "sequence": 5,
   "operation": "resume_grant",
   "fixture": {},
@@ -34,9 +41,13 @@ Every request has this shape:
 }
 ```
 
-`fixture` is the exact fixture object from the scenario. `attempt_id` appears
-when the operation targets an attempt already observed by the harness. The
-adapter must reject a target that does not match its own durable state.
+`fixture` is the exact fixture object from the scenario. It includes the
+activation ID and package digest, candidate, run, job, grant event and digest,
+source and manifest digests, export identity, and initial service generations.
+`attempt_id` appears when the operation targets an attempt already observed by
+the harness. After sequence one, every request also carries the controller and
+runner generations returned by the prior step. Either service rejects stale
+generations and any target that differs from durable state.
 
 ## Response
 
@@ -45,7 +56,7 @@ returns a normalized snapshot:
 
 ```json
 {
-  "schema_version": "buzz-ci-capacity-one-driver/v1",
+  "schema_version": "buzz-ci-capacity-one-driver/v2",
   "sequence": 1,
   "operation": "observe_initial",
   "snapshot": {
@@ -95,6 +106,8 @@ evidence-set digest to the terminal attempt's digest.
   later state from an earlier successful command.
 - Authenticate through the deployed service boundary. Do not place credentials
   in arguments, responses, stdout diagnostics, or receipts.
+- Bind every operation to the canonical scenario digest and deterministic
+  operation ID. Only a byte-identical replay may reuse an operation ID.
 - Return global active counts, not counts filtered to the fixture.
 - Preserve tombstoned attempts in the normalized run so folding is observable.
 - Return only after the requested state is durable and readable. For wait and

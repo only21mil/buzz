@@ -15,12 +15,12 @@ checks the operation against the exact policy in the public config.
 
 ## Public config
 
-`/etc/buzzci/keyholder-v1.json` is owned only by this package and contains
+`/etc/buzzci/keyholder-v2.json` is owned only by this package and contains
 only static public values. Its acceptance-enabled shape is:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "peer": {
     "uid": 1201,
     "gid": 1201,
@@ -40,7 +40,7 @@ only static public values. Its acceptance-enabled shape is:
   },
   "nip98_origin": "https://relay.example.invalid",
   "acceptance": {
-    "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
+    "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json",
     "credential_selector": "acceptance-actor.key"
   }
 }
@@ -62,12 +62,14 @@ validate the same bytes. The receipt has this declaration-order shape:
 
 ```json
 {
-  "schema_version": "buzz-ci-activation-acceptance-binding/v1",
+  "schema_version": "buzz-ci-activation-acceptance-binding/v2",
   "activation_id": "activation id",
   "activation_package_digest": "64 lowercase hex",
   "scenario_sha256": "64 lowercase hex",
-  "peer_uid": 1201,
-  "peer_gid": 1201,
+  "keyholder_peer_uid": 62002,
+  "keyholder_peer_gid": 62002,
+  "acceptance_peer_uid": 961,
+  "acceptance_peer_gid": 961,
   "timeout_millis": 1000,
   "fixture": { "...": "capacity-one fixture" },
   "acceptance": {
@@ -127,7 +129,7 @@ approval-gated activation work.
 
 Use the canonical `public-binding.json` emitted by the clean-host `prepare`
 step. The freezer requires schema
-`buzz-ci-clean-host-e2e-public-binding/v2`, validates the complete closed
+`buzz-ci-clean-host-e2e-public-binding/v3`, validates the complete closed
 document in the producer's exact declaration-order compact JSON plus LF,
 checks the controld UID and GID, rejects raw or private key fields, and verifies
 that the acceptance actor differs from all keyholder selectors. Reordered,

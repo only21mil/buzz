@@ -6,12 +6,17 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use buzz_core::ci::{
+    CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiSkipPolicy,
+    CiTeardownAttestationEnvelope, CiTeardownLease, CI_SCHEMA_VERSION,
+};
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
-use crate::production::{ControlStore, RunFinalization, SignedCiEvent, StoredPublication};
+use crate::production::{ControlStore, SignedCiEvent, StoredPublication};
 use crate::{RunIdentity, RunRecord, StoreWrite, MAX_SAFE_INTEGER};
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -234,56 +239,6 @@ impl ControlStore for DurableControlStore {
         })
     }
 
-    fn load_finalization(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<(u64, RunFinalization)>, Self::Error> {
-        validate_key(run_id)?;
-        self.with_locked(|snapshot| {
-            Ok(snapshot
-                .finalizations
-                .get(run_id)
-                .map(|stored| (stored.revision, stored.finalization.clone())))
-        })
-    }
-
-    fn compare_and_swap_finalization(
-        &mut self,
-        run_id: &str,
-        expected_revision: Option<u64>,
-        next: &RunFinalization,
-    ) -> Result<StoreWrite, Self::Error> {
-        validate_key(run_id)?;
-        next.validate().map_err(|_| StoreError::Conflict)?;
-        self.mutate(|snapshot| {
-            let actual = snapshot
-                .finalizations
-                .get(run_id)
-                .map(|stored| stored.revision);
-            if actual != expected_revision {
-                return Ok((
-                    StoreWrite::Conflict {
-                        actual_revision: actual,
-                    },
-                    false,
-                ));
-            }
-            let revision = actual
-                .unwrap_or(0)
-                .checked_add(1)
-                .filter(|revision| *revision <= MAX_SAFE_INTEGER)
-                .ok_or(StoreError::Conflict)?;
-            snapshot.finalizations.insert(
-                run_id.to_owned(),
-                StoredFinalization {
-                    revision,
-                    finalization: next.clone(),
-                },
-            );
-            Ok((StoreWrite::Written { revision }, true))
-        })
-    }
-
     fn load_publication(&self, key: &str) -> Result<Option<StoredPublication>, Self::Error> {
         validate_key(key)?;
         self.with_locked(|snapshot| Ok(snapshot.publications.get(key).cloned()))
@@ -419,11 +374,122 @@ struct StoredRun {
     record: RunRecord,
 }
 
+/// Deprecated schema-v1 finalization retained so existing snapshots remain
+/// readable and rewrites preserve their nonempty durable state.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredFinalization {
     revision: u64,
-    finalization: RunFinalization,
+    finalization: LegacyRunFinalization,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRunFinalization {
+    run_id: String,
+    target_repo_a: String,
+    tip_oid: String,
+    base_oid: String,
+    workflow_id: String,
+    workflow_digest: String,
+    request_event_id: String,
+    attempt: u32,
+    finalized_at: u64,
+    teardown_at: u64,
+    jobs: BTreeMap<String, LegacyFinalizedSelection>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyFinalizedSelection {
+    evidence: CiFinalizedJobAttempt,
+    lease: CiTeardownLease,
+    state: CiJobState,
+    required: bool,
+    skip_policy: CiSkipPolicy,
+}
+
+impl LegacyRunFinalization {
+    fn validate(&self) -> Result<(), StoreError> {
+        if Uuid::parse_str(&self.run_id).is_err()
+            || self.target_repo_a.is_empty()
+            || self.workflow_id.is_empty()
+            || self.workflow_digest.len() != 64
+            || self.request_event_id.len() != 64
+            || self.attempt == 0
+            || self.finalized_at == 0
+            || self.teardown_at == 0
+            || self.jobs.is_empty()
+            || self.jobs.iter().any(|(job_id, selected)| {
+                job_id != &selected.evidence.job_id
+                    || job_id != &selected.lease.job_id
+                    || selected.evidence.attempt != selected.lease.attempt
+                    || selected.evidence.attempt == 0
+                    || selected.lease.lease_id.is_empty()
+                    || !selected.state.is_terminal()
+            })
+        {
+            return Err(StoreError::InvalidSnapshot);
+        }
+        let mut lease_ids = self
+            .jobs
+            .values()
+            .map(|selected| selected.lease.lease_id.as_str())
+            .collect::<Vec<_>>();
+        lease_ids.sort_unstable();
+        lease_ids.dedup();
+        if lease_ids.len() != self.jobs.len() {
+            return Err(StoreError::InvalidSnapshot);
+        }
+        let validation_signer = "00".repeat(32);
+        if self.evidence(&validation_signer).validate().is_err()
+            || self.teardown(&validation_signer).validate().is_err()
+        {
+            return Err(StoreError::InvalidSnapshot);
+        }
+        Ok(())
+    }
+
+    fn evidence(&self, signer: &str) -> CiEvidenceFinalizedEnvelope {
+        CiEvidenceFinalizedEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_event_id: self.request_event_id.clone(),
+            run_id: self.run_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            target_repo_a: self.target_repo_a.clone(),
+            tip_oid: self.tip_oid.clone(),
+            attempt: self.attempt,
+            finalized_job_attempts: self
+                .jobs
+                .values()
+                .map(|selected| selected.evidence.clone())
+                .collect(),
+            finalized_at: self.finalized_at,
+            relay_signer: signer.to_owned(),
+        }
+    }
+
+    fn teardown(&self, signer: &str) -> CiTeardownAttestationEnvelope {
+        CiTeardownAttestationEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_event_id: self.request_event_id.clone(),
+            run_id: self.run_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            target_repo_a: self.target_repo_a.clone(),
+            tip_oid: self.tip_oid.clone(),
+            base_oid: self.base_oid.clone(),
+            workflow_digest: self.workflow_digest.clone(),
+            attempt: self.attempt,
+            leases: self
+                .jobs
+                .values()
+                .map(|selected| selected.lease.clone())
+                .collect(),
+            lease_empty: true,
+            teardown_at: self.teardown_at,
+            relay_signer: signer.to_owned(),
+        }
+    }
 }
 
 fn validate_absolute_path(path: &Path) -> Result<(), StoreError> {
@@ -519,38 +585,73 @@ mod tests {
         }
     }
 
-    fn finalization() -> RunFinalization {
-        serde_json::from_value(serde_json::json!({
-            "run_id": "123e4567-e89b-12d3-a456-426614174011",
-            "target_repo_a": format!("30617:{}:buzz", "22".repeat(32)),
-            "tip_oid": "44".repeat(20),
-            "base_oid": "55".repeat(20),
-            "workflow_id": "ci",
-            "workflow_digest": "66".repeat(32),
-            "request_event_id": "11".repeat(32),
-            "attempt": 1,
-            "finalized_at": 12,
-            "teardown_at": 12,
-            "jobs": {
-                "test": {
-                    "evidence": {
-                        "job_id": "test",
+    fn main_v1_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "cursors": {},
+            "runs": {},
+            "finalizations": {
+                "123e4567-e89b-12d3-a456-426614174011": {
+                    "revision": 1,
+                    "finalization": {
+                        "run_id": "123e4567-e89b-12d3-a456-426614174011",
+                        "target_repo_a": format!("30617:{}:buzz", "22".repeat(32)),
+                        "tip_oid": "44".repeat(20),
+                        "base_oid": "55".repeat(20),
+                        "workflow_id": "ci",
+                        "workflow_digest": "66".repeat(32),
+                        "request_event_id": "11".repeat(32),
                         "attempt": 1,
-                        "log_ref": "aa".repeat(32),
-                        "artifact_refs": []
-                    },
-                    "lease": {
-                        "job_id": "test",
-                        "attempt": 1,
-                        "lease_id": "lease-test-1"
-                    },
-                    "state": "success",
-                    "required": true,
-                    "skip_policy": "forbid"
+                        "finalized_at": 12,
+                        "teardown_at": 12,
+                        "jobs": {
+                            "test": {
+                                "evidence": {
+                                    "job_id": "test",
+                                    "attempt": 1,
+                                    "log_ref": "aa".repeat(32),
+                                    "artifact_refs": []
+                                },
+                                "lease": {
+                                    "job_id": "test",
+                                    "attempt": 1,
+                                    "lease_id": "lease-test-1"
+                                },
+                                "state": "success",
+                                "required": true,
+                                "skip_policy": "forbid"
+                            }
+                        }
+                    }
                 }
-            }
-        }))
-        .expect("finalization fixture")
+            },
+            "publications": {}
+        })
+    }
+
+    fn write_main_v1_snapshot(snapshot: &serde_json::Value) -> (tempfile::TempDir, PathBuf, u32) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+        let uid = fs::metadata(&root).expect("metadata").uid();
+        let bytes = serde_json::to_vec(snapshot).expect("serialize main-v1 snapshot");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(SNAPSHOT_NAME))
+            .expect("create main-v1 snapshot");
+        file.write_all(&bytes).expect("write main-v1 snapshot");
+        file.sync_all().expect("sync main-v1 snapshot");
+        (directory, root, uid)
+    }
+
+    fn assert_main_v1_snapshot_rejected(snapshot: &serde_json::Value) {
+        let (_directory, root, uid) = write_main_v1_snapshot(snapshot);
+        assert!(matches!(
+            DurableControlStore::open(root, uid),
+            Err(StoreError::InvalidSnapshot)
+        ));
     }
 
     #[test]
@@ -568,14 +669,6 @@ mod tests {
         assert!(store
             .record_publication_intent("run:queued", &event("a"))
             .expect("intent"));
-        let finalization = finalization();
-        let finalization_run_id = "123e4567-e89b-12d3-a456-426614174011";
-        assert_eq!(
-            store
-                .compare_and_swap_finalization(finalization_run_id, None, &finalization)
-                .expect("finalization"),
-            StoreWrite::Written { revision: 1 }
-        );
         drop(store);
 
         let root = fs::canonicalize(directory.path()).expect("canonical root");
@@ -592,12 +685,42 @@ mod tests {
                 .expect("publication"),
             Some(StoredPublication::Pending(event("a")))
         );
+    }
+
+    #[test]
+    fn main_v1_nonempty_finalizations_survive_open_mutation_and_restart() {
+        let snapshot = main_v1_snapshot();
+        let expected = snapshot["finalizations"]["123e4567-e89b-12d3-a456-426614174011"].clone();
+        let (directory, root, uid) = write_main_v1_snapshot(&snapshot);
+        let mut store = DurableControlStore::open(root.clone(), uid).expect("open main-v1 store");
+        assert!(store.advance_cursor("channel", 0, 7).expect("mutate store"));
+        drop(store);
+
+        let reopened = DurableControlStore::open(root.clone(), uid).expect("reopen main-v1 store");
+        assert_eq!(reopened.cursor("channel").expect("cursor"), 7);
+        drop(reopened);
+        let rewritten: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(SNAPSHOT_NAME)).expect("read rewritten snapshot"),
+        )
+        .expect("parse rewritten snapshot");
         assert_eq!(
-            reopened
-                .load_finalization(finalization_run_id)
-                .expect("finalization"),
-            Some((1, finalization))
+            rewritten["finalizations"]["123e4567-e89b-12d3-a456-426614174011"],
+            expected
         );
+        drop(directory);
+    }
+
+    #[test]
+    fn main_v1_finalizations_retain_exact_validation() {
+        let mut bad_revision = main_v1_snapshot();
+        bad_revision["finalizations"]["123e4567-e89b-12d3-a456-426614174011"]["revision"] =
+            serde_json::json!(0);
+        assert_main_v1_snapshot_rejected(&bad_revision);
+
+        let mut bad_finalization = main_v1_snapshot();
+        bad_finalization["finalizations"]["123e4567-e89b-12d3-a456-426614174011"]["finalization"]
+            ["jobs"]["test"]["lease"]["attempt"] = serde_json::json!(2);
+        assert_main_v1_snapshot_rejected(&bad_finalization);
     }
 
     #[test]

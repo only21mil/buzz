@@ -266,7 +266,7 @@ class ExecdPackageTests(unittest.TestCase):
             _apply_directory_plan(root, ACTIVATION_DIRECTORY_PLAN)
             shared = root / "var/lib/buzzci"
             receipt_root = shared / "activation-controller"
-            receipt = receipt_root / "controld-acceptance-v1.json"
+            receipt = receipt_root / "controld-acceptance-v2.json"
             receipt.write_bytes(b'{"schema_version":1}\n')
             receipt.chmod(0o444)
             private_state = receipt_root / "controller-state-v1.json"

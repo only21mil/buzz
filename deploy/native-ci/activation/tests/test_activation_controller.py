@@ -449,11 +449,11 @@ class ActivationFixture:
             execd_staged, 0o600, 0, 0, "execd-active-template.json", execd_active,
         )
         controld_staged = activation_package.canonical_json({
-            "schema_version": 1, "capacity": 0, "store_root": "/var/lib/buzzci/controld",
+            "schema_version": 2, "capacity": 0, "store_root": "/var/lib/buzzci/controld",
             "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
         })
         controld_active = activation_package.canonical_json({
-            "schema_version": 1, "capacity": 1, "store_root": "/var/lib/buzzci/controld",
+            "schema_version": 2, "capacity": 1, "store_root": "/var/lib/buzzci/controld",
             "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
             "relay_url": "wss://relay.example.invalid", "relay_http_origin": "https://relay.example.invalid",
             "channel_id": "12345678-1234-4abc-8def-123456789abc", "poll_interval_millis": 1000,
@@ -585,7 +585,7 @@ class ActivationFixture:
             }
             if name == "controld":
                 package: dict[str, object] = {
-                    "schema": "buzz-ci-controld-install-package-v1",
+                    "schema": "buzz-ci-controld-install-package-v2",
                     "source_commit": source_commit,
                     "daemon_contract": {
                         "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
@@ -662,7 +662,7 @@ class ActivationFixture:
             self.acceptance_template["grant_event"], ensure_ascii=False, separators=(",", ":"),
         ).encode())
         return {
-            "schema_version": "buzz-ci-capacity-one-scenario/v1",
+            "schema_version": "buzz-ci-capacity-one-scenario/v2",
             "fixture": {
                 "integrated_candidate_sha": self.manifest["source_commit"],
                 "activation_id": self.manifest["activation_id"],
@@ -748,7 +748,7 @@ class ActivationFixture:
                     0o644,
                 )
         keyholder = {
-            "schema_version": 1,
+            "schema_version": 2,
             "peer": {
                 "uid": 62002, "gid": 62002,
                 "allowed_operations": activation_package.KEYHOLDER_ALLOWED_OPERATIONS,
@@ -1333,7 +1333,14 @@ class ActivationControllerTests(unittest.TestCase):
                     payload = (REPO_ROOT / FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes()
                     owned.append(entry("socket" if record["path"].endswith(".socket") else "unit", record["path"], payload))
             if owner == "controld":
-                target = "/etc/buzzci/controld-v1.json"
+                target = "/etc/buzzci/controld-v2.json"
+                shared = activation_entries[target]
+                owned.append({
+                    "role": "config", "target": target, "sha256": shared["sha256"],
+                    "install_mode": shared["install_mode"], "uid": shared["uid"], "gid": shared["gid"],
+                })
+            if owner == "runner":
+                target = "/etc/buzzci/runner-v2.json"
                 shared = activation_entries[target]
                 owned.append({
                     "role": "config", "target": target, "sha256": shared["sha256"],
@@ -1358,7 +1365,7 @@ class ActivationControllerTests(unittest.TestCase):
         for category in ("binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt"):
             self.assertGreater(report["categories"].get(category, 0), 0, category)
 
-        self.assertFalse(any(
+        self.assertTrue(any(
             item["target"] == "/etc/buzzci/runner-v2.json"
             for item in packages["runner"]["entries"]
         ))
@@ -1370,7 +1377,7 @@ class ActivationControllerTests(unittest.TestCase):
         divergent = copy.deepcopy(packages)
         controld_config = next(
             item for item in divergent["controld"]["entries"]
-            if item["target"] == "/etc/buzzci/controld-v1.json"
+            if item["target"] == "/etc/buzzci/controld-v2.json"
         )
         controld_config["sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "divergent explicitly shared"):
@@ -1673,6 +1680,18 @@ class ActivationControllerTests(unittest.TestCase):
     def test_manifest_schema_mirrors_fixed_package_counts_and_systemd_abi(self) -> None:
         schema = json.loads((ACTIVATION_ROOT / "activation-manifest.schema.json").read_bytes())
         properties = schema["properties"]
+        self.assertTrue(schema["$id"].endswith("capacity-one-activation-v2.json"))
+        self.assertEqual(properties["schema"]["const"], activation_package.MANIFEST_SCHEMA)
+        legacy = copy.deepcopy(self.fixture.manifest)
+        legacy["schema"] = "buzz-ci-capacity-one-activation-package-v1"
+        with self.assertRaisesRegex(ValueError, "schema is unsupported"):
+            activation_package.validate_manifest(legacy)
+        legacy_draft = copy.deepcopy(self.fixture.manifest)
+        legacy_draft["schema"] = "buzz-ci-capacity-one-activation-draft-v1"
+        legacy_draft.pop("activation_id")
+        legacy_draft.pop("package_digest")
+        with self.assertRaisesRegex(ValueError, "schema is unsupported"):
+            activation_package.validate_manifest(legacy_draft, require_digest=False)
         self.assertEqual((properties["components"]["minItems"], properties["components"]["maxItems"]), (len(activation_package.COMPONENTS), len(activation_package.COMPONENTS)))
         expected_entries = len(activation_package.CONFIG_TARGETS) + len(activation_package.STATIC_TARGETS)
         self.assertEqual((properties["entries"]["minItems"], properties["entries"]["maxItems"]), (expected_entries, expected_entries))
@@ -1702,7 +1721,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "6efedeb02d338e1ceb5b5cde4033994ca096ecf55996afff32f3e989fcba9bb8",
+            "5a36cecec8ad048572939656f1b4c1751e7d4bb85b4961c9ebfddbc959bde6bc",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1725,14 +1744,26 @@ class ActivationControllerTests(unittest.TestCase):
             self.fixture.identities["qualification"]["gid"],
         )
         self.assertEqual(
-            (self.fixture.binding["peer_uid"], self.fixture.binding["peer_gid"]),
+            (
+                self.fixture.binding["keyholder_peer_uid"],
+                self.fixture.binding["keyholder_peer_gid"],
+            ),
             controld_peer,
+        )
+        self.assertEqual(
+            (
+                self.fixture.binding["acceptance_peer_uid"],
+                self.fixture.binding["acceptance_peer_gid"],
+            ),
+            qualification_peer,
         )
         self.assertEqual((keyholder["peer"]["uid"], keyholder["peer"]["gid"]), controld_peer)
         self.assertNotEqual(controld_peer, qualification_peer)
         self.assertEqual(list(self.fixture.binding), [
             "schema_version", "activation_id", "activation_package_digest", "scenario_sha256",
-            "peer_uid", "peer_gid", "timeout_millis", "fixture", "acceptance",
+            "keyholder_peer_uid", "keyholder_peer_gid",
+            "acceptance_peer_uid", "acceptance_peer_gid",
+            "timeout_millis", "fixture", "acceptance",
         ])
         self.assertEqual(list(self.fixture.binding["acceptance"]), [
             "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event",
@@ -2269,13 +2300,26 @@ class ActivationControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             CONTROLLER._acceptance_binding(self.fixture.manifest, changed)
         self.assertEqual(
-            (self.fixture.binding["peer_uid"], self.fixture.binding["peer_gid"]),
+            (
+                self.fixture.binding["keyholder_peer_uid"],
+                self.fixture.binding["keyholder_peer_gid"],
+            ),
             (self.fixture.identities["controld"]["uid"], self.fixture.identities["controld"]["gid"]),
         )
+        self.assertEqual(
+            (
+                self.fixture.binding["acceptance_peer_uid"],
+                self.fixture.binding["acceptance_peer_gid"],
+            ),
+            (
+                self.fixture.identities["qualification"]["uid"],
+                self.fixture.identities["qualification"]["gid"],
+            ),
+        )
         different_peer = copy.deepcopy(self.fixture.binding)
-        different_peer["peer_uid"] = self.fixture.identities["qualification"]["uid"]
-        different_peer["peer_gid"] = self.fixture.identities["qualification"]["gid"]
-        with self.assertRaisesRegex(ValueError, "controld peer differs"):
+        different_peer["acceptance_peer_uid"] = self.fixture.identities["controld"]["uid"]
+        different_peer["acceptance_peer_gid"] = self.fixture.identities["controld"]["gid"]
+        with self.assertRaisesRegex(ValueError, "peer identities differ"):
             CONTROLLER._acceptance_binding_bytes(self.fixture.manifest, different_peer)
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)

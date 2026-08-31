@@ -35,7 +35,7 @@ GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_TARGETS = {
     "binary": "/usr/libexec/buzz-ci-keyholder",
-    "config": "/etc/buzzci/keyholder-v1.json",
+    "config": "/etc/buzzci/keyholder-v2.json",
     "service": "/etc/systemd/system/buzz-ci-keyholder.service",
     "socket": "/etc/systemd/system/buzz-ci-keyholder.socket",
     "tmpfiles": "/usr/lib/tmpfiles.d/buzzci-keyholder.conf",

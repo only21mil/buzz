@@ -14,7 +14,9 @@ pub fn acceptance_signing_policy(
     expected_peer: PeerPolicy,
 ) -> Result<AcceptanceSigningPolicy, ReceiptError> {
     let validated = receipt.validate()?;
-    if (receipt.peer_uid, receipt.peer_gid) != (expected_peer.uid, expected_peer.gid) {
+    if (receipt.keyholder_peer_uid, receipt.keyholder_peer_gid)
+        != (expected_peer.uid, expected_peer.gid)
+    {
         return Err(ReceiptError::Invalid);
     }
     Ok(AcceptanceSigningPolicy::from_validated(
@@ -56,7 +58,7 @@ mod tests {
         let expected = canonical_acceptance_binding();
         let bytes = serde_json::to_vec(&expected).expect("canonical receipt");
         let receipt = AcceptanceBindingReceipt::from_canonical_bytes(&bytes).expect("receipt");
-        let peer_policy = peer_policy(expected.peer_uid, expected.peer_gid);
+        let peer_policy = peer_policy(expected.keyholder_peer_uid, expected.keyholder_peer_gid);
         let policy = acceptance_signing_policy(&receipt, peer_policy).expect("signing policy");
         assert_eq!(
             policy.actor().generation,
@@ -68,7 +70,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(policy.event_ids()[1]),
-            expected.fixture.grant_digest
+            expected.fixture.grant_event_id
         );
         let public_key = |value: &str| {
             hex::decode(value)
@@ -113,7 +115,7 @@ mod tests {
                 |receipt| {
                     acceptance_signing_policy(
                         &receipt,
-                        peer_policy(receipt.peer_uid, receipt.peer_gid),
+                        peer_policy(receipt.keyholder_peer_uid, receipt.keyholder_peer_gid),
                     )
                 },
             );
@@ -131,7 +133,7 @@ mod tests {
         let receipt = canonical_acceptance_binding();
         assert!(acceptance_signing_policy(
             &receipt,
-            peer_policy(receipt.peer_uid, receipt.peer_gid),
+            peer_policy(receipt.keyholder_peer_uid, receipt.keyholder_peer_gid),
         )
         .is_ok());
         assert_eq!(
@@ -144,14 +146,14 @@ mod tests {
         assert_eq!(
             acceptance_signing_policy(
                 &receipt,
-                peer_policy(CANONICAL_QUALIFICATION_UID, receipt.peer_gid),
+                peer_policy(receipt.acceptance_peer_uid, receipt.keyholder_peer_gid),
             ),
             Err(AcceptanceBindingError::Invalid),
         );
         assert_eq!(
             acceptance_signing_policy(
                 &receipt,
-                peer_policy(receipt.peer_uid, CANONICAL_QUALIFICATION_GID),
+                peer_policy(receipt.keyholder_peer_uid, receipt.acceptance_peer_gid),
             ),
             Err(AcceptanceBindingError::Invalid),
         );

@@ -11,14 +11,15 @@ from typing import Any
 
 
 PACKAGE_SCHEMAS = {
-    "runner": "buzz-ci-runner-install-package-v1",
-    "controld": "buzz-ci-controld-install-package-v1",
-    "keyholder": "buzz-ci-keyholder-acceptance-package-v1",
+    "runner": "buzz-ci-runner-install-package-v2",
+    "controld": "buzz-ci-controld-install-package-v2",
+    "keyholder": "buzz-ci-keyholder-acceptance-package-v2",
     "execd": "buzz-ci-execd-install-package-v1",
-    "activation": "buzz-ci-capacity-one-activation-package-v1",
+    "activation": "buzz-ci-capacity-one-activation-package-v2",
 }
 EXPLICIT_IDENTICAL_SHARES = {
-    "/etc/buzzci/controld-v1.json": frozenset({"controld", "activation"}),
+    "/etc/buzzci/runner-v2.json": frozenset({"runner", "activation"}),
+    "/etc/buzzci/controld-v2.json": frozenset({"controld", "activation"}),
 }
 REQUIRED_CATEGORIES = frozenset({
     "binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt",

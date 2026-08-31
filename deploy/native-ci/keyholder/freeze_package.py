@@ -25,16 +25,16 @@ if str(KEYHOLDER_DIR) not in sys.path:
 import package_source
 import render_keyholder_config
 
-SCHEMA = "buzz-ci-keyholder-acceptance-package-v1"
+SCHEMA = "buzz-ci-keyholder-acceptance-package-v2"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
-PUBLIC_BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v2"
+PUBLIC_BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v3"
 PACKAGE_RELATIVE = Path("deploy/native-ci/keyholder")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 RUNTIME_CONTRACT = {
     "socket_path": "/run/buzzci/keyholder.sock",
     "fd_name": "buzz-ci-keyholder-control",
-    "config_path": "/etc/buzzci/keyholder-v1.json",
+    "config_path": "/etc/buzzci/keyholder-v2.json",
     "enabled": False,
     "active": False,
 }
@@ -196,11 +196,11 @@ def _validate_units(payloads: dict[str, bytes]) -> None:
     }
     if not required_socket.issubset(set(socket.splitlines())):
         raise ValueError("keyholder socket/FD contract differs")
-    if "LimitCORE=0" not in service or "ExecStart=/usr/libexec/buzz-ci-keyholder --config /etc/buzzci/keyholder-v1.json" not in service:
+    if "LimitCORE=0" not in service or "ExecStart=/usr/libexec/buzz-ci-keyholder --config /etc/buzzci/keyholder-v2.json" not in service:
         raise ValueError("keyholder service contract differs")
     expected_read_only = (
-        "ReadOnlyPaths=/etc/buzzci/keyholder-v1.json /run/buzzci "
-        "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
+        "ReadOnlyPaths=/etc/buzzci/keyholder-v2.json /run/buzzci "
+        "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json"
     )
     if expected_read_only not in service.splitlines():
         raise ValueError("acceptance binding receipt mount contract differs")
@@ -350,7 +350,7 @@ def project_public_binding_bytes(binding_raw: bytes) -> tuple[bytes, bytes]:
     )
     if spec["nip98_origin"] != binding["relay_http_origin"]:
         raise ValueError("public binding NIP-98 origin differs")
-    if isinstance(spec["schema_version"], bool) or spec["schema_version"] != 1:
+    if isinstance(spec["schema_version"], bool) or spec["schema_version"] != 2:
         raise ValueError("public binding keyholder schema differs")
     rendered = render_keyholder_config.validate_config(spec)
     selectors = rendered["selectors"]
@@ -458,8 +458,8 @@ def freeze_package(
                 install_mode="0755",
             )
         )
-        _write(assets / "keyholder-v1.json", config, 0o400)
-        entries.append(_entry("config", "keyholder-v1.json", RUNTIME_CONTRACT["config_path"], keyholder_uid, keyholder_gid, config))
+        _write(assets / "keyholder-v2.json", config, 0o400)
+        entries.append(_entry("config", "keyholder-v2.json", RUNTIME_CONTRACT["config_path"], keyholder_uid, keyholder_gid, config))
         for role, source, name, target in STATIC_ASSETS:
             payload, _ = package_source.tracked_payload(source_root, PACKAGE_RELATIVE / source, 0o100644)
             payloads[role] = payload

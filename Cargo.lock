@@ -982,6 +982,10 @@ name = "buzz-ci-controld"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "buzz-ci-acceptance-ctl",
+ "buzz-ci-broker-protocol",
+ "buzz-ci-execd",
+ "buzz-ci-keyholder",
  "buzz-core",
  "hex",
  "nix 0.31.3",
@@ -994,7 +998,6 @@ dependencies = [
  "thiserror 2.0.18",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]

@@ -1,52 +1,50 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/runner-config-v1.json",
-  "title": "Buzz CI runner configuration v1",
+  "$id": "https://buzz.dev/schemas/native-ci/runner-config-v2.json",
+  "title": "Buzz CI runner configuration v2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "controld_uid"],
+  "required": ["schema_version", "controld_uid", "controld_gid", "mode"],
   "properties": {
-    "schema_version": { "const": 1 },
-    "controld_uid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
-    "host": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "owner_pubkey",
-        "manifest_verification_key",
-        "relay_signer",
-        "broker_socket",
-        "broker_uid",
-        "executor_program",
-        "evidence_directory",
-        "journal_directory",
-        "max_argv_items",
-        "max_argv_bytes",
-        "max_environment_items",
-        "max_environment_bytes",
-        "max_output_bytes"
-      ],
-      "properties": {
-        "owner_pubkey": { "$ref": "#/$defs/lowerHex64" },
-        "manifest_verification_key": { "$ref": "#/$defs/lowerHex64" },
-        "relay_signer": { "$ref": "#/$defs/lowerHex64" },
-        "broker_socket": { "const": "/run/buzzci/execd.sock" },
-        "broker_uid": { "const": 0 },
-        "executor_program": { "type": "string", "pattern": "^/[^\\u0000]+$" },
-        "evidence_directory": { "const": "/var/lib/buzzci/runner/evidence" },
-        "journal_directory": { "const": "/var/lib/buzzci/runner/journal" },
-        "max_argv_items": { "type": "integer", "minimum": 1, "maximum": 256 },
-        "max_argv_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 },
-        "max_environment_items": { "type": "integer", "minimum": 1, "maximum": 256 },
-        "max_environment_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 },
-        "max_output_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
-      }
-    }
+    "schema_version": { "const": 2 },
+    "controld_uid": { "$ref": "#/$defs/nonzeroU32" },
+    "controld_gid": { "$ref": "#/$defs/nonzeroU32" },
+    "mode": { "enum": ["dormant", "v2_proxy"] },
+    "execd_socket": { "const": "/run/buzzci/execd.sock" },
+    "execd_uid": { "const": 0 },
+    "execd_gid": { "const": 0 },
+    "replay_journal": { "const": "/var/lib/buzzci/runner/v2-replay.json" },
+    "connect_timeout_millis": { "type": "integer", "minimum": 1, "maximum": 30000 },
+    "io_timeout_millis": { "type": "integer", "minimum": 1, "maximum": 30000 },
+    "transport_attempts": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "retry_delay_millis": { "type": "integer", "minimum": 0, "maximum": 5000 },
+    "lane_manifest_digest": { "$ref": "#/$defs/sha256" },
+    "lane_epoch": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "admission_key_generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "isolation_profile_digest": { "$ref": "#/$defs/sha256" },
+    "audience_digest": { "$ref": "#/$defs/sha256" }
   },
-  "$defs": {
-    "lowerHex64": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
+  "oneOf": [
+    {
+      "properties": { "mode": { "const": "dormant" } },
+      "not": { "anyOf": [
+        { "required": ["execd_socket"] },
+        { "required": ["replay_journal"] },
+        { "required": ["lane_manifest_digest"] }
+      ] }
+    },
+    {
+      "properties": { "mode": { "const": "v2_proxy" } },
+      "required": [
+        "execd_socket", "execd_uid", "execd_gid", "replay_journal",
+        "connect_timeout_millis", "io_timeout_millis", "transport_attempts",
+        "retry_delay_millis", "lane_manifest_digest", "lane_epoch",
+        "admission_key_generation", "isolation_profile_digest", "audience_digest"
+      ]
     }
+  ],
+  "$defs": {
+    "nonzeroU32": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "sha256": { "type": "string", "pattern": "^(?!0{64}$)[0-9a-f]{64}$" }
   }
 }

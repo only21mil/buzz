@@ -15,7 +15,7 @@ provenance record. The staged and active runner, execd-template, and controld
 configs have separate digests. Execd's exact live configs are rendered only
 after the package digest and acceptance scenario are known. The separate
 keyholder package solely owns
-`/etc/buzzci/keyholder-v1.json`; activation validates its exact public receipt
+`/etc/buzzci/keyholder-v2.json`; activation validates its exact public receipt
 reference, peer operations, selectors, origin, owner, and mode but never writes
 the file.
 
@@ -76,7 +76,9 @@ services and sockets to be inactive. A pre-existing enabled and listening execd
 socket is captured as baseline state. Managed activation files must be absent or
 match the staged payload exactly. The controld closed config must already exist
 with its frozen staged bytes and metadata. The component-owned runner-v1 config
-remains in place; activation solely stages and later swaps runner-v2.
+remains in place. The runner and activation packages share the byte-identical
+dormant runner-v2 config, and activation later performs the active runner-v2
+swap.
 For all 13 lifecycle units, the controller reads both `FragmentPath` and
 ordered `DropInPaths`. It independently hashes every returned fragment and
 drop-in. Dormant checks allow only manifest-bound dependencies and exact
@@ -258,9 +260,11 @@ different package fails closed.
 The shared `/var/lib/buzzci` ancestor and this directory are `root:root` mode
 `0711`; sensitive child roots remain mode `0700`. The private controller receipt
 remains `root:root` mode `0600`; both controld and keyholder read only the
-separate `controld-acceptance-v1.json` binding at `root:root` mode `0444`.
+separate `controld-acceptance-v2.json` binding at `root:root` mode `0444`.
 Its compact declaration-order JSON has no trailing newline and uses schema
-`buzz-ci-activation-acceptance-binding/v1`. The frozen public acceptance
+`buzz-ci-activation-acceptance-binding/v2`. It binds the keyholder client to
+the controld identity and the acceptance client to the qualification identity.
+The frozen public acceptance
 template omits the scenario digest. After the package and scenario are final,
 the controller injects the independently computed digest at the receipt top
 level and in the nested acceptance object, where the two values must match.
@@ -271,7 +275,7 @@ canary, not the input file's whitespace or key order.
 
 Create a private mode-`0600` draft that follows
 `activation-manifest.schema.json`, except use schema
-`buzz-ci-capacity-one-activation-draft-v1` and omit `activation_id` and
+`buzz-ci-capacity-one-activation-draft-v2` and omit `activation_id` and
 `package_digest`. Asset names are flat `assets/...` names. Put config and
 provenance inputs in a private asset directory with the exact source modes
 declared by the draft. Qualification requests are never frozen assets because
@@ -310,9 +314,9 @@ digest, and installs it only at
 `/usr/libexec/buzz-ci-verify-acceptance-receipt` mode `0755`. A private
 umask checkout may materialize that source as `0700`; the freezer checks the
 Git executable class and writes the package asset and installed target at their
-declared exact modes. The settled source contract is commit
-`84698212017eb20891c931c645024c0e7de265f8`, SHA-256
-`2d95e2a97655e40ef779804065f68450dd6745ba2b499e4ecf9218f25540c6fd`.
+declared exact modes. The freezer binds the verifier to the exact candidate
+OID and computes its source digest from those tracked bytes at freeze time;
+the package manifest records both values.
 Its Git-`100644` expected-stage table is separately frozen at package mode
 `0400` and installed root:root mode `0644` only at
 `/usr/libexec/buzz-ci-acceptance-expected-stages.json`; the verifier has no
@@ -363,7 +367,7 @@ between the execd and activation packages:
 
 1. Freeze and verify the final runner, controld, and keyholder packages. The
    controld freezer's config entry is the canonical staged
-   `/etc/buzzci/controld-v1.json`: capacity zero plus the fixed public
+   `/etc/buzzci/controld-v2.json`: capacity zero plus the fixed public
    acceptance receipt path. Use those exact bytes and digest as the activation
    draft's staged controld config. Draft validation and final inventory reject
    any missing, substituted, or divergent config.
@@ -511,11 +515,12 @@ deploy/native-ci/activation/check_package_inventory.py \
   --activation /private/activation/activation-manifest.json
 ```
 
-Only the byte-identical dormant controld config is modeled as a shared target.
-The runner package owns its runner-v1 config, while activation solely owns the
-staged and active runner-v2 target. Every other duplicate fails, even with
-identical bytes. The modeled config share fails if its digest, mode, UID, or
-GID differs. The gate
+The byte-identical dormant controld and runner-v2 configs are modeled as shared
+targets. The runner and activation packages intentionally share
+`/etc/buzzci/runner-v2.json`; either package may install those exact dormant
+bytes before activation swaps in the active runner-v2 config. Every other
+duplicate fails, even with identical bytes. A modeled config share fails if its
+digest, mode, UID, or GID differs. The gate
 also checks the source tree and rejects any second
 `buzz-ci-controld-acceptance.socket` template. Its only source and package
 owner is controld.

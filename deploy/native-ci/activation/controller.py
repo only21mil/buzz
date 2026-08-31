@@ -565,7 +565,7 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
     if not isinstance(scenario, dict):
         raise ValueError("acceptance scenario must be an object")
     activation_package.require_keys(scenario, {"schema_version", "fixture", "driver"}, "acceptance scenario")
-    if scenario["schema_version"] != "buzz-ci-capacity-one-scenario/v1":
+    if scenario["schema_version"] != "buzz-ci-capacity-one-scenario/v2":
         raise ValueError("acceptance scenario schema is unsupported")
     fixture = scenario["fixture"]
     fixture_fields = (
@@ -646,13 +646,16 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         "tombstone_event": template["tombstone_event"],
     }
     controld = manifest["identities"]["controld"]
+    qualification = manifest["identities"]["qualification"]
     return {
         "schema_version": activation_package.ACCEPTANCE_BINDING_SCHEMA,
         "activation_id": manifest["activation_id"],
         "activation_package_digest": manifest["package_digest"],
         "scenario_sha256": scenario_sha256,
-        "peer_uid": controld["uid"],
-        "peer_gid": controld["gid"],
+        "keyholder_peer_uid": controld["uid"],
+        "keyholder_peer_gid": controld["gid"],
+        "acceptance_peer_uid": qualification["uid"],
+        "acceptance_peer_gid": qualification["gid"],
         "timeout_millis": timeout_seconds * 1000,
         "fixture": ordered_fixture,
         "acceptance": acceptance,
@@ -664,21 +667,33 @@ def _acceptance_binding_bytes(
 ) -> bytes:
     expected_top = [
         "schema_version", "activation_id", "activation_package_digest", "scenario_sha256",
-        "peer_uid", "peer_gid", "timeout_millis", "fixture", "acceptance",
+        "keyholder_peer_uid", "keyholder_peer_gid",
+        "acceptance_peer_uid", "acceptance_peer_gid",
+        "timeout_millis", "fixture", "acceptance",
     ]
     expected_acceptance = [
         "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event",
     ]
     acceptance = binding.get("acceptance")
     controld = manifest.get("identities", {}).get("controld", {})
+    qualification = manifest.get("identities", {}).get("qualification", {})
+    keyholder_peer = (
+        binding.get("keyholder_peer_uid"), binding.get("keyholder_peer_gid"),
+    )
+    acceptance_peer = (
+        binding.get("acceptance_peer_uid"), binding.get("acceptance_peer_gid"),
+    )
     if (
         list(binding) != expected_top or binding["schema_version"] != activation_package.ACCEPTANCE_BINDING_SCHEMA
         or not isinstance(acceptance, dict) or list(acceptance) != expected_acceptance
         or binding["scenario_sha256"] != acceptance["scenario_sha256"]
-        or (binding["peer_uid"], binding["peer_gid"])
-        != (controld.get("uid"), controld.get("gid"))
+        or keyholder_peer != (controld.get("uid"), controld.get("gid"))
+        or acceptance_peer != (qualification.get("uid"), qualification.get("gid"))
+        or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
+               for value in (*keyholder_peer, *acceptance_peer))
+        or keyholder_peer == acceptance_peer
     ):
-        raise ValueError("acceptance binding scenario or controld peer differs")
+        raise ValueError("acceptance binding scenario or peer identities differ")
     payload = json.dumps(binding, ensure_ascii=False, separators=(",", ":")).encode()
     if len(payload) > MAX_SCENARIO_BYTES:
         raise ValueError("acceptance binding exceeds its fixed byte bound")

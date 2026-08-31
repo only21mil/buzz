@@ -27,9 +27,9 @@ PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 PRE_ACTIVATION_PACKAGE_NAMES = PACKAGE_NAMES[:3]
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 PACKAGE_SCHEMAS = {
-    "runner": "buzz-ci-runner-install-package-v1",
-    "controld": "buzz-ci-controld-install-package-v1",
-    "keyholder": "buzz-ci-keyholder-acceptance-package-v1",
+    "runner": "buzz-ci-runner-install-package-v2",
+    "controld": "buzz-ci-controld-install-package-v2",
+    "keyholder": "buzz-ci-keyholder-acceptance-package-v2",
     "execd": "buzz-ci-execd-install-package-v1",
 }
 PACKAGE_KEYS = {
@@ -285,7 +285,7 @@ def manifest_digest(manifest: dict[str, Any], name: str) -> str:
         if "activation_id" not in unsigned:
             raise RenderError("activation package ID is absent")
         del unsigned["activation_id"]
-        unsigned["schema"] = "buzz-ci-capacity-one-activation-draft-v1"
+        unsigned["schema"] = "buzz-ci-capacity-one-activation-draft-v2"
     if hashlib.sha256(canonical(unsigned)).hexdigest() != claimed:
         raise RenderError("package manifest digest differs")
     return claimed
@@ -356,14 +356,14 @@ def load_manifests(root: DescriptorRoot, value: object, candidate: str, names: t
 
 def validate_public_binding(value: dict[str, Any]) -> None:
     require_keys(value, {"schema_version", "relay_url", "relay_http_origin", "acceptance_actor", "keyholder_public_spec"}, "public binding")
-    if value["schema_version"] != "buzz-ci-clean-host-e2e-public-binding/v2":
+    if value["schema_version"] != "buzz-ci-clean-host-e2e-public-binding/v3":
         raise RenderError("public binding schema differs")
     actor = require_keys(value["acceptance_actor"], {"public_key", "generation"}, "acceptance actor")
     require_sha(actor["public_key"], "acceptance actor public key")
     if actor["generation"] != 1:
         raise RenderError("acceptance actor generation differs")
     spec = require_keys(value["keyholder_public_spec"], {"schema_version", "peer", "selectors", "nip98_origin", "acceptance"}, "keyholder public spec")
-    if spec["schema_version"] != 1 or value["relay_http_origin"] != spec["nip98_origin"]:
+    if spec["schema_version"] != 2 or value["relay_http_origin"] != spec["nip98_origin"]:
         raise RenderError("public binding origin differs")
     selectors = require_keys(spec["selectors"], {"ci_event", "nip98", "manifest"}, "keyholder selectors")
     peer = require_keys(spec["peer"], {"uid", "gid", "allowed_operations"}, "keyholder public peer")
@@ -375,7 +375,7 @@ def validate_public_binding(value: dict[str, Any]) -> None:
     ]:
         raise RenderError("keyholder public operations differ")
     if spec["acceptance"] != {
-        "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
+        "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json",
         "credential_selector": "acceptance-actor.key",
     }:
         raise RenderError("public acceptance selector differs")
@@ -580,7 +580,7 @@ def render_draft(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, 
 
 def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]:
     scenario = require_keys(value, {"schema_version", "fixture", "driver"}, "capacity-one scenario")
-    if scenario["schema_version"] != "buzz-ci-capacity-one-scenario/v1":
+    if scenario["schema_version"] != "buzz-ci-capacity-one-scenario/v2":
         raise RenderError("capacity-one scenario schema differs")
     fixture = scenario["fixture"]
     if not isinstance(fixture, dict):
@@ -603,9 +603,10 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         raise RenderError("capacity-one scenario cross-binding differs")
     required = {
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
-        "request_digest", "manifest_digest", "source_oid", "approval_id", "grant_digest",
-        "approved_by", "export_subject", "export_authorization_digest", "expected_log",
-        "expected_artifacts",
+        "job_id", "request_digest", "manifest_digest", "source_oid", "approval_id",
+        "grant_event_id", "grant_digest", "approved_by", "export_subject",
+        "export_authorization_digest", "controller_generation", "runner_generation",
+        "expected_log", "expected_artifacts",
     }
     require_keys(fixture, required, "capacity-one fixture")
     try:

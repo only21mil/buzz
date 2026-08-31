@@ -101,28 +101,34 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
         ""
     ]);
     let request_digest = event_id(&run_event);
-    let grant_digest = event_id(&grant_event);
+    let grant_event_id = event_id(&grant_event);
     AcceptanceBindingReceipt {
         schema_version: ACCEPTANCE_BINDING_SCHEMA.to_owned(),
-        activation_id: "buzz-ci-capacity-one-111111111111-121212121212".to_owned(),
+        activation_id: "activation-1".to_owned(),
         activation_package_digest: "12".repeat(32),
         scenario_sha256: "09".repeat(32),
-        peer_uid: CANONICAL_CONTROLD_UID,
-        peer_gid: CANONICAL_CONTROLD_GID,
+        keyholder_peer_uid: CANONICAL_CONTROLD_UID,
+        keyholder_peer_gid: CANONICAL_CONTROLD_GID,
+        acceptance_peer_uid: CANONICAL_QUALIFICATION_UID,
+        acceptance_peer_gid: CANONICAL_QUALIFICATION_GID,
         timeout_millis: 1_000,
         fixture: FixtureSpec {
             integrated_candidate_sha: "11".repeat(20),
-            activation_id: "buzz-ci-capacity-one-111111111111-121212121212".to_owned(),
+            activation_id: "activation-1".to_owned(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
+            job_id: "test".to_owned(),
             request_digest,
             manifest_digest: "15".repeat(32),
             source_oid: "16".repeat(20),
             approval_id: "17".repeat(16),
-            grant_digest,
+            grant_event_id,
+            grant_digest: "19".repeat(32),
             approved_by: actor.to_owned(),
             export_subject: "1b".repeat(32),
             export_authorization_digest: "1c".repeat(32),
+            controller_generation: 7,
+            runner_generation: 9,
             expected_log: EvidenceObject {
                 name: "job.log".to_owned(),
                 sha256: "1d".repeat(32),
@@ -177,10 +183,10 @@ pub fn acceptance_binding_mutation_corpus() -> Vec<AcceptanceBindingMutation> {
         receipt.schema_version.push_str("-drift")
     });
     push_receipt_mutation(&mut cases, "activation", |receipt| {
-        receipt.activation_id.clear()
+        receipt.activation_id = "other-activation".to_owned()
     });
     push_receipt_mutation(&mut cases, "package", |receipt| {
-        receipt.activation_package_digest = "00".repeat(32)
+        receipt.activation_package_digest = "23".repeat(32)
     });
     push_receipt_mutation(&mut cases, "candidate", |receipt| {
         receipt.fixture.integrated_candidate_sha = "not-a-candidate".to_owned()
@@ -188,8 +194,22 @@ pub fn acceptance_binding_mutation_corpus() -> Vec<AcceptanceBindingMutation> {
     push_receipt_mutation(&mut cases, "scenario", |receipt| {
         receipt.acceptance.scenario_sha256 = "24".repeat(32)
     });
-    push_receipt_mutation(&mut cases, "peer_uid", |receipt| receipt.peer_uid = 0);
-    push_receipt_mutation(&mut cases, "peer_gid", |receipt| receipt.peer_gid = 0);
+    push_receipt_mutation(&mut cases, "keyholder_peer_uid", |receipt| {
+        receipt.keyholder_peer_uid = 0;
+    });
+    push_receipt_mutation(&mut cases, "keyholder_peer_gid", |receipt| {
+        receipt.keyholder_peer_gid = 0;
+    });
+    push_receipt_mutation(&mut cases, "acceptance_peer_uid", |receipt| {
+        receipt.acceptance_peer_uid = 0;
+    });
+    push_receipt_mutation(&mut cases, "acceptance_peer_gid", |receipt| {
+        receipt.acceptance_peer_gid = 0;
+    });
+    push_receipt_mutation(&mut cases, "peer_pairs_equal", |receipt| {
+        receipt.acceptance_peer_uid = receipt.keyholder_peer_uid;
+        receipt.acceptance_peer_gid = receipt.keyholder_peer_gid;
+    });
     push_receipt_mutation(&mut cases, "timeout", |receipt| receipt.timeout_millis = 0);
     push_receipt_mutation(&mut cases, "actor", |receipt| {
         receipt.acceptance.actor.public_key = "25".repeat(32)
@@ -201,7 +221,7 @@ pub fn acceptance_binding_mutation_corpus() -> Vec<AcceptanceBindingMutation> {
         receipt.fixture.request_digest = "26".repeat(32)
     });
     push_receipt_mutation(&mut cases, "grant_id", |receipt| {
-        receipt.fixture.grant_digest = "27".repeat(32)
+        receipt.fixture.grant_event_id = "27".repeat(32)
     });
     push_receipt_mutation(&mut cases, "run_actor", |receipt| {
         receipt.acceptance.run_event[1] = serde_json::json!("28".repeat(32))

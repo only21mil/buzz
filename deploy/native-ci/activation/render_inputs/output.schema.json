@@ -4,12 +4,12 @@
   "oneOf": [
     {
       "required": ["schema"],
-      "properties": {"schema": {"const": "buzz-ci-capacity-one-activation-draft-v1"}}
+      "properties": {"schema": {"const": "buzz-ci-capacity-one-activation-draft-v2"}}
     },
     {
       "required": ["schema_version"],
       "properties": {"schema_version": {"enum": [
-        "buzz-ci-capacity-one-scenario/v1",
+        "buzz-ci-capacity-one-scenario/v2",
         "buzz-ci-clean-host-e2e-vm-contract/v2",
         "buzz-ci-clean-host-residue-receipt-input/v1",
         "buzz-ci-sealed-freeze-receipt-input/v1"
@@ -18,11 +18,11 @@
   ],
   "allOf": [
     {
-      "if": {"required": ["schema"], "properties": {"schema": {"const": "buzz-ci-capacity-one-activation-draft-v1"}}},
+      "if": {"required": ["schema"], "properties": {"schema": {"const": "buzz-ci-capacity-one-activation-draft-v2"}}},
       "then": {"$ref": "#/$defs/draft"}
     },
     {
-      "if": {"required": ["schema_version"], "properties": {"schema_version": {"const": "buzz-ci-capacity-one-scenario/v1"}}},
+      "if": {"required": ["schema_version"], "properties": {"schema_version": {"const": "buzz-ci-capacity-one-scenario/v2"}}},
       "then": {"$ref": "../../acceptance/scenario.schema.json"}
     },
     {
@@ -45,7 +45,7 @@
       "type": "object",
       "required": ["schema", "source_commit", "default_state", "identities", "components", "entries", "access_group", "acceptance_template", "systemd", "socket_policy", "qualification", "package_uid", "package_gid"],
       "properties": {
-        "schema": {"const": "buzz-ci-capacity-one-activation-draft-v1"},
+        "schema": {"const": "buzz-ci-capacity-one-activation-draft-v2"},
         "source_commit": {"$ref": "#/$defs/candidate"}
       }
     },

@@ -19,6 +19,20 @@ exit status is transport evidence only. The binary checks identities, state,
 digests, byte lengths, attempt lineage, tombstone folding, restart recovery,
 and final capacity zero itself.
 
+The installed `/usr/libexec/buzz-ci-capacity-one-driver` uses two fixed local
+sockets. `/run/buzzci/acceptance-control.sock` returns root-owned capacity and
+service readback. `/run/buzzci/controld-acceptance.sock` performs the bound
+relay, signer, run-ledger, and evidence operations. The driver checks both
+server identities with `SO_PEERCRED`; each request carries the exact activation,
+candidate, scenario, run, job, grant, attempt, digest, and last-seen service
+generations.
+
+`/usr/libexec/buzz-ci-acceptance-control` is the socket-activated root helper.
+It accepts only capacity one, capacity zero, controller restart, runner restart,
+and readback. Its protocol contains no program, unit, path, argv, credential,
+or signer field. A durable operation ledger permits byte-identical replay and
+rejects an operation ID reused with different bytes.
+
 The canary is not part of the ordinary runner path. See
 `deploy/native-ci/acceptance/README.md` for its operator runbook and current
 activation status.

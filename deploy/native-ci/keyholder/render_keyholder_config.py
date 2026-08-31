@@ -28,7 +28,7 @@ ACCEPTANCE_KEYS = {
     "binding_receipt_path",
     "credential_selector",
 }
-BINDING_RECEIPT_PATH = "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
+BINDING_RECEIPT_PATH = "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json"
 ACCEPTANCE_CREDENTIAL_SELECTOR = "acceptance-actor.key"
 
 
@@ -70,7 +70,7 @@ def _identity(value: object, where: str) -> dict[str, object]:
 
 def validate_spec(value: object) -> dict[str, object]:
     spec = _object(value, SPEC_KEYS, "keyholder spec")
-    if spec["schema_version"] != 1:
+    if spec["schema_version"] != 2:
         raise ValueError("invalid schema version")
     peer = _object(spec["peer"], PEER_KEYS, "peer")
     selectors = _object(spec["selectors"], SELECTOR_KEYS, "selectors")
@@ -91,7 +91,7 @@ def validate_spec(value: object) -> dict[str, object]:
     }:
         raise ValueError("acceptance binding contract differs")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "peer": {
             "uid": _u32(peer["uid"], "peer uid"),
             "gid": _u32(peer["gid"], "peer gid"),

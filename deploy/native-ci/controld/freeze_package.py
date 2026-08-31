@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -21,7 +22,7 @@ if str(NATIVE_CI_DIR) not in sys.path:
 import package_source
 import render_controld_config
 
-SCHEMA = "buzz-ci-controld-install-package-v1"
+SCHEMA = "buzz-ci-controld-install-package-v2"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -29,12 +30,14 @@ PACKAGE_RELATIVE = Path("deploy/native-ci/controld")
 DEFAULT_STATE = {"enabled": False, "active": False, "provisioned": False, "capacity": 0, "providers_wired": False}
 DAEMON_CONTRACT = {
     "service_user": "buzzci-controld",
-    "config_path": "/etc/buzzci/controld-v1.json",
-    "store_root": "/var/lib/buzzci/controld",
-    "capacity": 0,
-    "network": False,
-    "keyholder": False,
+    "config_path": "/etc/buzzci/controld-v2.json",
     "acceptance_binding": render_controld_config.ACCEPTANCE_BINDING,
+    "store_root": "/var/lib/buzzci/controld",
+    "default_capacity": 0,
+    "maximum_capacity": 1,
+    "providers_fail_closed": True,
+    "runner_protocol": 2,
+    "acceptance_socket": "/run/buzzci/controld-acceptance.sock",
 }
 STATIC_ASSETS = (
     ("service", "templates/buzz-ci-controld.service", "buzz-ci-controld.service", "/etc/systemd/system/buzz-ci-controld.service", 0o400, 0o644, 0, 0),
@@ -87,17 +90,25 @@ def load_provenance(path: Path) -> tuple[dict[str, object], bytes]:
 
 
 def git_output(root: Path, *arguments: str) -> str:
-    return package_source.git_output(root, *arguments)
+    return subprocess.run(["git", "-C", str(root), *arguments], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
 
 
 def verify_source(root: Path, source_commit: str) -> Path:
     return package_source.verify_checkout(root, source_commit, PACKAGE_RELATIVE)
 
 
+def require_exact_mode(path: Path, expected_mode: int) -> None:
+    metadata = path.lstat()
+    if stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise OSError(f"could not materialize exact mode: {path}")
+
+
 def write_asset(path: Path, payload: bytes, file_mode: int) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, file_mode)
     try:
         os.fchmod(fd, file_mode)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != file_mode:
+            raise OSError(f"could not materialize exact asset mode: {path}")
         view = memoryview(payload)
         while view:
             view = view[os.write(fd, view):]
@@ -132,21 +143,22 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, provenan
         raise ValueError("package output must not already exist")
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=parent))
     stage.chmod(0o700)
+    require_exact_mode(stage, 0o700)
     assets = stage / "assets"
     assets.mkdir(mode=0o700)
+    assets.chmod(0o700)
+    require_exact_mode(assets, 0o700)
     try:
         entries: list[dict[str, object]] = []
         write_asset(assets / "buzz-ci-controld", binary_payload, 0o500)
         entries.append(entry("binary", "buzz-ci-controld", "/usr/libexec/buzz-ci-controld", 0o500, 0o755, 0, 0, binary_payload))
         config_payload = render_controld_config.config_bytes()
-        write_asset(assets / "controld-v1.json", config_payload, 0o400)
-        entries.append(entry("config", "controld-v1.json", "/etc/buzzci/controld-v1.json", 0o400, 0o600, controld_uid, controld_gid, config_payload))
+        write_asset(assets / "controld-v2.json", config_payload, 0o400)
+        entries.append(entry("config", "controld-v2.json", "/etc/buzzci/controld-v2.json", 0o400, 0o600, controld_uid, controld_gid, config_payload))
 
         for role, source_name, asset_name, target, source_mode, install_mode, uid, gid in STATIC_ASSETS:
             payload, _ = package_source.tracked_payload(
-                source_root,
-                PACKAGE_RELATIVE / source_name,
-                0o100644,
+                source_root, PACKAGE_RELATIVE / source_name, 0o100644,
             )
             write_asset(assets / asset_name, payload, source_mode)
             entries.append(entry(role, asset_name, target, source_mode, install_mode, uid, gid, payload))
@@ -168,6 +180,7 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, provenan
         write_asset(stage / "binary-provenance.json", provenance_raw, 0o600)
         write_asset(stage / "package-manifest.json", canonical_json(manifest), 0o600)
         os.replace(stage, output)
+        require_exact_mode(output, 0o700)
         return manifest
     except BaseException:
         shutil.rmtree(stage)
