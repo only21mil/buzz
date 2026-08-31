@@ -1009,11 +1009,14 @@ verify_image_platform_binding() {
   container=${verification_container}
   cleanup_target=${verification_cleanup_target}
   actual_id=$(container_image_id "${container}") || return 1
-  [[ ${actual_id} == "${prior_platform_image_id}" ]] || {
+  if [[ ${rollback_source_resolution} == prior-image-ref && ${actual_id} == "${prior_image_id}" ]]; then
+    printf 'Index-digest binding for name-based rollback reference %s resolves to prior image index %s; revision/binary/migration bindings enforced separately\n' \
+      "${image}" "${actual_id}"
+  elif [[ ${actual_id} != "${prior_platform_image_id}" ]]; then
     printf 'REFUSED: image %s resolves to platform image %s, expected prior platform image %s\n' \
       "${image}" "${actual_id}" "${prior_platform_image_id}" >&2
     return 1
-  }
+  fi
   revision=$(object_revision "${container}") || return 1
   [[ ${revision} == "${prior_revision}" ]] || {
     printf 'REFUSED: image %s revision %s does not match running container revision %s\n' \
@@ -1054,7 +1057,6 @@ capture_rollback_reference() {
     rollback_source_resolution=prior-image-ref
     docker image tag "${rollback_source}" "${rollback_tag}"
   fi
-  verify_image_platform_binding "${rollback_tag}"
 }
 
 relay_container() {
@@ -1640,6 +1642,7 @@ printf '%s\n' "${rollback_source}" >"${deploy_dir}/rollback-source.txt"
 printf '%s\n' "${rollback_source_image_id}" >"${deploy_dir}/rollback-source-image-id.txt"
 printf '%s\n' "${rollback_source_resolution}" >"${deploy_dir}/rollback-source-resolution.txt"
 printf '%s\n' "${rollback_tag}" >"${deploy_dir}/rollback-image-tag.txt"
+verify_image_platform_binding "${rollback_tag}"
 
 dump_file=${deploy_dir}/buzz-prod-before-${timestamp}.dump
 printf 'Writing Postgres custom-format dump: %s\n' "${dump_file}"
