@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/keyholder-acceptance-package-v1.json",
+  "title": "Buzz CI acceptance keyholder provisioning package v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "package_id", "source_commit", "binary_provenance_sha256", "public_binding_sha256", "acceptance_public_spec_sha256", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"],
+  "properties": {
+    "schema": { "const": "buzz-ci-keyholder-acceptance-package-v1" },
+    "package_id": { "type": "string", "pattern": "^buzz-ci-keyholder-acceptance-[0-9a-f]{12}-[0-9a-f]{12}$" },
+    "source_commit": { "$ref": "#/$defs/gitOid" },
+    "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
+    "public_binding_sha256": {
+      "description": "SHA-256 of the exact top-level mode-0600 public-binding.json retained in the package, or null only for a legacy --public-spec package where that artifact must be absent",
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "acceptance_public_spec_sha256": { "$ref": "#/$defs/sha256" },
+    "package_uid": { "const": 0 },
+    "package_gid": { "const": 0 },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyholder_uid", "keyholder_gid", "controld_uid", "controld_gid"],
+      "properties": {
+        "keyholder_uid": { "$ref": "#/$defs/nonzeroU32" },
+        "keyholder_gid": { "$ref": "#/$defs/nonzeroU32" },
+        "controld_uid": { "$ref": "#/$defs/nonzeroU32" },
+        "controld_gid": { "$ref": "#/$defs/nonzeroU32" }
+      }
+    },
+    "runtime_contract": {
+      "const": {
+        "socket_path": "/run/buzzci/keyholder.sock",
+        "fd_name": "buzz-ci-keyholder-control",
+        "config_path": "/etc/buzzci/keyholder-v1.json",
+        "enabled": false,
+        "active": false
+      }
+    },
+    "credential_contract": {
+      "const": {
+        "runtime_name": "acceptance-actor.key",
+        "encrypted_source": "/etc/credstore.encrypted/buzzci-keyholder/acceptance-actor.key",
+        "source_mode": "0400",
+        "source_uid": 0,
+        "source_gid": 0,
+        "plaintext_bytes": 32,
+        "packaged": false
+      }
+    },
+    "directories": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/directory" }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "package_digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "gitOid": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonzeroU32": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "mode": { "type": "string", "pattern": "^0[4567][0-7]{2}$" },
+    "directory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "mode", "uid", "gid"],
+      "properties": {
+        "target": { "enum": ["/etc/buzzci", "/etc/systemd/system/buzz-ci-keyholder.service.d", "/usr/libexec", "/usr/lib/tmpfiles.d", "/usr/share/doc/buzz-ci-keyholder"] },
+        "mode": { "const": "0755" },
+        "uid": { "const": 0 },
+        "gid": { "const": 0 }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256", "size"],
+      "properties": {
+        "role": { "enum": ["binary", "config", "service", "socket", "tmpfiles", "acceptance_credential_dropin", "documentation"] },
+        "source": { "type": "string", "pattern": "^assets/[A-Za-z0-9._-]+$" },
+        "target": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
+        "source_mode": { "$ref": "#/$defs/mode" },
+        "install_mode": { "$ref": "#/$defs/mode" },
+        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 134217728 }
+      }
+    }
+  }
+}

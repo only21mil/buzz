@@ -1,0 +1,15 @@
+[
+  "capacity_zero_closed",
+  "capacity_one_open",
+  "manifest_identity",
+  "approval_grant",
+  "grant_resume",
+  "first_attempt_terminal",
+  "authenticated_export",
+  "rerun_separation",
+  "cancellation_terminal",
+  "tombstone_folding",
+  "controller_restart_recovery",
+  "runner_restart_recovery",
+  "return_capacity_zero"
+]

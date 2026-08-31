@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/activation-render-input-descriptor-v1.json",
+  "oneOf": [
+    {"$ref": "#/$defs/draft"},
+    {"$ref": "#/$defs/scenario"},
+    {"$ref": "#/$defs/cleanHost"},
+    {"$ref": "#/$defs/residue"},
+    {"$ref": "#/$defs/sealedFreeze"}
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "not": {"pattern": "^0+$"}},
+    "candidate": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"pattern": "^0+$"}},
+    "relative": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)[^\\\\\\u0000]+$"},
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes", "mode"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relative"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 67108864},
+        "mode": {"type": "string", "pattern": "^[0-7]{4}$"}
+      }
+    },
+    "threeManifests": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/file"}, "controld": {"$ref": "#/$defs/file"},
+        "keyholder": {"$ref": "#/$defs/file"}
+      }
+    },
+    "fourManifests": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder", "execd"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/file"}, "controld": {"$ref": "#/$defs/file"},
+        "keyholder": {"$ref": "#/$defs/file"}, "execd": {"$ref": "#/$defs/file"}
+      }
+    },
+    "fiveManifests": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder", "execd", "activation"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/file"}, "controld": {"$ref": "#/$defs/file"},
+        "keyholder": {"$ref": "#/$defs/file"}, "execd": {"$ref": "#/$defs/file"},
+        "activation": {"$ref": "#/$defs/file"}
+      }
+    },
+    "packageTree": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "manifest_sha256", "manifest_bytes", "manifest_mode"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relative"}, "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "manifest_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "manifest_mode": {"type": "string", "pattern": "^[0-7]{4}$"}
+      }
+    },
+    "packageTrees": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder", "execd", "activation"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/packageTree"}, "controld": {"$ref": "#/$defs/packageTree"},
+        "keyholder": {"$ref": "#/$defs/packageTree"}, "execd": {"$ref": "#/$defs/packageTree"},
+        "activation": {"$ref": "#/$defs/packageTree"}
+      }
+    },
+    "lifecycle": {
+      "type": "object", "additionalProperties": false,
+      "required": ["result", "contract", "evidence_manifest", "acceptance_receipt", "verifier"],
+      "properties": {
+        "result": {"$ref": "#/$defs/file"}, "contract": {"$ref": "#/$defs/file"},
+        "evidence_manifest": {"$ref": "#/$defs/file"}, "acceptance_receipt": {"$ref": "#/$defs/file"},
+        "verifier": {"$ref": "#/$defs/file"}
+      }
+    },
+    "draft": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_sha", "public_binding", "package_manifests", "execd_preactivation", "template"],
+      "properties": {
+        "schema_version": {"const": "buzz-ci-activation-draft-render-input/v1"},
+        "candidate_sha": {"$ref": "#/$defs/candidate"}, "public_binding": {"$ref": "#/$defs/file"},
+        "package_manifests": {"$ref": "#/$defs/threeManifests"},
+        "execd_preactivation": {"$ref": "#/$defs/file"}, "template": {"$ref": "#/$defs/file"}
+      }
+    },
+    "scenario": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_sha", "public_binding", "package_manifests", "template"],
+      "properties": {
+        "schema_version": {"const": "buzz-ci-capacity-one-scenario-render-input/v1"},
+        "candidate_sha": {"$ref": "#/$defs/candidate"}, "public_binding": {"$ref": "#/$defs/file"},
+        "package_manifests": {"$ref": "#/$defs/fiveManifests"}, "template": {"$ref": "#/$defs/file"}
+      }
+    },
+    "cleanHost": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_sha", "state", "candidate_root", "public_binding", "scenario", "seccomp_source", "packages"],
+      "properties": {
+        "schema_version": {"const": "buzz-ci-clean-host-contract-render-input/v1"},
+        "candidate_sha": {"$ref": "#/$defs/candidate"}, "state": {"$ref": "#/$defs/relative"},
+        "candidate_root": {"$ref": "#/$defs/relative"}, "public_binding": {"$ref": "#/$defs/file"},
+        "scenario": {"$ref": "#/$defs/file"}, "seccomp_source": {"$ref": "#/$defs/file"},
+        "packages": {"$ref": "#/$defs/packageTrees"}
+      }
+    },
+    "residue": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_sha", "lifecycle"],
+      "properties": {
+        "schema_version": {"const": "buzz-ci-residue-receipt-render-input/v1"},
+        "candidate_sha": {"$ref": "#/$defs/candidate"}, "lifecycle": {"$ref": "#/$defs/lifecycle"}
+      }
+    },
+    "sealedFreeze": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_sha", "lifecycle", "public_binding", "package_manifests"],
+      "properties": {
+        "schema_version": {"const": "buzz-ci-sealed-freeze-receipt-render-input/v1"},
+        "candidate_sha": {"$ref": "#/$defs/candidate"}, "lifecycle": {"$ref": "#/$defs/lifecycle"},
+        "public_binding": {"$ref": "#/$defs/file"}, "package_manifests": {"$ref": "#/$defs/fiveManifests"}
+      }
+    }
+  }
+}

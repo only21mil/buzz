@@ -80,7 +80,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::DaemonConfig;
+    use crate::config::{DaemonConfig, ACCEPTANCE_BINDING};
 
     fn config_fixture(store_mode: u32) -> (TempDir, DaemonConfig, u32) {
         let root = tempfile::tempdir().expect("temporary directory");
@@ -93,6 +93,7 @@ mod tests {
             "schema_version": 1,
             "capacity": 0,
             "store_root": store,
+            "acceptance_binding": ACCEPTANCE_BINDING,
         }))
         .expect("configuration fixture");
         (root, config, owner_uid)

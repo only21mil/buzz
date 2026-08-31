@@ -386,7 +386,7 @@ class PromotionReadinessTest(unittest.TestCase):
                     terminal_job["artifact_refs"] = [artifact["id"]]
                     final_refs[job_id] = (attempt, log["id"], artifact["id"])
                 append(46102, terminal_job)
-            if final_request:
+            if final_request and terminal_state == "success":
                 assert set(final_refs) == set(jobs)
                 append(46105, {
                     **base_content, "attempt": attempt, "finalized_job_attempts": [
@@ -641,6 +641,30 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assertEqual(kinds.count(46101), 3)
         self.assertEqual(kinds.count(46102), 3)
         self.assertEqual(set(kinds), {46101, 46102, 46103, 46104, 46105, 46106})
+
+    def test_private_collection_sidecar_is_digest_bound(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        sidecar = self.evidence_dir / "relay-collection-manifest.json"
+        write_json(sidecar, {"schema_version": 1, "receipts": []})
+        bundle["evidence_files"]["collection_manifest"] = {
+            "path": str(sidecar),
+            "sha256": digest(sidecar),
+        }
+
+        result = self.invoke(bundle)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads((self.evidence_dir / "receipt.json").read_text())
+        self.assertEqual(
+            receipt["evidence"]["collection_manifest_sha256"], digest(sidecar)
+        )
+        bundle["evidence_files"]["collection_manifest"]["sha256"] = DIGEST_A
+        self.assert_refused(bundle, "collection manifest digest")
+
+    def test_file_descriptors_reject_unknown_fields(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["evidence_files"]["pre_freeze"]["annotation"] = "not allowed"
+        self.assert_refused(bundle, "unknown fields")
 
     def test_json_schemas_are_parseable(self) -> None:
         for name in ("promotion-evidence.schema.json", "promotion-readiness-receipt.schema.json"):
@@ -1065,6 +1089,10 @@ class PromotionReadinessTest(unittest.TestCase):
 
     def test_deliberate_red_is_bound_to_its_signed_red_history(self) -> None:
         bundle = copy.deepcopy(self.bundle)
+        self.assertEqual(
+            {event["kind"] for event in bundle["deliberate_red"]["event_evidence"]["events"]},
+            {46101, 46102, 46103, 46104},
+        )
         bundle["deliberate_red"]["event_evidence"] = copy.deepcopy(
             bundle["staging"]["event_evidence"]
         )

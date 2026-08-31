@@ -1,0 +1,17 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://buzz.dev/schemas/native-ci/execd-preactivation-input-v1.json",
+  "title":"Buzz CI execd pre-activation input v1",
+  "type":"object",
+  "additionalProperties":false,
+  "required":["schema","source_commit","binary_sha256","provenance_sha256"],
+  "properties":{
+    "schema":{"const":"buzz-ci-execd-preactivation-input-v1"},
+    "source_commit":{"type":"string","pattern":"^[0-9a-f]{40}$","not":{"pattern":"^0+$"}},
+    "binary_sha256":{"$ref":"#/$defs/sha256"},
+    "provenance_sha256":{"$ref":"#/$defs/sha256"}
+  },
+  "$defs":{
+    "sha256":{"type":"string","pattern":"^[0-9a-f]{64}$","not":{"pattern":"^0+$"}}
+  }
+}
