@@ -1,0 +1,24 @@
+[Unit]
+Description=Buzz CI capacity-one acceptance host control
+Requires=buzz-ci-acceptance-control.socket
+After=local-fs.target buzz-ci-acceptance-control.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/buzz-ci-acceptance-control
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/buzzci/acceptance-control-v1.json /var/lib/buzzci/activation-controller/receipt-v1.json
+ReadWritePaths=/var/lib/buzzci/acceptance-control
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+Restart=no

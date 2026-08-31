@@ -18,6 +18,7 @@ PACKAGE_SCHEMAS = {
     "activation": "buzz-ci-capacity-one-activation-package-v1",
 }
 EXPLICIT_IDENTICAL_SHARES = {
+    "/etc/buzzci/runner-v2.json": frozenset({"runner", "activation"}),
     "/etc/buzzci/controld-v1.json": frozenset({"controld", "activation"}),
 }
 REQUIRED_CATEGORIES = frozenset({

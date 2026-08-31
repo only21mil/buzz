@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/acceptance-control-config-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "activation_id",
+    "activation_package_digest",
+    "integrated_candidate_sha",
+    "scenario_sha256",
+    "run_id",
+    "job_id",
+    "request_digest",
+    "manifest_digest",
+    "approval_id",
+    "grant_event_id",
+    "grant_digest",
+    "qualification_uid",
+    "qualification_gid",
+    "controller_generation",
+    "runner_generation"
+  ],
+  "properties": {
+    "schema_version": { "const": "buzz-ci-acceptance-control-config/v1" },
+    "activation_id": {
+      "type": "string",
+      "pattern": "^buzz-ci-capacity-one-[0-9a-f]{12}-[0-9a-f]{12}$"
+    },
+    "activation_package_digest": { "$ref": "#/$defs/sha256" },
+    "integrated_candidate_sha": { "$ref": "#/$defs/gitOid" },
+    "scenario_sha256": { "$ref": "#/$defs/sha256" },
+    "run_id": { "$ref": "#/$defs/id32" },
+    "job_id": { "$ref": "#/$defs/name" },
+    "request_digest": { "$ref": "#/$defs/sha256" },
+    "manifest_digest": { "$ref": "#/$defs/sha256" },
+    "approval_id": { "$ref": "#/$defs/id32" },
+    "grant_event_id": { "$ref": "#/$defs/sha256" },
+    "grant_digest": { "$ref": "#/$defs/sha256" },
+    "qualification_uid": { "$ref": "#/$defs/id" },
+    "qualification_gid": { "$ref": "#/$defs/id" },
+    "controller_generation": { "type": "integer", "minimum": 1 },
+    "runner_generation": { "type": "integer", "minimum": 1 }
+  },
+  "$defs": {
+    "id": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "id32": { "type": "string", "pattern": "^[0-9a-f]{32}$", "not": { "pattern": "^0+$" } },
+    "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "not": { "pattern": "^0+$" } },
+    "gitOid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$", "not": { "pattern": "^0+$" } }
+  }
+}

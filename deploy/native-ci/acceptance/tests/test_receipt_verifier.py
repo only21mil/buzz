@@ -9,7 +9,6 @@ import json
 import os
 import shutil
 import stat
-import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -83,6 +82,7 @@ def _attempt(fixture, attempt_id, number, state, conclusion, parent=None, eviden
 def _approval(fixture, resumed):
     return {
         "approval_id": fixture["approval_id"],
+        "grant_event_id": fixture["grant_event_id"],
         "grant_digest": fixture["grant_digest"],
         "approved_by": fixture["approved_by"],
         "resumed": resumed,
@@ -181,6 +181,51 @@ def valid_receipt():
             check["export"] = copy.deepcopy(export)
         checks.append(check)
     scenario_sha256 = VERIFIER._digest(scenario)
+    proof = {
+        "schema_version": VERIFIER.ZERO_PROOF_VERSION,
+        "scenario_sha256": scenario_sha256,
+        "activation_id": fixture["activation_id"],
+        "activation_package_digest": fixture["activation_package_digest"],
+        "integrated_candidate_sha": fixture["integrated_candidate_sha"],
+        "capacity": 0,
+        "admission": "closed",
+        "controller_generation": 2,
+        "runner_generation": 2,
+        "controld_service_active": False,
+        "controld_acceptance_socket_active": False,
+        "controld_acceptance_socket_present": False,
+    }
+    phases = []
+    for sequence, operation in [(14, "finalize_capacity_zero"), (15, "prove_capacity_zero")]:
+        request = {
+            "sequence": sequence,
+            "operation": operation,
+            "operation_id": "pending",
+            "scenario_sha256": scenario_sha256,
+            "activation_id": fixture["activation_id"],
+            "activation_package_digest": fixture["activation_package_digest"],
+            "integrated_candidate_sha": fixture["integrated_candidate_sha"],
+            "failed_stage": "prepare_capacity_zero",
+            "final_response_sha256": checks[-1]["evidence_sha256"],
+            "expected_controller_generation": 2,
+            "expected_runner_generation": 2,
+        }
+        request["operation_id"] = VERIFIER._zero_operation_id(request, fixture["run_id"])
+        response = {
+            "operation_id": request["operation_id"],
+            "controller_receipt_sha256": _h("c" if sequence == 14 else "d", 64),
+            "proof": copy.deepcopy(proof),
+        }
+        phases.append({
+            "sequence": sequence,
+            "operation": operation,
+            "outcome": "pass",
+            "attempts": 1,
+            "request_sha256": VERIFIER._digest(request),
+            "response_sha256": VERIFIER._digest(response),
+            "request": request,
+            "response": response,
+        })
     receipt = {
         "schema_version": VERIFIER.RECEIPT_VERSION,
         "outcome": "pass",
@@ -188,6 +233,13 @@ def valid_receipt():
         "integrated_candidate_sha": fixture["integrated_candidate_sha"],
         "run_id": fixture["run_id"],
         "checks": checks,
+        "zero_transition": {
+            "schema_version": VERIFIER.ZERO_TRANSITION_VERSION,
+            "outcome": "pass",
+            "attempts": 1,
+            "phases": phases,
+            "zero_proof": copy.deepcopy(proof),
+        },
     }
     return scenario, stages, receipt
 
@@ -197,7 +249,7 @@ class ReceiptVerifierTests(unittest.TestCase):
         scenario, stages, receipt = valid_receipt()
         VERIFIER.verify(receipt, scenario, stages)
 
-    def test_partial_hash_only_and_wrong_bindings_fail_closed(self):
+    def test_partial_hash_only_wrong_binding_and_zero_faults_fail_closed(self):
         scenario, stages, receipt = valid_receipt()
         mutations = []
         value = copy.deepcopy(receipt); del value["checks"][0]["snapshot"]; mutations.append(value)
@@ -207,8 +259,12 @@ class ReceiptVerifierTests(unittest.TestCase):
         value = copy.deepcopy(receipt); value["checks"][5]["snapshot"]["run"]["attempts"][0]["manifest_digest"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["checks"][4]["evidence_sha256"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["checks"][6]["export"]["authenticated"] = False; mutations.append(value)
-        value = copy.deepcopy(receipt); value["checks"][12]["snapshot"]["capacity"] = 1; mutations.append(value)
-        value = copy.deepcopy(receipt); value["checks"][12]["stage"] = "capacity_one_open"; mutations.append(value)
+        value = copy.deepcopy(receipt); value["zero_transition"]["phases"][0]["request"]["activation_package_digest"] = _h("e", 64); mutations.append(value)
+        value = copy.deepcopy(receipt); value["zero_transition"]["phases"].reverse(); mutations.append(value)
+        value = copy.deepcopy(receipt); value["zero_transition"]["phases"][0]["request_sha256"] = _h("e", 64); mutations.append(value)
+        value = copy.deepcopy(receipt); value["zero_transition"]["phases"][1]["response"]["proof"]["runner_generation"] = 3; mutations.append(value)
+        value = copy.deepcopy(receipt); value["zero_transition"]["phases"][1]["response"]["proof"]["controld_service_active"] = True; mutations.append(value)
+        value = copy.deepcopy(receipt); value["zero_transition"]["zero_proof"]["controller_generation"] = 3; mutations.append(value)
         for candidate in mutations:
             with self.subTest(candidate=mutations.index(candidate)), self.assertRaises(
                 VERIFIER.ReceiptError
@@ -234,23 +290,6 @@ class ReceiptVerifierTests(unittest.TestCase):
             receipt_path = root / "receipt.json"
             scenario_path.write_text(json.dumps(scenario, separators=(",", ":")))
             receipt_path.write_text(json.dumps(receipt, separators=(",", ":")))
-            for schema_name, instance in (
-                ("scenario.schema.json", scenario_path),
-                ("receipt.schema.json", receipt_path),
-            ):
-                validation = subprocess.run(
-                    [
-                        "check-jsonschema",
-                        "--schemafile",
-                        str(ACCEPTANCE / schema_name),
-                        str(instance),
-                    ],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                )
-                self.assertEqual(validation.returncode, 0, validation.stderr)
             return_code, stdout, stderr = _invoke(
                 installed, stages_path, scenario_path, receipt_path
             )

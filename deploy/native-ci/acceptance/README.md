@@ -5,11 +5,16 @@ unit tests pass. A real acceptance run must finish with a schema-valid `pass`
 receipt against the exact installed candidate. The run ends by closing
 admission and returning capacity to zero.
 
-The harness drives a fixed sequence through injected commands. It does not
-contain provider URLs, service-manager commands, credentials, or prebaked
-success responses. Each adapter must read actual system state and return the
-normalized response described in [driver-protocol.md](driver-protocol.md). The
-harness checks that response independently.
+The harness drives a fixed sequence through the installed
+`/usr/libexec/buzz-ci-capacity-one-driver`. It does not contain provider URLs,
+service-manager commands, credentials, or prebaked success responses. The
+driver reads actual host state through the root acceptance helper, then binds
+that readback into a request to controld. The harness checks the normalized
+response independently.
+
+The acceptance tree does not own or retain a deployable copy of
+`buzz-ci-controld-acceptance.socket`. The controld package is its sole source
+and package owner.
 
 ## What the gate proves
 
@@ -27,7 +32,13 @@ The 13 checks run in this order:
 10. A tombstone keeps attempt two visible and folds the run back to attempt one.
 11. Controller restart advances its generation without losing folded state.
 12. Runner restart advances its generation without losing folded state.
-13. Capacity returns to zero, admission closes, and durable run state remains.
+13. The final durable controld snapshot is retained while capacity is prepared
+    for the root-only close.
+
+The receipt then retains two root-only phases. Sequence 14 finalizes capacity
+zero and stops the controld acceptance transport. Sequence 15 independently
+proves capacity zero, closed admission, and the absence of the controld service,
+socket unit, and socket path. These phases are not acceptance-stage entries.
 
 Any missing field, duplicate attempt, extra evidence object, identity mismatch,
 generation regression, or ambiguous active count stops the sequence. A failed
@@ -35,17 +46,12 @@ receipt never authorizes activation.
 
 ## Inputs
 
-Start from [scenario.template.json](scenario.template.json), but replace every
-identity and command with values from the frozen activation package. In
-particular, bind `integrated_candidate_sha`, `activation_id`, and
-`activation_package_digest` after the final integrated commit exists. The
-activation ID must derive from the candidate and package digest prefixes.
-Adapter programs must be absolute paths. Do not put secrets in `args`.
-
-Stage the activation package at its declared default capacity zero before this
-run. Do not start its persistent capacity-one target first. Check 2 opens the
-single slot through the control adapter, and check 13 closes it. A later
-persistent activation is a separate approved operation.
+Start from [scenario.template.json](scenario.template.json), then replace the
+activation package digest, activation ID suffix, scenario-specific identities,
+grant event, and initial systemd generations with frozen-package readback. The
+candidate path is pinned to the integrated base. All five endpoint entries are
+the same installed driver with an empty argument list. The schema rejects any
+other executable or arguments.
 
 The checked-in fixture runs
 [`fixtures/run-fixture.sh`](fixtures/run-fixture.sh). It verifies the source
@@ -71,22 +77,22 @@ qualification host and only while the ordinary CI path remains closed.
 
 ```bash
 . ./bin/activate-hermit
-cargo build --locked --release \
-  -p buzz-ci-acceptance-ctl \
-  --bin buzz-ci-capacity-one-canary
+cargo build --locked --release -p buzz-ci-acceptance-ctl \
+  --bin buzz-ci-capacity-one-canary \
+  --bin buzz-ci-capacity-one-driver \
+  --bin buzz-ci-acceptance-control
 
 target/release/buzz-ci-capacity-one-canary \
   < /protected/path/capacity-one-scenario.json \
   > /protected/path/capacity-one-receipt.json
 ```
 
-The binary returns `0` only after all 13 checks pass. It returns `1` with a
-failure receipt for a driver or evidence failure, and `2` for invalid input.
-Each check records the normalized snapshot used by the state machine. Check 7
-also records the normalized authenticated export. Adapter stderr is never
-copied into the receipt.
+The binary returns `0` only after all 13 checks and both root-only phases pass.
+It returns `1` with a failure receipt for a driver or evidence failure, and `2`
+for invalid input. It copies no raw adapter output or stderr into the receipt.
 
-Validate and inspect the receipt:
+Validate the receipt schema, then run the maintained semantic verifier against
+the exact rendered scenario:
 
 ```bash
 check-jsonschema \
@@ -98,16 +104,32 @@ check-jsonschema \
   /protected/path/capacity-one-receipt.json
 ```
 
-The independent verifier checks the scenario digest, candidate and run
-bindings, exact 13-stage vector, every normalized driver-response digest, the
-full state progression, and final closed capacity zero. A passing receipt is
-not a deployment receipt and does not leave capacity active. Keep capacity
-zero until the separate activation decision and its approval are recorded.
+The central activation package installs that sole verifier path with mode
+`0755`. Its source is the Git-`100755` file
+`deploy/native-ci/acceptance/verify-receipt.py`; restrictive checkouts may
+materialize it as `0700`. Packaging must validate the tracked execute intent
+and hardened file metadata through `verifier_source.py`, then install and read
+back the declared `0755` mode.
+
+The verifier reads its fixed 13-stage vector only from
+`/usr/libexec/buzz-ci-acceptance-expected-stages.json`. The activation package
+installs that tracked data asset as `root:root` mode `0644`; the verifier rejects
+missing, linked, multiply linked, ownership- or mode-drifted, noncanonical, or
+digest-drifted data. There is no argument or environment override for the path.
+
+The verifier rejects reordered, duplicate, partial, or hash-only stage records.
+It recomputes every retained driver-response and root-phase digest; binds the
+scenario, activation package, candidate, run, evidence, and service generations;
+and requires the sequence-15 proof to equal the retained final zero proof. Its
+single JSON success line is acceptance evidence for that exact scenario. It is
+not a deployment receipt and does not activate capacity. Keep capacity zero
+until the separate activation decision and its approval are recorded.
 
 ## Failure and recovery
 
-Treat every nonzero exit as closed. Confirm capacity zero through an independent
-read path before retrying. Do not edit a failed receipt or reuse its grant,
-request, run, or attempt identities. Fix the adapter or system, render a new
-scenario, and rerun the complete sequence. If the final capacity-zero operation
-cannot be proven, stop and use the approved service recovery procedure.
+Treat every nonzero canary or verifier exit as closed. A failure after capacity
+opened may retain a successful two-phase zero transition, but it never passes
+the verifier. Confirm capacity zero through an independent read path before
+retrying. Do not edit a failed receipt or reuse its grant, request, run, or
+attempt identities. If sequence 15 cannot prove the close, stop and use the
+approved service recovery procedure.

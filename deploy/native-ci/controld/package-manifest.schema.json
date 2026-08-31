@@ -36,11 +36,13 @@
       "const": {
         "service_user": "buzzci-controld",
         "config_path": "/etc/buzzci/controld-v1.json",
+        "acceptance_binding": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
         "store_root": "/var/lib/buzzci/controld",
-        "capacity": 0,
-        "network": false,
-        "keyholder": false,
-        "acceptance_binding": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json"
+        "default_capacity": 0,
+        "maximum_capacity": 1,
+        "providers_fail_closed": true,
+        "runner_protocol": 2,
+        "acceptance_socket": "/run/buzzci/controld-acceptance.sock"
       }
     },
     "package_uid": { "const": 0 },

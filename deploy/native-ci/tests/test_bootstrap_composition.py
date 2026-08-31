@@ -315,8 +315,8 @@ class BootstrapCompositionTests(unittest.TestCase):
             draft = self._retarget_draft(fixture, candidate)
             ready = self._ready_packages(ceremony, source, draft, fixture, candidate)
             runner_targets = {item["target"] for item in ready["runner"]["entries"]}
-            self.assertIn("/etc/buzzci/runner-v1.json", runner_targets)
-            self.assertNotIn("/etc/buzzci/runner-v2.json", runner_targets)
+            self.assertIn("/etc/buzzci/runner-v2.json", runner_targets)
+            self.assertNotIn("/etc/buzzci/runner-v1.json", runner_targets)
             controld_targets = {item["target"] for item in ready["controld"]["entries"]}
             self.assertIn("/etc/buzzci/controld-v1.json", controld_targets)
             self.assertIn(INVENTORY.CONTROLD_ACCEPTANCE_TARGET, controld_targets)

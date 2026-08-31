@@ -1339,6 +1339,13 @@ class ActivationControllerTests(unittest.TestCase):
                     "role": "config", "target": target, "sha256": shared["sha256"],
                     "install_mode": shared["install_mode"], "uid": shared["uid"], "gid": shared["gid"],
                 })
+            if owner == "runner":
+                target = "/etc/buzzci/runner-v2.json"
+                shared = activation_entries[target]
+                owned.append({
+                    "role": "config", "target": target, "sha256": shared["sha256"],
+                    "install_mode": shared["install_mode"], "uid": shared["uid"], "gid": shared["gid"],
+                })
             owned.extend([
                 entry("binary", f"/usr/libexec/buzz-ci-{owner}", f"{owner}-binary\n".encode(), mode="0755"),
                 entry("tmpfiles", f"/usr/lib/tmpfiles.d/buzzci-{owner}.conf", f"{owner}-tmpfiles\n".encode()),
@@ -1358,7 +1365,7 @@ class ActivationControllerTests(unittest.TestCase):
         for category in ("binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt"):
             self.assertGreater(report["categories"].get(category, 0), 0, category)
 
-        self.assertFalse(any(
+        self.assertTrue(any(
             item["target"] == "/etc/buzzci/runner-v2.json"
             for item in packages["runner"]["entries"]
         ))
@@ -1702,7 +1709,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "6efedeb02d338e1ceb5b5cde4033994ca096ecf55996afff32f3e989fcba9bb8",
+            "da22427e9a2cdb9dc021583c9ac4b6e5ca4e77b7ec7ec403ea56751b5c0fab3c",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -3324,7 +3331,7 @@ class ActivationControllerTests(unittest.TestCase):
             activation_package.execution_declaration_digest(
                 "aa" * 20, "70" * 32, config["lane_manifest"], config["execution"],
             ),
-            "e941bf7b2a6152a5633f14f8c632fb8ce048c1d6eee008f2dc0d6f8dda90efe4",
+            "a0c535305d1e1f370c39aaaa077f0a01f88993d76fb743892d5d161e8411f438",
         )
 
     def test_every_execution_declaration_field_drift_is_rejected(self) -> None:
