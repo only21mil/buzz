@@ -7,13 +7,14 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Component, Path};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_core::ci::{
     artifact_reference_tags, evidence_finalized_tags, job_status_tags, log_reference_tags,
     run_status_tags, teardown_attestation_tags, CiArtifactReferenceEnvelope,
     CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope,
     CiLogReferenceEnvelope, CiRequestEnvelope, CiRunState, CiRunStatusEnvelope, CiSkipPolicy,
-    CiTeardownAttestationEnvelope, CiTeardownLease, CI_SCHEMA_VERSION,
+    CiTeardownAttestationEnvelope, CI_SCHEMA_VERSION,
 };
 use buzz_core::kind::{
     KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
@@ -85,31 +86,6 @@ pub struct AttemptCompletion {
     pub jobs: Vec<JobCompletion>,
     pub teardown: CiTeardownAttestationEnvelope,
     pub finished_at: u64,
-}
-
-/// Durable selected evidence and teardown graph accumulated across reruns.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RunFinalization {
-    run_id: String,
-    target_repo_a: String,
-    tip_oid: String,
-    base_oid: String,
-    workflow_id: String,
-    workflow_digest: String,
-    request_event_id: String,
-    attempt: u32,
-    finalized_at: u64,
-    teardown_at: u64,
-    jobs: BTreeMap<String, FinalizedSelection>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct FinalizedSelection {
-    evidence: CiFinalizedJobAttempt,
-    lease: CiTeardownLease,
-    state: CiJobState,
-    required: bool,
-    skip_policy: CiSkipPolicy,
 }
 
 /// Concrete signed event passed to the relay publisher.
@@ -365,16 +341,6 @@ pub trait ControlStore {
         expected_revision: Option<u64>,
         next: &RunRecord,
     ) -> Result<StoreWrite, Self::Error>;
-    fn load_finalization(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<(u64, RunFinalization)>, Self::Error>;
-    fn compare_and_swap_finalization(
-        &mut self,
-        run_id: &str,
-        expected_revision: Option<u64>,
-        next: &RunFinalization,
-    ) -> Result<StoreWrite, Self::Error>;
     fn load_publication(&self, key: &str) -> Result<Option<StoredPublication>, Self::Error>;
     fn record_publication_intent(
         &mut self,
@@ -493,62 +459,81 @@ where
             },
         };
         if record.state().is_terminal() {
+            if record.terminal_event_id().is_none() {
+                let terminal_event_id = self.publish_run(accepted, &record, "run:terminal")?;
+                let bound = record.with_terminal_event(terminal_event_id)?;
+                persist_run(&mut self.store, &identity, revision, &bound)?;
+            }
             return Ok(());
         }
 
         if record.state() == RunState::Queued {
             self.publish_run(accepted, &record, "run:queued")?;
         }
-        let completion = self
-            .executor
-            .execute(accepted)
-            .map_err(|_| ProductionError::Runner)?;
-        validate_completion(accepted, &completion, self.signer.pubkey())?;
+        let completion = match self.executor.execute(accepted) {
+            Ok(completion) => completion,
+            Err(_) => {
+                self.publish_terminal_infrastructure_failure(
+                    accepted, &identity, revision, &record,
+                )?;
+                return Err(ProductionError::Runner);
+            }
+        };
+        if let Err(error) = validate_completion(accepted, &completion, self.signer.pubkey()) {
+            self.publish_terminal_infrastructure_failure(accepted, &identity, revision, &record)?;
+            return Err(error);
+        }
 
         if record.state() == RunState::Queued {
             let running = record.transition(RunState::Running, first_started(&completion), None)?;
             revision = persist_run(&mut self.store, &identity, revision, &running)?;
             record = running;
-            self.publish_run(accepted, &record, "run:running")?;
         }
         if record.state() == RunState::Running {
-            let finalized_job_attempts = self.publish_completion(accepted, &completion)?;
-            let finalization = update_finalization(
-                &mut self.store,
-                accepted,
+            self.publish_run(accepted, &record, "run:running")?;
+            let finalized_job_attempts = match self.publish_completion(accepted, &completion) {
+                Ok(finalized) => finalized,
+                Err(error @ (ProductionError::Evidence | ProductionError::Invalid)) => {
+                    self.publish_terminal_infrastructure_failure(
+                        accepted, &identity, revision, &record,
+                    )?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+
+            let evidence = CiEvidenceFinalizedEnvelope {
+                schema_version: CI_SCHEMA_VERSION,
+                request_event_id: accepted.event_id.clone(),
+                run_id: accepted.envelope.run_id.clone(),
+                workflow_id: accepted.envelope.workflow_id.clone(),
+                target_repo_a: accepted.envelope.target_repo_a.clone(),
+                tip_oid: accepted.envelope.tip_oid.clone(),
+                attempt: accepted.envelope.attempt,
                 finalized_job_attempts,
-                &completion.jobs,
-                &completion.teardown,
-                completion.finished_at,
+                finalized_at: completion.finished_at,
+                relay_signer: self.signer.pubkey().to_owned(),
+            };
+            let evidence_id = self.publish_envelope(
+                accepted,
+                KIND_CI_EVIDENCE_FINALIZED,
+                &evidence,
+                evidence_finalized_tags(&accepted.channel_id, &evidence)
+                    .map_err(|_| ProductionError::Invalid)?,
+                "evidence:finalized",
             )?;
-            let mut terminal_state = terminal_run_state(&completion.jobs);
-            if terminal_state == RunState::Success && !finalization.terminal_good() {
-                terminal_state = RunState::Failure;
-            }
-            if terminal_state == RunState::Success {
-                let evidence = finalization.evidence(self.signer.pubkey());
-                let evidence_id = self.publish_envelope(
-                    accepted,
-                    KIND_CI_EVIDENCE_FINALIZED,
-                    &evidence,
-                    evidence_finalized_tags(&accepted.channel_id, &evidence)
-                        .map_err(|_| ProductionError::Invalid)?,
-                    "evidence:finalized",
-                )?;
-                let teardown = finalization.teardown(self.signer.pubkey());
-                let teardown_id = self.publish_envelope(
-                    accepted,
-                    KIND_CI_TEARDOWN_ATTESTATION,
-                    &teardown,
-                    teardown_attestation_tags(&accepted.channel_id, &teardown)
-                        .map_err(|_| ProductionError::Invalid)?,
-                    "teardown",
-                )?;
-                record = record.with_evidence_finalized(evidence_id)?;
-                record = record.with_teardown_attestation(teardown_id)?;
-            }
+            let teardown_id = self.publish_envelope(
+                accepted,
+                KIND_CI_TEARDOWN_ATTESTATION,
+                &completion.teardown,
+                teardown_attestation_tags(&accepted.channel_id, &completion.teardown)
+                    .map_err(|_| ProductionError::Invalid)?,
+                "teardown",
+            )?;
+            record = record.with_evidence_finalized(evidence_id)?;
+            record = record.with_teardown_attestation(teardown_id)?;
             let terminal = record.transition(
-                terminal_state,
+                terminal_run_state(&completion.jobs),
                 completion.finished_at,
                 terminal_reason(&completion.jobs),
             )?;
@@ -557,6 +542,31 @@ where
             let bound = terminal.with_terminal_event(terminal_event_id)?;
             persist_run(&mut self.store, &identity, terminal_revision, &bound)?;
         }
+        Ok(())
+    }
+
+    fn publish_terminal_infrastructure_failure(
+        &mut self,
+        accepted: &AcceptedRequest,
+        identity: &RunIdentity,
+        revision: u64,
+        record: &RunRecord,
+    ) -> Result<(), ProductionError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ProductionError::Invalid)?
+            .as_secs()
+            .max(record.queued_at())
+            .max(record.started_at().unwrap_or(0));
+        let terminal = record.transition(
+            RunState::InfrastructureFailure,
+            now,
+            Some("runner_or_evidence_provider_failure".to_owned()),
+        )?;
+        let terminal_revision = persist_run(&mut self.store, identity, revision, &terminal)?;
+        let terminal_event_id = self.publish_run(accepted, &terminal, "run:terminal")?;
+        let bound = terminal.with_terminal_event(terminal_event_id)?;
+        persist_run(&mut self.store, identity, terminal_revision, &bound)?;
         Ok(())
     }
 
@@ -818,214 +828,6 @@ fn persist_run<P: ControlStore>(
     }
 }
 
-impl RunFinalization {
-    pub(crate) fn validate(&self) -> Result<(), ProductionError> {
-        if Uuid::parse_str(&self.run_id).is_err()
-            || self.target_repo_a.is_empty()
-            || self.workflow_id.is_empty()
-            || self.workflow_digest.len() != 64
-            || self.request_event_id.len() != 64
-            || self.attempt == 0
-            || self.finalized_at == 0
-            || self.teardown_at == 0
-            || self.jobs.is_empty()
-            || self.jobs.iter().any(|(job_id, selected)| {
-                job_id != &selected.evidence.job_id
-                    || job_id != &selected.lease.job_id
-                    || selected.evidence.attempt != selected.lease.attempt
-                    || selected.evidence.attempt == 0
-                    || selected.lease.lease_id.is_empty()
-                    || !selected.state.is_terminal()
-            })
-        {
-            return Err(ProductionError::Invalid);
-        }
-        let mut lease_ids = self
-            .jobs
-            .values()
-            .map(|selected| selected.lease.lease_id.as_str())
-            .collect::<Vec<_>>();
-        lease_ids.sort_unstable();
-        lease_ids.dedup();
-        if lease_ids.len() != self.jobs.len() {
-            return Err(ProductionError::Invalid);
-        }
-        let validation_signer = "00".repeat(32);
-        if self.evidence(&validation_signer).validate().is_err()
-            || self.teardown(&validation_signer).validate().is_err()
-        {
-            return Err(ProductionError::Invalid);
-        }
-        Ok(())
-    }
-
-    fn evidence(&self, signer: &str) -> CiEvidenceFinalizedEnvelope {
-        CiEvidenceFinalizedEnvelope {
-            schema_version: CI_SCHEMA_VERSION,
-            request_event_id: self.request_event_id.clone(),
-            run_id: self.run_id.clone(),
-            workflow_id: self.workflow_id.clone(),
-            target_repo_a: self.target_repo_a.clone(),
-            tip_oid: self.tip_oid.clone(),
-            attempt: self.attempt,
-            finalized_job_attempts: self
-                .jobs
-                .values()
-                .map(|selected| selected.evidence.clone())
-                .collect(),
-            finalized_at: self.finalized_at,
-            relay_signer: signer.to_owned(),
-        }
-    }
-
-    fn teardown(&self, signer: &str) -> CiTeardownAttestationEnvelope {
-        CiTeardownAttestationEnvelope {
-            schema_version: CI_SCHEMA_VERSION,
-            request_event_id: self.request_event_id.clone(),
-            run_id: self.run_id.clone(),
-            workflow_id: self.workflow_id.clone(),
-            target_repo_a: self.target_repo_a.clone(),
-            tip_oid: self.tip_oid.clone(),
-            base_oid: self.base_oid.clone(),
-            workflow_digest: self.workflow_digest.clone(),
-            attempt: self.attempt,
-            leases: self
-                .jobs
-                .values()
-                .map(|selected| selected.lease.clone())
-                .collect(),
-            lease_empty: true,
-            teardown_at: self.teardown_at,
-            relay_signer: signer.to_owned(),
-        }
-    }
-
-    fn terminal_good(&self) -> bool {
-        self.jobs.values().all(|selected| {
-            !selected.required
-                || selected.state == CiJobState::Success
-                || (selected.state == CiJobState::Skipped
-                    && selected.skip_policy == CiSkipPolicy::Allow)
-        })
-    }
-}
-
-fn update_finalization<P: ControlStore>(
-    store: &mut P,
-    accepted: &AcceptedRequest,
-    evidence: Vec<CiFinalizedJobAttempt>,
-    jobs: &[JobCompletion],
-    teardown: &CiTeardownAttestationEnvelope,
-    finalized_at: u64,
-) -> Result<RunFinalization, ProductionError> {
-    let leases = teardown
-        .leases
-        .iter()
-        .map(|lease| (lease.job_id.as_str(), lease))
-        .collect::<BTreeMap<_, _>>();
-    if evidence.len() != leases.len() {
-        return Err(ProductionError::Invalid);
-    }
-    let completions = jobs
-        .iter()
-        .map(|job| (job.metadata.job_id.as_str(), job))
-        .collect::<BTreeMap<_, _>>();
-    if evidence.len() != completions.len() {
-        return Err(ProductionError::Invalid);
-    }
-    let loaded = store
-        .load_finalization(&accepted.envelope.run_id)
-        .map_err(|_| ProductionError::Store)?;
-    let (revision, mut finalization, replay) = match loaded {
-        Some((revision, existing)) => {
-            if existing.run_id != accepted.envelope.run_id
-                || existing.target_repo_a != accepted.envelope.target_repo_a
-                || existing.tip_oid != accepted.envelope.tip_oid
-                || existing.base_oid != accepted.envelope.base_oid
-                || existing.workflow_id != accepted.envelope.workflow_id
-                || existing.workflow_digest != accepted.envelope.workflow_digest
-                || accepted.envelope.attempt < existing.attempt
-            {
-                return Err(ProductionError::Invalid);
-            }
-            let replay = existing.request_event_id == accepted.event_id;
-            (Some(revision), existing, replay)
-        }
-        None => {
-            if accepted.envelope.attempt != 1 {
-                return Err(ProductionError::Invalid);
-            }
-            (
-                None,
-                RunFinalization {
-                    run_id: accepted.envelope.run_id.clone(),
-                    target_repo_a: accepted.envelope.target_repo_a.clone(),
-                    tip_oid: accepted.envelope.tip_oid.clone(),
-                    base_oid: accepted.envelope.base_oid.clone(),
-                    workflow_id: accepted.envelope.workflow_id.clone(),
-                    workflow_digest: accepted.envelope.workflow_digest.clone(),
-                    request_event_id: accepted.event_id.clone(),
-                    attempt: accepted.envelope.attempt,
-                    finalized_at,
-                    teardown_at: teardown.teardown_at,
-                    jobs: BTreeMap::new(),
-                },
-                false,
-            )
-        }
-    };
-    for entry in evidence {
-        let lease = leases
-            .get(entry.job_id.as_str())
-            .ok_or(ProductionError::Invalid)?;
-        let completion = completions
-            .get(entry.job_id.as_str())
-            .ok_or(ProductionError::Invalid)?;
-        let next = FinalizedSelection {
-            evidence: entry.clone(),
-            lease: (*lease).clone(),
-            state: completion.state,
-            required: completion.metadata.required,
-            skip_policy: completion.metadata.skip_policy,
-        };
-        let prior = finalization.jobs.get(&entry.job_id);
-        let valid_attempt = if replay {
-            prior == Some(&next)
-        } else {
-            match prior {
-                Some(selected) => selected.evidence.attempt.checked_add(1) == Some(entry.attempt),
-                None => revision.is_none() && entry.attempt == 1,
-            }
-        };
-        if entry.attempt != accepted.envelope.attempt
-            || lease.attempt != entry.attempt
-            || !valid_attempt
-        {
-            return Err(ProductionError::Invalid);
-        }
-        if replay {
-            continue;
-        }
-        finalization.jobs.insert(entry.job_id.clone(), next);
-    }
-    if replay {
-        finalization.validate()?;
-        return Ok(finalization);
-    }
-    finalization.request_event_id = accepted.event_id.clone();
-    finalization.attempt = accepted.envelope.attempt;
-    finalization.finalized_at = finalized_at;
-    finalization.teardown_at = teardown.teardown_at;
-    finalization.validate()?;
-    match store
-        .compare_and_swap_finalization(&accepted.envelope.run_id, revision, &finalization)
-        .map_err(|_| ProductionError::Store)?
-    {
-        StoreWrite::Written { .. } => Ok(finalization),
-        StoreWrite::Conflict { .. } => Err(ProductionError::PublicationConflict),
-    }
-}
-
 fn validate_completion(
     accepted: &AcceptedRequest,
     completion: &AttemptCompletion,
@@ -1267,7 +1069,6 @@ mod tests {
     struct MemoryStore {
         cursor: u64,
         run: Option<(u64, RunRecord)>,
-        finalization: Option<(u64, RunFinalization)>,
         publications: HashMap<String, StoredPublication>,
     }
 
@@ -1312,30 +1113,6 @@ mod tests {
             }
             let revision = actual.unwrap_or(0) + 1;
             self.run = Some((revision, next.clone()));
-            Ok(StoreWrite::Written { revision })
-        }
-
-        fn load_finalization(
-            &self,
-            _run_id: &str,
-        ) -> Result<Option<(u64, RunFinalization)>, Self::Error> {
-            Ok(self.finalization.clone())
-        }
-
-        fn compare_and_swap_finalization(
-            &mut self,
-            _run_id: &str,
-            expected_revision: Option<u64>,
-            next: &RunFinalization,
-        ) -> Result<StoreWrite, Self::Error> {
-            let actual = self.finalization.as_ref().map(|(revision, _)| *revision);
-            if actual != expected_revision {
-                return Ok(StoreWrite::Conflict {
-                    actual_revision: actual,
-                });
-            }
-            let revision = actual.unwrap_or(0) + 1;
-            self.finalization = Some((revision, next.clone()));
             Ok(StoreWrite::Written { revision })
         }
 
@@ -1423,6 +1200,19 @@ mod tests {
             _request: &AcceptedRequest,
         ) -> Result<AttemptCompletion, Self::Error> {
             Ok(self.0.clone())
+        }
+    }
+
+    struct FailingExecutor;
+
+    impl AttemptExecutor for FailingExecutor {
+        type Error = ();
+
+        fn execute(
+            &mut self,
+            _request: &AcceptedRequest,
+        ) -> Result<AttemptCompletion, Self::Error> {
+            Err(())
         }
     }
 
@@ -1603,148 +1393,120 @@ mod tests {
     }
 
     #[test]
-    fn failed_attempt_stays_rerunnable_without_consuming_terminal_fact_slots() {
-        let log = b"failed\n".to_vec();
-        let mut failed = completion(&log);
-        failed.jobs[0].state = CiJobState::Failure;
-        failed.jobs[0].reason = Some("test failed".into());
-        let relay = Relay {
-            accepted: Some(accepted()),
-            published: Vec::new(),
-            intent_signal: None,
-            refuse_publication: false,
-        };
+    fn runner_failure_publishes_durable_terminal_infrastructure_status() {
         let mut handler = ProductionHandler::new(
-            relay,
+            Relay {
+                accepted: Some(accepted()),
+                published: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
             DeterministicSigner,
-            Executor(failed),
+            FailingExecutor,
             MemoryStore::default(),
+            MemoryOutput(Vec::new()),
+        );
+
+        assert!(matches!(
+            handler.poll_once(CHANNEL),
+            Err(ProductionError::Runner)
+        ));
+        assert_eq!(handler.relay.published, vec![46101, 46101]);
+        let record = &handler.store.run.as_ref().expect("durable run").1;
+        assert_eq!(record.state(), RunState::InfrastructureFailure);
+        assert_eq!(record.reason(), Some("runner_or_evidence_provider_failure"));
+        assert!(record.terminal_event_id().is_some());
+        assert_eq!(handler.store.cursor, 0);
+    }
+
+    #[test]
+    fn restart_republishes_running_status_before_completion() {
+        let accepted = accepted();
+        let identity = RunIdentity::new(
+            accepted.event_id.clone(),
+            Uuid::parse_str(&accepted.envelope.run_id).expect("run id"),
+            accepted.envelope.attempt,
+            accepted.envelope.target_repo_a.clone(),
+            accepted.envelope.tip_oid.clone(),
+            accepted.envelope.workflow_id.clone(),
+        )
+        .expect("identity");
+        let queued = RunRecord::queued(identity, accepted.envelope.issued_at).expect("queued");
+        let running = queued
+            .transition(RunState::Running, 11, None)
+            .expect("running");
+        let log = b"ok\n".to_vec();
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted),
+                published: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            Executor(completion(&log)),
+            MemoryStore {
+                cursor: 0,
+                run: Some((2, running)),
+                publications: HashMap::new(),
+            },
             MemoryOutput(log),
         );
 
-        assert!(handler.poll_once(CHANNEL).unwrap());
-        assert_eq!(
-            handler.relay.published,
-            vec![46101, 46101, 46102, 46103, 46102, 46101]
+        assert!(handler.poll_once(CHANNEL).expect("reconcile running"));
+        assert_eq!(handler.relay.published.first(), Some(&KIND_CI_RUN_STATUS));
+        assert!(handler
+            .store
+            .publications
+            .contains_key(&format!("{}:run:running", "11".repeat(32))));
+    }
+
+    #[test]
+    fn restart_binds_unpublished_terminal_status_before_advancing_cursor() {
+        let accepted = accepted();
+        let identity = RunIdentity::new(
+            accepted.event_id.clone(),
+            Uuid::parse_str(&accepted.envelope.run_id).expect("run id"),
+            accepted.envelope.attempt,
+            accepted.envelope.target_repo_a.clone(),
+            accepted.envelope.tip_oid.clone(),
+            accepted.envelope.workflow_id.clone(),
+        )
+        .expect("identity");
+        let terminal = RunRecord::queued(identity, accepted.envelope.issued_at)
+            .expect("queued")
+            .transition(RunState::Running, 11, None)
+            .expect("running")
+            .transition(RunState::Failure, 12, Some("failed".to_owned()))
+            .expect("terminal");
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted),
+                published: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            Executor(completion(b"unused")),
+            MemoryStore {
+                cursor: 0,
+                run: Some((3, terminal)),
+                publications: HashMap::new(),
+            },
+            MemoryOutput(Vec::new()),
         );
-        assert_eq!(
-            handler.store.run.as_ref().unwrap().1.state(),
-            RunState::Failure
-        );
+
+        assert!(handler.poll_once(CHANNEL).expect("reconcile terminal"));
+        assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);
+        assert_eq!(handler.store.cursor, 7);
         assert!(handler
             .store
             .run
             .as_ref()
-            .unwrap()
+            .expect("stored run")
             .1
-            .terminal_facts()
-            .evidence_finalized_event_id()
-            .is_none());
-    }
-
-    #[test]
-    fn finalization_replaces_only_rerun_jobs_and_binds_the_final_request() {
-        let mut initial = accepted();
-        initial.envelope.job_ids = vec!["build".into(), "test".into()];
-        let initial_evidence = vec![
-            CiFinalizedJobAttempt {
-                job_id: "build".into(),
-                attempt: 1,
-                log_ref: "aa".repeat(32),
-                artifact_refs: Vec::new(),
-            },
-            CiFinalizedJobAttempt {
-                job_id: "test".into(),
-                attempt: 1,
-                log_ref: "bb".repeat(32),
-                artifact_refs: Vec::new(),
-            },
-        ];
-        let mut initial_teardown = completion(b"initial\n").teardown;
-        initial_teardown.leases = vec![
-            CiTeardownLease {
-                job_id: "build".into(),
-                attempt: 1,
-                lease_id: "lease-build-1".into(),
-            },
-            CiTeardownLease {
-                job_id: "test".into(),
-                attempt: 1,
-                lease_id: "lease-test-1".into(),
-            },
-        ];
-        let mut build = completion(b"build\n").jobs.remove(0);
-        build.metadata.job_id = "build".into();
-        let mut test = completion(b"test\n").jobs.remove(0);
-        test.state = CiJobState::Failure;
-        let initial_jobs = vec![build, test];
-        let mut store = MemoryStore::default();
-        let failed_finalization = update_finalization(
-            &mut store,
-            &initial,
-            initial_evidence,
-            &initial_jobs,
-            &initial_teardown,
-            12,
-        )
-        .unwrap();
-        assert!(!failed_finalization.terminal_good());
-
-        let mut rerun = initial.clone();
-        rerun.event_id = "22".repeat(32);
-        rerun.envelope.request_type = CiRequestType::Rerun;
-        rerun.envelope.job_ids = vec!["test".into()];
-        rerun.envelope.attempt = 2;
-        rerun.envelope.parent_attempt = Some(1);
-        rerun.envelope.parent_run_id = Some(rerun.envelope.run_id.clone());
-        let mut rerun_teardown = initial_teardown;
-        rerun_teardown.request_event_id = rerun.event_id.clone();
-        rerun_teardown.attempt = 2;
-        rerun_teardown.leases = vec![CiTeardownLease {
-            job_id: "test".into(),
-            attempt: 2,
-            lease_id: "lease-test-2".into(),
-        }];
-        rerun_teardown.teardown_at = 20;
-        let mut rerun_job = completion(b"rerun\n").jobs.remove(0);
-        rerun_job.attempt = 2;
-        let finalization = update_finalization(
-            &mut store,
-            &rerun,
-            vec![CiFinalizedJobAttempt {
-                job_id: "test".into(),
-                attempt: 2,
-                log_ref: "cc".repeat(32),
-                artifact_refs: Vec::new(),
-            }],
-            &[rerun_job],
-            &rerun_teardown,
-            20,
-        )
-        .unwrap();
-        assert!(finalization.terminal_good());
-
-        let evidence = finalization.evidence(SIGNER);
-        let teardown = finalization.teardown(SIGNER);
-        assert_eq!(evidence.request_event_id, rerun.event_id);
-        assert_eq!(evidence.attempt, 2);
-        assert_eq!(
-            evidence
-                .finalized_job_attempts
-                .iter()
-                .map(|entry| (entry.job_id.as_str(), entry.attempt))
-                .collect::<Vec<_>>(),
-            vec![("build", 1), ("test", 2)]
-        );
-        assert!(teardown.lease_empty);
-        assert_eq!(
-            teardown
-                .leases
-                .iter()
-                .map(|lease| (lease.job_id.as_str(), lease.attempt))
-                .collect::<Vec<_>>(),
-            vec![("build", 1), ("test", 2)]
-        );
+            .terminal_event_id()
+            .is_some());
     }
 
     #[test]
@@ -1785,23 +1547,6 @@ mod tests {
             ) -> Result<StoreWrite, Self::Error> {
                 self.durable
                     .compare_and_swap_run(identity, expected_revision, next)
-            }
-
-            fn load_finalization(
-                &self,
-                run_id: &str,
-            ) -> Result<Option<(u64, RunFinalization)>, Self::Error> {
-                self.durable.load_finalization(run_id)
-            }
-
-            fn compare_and_swap_finalization(
-                &mut self,
-                run_id: &str,
-                expected_revision: Option<u64>,
-                next: &RunFinalization,
-            ) -> Result<StoreWrite, Self::Error> {
-                self.durable
-                    .compare_and_swap_finalization(run_id, expected_revision, next)
             }
 
             fn load_publication(

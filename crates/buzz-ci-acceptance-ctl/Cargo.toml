@@ -22,6 +22,18 @@ path = "src/main.rs"
 name = "buzz-ci-capacity-one-canary"
 path = "src/bin/capacity_one_canary.rs"
 
+[[bin]]
+name = "buzz-ci-capacity-one-driver"
+path = "src/bin/capacity_one_driver.rs"
+
+[[bin]]
+name = "buzz-ci-acceptance-control"
+path = "src/bin/acceptance_control.rs"
+
+[[bin]]
+name = "buzz-ci-production-qualification"
+path = "src/bin/production_qualification.rs"
+
 [dependencies]
 buzz-ci-broker-protocol = { workspace = true }
 buzz-core = { workspace = true }
@@ -34,7 +46,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "signal", "socket", "user"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::validate_private_directory;
 use crate::handler::{JournalWrite, ReceiptJournal, ReceiptJournalError};
-use crate::host::validate_private_directory;
 use crate::transport::{ReceiptWriter, RunnerReceipt};
 
 const JOURNAL_SCHEMA_VERSION: u32 = 2;
