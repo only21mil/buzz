@@ -1,0 +1,55 @@
+{
+  "schema_version": "buzz-ci-clean-host-e2e-timing/v2",
+  "leaf_seconds": {
+    "cloud_init_margin": 180,
+    "command_default": 30,
+    "controller_check": 60,
+    "controller_stage": 120,
+    "controller_activate": 120,
+    "driver_operation": 120,
+    "canary_orchestration_margin": 30,
+    "receipt_verifier": 60,
+    "rollback": 60,
+    "unit_stop": 10,
+    "relay_ready_window": 10,
+    "relay_probe": 2,
+    "phase_margin": 30,
+    "verifier_local_work": 60,
+    "guest_command_reap": 10,
+    "poweroff": 30,
+    "host_reap": 10
+  },
+  "phase_terms": {
+    "boot_cloud_init": {"cloud_init_margin": 1},
+    "ceremony": {"phase_margin": 1},
+    "install": {"relay_ready_window": 1, "relay_probe": 1, "phase_margin": 1},
+    "controller_check": {"phase_margin": 1},
+    "controller_stage": {"phase_margin": 1},
+    "controller_activate": {"phase_margin": 1},
+    "canary": {"driver_operation": 13, "canary_orchestration_margin": 1, "phase_margin": 1},
+    "receipt_verifier": {"phase_margin": 1},
+    "rollback": {"phase_margin": 1},
+    "cleanup": {"phase_margin": 1},
+    "verifier": {"verifier_local_work": 1},
+    "poweroff": {"poweroff": 1}
+  },
+  "command_inventory": {
+    "boot_cloud_init": {"command_default": 1, "guest_command_reap": 1},
+    "ceremony": {"command_default": 21, "guest_command_reap": 21},
+    "install": {"command_default": 35, "guest_command_reap": 36},
+    "controller_check": {"controller_check": 1, "guest_command_reap": 1},
+    "controller_stage": {"controller_stage": 1, "command_default": 13, "guest_command_reap": 14},
+    "controller_activate": {"controller_activate": 1, "guest_command_reap": 1},
+    "canary": {"guest_command_reap": 1},
+    "receipt_verifier": {"receipt_verifier": 1, "guest_command_reap": 1},
+    "rollback": {"rollback": 1, "guest_command_reap": 1},
+    "cleanup": {"command_default": 17, "unit_stop": 14, "guest_command_reap": 31},
+    "verifier": {},
+    "poweroff": {}
+  },
+  "role_phases": {
+    "ceremony": ["boot_cloud_init", "ceremony", "poweroff"],
+    "candidate": ["boot_cloud_init", "install", "controller_check", "controller_stage", "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup", "poweroff"],
+    "verifier": ["boot_cloud_init", "verifier", "poweroff"]
+  }
+}

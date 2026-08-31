@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 CONTROLD_DIR = Path(__file__).resolve().parents[1]
+NATIVE_CI_DIR = CONTROLD_DIR.parent
 
 
 def load_module(name: str, path: Path):
@@ -40,10 +41,11 @@ class ControldInstallTests(unittest.TestCase):
         copied = self.source_root / "deploy/native-ci/controld"
         copied.parent.mkdir(mode=0o700, parents=True)
         shutil.copytree(CONTROLD_DIR, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy2(NATIVE_CI_DIR / "package_source.py", copied.parent / "package_source.py")
         subprocess.run(["git", "init", "-q", str(self.source_root)], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.name", "Controld test"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.email", "controld@test.invalid"], check=True)
-        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci/controld"], check=True)
+        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "commit", "-qm", "fixture"], check=True)
         self.source_commit = FREEZER.git_output(self.source_root, "rev-parse", "HEAD")
         self.binary = self.base / "buzz-ci-controld"

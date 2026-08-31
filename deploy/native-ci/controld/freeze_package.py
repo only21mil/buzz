@@ -11,9 +11,14 @@ from pathlib import Path
 import re
 import shutil
 import stat
-import subprocess
+import sys
 import tempfile
 
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+import package_source
 import render_controld_config
 
 SCHEMA = "buzz-ci-controld-install-package-v1"
@@ -80,24 +85,11 @@ def load_provenance(path: Path) -> tuple[dict[str, object], bytes]:
 
 
 def git_output(root: Path, *arguments: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *arguments], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
+    return package_source.git_output(root, *arguments)
 
 
 def verify_source(root: Path, source_commit: str) -> Path:
-    if not GIT_OID.fullmatch(source_commit):
-        raise ValueError("source commit must be a full lowercase Git object id")
-    root = Path(git_output(root, "rev-parse", "--show-toplevel"))
-    if git_output(root, "rev-parse", "HEAD") != source_commit:
-        raise ValueError("source checkout HEAD does not match the requested commit")
-    if git_output(root, "status", "--porcelain", "--untracked-files=all", "--", str(PACKAGE_RELATIVE)):
-        raise ValueError("controld package source path is not clean")
-    package_dir = root / PACKAGE_RELATIVE
-    if Path(os.path.realpath(package_dir)) != package_dir:
-        raise ValueError("controld package source directory must not contain symbolic links")
-    subprocess.run(["git", "-C", str(root), "diff", "--quiet", source_commit, "--", str(PACKAGE_RELATIVE)], check=True)
-    for path in (PACKAGE_RELATIVE / "README.md", PACKAGE_RELATIVE / "templates/buzz-ci-controld.service", PACKAGE_RELATIVE / "templates/buzzci-controld.tmpfiles"):
-        subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", str(path)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return root
+    return package_source.verify_checkout(root, source_commit, PACKAGE_RELATIVE)
 
 
 def write_asset(path: Path, payload: bytes, file_mode: int) -> None:
@@ -148,9 +140,12 @@ def freeze_package(source_root: Path, source_commit: str, binary: Path, provenan
         write_asset(assets / "controld-v1.json", config_payload, 0o400)
         entries.append(entry("config", "controld-v1.json", "/etc/buzzci/controld-v1.json", 0o400, 0o600, controld_uid, controld_gid, config_payload))
 
-        package_dir = source_root / PACKAGE_RELATIVE
         for role, source_name, asset_name, target, source_mode, install_mode, uid, gid in STATIC_ASSETS:
-            payload, _ = read_regular(package_dir / source_name, 0o644)
+            payload, _ = package_source.tracked_payload(
+                source_root,
+                PACKAGE_RELATIVE / source_name,
+                0o100644,
+            )
             write_asset(assets / asset_name, payload, source_mode)
             entries.append(entry(role, asset_name, target, source_mode, install_mode, uid, gid, payload))
         entries.sort(key=lambda item: str(item["target"]).encode())
