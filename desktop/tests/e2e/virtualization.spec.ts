@@ -43,6 +43,21 @@ async function dragOver(page: Page, source: Locator, target: Locator) {
   await page.mouse.up();
 }
 
+async function scrollTimelineAwayFromBottom(page: Page) {
+  const timeline = page.getByTestId("message-timeline");
+  await timeline.hover();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await page.mouse.wheel(0, -800);
+    const distanceFromBottom = await timeline.evaluate(
+      (element) =>
+        element.scrollHeight - element.clientHeight - element.scrollTop,
+    );
+    if (distanceFromBottom > 160) return;
+    await page.waitForTimeout(25);
+  }
+  throw new Error("timeline did not move away from the visual tail");
+}
+
 test.describe("list virtualization", () => {
   test("01 — Pulse windowed feed with sticky composer pinned mid-scroll", async ({
     page,
@@ -206,6 +221,8 @@ test.describe("list virtualization", () => {
     // Initial bottom positioning can momentarily cross the start threshold. Let
     // any resulting page transaction settle before driving explicit crossings.
     await page.waitForTimeout(1_000);
+    await timeline.hover();
+    await page.mouse.wheel(0, -1);
 
     const sampleVisibleAnchor = (expectedId?: string) =>
       timeline.evaluate(async (scroller, anchorId) => {
@@ -810,10 +827,7 @@ test("live tail arrivals stay buffered while reading and release on jump", async
 
   const timeline = page.getByTestId("message-timeline");
   await expect(timeline.locator("[data-message-id]").first()).toBeVisible();
-  await timeline.evaluate((element) => {
-    element.scrollTop = Math.max(500, element.scrollHeight / 2);
-    element.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
+  await scrollTimelineAwayFromBottom(page);
   await expect(page.getByTestId("message-scroll-to-latest")).toBeVisible();
   const frozenHeight = await timeline.evaluate(
     (element) => element.scrollHeight,
