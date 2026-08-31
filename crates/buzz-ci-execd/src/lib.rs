@@ -44,7 +44,11 @@ pub mod normal_qualification_host;
 #[cfg(target_os = "linux")]
 pub mod normal_source;
 #[cfg(target_os = "linux")]
+pub mod production_binding;
+#[cfg(target_os = "linux")]
 pub mod production_composition;
+#[cfg(target_os = "linux")]
+pub mod production_v2;
 mod proxy_journal;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod proxy_lease;

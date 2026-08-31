@@ -229,11 +229,18 @@ fn job_status(
         base_oid: request.base_oid.clone(),
         job_id: "test".into(),
         name: "test".into(),
-        attempt: 1,
-        parent_attempt: None,
+        attempt: request.attempt,
+        parent_attempt: request.parent_attempt,
         sequence,
         state,
-        conclusion: terminal.then(|| "success".into()),
+        conclusion: terminal.then(|| match state {
+            CiJobState::Success => "success".into(),
+            CiJobState::Failure => "failure".into(),
+            CiJobState::Cancelled => "cancelled".into(),
+            CiJobState::TimedOut => "timed_out".into(),
+            CiJobState::Skipped => "skipped".into(),
+            CiJobState::Queued | CiJobState::Running => unreachable!(),
+        }),
         reason: None,
         required: true,
         skip_policy: CiSkipPolicy::Forbid,
@@ -271,10 +278,17 @@ fn run_status(
         target_repo_a: request.target_repo_a.clone(),
         tip_oid: request.tip_oid.clone(),
         base_oid: request.base_oid.clone(),
-        attempt: 1,
+        attempt: request.attempt,
         sequence,
         state,
-        conclusion: terminal.then(|| "success".into()),
+        conclusion: terminal.then(|| match state {
+            CiRunState::Success => "success".into(),
+            CiRunState::Failure => "failure".into(),
+            CiRunState::Cancelled => "cancelled".into(),
+            CiRunState::TimedOut => "timed_out".into(),
+            CiRunState::InfrastructureFailure => "infrastructure_failure".into(),
+            CiRunState::Queued | CiRunState::Running => unreachable!(),
+        }),
         reason: None,
         started_at: (sequence >= 2).then_some(1_800_000_010),
         finished_at: terminal.then_some(1_800_000_040),
@@ -304,7 +318,7 @@ fn log_reference(
         target_repo_a: request.target_repo_a.clone(),
         tip_oid: request.tip_oid.clone(),
         job_id: "test".into(),
-        attempt: 1,
+        attempt: request.attempt,
         log_sha256: "55".repeat(32),
         byte_length: 3,
         cap_bytes: 1024,
@@ -338,10 +352,10 @@ fn evidence_finalized(
         workflow_id: request.workflow_id.clone(),
         target_repo_a: request.target_repo_a.clone(),
         tip_oid: request.tip_oid.clone(),
-        attempt: 1,
+        attempt: request.attempt,
         finalized_job_attempts: vec![CiFinalizedJobAttempt {
             job_id: job_id.into(),
-            attempt: 1,
+            attempt: request.attempt,
             log_ref: log_ref.into(),
             artifact_refs: Vec::new(),
         }],
@@ -372,10 +386,10 @@ fn teardown_attestation(
         tip_oid: request.tip_oid.clone(),
         base_oid: request.base_oid.clone(),
         workflow_digest: request.workflow_digest.clone(),
-        attempt: 1,
+        attempt: request.attempt,
         leases: vec![CiTeardownLease {
             job_id: "test".into(),
-            attempt: 1,
+            attempt: request.attempt,
             lease_id: Uuid::new_v4().to_string(),
         }],
         lease_empty: true,
@@ -897,6 +911,212 @@ async fn request_and_status_chain_round_trip_into_reducer() {
         .await,
         Err(buzz_db::DbError::InvalidData(_))
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn rerun_final_facts_bind_only_the_final_request_and_selected_graph() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let authorized_status_signers = HashSet::from([control.public_key().to_hex()]);
+    let initial = request(&actor, Uuid::new_v4());
+    let initial_event = signed_request(&actor, channel_id, &initial);
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &initial_event,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store initial request");
+    for (sequence, state) in [
+        (1, CiRunState::Queued),
+        (2, CiRunState::Running),
+        (3, CiRunState::Failure),
+    ] {
+        let event = run_status(
+            &control,
+            channel_id,
+            &initial,
+            &initial_event.id.to_hex(),
+            sequence,
+            state,
+        );
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &event,
+            &authorized_status_signers,
+        )
+        .await
+        .expect("store initial run status");
+    }
+    store_selected_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &initial,
+        &initial_event,
+        "test",
+        1,
+        None,
+        CiJobState::Failure,
+        &[],
+        &authorized_status_signers,
+    )
+    .await;
+
+    let rerun = rerun_request(&initial, "test", 1);
+    let rerun_event = signed_request(&actor, channel_id, &rerun);
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &rerun_event,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store rerun request");
+    for (sequence, state) in [(1, CiRunState::Queued), (2, CiRunState::Running)] {
+        let event = run_status(
+            &control,
+            channel_id,
+            &rerun,
+            &rerun_event.id.to_hex(),
+            sequence,
+            state,
+        );
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &event,
+            &authorized_status_signers,
+        )
+        .await
+        .expect("store rerun status");
+    }
+    let log = store_terminal_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &rerun,
+        &rerun_event,
+        &authorized_status_signers,
+    )
+    .await;
+
+    let stale_evidence = evidence_finalized(
+        &control,
+        channel_id,
+        &rerun,
+        &initial_event.id.to_hex(),
+        "test",
+        &log.id.to_hex(),
+    );
+    assert!(matches!(
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &stale_evidence,
+            &authorized_status_signers,
+        )
+        .await,
+        Err(buzz_db::DbError::InvalidData(_))
+    ));
+
+    let evidence = evidence_finalized(
+        &control,
+        channel_id,
+        &rerun,
+        &rerun_event.id.to_hex(),
+        "test",
+        &log.id.to_hex(),
+    );
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &evidence,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store final-request evidence");
+    let teardown = teardown_attestation(&control, channel_id, &rerun, &rerun_event.id.to_hex());
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &teardown,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store final-request teardown");
+    let success = run_status(
+        &control,
+        channel_id,
+        &rerun,
+        &rerun_event.id.to_hex(),
+        3,
+        CiRunState::Success,
+    );
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &success,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store terminal success after final facts");
+
+    let events = list_ci_run_events(
+        &pool,
+        community_id,
+        channel_id,
+        Uuid::parse_str(&initial.run_id).unwrap(),
+        0,
+        100,
+    )
+    .await
+    .expect("list final run history");
+    let terminal_facts = events
+        .iter()
+        .filter(|stored| {
+            matches!(
+                stored.stored_event.event.kind.as_u16() as u32,
+                buzz_core::kind::KIND_CI_EVIDENCE_FINALIZED
+                    | buzz_core::kind::KIND_CI_TEARDOWN_ATTESTATION
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_facts.len(), 2);
+    assert!(terminal_facts.iter().all(|stored| {
+        let envelope: serde_json::Value =
+            serde_json::from_str(&stored.stored_event.event.content).unwrap();
+        envelope["request_event_id"] == rerun_event.id.to_hex() && envelope["attempt"] == 2
+    }));
+    let evidence_position = events
+        .iter()
+        .position(|stored| stored.stored_event.event.id == evidence.id)
+        .expect("finalized evidence event");
+    let teardown_position = events
+        .iter()
+        .position(|stored| stored.stored_event.event.id == teardown.id)
+        .expect("teardown event");
+    let success_position = events
+        .iter()
+        .position(|stored| stored.stored_event.event.id == success.id)
+        .expect("terminal success event");
+    assert!(evidence_position < success_position);
+    assert!(teardown_position < success_position);
 }
 
 #[tokio::test]

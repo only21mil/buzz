@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 
 SECTIONS = ("staging", "production_canary", "deliberate_red")
+ANNOTATION_FIELDS = {"_usage", "_role"}
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
@@ -88,11 +89,30 @@ def populate_event_evidence(section: Any, relay_origin: str, path: str) -> dict[
     return result
 
 
+def remove_template_annotations(value: Any, path: str = "evidence") -> Any:
+    """Remove the two documented guide-only fields without altering wire values."""
+    if isinstance(value, list):
+        return [remove_template_annotations(item, f"{path}[]") for item in value]
+    if not isinstance(value, dict):
+        return value
+    unknown_annotations = {
+        key for key in value if isinstance(key, str) and key.startswith("_")
+        and key not in ANNOTATION_FIELDS
+    }
+    if unknown_annotations:
+        refuse(f"{path} has unknown annotation fields: {sorted(unknown_annotations)}")
+    return {
+        key: remove_template_annotations(item, f"{path}.{key}")
+        for key, item in value.items()
+        if key not in ANNOTATION_FIELDS
+    }
+
+
 def populate_promotion_evidence(bundle: Any, configured_url: Any) -> dict[str, Any]:
     if not isinstance(bundle, dict):
         refuse("promotion evidence must be an object")
     origin = canonical_relay_origin(configured_url, "configured relay URL")
-    result = copy.deepcopy(bundle)
+    result = remove_template_annotations(copy.deepcopy(bundle))
     for section_name in SECTIONS:
         section = result.get(section_name)
         if not isinstance(section, dict):
