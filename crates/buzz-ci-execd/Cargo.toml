@@ -15,12 +15,17 @@ path = "src/lib.rs"
 name = "buzz-ci-execd"
 path = "src/main.rs"
 
+[[bin]]
+name = "buzz-ci-executor"
+path = "src/executor_main.rs"
+
 [dependencies]
 buzz-ci-broker-protocol = { workspace = true }
 buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }
 buzz-ci-materializer = { path = "../buzz-ci-materializer" }
 buzz-ci-policy-proxy = { path = "../buzz-ci-policy-proxy" }
 hex = { workspace = true }
+nostr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

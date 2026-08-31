@@ -83,9 +83,12 @@ deploy/native-ci/runner/freeze_package.py \
   --controld-gid CONTROLD_GID
 ```
 
-The freezer refuses a different checkout head, a dirty package source path, an
-untracked template, a linked input, a broad source mode, a provenance mismatch,
-or a pre-existing output. It copies the binary provenance into the package and
+The freezer binds each tracked source to its Git executable class. A Git
+`100644` file may materialize as `0600` or `0644`, and a Git `100755` file may
+materialize as `0700` or `0755`; other or unsafe modes are refused. The freezer
+also refuses a different checkout head, a dirty package source path, an
+untracked template, a linked input, a provenance mismatch, or a pre-existing
+output. It copies the binary provenance into the package and
 binds its digest, the full Git commit, every payload digest, every destination,
 and every installed UID, GID, and mode in `package-manifest.json`.
 

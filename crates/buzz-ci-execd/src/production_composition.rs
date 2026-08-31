@@ -4,23 +4,29 @@
 //! linked. Partial discovery never falls through to an executor with weaker
 //! facts, and tests inject typed fakes without running host commands.
 
+#[cfg(test)]
 use buzz_ci_broker_protocol::{
     AdmitAttemptRequest, BrokerResponse, FrameHeader, QualificationRequest, Request,
 };
 
 use crate::{
-    activation::{LeaseToken, OrdinaryAdmission, QualificationLease},
-    control::{ClosedDispatch, ControlDispatch},
-    durable_dispatch::{
-        load_dispatch, BootstrapDispatch, ExecutionUnavailable, OrdinaryCleanup, OrdinaryExecutor,
-        OrdinaryReceipts, OrdinaryStop, QualificationCleanup, QualificationExecution,
-        QualificationExecutor, QualificationStop, ReadyHostProofs, ReadyValidationProvider,
-    },
+    durable_dispatch::ExecutionUnavailable,
     host_composition::HostCompositionContract,
     normal_backend::{
         materialization_input::MaterializationInputProvider,
         proxy_input::{BoundPrestartPersister, ProxyInputProvider},
         BrokerProxyRuntime, MediatedActThroughProxyLauncher, RuntimeDescriptorProvider,
+    },
+};
+
+#[cfg(test)]
+use crate::{
+    activation::{LeaseToken, OrdinaryAdmission, QualificationLease},
+    control::{ClosedDispatch, ControlDispatch},
+    durable_dispatch::{
+        load_dispatch, BootstrapDispatch, OrdinaryCleanup, OrdinaryExecutor, OrdinaryReceipts,
+        OrdinaryStop, QualificationCleanup, QualificationExecution, QualificationExecutor,
+        QualificationStop, ReadyHostProofs, ReadyValidationProvider,
     },
     runtime::ReadyValidationTarget,
 };
@@ -37,8 +43,8 @@ pub enum HostBackendSeam {
     CrashRecoveryCoordinator,
 }
 
-/// Exact ordinary provider inventory that canonical startup still requires.
-pub const MISSING_ORDINARY_HOST_SEAMS: [HostBackendSeam; 7] = [
+/// Exact ordinary provider inventory bound by the capacity-one composition.
+pub const REQUIRED_ORDINARY_HOST_SEAMS: [HostBackendSeam; 7] = [
     HostBackendSeam::ExecutorUnitHandoff,
     HostBackendSeam::RuntimeDescriptorProvider,
     HostBackendSeam::MaterializationInputProvider,
@@ -53,8 +59,8 @@ pub const MISSING_ORDINARY_HOST_SEAMS: [HostBackendSeam; 7] = [
 pub enum ProductionCompositionError {
     /// Root-authored host composition is absent, partial, or malformed.
     HostContractUnavailable,
-    /// Lease-scoped providers are absent even though the static contract loaded.
-    HostBackendsMissing(&'static [HostBackendSeam]),
+    /// The explicit capacity-one config or one of its bound resources is unavailable.
+    V2CompositionUnavailable(&'static [HostBackendSeam]),
 }
 
 /// Concrete PR112/PR113 input consumers bound to one descriptor sequence.
@@ -112,21 +118,25 @@ impl<P: BoundPrestartPersister> ProductionInputProviders<P> {
 }
 
 /// Fresh host proof adapter. The source must bind all facts to `target`.
+#[cfg(test)]
 pub trait ProductionReadyProofSource {
     fn validate(&mut self, target: &ReadyValidationTarget, now: u64) -> Option<ReadyHostProofs>;
 }
 
 /// Ready validator used by the production bootstrap path.
+#[cfg(test)]
 pub struct ProductionReadyValidator {
     source: Box<dyn ProductionReadyProofSource>,
 }
 
+#[cfg(test)]
 impl ProductionReadyValidator {
     pub fn new(source: Box<dyn ProductionReadyProofSource>) -> Self {
         Self { source }
     }
 }
 
+#[cfg(test)]
 impl ReadyValidationProvider for ProductionReadyValidator {
     fn ready_validation(
         &mut self,
@@ -138,16 +148,19 @@ impl ReadyValidationProvider for ProductionReadyValidator {
 }
 
 /// Ordinary adapter that accepts only the durable dispatcher's typed seam.
+#[cfg(test)]
 pub struct ProductionOrdinaryExecutor {
     backend: Box<dyn OrdinaryExecutor>,
 }
 
+#[cfg(test)]
 impl ProductionOrdinaryExecutor {
     pub fn new(backend: Box<dyn OrdinaryExecutor>) -> Self {
         Self { backend }
     }
 }
 
+#[cfg(test)]
 impl OrdinaryExecutor for ProductionOrdinaryExecutor {
     fn preflight(
         &mut self,
@@ -198,16 +211,19 @@ impl OrdinaryExecutor for ProductionOrdinaryExecutor {
 }
 
 /// Qualification adapter that accepts only the durable dispatcher's typed seam.
+#[cfg(test)]
 pub struct ProductionQualificationExecutor {
     backend: Box<dyn QualificationExecutor>,
 }
 
+#[cfg(test)]
 impl ProductionQualificationExecutor {
     pub fn new(backend: Box<dyn QualificationExecutor>) -> Self {
         Self { backend }
     }
 }
 
+#[cfg(test)]
 impl QualificationExecutor for ProductionQualificationExecutor {
     fn preflight(&mut self, request: QualificationRequest) -> Result<(), ExecutionUnavailable> {
         self.backend.preflight(request)
@@ -234,19 +250,24 @@ impl QualificationExecutor for ProductionQualificationExecutor {
 }
 
 /// Complete production adapter set. It cannot represent a partial composition.
-pub struct ProductionAdapters {
-    validation: ProductionReadyValidator,
-    ordinary: ProductionOrdinaryExecutor,
-    qualification: ProductionQualificationExecutor,
+#[cfg(test)]
+pub enum ProductionAdapters {
+    Legacy {
+        validation: ProductionReadyValidator,
+        ordinary: ProductionOrdinaryExecutor,
+        qualification: ProductionQualificationExecutor,
+    },
+    V2(Box<dyn ControlDispatch>),
 }
 
+#[cfg(test)]
 impl ProductionAdapters {
     pub fn from_backends(
         validation: Box<dyn ProductionReadyProofSource>,
         ordinary: Box<dyn OrdinaryExecutor>,
         qualification: Box<dyn QualificationExecutor>,
     ) -> Self {
-        Self {
+        Self::Legacy {
             validation: ProductionReadyValidator::new(validation),
             ordinary: ProductionOrdinaryExecutor::new(ordinary),
             qualification: ProductionQualificationExecutor::new(qualification),
@@ -257,51 +278,95 @@ impl ProductionAdapters {
     ///
     /// Discovery remains closed until every production proof source and host
     /// execution adapter is bound. It never assembles a partial host path.
-    pub fn canonical() -> Result<Self, ProductionCompositionError> {
-        crate::host_composition::HostCompositionContract::canonical()
-            .map_err(|_| ProductionCompositionError::HostContractUnavailable)?;
-        Err(ProductionCompositionError::HostBackendsMissing(
-            &MISSING_ORDINARY_HOST_SEAMS,
-        ))
+    pub fn canonical(now: u64) -> Result<Self, ProductionCompositionError> {
+        crate::production_v2::load_canonical(now)
+            .map(|runtime| Self::V2(runtime.dispatch))
+            .map_err(|_| {
+                ProductionCompositionError::V2CompositionUnavailable(&REQUIRED_ORDINARY_HOST_SEAMS)
+            })
     }
 }
 
-/// Concrete dispatch type used by `buzz-ci-execd` production main.
+/// Test-only legacy dispatch composition. Production startup has no injected
+/// adapter or closed fallback path.
+#[cfg(test)]
 pub enum ProductionDispatch {
     Closed(ClosedDispatch),
     Configured(BootstrapDispatch<ProductionOrdinaryExecutor, ProductionQualificationExecutor>),
+    ConfiguredV2(Box<dyn ControlDispatch>),
 }
 
+#[cfg(test)]
 impl ControlDispatch for ProductionDispatch {
     fn dispatch(&mut self, header: FrameHeader, request: Request, now: u64) -> BrokerResponse {
         match self {
             Self::Closed(dispatch) => dispatch.dispatch(header, request, now),
             Self::Configured(dispatch) => dispatch.dispatch(header, request, now),
+            Self::ConfiguredV2(dispatch) => dispatch.dispatch(header, request, now),
+        }
+    }
+
+    fn dispatch_v2(
+        &mut self,
+        header: buzz_ci_broker_protocol::v2::FrameHeader,
+        request: buzz_ci_broker_protocol::v2::Request,
+        now: u64,
+    ) -> buzz_ci_broker_protocol::v2::BrokerResponse {
+        match self {
+            Self::ConfiguredV2(dispatch) => dispatch.dispatch_v2(header, request, now),
+            Self::Closed(_) | Self::Configured(_) => crate::production_binding::empty_response(
+                buzz_ci_broker_protocol::ResponseCode::NotProvisioned,
+                now,
+            ),
+        }
+    }
+
+    fn dispatch_v2_encoded(
+        &mut self,
+        header: buzz_ci_broker_protocol::v2::FrameHeader,
+        request: buzz_ci_broker_protocol::v2::Request,
+        now: u64,
+    ) -> buzz_ci_broker_protocol::v2::EncodedFrame {
+        match self {
+            Self::ConfiguredV2(dispatch) => dispatch.dispatch_v2_encoded(header, request, now),
+            Self::Closed(dispatch) => dispatch.dispatch_v2_encoded(header, request, now),
+            Self::Configured(dispatch) => dispatch.dispatch_v2_encoded(header, request, now),
         }
     }
 
     fn maintenance(&mut self, now: u64) {
-        if let Self::Configured(dispatch) = self {
-            dispatch.maintenance(now);
+        match self {
+            Self::Configured(dispatch) => dispatch.maintenance(now),
+            Self::ConfiguredV2(dispatch) => dispatch.maintenance(now),
+            Self::Closed(_) => {}
         }
     }
 }
 
-/// Load the exact production composition. Missing backends expose zero capacity.
-pub fn load_production_dispatch(now: u64) -> ProductionDispatch {
-    let Ok(adapters) = ProductionAdapters::canonical() else {
-        return ProductionDispatch::Closed(ClosedDispatch::new());
-    };
-    compose_production_dispatch(now, adapters)
+/// Load the exact production-v2 composition. Any failure prevents serving.
+pub fn load_production_dispatch(
+    now: u64,
+) -> Result<crate::production_v2::ProductionRuntime, ProductionCompositionError> {
+    crate::production_v2::load_canonical(now).map_err(|_| {
+        ProductionCompositionError::V2CompositionUnavailable(&REQUIRED_ORDINARY_HOST_SEAMS)
+    })
 }
 
-fn compose_production_dispatch(now: u64, mut adapters: ProductionAdapters) -> ProductionDispatch {
-    ProductionDispatch::Configured(load_dispatch(
-        now,
-        &mut adapters.validation,
-        adapters.ordinary,
-        adapters.qualification,
-    ))
+#[cfg(test)]
+fn compose_production_dispatch(now: u64, adapters: ProductionAdapters) -> ProductionDispatch {
+    match adapters {
+        ProductionAdapters::Legacy {
+            mut validation,
+            ordinary,
+            qualification,
+        } => ProductionDispatch::Configured(load_dispatch(
+            now,
+            &mut validation,
+            ordinary,
+            qualification,
+        )),
+        ProductionAdapters::V2(dispatch) => ProductionDispatch::ConfiguredV2(dispatch),
+    }
 }
 
 #[cfg(test)]
@@ -499,11 +564,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_composition_is_closed_until_every_backend_is_linked() {
-        assert!(ProductionAdapters::canonical().is_err());
-        assert_eq!(MISSING_ORDINARY_HOST_SEAMS.len(), 7);
+    fn canonical_composition_is_closed_without_exact_capacity_one_config() {
+        assert!(ProductionAdapters::canonical(1).is_err());
+        assert_eq!(REQUIRED_ORDINARY_HOST_SEAMS.len(), 7);
         assert_eq!(
-            MISSING_ORDINARY_HOST_SEAMS,
+            REQUIRED_ORDINARY_HOST_SEAMS,
             [
                 HostBackendSeam::ExecutorUnitHandoff,
                 HostBackendSeam::RuntimeDescriptorProvider,
@@ -514,10 +579,7 @@ mod tests {
                 HostBackendSeam::CrashRecoveryCoordinator,
             ]
         );
-        assert!(matches!(
-            load_production_dispatch(1),
-            ProductionDispatch::Closed(_)
-        ));
+        assert!(load_production_dispatch(1).is_err());
     }
 
     #[test]

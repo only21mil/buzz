@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::production::{ControlStore, SignedCiEvent, StoredPublication};
+use crate::production::{ControlStore, RunFinalization, SignedCiEvent, StoredPublication};
 use crate::{RunIdentity, RunRecord, StoreWrite, MAX_SAFE_INTEGER};
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -234,6 +234,56 @@ impl ControlStore for DurableControlStore {
         })
     }
 
+    fn load_finalization(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(u64, RunFinalization)>, Self::Error> {
+        validate_key(run_id)?;
+        self.with_locked(|snapshot| {
+            Ok(snapshot
+                .finalizations
+                .get(run_id)
+                .map(|stored| (stored.revision, stored.finalization.clone())))
+        })
+    }
+
+    fn compare_and_swap_finalization(
+        &mut self,
+        run_id: &str,
+        expected_revision: Option<u64>,
+        next: &RunFinalization,
+    ) -> Result<StoreWrite, Self::Error> {
+        validate_key(run_id)?;
+        next.validate().map_err(|_| StoreError::Conflict)?;
+        self.mutate(|snapshot| {
+            let actual = snapshot
+                .finalizations
+                .get(run_id)
+                .map(|stored| stored.revision);
+            if actual != expected_revision {
+                return Ok((
+                    StoreWrite::Conflict {
+                        actual_revision: actual,
+                    },
+                    false,
+                ));
+            }
+            let revision = actual
+                .unwrap_or(0)
+                .checked_add(1)
+                .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+                .ok_or(StoreError::Conflict)?;
+            snapshot.finalizations.insert(
+                run_id.to_owned(),
+                StoredFinalization {
+                    revision,
+                    finalization: next.clone(),
+                },
+            );
+            Ok((StoreWrite::Written { revision }, true))
+        })
+    }
+
     fn load_publication(&self, key: &str) -> Result<Option<StoredPublication>, Self::Error> {
         validate_key(key)?;
         self.with_locked(|snapshot| Ok(snapshot.publications.get(key).cloned()))
@@ -296,6 +346,8 @@ struct Snapshot {
     schema_version: u32,
     cursors: BTreeMap<String, u64>,
     runs: BTreeMap<String, StoredRun>,
+    #[serde(default)]
+    finalizations: BTreeMap<String, StoredFinalization>,
     publications: BTreeMap<String, StoredPublication>,
 }
 
@@ -305,6 +357,7 @@ impl Default for Snapshot {
             schema_version: SCHEMA_VERSION,
             cursors: BTreeMap::new(),
             runs: BTreeMap::new(),
+            finalizations: BTreeMap::new(),
             publications: BTreeMap::new(),
         }
     }
@@ -324,6 +377,15 @@ impl Snapshot {
             if stored.revision == 0
                 || stored.revision > MAX_SAFE_INTEGER
                 || identity_key(stored.record.identity())? != *key
+            {
+                return Err(StoreError::InvalidSnapshot);
+            }
+        }
+        for (run_id, stored) in &self.finalizations {
+            if stored.revision == 0
+                || stored.revision > MAX_SAFE_INTEGER
+                || validate_key(run_id).is_err()
+                || stored.finalization.validate().is_err()
             {
                 return Err(StoreError::InvalidSnapshot);
             }
@@ -355,6 +417,13 @@ impl Snapshot {
 struct StoredRun {
     revision: u64,
     record: RunRecord,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredFinalization {
+    revision: u64,
+    finalization: RunFinalization,
 }
 
 fn validate_absolute_path(path: &Path) -> Result<(), StoreError> {
@@ -450,6 +519,40 @@ mod tests {
         }
     }
 
+    fn finalization() -> RunFinalization {
+        serde_json::from_value(serde_json::json!({
+            "run_id": "123e4567-e89b-12d3-a456-426614174011",
+            "target_repo_a": format!("30617:{}:buzz", "22".repeat(32)),
+            "tip_oid": "44".repeat(20),
+            "base_oid": "55".repeat(20),
+            "workflow_id": "ci",
+            "workflow_digest": "66".repeat(32),
+            "request_event_id": "11".repeat(32),
+            "attempt": 1,
+            "finalized_at": 12,
+            "teardown_at": 12,
+            "jobs": {
+                "test": {
+                    "evidence": {
+                        "job_id": "test",
+                        "attempt": 1,
+                        "log_ref": "aa".repeat(32),
+                        "artifact_refs": []
+                    },
+                    "lease": {
+                        "job_id": "test",
+                        "attempt": 1,
+                        "lease_id": "lease-test-1"
+                    },
+                    "state": "success",
+                    "required": true,
+                    "skip_policy": "forbid"
+                }
+            }
+        }))
+        .expect("finalization fixture")
+    }
+
     #[test]
     fn restart_restores_cursor_run_and_publication() {
         let (directory, mut store) = store();
@@ -465,6 +568,14 @@ mod tests {
         assert!(store
             .record_publication_intent("run:queued", &event("a"))
             .expect("intent"));
+        let finalization = finalization();
+        let finalization_run_id = "123e4567-e89b-12d3-a456-426614174011";
+        assert_eq!(
+            store
+                .compare_and_swap_finalization(finalization_run_id, None, &finalization)
+                .expect("finalization"),
+            StoreWrite::Written { revision: 1 }
+        );
         drop(store);
 
         let root = fs::canonicalize(directory.path()).expect("canonical root");
@@ -480,6 +591,12 @@ mod tests {
                 .load_publication("run:queued")
                 .expect("publication"),
             Some(StoredPublication::Pending(event("a")))
+        );
+        assert_eq!(
+            reopened
+                .load_finalization(finalization_run_id)
+                .expect("finalization"),
+            Some((1, finalization))
         );
     }
 

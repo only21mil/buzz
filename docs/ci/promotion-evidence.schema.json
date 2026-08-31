@@ -45,7 +45,8 @@
         "pre_freeze": {"$ref": "#/$defs/file_descriptor"},
         "protected_ci": {"$ref": "#/$defs/file_descriptor"},
         "acceptance_verdict": {"$ref": "#/$defs/file_descriptor"},
-        "acceptance_records": {"$ref": "#/$defs/file_descriptor"}
+        "acceptance_records": {"$ref": "#/$defs/file_descriptor"},
+        "collection_manifest": {"$ref": "#/$defs/file_descriptor"}
       }
     },
     "protected_ci": {

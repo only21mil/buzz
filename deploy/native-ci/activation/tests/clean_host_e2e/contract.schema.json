@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/clean-host-e2e-vm-contract-v3.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages"],
+  "properties": {
+    "schema_version": {"const": "buzz-ci-clean-host-e2e-vm-contract/v3"},
+    "state": {"type": "string", "minLength": 1},
+    "candidate_root": {"type": "string", "minLength": 1},
+    "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"pattern": "^0+$"}},
+    "harness_sha256": {"$ref": "#/$defs/sha"},
+    "timing_asset_sha256": {"$ref": "#/$defs/sha"},
+    "timing_sha256": {"$ref": "#/$defs/sha"},
+    "timing": {
+      "const": {
+        "schema_version": "buzz-ci-clean-host-e2e-timing/v2",
+        "leaf_seconds": {
+          "cloud_init_margin": 180, "command_default": 30,
+          "controller_check": 60, "controller_stage": 120,
+          "controller_activate": 120, "driver_operation": 120,
+          "canary_orchestration_margin": 30, "receipt_verifier": 60,
+          "rollback": 60, "unit_stop": 10, "relay_ready_window": 10,
+          "relay_probe": 2, "phase_margin": 30, "verifier_local_work": 60,
+          "guest_command_reap": 10, "poweroff": 30, "host_reap": 10
+        },
+        "phase_terms": {
+          "boot_cloud_init": {"cloud_init_margin": 1},
+          "ceremony": {"phase_margin": 1},
+          "install": {"relay_ready_window": 1, "relay_probe": 1, "phase_margin": 1},
+          "controller_check": {"phase_margin": 1},
+          "controller_stage": {"phase_margin": 1},
+          "controller_activate": {"phase_margin": 1},
+          "canary": {"driver_operation": 13, "canary_orchestration_margin": 1, "phase_margin": 1},
+          "receipt_verifier": {"phase_margin": 1},
+          "rollback": {"phase_margin": 1},
+          "cleanup": {"phase_margin": 1},
+          "verifier": {"verifier_local_work": 1},
+          "poweroff": {"poweroff": 1}
+        },
+        "command_inventory": {
+          "boot_cloud_init": {"command_default": 1, "guest_command_reap": 1},
+          "ceremony": {"command_default": 21, "guest_command_reap": 21},
+          "install": {"command_default": 35, "guest_command_reap": 36},
+          "controller_check": {"controller_check": 1, "guest_command_reap": 1},
+          "controller_stage": {"controller_stage": 1, "command_default": 13, "guest_command_reap": 14},
+          "controller_activate": {"controller_activate": 1, "guest_command_reap": 1},
+          "canary": {"guest_command_reap": 1},
+          "receipt_verifier": {"receipt_verifier": 1, "guest_command_reap": 1},
+          "rollback": {"rollback": 1, "guest_command_reap": 1},
+          "cleanup": {"command_default": 17, "unit_stop": 14, "guest_command_reap": 31},
+          "verifier": {},
+          "poweroff": {}
+        },
+        "role_phases": {
+          "ceremony": ["boot_cloud_init", "ceremony", "poweroff"],
+          "candidate": ["boot_cloud_init", "install", "controller_check", "controller_stage", "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup", "poweroff"],
+          "verifier": ["boot_cloud_init", "verifier", "poweroff"]
+        }
+      }
+    },
+    "scenario": {"$ref": "#/$defs/file"},
+    "seccomp_source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"const": "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"}
+      }
+    },
+    "packages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "controld", "keyholder", "execd", "activation"],
+      "properties": {
+        "runner": {"$ref": "#/$defs/tree"},
+        "controld": {"$ref": "#/$defs/tree"},
+        "keyholder": {"$ref": "#/$defs/tree"},
+        "execd": {"$ref": "#/$defs/tree"},
+        "activation": {"$ref": "#/$defs/tree"}
+      }
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha"}}
+    },
+    "tree": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "tree_sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "tree_sha256": {"$ref": "#/$defs/sha"}}
+    },
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$", "not": {"pattern": "^0+$"}}
+  }
+}

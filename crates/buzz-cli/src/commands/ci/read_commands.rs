@@ -240,6 +240,37 @@ struct WatchRecordOutput {
 pub(super) async fn cmd_watch(
     client: &BuzzClient,
     run_id: &str,
+    timeout_seconds: u64,
+    trusted: &RunTrustedContext,
+) -> Result<(), CliError> {
+    if timeout_seconds == 0 {
+        return Err(CliError::Usage(
+            "CI watch --timeout-seconds must be greater than zero".into(),
+        ));
+    }
+    let deadline = std::time::Duration::from_secs(timeout_seconds);
+    with_watch_deadline(deadline, cmd_watch_until_terminal(client, run_id, trusted)).await
+}
+
+async fn with_watch_deadline<F, T>(
+    deadline: std::time::Duration,
+    operation: F,
+) -> Result<T, CliError>
+where
+    F: std::future::Future<Output = Result<T, CliError>>,
+{
+    match tokio::time::timeout(deadline, operation).await {
+        Ok(result) => result,
+        Err(_) => Err(CliError::Other(format!(
+            "CI watch exceeded its fixed deadline of {} seconds",
+            deadline.as_secs()
+        ))),
+    }
+}
+
+async fn cmd_watch_until_terminal(
+    client: &BuzzClient,
+    run_id: &str,
     trusted: &RunTrustedContext,
 ) -> Result<(), CliError> {
     let request = super::dispatch::fetch_ci_run_request(client, run_id, trusted).await?;
@@ -589,5 +620,16 @@ mod tests {
         assert_eq!(record.state, None);
         assert_eq!(record.watch_cursor, 41);
         assert_eq!(record.event_id, "22".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn watch_deadline_fails_instead_of_polling_forever() {
+        let pending = std::future::pending::<Result<(), CliError>>();
+        let error = with_watch_deadline(std::time::Duration::from_millis(5), pending)
+            .await
+            .expect_err("deadline must fail");
+        assert!(error
+            .to_string()
+            .contains("CI watch exceeded its fixed deadline"));
     }
 }
