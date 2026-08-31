@@ -1,0 +1,45 @@
+[Unit]
+Description=Buzz CI isolated signing keyholder
+Documentation=file:/usr/share/doc/buzz-ci-keyholder/README.md
+Requires=buzz-ci-keyholder.socket
+After=local-fs.target buzz-ci-keyholder.socket
+
+[Service]
+Type=exec
+User=buzzci-keyholder
+Group=buzzci-keyholder
+UMask=0077
+ExecStart=/usr/libexec/buzz-ci-keyholder --config /etc/buzzci/keyholder-v1.json
+LoadCredentialEncrypted=ci-event.key:/etc/credstore.encrypted/buzzci-keyholder/ci-event.key
+LoadCredentialEncrypted=nip98.key:/etc/credstore.encrypted/buzzci-keyholder/nip98.key
+LoadCredentialEncrypted=manifest.key:/etc/credstore.encrypted/buzzci-keyholder/manifest.key
+CapabilityBoundingSet=
+KeyringMode=private
+LockPersonality=yes
+LimitCORE=0
+LimitMEMLOCK=infinity
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProcSubset=pid
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ReadOnlyPaths=/etc/buzzci/keyholder-v1.json /run/buzzci /var/lib/buzzci/activation-controller/controld-acceptance-v1.json
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged @resources
+Restart=no

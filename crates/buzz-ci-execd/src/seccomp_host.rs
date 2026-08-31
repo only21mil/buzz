@@ -13,8 +13,12 @@ use crate::seccomp::{
 pub const SECCOMP_OWNER_UID: u32 = 0;
 /// Exact group required for installed directories and files.
 pub const SECCOMP_OWNER_GID: u32 = 0;
-/// Exact mode for the broker-owned directory chain.
-pub const SECCOMP_DIRECTORY_MODE: u32 = 0o700;
+/// Exact traverse-only mode for the immutable profile chain.
+///
+/// The installed profile is public input, while activation receipts remain in
+/// a separate private tree. Execute-only access lets the job principal open
+/// the one compiled profile path without listing sibling names.
+pub const SECCOMP_DIRECTORY_MODE: u32 = 0o711;
 
 const DIRECTORY_SPECS: [SeccompDirectorySpec; 4] = [
     SeccompDirectorySpec::new("/var/lib/buzzci"),

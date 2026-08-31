@@ -17,6 +17,10 @@ pub enum Operation {
     Nip98Authorize = 3,
     /// Sign one canonical CI manifest.
     SignManifest = 4,
+    /// Describe activation-bound acceptance mutation authority.
+    DescribeAcceptance = 5,
+    /// Sign one activation-bound acceptance mutation template.
+    SignAcceptanceMutation = 6,
 }
 
 impl TryFrom<u8> for Operation {
@@ -28,6 +32,8 @@ impl TryFrom<u8> for Operation {
             2 => Ok(Self::SignCiEvent),
             3 => Ok(Self::Nip98Authorize),
             4 => Ok(Self::SignManifest),
+            5 => Ok(Self::DescribeAcceptance),
+            6 => Ok(Self::SignAcceptanceMutation),
             _ => Err(()),
         }
     }
@@ -41,7 +47,7 @@ impl OperationSet {
     /// No operations.
     pub const NONE: Self = Self(0);
     /// All protocol operations.
-    pub const ALL: Self = Self(0b1111);
+    pub const ALL: Self = Self(0b11_1111);
 
     /// Construct a set from known operation bits.
     pub fn from_bits(bits: u8) -> Option<Self> {
@@ -207,10 +213,39 @@ impl TryFrom<u8> for HttpMethod {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ManifestKind {
-    /// Static root-owned lane activation policy.
+    /// Static root-owned lane activation policy. Production signing refuses
+    /// this kind because activation authority is provisioned, not minted.
     LaneActivationV1 = 1,
-    /// Immutable pre-admission job intent.
+    /// Immutable pre-admission JobIntentV2 admission message.
     JobIntentV2 = 2,
+}
+
+/// Closed activation acceptance mutation set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AcceptanceMutation {
+    /// Actor-authored kind 46100 initial run request.
+    Run = 1,
+    /// Owner/admin-authored kind 46107 CI signer grant.
+    Grant = 2,
+    /// Actor-authored kind 46100 failed-job rerun request.
+    Rerun = 3,
+    /// Actor-authored kind 5 tombstone of the rerun request.
+    Tombstone = 4,
+}
+
+impl TryFrom<u8> for AcceptanceMutation {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Run),
+            2 => Ok(Self::Grant),
+            3 => Ok(Self::Rerun),
+            4 => Ok(Self::Tombstone),
+            _ => Err(()),
+        }
+    }
 }
 
 impl TryFrom<u8> for ManifestKind {
@@ -228,6 +263,10 @@ impl TryFrom<u8> for ManifestKind {
 /// Empty public-identity query.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DescribeRequest;
+
+/// Empty acceptance-authority description query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DescribeAcceptanceRequest;
 
 /// Request to sign a canonical unsigned CI event.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -264,8 +303,20 @@ pub struct SignManifestRequest {
     pub expected_generation: u64,
     /// Closed manifest domain.
     pub manifest_kind: ManifestKind,
-    /// Canonical manifest bytes checked and hashed by the signer.
+    /// Canonical manifest bytes checked and hashed by the signer. For
+    /// JobIntentV2 these are the exact broker v2 admission-signature message.
     pub canonical_manifest: CanonicalPayload,
+}
+
+/// Request to sign one exact activation-bound acceptance mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignAcceptanceMutationRequest {
+    /// Required active acceptance-actor key generation.
+    pub expected_generation: u64,
+    /// Exact activation scenario digest configured at keyholder startup.
+    pub scenario_sha256: [u8; 32],
+    /// One closed preconfigured mutation template.
+    pub mutation: AcceptanceMutation,
 }
 
 /// Closed request set.
@@ -279,6 +330,10 @@ pub enum Request {
     Nip98Authorize(Nip98AuthorizeRequest),
     /// Sign a CI manifest.
     SignManifest(SignManifestRequest),
+    /// Query activation-bound acceptance authority.
+    DescribeAcceptance(DescribeAcceptanceRequest),
+    /// Sign one preconfigured acceptance mutation.
+    SignAcceptanceMutation(SignAcceptanceMutationRequest),
 }
 
 impl Request {
@@ -289,6 +344,8 @@ impl Request {
             Self::SignCiEvent(_) => Operation::SignCiEvent,
             Self::Nip98Authorize(_) => Operation::Nip98Authorize,
             Self::SignManifest(_) => Operation::SignManifest,
+            Self::DescribeAcceptance(_) => Operation::DescribeAcceptance,
+            Self::SignAcceptanceMutation(_) => Operation::SignAcceptanceMutation,
         }
     }
 }
@@ -313,6 +370,17 @@ pub struct DescribeResponse {
     pub manifest: PublicIdentity,
     /// Exact peer policy enforced by the future service transport.
     pub peer_policy: PeerPolicy,
+}
+
+/// Public activation-bound authority returned by `describe_acceptance`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DescribeAcceptanceResponse {
+    /// Dedicated acceptance actor identity and generation.
+    pub actor: PublicIdentity,
+    /// Exact activation scenario digest.
+    pub scenario_sha256: [u8; 32],
+    /// Event IDs in Run, Grant, Rerun, Tombstone order.
+    pub event_ids: [[u8; 32]; 4],
 }
 
 /// Public result of a successful signing operation.
@@ -377,6 +445,10 @@ pub enum Response {
     Nip98Authorize(SignatureResponse),
     /// Manifest signature.
     SignManifest(SignatureResponse),
+    /// Acceptance authority description.
+    DescribeAcceptance(DescribeAcceptanceResponse),
+    /// Acceptance mutation signature.
+    SignAcceptanceMutation(SignatureResponse),
     /// Public failure bound to its attempted operation.
     Error {
         /// Operation that failed.
@@ -394,6 +466,8 @@ impl Response {
             Self::SignCiEvent(_) => Operation::SignCiEvent,
             Self::Nip98Authorize(_) => Operation::Nip98Authorize,
             Self::SignManifest(_) => Operation::SignManifest,
+            Self::DescribeAcceptance(_) => Operation::DescribeAcceptance,
+            Self::SignAcceptanceMutation(_) => Operation::SignAcceptanceMutation,
             Self::Error { operation, .. } => *operation,
         }
     }

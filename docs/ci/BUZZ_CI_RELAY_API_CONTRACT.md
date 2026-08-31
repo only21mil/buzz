@@ -149,7 +149,9 @@ The next rerun attempt for a selected failed job is `selected_job_attempt + 1`; 
 
 Per-envelope `sequence` remains stream-local and is never presented as a global order. On accepted CI event insertion, the relay transactionally assigns a durable, strictly increasing `watch_cursor` within the run's unique request index. The cursor orders storage acceptance, not event `created_at`.
 
-`buzz ci watch --run <run_id>` first resolves the request, then requests events after an optional cursor. Each output record is:
+`buzz ci watch --run <run_id> --timeout-seconds <bound>` first resolves the request, then
+requests events after an optional cursor. The required timeout is one fixed deadline for the
+whole watch. Empty pages and retryable transport errors cannot extend it. Each output record is:
 
 ```text
 {
