@@ -448,6 +448,28 @@ test("mounted wheel path accumulates fractional lines per active session", async
   assert.deepEqual(calls.scroll, [1]);
 });
 
+test("removing a session prunes its wheel remainder", async () => {
+  const subject = fixture();
+  await ready(subject.view);
+  const substrate = subject.view.container.querySelector(
+    ".buzz-terminal-substrate",
+  );
+  fireEvent.wheel(substrate, { deltaMode: 0, deltaY: 8 });
+  assert.deepEqual(subject.calls.scroll, []);
+
+  subject.rerender({ sessions: [] });
+  subject.rerender({
+    sessions: [{ active: true, closing: false, id: "one", title: "SHELL" }],
+  });
+  fireEvent.wheel(substrate, { deltaMode: 0, deltaY: 10 });
+
+  assert.deepEqual(
+    subject.calls.scroll,
+    [],
+    "a reused id must not inherit the removed session's fractional delta",
+  );
+});
+
 test("canvas failure atomically restores Buzz ownership", async () => {
   const { props, view } = fixture();
   await ready(view);
@@ -643,6 +665,30 @@ test("switching to a session with no frame yet clears the outgoing pixels", asyn
   assert.equal(
     gridDraws(subject.view).some((entry) => entry.text === "one"),
     false,
+  );
+});
+
+test("removing a session prunes its retained grid", async () => {
+  const subject = fixture({
+    sessionFrames: [{ frame: frameWith("stale"), sessionId: "one" }],
+  });
+  await ready(subject.view);
+  await waitFor(() =>
+    assert.ok(gridDraws(subject.view).some((entry) => entry.text === "stale")),
+  );
+
+  subject.rerender({ sessionFrames: [], sessions: [] });
+  paintLog.length = 0;
+  subject.rerender({
+    sessionFrames: [],
+    sessions: [{ active: true, closing: false, id: "one", title: "NEW" }],
+  });
+  await new Promise((resolve) => window.requestAnimationFrame(resolve));
+
+  assert.equal(
+    gridDraws(subject.view).some((entry) => entry.text === "stale"),
+    false,
+    "a reused id must not repaint the removed session's rows",
   );
 });
 

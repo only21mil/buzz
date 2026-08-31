@@ -1,11 +1,32 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { after, afterEach, before, test } from "node:test";
 
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { JSDOM } from "jsdom";
 
 import { describeRawEvent } from "./agentSessionTranscriptHelpers.ts";
 import { RawEventRail } from "./RawEventRail.tsx";
+
+const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+  url: "http://localhost",
+});
+
+before(() => {
+  Object.assign(globalThis, {
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    IS_REACT_ACT_ENVIRONMENT: true,
+    window: dom.window,
+  });
+});
+
+afterEach(async () => {
+  const { cleanup } = await import("@testing-library/react");
+  cleanup();
+});
+
+after(() => dom.window.close());
 
 function rawEvent(overrides = {}) {
   return {
@@ -81,4 +102,53 @@ test("RawEventRail render: rows sharing seq across an agent restart get distinct
     html.includes('data-message-id="1:2026-07-13T01:00:00.000Z"'),
     "post-restart row should carry a distinct post-restart id",
   );
+});
+
+test("RawEventRail serializes payloads only while their row is open", async () => {
+  let serializationCount = 0;
+  const payload = {
+    toJSON() {
+      serializationCount += 1;
+      return { private: "expanded payload" };
+    },
+  };
+  const events = [rawEvent({ payload })];
+  const { fireEvent, render, screen } = await import("@testing-library/react");
+  const view = render(React.createElement(RawEventRail, { events }));
+  const details = view.container.querySelector("details");
+  const summary = view.container.querySelector("summary");
+
+  assert.ok(details);
+  assert.ok(summary);
+  assert.equal(
+    serializationCount,
+    0,
+    "closed rows must not stringify payloads",
+  );
+  assert.equal(view.container.querySelector("pre"), null);
+
+  details.open = true;
+  fireEvent(details, new dom.window.Event("toggle", { bubbles: true }));
+
+  assert.equal(details.open, true);
+  assert.ok(view.container.querySelector("pre"));
+  assert.equal(serializationCount, 1);
+  assert.match(
+    screen.getByText(/expanded payload/).textContent,
+    /expanded payload/,
+  );
+
+  details.open = false;
+  fireEvent(details, new dom.window.Event("toggle", { bubbles: true }));
+
+  assert.equal(details.open, false);
+  assert.equal(view.container.querySelector("pre"), null);
+  view.rerender(React.createElement(RawEventRail, { events }));
+
+  assert.equal(
+    serializationCount,
+    1,
+    "closing and rerendering must not stringify again",
+  );
+  assert.equal(view.container.querySelector("pre"), null);
 });

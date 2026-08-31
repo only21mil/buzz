@@ -160,6 +160,18 @@ impl SessionState {
         self.last_used.insert(channel_id, Instant::now());
     }
 
+    fn least_recently_used_live_channel(&self) -> Option<Uuid> {
+        self.sessions
+            .keys()
+            .min_by(|left, right| {
+                self.last_used
+                    .get(left)
+                    .cmp(&self.last_used.get(right))
+                    .then_with(|| left.cmp(right))
+            })
+            .copied()
+    }
+
     fn idle_reap_candidates(
         &self,
         now: Instant,
@@ -368,6 +380,58 @@ impl OwnedAgent {
             self.release_session_best_effort(&session_id, reason, false)
                 .await;
         }
+    }
+
+    /// Ensure activating another channel session cannot exceed the configured hard cap.
+    ///
+    /// Successful evictions remain resumable as cold sessions. If the adapter cannot confirm
+    /// the close, activation is refused while the existing live session remains tracked.
+    async fn make_room_for_channel_session(
+        &mut self,
+        max_live_sessions: usize,
+    ) -> Result<(), AcpError> {
+        if max_live_sessions == 0 {
+            return Err(AcpError::Protocol(
+                "max_live_sessions must be at least 1".to_string(),
+            ));
+        }
+
+        while self.state.sessions.len() >= max_live_sessions {
+            let Some(channel_id) = self.state.least_recently_used_live_channel() else {
+                return Err(AcpError::Protocol(
+                    "live ACP session count is nonzero but no session can be evicted".to_string(),
+                ));
+            };
+            let session_id = self
+                .state
+                .sessions
+                .get(&channel_id)
+                .expect("least-recently-used channel must have a live session")
+                .clone();
+
+            self.acp.session_close(&session_id).await.map_err(|error| {
+                tracing::warn!(
+                    target: "pool::session",
+                    %channel_id,
+                    session_id = %session_id,
+                    max_live_sessions,
+                    %error,
+                    "failed to evict least-recently-used ACP session; refusing activation"
+                );
+                error
+            })?;
+
+            self.state.suspend_channel(&channel_id);
+            tracing::info!(
+                target: "pool::session",
+                %channel_id,
+                session_id = %session_id,
+                max_live_sessions,
+                "evicted least-recently-used ACP session before activation"
+            );
+        }
+
+        Ok(())
     }
 
     async fn reap_one_idle_session(
@@ -724,6 +788,8 @@ pub struct PromptContext {
     pub context_message_limit: u32,
     /// Max turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Hard cap on adapter-side channel sessions active at once.
+    pub max_live_sessions: usize,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Agent identity — used to derive the NIP-AE conversation key at
@@ -1104,6 +1170,12 @@ async fn create_session_and_apply_model(
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
 ) -> Result<String, AcpError> {
+    if channel_id.is_some() {
+        agent
+            .make_room_for_channel_session(ctx.max_live_sessions)
+            .await?;
+    }
+
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -1813,6 +1885,20 @@ pub async fn run_prompt_task(
     if let PromptSource::Channel(cid) = &source {
         if !agent.state.sessions.contains_key(cid) {
             if let Some(session_id) = agent.state.cold_sessions.get(cid).cloned() {
+                if let Err(error) = agent
+                    .make_room_for_channel_session(ctx.max_live_sessions)
+                    .await
+                {
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Error(error),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
+                }
                 let mcp_servers = mcp_servers_with_git_origin(
                     &ctx.mcp_servers,
                     Some(*cid),
@@ -6583,6 +6669,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hard_session_cap_never_exceeds_configured_limit() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-hard-session-cap-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"
+                for id in $(seq 0 11); do
+                    read CLOSE || exit 1
+                    printf '%s\n' "$CLOSE" >> '{}'
+                    printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+                done
+                sleep 1
+            "#,
+            capture.display()
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+
+        const CAP: usize = 8;
+        for index in 0_u128..20 {
+            agent
+                .make_room_for_channel_session(CAP)
+                .await
+                .expect("capacity eviction succeeds");
+            let channel_id = Uuid::from_u128(index + 1);
+            agent
+                .state
+                .sessions
+                .insert(channel_id, format!("session-{index}"));
+            agent.state.last_used.insert(channel_id, Instant::now());
+            assert!(agent.state.sessions.len() <= CAP);
+        }
+
+        assert_eq!(agent.state.sessions.len(), CAP);
+        assert_eq!(agent.state.cold_sessions.len(), 12);
+        let requests = std::fs::read_to_string(&capture).expect("captured close requests");
+        let closed_sessions: HashSet<String> = requests
+            .lines()
+            .map(|line| {
+                let request: serde_json::Value =
+                    serde_json::from_str(line).expect("valid JSON-RPC close request");
+                assert_eq!(request["method"], "session/close");
+                request["params"]["sessionId"]
+                    .as_str()
+                    .expect("close request has session id")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(closed_sessions.len(), 12);
+        let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn test_hard_session_cap_refuses_activation_when_close_fails() {
+        let script = r#"
+            read _close || exit 1
+            exit 0
+        "#;
+        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let mut state = SessionState::default();
+        for index in 0_u128..8 {
+            let channel_id = Uuid::from_u128(index + 1);
+            state
+                .sessions
+                .insert(channel_id, format!("session-{index}"));
+            state.last_used.insert(channel_id, Instant::now());
+        }
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+
+        let result = agent.make_room_for_channel_session(8).await;
+
+        assert!(result.is_err());
+        assert_eq!(agent.state.sessions.len(), 8);
+        assert!(agent.state.cold_sessions.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_shutdown_closes_every_live_session_but_keeps_cold_history() {
         let script = r#"
             read _first || exit 1
@@ -7044,6 +7232,7 @@ mod tests {
             ),
             context_message_limit: 0,
             max_turns_per_session: 0,
+            max_live_sessions: 8,
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
