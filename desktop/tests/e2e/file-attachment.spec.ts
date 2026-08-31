@@ -60,6 +60,21 @@ async function chooseLargeVideo(page: Page) {
   });
 }
 
+async function scrollTimelineAwayFromBottom(page: Page) {
+  const timeline = page.getByTestId("message-timeline");
+  await timeline.hover();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await page.mouse.wheel(0, -800);
+    const distanceFromBottom = await timeline.evaluate(
+      (element) =>
+        element.scrollHeight - element.clientHeight - element.scrollTop,
+    );
+    if (distanceFromBottom > 160) return;
+    await page.waitForTimeout(25);
+  }
+  throw new Error("timeline did not move away from the visual tail");
+}
+
 async function choosePhoto(page: Page) {
   const [chooser] = await Promise.all([
     page.waitForEvent("filechooser"),
@@ -358,10 +373,7 @@ test("upload progress floats above the dock and lifts Jump to latest", async ({
 
   const timeline = page.getByTestId("message-timeline");
   await expect(timeline.locator("[data-message-id]").first()).toBeVisible();
-  await timeline.evaluate((element) => {
-    element.scrollTop = Math.max(500, element.scrollHeight / 2);
-    element.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
+  await scrollTimelineAwayFromBottom(page);
   const jumpToLatest = page.getByTestId("message-scroll-to-latest");
   await expect(jumpToLatest).toBeVisible();
   const restingBox = await jumpToLatest.boundingBox();
@@ -370,10 +382,7 @@ test("upload progress floats above the dock and lifts Jump to latest", async ({
   await page.getByTestId("send-message").click();
   const uploadMotion = page.getByTestId("composer-upload-progress-motion");
   await expect(uploadMotion).toBeVisible();
-  await timeline.evaluate((element) => {
-    element.scrollTop = Math.max(500, element.scrollHeight / 2);
-    element.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
+  await scrollTimelineAwayFromBottom(page);
   await expect(jumpToLatest).toBeVisible();
   await page.waitForTimeout(250);
 

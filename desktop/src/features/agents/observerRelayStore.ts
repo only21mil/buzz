@@ -45,6 +45,13 @@ const EMPTY_EVENTS: ObserverEvent[] = [];
 const EMPTY_TRANSCRIPT: TranscriptItem[] = [];
 
 const listeners = new Set<() => void>();
+export type AgentObserverEventDelta = Readonly<{
+  agentPubkey: string;
+  event: ObserverEvent;
+}>;
+const eventBatchListeners = new Set<
+  (batch: readonly AgentObserverEventDelta[]) => void
+>();
 const eventsByAgent = new Map<string, ObserverEvent[]>();
 const transcriptByAgent = new Map<string, TranscriptState>();
 const snapshotByAgent = new Map<string, ObserverSnapshot>();
@@ -183,6 +190,22 @@ function notifyListeners() {
   }
 }
 
+function notifyEventBatchListeners(batch: readonly AgentObserverEventDelta[]) {
+  if (batch.length === 0) return;
+  const orderedBatch =
+    batch.length === 1
+      ? batch
+      : [...batch].sort((left, right) => {
+          const agentOrder = normalizePubkey(left.agentPubkey).localeCompare(
+            normalizePubkey(right.agentPubkey),
+          );
+          return agentOrder || compareObserverEvents(left.event, right.event);
+        });
+  for (const listener of eventBatchListeners) {
+    listener(orderedBatch);
+  }
+}
+
 function invalidateSnapshot(key: string) {
   snapshotByAgent.delete(key);
 }
@@ -201,7 +224,7 @@ function observerTag(event: RelayEvent, tagName: string) {
   return event.tags.find((tag) => tag[0] === tagName)?.[1] ?? null;
 }
 
-function appendAgentEvent(agentPubkey: string, event: ObserverEvent) {
+function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
   const key = normalizePubkey(agentPubkey);
   const current = eventsByAgent.get(key) ?? [];
   if (
@@ -210,7 +233,7 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent) {
         existing.seq === event.seq && existing.timestamp === event.timestamp,
     )
   ) {
-    return;
+    return false;
   }
 
   const sorted = [...current, event].sort(compareObserverEvents);
@@ -237,8 +260,7 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent) {
   }
 
   invalidateSnapshot(key);
-
-  notifyListeners();
+  return true;
 }
 
 /**
@@ -370,7 +392,17 @@ function unwrapObserverBatch(parsed: ObserverEvent): ObserverEvent[] {
 
 // Per-event processing shared by every event a live frame carries (one for a
 // plain frame, many for a batch envelope).
-function processLiveObserverEvent(agentPubkey: string, parsed: ObserverEvent) {
+function processLiveObserverEvent(
+  agentPubkey: string,
+  parsed: ObserverEvent,
+): boolean {
+  // The event store is the acceptance gate for both UI and derived consumers.
+  // Relay replay duplicates stop here, before they can repeat lifecycle side
+  // effects or make the active-turn bridge revisit retained history.
+  if (!appendAgentEvent(agentPubkey, parsed)) {
+    return false;
+  }
+
   // Track the latest-live-session-id per (agent, channel) on the live path.
   // Only set when the parsed event carries both a sessionId and channelId,
   // so we never attribute a session to the wrong channel.
@@ -390,7 +422,6 @@ function processLiveObserverEvent(agentPubkey: string, parsed: ObserverEvent) {
       });
     }
   }
-  appendAgentEvent(agentPubkey, parsed);
   const managementRequest = parseAgentManagementRequest(parsed.payload);
   if (managementRequest) {
     for (const listener of agentManagementListeners) {
@@ -409,6 +440,22 @@ function processLiveObserverEvent(agentPubkey: string, parsed: ObserverEvent) {
       },
     );
   }
+  return true;
+}
+
+function processLiveObserverBatch(
+  agentPubkey: string,
+  events: readonly ObserverEvent[],
+): void {
+  const accepted: AgentObserverEventDelta[] = [];
+  for (const event of events) {
+    if (processLiveObserverEvent(agentPubkey, event)) {
+      accepted.push({ agentPubkey, event });
+    }
+  }
+  if (accepted.length === 0) return;
+  notifyListeners();
+  notifyEventBatchListeners(accepted);
 }
 
 export async function handleRelayObserverEvent(
@@ -475,9 +522,7 @@ export async function handleRelayObserverEvent(
           }
           return;
         }
-        for (const inner of telemetryEvents) {
-          processLiveObserverEvent(agentPubkey, inner);
-        }
+        processLiveObserverBatch(agentPubkey, telemetryEvents);
       }
     } catch (error) {
       if (activeGeneration !== generation) {
@@ -517,9 +562,7 @@ export async function handleRelayObserverEvent(
     if (activeGeneration !== generation) {
       return;
     }
-    for (const inner of unwrapObserverBatch(parsed)) {
-      processLiveObserverEvent(agentPubkey, inner);
-    }
+    processLiveObserverBatch(agentPubkey, unwrapObserverBatch(parsed));
   } catch (error) {
     if (activeGeneration !== generation) {
       return;
@@ -594,6 +637,21 @@ export function subscribeAgentObserverStore(listener: () => void) {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
+  };
+}
+
+/**
+ * Subscribe to newly accepted live-store events. Each callback receives only
+ * the events accepted from one source batch, sorted by agent and observer-event
+ * order; replay duplicates are omitted. Consumers that need existing state
+ * must hydrate once from snapshots before subscribing.
+ */
+export function subscribeAgentObserverEventBatches(
+  listener: (batch: readonly AgentObserverEventDelta[]) => void,
+) {
+  eventBatchListeners.add(listener);
+  return () => {
+    eventBatchListeners.delete(listener);
   };
 }
 
@@ -777,6 +835,7 @@ export async function ingestArchivedObserverEvents(
   _decryptFn: (event: RelayEvent) => Promise<unknown> = decryptObserverEvent,
 ): Promise<void> {
   let archiveChanged = false;
+  const acceptedLiveEvents: AgentObserverEventDelta[] = [];
   for (const event of rawEvents) {
     const agentPubkey = observerTag(event, "agent");
     const frame = observerTag(event, "frame");
@@ -804,20 +863,21 @@ export async function ingestArchivedObserverEvents(
           );
           if (added) archiveChanged = true;
         } else {
-          // Live path already calls notifyListeners() inside appendAgentEvent.
-          appendAgentEvent(agentPubkey, inner);
+          if (appendAgentEvent(agentPubkey, inner)) {
+            acceptedLiveEvents.push({ agentPubkey, event: inner });
+          }
         }
       }
     } catch {
       // Silently drop decrypt failures — same as live path error handling.
     }
   }
-  // Batch-notify once for the whole page of archive events. appendAgentEvent
-  // already notifies individually for live/no-channelId events above, so we
-  // only need one extra notify here for the archive path.
-  if (archiveChanged) {
+  // One page is one publication unit, even when it contains both scoped
+  // archive events and accepted no-channel events for the live store.
+  if (archiveChanged || acceptedLiveEvents.length > 0) {
     notifyListeners();
   }
+  notifyEventBatchListeners(acceptedLiveEvents);
 }
 
 /**
@@ -833,10 +893,16 @@ export function injectObserverEventsForE2E(
   agentPubkey: string,
   events: ObserverEvent[],
 ) {
+  const accepted: AgentObserverEventDelta[] = [];
   for (const event of events) {
-    appendAgentEvent(agentPubkey, event);
+    if (appendAgentEvent(agentPubkey, event)) {
+      accepted.push({ agentPubkey, event });
+    }
   }
-  notifyListeners();
+  if (accepted.length > 0) {
+    notifyListeners();
+    notifyEventBatchListeners(accepted);
+  }
 }
 
 /**
@@ -847,8 +913,15 @@ export function syncAgentObserverEvents(
   agentPubkey: string,
   events: ObserverEvent[],
 ) {
+  const accepted: AgentObserverEventDelta[] = [];
   for (const event of events) {
-    appendAgentEvent(agentPubkey, event);
+    if (appendAgentEvent(agentPubkey, event)) {
+      accepted.push({ agentPubkey, event });
+    }
+  }
+  if (accepted.length > 0) {
+    notifyListeners();
+    notifyEventBatchListeners(accepted);
   }
 }
 

@@ -449,6 +449,212 @@ test("manager_forwards_events_to_archive_events_on_flush", async () => {
   mgr.destroy();
 });
 
+test("manager_bounds_backlog_and_retries_in_fifo_order_with_one_in_flight_call", async () => {
+  const relay = makeFakeRelayClient();
+  const archive = makeFakeArchive();
+  archive.setSubs([
+    {
+      scopeType: "channel_h",
+      scopeValue: "chan-pressure",
+      kinds: [9],
+      identityPubkey: "pk",
+      relayUrl: "wss://r",
+      createdAt: 0,
+    },
+  ]);
+
+  const calls = [];
+  const successful = [];
+  const pending = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+
+  const mgr = makeManager(relay, archive, {
+    flushBatchSize: 2,
+    flushIdleMs: 10_000,
+    maxBufferedEvents: 5,
+    retryDelayMs: 0,
+    archiveEvents(candidates) {
+      const ids = candidates.map(
+        (candidate) => JSON.parse(candidate.rawEventJson).id,
+      );
+      calls.push(ids);
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise((resolvePromise, rejectPromise) => {
+        pending.push({
+          reject(error) {
+            inFlight--;
+            rejectPromise(error);
+          },
+          resolve() {
+            inFlight--;
+            successful.push(ids);
+            resolvePromise({ persisted: ids.length, dropped: 0 });
+          },
+        });
+      });
+    },
+  });
+
+  try {
+    await mgr.start();
+    const filter = JSON.parse([...relay.subs.keys()][0]);
+    const push = (id) =>
+      relay.push(filter, {
+        id,
+        kind: 9,
+        pubkey: "pk",
+        created_at: Number(id.slice(2)),
+        content: id,
+        tags: [],
+      });
+
+    // The second event starts the first fixed-size batch. Keep it unresolved
+    // while six more events arrive; only the first five total queued events fit.
+    for (let i = 0; i < 8; i++) push(`ev${i}`);
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], ["ev0", "ev1"]);
+    assert.equal(inFlight, 1);
+    assert.equal(maxInFlight, 1);
+    assert.equal(
+      // biome-ignore lint/complexity/useLiteralKeys: intentional private access in test
+      mgr["buffer"].length,
+      5,
+      "the in-flight batch counts toward the bounded backlog",
+    );
+
+    // A failure must retry the same head batch. Newer retained events cannot
+    // overtake it, and dropped-newest overflow cannot disturb the FIFO prefix.
+    pending.shift().reject(new Error("sqlite busy"));
+    await tick();
+    await tick();
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1], ["ev0", "ev1"]);
+    assert.equal(inFlight, 1);
+    assert.equal(maxInFlight, 1);
+
+    pending.shift().resolve();
+    await tick();
+    assert.deepEqual(calls[2], ["ev2", "ev3"]);
+    assert.equal(maxInFlight, 1);
+
+    pending.shift().resolve();
+    await tick();
+    assert.deepEqual(calls[3], ["ev4"]);
+    assert.equal(maxInFlight, 1);
+
+    pending.shift().resolve();
+    await tick();
+    assert.deepEqual(successful, [["ev0", "ev1"], ["ev2", "ev3"], ["ev4"]]);
+    assert.equal(
+      // biome-ignore lint/complexity/useLiteralKeys: intentional private access in test
+      mgr["buffer"].length,
+      0,
+    );
+    assert.ok(
+      warnings.some((warning) =>
+        warning.includes("backlog reached 5 events; dropping newest arrivals"),
+      ),
+    );
+    assert.ok(
+      warnings.some((warning) => warning.includes("dropped 3 newest event(s)")),
+    );
+  } finally {
+    mgr.destroy();
+    console.warn = originalWarn;
+  }
+});
+
+test("manager_cancels_retry_delay_and_drops_failed_backlog_on_destroy", async () => {
+  const relay = makeFakeRelayClient();
+  const archive = makeFakeArchive();
+  archive.setSubs([
+    {
+      scopeType: "channel_h",
+      scopeValue: "chan-retry-destroy",
+      kinds: [9],
+      identityPubkey: "pk",
+      relayUrl: "wss://r",
+      createdAt: 0,
+    },
+  ]);
+
+  let rejectArchive;
+  let archiveCallCount = 0;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  const mgr = makeManager(relay, archive, {
+    flushBatchSize: 1,
+    retryDelayMs: 60_000,
+    archiveEvents() {
+      archiveCallCount++;
+      return new Promise((_resolve, reject) => {
+        rejectArchive = reject;
+      });
+    },
+  });
+
+  try {
+    await mgr.start();
+    const filter = JSON.parse([...relay.subs.keys()][0]);
+    relay.push(filter, {
+      id: "ev-retry-destroy",
+      kind: 9,
+      pubkey: "pk",
+      created_at: 1,
+      content: "retry",
+      tags: [],
+    });
+
+    rejectArchive(new Error("sqlite busy"));
+    await tick();
+    assert.notEqual(
+      // biome-ignore lint/complexity/useLiteralKeys: intentional private access in test
+      mgr["retryTimer"],
+      null,
+      "a failed live flush should enter the retry delay",
+    );
+
+    mgr.destroy();
+    await tick();
+
+    assert.equal(archiveCallCount, 1, "destroy must not start another retry");
+    assert.equal(
+      // biome-ignore lint/complexity/useLiteralKeys: intentional private access in test
+      mgr["retryTimer"],
+      null,
+      "destroy must clear the pending retry timer",
+    );
+    assert.equal(
+      // biome-ignore lint/complexity/useLiteralKeys: intentional private access in test
+      mgr["buffer"].length,
+      0,
+      "a failed shutdown flush must release its retained backlog",
+    );
+    assert.equal(
+      // biome-ignore lint/complexity/useLiteralKeys: intentional private access in test
+      mgr["draining"],
+      false,
+    );
+    assert.ok(
+      warnings.some((warning) =>
+        warning.includes(
+          "destroyed during retry delay; dropping 1 queued event",
+        ),
+      ),
+    );
+  } finally {
+    mgr.destroy();
+    console.warn = originalWarn;
+  }
+});
+
 test("manager_resubscribes_when_subscription_added", async () => {
   const relay = makeFakeRelayClient();
   const archive = makeFakeArchive();

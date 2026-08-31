@@ -37,7 +37,10 @@ import {
   useObserverEvents,
   useArchivedChannelEvents,
 } from "./useObserverEvents";
-import { buildTranscriptState } from "./agentSessionTranscript";
+import {
+  projectTranscriptEvents,
+  type TranscriptProjection,
+} from "./agentSessionTranscriptProjection";
 
 type ManagedAgentSessionPanelProps = {
   agent: Pick<ManagedAgent, "pubkey" | "name" | "status"> & {
@@ -109,13 +112,29 @@ export function ManagedAgentSessionPanel({
     [scopedLiveEvents, archivedChannelEvents],
   );
 
-  // Derive transcript once from the combined raw window. When transcriptOverride
-  // is set (e.g. E2E snapshot specs), bypass both — the caller supplies the full
-  // transcript directly.
-  const derivedTranscript = React.useMemo(
-    () => buildTranscriptState(combinedEvents).items,
-    [combinedEvents],
+  // Keep the parsed projection across renders. Live traffic normally appends,
+  // so only new frames are processed; archive prepends, late inserts, and live
+  // window trims fail the strict prefix check and rebuild from the full window.
+  const transcriptProjectionRef = React.useRef<TranscriptProjection | null>(
+    null,
   );
+  const transcriptProjection = React.useMemo(() => {
+    // Snapshot/E2E callers provide the complete transcript. Avoid parsing an
+    // unused observer window.
+    if (transcriptOverride != null) {
+      return null;
+    }
+    return projectTranscriptEvents(
+      transcriptProjectionRef.current,
+      combinedEvents,
+    );
+  }, [combinedEvents, transcriptOverride]);
+  // Publish render-local cache state only after commit. An interrupted React
+  // render cannot leak an uncommitted projection into a later render.
+  React.useLayoutEffect(() => {
+    transcriptProjectionRef.current = transcriptProjection;
+  }, [transcriptProjection]);
+  const derivedTranscript = transcriptProjection?.state.items ?? [];
   const displayTranscript = transcriptOverride ?? derivedTranscript;
 
   const displayEvents = React.useMemo(

@@ -3,13 +3,25 @@ import { emit, listen } from "@tauri-apps/api/event";
 import * as React from "react";
 
 import { setupAudioWorklet, type AudioWorkletHandle } from "./lib/audioWorklet";
-import { type AudioInputDevice, useAudioDevices } from "./lib/useAudioDevices";
 import { formatHuddleActionError } from "./lib/huddleError";
+import {
+  HUDDLE_AUDIO_COMMAND_EVENT,
+  HUDDLE_AUDIO_LEVEL_EVENT,
+  HUDDLE_AUDIO_STATE_EVENT,
+  type HuddleAudioCommand,
+  type HuddleAudioMirrorState,
+  type HuddleJoinInfo,
+} from "./lib/huddleSessionProtocol";
+import { useAudioDevices } from "./lib/useAudioDevices";
 import {
   type VoiceInputMode,
   useHuddlePttState,
 } from "./lib/useHuddlePttState";
-import { useHuddleSpeakerActivity } from "./lib/useHuddleSpeakerActivity";
+import {
+  HUDDLE_METER_UPDATE_INTERVAL_MS,
+  reconcileHuddleMeterLevel,
+  useHuddleSpeakerActivity,
+} from "./lib/useHuddleSpeakerActivity";
 import { useTtsSubscription } from "./lib/useTtsSubscription";
 import type { HuddleContextValue } from "./HuddleContext.types";
 
@@ -22,31 +34,6 @@ import type { HuddleContextValue } from "./HuddleContext.types";
  *   Active speakers: Tauri "huddle-active-speakers" event (Rust backend emits)
  */
 
-type HuddleJoinInfo = {
-  ephemeral_channel_id: string;
-};
-
-type HuddleAudioMirrorState = {
-  isMuted: boolean;
-  micConnected: boolean;
-  audioDevices: AudioInputDevice[];
-  selectedDeviceId: string;
-  micGain: number;
-  voiceInputMode: VoiceInputMode;
-};
-
-type HuddleAudioCommand =
-  | { type: "request-state" }
-  | { type: "set-muted"; isMuted: boolean }
-  | { type: "set-input-device"; deviceId: string }
-  | { type: "set-mic-gain"; gain: number }
-  | { type: "set-voice-input-mode"; mode: VoiceInputMode };
-
-const HUDDLE_AUDIO_COMMAND_EVENT = "huddle-audio-command";
-const HUDDLE_AUDIO_STATE_EVENT = "huddle-audio-state";
-const HUDDLE_AUDIO_LEVEL_EVENT = "huddle-audio-level";
-
-const MIC_ANALYSER_UPDATE_INTERVAL_MS = 33;
 const PIPELINE_HOTSTART_INTERVAL_MS = 15_000;
 const MIC_INITIAL_NOISE_FLOOR = 0.01;
 const MIC_VOICE_GATE_ON_RMS = 0.018;
@@ -111,6 +98,7 @@ export function HuddleProvider({
     React.useState<HuddleAudioMirrorState | null>(null);
   const [mirroredMicLevel, setMirroredMicLevel] = React.useState(0);
   const [micLevel, setMicLevel] = React.useState(0);
+  const emittedMicLevelRef = React.useRef(0);
   const {
     getVoiceInputMode,
     pttActive,
@@ -792,7 +780,7 @@ export function HuddleProvider({
   // Mic level analyser — drives the voice activity indicator
   React.useEffect(() => {
     if (!localAudioTrack || !micConnected) {
-      setMicLevel(0);
+      setMicLevel((previous) => reconcileHuddleMeterLevel(previous, 0));
       return;
     }
 
@@ -812,7 +800,7 @@ export function HuddleProvider({
     let smoothedLevel = 0;
     function tick(now: number) {
       raf = requestAnimationFrame(tick);
-      if (now - lastUpdate < MIC_ANALYSER_UPDATE_INTERVAL_MS) return;
+      if (now - lastUpdate < HUDDLE_METER_UPDATE_INTERVAL_MS) return;
       lastUpdate = now;
       analyser.getFloatTimeDomainData(buf);
 
@@ -842,7 +830,7 @@ export function HuddleProvider({
 
       if (!voiceActive) {
         smoothedLevel = 0;
-        setMicLevel(0);
+        setMicLevel((previous) => reconcileHuddleMeterLevel(previous, 0));
         return;
       }
 
@@ -851,7 +839,9 @@ export function HuddleProvider({
       );
       const targetLevel = Math.max(normalized, MIC_MIN_ACTIVE_LEVEL);
       smoothedLevel += (targetLevel - smoothedLevel) * MIC_LEVEL_ATTACK;
-      setMicLevel(smoothedLevel);
+      setMicLevel((previous) =>
+        reconcileHuddleMeterLevel(previous, smoothedLevel),
+      );
     }
     raf = requestAnimationFrame(tick);
 
@@ -863,9 +853,13 @@ export function HuddleProvider({
   }, [localAudioTrack, micConnected]);
 
   React.useEffect(() => {
-    if (ownsAudioSession) {
-      void emit(HUDDLE_AUDIO_LEVEL_EVENT, micLevel);
+    if (!ownsAudioSession) {
+      emittedMicLevelRef.current = 0;
+      return;
     }
+    if (emittedMicLevelRef.current === micLevel) return;
+    emittedMicLevelRef.current = micLevel;
+    void emit(HUDDLE_AUDIO_LEVEL_EVENT, micLevel);
   }, [micLevel, ownsAudioSession]);
 
   React.useEffect(() => {
@@ -873,7 +867,11 @@ export function HuddleProvider({
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     void listen<number>(HUDDLE_AUDIO_LEVEL_EVENT, (event) => {
-      if (!cancelled) setMirroredMicLevel(event.payload);
+      if (!cancelled) {
+        setMirroredMicLevel((previous) =>
+          reconcileHuddleMeterLevel(previous, event.payload),
+        );
+      }
     }).then((cleanup) => {
       if (cancelled) cleanup();
       else unlisten = cleanup;

@@ -22,6 +22,8 @@ let deferResizes = false;
 let deferClose = false;
 let closeResolver = null;
 const pendingResizes = [];
+const paintedText = [];
+let subscriptionIdOverride = null;
 
 before(async () => {
   Object.assign(globalThis, {
@@ -73,7 +75,9 @@ before(async () => {
     clearRect() {},
     fillRect() {},
     fillStyle: "",
-    fillText() {},
+    fillText(text) {
+      paintedText.push(text);
+    },
     font: "",
     restore() {},
     save() {},
@@ -90,7 +94,8 @@ before(async () => {
         ).length;
         const response = {
           sessionId: `session-${sessionNumber}`,
-          subscriptionId: `subscription-${sessionNumber}`,
+          subscriptionId:
+            subscriptionIdOverride ?? `subscription-${sessionNumber}`,
           viewport: { columns: 100, generation: 0, screenLines: 24 },
         };
         return attachResolver
@@ -141,6 +146,8 @@ afterEach(async () => {
   deferClose = false;
   closeResolver = null;
   pendingResizes.length = 0;
+  paintedText.length = 0;
+  subscriptionIdOverride = null;
 });
 
 function emit(message, index = 0) {
@@ -458,6 +465,164 @@ test("restoring a channel resizes its PTY to the current dock viewport", async (
   view.unmount();
 });
 
+test("restoring a channel repaints its retained frame without new PTY output", async () => {
+  const { createElement } = await import("react");
+  const { act, render, waitFor } = await import("@testing-library/react");
+  const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
+  const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
+
+  const tree = (channelId, channelName) =>
+    createElement(
+      ThemeProvider,
+      null,
+      createElement(TerminalBootstrap, {
+        channelId,
+        channelName,
+        npub: "npub1owner",
+        relayUrl: "wss://relay.example",
+        threadId: null,
+      }),
+    );
+  const frame = (text, subscriptionId) => ({
+    type: "frame",
+    payload: {
+      bracketedPaste: false,
+      cursor: { column: 0, line: 0, visible: false },
+      focusReporting: false,
+      full: true,
+      rows: [
+        {
+          line: 0,
+          spans: [
+            {
+              clusters: [{ column: 0, text, width: 1 }],
+              style: { bg: 0, fg: 0, flags: 0 },
+            },
+          ],
+          wrapped: false,
+        },
+      ],
+      sequence: 1,
+      subscriptionId,
+      viewport: { columns: 100, generation: 0, screenLines: 24 },
+    },
+  });
+
+  const view = render(tree("channel-a", "alpha"));
+  await waitFor(() =>
+    assert.ok(calls.some(({ command }) => command === "terminal_attach")),
+  );
+  await act(async () => emit(frame("a", "subscription-1")));
+  await waitFor(() => assert.ok(paintedText.includes("a")));
+
+  view.rerender(tree("channel-b", "beta"));
+  await waitFor(() =>
+    assert.equal(
+      calls.filter(({ command }) => command === "terminal_attach").length,
+      2,
+    ),
+  );
+  await act(async () => emit(frame("b", "subscription-2")));
+  await waitFor(() => assert.ok(paintedText.includes("b")));
+
+  paintedText.length = 0;
+  view.rerender(tree("channel-a", "alpha"));
+  await waitFor(() =>
+    assert.ok(
+      paintedText.includes("a"),
+      "the retained channel must repaint without another frame delivery",
+    ),
+  );
+  assert.equal(
+    calls.filter(({ command }) => command === "terminal_attach").length,
+    2,
+    "restoring a live channel must not attach a replacement PTY",
+  );
+  view.unmount();
+});
+
+test("closing a session prunes its acknowledged subscription sequence", async () => {
+  const { createElement } = await import("react");
+  const { act, fireEvent, render, waitFor } = await import(
+    "@testing-library/react"
+  );
+  const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
+  const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
+
+  subscriptionIdOverride = "reused-subscription";
+  const view = render(
+    createElement(
+      ThemeProvider,
+      null,
+      createElement(TerminalBootstrap, {
+        channelId: "channel-1",
+        channelName: "general",
+        npub: "npub1owner",
+        relayUrl: "wss://relay.example",
+        threadId: null,
+      }),
+    ),
+  );
+  await waitFor(() =>
+    assert.ok(calls.some(({ command }) => command === "terminal_attach")),
+  );
+  const frame = (sequence) => ({
+    type: "frame",
+    payload: {
+      bracketedPaste: false,
+      cursor: { column: 0, line: 0, visible: false },
+      focusReporting: false,
+      full: true,
+      rows: [
+        {
+          line: 0,
+          spans: [
+            {
+              clusters: [{ column: 0, text: String(sequence), width: 1 }],
+              style: { bg: 0, fg: 0, flags: 0 },
+            },
+          ],
+          wrapped: false,
+        },
+      ],
+      sequence,
+      subscriptionId: "reused-subscription",
+      viewport: { columns: 100, generation: 0, screenLines: 24 },
+    },
+  });
+
+  await act(async () => emit(frame(7)));
+  await waitFor(() =>
+    assert.equal(
+      calls.filter(({ command }) => command === "terminal_ack").length,
+      1,
+    ),
+  );
+  fireEvent.click(view.getByLabelText("Close SHELL"));
+  await waitFor(() =>
+    assert.equal(
+      calls.filter(({ command }) => command === "terminal_attach").length,
+      2,
+    ),
+  );
+
+  await act(async () => emit(frame(1)));
+  await waitFor(() => assert.ok(paintedText.includes("1")));
+  await waitFor(() =>
+    assert.equal(
+      calls.filter(({ command }) => command === "terminal_ack").length,
+      2,
+      "a reused subscription id must not inherit the closed session's sequence",
+    ),
+  );
+  assert.equal(
+    calls.filter(({ command }) => command === "terminal_ack").at(-1).args
+      .sequence,
+    1,
+  );
+  view.unmount();
+});
+
 test("closing a tab while attach is pending closes the eventual session", async () => {
   const { createElement } = await import("react");
   const { act, fireEvent, render, waitFor } = await import(
@@ -547,6 +712,60 @@ test("closing removes the tab before native shutdown resolves", async () => {
   await waitFor(() => assert.equal(view.queryByRole("tab"), null));
   assert.equal(typeof closeResolver, "function");
   closeResolver();
+  view.unmount();
+});
+
+test("twenty-one sequential natural exits close their native sessions", async () => {
+  const { createElement } = await import("react");
+  const { act, render, waitFor } = await import("@testing-library/react");
+  const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
+  const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
+
+  const view = render(
+    createElement(
+      ThemeProvider,
+      null,
+      createElement(TerminalBootstrap, {
+        channelId: "channel-1",
+        channelName: "general",
+        npub: "npub1owner",
+        relayUrl: "wss://relay.example",
+        threadId: null,
+      }),
+    ),
+  );
+
+  for (let index = 1; index <= 21; index += 1) {
+    await waitFor(() =>
+      assert.equal(
+        calls.filter(({ command }) => command === "terminal_attach").length,
+        index,
+      ),
+    );
+    await waitFor(() => assert.ok(view.queryByRole("tab")));
+    await act(async () => emit({ type: "exit" }));
+    await waitFor(() =>
+      assert.ok(
+        calls.some(
+          ({ command, args }) =>
+            command === "terminal_close" &&
+            args.sessionId === `session-${index}`,
+        ),
+      ),
+    );
+  }
+
+  await waitFor(() =>
+    assert.equal(
+      calls.filter(({ command }) => command === "terminal_attach").length,
+      22,
+    ),
+  );
+  assert.equal(
+    calls.filter(({ command }) => command === "terminal_close").length,
+    21,
+  );
+  assert.equal(view.getAllByRole("tab").length, 1);
   view.unmount();
 });
 

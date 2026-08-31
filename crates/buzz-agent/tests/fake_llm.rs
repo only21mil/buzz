@@ -1384,20 +1384,20 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
     })
     .await;
 
-    // Now send cancel and release the round-2 gate. Cancel is enqueued before
-    // round 2 can respond, so the turn exits with stopReason: cancelled.
+    // Send cancel and wait for its acknowledgement before releasing round 2.
+    // `Harness::send` only flushes the request to stdin; without the ack, the
+    // fake provider can win the race after the gate opens and return its error
+    // before buzz-agent has processed the cancellation.
     let c_id = h.send("session/cancel", json!({"sessionId": sid})).await;
+    h.recv_until(|v| v["id"] == json!(c_id)).await;
     let _ = gate_tx.send(()); // unblock round 2
 
     let mut saw_usage_before_prompt_response = false;
     let mut saw_usage = false;
-    let mut saw_cancel_ok = false;
     let mut saw_prompt_response = false;
     for _ in 0..40 {
         let v = h.recv().await;
-        if v["id"] == json!(c_id) {
-            saw_cancel_ok = true;
-        } else if is_usage_update(&v) {
+        if is_usage_update(&v) {
             saw_usage = true;
             if !saw_prompt_response {
                 saw_usage_before_prompt_response = true;
@@ -1410,11 +1410,10 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
                 "turn must end with stopReason: cancelled"
             );
         }
-        if saw_usage && saw_prompt_response && saw_cancel_ok {
+        if saw_usage && saw_prompt_response {
             break;
         }
     }
-    assert!(saw_cancel_ok, "session/cancel was not acknowledged");
     assert!(
         saw_usage,
         "expected usage_update notification for cancelled turn with observed tokens"

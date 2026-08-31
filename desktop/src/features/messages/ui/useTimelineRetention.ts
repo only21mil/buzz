@@ -1,6 +1,10 @@
 import * as React from "react";
 import type { VListHandle } from "virtua";
-import { nextRetainedTimelineKeys } from "./timelineRetention";
+import {
+  initialRetainedTimelineKeys,
+  nextRetainedTimelineKeys,
+  retainedTimelineIndices,
+} from "./timelineRetention";
 
 export function useTimelineRetention(
   keys: readonly string[],
@@ -8,7 +12,7 @@ export function useTimelineRetention(
   isPrepend: boolean,
 ) {
   const [retainedKeys, setRetainedKeys] = React.useState<ReadonlySet<string>>(
-    () => new Set(keys),
+    () => initialRetainedTimelineKeys(keys),
   );
   const evictionNotBeforeRef = React.useRef(0);
   const refreshTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
@@ -50,7 +54,7 @@ export function useTimelineRetention(
   );
 
   const retainedIndices = React.useMemo(
-    () => keys.flatMap((key, index) => (retainedKeys.has(key) ? [index] : [])),
+    () => retainedTimelineIndices(keys, retainedKeys),
     [keys, retainedKeys],
   );
   const onScrollEnd = React.useCallback(() => {

@@ -1,6 +1,29 @@
 import type { VListHandle } from "virtua";
 
 /**
+ * Retain at most one bounded initial page around the visual tail. Channel
+ * windows normally open with 50 messages, so the same hard limit protects the
+ * first reading surface while a remounted, deeply cached channel never hands
+ * Virtua an unbounded keepMounted list. The first scroll settle replaces this
+ * seed with the normal viewport-relative retention window.
+ */
+export const INITIAL_TIMELINE_RETENTION_LIMIT = 50;
+
+export function initialRetainedTimelineKeys(
+  keys: readonly string[],
+): ReadonlySet<string> {
+  return new Set(keys.slice(-INITIAL_TIMELINE_RETENTION_LIMIT));
+}
+
+export function retainedTimelineIndices(
+  keys: readonly string[],
+  retainedKeys: ReadonlySet<string>,
+): number[] {
+  if (retainedKeys.size === 0) return [];
+  return keys.flatMap((key, index) => (retainedKeys.has(key) ? [index] : []));
+}
+
+/**
  * Keep a wide ID-keyed neighborhood around the reader plus the visual tail.
  * The wider eviction band adds hysteresis, so small direction changes do not
  * churn mounted rows. Virtua continues to own measured sizes and spacer math.
