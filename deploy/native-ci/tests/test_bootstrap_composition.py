@@ -377,7 +377,9 @@ class BootstrapCompositionTests(unittest.TestCase):
             controld_entry["active_sha256"] = hashlib.sha256(
                 controld_active_raw
             ).hexdigest()
-            public_path = ceremony / "state/public-binding.json"
+            state = ceremony / "state"
+            state.mkdir(mode=0o700)
+            public_path = state / "public-binding.json"
             write_file(
                 public_path,
                 KEYHOLDER_FREEZER.canonical_public_binding(public),
