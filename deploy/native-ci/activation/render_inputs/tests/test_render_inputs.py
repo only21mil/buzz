@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "render_inputs.py"
+TEMPLATE_GENERATOR = ROOT / "generate_checked_templates.py"
 SPEC = importlib.util.spec_from_file_location("render_inputs", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 RENDER = importlib.util.module_from_spec(SPEC)
@@ -28,6 +30,9 @@ HEX = {
     "config": "2" * 64,
     "units": "3" * 64,
 }
+TIMING = json.loads(
+    (ROOT.parents[0] / "tests/clean_host_e2e/timing-contract.json").read_bytes()
+)
 
 
 def canonical(value: object) -> bytes:
@@ -41,6 +46,22 @@ def write_json(root: Path, relative: str, value: object, mode: int = 0o600) -> d
     path.write_bytes(raw)
     path.chmod(mode)
     return {"path": relative, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw), "mode": f"{mode:04o}"}
+
+
+def write_declared_json(
+    root: Path, relative: str, value: object, mode: int = 0o600,
+) -> dict[str, object]:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = RENDER.canonical_declared(value)
+    path.write_bytes(raw)
+    path.chmod(mode)
+    return {
+        "path": relative,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+        "mode": f"{mode:04o}",
+    }
 
 
 def file_ref(root: Path, relative: str) -> dict[str, object]:
@@ -94,6 +115,102 @@ def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> d
 
 
 class RendererTests(unittest.TestCase):
+    def test_production_scenario_template_generator_is_deterministic_and_no_clobber(self) -> None:
+        scenario_path = ROOT.parents[1] / "acceptance/scenario.template.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "scenario-template.json"
+            command = [
+                "python3", str(TEMPLATE_GENERATOR), "capacity-one-scenario",
+                "--input", str(scenario_path), "--output", str(output),
+            ]
+            first = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            template = json.loads(output.read_bytes())
+            self.assertEqual(template["kind"], "capacity-one-scenario")
+            self.assertEqual(
+                template["document"]["fixture"]["integrated_candidate_sha"],
+                {"$copy": "candidate_sha"},
+            )
+            expected = output.read_bytes()
+            second = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(second.returncode, 64)
+            self.assertEqual(output.read_bytes(), expected)
+
+            scenario = json.loads(scenario_path.read_bytes())
+            nested_reordered = json.loads(json.dumps(scenario))
+            nested_reordered["fixture"] = {
+                key: nested_reordered["fixture"][key]
+                for key in reversed(nested_reordered["fixture"])
+            }
+            for label, value in (
+                ("top", {key: scenario[key] for key in reversed(scenario)}),
+                ("nested", nested_reordered),
+            ):
+                reordered = Path(temporary) / f"{label}-reordered-scenario.json"
+                rejected_output = Path(temporary) / f"{label}-reordered-template.json"
+                reordered.write_bytes(RENDER.compact_declared(value))
+                reordered.chmod(0o600)
+                rejected = subprocess.run(
+                    [
+                        "python3", str(TEMPLATE_GENERATOR), "capacity-one-scenario",
+                        "--input", str(reordered), "--output", str(rejected_output),
+                    ],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(rejected.returncode, 64)
+                self.assertIn("declaration order differs", rejected.stderr)
+                self.assertFalse(rejected_output.exists())
+
+    def test_scenario_wire_parser_matches_installed_verifier_literal_bytes(self) -> None:
+        scenario = json.loads(
+            (ROOT.parents[1] / "acceptance/scenario.template.json").read_bytes()
+        )
+        raw = RENDER.canonical_scenario(scenario)
+        verifier = RENDER.receipt_verifier_module()
+        self.assertFalse(raw.endswith(b"\n"))
+        self.assertEqual(RENDER.parse_scenario_json(raw, "scenario"), scenario)
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            verifier._digest(verifier._ordered_scenario(scenario)),
+        )
+        top_reordered = RENDER.compact_declared({
+            key: scenario[key] for key in reversed(scenario)
+        })
+        nested_reordered_value = json.loads(raw)
+        nested_reordered_value["fixture"] = {
+            key: nested_reordered_value["fixture"][key]
+            for key in reversed(nested_reordered_value["fixture"])
+        }
+        nested_reordered = RENDER.compact_declared(nested_reordered_value)
+        for label, payload in (
+            ("top-level reorder", top_reordered),
+            ("nested reorder", nested_reordered),
+            ("trailing LF", raw + b"\n"),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                RENDER.RenderError, "canonical scenario-order JSON without trailing LF",
+            ):
+                RENDER.parse_scenario_json(payload, "scenario")
+        duplicate = b'{"schema_version":"buzz-ci-capacity-one-scenario/v2",' + raw[1:]
+        with self.assertRaisesRegex(RENDER.RenderError, "duplicate JSON key"):
+            RENDER.parse_scenario_json(duplicate, "scenario")
+
+    def test_non_scenario_renderer_outputs_remain_sorted_canonical_plus_lf(self) -> None:
+        value = {"z": 1, "a": {"y": 2, "b": 3}}
+        for action in set(RENDER.DESCRIPTOR_SCHEMAS) - {"render-scenario"}:
+            with self.subTest(action=action):
+                payload = RENDER.render_output(action, value)
+                self.assertEqual(payload, canonical(value))
+                self.assertTrue(payload.endswith(b"\n"))
+
     def test_acceptance_client_identity_is_cross_bound_to_controld(self) -> None:
         public = public_binding()
         peer = public["keyholder_public_spec"]["peer"]
@@ -212,7 +329,7 @@ class RendererTests(unittest.TestCase):
             descriptor_path = root / "descriptor.json"
             output_path = root / "scenario.json"
             descriptor_path.write_bytes(canonical(descriptor))
-            output_path.write_bytes(canonical(rendered))
+            output_path.write_bytes(RENDER.canonical_scenario(rendered))
             for schema, instance in (
                 (ROOT / "descriptor.schema.json", descriptor_path),
                 (ROOT / "output.schema.json", output_path),
@@ -286,21 +403,29 @@ class RendererTests(unittest.TestCase):
                 "package_digest": activation_digest,
             }
 
+            public_raw = RENDER.canonical_public_binding(public_binding())
             manifests: dict[str, dict[str, object]] = {}
             for name in RENDER.PACKAGE_NAMES[:-1]:
                 manifest = {key: {} for key in RENDER.PACKAGE_KEYS[name]}
+                manifest_entry = dict(entry)
+                manifest_entry["role"] = "binary"
+                if name == "keyholder":
+                    manifest_entry["size"] = 1
                 manifest.update(
                     {
                         "schema": RENDER.PACKAGE_SCHEMAS[name],
                         "source_commit": CANDIDATE,
-                        "entries": [entry],
+                        "entries": [manifest_entry],
                     }
                 )
+                manifest["binary_provenance_sha256"] = "9" * 64
                 if name == "keyholder":
                     manifest["identities"] = {
                         "controld_uid": 1201,
                         "controld_gid": 1201,
                     }
+                    manifest["public_binding_sha256"] = hashlib.sha256(public_raw).hexdigest()
+                    manifest["acceptance_public_spec_sha256"] = "a" * 64
                 if name == "execd":
                     manifest["activation_binding"] = {
                         "source_commit": CANDIDATE,
@@ -316,7 +441,10 @@ class RendererTests(unittest.TestCase):
                 name: write_json(root, f"inputs/{name}.json", manifest, 0o400)
                 for name, manifest in manifests.items()
             }
-            public_ref = write_json(root, "inputs/public.json", public_binding(), 0o400)
+            public_path = root / "inputs/public.json"
+            public_path.write_bytes(public_raw)
+            public_path.chmod(0o400)
+            public_ref = file_ref(root, "inputs/public.json")
             scenario = json.loads((acceptance / "scenario.template.json").read_bytes())
             scenario["fixture"].update(
                 {
@@ -361,9 +489,12 @@ class RendererTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(process.returncode, 0, process.stderr)
-            rendered = json.loads((root / "scenario.json").read_bytes())
+            rendered_raw = (root / "scenario.json").read_bytes()
+            rendered = json.loads(rendered_raw)
             self.assertEqual(rendered, scenario)
             self.assertEqual(rendered["fixture"]["integrated_candidate_sha"], CANDIDATE)
+            self.assertEqual(rendered_raw, RENDER.canonical_scenario(scenario))
+            self.assertFalse(rendered_raw.endswith(b"\n"))
 
     def make_lifecycle(self, root: Path) -> dict[str, object]:
         proof = {
@@ -372,34 +503,55 @@ class RendererTests(unittest.TestCase):
             "encrypted_credentials_absent": True, "relay_residue_absent": True,
         }
         trees = {name: digit * 64 for name, digit in zip(RENDER.PACKAGE_NAMES, "89abc", strict=True)}
+        harness_sha = hashlib.sha256(
+            (ROOT.parents[0] / "tests/clean_host_e2e/harness.py").read_bytes()
+        ).hexdigest()
+        timing_asset_sha = hashlib.sha256(
+            (ROOT.parents[0] / "tests/clean_host_e2e/timing-contract.json").read_bytes()
+        ).hexdigest()
+        timing_sha = hashlib.sha256(RENDER.canonical_declared(TIMING)).hexdigest()
         contract = {
-            "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v2", "candidate_sha": CANDIDATE,
+            "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3", "candidate_sha": CANDIDATE,
             "state": "state", "candidate_root": "candidate",
+            "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
+            "timing": TIMING, "timing_sha256": timing_sha,
             "scenario": {"path": "scenario.json", "sha256": HEX["scenario"]},
             "seccomp_source": {"path": "seccomp.json", "sha256": RENDER.SECCOMP_SHA256},
             "packages": {name: {"path": name, "tree_sha256": trees[name]} for name in RENDER.PACKAGE_NAMES},
         }
         receipt = {"outcome": "pass", "integrated_candidate_sha": CANDIDATE, "scenario_sha256": HEX["scenario"]}
-        verifier = {"status": "pass"}
-        receipt_ref = write_json(root, "evidence/acceptance-receipt.json", receipt, 0o400)
-        verifier_ref = write_json(root, "evidence/verifier.json", verifier, 0o400)
+        verifier = {"outcome": "pass", "status": "verified"}
+        receipt_ref = write_declared_json(root, "evidence/acceptance-receipt.json", receipt, 0o400)
+        verifier_ref = write_declared_json(root, "evidence/verifier.json", verifier, 0o400)
         evidence = {
-            "schema_version": "buzz-ci-clean-host-e2e-evidence/v2", "candidate_sha": CANDIDATE,
-            "image_sha256": "d" * 64, "tool_sha256": {"qemu": "e" * 64},
-            "harness_asset_sha256": {"guest_entry.py": "f" * 64},
+            "schema_version": "buzz-ci-clean-host-e2e-evidence/v3", "candidate_sha": CANDIDATE,
+            "harness_sha256": harness_sha,
+            "timing_asset_sha256": timing_asset_sha,
+            "image_sha256": "f" * 64,
+            "tool_sha256": {name: "1" * 64 for name in RENDER.HARNESS_TOOLS},
+            "harness_asset_sha256": {
+                **{name: "2" * 64 for name in RENDER.HARNESS_ASSETS},
+                "harness.py": harness_sha,
+                "timing-contract.json": timing_asset_sha,
+            },
+            "timing": TIMING, "timing_sha256": timing_sha,
             "package_tree_sha256": trees, "scenario_sha256": HEX["scenario"],
             "seccomp_source_sha256": RENDER.SECCOMP_SHA256,
+            "transfer_bytes": RENDER.TRANSFER_BYTES, "transfer_sha256": "3" * 64,
             "receipt_sha256": receipt_ref["sha256"], "verifier_sha256": verifier_ref["sha256"],
             "dormant_proof": proof,
         }
-        evidence_ref = write_json(root, "evidence/evidence-manifest.json", evidence, 0o400)
+        evidence_ref = write_declared_json(root, "evidence/evidence-manifest.json", evidence, 0o400)
         contract_ref = write_json(root, "evidence/contract.json", contract, 0o400)
         result = {
-            "status": "pass", "candidate_sha": CANDIDATE, "vm_state_absent": True,
+            "status": "pass", "candidate_sha": CANDIDATE,
+            "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
+            "timing_sha256": timing_sha,
             "receipt_sha256": receipt_ref["sha256"], "verifier_sha256": verifier_ref["sha256"],
-            "evidence_manifest_sha256": evidence_ref["sha256"], "dormant_proof": proof,
+            "evidence_manifest_sha256": evidence_ref["sha256"],
+            "dormant_proof": proof, "vm_state_absent": True,
         }
-        result_ref = write_json(root, "evidence/result.json", result, 0o400)
+        result_ref = write_declared_json(root, "evidence/result.json", result, 0o400)
         return {
             "result": result_ref, "contract": contract_ref, "evidence_manifest": evidence_ref,
             "acceptance_receipt": receipt_ref, "verifier": verifier_ref,
@@ -429,6 +581,39 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(value["claims"], {"protected_ci": False, "tier2": False})
             self.assertEqual(value["lifecycle_status"], "verified_pass")
             self.assertEqual((root / "first.json").stat().st_mode & 0o7777, 0o600)
+
+    def test_lifecycle_reader_accepts_literal_harness_canonical_order_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            descriptor_path = root_path / "descriptor.json"
+            descriptor_path.write_bytes(canonical({"unused": True}))
+            descriptor_path.chmod(0o600)
+            result = {
+                "status": "pass",
+                "candidate_sha": CANDIDATE,
+                "vm_state_absent": True,
+            }
+            result_path = root_path / "result.json"
+            result_path.write_bytes(RENDER.canonical_declared(result))
+            result_path.chmod(0o400)
+            root = RENDER.DescriptorRoot(descriptor_path)
+            try:
+                value, raw, _ = root.declared_json_ref(
+                    file_ref(root_path, "result.json"), "harness result",
+                )
+                self.assertEqual(value, result)
+                self.assertEqual(raw, b'{"status":"pass","candidate_sha":"' + CANDIDATE.encode() + b'","vm_state_absent":true}\n')
+                with self.assertRaisesRegex(RENDER.RenderError, "canonical"):
+                    root.json_ref(file_ref(root_path, "result.json"), "harness result")
+                result_path.chmod(0o600)
+                result_path.write_bytes(json.dumps(result, indent=2).encode() + b"\n")
+                result_path.chmod(0o400)
+                with self.assertRaisesRegex(RENDER.RenderError, "declaration-order"):
+                    root.declared_json_ref(
+                        file_ref(root_path, "result.json"), "harness result",
+                    )
+            finally:
+                root.close()
 
     def test_bound_lifecycle_mutation_fails_without_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -529,17 +714,52 @@ class RendererTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDER.RenderError, "shape differs|private"):
             RENDER.validate_public_binding(binding)
 
+    def test_public_binding_reference_requires_ceremony_declaration_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            descriptor_path = root_path / "descriptor.json"
+            descriptor_path.write_bytes(canonical({"unused": True}))
+            descriptor_path.chmod(0o600)
+            binding_path = root_path / "public-binding.json"
+            binding_path.write_bytes(canonical(public_binding()))
+            binding_path.chmod(0o444)
+            root = RENDER.DescriptorRoot(descriptor_path)
+            try:
+                with self.assertRaisesRegex(RENDER.RenderError, "schema-order"):
+                    root.public_binding_ref(
+                        file_ref(root_path, "public-binding.json"), "public binding",
+                    )
+                binding_path.chmod(0o600)
+                binding_path.write_bytes(
+                    RENDER.canonical_public_binding(public_binding()),
+                )
+                binding_path.chmod(0o444)
+                value, raw, relative = root.public_binding_ref(
+                    file_ref(root_path, "public-binding.json"), "public binding",
+                )
+                self.assertEqual(value, public_binding())
+                self.assertEqual(raw, RENDER.canonical_public_binding(value))
+                self.assertEqual(relative, "public-binding.json")
+            finally:
+                root.close()
+
     def test_sealed_freeze_requires_cross_bound_manifests(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root_path = Path(temporary)
             lifecycle = self.make_lifecycle(root_path)
-            public_ref = write_json(root_path, "state/public-binding.json", public_binding(), 0o444)
+            public_path = root_path / "state/public-binding.json"
+            public_path.parent.mkdir(parents=True)
+            public_path.write_bytes(RENDER.canonical_public_binding(public_binding()))
+            public_path.chmod(0o444)
+            public_ref = file_ref(root_path, "state/public-binding.json")
             refs: dict[str, object] = {}
             manifests: dict[str, object] = {}
             activation_digest = "a" * 64
             for name in RENDER.PACKAGE_NAMES:
                 payload = name.encode()
                 manifest = minimal_manifest(name, f"assets/{name}", payload)
+                if name == "keyholder":
+                    manifest["public_binding_sha256"] = public_ref["sha256"]
                 if name == "activation":
                     unsigned = dict(manifest)
                     unsigned.pop("package_digest")

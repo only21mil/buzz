@@ -25,6 +25,19 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MODE = re.compile(r"^[0-7]{4}$")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 PRE_ACTIVATION_PACKAGE_NAMES = PACKAGE_NAMES[:3]
+HARNESS_ASSETS = (
+    "harness.py",
+    "guest_entry.py",
+    "timing-contract.json",
+    "local_tls_relay.py",
+    "receipt_verifier.py",
+    "expected-stages.json",
+)
+HARNESS_TOOLS = ("qemu", "qemu_img", "bwrap", "xorriso", "cloud_localds")
+TRANSFER_BYTES = 8 * 1024 * 1024
+HARNESS_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/harness.py"
+GUEST_ENTRY_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/guest_entry.py"
+TIMING_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json"
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 PACKAGE_SCHEMAS = {
     "runner": "buzz-ci-runner-install-package-v2",
@@ -35,7 +48,7 @@ PACKAGE_SCHEMAS = {
 PACKAGE_KEYS = {
     "runner": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "default_state", "peer_policy", "package_uid", "package_gid", "identities", "directories", "entries", "package_digest"},
     "controld": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "default_state", "daemon_contract", "package_uid", "package_gid", "identity", "directories", "entries", "package_digest"},
-    "keyholder": {"schema", "package_id", "source_commit", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"},
+    "keyholder": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "public_binding_sha256", "acceptance_public_spec_sha256", "package_uid", "package_gid", "identities", "runtime_contract", "credential_contract", "directories", "entries", "package_digest"},
     "execd": {"schema", "package_id", "source_commit", "binary_provenance_sha256", "default_state", "runtime_contract", "activation_owned_targets", "activation_binding", "seccomp_contract", "install_receipt", "package_uid", "package_gid", "directories", "entries", "package_digest"},
 }
 
@@ -56,6 +69,19 @@ def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 
+def canonical_declared(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode() + b"\n"
+
+
+def compact_declared(value: object) -> bytes:
+    """Encode declaration-order JSON without adding transport whitespace."""
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode()
+
+
 def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -65,13 +91,18 @@ def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def parse_canonical_json(raw: bytes, where: str) -> dict[str, Any]:
+def parse_json_object(raw: bytes, where: str) -> dict[str, Any]:
     try:
         value = json.loads(raw, object_pairs_hook=reject_duplicates)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RenderError(f"{where} is not valid JSON") from error
     if not isinstance(value, dict):
         raise RenderError(f"{where} is not a JSON object")
+    return value
+
+
+def parse_canonical_json(raw: bytes, where: str) -> dict[str, Any]:
+    value = parse_json_object(raw, where)
     if canonical(value) != raw:
         raise RenderError(f"{where} is not canonical JSON plus LF")
     return value
@@ -199,6 +230,25 @@ class DescriptorRoot:
         raw, relative = self.read_ref(value, where, MAX_JSON)
         return parse_canonical_json(raw, where), raw, relative
 
+    def declared_json_ref(self, value: object, where: str) -> tuple[dict[str, Any], bytes, str]:
+        raw, relative = self.read_ref(value, where, MAX_JSON)
+        document = parse_json_object(raw, where)
+        if canonical_declared(document) != raw:
+            raise RenderError(f"{where} is not compact declaration-order JSON plus LF")
+        return document, raw, relative
+
+    def public_binding_ref(self, value: object, where: str) -> tuple[dict[str, Any], bytes, str]:
+        raw, relative = self.read_ref(value, where, MAX_JSON)
+        binding = parse_json_object(raw, where)
+        validate_public_binding(binding)
+        if canonical_public_binding(binding) != raw:
+            raise RenderError(f"{where} is not canonical schema-order JSON plus LF")
+        return binding, raw, relative
+
+    def scenario_ref(self, value: object, where: str) -> tuple[dict[str, Any], bytes, str]:
+        raw, relative = self.read_ref(value, where, MAX_JSON)
+        return parse_scenario_json(raw, where), raw, relative
+
     def open_directory(self, relative: object, where: str) -> int:
         path = normalized(relative, where)
         parent, name = self._open_parent(path)
@@ -296,6 +346,12 @@ def validate_manifest(manifest: dict[str, Any], candidate: str, name: str) -> No
         raise RenderError(f"{name} package manifest has missing or extra fields")
     if manifest.get("source_commit") != candidate:
         raise RenderError(f"{name} package candidate differs")
+    if name == "keyholder":
+        require_sha(manifest["binary_provenance_sha256"], "keyholder binary provenance")
+        public_binding_sha256 = manifest["public_binding_sha256"]
+        if public_binding_sha256 is not None:
+            require_sha(public_binding_sha256, "keyholder public binding")
+        require_sha(manifest["acceptance_public_spec_sha256"], "keyholder acceptance public spec")
     manifest_digest(manifest, name)
     entries = manifest.get("entries")
     if not isinstance(entries, list) or not entries:
@@ -304,7 +360,10 @@ def validate_manifest(manifest: dict[str, Any], candidate: str, name: str) -> No
     for item in entries:
         base_entry = {"role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"}
         active_entry = base_entry | {"active_source", "active_source_mode", "active_sha256"}
-        if not isinstance(item, dict) or frozenset(item) not in {frozenset(base_entry), frozenset(active_entry)}:
+        allowed_entries = {frozenset(base_entry), frozenset(active_entry)}
+        if name == "keyholder":
+            allowed_entries = {frozenset(base_entry | {"size"})}
+        if not isinstance(item, dict) or frozenset(item) not in allowed_entries:
             raise RenderError(f"{name} package entry shape differs")
         source = normalized(item["source"], f"{name} package source")
         if source in sources:
@@ -312,6 +371,12 @@ def validate_manifest(manifest: dict[str, Any], candidate: str, name: str) -> No
         sources.add(source)
         mode_value(item["source_mode"], f"{name} package source")
         require_sha(item["sha256"], f"{name} package source")
+        if name == "keyholder" and (
+            isinstance(item["size"], bool)
+            or not isinstance(item["size"], int)
+            or not 0 < item["size"] <= MAX_FILE
+        ):
+            raise RenderError("keyholder package source size is invalid")
         if "active_source" in item:
             required = {"active_source", "active_source_mode", "active_sha256"}
             if not required <= set(item):
@@ -399,6 +464,81 @@ def validate_public_binding(value: dict[str, Any]) -> None:
             stack.extend(item)
 
 
+def canonical_public_binding(value: dict[str, Any]) -> bytes:
+    actor = value["acceptance_actor"]
+    spec = value["keyholder_public_spec"]
+    peer = spec["peer"]
+    selectors = spec["selectors"]
+    acceptance = spec["acceptance"]
+    ordered = {
+        "schema_version": value["schema_version"],
+        "relay_url": value["relay_url"],
+        "relay_http_origin": value["relay_http_origin"],
+        "acceptance_actor": {
+            "public_key": actor["public_key"],
+            "generation": actor["generation"],
+        },
+        "keyholder_public_spec": {
+            "schema_version": spec["schema_version"],
+            "peer": {
+                "uid": peer["uid"],
+                "gid": peer["gid"],
+                "allowed_operations": peer["allowed_operations"],
+            },
+            "selectors": {
+                name: {
+                    "public_key": selectors[name]["public_key"],
+                    "generation": selectors[name]["generation"],
+                }
+                for name in ("ci_event", "nip98", "manifest")
+            },
+            "nip98_origin": spec["nip98_origin"],
+            "acceptance": {
+                "binding_receipt_path": acceptance["binding_receipt_path"],
+                "credential_selector": acceptance["credential_selector"],
+            },
+        },
+    }
+    return json.dumps(
+        ordered, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode() + b"\n"
+
+
+def validate_keyholder_public_binding(
+    public_raw: bytes, manifests: dict[str, Any],
+) -> None:
+    keyholder = manifests.get("keyholder")
+    if not isinstance(keyholder, dict):
+        raise RenderError("keyholder package manifest is absent")
+    if keyholder.get("public_binding_sha256") != hashlib.sha256(public_raw).hexdigest():
+        raise RenderError("keyholder package public binding differs")
+
+
+def package_component_bindings(
+    manifests: dict[str, Any], names: tuple[str, ...],
+) -> dict[str, dict[str, str]]:
+    bindings: dict[str, dict[str, str]] = {}
+    for name in names:
+        manifest = manifests[name]
+        binaries = [
+            entry for entry in manifest["entries"]
+            if isinstance(entry, dict) and entry.get("role") == "binary"
+        ]
+        if len(binaries) != 1:
+            raise RenderError(f"{name} package binary entry differs")
+        bindings[name] = {
+            "binary_sha256": require_sha(
+                binaries[0].get("sha256"), f"{name} package binary",
+            ),
+            "provenance_sha256": require_sha(
+                manifest.get("binary_provenance_sha256"),
+                f"{name} package binary provenance",
+            ),
+            "source_commit": manifest["source_commit"],
+        }
+    return bindings
+
+
 def validate_acceptance_client_binding(
     public: dict[str, Any], manifests: dict[str, Any],
 ) -> None:
@@ -483,9 +623,9 @@ def resolve_template(template: dict[str, Any], kind: str, bindings: dict[str, An
 
 def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], names: tuple[str, ...]) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = require_sha(descriptor["candidate_sha"], "candidate", git=True)
-    public, public_raw, _ = root.json_ref(descriptor["public_binding"], "public binding")
-    validate_public_binding(public)
+    public, public_raw, _ = root.public_binding_ref(descriptor["public_binding"], "public binding")
     manifests, manifest_file_sha = load_manifests(root, descriptor["package_manifests"], candidate, names)
+    validate_keyholder_public_binding(public_raw, manifests)
     validate_acceptance_client_binding(public, manifests)
     bindings = {
         "candidate_sha": candidate,
@@ -500,24 +640,16 @@ def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], nam
 
 def activation_package_module() -> Any:
     path = Path(__file__).resolve().parent.parent / "package.py"
-    spec = importlib.util.spec_from_file_location("buzz_ci_activation_package_for_renderer", path)
-    if spec is None or spec.loader is None:
-        raise RenderError("activation package validator is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_local_module(path, "buzz_ci_activation_package_for_renderer", "activation package validator")
 
 
 def execd_preactivation_module() -> Any:
     path = Path(__file__).resolve().parents[2] / "execd" / "freeze_package.py"
-    spec = importlib.util.spec_from_file_location(
-        "buzz_ci_execd_preactivation_for_renderer", path
+    return load_local_module(
+        path,
+        "buzz_ci_execd_preactivation_for_renderer",
+        "execd pre-activation input validator",
     )
-    if spec is None or spec.loader is None:
-        raise RenderError("execd pre-activation input validator is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def load_execd_preactivation(
@@ -537,12 +669,103 @@ def load_execd_preactivation(
 
 def receipt_verifier_module() -> Any:
     path = Path(__file__).resolve().parents[2] / "acceptance" / "verify-receipt.py"
-    spec = importlib.util.spec_from_file_location("buzz_ci_acceptance_verifier_for_renderer", path)
-    if spec is None or spec.loader is None:
-        raise RenderError("acceptance scenario validator is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_local_module(
+        path,
+        "buzz_ci_acceptance_verifier_for_renderer",
+        "acceptance scenario validator",
+    )
+
+
+def ordered_scenario(value: object) -> dict[str, Any]:
+    """Validate and normalize one scenario with the shipped receipt contract."""
+    try:
+        ordered = receipt_verifier_module()._ordered_scenario(value)
+    except (KeyError, TypeError, ValueError) as error:
+        raise RenderError(f"capacity-one scenario validation failed: {error}") from error
+    if not isinstance(ordered, dict):
+        raise RenderError("capacity-one scenario normalization differs")
+    return ordered
+
+
+def canonical_scenario(value: object) -> bytes:
+    """Return the exact no-LF bytes hashed by controller and receipt verifier."""
+    return compact_declared(ordered_scenario(value))
+
+
+def parse_scenario_json(raw: bytes, where: str) -> dict[str, Any]:
+    """Parse only exact declaration-order, compact, no-LF scenario bytes."""
+    scenario = parse_json_object(raw, where)
+    if canonical_scenario(scenario) != raw:
+        raise RenderError(
+            f"{where} is not canonical scenario-order JSON without trailing LF"
+        )
+    return scenario
+
+
+def load_local_module(path: Path, name: str, label: str) -> Any:
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError("module loader is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as error:
+        raise RenderError(f"{label} is unavailable") from error
+
+
+def candidate_blob(candidate_root: Path, candidate: str, relative: str) -> bytes:
+    """Read one bounded blob from the already verified candidate commit."""
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    object_name = f"{candidate}:{relative}"
+    try:
+        size_raw = subprocess.run(
+            ["git", "-C", str(candidate_root), "cat-file", "-s", object_name],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=10,
+        ).stdout
+        size = int(size_raw)
+        if not 0 < size <= MAX_JSON:
+            raise RenderError(f"candidate asset exceeds its fixed bound: {relative}")
+        raw = subprocess.run(
+            ["git", "-C", str(candidate_root), "show", object_name],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=10,
+        ).stdout
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RenderError(f"candidate asset could not be verified: {relative}") from error
+    if len(raw) != size:
+        raise RenderError(f"candidate asset size differs: {relative}")
+    return raw
+
+
+def checked_renderer_asset(relative: str) -> bytes:
+    """Read one fixed renderer-side harness asset without following links."""
+    repository = Path(__file__).resolve().parents[4]
+    path = repository / relative
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise RenderError(f"renderer harness asset is unavailable: {relative}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not 0 < metadata.st_size <= MAX_JSON
+        ):
+            raise RenderError(f"renderer harness asset metadata is unsafe: {relative}")
+        return DescriptorRoot._read_fd(
+            descriptor, metadata.st_size, MAX_JSON, f"renderer harness asset {relative}",
+        )
+    finally:
+        os.close(descriptor)
 
 
 def render_draft(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, Any]:
@@ -559,6 +782,9 @@ def render_draft(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, 
         "draft descriptor",
     )
     template, bindings = load_template_bindings(root, descriptor, PRE_ACTIVATION_PACKAGE_NAMES)
+    bindings["package_components"] = package_component_bindings(
+        bindings["packages"], PRE_ACTIVATION_PACKAGE_NAMES,
+    )
     preactivation, preactivation_sha256 = load_execd_preactivation(
         root, descriptor["execd_preactivation"], bindings["candidate_sha"]
     )
@@ -609,13 +835,7 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         "expected_log", "expected_artifacts",
     }
     require_keys(fixture, required, "capacity-one fixture")
-    try:
-        ordered = receipt_verifier_module()._ordered_scenario(scenario)
-    except (KeyError, TypeError, ValueError) as error:
-        raise RenderError(f"capacity-one scenario validation failed: {error}") from error
-    if ordered != scenario:
-        raise RenderError("capacity-one scenario normalization differs")
-    return scenario
+    return ordered_scenario(scenario)
 
 
 def render_scenario(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, Any]:
@@ -655,7 +875,11 @@ def validate_package_tree(root: DescriptorRoot, name: str, package: dict[str, An
             actual = record_map.get(source)
             if actual is None:
                 raise RenderError(f"{name} package source is missing: {source}")
-            if actual[0] != mode_value(item[mode_field], f"{name} package source") or hashlib.sha256(actual[1]).hexdigest() != item[digest_field]:
+            if (
+                actual[0] != mode_value(item[mode_field], f"{name} package source")
+                or hashlib.sha256(actual[1]).hexdigest() != item[digest_field]
+                or (name == "keyholder" and len(actual[1]) != item["size"])
+            ):
                 raise RenderError(f"{name} package source metadata differs: {source}")
     for component in manifest.get("components", []):
         if not isinstance(component, dict) or "provenance_source" not in component or "provenance_sha256" not in component:
@@ -686,6 +910,16 @@ def validate_package_tree(root: DescriptorRoot, name: str, package: dict[str, An
         actual = record_map.get(source)
         if actual is None or hashlib.sha256(actual[1]).hexdigest() != manifest["binary_provenance_sha256"]:
             raise RenderError(f"{name} binary provenance differs")
+    if name == "keyholder" and manifest["public_binding_sha256"] is not None:
+        source = "public-binding.json"
+        expected.add(source)
+        actual = record_map.get(source)
+        if (
+            actual is None
+            or actual[0] != 0o600
+            or hashlib.sha256(actual[1]).hexdigest() != manifest["public_binding_sha256"]
+        ):
+            raise RenderError("keyholder retained public binding differs")
     if set(record_map) != expected:
         raise RenderError(f"{name} package tree has missing or extra members")
     return manifest, hashlib.sha256(manifest_raw).hexdigest(), tree_sha256(records)
@@ -700,10 +934,9 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
     os.close(state_fd)
     candidate_fd = root.open_directory(candidate_root, "candidate root")
     os.close(candidate_fd)
-    public, _public_raw, public_path = root.json_ref(descriptor["public_binding"], "public binding")
+    public, public_raw, public_path = root.public_binding_ref(descriptor["public_binding"], "public binding")
     if public_path != f"{state}/public-binding.json":
         raise RenderError("public binding is not the prepared state binding")
-    validate_public_binding(public)
     try:
         resolved = subprocess.run(
             ["git", "-C", str(root.base / candidate_root), "rev-parse", "HEAD^{commit}"],
@@ -714,7 +947,26 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
         raise RenderError("candidate Git identity could not be verified") from error
     if resolved != candidate:
         raise RenderError("candidate root HEAD differs")
-    scenario, scenario_raw, scenario_path = root.json_ref(descriptor["scenario"], "scenario")
+    candidate_repository = root.base / candidate_root
+    harness_raw = candidate_blob(candidate_repository, candidate, HARNESS_PATH)
+    guest_entry_raw = candidate_blob(candidate_repository, candidate, GUEST_ENTRY_PATH)
+    timing_raw = candidate_blob(candidate_repository, candidate, TIMING_PATH)
+    for relative, raw in (
+        (HARNESS_PATH, harness_raw),
+        (GUEST_ENTRY_PATH, guest_entry_raw),
+        (TIMING_PATH, timing_raw),
+    ):
+        if checked_renderer_asset(relative) != raw:
+            raise RenderError(f"renderer checkout differs from candidate harness asset: {relative}")
+    timing = parse_json_object(timing_raw, "candidate timing contract")
+    if timing.get("schema_version") != "buzz-ci-clean-host-e2e-timing/v2":
+        raise RenderError("candidate timing contract schema differs")
+    harness_sha256 = hashlib.sha256(harness_raw).hexdigest()
+    timing_asset_sha256 = hashlib.sha256(timing_raw).hexdigest()
+    timing_sha256 = hashlib.sha256(canonical_declared(timing)).hexdigest()
+    scenario, scenario_raw, scenario_path = root.scenario_ref(
+        descriptor["scenario"], "scenario",
+    )
     seccomp_raw, seccomp_path = root.read_ref(descriptor["seccomp_source"], "seccomp source", 16 * 1024 * 1024)
     if hashlib.sha256(seccomp_raw).hexdigest() != SECCOMP_SHA256:
         raise RenderError("seccomp source differs from the frozen contract")
@@ -728,6 +980,7 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
             raise RenderError(f"{name} package descriptor differs")
         manifests[name], _manifest_sha, tree_digests[name] = validate_package_tree(root, name, package_value, candidate)
         paths[name] = normalized(package_value["path"], f"{name} package path")
+    validate_keyholder_public_binding(public_raw, manifests)
     bindings = {"candidate_sha": candidate, "packages": manifests}
     validate_scenario(scenario, bindings)
     activation = manifests["activation"]
@@ -739,11 +992,15 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
     return {
         "candidate_root": candidate_root,
         "candidate_sha": candidate,
+        "harness_sha256": harness_sha256,
         "packages": {name: {"path": paths[name], "tree_sha256": tree_digests[name]} for name in PACKAGE_NAMES},
         "scenario": {"path": scenario_path, "sha256": hashlib.sha256(scenario_raw).hexdigest()},
-        "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v2",
+        "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3",
         "seccomp_source": {"path": seccomp_path, "sha256": SECCOMP_SHA256},
         "state": state,
+        "timing": timing,
+        "timing_asset_sha256": timing_asset_sha256,
+        "timing_sha256": timing_sha256,
     }
 
 
@@ -751,20 +1008,41 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     refs = require_keys(descriptor["lifecycle"], {"result", "contract", "evidence_manifest", "acceptance_receipt", "verifier"}, "lifecycle outputs")
     values: dict[str, dict[str, Any]] = {}
     raws: dict[str, bytes] = {}
-    for name, ref in refs.items():
-        values[name], raws[name], _ = root.json_ref(ref, f"lifecycle {name}")
+    values["contract"], raws["contract"], _ = root.json_ref(
+        refs["contract"], "lifecycle contract",
+    )
+    for name in ("result", "evidence_manifest", "acceptance_receipt", "verifier"):
+        values[name], raws[name], _ = root.declared_json_ref(
+            refs[name], f"lifecycle {name}",
+        )
     candidate = require_sha(descriptor["candidate_sha"], "candidate", git=True)
     result = values["result"]
     contract = values["contract"]
     evidence = values["evidence_manifest"]
     receipt = values["acceptance_receipt"]
     verifier = values["verifier"]
-    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "scenario", "seccomp_source", "packages"}, "lifecycle contract")
-    require_keys(evidence, {"schema_version", "candidate_sha", "image_sha256", "tool_sha256", "harness_asset_sha256", "package_tree_sha256", "scenario_sha256", "seccomp_source_sha256", "receipt_sha256", "verifier_sha256", "dormant_proof"}, "lifecycle evidence manifest")
-    require_keys(result, {"status", "candidate_sha", "receipt_sha256", "verifier_sha256", "evidence_manifest_sha256", "dormant_proof", "vm_state_absent"}, "lifecycle result")
-    require_keys(verifier, {"status"}, "installed verifier output")
-    if contract.get("schema_version") != "buzz-ci-clean-host-e2e-vm-contract/v2" or contract.get("candidate_sha") != candidate:
+    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages"}, "lifecycle contract")
+    require_keys(evidence, {"schema_version", "candidate_sha", "image_sha256", "tool_sha256", "harness_sha256", "harness_asset_sha256", "timing_asset_sha256", "timing", "timing_sha256", "package_tree_sha256", "scenario_sha256", "seccomp_source_sha256", "transfer_bytes", "transfer_sha256", "receipt_sha256", "verifier_sha256", "dormant_proof"}, "lifecycle evidence manifest")
+    require_keys(result, {"status", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256", "receipt_sha256", "verifier_sha256", "evidence_manifest_sha256", "dormant_proof", "vm_state_absent"}, "lifecycle result")
+    require_keys(verifier, {"outcome", "status"}, "installed verifier output")
+    if contract.get("schema_version") != "buzz-ci-clean-host-e2e-vm-contract/v3" or contract.get("candidate_sha") != candidate:
         raise RenderError("lifecycle contract candidate differs")
+    harness_sha256 = require_sha(contract["harness_sha256"], "lifecycle harness")
+    timing_asset_sha256 = require_sha(contract["timing_asset_sha256"], "lifecycle timing asset")
+    timing_sha256 = require_sha(contract["timing_sha256"], "lifecycle timing")
+    timing = contract["timing"]
+    shipped_harness = checked_renderer_asset(HARNESS_PATH)
+    shipped_timing_raw = checked_renderer_asset(TIMING_PATH)
+    shipped_timing = parse_json_object(shipped_timing_raw, "renderer timing contract")
+    if (
+        not isinstance(timing, dict)
+        or timing != shipped_timing
+        or harness_sha256 != hashlib.sha256(shipped_harness).hexdigest()
+        or timing_asset_sha256 != hashlib.sha256(shipped_timing_raw).hexdigest()
+        or timing_sha256
+        != hashlib.sha256(canonical_declared(shipped_timing)).hexdigest()
+    ):
+        raise RenderError("lifecycle timing contract differs")
     normalized(contract["state"], "lifecycle state")
     normalized(contract["candidate_root"], "lifecycle candidate root")
     contract_scenario = require_keys(contract["scenario"], {"path", "sha256"}, "lifecycle scenario")
@@ -774,25 +1052,48 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     normalized(contract_seccomp["path"], "lifecycle seccomp source")
     if contract_seccomp["sha256"] != SECCOMP_SHA256:
         raise RenderError("lifecycle seccomp source differs")
-    if evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v2" or evidence.get("candidate_sha") != candidate:
+    if evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v3" or evidence.get("candidate_sha") != candidate:
         raise RenderError("lifecycle evidence candidate differs")
     require_sha(evidence["image_sha256"], "lifecycle image")
-    for field in ("tool_sha256", "harness_asset_sha256"):
+    for field, expected_names in (
+        ("tool_sha256", set(HARNESS_TOOLS)),
+        ("harness_asset_sha256", set(HARNESS_ASSETS)),
+    ):
         digest_map = evidence[field]
-        if not isinstance(digest_map, dict) or not digest_map:
+        if not isinstance(digest_map, dict) or set(digest_map) != expected_names:
             raise RenderError(f"lifecycle {field} differs")
         for name, digest in digest_map.items():
             if not isinstance(name, str) or not name or "/" in name:
                 raise RenderError(f"lifecycle {field} name differs")
             require_sha(digest, f"lifecycle {field} digest")
+    if (
+        evidence.get("harness_sha256") != harness_sha256
+        or evidence["harness_asset_sha256"].get("harness.py") != harness_sha256
+        or evidence.get("timing_asset_sha256") != timing_asset_sha256
+        or evidence["harness_asset_sha256"].get("timing-contract.json") != timing_asset_sha256
+        or evidence.get("timing") != timing
+        or evidence.get("timing_sha256") != timing_sha256
+        or evidence.get("transfer_bytes") != TRANSFER_BYTES
+    ):
+        raise RenderError("lifecycle harness or timing evidence differs")
+    require_sha(evidence["transfer_sha256"], "lifecycle transfer")
     if evidence["seccomp_source_sha256"] != SECCOMP_SHA256:
         raise RenderError("lifecycle evidence seccomp source differs")
     if result.get("status") != "pass" or result.get("candidate_sha") != candidate or result.get("vm_state_absent") is not True:
         raise RenderError("clean-host lifecycle did not return verified pass with absent state")
     if receipt.get("outcome") != "pass" or receipt.get("integrated_candidate_sha") != candidate:
         raise RenderError("acceptance lifecycle receipt did not pass for the candidate")
-    if verifier.get("status") != "pass":
+    if verifier != {"outcome": "pass", "status": "verified"}:
         raise RenderError("installed verifier lifecycle output did not pass")
+    if any(
+        result.get(field) != expected
+        for field, expected in (
+            ("harness_sha256", harness_sha256),
+            ("timing_asset_sha256", timing_asset_sha256),
+            ("timing_sha256", timing_sha256),
+        )
+    ):
+        raise RenderError("lifecycle result harness or timing binding differs")
     scenario_sha = contract.get("scenario", {}).get("sha256") if isinstance(contract.get("scenario"), dict) else None
     if not isinstance(scenario_sha, str) or any(item.get("scenario_sha256") != scenario_sha for item in (evidence, receipt)):
         raise RenderError("lifecycle scenario binding differs")
@@ -854,12 +1155,12 @@ def record_residue(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str
 def record_sealed_freeze(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, Any]:
     require_keys(descriptor, {"schema_version", "candidate_sha", "lifecycle", "public_binding", "package_manifests"}, "sealed-freeze descriptor")
     evidence = lifecycle_evidence(root, descriptor)
-    public, public_raw, public_path = root.json_ref(descriptor["public_binding"], "public binding")
-    validate_public_binding(public)
+    public, public_raw, public_path = root.public_binding_ref(descriptor["public_binding"], "public binding")
     contract = evidence["contract"]
     if public_path != f"{contract['state']}/public-binding.json":
         raise RenderError("sealed-freeze public binding differs from the lifecycle state")
     manifests, manifest_file_sha = load_manifests(root, descriptor["package_manifests"], evidence["candidate_sha"], PACKAGE_NAMES)
+    validate_keyholder_public_binding(public_raw, manifests)
     package_refs = require_keys(descriptor["package_manifests"], set(PACKAGE_NAMES), "sealed-freeze manifests")
     for name in PACKAGE_NAMES:
         contract_package = contract["packages"][name]
@@ -905,6 +1206,11 @@ def render(action: str, root: DescriptorRoot) -> dict[str, Any]:
     }[action](root, descriptor)
 
 
+def render_output(action: str, value: dict[str, Any]) -> bytes:
+    """Encode one result without changing any non-scenario wire format."""
+    return canonical_scenario(value) if action == "render-scenario" else canonical(value)
+
+
 def write_output(root: DescriptorRoot, relative: str, payload: bytes) -> None:
     output = normalized(relative, "output")
     parent, name = root._open_parent(output)
@@ -934,7 +1240,7 @@ def main() -> int:
     try:
         root = DescriptorRoot(arguments.descriptor)
         value = render(arguments.action, root)
-        write_output(root, arguments.output, canonical(value))
+        write_output(root, arguments.output, render_output(arguments.action, value))
         return 0
     except (OSError, RenderError) as error:
         print(f"render_inputs: {error}", file=sys.stderr)
