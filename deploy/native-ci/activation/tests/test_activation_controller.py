@@ -44,6 +44,18 @@ def load_registered_module(name: str, path: Path):
 CONTROLLER = load_module("activation_controller", ACTIVATION_ROOT / "controller.py")
 FREEZER = load_module("activation_freezer", ACTIVATION_ROOT / "freeze_package.py")
 INVENTORY = load_module("activation_inventory", ACTIVATION_ROOT / "check_package_inventory.py")
+RENDERER = load_module(
+    "activation_test_render_inputs",
+    ACTIVATION_ROOT / "render_inputs/render_inputs.py",
+)
+TEMPLATE_GENERATOR = load_module(
+    "activation_test_checked_templates",
+    ACTIVATION_ROOT / "render_inputs/generate_checked_templates.py",
+)
+CLEAN_HOST_GUEST = load_module(
+    "activation_test_clean_host_guest",
+    ACTIVATION_ROOT / "tests/clean_host_e2e/guest_entry.py",
+)
 EXECD_ROOT = REPO_ROOT / "deploy/native-ci/execd"
 EXECD_FREEZER = load_registered_module(
     "activation_test_execd_freezer", EXECD_ROOT / "freeze_package.py",
@@ -278,7 +290,7 @@ class ActivationFixture:
         self.entries: list[dict[str, object]] = []
         self.components = self._add_components()
         self._add_configs()
-        self._bind_controld_package_config()
+        self._bind_component_package_configs()
         self._add_static_assets()
         self.qualification = {
             "program": "/usr/libexec/buzz-ci-production-qualification",
@@ -583,58 +595,113 @@ class ActivationFixture:
                 "mode": "0755",
                 "unit": unit,
             }
-            if name == "controld":
+            if name in activation_package.COMPONENT_PACKAGE_NAMES:
+                socket_role = "socket" if name == "runner" else "acceptance_socket"
+                socket_name = (
+                    "buzz-ci-runner.socket"
+                    if name == "runner"
+                    else "buzz-ci-controld-acceptance.socket"
+                )
+                package_id = f"buzz-ci-{name}-{source_commit[:12]}-{activation_package.digest(binary)[:12]}"
                 package: dict[str, object] = {
-                    "schema": "buzz-ci-controld-install-package-v2",
+                    "schema": f"buzz-ci-{name}-install-package-v2",
+                    "package_id": package_id,
                     "source_commit": source_commit,
-                    "daemon_contract": {
-                        "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
-                    },
+                    "binary_provenance_sha256": activation_package.digest(provenance),
+                    "default_state": (
+                        {"enabled": False, "active": False, "provisioned": False, "capacity": 0, "host_block": False}
+                        if name == "runner"
+                        else {"enabled": False, "active": False, "provisioned": False, "capacity": 0, "providers_wired": False}
+                    ),
+                    "package_uid": 0,
+                    "package_gid": 0,
+                    "directories": [
+                        {"target": "/etc/buzzci", "mode": "0755", "uid": 0, "gid": 0},
+                        {"target": f"/usr/share/doc/buzz-ci-{name}", "mode": "0755", "uid": 0, "gid": 0},
+                    ],
                     "entries": [],
                 }
+                if name == "runner":
+                    package["peer_policy"] = {
+                        "runner_control_socket": {
+                            "path": "/run/buzzci/runner-control.sock", "descriptor_name": "buzz-ci-runner-control",
+                            "user": "buzzci-runner", "group": "buzzci-controld", "mode": "0620", "directory_mode": "0711",
+                        },
+                        "broker_socket": {
+                            "path": "/run/buzzci/execd.sock", "expected_uid": 0, "owner": "root",
+                            "group": "buzzci-execd", "mode": "0620",
+                            "supplementary_members": ["buzzci-runner", "buzzci-ctl"], "managed_by_package": False,
+                        },
+                    }
+                    package["identities"] = {
+                        role: {
+                            "user": self.identities[role]["user"], "group": self.identities[role]["group"],
+                            "uid": self.identities[role]["uid"], "gid": self.identities[role]["gid"],
+                        }
+                        for role in ("runner", "controld")
+                    }
+                else:
+                    package["daemon_contract"] = {
+                        "service_user": "buzzci-controld", "config_path": "/etc/buzzci/controld-v2.json",
+                        "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
+                        "store_root": "/var/lib/buzzci/controld", "default_capacity": 0,
+                        "maximum_capacity": 1, "providers_fail_closed": True, "runner_protocol": 2,
+                        "acceptance_socket": "/run/buzzci/controld-acceptance.sock",
+                    }
+                    package["identity"] = {
+                        "user": self.identities["controld"]["user"], "group": self.identities["controld"]["group"],
+                        "uid": self.identities["controld"]["uid"], "gid": self.identities["controld"]["gid"],
+                    }
+                package["entries"].append({
+                    "role": "binary", "source": f"assets/buzz-ci-{name}", "target": binary_path,
+                    "source_mode": "0500", "install_mode": "0755", "uid": 0, "gid": 0,
+                    "sha256": activation_package.digest(binary),
+                })
                 for role, relative, target in (
-                    ("service", "deploy/native-ci/controld/templates/buzz-ci-controld.service", "/etc/systemd/system/buzz-ci-controld.service"),
-                    ("acceptance_socket", "deploy/native-ci/controld/templates/buzz-ci-controld-acceptance.socket", "/etc/systemd/system/buzz-ci-controld-acceptance.socket"),
+                    ("service", f"deploy/native-ci/{name}/templates/buzz-ci-{name}.service", f"/etc/systemd/system/buzz-ci-{name}.service"),
+                    (socket_role, f"deploy/native-ci/{name}/templates/{socket_name}", f"/etc/systemd/system/{socket_name}"),
+                    ("tmpfiles", f"deploy/native-ci/{name}/templates/buzzci-{name}.tmpfiles", activation_package.COMPONENT_TMPFILES_TARGETS[name]),
+                    ("documentation", f"deploy/native-ci/{name}/README.md", f"/usr/share/doc/buzz-ci-{name}/README.md"),
                 ):
                     payload = (REPO_ROOT / relative).read_bytes()
                     package["entries"].append({
-                        "role": role, "target": target, "sha256": activation_package.digest(payload),
-                        "install_mode": "0644", "uid": 0, "gid": 0,
+                        "role": role,
+                        "source": "assets/README.md" if role == "documentation" else f"assets/{Path(target).name}",
+                        "target": target, "source_mode": "0400",
+                        "sha256": activation_package.digest(payload), "install_mode": "0644", "uid": 0, "gid": 0,
                     })
-                package["package_digest"] = activation_package.digest(activation_package.canonical_json(package))
+                package["entries"].sort(key=lambda item: item["target"].encode())
                 package_raw = activation_package.canonical_json(package)
-                source = "assets/controld-package-manifest.json"
+                source = f"assets/{name}-package-manifest.json"
                 self.assets[source] = (package_raw, 0o400)
                 component.update({
                     "package_manifest_source": source,
-                    "package_manifest_sha256": activation_package.digest(package_raw),
-                    "package_digest": package["package_digest"],
+                    "package_manifest_sha256": "0" * 64,
+                    "package_digest": "0" * 64,
                 })
             components.append(component)
         return components
 
-    def _bind_controld_package_config(self) -> None:
-        component = next(item for item in self.components if item["name"] == "controld")
-        source = component["package_manifest_source"]
-        package = json.loads(self.assets[source][0])
-        config = next(item for item in self.entries if item["role"] == "controld_config")
-        package["entries"].append({
-            "role": "config",
-            "target": config["target"],
-            "sha256": config["sha256"],
-            "install_mode": config["install_mode"],
-            "uid": config["uid"],
-            "gid": config["gid"],
-        })
-        package["package_digest"] = activation_package.digest(
-            activation_package.canonical_json({
-                key: value for key, value in package.items() if key != "package_digest"
+    def _bind_component_package_configs(self) -> None:
+        for name in activation_package.COMPONENT_PACKAGE_NAMES:
+            component = next(item for item in self.components if item["name"] == name)
+            source = component["package_manifest_source"]
+            package = json.loads(self.assets[source][0])
+            config = next(item for item in self.entries if item["role"] == f"{name}_config")
+            package["entries"].append({
+                "role": "config", "source": f"assets/{name}-v2.json",
+                "target": config["target"], "source_mode": "0400",
+                "sha256": config["sha256"], "install_mode": config["install_mode"],
+                "uid": config["uid"], "gid": config["gid"],
             })
-        )
-        raw = activation_package.canonical_json(package)
-        self.assets[source] = (raw, 0o400)
-        component["package_manifest_sha256"] = activation_package.digest(raw)
-        component["package_digest"] = package["package_digest"]
+            package["entries"].sort(key=lambda item: item["target"].encode())
+            package["package_digest"] = activation_package.digest(
+                activation_package.canonical_json(package)
+            )
+            raw = activation_package.canonical_json(package)
+            self.assets[source] = (raw, 0o400)
+            component["package_manifest_sha256"] = activation_package.digest(raw)
+            component["package_digest"] = package["package_digest"]
 
     def _effective_systemd(self) -> list[dict[str, object]]:
         entries = {entry["target"]: entry for entry in self.entries}
@@ -670,7 +737,7 @@ class ActivationFixture:
                 "run_id": "1" * 32,
                 "job_id": "capacity-one-fixture",
                 "request_digest": "2" * 64,
-                "manifest_digest": self.lane_manifest_digest,
+                "manifest_digest": activation_package.FIXTURE_MANIFEST_SHA256,
                 "source_oid": "a" * 40,
                 "approval_id": "4" * 32,
                 "grant_event_id": grant_event_id,
@@ -706,6 +773,7 @@ class ActivationFixture:
                 "stage_capacity": 0,
                 "active_capacity": 1,
             },
+            "platform_systemd": activation_package.PLATFORM_SYSTEMD,
             "effective_systemd": self._effective_systemd(),
             "socket_policy": activation_package.SOCKET_POLICY,
             "qualification": self.qualification,
@@ -780,12 +848,12 @@ class ActivationFixture:
                 "LoadState": load_state,
                 "ActiveState": "inactive",
                 "SubState": "dead",
-                "UnitFileState": "disabled" if load_state == "not-found" or name.endswith(".socket") else "static",
+                "UnitFileState": "" if load_state == "not-found" else "disabled" if name.endswith(".socket") else "static",
                 "FragmentPath": "" if load_state == "not-found" else item["fragment"]["path"],
-                "DropInPaths": [
+                "DropInPaths": activation_package.systemd_drop_in_order([
                     record["path"] for record in item["drop_ins"]
                     if record["owner"] != "activation"
-                ],
+                ]),
             }
         state = {"schema": "buzz-ci-fake-systemd-v1", "units": units, "identities": {}, "groups": {}, "sockets": {}}
         self.fake_state = self.root / "var/lib/buzzci/activation-controller/fake-systemd-v1.json"
@@ -1067,6 +1135,7 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(activated["state"], "active_one")
         active = CONTROLLER.check_current(manifest, self.fixture.root, driver)
         self.assertEqual(active["readback"]["installed_units"]["buzz-ci-runner.service"]["drop_in_paths"], [
+            "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
             "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
         ])
         self.assertEqual(CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["status"], "unchanged")
@@ -1099,6 +1168,18 @@ class ActivationControllerTests(unittest.TestCase):
         )
         for unit in activation_package.PACKAGE_UNIT_ROLES:
             self.assertEqual(report["units"][unit]["LoadState"], "not-found")
+            self.assertEqual(
+                {
+                    key: report["units"][unit][key]
+                    for key in ("LoadState", "ActiveState", "SubState", "UnitFileState")
+                },
+                {
+                    "LoadState": "not-found",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "UnitFileState": "",
+                },
+            )
         for unit in activation_package.DEPENDENCY_UNITS:
             self.assertEqual(report["units"][unit]["LoadState"], "loaded")
 
@@ -1120,6 +1201,100 @@ class ActivationControllerTests(unittest.TestCase):
             self.assertEqual(staged["installed_units"][unit]["LoadState"], "loaded")
             self.assertEqual(staged["installed_units"][unit]["fragment_path"], entries[role]["target"])
             self.assertEqual(staged["installed_units"][unit]["sha256"], entries[role]["sha256"])
+
+    def test_live_and_clean_host_parsers_share_exact_fedora259_absence(self) -> None:
+        controller_process = subprocess.CompletedProcess(
+            ["systemctl"], 0,
+            b"LoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=\n",
+            b"",
+        )
+        with mock.patch.object(CONTROLLER.LiveSystemd, "_run", return_value=controller_process):
+            observed = CONTROLLER.LiveSystemd(Path("/")).unit(
+                "buzz-ci-acceptance-control.service",
+            )
+        self.assertEqual(observed, {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "UnitFileState": "",
+        })
+
+        clean_host_process = subprocess.CompletedProcess(
+            ["systemctl"], 0,
+            b"LoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=\nMainPID=0\nInvocationID=\nFragmentPath=\n",
+            b"",
+        )
+        clean_host = CLEAN_HOST_GUEST.systemd_unit_values(
+            "buzz-ci-acceptance-control.service", clean_host_process,
+        )
+        self.assertEqual(
+            {key: clean_host[key] for key in observed},
+            observed,
+        )
+
+        lines = controller_process.stdout.splitlines()
+        for missing in observed:
+            incomplete = subprocess.CompletedProcess(
+                ["systemctl"], 0,
+                b"\n".join(
+                    line for line in lines
+                    if not line.startswith(missing.encode() + b"=")
+                ) + b"\n",
+                b"",
+            )
+            with self.subTest(missing=missing), mock.patch.object(
+                CONTROLLER.LiveSystemd, "_run", return_value=incomplete,
+            ), self.assertRaisesRegex(ValueError, "incomplete systemd readback"):
+                CONTROLLER.LiveSystemd(Path("/")).unit(
+                    "buzz-ci-acceptance-control.service",
+                )
+
+    def test_preflight_accepts_empty_unit_file_state_only_for_exact_absence(self) -> None:
+        _manifest, _payloads, driver = self.fixture.load()
+        self.assertEqual(driver.unit("buzz-ci-unmodeled.service"), {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "UnitFileState": "",
+        })
+        observed = CONTROLLER._preflight_units(driver)
+        for unit in activation_package.PACKAGE_UNIT_ROLES:
+            self.assertEqual(observed[unit], {
+                "LoadState": "not-found",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "UnitFileState": "",
+            })
+
+        baseline = driver._read()
+        absent_service = next(
+            unit for unit in activation_package.PACKAGE_UNIT_ROLES
+            if unit.endswith(".service")
+        )
+        absent_socket = next(
+            unit for unit in activation_package.PACKAGE_UNIT_ROLES
+            if unit.endswith(".socket")
+        )
+        cases = (
+            (absent_service, {"UnitFileState": "disabled"}, "absent package-owned"),
+            (absent_service, {"UnitFileState": "static"}, "absent package-owned"),
+            (absent_service, {"ActiveState": "active"}, "absent package-owned"),
+            (absent_service, {"SubState": "running"}, "absent package-owned"),
+            (absent_service, {"LoadState": "failed"}, "required systemd unit"),
+            (
+                absent_socket,
+                {"LoadState": "loaded", "UnitFileState": ""},
+                "systemd socket is enabled before activation",
+            ),
+        )
+        for unit, replacement, message in cases:
+            with self.subTest(unit=unit, replacement=replacement):
+                state = copy.deepcopy(baseline)
+                state["units"][unit].update(replacement)
+                driver._write(state)
+                with self.assertRaisesRegex(ValueError, message):
+                    CONTROLLER._preflight_units(driver)
+        driver._write(baseline)
 
     def test_effective_systemd_rejects_missing_extra_order_relocation_digest_and_duplicate_drift(self) -> None:
         manifest, payloads, driver = self.fixture.load()
@@ -1175,6 +1350,196 @@ class ActivationControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "(?:file digest differs|staged readback failed)"):
             CONTROLLER.check_current(manifest, self.fixture.root, driver)
 
+    def test_platform_global_drop_in_is_exact_for_services_only(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        global_record = activation_package.PLATFORM_SYSTEMD["service_drop_ins"][0]
+        for unit in manifest["effective_systemd"]:
+            paths = [record["path"] for record in unit["drop_ins"]]
+            if unit["unit"].endswith(".service"):
+                self.assertIn(global_record["path"], paths)
+                self.assertEqual(
+                    paths,
+                    activation_package.systemd_drop_in_order(paths),
+                )
+                self.assertEqual(
+                    next(record for record in unit["drop_ins"] if record["owner"] == "platform"),
+                    global_record,
+                )
+            else:
+                self.assertNotIn(global_record["path"], paths)
+
+        changed = copy.deepcopy(manifest)
+        changed["platform_systemd"]["service_drop_ins"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "platform binding differs"):
+            activation_package.validate_manifest(changed)
+
+        runner = next(
+            item for item in manifest["effective_systemd"]
+            if item["unit"] == "buzz-ci-runner.service"
+        )
+
+        def platform_record(drops: list[dict[str, object]]) -> dict[str, object]:
+            return next(record for record in drops if record["owner"] == "platform")
+
+        for label, mutate in (
+            ("missing", lambda drops: drops.remove(platform_record(drops))),
+            ("reordered", lambda drops: drops.reverse()),
+            ("relocated", lambda drops: platform_record(drops).update(path="/etc/systemd/system/service.d/10-timeout-abort.conf")),
+            ("drifted", lambda drops: platform_record(drops).update(sha256="1" * 64)),
+        ):
+            hostile = copy.deepcopy(manifest)
+            drops = next(
+                item["drop_ins"] for item in hostile["effective_systemd"]
+                if item["unit"] == runner["unit"]
+            )
+            mutate(drops)
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ValueError,
+                "(?:drop-in inventory differs|drop-in owner, path, or order differs|platform effective systemd binding differs)",
+            ):
+                activation_package.validate_manifest(hostile)
+
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        target = self.fixture.root / global_record["path"].lstrip("/")
+        expected = target.read_bytes()
+        target.unlink()
+        with self.assertRaisesRegex(ValueError, "effective systemd file is missing"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        write_file(target, b"[Service]\nHostile=yes\n", 0o644)
+        with self.assertRaisesRegex(ValueError, "effective systemd file digest differs"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        write_file(target, expected, 0o644)
+        state = driver._read()
+        state["units"][runner["unit"]]["DropInPaths"].insert(
+            0, "/etc/systemd/system/buzz-ci-runner.service.d/10-host-adapters.conf",
+        )
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "drop-in paths or order"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+    def test_systemd_drop_in_order_matches_fedora_and_rejects_collisions(self) -> None:
+        global_10 = "/usr/lib/systemd/system/service.d/10-timeout-abort.conf"
+        unit_20 = "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf"
+        host_10 = "/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf"
+        self.assertEqual(
+            activation_package.systemd_drop_in_order([unit_20, global_10]),
+            [global_10, unit_20],
+        )
+        self.assertEqual(
+            activation_package.systemd_drop_in_order([global_10, unit_20]),
+            [global_10, unit_20],
+        )
+        self.assertEqual(
+            activation_package.systemd_drop_in_order([global_10, host_10]),
+            [host_10, global_10],
+        )
+        with self.assertRaisesRegex(ValueError, "basename collision"):
+            activation_package.systemd_drop_in_order([
+                global_10,
+                "/etc/systemd/system/buzz-ci-keyholder.service.d/10-timeout-abort.conf",
+            ])
+
+        self.assertEqual(len(activation_package.SYSTEMD_UNIT_LAYOUT), 13)
+        self.assertEqual(
+            sum(
+                record["owner"] != "platform"
+                for unit in activation_package.SYSTEMD_UNIT_LAYOUT.values()
+                for record in unit["drop_ins"]
+            ),
+            5,
+        )
+        for unit in ("buzz-ci-runner.service", "buzz-ci-keyholder.service"):
+            paths = [
+                record["path"]
+                for record in activation_package.SYSTEMD_UNIT_LAYOUT[unit]["drop_ins"]
+            ]
+            self.assertEqual(paths, activation_package.systemd_drop_in_order(paths))
+
+    def test_systemd_analyze_serializes_global_10_before_unit_20(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unit_root = root / "etc/systemd/system"
+            unit_drop_ins = unit_root / "buzz-ci-order.service.d"
+            global_drop_ins = root / "usr/lib/systemd/system/service.d"
+            binary_root = root / "bin"
+            unit_drop_ins.mkdir(parents=True)
+            global_drop_ins.mkdir(parents=True)
+            binary_root.mkdir(parents=True)
+            shutil.copyfile("/bin/true", binary_root / "true")
+            (binary_root / "true").chmod(0o755)
+            (unit_root / "buzz-ci-order.service").write_text(
+                "[Unit]\nDefaultDependencies=no\n[Service]\nExecStart=/bin/true\n",
+            )
+            shutil.copyfile(
+                ACTIVATION_ROOT / "platform/fedora-44-systemd-259/10-timeout-abort.conf",
+                global_drop_ins / "10-timeout-abort.conf",
+            )
+            shutil.copyfile(
+                REPO_ROOT / "deploy/native-ci/keyholder/templates/20-acceptance-actor.conf",
+                unit_drop_ins / "20-acceptance-actor.conf",
+            )
+            verified = subprocess.run(
+                [
+                    "systemd-analyze", "verify", f"--root={root}",
+                    "buzz-ci-order.service",
+                ],
+                check=False,
+                env={**os.environ, "SYSTEMD_LOG_LEVEL": "debug"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            serialized = verified.stdout + verified.stderr
+            global_marker = "DropIn Path: " + str(
+                global_drop_ins / "10-timeout-abort.conf",
+            )
+            unit_marker = "DropIn Path: " + str(
+                unit_drop_ins / "20-acceptance-actor.conf",
+            )
+            self.assertGreaterEqual(serialized.find(global_marker), 0, serialized)
+            self.assertGreaterEqual(serialized.find(unit_marker), 0, serialized)
+            self.assertLess(serialized.find(global_marker), serialized.find(unit_marker))
+
+    def test_fedora259_serialized_drop_in_order_passes_exact_readback(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        keyholder = next(
+            item for item in manifest["effective_systemd"]
+            if item["unit"] == "buzz-ci-keyholder.service"
+        )
+        expected = [record["path"] for record in keyholder["drop_ins"]]
+        self.assertEqual(expected, [
+            "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf",
+        ])
+        serialized = subprocess.CompletedProcess(
+            ["systemctl"], 0,
+            (
+                "FragmentPath=/etc/systemd/system/buzz-ci-keyholder.service\n"
+                f"DropInPaths={' '.join(expected)}\n"
+            ).encode(),
+            b"",
+        )
+        with mock.patch.object(CONTROLLER.LiveSystemd, "_run", return_value=serialized):
+            self.assertEqual(
+                CONTROLLER.LiveSystemd(Path("/")).effective_paths(
+                    "buzz-ci-keyholder.service",
+                )["drop_in_paths"],
+                expected,
+            )
+
+        CONTROLLER.preflight(
+            manifest, self.fixture.root, driver, require_dormant=True, payloads=payloads,
+        )
+        state = driver._read()
+        state["units"]["buzz-ci-keyholder.service"]["DropInPaths"] = list(reversed(expected))
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "drop-in paths or order differ"):
+            CONTROLLER.preflight(
+                manifest, self.fixture.root, driver,
+                require_dormant=True, payloads=payloads,
+            )
+
     def test_dependency_drop_in_rejects_missing_and_stale_bytes(self) -> None:
         manifest, payloads, driver = self.fixture.load()
         CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
@@ -1182,7 +1547,10 @@ class ActivationControllerTests(unittest.TestCase):
             item for item in manifest["effective_systemd"]
             if item["unit"] == "buzz-ci-keyholder.service"
         )
-        record = effective["drop_ins"][0]
+        record = next(
+            item for item in effective["drop_ins"]
+            if item["owner"] == "keyholder"
+        )
         target = self.fixture.root / record["path"].lstrip("/")
         expected = (REPO_ROOT / FREEZER.SYSTEMD_SOURCE_PATHS[record["path"]]).read_bytes()
 
@@ -1307,6 +1675,48 @@ class ActivationControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "staged config binding differs"):
             activation_package._validate_controld_package_manifest(changed, hostile)
 
+    def test_component_package_manifests_reject_structural_and_scalar_bypasses(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+
+        def rebound(name: str, mutate: Callable[[dict[str, object]], None]) -> tuple[dict[str, object], dict[str, bytes]]:
+            changed = copy.deepcopy(manifest)
+            component = next(item for item in changed["components"] if item["name"] == name)
+            package = json.loads(payloads[component["package_manifest_source"]])
+            mutate(package)
+            unsigned = {key: value for key, value in package.items() if key != "package_digest"}
+            package["package_digest"] = activation_package.digest(activation_package.canonical_json(unsigned))
+            raw = activation_package.canonical_json(package)
+            component["package_digest"] = package["package_digest"]
+            component["package_manifest_sha256"] = activation_package.digest(raw)
+            changed_payloads = dict(payloads)
+            changed_payloads[component["package_manifest_source"]] = raw
+            return changed, changed_payloads
+
+        changed, changed_payloads = rebound("runner", lambda package: package.__setitem__("extra", True))
+        with self.assertRaisesRegex(ValueError, "fields differ"):
+            activation_package.component_tmpfiles_plan(changed, changed_payloads)
+
+        def boolean_owner(package: dict[str, object]) -> None:
+            package["package_uid"] = False
+
+        changed, changed_payloads = rebound("runner", boolean_owner)
+        with self.assertRaisesRegex(ValueError, "ownership types differ"):
+            activation_package.component_tmpfiles_plan(changed, changed_payloads)
+
+        def duplicate_role(package: dict[str, object]) -> None:
+            package["entries"][0]["role"] = package["entries"][1]["role"]
+
+        changed, changed_payloads = rebound("controld", duplicate_role)
+        with self.assertRaisesRegex(ValueError, "role or target inventory differs"):
+            activation_package.component_tmpfiles_plan(changed, changed_payloads)
+
+        swapped = dict(payloads)
+        runner = next(item for item in manifest["components"] if item["name"] == "runner")
+        controld = next(item for item in manifest["components"] if item["name"] == "controld")
+        swapped[runner["package_manifest_source"]] = payloads[controld["package_manifest_source"]]
+        with self.assertRaisesRegex(ValueError, "runner package manifest bytes differ"):
+            activation_package.component_tmpfiles_plan(manifest, swapped)
+
     def test_static_five_package_inventory_is_collision_closed(self) -> None:
         activation = copy.deepcopy(self.fixture.manifest)
         activation_entries = {entry["target"]: entry for entry in activation["entries"]}
@@ -1365,6 +1775,11 @@ class ActivationControllerTests(unittest.TestCase):
         for category in ("binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt"):
             self.assertGreater(report["categories"].get(category, 0), 0, category)
 
+        platform_drift = copy.deepcopy(packages)
+        platform_drift["activation"]["platform_systemd"]["service_drop_ins"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "systemd platform binding differs"):
+            INVENTORY.check_inventory(platform_drift)
+
         self.assertTrue(any(
             item["target"] == "/etc/buzzci/runner-v2.json"
             for item in packages["runner"]["entries"]
@@ -1407,6 +1822,12 @@ class ActivationControllerTests(unittest.TestCase):
             root = Path(temporary)
             canonical = root / INVENTORY.CONTROLD_ACCEPTANCE_SOURCE
             write_file(canonical, b"canonical\n", 0o644)
+            platform = root / INVENTORY.PLATFORM_SYSTEMD_SOURCE
+            write_file(
+                platform,
+                (REPO_ROOT / INVENTORY.PLATFORM_SYSTEMD_SOURCE).read_bytes(),
+                0o644,
+            )
             report = INVENTORY.check_source_inventory(root)
             self.assertEqual(report["controld_acceptance_source"], str(INVENTORY.CONTROLD_ACCEPTANCE_SOURCE))
             duplicate = root / "deploy/native-ci/acceptance/templates" / INVENTORY.CONTROLD_ACCEPTANCE_NAME
@@ -1699,6 +2120,9 @@ class ActivationControllerTests(unittest.TestCase):
             (properties["effective_systemd"]["minItems"], properties["effective_systemd"]["maxItems"]),
             (len(activation_package.SYSTEMD_UNIT_LAYOUT), len(activation_package.SYSTEMD_UNIT_LAYOUT)),
         )
+        self.assertEqual(properties["platform_systemd"]["const"], activation_package.PLATFORM_SYSTEMD)
+        self.assertEqual(INVENTORY.PLATFORM_SYSTEMD, activation_package.PLATFORM_SYSTEMD)
+        self.assertIn("platform", schema["$defs"]["effectivePath"]["properties"]["owner"]["enum"])
         self.assertEqual(properties["socket_policy"]["const"], activation_package.SOCKET_POLICY)
         self.assertEqual(
             properties["systemd"]["const"],
@@ -1721,7 +2145,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "5a36cecec8ad048572939656f1b4c1751e7d4bb85b4961c9ebfddbc959bde6bc",
+            "cac150944918deb861743f06c6bb88121515f3c4192357b73c1ecc568b14d0ce",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -2996,6 +3420,330 @@ class ActivationControllerTests(unittest.TestCase):
                 template["grant_event"], ensure_ascii=False, separators=(",", ":"),
             ).encode()),
         )
+
+    def test_frozen_grant_event_flows_through_checked_render_and_controller(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        source = json.loads(
+            (REPO_ROOT / "deploy/native-ci/acceptance/scenario.template.json").read_bytes(),
+        )
+        checked = TEMPLATE_GENERATOR.checked_scenario_template(source)
+        grant_event_id = RENDERER.activation_grant_event_id(manifest)
+        bindings = {
+            "candidate_sha": manifest["source_commit"],
+            "packages": {"activation": manifest},
+            "activation_grant_event_id": grant_event_id,
+            "activation_fixture_manifest_sha256": RENDERER.activation_fixture_manifest_sha256(
+                manifest,
+            ),
+        }
+        rendered = RENDERER.resolve_template(
+            checked, "capacity-one-scenario", bindings,
+        )
+        rendered = RENDERER.validate_scenario(rendered, bindings)
+        self.assertEqual(rendered["fixture"]["grant_event_id"], grant_event_id)
+        self.assertEqual(
+            rendered["fixture"]["manifest_digest"],
+            activation_package.FIXTURE_MANIFEST_SHA256,
+        )
+
+        scenario_path = self.fixture.temporary / "renderer-scenario.json"
+        write_file(scenario_path, RENDERER.canonical_scenario(rendered), 0o400)
+        controller_binding = CONTROLLER.load_acceptance_scenario(
+            scenario_path, manifest, live=False,
+        )
+        self.assertEqual(
+            controller_binding["fixture"]["grant_event_id"], grant_event_id,
+        )
+        generated = CONTROLLER._generated_acceptance_files(
+            manifest, payloads, controller_binding,
+        )
+        execd_config = json.loads(next(
+            item["payload"] for item in generated if item["role"] == "execd_config"
+        ))
+        self.assertEqual(
+            controller_binding["fixture"]["manifest_digest"],
+            execd_config["execution"]["fixture_manifest_sha256"],
+        )
+        self.assertEqual(
+            execd_config["lane_manifest_digest"],
+            activation_package.lane_manifest_digest(execd_config["lane_manifest"]),
+        )
+        self.assertNotEqual(
+            execd_config["lane_manifest_digest"],
+            controller_binding["fixture"]["manifest_digest"],
+        )
+
+        stale = copy.deepcopy(rendered)
+        stale["fixture"]["grant_event_id"] = "8" * 64
+        with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
+            RENDERER.validate_scenario(stale, bindings)
+        stale_path = self.fixture.temporary / "stale-renderer-scenario.json"
+        write_file(stale_path, RENDERER.canonical_scenario(stale), 0o400)
+        with self.assertRaisesRegex(
+            ValueError, "grant event id differs from the frozen public template",
+        ):
+            CONTROLLER.load_acceptance_scenario(stale_path, manifest, live=False)
+
+        wrong_fixture = copy.deepcopy(rendered)
+        wrong_fixture["fixture"]["manifest_digest"] = self.fixture.lane_manifest_digest
+        with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
+            RENDERER.validate_scenario(wrong_fixture, bindings)
+        wrong_fixture_path = self.fixture.temporary / "wrong-fixture-renderer-scenario.json"
+        write_file(
+            wrong_fixture_path, RENDERER.canonical_scenario(wrong_fixture), 0o400,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "fixture manifest digest differs from the activation package",
+        ):
+            CONTROLLER.load_acceptance_scenario(
+                wrong_fixture_path, manifest, live=False,
+            )
+
+        changed_manifest = copy.deepcopy(manifest)
+        changed_manifest["acceptance_template"]["grant_event"][5] = "{\"type\":\"different-grant\"}"
+        changed_bindings = {**bindings, "packages": {"activation": changed_manifest}}
+        with self.assertRaisesRegex(RENDERER.RenderError, "renderer binding differs"):
+            RENDERER.validate_scenario(rendered, changed_bindings)
+
+        extra = copy.deepcopy(rendered)
+        extra["fixture"]["caller_grant_event_id"] = grant_event_id
+        with self.assertRaisesRegex(RENDERER.RenderError, "shape differs"):
+            RENDERER.validate_scenario(extra, bindings)
+
+    def test_stage_executes_all_installed_tmpfiles_declarations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "usr/lib/tmpfiles.d").mkdir(parents=True)
+            manifest, payloads, _fake = self.fixture.load()
+            plan = activation_package.tmpfiles_plan(manifest, payloads)
+            source_payloads = {
+                activation_package.STATIC_TARGETS["tmpfiles"]: (ACTIVATION_ROOT / "templates/buzzci-activation.tmpfiles").read_bytes(),
+                activation_package.STATIC_TARGETS["acceptance_tmpfiles"]: (ACTIVATION_ROOT / "templates/buzzci-acceptance.tmpfiles").read_bytes(),
+                activation_package.COMPONENT_TMPFILES_TARGETS["runner"]: (REPO_ROOT / "deploy/native-ci/runner/templates/buzzci-runner.tmpfiles").read_bytes(),
+                activation_package.COMPONENT_TMPFILES_TARGETS["controld"]: (REPO_ROOT / "deploy/native-ci/controld/templates/buzzci-controld.tmpfiles").read_bytes(),
+            }
+            self.assertEqual({item["target"] for item in plan}, set(source_payloads))
+            for item in plan:
+                payload = source_payloads[item["target"]]
+                self.assertEqual(activation_package.digest(payload), item["sha256"])
+                write_file(root / str(item["target"]).lstrip("/"), payload, 0o644)
+
+            calls: list[tuple[str, list[str], bool]] = []
+            driver = object.__new__(CONTROLLER.LiveSystemd)
+            driver.root = root
+            directories = {
+                "run/buzzci": 0o711,
+                "var/lib/buzzci": 0o711,
+                "var/lib/buzzci/activation-controller": 0o711,
+                "var/lib/buzzci/acceptance-control": 0o700,
+                "var/lib/buzzci/seccomp": 0o711,
+                "var/lib/buzzci/seccomp/v1": 0o711,
+                "var/lib/buzzci/seccomp/v1/sha256": 0o711,
+                "var/lib/buzzci/activation": 0o700,
+                "var/lib/buzzci/activation/receipts": 0o700,
+                "var/lib/buzzci/execd-v2": 0o711,
+                "var/lib/buzzci/execd-v2/intents": 0o700,
+                "var/lib/buzzci/execd-v2/bindings": 0o700,
+                "var/lib/buzzci/execd-v2/evidence": 0o700,
+                "var/lib/buzzci/execd-v2/teardown": 0o700,
+                "var/lib/buzzci/execd-v2/attempts": 0o711,
+                "var/lib/buzzci/execd-v2/qualification": 0o700,
+                "var/lib/buzzci/controld": 0o700,
+                "var/lib/buzzci/runner": 0o700,
+            }
+
+            def record(program: str, args: list[str], *, mutation: bool = False) -> subprocess.CompletedProcess[bytes]:
+                calls.append((program, args, mutation))
+                for target, mode in directories.items():
+                    directory = root / target
+                    directory.mkdir(parents=True, exist_ok=True)
+                    directory.chmod(mode)
+                return subprocess.CompletedProcess([program, *args], 0, b"", b"")
+
+            driver._run = record
+            driver.tmpfiles(self.fixture.identities, plan)
+            driver.tmpfiles(self.fixture.identities, plan)
+            expected_args = ["--create", *(item["target"] for item in plan)]
+            self.assertEqual(calls, [
+                (CONTROLLER.TMPFILES, expected_args, True),
+                (CONTROLLER.TMPFILES, expected_args, True),
+            ])
+
+            declaration = root / str(plan[-1]["target"]).lstrip("/")
+            original = declaration.read_bytes()
+            declaration.write_bytes(b"d /tmp/hostile 0777 root root -\n")
+            with self.assertRaisesRegex(ValueError, "content drift"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            declaration.write_bytes(original)
+            declaration.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "metadata drift"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            declaration.chmod(0o644)
+            declaration.unlink()
+            with self.assertRaisesRegex(ValueError, "required target is absent"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            declaration.mkdir()
+            with self.assertRaisesRegex(ValueError, "metadata drift"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            declaration.rmdir()
+            write_file(declaration, original, 0o644)
+            with mock.patch.object(
+                CONTROLLER, "_physical_ids",
+                return_value=(os.geteuid() + 1, os.getegid() + 1),
+            ):
+                with self.assertRaisesRegex(ValueError, "parent chain is unsafe"):
+                    driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            with (
+                mock.patch.object(CONTROLLER, "_verify_tmpfiles_parent_chain"),
+                mock.patch.object(
+                    CONTROLLER, "_physical_ids",
+                    return_value=(os.geteuid() + 1, os.getegid() + 1),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "metadata drift"):
+                    driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            hardlink = declaration.with_name("hardlink.conf")
+            os.link(declaration, hardlink)
+            with self.assertRaisesRegex(ValueError, "metadata drift"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            hardlink.unlink()
+            declaration.unlink()
+            declaration.symlink_to("missing.conf")
+            with self.assertRaises(OSError):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            declaration.unlink()
+            write_file(declaration, original, 0o644)
+            tmpfiles_parent = declaration.parent
+            tmpfiles_parent.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "parent chain is unsafe"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            tmpfiles_parent.chmod(0o755)
+            real_parent = tmpfiles_parent.with_name("tmpfiles.real")
+            tmpfiles_parent.rename(real_parent)
+            tmpfiles_parent.symlink_to(real_parent.name)
+            with self.assertRaises(OSError):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            tmpfiles_parent.unlink()
+            real_parent.rename(tmpfiles_parent)
+            (root / "var/lib/buzzci/runner").chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "directory differs"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 2)
+            (root / "var/lib/buzzci/runner").chmod(0o700)
+
+            def wrong_post(program: str, args: list[str], *, mutation: bool = False) -> subprocess.CompletedProcess[bytes]:
+                result = record(program, args, mutation=mutation)
+                declaration.write_bytes(b"post-command swap\n")
+                (root / "var/lib/buzzci/controld").chmod(0o755)
+                return result
+
+            driver._run = wrong_post
+            with self.assertRaisesRegex(ValueError, "content drift"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 3)
+            declaration.write_bytes(original)
+            (root / "var/lib/buzzci/controld").chmod(0o700)
+
+            def wrong_directory_post(program: str, args: list[str], *, mutation: bool = False) -> subprocess.CompletedProcess[bytes]:
+                result = record(program, args, mutation=mutation)
+                (root / "var/lib/buzzci/controld").chmod(0o755)
+                return result
+
+            driver._run = wrong_directory_post
+            with self.assertRaisesRegex(ValueError, "directory differs"):
+                driver.tmpfiles(self.fixture.identities, plan)
+            self.assertEqual(len(calls), 4)
+
+    def test_live_systemd_constructor_drives_tmpfiles_pre_and_post_readback(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "live systemd driver requires root /",
+        ):
+            CONTROLLER.LiveSystemd(Path("/tmp"))
+
+        driver = CONTROLLER.LiveSystemd(Path("/"))
+        self.assertEqual(driver.root, Path("/"))
+        plan = ({
+            "component": "runner",
+            "target": "/usr/lib/tmpfiles.d/buzzci-runner.conf",
+            "sha256": "1" * 64,
+            "mode": "0644",
+            "uid": 0,
+            "gid": 0,
+        },)
+        calls: list[tuple[str, list[str], bool]] = []
+
+        def record(
+            program: str, arguments: list[str], *, mutation: bool = False,
+        ) -> subprocess.CompletedProcess[bytes]:
+            calls.append((program, arguments, mutation))
+            return subprocess.CompletedProcess([program, *arguments], 0, b"", b"")
+
+        driver._run = record
+        with (
+            mock.patch.object(CONTROLLER, "_tmpfiles_config_readback") as config_readback,
+            mock.patch.object(
+                CONTROLLER, "_tmpfiles_directory_readback",
+                side_effect=({"pre": "exact"}, {"post": "exact"}),
+            ) as directory_readback,
+        ):
+            driver.tmpfiles(self.fixture.identities, plan)
+        self.assertEqual(
+            config_readback.call_args_list,
+            [mock.call(Path("/"), plan), mock.call(Path("/"), plan)],
+        )
+        self.assertEqual(
+            directory_readback.call_args_list,
+            [
+                mock.call(Path("/"), self.fixture.identities, allow_absent=True),
+                mock.call(Path("/"), self.fixture.identities, allow_absent=False),
+            ],
+        )
+        self.assertEqual(calls, [(
+            CONTROLLER.TMPFILES,
+            ["--create", "/usr/lib/tmpfiles.d/buzzci-runner.conf"],
+            True,
+        )])
+
+    def test_staged_zero_controld_does_not_activate_operational_sockets(self) -> None:
+        drop_in = (ACTIVATION_ROOT / "templates/20-controld-capacity-one.conf").read_text()
+        self.assertIn("Requires=buzz-ci-controld-acceptance.socket\n", drop_in)
+        requires = next(line for line in drop_in.splitlines() if line.startswith("Requires="))
+        self.assertNotIn("buzz-ci-keyholder.socket", requires)
+        self.assertNotIn("buzz-ci-runner.socket", requires)
+        read_only = next(line for line in drop_in.splitlines() if line.startswith("ReadOnlyPaths="))
+        self.assertIn("-/run/buzzci/keyholder.sock", read_only)
+        self.assertIn("-/run/buzzci/runner-control.sock", read_only)
+        base = (REPO_ROOT / "deploy/native-ci/controld/templates/buzz-ci-controld.service").read_text()
+        self.assertIn("-/run/buzzci/keyholder.sock", base)
+        self.assertIn("-/run/buzzci/runner-control.sock", base)
+
+        manifest, payloads, driver = self.fixture.load()
+        staged = CONTROLLER.stage(
+            manifest, payloads, self.fixture.root, driver, self.fixture.binding,
+        )
+        units = staged["staged_zero"]["units"]
+        self.assertEqual(units["buzz-ci-controld.service"]["ActiveState"], "active")
+        self.assertEqual(units["buzz-ci-keyholder.socket"]["ActiveState"], "inactive")
+        self.assertEqual(units["buzz-ci-keyholder.service"]["ActiveState"], "inactive")
+        self.assertEqual(units["buzz-ci-runner.socket"]["ActiveState"], "inactive")
+        self.assertEqual(units["buzz-ci-runner.service"]["ActiveState"], "inactive")
+        self.assertTrue(driver.socket_absent(manifest["socket_policy"]["keyholder"]))
+        self.assertTrue(driver.socket_absent(manifest["socket_policy"]["runner"]))
+        for relative in ("var/lib/buzzci/controld", "var/lib/buzzci/runner"):
+            target = self.fixture.root / relative
+            self.assertTrue(target.is_dir())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
 
     def test_keyholder_fd_name_and_execd_access_group_are_exact(self) -> None:
         manifest, payloads, driver = self.fixture.load()
