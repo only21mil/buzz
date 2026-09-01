@@ -408,6 +408,11 @@ class BoundaryTests(unittest.TestCase):
                 evidence = state / "evidence.bin"
                 self.assertTrue(evidence.is_file())
                 self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
+                (state / "progress.bin").write_bytes(b"".join((
+                    progress_frame("verifier", 0, "guest_started", "start", 1),
+                    progress_frame("verifier", 1, "verifier", "start", 2),
+                    progress_frame("verifier", 2, "complete", "complete", 3),
+                )))
                 return ["/usr/bin/true"]
 
             with mock.patch.object(harness, "qemu_command", side_effect=command):
@@ -675,6 +680,127 @@ class BoundaryTests(unittest.TestCase):
 
 
 class TimingAndProgressTests(unittest.TestCase):
+    def test_rc_zero_requires_one_timeout_free_terminal_progress_record(self) -> None:
+        evidence_value = {"schema_version": harness.FRAME_SCHEMA, "outcome": "pass"}
+        evidence_payload = harness.canonical(evidence_value)
+        evidence_frame = (
+            struct.pack(">I", len(evidence_payload))
+            + evidence_payload
+            + hashlib.sha256(evidence_payload).digest()
+        )
+        cases = {
+            "candidate": (
+                "candidate.qcow2", False, "read-write",
+                (
+                    ("missing", b"", "boot_cloud_init guest failure"),
+                    ("truncated", progress_frame("candidate", 0, "install", "start", 1)[:-1], "boot_cloud_init guest failure"),
+                    ("install-only", progress_frame("candidate", 0, "install", "start", 1), "install guest failure"),
+                    ("no-complete", b"".join((
+                        progress_frame("candidate", 0, "guest_started", "start", 1),
+                        progress_frame("candidate", 1, "install", "start", 2),
+                        progress_frame("candidate", 2, "cleanup", "start", 3),
+                    )), "cleanup guest failure"),
+                    ("timeout-then-complete", b"".join((
+                        progress_frame("candidate", 0, "canary", "start", 1),
+                        progress_frame("candidate", 1, "canary", "timeout", 2),
+                        progress_frame("candidate", 2, "cleanup", "start", 3),
+                        progress_frame("candidate", 3, "complete", "complete", 4),
+                    )), "canary inner timeout"),
+                    ("duplicate-complete", b"".join((
+                        progress_frame("candidate", 0, "complete", "complete", 1),
+                        progress_frame("candidate", 1, "complete", "complete", 2),
+                    )), "complete guest failure"),
+                ),
+            ),
+            "verifier": (
+                "verifier.qcow2", True, "read-only",
+                (
+                    ("missing", b"", "boot_cloud_init guest failure"),
+                    ("truncated", progress_frame("verifier", 0, "verifier", "start", 1)[:-1], "boot_cloud_init guest failure"),
+                    ("install-only", progress_frame("verifier", 0, "install", "start", 1), "install guest failure"),
+                    ("no-complete", b"".join((
+                        progress_frame("verifier", 0, "guest_started", "start", 1),
+                        progress_frame("verifier", 1, "verifier", "start", 2),
+                    )), "verifier guest failure"),
+                    ("timeout-then-complete", b"".join((
+                        progress_frame("verifier", 0, "verifier", "start", 1),
+                        progress_frame("verifier", 1, "verifier", "timeout", 2),
+                        progress_frame("verifier", 2, "complete", "complete", 3),
+                    )), "verifier inner timeout"),
+                    ("duplicate-complete", b"".join((
+                        progress_frame("verifier", 0, "complete", "complete", 1),
+                        progress_frame("verifier", 1, "complete", "complete", 2),
+                    )), "complete guest failure"),
+                ),
+            ),
+        }
+        for role, (overlay, evidence_expected, transfer, mutations) in cases.items():
+            for name, raw_progress, expected in mutations:
+                with self.subTest(role=role, mutation=name), tempfile.TemporaryDirectory() as temporary:
+                    state = Path(temporary)
+                    process = mock.Mock()
+                    process.poll.return_value = 0
+
+                    def spawn(*_args, **_kwargs):
+                        (state / "progress.bin").write_bytes(raw_progress)
+                        if evidence_expected:
+                            (state / "evidence.bin").write_bytes(evidence_frame)
+                        return process
+
+                    with mock.patch.object(harness.subprocess, "Popen", side_effect=spawn), mock.patch.object(
+                        harness, "reap_process_group",
+                    ), mock.patch.object(harness, "parse_frame", wraps=harness.parse_frame) as parse_frame:
+                        with self.assertRaisesRegex(harness.HarnessError, expected):
+                            harness.boot(
+                                state, harness.watchdog_seconds(role), overlay=overlay,
+                                evidence_expected=evidence_expected, transfer=transfer,
+                            )
+                    parse_frame.assert_not_called()
+
+    def test_rc_zero_with_exact_terminal_progress_preserves_each_boot_role(self) -> None:
+        evidence_value = {"schema_version": harness.FRAME_SCHEMA, "outcome": "pass"}
+        evidence_payload = harness.canonical(evidence_value)
+        evidence_frame = (
+            struct.pack(">I", len(evidence_payload))
+            + evidence_payload
+            + hashlib.sha256(evidence_payload).digest()
+        )
+        cases = (
+            ("ceremony", "ceremony.qcow2", True, None, ("guest_started", "ceremony")),
+            (
+                "candidate", "candidate.qcow2", False, "read-write",
+                (
+                    "guest_started", "install", "controller_check", "controller_stage",
+                    "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+                ),
+            ),
+            ("verifier", "verifier.qcow2", True, "read-only", ("guest_started", "verifier")),
+        )
+        for role, overlay, evidence_expected, transfer, phases in cases:
+            raw_progress = b"".join(
+                progress_frame(role, sequence, phase, "start", sequence + 1)
+                for sequence, phase in enumerate(phases)
+            ) + progress_frame(role, len(phases), "complete", "complete", len(phases) + 1)
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                process = mock.Mock()
+                process.poll.return_value = 0
+
+                def spawn(*_args, **_kwargs):
+                    (state / "progress.bin").write_bytes(raw_progress)
+                    if evidence_expected:
+                        (state / "evidence.bin").write_bytes(evidence_frame)
+                    return process
+
+                with mock.patch.object(harness.subprocess, "Popen", side_effect=spawn), mock.patch.object(
+                    harness, "reap_process_group",
+                ):
+                    result = harness.boot(
+                        state, harness.watchdog_seconds(role), overlay=overlay,
+                        evidence_expected=evidence_expected, transfer=transfer,
+                    )
+                self.assertEqual(result, evidence_value if evidence_expected else None)
+
     def test_timing_source_recursively_matches_actual_leaf_counts(self) -> None:
         harness.validate_timing_contract()
         timing = harness.TIMING_CONTRACT

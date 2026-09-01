@@ -34,10 +34,12 @@ The flow has two user-visible phases and three isolated boots:
    zero, strict installed verification, and rollback. It can write only a
    digest-framed pending record to the fixed-capacity raw transfer device.
    A second virtio-serial port carries only digest-framed progress records with
-   a fixed boot, phase, event, sequence, and elapsed-millisecond schema. This
-   stream is diagnostic and cannot make a run pass or fail. Missing, malformed,
-   stale, oversized, or truncated progress changes only the sanitized timeout
-   detail returned by the host.
+   a fixed boot, phase, event, sequence, and elapsed-millisecond schema. The
+   stream contains no guest output and cannot make a failed run pass. After a
+   zero QEMU exit, the host requires valid role-specific progress with exactly
+   one final `complete` record and no timeout record. Missing, malformed, stale,
+   oversized, truncated, or incomplete progress fails with sanitized phase
+   detail before evidence parsing or the next boot.
    The host kills and reaps the QEMU process group, proves it absent, and
    deletes the candidate overlay before continuing.
 4. A fresh verifier overlay over the same frozen ceremony image receives the

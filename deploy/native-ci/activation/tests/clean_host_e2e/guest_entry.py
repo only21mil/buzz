@@ -168,7 +168,7 @@ def open_progress_device() -> int:
 
 
 def emit_progress(phase: str, event: str = "start") -> None:
-    """Best-effort diagnostic signal. Acceptance never depends on this channel."""
+    """Emit a bounded diagnostic frame; the host requires terminal completion."""
     global _PROGRESS_SEQUENCE
     if _PROGRESS_BOOT is None:
         return

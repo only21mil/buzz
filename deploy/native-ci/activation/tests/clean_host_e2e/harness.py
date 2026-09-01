@@ -1006,6 +1006,25 @@ def progress_failure(boot_role: str, progress: dict[str, object], *, timed_out: 
     return HarnessError(f"{boot_role} {phase} {failure}; progress={canonical(detail).decode().strip()}")
 
 
+def progress_completed(progress: dict[str, object]) -> bool:
+    records = progress.get("records")
+    if progress.get("status") != "valid" or not isinstance(records, list) or not records:
+        return False
+    terminal = [
+        index for index, record in enumerate(records)
+        if isinstance(record, dict)
+        and record.get("phase") == "complete"
+        and record.get("event") == "complete"
+    ]
+    return (
+        terminal == [len(records) - 1]
+        and not any(
+            isinstance(record, dict) and record.get("event") == "timeout"
+            for record in records
+        )
+    )
+
+
 def boot(
     state: Path, timeout: int, *, overlay: str,
     evidence_expected: bool, transfer: str | None = None,
@@ -1057,6 +1076,8 @@ def boot(
     if timed_out:
         raise progress_failure(boot_role, progress, timed_out=True)
     if code != 0:
+        raise progress_failure(boot_role, progress, timed_out=False)
+    if not progress_completed(progress):
         raise progress_failure(boot_role, progress, timed_out=False)
     if not evidence_expected:
         if evidence.exists():
