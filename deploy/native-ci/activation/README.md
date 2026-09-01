@@ -446,8 +446,9 @@ deploy/native-ci/activation/controller.py activate --package /private/package
 deploy/native-ci/activation/controller.py rollback --package /private/package
 ```
 
-`activate` runs the closed production qualification and stops at
-`qualified_closed`. The acceptance canary then uses the fixed controller calls
+`activate` itself runs the closed production qualification and returns only
+after the host reaches `qualified_closed`. Do not run a separate `qualify`
+command before the acceptance sequence. The acceptance canary then uses the fixed controller calls
 above, exercises capacity one, and returns the host to proven capacity zero.
 Validate its pass receipt as described in
 [`../acceptance/README.md`](../acceptance/README.md). The approved keyholder then
@@ -481,6 +482,13 @@ not retry activation. Recover deterministically with the fixed package path:
 
 `qualify --package ...` remains a post-activation health probe. It is not the
 persistent cutover and requires `active_one`.
+
+After `persist-capacity-one` reports `persistent_active`, run the separately
+approved relay E2E canary exactly once. A failure does not authorize another
+relay E2E attempt or an edited acceptance receipt. Use the fixed installed
+controller rollback command above to close capacity and restore the prior
+state, then prove the host is at capacity zero through an independent readback.
+This is the approved return-to-zero path after a persistent active-one failure.
 
 The installed canary calls these fixed commands. Operators do not pass a
 package path to them:
