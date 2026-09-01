@@ -2394,7 +2394,8 @@ def create_run_stage(
     candidate_tar = stage / "candidate.tar"
     bounded([
         "/usr/bin/git", "-C", str(contract["candidate_root"]), "archive", "--format=tar",
-        f"--output={candidate_tar}", contract["candidate_sha"], "--", "deploy/native-ci",
+        "--prefix=deploy/native-ci/", f"--output={candidate_tar}",
+        f"{contract['candidate_sha']}:deploy/native-ci",
     ], timeout=60)
     candidate_tar.chmod(0o400)
     inputs = stage / "inputs"

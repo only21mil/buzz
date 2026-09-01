@@ -7,6 +7,7 @@ import base64
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -1282,6 +1284,85 @@ class InputTests(unittest.TestCase):
             for name in harness.GUEST_ASSETS:
                 self.assertEqual((stage / name).read_bytes(), ("frozen-" + name).encode())
             self.assertFalse((stage / "harness.py").exists())
+
+    def test_run_stage_archive_matches_guest_scope_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate"
+            candidate.mkdir()
+            subprocess.run(["/usr/bin/git", "init", "--quiet", str(candidate)], check=True)
+            source = candidate / "deploy/native-ci/probe.txt"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"candidate-bound\n")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(candidate), "add", "deploy/native-ci/probe.txt"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "/usr/bin/git", "-C", str(candidate),
+                    "-c", "user.name=Clean Host Test",
+                    "-c", "user.email=clean-host@example.invalid",
+                    "commit", "--quiet", "-m", "candidate",
+                ],
+                check=True,
+            )
+            candidate_sha = subprocess.run(
+                ["/usr/bin/git", "-C", str(candidate), "rev-parse", "HEAD^{commit}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            source.write_bytes(b"uncommitted\n")
+
+            state = root / "state"
+            state.mkdir()
+            (state / "state.json").write_bytes(harness.canonical({"challenge": "1" * 64}))
+            (state / "public-binding.json").write_bytes(b"{}\n")
+            frozen = state / "frozen-assets"
+            frozen.mkdir()
+            for name in harness.GUEST_ASSETS:
+                (frozen / name).write_bytes(("frozen-" + name).encode())
+            records = {}
+            for name in harness.PACKAGE_NAMES:
+                package = root / f"package-{name}"
+                package.mkdir()
+                (package / "payload").write_bytes(name.encode())
+                records[name] = harness.tree_records(package)
+            contract = {
+                "candidate_root": str(candidate),
+                "candidate_sha": candidate_sha,
+                "harness_sha256": "2" * 64,
+                "timing_asset_sha256": "3" * 64,
+                "timing_sha256": harness.timing_sha256(),
+                "scenario": {"sha256": hashlib.sha256(b"{}\n").hexdigest()},
+                "platform_systemd": copy.deepcopy(harness.PLATFORM_SYSTEMD),
+            }
+            archive = b""
+
+            def capture_archive(stage: Path, _output: Path, _label: str) -> None:
+                nonlocal archive
+                archive = (stage / "candidate.tar").read_bytes()
+
+            with mock.patch.object(harness, "make_iso", side_effect=capture_archive), mock.patch.object(
+                harness, "make_seed",
+            ):
+                harness.create_run_stage(contract, state, records, b"{}\n", b"seccomp\n")
+
+            extracted = root / "extracted"
+            guest.extract_candidate(archive, extracted)
+            self.assertEqual(
+                (extracted / "deploy/native-ci/probe.txt").read_bytes(),
+                b"candidate-bound\n",
+            )
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as handle:
+                self.assertEqual(handle.getmembers()[0].name, "deploy/native-ci")
+
+            hostile = io.BytesIO()
+            with tarfile.open(fileobj=hostile, mode="w:") as handle:
+                member = tarfile.TarInfo("outside.txt")
+                member.size = len(b"hostile\n")
+                handle.addfile(member, io.BytesIO(b"hostile\n"))
+            with self.assertRaisesRegex(guest.GuestError, "archive scope differs"):
+                guest.extract_candidate(hostile.getvalue(), root / "hostile")
 
     def test_tree_digest_rejects_links_and_binds_mode_name_and_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
