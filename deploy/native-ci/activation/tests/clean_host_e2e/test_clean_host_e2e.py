@@ -265,6 +265,39 @@ def nip98(secret: int, method: str, url: str, body: bytes, now: int) -> str:
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_qemu_boots_only_the_os_disk_before_the_transfer_disk(self) -> None:
+        for overlay, transfer in (
+            ("ceremony.qcow2", None),
+            ("candidate.qcow2", "read-write"),
+            ("verifier.qcow2", "read-only"),
+        ):
+            with self.subTest(overlay=overlay, transfer=transfer):
+                command = harness.qemu_command(
+                    Path("/private-state"), overlay=overlay,
+                    evidence=overlay != "candidate.qcow2", transfer=transfer,
+                )
+                qemu = command[command.index("--") + 1:]
+                os_drive = f"file=/work/{overlay},if=none,format=qcow2,cache=none,id=os"
+                os_index = qemu.index(os_drive)
+                self.assertEqual(qemu[os_index - 1:os_index + 3], [
+                    "-drive", os_drive,
+                    "-device", "virtio-blk-pci,drive=os,bootindex=1",
+                ])
+                self.assertEqual(
+                    [value for value in qemu if "bootindex=" in value],
+                    ["virtio-blk-pci,drive=os,bootindex=1"],
+                )
+                if transfer is not None:
+                    transfer_drive = (
+                        "file=/work/transfer.raw,if=none,format=raw,cache=none,id=transfer"
+                        + (",readonly=on" if transfer == "read-only" else "")
+                    )
+                    transfer_index = qemu.index(transfer_drive)
+                    self.assertEqual(qemu[transfer_index - 1:transfer_index + 3], [
+                        "-drive", transfer_drive,
+                        "-device", "virtio-blk-pci,drive=transfer,serial=buzzci-transfer",
+                    ])
+
     def test_qemu_boundary_has_no_container_network_or_host_share(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             command = harness.qemu_command(

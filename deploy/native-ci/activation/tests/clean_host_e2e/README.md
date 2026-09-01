@@ -9,7 +9,9 @@ a fixed 8 MiB raw transfer device. Bubblewrap mounts the prepared state
 read-only, then exposes only the current overlay, the candidate's transfer
 device, and the verifier's pre-created evidence destination as writable files.
 Only the trusted verifier boot receives the bounded virtio-serial evidence
-channel.
+channel. Every boot gives only the qcow2 operating-system disk a firmware boot
+index. The raw transfer disk remains data-only even when QEMU enumerates it
+before the operating-system disk.
 
 The flow has two user-visible phases and three isolated boots:
 
