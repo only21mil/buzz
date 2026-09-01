@@ -97,6 +97,7 @@ TRACKED_EXECUTABLES = (
 )
 
 SYSTEMD_SOURCE_PATHS = {
+    "/usr/lib/systemd/system/service.d/10-timeout-abort.conf": Path("deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf"),
     "/etc/systemd/system/buzz-ci-capacity-one.target": Path("deploy/native-ci/activation/templates/buzz-ci-capacity-one.target"),
     "/etc/systemd/system/buzz-ci-controld-acceptance.socket": Path("deploy/native-ci/controld/templates/buzz-ci-controld-acceptance.socket"),
     "/etc/systemd/system/buzz-ci-acceptance-control.socket": Path("deploy/native-ci/activation/templates/buzz-ci-acceptance-control.socket"),
@@ -433,7 +434,11 @@ def freeze_package(
             source_path = SYSTEMD_SOURCE_PATHS.get(record["path"])
             if source_path is None:
                 raise ValueError(f"effective systemd source is unknown: {record['path']}")
-            revision = source_commit if record["owner"] == "activation" else component_commits[record["owner"]]
+            revision = (
+                source_commit
+                if record["owner"] in {"activation", "platform"}
+                else component_commits[record["owner"]]
+            )
             if activation_package.digest(_git_blob(source_root, revision, source_path)) != record["sha256"]:
                 raise ValueError(f"effective systemd source digest differs: {record['path']}")
 
