@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import importlib.util
@@ -703,6 +704,240 @@ class BoundaryTests(unittest.TestCase):
 
 
 class TimingAndProgressTests(unittest.TestCase):
+    INSTALL_CHECKPOINTS = (
+        "relay_ready", "preinstall_units_clean", "package_units_validated",
+        "principals_created", "seccomp_ready", "runner_installed",
+        "controld_installed", "keyholder_installed", "execd_installed",
+        "installed_units_verified",
+    )
+
+    def run_mocked_acceptance(
+        self, *, fail_at: str | None = None, cleanup_errors: tuple[str, ...] = (),
+    ) -> tuple[list[tuple[str, str]], BaseException | None]:
+        events: list[tuple[str, str]] = []
+        descriptor = {
+            "schema_version": guest.STAGE_SCHEMA,
+            "candidate_sha": "a" * 40,
+            "harness_sha256": "b" * 64,
+            "timing_asset_sha256": "c" * 64,
+            "timing_sha256": "d" * 64,
+            "candidate_tar_sha256": "e" * 64,
+            "scenario_sha256": "f" * 64,
+            "seccomp_source_sha256": guest.SECCOMP_SHA256,
+            "public_binding_sha256": "1" * 64,
+            "package_tree_sha256": {name: "2" * 64 for name in guest.PACKAGE_NAMES},
+            "platform_systemd": copy.deepcopy(guest.PLATFORM_SYSTEMD),
+        }
+        phase = {
+            "challenge": "3" * 64,
+            "descriptor_sha256": hashlib.sha256(guest.canonical(descriptor)).hexdigest(),
+            "timing_sha256": descriptor["timing_sha256"],
+        }
+        expected_units = {
+            unit: {"fragment_path": f"/usr/lib/systemd/system/{unit}", "sha256": "4" * 64}
+            for unit in guest.UNITS
+        }
+
+        def completed(name: str, value=None):
+            if fail_at == name:
+                raise guest.GuestError("injected boundary failure")
+            return value
+
+        def command(argv, **_keywords):
+            for component in ("runner", "controld", "keyholder", "execd"):
+                if f"/{component}/install.py" in str(argv[1]) and fail_at == f"{component}_installed":
+                    raise guest.GuestError("injected boundary failure")
+            return subprocess.CompletedProcess(argv, 0, b"verifier", b"")
+
+        unit_inventory_calls = 0
+
+        def expected_unit_fragments(_inputs, _names):
+            nonlocal unit_inventory_calls
+            unit_inventory_calls += 1
+            if fail_at == "package_units_validated":
+                raise guest.GuestError("injected boundary failure")
+            return expected_units if unit_inventory_calls == 1 else {}
+
+        def cleanup(_candidate, _activation, attempted_stage, _hosts_added):
+            if attempted_stage:
+                guest.emit_progress("rollback")
+            guest.emit_progress("cleanup")
+            return list(cleanup_errors)
+
+        error: BaseException | None = None
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            root = Path(temporary)
+            state = root / "state"
+            stage = root / "stage"
+            state.mkdir()
+            stage.mkdir()
+            candidate = root / "candidate"
+            stack.enter_context(mock.patch.object(guest, "STATE_ROOT", state))
+            stack.enter_context(mock.patch.object(guest, "load_json", return_value=descriptor))
+            stack.enter_context(mock.patch.object(
+                guest, "cross_bind", return_value=(candidate, {}, {}),
+            ))
+            stack.enter_context(mock.patch.object(guest, "relay_mapping_present", return_value=False))
+            stack.enter_context(mock.patch.object(
+                guest, "start_relay", side_effect=lambda _public: completed("relay_ready"),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "unit_state", side_effect=lambda: completed(
+                    "preinstall_units_clean",
+                    {unit: {"LoadState": "not-found"} for unit in guest.UNITS},
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "expected_unit_fragments", side_effect=expected_unit_fragments,
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "create_principals",
+                side_effect=lambda _package: completed("principals_created"),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "provision_seccomp",
+                side_effect=lambda _source: completed("seccomp_ready"),
+            ))
+            stack.enter_context(mock.patch.object(guest, "command", side_effect=command))
+            stack.enter_context(mock.patch.object(guest, "tree_state", return_value={}))
+            stack.enter_context(mock.patch.object(
+                guest, "prove_installed_units",
+                side_effect=lambda _expected: completed("installed_units_verified", expected_units),
+            ))
+            stack.enter_context(mock.patch.object(guest, "run_capacity_one_canary", return_value=b"receipt"))
+            stack.enter_context(mock.patch.object(guest, "read_file", return_value=b"scenario"))
+            stack.enter_context(mock.patch.object(guest, "parse_verdict"))
+            stack.enter_context(mock.patch.object(guest, "cleanup", side_effect=cleanup))
+            stack.enter_context(mock.patch.object(guest, "dormant_proof", return_value={"proof": True}))
+            stack.enter_context(mock.patch.object(guest, "write_transfer"))
+            stack.enter_context(mock.patch.object(
+                guest, "emit_progress", side_effect=lambda name, event="start": events.append((name, event)),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "begin_phase", side_effect=lambda name, **_keywords: guest.emit_progress(name),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "complete_progress", side_effect=lambda: guest.emit_progress("complete", "complete"),
+            ))
+            stack.enter_context(mock.patch.object(guest, "abandon_command_inventory"))
+            try:
+                guest.run_acceptance(phase, stage)
+            except BaseException as caught:
+                error = caught
+        return events, error
+
+    def test_candidate_checkpoint_contract_is_shared_role_scoped_and_ordered(self) -> None:
+        self.assertEqual(guest.PROGRESS_PHASES, harness.PROGRESS_PHASES)
+        phases = (
+            "guest_started", "install", *self.INSTALL_CHECKPOINTS,
+            "controller_check", "controller_stage", "controller_activate", "canary",
+            "receipt_verifier", "rollback", "cleanup", "cleanup_return",
+        )
+        raw = b"".join(
+            progress_frame("candidate", sequence, phase, "start", sequence + 1)
+            for sequence, phase in enumerate(phases)
+        ) + progress_frame("candidate", len(phases), "complete", "complete", len(phases) + 1)
+        parsed = harness.parse_progress(raw, "candidate")
+        self.assertEqual(parsed["status"], "valid")
+        self.assertTrue(harness.progress_completed(parsed))
+
+        for role in ("ceremony", "verifier"):
+            hostile = progress_frame(role, 0, "relay_ready", "start", 1)
+            self.assertEqual(harness.parse_progress(hostile, role)["reason"], "boot-phase")
+        backward = progress_frame("candidate", 0, "seccomp_ready", "start", 1) + progress_frame(
+            "candidate", 1, "principals_created", "start", 2,
+        )
+        self.assertEqual(harness.parse_progress(backward, "candidate")["reason"], "order")
+        stale_timeout = progress_frame("candidate", 0, "seccomp_ready", "start", 1) + progress_frame(
+            "candidate", 1, "principals_created", "timeout", 2,
+        )
+        self.assertEqual(harness.parse_progress(stale_timeout, "candidate")["reason"], "order")
+        no_terminal = harness.parse_progress(raw.rsplit(progress_frame(
+            "candidate", len(phases), "complete", "complete", len(phases) + 1,
+        ), 1)[0], "candidate")
+        self.assertFalse(harness.progress_completed(no_terminal))
+
+    def test_guest_checkpoint_emitter_rejects_unknown_and_backward_phases(self) -> None:
+        original = (
+            guest._PROGRESS_BOOT, guest._PROGRESS_LAST_PHASE, guest._ACTIVE_PHASE,
+        )
+        try:
+            guest._PROGRESS_BOOT = "candidate"
+            guest._PROGRESS_LAST_PHASE = "seccomp_ready"
+            guest._ACTIVE_PHASE = "install"
+            with self.assertRaisesRegex(guest.GuestError, "progress order differs"):
+                guest.emit_progress("caller-controlled")
+            with self.assertRaisesRegex(guest.GuestError, "progress order differs"):
+                guest.emit_progress("principals_created")
+            with mock.patch.object(guest, "emit_progress") as emitted:
+                guest.emit_timeout_progress()
+            emitted.assert_called_once_with("seccomp_ready", "timeout")
+        finally:
+            guest._PROGRESS_BOOT, guest._PROGRESS_LAST_PHASE, guest._ACTIVE_PHASE = original
+
+    def test_run_acceptance_checkpoints_follow_completed_boundaries(self) -> None:
+        events, error = self.run_mocked_acceptance()
+        self.assertIsNone(error)
+        self.assertEqual(
+            [name for name, _event in events],
+            [
+                "install", *self.INSTALL_CHECKPOINTS, "controller_check", "controller_stage",
+                "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+                "cleanup_return", "complete",
+            ],
+        )
+
+        previous = "install"
+        for checkpoint in self.INSTALL_CHECKPOINTS:
+            with self.subTest(checkpoint=checkpoint):
+                events, error = self.run_mocked_acceptance(fail_at=checkpoint)
+                names = [name for name, _event in events]
+                self.assertIsInstance(error, guest.GuestError)
+                self.assertNotIn(checkpoint, names)
+                self.assertIn(previous, names)
+                self.assertEqual(names[-2:], ["cleanup", "cleanup_return"])
+                raw = b"".join(
+                    progress_frame("candidate", sequence, name, event, sequence + 1)
+                    for sequence, (name, event) in enumerate(events)
+                )
+                parsed = harness.parse_progress(raw, "candidate")
+                self.assertEqual(parsed["status"], "valid")
+                failure = harness.progress_failure("candidate", parsed, timed_out=False)
+                self.assertIn(f"candidate {previous} guest failure", str(failure))
+                self.assertIn('"cleanup_returned":true', str(failure))
+                self.assertNotIn("injected boundary failure", str(failure))
+            previous = checkpoint
+
+    def test_cleanup_return_requires_successful_cleanup(self) -> None:
+        events, error = self.run_mocked_acceptance(cleanup_errors=("cleanup failed",))
+        self.assertIsInstance(error, guest.GuestError)
+        names = [name for name, _event in events]
+        self.assertEqual(names[-1], "cleanup")
+        self.assertNotIn("cleanup_return", names)
+        self.assertNotIn("complete", names)
+
+    def test_cleanup_enters_rollback_then_cleanup_without_filesystem_access(self) -> None:
+        events: list[str] = []
+        completed = subprocess.CompletedProcess(["mocked"], 0, b"", b"")
+        with mock.patch.object(
+            guest, "begin_phase", side_effect=events.append,
+        ), mock.patch.object(
+            guest, "command", return_value=completed,
+        ), mock.patch.object(
+            guest.shutil, "rmtree",
+        ), mock.patch.object(
+            Path, "is_file", return_value=False,
+        ), mock.patch.object(
+            Path, "exists", return_value=False,
+        ), mock.patch.object(
+            Path, "unlink", side_effect=FileNotFoundError,
+        ):
+            errors = guest.cleanup(
+                Path("/not-accessed/candidate"), Path("/not-accessed/activation"), True, False,
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(events, ["rollback", "cleanup"])
+
     def test_rc_zero_requires_one_timeout_free_terminal_progress_record(self) -> None:
         evidence_value = {"schema_version": harness.FRAME_SCHEMA, "outcome": "pass"}
         evidence_payload = harness.canonical(evidence_value)
@@ -793,8 +1028,9 @@ class TimingAndProgressTests(unittest.TestCase):
             (
                 "candidate", "candidate.qcow2", False, "read-write",
                 (
-                    "guest_started", "install", "controller_check", "controller_stage",
-                    "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+                    "guest_started", "install", *self.INSTALL_CHECKPOINTS,
+                    "controller_check", "controller_stage", "controller_activate", "canary",
+                    "receipt_verifier", "rollback", "cleanup", "cleanup_return",
                 ),
             ),
             ("verifier", "verifier.qcow2", True, "read-only", ("guest_started", "verifier")),
@@ -1112,7 +1348,8 @@ class TimingAndProgressTests(unittest.TestCase):
         )
         self.assertIn("verifier boot_cloud_init watchdog timeout", str(missing))
         for phase in (
-            "install", "controller_stage", "canary", "receipt_verifier", "rollback", "cleanup",
+            "install", *self.INSTALL_CHECKPOINTS, "controller_stage", "canary",
+            "receipt_verifier", "rollback", "cleanup", "cleanup_return",
         ):
             raw = progress_frame("candidate", 0, phase, "start", 1) + progress_frame(
                 "candidate", 1, phase, "timeout", 2,

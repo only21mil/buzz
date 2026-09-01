@@ -40,9 +40,12 @@ TRANSFER_SIZE = 8 * 1024 * 1024
 TIMING_PATH = Path(__file__).with_name("timing-contract.json")
 TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
 PROGRESS_PHASES = (
-    "boot_cloud_init", "guest_started", "ceremony", "install", "controller_check",
-    "controller_stage", "controller_activate", "canary", "receipt_verifier",
-    "rollback", "cleanup", "verifier", "complete",
+    "boot_cloud_init", "guest_started", "ceremony", "install", "relay_ready",
+    "preinstall_units_clean", "package_units_validated", "principals_created",
+    "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
+    "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+    "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+    "cleanup_return", "verifier", "complete",
 )
 PROGRESS_EVENTS = ("start", "timeout", "complete")
 PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
@@ -959,9 +962,12 @@ def parse_progress(raw: bytes, boot_role: str) -> dict[str, object]:
     allowed = {
         "ceremony": {"boot_cloud_init", "guest_started", "ceremony", "complete"},
         "candidate": {
-            "boot_cloud_init", "guest_started", "install", "controller_check", "controller_stage",
-            "controller_activate", "canary", "receipt_verifier", "rollback",
-            "cleanup", "complete",
+            "boot_cloud_init", "guest_started", "install", "relay_ready",
+            "preinstall_units_clean", "package_units_validated", "principals_created",
+            "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
+            "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+            "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+            "cleanup_return", "complete",
         },
         "verifier": {"boot_cloud_init", "guest_started", "verifier", "complete"},
     }
@@ -990,7 +996,12 @@ def progress_failure(boot_role: str, progress: dict[str, object], *, timed_out: 
         None,
     )
     latest = safe_records[-1] if safe_records and isinstance(safe_records[-1], dict) else None
-    phase = str((timeout_record or latest or {}).get("phase", "boot_cloud_init"))
+    cleanup_returned = latest is not None and latest.get("phase") == "cleanup_return"
+    prior = next((
+        record for record in reversed(safe_records[:-1])
+        if isinstance(record, dict) and record.get("phase") not in {"rollback", "cleanup"}
+    ), None) if cleanup_returned else None
+    phase = str((timeout_record or prior or latest or {}).get("phase", "boot_cloud_init"))
     if phase == "guest_started":
         phase = "boot_cloud_init"
     detail = {
@@ -1000,6 +1011,8 @@ def progress_failure(boot_role: str, progress: dict[str, object], *, timed_out: 
         "last_sequence": latest.get("sequence") if latest else None,
         "last_elapsed_ms": latest.get("elapsed_ms") if latest else None,
     }
+    if cleanup_returned:
+        detail["cleanup_returned"] = True
     if progress.get("status") == "invalid":
         detail["reason"] = progress.get("reason", "invalid")
     failure = "watchdog timeout" if timed_out else "inner timeout" if timeout_record is not None else "guest failure"

@@ -40,6 +40,15 @@ The flow has two user-visible phases and three isolated boots:
    one final `complete` record and no timeout record. Missing, malformed, stale,
    oversized, truncated, or incomplete progress fails with sanitized phase
    detail before evidence parsing or the next boot.
+   Candidate install progress advances only after these completed boundaries:
+   `relay_ready`, `preinstall_units_clean`, `package_units_validated`,
+   `principals_created`, `seccomp_ready`, `runner_installed`,
+   `controld_installed`, `keyholder_installed`, `execd_installed`, and
+   `installed_units_verified`. Controller phases follow in execution order.
+   A failure may jump forward to `rollback` or `cleanup`. `cleanup_return`
+   appears only after cleanup and its dormant-state check return without an
+   error. On failure, the host reports the last completed operational phase
+   and separately records that cleanup returned, without guest exception text.
    The host kills and reaps the QEMU process group, proves it absent, and
    deletes the candidate overlay before continuing.
 4. A fresh verifier overlay over the same frozen ceremony image receives the

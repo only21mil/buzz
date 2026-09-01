@@ -88,9 +88,20 @@ CA_BACKENDS = (
 )
 TIMING_PATH = Path(__file__).with_name("timing-contract.json")
 TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
+PROGRESS_PHASES = (
+    "boot_cloud_init", "guest_started", "ceremony", "install", "relay_ready",
+    "preinstall_units_clean", "package_units_validated", "principals_created",
+    "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
+    "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+    "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+    "cleanup_return", "verifier", "complete",
+)
+PROGRESS_EVENTS = ("start", "timeout", "complete")
+PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
 _PROGRESS_BOOT: str | None = None
 _PROGRESS_SEQUENCE = 0
 _PROGRESS_STARTED = 0.0
+_PROGRESS_LAST_PHASE: str | None = None
 _ACTIVE_PHASE: str | None = None
 _PHASE_DEADLINE: float | None = None
 _OBSERVED_COMMAND_TERMS: dict[str, int] = {}
@@ -169,9 +180,20 @@ def open_progress_device() -> int:
 
 def emit_progress(phase: str, event: str = "start") -> None:
     """Emit a bounded diagnostic frame; the host requires terminal completion."""
-    global _PROGRESS_SEQUENCE
+    global _PROGRESS_LAST_PHASE, _PROGRESS_SEQUENCE
     if _PROGRESS_BOOT is None:
         return
+    order = PROGRESS_ORDER.get(phase)
+    last_order = PROGRESS_ORDER.get(_PROGRESS_LAST_PHASE, -1)
+    if (
+        order is None
+        or event not in PROGRESS_EVENTS
+        or order < last_order
+        or event == "timeout" and order != last_order
+        or event == "complete" and phase != "complete"
+        or phase == "complete" and event != "complete"
+    ):
+        raise GuestError("guest progress order differs")
     value = {
         "schema_version": PROGRESS_SCHEMA,
         "boot": _PROGRESS_BOOT,
@@ -198,6 +220,15 @@ def emit_progress(phase: str, event: str = "start") -> None:
     except BaseException:
         return
     _PROGRESS_SEQUENCE += 1
+    _PROGRESS_LAST_PHASE = phase
+
+
+def emit_timeout_progress() -> None:
+    phase = _PROGRESS_LAST_PHASE
+    if phase is None or _ACTIVE_PHASE is not None and PROGRESS_ORDER[_ACTIVE_PHASE] > PROGRESS_ORDER[phase]:
+        phase = _ACTIVE_PHASE
+    if phase is not None:
+        emit_progress(phase, "timeout")
 
 
 def verify_command_inventory() -> None:
@@ -359,7 +390,7 @@ def command(
     guest_reap = timing_leaf("guest_command_reap")
     if phase_deadline is not None and time.monotonic() >= phase_deadline - guest_reap:
         if _ACTIVE_PHASE is not None:
-            emit_progress(_ACTIVE_PHASE, "timeout")
+            emit_timeout_progress()
         raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
     with (
         tempfile.TemporaryFile(dir=SCRATCH_ROOT) as input_file,
@@ -386,7 +417,7 @@ def command(
                     raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
                 if time.monotonic() >= deadline:
                     if _ACTIVE_PHASE is not None:
-                        emit_progress(_ACTIVE_PHASE, "timeout")
+                        emit_timeout_progress()
                     raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
                 time.sleep(0.01)
             stdout.seek(0)
@@ -1089,8 +1120,11 @@ def create_principals(activation: Path) -> None:
 def install_components(candidate: Path, inputs: Path) -> None:
     for name in ("runner", "controld"):
         command(["python3", str(candidate / f"deploy/native-ci/{name}/install.py"), "install", "--package", str(inputs / name)])
+        emit_progress(f"{name}_installed")
     command(["python3", str(candidate / "deploy/native-ci/keyholder/install.py"), "install", "--package", str(inputs / "keyholder")])
+    emit_progress("keyholder_installed")
     command(["python3", str(candidate / "deploy/native-ci/execd/install.py"), "install", "--package", str(inputs / "execd")])
+    emit_progress("execd_installed")
     command(["systemctl", "daemon-reload"])
 
 
@@ -1385,9 +1419,11 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     try:
         hosts_added = not relay_mapping_present()
         start_relay(public)
+        emit_progress("relay_ready")
         preinstall_units = unit_state()
         if any(state["LoadState"] != "not-found" for state in preinstall_units.values()):
             raise GuestError("clean host already contains a package-owned unit")
+        emit_progress("preinstall_units_clean")
         component_units = expected_unit_fragments(inputs, ("runner", "controld", "keyholder", "execd"))
         activation_units = expected_unit_fragments(inputs, ("activation",))
         expected_units = dict(component_units)
@@ -1397,11 +1433,15 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             expected_units[unit] = binding
         if set(expected_units) != set(UNITS):
             raise GuestError("package systemd unit set differs")
+        emit_progress("package_units_validated")
         create_principals(activation_package)
+        emit_progress("principals_created")
         provision_seccomp(inputs / "seccomp.json")
+        emit_progress("seccomp_ready")
         install_components(candidate, inputs)
         configs = tree_state(Path("/etc/buzzci"))
         units = prove_installed_units(component_units)
+        emit_progress("installed_units_verified")
         controller = candidate / "deploy/native-ci/activation/controller.py"
         begin_phase("controller_check")
         command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=timing_leaf("controller_check"), timing_terms={"controller_check": 1})
@@ -1438,6 +1478,8 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             path.unlink()
         except FileNotFoundError:
             pass
+    if not cleanup_errors:
+        emit_progress("cleanup_return")
     if primary is not None or cleanup_errors or receipt_raw is None or verifier_raw is None or proof is None:
         message = str(primary) if primary is not None else "acceptance evidence incomplete"
         if cleanup_errors:
@@ -1546,7 +1588,7 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
 
 
 def main(argv: list[str]) -> int:
-    global _PROGRESS_BOOT, _PROGRESS_SEQUENCE, _PROGRESS_STARTED
+    global _PROGRESS_BOOT, _PROGRESS_LAST_PHASE, _PROGRESS_SEQUENCE, _PROGRESS_STARTED
     if len(argv) != 1:
         return 2
     try:
@@ -1562,6 +1604,7 @@ def main(argv: list[str]) -> int:
             raise GuestError("guest phase differs")
         _PROGRESS_SEQUENCE = 0
         _PROGRESS_STARTED = time.monotonic()
+        _PROGRESS_LAST_PHASE = None
         begin_phase("boot_cloud_init", emit_event=False)
         require_guest()
         disable_swap()
