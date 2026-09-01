@@ -40,11 +40,25 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 VIRTIO_PORT_TARGET = re.compile(r"^\.\./(vport[0-9]+p[0-9]+)$")
 MAX_JSON = 1024 * 1024
 MAX_COMMAND = 4 * 1024 * 1024
+STAGE_PROGRESS_MAX = 128
+STAGE_PROGRESS_MAGIC = b"BSP\x01"
 MAX_TREE_FILES = 1024
 MAX_TREE_BYTES = 64 * 1024 * 1024
 TRANSFER_SIZE = 8 * 1024 * 1024
 TRANSFER_MAGIC = b"BUZZCI-EVIDENCE\0"
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
+PLATFORM_SYSTEMD_SOURCE = Path(
+    "deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf"
+)
 SCRATCH_ROOT = Path("/run")
 SWAPS_PATH = Path("/proc/swaps")
 UNITS = (
@@ -55,6 +69,29 @@ UNITS = (
     "buzz-ci-executor.service", "buzz-ci-executor.socket",
     "buzz-ci-keyholder.service", "buzz-ci-keyholder.socket",
 )
+STAGE_STOP_ORDER = (
+    "buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service",
+    "buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service",
+    "buzz-ci-runner.service", "buzz-ci-runner.socket", "buzz-ci-execd.service",
+    "buzz-ci-execd.socket", "buzz-ci-executor.service", "buzz-ci-executor.socket",
+    "buzz-ci-keyholder.service", "buzz-ci-keyholder.socket",
+)
+STAGE_ZERO_UNITS = STAGE_STOP_ORDER[:4]
+STAGE_PROGRESS_SUBPHASES = (
+    "package_load", "live_driver", "scenario_binding", "generated_plan", "tmpfiles_plan",
+    "receipt_read", "preflight", "fixed_package_install", "fixed_package_verify",
+    "new_receipt_capture", "recovery_targets_install", "preparing_receipt_write",
+    "staged_apply", "sysusers", "tmpfiles", "generated_apply", "daemon_reload",
+    "installed_unit_readback", "persistent_target_disable",
+    *(f"stop:{unit}" for unit in STAGE_STOP_ORDER),
+    "persistent_target_stop", "zero_readback", "captured_ledger_removal",
+    "identity_readback", "access_group_readback", "managed_target_readback",
+    "generated_readback", "staged_receipt_write",
+    *(f"start:{unit}" for unit in STAGE_ZERO_UNITS),
+    "staged_zero_readback", "rollback_retirement_completion", "stage_complete",
+)
+if len(STAGE_PROGRESS_SUBPHASES) != 46:
+    raise RuntimeError("stage progress operation inventory differs")
 SOCKETS = (
     "/run/buzzci/acceptance-control.sock", "/run/buzzci/controld-acceptance.sock",
     "/run/buzzci/runner-control.sock", "/run/buzzci/execd.sock",
@@ -76,9 +113,23 @@ CA_BACKENDS = (
 )
 TIMING_PATH = Path(__file__).with_name("timing-contract.json")
 TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
+PROGRESS_PHASES = (
+    "boot_cloud_init", "guest_started", "ceremony", "install", "relay_ready",
+    "preinstall_units_clean", "package_units_validated", "principals_created",
+    "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
+    "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+    *(f"controller_stage:{name}" for name in STAGE_PROGRESS_SUBPHASES),
+    "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+    "cleanup_return", "verifier", "complete",
+)
+PROGRESS_EVENTS = ("start", "timeout", "complete")
+PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
+for _stage_subphase in STAGE_PROGRESS_SUBPHASES:
+    PROGRESS_ORDER[f"controller_stage:{_stage_subphase}"] = PROGRESS_ORDER["controller_stage"]
 _PROGRESS_BOOT: str | None = None
 _PROGRESS_SEQUENCE = 0
 _PROGRESS_STARTED = 0.0
+_PROGRESS_LAST_PHASE: str | None = None
 _ACTIVE_PHASE: str | None = None
 _PHASE_DEADLINE: float | None = None
 _OBSERVED_COMMAND_TERMS: dict[str, int] = {}
@@ -156,10 +207,21 @@ def open_progress_device() -> int:
 
 
 def emit_progress(phase: str, event: str = "start") -> None:
-    """Best-effort diagnostic signal. Acceptance never depends on this channel."""
-    global _PROGRESS_SEQUENCE
+    """Emit a bounded diagnostic frame; the host requires terminal completion."""
+    global _PROGRESS_LAST_PHASE, _PROGRESS_SEQUENCE
     if _PROGRESS_BOOT is None:
         return
+    order = PROGRESS_ORDER.get(phase)
+    last_order = PROGRESS_ORDER.get(_PROGRESS_LAST_PHASE, -1)
+    if (
+        order is None
+        or event not in PROGRESS_EVENTS
+        or order < last_order
+        or event == "timeout" and order != last_order
+        or event == "complete" and phase != "complete"
+        or phase == "complete" and event != "complete"
+    ):
+        raise GuestError("guest progress order differs")
     value = {
         "schema_version": PROGRESS_SCHEMA,
         "boot": _PROGRESS_BOOT,
@@ -186,6 +248,15 @@ def emit_progress(phase: str, event: str = "start") -> None:
     except BaseException:
         return
     _PROGRESS_SEQUENCE += 1
+    _PROGRESS_LAST_PHASE = phase
+
+
+def emit_timeout_progress() -> None:
+    phase = _PROGRESS_LAST_PHASE
+    if phase is None or _ACTIVE_PHASE is not None and PROGRESS_ORDER[_ACTIVE_PHASE] > PROGRESS_ORDER[phase]:
+        phase = _ACTIVE_PHASE
+    if phase is not None:
+        emit_progress(phase, "timeout")
 
 
 def verify_command_inventory() -> None:
@@ -347,7 +418,7 @@ def command(
     guest_reap = timing_leaf("guest_command_reap")
     if phase_deadline is not None and time.monotonic() >= phase_deadline - guest_reap:
         if _ACTIVE_PHASE is not None:
-            emit_progress(_ACTIVE_PHASE, "timeout")
+            emit_timeout_progress()
         raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
     with (
         tempfile.TemporaryFile(dir=SCRATCH_ROOT) as input_file,
@@ -374,7 +445,7 @@ def command(
                     raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
                 if time.monotonic() >= deadline:
                     if _ACTIVE_PHASE is not None:
-                        emit_progress(_ACTIVE_PHASE, "timeout")
+                        emit_timeout_progress()
                     raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
                 time.sleep(0.01)
             stdout.seek(0)
@@ -386,6 +457,104 @@ def command(
         raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
     if result.returncode != 0 and not allow_failure:
         raise GuestError(f"guest command failed: {Path(argv[0]).name}")
+    return result
+
+
+def parse_stage_progress(raw: bytes, *, require_complete: bool) -> str | None:
+    if len(raw) > STAGE_PROGRESS_MAX or not raw.startswith(STAGE_PROGRESS_MAGIC):
+        return None
+    body = raw[len(STAGE_PROGRESS_MAGIC):]
+    if len(body) % 2 != 0:
+        return None
+    last = 0
+    for offset in range(0, len(body), 2):
+        ordinal, complement = body[offset], body[offset + 1]
+        if ordinal != last + 1 or complement != ordinal ^ 0xFF or ordinal > len(STAGE_PROGRESS_SUBPHASES):
+            return None
+        last = ordinal
+    if require_complete and last != len(STAGE_PROGRESS_SUBPHASES):
+        return None
+    return STAGE_PROGRESS_SUBPHASES[last - 1] if last else ""
+
+
+def stage_command(argv: list[str], *, timeout: int) -> subprocess.CompletedProcess[bytes]:
+    record_command_timing({"controller_stage": 1})
+    phase_deadline = _PHASE_DEADLINE
+    guest_reap = timing_leaf("guest_command_reap")
+    read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    process: subprocess.Popen[bytes] | None = None
+    failure: str | None = None
+    result: subprocess.CompletedProcess[bytes] | None = None
+    progress = bytearray()
+    try:
+        with (
+            tempfile.TemporaryFile(dir=SCRATCH_ROOT) as stdout,
+            tempfile.TemporaryFile(dir=SCRATCH_ROOT) as stderr,
+        ):
+            process = subprocess.Popen(
+                [*argv, "--stage-progress-fd", str(write_descriptor)],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+                env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+                pass_fds=(write_descriptor,),
+            )
+            os.close(write_descriptor)
+            write_descriptor = -1
+            deadline = time.monotonic() + timeout
+            if phase_deadline is not None:
+                deadline = min(deadline, phase_deadline - guest_reap)
+            while process.poll() is None:
+                if stdout.tell() > MAX_COMMAND or stderr.tell() > MAX_COMMAND:
+                    failure = "guest command output exceeded bound"
+                    break
+                if time.monotonic() >= deadline:
+                    failure = "guest command timed out"
+                    break
+                time.sleep(0.01)
+            reap_process_group(process, wait_seconds=guest_reap)
+            stdout.seek(0)
+            stderr.seek(0)
+            result = subprocess.CompletedProcess(
+                argv,
+                process.returncode,
+                stdout.read(MAX_COMMAND + 1),
+                stderr.read(MAX_COMMAND + 1),
+            )
+        while len(progress) <= STAGE_PROGRESS_MAX:
+            try:
+                chunk = os.read(read_descriptor, STAGE_PROGRESS_MAX + 1 - len(progress))
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            progress.extend(chunk)
+    finally:
+        try:
+            if write_descriptor >= 0:
+                os.close(write_descriptor)
+            if process is not None and process.poll() is None:
+                reap_process_group(process, wait_seconds=guest_reap)
+        finally:
+            os.close(read_descriptor)
+    if result is None:
+        raise GuestError("guest command failed: controller_stage")
+    if len(result.stdout) > MAX_COMMAND or len(result.stderr) > MAX_COMMAND:
+        failure = "guest command output exceeded bound"
+    successful = failure is None and result.returncode == 0
+    subphase = parse_stage_progress(bytes(progress), require_complete=successful)
+    if successful and subphase != "stage_complete":
+        successful = False
+        failure = "guest command progress rejected"
+        subphase = None
+    if not successful:
+        if subphase:
+            emit_progress(
+                f"controller_stage:{subphase}",
+                "timeout" if failure == "guest command timed out" else "start",
+            )
+        raise GuestError(f"{failure or 'guest command failed'}: controller_stage")
     return result
 
 
@@ -923,7 +1092,19 @@ def run_capacity_one_canary(
     ).stdout
 
 
+def verify_platform_systemd(platform_systemd: object) -> None:
+    """Reject a clean-host image that differs from the frozen platform files."""
+    if platform_systemd != PLATFORM_SYSTEMD:
+        raise GuestError("systemd platform binding differs inside guest")
+    for record in PLATFORM_SYSTEMD["service_drop_ins"]:
+        raw = read_file(Path(record["path"]), MAX_JSON)
+        if hashlib.sha256(raw).hexdigest() != record["sha256"]:
+            raise GuestError(f"systemd platform file digest differs inside guest: {record['path']}")
+
+
 def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[str, object], dict[str, object]]:
+    platform_systemd = descriptor.get("platform_systemd")
+    verify_platform_systemd(platform_systemd)
     candidate_tar = stage / "candidate.tar"
     candidate_raw = read_file(candidate_tar, MAX_TREE_BYTES)
     if hashlib.sha256(candidate_raw).hexdigest() != descriptor.get("candidate_tar_sha256"):
@@ -945,6 +1126,9 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         raise GuestError("public binding differs from key ceremony")
     candidate = STATE_ROOT / "candidate"
     extract_candidate(candidate_raw, candidate)
+    tracked_platform = read_file(candidate / PLATFORM_SYSTEMD_SOURCE, MAX_JSON)
+    if hashlib.sha256(tracked_platform).hexdigest() != PLATFORM_SYSTEMD["service_drop_ins"][0]["sha256"]:
+        raise GuestError("candidate systemd platform source differs inside guest")
     candidate_harness = read_file(
         candidate / "deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
         2 * 1024 * 1024,
@@ -973,6 +1157,8 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         if manifest.get("source_commit") != candidate_sha:
             raise GuestError(f"package source commit differs: {name}")
     activation = manifests["activation"]
+    if activation.get("platform_systemd") != platform_systemd:
+        raise GuestError("activation package systemd platform binding differs")
     execd = manifests["execd"]
     activation_digest = activation.get("package_digest")
     activation_id = activation.get("activation_id")
@@ -1060,13 +1246,19 @@ def create_principals(activation: Path) -> None:
 def install_components(candidate: Path, inputs: Path) -> None:
     for name in ("runner", "controld"):
         command(["python3", str(candidate / f"deploy/native-ci/{name}/install.py"), "install", "--package", str(inputs / name)])
+        emit_progress(f"{name}_installed")
     command(["python3", str(candidate / "deploy/native-ci/keyholder/install.py"), "install", "--package", str(inputs / "keyholder")])
+    emit_progress("keyholder_installed")
     command(["python3", str(candidate / "deploy/native-ci/execd/install.py"), "install", "--package", str(inputs / "execd")])
+    emit_progress("execd_installed")
     command(["systemctl", "daemon-reload"])
 
 
 def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dict[str, dict[str, str]]:
     expected: dict[str, dict[str, str]] = {}
+    systemd_roots = ("/etc/systemd/system/", "/usr/lib/systemd/system/")
+    unit_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.(?:service|socket|target)$")
+    drop_in_name = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_-])?\.conf$")
     for name in package_names:
         package = inputs / name
         manifest = package_manifest(package, name)
@@ -1077,15 +1269,30 @@ def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dic
             if not isinstance(entry, dict):
                 raise GuestError(f"{name} package entry differs")
             target = entry.get("target")
-            if not isinstance(target, str) or not target.startswith(("/etc/systemd/system/", "/usr/lib/systemd/system/")):
+            if not isinstance(target, str):
                 continue
-            unit = Path(target).name
-            if not unit.endswith((".service", ".socket", ".target")):
-                raise GuestError("package systemd unit inventory differs")
+            root = next((value for value in systemd_roots if target.startswith(value)), None)
+            if root is None:
+                continue
             source = package_member(package, entry.get("source"))
             digest = entry.get("sha256")
             if not isinstance(digest, str) or HEX64.fullmatch(digest) is None or hashlib.sha256(read_file(source)).hexdigest() != digest:
-                raise GuestError(f"package systemd unit digest differs: {unit}")
+                raise GuestError(f"package systemd unit digest differs: {target}")
+            parts = target.removeprefix(root).split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                raise GuestError("package systemd unit inventory differs")
+            if len(parts) == 2:
+                parent, drop_in = parts
+                if (
+                    not parent.endswith(".d")
+                    or unit_name.fullmatch(parent[:-2]) is None
+                    or drop_in_name.fullmatch(drop_in) is None
+                ):
+                    raise GuestError("package systemd unit inventory differs")
+                continue
+            if len(parts) != 1 or unit_name.fullmatch(parts[0]) is None:
+                raise GuestError("package systemd unit inventory differs")
+            unit = parts[0]
             binding = {"fragment_path": target, "sha256": digest}
             if unit in expected and expected[unit] != binding:
                 raise GuestError(f"package systemd unit binding conflicts: {unit}")
@@ -1148,19 +1355,63 @@ def tree_state(root: Path) -> dict[str, dict[str, object]]:
     return result
 
 
+SYSTEMD_UNIT_PROPERTIES = (
+    "LoadState", "ActiveState", "SubState", "UnitFileState", "MainPID",
+    "InvocationID", "FragmentPath",
+)
+RELAY_PROPERTIES = ("LoadState", "ActiveState", "MainPID")
+
+
+def parse_systemd_properties(
+    process: subprocess.CompletedProcess[bytes], properties: tuple[str, ...],
+    *, optional: tuple[str, ...] = (), error: str,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = process.stdout.decode().splitlines()
+    except (AttributeError, UnicodeDecodeError) as exception:
+        raise GuestError(error) from exception
+    if not isinstance(process.stderr, bytes) or process.stderr or not lines:
+        raise GuestError(error)
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or key not in properties or key in values:
+            raise GuestError(error)
+        values[key] = value
+    optional_set = set(optional)
+    required = set(properties) - optional_set
+    if not optional_set <= set(properties) or not required <= set(values):
+        raise GuestError(error)
+    for key in optional:
+        values.setdefault(key, "0")
+    return values
+
+
+def systemd_unit_values(
+    unit: str, process: subprocess.CompletedProcess[bytes],
+) -> dict[str, str]:
+    error = f"systemd unit readback failed: {unit}"
+    optional = ("MainPID",) if unit.endswith((".socket", ".target")) else ()
+    values = parse_systemd_properties(
+        process, SYSTEMD_UNIT_PROPERTIES, optional=optional, error=error,
+    )
+    if (
+        re.fullmatch(r"0|[1-9][0-9]*", values["MainPID"]) is None
+        or values["ActiveState"] == "inactive" and values["MainPID"] != "0"
+        or process.returncode != 0 and values["LoadState"] != "not-found"
+    ):
+        raise GuestError(error)
+    return values
+
+
 def unit_state() -> dict[str, dict[str, str]]:
-    properties = ("LoadState", "ActiveState", "SubState", "UnitFileState", "MainPID", "InvocationID", "FragmentPath")
     result: dict[str, dict[str, str]] = {}
     for unit in UNITS:
-        process = command(["systemctl", "show", unit, "--property=" + ",".join(properties)], allow_failure=True)
-        values: dict[str, str] = {}
-        for line in process.stdout.decode().splitlines():
-            key, separator, value = line.partition("=")
-            if separator and key in properties:
-                values[key] = value
-        if set(values) != set(properties) or process.returncode != 0 and values.get("LoadState") != "not-found":
-            raise GuestError(f"systemd unit readback failed: {unit}")
-        result[unit] = values
+        process = command([
+            "systemctl", "show", unit,
+            "--property=" + ",".join(SYSTEMD_UNIT_PROPERTIES),
+        ], allow_failure=True)
+        result[unit] = systemd_unit_values(unit, process)
     return result
 
 
@@ -1289,9 +1540,14 @@ def dormant_proof(configs: dict[str, dict[str, object]], units: dict[str, dict[s
             raise GuestError(f"unit load/enable state differs: {unit}")
     if any(Path(path).exists() for path in SOCKETS):
         raise GuestError("socket residue remains")
-    relay = command(["systemctl", "show", "buzzci-e2e-relay.service", "--property=LoadState,ActiveState,MainPID"], allow_failure=True)
-    relay_values = dict(line.partition("=")[::2] for line in relay.stdout.decode().splitlines() if "=" in line)
-    if relay.returncode == 0 or relay_values != {"LoadState": "not-found", "ActiveState": "inactive", "MainPID": "0"}:
+    relay = command([
+        "systemctl", "show", "buzzci-e2e-relay.service",
+        "--property=" + ",".join(RELAY_PROPERTIES),
+    ], allow_failure=True)
+    relay_values = parse_systemd_properties(
+        relay, RELAY_PROPERTIES, error="relay unit residue remains",
+    )
+    if relay_values != {"LoadState": "not-found", "ActiveState": "inactive", "MainPID": "0"}:
         raise GuestError("relay unit residue remains")
     process = command(["pgrep", "-a", "-f", "buzz-ci-(runner|controld|execd|executor|keyholder|acceptance)|local_tls_relay.py"], allow_failure=True)
     if process.returncode == 0 and process.stdout.strip():
@@ -1313,7 +1569,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         or set(descriptor) != {
             "schema_version", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256",
             "candidate_tar_sha256", "scenario_sha256", "seccomp_source_sha256",
-            "public_binding_sha256", "package_tree_sha256",
+            "public_binding_sha256", "package_tree_sha256", "platform_systemd",
         }
         or descriptor.get("schema_version") != STAGE_SCHEMA
         or descriptor.get("timing_sha256") != phase.get("timing_sha256")
@@ -1338,9 +1594,11 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     try:
         hosts_added = not relay_mapping_present()
         start_relay(public)
+        emit_progress("relay_ready")
         preinstall_units = unit_state()
         if any(state["LoadState"] != "not-found" for state in preinstall_units.values()):
             raise GuestError("clean host already contains a package-owned unit")
+        emit_progress("preinstall_units_clean")
         component_units = expected_unit_fragments(inputs, ("runner", "controld", "keyholder", "execd"))
         activation_units = expected_unit_fragments(inputs, ("activation",))
         expected_units = dict(component_units)
@@ -1350,17 +1608,24 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             expected_units[unit] = binding
         if set(expected_units) != set(UNITS):
             raise GuestError("package systemd unit set differs")
+        emit_progress("package_units_validated")
         create_principals(activation_package)
+        emit_progress("principals_created")
         provision_seccomp(inputs / "seccomp.json")
+        emit_progress("seccomp_ready")
         install_components(candidate, inputs)
         configs = tree_state(Path("/etc/buzzci"))
         units = prove_installed_units(component_units)
+        emit_progress("installed_units_verified")
         controller = candidate / "deploy/native-ci/activation/controller.py"
         begin_phase("controller_check")
         command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=timing_leaf("controller_check"), timing_terms={"controller_check": 1})
         attempted_stage = True
         begin_phase("controller_stage")
-        command(["python3", str(controller), "stage", "--package", str(activation_package), "--scenario", str(inputs / "scenario.json")], timeout=timing_leaf("controller_stage"), timing_terms={"controller_stage": 1})
+        stage_command(
+            ["python3", str(controller), "stage", "--package", str(activation_package), "--scenario", str(inputs / "scenario.json")],
+            timeout=timing_leaf("controller_stage"),
+        )
         prove_installed_units(expected_units)
         begin_phase("controller_activate")
         command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=timing_leaf("controller_activate"), timing_terms={"controller_activate": 1})
@@ -1391,6 +1656,8 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             path.unlink()
         except FileNotFoundError:
             pass
+    if not cleanup_errors:
+        emit_progress("cleanup_return")
     if primary is not None or cleanup_errors or receipt_raw is None or verifier_raw is None or proof is None:
         message = str(primary) if primary is not None else "acceptance evidence incomplete"
         if cleanup_errors:
@@ -1499,7 +1766,7 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
 
 
 def main(argv: list[str]) -> int:
-    global _PROGRESS_BOOT, _PROGRESS_SEQUENCE, _PROGRESS_STARTED
+    global _PROGRESS_BOOT, _PROGRESS_LAST_PHASE, _PROGRESS_SEQUENCE, _PROGRESS_STARTED
     if len(argv) != 1:
         return 2
     try:
@@ -1515,6 +1782,7 @@ def main(argv: list[str]) -> int:
             raise GuestError("guest phase differs")
         _PROGRESS_SEQUENCE = 0
         _PROGRESS_STARTED = time.monotonic()
+        _PROGRESS_LAST_PHASE = None
         begin_phase("boot_cloud_init", emit_event=False)
         require_guest()
         disable_swap()

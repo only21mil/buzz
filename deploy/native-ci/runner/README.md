@@ -96,6 +96,13 @@ provenance, and every asset to `root:root`. The two directories must be mode
 must match the manifest. `install.py` checks all of this with no-follow file
 descriptors.
 
+The default transaction path uses the cross-installer shared parent
+`/var/lib/buzzci`, which must be root-owned mode `0711`. The installer creates
+an absent shared parent with that exact mode even under umask `077`; it refuses
+an existing symlink or any ownership or mode drift instead of widening it.
+`/var/lib/buzzci/install-backups` and the runner transaction tree remain
+root-owned mode `0700`.
+
 ## Source-only operator modes
 
 These commands describe the installation lifecycle. Do not run `install` or
