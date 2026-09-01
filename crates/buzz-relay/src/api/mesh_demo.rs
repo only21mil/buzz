@@ -159,6 +159,9 @@ mod tests {
     use super::*;
     use crate::tunnel::directory::SessionDirectory;
 
+    const TEST_LEASE_TTL: Duration = Duration::from_secs(30);
+    const _: () = assert!(TEST_LEASE_TTL.as_secs() > ECHO_TIMEOUT.as_secs());
+
     fn pool() -> deadpool_redis::Pool {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
         deadpool_redis::Config::from_url(url)
@@ -173,10 +176,7 @@ mod tests {
             .query_async::<String>(&mut *conn)
             .await
             .ok()?;
-        Some(SessionDirectory::with_lease_ttl(
-            pool,
-            Duration::from_secs(5),
-        ))
+        Some(SessionDirectory::with_lease_ttl(pool, TEST_LEASE_TTL))
     }
 
     struct NoopTransport;
