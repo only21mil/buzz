@@ -107,6 +107,13 @@ Before any install against `/`, the package root and assets directory must be
 root-owned mode `0700`. Manifest and provenance files must be root-owned mode
 `0600`; every asset must retain the manifest mode.
 
+The default transaction path uses the cross-installer shared parent
+`/var/lib/buzzci`, which must be root-owned mode `0711`. The installer creates
+an absent shared parent with that exact mode even under umask `077`; it refuses
+an existing symlink or any ownership or mode drift instead of widening it.
+`/var/lib/buzzci/install-backups` and the controld transaction tree remain
+root-owned mode `0700`.
+
 ## Source-only operator modes
 
 These commands document the lifecycle. Live install or rollback remains

@@ -160,6 +160,7 @@ deploy/native-ci/execd/freeze_package.py freeze-package \
   --preactivation-input "$EXECD_PREACTIVATION_INPUT" \
   --activation-package "$ACTIVATION_PACKAGE" --output "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py verify-package --package "$EXECD_PACKAGE"
+deploy/native-ci/execd/install.py install --dry-run --package "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py install --package "$EXECD_PACKAGE"
 ```
 

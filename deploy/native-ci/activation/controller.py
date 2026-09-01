@@ -1666,7 +1666,7 @@ class FakeSystemd:
         state = self._read()
         unit = state["units"].get(name)
         if not isinstance(unit, dict):
-            return {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled"}
+            return {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": ""}
         return {
             key: str(unit[key])
             for key in ("LoadState", "ActiveState", "SubState", "UnitFileState")
@@ -1763,13 +1763,21 @@ class FakeSystemd:
                 drop_in_directory = activation_package.rooted(
                     self.root, f"/etc/systemd/system/{unit}.d",
                 )
-                state["units"][unit]["DropInPaths"] = (
+                unit_drop_ins = (
                     [f"/etc/systemd/system/{unit}.d/{path.name}" for path in sorted(drop_in_directory.glob("*.conf"), key=lambda item: item.name.encode())]
                     if drop_in_directory.is_dir() else []
                 )
+                global_directory = activation_package.rooted(
+                    self.root, "/usr/lib/systemd/system/service.d",
+                )
+                global_drop_ins = (
+                    [f"/usr/lib/systemd/system/service.d/{path.name}" for path in sorted(global_directory.glob("*.conf"), key=lambda item: item.name.encode())]
+                    if unit.endswith(".service") and global_directory.is_dir() else []
+                )
+                state["units"][unit]["DropInPaths"] = unit_drop_ins + global_drop_ins
             else:
                 state["units"][unit] = {
-                    "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
+                    "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "",
                     "FragmentPath": "", "DropInPaths": [],
                 }
         self._write(state)
@@ -2080,9 +2088,13 @@ def _preflight_units(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, s
         if state["LoadState"] not in ({"loaded", "not-found"} if package_owned else {"loaded"}):
             raise ValueError(f"required systemd unit is not loaded: {name}")
         if state["LoadState"] == "not-found" and (
-            state["ActiveState"] != "inactive" or state["UnitFileState"] not in {"disabled", "static"}
+            state["ActiveState"] != "inactive"
+            or state["SubState"] != "dead"
+            or state["UnitFileState"] != ""
         ):
             raise ValueError(f"absent package-owned systemd unit is not dormant: {name}")
+        if state["LoadState"] == "not-found":
+            continue
         baseline_execd = name == "buzz-ci-execd.socket"
         if state["ActiveState"] != "inactive" and not baseline_execd:
             raise ValueError(f"systemd unit is not dormant: {name}")
