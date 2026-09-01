@@ -245,6 +245,27 @@ DEPENDENCY_UNITS = sorted(
     set(START_ORDER + STOP_ORDER) - set(PACKAGE_UNIT_ROLES)
 )
 
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
+
+
+def _service_drop_ins(*records: dict[str, str]) -> list[dict[str, str]]:
+    """Return systemd's unit-specific paths followed by global service paths."""
+    return [
+        *records,
+        *[
+            {"owner": item["owner"], "path": item["path"]}
+            for item in PLATFORM_SYSTEMD["service_drop_ins"]
+        ],
+    ]
+
 SYSTEMD_UNIT_LAYOUT = {
     "buzz-ci-capacity-one.target": {
         "fragment": {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-capacity-one.target"},
@@ -260,13 +281,13 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-acceptance-control.service": {
         "fragment": {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-acceptance-control.service"},
-        "drop_ins": [],
+        "drop_ins": _service_drop_ins(),
     },
     "buzz-ci-runner.service": {
         "fragment": {"owner": "runner", "path": "/etc/systemd/system/buzz-ci-runner.service"},
-        "drop_ins": [
+        "drop_ins": _service_drop_ins(
             {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf"},
-        ],
+        ),
     },
     "buzz-ci-runner.socket": {
         "fragment": {"owner": "runner", "path": "/etc/systemd/system/buzz-ci-runner.socket"},
@@ -274,15 +295,15 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-controld.service": {
         "fragment": {"owner": "controld", "path": "/etc/systemd/system/buzz-ci-controld.service"},
-        "drop_ins": [
+        "drop_ins": _service_drop_ins(
             {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf"},
-        ],
+        ),
     },
     "buzz-ci-keyholder.service": {
         "fragment": {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.service"},
-        "drop_ins": [
+        "drop_ins": _service_drop_ins(
             {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf"},
-        ],
+        ),
     },
     "buzz-ci-keyholder.socket": {
         "fragment": {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.socket"},
@@ -292,7 +313,7 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-execd.service": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-execd.service"},
-        "drop_ins": [],
+        "drop_ins": _service_drop_ins(),
     },
     "buzz-ci-execd.socket": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-execd.socket"},
@@ -302,7 +323,7 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-executor.service": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-executor.service"},
-        "drop_ins": [],
+        "drop_ins": _service_drop_ins(),
     },
     "buzz-ci-executor.socket": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-executor.socket"},
@@ -513,9 +534,10 @@ def _validate_effective_systemd(value: object) -> list[dict[str, Any]]:
             if not isinstance(drop_in["sha256"], str) or not SHA256.fullmatch(drop_in["sha256"]):
                 raise ValueError(f"effective systemd drop-in digest is invalid: {unit}")
             require_absolute(drop_in["path"], f"effective systemd drop-in path {unit}")
-            if drop_in["path"] in observed_paths:
+            if drop_in["path"] in observed_paths and drop_in["owner"] != "platform":
                 raise ValueError("effective systemd path is duplicated")
-            observed_paths.add(drop_in["path"])
+            if drop_in["owner"] != "platform":
+                observed_paths.add(drop_in["path"])
         result.append(item)
     if observed_units != set(SYSTEMD_UNIT_LAYOUT):
         raise ValueError("effective systemd units are incomplete")
@@ -564,7 +586,7 @@ def _validate_entry(value: object) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) -> dict[str, Any]:
     expected = {
         "schema", "activation_id", "source_commit", "default_state", "identities", "components", "entries",
-        "access_group", "acceptance_template", "systemd", "effective_systemd", "socket_policy", "qualification", "package_uid",
+        "access_group", "acceptance_template", "systemd", "platform_systemd", "effective_systemd", "socket_policy", "qualification", "package_uid",
         "package_gid", "package_digest",
     }
     if not require_digest:
@@ -580,6 +602,8 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
         raise ValueError("activation package must remain dormant by default")
     if manifest["package_uid"] != 0 or manifest["package_gid"] != 0:
         raise ValueError("activation package must be root owned")
+    if manifest["platform_systemd"] != PLATFORM_SYSTEMD:
+        raise ValueError("systemd platform binding differs from the fixed plan")
 
     identities = manifest["identities"]
     if not isinstance(identities, dict) or set(identities) != set(IDENTITIES):
@@ -662,12 +686,18 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
             raise ValueError(f"tracked activation program entry mode differs: {role}")
 
     effective_systemd = _validate_effective_systemd(manifest["effective_systemd"])
+    platform_records = {
+        item["path"]: item for item in manifest["platform_systemd"]["service_drop_ins"]
+    }
     for unit in effective_systemd:
         for record in (unit["fragment"], *unit["drop_ins"]):
             role = SYSTEMD_ENTRY_ROLES.get(record["path"])
             if record["owner"] == "activation":
                 if role is None or entries_by_role[role]["sha256"] != record["sha256"]:
                     raise ValueError(f"activation effective systemd bytes differ: {record['path']}")
+            elif record["owner"] == "platform":
+                if role is not None or platform_records.get(record["path"]) != record:
+                    raise ValueError(f"platform effective systemd binding differs: {record['path']}")
             elif role is not None:
                 raise ValueError(f"non-activation systemd path is activation-owned: {record['path']}")
 
