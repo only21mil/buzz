@@ -1,8 +1,9 @@
 #![deny(unsafe_code)]
 
+use std::io::{self, Read, Write};
+
 #[cfg(target_os = "linux")]
 use std::{
-    io::{Read, Write},
     os::{
         fd::{AsFd, FromRawFd},
         unix::net::{UnixListener, UnixStream},
@@ -10,6 +11,9 @@ use std::{
     path::Path,
 };
 
+use buzz_ci_acceptance_ctl::acceptance_binding::{
+    AcceptanceBindingReceipt, MAX_ACCEPTANCE_BINDING_BYTES,
+};
 #[cfg(target_os = "linux")]
 use buzz_ci_acceptance_ctl::production::{
     handle_control_durable, AcceptanceControlConfig, ControlError, HostControl, SystemdHostControl,
@@ -25,6 +29,12 @@ struct ErrorLine {
 }
 
 fn main() {
+    if std::env::args_os().len() == 2
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--validate-binding-stdin"))
+    {
+        std::process::exit(if validate_binding_stdin() { 0 } else { 4 });
+    }
     #[cfg(target_os = "linux")]
     if let Err(error) = run() {
         emit_error(error);
@@ -35,6 +45,31 @@ fn main() {
         emit_error(ControlError::InvalidConfig);
         std::process::exit(4);
     }
+}
+
+fn validate_binding_stdin() -> bool {
+    let mut bytes = Vec::new();
+    if io::stdin()
+        .lock()
+        .take(MAX_ACCEPTANCE_BINDING_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.is_empty()
+        || bytes.len() as u64 > MAX_ACCEPTANCE_BINDING_BYTES
+    {
+        return false;
+    }
+    let Some(granted_ci_signer) = validate_binding_bytes(&bytes) else {
+        return false;
+    };
+    let mut output = hex::encode(granted_ci_signer).into_bytes();
+    output.push(b'\n');
+    io::stdout().lock().write_all(&output).is_ok()
+}
+
+fn validate_binding_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
+    let receipt = AcceptanceBindingReceipt::from_canonical_bytes(bytes).ok()?;
+    Some(receipt.validate().ok()?.granted_ci_signer())
 }
 
 #[cfg(target_os = "linux")]
@@ -173,5 +208,10 @@ mod tests {
 
         let flags = fcntl(&listener, FcntlArg::F_GETFD).expect("read descriptor flags");
         assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
+    fn offline_binding_mode_rejects_non_receipt_input() {
+        assert_eq!(validate_binding_bytes(b"{}"), None);
     }
 }
