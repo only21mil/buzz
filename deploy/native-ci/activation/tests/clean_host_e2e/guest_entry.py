@@ -45,6 +45,18 @@ MAX_TREE_BYTES = 64 * 1024 * 1024
 TRANSFER_SIZE = 8 * 1024 * 1024
 TRANSFER_MAGIC = b"BUZZCI-EVIDENCE\0"
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
+PLATFORM_SYSTEMD_SOURCE = Path(
+    "deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf"
+)
 SCRATCH_ROOT = Path("/run")
 SWAPS_PATH = Path("/proc/swaps")
 UNITS = (
@@ -156,7 +168,7 @@ def open_progress_device() -> int:
 
 
 def emit_progress(phase: str, event: str = "start") -> None:
-    """Best-effort diagnostic signal. Acceptance never depends on this channel."""
+    """Emit a bounded diagnostic frame; the host requires terminal completion."""
     global _PROGRESS_SEQUENCE
     if _PROGRESS_BOOT is None:
         return
@@ -923,7 +935,19 @@ def run_capacity_one_canary(
     ).stdout
 
 
+def verify_platform_systemd(platform_systemd: object) -> None:
+    """Reject a clean-host image that differs from the frozen platform files."""
+    if platform_systemd != PLATFORM_SYSTEMD:
+        raise GuestError("systemd platform binding differs inside guest")
+    for record in PLATFORM_SYSTEMD["service_drop_ins"]:
+        raw = read_file(Path(record["path"]), MAX_JSON)
+        if hashlib.sha256(raw).hexdigest() != record["sha256"]:
+            raise GuestError(f"systemd platform file digest differs inside guest: {record['path']}")
+
+
 def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[str, object], dict[str, object]]:
+    platform_systemd = descriptor.get("platform_systemd")
+    verify_platform_systemd(platform_systemd)
     candidate_tar = stage / "candidate.tar"
     candidate_raw = read_file(candidate_tar, MAX_TREE_BYTES)
     if hashlib.sha256(candidate_raw).hexdigest() != descriptor.get("candidate_tar_sha256"):
@@ -945,6 +969,9 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         raise GuestError("public binding differs from key ceremony")
     candidate = STATE_ROOT / "candidate"
     extract_candidate(candidate_raw, candidate)
+    tracked_platform = read_file(candidate / PLATFORM_SYSTEMD_SOURCE, MAX_JSON)
+    if hashlib.sha256(tracked_platform).hexdigest() != PLATFORM_SYSTEMD["service_drop_ins"][0]["sha256"]:
+        raise GuestError("candidate systemd platform source differs inside guest")
     candidate_harness = read_file(
         candidate / "deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
         2 * 1024 * 1024,
@@ -973,6 +1000,8 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         if manifest.get("source_commit") != candidate_sha:
             raise GuestError(f"package source commit differs: {name}")
     activation = manifests["activation"]
+    if activation.get("platform_systemd") != platform_systemd:
+        raise GuestError("activation package systemd platform binding differs")
     execd = manifests["execd"]
     activation_digest = activation.get("package_digest")
     activation_id = activation.get("activation_id")
@@ -1067,6 +1096,9 @@ def install_components(candidate: Path, inputs: Path) -> None:
 
 def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dict[str, dict[str, str]]:
     expected: dict[str, dict[str, str]] = {}
+    systemd_roots = ("/etc/systemd/system/", "/usr/lib/systemd/system/")
+    unit_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.(?:service|socket|target)$")
+    drop_in_name = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_-])?\.conf$")
     for name in package_names:
         package = inputs / name
         manifest = package_manifest(package, name)
@@ -1077,15 +1109,30 @@ def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dic
             if not isinstance(entry, dict):
                 raise GuestError(f"{name} package entry differs")
             target = entry.get("target")
-            if not isinstance(target, str) or not target.startswith(("/etc/systemd/system/", "/usr/lib/systemd/system/")):
+            if not isinstance(target, str):
                 continue
-            unit = Path(target).name
-            if not unit.endswith((".service", ".socket", ".target")):
-                raise GuestError("package systemd unit inventory differs")
+            root = next((value for value in systemd_roots if target.startswith(value)), None)
+            if root is None:
+                continue
             source = package_member(package, entry.get("source"))
             digest = entry.get("sha256")
             if not isinstance(digest, str) or HEX64.fullmatch(digest) is None or hashlib.sha256(read_file(source)).hexdigest() != digest:
-                raise GuestError(f"package systemd unit digest differs: {unit}")
+                raise GuestError(f"package systemd unit digest differs: {target}")
+            parts = target.removeprefix(root).split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                raise GuestError("package systemd unit inventory differs")
+            if len(parts) == 2:
+                parent, drop_in = parts
+                if (
+                    not parent.endswith(".d")
+                    or unit_name.fullmatch(parent[:-2]) is None
+                    or drop_in_name.fullmatch(drop_in) is None
+                ):
+                    raise GuestError("package systemd unit inventory differs")
+                continue
+            if len(parts) != 1 or unit_name.fullmatch(parts[0]) is None:
+                raise GuestError("package systemd unit inventory differs")
+            unit = parts[0]
             binding = {"fragment_path": target, "sha256": digest}
             if unit in expected and expected[unit] != binding:
                 raise GuestError(f"package systemd unit binding conflicts: {unit}")
@@ -1313,7 +1360,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         or set(descriptor) != {
             "schema_version", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256",
             "candidate_tar_sha256", "scenario_sha256", "seccomp_source_sha256",
-            "public_binding_sha256", "package_tree_sha256",
+            "public_binding_sha256", "package_tree_sha256", "platform_systemd",
         }
         or descriptor.get("schema_version") != STAGE_SCHEMA
         or descriptor.get("timing_sha256") != phase.get("timing_sha256")

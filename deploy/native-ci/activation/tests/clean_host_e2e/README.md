@@ -9,7 +9,9 @@ a fixed 8 MiB raw transfer device. Bubblewrap mounts the prepared state
 read-only, then exposes only the current overlay, the candidate's transfer
 device, and the verifier's pre-created evidence destination as writable files.
 Only the trusted verifier boot receives the bounded virtio-serial evidence
-channel.
+channel. Every boot gives only the qcow2 operating-system disk a firmware boot
+index. The raw transfer disk remains data-only even when QEMU enumerates it
+before the operating-system disk.
 
 The flow has two user-visible phases and three isolated boots:
 
@@ -32,10 +34,12 @@ The flow has two user-visible phases and three isolated boots:
    zero, strict installed verification, and rollback. It can write only a
    digest-framed pending record to the fixed-capacity raw transfer device.
    A second virtio-serial port carries only digest-framed progress records with
-   a fixed boot, phase, event, sequence, and elapsed-millisecond schema. This
-   stream is diagnostic and cannot make a run pass or fail. Missing, malformed,
-   stale, oversized, or truncated progress changes only the sanitized timeout
-   detail returned by the host.
+   a fixed boot, phase, event, sequence, and elapsed-millisecond schema. The
+   stream contains no guest output and cannot make a failed run pass. After a
+   zero QEMU exit, the host requires valid role-specific progress with exactly
+   one final `complete` record and no timeout record. Missing, malformed, stale,
+   oversized, truncated, or incomplete progress fails with sanitized phase
+   detail before evidence parsing or the next boot.
    The host kills and reaps the QEMU process group, proves it absent, and
    deletes the candidate overlay before continuing.
 4. A fresh verifier overlay over the same frozen ceremony image receives the
@@ -86,13 +90,23 @@ python3 "$HARNESS" run \
 ```
 
 The closed v3 contract includes `harness_sha256`, `timing_asset_sha256`,
-`timing`, and `timing_sha256`. The maintained final renderer derives them from
-the exact candidate Git object. For a manually assembled contract, copy the
-same values from `capabilities`; `prepare` records them in `state.json`.
+`timing`, `timing_sha256`, and the exact `platform_systemd` binding copied from
+the validated activation package. The maintained final renderer derives the
+harness and timing values from the exact candidate Git object. For a manually
+assembled contract, copy the harness and timing values from `capabilities` and
+the platform value from the validated activation manifest. `prepare` records
+the harness and timing values in `state.json`.
 Preflight rejects a state prepared by any other `harness.py`, a contract with
 another timing asset or timing table, or a candidate commit whose tracked
 harness bytes do not match. Any harness change makes an unused older prepared
 state stale by design.
+
+Before it extracts candidate code or installs a package, the run guest opens
+the bound Fedora global service drop-in without following symlinks and hashes
+its exact bytes. A missing, relocated, replaced, or byte-drifted file stops the
+clean-host run. This means a pinned cloud image that differs from the
+production platform binding is a qualification blocker. The harness does not
+ignore the mismatch or inject production's file into the image.
 
 The exact `timing-contract.json` blob has a separate SHA-256 binding in the
 prepare result, state, run contract, candidate stage descriptor, final evidence,

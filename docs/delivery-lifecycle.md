@@ -52,7 +52,8 @@ following before calling the landing complete:
 - authoritative relay default branch at the merge commit;
 - GitHub mirror default branch at the same commit;
 - intended feature-branch retention or deletion; and
-- terminal post-merge CI for the merge commit.
+- terminal post-merge CI for the merge commit, including the mandatory
+  `Desktop Release Candidate` check on that exact commit.
 
 Record the merge commit and any failed, skipped, superseded, or duplicate CI
 runs in the Buzz repository record. Do not describe a history containing a
