@@ -87,6 +87,12 @@ has this exact envelope:
 {"definitions":{},"document":{"source_commit":{"$copy":"candidate_sha"}},"kind":"activation-draft","schema_version":"buzz-ci-checked-render-template/v1"}
 ```
 
+`render-clean-host` copies the validated activation manifest's closed
+`platform_systemd` object into the VM contract. The guest compares that object
+with the activation package and the distribution-owned file in the pinned
+image before installation. The renderer accepts no caller override for this
+binding.
+
 `$copy` reads only the immutable binding graph: `candidate_sha`,
 `public_binding`, `packages`, normalized ready-package component evidence,
 execd pre-activation evidence, package manifest hashes, and the public-binding
