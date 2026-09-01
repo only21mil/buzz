@@ -11,19 +11,27 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import sys
-import tempfile
 import uuid
 
-SCHEMA = "buzz-ci-runner-install-package-v1"
-RECEIPT_SCHEMA = "buzz-ci-runner-install-receipt-v1"
+SCHEMA = "buzz-ci-runner-install-package-v2"
+RECEIPT_SCHEMA = "buzz-ci-runner-install-receipt-v2"
+LEGACY_RECEIPT_SCHEMA = "buzz-ci-runner-install-receipt-v1"
+TRANSACTION_SCHEMA = "buzz-ci-runner-install-transaction-v1"
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 PACKAGE_ID = re.compile(r"^buzz-ci-runner-[0-9a-f]{12}-[0-9a-f]{12}$")
 DEFAULT_BACKUP_ROOT = Path("/var/lib/buzzci/install-backups/runner")
 MAX_JSON_BYTES = 1024 * 1024
+TRANSACTION_PHASES = {
+    "install_prepared",
+    "install_publishing",
+    "installed",
+    "rollback_prepared",
+    "rollback_restoring",
+    "rolled_back",
+}
 
 DEFAULT_STATE = {
     "enabled": False,
@@ -44,12 +52,16 @@ PEER_POLICY = {
     "broker_socket": {
         "path": "/run/buzzci/execd.sock",
         "expected_uid": 0,
+        "owner": "root",
+        "group": "buzzci-execd",
+        "mode": "0620",
+        "supplementary_members": ["buzzci-runner", "buzzci-ctl"],
         "managed_by_package": False,
     },
 }
 EXPECTED_TARGETS = {
     "binary": "/usr/libexec/buzz-ci-runner",
-    "config": "/etc/buzzci/runner-v1.json",
+    "config": "/etc/buzzci/runner-v2.json",
     "service": "/etc/systemd/system/buzz-ci-runner.service",
     "socket": "/etc/systemd/system/buzz-ci-runner.socket",
     "tmpfiles": "/usr/lib/tmpfiles.d/buzzci-runner.conf",
@@ -282,19 +294,38 @@ def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[E
 def validate_assets(package: Path, entries: list[Entry], identities: dict[str, object]) -> None:
     payloads = {entry.role: read_fd(package / entry.source)[0] for entry in entries}
     config = json.loads(payloads["config"], object_pairs_hook=reject_duplicates)
-    if not isinstance(config, dict) or set(config) != {"schema_version", "controld_uid"} or config["schema_version"] != 1:
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"schema_version", "controld_uid", "controld_gid", "mode"}
+        or config["schema_version"] != 2
+        or config["mode"] != "dormant"
+    ):
         raise ValueError("runner config is not canonical and closed")
     if u32(config["controld_uid"], nonzero=True) != identities["controld"]["uid"]:
         raise ValueError("runner config controld UID binding mismatch")
+    if u32(config["controld_gid"], nonzero=True) != identities["controld"]["gid"]:
+        raise ValueError("runner config controld GID binding mismatch")
     service = payloads["service"].decode()
     socket = payloads["socket"].decode()
     tmpfiles = payloads["tmpfiles"].decode()
     required_service = {
-        "ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v1.json",
+        "ExecStart=/usr/libexec/buzz-ci-runner --config /etc/buzzci/runner-v2.json",
+        "SupplementaryGroups=buzzci-execd",
+        "UMask=0077",
         "ReadWritePaths=/var/lib/buzzci/runner",
         "RestrictAddressFamilies=AF_UNIX",
     }
-    if not all(line in service.splitlines() for line in required_service) or "/var/lib/buzzci/runner-output" in service:
+    forbidden_service = {
+        "User=root",
+        "AmbientCapabilities=",
+        "CapabilityBoundingSet=",
+        "buzz-ci-executor",
+    }
+    if (
+        not all(line in service.splitlines() for line in required_service)
+        or any(token in service for token in forbidden_service)
+        or "/var/lib/buzzci/runner-output" in service
+    ):
         raise ValueError("runner service path contract mismatch")
     required_socket = {
         "ListenStream=/run/buzzci/runner-control.sock",
@@ -309,8 +340,6 @@ def validate_assets(package: Path, entries: list[Entry], identities: dict[str, o
         raise ValueError("runner and broker socket contracts overlap")
     for required in (
         "d /var/lib/buzzci/runner 0700 buzzci-runner buzzci-runner -",
-        "d /var/lib/buzzci/runner/evidence 0700 buzzci-runner buzzci-runner -",
-        "d /var/lib/buzzci/runner/journal 0700 buzzci-runner buzzci-runner -",
     ):
         if required not in tmpfiles.splitlines():
             raise ValueError("runner tmpfiles contract mismatch")
@@ -421,13 +450,35 @@ def changes(package: Path, root: Path, entries: list[Entry]) -> list[Entry]:
     return changed
 
 
-def atomic_write(target: Path, payload: bytes, mode_value: int, uid: int, gid: int) -> None:
-    if target.is_symlink():
-        raise ValueError(f"target is a symbolic link: {target}")
-    parent = target.parent
-    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=parent)
-    temporary = Path(name)
+def directory_fd(path: Path) -> int:
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+
+
+def fsync_directory(path: Path) -> None:
+    fd = directory_fd(path)
     try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(target: Path, payload: bytes, mode_value: int, uid: int, gid: int) -> None:
+    parent_fd = directory_fd(target.parent)
+    temporary_name = f".{target.name}.{uuid.uuid4().hex}.tmp"
+    fd = -1
+    try:
+        try:
+            target_meta = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            target_meta = None
+        if target_meta is not None and stat.S_ISLNK(target_meta.st_mode):
+            raise ValueError(f"target is a symbolic link: {target}")
+        fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            mode_value,
+            dir_fd=parent_fd,
+        )
         os.fchmod(fd, mode_value)
         os.fchown(fd, uid, gid)
         view = memoryview(payload)
@@ -436,33 +487,82 @@ def atomic_write(target: Path, payload: bytes, mode_value: int, uid: int, gid: i
         os.fsync(fd)
         os.close(fd)
         fd = -1
-        os.replace(temporary, target)
-        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.replace(
+            temporary_name,
+            target.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
     finally:
         if fd >= 0:
             os.close(fd)
         try:
-            temporary.unlink()
+            os.unlink(temporary_name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
+        os.close(parent_fd)
+
+
+def unlink_target(target: Path) -> None:
+    parent_fd = directory_fd(target.parent)
+    try:
+        metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"target is not a regular file: {target}")
+        os.unlink(target.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def ensure_managed_directories(root: Path, manifest: dict[str, object], created: list[str]) -> None:
+    created_set = set(created)
     for item in manifest["directories"]:
-        target = rooted(root, str(item["target"]))
+        logical = str(item["target"])
+        target = rooted(root, logical)
         if target.exists() or target.is_symlink():
-            require_directory(target, mapped_id(0, root), mapped_id(0, root, group=True), 0o755)
+            metadata = target.lstat()
+            allowed_modes = {0o755, 0o700} if logical in created_set else {0o755}
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != mapped_id(0, root)
+                or metadata.st_gid != mapped_id(0, root, group=True)
+                or stat.S_IMODE(metadata.st_mode) not in allowed_modes
+            ):
+                raise ValueError(f"unsafe directory metadata: {target}")
+            if stat.S_IMODE(metadata.st_mode) == 0o700:
+                fd = directory_fd(target)
+                try:
+                    os.fchmod(fd, 0o755)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                fsync_directory(target.parent)
+                _phase_boundary("install_directory_created", logical)
             continue
+        if logical not in created_set:
+            raise ValueError(f"managed directory disappeared after transaction preparation: {logical}")
         validate_parent_chain(root, target.parent)
-        target.mkdir(mode=0o700)
-        created.append(str(item["target"]))
-        os.chown(target, mapped_id(0, root), mapped_id(0, root, group=True))
-        target.chmod(0o755)
+        parent_fd = directory_fd(target.parent)
+        target_fd = -1
+        try:
+            os.mkdir(target.name, mode=0o700, dir_fd=parent_fd)
+            target_fd = os.open(
+                target.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.fchown(target_fd, mapped_id(0, root), mapped_id(0, root, group=True))
+            os.fchmod(target_fd, 0o755)
+            os.fsync(target_fd)
+            os.fsync(parent_fd)
+        finally:
+            if target_fd >= 0:
+                os.close(target_fd)
+            os.close(parent_fd)
         require_directory(target, mapped_id(0, root), mapped_id(0, root, group=True), 0o755)
+        _phase_boundary("install_directory_created", logical)
 
 
 def backup_root_path(root: Path, backup_root: Path) -> Path:
@@ -478,12 +578,516 @@ def ensure_private_tree(root: Path, path: Path) -> None:
     for component in path.relative_to(root).parts:
         current /= component
         if not current.exists():
+            parent = current.parent
             current.mkdir(mode=0o700)
             os.chown(current, root_uid, root_gid)
+            fsync_directory(parent)
         metadata = current.lstat()
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != root_uid or metadata.st_gid != root_gid or metadata.st_mode & 0o022:
             raise ValueError(f"unsafe backup directory chain: {current}")
     require_directory(path, root_uid, root_gid, 0o700)
+
+
+def _phase_boundary(phase: str, target: str | None = None) -> None:
+    """Test hook called only after a durable phase or target boundary."""
+
+
+def transaction_contract(state: dict[str, object]) -> dict[str, object]:
+    return {
+        key: state[key]
+        for key in (
+            "schema",
+            "transaction_id",
+            "package_id",
+            "package_digest",
+            "source_commit",
+            "changed_targets",
+            "created_directories",
+            "inventory",
+            "candidate",
+        )
+    }
+
+
+def transaction_digest(state: dict[str, object]) -> str:
+    return sha256(canonical_json(transaction_contract(state)))
+
+
+def write_transaction_state(root: Path, transaction: Path, state: dict[str, object], phase: str) -> dict[str, object]:
+    if phase not in TRANSACTION_PHASES:
+        raise ValueError("invalid transaction phase")
+    updated = dict(state)
+    updated["phase"] = phase
+    updated["transaction_digest"] = transaction_digest(updated)
+    atomic_write(
+        transaction / "transaction.json",
+        canonical_json(updated),
+        0o600,
+        mapped_id(0, root),
+        mapped_id(0, root, group=True),
+    )
+    return updated
+
+
+def receipt_for(state: dict[str, object], terminal_state: str) -> dict[str, object]:
+    if terminal_state not in {"installed", "rolled_back"}:
+        raise ValueError("invalid receipt state")
+    return {
+        "schema": RECEIPT_SCHEMA,
+        "state": terminal_state,
+        "transaction_id": state["transaction_id"],
+        "transaction_digest": state["transaction_digest"],
+        "package_id": state["package_id"],
+        "package_digest": state["package_digest"],
+        "source_commit": state["source_commit"],
+        "changed_targets": state["changed_targets"],
+        "created_directories": state["created_directories"],
+        "inventory": state["inventory"],
+    }
+
+
+def legacy_receipt_for(state: dict[str, object], terminal_state: str) -> dict[str, object]:
+    if terminal_state not in {"installed", "rolled_back"}:
+        raise ValueError("invalid legacy receipt state")
+    return {
+        "schema": LEGACY_RECEIPT_SCHEMA,
+        "state": terminal_state,
+        "package_id": state["package_id"],
+        "package_digest": state["package_digest"],
+        "changed_targets": state["changed_targets"],
+        "created_directories": state["created_directories"],
+        "inventory": state["inventory"],
+    }
+
+
+def write_receipt(root: Path, transaction: Path, state: dict[str, object], terminal_state: str) -> dict[str, object]:
+    receipt = receipt_for(state, terminal_state)
+    atomic_write(
+        transaction / "receipt.json",
+        canonical_json(receipt),
+        0o600,
+        mapped_id(0, root),
+        mapped_id(0, root, group=True),
+    )
+    return receipt
+
+
+def validate_inventory(
+    root: Path,
+    transaction: Path,
+    state: dict[str, object],
+    entries: list[Entry],
+) -> dict[str, bytes | None]:
+    by_target = {entry.target: entry for entry in entries}
+    changed_targets = state.get("changed_targets")
+    inventory = state.get("inventory")
+    candidate = state.get("candidate")
+    created_directories = state.get("created_directories")
+    if (
+        not isinstance(changed_targets, list)
+        or not changed_targets
+        or len(set(changed_targets)) != len(changed_targets)
+        or any(not isinstance(target, str) or target not in by_target for target in changed_targets)
+        or not isinstance(inventory, list)
+        or len(inventory) != len(changed_targets)
+        or not isinstance(candidate, list)
+        or len(candidate) != len(changed_targets)
+        or not isinstance(created_directories, list)
+        or len(set(created_directories)) != len(created_directories)
+        or any(directory not in EXPECTED_DIRECTORIES for directory in created_directories)
+    ):
+        raise ValueError("transaction inventory is invalid")
+
+    prior_payloads: dict[str, bytes | None] = {}
+    if any(isinstance(record, dict) and record.get("existed") is True for record in inventory):
+        require_directory(
+            transaction / "files",
+            mapped_id(0, root),
+            mapped_id(0, root, group=True),
+            0o700,
+        )
+    for index, (target, record, desired) in enumerate(
+        zip(changed_targets, inventory, candidate, strict=True)
+    ):
+        entry = by_target[target]
+        if not isinstance(record, dict) or record.get("target") != target or not isinstance(record.get("existed"), bool):
+            raise ValueError("transaction inventory entry is invalid")
+        expected_record_keys = {"target", "existed"}
+        prior_payload: bytes | None = None
+        if record["existed"]:
+            expected_record_keys |= {"mode", "uid", "gid", "sha256", "backup"}
+            if (
+                set(record) != expected_record_keys
+                or record.get("backup") != f"files/{index}"
+                or isinstance(record.get("mode"), bool)
+                or not isinstance(record.get("mode"), int)
+                or not 0 <= record["mode"] <= 0o777
+                or isinstance(record.get("uid"), bool)
+                or not isinstance(record.get("uid"), int)
+                or not 0 <= record["uid"] <= (1 << 32) - 1
+                or isinstance(record.get("gid"), bool)
+                or not isinstance(record.get("gid"), int)
+                or not 0 <= record["gid"] <= (1 << 32) - 1
+                or not isinstance(record.get("sha256"), str)
+                or not DIGEST.fullmatch(record["sha256"])
+            ):
+                raise ValueError("transaction prior-state binding is invalid")
+            prior_payload, backup_meta = read_fd(transaction / str(record["backup"]))
+            if (
+                backup_meta.st_uid != mapped_id(0, root)
+                or backup_meta.st_gid != mapped_id(0, root, group=True)
+                or stat.S_IMODE(backup_meta.st_mode) != 0o600
+            ):
+                raise ValueError("backup file mode drift")
+            if sha256(prior_payload) != record["sha256"]:
+                raise ValueError("backup file digest drift")
+        elif set(record) != expected_record_keys:
+            raise ValueError("transaction absent-state binding is invalid")
+        prior_payloads[target] = prior_payload
+
+        uid, gid, install_mode = desired_metadata(root, entry)
+        if (
+            not isinstance(desired, dict)
+            or set(desired) != {"target", "sha256", "mode", "uid", "gid"}
+            or desired != {
+                "target": target,
+                "sha256": entry.sha256,
+                "mode": install_mode,
+                "uid": uid,
+                "gid": gid,
+            }
+        ):
+            raise ValueError("transaction candidate binding is invalid")
+    return prior_payloads
+
+
+def validate_unchanged_targets(root: Path, state: dict[str, object], entries: list[Entry]) -> None:
+    changed = set(state["changed_targets"])
+    for entry in entries:
+        if entry.target in changed:
+            continue
+        observed = target_state(root, entry)
+        uid, gid, install_mode = desired_metadata(root, entry)
+        if observed is None or (
+            observed["sha256"], observed["mode"], observed["uid"], observed["gid"]
+        ) != (entry.sha256, install_mode, uid, gid):
+            raise ValueError(f"unchanged package target drift: {entry.target}")
+
+
+def read_transaction(
+    package: Path,
+    root: Path,
+    transaction: Path,
+    manifest: dict[str, object],
+    entries: list[Entry],
+) -> tuple[dict[str, object], dict[str, bytes | None], dict[str, object] | None]:
+    require_directory(transaction, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
+    state, _, metadata = parse_json_file(transaction / "transaction.json")
+    required_keys = {
+        "schema",
+        "transaction_id",
+        "package_id",
+        "package_digest",
+        "source_commit",
+        "phase",
+        "changed_targets",
+        "created_directories",
+        "inventory",
+        "candidate",
+        "transaction_digest",
+    }
+    if (
+        metadata.st_uid != mapped_id(0, root)
+        or metadata.st_gid != mapped_id(0, root, group=True)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or set(state) != required_keys
+        or state.get("schema") != TRANSACTION_SCHEMA
+        or state.get("transaction_id") != transaction.name
+        or state.get("package_id") != manifest["package_id"]
+        or state.get("package_digest") != manifest["package_digest"]
+        or state.get("source_commit") != manifest["source_commit"]
+        or state.get("phase") not in TRANSACTION_PHASES
+        or not isinstance(state.get("transaction_digest"), str)
+        or not DIGEST.fullmatch(state["transaction_digest"])
+        or transaction_digest(state) != state["transaction_digest"]
+    ):
+        raise ValueError("transaction state is invalid or bound to another candidate")
+    prior_payloads = validate_inventory(root, transaction, state, entries)
+    validate_unchanged_targets(root, state, entries)
+
+    receipt_path = transaction / "receipt.json"
+    receipt: dict[str, object] | None = None
+    if receipt_path.exists() or receipt_path.is_symlink():
+        receipt, _, receipt_meta = parse_json_file(receipt_path)
+        receipt_state_value = receipt.get("state")
+        expected: dict[str, object] | None = None
+        if receipt.get("schema") == RECEIPT_SCHEMA and receipt_state_value in {"installed", "rolled_back"}:
+            expected = receipt_for(state, str(receipt_state_value))
+        elif (
+            receipt.get("schema") == LEGACY_RECEIPT_SCHEMA
+            and state.get("phase") in {"installed", "rollback_restoring"}
+            and receipt_state_value == "installed"
+        ):
+            expected = legacy_receipt_for(state, "installed")
+        if (
+            receipt_meta.st_uid != mapped_id(0, root)
+            or receipt_meta.st_gid != mapped_id(0, root, group=True)
+            or stat.S_IMODE(receipt_meta.st_mode) != 0o600
+            or expected is None
+            or receipt != expected
+        ):
+            raise ValueError("receipt/state mismatch")
+    phase = str(state["phase"])
+    receipt_state = receipt.get("state") if receipt is not None else None
+    allowed_receipts = {
+        "install_prepared": {None},
+        "install_publishing": {None, "installed"},
+        "installed": {"installed"},
+        "rollback_prepared": {"installed"},
+        "rollback_restoring": {"installed", "rolled_back"},
+        "rolled_back": {"rolled_back"},
+    }
+    if receipt_state not in allowed_receipts[phase]:
+        raise ValueError("receipt/state mismatch")
+    return state, prior_payloads, receipt
+
+
+def target_classification(
+    root: Path,
+    entry: Entry,
+    record: dict[str, object],
+    desired: dict[str, object],
+) -> str:
+    observed = target_state(root, entry)
+    if observed is not None and (
+        observed["sha256"],
+        observed["mode"],
+        observed["uid"],
+        observed["gid"],
+    ) == (desired["sha256"], desired["mode"], desired["uid"], desired["gid"]):
+        return "candidate"
+    if record["existed"]:
+        if observed is not None and (
+            observed["sha256"],
+            observed["mode"],
+            observed["uid"],
+            observed["gid"],
+        ) == (record["sha256"], record["mode"], record["uid"], record["gid"]):
+            return "prior"
+    elif observed is None:
+        return "prior"
+    return "drift"
+
+
+def target_classifications(
+    root: Path,
+    state: dict[str, object],
+    entries: list[Entry],
+) -> dict[str, str]:
+    by_target = {entry.target: entry for entry in entries}
+    result: dict[str, str] = {}
+    for target, record, desired in zip(
+        state["changed_targets"], state["inventory"], state["candidate"], strict=True
+    ):
+        result[str(target)] = target_classification(root, by_target[str(target)], record, desired)
+    return result
+
+
+def require_classifications(classifications: dict[str, str], allowed: set[str], operation: str) -> None:
+    refused = {target: value for target, value in classifications.items() if value not in allowed}
+    if refused:
+        target, value = next(iter(refused.items()))
+        raise ValueError(f"{operation} target drift: {target} is {value}")
+
+
+def remove_created_directory(root: Path, logical: str) -> None:
+    path = rooted(root, logical)
+    parent_fd = directory_fd(path.parent)
+    try:
+        os.rmdir(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def validate_rollback_directories(
+    root: Path,
+    state: dict[str, object],
+    classifications: dict[str, str],
+) -> None:
+    inventory = {str(record["target"]): record for record in state["inventory"]}
+    for logical in state["created_directories"]:
+        path = rooted(root, str(logical))
+        expected_present = {
+            Path(target).name
+            for target, classification in classifications.items()
+            if classification == "candidate"
+            and not inventory[target]["existed"]
+            and rooted(root, target).parent == path
+        }
+        if not path.exists() and not path.is_symlink():
+            if expected_present:
+                raise ValueError(f"rollback directory disappeared with candidate targets: {logical}")
+            continue
+        try:
+            require_directory(path, mapped_id(0, root), mapped_id(0, root, group=True), 0o755)
+        except ValueError as error:
+            raise ValueError(f"rollback directory metadata drift: {logical}") from error
+        fd = directory_fd(path)
+        try:
+            present = set(os.listdir(fd))
+        finally:
+            os.close(fd)
+        if present != expected_present:
+            raise ValueError(f"rollback directory removal is blocked: {logical}")
+
+
+def read_legacy_receipt(
+    root: Path,
+    transaction: Path,
+    manifest: dict[str, object],
+    entries: list[Entry],
+) -> tuple[dict[str, object], dict[str, bytes | None], dict[str, object]]:
+    require_directory(transaction, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
+    receipt, _, metadata = parse_json_file(transaction / "receipt.json")
+    expected_keys = {
+        "schema",
+        "state",
+        "package_id",
+        "package_digest",
+        "changed_targets",
+        "created_directories",
+        "inventory",
+    }
+    if (
+        metadata.st_uid != mapped_id(0, root)
+        or metadata.st_gid != mapped_id(0, root, group=True)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or set(receipt) != expected_keys
+        or receipt.get("schema") != LEGACY_RECEIPT_SCHEMA
+        or receipt.get("state") not in {"installed", "rolled_back"}
+        or receipt.get("package_id") != manifest["package_id"]
+        or receipt.get("package_digest") != manifest["package_digest"]
+        or not transaction.name.startswith(f"{manifest['package_id']}-")
+    ):
+        raise ValueError("legacy backup receipt is invalid or bound to another candidate")
+
+    changed_targets = receipt.get("changed_targets")
+    created_directories = receipt.get("created_directories")
+    by_target = {entry.target: entry for entry in entries}
+    if (
+        not isinstance(changed_targets, list)
+        or not changed_targets
+        or any(not isinstance(target, str) or target not in by_target for target in changed_targets)
+        or changed_targets != sorted(changed_targets, key=str.encode)
+        or not isinstance(created_directories, list)
+        or any(
+            not isinstance(directory, str) or directory not in EXPECTED_DIRECTORIES
+            for directory in created_directories
+        )
+        or len(set(created_directories)) != len(created_directories)
+        or created_directories
+        != [
+            str(item["target"])
+            for item in manifest["directories"]
+            if item["target"] in set(created_directories)
+        ]
+    ):
+        raise ValueError("legacy backup receipt inventory is ambiguous")
+
+    candidate: list[dict[str, object]] = []
+    for target in changed_targets:
+        entry = by_target[target]
+        uid, gid, install_mode = desired_metadata(root, entry)
+        candidate.append(
+            {
+                "target": target,
+                "sha256": entry.sha256,
+                "mode": install_mode,
+                "uid": uid,
+                "gid": gid,
+            }
+        )
+    state = {
+        "schema": TRANSACTION_SCHEMA,
+        "transaction_id": transaction.name,
+        "package_id": manifest["package_id"],
+        "package_digest": manifest["package_digest"],
+        "source_commit": manifest["source_commit"],
+        "phase": str(receipt["state"]),
+        "changed_targets": changed_targets,
+        "created_directories": created_directories,
+        "inventory": receipt["inventory"],
+        "candidate": candidate,
+    }
+    state["transaction_digest"] = transaction_digest(state)
+    if receipt != legacy_receipt_for(state, str(receipt["state"])):
+        raise ValueError("legacy backup receipt binding is invalid")
+    prior_payloads = validate_inventory(root, transaction, state, entries)
+    validate_unchanged_targets(root, state, entries)
+    for record, desired in zip(state["inventory"], candidate, strict=True):
+        if record["existed"] and (
+            record["sha256"], record["mode"], record["uid"], record["gid"]
+        ) == (desired["sha256"], desired["mode"], desired["uid"], desired["gid"]):
+            raise ValueError("legacy backup prior state is indistinguishable from the candidate")
+
+    classifications = target_classifications(root, state, entries)
+    if receipt["state"] == "installed":
+        require_classifications(classifications, {"candidate", "prior"}, "legacy installed backup")
+        validate_rollback_directories(root, state, classifications)
+        if set(classifications.values()) != {"candidate"}:
+            state["phase"] = "rollback_restoring"
+            state["transaction_digest"] = transaction_digest(state)
+    else:
+        require_classifications(classifications, {"prior"}, "legacy rolled-back backup")
+        validate_rollback_directories(root, state, classifications)
+        if any(
+            rooted(root, str(logical)).exists() or rooted(root, str(logical)).is_symlink()
+            for logical in state["created_directories"]
+        ):
+            raise ValueError("legacy rolled-back directory evidence is ambiguous")
+    return state, prior_payloads, receipt
+
+
+def result_for_install(manifest: dict[str, object], state: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": "installed",
+        "package_id": manifest["package_id"],
+        "package_digest": manifest["package_digest"],
+        "backup_id": state["transaction_id"],
+        "changed_targets": state["changed_targets"],
+        "peer_policy": manifest["peer_policy"],
+        **DEFAULT_STATE,
+    }
+
+
+def result_for_rollback(manifest: dict[str, object], state: dict[str, object], *, dry_run: bool) -> dict[str, object]:
+    return {
+        "status": "rollback_dry_run" if dry_run else "rolled_back",
+        "package_id": manifest["package_id"],
+        "backup_id": state["transaction_id"],
+        "restored_targets": state["changed_targets"],
+    }
+
+
+def matching_transactions(
+    package: Path,
+    root: Path,
+    backup_base: Path,
+    manifest: dict[str, object],
+    entries: list[Entry],
+) -> list[tuple[Path, dict[str, object], dict[str, bytes | None], dict[str, object] | None]]:
+    prefix = f"{manifest['package_id']}-"
+    matches = []
+    for transaction in sorted(backup_base.iterdir(), key=lambda item: item.name.encode()):
+        if not transaction.name.startswith(prefix):
+            continue
+        state_path = transaction / "transaction.json"
+        if not state_path.exists() and not state_path.is_symlink():
+            continue
+        state, prior_payloads, receipt = read_transaction(package, root, transaction, manifest, entries)
+        matches.append((transaction, state, prior_payloads, receipt))
+    return matches
 
 
 def check(package: Path, root: Path) -> dict[str, object]:
@@ -506,69 +1110,169 @@ def install(package: Path, root: Path, backup_root: Path, *, dry_run: bool = Fal
     validate_host_identities(root, manifest)
     if root == Path("/") and os.geteuid() != 0:
         raise PermissionError("install requires root")
-    planned = changes(package, root, entries)
-    result: dict[str, object] = {
-        "status": "dry_run" if dry_run else ("unchanged" if not planned else "installed"),
-        "package_id": manifest["package_id"],
-        "package_digest": manifest["package_digest"],
-        "changed_targets": [entry.target for entry in planned],
-        "peer_policy": manifest["peer_policy"],
-        **DEFAULT_STATE,
-    }
-    if dry_run or not planned:
-        return result
     backup_base = backup_root_path(root, backup_root)
+    if dry_run:
+        planned = changes(package, root, entries)
+        return {
+            "status": "dry_run",
+            "package_id": manifest["package_id"],
+            "package_digest": manifest["package_digest"],
+            "changed_targets": [entry.target for entry in planned],
+            "peer_policy": manifest["peer_policy"],
+            **DEFAULT_STATE,
+        }
+
     ensure_private_tree(root, backup_base)
-    backup_id = f"{manifest['package_id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}-{uuid.uuid4().hex[:8]}"
-    transaction = backup_base / backup_id
-    transaction.mkdir(mode=0o700)
-    os.chown(transaction, mapped_id(0, root), mapped_id(0, root, group=True))
-    transaction.chmod(0o700)
-    require_directory(transaction, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
-    inventory: list[dict[str, object]] = []
-    created_directories: list[str] = []
-    try:
-        ensure_managed_directories(root, manifest, created_directories)
+    transactions = matching_transactions(package, root, backup_base, manifest, entries)
+    active = [item for item in transactions if item[1]["phase"] != "rolled_back"]
+    if len(active) > 1:
+        raise ValueError("multiple non-terminal transactions are bound to this package")
+
+    if active:
+        transaction, state, _prior_payloads, receipt = active[0]
+        phase = str(state["phase"])
+        classifications = target_classifications(root, state, entries)
+        if phase in {"rollback_prepared", "rollback_restoring"}:
+            raise ValueError(
+                f"rollback transaction is incomplete; retry rollback with backup id {state['transaction_id']}"
+            )
+        if phase == "installed":
+            require_classifications(classifications, {"candidate"}, "installed transaction")
+            return result_for_install(manifest, state)
+        if phase == "install_prepared":
+            require_classifications(classifications, {"prior"}, "prepared install")
+            if receipt is not None:
+                raise ValueError("receipt/state mismatch")
+            state = write_transaction_state(root, transaction, state, "install_publishing")
+            _phase_boundary("install_publishing")
+        elif phase == "install_publishing":
+            if receipt is not None:
+                require_classifications(classifications, {"candidate"}, "completed install")
+                state = write_transaction_state(root, transaction, state, "installed")
+                _phase_boundary("installed")
+                return result_for_install(manifest, state)
+            require_classifications(classifications, {"prior", "candidate"}, "resumed install")
+        else:
+            raise ValueError("transaction phase cannot be resumed by install")
+    else:
+        planned = changes(package, root, entries)
+        if not planned:
+            return {
+                "status": "unchanged",
+                "package_id": manifest["package_id"],
+                "package_digest": manifest["package_digest"],
+                "changed_targets": [],
+                "peer_policy": manifest["peer_policy"],
+                **DEFAULT_STATE,
+            }
+        backup_id = f"{manifest['package_id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}-{uuid.uuid4().hex[:8]}"
+        transaction = backup_base / backup_id
+        transaction.mkdir(mode=0o700)
+        os.chown(transaction, mapped_id(0, root), mapped_id(0, root, group=True))
+        transaction.chmod(0o700)
+        fsync_directory(backup_base)
+        require_directory(transaction, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
+
+        created_directories: list[str] = []
+        for item in manifest["directories"]:
+            logical = str(item["target"])
+            directory = rooted(root, logical)
+            if directory.exists() or directory.is_symlink():
+                require_directory(directory, mapped_id(0, root), mapped_id(0, root, group=True), 0o755)
+            else:
+                validate_parent_chain(root, directory.parent)
+                created_directories.append(logical)
+
+        inventory: list[dict[str, object]] = []
+        candidate: list[dict[str, object]] = []
+        files_created = False
         for index, entry in enumerate(planned):
             prior = target_state(root, entry)
             record: dict[str, object] = {"target": entry.target, "existed": prior is not None}
             if prior is not None:
-                record.update({"mode": prior["mode"], "uid": prior["uid"], "gid": prior["gid"], "sha256": prior["sha256"], "backup": f"files/{index}"})
+                record.update(
+                    {
+                        "mode": prior["mode"],
+                        "uid": prior["uid"],
+                        "gid": prior["gid"],
+                        "sha256": prior["sha256"],
+                        "backup": f"files/{index}",
+                    }
+                )
                 files = transaction / "files"
-                files.mkdir(mode=0o700, exist_ok=True)
-                backup_file = files / str(index)
-                atomic_write(backup_file, prior["payload"], 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
+                if not files_created:
+                    files.mkdir(mode=0o700)
+                    os.chown(files, mapped_id(0, root), mapped_id(0, root, group=True))
+                    files.chmod(0o700)
+                    fsync_directory(transaction)
+                    files_created = True
+                atomic_write(
+                    files / str(index),
+                    prior["payload"],
+                    0o600,
+                    mapped_id(0, root),
+                    mapped_id(0, root, group=True),
+                )
             inventory.append(record)
-            payload, _ = read_fd(package / entry.source)
             uid, gid, install_mode = desired_metadata(root, entry)
-            target = rooted(root, entry.target)
-            atomic_write(target, payload, install_mode, uid, gid)
-            installed = target_state(root, entry)
-            if installed is None or (installed["sha256"], installed["mode"], installed["uid"], installed["gid"]) != (entry.sha256, install_mode, uid, gid):
-                raise ValueError(f"installed target readback mismatch: {entry.target}")
-        receipt = {
-            "schema": RECEIPT_SCHEMA,
-            "state": "installed",
+            candidate.append(
+                {
+                    "target": entry.target,
+                    "sha256": entry.sha256,
+                    "mode": install_mode,
+                    "uid": uid,
+                    "gid": gid,
+                }
+            )
+        state = {
+            "schema": TRANSACTION_SCHEMA,
+            "transaction_id": backup_id,
             "package_id": manifest["package_id"],
             "package_digest": manifest["package_digest"],
+            "source_commit": manifest["source_commit"],
             "changed_targets": [entry.target for entry in planned],
             "created_directories": created_directories,
             "inventory": inventory,
+            "candidate": candidate,
         }
-        atomic_write(transaction / "receipt.json", canonical_json(receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
-    except BaseException:
-        for record in reversed(inventory):
-            target = rooted(root, str(record["target"]))
-            if record["existed"]:
-                payload, _ = read_fd(transaction / str(record["backup"]))
-                atomic_write(target, payload, int(record["mode"]), int(record["uid"]), int(record["gid"]))
-            elif target.exists():
-                target.unlink()
-        for directory in reversed(created_directories):
-            rooted(root, directory).rmdir()
-        raise
-    result["backup_id"] = backup_id
-    return result
+        state = write_transaction_state(root, transaction, state, "install_prepared")
+        _phase_boundary("install_prepared")
+        validate_unchanged_targets(root, state, entries)
+        classifications = target_classifications(root, state, entries)
+        require_classifications(classifications, {"prior"}, "prepared install")
+        state = write_transaction_state(root, transaction, state, "install_publishing")
+        _phase_boundary("install_publishing")
+
+    ensure_managed_directories(root, manifest, list(state["created_directories"]))
+    by_target = {entry.target: entry for entry in entries}
+    classifications = target_classifications(root, state, entries)
+    require_classifications(classifications, {"prior", "candidate"}, "install")
+    for target, desired in zip(state["changed_targets"], state["candidate"], strict=True):
+        entry = by_target[str(target)]
+        if classifications[str(target)] == "prior":
+            payload, source_meta = read_fd(package / entry.source)
+            if stat.S_IMODE(source_meta.st_mode) != entry.source_mode or sha256(payload) != entry.sha256:
+                raise ValueError(f"package source drift during install: {entry.source}")
+            atomic_write(
+                rooted(root, entry.target),
+                payload,
+                int(desired["mode"]),
+                int(desired["uid"]),
+                int(desired["gid"]),
+            )
+            observed = target_state(root, entry)
+            if observed is None or (
+                observed["sha256"], observed["mode"], observed["uid"], observed["gid"]
+            ) != (desired["sha256"], desired["mode"], desired["uid"], desired["gid"]):
+                raise ValueError(f"installed target readback mismatch: {entry.target}")
+            _phase_boundary("install_target_published", entry.target)
+    classifications = target_classifications(root, state, entries)
+    require_classifications(classifications, {"candidate"}, "install completion")
+    write_receipt(root, transaction, state, "installed")
+    _phase_boundary("installed_receipt_written")
+    state = write_transaction_state(root, transaction, state, "installed")
+    _phase_boundary("installed")
+    return result_for_install(manifest, state)
 
 
 def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dry_run: bool = False) -> dict[str, object]:
@@ -579,126 +1283,114 @@ def rollback(package: Path, root: Path, backup_root: Path, backup_id: str, *, dr
         raise ValueError("invalid backup id")
     transaction = backup_root_path(root, backup_root) / backup_id
     require_directory(transaction.parent, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
-    require_directory(transaction, mapped_id(0, root), mapped_id(0, root, group=True), 0o700)
-    receipt, _, metadata = parse_json_file(transaction / "receipt.json")
-    if (
-        metadata.st_uid != mapped_id(0, root)
-        or metadata.st_gid != mapped_id(0, root, group=True)
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or receipt.get("schema") != RECEIPT_SCHEMA
-        or receipt.get("state") != "installed"
-    ):
-        raise ValueError("backup receipt is not rollbackable")
-    if receipt.get("package_id") != manifest["package_id"] or receipt.get("package_digest") != manifest["package_digest"]:
-        raise ValueError("backup is bound to another package")
+    state_path = transaction / "transaction.json"
+    if not state_path.exists() and not state_path.is_symlink():
+        state, prior_payloads, receipt = read_legacy_receipt(root, transaction, manifest, entries)
+        if state["phase"] == "rolled_back" or dry_run:
+            return result_for_rollback(manifest, state, dry_run=dry_run)
+        state = write_transaction_state(root, transaction, state, str(state["phase"]))
+        _phase_boundary("legacy_transaction_persisted")
+        receipt = write_receipt(root, transaction, state, "installed")
+        _phase_boundary("legacy_receipt_migrated")
+    else:
+        state, prior_payloads, receipt = read_transaction(package, root, transaction, manifest, entries)
+        if (
+            not dry_run
+            and state["phase"] in {"installed", "rollback_restoring"}
+            and receipt is not None
+            and receipt.get("schema") == LEGACY_RECEIPT_SCHEMA
+        ):
+            receipt = write_receipt(root, transaction, state, "installed")
+            _phase_boundary("legacy_receipt_migrated")
+    phase = str(state["phase"])
+    if phase in {"install_prepared", "install_publishing"}:
+        raise ValueError("install transaction is incomplete; retry install before rollback")
+    if phase == "rolled_back":
+        classifications = target_classifications(root, state, entries)
+        require_classifications(classifications, {"prior"}, "rolled-back transaction")
+        validate_rollback_directories(root, state, classifications)
+        return result_for_rollback(manifest, state, dry_run=dry_run)
+
+    classifications = target_classifications(root, state, entries)
+    if phase == "rollback_restoring" and receipt is not None and receipt.get("state") == "rolled_back":
+        if set(classifications.values()) != {"prior"} or any(
+            rooted(root, str(logical)).exists() or rooted(root, str(logical)).is_symlink()
+            for logical in state["created_directories"]
+        ):
+            raise ValueError("receipt/state mismatch")
+        state = write_transaction_state(root, transaction, state, "rolled_back")
+        _phase_boundary("rolled_back")
+        return result_for_rollback(manifest, state, dry_run=dry_run)
+    if phase == "installed":
+        require_classifications(classifications, {"candidate"}, "installed target drift blocks rollback")
+        validate_rollback_directories(root, state, classifications)
+        if dry_run:
+            return result_for_rollback(manifest, state, dry_run=True)
+        if receipt is None or receipt.get("state") != "installed":
+            raise ValueError("receipt/state mismatch")
+        state = write_transaction_state(root, transaction, state, "rollback_prepared")
+        _phase_boundary("rollback_prepared")
+        phase = "rollback_prepared"
+    elif dry_run:
+        require_classifications(classifications, {"prior", "candidate"}, "rollback recovery preflight")
+        validate_rollback_directories(root, state, classifications)
+        return result_for_rollback(manifest, state, dry_run=True)
+
+    if phase == "rollback_prepared":
+        classifications = target_classifications(root, state, entries)
+        require_classifications(classifications, {"candidate"}, "prepared rollback")
+        validate_rollback_directories(root, state, classifications)
+        state = write_transaction_state(root, transaction, state, "rollback_restoring")
+        _phase_boundary("rollback_restoring")
+    elif phase != "rollback_restoring":
+        raise ValueError("transaction phase cannot be resumed by rollback")
+
+    classifications = target_classifications(root, state, entries)
+    require_classifications(classifications, {"prior", "candidate"}, "resumed rollback")
+    validate_rollback_directories(root, state, classifications)
     by_target = {entry.target: entry for entry in entries}
-    changed_targets = receipt.get("changed_targets")
-    inventory = receipt.get("inventory")
-    created_directories = receipt.get("created_directories")
-    if (
-        not isinstance(changed_targets, list)
-        or not changed_targets
-        or len(set(changed_targets)) != len(changed_targets)
-        or any(target not in by_target for target in changed_targets)
-        or not isinstance(inventory, list)
-        or len(inventory) != len(changed_targets)
-        or not isinstance(created_directories, list)
-        or len(set(created_directories)) != len(created_directories)
-        or any(directory not in EXPECTED_DIRECTORIES for directory in created_directories)
-    ):
-        raise ValueError("backup receipt inventory is invalid")
-    for index, (target, record) in enumerate(zip(changed_targets, inventory, strict=True)):
-        if not isinstance(record, dict) or record.get("target") != target or not isinstance(record.get("existed"), bool):
-            raise ValueError("backup receipt entry is invalid")
-        expected_record_keys = {"target", "existed"}
+    records = {
+        str(record["target"]): record
+        for record in state["inventory"]
+    }
+    for target in reversed(state["changed_targets"]):
+        logical = str(target)
+        if classifications[logical] == "prior":
+            continue
+        record = records[logical]
+        path = rooted(root, logical)
+        prior_payload = prior_payloads[logical]
         if record["existed"]:
-            expected_record_keys |= {"mode", "uid", "gid", "sha256", "backup"}
-            if (
-                set(record) != expected_record_keys
-                or not isinstance(record["backup"], str)
-                or record["backup"] != f"files/{index}"
-                or isinstance(record["mode"], bool)
-                or not isinstance(record["mode"], int)
-                or not 0 <= record["mode"] <= 0o777
-                or isinstance(record["uid"], bool)
-                or not isinstance(record["uid"], int)
-                or not 0 <= record["uid"] <= (1 << 32) - 1
-                or isinstance(record["gid"], bool)
-                or not isinstance(record["gid"], int)
-                or not 0 <= record["gid"] <= (1 << 32) - 1
-                or not isinstance(record["sha256"], str)
-                or not DIGEST.fullmatch(record["sha256"])
-            ):
-                raise ValueError("backup receipt prior-state binding is invalid")
-        elif set(record) != expected_record_keys:
-            raise ValueError("backup receipt new-target binding is invalid")
-
-    if any(record["existed"] for record in inventory):
-        require_directory(
-            transaction / "files",
-            mapped_id(0, root),
-            mapped_id(0, root, group=True),
-            0o700,
-        )
-
-    rollback_plan: list[tuple[dict[str, object], Path, bytes | None]] = []
-    for target, record in zip(changed_targets, inventory, strict=True):
-        entry = by_target[target]
-        state = target_state(root, entry)
-        uid, gid, install_mode = desired_metadata(root, entry)
-        if state is None or (state["sha256"], state["mode"], state["uid"], state["gid"]) != (entry.sha256, install_mode, uid, gid):
-            raise ValueError(f"installed target drift blocks rollback: {target}")
-        prior_payload: bytes | None = None
-        if record["existed"]:
-            prior_payload, backup_meta = read_fd(transaction / str(record["backup"]))
-            if (
-                backup_meta.st_uid != mapped_id(0, root)
-                or backup_meta.st_gid != mapped_id(0, root, group=True)
-                or stat.S_IMODE(backup_meta.st_mode) != 0o600
-            ):
-                raise ValueError("backup file mode drift")
-            if sha256(prior_payload) != record["sha256"]:
-                raise ValueError("backup file digest drift")
-        rollback_plan.append((record, rooted(root, target), prior_payload))
-
-    removal_plan: list[Path] = []
-    for directory in created_directories:
-        path = rooted(root, directory)
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        try:
-            directory_meta = os.fstat(fd)
-            if (
-                not stat.S_ISDIR(directory_meta.st_mode)
-                or directory_meta.st_uid != mapped_id(0, root)
-                or directory_meta.st_gid != mapped_id(0, root, group=True)
-                or stat.S_IMODE(directory_meta.st_mode) != 0o755
-            ):
-                raise ValueError(f"rollback directory metadata drift: {directory}")
-            present = set(os.listdir(fd))
-        finally:
-            os.close(fd)
-        removable = {
-            step_target.name
-            for record, step_target, _prior_payload in rollback_plan
-            if not record["existed"] and step_target.parent == path
-        }
-        if present != removable:
-            raise ValueError(f"rollback directory removal is blocked: {directory}")
-        removal_plan.append(path)
-
-    result = {"status": "rollback_dry_run" if dry_run else "rolled_back", "package_id": manifest["package_id"], "backup_id": backup_id, "restored_targets": receipt["changed_targets"]}
-    if dry_run:
-        return result
-    for record, target, prior_payload in reversed(rollback_plan):
-        if prior_payload is not None:
-            atomic_write(target, prior_payload, int(record["mode"]), int(record["uid"]), int(record["gid"]))
+            if prior_payload is None:
+                raise ValueError("transaction prior payload is missing")
+            atomic_write(path, prior_payload, int(record["mode"]), int(record["uid"]), int(record["gid"]))
         else:
-            target.unlink()
-    for directory in reversed(removal_plan):
-        directory.rmdir()
-    receipt["state"] = "rolled_back"
-    atomic_write(transaction / "receipt.json", canonical_json(receipt), 0o600, mapped_id(0, root), mapped_id(0, root, group=True))
-    return result
+            unlink_target(path)
+        observed = target_classification(
+            root,
+            by_target[logical],
+            record,
+            next(item for item in state["candidate"] if item["target"] == logical),
+        )
+        if observed != "prior":
+            raise ValueError(f"rolled-back target readback mismatch: {logical}")
+        classifications[logical] = "prior"
+        _phase_boundary("rollback_target_restored", logical)
+
+    validate_rollback_directories(root, state, classifications)
+    for logical in reversed(state["created_directories"]):
+        path = rooted(root, str(logical))
+        if path.exists() or path.is_symlink():
+            remove_created_directory(root, str(logical))
+            _phase_boundary("rollback_directory_removed", str(logical))
+    classifications = target_classifications(root, state, entries)
+    require_classifications(classifications, {"prior"}, "rollback completion")
+    validate_rollback_directories(root, state, classifications)
+    write_receipt(root, transaction, state, "rolled_back")
+    _phase_boundary("rolled_back_receipt_written")
+    state = write_transaction_state(root, transaction, state, "rolled_back")
+    _phase_boundary("rolled_back")
+    return result_for_rollback(manifest, state, dry_run=False)
 
 
 def main() -> int:

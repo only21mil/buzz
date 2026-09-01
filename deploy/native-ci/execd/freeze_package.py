@@ -37,8 +37,8 @@ ACTIVATION_OWNED_TARGETS = [
     "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json",
     "/usr/share/buzzci/execd-v2/fixture/input.txt",
 ]
-ACTIVATION_SCHEMA = "buzz-ci-capacity-one-activation-package-v1"
-ACTIVATION_DRAFT_SCHEMA = "buzz-ci-capacity-one-activation-draft-v1"
+ACTIVATION_SCHEMA = "buzz-ci-capacity-one-activation-package-v2"
+ACTIVATION_DRAFT_SCHEMA = "buzz-ci-capacity-one-activation-draft-v2"
 SECCOMP_CONTRACT = {
     "source_path": "/usr/share/containers/seccomp.json",
     "source_sha256": "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4",

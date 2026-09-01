@@ -13,13 +13,16 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::acceptance::{EvidenceObject, FixtureSpec};
+use crate::acceptance::{AdmissionState, FixtureSpec, Operation};
+use crate::production::{
+    expected_adapter_operation_id, AdapterRequest, ControlReadback, ADAPTER_REQUEST_SCHEMA,
+};
 
 /// Fixed root-owned receipt read independently by keyholder and controld.
 pub const ACCEPTANCE_BINDING_PATH: &str =
-    "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json";
+    "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json";
 /// Exact receipt schema. This is distinct from the capacity-one acceptance receipt v2.
-pub const ACCEPTANCE_BINDING_SCHEMA: &str = "buzz-ci-activation-acceptance-binding/v1";
+pub const ACCEPTANCE_BINDING_SCHEMA: &str = "buzz-ci-activation-acceptance-binding/v2";
 /// Required mode of the root-owned receipt.
 pub const ACCEPTANCE_BINDING_MODE: u32 = 0o444;
 /// Required mode of the immediate root-owned receipt directory.
@@ -58,8 +61,10 @@ pub struct AcceptanceBindingReceipt {
     pub activation_id: String,
     pub activation_package_digest: String,
     pub scenario_sha256: String,
-    pub peer_uid: u32,
-    pub peer_gid: u32,
+    pub keyholder_peer_uid: u32,
+    pub keyholder_peer_gid: u32,
+    pub acceptance_peer_uid: u32,
+    pub acceptance_peer_gid: u32,
     pub timeout_millis: u64,
     pub fixture: FixtureSpec,
     pub acceptance: AcceptanceAuthorityBinding,
@@ -133,13 +138,18 @@ impl AcceptanceBindingReceipt {
     /// exact Run/Grant/Rerun/Tombstone event bindings.
     pub fn validate(&self) -> Result<ValidatedAcceptanceBinding, AcceptanceBindingError> {
         if self.schema_version != ACCEPTANCE_BINDING_SCHEMA
-            || !valid_name(&self.activation_id, 128)
+            || self.activation_id != self.fixture.activation_id
+            || self.activation_package_digest != self.fixture.activation_package_digest
             || self.scenario_sha256 != self.acceptance.scenario_sha256
             || decode_hex::<32>(&self.activation_package_digest).is_none()
             || !matches!(self.fixture.integrated_candidate_sha.len(), 40 | 64)
             || !lower_hex_nonzero(&self.fixture.integrated_candidate_sha)
-            || self.peer_uid == 0
-            || self.peer_gid == 0
+            || self.keyholder_peer_uid == 0
+            || self.keyholder_peer_gid == 0
+            || self.acceptance_peer_uid == 0
+            || self.acceptance_peer_gid == 0
+            || (self.keyholder_peer_uid, self.keyholder_peer_gid)
+                == (self.acceptance_peer_uid, self.acceptance_peer_gid)
             || self.timeout_millis == 0
             || self.timeout_millis > 300_000
             || self.acceptance.actor.generation == 0
@@ -159,7 +169,7 @@ impl AcceptanceBindingReceipt {
         let event_refs = event_bytes.each_ref().map(Vec::as_slice);
         let templates = validate_acceptance_event_templates(actor_public_key, event_refs)?;
         if self.fixture.request_digest != hex::encode(templates.event_ids[0])
-            || self.fixture.grant_digest != hex::encode(templates.event_ids[1])
+            || self.fixture.grant_event_id != hex::encode(templates.event_ids[1])
             || self.fixture.approved_by != self.acceptance.actor.public_key
         {
             return Err(AcceptanceBindingError::Invalid);
@@ -504,63 +514,31 @@ fn validate_tombstone_template(
 }
 
 fn validate_fixture(receipt: &AcceptanceBindingReceipt) -> Result<(), AcceptanceBindingError> {
-    let fixture = &receipt.fixture;
-    if !matches!(fixture.integrated_candidate_sha.len(), 40 | 64)
-        || !lower_hex_nonzero(&fixture.integrated_candidate_sha)
-        || !lower_hex_nonzero_len(&fixture.run_id, 32)
-        || !lower_hex_nonzero_len(&fixture.approval_id, 32)
-        || !matches!(fixture.source_oid.len(), 40 | 64)
-        || !lower_hex_nonzero(&fixture.source_oid)
-        || [
-            &fixture.request_digest,
-            &fixture.manifest_digest,
-            &fixture.grant_digest,
-            &fixture.approved_by,
-            &fixture.export_subject,
-            &fixture.export_authorization_digest,
-        ]
-        .into_iter()
-        .any(|value| !lower_hex_nonzero_len(value, 64))
-        || !valid_evidence(&fixture.expected_log)
-        || fixture.expected_artifacts.is_empty()
-        || fixture
-            .expected_artifacts
-            .iter()
-            .any(|item| !valid_evidence(item))
-    {
-        return Err(AcceptanceBindingError::Invalid);
-    }
-    let names = fixture
-        .expected_artifacts
-        .iter()
-        .map(|item| item.name.as_str())
-        .collect::<HashSet<_>>();
-    if names.len() != fixture.expected_artifacts.len()
-        || names.contains(fixture.expected_log.name.as_str())
-    {
-        return Err(AcceptanceBindingError::Invalid);
-    }
-    Ok(())
-}
-
-fn valid_evidence(value: &EvidenceObject) -> bool {
-    !value.name.is_empty()
-        && value.name.len() <= 255
-        && !value.name.contains('/')
-        && value.bytes > 0
-        && lower_hex_nonzero_len(&value.sha256, 64)
-}
-
-fn lower_hex_nonzero_len(value: &str, len: usize) -> bool {
-    value.len() == len && lower_hex_nonzero(value)
-}
-
-fn valid_name(value: &str, maximum: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= maximum
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    let mut probe = AdapterRequest {
+        schema_version: ADAPTER_REQUEST_SCHEMA.to_owned(),
+        sequence: 1,
+        operation: Operation::ObserveInitial,
+        scenario_sha256: receipt.scenario_sha256.clone(),
+        operation_id: String::new(),
+        fixture: receipt.fixture.clone(),
+        attempt_id: None,
+        expected_controller_generation: None,
+        expected_runner_generation: None,
+        host: ControlReadback {
+            activation_id: receipt.activation_id.clone(),
+            activation_package_digest: receipt.activation_package_digest.clone(),
+            integrated_candidate_sha: receipt.fixture.integrated_candidate_sha.clone(),
+            capacity: 0,
+            admission: AdmissionState::Closed,
+            controller_generation: receipt.fixture.controller_generation,
+            runner_generation: receipt.fixture.runner_generation,
+        },
+    };
+    probe.operation_id =
+        expected_adapter_operation_id(&probe).map_err(|_| AcceptanceBindingError::Invalid)?;
+    probe
+        .validate()
+        .map_err(|_| AcceptanceBindingError::Invalid)
 }
 
 fn validate_canonical_json(bytes: &[u8]) -> Result<serde_json::Value, AcceptanceBindingError> {
@@ -686,7 +664,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(validated.event_ids()[1]),
-            receipt.fixture.grant_digest
+            receipt.fixture.grant_event_id
         );
         for mutation in acceptance_binding_mutation_corpus() {
             assert_eq!(

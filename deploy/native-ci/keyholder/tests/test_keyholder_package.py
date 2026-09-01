@@ -39,7 +39,7 @@ def identity(public_key: str, generation: int) -> dict[str, object]:
 
 def public_spec(uid: int = 1201, gid: int = 1201) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "peer": {"uid": uid, "gid": gid},
         "selectors": {
             "ci_event": identity("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798", 7),
@@ -209,6 +209,10 @@ class KeyholderPackageTests(unittest.TestCase):
         config_schema = json.loads((KEYHOLDER_DIR / "keyholder-config.schema.json").read_text())
         package_schema = json.loads((KEYHOLDER_DIR / "package-manifest.schema.json").read_text())
         provenance_schema = json.loads((KEYHOLDER_DIR / "binary-provenance.schema.json").read_text())
+        self.assertTrue(config_schema["$id"].endswith("keyholder-config-v2.json"))
+        self.assertEqual(config_schema["properties"]["schema_version"]["const"], 2)
+        self.assertTrue(package_schema["$id"].endswith("keyholder-acceptance-package-v2.json"))
+        self.assertEqual(package_schema["properties"]["schema"]["const"], FREEZER.SCHEMA)
         self.assertFalse(config_schema["additionalProperties"])
         self.assertFalse(config_schema["properties"]["acceptance"]["additionalProperties"])
         self.assertEqual(config_schema["properties"]["peer"]["properties"]["allowed_operations"]["const"], RENDERER.OPERATIONS)
@@ -227,6 +231,20 @@ class KeyholderPackageTests(unittest.TestCase):
         self.assertEqual(provenance_schema["properties"]["binary"]["const"], "buzz-ci-keyholder")
         self.assertEqual(package_schema["properties"]["credential_contract"]["const"], FREEZER.CREDENTIAL_CONTRACT)
         self.assertEqual(package_schema["properties"]["runtime_contract"]["const"], FREEZER.RUNTIME_CONTRACT)
+
+        legacy_spec = public_spec()
+        legacy_spec["schema_version"] = 1
+        with self.assertRaisesRegex(ValueError, "schema version"):
+            RENDERER.validate_spec(legacy_spec)
+
+    def test_v1_package_discriminator_fails_closed(self) -> None:
+        self.freeze()
+        manifest_path = self.package / "package-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["schema"] = "buzz-ci-keyholder-acceptance-package-v1"
+        manifest_path.write_bytes(FREEZER.canonical_json(manifest))
+        with self.assertRaisesRegex(ValueError, "invalid package manifest fields"):
+            INSTALLER.parse_package(self.package, self.package)
 
     def test_systemd_domains_fd_and_dormant_base_are_exact(self) -> None:
         service = (KEYHOLDER_DIR / "templates/buzz-ci-keyholder.service").read_text()
@@ -327,11 +345,11 @@ class KeyholderPackageTests(unittest.TestCase):
         lean_raw = (FIXTURES / "retained-acceptance-public.json").read_bytes()
         self.assertEqual(
             hashlib.sha256(binding_raw).hexdigest(),
-            "9bcb090acaf8ffaf6d3aa72d43d9f804c1d1120f5889e6a90ddefaff4ce04ff3",
+            "38cfc4dbd9bbc310bb9b3dbc35464d2114458c357d000ca808d3ed4ceafc4132",
         )
         self.assertEqual(
             hashlib.sha256(lean_raw).hexdigest(),
-            "4a2792043f83e4c6e6274b6ce9a33ba2eeccd5c14d63283f200c02646204eecd",
+            "f144649f92355ca44626ad7fda6fc9fb93dfa67ff02cd13907d9f697b6a99ddf",
         )
         self.binding.chmod(0o600)
         self.binding.write_bytes(binding_raw)
@@ -376,9 +394,10 @@ class KeyholderPackageTests(unittest.TestCase):
         missing = public_binding()
         del missing["relay_url"]
         cases.append(("missing", missing, "fields"))
-        schema = public_binding()
-        schema["schema_version"] = "buzz-ci-clean-host-e2e-public-binding/v1"
-        cases.append(("schema", schema, "schema"))
+        for version in ("v1", "v2"):
+            schema = public_binding()
+            schema["schema_version"] = f"buzz-ci-clean-host-e2e-public-binding/{version}"
+            cases.append((f"schema-{version}", schema, "schema"))
         operations = public_binding()
         operations["keyholder_public_spec"]["peer"]["allowed_operations"] = ["describe"]
         cases.append(("operations", operations, "operation set"))

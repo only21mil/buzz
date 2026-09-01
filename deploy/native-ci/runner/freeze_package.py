@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze an exact, dormant Buzz CI runner installation package."""
+"""Freeze an exact Buzz CI runner installation package."""
 
 from __future__ import annotations
 
@@ -11,17 +11,12 @@ from pathlib import Path
 import re
 import shutil
 import stat
-import sys
+import subprocess
 import tempfile
 
-NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
-if str(NATIVE_CI_DIR) not in sys.path:
-    sys.path.insert(0, str(NATIVE_CI_DIR))
-
-import package_source
 import render_runner_config
 
-SCHEMA = "buzz-ci-runner-install-package-v1"
+SCHEMA = "buzz-ci-runner-install-package-v2"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -45,6 +40,10 @@ PEER_POLICY = {
     "broker_socket": {
         "path": render_runner_config.BROKER_SOCKET,
         "expected_uid": render_runner_config.BROKER_UID,
+        "owner": "root",
+        "group": "buzzci-execd",
+        "mode": "0620",
+        "supplementary_members": ["buzzci-runner", "buzzci-ctl"],
         "managed_by_package": False,
     },
 }
@@ -65,14 +64,20 @@ def sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def read_regular(path: Path, mode: int | None = None, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
+def read_regular(
+    path: Path,
+    mode: int | frozenset[int] | None = None,
+    max_bytes: int = 128 * 1024 * 1024,
+) -> tuple[bytes, os.stat_result]:
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise ValueError(f"unsafe regular file: {path}")
-        if mode is not None and stat.S_IMODE(metadata.st_mode) != mode:
-            raise ValueError(f"wrong source mode: {path}")
+        if mode is not None:
+            allowed_modes = mode if isinstance(mode, frozenset) else frozenset({mode})
+            if stat.S_IMODE(metadata.st_mode) not in allowed_modes:
+                raise ValueError(f"wrong source mode: {path}")
         chunks: list[bytes] = []
         size = 0
         while chunk := os.read(fd, 1024 * 1024):
@@ -100,11 +105,43 @@ def load_provenance(path: Path) -> tuple[dict[str, object], bytes]:
 
 
 def git_output(root: Path, *arguments: str) -> str:
-    return package_source.git_output(root, *arguments)
+    return subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
 
 
 def verify_source(root: Path, source_commit: str) -> Path:
-    return package_source.verify_checkout(root, source_commit, PACKAGE_RELATIVE)
+    if not GIT_OID.fullmatch(source_commit):
+        raise ValueError("source commit must be a full lowercase Git object id")
+    root = Path(git_output(root, "rev-parse", "--show-toplevel"))
+    if git_output(root, "rev-parse", "HEAD") != source_commit:
+        raise ValueError("source checkout HEAD does not match the requested commit")
+    if git_output(root, "status", "--porcelain", "--untracked-files=all", "--", str(PACKAGE_RELATIVE)):
+        raise ValueError("runner package source path is not clean")
+    package_dir = root / PACKAGE_RELATIVE
+    if Path(os.path.realpath(package_dir)) != package_dir:
+        raise ValueError("runner package source directory must not contain symbolic links")
+    subprocess.run(
+        ["git", "-C", str(root), "diff", "--quiet", source_commit, "--", str(PACKAGE_RELATIVE)],
+        check=True,
+    )
+    for path in (
+        PACKAGE_RELATIVE / "README.md",
+        PACKAGE_RELATIVE / "templates/buzz-ci-runner.service",
+        PACKAGE_RELATIVE / "templates/buzz-ci-runner.socket",
+        PACKAGE_RELATIVE / "templates/buzzci-runner.tmpfiles",
+    ):
+        subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", str(path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    return root
 
 
 def write_asset(path: Path, payload: bytes, mode: int) -> None:
@@ -132,7 +169,7 @@ def entry(role: str, source: str, target: str, source_mode: int, install_mode: i
     }
 
 
-def freeze_package(
+def _freeze_package(
     source_root: Path,
     source_commit: str,
     binary: Path,
@@ -172,16 +209,13 @@ def freeze_package(
         write_asset(assets / "buzz-ci-runner", binary_payload, 0o500)
         entries.append(entry("binary", "buzz-ci-runner", "/usr/libexec/buzz-ci-runner", 0o500, 0o755, 0, 0, binary_payload))
 
-        config_payload = render_runner_config.config_bytes(controld_uid)
-        write_asset(assets / "runner-v1.json", config_payload, 0o400)
-        entries.append(entry("config", "runner-v1.json", "/etc/buzzci/runner-v1.json", 0o400, 0o600, runner_uid, runner_gid, config_payload))
+        config_payload = render_runner_config.config_bytes(controld_uid, controld_gid)
+        write_asset(assets / "runner-v2.json", config_payload, 0o400)
+        entries.append(entry("config", "runner-v2.json", "/etc/buzzci/runner-v2.json", 0o400, 0o600, runner_uid, runner_gid, config_payload))
 
+        package_dir = source_root / PACKAGE_RELATIVE
         for role, source_name, asset_name, target, source_mode, install_mode, uid, gid in STATIC_ASSETS:
-            payload, _ = package_source.tracked_payload(
-                source_root,
-                PACKAGE_RELATIVE / source_name,
-                0o100644,
-            )
+            payload, _ = read_regular(package_dir / source_name, frozenset({0o600, 0o644}))
             write_asset(assets / asset_name, payload, source_mode)
             entries.append(entry(role, asset_name, target, source_mode, install_mode, uid, gid, payload))
 
@@ -213,6 +247,34 @@ def freeze_package(
     except BaseException:
         shutil.rmtree(stage)
         raise
+
+
+def freeze_package(
+    source_root: Path,
+    source_commit: str,
+    binary: Path,
+    provenance_path: Path,
+    output: Path,
+    runner_uid: int,
+    runner_gid: int,
+    controld_uid: int,
+    controld_gid: int,
+) -> dict[str, object]:
+    previous_umask = os.umask(0o077)
+    try:
+        return _freeze_package(
+            source_root,
+            source_commit,
+            binary,
+            provenance_path,
+            output,
+            runner_uid,
+            runner_gid,
+            controld_uid,
+            controld_gid,
+        )
+    finally:
+        os.umask(previous_umask)
 
 
 def main() -> int:

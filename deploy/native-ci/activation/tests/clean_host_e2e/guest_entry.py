@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import pwd
 import re
 import select
 import shutil
@@ -26,7 +27,7 @@ import time
 PHASE_SCHEMA = "buzz-ci-clean-host-e2e-guest-phase/v3"
 FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
 PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
-BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v2"
+BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v3"
 STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v2"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
 EVIDENCE_DEVICE = Path("/dev/virtio-ports/buzzci.evidence")
@@ -335,7 +336,8 @@ def reap_process_group(process: subprocess.Popen[bytes], *, wait_seconds: float 
 def command(
     argv: list[str], *, stdin: bytes | None = None, timeout: int | None = None,
     allow_failure: bool = False, timing_terms: dict[str, int] | None = None,
-    inventory: bool = True,
+    inventory: bool = True, uid: int | None = None, gid: int | None = None,
+    supplementary_gids: list[int] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if timeout is None:
         timeout = timing_leaf("command_default")
@@ -359,6 +361,9 @@ def command(
             argv, stdin=input_file if stdin is not None else subprocess.DEVNULL,
             stdout=stdout, stderr=stderr, start_new_session=True,
             env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            user=uid,
+            group=gid,
+            extra_groups=supplementary_gids,
         )
         try:
             deadline = time.monotonic() + timeout
@@ -653,7 +658,7 @@ def ceremony(phase: dict[str, object]) -> dict[str, object]:
         "relay_http_origin": "https://relay.test.invalid:3443",
         "acceptance_actor": {"public_key": public["acceptance-actor"], "generation": 1},
         "keyholder_public_spec": {
-            "schema_version": 1,
+            "schema_version": 2,
             "peer": {
                 "uid": uid, "gid": gid,
                 "allowed_operations": [
@@ -668,7 +673,7 @@ def ceremony(phase: dict[str, object]) -> dict[str, object]:
             },
             "nip98_origin": "https://relay.test.invalid:3443",
             "acceptance": {
-                "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
+                "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json",
                 "credential_selector": "acceptance-actor.key",
             },
         },
@@ -825,6 +830,97 @@ def validate_ceremony_identities(
         != (keyholder_identities.get("keyholder_uid"), keyholder_identities.get("keyholder_gid"))
     ):
         raise GuestError("activation controld provider differs from ceremony binding")
+
+
+def qualification_credentials(activation: dict[str, object]) -> tuple[int, int, list[int]]:
+    identities = activation.get("identities", {})
+    qualification = identities.get("qualification", {}) if isinstance(identities, dict) else {}
+    access_group = activation.get("access_group", {})
+    if (
+        not isinstance(qualification, dict)
+        or not isinstance(access_group, dict)
+        or (qualification.get("uid"), qualification.get("gid")) != (961, 961)
+        or qualification.get("supplementary_groups") != ["buzzci-execd"]
+        or access_group.get("group") != "buzzci-execd"
+        or access_group.get("members") != ["buzzci-ctl", "buzzci-runner"]
+        or isinstance(access_group.get("gid"), bool)
+        or not isinstance(access_group.get("gid"), int)
+        or not 1 <= access_group["gid"] <= 0xFFFF_FFFF
+    ):
+        raise GuestError("qualification credentials differ from the frozen manifest")
+    return 961, 961, [access_group["gid"]]
+
+
+def assert_live_acceptance_roles(activation: dict[str, object]) -> tuple[int, int, list[int]]:
+    identities = activation["identities"]
+    controld = identities["controld"]
+    credentials = qualification_credentials(activation)
+    if (
+        (controld["uid"], controld["gid"]) != (62002, 62002)
+        or pwd.getpwnam("buzzci-controld").pw_uid != 62002
+        or pwd.getpwnam("buzzci-controld").pw_gid != 62002
+        or pwd.getpwnam("buzzci-ctl").pw_uid != 961
+        or pwd.getpwnam("buzzci-ctl").pw_gid != 961
+        or controld["supplementary_groups"]
+    ):
+        raise GuestError("installed acceptance identities differ")
+
+    socket_metadata = Path("/run/buzzci/controld-acceptance.sock").lstat()
+    if (
+        not stat.S_ISSOCK(socket_metadata.st_mode)
+        or (socket_metadata.st_uid, socket_metadata.st_gid) != (0, 961)
+        or stat.S_IMODE(socket_metadata.st_mode) != 0o620
+    ):
+        raise GuestError("controld acceptance socket credentials differ")
+
+    binding = load_json(Path("/var/lib/buzzci/activation-controller/controld-acceptance-v2.json"))
+    keyholder = load_json(Path("/etc/buzzci/keyholder-v2.json"))
+    if (
+        binding.get("schema_version") != "buzz-ci-activation-acceptance-binding/v2"
+        or (binding.get("keyholder_peer_uid"), binding.get("keyholder_peer_gid"))
+        != (62002, 62002)
+        or (binding.get("acceptance_peer_uid"), binding.get("acceptance_peer_gid")) != (961, 961)
+        or (keyholder.get("peer", {}).get("uid"), keyholder.get("peer", {}).get("gid"))
+        != (62002, 62002)
+    ):
+        raise GuestError("acceptance role binding differs")
+
+    controld_processes = []
+    for process_root in Path("/proc").iterdir():
+        if not process_root.name.isdigit():
+            continue
+        try:
+            if (process_root / "exe").resolve() != Path("/usr/libexec/buzz-ci-controld"):
+                continue
+            status_lines = (process_root / "status").read_text().splitlines()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        status = dict(line.split(":", 1) for line in status_lines if ":" in line)
+        try:
+            process_credentials = tuple(
+                status[field].split() for field in ("Uid", "Gid", "Groups")
+            )
+        except KeyError as error:
+            raise GuestError("live controld credentials differ") from error
+        controld_processes.append(process_credentials)
+    if controld_processes != [(["62002"] * 4, ["62002"] * 4, [])]:
+        raise GuestError("live controld credentials differ")
+    return credentials
+
+
+def run_capacity_one_canary(
+    activation: dict[str, object], scenario: bytes,
+) -> bytes:
+    uid, gid, supplementary_gids = assert_live_acceptance_roles(activation)
+    return command(
+        ["/usr/libexec/buzz-ci-capacity-one-canary"],
+        stdin=scenario,
+        timeout=canary_command_seconds(),
+        timing_terms={},
+        uid=uid,
+        gid=gid,
+        supplementary_gids=supplementary_gids,
+    ).stdout
 
 
 def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[str, object], dict[str, object]]:
@@ -1269,7 +1365,10 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         begin_phase("controller_activate")
         command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=timing_leaf("controller_activate"), timing_terms={"controller_activate": 1})
         begin_phase("canary")
-        receipt_raw = command(["/usr/libexec/buzz-ci-capacity-one-canary"], stdin=read_file(inputs / "scenario.json"), timeout=canary_command_seconds(), timing_terms={}).stdout
+        receipt_raw = run_capacity_one_canary(
+            package_manifest(activation_package, "activation"),
+            read_file(inputs / "scenario.json"),
+        )
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)
         receipt_path.chmod(0o400)

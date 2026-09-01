@@ -57,12 +57,12 @@ def file_ref(root: Path, relative: str) -> dict[str, object]:
 def public_binding() -> dict[str, object]:
     keys = ["4" * 64, "5" * 64, "6" * 64, "7" * 64]
     return {
-        "schema_version": "buzz-ci-clean-host-e2e-public-binding/v2",
+        "schema_version": "buzz-ci-clean-host-e2e-public-binding/v3",
         "relay_url": "wss://relay.test.invalid:3443",
         "relay_http_origin": "https://relay.test.invalid:3443",
         "acceptance_actor": {"public_key": keys[0], "generation": 1},
         "keyholder_public_spec": {
-            "schema_version": 1,
+            "schema_version": 2,
             "peer": {"uid": 1201, "gid": 1201, "allowed_operations": [
                 "describe", "sign_ci_event", "nip98_authorize", "sign_manifest",
                 "describe_acceptance", "sign_acceptance_mutation",
@@ -74,7 +74,7 @@ def public_binding() -> dict[str, object]:
             },
             "nip98_origin": "https://relay.test.invalid:3443",
             "acceptance": {
-                "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json",
+                "binding_receipt_path": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json",
                 "credential_selector": "acceptance-actor.key",
             },
         },
@@ -121,6 +121,8 @@ class RendererTests(unittest.TestCase):
         )
         for schema_path in schema_paths:
             schema = json.loads(schema_path.read_bytes())
+            if schema_path.name == "scenario.schema.json":
+                self.assertTrue(schema["$id"].endswith("capacity-one-scenario-v2.json"))
             stack: list[object] = [schema]
             while stack:
                 value = stack.pop()
@@ -268,7 +270,7 @@ class RendererTests(unittest.TestCase):
                 "provisioned": False,
             }
             activation_draft = {
-                "schema": "buzz-ci-capacity-one-activation-draft-v1",
+                "schema": "buzz-ci-capacity-one-activation-draft-v2",
                 "source_commit": CANDIDATE,
                 "default_state": zero,
                 "identities": {"controld": {"uid": 1201, "gid": 1201}},
@@ -277,7 +279,7 @@ class RendererTests(unittest.TestCase):
             activation_digest = hashlib.sha256(canonical(activation_draft)).hexdigest()
             activation = {
                 **activation_draft,
-                "schema": "buzz-ci-capacity-one-activation-package-v1",
+                "schema": "buzz-ci-capacity-one-activation-package-v2",
                 "activation_id": (
                     f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{activation_digest[:12]}"
                 ),
@@ -541,10 +543,10 @@ class RendererTests(unittest.TestCase):
                 if name == "activation":
                     unsigned = dict(manifest)
                     unsigned.pop("package_digest")
-                    unsigned["schema"] = "buzz-ci-capacity-one-activation-draft-v1"
+                    unsigned["schema"] = "buzz-ci-capacity-one-activation-draft-v2"
                     activation_digest = hashlib.sha256(canonical(unsigned)).hexdigest()
                     manifest = {
-                        **unsigned, "schema": "buzz-ci-capacity-one-activation-package-v1",
+                        **unsigned, "schema": "buzz-ci-capacity-one-activation-package-v2",
                         "activation_id": f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{activation_digest[:12]}",
                         "package_digest": activation_digest,
                     }

@@ -1,18 +1,22 @@
 {
-  "schema_version": "buzz-ci-capacity-one-scenario/v1",
+  "schema_version": "buzz-ci-capacity-one-scenario/v2",
   "fixture": {
-    "integrated_candidate_sha": "edf07d62cfdfa65a8352d04503e08ca21c7371db",
-    "activation_id": "buzz-ci-capacity-one-edf07d62cfdf-888888888888",
-    "activation_package_digest": "8888888888888888888888888888888888888888888888888888888888888888",
+    "integrated_candidate_sha": "784c368b2f268a05abf0782b0901837fdc4cf044",
+    "activation_id": "buzz-ci-capacity-one-784c368b2f26-bbbbbbbbbbbb",
+    "activation_package_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "run_id": "11111111111111111111111111111111",
+    "job_id": "capacity-one-fixture",
     "request_digest": "2222222222222222222222222222222222222222222222222222222222222222",
     "manifest_digest": "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23",
-    "source_oid": "edf07d62cfdfa65a8352d04503e08ca21c7371db",
+    "source_oid": "784c368b2f268a05abf0782b0901837fdc4cf044",
     "approval_id": "33333333333333333333333333333333",
+    "grant_event_id": "8888888888888888888888888888888888888888888888888888888888888888",
     "grant_digest": "4444444444444444444444444444444444444444444444444444444444444444",
     "approved_by": "5555555555555555555555555555555555555555555555555555555555555555",
     "export_subject": "6666666666666666666666666666666666666666666666666666666666666666",
     "export_authorization_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "controller_generation": 1,
+    "runner_generation": 1,
     "expected_log": {
       "name": "job.log",
       "sha256": "54e15345b0e920fd0b3c3864422c336f4f66f023b5b2a9cf7874c8a6fe2984ff",
@@ -28,23 +32,23 @@
   },
   "driver": {
     "control": {
-      "program": "/opt/buzzci/libexec/acceptance-control-adapter",
+      "program": "/usr/libexec/buzz-ci-capacity-one-driver",
       "args": []
     },
     "observe": {
-      "program": "/opt/buzzci/libexec/acceptance-observe-adapter",
+      "program": "/usr/libexec/buzz-ci-capacity-one-driver",
       "args": []
     },
     "export": {
-      "program": "/opt/buzzci/libexec/acceptance-export-adapter",
+      "program": "/usr/libexec/buzz-ci-capacity-one-driver",
       "args": []
     },
     "controller_process": {
-      "program": "/opt/buzzci/libexec/acceptance-controller-process",
+      "program": "/usr/libexec/buzz-ci-capacity-one-driver",
       "args": []
     },
     "runner_process": {
-      "program": "/opt/buzzci/libexec/acceptance-runner-process",
+      "program": "/usr/libexec/buzz-ci-capacity-one-driver",
       "args": []
     },
     "timeout_seconds": 120

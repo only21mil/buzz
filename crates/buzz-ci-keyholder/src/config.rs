@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Exact production configuration schema.
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 const MAX_CONFIG_SIZE: u64 = 16 * 1024;
 
 /// Validated public service configuration. It contains no secret material.
@@ -230,7 +230,7 @@ mod tests {
     fn config(operations: &str, origin: &str) -> Vec<u8> {
         format!(
             r#"{{
-                "schema_version": 1,
+                "schema_version": 2,
                 "peer": {{"uid": 1000, "gid": 1001, "allowed_operations": {operations}}},
                 "selectors": {{
                     "ci_event": {{"public_key": "{CI_KEY}", "generation": 1}},
@@ -245,6 +245,14 @@ mod tests {
 
     #[test]
     fn valid_config_builds_closed_peer_and_selector_state() {
+        let legacy = String::from_utf8(config(
+            r#"["describe", "sign_ci_event", "nip98_authorize", "sign_manifest"]"#,
+            "https://relay.example.test",
+        ))
+        .expect("UTF-8 config")
+        .replace(r#""schema_version": 2"#, r#""schema_version": 1"#);
+        assert!(KeyholderConfig::from_slice(legacy.as_bytes()).is_err());
+
         let parsed = KeyholderConfig::from_slice(&config(
             r#"["describe", "sign_ci_event", "nip98_authorize", "sign_manifest"]"#,
             "https://relay.example.test",

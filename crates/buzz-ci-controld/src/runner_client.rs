@@ -3,6 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use buzz_core::ci::{
     CiJobState, CiRequestEnvelope, CiTeardownAttestationEnvelope, CI_MAX_SAFE_INTEGER,
@@ -542,6 +548,235 @@ pub trait RunnerConnector {
     type Error;
     /// Open one fresh connection to the configured runner endpoint.
     fn connect(&mut self) -> Result<Self::Connection, Self::Error>;
+}
+
+/// Exact local runner-control endpoint binding used by the production daemon.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnixRunnerConnectorConfig {
+    pub socket_path: PathBuf,
+    pub runner_uid: u32,
+    pub runner_gid: u32,
+    pub connect_timeout_millis: u64,
+    pub io_timeout_millis: u64,
+}
+
+impl UnixRunnerConnectorConfig {
+    /// Reject incomplete identities, unbounded waits, and non-canonical paths.
+    pub fn validate(&self) -> Result<(), UnixRunnerConnectorError> {
+        if self.runner_uid == 0
+            || self.runner_gid == 0
+            || self.connect_timeout_millis == 0
+            || self.connect_timeout_millis > 5_000
+            || self.io_timeout_millis == 0
+            || self.io_timeout_millis > 30_000
+            || !self.socket_path.is_absolute()
+            || self.socket_path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(UnixRunnerConnectorError::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
+/// Sanitized production runner transport failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum UnixRunnerConnectorError {
+    #[error("runner connector configuration is invalid")]
+    InvalidConfig,
+    #[error("runner control socket is unavailable")]
+    Unavailable,
+    #[error("runner control socket metadata is invalid")]
+    WrongSocket,
+    #[error("runner service identity is invalid")]
+    WrongPeer,
+    #[error("runner connection timed out")]
+    Timeout,
+    #[error("runner returned an invalid response frame")]
+    InvalidResponse,
+}
+
+/// Per-attempt connection factory for the dedicated runner-control socket.
+#[derive(Clone, Debug)]
+pub struct UnixRunnerConnector {
+    config: UnixRunnerConnectorConfig,
+}
+
+impl UnixRunnerConnector {
+    pub fn new(config: UnixRunnerConnectorConfig) -> Result<Self, UnixRunnerConnectorError> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+
+    /// Send one immutable v2 frame, close the write half, and read one exact
+    /// operation-specific response. Every retry reuses the same bytes.
+    #[cfg(target_os = "linux")]
+    pub fn exchange_v2_frame(
+        &mut self,
+        frame: &[u8],
+        response_length: usize,
+        transport_attempts: u32,
+    ) -> Result<Vec<u8>, UnixRunnerConnectorError> {
+        use std::net::Shutdown;
+
+        if frame.is_empty()
+            || frame.len() > buzz_ci_broker_protocol::v2::MAX_FRAME_SIZE
+            || response_length == 0
+            || response_length > buzz_ci_broker_protocol::v2::MAX_FRAME_SIZE
+            || !(1..=8).contains(&transport_attempts)
+        {
+            return Err(UnixRunnerConnectorError::InvalidConfig);
+        }
+        for attempt in 1..=transport_attempts {
+            let result = (|| {
+                let mut stream = self.connect()?;
+                stream
+                    .write_all(frame)
+                    .and_then(|()| stream.flush())
+                    .and_then(|()| stream.shutdown(Shutdown::Write))
+                    .map_err(|error| {
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            UnixRunnerConnectorError::Timeout
+                        } else {
+                            UnixRunnerConnectorError::Unavailable
+                        }
+                    })?;
+                let mut response = Vec::with_capacity(response_length);
+                stream
+                    .take(response_length as u64 + 1)
+                    .read_to_end(&mut response)
+                    .map_err(|error| {
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            UnixRunnerConnectorError::Timeout
+                        } else {
+                            UnixRunnerConnectorError::Unavailable
+                        }
+                    })?;
+                if response.len() != response_length {
+                    return Err(UnixRunnerConnectorError::InvalidResponse);
+                }
+                Ok(response)
+            })();
+            match result {
+                Err(UnixRunnerConnectorError::Unavailable | UnixRunnerConnectorError::Timeout)
+                    if attempt < transport_attempts => {}
+                other => return other,
+            }
+        }
+        Err(UnixRunnerConnectorError::Unavailable)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn exchange_v2_frame(
+        &mut self,
+        _frame: &[u8],
+        _response_length: usize,
+        _transport_attempts: u32,
+    ) -> Result<Vec<u8>, UnixRunnerConnectorError> {
+        Err(UnixRunnerConnectorError::Unavailable)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RunnerConnector for UnixRunnerConnector {
+    type Connection = UnixStream;
+    type Error = UnixRunnerConnectorError;
+
+    fn connect(&mut self) -> Result<Self::Connection, Self::Error> {
+        use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+        use nix::unistd::getegid;
+
+        let metadata = std::fs::symlink_metadata(&self.config.socket_path)
+            .map_err(|_| UnixRunnerConnectorError::Unavailable)?;
+        if !metadata.file_type().is_socket()
+            || metadata.permissions().mode() & 0o7777 != 0o620
+            || metadata.uid() != self.config.runner_uid
+            || metadata.gid() != getegid().as_raw()
+        {
+            return Err(UnixRunnerConnectorError::WrongSocket);
+        }
+        let stream = connect_unix_with_timeout(
+            &self.config.socket_path,
+            Duration::from_millis(self.config.connect_timeout_millis),
+        )?;
+        let peer = getsockopt(&stream, PeerCredentials)
+            .map_err(|_| UnixRunnerConnectorError::WrongPeer)?;
+        if peer.uid() != self.config.runner_uid || peer.gid() != self.config.runner_gid {
+            return Err(UnixRunnerConnectorError::WrongPeer);
+        }
+        let timeout = Duration::from_millis(self.config.io_timeout_millis);
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
+            .map_err(|_| UnixRunnerConnectorError::Unavailable)?;
+        Ok(stream)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl RunnerConnector for UnixRunnerConnector {
+    type Connection = std::io::Cursor<Vec<u8>>;
+    type Error = UnixRunnerConnectorError;
+
+    fn connect(&mut self) -> Result<Self::Connection, Self::Error> {
+        Err(UnixRunnerConnectorError::Unavailable)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn connect_unix_with_timeout(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Result<UnixStream, UnixRunnerConnectorError> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::sys::socket::{
+        connect, getsockopt, socket, sockopt::SocketError, AddressFamily, SockFlag, SockType,
+        UnixAddr,
+    };
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let descriptor = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+    .map_err(|_| UnixRunnerConnectorError::Unavailable)?;
+    let address = UnixAddr::new(path).map_err(|_| UnixRunnerConnectorError::InvalidConfig)?;
+    match connect(descriptor.as_raw_fd(), &address) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EINPROGRESS) => {
+            let mut poll_descriptors = [PollFd::new(descriptor.as_fd(), PollFlags::POLLOUT)];
+            let timeout = PollTimeout::try_from(timeout)
+                .map_err(|_| UnixRunnerConnectorError::InvalidConfig)?;
+            if poll(&mut poll_descriptors, timeout)
+                .map_err(|_| UnixRunnerConnectorError::Unavailable)?
+                == 0
+            {
+                return Err(UnixRunnerConnectorError::Timeout);
+            }
+            let socket_error = getsockopt(&descriptor, SocketError)
+                .map_err(|_| UnixRunnerConnectorError::Unavailable)?;
+            if socket_error != 0 {
+                return Err(UnixRunnerConnectorError::Unavailable);
+            }
+        }
+        Err(_) => return Err(UnixRunnerConnectorError::Unavailable),
+    }
+    let current =
+        fcntl(&descriptor, FcntlArg::F_GETFL).map_err(|_| UnixRunnerConnectorError::Unavailable)?;
+    let mut flags = OFlag::from_bits_truncate(current);
+    flags.remove(OFlag::O_NONBLOCK);
+    fcntl(&descriptor, FcntlArg::F_SETFL(flags))
+        .map_err(|_| UnixRunnerConnectorError::Unavailable)?;
+    Ok(UnixStream::from(descriptor))
 }
 
 #[derive(Clone)]

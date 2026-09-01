@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/runner-package-v1.json",
-  "title": "Buzz CI runner install package v1",
+  "$id": "https://buzz.dev/schemas/native-ci/runner-package-v2.json",
+  "title": "Buzz CI runner install package v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -19,7 +19,7 @@
     "package_digest"
   ],
   "properties": {
-    "schema": { "const": "buzz-ci-runner-install-package-v1" },
+    "schema": { "const": "buzz-ci-runner-install-package-v2" },
     "package_id": { "type": "string", "pattern": "^buzz-ci-runner-[0-9a-f]{12}-[0-9a-f]{12}$" },
     "source_commit": { "$ref": "#/$defs/gitOid" },
     "binary_provenance_sha256": { "$ref": "#/$defs/sha256" },
@@ -45,6 +45,10 @@
         "broker_socket": {
           "path": "/run/buzzci/execd.sock",
           "expected_uid": 0,
+          "owner": "root",
+          "group": "buzzci-execd",
+          "mode": "0620",
+          "supplementary_members": ["buzzci-runner", "buzzci-ctl"],
           "managed_by_package": false
         }
       }

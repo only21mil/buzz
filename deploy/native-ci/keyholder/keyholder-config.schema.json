@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/keyholder-config-v1.json",
-  "title": "Buzz CI static keyholder config v1",
+  "$id": "https://buzz.dev/schemas/native-ci/keyholder-config-v2.json",
+  "title": "Buzz CI static keyholder config v2",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "peer", "selectors", "nip98_origin", "acceptance"],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "peer": {
       "type": "object",
       "additionalProperties": false,
@@ -42,7 +42,7 @@
       "additionalProperties": false,
       "required": ["binding_receipt_path", "credential_selector"],
       "properties": {
-        "binding_receipt_path": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json" },
+        "binding_receipt_path": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json" },
         "credential_selector": { "const": "acceptance-actor.key" }
       }
     }

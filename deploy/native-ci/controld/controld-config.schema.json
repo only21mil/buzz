@@ -1,14 +1,110 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/controld-config-v1.json",
-  "title": "Buzz CI capacity-zero controld configuration v1",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["schema_version", "capacity", "store_root", "acceptance_binding"],
-  "properties": {
-    "schema_version": { "const": 1 },
-    "capacity": { "const": 0 },
-    "store_root": { "const": "/var/lib/buzzci/controld" },
-    "acceptance_binding": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v1.json" }
+  "$id": "https://buzz.dev/schemas/native-ci/controld-config-v2.json",
+  "title": "Buzz CI controld configuration v2",
+  "oneOf": [
+    { "$ref": "#/$defs/dormant" },
+    { "$ref": "#/$defs/active" }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "identity": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_key", "generation"],
+      "properties": {
+        "public_key": { "$ref": "#/$defs/digest" },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "name", "required", "skip_policy", "selected_job_instance", "also_reruns", "artifacts"],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "required": { "type": "boolean" },
+        "skip_policy": { "enum": ["forbid", "allow"] },
+        "selected_job_instance": { "type": "string", "minLength": 1 },
+        "also_reruns": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "artifacts": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/artifact" } }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "name", "media_type", "relative_name", "max_bytes"],
+      "properties": {
+        "artifact_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
+        "media_type": { "type": "string", "pattern": "^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$", "maxLength": 64 },
+        "relative_name": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
+        "max_bytes": { "type": "integer", "minimum": 1, "maximum": 32768 }
+      }
+    },
+    "dormant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "capacity", "store_root", "acceptance_binding"],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "capacity": { "const": 0 },
+        "store_root": { "const": "/var/lib/buzzci/controld" },
+        "acceptance_binding": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json" }
+      }
+    },
+    "active": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "capacity", "store_root", "relay_url", "relay_http_origin",
+        "channel_id", "poll_interval_millis", "runner_socket", "runner_uid", "runner_gid",
+        "runner_connect_timeout_millis", "runner_io_timeout_millis", "runner_transport_attempts",
+        "lane_manifest_digest", "lane_epoch", "audience_digest",
+        "isolation_profile_digest", "workflow_id", "workflow_digest", "jobs", "keyholder_socket",
+        "keyholder_uid", "keyholder_gid", "keyholder_selectors", "keyholder_timeout_millis",
+        "keyholder_transport_attempts", "acceptance_binding"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "capacity": { "const": 1 },
+        "store_root": { "const": "/var/lib/buzzci/controld" },
+        "acceptance_binding": { "const": "/var/lib/buzzci/activation-controller/controld-acceptance-v2.json" },
+        "relay_url": { "type": "string", "pattern": "^wss://[^/?#]+/?$" },
+        "relay_http_origin": { "type": "string", "pattern": "^https://[^/?#]+/?$" },
+        "channel_id": { "type": "string", "format": "uuid" },
+        "poll_interval_millis": { "type": "integer", "minimum": 1, "maximum": 60000 },
+        "runner_socket": { "const": "/run/buzzci/runner-control.sock" },
+        "runner_uid": { "$ref": "#/$defs/identity" },
+        "runner_gid": { "$ref": "#/$defs/identity" },
+        "runner_connect_timeout_millis": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "runner_io_timeout_millis": { "type": "integer", "minimum": 1, "maximum": 30000 },
+        "runner_transport_attempts": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "lane_manifest_digest": { "$ref": "#/$defs/digest" },
+        "lane_epoch": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "audience_digest": { "$ref": "#/$defs/digest" },
+        "isolation_profile_digest": { "$ref": "#/$defs/digest" },
+        "workflow_id": { "type": "string", "minLength": 1 },
+        "workflow_digest": { "$ref": "#/$defs/digest" },
+        "jobs": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/job" } },
+        "keyholder_socket": { "const": "/run/buzzci/keyholder.sock" },
+        "keyholder_uid": { "$ref": "#/$defs/identity" },
+        "keyholder_gid": { "$ref": "#/$defs/identity" },
+        "keyholder_selectors": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ci_event", "nip98", "manifest"],
+          "properties": {
+            "ci_event": { "$ref": "#/$defs/selector" },
+            "nip98": { "$ref": "#/$defs/selector" },
+            "manifest": { "$ref": "#/$defs/selector" }
+          }
+        },
+        "keyholder_timeout_millis": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "keyholder_transport_attempts": { "type": "integer", "minimum": 1, "maximum": 8 }
+      }
+    }
   }
 }

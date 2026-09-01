@@ -6,12 +6,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acceptance_socket;
+pub mod controller;
 pub mod keyholder;
 pub mod manifest;
 pub mod production;
+pub mod production_v2;
 pub mod runner_client;
+pub mod runner_v2;
 pub mod source;
 pub mod store;
+
+pub use acceptance_socket::{
+    AcceptanceActorBinding, AcceptanceAuthorityBinding, AcceptanceBinding, ACCEPTANCE_BINDING_PATH,
+    ACCEPTANCE_BINDING_SCHEMA,
+};
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};

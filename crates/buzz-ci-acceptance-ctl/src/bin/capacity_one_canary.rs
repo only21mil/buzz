@@ -1,7 +1,8 @@
 use std::io::{self, Read};
 
 use buzz_ci_acceptance_ctl::acceptance::{
-    parse_scenario, run_acceptance, CommandAcceptanceDriver, Outcome, MAX_SCENARIO_BYTES,
+    parse_scenario, run_acceptance, validate_receipt, CommandAcceptanceDriver, Outcome,
+    MAX_SCENARIO_BYTES,
 };
 use serde::Serialize;
 
@@ -45,7 +46,7 @@ fn main() {
         std::process::exit(3);
     }
     println!();
-    if outcome != Outcome::Pass {
+    if outcome != Outcome::Pass || validate_receipt(&receipt).is_err() {
         std::process::exit(1);
     }
 }

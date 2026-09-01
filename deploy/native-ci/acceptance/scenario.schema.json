@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/capacity-one-scenario-v1.json",
+  "$id": "https://buzz.dev/schemas/native-ci/capacity-one-scenario-v2.json",
   "title": "Buzz native CI capacity-one acceptance scenario",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "fixture", "driver"],
   "properties": {
     "schema_version": {
-      "const": "buzz-ci-capacity-one-scenario/v1"
+      "const": "buzz-ci-capacity-one-scenario/v2"
     },
     "fixture": {
       "$ref": "#/$defs/fixture"
@@ -55,14 +55,18 @@
         "activation_id",
         "activation_package_digest",
         "run_id",
+        "job_id",
         "request_digest",
         "manifest_digest",
         "source_oid",
         "approval_id",
+        "grant_event_id",
         "grant_digest",
         "approved_by",
         "export_subject",
         "export_authorization_digest",
+        "controller_generation",
+        "runner_generation",
         "expected_log",
         "expected_artifacts"
       ],
@@ -74,14 +78,23 @@
         },
         "activation_package_digest": { "$ref": "#/$defs/hex64" },
         "run_id": { "$ref": "#/$defs/hex32" },
+        "job_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
         "request_digest": { "$ref": "#/$defs/hex64" },
         "manifest_digest": { "$ref": "#/$defs/hex64" },
         "source_oid": { "$ref": "#/$defs/gitOid" },
         "approval_id": { "$ref": "#/$defs/hex32" },
+        "grant_event_id": { "$ref": "#/$defs/hex64" },
         "grant_digest": { "$ref": "#/$defs/hex64" },
         "approved_by": { "$ref": "#/$defs/hex64" },
         "export_subject": { "$ref": "#/$defs/hex64" },
         "export_authorization_digest": { "$ref": "#/$defs/hex64" },
+        "controller_generation": { "type": "integer", "minimum": 1 },
+        "runner_generation": { "type": "integer", "minimum": 1 },
         "expected_log": { "$ref": "#/$defs/evidence" },
         "expected_artifacts": {
           "type": "array",
@@ -96,14 +109,11 @@
       "required": ["program"],
       "properties": {
         "program": {
-          "type": "string",
-          "pattern": "^/",
-          "minLength": 2
+          "const": "/usr/libexec/buzz-ci-capacity-one-driver"
         },
         "args": {
           "type": "array",
-          "maxItems": 32,
-          "items": { "type": "string", "maxLength": 4096 }
+          "maxItems": 0
         }
       }
     },
