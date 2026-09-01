@@ -110,6 +110,7 @@ def checked_scenario_template(scenario: dict[str, Any]) -> dict[str, Any]:
         ("source_oid", "candidate_sha"),
         ("activation_id", "packages.activation.activation_id"),
         ("activation_package_digest", "packages.activation.package_digest"),
+        ("grant_event_id", "activation_grant_event_id"),
     ):
         fixture[field] = {"$copy": binding}
     return {

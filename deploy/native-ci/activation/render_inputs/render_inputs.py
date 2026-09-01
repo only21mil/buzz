@@ -39,6 +39,15 @@ HARNESS_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/harness.py"
 GUEST_ENTRY_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/guest_entry.py"
 TIMING_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json"
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
 PACKAGE_SCHEMAS = {
     "runner": "buzz-ci-runner-install-package-v2",
     "controld": "buzz-ci-controld-install-package-v2",
@@ -634,6 +643,10 @@ def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], nam
         "package_manifest_sha256": manifest_file_sha,
         "public_binding_sha256": hashlib.sha256(public_raw).hexdigest(),
     }
+    if "activation" in manifests:
+        bindings["activation_grant_event_id"] = activation_grant_event_id(
+            manifests["activation"],
+        )
     template, _raw, _ = root.json_ref(descriptor["template"], "checked template")
     return template, bindings
 
@@ -690,6 +703,21 @@ def ordered_scenario(value: object) -> dict[str, Any]:
 def canonical_scenario(value: object) -> bytes:
     """Return the exact no-LF bytes hashed by controller and receipt verifier."""
     return compact_declared(ordered_scenario(value))
+
+
+def activation_grant_event_id(activation: object) -> str:
+    """Bind a scenario to the exact frozen public grant-event bytes."""
+    if not isinstance(activation, dict):
+        raise RenderError("activation package manifest is absent")
+    try:
+        template = activation_package_module().validate_acceptance_template(
+            activation["acceptance_template"],
+        )
+        grant_event = template["grant_event"]
+        raw = compact_declared(grant_event)
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise RenderError("activation grant event binding is invalid") from error
+    return hashlib.sha256(raw).hexdigest()
 
 
 def parse_scenario_json(raw: bytes, where: str) -> dict[str, Any]:
@@ -811,22 +839,6 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
     fixture = scenario["fixture"]
     if not isinstance(fixture, dict):
         raise RenderError("capacity-one scenario fixture differs")
-    activation = bindings["packages"]["activation"]
-    if activation.get("default_state") != {
-        "capacity": 0,
-        "enabled": False,
-        "active": False,
-        "provisioned": False,
-    }:
-        raise RenderError("activation package does not stage at closed capacity zero")
-    expected = {
-        "integrated_candidate_sha": bindings["candidate_sha"],
-        "source_oid": bindings["candidate_sha"],
-        "activation_id": activation["activation_id"],
-        "activation_package_digest": activation["package_digest"],
-    }
-    if any(fixture.get(key) != wanted for key, wanted in expected.items()):
-        raise RenderError("capacity-one scenario cross-binding differs")
     required = {
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
         "job_id", "request_digest", "manifest_digest", "source_oid", "approval_id",
@@ -835,6 +847,26 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         "expected_log", "expected_artifacts",
     }
     require_keys(fixture, required, "capacity-one fixture")
+    activation = bindings["packages"]["activation"]
+    if activation.get("default_state") != {
+        "capacity": 0,
+        "enabled": False,
+        "active": False,
+        "provisioned": False,
+    }:
+        raise RenderError("activation package does not stage at closed capacity zero")
+    grant_event_id = activation_grant_event_id(activation)
+    if bindings.get("activation_grant_event_id") != grant_event_id:
+        raise RenderError("activation grant event renderer binding differs")
+    expected = {
+        "integrated_candidate_sha": bindings["candidate_sha"],
+        "source_oid": bindings["candidate_sha"],
+        "activation_id": activation["activation_id"],
+        "activation_package_digest": activation["package_digest"],
+        "grant_event_id": grant_event_id,
+    }
+    if any(fixture.get(key) != wanted for key, wanted in expected.items()):
+        raise RenderError("capacity-one scenario cross-binding differs")
     return ordered_scenario(scenario)
 
 
@@ -981,9 +1013,16 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
         manifests[name], _manifest_sha, tree_digests[name] = validate_package_tree(root, name, package_value, candidate)
         paths[name] = normalized(package_value["path"], f"{name} package path")
     validate_keyholder_public_binding(public_raw, manifests)
-    bindings = {"candidate_sha": candidate, "packages": manifests}
+    bindings = {
+        "candidate_sha": candidate,
+        "packages": manifests,
+        "activation_grant_event_id": activation_grant_event_id(manifests["activation"]),
+    }
     validate_scenario(scenario, bindings)
     activation = manifests["activation"]
+    platform_systemd = activation.get("platform_systemd")
+    if platform_systemd != PLATFORM_SYSTEMD:
+        raise RenderError("activation systemd platform binding differs")
     binding = manifests["execd"].get("activation_binding")
     if not isinstance(binding, dict) or any(binding.get(key) != value for key, value in (
         ("source_commit", candidate), ("activation_id", activation["activation_id"]), ("package_digest", activation["package_digest"]),
@@ -994,6 +1033,7 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
         "candidate_sha": candidate,
         "harness_sha256": harness_sha256,
         "packages": {name: {"path": paths[name], "tree_sha256": tree_digests[name]} for name in PACKAGE_NAMES},
+        "platform_systemd": platform_systemd,
         "scenario": {"path": scenario_path, "sha256": hashlib.sha256(scenario_raw).hexdigest()},
         "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3",
         "seccomp_source": {"path": seccomp_path, "sha256": SECCOMP_SHA256},
@@ -1021,7 +1061,7 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     evidence = values["evidence_manifest"]
     receipt = values["acceptance_receipt"]
     verifier = values["verifier"]
-    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages"}, "lifecycle contract")
+    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages", "platform_systemd"}, "lifecycle contract")
     require_keys(evidence, {"schema_version", "candidate_sha", "image_sha256", "tool_sha256", "harness_sha256", "harness_asset_sha256", "timing_asset_sha256", "timing", "timing_sha256", "package_tree_sha256", "scenario_sha256", "seccomp_source_sha256", "transfer_bytes", "transfer_sha256", "receipt_sha256", "verifier_sha256", "dormant_proof"}, "lifecycle evidence manifest")
     require_keys(result, {"status", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256", "receipt_sha256", "verifier_sha256", "evidence_manifest_sha256", "dormant_proof", "vm_state_absent"}, "lifecycle result")
     require_keys(verifier, {"outcome", "status"}, "installed verifier output")
@@ -1052,6 +1092,8 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     normalized(contract_seccomp["path"], "lifecycle seccomp source")
     if contract_seccomp["sha256"] != SECCOMP_SHA256:
         raise RenderError("lifecycle seccomp source differs")
+    if contract["platform_systemd"] != PLATFORM_SYSTEMD:
+        raise RenderError("lifecycle systemd platform binding differs")
     if evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v3" or evidence.get("candidate_sha") != candidate:
         raise RenderError("lifecycle evidence candidate differs")
     require_sha(evidence["image_sha256"], "lifecycle image")

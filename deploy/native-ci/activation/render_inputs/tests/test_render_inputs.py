@@ -102,6 +102,17 @@ def public_binding() -> dict[str, object]:
     }
 
 
+def acceptance_template() -> dict[str, object]:
+    actor = "f0926858db8b13c1febe9fbc1cf3b7fb59f3f1be42b8e5e5faf07a76dd9fd895"
+    return {
+        "actor": {"public_key": actor, "generation": 1},
+        "run_event": [0, actor, 1_800_000_000, 46_100, [["h", "capacity-one"]], "{\"type\":\"run\"}"],
+        "grant_event": [0, actor, 1_800_000_001, 46_107, [["h", "capacity-one"]], "{\"type\":\"grant\"}"],
+        "rerun_event": [0, actor, 1_800_000_010, 46_100, [["h", "capacity-one"]], "{\"type\":\"rerun\"}"],
+        "tombstone_event": [0, actor, 1_800_000_020, 5, [["e", "8" * 64]], ""],
+    }
+
+
 def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> dict[str, object]:
     unsigned: dict[str, object] = {
         "schema": f"test-{name}-package-v1",
@@ -115,6 +126,9 @@ def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> d
 
 
 class RendererTests(unittest.TestCase):
+    def test_systemd_platform_binding_matches_activation_validator(self) -> None:
+        self.assertEqual(RENDER.PLATFORM_SYSTEMD, RENDER.activation_package_module().PLATFORM_SYSTEMD)
+
     def test_production_scenario_template_generator_is_deterministic_and_no_clobber(self) -> None:
         scenario_path = ROOT.parents[1] / "acceptance/scenario.template.json"
         with tempfile.TemporaryDirectory() as temporary:
@@ -134,6 +148,10 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(
                 template["document"]["fixture"]["integrated_candidate_sha"],
                 {"$copy": "candidate_sha"},
+            )
+            self.assertEqual(
+                template["document"]["fixture"]["grant_event_id"],
+                {"$copy": "activation_grant_event_id"},
             )
             expected = output.read_bytes()
             second = subprocess.run(
@@ -279,6 +297,7 @@ class RendererTests(unittest.TestCase):
         activation = {
             "activation_id": fixture["activation_id"],
             "package_digest": fixture["activation_package_digest"],
+            "acceptance_template": acceptance_template(),
             "default_state": {
                 "capacity": 0,
                 "enabled": False,
@@ -290,11 +309,23 @@ class RendererTests(unittest.TestCase):
             "candidate_sha": fixture["integrated_candidate_sha"],
             "packages": {"activation": activation},
         }
+        grant_event_id = RENDER.activation_grant_event_id(activation)
+        self.assertEqual(
+            grant_event_id,
+            "94f4d4fc1af7e5e0485fbc4eba73b0fdb70c6ee95867e77a5d9fcf7f39c95a33",
+        )
+        bindings["activation_grant_event_id"] = grant_event_id
         template = {
             "schema_version": "buzz-ci-checked-render-template/v1",
             "kind": "capacity-one-scenario",
             "definitions": {},
-            "document": scenario,
+            "document": {
+                **scenario,
+                "fixture": {
+                    **scenario["fixture"],
+                    "grant_event_id": {"$copy": "activation_grant_event_id"},
+                },
+            },
         }
         descriptor = {
             "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
@@ -323,6 +354,7 @@ class RendererTests(unittest.TestCase):
         }
         with mock.patch.object(RENDER, "load_template_bindings", return_value=(template, bindings)):
             rendered = RENDER.render_scenario(mock.Mock(), descriptor)
+        scenario["fixture"]["grant_event_id"] = grant_event_id
         self.assertEqual(rendered, scenario)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -351,6 +383,24 @@ class RendererTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDER.RenderError, "closed capacity zero"):
             RENDER.validate_scenario(scenario, bindings)
 
+        bindings["packages"] = {"activation": activation}
+        stale = json.loads(json.dumps(scenario))
+        stale["fixture"]["grant_event_id"] = "8" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+            RENDER.validate_scenario(stale, bindings)
+        bindings["activation_grant_event_id"] = "9" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "renderer binding differs"):
+            RENDER.validate_scenario(scenario, bindings)
+        bindings["activation_grant_event_id"] = grant_event_id
+        missing = json.loads(json.dumps(scenario))
+        del missing["fixture"]["grant_event_id"]
+        with self.assertRaisesRegex(RENDER.RenderError, "shape differs"):
+            RENDER.validate_scenario(missing, bindings)
+        extra = json.loads(json.dumps(scenario))
+        extra["fixture"]["caller_grant_event_id"] = grant_event_id
+        with self.assertRaisesRegex(RENDER.RenderError, "shape differs"):
+            RENDER.validate_scenario(extra, bindings)
+
     def test_scenario_cli_renders_descriptor_bound_final_candidate(self) -> None:
         acceptance = ROOT.parents[1] / "acceptance"
         with tempfile.TemporaryDirectory() as temporary:
@@ -368,6 +418,10 @@ class RendererTests(unittest.TestCase):
                 "        'capacity': 0, 'enabled': False, 'active': False, 'provisioned': False\n"
                 "    }:\n"
                 "        raise ValueError('default state differs')\n"
+                "def validate_acceptance_template(value):\n"
+                "    if set(value) != {'actor', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event'}:\n"
+                "        raise ValueError('template shape differs')\n"
+                "    return value\n"
             )
 
             entry = {
@@ -390,6 +444,7 @@ class RendererTests(unittest.TestCase):
                 "schema": "buzz-ci-capacity-one-activation-draft-v2",
                 "source_commit": CANDIDATE,
                 "default_state": zero,
+                "acceptance_template": acceptance_template(),
                 "identities": {"controld": {"uid": 1201, "gid": 1201}},
                 "entries": [entry],
             }
@@ -445,26 +500,36 @@ class RendererTests(unittest.TestCase):
             public_path.write_bytes(public_raw)
             public_path.chmod(0o400)
             public_ref = file_ref(root, "inputs/public.json")
-            scenario = json.loads((acceptance / "scenario.template.json").read_bytes())
+            source_scenario = json.loads((acceptance / "scenario.template.json").read_bytes())
+            scenario = json.loads(json.dumps(source_scenario))
+            grant_event_id = hashlib.sha256(
+                RENDER.compact_declared(activation["acceptance_template"]["grant_event"]),
+            ).hexdigest()
+            self.assertEqual(
+                grant_event_id,
+                "94f4d4fc1af7e5e0485fbc4eba73b0fdb70c6ee95867e77a5d9fcf7f39c95a33",
+            )
             scenario["fixture"].update(
                 {
                     "integrated_candidate_sha": CANDIDATE,
                     "source_oid": CANDIDATE,
                     "activation_id": activation["activation_id"],
                     "activation_package_digest": activation_digest,
+                    "grant_event_id": grant_event_id,
                 }
             )
-            template_ref = write_json(
-                root,
-                "inputs/scenario-template.json",
-                {
-                    "schema_version": "buzz-ci-checked-render-template/v1",
-                    "kind": "capacity-one-scenario",
-                    "definitions": {},
-                    "document": scenario,
-                },
-                0o400,
+            template_path = root / "inputs/scenario-template.json"
+            template_process = subprocess.run(
+                [
+                    "python3", str(TEMPLATE_GENERATOR), "capacity-one-scenario",
+                    "--input", str(acceptance / "scenario.template.json"),
+                    "--output", str(template_path),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             )
+            self.assertEqual(template_process.returncode, 0, template_process.stderr)
+            template_path.chmod(0o400)
+            template_ref = file_ref(root, "inputs/scenario-template.json")
             descriptor = {
                 "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
                 "candidate_sha": CANDIDATE,
@@ -493,6 +558,7 @@ class RendererTests(unittest.TestCase):
             rendered = json.loads(rendered_raw)
             self.assertEqual(rendered, scenario)
             self.assertEqual(rendered["fixture"]["integrated_candidate_sha"], CANDIDATE)
+            self.assertEqual(rendered["fixture"]["grant_event_id"], grant_event_id)
             self.assertEqual(rendered_raw, RENDER.canonical_scenario(scenario))
             self.assertFalse(rendered_raw.endswith(b"\n"))
 
@@ -515,6 +581,7 @@ class RendererTests(unittest.TestCase):
             "state": "state", "candidate_root": "candidate",
             "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
             "timing": TIMING, "timing_sha256": timing_sha,
+            "platform_systemd": RENDER.PLATFORM_SYSTEMD,
             "scenario": {"path": "scenario.json", "sha256": HEX["scenario"]},
             "seccomp_source": {"path": "seccomp.json", "sha256": RENDER.SECCOMP_SHA256},
             "packages": {name: {"path": name, "tree_sha256": trees[name]} for name in RENDER.PACKAGE_NAMES},
