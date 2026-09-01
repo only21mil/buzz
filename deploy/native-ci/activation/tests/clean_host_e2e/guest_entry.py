@@ -1096,6 +1096,9 @@ def install_components(candidate: Path, inputs: Path) -> None:
 
 def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dict[str, dict[str, str]]:
     expected: dict[str, dict[str, str]] = {}
+    systemd_roots = ("/etc/systemd/system/", "/usr/lib/systemd/system/")
+    unit_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.(?:service|socket|target)$")
+    drop_in_name = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_-])?\.conf$")
     for name in package_names:
         package = inputs / name
         manifest = package_manifest(package, name)
@@ -1106,15 +1109,30 @@ def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dic
             if not isinstance(entry, dict):
                 raise GuestError(f"{name} package entry differs")
             target = entry.get("target")
-            if not isinstance(target, str) or not target.startswith(("/etc/systemd/system/", "/usr/lib/systemd/system/")):
+            if not isinstance(target, str):
                 continue
-            unit = Path(target).name
-            if not unit.endswith((".service", ".socket", ".target")):
-                raise GuestError("package systemd unit inventory differs")
+            root = next((value for value in systemd_roots if target.startswith(value)), None)
+            if root is None:
+                continue
             source = package_member(package, entry.get("source"))
             digest = entry.get("sha256")
             if not isinstance(digest, str) or HEX64.fullmatch(digest) is None or hashlib.sha256(read_file(source)).hexdigest() != digest:
-                raise GuestError(f"package systemd unit digest differs: {unit}")
+                raise GuestError(f"package systemd unit digest differs: {target}")
+            parts = target.removeprefix(root).split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                raise GuestError("package systemd unit inventory differs")
+            if len(parts) == 2:
+                parent, drop_in = parts
+                if (
+                    not parent.endswith(".d")
+                    or unit_name.fullmatch(parent[:-2]) is None
+                    or drop_in_name.fullmatch(drop_in) is None
+                ):
+                    raise GuestError("package systemd unit inventory differs")
+                continue
+            if len(parts) != 1 or unit_name.fullmatch(parts[0]) is None:
+                raise GuestError("package systemd unit inventory differs")
+            unit = parts[0]
             binding = {"fragment_path": target, "sha256": digest}
             if unit in expected and expected[unit] != binding:
                 raise GuestError(f"package systemd unit binding conflicts: {unit}")

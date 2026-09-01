@@ -172,6 +172,27 @@ def rewrite_contract(path: Path, value: dict[str, object]) -> None:
     path.write_bytes(harness.canonical(value))
 
 
+def write_guest_package(
+    inputs: Path, name: str, entries: list[tuple[str, str, bytes]],
+) -> Path:
+    package = inputs / name
+    package.mkdir(parents=True)
+    manifest_entries = []
+    for index, (source, target, payload) in enumerate(entries):
+        member = package / source
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(payload)
+        manifest_entries.append({
+            "role": f"test_{index}",
+            "source": source,
+            "target": target,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    manifest_name = "activation-manifest.json" if name == "activation" else "package-manifest.json"
+    (package / manifest_name).write_bytes(harness.canonical({"entries": manifest_entries}))
+    return package
+
+
 def passing_frame(contract: dict[str, object]) -> dict[str, object]:
     proof = {
         "configs_sha256": "5" * 64,
@@ -1192,6 +1213,91 @@ class TimingAndProgressTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_guest_unit_inventory_accepts_direct_unit_and_valid_drop_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            write_guest_package(inputs, "runner", [
+                (
+                    "buzz-ci-runner.service", "/usr/lib/systemd/system/buzz-ci-runner.service",
+                    b"[Service]\nExecStart=/usr/libexec/buzz-ci-runner\n",
+                ),
+                (
+                    "20-capacity-one.conf",
+                    "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+                    b"[Service]\nEnvironment=BUZZ_CI_CAPACITY=1\n",
+                ),
+            ])
+
+            expected = guest.expected_unit_fragments(inputs, ("runner",))
+
+            self.assertEqual(set(expected), {"buzz-ci-runner.service"})
+            self.assertEqual(
+                expected["buzz-ci-runner.service"]["fragment_path"],
+                "/usr/lib/systemd/system/buzz-ci-runner.service",
+            )
+
+    def test_guest_unit_inventory_rejects_malformed_or_nested_paths(self) -> None:
+        invalid = (
+            "/usr/lib/systemd/system/buzz-ci-runner.timer",
+            "/etc/systemd/system/buzz-ci-runner.service.d/nested/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-runner.service.d/../20-capacity-one.conf",
+            "/etc/systemd/system//buzz-ci-runner.service",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_rejects_invalid_drop_in_parent_suffix(self) -> None:
+        invalid = (
+            "/etc/systemd/system/buzz-ci-runner.timer.d/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-runner.service/20-capacity-one.conf",
+            "/etc/systemd/system/.service.d/20-capacity-one.conf",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_rejects_invalid_drop_in_name(self) -> None:
+        invalid = (
+            "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.txt",
+            "/etc/systemd/system/buzz-ci-runner.service.d/.conf",
+            "/etc/systemd/system/buzz-ci-runner.service.d/-hostile.conf",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_retains_digest_and_conflict_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            package = write_guest_package(inputs, "runner", [(
+                "drop-in", "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+                b"trusted",
+            )])
+            (package / "drop-in").write_bytes(b"changed")
+            with self.assertRaisesRegex(guest.GuestError, "unit digest differs"):
+                guest.expected_unit_fragments(inputs, ("runner",))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            write_guest_package(inputs, "runner", [(
+                "runner-unit", "/usr/lib/systemd/system/buzz-ci-runner.service", b"first",
+            )])
+            write_guest_package(inputs, "controld", [(
+                "runner-unit", "/etc/systemd/system/buzz-ci-runner.service", b"second",
+            )])
+            with self.assertRaisesRegex(guest.GuestError, "unit binding conflicts"):
+                guest.expected_unit_fragments(inputs, ("runner", "controld"))
+
     def test_guest_requires_exact_fedora_global_service_drop_in(self) -> None:
         self.assertEqual(guest.PLATFORM_SYSTEMD, harness.PLATFORM_SYSTEMD)
         schema = json.loads((HERE / "contract.schema.json").read_bytes())
