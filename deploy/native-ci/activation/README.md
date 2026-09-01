@@ -269,7 +269,9 @@ template omits the scenario digest. After the package and scenario are final,
 the controller injects the independently computed digest at the receipt top
 level and in the nested acceptance object, where the two values must match.
 The scenario digest matches `serde_json::to_vec` field order used by the Rust
-canary, not the input file's whitespace or key order.
+canary. `render-scenario` emits that declaration order as compact JSON with no
+trailing LF, so its literal file bytes hash to the same digest used by the
+controller and installed verifier.
 
 ## Freeze
 
@@ -373,19 +375,24 @@ between the execd and activation packages:
    any missing, substituted, or divergent config.
 2. Run `deploy/native-ci/execd/freeze_package.py prepare-input` against the exact
    execd release binary and its canonical provenance. Keep those bytes fixed.
-3. Run `render_inputs.py render-draft`. Its descriptor names the three ready
+3. Run `render_inputs/generate_checked_templates.py activation-draft` against
+   the complete validated draft. This production generator replaces only the
+   candidate, public actor, ready-package component evidence, execd
+   pre-activation evidence, and controld package bindings.
+4. Run `render_inputs.py render-draft`. Its descriptor names the three ready
    manifests and the pre-activation execd input. It does not name an execd
    package manifest.
-4. Freeze the activation package from that rendered draft and the exact asset
+5. Freeze the activation package from that rendered draft and the exact asset
    directory.
-5. Run `deploy/native-ci/execd/freeze_package.py freeze-package` with the same
+6. Run `deploy/native-ci/execd/freeze_package.py freeze-package` with the same
    binary, provenance, and pre-activation input plus the final activation
    package. Any changed or replayed tuple fails.
-6. Run `render-scenario`, then `render-clean-host`, with all five final package
-   manifests and trees. The final renderer derives the closed v3 harness and
-   timing bindings from the exact candidate Git object and rejects a renderer
-   checkout whose harness, guest entry, or timing asset differs.
-7. Run `check_package_inventory.py` against those same five manifests before
+7. Generate the checked scenario template from the maintained production
+   scenario, then run `render-scenario` and `render-clean-host` with all five
+   final package manifests and trees. The final renderer derives the closed v3
+   harness and timing bindings from the exact candidate Git object and rejects
+   a renderer checkout whose harness, guest entry, or timing asset differs.
+8. Run `check_package_inventory.py` against those same five manifests before
    installation.
 
 Do not substitute a provisional execd manifest, a synthetic activation
