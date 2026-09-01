@@ -3,12 +3,25 @@
   "$id": "https://buzz.dev/schemas/native-ci/clean-host-e2e-vm-contract-v3.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages"],
+  "required": ["schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages", "platform_systemd"],
   "properties": {
     "schema_version": {"const": "buzz-ci-clean-host-e2e-vm-contract/v3"},
     "state": {"type": "string", "minLength": 1},
     "candidate_root": {"type": "string", "minLength": 1},
     "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"pattern": "^0+$"}},
+    "platform_systemd": {
+      "const": {
+        "schema_version": "buzz-ci-systemd-platform-binding/v1",
+        "platform_id": "fedora-44-systemd-259",
+        "service_drop_ins": [
+          {
+            "owner": "platform",
+            "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37"
+          }
+        ]
+      }
+    },
     "harness_sha256": {"$ref": "#/$defs/sha"},
     "timing_asset_sha256": {"$ref": "#/$defs/sha"},
     "timing_sha256": {"$ref": "#/$defs/sha"},

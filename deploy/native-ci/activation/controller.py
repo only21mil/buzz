@@ -12,7 +12,7 @@ import grp
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import pwd
 import resource
 import re
@@ -319,7 +319,10 @@ def _verify_target_digest(root: Path, target: str, expected: dict[str, object], 
         raise ValueError(f"required target is absent: {target}") from None
     fd = -1
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise ValueError(f"required target is absent: {target}") from None
     finally:
         os.close(parent_fd)
     try:
@@ -577,6 +580,15 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
     if not isinstance(fixture, dict):
         raise ValueError("acceptance scenario fixture must be an object")
     activation_package.require_keys(fixture, set(fixture_fields), "acceptance scenario fixture")
+    fixture_entries = [
+        entry for entry in manifest["entries"]
+        if entry.get("role") == "fixture_manifest"
+    ]
+    if (
+        len(fixture_entries) != 1
+        or fixture.get("manifest_digest") != fixture_entries[0].get("sha256")
+    ):
+        raise ValueError("acceptance fixture manifest digest differs from the activation package")
     activation_id = fixture["activation_id"]
     if activation_id != manifest["activation_id"] or fixture["activation_package_digest"] != manifest["package_digest"]:
         raise ValueError("acceptance scenario belongs to a different activation package")
@@ -801,10 +813,10 @@ def _render_execd_config(
         "controller_generation": fixture["controller_generation"],
         "runner_generation": fixture["runner_generation"],
     })
-    if fixture.get("manifest_digest") != rendered.get("lane_manifest_digest"):
-        raise ValueError("acceptance fixture manifest digest differs from the execd lane manifest")
     execution = rendered.get("execution")
     activation_package.validate_execution_declaration(execution, allow_placeholder=True)
+    if fixture.get("manifest_digest") != execution.get("fixture_manifest_sha256"):
+        raise ValueError("acceptance fixture manifest digest differs from the execd execution fixture")
     execution["declaration_digest"] = activation_package.execution_declaration_digest(
         manifest["source_commit"], manifest["package_digest"], rendered["lane_manifest"], execution,
     )
@@ -990,7 +1002,7 @@ def load_package(package: Path, *, live: bool) -> tuple[dict[str, Any], dict[str
             references[entry["active_source"]] = (activation_package.parse_mode(entry["active_source_mode"]), entry["active_sha256"])
     for component in manifest["components"]:
         references[component["provenance_source"]] = (0o400, component["provenance_sha256"])
-        if component["name"] == "controld":
+        if "package_manifest_source" in component:
             references[component["package_manifest_source"]] = (0o400, component["package_manifest_sha256"])
     actual_assets = {f"assets/{item.name}" for item in (package / "assets").iterdir()}
     if actual_assets != set(references):
@@ -1021,7 +1033,7 @@ def _package_references(manifest: dict[str, Any]) -> dict[str, int]:
             references[entry["active_source"]] = activation_package.parse_mode(entry["active_source_mode"])
     for component in manifest["components"]:
         references[component["provenance_source"]] = 0o400
-        if component["name"] == "controld":
+        if "package_manifest_source" in component:
             references[component["package_manifest_source"]] = 0o400
     return references
 
@@ -1463,6 +1475,110 @@ def _validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes]
     activation_package.validate_phase_configs(manifest, payloads)
 
 
+def _tmpfiles_directory_readback(
+    root: Path, identities: dict[str, object], *, allow_absent: bool,
+) -> dict[str, str]:
+    root_uid, root_gid = _physical_ids(root, 0, 0)
+    runner_uid, runner_gid = _physical_ids(
+        root, identities["runner"]["uid"], identities["runner"]["gid"],
+    )
+    controld_uid, controld_gid = _physical_ids(
+        root, identities["controld"]["uid"], identities["controld"]["gid"],
+    )
+    expected = {
+        "/run/buzzci": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci/activation-controller": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci/acceptance-control": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/seccomp": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci/seccomp/v1": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci/seccomp/v1/sha256": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci/activation": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/activation/receipts": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/execd-v2": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci/execd-v2/intents": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/execd-v2/bindings": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/execd-v2/evidence": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/execd-v2/teardown": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/execd-v2/attempts": (0o711, root_uid, root_gid),
+        "/var/lib/buzzci/execd-v2/qualification": (0o700, root_uid, root_gid),
+        "/var/lib/buzzci/controld": (0o700, controld_uid, controld_gid),
+        "/var/lib/buzzci/runner": (0o700, runner_uid, runner_gid),
+    }
+    result: dict[str, str] = {}
+    for target, (mode, uid, gid) in expected.items():
+        try:
+            parent_fd, name = activation_package.open_parent_fd(root, target)
+        except FileNotFoundError:
+            if allow_absent:
+                result[target] = "absent"
+                continue
+            raise ValueError(f"tmpfiles directory is absent after create: {target}")
+        try:
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if allow_absent:
+                    result[target] = "absent"
+                    continue
+                raise ValueError(f"tmpfiles directory is absent after create: {target}")
+        finally:
+            os.close(parent_fd)
+        observed = _metadata_dict(metadata)
+        allowed_private_receipt = (
+            allow_absent
+            and target == "/var/lib/buzzci/activation-controller"
+            and observed == {"mode": 0o700, "uid": root_uid, "gid": root_gid}
+        )
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (observed != {"mode": mode, "uid": uid, "gid": gid} and not allowed_private_receipt)
+        ):
+            raise ValueError(f"tmpfiles directory differs: {target}")
+        result[target] = "exact"
+    return result
+
+
+def _verify_tmpfiles_parent_chain(root: Path, target: str) -> None:
+    expected_uid, expected_gid = _physical_ids(root, 0, 0)
+    current_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        root_metadata = os.fstat(current_fd)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != expected_uid
+            or root_metadata.st_gid != expected_gid
+            or stat.S_IMODE(root_metadata.st_mode) & 0o022
+        ):
+            raise ValueError("tmpfiles target parent chain is unsafe: /")
+        current = ""
+        for part in PurePosixPath(target).parts[1:-1]:
+            current += f"/{part}"
+            next_fd = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+            metadata = os.fstat(current_fd)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise ValueError(f"tmpfiles target parent chain is unsafe: {current}")
+    finally:
+        os.close(current_fd)
+
+
+def _tmpfiles_config_readback(root: Path, plan: tuple[dict[str, object], ...]) -> None:
+    for item in plan:
+        target = str(item["target"])
+        _verify_tmpfiles_parent_chain(root, target)
+        _verify_target_digest(root, target, item, 64 * 1024)
+
+
 class LiveSystemd:
     def __init__(self, root: Path) -> None:
         if root != Path("/"):
@@ -1536,9 +1652,20 @@ class LiveSystemd:
     def provision(self, _identities: dict[str, object]) -> None:
         self._run(SYSUSERS, [activation_package.STATIC_TARGETS["sysusers"]], mutation=True)
 
-    def tmpfiles(self) -> None:
-        self._run(TMPFILES, ["--create", activation_package.STATIC_TARGETS["tmpfiles"]], mutation=True)
-        self._run(TMPFILES, ["--create", activation_package.STATIC_TARGETS["acceptance_tmpfiles"]], mutation=True)
+    def tmpfiles_readback(
+        self, identities: dict[str, object], plan: tuple[dict[str, object], ...],
+    ) -> dict[str, str]:
+        _tmpfiles_config_readback(self.root, plan)
+        return _tmpfiles_directory_readback(self.root, identities, allow_absent=False)
+
+    def tmpfiles(
+        self, identities: dict[str, object], plan: tuple[dict[str, object], ...],
+    ) -> None:
+        targets = tuple(str(item["target"]) for item in plan)
+        _tmpfiles_config_readback(self.root, plan)
+        _tmpfiles_directory_readback(self.root, identities, allow_absent=True)
+        self._run(TMPFILES, ["--create", *targets], mutation=True)
+        self.tmpfiles_readback(identities, plan)
 
     def daemon_reload(self) -> None:
         self._run(SYSTEMCTL, ["daemon-reload"], mutation=True)
@@ -1666,7 +1793,7 @@ class FakeSystemd:
         state = self._read()
         unit = state["units"].get(name)
         if not isinstance(unit, dict):
-            return {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled"}
+            return {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": ""}
         return {
             key: str(unit[key])
             for key in ("LoadState", "ActiveState", "SubState", "UnitFileState")
@@ -1721,7 +1848,14 @@ class FakeSystemd:
         state["groups"][self.access_group["group"]] = expected_group
         self._write(state)
 
-    def tmpfiles(self) -> None:
+    def tmpfiles_readback(
+        self, identities: dict[str, object], _plan: tuple[dict[str, object], ...],
+    ) -> dict[str, str]:
+        return _tmpfiles_directory_readback(self.root, identities, allow_absent=False)
+
+    def tmpfiles(
+        self, identities: dict[str, object], plan: tuple[dict[str, object], ...],
+    ) -> None:
         directory = _require_receipt_root(
             self.root, self.planned_identities["controld"]["gid"], allow_private=True,
         )
@@ -1730,6 +1864,7 @@ class FakeSystemd:
         acceptance.mkdir(parents=True, mode=0o700, exist_ok=True)
         acceptance.chmod(0o700)
         for target, mode in (
+            ("/run/buzzci", 0o711),
             ("/var/lib/buzzci", 0o711),
             ("/var/lib/buzzci/seccomp", 0o711),
             ("/var/lib/buzzci/seccomp/v1", 0o711),
@@ -1743,11 +1878,14 @@ class FakeSystemd:
             (activation_package.EXECD_TEARDOWN_ROOT, 0o700),
             (activation_package.EXECD_ATTEMPT_ROOT, 0o711),
             (activation_package.EXECD_QUALIFICATION_ROOT, 0o700),
+            ("/var/lib/buzzci/controld", 0o700),
+            ("/var/lib/buzzci/runner", 0o700),
         ):
             directory = activation_package.rooted(self.root, target)
             directory.mkdir(parents=True, mode=mode, exist_ok=True)
             directory.chmod(mode)
         _require_receipt_root(self.root, self.planned_identities["controld"]["gid"])
+        self.tmpfiles_readback(identities, plan)
 
     def daemon_reload(self) -> None:
         state = self._read()
@@ -1763,13 +1901,23 @@ class FakeSystemd:
                 drop_in_directory = activation_package.rooted(
                     self.root, f"/etc/systemd/system/{unit}.d",
                 )
-                state["units"][unit]["DropInPaths"] = (
+                unit_drop_ins = (
                     [f"/etc/systemd/system/{unit}.d/{path.name}" for path in sorted(drop_in_directory.glob("*.conf"), key=lambda item: item.name.encode())]
                     if drop_in_directory.is_dir() else []
                 )
+                global_directory = activation_package.rooted(
+                    self.root, "/usr/lib/systemd/system/service.d",
+                )
+                global_drop_ins = (
+                    [f"/usr/lib/systemd/system/service.d/{path.name}" for path in sorted(global_directory.glob("*.conf"), key=lambda item: item.name.encode())]
+                    if unit.endswith(".service") and global_directory.is_dir() else []
+                )
+                state["units"][unit]["DropInPaths"] = activation_package.systemd_drop_in_order(
+                    unit_drop_ins + global_drop_ins,
+                )
             else:
                 state["units"][unit] = {
-                    "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
+                    "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "",
                     "FragmentPath": "", "DropInPaths": [],
                 }
         self._write(state)
@@ -2080,9 +2228,13 @@ def _preflight_units(driver: LiveSystemd | FakeSystemd) -> dict[str, dict[str, s
         if state["LoadState"] not in ({"loaded", "not-found"} if package_owned else {"loaded"}):
             raise ValueError(f"required systemd unit is not loaded: {name}")
         if state["LoadState"] == "not-found" and (
-            state["ActiveState"] != "inactive" or state["UnitFileState"] not in {"disabled", "static"}
+            state["ActiveState"] != "inactive"
+            or state["SubState"] != "dead"
+            or state["UnitFileState"] != ""
         ):
             raise ValueError(f"absent package-owned systemd unit is not dormant: {name}")
+        if state["LoadState"] == "not-found":
+            continue
         baseline_execd = name == "buzz-ci-execd.socket"
         if state["ActiveState"] != "inactive" and not baseline_execd:
             raise ValueError(f"systemd unit is not dormant: {name}")
@@ -3483,6 +3635,7 @@ def _stage_unlocked(
     binding: dict[str, object],
 ) -> dict[str, object]:
     generated = _generated_acceptance_files(manifest, payloads, binding)
+    tmpfiles_plan = activation_package.tmpfiles_plan(manifest, payloads)
     existing = _read_receipt(root)
     rolled_back_receipt: dict[str, Any] | None = None
     if existing is not None:
@@ -3507,6 +3660,7 @@ def _stage_unlocked(
                     generated_readback = _verify_generated(root, existing["acceptance_generated"])
                     fixed_package = _verify_fixed_package(manifest, root)
                     installed_units = _installed_unit_readback(manifest, root, driver)
+                    driver.tmpfiles_readback(manifest["identities"], tmpfiles_plan)
                     _staged_zero_convergence_readback(manifest, root, driver)
                     for unit in activation_package.STAGED_ZERO_UNITS:
                         driver.start(unit)
@@ -3555,7 +3709,7 @@ def _stage_unlocked(
     try:
         _apply_phase(manifest, payloads, root, "staged")
         driver.provision(manifest["identities"])
-        driver.tmpfiles()
+        driver.tmpfiles(manifest["identities"], tmpfiles_plan)
         _apply_generated(root, receipt["acceptance_generated"])
         driver.daemon_reload()
         installed_units = _installed_unit_readback(manifest, root, driver)

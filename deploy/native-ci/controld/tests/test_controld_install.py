@@ -194,6 +194,79 @@ class ControldInstallTests(unittest.TestCase):
         with self.assertRaises(OSError):
             RENDERER.check(linked)
 
+    def test_default_backup_tree_composes_with_shared_state_contract_under_private_umask(self) -> None:
+        self.freeze()
+        for name, precreate_shared in (("absent-shared", False), ("exact-shared", True)):
+            with self.subTest(name=name):
+                root = self.make_root(name)
+                shared = root / "var/lib/buzzci"
+                if precreate_shared:
+                    shared.mkdir(mode=0o711)
+                    shared.chmod(0o711)
+                previous_umask = os.umask(0o077)
+                try:
+                    installed = INSTALLER.install(
+                        self.package, root, INSTALLER.DEFAULT_BACKUP_ROOT,
+                    )
+                finally:
+                    os.umask(previous_umask)
+                backup_root = INSTALLER.backup_root_path(
+                    root, INSTALLER.DEFAULT_BACKUP_ROOT,
+                )
+                transaction = backup_root / str(installed["backup_id"])
+                self.assertEqual(stat.S_IMODE(shared.lstat().st_mode), 0o711)
+                self.assertEqual(
+                    stat.S_IMODE((shared / "install-backups").lstat().st_mode), 0o700,
+                )
+                self.assertEqual(stat.S_IMODE(backup_root.lstat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(transaction.lstat().st_mode), 0o700)
+
+    def test_default_backup_tree_rejects_hostile_shared_state_without_repair(self) -> None:
+        for name, mode in (("legacy-private", 0o700), ("group-searchable", 0o750), ("sticky", 0o1711)):
+            with self.subTest(name=name):
+                root = self.make_root(name)
+                shared = root / "var/lib/buzzci"
+                shared.mkdir(mode=mode)
+                shared.chmod(mode)
+                with self.assertRaisesRegex(ValueError, "unsafe backup directory chain"):
+                    INSTALLER.ensure_private_tree(
+                        root, INSTALLER.backup_root_path(root, INSTALLER.DEFAULT_BACKUP_ROOT),
+                    )
+                self.assertEqual(stat.S_IMODE(shared.lstat().st_mode), mode)
+                self.assertFalse((shared / "install-backups").exists())
+
+        root = self.make_root("linked-shared")
+        linked_target = self.base / "linked-target"
+        linked_target.mkdir(mode=0o711)
+        (root / "var/lib/buzzci").symlink_to(linked_target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "unsafe backup directory chain"):
+            INSTALLER.ensure_private_tree(
+                root, INSTALLER.backup_root_path(root, INSTALLER.DEFAULT_BACKUP_ROOT),
+            )
+        self.assertTrue((root / "var/lib/buzzci").is_symlink())
+
+        root = self.make_root("wrong-owner")
+        shared = root / "var/lib/buzzci"
+        shared.mkdir(mode=0o711)
+        shared.chmod(0o711)
+        original_lstat = Path.lstat
+
+        def wrong_owner(path: Path) -> os.stat_result:
+            metadata = original_lstat(path)
+            if path == shared:
+                fields = list(metadata)
+                fields[4] = metadata.st_uid + 1
+                return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(Path, "lstat", wrong_owner):
+            with self.assertRaisesRegex(ValueError, "unsafe backup directory chain"):
+                INSTALLER.ensure_private_tree(
+                    root, INSTALLER.backup_root_path(root, INSTALLER.DEFAULT_BACKUP_ROOT),
+                )
+        self.assertEqual(stat.S_IMODE(shared.lstat().st_mode), 0o711)
+        self.assertFalse((shared / "install-backups").exists())
+
     def test_renderer_accepts_only_complete_capacity_one_bindings(self) -> None:
         digest = "11" * 32
         active = {

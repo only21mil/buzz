@@ -23,6 +23,8 @@ DIGEST = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 PACKAGE_ID = re.compile(r"^buzz-ci-runner-[0-9a-f]{12}-[0-9a-f]{12}$")
 DEFAULT_BACKUP_ROOT = Path("/var/lib/buzzci/install-backups/runner")
+SHARED_STATE_ROOT = Path("/var/lib/buzzci")
+INSTALL_BACKUPS_ROOT = SHARED_STATE_ROOT / "install-backups"
 MAX_JSON_BYTES = 1024 * 1024
 TRANSACTION_PHASES = {
     "install_prepared",
@@ -574,16 +576,38 @@ def backup_root_path(root: Path, backup_root: Path) -> Path:
 def ensure_private_tree(root: Path, path: Path) -> None:
     root_uid = mapped_id(0, root)
     root_gid = mapped_id(0, root, group=True)
+    default_path = backup_root_path(root, DEFAULT_BACKUP_ROOT)
+    exact_modes = {
+        rooted(root, str(SHARED_STATE_ROOT)): 0o711,
+        rooted(root, str(INSTALL_BACKUPS_ROOT)): 0o700,
+        default_path: 0o700,
+    } if path == default_path else {path: 0o700}
     current = root
     for component in path.relative_to(root).parts:
         current /= component
-        if not current.exists():
+        created = not current.exists() and not current.is_symlink()
+        if created:
             parent = current.parent
             current.mkdir(mode=0o700)
-            os.chown(current, root_uid, root_gid)
+            descriptor = os.open(
+                current, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                os.fchown(descriptor, root_uid, root_gid)
+                os.fchmod(descriptor, exact_modes.get(current, 0o700))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
             fsync_directory(parent)
         metadata = current.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != root_uid or metadata.st_gid != root_gid or metadata.st_mode & 0o022:
+        expected_mode = exact_modes.get(current)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != root_uid
+            or metadata.st_gid != root_gid
+            or (expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode)
+            or (expected_mode is None and metadata.st_mode & 0o022)
+        ):
             raise ValueError(f"unsafe backup directory chain: {current}")
     require_directory(path, root_uid, root_gid, 0o700)
 

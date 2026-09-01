@@ -298,10 +298,10 @@ class BootstrapCompositionTests(unittest.TestCase):
                     identities["controld"]["uid"],
                     identities["controld"]["gid"],
                 )
-                raw = (output / "package-manifest.json").read_bytes()
-                component["package_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-                component["package_digest"] = manifest["package_digest"]
-                fixture.assets[component["package_manifest_source"]] = (raw, 0o400)
+            raw = (output / "package-manifest.json").read_bytes()
+            component["package_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            component["package_digest"] = manifest["package_digest"]
+            fixture.assets[component["package_manifest_source"]] = (raw, 0o400)
             results[name] = manifest
 
         keyholder_component = next(
@@ -514,6 +514,33 @@ class BootstrapCompositionTests(unittest.TestCase):
                 activation_path, live=False,
             )
             self.assertEqual(loaded_manifest, activation_manifest)
+            hostile_draft = copy.deepcopy(rendered_draft)
+            hostile_runner = next(
+                item for item in hostile_draft["components"] if item["name"] == "runner"
+            )
+            runner_asset = asset_root / Path(hostile_runner["package_manifest_source"]).name
+            original_runner_raw = runner_asset.read_bytes()
+            hostile_package = json.loads(original_runner_raw)
+            hostile_tmpfiles = next(
+                item for item in hostile_package["entries"] if item["role"] == "tmpfiles"
+            )
+            hostile_tmpfiles["sha256"] = "f" * 64
+            hostile_unsigned = {
+                key: value for key, value in hostile_package.items() if key != "package_digest"
+            }
+            hostile_package["package_digest"] = hashlib.sha256(canonical(hostile_unsigned)).hexdigest()
+            hostile_raw = canonical(hostile_package)
+            hostile_runner["package_manifest_sha256"] = hashlib.sha256(hostile_raw).hexdigest()
+            hostile_runner["package_digest"] = hostile_package["package_digest"]
+            hostile_draft_path = ceremony / "hostile-activation-draft.json"
+            write_file(hostile_draft_path, canonical(hostile_draft), 0o600)
+            write_file(runner_asset, hostile_raw, 0o400)
+            with self.assertRaisesRegex(ValueError, "runner package tmpfiles source binding differs"):
+                ACTIVATION_FREEZER.freeze_package(
+                    source, candidate, hostile_draft_path, asset_root,
+                    ceremony / "packages/hostile-activation",
+                )
+            write_file(runner_asset, original_runner_raw, 0o400)
             execd_path = ceremony / "packages/execd"
             execd_manifest = EXECD_FREEZER.freeze_package(
                 source, candidate, execd_binary, execd_provenance, preactivation_path,
@@ -538,13 +565,6 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "source_oid": candidate,
                 "activation_id": activation_manifest["activation_id"],
                 "activation_package_digest": activation_manifest["package_digest"],
-                "grant_event_id": ACTIVATION_PACKAGE.digest(
-                    json.dumps(
-                        activation_manifest["acceptance_template"]["grant_event"],
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode()
-                ),
             })
             scenario_template_path = ceremony / "scenario-template.json"
             scenario_source_path = ceremony / "scenario-source.json"
@@ -561,6 +581,18 @@ class BootstrapCompositionTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(scenario_template_path.read_bytes()),
                 TEMPLATE_GENERATOR.checked_scenario_template(scenario),
+            )
+            checked_scenario = json.loads(scenario_template_path.read_bytes())
+            self.assertEqual(
+                checked_scenario["document"]["fixture"]["grant_event_id"],
+                {"$copy": "activation_grant_event_id"},
+            )
+            scenario["fixture"]["grant_event_id"] = ACTIVATION_PACKAGE.digest(
+                json.dumps(
+                    activation_manifest["acceptance_template"]["grant_event"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
             )
             scenario_descriptor = self._write_descriptor(ceremony, "scenario-descriptor.json", {
                 "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
@@ -632,6 +664,25 @@ class BootstrapCompositionTests(unittest.TestCase):
             self.assertEqual(set(clean_contract["packages"]), set(RENDER.PACKAGE_NAMES))
             self.assertEqual(clean_contract["seccomp_source"]["sha256"], seccomp_sha256)
             self.assertEqual(clean_contract["scenario"]["sha256"], scenario_sha256)
+            self.assertEqual(clean_contract["platform_systemd"], RENDER.PLATFORM_SYSTEMD)
+
+            stale_scenario = copy.deepcopy(scenario)
+            stale_scenario["fixture"]["grant_event_id"] = "8" * 64
+            write_file(scenario_path, RENDER.canonical_scenario(stale_scenario), 0o600)
+            stale_clean_descriptor = json.loads(clean_descriptor.read_bytes())
+            stale_clean_descriptor["scenario"] = file_ref(ceremony, scenario_path)
+            stale_clean_descriptor_path = self._write_descriptor(
+                ceremony, "stale-grant-clean-descriptor.json", stale_clean_descriptor,
+            )
+            with mock.patch.object(
+                RENDER, "SECCOMP_SHA256", seccomp_sha256,
+            ), self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+                self._render(
+                    "render-clean-host",
+                    stale_clean_descriptor_path,
+                    "stale-grant-clean-host-contract.json",
+                )
+            write_file(scenario_path, scenario_raw, 0o600)
             previous_directory = Path.cwd()
             try:
                 os.chdir(ceremony)
@@ -675,6 +726,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                     "tar", "-cf", str(guest_stage / "candidate.tar"), "-C", str(source),
                     "deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
                     "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
+                    "deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf",
                 ],
                 check=True,
             )
@@ -694,6 +746,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "scenario_sha256": scenario_sha256,
                 "seccomp_source_sha256": seccomp_sha256,
                 "timing_asset_sha256": clean_contract["timing_asset_sha256"],
+                "platform_systemd": clean_contract["platform_systemd"],
             }
             with (
                 mock.patch.object(CLEAN_HOST_GUEST, "STATE_ROOT", guest_state),
@@ -703,10 +756,12 @@ class BootstrapCompositionTests(unittest.TestCase):
                     source / "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
                 ),
                 mock.patch.object(CLEAN_HOST_GUEST, "SECCOMP_SHA256", seccomp_sha256),
+                mock.patch.object(CLEAN_HOST_GUEST, "verify_platform_systemd") as platform_check,
             ):
                 _candidate_path, guest_scenario, _guest_public = CLEAN_HOST_GUEST.cross_bind(
                     guest_stage, guest_descriptor,
                 )
+            platform_check.assert_called_once_with(clean_contract["platform_systemd"])
             self.assertEqual(RENDER.canonical_scenario(guest_scenario), scenario_raw)
 
             drifted_seccomp = b'{"defaultAction":"SCMP_ACT_ALLOW"}\n'
