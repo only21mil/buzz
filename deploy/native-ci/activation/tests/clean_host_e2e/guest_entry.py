@@ -45,6 +45,18 @@ MAX_TREE_BYTES = 64 * 1024 * 1024
 TRANSFER_SIZE = 8 * 1024 * 1024
 TRANSFER_MAGIC = b"BUZZCI-EVIDENCE\0"
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
+PLATFORM_SYSTEMD_SOURCE = Path(
+    "deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf"
+)
 SCRATCH_ROOT = Path("/run")
 SWAPS_PATH = Path("/proc/swaps")
 UNITS = (
@@ -76,9 +88,20 @@ CA_BACKENDS = (
 )
 TIMING_PATH = Path(__file__).with_name("timing-contract.json")
 TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
+PROGRESS_PHASES = (
+    "boot_cloud_init", "guest_started", "ceremony", "install", "relay_ready",
+    "preinstall_units_clean", "package_units_validated", "principals_created",
+    "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
+    "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+    "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+    "cleanup_return", "verifier", "complete",
+)
+PROGRESS_EVENTS = ("start", "timeout", "complete")
+PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
 _PROGRESS_BOOT: str | None = None
 _PROGRESS_SEQUENCE = 0
 _PROGRESS_STARTED = 0.0
+_PROGRESS_LAST_PHASE: str | None = None
 _ACTIVE_PHASE: str | None = None
 _PHASE_DEADLINE: float | None = None
 _OBSERVED_COMMAND_TERMS: dict[str, int] = {}
@@ -156,10 +179,21 @@ def open_progress_device() -> int:
 
 
 def emit_progress(phase: str, event: str = "start") -> None:
-    """Best-effort diagnostic signal. Acceptance never depends on this channel."""
-    global _PROGRESS_SEQUENCE
+    """Emit a bounded diagnostic frame; the host requires terminal completion."""
+    global _PROGRESS_LAST_PHASE, _PROGRESS_SEQUENCE
     if _PROGRESS_BOOT is None:
         return
+    order = PROGRESS_ORDER.get(phase)
+    last_order = PROGRESS_ORDER.get(_PROGRESS_LAST_PHASE, -1)
+    if (
+        order is None
+        or event not in PROGRESS_EVENTS
+        or order < last_order
+        or event == "timeout" and order != last_order
+        or event == "complete" and phase != "complete"
+        or phase == "complete" and event != "complete"
+    ):
+        raise GuestError("guest progress order differs")
     value = {
         "schema_version": PROGRESS_SCHEMA,
         "boot": _PROGRESS_BOOT,
@@ -186,6 +220,15 @@ def emit_progress(phase: str, event: str = "start") -> None:
     except BaseException:
         return
     _PROGRESS_SEQUENCE += 1
+    _PROGRESS_LAST_PHASE = phase
+
+
+def emit_timeout_progress() -> None:
+    phase = _PROGRESS_LAST_PHASE
+    if phase is None or _ACTIVE_PHASE is not None and PROGRESS_ORDER[_ACTIVE_PHASE] > PROGRESS_ORDER[phase]:
+        phase = _ACTIVE_PHASE
+    if phase is not None:
+        emit_progress(phase, "timeout")
 
 
 def verify_command_inventory() -> None:
@@ -347,7 +390,7 @@ def command(
     guest_reap = timing_leaf("guest_command_reap")
     if phase_deadline is not None and time.monotonic() >= phase_deadline - guest_reap:
         if _ACTIVE_PHASE is not None:
-            emit_progress(_ACTIVE_PHASE, "timeout")
+            emit_timeout_progress()
         raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
     with (
         tempfile.TemporaryFile(dir=SCRATCH_ROOT) as input_file,
@@ -374,7 +417,7 @@ def command(
                     raise GuestError(f"guest command output exceeded bound: {Path(argv[0]).name}")
                 if time.monotonic() >= deadline:
                     if _ACTIVE_PHASE is not None:
-                        emit_progress(_ACTIVE_PHASE, "timeout")
+                        emit_timeout_progress()
                     raise GuestError(f"guest command timed out: {Path(argv[0]).name}")
                 time.sleep(0.01)
             stdout.seek(0)
@@ -923,7 +966,19 @@ def run_capacity_one_canary(
     ).stdout
 
 
+def verify_platform_systemd(platform_systemd: object) -> None:
+    """Reject a clean-host image that differs from the frozen platform files."""
+    if platform_systemd != PLATFORM_SYSTEMD:
+        raise GuestError("systemd platform binding differs inside guest")
+    for record in PLATFORM_SYSTEMD["service_drop_ins"]:
+        raw = read_file(Path(record["path"]), MAX_JSON)
+        if hashlib.sha256(raw).hexdigest() != record["sha256"]:
+            raise GuestError(f"systemd platform file digest differs inside guest: {record['path']}")
+
+
 def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[str, object], dict[str, object]]:
+    platform_systemd = descriptor.get("platform_systemd")
+    verify_platform_systemd(platform_systemd)
     candidate_tar = stage / "candidate.tar"
     candidate_raw = read_file(candidate_tar, MAX_TREE_BYTES)
     if hashlib.sha256(candidate_raw).hexdigest() != descriptor.get("candidate_tar_sha256"):
@@ -945,6 +1000,9 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         raise GuestError("public binding differs from key ceremony")
     candidate = STATE_ROOT / "candidate"
     extract_candidate(candidate_raw, candidate)
+    tracked_platform = read_file(candidate / PLATFORM_SYSTEMD_SOURCE, MAX_JSON)
+    if hashlib.sha256(tracked_platform).hexdigest() != PLATFORM_SYSTEMD["service_drop_ins"][0]["sha256"]:
+        raise GuestError("candidate systemd platform source differs inside guest")
     candidate_harness = read_file(
         candidate / "deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
         2 * 1024 * 1024,
@@ -973,6 +1031,8 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         if manifest.get("source_commit") != candidate_sha:
             raise GuestError(f"package source commit differs: {name}")
     activation = manifests["activation"]
+    if activation.get("platform_systemd") != platform_systemd:
+        raise GuestError("activation package systemd platform binding differs")
     execd = manifests["execd"]
     activation_digest = activation.get("package_digest")
     activation_id = activation.get("activation_id")
@@ -1060,13 +1120,19 @@ def create_principals(activation: Path) -> None:
 def install_components(candidate: Path, inputs: Path) -> None:
     for name in ("runner", "controld"):
         command(["python3", str(candidate / f"deploy/native-ci/{name}/install.py"), "install", "--package", str(inputs / name)])
+        emit_progress(f"{name}_installed")
     command(["python3", str(candidate / "deploy/native-ci/keyholder/install.py"), "install", "--package", str(inputs / "keyholder")])
+    emit_progress("keyholder_installed")
     command(["python3", str(candidate / "deploy/native-ci/execd/install.py"), "install", "--package", str(inputs / "execd")])
+    emit_progress("execd_installed")
     command(["systemctl", "daemon-reload"])
 
 
 def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dict[str, dict[str, str]]:
     expected: dict[str, dict[str, str]] = {}
+    systemd_roots = ("/etc/systemd/system/", "/usr/lib/systemd/system/")
+    unit_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.(?:service|socket|target)$")
+    drop_in_name = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_-])?\.conf$")
     for name in package_names:
         package = inputs / name
         manifest = package_manifest(package, name)
@@ -1077,15 +1143,30 @@ def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dic
             if not isinstance(entry, dict):
                 raise GuestError(f"{name} package entry differs")
             target = entry.get("target")
-            if not isinstance(target, str) or not target.startswith(("/etc/systemd/system/", "/usr/lib/systemd/system/")):
+            if not isinstance(target, str):
                 continue
-            unit = Path(target).name
-            if not unit.endswith((".service", ".socket", ".target")):
-                raise GuestError("package systemd unit inventory differs")
+            root = next((value for value in systemd_roots if target.startswith(value)), None)
+            if root is None:
+                continue
             source = package_member(package, entry.get("source"))
             digest = entry.get("sha256")
             if not isinstance(digest, str) or HEX64.fullmatch(digest) is None or hashlib.sha256(read_file(source)).hexdigest() != digest:
-                raise GuestError(f"package systemd unit digest differs: {unit}")
+                raise GuestError(f"package systemd unit digest differs: {target}")
+            parts = target.removeprefix(root).split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                raise GuestError("package systemd unit inventory differs")
+            if len(parts) == 2:
+                parent, drop_in = parts
+                if (
+                    not parent.endswith(".d")
+                    or unit_name.fullmatch(parent[:-2]) is None
+                    or drop_in_name.fullmatch(drop_in) is None
+                ):
+                    raise GuestError("package systemd unit inventory differs")
+                continue
+            if len(parts) != 1 or unit_name.fullmatch(parts[0]) is None:
+                raise GuestError("package systemd unit inventory differs")
+            unit = parts[0]
             binding = {"fragment_path": target, "sha256": digest}
             if unit in expected and expected[unit] != binding:
                 raise GuestError(f"package systemd unit binding conflicts: {unit}")
@@ -1313,7 +1394,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         or set(descriptor) != {
             "schema_version", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256",
             "candidate_tar_sha256", "scenario_sha256", "seccomp_source_sha256",
-            "public_binding_sha256", "package_tree_sha256",
+            "public_binding_sha256", "package_tree_sha256", "platform_systemd",
         }
         or descriptor.get("schema_version") != STAGE_SCHEMA
         or descriptor.get("timing_sha256") != phase.get("timing_sha256")
@@ -1338,9 +1419,11 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     try:
         hosts_added = not relay_mapping_present()
         start_relay(public)
+        emit_progress("relay_ready")
         preinstall_units = unit_state()
         if any(state["LoadState"] != "not-found" for state in preinstall_units.values()):
             raise GuestError("clean host already contains a package-owned unit")
+        emit_progress("preinstall_units_clean")
         component_units = expected_unit_fragments(inputs, ("runner", "controld", "keyholder", "execd"))
         activation_units = expected_unit_fragments(inputs, ("activation",))
         expected_units = dict(component_units)
@@ -1350,11 +1433,15 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             expected_units[unit] = binding
         if set(expected_units) != set(UNITS):
             raise GuestError("package systemd unit set differs")
+        emit_progress("package_units_validated")
         create_principals(activation_package)
+        emit_progress("principals_created")
         provision_seccomp(inputs / "seccomp.json")
+        emit_progress("seccomp_ready")
         install_components(candidate, inputs)
         configs = tree_state(Path("/etc/buzzci"))
         units = prove_installed_units(component_units)
+        emit_progress("installed_units_verified")
         controller = candidate / "deploy/native-ci/activation/controller.py"
         begin_phase("controller_check")
         command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=timing_leaf("controller_check"), timing_terms={"controller_check": 1})
@@ -1391,6 +1478,8 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             path.unlink()
         except FileNotFoundError:
             pass
+    if not cleanup_errors:
+        emit_progress("cleanup_return")
     if primary is not None or cleanup_errors or receipt_raw is None or verifier_raw is None or proof is None:
         message = str(primary) if primary is not None else "acceptance evidence incomplete"
         if cleanup_errors:
@@ -1499,7 +1588,7 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
 
 
 def main(argv: list[str]) -> int:
-    global _PROGRESS_BOOT, _PROGRESS_SEQUENCE, _PROGRESS_STARTED
+    global _PROGRESS_BOOT, _PROGRESS_LAST_PHASE, _PROGRESS_SEQUENCE, _PROGRESS_STARTED
     if len(argv) != 1:
         return 2
     try:
@@ -1515,6 +1604,7 @@ def main(argv: list[str]) -> int:
             raise GuestError("guest phase differs")
         _PROGRESS_SEQUENCE = 0
         _PROGRESS_STARTED = time.monotonic()
+        _PROGRESS_LAST_PHASE = None
         begin_phase("boot_cloud_init", emit_event=False)
         require_guest()
         disable_swap()

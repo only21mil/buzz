@@ -706,6 +706,7 @@ class ActivationFixture:
                 "stage_capacity": 0,
                 "active_capacity": 1,
             },
+            "platform_systemd": activation_package.PLATFORM_SYSTEMD,
             "effective_systemd": self._effective_systemd(),
             "socket_policy": activation_package.SOCKET_POLICY,
             "qualification": self.qualification,
@@ -1068,6 +1069,7 @@ class ActivationControllerTests(unittest.TestCase):
         active = CONTROLLER.check_current(manifest, self.fixture.root, driver)
         self.assertEqual(active["readback"]["installed_units"]["buzz-ci-runner.service"]["drop_in_paths"], [
             "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+            "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
         ])
         self.assertEqual(CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)["status"], "unchanged")
         self.assertEqual(CONTROLLER.qualify(manifest, payloads, self.fixture.root, driver)["status"], "qualified")
@@ -1173,6 +1175,62 @@ class ActivationControllerTests(unittest.TestCase):
         drop_in = self.fixture.root / expected["drop_ins"][0]["path"].lstrip("/")
         drop_in.write_bytes(b"[Service]\nEnvironment=HOSTILE=1\n")
         with self.assertRaisesRegex(ValueError, "(?:file digest differs|staged readback failed)"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
+    def test_platform_global_drop_in_is_exact_for_services_only(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        global_record = activation_package.PLATFORM_SYSTEMD["service_drop_ins"][0]
+        for unit in manifest["effective_systemd"]:
+            paths = [record["path"] for record in unit["drop_ins"]]
+            if unit["unit"].endswith(".service"):
+                self.assertEqual(paths[-1], global_record["path"])
+                self.assertEqual(unit["drop_ins"][-1], global_record)
+            else:
+                self.assertNotIn(global_record["path"], paths)
+
+        changed = copy.deepcopy(manifest)
+        changed["platform_systemd"]["service_drop_ins"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "platform binding differs"):
+            activation_package.validate_manifest(changed)
+
+        runner = next(
+            item for item in manifest["effective_systemd"]
+            if item["unit"] == "buzz-ci-runner.service"
+        )
+        for label, mutate in (
+            ("missing", lambda drops: drops.pop()),
+            ("reordered", lambda drops: drops.reverse()),
+            ("relocated", lambda drops: drops[-1].update(path="/etc/systemd/system/service.d/10-timeout-abort.conf")),
+            ("drifted", lambda drops: drops[-1].update(sha256="1" * 64)),
+        ):
+            hostile = copy.deepcopy(manifest)
+            drops = next(
+                item["drop_ins"] for item in hostile["effective_systemd"]
+                if item["unit"] == runner["unit"]
+            )
+            mutate(drops)
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ValueError,
+                "(?:drop-in inventory differs|drop-in owner, path, or order differs|platform effective systemd binding differs)",
+            ):
+                activation_package.validate_manifest(hostile)
+
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        target = self.fixture.root / global_record["path"].lstrip("/")
+        expected = target.read_bytes()
+        target.unlink()
+        with self.assertRaisesRegex(ValueError, "effective systemd file is missing"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        write_file(target, b"[Service]\nHostile=yes\n", 0o644)
+        with self.assertRaisesRegex(ValueError, "effective systemd file digest differs"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        write_file(target, expected, 0o644)
+        state = driver._read()
+        state["units"][runner["unit"]]["DropInPaths"].insert(
+            0, "/etc/systemd/system/buzz-ci-runner.service.d/10-host-adapters.conf",
+        )
+        driver._write(state)
+        with self.assertRaisesRegex(ValueError, "drop-in paths or order"):
             CONTROLLER.check_current(manifest, self.fixture.root, driver)
 
     def test_dependency_drop_in_rejects_missing_and_stale_bytes(self) -> None:
@@ -1365,6 +1423,11 @@ class ActivationControllerTests(unittest.TestCase):
         for category in ("binary", "config", "unit", "socket", "drop_in", "tmpfiles", "sysusers", "fixture", "receipt"):
             self.assertGreater(report["categories"].get(category, 0), 0, category)
 
+        platform_drift = copy.deepcopy(packages)
+        platform_drift["activation"]["platform_systemd"]["service_drop_ins"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "systemd platform binding differs"):
+            INVENTORY.check_inventory(platform_drift)
+
         self.assertTrue(any(
             item["target"] == "/etc/buzzci/runner-v2.json"
             for item in packages["runner"]["entries"]
@@ -1407,6 +1470,12 @@ class ActivationControllerTests(unittest.TestCase):
             root = Path(temporary)
             canonical = root / INVENTORY.CONTROLD_ACCEPTANCE_SOURCE
             write_file(canonical, b"canonical\n", 0o644)
+            platform = root / INVENTORY.PLATFORM_SYSTEMD_SOURCE
+            write_file(
+                platform,
+                (REPO_ROOT / INVENTORY.PLATFORM_SYSTEMD_SOURCE).read_bytes(),
+                0o644,
+            )
             report = INVENTORY.check_source_inventory(root)
             self.assertEqual(report["controld_acceptance_source"], str(INVENTORY.CONTROLD_ACCEPTANCE_SOURCE))
             duplicate = root / "deploy/native-ci/acceptance/templates" / INVENTORY.CONTROLD_ACCEPTANCE_NAME
@@ -1699,6 +1768,9 @@ class ActivationControllerTests(unittest.TestCase):
             (properties["effective_systemd"]["minItems"], properties["effective_systemd"]["maxItems"]),
             (len(activation_package.SYSTEMD_UNIT_LAYOUT), len(activation_package.SYSTEMD_UNIT_LAYOUT)),
         )
+        self.assertEqual(properties["platform_systemd"]["const"], activation_package.PLATFORM_SYSTEMD)
+        self.assertEqual(INVENTORY.PLATFORM_SYSTEMD, activation_package.PLATFORM_SYSTEMD)
+        self.assertIn("platform", schema["$defs"]["effectivePath"]["properties"]["owner"]["enum"])
         self.assertEqual(properties["socket_policy"]["const"], activation_package.SOCKET_POLICY)
         self.assertEqual(
             properties["systemd"]["const"],
@@ -1721,7 +1793,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "5a36cecec8ad048572939656f1b4c1751e7d4bb85b4961c9ebfddbc959bde6bc",
+            "336857c41966b1c0ec87955d014fc3aec9647134f076a7f20bbd475355e31eb8",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
