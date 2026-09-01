@@ -49,6 +49,15 @@ PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
 MAX_PROGRESS_RECORDS = 32
 MAX_PROGRESS = 16 * 1024
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
 TOOLS = {
     "qemu": "/usr/bin/qemu-system-x86_64",
     "qemu_img": "/usr/bin/qemu-img",
@@ -1445,6 +1454,7 @@ def validate_contract_envelope(value: object) -> dict[str, object]:
     required = {
         "schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256",
         "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages",
+        "platform_systemd",
     }
     if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA:
         raise HarnessError("run contract shape differs")
@@ -1459,6 +1469,8 @@ def validate_contract_envelope(value: object) -> dict[str, object]:
         or value.get("timing_sha256") != timing_sha256()
     ):
         raise HarnessError("run contract harness or timing binding differs")
+    if value.get("platform_systemd") != PLATFORM_SYSTEMD:
+        raise HarnessError("run contract systemd platform binding differs")
     return value
 
 
@@ -2385,6 +2397,7 @@ def create_run_stage(
         "seccomp_source_sha256": SECCOMP_SHA256,
         "public_binding_sha256": hashlib.sha256(public_raw).hexdigest(),
         "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
+        "platform_systemd": contract["platform_systemd"],
     }
     (stage / "descriptor.json").write_bytes(canonical(descriptor))
     (stage / "descriptor.json").chmod(0o444)

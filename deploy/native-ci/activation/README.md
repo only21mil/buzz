@@ -84,6 +84,14 @@ ordered `DropInPaths`. It independently hashes every returned fragment and
 drop-in. Dormant checks allow only manifest-bound dependencies and exact
 activation files captured as prior state. Every later phase rejects missing,
 extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
+The manifest's closed `platform_systemd` binding permits exactly Fedora 44
+systemd 259's global
+`/usr/lib/systemd/system/service.d/10-timeout-abort.conf`, with SHA-256
+`ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37`.
+Systemd reports a unit-specific service drop-in before that global service
+drop-in. The manifest records that order for every service. Sockets and the
+capacity target do not receive the global service drop-in. An extra host,
+administrator, or distribution drop-in remains a hard failure.
 
 1. `stage --scenario` validates the exact scenario and atomically installs and
    reopens the complete package at the fixed root-owned mode-`0700`
@@ -358,6 +366,10 @@ directories never receive this exception.
 It renders exact numeric sysusers entries, copies the reviewed systemd files,
 checks all config and provenance digests, writes a canonical manifest, and
 binds the activation ID to its package digest.
+The freezer also compares the platform binding with the tracked Fedora package
+bytes at
+`deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf`.
+It does not install or replace that distribution-owned file.
 The draft's controld component names a mode-`0400` copy of the frozen controld
 `package-manifest.json` in `--asset-root`. The freezer checks its canonical
 package digest, source commit, and both controld unit entries.
@@ -404,8 +416,9 @@ Clean-host preflight permits `not-found` only for the seven fragments installed
 by this package. Every external dependency unit, including the controld
 acceptance socket, must already be loaded from its sole package owner. After
 installation and `daemon-reload`, staging requires all 13 lifecycle units
-loaded and re-reads 18 exact fragment/drop-in paths and digests before starting
-any staged service.
+loaded and re-reads 24 exact fragment/drop-in bindings and digests before
+starting any staged service. Six service-unit bindings refer to the same
+distribution-owned global file by exact path and digest.
 
 A clean-host terminal run takes an exclusive advisory lock through a no-follow
 descriptor for the prepared state's parent directory. Contention waits at most
