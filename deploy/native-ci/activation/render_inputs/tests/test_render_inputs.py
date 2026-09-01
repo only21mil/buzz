@@ -115,6 +115,9 @@ def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> d
 
 
 class RendererTests(unittest.TestCase):
+    def test_systemd_platform_binding_matches_activation_validator(self) -> None:
+        self.assertEqual(RENDER.PLATFORM_SYSTEMD, RENDER.activation_package_module().PLATFORM_SYSTEMD)
+
     def test_production_scenario_template_generator_is_deterministic_and_no_clobber(self) -> None:
         scenario_path = ROOT.parents[1] / "acceptance/scenario.template.json"
         with tempfile.TemporaryDirectory() as temporary:
@@ -515,6 +518,7 @@ class RendererTests(unittest.TestCase):
             "state": "state", "candidate_root": "candidate",
             "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
             "timing": TIMING, "timing_sha256": timing_sha,
+            "platform_systemd": RENDER.PLATFORM_SYSTEMD,
             "scenario": {"path": "scenario.json", "sha256": HEX["scenario"]},
             "seccomp_source": {"path": "seccomp.json", "sha256": RENDER.SECCOMP_SHA256},
             "packages": {name: {"path": name, "tree_sha256": trees[name]} for name in RENDER.PACKAGE_NAMES},
