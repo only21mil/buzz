@@ -103,6 +103,30 @@ grep -Fq 'TAG_PREFIX="desktop-v"' "$auto_tag"
 grep -Fq 'target_sha=${{ github.event.pull_request.head.sha }}' "$auto_tag"
 grep -Fq 'scripts/verify-desktop-release-merge.sh' "$auto_tag"
 candidate_workflow="$repo_root/.github/workflows/desktop-release-candidate.yml"
+grep -Fq '  push:' "$candidate_workflow" || {
+  echo "desktop candidate workflow does not run for main pushes" >&2
+  exit 1
+}
+[[ "$(grep -Fc '    branches: [main]' "$candidate_workflow")" -eq 2 ]] || {
+  echo "desktop candidate workflow must bind both pull requests and pushes to main" >&2
+  exit 1
+}
+[[ "$(grep -Fc '          ref:' "$candidate_workflow")" -eq 1 ]] || {
+  echo "desktop candidate workflow has an ambiguous checkout ref" >&2
+  exit 1
+}
+grep -Fq "          ref: \${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" "$candidate_workflow" || {
+  echo "desktop candidate checkout is not bound to the PR head or exact push SHA" >&2
+  exit 1
+}
+if grep -Eq 'ref:.*github\.(head_ref|ref)([^_a-zA-Z]|$)' "$candidate_workflow"; then
+  echo "desktop candidate checkout accepts an untrusted or mutable branch ref" >&2
+  exit 1
+fi
+grep -Fq '          persist-credentials: false' "$candidate_workflow" || {
+  echo "desktop candidate checkout persists repository credentials" >&2
+  exit 1
+}
 grep -Eq '^  pull-requests: read$' "$candidate_workflow" || {
   echo "desktop candidate token cannot read pull requests for prior-release lookup" >&2
   exit 1
