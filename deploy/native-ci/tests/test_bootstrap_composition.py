@@ -632,6 +632,7 @@ class BootstrapCompositionTests(unittest.TestCase):
             self.assertEqual(set(clean_contract["packages"]), set(RENDER.PACKAGE_NAMES))
             self.assertEqual(clean_contract["seccomp_source"]["sha256"], seccomp_sha256)
             self.assertEqual(clean_contract["scenario"]["sha256"], scenario_sha256)
+            self.assertEqual(clean_contract["platform_systemd"], RENDER.PLATFORM_SYSTEMD)
             previous_directory = Path.cwd()
             try:
                 os.chdir(ceremony)
@@ -675,6 +676,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                     "tar", "-cf", str(guest_stage / "candidate.tar"), "-C", str(source),
                     "deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
                     "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
+                    "deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf",
                 ],
                 check=True,
             )
@@ -694,6 +696,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "scenario_sha256": scenario_sha256,
                 "seccomp_source_sha256": seccomp_sha256,
                 "timing_asset_sha256": clean_contract["timing_asset_sha256"],
+                "platform_systemd": clean_contract["platform_systemd"],
             }
             with (
                 mock.patch.object(CLEAN_HOST_GUEST, "STATE_ROOT", guest_state),
@@ -703,10 +706,12 @@ class BootstrapCompositionTests(unittest.TestCase):
                     source / "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
                 ),
                 mock.patch.object(CLEAN_HOST_GUEST, "SECCOMP_SHA256", seccomp_sha256),
+                mock.patch.object(CLEAN_HOST_GUEST, "verify_platform_systemd") as platform_check,
             ):
                 _candidate_path, guest_scenario, _guest_public = CLEAN_HOST_GUEST.cross_bind(
                     guest_stage, guest_descriptor,
                 )
+            platform_check.assert_called_once_with(clean_contract["platform_systemd"])
             self.assertEqual(RENDER.canonical_scenario(guest_scenario), scenario_raw)
 
             drifted_seccomp = b'{"defaultAction":"SCMP_ACT_ALLOW"}\n'
