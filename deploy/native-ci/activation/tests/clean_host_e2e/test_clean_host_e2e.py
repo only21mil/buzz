@@ -248,6 +248,45 @@ def systemd_process(
     return subprocess.CompletedProcess(["systemctl", "show"], returncode, stdout, stderr)
 
 
+def rock_ridge_metadata(image: Path, root: str) -> dict[str, tuple[str, int, int]]:
+    process = subprocess.run(
+        [
+            HOST_TOOLS["xorriso"], "-indev", str(image),
+            "-find", root, "-exec", "lsdl", "--",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result: dict[str, tuple[str, int, int]] = {}
+    pattern = re.compile(
+        r"^([d-][rwx-]{9})\s+\d+\s+(\d+)\s+(\d+)\s+\d+\s+"
+        r"\S+\s+\S+\s+\S+\s+'([^']+)'$",
+    )
+    for line in (process.stdout + process.stderr).splitlines():
+        match = pattern.fullmatch(line)
+        if match is not None:
+            result[match.group(4)] = (
+                match.group(1), int(match.group(2)), int(match.group(3)),
+            )
+    if not result:
+        raise AssertionError("Rock Ridge metadata listing is empty")
+    return result
+
+
+def require_root_owned_iso_paths(
+    metadata: dict[str, tuple[str, int, int]], expected: dict[str, str],
+) -> None:
+    if set(metadata) != set(expected):
+        raise AssertionError("Rock Ridge path inventory differs")
+    for path, expected_mode in expected.items():
+        mode, uid, gid = metadata[path]
+        if (uid, gid) != (0, 0):
+            raise AssertionError(f"Rock Ridge owner differs: {path}")
+        if mode != expected_mode:
+            raise AssertionError(f"Rock Ridge mode differs: {path}")
+
+
 def mount_pairs(command: list[str], option: str) -> list[tuple[str, str]]:
     return [
         (command[index + 1], command[index + 2])
@@ -328,6 +367,99 @@ class BoundaryTests(unittest.TestCase):
                         "-drive", transfer_drive,
                         "-device", "virtio-blk-pci,drive=transfer,serial=buzzci-transfer",
                     ])
+
+    def test_stage_iso_normalizes_root_ownership_and_preserves_package_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage"
+            package = stage / "inputs/runner"
+            assets = package / "assets"
+            assets.mkdir(mode=0o700, parents=True)
+            stage.chmod(0o700)
+            (stage / "inputs").chmod(0o700)
+            package.chmod(0o700)
+            manifest = package / "package-manifest.json"
+            manifest.write_bytes(harness.canonical({"schema": "test"}))
+            manifest.chmod(0o600)
+            payload = assets / "payload"
+            payload.write_bytes(b"exact package payload\n")
+            payload.chmod(0o400)
+
+            source_uid, source_gid = os.geteuid(), os.getegid()
+            if source_uid == 0 or source_gid == 0:
+                source_uid = source_gid = 1
+                for path in (stage, stage / "inputs", package, assets, manifest, payload):
+                    os.chown(path, source_uid, source_gid)
+            self.assertNotEqual(source_uid, 0)
+            self.assertNotEqual(source_gid, 0)
+            self.assertEqual(
+                (package.stat().st_uid, package.stat().st_gid),
+                (source_uid, source_gid),
+            )
+
+            original_digest = harness.tree_digest(harness.tree_records(package))
+            image = root / "stage.iso"
+            observed_commands: list[list[str]] = []
+            real_bounded = harness.bounded
+
+            def bounded(argv, **keywords):
+                observed_commands.append(list(argv))
+                return real_bounded(argv, **keywords)
+
+            with mock.patch.dict(
+                harness.TOOLS, {"xorriso": HOST_TOOLS["xorriso"]}, clear=False,
+            ), mock.patch.object(harness, "bounded", side_effect=bounded):
+                harness.make_iso(stage, image, "BUZZCI_STAGE_TEST")
+
+            self.assertEqual(observed_commands, [[
+                HOST_TOOLS["xorriso"], "-as", "mkisofs", "-quiet", "-J", "-R",
+                "-uid", "0", "-gid", "0", "-V", "BUZZCI_STAGE_TEST",
+                "-o", str(image), str(stage),
+            ]])
+            self.assertEqual(stat.S_IMODE(image.stat().st_mode), 0o400)
+            expected = {
+                "/inputs/runner": "drwx------",
+                "/inputs/runner/assets": "drwx------",
+                "/inputs/runner/assets/payload": "-r--------",
+                "/inputs/runner/package-manifest.json": "-rw-------",
+            }
+            require_root_owned_iso_paths(
+                rock_ridge_metadata(image, "/inputs/runner"), expected,
+            )
+
+            extracted = root / "extracted-runner"
+            subprocess.run(
+                [
+                    HOST_TOOLS["xorriso"], "-osirrox", "on", "-indev", str(image),
+                    "-extract", "/inputs/runner", str(extracted),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                harness.tree_digest(harness.tree_records(extracted)), original_digest,
+            )
+
+            for name, owner_flags in (
+                ("omitted", []),
+                ("mutated", ["-uid", "1", "-gid", "1"]),
+            ):
+                hostile = root / f"{name}.iso"
+                subprocess.run(
+                    [
+                        HOST_TOOLS["xorriso"], "-as", "mkisofs", "-quiet", "-J", "-R",
+                        *owner_flags, "-V", "BUZZCI_STAGE_TEST",
+                        "-o", str(hostile), str(stage),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                with self.subTest(owner_flags=owner_flags), self.assertRaisesRegex(
+                    AssertionError, "Rock Ridge owner differs",
+                ):
+                    require_root_owned_iso_paths(
+                        rock_ridge_metadata(hostile, "/inputs/runner"), expected,
+                    )
 
     def test_qemu_boundary_has_no_container_network_or_host_share(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

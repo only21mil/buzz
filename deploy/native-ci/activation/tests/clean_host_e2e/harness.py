@@ -864,6 +864,7 @@ def validate_transfer(state: Path) -> None:
 def make_iso(source: Path, output: Path, label: str) -> None:
     bounded([
         TOOLS["xorriso"], "-as", "mkisofs", "-quiet", "-J", "-R",
+        "-uid", "0", "-gid", "0",
         "-V", label, "-o", str(output), str(source),
     ], timeout=60)
     output.chmod(0o400)

@@ -68,6 +68,10 @@ The flow has two user-visible phases and three isolated boots:
 The relay is guest-loopback only. It verifies the complete NIP-98 event ID,
 BIP-340 signature, public key, method, exact URL, payload digest, and timestamp.
 Published Nostr events receive the same event-ID and signature verification.
+The host records every staged ISO path with Rock Ridge owner and group `0:0`
+while retaining each frozen file and directory mode. Package manifests,
+payload bytes, and tree digests are unchanged, so the guest's strict root-owned
+package validation applies directly to the read-only staging media.
 
 ## Commands
 
