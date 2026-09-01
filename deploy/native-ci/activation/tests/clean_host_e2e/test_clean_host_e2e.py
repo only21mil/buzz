@@ -156,6 +156,7 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
         "timing_asset_sha256": harness.timing_asset_sha256(),
         "timing": harness.TIMING_CONTRACT,
         "timing_sha256": harness.timing_sha256(),
+        "platform_systemd": copy.deepcopy(harness.PLATFORM_SYSTEMD),
         "scenario": {"path": str(scenario), "sha256": harness.file_sha256(scenario)},
         "seccomp_source": {"path": str(seccomp), "sha256": seccomp_sha},
         "packages": packages,
@@ -264,6 +265,39 @@ def nip98(secret: int, method: str, url: str, body: bytes, now: int) -> str:
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_qemu_boots_only_the_os_disk_before_the_transfer_disk(self) -> None:
+        for overlay, transfer in (
+            ("ceremony.qcow2", None),
+            ("candidate.qcow2", "read-write"),
+            ("verifier.qcow2", "read-only"),
+        ):
+            with self.subTest(overlay=overlay, transfer=transfer):
+                command = harness.qemu_command(
+                    Path("/private-state"), overlay=overlay,
+                    evidence=overlay != "candidate.qcow2", transfer=transfer,
+                )
+                qemu = command[command.index("--") + 1:]
+                os_drive = f"file=/work/{overlay},if=none,format=qcow2,cache=none,id=os"
+                os_index = qemu.index(os_drive)
+                self.assertEqual(qemu[os_index - 1:os_index + 3], [
+                    "-drive", os_drive,
+                    "-device", "virtio-blk-pci,drive=os,bootindex=1",
+                ])
+                self.assertEqual(
+                    [value for value in qemu if "bootindex=" in value],
+                    ["virtio-blk-pci,drive=os,bootindex=1"],
+                )
+                if transfer is not None:
+                    transfer_drive = (
+                        "file=/work/transfer.raw,if=none,format=raw,cache=none,id=transfer"
+                        + (",readonly=on" if transfer == "read-only" else "")
+                    )
+                    transfer_index = qemu.index(transfer_drive)
+                    self.assertEqual(qemu[transfer_index - 1:transfer_index + 3], [
+                        "-drive", transfer_drive,
+                        "-device", "virtio-blk-pci,drive=transfer,serial=buzzci-transfer",
+                    ])
+
     def test_qemu_boundary_has_no_container_network_or_host_share(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             command = harness.qemu_command(
@@ -1030,6 +1064,46 @@ class TimingAndProgressTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_guest_requires_exact_fedora_global_service_drop_in(self) -> None:
+        self.assertEqual(guest.PLATFORM_SYSTEMD, harness.PLATFORM_SYSTEMD)
+        schema = json.loads((HERE / "contract.schema.json").read_bytes())
+        self.assertEqual(schema["properties"]["platform_systemd"]["const"], guest.PLATFORM_SYSTEMD)
+        expected = (
+            HERE.parents[1]
+            / "platform/fedora-44-systemd-259/10-timeout-abort.conf"
+        ).read_bytes()
+        with mock.patch.object(guest, "read_file", return_value=expected) as opened:
+            guest.verify_platform_systemd(copy.deepcopy(guest.PLATFORM_SYSTEMD))
+        opened.assert_called_once_with(
+            Path("/usr/lib/systemd/system/service.d/10-timeout-abort.conf"),
+            guest.MAX_JSON,
+        )
+
+        mutations = []
+        for field, value in (
+            ("path", "/etc/systemd/system/service.d/10-timeout-abort.conf"),
+            ("sha256", "0" * 64),
+        ):
+            changed = copy.deepcopy(guest.PLATFORM_SYSTEMD)
+            changed["service_drop_ins"][0][field] = value
+            mutations.append(changed)
+        extra = copy.deepcopy(guest.PLATFORM_SYSTEMD)
+        extra["service_drop_ins"].append({
+            "owner": "platform",
+            "path": "/usr/lib/systemd/system/service.d/99-hostile.conf",
+            "sha256": "1" * 64,
+        })
+        mutations.append(extra)
+        mutations.append({**copy.deepcopy(guest.PLATFORM_SYSTEMD), "service_drop_ins": []})
+        for changed in mutations:
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                guest.GuestError, "platform binding differs",
+            ):
+                guest.verify_platform_systemd(changed)
+        with mock.patch.object(guest, "read_file", return_value=b"[Service]\nHostile=yes\n"):
+            with self.assertRaisesRegex(guest.GuestError, "platform file digest differs"):
+                guest.verify_platform_systemd(copy.deepcopy(guest.PLATFORM_SYSTEMD))
+
     def test_guest_cross_binds_keyholder_client_and_service_identities(self) -> None:
         public_spec = {"peer": {"uid": 1201, "gid": 1201}}
         activation = {"identities": {
@@ -1283,6 +1357,7 @@ class InputTests(unittest.TestCase):
             lambda value: value.update(schema_version="wrong"),
             lambda value: value.update(candidate_sha="not-a-commit"),
             lambda value: value.update(state=["not", "a", "path"]),
+            lambda value: value["platform_systemd"]["service_drop_ins"][0].update(sha256="0" * 64),
             lambda value: value.update(extra="rejected"),
         )
         for mutate in mutations:

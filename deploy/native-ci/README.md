@@ -1,5 +1,10 @@
 # Buzz CI native deploy packages
 
+The one-time, approval-gated migration for the legacy framework host is in
+[`legacy_state_migration/`](legacy_state_migration/README.md). Run its
+read-only plan and complete the migration receipt before installing v2 packages
+on a host with the old direct `/var/lib/buzzci` layout.
+
 `runner/`, `controld/`, and `execd/` hold the dormant Buzz CI source packages
 and their check/dry-run/install/rollback installers. Each lane freezes a
 supplied release binary and provenance record; none of them builds, fetches,

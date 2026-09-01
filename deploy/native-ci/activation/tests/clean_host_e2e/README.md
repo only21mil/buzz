@@ -9,7 +9,9 @@ a fixed 8 MiB raw transfer device. Bubblewrap mounts the prepared state
 read-only, then exposes only the current overlay, the candidate's transfer
 device, and the verifier's pre-created evidence destination as writable files.
 Only the trusted verifier boot receives the bounded virtio-serial evidence
-channel.
+channel. Every boot gives only the qcow2 operating-system disk a firmware boot
+index. The raw transfer disk remains data-only even when QEMU enumerates it
+before the operating-system disk.
 
 The flow has two user-visible phases and three isolated boots:
 
@@ -86,13 +88,23 @@ python3 "$HARNESS" run \
 ```
 
 The closed v3 contract includes `harness_sha256`, `timing_asset_sha256`,
-`timing`, and `timing_sha256`. The maintained final renderer derives them from
-the exact candidate Git object. For a manually assembled contract, copy the
-same values from `capabilities`; `prepare` records them in `state.json`.
+`timing`, `timing_sha256`, and the exact `platform_systemd` binding copied from
+the validated activation package. The maintained final renderer derives the
+harness and timing values from the exact candidate Git object. For a manually
+assembled contract, copy the harness and timing values from `capabilities` and
+the platform value from the validated activation manifest. `prepare` records
+the harness and timing values in `state.json`.
 Preflight rejects a state prepared by any other `harness.py`, a contract with
 another timing asset or timing table, or a candidate commit whose tracked
 harness bytes do not match. Any harness change makes an unused older prepared
 state stale by design.
+
+Before it extracts candidate code or installs a package, the run guest opens
+the bound Fedora global service drop-in without following symlinks and hashes
+its exact bytes. A missing, relocated, replaced, or byte-drifted file stops the
+clean-host run. This means a pinned cloud image that differs from the
+production platform binding is a qualification blocker. The harness does not
+ignore the mismatch or inject production's file into the image.
 
 The exact `timing-contract.json` blob has a separate SHA-256 binding in the
 prepare result, state, run contract, candidate stage descriptor, final evidence,

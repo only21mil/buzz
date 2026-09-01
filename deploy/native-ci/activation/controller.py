@@ -1763,10 +1763,18 @@ class FakeSystemd:
                 drop_in_directory = activation_package.rooted(
                     self.root, f"/etc/systemd/system/{unit}.d",
                 )
-                state["units"][unit]["DropInPaths"] = (
+                unit_drop_ins = (
                     [f"/etc/systemd/system/{unit}.d/{path.name}" for path in sorted(drop_in_directory.glob("*.conf"), key=lambda item: item.name.encode())]
                     if drop_in_directory.is_dir() else []
                 )
+                global_directory = activation_package.rooted(
+                    self.root, "/usr/lib/systemd/system/service.d",
+                )
+                global_drop_ins = (
+                    [f"/usr/lib/systemd/system/service.d/{path.name}" for path in sorted(global_directory.glob("*.conf"), key=lambda item: item.name.encode())]
+                    if unit.endswith(".service") and global_directory.is_dir() else []
+                )
+                state["units"][unit]["DropInPaths"] = unit_drop_ins + global_drop_ins
             else:
                 state["units"][unit] = {
                     "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
