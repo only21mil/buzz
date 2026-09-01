@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -156,6 +159,7 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
         "timing_asset_sha256": harness.timing_asset_sha256(),
         "timing": harness.TIMING_CONTRACT,
         "timing_sha256": harness.timing_sha256(),
+        "platform_systemd": copy.deepcopy(harness.PLATFORM_SYSTEMD),
         "scenario": {"path": str(scenario), "sha256": harness.file_sha256(scenario)},
         "seccomp_source": {"path": str(seccomp), "sha256": seccomp_sha},
         "packages": packages,
@@ -167,6 +171,27 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
 
 def rewrite_contract(path: Path, value: dict[str, object]) -> None:
     path.write_bytes(harness.canonical(value))
+
+
+def write_guest_package(
+    inputs: Path, name: str, entries: list[tuple[str, str, bytes]],
+) -> Path:
+    package = inputs / name
+    package.mkdir(parents=True)
+    manifest_entries = []
+    for index, (source, target, payload) in enumerate(entries):
+        member = package / source
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(payload)
+        manifest_entries.append({
+            "role": f"test_{index}",
+            "source": source,
+            "target": target,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    manifest_name = "activation-manifest.json" if name == "activation" else "package-manifest.json"
+    (package / manifest_name).write_bytes(harness.canonical({"entries": manifest_entries}))
+    return package
 
 
 def passing_frame(contract: dict[str, object]) -> dict[str, object]:
@@ -214,6 +239,13 @@ def progress_frame(
     }
     payload = harness.canonical(value)
     return struct.pack(">I", len(payload)) + payload + hashlib.sha256(payload).digest()
+
+
+def systemd_process(
+    lines: list[str], *, returncode: int = 0, stderr: bytes = b"",
+) -> subprocess.CompletedProcess[bytes]:
+    stdout = ("\n".join(lines) + "\n").encode()
+    return subprocess.CompletedProcess(["systemctl", "show"], returncode, stdout, stderr)
 
 
 def mount_pairs(command: list[str], option: str) -> list[tuple[str, str]]:
@@ -264,6 +296,39 @@ def nip98(secret: int, method: str, url: str, body: bytes, now: int) -> str:
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_qemu_boots_only_the_os_disk_before_the_transfer_disk(self) -> None:
+        for overlay, transfer in (
+            ("ceremony.qcow2", None),
+            ("candidate.qcow2", "read-write"),
+            ("verifier.qcow2", "read-only"),
+        ):
+            with self.subTest(overlay=overlay, transfer=transfer):
+                command = harness.qemu_command(
+                    Path("/private-state"), overlay=overlay,
+                    evidence=overlay != "candidate.qcow2", transfer=transfer,
+                )
+                qemu = command[command.index("--") + 1:]
+                os_drive = f"file=/work/{overlay},if=none,format=qcow2,cache=none,id=os"
+                os_index = qemu.index(os_drive)
+                self.assertEqual(qemu[os_index - 1:os_index + 3], [
+                    "-drive", os_drive,
+                    "-device", "virtio-blk-pci,drive=os,bootindex=1",
+                ])
+                self.assertEqual(
+                    [value for value in qemu if "bootindex=" in value],
+                    ["virtio-blk-pci,drive=os,bootindex=1"],
+                )
+                if transfer is not None:
+                    transfer_drive = (
+                        "file=/work/transfer.raw,if=none,format=raw,cache=none,id=transfer"
+                        + (",readonly=on" if transfer == "read-only" else "")
+                    )
+                    transfer_index = qemu.index(transfer_drive)
+                    self.assertEqual(qemu[transfer_index - 1:transfer_index + 3], [
+                        "-drive", transfer_drive,
+                        "-device", "virtio-blk-pci,drive=transfer,serial=buzzci-transfer",
+                    ])
+
     def test_qemu_boundary_has_no_container_network_or_host_share(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             command = harness.qemu_command(
@@ -374,6 +439,11 @@ class BoundaryTests(unittest.TestCase):
                 evidence = state / "evidence.bin"
                 self.assertTrue(evidence.is_file())
                 self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
+                (state / "progress.bin").write_bytes(b"".join((
+                    progress_frame("verifier", 0, "guest_started", "start", 1),
+                    progress_frame("verifier", 1, "verifier", "start", 2),
+                    progress_frame("verifier", 2, "complete", "complete", 3),
+                )))
                 return ["/usr/bin/true"]
 
             with mock.patch.object(harness, "qemu_command", side_effect=command):
@@ -628,6 +698,173 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(guest.GuestError, "readback failed"):
                 guest.unit_state()
 
+    def test_systemd259_absent_unit_shapes_normalize_only_nonservice_main_pid(self) -> None:
+        common = [
+            "LoadState=not-found", "ActiveState=inactive", "SubState=dead",
+            "FragmentPath=", "UnitFileState=", "InvocationID=",
+        ]
+
+        def show(argv, **_keywords):
+            unit = argv[2]
+            lines = list(common)
+            if unit.endswith(".service"):
+                lines.append("MainPID=0")
+            return systemd_process(lines)
+
+        with mock.patch.object(guest, "command", side_effect=show) as command:
+            observed = guest.unit_state()
+        self.assertEqual(set(observed), set(guest.UNITS))
+        self.assertTrue(all(value["MainPID"] == "0" for value in observed.values()))
+        self.assertEqual(command.call_count, len(guest.UNITS))
+        for call in command.call_args_list:
+            self.assertEqual(
+                call.args[0][3], "--property=" + ",".join(guest.SYSTEMD_UNIT_PROPERTIES),
+            )
+
+    def test_systemd_unit_readback_accepts_loaded_service_and_active_socket(self) -> None:
+        loaded_service = systemd_process([
+            "LoadState=loaded", "ActiveState=active", "SubState=running",
+            "UnitFileState=enabled", "MainPID=123", "InvocationID=" + "a" * 32,
+            "FragmentPath=/usr/lib/systemd/system/buzz-ci-runner.service",
+        ])
+        service = guest.systemd_unit_values("buzz-ci-runner.service", loaded_service)
+        self.assertEqual(service["MainPID"], "123")
+        self.assertEqual(service["LoadState"], "loaded")
+
+        active_socket = systemd_process([
+            "LoadState=loaded", "ActiveState=active", "SubState=listening",
+            "UnitFileState=enabled", "InvocationID=" + "b" * 32,
+            "FragmentPath=/usr/lib/systemd/system/buzz-ci-runner.socket",
+        ])
+        socket = guest.systemd_unit_values("buzz-ci-runner.socket", active_socket)
+        self.assertEqual(socket["MainPID"], "0")
+        self.assertEqual(socket["SubState"], "listening")
+        active_socket_with_pid = systemd_process([
+            *active_socket.stdout.decode().splitlines(), "MainPID=456",
+        ])
+        self.assertEqual(
+            guest.systemd_unit_values(
+                "buzz-ci-runner.socket", active_socket_with_pid,
+            )["MainPID"],
+            "456",
+        )
+
+    def test_systemd_unit_readback_rejects_missing_service_pid_and_hostile_output(self) -> None:
+        valid = [
+            "LoadState=not-found", "ActiveState=inactive", "SubState=dead",
+            "UnitFileState=", "MainPID=0", "InvocationID=", "FragmentPath=",
+        ]
+        for missing in set(guest.SYSTEMD_UNIT_PROPERTIES) - {"MainPID"}:
+            lines = [line for line in valid if not line.startswith(missing + "=")]
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                guest.GuestError, "readback failed",
+            ):
+                guest.systemd_unit_values("buzz-ci-runner.service", systemd_process(lines))
+
+        omitted_pid = [line for line in valid if not line.startswith("MainPID=")]
+        hostile = (
+            (omitted_pid, 0, b""),
+            ([*valid, "LoadState=not-found"], 0, b""),
+            ([*valid, "Description=hostile"], 0, b""),
+            ([*valid, "malformed"], 0, b""),
+            ([line.replace("MainPID=0", "MainPID=7") for line in valid], 0, b""),
+            ([line.replace("MainPID=0", "MainPID=invalid") for line in valid], 0, b""),
+            ([line.replace("LoadState=not-found", "LoadState=loaded") for line in valid], 1, b""),
+            (valid, 0, b"unexpected stderr"),
+        )
+        for lines, returncode, stderr in hostile:
+            with self.subTest(lines=lines, returncode=returncode, stderr=stderr), self.assertRaisesRegex(
+                guest.GuestError, "readback failed",
+            ):
+                guest.systemd_unit_values(
+                    "buzz-ci-runner.service",
+                    systemd_process(lines, returncode=returncode, stderr=stderr),
+                )
+
+        absent_nonzero = systemd_process(valid, returncode=1)
+        self.assertEqual(
+            guest.systemd_unit_values("buzz-ci-runner.service", absent_nonzero)["LoadState"],
+            "not-found",
+        )
+        with self.assertRaisesRegex(guest.GuestError, "readback failed"):
+            guest.systemd_unit_values(
+                "buzz-ci-runner.service",
+                subprocess.CompletedProcess(["systemctl"], 0, b"\xff", b""),
+            )
+
+    def test_dormant_relay_accepts_exact_absence_for_zero_or_nonzero_return(self) -> None:
+        exact = ["LoadState=not-found", "ActiveState=inactive", "MainPID=0"]
+        units = {
+            unit: {
+                "LoadState": "not-found", "ActiveState": "inactive",
+                "UnitFileState": "", "MainPID": "0",
+            }
+            for unit in guest.UNITS
+        }
+        baseline = {
+            unit: {"LoadState": "not-found", "UnitFileState": ""}
+            for unit in guest.UNITS
+        }
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode), mock.patch.object(
+                guest, "tree_state", return_value={},
+            ), mock.patch.object(
+                guest, "unit_state", return_value=units,
+            ), mock.patch.object(
+                Path, "exists", return_value=False,
+            ), mock.patch.object(
+                guest, "command", side_effect=(
+                    systemd_process(exact, returncode=returncode),
+                    subprocess.CompletedProcess(["pgrep"], 1, b"", b""),
+                ),
+            ):
+                proof = guest.dormant_proof({}, baseline)
+            self.assertTrue(proof["relay_residue_absent"])
+
+    def test_dormant_relay_rejects_residue_and_malformed_absence(self) -> None:
+        exact = ["LoadState=not-found", "ActiveState=inactive", "MainPID=0"]
+        units = {
+            unit: {
+                "LoadState": "not-found", "ActiveState": "inactive",
+                "UnitFileState": "", "MainPID": "0",
+            }
+            for unit in guest.UNITS
+        }
+        baseline = {
+            unit: {"LoadState": "not-found", "UnitFileState": ""}
+            for unit in guest.UNITS
+        }
+        hostile = (
+            ["LoadState=loaded", "ActiveState=inactive", "MainPID=0"],
+            ["LoadState=not-found", "ActiveState=active", "MainPID=0"],
+            ["LoadState=not-found", "ActiveState=inactive", "MainPID=7"],
+            exact[:-1],
+            [*exact, "LoadState=not-found"],
+            [*exact, "Description=hostile"],
+            [*exact, "malformed"],
+        )
+        for lines in hostile:
+            with self.subTest(lines=lines), mock.patch.object(
+                guest, "tree_state", return_value={},
+            ), mock.patch.object(
+                guest, "unit_state", return_value=units,
+            ), mock.patch.object(
+                Path, "exists", return_value=False,
+            ), mock.patch.object(
+                guest, "command", return_value=systemd_process(lines),
+            ), self.assertRaisesRegex(guest.GuestError, "relay unit residue remains"):
+                guest.dormant_proof({}, baseline)
+        with mock.patch.object(
+            guest, "tree_state", return_value={},
+        ), mock.patch.object(
+            guest, "unit_state", return_value=units,
+        ), mock.patch.object(
+            Path, "exists", return_value=False,
+        ), mock.patch.object(
+            guest, "command", return_value=systemd_process(exact, stderr=b"unexpected stderr"),
+        ), self.assertRaisesRegex(guest.GuestError, "relay unit residue remains"):
+            guest.dormant_proof({}, baseline)
+
     def test_strict_verifier_verdict_rejects_status_and_outcome_mutation(self) -> None:
         valid = guest.canonical({"outcome": "pass", "status": "verified"})
         self.assertEqual(guest.parse_verdict(valid), {"outcome": "pass", "status": "verified"})
@@ -641,6 +878,362 @@ class BoundaryTests(unittest.TestCase):
 
 
 class TimingAndProgressTests(unittest.TestCase):
+    INSTALL_CHECKPOINTS = (
+        "relay_ready", "preinstall_units_clean", "package_units_validated",
+        "principals_created", "seccomp_ready", "runner_installed",
+        "controld_installed", "keyholder_installed", "execd_installed",
+        "installed_units_verified",
+    )
+
+    def run_mocked_acceptance(
+        self, *, fail_at: str | None = None, cleanup_errors: tuple[str, ...] = (),
+    ) -> tuple[list[tuple[str, str]], BaseException | None]:
+        events: list[tuple[str, str]] = []
+        descriptor = {
+            "schema_version": guest.STAGE_SCHEMA,
+            "candidate_sha": "a" * 40,
+            "harness_sha256": "b" * 64,
+            "timing_asset_sha256": "c" * 64,
+            "timing_sha256": "d" * 64,
+            "candidate_tar_sha256": "e" * 64,
+            "scenario_sha256": "f" * 64,
+            "seccomp_source_sha256": guest.SECCOMP_SHA256,
+            "public_binding_sha256": "1" * 64,
+            "package_tree_sha256": {name: "2" * 64 for name in guest.PACKAGE_NAMES},
+            "platform_systemd": copy.deepcopy(guest.PLATFORM_SYSTEMD),
+        }
+        phase = {
+            "challenge": "3" * 64,
+            "descriptor_sha256": hashlib.sha256(guest.canonical(descriptor)).hexdigest(),
+            "timing_sha256": descriptor["timing_sha256"],
+        }
+        expected_units = {
+            unit: {"fragment_path": f"/usr/lib/systemd/system/{unit}", "sha256": "4" * 64}
+            for unit in guest.UNITS
+        }
+
+        def completed(name: str, value=None):
+            if fail_at == name:
+                raise guest.GuestError("injected boundary failure")
+            return value
+
+        def command(argv, **_keywords):
+            for component in ("runner", "controld", "keyholder", "execd"):
+                if f"/{component}/install.py" in str(argv[1]) and fail_at == f"{component}_installed":
+                    raise guest.GuestError("injected boundary failure")
+            return subprocess.CompletedProcess(argv, 0, b"verifier", b"")
+
+        unit_inventory_calls = 0
+
+        def expected_unit_fragments(_inputs, _names):
+            nonlocal unit_inventory_calls
+            unit_inventory_calls += 1
+            if fail_at == "package_units_validated":
+                raise guest.GuestError("injected boundary failure")
+            return expected_units if unit_inventory_calls == 1 else {}
+
+        def cleanup(_candidate, _activation, attempted_stage, _hosts_added):
+            if attempted_stage:
+                guest.emit_progress("rollback")
+            guest.emit_progress("cleanup")
+            return list(cleanup_errors)
+
+        error: BaseException | None = None
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            root = Path(temporary)
+            state = root / "state"
+            stage = root / "stage"
+            state.mkdir()
+            stage.mkdir()
+            candidate = root / "candidate"
+            stack.enter_context(mock.patch.object(guest, "STATE_ROOT", state))
+            stack.enter_context(mock.patch.object(guest, "load_json", return_value=descriptor))
+            stack.enter_context(mock.patch.object(
+                guest, "cross_bind", return_value=(candidate, {}, {}),
+            ))
+            stack.enter_context(mock.patch.object(guest, "relay_mapping_present", return_value=False))
+            stack.enter_context(mock.patch.object(
+                guest, "start_relay", side_effect=lambda _public: completed("relay_ready"),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "unit_state", side_effect=lambda: completed(
+                    "preinstall_units_clean",
+                    {unit: {"LoadState": "not-found"} for unit in guest.UNITS},
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "expected_unit_fragments", side_effect=expected_unit_fragments,
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "create_principals",
+                side_effect=lambda _package: completed("principals_created"),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "provision_seccomp",
+                side_effect=lambda _source: completed("seccomp_ready"),
+            ))
+            stack.enter_context(mock.patch.object(guest, "command", side_effect=command))
+            stack.enter_context(mock.patch.object(guest, "tree_state", return_value={}))
+            stack.enter_context(mock.patch.object(
+                guest, "prove_installed_units",
+                side_effect=lambda _expected: completed("installed_units_verified", expected_units),
+            ))
+            stack.enter_context(mock.patch.object(guest, "run_capacity_one_canary", return_value=b"receipt"))
+            stack.enter_context(mock.patch.object(guest, "read_file", return_value=b"scenario"))
+            stack.enter_context(mock.patch.object(guest, "parse_verdict"))
+            stack.enter_context(mock.patch.object(guest, "cleanup", side_effect=cleanup))
+            stack.enter_context(mock.patch.object(guest, "dormant_proof", return_value={"proof": True}))
+            stack.enter_context(mock.patch.object(guest, "write_transfer"))
+            stack.enter_context(mock.patch.object(
+                guest, "emit_progress", side_effect=lambda name, event="start": events.append((name, event)),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "begin_phase", side_effect=lambda name, **_keywords: guest.emit_progress(name),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "complete_progress", side_effect=lambda: guest.emit_progress("complete", "complete"),
+            ))
+            stack.enter_context(mock.patch.object(guest, "abandon_command_inventory"))
+            try:
+                guest.run_acceptance(phase, stage)
+            except BaseException as caught:
+                error = caught
+        return events, error
+
+    def test_candidate_checkpoint_contract_is_shared_role_scoped_and_ordered(self) -> None:
+        self.assertEqual(guest.PROGRESS_PHASES, harness.PROGRESS_PHASES)
+        phases = (
+            "guest_started", "install", *self.INSTALL_CHECKPOINTS,
+            "controller_check", "controller_stage", "controller_activate", "canary",
+            "receipt_verifier", "rollback", "cleanup", "cleanup_return",
+        )
+        raw = b"".join(
+            progress_frame("candidate", sequence, phase, "start", sequence + 1)
+            for sequence, phase in enumerate(phases)
+        ) + progress_frame("candidate", len(phases), "complete", "complete", len(phases) + 1)
+        parsed = harness.parse_progress(raw, "candidate")
+        self.assertEqual(parsed["status"], "valid")
+        self.assertTrue(harness.progress_completed(parsed))
+
+        for role in ("ceremony", "verifier"):
+            hostile = progress_frame(role, 0, "relay_ready", "start", 1)
+            self.assertEqual(harness.parse_progress(hostile, role)["reason"], "boot-phase")
+        backward = progress_frame("candidate", 0, "seccomp_ready", "start", 1) + progress_frame(
+            "candidate", 1, "principals_created", "start", 2,
+        )
+        self.assertEqual(harness.parse_progress(backward, "candidate")["reason"], "order")
+        stale_timeout = progress_frame("candidate", 0, "seccomp_ready", "start", 1) + progress_frame(
+            "candidate", 1, "principals_created", "timeout", 2,
+        )
+        self.assertEqual(harness.parse_progress(stale_timeout, "candidate")["reason"], "order")
+        no_terminal = harness.parse_progress(raw.rsplit(progress_frame(
+            "candidate", len(phases), "complete", "complete", len(phases) + 1,
+        ), 1)[0], "candidate")
+        self.assertFalse(harness.progress_completed(no_terminal))
+
+    def test_guest_checkpoint_emitter_rejects_unknown_and_backward_phases(self) -> None:
+        original = (
+            guest._PROGRESS_BOOT, guest._PROGRESS_LAST_PHASE, guest._ACTIVE_PHASE,
+        )
+        try:
+            guest._PROGRESS_BOOT = "candidate"
+            guest._PROGRESS_LAST_PHASE = "seccomp_ready"
+            guest._ACTIVE_PHASE = "install"
+            with self.assertRaisesRegex(guest.GuestError, "progress order differs"):
+                guest.emit_progress("caller-controlled")
+            with self.assertRaisesRegex(guest.GuestError, "progress order differs"):
+                guest.emit_progress("principals_created")
+            with mock.patch.object(guest, "emit_progress") as emitted:
+                guest.emit_timeout_progress()
+            emitted.assert_called_once_with("seccomp_ready", "timeout")
+        finally:
+            guest._PROGRESS_BOOT, guest._PROGRESS_LAST_PHASE, guest._ACTIVE_PHASE = original
+
+    def test_run_acceptance_checkpoints_follow_completed_boundaries(self) -> None:
+        events, error = self.run_mocked_acceptance()
+        self.assertIsNone(error)
+        self.assertEqual(
+            [name for name, _event in events],
+            [
+                "install", *self.INSTALL_CHECKPOINTS, "controller_check", "controller_stage",
+                "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+                "cleanup_return", "complete",
+            ],
+        )
+
+        previous = "install"
+        for checkpoint in self.INSTALL_CHECKPOINTS:
+            with self.subTest(checkpoint=checkpoint):
+                events, error = self.run_mocked_acceptance(fail_at=checkpoint)
+                names = [name for name, _event in events]
+                self.assertIsInstance(error, guest.GuestError)
+                self.assertNotIn(checkpoint, names)
+                self.assertIn(previous, names)
+                self.assertEqual(names[-2:], ["cleanup", "cleanup_return"])
+                raw = b"".join(
+                    progress_frame("candidate", sequence, name, event, sequence + 1)
+                    for sequence, (name, event) in enumerate(events)
+                )
+                parsed = harness.parse_progress(raw, "candidate")
+                self.assertEqual(parsed["status"], "valid")
+                failure = harness.progress_failure("candidate", parsed, timed_out=False)
+                self.assertIn(f"candidate {previous} guest failure", str(failure))
+                self.assertIn('"cleanup_returned":true', str(failure))
+                self.assertNotIn("injected boundary failure", str(failure))
+            previous = checkpoint
+
+    def test_cleanup_return_requires_successful_cleanup(self) -> None:
+        events, error = self.run_mocked_acceptance(cleanup_errors=("cleanup failed",))
+        self.assertIsInstance(error, guest.GuestError)
+        names = [name for name, _event in events]
+        self.assertEqual(names[-1], "cleanup")
+        self.assertNotIn("cleanup_return", names)
+        self.assertNotIn("complete", names)
+
+    def test_cleanup_enters_rollback_then_cleanup_without_filesystem_access(self) -> None:
+        events: list[str] = []
+        completed = subprocess.CompletedProcess(["mocked"], 0, b"", b"")
+        with mock.patch.object(
+            guest, "begin_phase", side_effect=events.append,
+        ), mock.patch.object(
+            guest, "command", return_value=completed,
+        ), mock.patch.object(
+            guest.shutil, "rmtree",
+        ), mock.patch.object(
+            Path, "is_file", return_value=False,
+        ), mock.patch.object(
+            Path, "exists", return_value=False,
+        ), mock.patch.object(
+            Path, "unlink", side_effect=FileNotFoundError,
+        ):
+            errors = guest.cleanup(
+                Path("/not-accessed/candidate"), Path("/not-accessed/activation"), True, False,
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(events, ["rollback", "cleanup"])
+
+    def test_rc_zero_requires_one_timeout_free_terminal_progress_record(self) -> None:
+        evidence_value = {"schema_version": harness.FRAME_SCHEMA, "outcome": "pass"}
+        evidence_payload = harness.canonical(evidence_value)
+        evidence_frame = (
+            struct.pack(">I", len(evidence_payload))
+            + evidence_payload
+            + hashlib.sha256(evidence_payload).digest()
+        )
+        cases = {
+            "candidate": (
+                "candidate.qcow2", False, "read-write",
+                (
+                    ("missing", b"", "boot_cloud_init guest failure"),
+                    ("truncated", progress_frame("candidate", 0, "install", "start", 1)[:-1], "boot_cloud_init guest failure"),
+                    ("install-only", progress_frame("candidate", 0, "install", "start", 1), "install guest failure"),
+                    ("no-complete", b"".join((
+                        progress_frame("candidate", 0, "guest_started", "start", 1),
+                        progress_frame("candidate", 1, "install", "start", 2),
+                        progress_frame("candidate", 2, "cleanup", "start", 3),
+                    )), "cleanup guest failure"),
+                    ("timeout-then-complete", b"".join((
+                        progress_frame("candidate", 0, "canary", "start", 1),
+                        progress_frame("candidate", 1, "canary", "timeout", 2),
+                        progress_frame("candidate", 2, "cleanup", "start", 3),
+                        progress_frame("candidate", 3, "complete", "complete", 4),
+                    )), "canary inner timeout"),
+                    ("duplicate-complete", b"".join((
+                        progress_frame("candidate", 0, "complete", "complete", 1),
+                        progress_frame("candidate", 1, "complete", "complete", 2),
+                    )), "complete guest failure"),
+                ),
+            ),
+            "verifier": (
+                "verifier.qcow2", True, "read-only",
+                (
+                    ("missing", b"", "boot_cloud_init guest failure"),
+                    ("truncated", progress_frame("verifier", 0, "verifier", "start", 1)[:-1], "boot_cloud_init guest failure"),
+                    ("install-only", progress_frame("verifier", 0, "install", "start", 1), "install guest failure"),
+                    ("no-complete", b"".join((
+                        progress_frame("verifier", 0, "guest_started", "start", 1),
+                        progress_frame("verifier", 1, "verifier", "start", 2),
+                    )), "verifier guest failure"),
+                    ("timeout-then-complete", b"".join((
+                        progress_frame("verifier", 0, "verifier", "start", 1),
+                        progress_frame("verifier", 1, "verifier", "timeout", 2),
+                        progress_frame("verifier", 2, "complete", "complete", 3),
+                    )), "verifier inner timeout"),
+                    ("duplicate-complete", b"".join((
+                        progress_frame("verifier", 0, "complete", "complete", 1),
+                        progress_frame("verifier", 1, "complete", "complete", 2),
+                    )), "complete guest failure"),
+                ),
+            ),
+        }
+        for role, (overlay, evidence_expected, transfer, mutations) in cases.items():
+            for name, raw_progress, expected in mutations:
+                with self.subTest(role=role, mutation=name), tempfile.TemporaryDirectory() as temporary:
+                    state = Path(temporary)
+                    process = mock.Mock()
+                    process.poll.return_value = 0
+
+                    def spawn(*_args, **_kwargs):
+                        (state / "progress.bin").write_bytes(raw_progress)
+                        if evidence_expected:
+                            (state / "evidence.bin").write_bytes(evidence_frame)
+                        return process
+
+                    with mock.patch.object(harness.subprocess, "Popen", side_effect=spawn), mock.patch.object(
+                        harness, "reap_process_group",
+                    ), mock.patch.object(harness, "parse_frame", wraps=harness.parse_frame) as parse_frame:
+                        with self.assertRaisesRegex(harness.HarnessError, expected):
+                            harness.boot(
+                                state, harness.watchdog_seconds(role), overlay=overlay,
+                                evidence_expected=evidence_expected, transfer=transfer,
+                            )
+                    parse_frame.assert_not_called()
+
+    def test_rc_zero_with_exact_terminal_progress_preserves_each_boot_role(self) -> None:
+        evidence_value = {"schema_version": harness.FRAME_SCHEMA, "outcome": "pass"}
+        evidence_payload = harness.canonical(evidence_value)
+        evidence_frame = (
+            struct.pack(">I", len(evidence_payload))
+            + evidence_payload
+            + hashlib.sha256(evidence_payload).digest()
+        )
+        cases = (
+            ("ceremony", "ceremony.qcow2", True, None, ("guest_started", "ceremony")),
+            (
+                "candidate", "candidate.qcow2", False, "read-write",
+                (
+                    "guest_started", "install", *self.INSTALL_CHECKPOINTS,
+                    "controller_check", "controller_stage", "controller_activate", "canary",
+                    "receipt_verifier", "rollback", "cleanup", "cleanup_return",
+                ),
+            ),
+            ("verifier", "verifier.qcow2", True, "read-only", ("guest_started", "verifier")),
+        )
+        for role, overlay, evidence_expected, transfer, phases in cases:
+            raw_progress = b"".join(
+                progress_frame(role, sequence, phase, "start", sequence + 1)
+                for sequence, phase in enumerate(phases)
+            ) + progress_frame(role, len(phases), "complete", "complete", len(phases) + 1)
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                process = mock.Mock()
+                process.poll.return_value = 0
+
+                def spawn(*_args, **_kwargs):
+                    (state / "progress.bin").write_bytes(raw_progress)
+                    if evidence_expected:
+                        (state / "evidence.bin").write_bytes(evidence_frame)
+                    return process
+
+                with mock.patch.object(harness.subprocess, "Popen", side_effect=spawn), mock.patch.object(
+                    harness, "reap_process_group",
+                ):
+                    result = harness.boot(
+                        state, harness.watchdog_seconds(role), overlay=overlay,
+                        evidence_expected=evidence_expected, transfer=transfer,
+                    )
+                self.assertEqual(result, evidence_value if evidence_expected else None)
+
     def test_timing_source_recursively_matches_actual_leaf_counts(self) -> None:
         harness.validate_timing_contract()
         timing = harness.TIMING_CONTRACT
@@ -929,7 +1522,8 @@ class TimingAndProgressTests(unittest.TestCase):
         )
         self.assertIn("verifier boot_cloud_init watchdog timeout", str(missing))
         for phase in (
-            "install", "controller_stage", "canary", "receipt_verifier", "rollback", "cleanup",
+            "install", *self.INSTALL_CHECKPOINTS, "controller_stage", "canary",
+            "receipt_verifier", "rollback", "cleanup", "cleanup_return",
         ):
             raw = progress_frame("candidate", 0, phase, "start", 1) + progress_frame(
                 "candidate", 1, phase, "timeout", 2,
@@ -1030,6 +1624,131 @@ class TimingAndProgressTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_guest_unit_inventory_accepts_direct_unit_and_valid_drop_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            write_guest_package(inputs, "runner", [
+                (
+                    "buzz-ci-runner.service", "/usr/lib/systemd/system/buzz-ci-runner.service",
+                    b"[Service]\nExecStart=/usr/libexec/buzz-ci-runner\n",
+                ),
+                (
+                    "20-capacity-one.conf",
+                    "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+                    b"[Service]\nEnvironment=BUZZ_CI_CAPACITY=1\n",
+                ),
+            ])
+
+            expected = guest.expected_unit_fragments(inputs, ("runner",))
+
+            self.assertEqual(set(expected), {"buzz-ci-runner.service"})
+            self.assertEqual(
+                expected["buzz-ci-runner.service"]["fragment_path"],
+                "/usr/lib/systemd/system/buzz-ci-runner.service",
+            )
+
+    def test_guest_unit_inventory_rejects_malformed_or_nested_paths(self) -> None:
+        invalid = (
+            "/usr/lib/systemd/system/buzz-ci-runner.timer",
+            "/etc/systemd/system/buzz-ci-runner.service.d/nested/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-runner.service.d/../20-capacity-one.conf",
+            "/etc/systemd/system//buzz-ci-runner.service",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_rejects_invalid_drop_in_parent_suffix(self) -> None:
+        invalid = (
+            "/etc/systemd/system/buzz-ci-runner.timer.d/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-runner.service/20-capacity-one.conf",
+            "/etc/systemd/system/.service.d/20-capacity-one.conf",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_rejects_invalid_drop_in_name(self) -> None:
+        invalid = (
+            "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.txt",
+            "/etc/systemd/system/buzz-ci-runner.service.d/.conf",
+            "/etc/systemd/system/buzz-ci-runner.service.d/-hostile.conf",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_retains_digest_and_conflict_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            package = write_guest_package(inputs, "runner", [(
+                "drop-in", "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+                b"trusted",
+            )])
+            (package / "drop-in").write_bytes(b"changed")
+            with self.assertRaisesRegex(guest.GuestError, "unit digest differs"):
+                guest.expected_unit_fragments(inputs, ("runner",))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            write_guest_package(inputs, "runner", [(
+                "runner-unit", "/usr/lib/systemd/system/buzz-ci-runner.service", b"first",
+            )])
+            write_guest_package(inputs, "controld", [(
+                "runner-unit", "/etc/systemd/system/buzz-ci-runner.service", b"second",
+            )])
+            with self.assertRaisesRegex(guest.GuestError, "unit binding conflicts"):
+                guest.expected_unit_fragments(inputs, ("runner", "controld"))
+
+    def test_guest_requires_exact_fedora_global_service_drop_in(self) -> None:
+        self.assertEqual(guest.PLATFORM_SYSTEMD, harness.PLATFORM_SYSTEMD)
+        schema = json.loads((HERE / "contract.schema.json").read_bytes())
+        self.assertEqual(schema["properties"]["platform_systemd"]["const"], guest.PLATFORM_SYSTEMD)
+        expected = (
+            HERE.parents[1]
+            / "platform/fedora-44-systemd-259/10-timeout-abort.conf"
+        ).read_bytes()
+        with mock.patch.object(guest, "read_file", return_value=expected) as opened:
+            guest.verify_platform_systemd(copy.deepcopy(guest.PLATFORM_SYSTEMD))
+        opened.assert_called_once_with(
+            Path("/usr/lib/systemd/system/service.d/10-timeout-abort.conf"),
+            guest.MAX_JSON,
+        )
+
+        mutations = []
+        for field, value in (
+            ("path", "/etc/systemd/system/service.d/10-timeout-abort.conf"),
+            ("sha256", "0" * 64),
+        ):
+            changed = copy.deepcopy(guest.PLATFORM_SYSTEMD)
+            changed["service_drop_ins"][0][field] = value
+            mutations.append(changed)
+        extra = copy.deepcopy(guest.PLATFORM_SYSTEMD)
+        extra["service_drop_ins"].append({
+            "owner": "platform",
+            "path": "/usr/lib/systemd/system/service.d/99-hostile.conf",
+            "sha256": "1" * 64,
+        })
+        mutations.append(extra)
+        mutations.append({**copy.deepcopy(guest.PLATFORM_SYSTEMD), "service_drop_ins": []})
+        for changed in mutations:
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                guest.GuestError, "platform binding differs",
+            ):
+                guest.verify_platform_systemd(changed)
+        with mock.patch.object(guest, "read_file", return_value=b"[Service]\nHostile=yes\n"):
+            with self.assertRaisesRegex(guest.GuestError, "platform file digest differs"):
+                guest.verify_platform_systemd(copy.deepcopy(guest.PLATFORM_SYSTEMD))
+
     def test_guest_cross_binds_keyholder_client_and_service_identities(self) -> None:
         public_spec = {"peer": {"uid": 1201, "gid": 1201}}
         activation = {"identities": {
@@ -1082,6 +1801,85 @@ class InputTests(unittest.TestCase):
             for name in harness.GUEST_ASSETS:
                 self.assertEqual((stage / name).read_bytes(), ("frozen-" + name).encode())
             self.assertFalse((stage / "harness.py").exists())
+
+    def test_run_stage_archive_matches_guest_scope_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate"
+            candidate.mkdir()
+            subprocess.run(["/usr/bin/git", "init", "--quiet", str(candidate)], check=True)
+            source = candidate / "deploy/native-ci/probe.txt"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"candidate-bound\n")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(candidate), "add", "deploy/native-ci/probe.txt"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "/usr/bin/git", "-C", str(candidate),
+                    "-c", "user.name=Clean Host Test",
+                    "-c", "user.email=clean-host@example.invalid",
+                    "commit", "--quiet", "-m", "candidate",
+                ],
+                check=True,
+            )
+            candidate_sha = subprocess.run(
+                ["/usr/bin/git", "-C", str(candidate), "rev-parse", "HEAD^{commit}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            source.write_bytes(b"uncommitted\n")
+
+            state = root / "state"
+            state.mkdir()
+            (state / "state.json").write_bytes(harness.canonical({"challenge": "1" * 64}))
+            (state / "public-binding.json").write_bytes(b"{}\n")
+            frozen = state / "frozen-assets"
+            frozen.mkdir()
+            for name in harness.GUEST_ASSETS:
+                (frozen / name).write_bytes(("frozen-" + name).encode())
+            records = {}
+            for name in harness.PACKAGE_NAMES:
+                package = root / f"package-{name}"
+                package.mkdir()
+                (package / "payload").write_bytes(name.encode())
+                records[name] = harness.tree_records(package)
+            contract = {
+                "candidate_root": str(candidate),
+                "candidate_sha": candidate_sha,
+                "harness_sha256": "2" * 64,
+                "timing_asset_sha256": "3" * 64,
+                "timing_sha256": harness.timing_sha256(),
+                "scenario": {"sha256": hashlib.sha256(b"{}\n").hexdigest()},
+                "platform_systemd": copy.deepcopy(harness.PLATFORM_SYSTEMD),
+            }
+            archive = b""
+
+            def capture_archive(stage: Path, _output: Path, _label: str) -> None:
+                nonlocal archive
+                archive = (stage / "candidate.tar").read_bytes()
+
+            with mock.patch.object(harness, "make_iso", side_effect=capture_archive), mock.patch.object(
+                harness, "make_seed",
+            ):
+                harness.create_run_stage(contract, state, records, b"{}\n", b"seccomp\n")
+
+            extracted = root / "extracted"
+            guest.extract_candidate(archive, extracted)
+            self.assertEqual(
+                (extracted / "deploy/native-ci/probe.txt").read_bytes(),
+                b"candidate-bound\n",
+            )
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as handle:
+                self.assertEqual(handle.getmembers()[0].name, "deploy/native-ci")
+
+            hostile = io.BytesIO()
+            with tarfile.open(fileobj=hostile, mode="w:") as handle:
+                member = tarfile.TarInfo("outside.txt")
+                member.size = len(b"hostile\n")
+                handle.addfile(member, io.BytesIO(b"hostile\n"))
+            with self.assertRaisesRegex(guest.GuestError, "archive scope differs"):
+                guest.extract_candidate(hostile.getvalue(), root / "hostile")
 
     def test_tree_digest_rejects_links_and_binds_mode_name_and_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1283,6 +2081,7 @@ class InputTests(unittest.TestCase):
             lambda value: value.update(schema_version="wrong"),
             lambda value: value.update(candidate_sha="not-a-commit"),
             lambda value: value.update(state=["not", "a", "path"]),
+            lambda value: value["platform_systemd"]["service_drop_ins"][0].update(sha256="0" * 64),
             lambda value: value.update(extra="rejected"),
         )
         for mutate in mutations:
