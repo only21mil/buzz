@@ -241,6 +241,13 @@ def progress_frame(
     return struct.pack(">I", len(payload)) + payload + hashlib.sha256(payload).digest()
 
 
+def systemd_process(
+    lines: list[str], *, returncode: int = 0, stderr: bytes = b"",
+) -> subprocess.CompletedProcess[bytes]:
+    stdout = ("\n".join(lines) + "\n").encode()
+    return subprocess.CompletedProcess(["systemctl", "show"], returncode, stdout, stderr)
+
+
 def mount_pairs(command: list[str], option: str) -> list[tuple[str, str]]:
     return [
         (command[index + 1], command[index + 2])
@@ -690,6 +697,173 @@ class BoundaryTests(unittest.TestCase):
         with mock.patch.object(guest, "command", return_value=failed):
             with self.assertRaisesRegex(guest.GuestError, "readback failed"):
                 guest.unit_state()
+
+    def test_systemd259_absent_unit_shapes_normalize_only_nonservice_main_pid(self) -> None:
+        common = [
+            "LoadState=not-found", "ActiveState=inactive", "SubState=dead",
+            "FragmentPath=", "UnitFileState=", "InvocationID=",
+        ]
+
+        def show(argv, **_keywords):
+            unit = argv[2]
+            lines = list(common)
+            if unit.endswith(".service"):
+                lines.append("MainPID=0")
+            return systemd_process(lines)
+
+        with mock.patch.object(guest, "command", side_effect=show) as command:
+            observed = guest.unit_state()
+        self.assertEqual(set(observed), set(guest.UNITS))
+        self.assertTrue(all(value["MainPID"] == "0" for value in observed.values()))
+        self.assertEqual(command.call_count, len(guest.UNITS))
+        for call in command.call_args_list:
+            self.assertEqual(
+                call.args[0][3], "--property=" + ",".join(guest.SYSTEMD_UNIT_PROPERTIES),
+            )
+
+    def test_systemd_unit_readback_accepts_loaded_service_and_active_socket(self) -> None:
+        loaded_service = systemd_process([
+            "LoadState=loaded", "ActiveState=active", "SubState=running",
+            "UnitFileState=enabled", "MainPID=123", "InvocationID=" + "a" * 32,
+            "FragmentPath=/usr/lib/systemd/system/buzz-ci-runner.service",
+        ])
+        service = guest.systemd_unit_values("buzz-ci-runner.service", loaded_service)
+        self.assertEqual(service["MainPID"], "123")
+        self.assertEqual(service["LoadState"], "loaded")
+
+        active_socket = systemd_process([
+            "LoadState=loaded", "ActiveState=active", "SubState=listening",
+            "UnitFileState=enabled", "InvocationID=" + "b" * 32,
+            "FragmentPath=/usr/lib/systemd/system/buzz-ci-runner.socket",
+        ])
+        socket = guest.systemd_unit_values("buzz-ci-runner.socket", active_socket)
+        self.assertEqual(socket["MainPID"], "0")
+        self.assertEqual(socket["SubState"], "listening")
+        active_socket_with_pid = systemd_process([
+            *active_socket.stdout.decode().splitlines(), "MainPID=456",
+        ])
+        self.assertEqual(
+            guest.systemd_unit_values(
+                "buzz-ci-runner.socket", active_socket_with_pid,
+            )["MainPID"],
+            "456",
+        )
+
+    def test_systemd_unit_readback_rejects_missing_service_pid_and_hostile_output(self) -> None:
+        valid = [
+            "LoadState=not-found", "ActiveState=inactive", "SubState=dead",
+            "UnitFileState=", "MainPID=0", "InvocationID=", "FragmentPath=",
+        ]
+        for missing in set(guest.SYSTEMD_UNIT_PROPERTIES) - {"MainPID"}:
+            lines = [line for line in valid if not line.startswith(missing + "=")]
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                guest.GuestError, "readback failed",
+            ):
+                guest.systemd_unit_values("buzz-ci-runner.service", systemd_process(lines))
+
+        omitted_pid = [line for line in valid if not line.startswith("MainPID=")]
+        hostile = (
+            (omitted_pid, 0, b""),
+            ([*valid, "LoadState=not-found"], 0, b""),
+            ([*valid, "Description=hostile"], 0, b""),
+            ([*valid, "malformed"], 0, b""),
+            ([line.replace("MainPID=0", "MainPID=7") for line in valid], 0, b""),
+            ([line.replace("MainPID=0", "MainPID=invalid") for line in valid], 0, b""),
+            ([line.replace("LoadState=not-found", "LoadState=loaded") for line in valid], 1, b""),
+            (valid, 0, b"unexpected stderr"),
+        )
+        for lines, returncode, stderr in hostile:
+            with self.subTest(lines=lines, returncode=returncode, stderr=stderr), self.assertRaisesRegex(
+                guest.GuestError, "readback failed",
+            ):
+                guest.systemd_unit_values(
+                    "buzz-ci-runner.service",
+                    systemd_process(lines, returncode=returncode, stderr=stderr),
+                )
+
+        absent_nonzero = systemd_process(valid, returncode=1)
+        self.assertEqual(
+            guest.systemd_unit_values("buzz-ci-runner.service", absent_nonzero)["LoadState"],
+            "not-found",
+        )
+        with self.assertRaisesRegex(guest.GuestError, "readback failed"):
+            guest.systemd_unit_values(
+                "buzz-ci-runner.service",
+                subprocess.CompletedProcess(["systemctl"], 0, b"\xff", b""),
+            )
+
+    def test_dormant_relay_accepts_exact_absence_for_zero_or_nonzero_return(self) -> None:
+        exact = ["LoadState=not-found", "ActiveState=inactive", "MainPID=0"]
+        units = {
+            unit: {
+                "LoadState": "not-found", "ActiveState": "inactive",
+                "UnitFileState": "", "MainPID": "0",
+            }
+            for unit in guest.UNITS
+        }
+        baseline = {
+            unit: {"LoadState": "not-found", "UnitFileState": ""}
+            for unit in guest.UNITS
+        }
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode), mock.patch.object(
+                guest, "tree_state", return_value={},
+            ), mock.patch.object(
+                guest, "unit_state", return_value=units,
+            ), mock.patch.object(
+                Path, "exists", return_value=False,
+            ), mock.patch.object(
+                guest, "command", side_effect=(
+                    systemd_process(exact, returncode=returncode),
+                    subprocess.CompletedProcess(["pgrep"], 1, b"", b""),
+                ),
+            ):
+                proof = guest.dormant_proof({}, baseline)
+            self.assertTrue(proof["relay_residue_absent"])
+
+    def test_dormant_relay_rejects_residue_and_malformed_absence(self) -> None:
+        exact = ["LoadState=not-found", "ActiveState=inactive", "MainPID=0"]
+        units = {
+            unit: {
+                "LoadState": "not-found", "ActiveState": "inactive",
+                "UnitFileState": "", "MainPID": "0",
+            }
+            for unit in guest.UNITS
+        }
+        baseline = {
+            unit: {"LoadState": "not-found", "UnitFileState": ""}
+            for unit in guest.UNITS
+        }
+        hostile = (
+            ["LoadState=loaded", "ActiveState=inactive", "MainPID=0"],
+            ["LoadState=not-found", "ActiveState=active", "MainPID=0"],
+            ["LoadState=not-found", "ActiveState=inactive", "MainPID=7"],
+            exact[:-1],
+            [*exact, "LoadState=not-found"],
+            [*exact, "Description=hostile"],
+            [*exact, "malformed"],
+        )
+        for lines in hostile:
+            with self.subTest(lines=lines), mock.patch.object(
+                guest, "tree_state", return_value={},
+            ), mock.patch.object(
+                guest, "unit_state", return_value=units,
+            ), mock.patch.object(
+                Path, "exists", return_value=False,
+            ), mock.patch.object(
+                guest, "command", return_value=systemd_process(lines),
+            ), self.assertRaisesRegex(guest.GuestError, "relay unit residue remains"):
+                guest.dormant_proof({}, baseline)
+        with mock.patch.object(
+            guest, "tree_state", return_value={},
+        ), mock.patch.object(
+            guest, "unit_state", return_value=units,
+        ), mock.patch.object(
+            Path, "exists", return_value=False,
+        ), mock.patch.object(
+            guest, "command", return_value=systemd_process(exact, stderr=b"unexpected stderr"),
+        ), self.assertRaisesRegex(guest.GuestError, "relay unit residue remains"):
+            guest.dormant_proof({}, baseline)
 
     def test_strict_verifier_verdict_rejects_status_and_outcome_mutation(self) -> None:
         valid = guest.canonical({"outcome": "pass", "status": "verified"})

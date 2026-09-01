@@ -1229,19 +1229,63 @@ def tree_state(root: Path) -> dict[str, dict[str, object]]:
     return result
 
 
+SYSTEMD_UNIT_PROPERTIES = (
+    "LoadState", "ActiveState", "SubState", "UnitFileState", "MainPID",
+    "InvocationID", "FragmentPath",
+)
+RELAY_PROPERTIES = ("LoadState", "ActiveState", "MainPID")
+
+
+def parse_systemd_properties(
+    process: subprocess.CompletedProcess[bytes], properties: tuple[str, ...],
+    *, optional: tuple[str, ...] = (), error: str,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = process.stdout.decode().splitlines()
+    except (AttributeError, UnicodeDecodeError) as exception:
+        raise GuestError(error) from exception
+    if not isinstance(process.stderr, bytes) or process.stderr or not lines:
+        raise GuestError(error)
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or key not in properties or key in values:
+            raise GuestError(error)
+        values[key] = value
+    optional_set = set(optional)
+    required = set(properties) - optional_set
+    if not optional_set <= set(properties) or not required <= set(values):
+        raise GuestError(error)
+    for key in optional:
+        values.setdefault(key, "0")
+    return values
+
+
+def systemd_unit_values(
+    unit: str, process: subprocess.CompletedProcess[bytes],
+) -> dict[str, str]:
+    error = f"systemd unit readback failed: {unit}"
+    optional = ("MainPID",) if unit.endswith((".socket", ".target")) else ()
+    values = parse_systemd_properties(
+        process, SYSTEMD_UNIT_PROPERTIES, optional=optional, error=error,
+    )
+    if (
+        re.fullmatch(r"0|[1-9][0-9]*", values["MainPID"]) is None
+        or values["ActiveState"] == "inactive" and values["MainPID"] != "0"
+        or process.returncode != 0 and values["LoadState"] != "not-found"
+    ):
+        raise GuestError(error)
+    return values
+
+
 def unit_state() -> dict[str, dict[str, str]]:
-    properties = ("LoadState", "ActiveState", "SubState", "UnitFileState", "MainPID", "InvocationID", "FragmentPath")
     result: dict[str, dict[str, str]] = {}
     for unit in UNITS:
-        process = command(["systemctl", "show", unit, "--property=" + ",".join(properties)], allow_failure=True)
-        values: dict[str, str] = {}
-        for line in process.stdout.decode().splitlines():
-            key, separator, value = line.partition("=")
-            if separator and key in properties:
-                values[key] = value
-        if set(values) != set(properties) or process.returncode != 0 and values.get("LoadState") != "not-found":
-            raise GuestError(f"systemd unit readback failed: {unit}")
-        result[unit] = values
+        process = command([
+            "systemctl", "show", unit,
+            "--property=" + ",".join(SYSTEMD_UNIT_PROPERTIES),
+        ], allow_failure=True)
+        result[unit] = systemd_unit_values(unit, process)
     return result
 
 
@@ -1370,9 +1414,14 @@ def dormant_proof(configs: dict[str, dict[str, object]], units: dict[str, dict[s
             raise GuestError(f"unit load/enable state differs: {unit}")
     if any(Path(path).exists() for path in SOCKETS):
         raise GuestError("socket residue remains")
-    relay = command(["systemctl", "show", "buzzci-e2e-relay.service", "--property=LoadState,ActiveState,MainPID"], allow_failure=True)
-    relay_values = dict(line.partition("=")[::2] for line in relay.stdout.decode().splitlines() if "=" in line)
-    if relay.returncode == 0 or relay_values != {"LoadState": "not-found", "ActiveState": "inactive", "MainPID": "0"}:
+    relay = command([
+        "systemctl", "show", "buzzci-e2e-relay.service",
+        "--property=" + ",".join(RELAY_PROPERTIES),
+    ], allow_failure=True)
+    relay_values = parse_systemd_properties(
+        relay, RELAY_PROPERTIES, error="relay unit residue remains",
+    )
+    if relay_values != {"LoadState": "not-found", "ActiveState": "inactive", "MainPID": "0"}:
         raise GuestError("relay unit residue remains")
     process = command(["pgrep", "-a", "-f", "buzz-ci-(runner|controld|execd|executor|keyholder|acceptance)|local_tls_relay.py"], allow_failure=True)
     if process.returncode == 0 and process.stdout.strip():
