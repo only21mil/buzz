@@ -1334,6 +1334,20 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assert_refused(self.bundle, "re-verification against GitHub failed")
         self.assertIn("has no run from app", self.invoke(self.bundle).stderr)
 
+    def test_pull_request_scope_authority_drift_is_refused(self) -> None:
+        for drift, message in (
+            ("pr_closed", "live pull request #17 is not open"),
+            ("pr_draft", "live pull request #17 is a draft"),
+            ("pr_head_mismatch", "not the receipt head"),
+            ("pr_base_moved", "live pull request #17 base moved from"),
+            ("main_head_moved", "live refs/heads/main moved from"),
+        ):
+            with self.subTest(drift=drift):
+                self.github_drift = drift
+                self.assert_refused(self.bundle, "re-verification against GitHub failed")
+                self.assertIn(message, self.invoke(self.bundle).stderr)
+                self.assertFalse((self.evidence_dir / "receipt.json").exists())
+
     def test_re_verification_runs_only_after_offline_checks(self) -> None:
         self.github_drift = "no_runs"
         bundle = copy.deepcopy(self.bundle)

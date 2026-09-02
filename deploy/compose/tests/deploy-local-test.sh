@@ -633,6 +633,7 @@ drift = {
     "reverify_forged_receipt": "no_runs",
     "reverify_check_drift": "check_failure",
     "reverify_ruleset_drift": "ruleset_changed",
+    "reverify_main_head_moved": "main_head_moved",
 }.get(os.environ.get("TEST_SCENARIO", ""), "none")
 
 
@@ -862,7 +863,8 @@ ENV
 for early_failure in stale_checkout stale_source dirty_checkout dirty_receipt \
   short_receipt mismatched_receipt stale_receipt legacy_protected_receipt \
   noncanonical_protected_receipt pull_request_protected_receipt \
-  reverify_forged_receipt reverify_check_drift reverify_ruleset_drift; do
+  reverify_forged_receipt reverify_check_drift reverify_ruleset_drift \
+  reverify_main_head_moved; do
   run_case "${early_failure}" failure
   assert_not_contains "${scratch}/${early_failure}/commands.log" '^docker '
 done
@@ -870,7 +872,8 @@ for offline_failure in dirty_receipt mismatched_receipt stale_receipt \
   legacy_protected_receipt noncanonical_protected_receipt pull_request_protected_receipt; do
   assert_not_contains "${scratch}/${offline_failure}/commands.log" '^protected-ci-receipt live-client '
 done
-for reverify_failure in reverify_forged_receipt reverify_check_drift reverify_ruleset_drift; do
+for reverify_failure in reverify_forged_receipt reverify_check_drift reverify_ruleset_drift \
+  reverify_main_head_moved; do
   assert_contains "${scratch}/${reverify_failure}/commands.log" \
     '^protected-ci-receipt validate .* --scope main .* --reverify$'
   assert_contains "${scratch}/${reverify_failure}/commands.log" \
@@ -880,6 +883,8 @@ assert_contains "${scratch}/reverify_forged_receipt/output" 'has no run from app
 assert_contains "${scratch}/reverify_check_drift/output" "required check 'build' did not succeed"
 assert_contains "${scratch}/reverify_ruleset_drift/output" \
   'live GitHub rulesets differs from the receipt binding'
+assert_contains "${scratch}/reverify_main_head_moved/output" \
+  "live refs/heads/main is at dddddddddddddddddddddddddddddddddddddddd, not the receipt head ${test_commit}"
 assert_contains "${scratch}/stale_checkout/output" 'source checkout is at'
 assert_contains "${scratch}/stale_source/output" 'source ref .* expected'
 assert_contains "${scratch}/dirty_checkout/output" 'source checkout is dirty'

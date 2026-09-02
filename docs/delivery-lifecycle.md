@@ -30,10 +30,13 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
    `0600` before exporting `BUZZ_PRE_FREEZE_RECEIPT`.
 3. Acquire the pull-request receipt for the exact candidate with
    `scripts/protected-ci-receipt.py acquire`. The receipt is operator-acquired
-   evidence: it retains the exact GitHub REST bodies for the branch rules,
-   rulesets, and check runs, hash-bound and replayed on every validation.
-   GitHub does not sign those responses, so the receipt is trusted only after
-   `validate --reverify` finds the live authority unchanged. The output parent
+   evidence: it retains the exact GitHub REST bodies for the repository, the
+   `main` ref, the pull request, the branch rules, the rulesets, and the check
+   runs, hash-bound and replayed on every validation. GitHub does not sign
+   those responses, so the receipt is trusted only after `validate --reverify`
+   finds the live authority unchanged, including the pull request itself: it
+   must still be open, non-draft, at the receipt head, based on `main`, with
+   its base SHA and the live `main` head equal to the recorded base. The output parent
    must be an absolute, canonical, caller-owned mode-`0700` directory; the tool
    publishes a new mode-`0600` file and refuses replacement. Validate it with
    literal scope `pull-request` and `--reverify` before supplying it to the
@@ -55,7 +58,9 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
    place a token in the command line or receipt. Legacy JSON that merely
    asserts `protected: true` or `full_exact_head: true` is not evidence and is
    refused, and so is a receipt whose retained bodies no longer reproduce its
-   recorded hashes or whose binding live GitHub no longer backs.
+   recorded hashes, whose binding live GitHub no longer backs, or whose
+   commit is no longer the head of an open pull request against the current
+   `main`.
 4. Apply the current risk classifier. When Tier 2 is required, close review on
    the exact candidate before promotion. A review of an ancestor, tree-equivalent
    reconstruction, or later amended commit does not close the gate.
@@ -65,8 +70,9 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
 `scripts/ci-promotion-readiness.py` validates a supplied promotion evidence
 bundle when that broader gate applies. It accepts only the canonical
 `pull-request` receipt, and after every offline invariant passes it re-verifies
-that receipt against live GitHub through the pinned `gh` and `GH_TOKEN`. That
-is its only network call; it does not acquire evidence or create approval.
+that receipt against live GitHub through the pinned `gh` and `GH_TOKEN`,
+including the live pull request and `main` head. That is its only network
+call; it does not acquire evidence or create approval.
 
 ## Landing
 
@@ -133,8 +139,10 @@ the deploy re-verifies the protected-CI receipt against GitHub.
   evidence for the landed commit, fresh, and a full exact-head protected-CI
   pass whose retained GitHub bodies reproduce every recorded hash and whose
   binding live GitHub still backs (`validate --reverify` through the pinned
-  `gh` with `GH_TOKEN`); a pull-request-scoped, legacy self-asserted,
-  hand-edited, or no-longer-backed receipt is refused;
+  `gh` with `GH_TOKEN`), with the live `refs/heads/main` head equal to the
+  landed commit; the local remote-tracking ref alone does not establish that
+  the commit landed. A pull-request-scoped, legacy self-asserted,
+  hand-edited, no-longer-backed, or not-yet-landed receipt is refused;
 - the Compose runner, both Compose files, the non-secret settings file, the
   secret file, and their relevant parent directories have the required regular
   file or directory type, ownership, mode, and no-symlink state. The non-secret
@@ -196,15 +204,21 @@ and repeats it after the candidate build before rollback capture or backup, so
 live-state drift during the build fails closed.
 
 `protected-ci-receipt.py` records the pinned client identity, every request's
-metadata and body hash, and the exact response bodies for the branch rules,
-rulesets, and check runs. Those retained bodies count toward the 4 MiB receipt
-cap; acquisition refuses to publish anything larger. Every `validate` recomputes
-the body hashes and replays the bodies through the acquisition logic, so a
-hand-edited receipt fails offline. GitHub does not sign REST responses, so a
-receipt fabricated without contacting GitHub can still be internally
-consistent; `validate --reverify` closes that gap by requiring the live
-rulesets, required contexts, and exact-head check runs to match the receipt
-binding. `deploy-local.sh` always validates with `--reverify`, which is its
+metadata and body hash, and the exact response bodies for the repository, the
+`main` ref, the pull request (pull-request scope), the branch rules, the
+rulesets, and the check runs. Those retained bodies count toward the 4 MiB
+receipt cap; acquisition refuses to publish anything larger. Every `validate`
+recomputes the body hashes and replays the bodies through the scope's
+acquisition sequence, so a hand-edited receipt fails offline. GitHub does not
+sign REST responses, so a receipt fabricated without contacting GitHub can
+still be internally consistent; `validate --reverify` closes that gap by
+requiring the live rulesets, required contexts, and exact-head check runs to
+match the receipt binding, and by re-reading the scope authority: a `main`
+receipt needs the live `refs/heads/main` head at the receipt head; a
+`pull-request` receipt needs the live pull request open, non-draft, at the
+receipt head, based on `main`, with its base SHA and the live `main` head
+equal to the recorded base. Passing checks on a commit are not enough on
+their own. `deploy-local.sh` always validates with `--reverify`, which is its
 only GitHub contact, and requires an explicit absolute
 `BUZZ_PROTECTED_CI_RECEIPT`; a repository-root default is intentionally absent
 because a normal checkout is not a private mode-`0700` evidence directory.

@@ -84,11 +84,12 @@ all name the requested full commit. Both receipts must be mode-safe JSON from
 and be no older than `BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS` (default 86400).
 The pre-freeze receipt comes from `scripts/pre-freeze.sh`. The protected-CI
 receipt must be the canonical `main`-scope receipt acquired for the landed
-commit: operator-acquired, with the exact GitHub branch-rule, ruleset, and
-check-run bodies retained and hash-bound. GitHub does not sign those bodies, so
-the deploy runs `validate --reverify`, which requires the live GitHub authority
-to match the receipt binding through the pinned `gh`; `GH_TOKEN` must be in the
-environment. `BUZZ_PROTECTED_CI_RECEIPT` is mandatory and absolute; its
+commit: operator-acquired, with the exact GitHub repository, `main` ref,
+branch-rule, ruleset, and check-run bodies retained and hash-bound. GitHub does
+not sign those bodies, so the deploy runs `validate --reverify`, which requires
+the live GitHub authority to match the receipt binding through the pinned `gh`
+and the live `refs/heads/main` head to equal the landed commit; `GH_TOKEN` must
+be in the environment. `BUZZ_PROTECTED_CI_RECEIPT` is mandatory and absolute; its
 immediate parent must be caller-owned mode `0700`, and the receipt must be mode
 `0600`. Pull-request-scoped receipts, legacy JSON that merely asserts
 `protected: true` or `full_exact_head: true`, hand-edited receipts, and

@@ -213,7 +213,9 @@ class FakeClient:
 
 
 DRIFTS = ("none", "no_runs", "check_failure", "ruleset_changed", "ruleset_inactive",
-          "required_checks_changed")
+          "required_checks_changed", "main_head_moved", "pr_closed", "pr_draft",
+          "pr_head_mismatch", "pr_base_moved")
+MOVED = "d" * 40
 
 
 def apply_drift(client: FakeClient, name: str) -> None:
@@ -222,6 +224,17 @@ def apply_drift(client: FakeClient, name: str) -> None:
         return
     if name == "no_runs":
         client.runs = []
+    elif name == "main_head_moved":
+        client.base_ref_sha = MOVED
+    elif name == "pr_closed":
+        client.pr["state"] = "closed"
+    elif name == "pr_draft":
+        client.pr["draft"] = True
+    elif name == "pr_head_mismatch":
+        client.pr["head"]["sha"] = MOVED
+    elif name == "pr_base_moved":
+        client.pr["base"]["sha"] = MOVED
+        client.base_ref_sha = MOVED
     elif name == "check_failure":
         client.runs.insert(0, client.run("build", 102, "failure"))
     elif name == "ruleset_changed":
@@ -599,17 +612,30 @@ class ReceiptTests(unittest.TestCase):
         by_endpoint = {}
         for request in value["provider"]["requests"]:
             by_endpoint.setdefault(receipt.urlsplit(request["endpoint"]).path, request)
-        self.assertIsNone(by_endpoint["/user"]["body"])
-        self.assertIsNone(by_endpoint["/repos/only21mil/buzz/pulls/17"]["body"])
-        for path in ("/repos/only21mil/buzz/rules/branches/main",
+        for path in ("/user", "/repos/only21mil/buzz/git/ref/heads/sats%2Fprotected-ci",
+                     f"/repos/only21mil/buzz/commits/{HEAD}",
+                     f"/repos/only21mil/buzz/compare/main...{HEAD}"):
+            self.assertIsNone(by_endpoint[path]["body"], path)
+        for path in ("/repos/only21mil/buzz",
+                     "/repos/only21mil/buzz/pulls/17",
+                     "/repos/only21mil/buzz/git/ref/heads/main",
+                     "/repos/only21mil/buzz/rules/branches/main",
                      "/repos/only21mil/buzz/rulesets/20246414",
                      f"/repos/only21mil/buzz/commits/{HEAD}/check-runs"):
             body = by_endpoint[path]["body"]
-            self.assertIsInstance(body, str)
+            self.assertIsInstance(body, str, path)
             self.assertEqual(hashlib.sha256(body.encode()).hexdigest(),
                              by_endpoint[path]["body_sha256"])
-        retained = [request for request in value["provider"]["requests"] if request["body"]]
-        self.assertEqual(len(retained), 2 * 3)
+        retained = [receipt.urlsplit(request["endpoint"]).path
+                    for request in value["provider"]["requests"] if request["body"]]
+        # repository x2, pull request x3, main ref x3, two snapshots of three bodies each
+        self.assertEqual(len(retained), 2 + 3 + 3 + 2 * 3)
+        self.assertEqual(retained.count("/repos/only21mil/buzz/pulls/17"), 3)
+        client = FakeClient()
+        client.base_ref_sha = HEAD
+        main_value = receipt.build_main_receipt(client, HEAD, "main")
+        retained = [request for request in main_value["provider"]["requests"] if request["body"]]
+        self.assertEqual(len(retained), 2 + 3 + 2 * 3)
 
     def validate(self, value: dict) -> None:
         now = dt.datetime(2026, 9, 1, 12, 5, tzinfo=dt.timezone.utc)
@@ -660,14 +686,75 @@ class ReceiptTests(unittest.TestCase):
             self.validate(edited)
 
         edited = copy.deepcopy(value)
-        first_rules = next(index for index, item in enumerate(edited["provider"]["requests"])
-                           if item["body"] is not None)
-        second_rules = next(index for index, item in enumerate(edited["provider"]["requests"])
-                            if item["body"] is not None and index > first_rules
-                            and item["endpoint"] == edited["provider"]["requests"][first_rules]["endpoint"])
-        del edited["provider"]["requests"][second_rules:second_rules + 3]
-        with self.assertRaisesRegex(receipt.GateError, "exactly 2 acquisition snapshots"):
+        rules_indexes = [index for index, item in enumerate(edited["provider"]["requests"])
+                         if item["endpoint"].endswith("/rules/branches/main?per_page=100")]
+        self.assertEqual(len(rules_indexes), 2)
+        del edited["provider"]["requests"][rules_indexes[1]:rules_indexes[1] + 3]
+        with self.assertRaisesRegex(receipt.GateError, "out of acquisition order"):
             self.validate(edited)
+
+        edited = copy.deepcopy(value)
+        edited["provider"]["requests"].extend(
+            copy.deepcopy(edited["provider"]["requests"][-3:]))
+        with self.assertRaisesRegex(receipt.GateError, "beyond the acquisition sequence"):
+            self.validate(edited)
+
+    def edit_retained_body(self, value: dict, path_suffix: str, edit) -> dict:
+        """Return a copy whose last retained body at path_suffix is edited and re-hashed."""
+        edited = copy.deepcopy(value)
+        request = [item for item in edited["provider"]["requests"]
+                   if receipt.urlsplit(item["endpoint"]).path.endswith(path_suffix)][-1]
+        body = json.loads(request["body"])
+        edit(body)
+        request["body"] = json.dumps(body)
+        request["body_sha256"] = hashlib.sha256(request["body"].encode()).hexdigest()
+        return edited
+
+    def test_offline_validate_replays_scope_authority_bodies(self) -> None:
+        value = self.build()
+        self.validate(value)
+        for name, suffix, edit, message in (
+            ("pr closed", "/pulls/17", lambda pr: pr.update(state="closed"),
+             "retained pull request #17 is not open"),
+            ("pr draft", "/pulls/17", lambda pr: pr.update(draft=True),
+             "retained pull request #17 is a draft"),
+            ("pr head", "/pulls/17", lambda pr: pr["head"].update(sha=MOVED),
+             f"retained pull request #17 head is {MOVED}"),
+            ("pr base moved", "/pulls/17", lambda pr: pr["base"].update(sha=MOVED),
+             f"base moved from {BASE} to {MOVED}"),
+            ("pr base ref", "/pulls/17", lambda pr: pr["base"].update(ref="release"),
+             "base ref is not the default branch main"),
+            ("pr number", "/pulls/17", lambda pr: pr.update(number=18),
+             "retained pull request number drift"),
+            ("main ref moved", "/git/ref/heads/main",
+             lambda ref: ref["object"].update(sha=MOVED), "refs/heads/main SHA drift"),
+            ("repository default", "/repos/only21mil/buzz",
+             lambda repo: repo.update(default_branch="release"),
+             "retained repository authority does not match"),
+            ("repository id", "/repos/only21mil/buzz", lambda repo: repo.update(id=78),
+             "retained repository authority does not match"),
+        ):
+            with self.subTest(name=name):
+                edited = self.edit_retained_body(value, suffix, edit)
+                with self.assertRaisesRegex(receipt.GateError, message):
+                    self.validate(edited)
+        # A body edit without a matching hash update still fails on the hash.
+        edited = self.edit_retained_body(value, "/pulls/17", lambda pr: pr.update(state="closed"))
+        pr_index = [index for index, item in enumerate(edited["provider"]["requests"])
+                    if item["endpoint"].endswith("/pulls/17")][-1]
+        edited["provider"]["requests"][pr_index]["body_sha256"] = (
+            value["provider"]["requests"][pr_index]["body_sha256"])
+        with self.assertRaisesRegex(receipt.GateError, "retained body does not match body_sha256"):
+            self.validate(edited)
+        client = FakeClient()
+        client.base_ref_sha = HEAD
+        main_value = receipt.build_main_receipt(client, HEAD, "main")
+        now = dt.datetime(2026, 9, 1, 12, 5, tzinfo=dt.timezone.utc)
+        receipt.validate_receipt(main_value, receipt.REPOSITORY, HEAD, "main", now, 600)
+        edited = self.edit_retained_body(main_value, "/git/ref/heads/main",
+                                         lambda ref: ref["object"].update(sha=MOVED))
+        with self.assertRaisesRegex(receipt.GateError, "refs/heads/main SHA drift"):
+            receipt.validate_receipt(edited, receipt.REPOSITORY, HEAD, "main", now, 600)
 
     def test_reverify_requires_matching_live_authority(self) -> None:
         value = self.build()
@@ -696,6 +783,55 @@ class ReceiptTests(unittest.TestCase):
         forged_live.runs.append(check_run("test", 202))
         with self.assertRaisesRegex(receipt.GateError, "checks differs from the receipt binding"):
             receipt.reverify_receipt(forged, forged_live)
+
+    def test_reverify_requires_live_scope_authority(self) -> None:
+        value = self.build()
+        self.validate(value)
+        live = FakeClient()
+        receipt.reverify_receipt(value, live)
+        live_paths = [receipt.urlsplit(request["endpoint"]).path for request in live.requests]
+        self.assertEqual(live_paths[:3], ["/repos/only21mil/buzz", "/repos/only21mil/buzz/pulls/17",
+                                          "/repos/only21mil/buzz/git/ref/heads/main"])
+        for drift, message in (
+            ("pr_closed", "live pull request #17 is not open \(state 'closed'\)"),
+            ("pr_draft", "live pull request #17 is a draft"),
+            ("pr_head_mismatch",
+             f"live pull request #17 head is {MOVED}, not the receipt head {HEAD}"),
+            ("pr_base_moved", f"live pull request #17 base moved from {BASE} to {MOVED}"),
+            ("main_head_moved", f"live refs/heads/main moved from {BASE} to {MOVED}"),
+        ):
+            with self.subTest(drift=drift):
+                drifted = FakeClient()
+                apply_drift(drifted, drift)
+                with self.assertRaisesRegex(receipt.GateError, message):
+                    receipt.reverify_receipt(value, drifted)
+        # A receipt for a commit that is no longer the pull request head is refused
+        # even when that commit still has passing live checks.
+        other = receipt.build_receipt(FakeClient(head=MOVED), 17, MOVED, "main")
+        with self.assertRaisesRegex(receipt.GateError,
+                                    f"live pull request #17 head is {HEAD}, not the receipt head {MOVED}"):
+            receipt.reverify_receipt(other, FakeClient())
+
+        client = FakeClient()
+        client.base_ref_sha = HEAD
+        main_value = receipt.build_main_receipt(client, HEAD, "main")
+        now = dt.datetime(2026, 9, 1, 12, 5, tzinfo=dt.timezone.utc)
+        receipt.validate_receipt(main_value, receipt.REPOSITORY, HEAD, "main", now, 600)
+        live = FakeClient()
+        live.base_ref_sha = HEAD
+        receipt.reverify_receipt(main_value, live)
+        live_paths = [receipt.urlsplit(request["endpoint"]).path for request in live.requests]
+        self.assertEqual(live_paths[:2], ["/repos/only21mil/buzz",
+                                          "/repos/only21mil/buzz/git/ref/heads/main"])
+        self.assertNotIn("/repos/only21mil/buzz/pulls/17", live_paths)
+        for name, base_ref_sha in (("main moved on", MOVED), ("main still at base", BASE)):
+            with self.subTest(name=name):
+                drifted = FakeClient()
+                drifted.base_ref_sha = base_ref_sha
+                with self.assertRaisesRegex(
+                        receipt.GateError,
+                        f"live refs/heads/main is at {base_ref_sha}, not the receipt head {HEAD}"):
+                    receipt.reverify_receipt(main_value, drifted)
 
     def test_validate_cli_reverify_uses_the_pinned_client(self) -> None:
         http_date = dt.datetime.now(dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")

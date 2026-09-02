@@ -6,10 +6,16 @@ evidence and emits a machine-readable receipt. It does not contact Docker, the
 relay, a database, or a deployment host. Its one network call is to GitHub,
 after every offline invariant passes: it re-verifies the protected-CI receipt
 against the live rulesets, required contexts, and exact-head check runs through
-the pinned `gh` and `GH_TOKEN`. The protected-CI receipt is operator-acquired
-evidence with the exact GitHub REST bodies retained and hash-bound; GitHub does
-not sign those bodies, so a receipt is accepted only when live GitHub still
-matches it. Passing the hermetic tests is not live acceptance.
+the pinned `gh` and `GH_TOKEN`, and re-reads the receipt's scope authority: the
+recorded pull request must still be open, non-draft, at the receipt head, based
+on `main`, and its base SHA and the live `refs/heads/main` head must still equal
+the recorded base. A receipt for a commit with passing checks that is no longer
+the pull request head, or whose base has moved, is refused. The protected-CI
+receipt is operator-acquired evidence with the exact GitHub REST bodies retained
+and hash-bound (repository, main ref, pull request, branch rules, rulesets, and
+check runs); GitHub does not sign those bodies, so a receipt is accepted only
+when live GitHub still matches it. Passing the hermetic tests is not live
+acceptance.
 
 ## Inputs and invariants
 
@@ -91,7 +97,8 @@ receipt is written.
    protected exact-head CI receipt, including their SHA-256 digests. Acquire
    the CI receipt with `scripts/protected-ci-receipt.py acquire` and confirm it
    with `validate --scope pull-request --reverify`; the verifier repeats that
-   live re-verification when it runs.
+   live re-verification, including the pull request and base re-read, when it
+   runs. Reacquire after any push to the branch or any movement of `main`.
 2. Run the final Tier 2 review after exact-head CI. Its checked commit and
    fingerprint must still match the frozen candidate, and its review window
    may not exceed 5,400 seconds or be expired at verification time.

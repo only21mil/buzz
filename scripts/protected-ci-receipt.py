@@ -2,13 +2,18 @@
 """Acquire and validate an exact-head GitHub protected-CI receipt.
 
 The receipt is operator-acquired point-in-time evidence. GitHub does not sign
-REST responses, so the receipt retains the exact branch-rule, ruleset, and
-check-run response bodies it was derived from. Offline validation recomputes
-every recorded hash and replays the retained bodies through the acquisition
-logic, so a hand-edited receipt fails without network access. A receipt built
-without contacting GitHub can still be internally consistent, so consumers must
-run `validate --reverify`, which requires the live GitHub authority to match
-the receipt binding exactly.
+REST responses, so the receipt retains the exact response bodies it was derived
+from: the repository, the default-branch ref, the pull request (pull-request
+scope), the branch rules, the rulesets, and the check runs. Offline validation
+recomputes every recorded hash and replays the retained bodies through the
+acquisition sequence, so a hand-edited receipt fails without network access. A
+receipt built without contacting GitHub can still be internally consistent, so
+consumers must run `validate --reverify`, which requires the live GitHub
+authority to match the receipt binding exactly: the rulesets, required
+contexts, and exact-head check runs, plus the scope authority. A main receipt
+needs the live default-branch head at the receipt head; a pull-request receipt
+needs the live pull request open, non-draft, at the receipt head, based on the
+default branch, with the base unmoved.
 """
 
 from __future__ import annotations
@@ -49,7 +54,22 @@ GH_MODE = 0o755
 GH_SHA256 = "16fdbf30d6f97bc5b0fb94745e00fa06ae68beb6c6653d7f584b32602800397d"
 RENAME_NOREPLACE = 1
 ACQUISITION_SNAPSHOTS = 2
+# Retained-body order for each scope. Offline validation replays exactly this
+# sequence, so a receipt with bodies missing, reordered, or added fails.
+PULL_REQUEST_ACQUISITION = (
+    "repository", "pull_request", "base_ref", "snapshot",
+    "pull_request", "base_ref", "snapshot",
+    "repository", "pull_request", "base_ref",
+)
+MAIN_ACQUISITION = (
+    "repository", "base_ref", "snapshot", "base_ref", "snapshot", "repository", "base_ref",
+)
+assert PULL_REQUEST_ACQUISITION.count("snapshot") == ACQUISITION_SNAPSHOTS
+assert MAIN_ACQUISITION.count("snapshot") == ACQUISITION_SNAPSHOTS
 AUTHORITY_PATHS = [
+    re.compile(rf"^/repos/{re.escape(REPOSITORY)}$"),
+    re.compile(rf"^/repos/{re.escape(REPOSITORY)}/git/ref/heads/main$"),
+    re.compile(rf"^/repos/{re.escape(REPOSITORY)}/pulls/[1-9][0-9]*$"),
     re.compile(rf"^/repos/{re.escape(REPOSITORY)}/rules/branches/main$"),
     re.compile(rf"^/repos/{re.escape(REPOSITORY)}/commits/[0-9a-f]{{40}}/check-runs$"),
     re.compile(rf"^/repos/{re.escape(REPOSITORY)}/rulesets/[1-9][0-9]*$"),
@@ -238,8 +258,9 @@ def api_endpoint(value: str) -> str:
 def retains_body(endpoint: str) -> bool:
     """Whether a request's exact response body is retained in the receipt.
 
-    Only the branch rules, rulesets, and check runs are authority the validator
-    replays; other requests keep just their body hash.
+    The repository, default-branch ref, pull request, branch rules, rulesets,
+    and check runs are authority the validator replays; other requests keep
+    just their body hash.
     """
     path = urlsplit(endpoint).path
     return any(pattern.fullmatch(path) for pattern in AUTHORITY_PATHS)
@@ -472,6 +493,38 @@ def require_pr(value: Any, number: int, head: str, base: str) -> dict[str, Any]:
     refuse(head_repo == REPOSITORY and base_repo == REPOSITORY, "pull request must be internal")
     refuse(sha40(head_data.get("sha"), "pull request head SHA") == head, "pull request head SHA drift")
     refuse(base_data.get("ref") == base, "pull request base ref drift")
+    return pr
+
+
+def require_repository(value: Any, repository_id: int, origin: str) -> dict[str, Any]:
+    """Require a repository body to name the pinned repository with main as default."""
+    repository = object_(value, origin)
+    refuse(repository.get("full_name") == REPOSITORY and
+           positive(repository.get("id"), f"{origin} id") == repository_id and
+           repository.get("default_branch") == "main",
+           f"{origin} authority does not match the receipt")
+    return repository
+
+
+def require_pr_authority(value: Any, number: int, head: str, base_sha: str,
+                         origin: str) -> dict[str, Any]:
+    """Require a pull-request body to still carry the receipt's scope authority."""
+    pr = object_(value, origin)
+    refuse(positive(pr.get("number"), f"{origin} number") == number, f"{origin} number drift")
+    label = f"{origin} #{number}"
+    refuse(pr.get("state") == "open", f"{label} is not open (state {pr.get('state')!r})")
+    refuse(pr.get("draft") is False, f"{label} is a draft")
+    head_data = object_(pr.get("head"), f"{label} head")
+    base_data = object_(pr.get("base"), f"{label} base")
+    head_repo = object_(head_data.get("repo"), f"{label} head repository").get("full_name")
+    base_repo = object_(base_data.get("repo"), f"{label} base repository").get("full_name")
+    refuse(head_repo == REPOSITORY and base_repo == REPOSITORY, f"{label} is not internal")
+    pr_head = sha40(head_data.get("sha"), f"{label} head SHA")
+    refuse(pr_head == head, f"{label} head is {pr_head}, not the receipt head {head}")
+    refuse(base_data.get("ref") == "main", f"{label} base ref is not the default branch main")
+    pr_base = sha40(base_data.get("sha"), f"{label} base SHA")
+    refuse(pr_base == base_sha,
+           f"{label} base moved from {base_sha} to {pr_base}; reacquire the receipt")
     return pr
 
 
@@ -991,32 +1044,74 @@ def require_binding_match(actual: dict[str, Any], receipt: dict[str, Any], origi
 
 
 def replay_retained_bodies(retained: list[tuple[str, int, Any]], receipt: dict[str, Any]) -> None:
-    """Rebuild the binding from retained bodies; every recorded hash is recomputed here."""
+    """Replay the retained bodies through the acquisition sequence for the receipt's scope.
+
+    Every recorded hash is recomputed here, and every retained repository,
+    default-branch ref, and pull-request body must carry the scope authority the
+    receipt claims.
+    """
     owner, repo = REPOSITORY.split("/")
     client = RetainedClient(retained)
+    head = receipt["head_sha"]
+    base_sha = receipt["protection"]["base_sha"]
+    repository_id = receipt["provider"]["repository_id"]
+    if receipt["scope"] == "pull-request":
+        steps = PULL_REQUEST_ACQUISITION
+        number = receipt["pull_request"]["number"]
+    else:
+        steps = MAIN_ACQUISITION
+        number = 0
     replays = 0
     try:
-        while not client.exhausted():
-            require_binding_match(snapshot(client, owner, repo, receipt["head_sha"], "main"),
-                                  receipt, "retained provider bodies")
-            replays += 1
+        for step in steps:
+            if step == "repository":
+                require_repository(client.one(f"/repos/{owner}/{repo}"), repository_id,
+                                   "retained repository")
+            elif step == "base_ref":
+                require_ref(client.one(f"/repos/{owner}/{repo}/git/ref/heads/main"),
+                            "refs/heads/main", base_sha)
+            elif step == "pull_request":
+                require_pr_authority(client.one(f"/repos/{owner}/{repo}/pulls/{number}"),
+                                     number, head, base_sha, "retained pull request")
+            else:
+                require_binding_match(snapshot(client, owner, repo, head, "main"),
+                                      receipt, "retained provider bodies")
+                replays += 1
     except ProviderError as exc:
         raise GateError(f"retained provider bodies are inconsistent: {exc}") from exc
+    refuse(client.exhausted(), "receipt retains provider bodies beyond the acquisition sequence")
     refuse(replays == ACQUISITION_SNAPSHOTS,
            f"receipt must retain exactly {ACQUISITION_SNAPSHOTS} acquisition snapshots")
 
 
 def reverify_receipt(receipt: dict[str, Any], client: GhClient) -> None:
-    """Require the live GitHub authority to still match an already validated receipt."""
+    """Require the live GitHub authority to still match an already validated receipt.
+
+    Beyond the rulesets, required contexts, and exact-head check runs, the
+    receipt's scope authority is re-read live: a main receipt needs
+    refs/heads/main at the receipt head; a pull-request receipt needs the pull
+    request open, non-draft, at the receipt head, based on main, with both the
+    pull request's base SHA and the live main head equal to the recorded base.
+    """
     owner, repo = REPOSITORY.split("/")
-    repository = object_(client.one(f"/repos/{owner}/{repo}"), "live repository")
-    refuse(repository.get("full_name") == REPOSITORY and
-           positive(repository.get("id"), "live repository id") ==
-           receipt["provider"]["repository_id"] and
-           repository.get("default_branch") == "main",
-           "live repository authority does not match the receipt")
-    require_binding_match(snapshot(client, owner, repo, receipt["head_sha"], "main"),
-                          receipt, "live GitHub")
+    head = receipt["head_sha"]
+    require_repository(client.one(f"/repos/{owner}/{repo}"),
+                       receipt["provider"]["repository_id"], "live repository")
+    main_endpoint = f"/repos/{owner}/{repo}/git/ref/heads/main"
+    if receipt["scope"] == "main":
+        live_main = require_ref(client.one(main_endpoint), "refs/heads/main")
+        refuse(live_main == head,
+               f"live refs/heads/main is at {live_main}, not the receipt head {head}")
+    else:
+        pr = receipt["pull_request"]
+        number = pr["number"]
+        require_pr_authority(client.one(f"/repos/{owner}/{repo}/pulls/{number}"),
+                             number, head, pr["base_sha"], "live pull request")
+        live_main = require_ref(client.one(main_endpoint), "refs/heads/main")
+        refuse(live_main == pr["base_sha"],
+               f"live refs/heads/main moved from {pr['base_sha']} to {live_main}; "
+               "reacquire the receipt")
+    require_binding_match(snapshot(client, owner, repo, head, "main"), receipt, "live GitHub")
 
 
 def rename_noreplace(dir_fd: int, source: str, destination: str) -> None:
