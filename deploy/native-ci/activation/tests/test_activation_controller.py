@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "6d79e3a77303c59fc4e5e1fda73bcc662ecb8aab218ebc2c8ffd77fbb7adc96f",
+            "c4a6b0f32b08215a0226cd853641bc5eb51108286dbc9ee1d1db1855005fbdb8",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -2009,6 +2009,57 @@ class ActivationControllerTests(unittest.TestCase):
         receipt = CONTROLLER._read_receipt(self.fixture.root)
         self.assertEqual((receipt["state"], receipt["capacity_one"]["phase"]), ("qualified_closed", "compensated"))
         CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
+
+    def test_capacity_one_accepts_retained_invocation_ids_on_dead_units(self) -> None:
+        # systemd 259 keeps the InvocationID of a stopped service until its next
+        # stop job: after the closed qualification execd is inactive/dead with
+        # MainPID=0 and a retained id. Capacity one must start it anyway and
+        # prove a new id afterwards.
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        state = json.loads(self.fixture.fake_state.read_bytes())
+        for unit in ("buzz-ci-execd.service", "buzz-ci-runner.service"):
+            state["units"].setdefault(unit, {}).update({
+                "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+                "InvocationID": "e" * 32, "MainPID": 0,
+            })
+        write_file(self.fixture.fake_state, activation_package.canonical_json(state), 0o600)
+        self.assertEqual(driver.process("buzz-ci-execd.service"), {"invocation_id": "e" * 32, "main_pid": 0})
+        _request, raw = self.capacity_one_request("b")
+        parsed, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, CONTROLLER._read_receipt(self.fixture.root))
+        response = CONTROLLER._set_capacity_one(
+            manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+        )
+        self.assertEqual(response["state"], "active_one")
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        capacity_one = receipt["capacity_one"]
+        self.assertEqual(capacity_one["processes_before"]["buzz-ci-execd.service"], {"invocation_id": "e" * 32, "main_pid": 0})
+        self.assertEqual(capacity_one["processes_before"]["buzz-ci-runner.service"], {"invocation_id": "e" * 32, "main_pid": 0})
+        for unit in ("buzz-ci-execd.service", "buzz-ci-runner.service"):
+            after = capacity_one["processes_after"][unit]
+            self.assertNotEqual(after["invocation_id"], "e" * 32)
+            self.assertGreater(after["main_pid"], 0)
+
+    def test_capacity_one_rejects_a_dead_unit_that_still_reports_a_main_pid(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        _request, raw = self.capacity_one_request("b")
+        parsed, request_sha256 = CONTROLLER._parse_capacity_one_request(raw, CONTROLLER._read_receipt(self.fixture.root))
+        for field, value in (("MainPID", 4242), ("SubState", "auto-restart")):
+            state = json.loads(self.fixture.fake_state.read_bytes())
+            state["units"].setdefault("buzz-ci-execd.service", {}).update({
+                "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+                "InvocationID": "e" * 32, "MainPID": 0, field: value,
+            })
+            write_file(self.fixture.fake_state, activation_package.canonical_json(state), 0o600)
+            with self.assertRaisesRegex(ValueError, "stale staged process remains active: buzz-ci-execd.service"):
+                CONTROLLER._set_capacity_one(
+                    manifest, payloads, self.fixture.root, driver, parsed, request_sha256,
+                )
+            receipt = CONTROLLER._read_receipt(self.fixture.root)
+            self.assertEqual((receipt["state"], receipt["capacity_one"]), ("qualified_closed", None))
 
     def test_fixed_zero_actions_are_bound_idempotent_and_prove_without_writes(self) -> None:
         manifest, payloads, driver = self.fixture.load()

@@ -16,8 +16,8 @@ use buzz_ci_acceptance_ctl::acceptance_binding::{
 };
 #[cfg(target_os = "linux")]
 use buzz_ci_acceptance_ctl::production::{
-    handle_control_durable, AcceptanceControlConfig, ControlError, HostControl, SystemdHostControl,
-    CONTROL_CONFIG_PATH, MAX_ADAPTER_FRAME_BYTES,
+    handle_control_durable, AcceptanceControlConfig, ControlError, ControlErrorFrame, HostControl,
+    SystemdHostControl, CONTROL_CONFIG_PATH, MAX_ADAPTER_FRAME_BYTES,
 };
 use serde::Serialize;
 
@@ -162,7 +162,19 @@ fn serve_connection(
     if request.len() > MAX_ADAPTER_FRAME_BYTES {
         return Err(ControlError::BindingMismatch);
     }
-    let response = handle_control_durable(config, &request, host)?;
+    let response = match handle_control_durable(config, &request, host) {
+        Ok(response) => response,
+        Err(error) => {
+            // Name the error class in the journal and hand the driver a
+            // structured frame instead of an empty one; the caller still
+            // fails closed to capacity zero.
+            emit_error(error);
+            if let Ok(frame) = serde_json::to_vec(&ControlErrorFrame::new(error)) {
+                let _ = stream.write_all(&frame).and_then(|()| stream.flush());
+            }
+            return Err(error);
+        }
+    };
     let bytes = serde_json::to_vec(&response).map_err(|_| ControlError::HostAction)?;
     if bytes.len() > MAX_ADAPTER_FRAME_BYTES {
         return Err(ControlError::HostAction);
@@ -177,15 +189,7 @@ fn emit_error(error: ControlError) {
     let line = ErrorLine {
         schema_version: "buzz-ci-acceptance-control-error/v1",
         code: error.code(),
-        message: match error {
-            ControlError::InvalidConfig => "control configuration rejected",
-            ControlError::BindingMismatch => "control binding rejected",
-            ControlError::HostAction => "host action failed",
-            ControlError::ReadbackMismatch => "host readback rejected",
-            ControlError::StaleGeneration => "host generation rejected",
-            ControlError::ReplayMismatch => "operation replay rejected",
-            ControlError::Ledger => "operation ledger unavailable",
-        },
+        message: error.message(),
     };
     if serde_json::to_writer(std::io::stderr().lock(), &line).is_ok() {
         eprintln!();

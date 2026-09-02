@@ -3483,12 +3483,22 @@ def _validate_staged_processes(
     driver: LiveSystemd | FakeSystemd, processes: dict[str, dict[str, object]],
 ) -> None:
     for unit in CAPACITY_ONE_PROCESS_UNITS:
-        active = driver.unit(unit)["ActiveState"] == "active"
+        state = driver.unit(unit)
+        active = state["ActiveState"] == "active"
         process = processes[unit]
         if unit == "buzz-ci-controld.service":
             if not active or not re.fullmatch(r"[0-9a-f]{32}", str(process["invocation_id"])) or process["main_pid"] <= 0:
                 raise ValueError("staged controld process generation is absent")
-        elif active or process != {"invocation_id": "", "main_pid": 0}:
+        elif (
+            active
+            or state["SubState"] != "dead"
+            or process["main_pid"] != 0
+            or not (process["invocation_id"] == "" or re.fullmatch(r"[0-9a-f]{32}", str(process["invocation_id"])))
+        ):
+            # systemd 259 keeps the InvocationID of a stopped service until its
+            # next stop job, so a retained id on a dead unit is not a live
+            # process. _active_capacity_one_readback requires the restarted
+            # unit to report a different id.
             raise ValueError(f"stale staged process remains active: {unit}")
 
 

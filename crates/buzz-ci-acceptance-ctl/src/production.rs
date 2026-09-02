@@ -518,7 +518,7 @@ impl<T: AdapterTransport> ProductionDriver<T> {
                 .exchange(AdapterEndpoint::Control, &bytes, timeout)
             {
                 Ok(response) => {
-                    let response: ControlResponse = parse_bounded(&response)?;
+                    let response = parse_control_response(&response)?;
                     validate_control_response(request, &response)?;
                     return Ok((response, attempt));
                 }
@@ -547,7 +547,7 @@ where
             .transport
             .exchange(AdapterEndpoint::Control, &control_bytes, timeout)
             .map_err(|_| DriverError::Transport)?;
-        let control_response: ControlResponse = parse_bounded(&response)?;
+        let control_response = parse_control_response(&response)?;
         validate_control_response(&control, &control_response)?;
 
         let adapter = AdapterRequest {
@@ -1548,6 +1548,41 @@ struct CapacityOneTransition {
     runner_invocation: String,
 }
 
+/// InvocationIDs the staged services carry before capacity one starts them.
+///
+/// systemd 259 keeps the InvocationID of a stopped service until its next stop
+/// job, so after the closed qualification `buzz-ci-execd.service` is
+/// `inactive`/`dead` with `MainPID=0` and a non-empty id. A retained id is not a
+/// live process. Staleness is proven twice: now, by `SubState=dead` and
+/// `MainPID=0`; and after the controller ran, by every service reporting an id
+/// that differs from the retained one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RetainedInvocations {
+    runner: String,
+    execd: String,
+    executor: String,
+    keyholder: String,
+}
+
+fn retained_staged_invocations<R: CapacityOneRuntime>(
+    runtime: &mut R,
+    timeout: Duration,
+) -> Result<RetainedInvocations, ControlError> {
+    let mut retained = RetainedInvocations::default();
+    for (unit, slot) in [
+        ("buzz-ci-runner.service", &mut retained.runner),
+        (EXECD_SERVICE, &mut retained.execd),
+        (EXECUTOR_SERVICE, &mut retained.executor),
+        ("buzz-ci-keyholder.service", &mut retained.keyholder),
+    ] {
+        if runtime.sub_state(unit, timeout)? != "dead" || runtime.main_pid(unit, timeout)? != 0 {
+            return Err(ControlError::StaleGeneration);
+        }
+        *slot = runtime.optional_invocation(unit, timeout)?;
+    }
+    Ok(retained)
+}
+
 fn activate_capacity_one<R: CapacityOneRuntime>(
     config: &AcceptanceControlConfig,
     request: &ControlRequest,
@@ -1561,7 +1596,7 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
         || request.expected_controller_generation != Some(config.controller_generation)
         || request.expected_runner_generation != Some(config.runner_generation)
         || !lower_hex(staged_controller_invocation, &[32])
-        || !staged_runner_invocation.is_empty()
+        || !(staged_runner_invocation.is_empty() || lower_hex(staged_runner_invocation, &[32]))
     {
         return Err(ControlError::BindingMismatch);
     }
@@ -1591,21 +1626,10 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
             return Err(ControlError::ReadbackMismatch);
         }
     }
-    if runtime.invocation("buzz-ci-controld.service", timeout)? != staged_controller_invocation
-        || !runtime
-            .optional_invocation("buzz-ci-runner.service", timeout)?
-            .is_empty()
-        || !runtime
-            .optional_invocation(EXECD_SERVICE, timeout)?
-            .is_empty()
-        || !runtime
-            .optional_invocation(EXECUTOR_SERVICE, timeout)?
-            .is_empty()
-        || runtime.main_pid(EXECD_SERVICE, timeout)? != 0
-        || runtime.main_pid(EXECUTOR_SERVICE, timeout)? != 0
-    {
+    if runtime.invocation("buzz-ci-controld.service", timeout)? != staged_controller_invocation {
         return Err(ControlError::StaleGeneration);
     }
+    let retained = retained_staged_invocations(runtime, timeout)?;
 
     let body = CapacityOneRequest {
         schema_version: CAPACITY_ONE_REQUEST_SCHEMA,
@@ -1717,9 +1741,10 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
     let executor_pid = runtime.main_pid(EXECUTOR_SERVICE, timeout)?;
     if controller_invocation == staged_controller_invocation
         || runner_invocation == staged_runner_invocation
-        || execd_invocation.is_empty()
-        || executor_invocation.is_empty()
-        || keyholder_invocation.is_empty()
+        || runner_invocation == retained.runner
+        || execd_invocation == retained.execd
+        || executor_invocation == retained.executor
+        || keyholder_invocation == retained.keyholder
         || execd_pid == 0
         || executor_pid == 0
     {
@@ -2774,7 +2799,68 @@ pub enum ControlError {
     Ledger,
 }
 
+/// Schema of the rejection frame the root helper writes before it closes a
+/// rejected connection, so the driver reads a reason instead of an empty frame.
+pub const CONTROL_ERROR_SCHEMA: &str = "buzz-ci-acceptance-control-error/v1";
+
+/// Structured rejection returned by the root helper. It names only the error
+/// class; the helper's own journal line carries the same code.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlErrorFrame {
+    pub schema_version: String,
+    pub code: String,
+    pub message: String,
+}
+
+impl ControlErrorFrame {
+    pub fn new(error: ControlError) -> Self {
+        Self {
+            schema_version: CONTROL_ERROR_SCHEMA.to_owned(),
+            code: error.code().to_owned(),
+            message: error.message().to_owned(),
+        }
+    }
+
+    /// Driver-side classification of a helper rejection.
+    pub fn driver_error(&self) -> DriverError {
+        match self.code.as_str() {
+            "stale_generation" => DriverError::StaleGeneration,
+            "binding_mismatch" | "replay_mismatch" | "invalid_config" => {
+                DriverError::BindingMismatch
+            }
+            _ => DriverError::Protocol,
+        }
+    }
+}
+
+/// Parse a helper response: either the bound [`ControlResponse`] or a
+/// [`ControlErrorFrame`], which fails closed with its classified error.
+fn parse_control_response(bytes: &[u8]) -> Result<ControlResponse, DriverError> {
+    if bytes.is_empty() || bytes.len() > MAX_ADAPTER_FRAME_BYTES {
+        return Err(DriverError::FrameTooLarge);
+    }
+    if let Ok(frame) = serde_json::from_slice::<ControlErrorFrame>(bytes) {
+        if frame.schema_version == CONTROL_ERROR_SCHEMA {
+            return Err(frame.driver_error());
+        }
+    }
+    parse_bounded(bytes)
+}
+
 impl ControlError {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidConfig => "control configuration rejected",
+            Self::BindingMismatch => "control binding rejected",
+            Self::HostAction => "host action failed",
+            Self::ReadbackMismatch => "host readback rejected",
+            Self::StaleGeneration => "host generation rejected",
+            Self::ReplayMismatch => "operation replay rejected",
+            Self::Ledger => "operation ledger unavailable",
+        }
+    }
+
     pub const fn code(self) -> &'static str {
         match self {
             Self::InvalidConfig => "invalid_config",
@@ -4140,6 +4226,119 @@ mod tests {
             Err(ControlError::ReadbackMismatch)
         );
         assert_eq!(runtime.controller_calls, 0);
+    }
+
+    #[test]
+    fn retained_invocation_ids_on_dead_units_do_not_block_capacity_one() {
+        // systemd 259 keeps a stopped unit's InvocationID until its next stop
+        // job. After the closed qualification execd is inactive/dead with
+        // MainPID=0 and a retained id; that is not a live process.
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+        let mut state = runtime.state();
+        for unit in [
+            EXECD_SERVICE,
+            EXECD_SOCKET,
+            EXECUTOR_SOCKET,
+            "buzz-ci-runner.service",
+        ] {
+            state["units"][unit]["invocation_id"] = hex('f', 32).into();
+        }
+        fs::write(&runtime.state, serde_json::to_vec(&state).unwrap()).unwrap();
+        let transition = activate_capacity_one(
+            &config,
+            &request,
+            &hex('1', 32),
+            &hex('f', 32),
+            Duration::from_millis(500),
+            &mut runtime,
+        )
+        .unwrap();
+        assert_eq!(transition.result.readback.capacity, 1);
+        assert_eq!(transition.result.readback.admission, AdmissionState::Open);
+        assert_eq!(transition.runner_invocation, hex('3', 32));
+        assert_eq!(runtime.controller_calls, 1);
+    }
+
+    #[test]
+    fn dead_unit_with_a_live_substate_or_main_pid_is_stale_before_the_controller_runs() {
+        for (field, value) in [
+            ("sub_state", serde_json::json!("auto-restart")),
+            ("main_pid", serde_json::json!(404)),
+        ] {
+            let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+            let mut state = runtime.state();
+            state["units"][EXECD_SERVICE]["invocation_id"] = hex('f', 32).into();
+            state["units"][EXECD_SERVICE][field] = value;
+            fs::write(&runtime.state, serde_json::to_vec(&state).unwrap()).unwrap();
+            assert_eq!(
+                activate_capacity_one(
+                    &config,
+                    &request,
+                    &hex('1', 32),
+                    "",
+                    Duration::from_millis(500),
+                    &mut runtime,
+                )
+                .map(|_| ()),
+                Err(ControlError::StaleGeneration),
+                "{field}"
+            );
+            assert_eq!(runtime.controller_calls, 0, "{field}");
+        }
+    }
+
+    #[test]
+    fn unchanged_invocation_id_after_the_controller_ran_is_stale() {
+        // The fixture controller reports hex('4') for execd afterwards; a
+        // retained id equal to it means the unit was never restarted.
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+        let mut state = runtime.state();
+        state["units"][EXECD_SERVICE]["invocation_id"] = hex('4', 32).into();
+        fs::write(&runtime.state, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            activate_capacity_one(
+                &config,
+                &request,
+                &hex('1', 32),
+                "",
+                Duration::from_millis(500),
+                &mut runtime,
+            )
+            .map(|_| ()),
+            Err(ControlError::StaleGeneration)
+        );
+        assert_eq!(runtime.controller_calls, 1);
+    }
+
+    #[test]
+    fn control_error_frames_are_classified_and_never_parsed_as_responses() {
+        let frame = ControlErrorFrame::new(ControlError::StaleGeneration);
+        assert_eq!(frame.schema_version, CONTROL_ERROR_SCHEMA);
+        assert_eq!(frame.code, "stale_generation");
+        assert_eq!(frame.message, "host generation rejected");
+        for (error, expected) in [
+            (ControlError::StaleGeneration, DriverError::StaleGeneration),
+            (ControlError::BindingMismatch, DriverError::BindingMismatch),
+            (ControlError::ReplayMismatch, DriverError::BindingMismatch),
+            (ControlError::InvalidConfig, DriverError::BindingMismatch),
+            (ControlError::HostAction, DriverError::Protocol),
+            (ControlError::ReadbackMismatch, DriverError::Protocol),
+            (ControlError::Ledger, DriverError::Protocol),
+        ] {
+            let bytes = serde_json::to_vec(&ControlErrorFrame::new(error)).unwrap();
+            assert_eq!(parse_control_response(&bytes).err(), Some(expected));
+        }
+        assert_eq!(
+            parse_control_response(b"").err(),
+            Some(DriverError::FrameTooLarge)
+        );
+        assert_eq!(
+            parse_control_response(
+                b"{\"schema_version\":\"other\",\"code\":\"x\",\"message\":\"y\"}"
+            )
+            .err(),
+            Some(DriverError::Protocol)
+        );
     }
 
     #[test]
