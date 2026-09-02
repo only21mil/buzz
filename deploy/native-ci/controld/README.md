@@ -60,7 +60,12 @@ bytes that contribute to the package digest.
 Capacity one is accepted only with the complete relay authority, channel,
 authenticated runner identity and bounds, exact static lane, JobIntentV2 job
 and artifact declaration, keyholder selector generations, and a receipt whose
-authority description exactly matches keyholder.
+authority description exactly matches keyholder. The `manifest` keyholder
+selector is the one source of the admission key: controld derives
+`admission_key_generation` from `keyholder_selectors.manifest.generation`, the
+activation freezer requires the execd lane manifest's `admission_verifying_key`
+and `admission_key_generation` to equal that selector, and the runner's static
+activation coordinates copy the lane manifest.
 The active daemon polls the authenticated accepted-request source one at a
 time, signs through keyholder, admits only the exact runner-control v2 frame,
 and fetches terminal logs, the declared artifact, and teardown through the

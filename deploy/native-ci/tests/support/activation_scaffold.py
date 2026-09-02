@@ -140,12 +140,19 @@ class ActivationFixture:
         self.entries.append(entry)
 
     def _add_configs(self) -> None:
+        # The admission key is the keyholder's manifest selector (see
+        # package.validate_phase_configs); the lane manifest copies it.
+        keyholder_selectors = {
+            "ci_event": {"public_key": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5", "generation": 1},
+            "nip98": {"public_key": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", "generation": 2},
+            "manifest": {"public_key": "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13", "generation": 3},
+        }
         lane_manifest = {
             "schema_version": 1,
             "lane_id": "10" * 32,
             "lane_epoch": 4,
-            "admission_verifying_key": "20" * 32,
-            "admission_key_generation": 9,
+            "admission_verifying_key": keyholder_selectors["manifest"]["public_key"],
+            "admission_key_generation": keyholder_selectors["manifest"]["generation"],
             "broker_build_identity": "30" * 32,
             "host_profile_digest": "40" * 32,
             "suite_identity": "50" * 32,
@@ -277,11 +284,7 @@ class ActivationFixture:
             }],
             "keyholder_socket": "/run/buzzci/keyholder.sock",
             "keyholder_uid": 62003, "keyholder_gid": 62003,
-            "keyholder_selectors": {
-                "ci_event": {"public_key": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5", "generation": 1},
-                "nip98": {"public_key": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", "generation": 2},
-                "manifest": {"public_key": "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13", "generation": 3},
-            },
+            "keyholder_selectors": keyholder_selectors,
             "keyholder_timeout_millis": 5000, "keyholder_transport_attempts": 2,
         })
         self._asset_entry(

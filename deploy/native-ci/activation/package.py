@@ -1468,6 +1468,17 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
             raise ValueError(f"controld keyholder selector is invalid: {name}")
         _nonzero_sha256(selector["public_key"], f"controld keyholder selector {name}")
         _positive_integer(selector["generation"], 9_007_199_254_740_991, f"controld keyholder generation {name}")
+    # The keyholder's manifest selector is the one source of the admission key
+    # and its generation: keyholder signs admissions with that key at that
+    # generation, controld derives admission_key_generation from this selector,
+    # execd verifies against the lane manifest, and the runner's static
+    # coordinates copy the lane manifest (checked above). All must agree.
+    manifest_selector = selectors["manifest"]
+    if (
+        lane_manifest["admission_verifying_key"] != manifest_selector["public_key"]
+        or lane_manifest["admission_key_generation"] != manifest_selector["generation"]
+    ):
+        raise ValueError("execd lane manifest admission key differs from the keyholder manifest selector")
     controld_encoded = canonical_json(controld_active)
     if SOCKET_POLICY["execd"]["path"].encode() in controld_encoded or COMPONENTS["execd"][0].encode() in controld_encoded:
         raise ValueError("controld configuration must not bypass the runner to reach execd")

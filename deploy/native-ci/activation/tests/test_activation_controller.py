@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "396c309da22e73e6b51904fbeed5ce876e4ee3df3c2f0124059da9a5868b0458",
+            "2d09d2dd6f5854b23916bbe536e110374b577925bc970fd1511e7029c66bfb3f",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -3701,7 +3701,12 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(active["lane_manifest_digest"], broker["lane_manifest_digest"])
         self.assertEqual(
             activation_package.lane_manifest_digest(broker["lane_manifest"]),
-            "12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04",
+            "5d016bf76974d69c05899940b899c329c8f25302a39bd7864ec10ec03d6a0bef",
+        )
+        selectors = json.loads(payloads[entries["controld_config"]["active_source"]])["keyholder_selectors"]
+        self.assertEqual(
+            (broker["lane_manifest"]["admission_verifying_key"], broker["lane_manifest"]["admission_key_generation"]),
+            (selectors["manifest"]["public_key"], selectors["manifest"]["generation"]),
         )
         qualification = next(item for item in manifest["components"] if item["name"] == "qualification")
         qualification_entry = entries["qualification_binary"]
@@ -4053,16 +4058,57 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, _driver = self.fixture.load()
         entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
         config = json.loads(payloads[entry["source"]])
+        # The Rust vector (crates/buzz-ci-execd/src/production_v2.rs) freezes a
+        # lane manifest with the placeholder admission key; the scaffold now
+        # carries the keyholder manifest selector, so the vector is rebuilt here.
+        frozen_lane_manifest = dict(
+            config["lane_manifest"], admission_verifying_key="20" * 32, admission_key_generation=9,
+        )
         self.assertEqual(
-            activation_package.lane_manifest_digest(config["lane_manifest"]),
+            activation_package.lane_manifest_digest(frozen_lane_manifest),
             "12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04",
         )
         self.assertEqual(
             activation_package.execution_declaration_digest(
-                "aa" * 20, "70" * 32, config["lane_manifest"], config["execution"],
+                "aa" * 20, "70" * 32, frozen_lane_manifest, config["execution"],
             ),
             "e941bf7b2a6152a5633f14f8c632fb8ce048c1d6eee008f2dc0d6f8dda90efe4",
         )
+
+    def test_lane_manifest_admission_key_must_be_the_keyholder_manifest_selector(self) -> None:
+        """H6 clean host, canary stage 5: runner-active carried
+        admission_key_generation 9 from a placeholder lane manifest while
+        controld derived 1 from the keyholder manifest selector, so the runner
+        rejected controld's first dispatch ("does not match static activation
+        coordinates"). The freezer now binds the lane manifest to the selector."""
+        manifest, payloads, _driver = self.fixture.load()
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        controld_active = json.loads(payloads[entries["controld_config"]["active_source"]])
+        selector = controld_active["keyholder_selectors"]["manifest"]
+        for field, value in (
+            ("admission_key_generation", 9),
+            ("admission_key_generation", selector["generation"] + 1),
+            ("admission_verifying_key", "20" * 32),
+        ):
+            manifest, payloads, _driver = self.fixture.load()
+            entries = {entry["role"]: entry for entry in manifest["entries"]}
+            for source in (entries["execd_config"]["source"], entries["execd_config"]["active_source"]):
+                execd = json.loads(payloads[source])
+                execd["lane_manifest"][field] = value
+                execd["lane_manifest_digest"] = activation_package.lane_manifest_digest(execd["lane_manifest"])
+                payloads[source] = activation_package.canonical_json(execd)
+            runner_active = json.loads(payloads[entries["runner_config"]["active_source"]])
+            runner_active["lane_manifest_digest"] = execd["lane_manifest_digest"]
+            if field == "admission_key_generation":
+                runner_active["admission_key_generation"] = value
+            payloads[entries["runner_config"]["active_source"]] = activation_package.canonical_json(runner_active)
+            controld_active = json.loads(payloads[entries["controld_config"]["active_source"]])
+            controld_active["lane_manifest_digest"] = execd["lane_manifest_digest"]
+            payloads[entries["controld_config"]["active_source"]] = activation_package.canonical_json(controld_active)
+            with self.assertRaisesRegex(ValueError, "admission key differs from the keyholder manifest selector"):
+                CONTROLLER._validate_phase_configs(manifest, payloads)
+        manifest, payloads, _driver = self.fixture.load()
+        CONTROLLER._validate_phase_configs(manifest, payloads)
 
     def test_every_execution_declaration_field_drift_is_rejected(self) -> None:
         mutations = {

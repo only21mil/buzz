@@ -291,6 +291,51 @@ class BootstrapCompositionTests(unittest.TestCase):
 
         return draft
 
+    def _bind_admission_key(
+        self,
+        draft: dict[str, object],
+        fixture: object,
+        public: dict[str, object],
+    ) -> dict[str, object]:
+        """Retarget the draft to the ceremony's keyholder selectors.
+
+        The manifest selector is the one source of the admission key: the execd
+        lane manifest copies its public key and generation, the runner's static
+        coordinates and every lane_manifest_digest follow, and controld carries
+        the selectors themselves (package.validate_phase_configs binds them).
+        """
+        selectors = copy.deepcopy(public["keyholder_public_spec"]["selectors"])
+        entries = {item["role"]: item for item in draft["entries"]}
+        execd_entry = entries["execd_config"]
+        lane_digest = ""
+        for source_key, digest_key in (
+            ("source", "sha256"), ("active_source", "active_sha256"),
+        ):
+            source = execd_entry[source_key]
+            value = json.loads(fixture.assets[source][0])
+            value["lane_manifest"]["admission_verifying_key"] = selectors["manifest"]["public_key"]
+            value["lane_manifest"]["admission_key_generation"] = selectors["manifest"]["generation"]
+            lane_digest = ACTIVATION_PACKAGE.lane_manifest_digest(value["lane_manifest"])
+            value["lane_manifest_digest"] = lane_digest
+            payload = canonical(value)
+            fixture.assets[source] = (payload, 0o400)
+            execd_entry[digest_key] = hashlib.sha256(payload).hexdigest()
+        runner_entry = entries["runner_config"]
+        runner_active = json.loads(fixture.assets[runner_entry["active_source"]][0])
+        runner_active["lane_manifest_digest"] = lane_digest
+        runner_active["admission_key_generation"] = selectors["manifest"]["generation"]
+        payload = canonical(runner_active)
+        fixture.assets[runner_entry["active_source"]] = (payload, 0o400)
+        runner_entry["active_sha256"] = hashlib.sha256(payload).hexdigest()
+        controld_entry = entries["controld_config"]
+        controld_active = json.loads(fixture.assets[controld_entry["active_source"]][0])
+        controld_active["keyholder_selectors"] = selectors
+        controld_active["lane_manifest_digest"] = lane_digest
+        payload = canonical(controld_active)
+        fixture.assets[controld_entry["active_source"]] = (payload, 0o400)
+        controld_entry["active_sha256"] = hashlib.sha256(payload).hexdigest()
+        return controld_active
+
     def _ready_packages(
         self,
         ceremony: Path,
@@ -418,19 +463,7 @@ class BootstrapCompositionTests(unittest.TestCase):
             fixture = ACTIVATION_SCAFFOLD.ActivationFixture(fixture_root)
             draft = self._retarget_draft(fixture, candidate)
             public = self._public_binding(draft["acceptance_template"]["actor"])
-            controld_entry = next(
-                item for item in draft["entries"] if item["role"] == "controld_config"
-            )
-            controld_active_source = controld_entry["active_source"]
-            controld_active = json.loads(fixture.assets[controld_active_source][0])
-            controld_active["keyholder_selectors"] = copy.deepcopy(
-                public["keyholder_public_spec"]["selectors"]
-            )
-            controld_active_raw = canonical(controld_active)
-            fixture.assets[controld_active_source] = (controld_active_raw, 0o400)
-            controld_entry["active_sha256"] = hashlib.sha256(
-                controld_active_raw
-            ).hexdigest()
+            controld_active = self._bind_admission_key(draft, fixture, public)
             state = ceremony / "state"
             state.mkdir(mode=0o700)
             public_path = state / "public-binding.json"
