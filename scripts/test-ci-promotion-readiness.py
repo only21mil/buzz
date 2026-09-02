@@ -97,21 +97,52 @@ def write_protected_receipt(path: Path, value: dict) -> None:
     path.chmod(0o600)
 
 
-def replace_fixture_values(value, replacements: dict[str, str]):
-    if isinstance(value, dict):
-        return {key: replace_fixture_values(item, replacements) for key, item in value.items()}
-    if isinstance(value, list):
-        return [replace_fixture_values(item, replacements) for item in value]
-    if isinstance(value, str):
-        for before, after in replacements.items():
-            value = value.replace(before, after)
-    return value
-
-
 def write_jsonl(path: Path, values: list[dict]) -> None:
     path.write_text("".join(json.dumps(value, sort_keys=True) + "\n" for value in values),
                     encoding="utf-8")
     path.chmod(0o600)
+
+
+FAKE_GITHUB_WRAPPER = """#!/usr/bin/env python3
+# Test-only entry point: runs ci-promotion-readiness.py with the pinned GitHub
+# client replaced by the hermetic FakeClient so re-verification never touches
+# the network. The verifier itself carries no such seam.
+import importlib.util
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+readiness = load("ci_promotion_readiness", sys.argv[1])
+fixture = load("protected_ci_receipt_test_fixture", sys.argv[2])
+config = json.loads(os.environ["TEST_FAKE_GITHUB"])
+calls = []
+
+
+def fake_client(gh, identity=None, runner=None):
+    client = fixture.FakeClient(**config["client"])
+    fixture.apply_drift(client, config["drift"])
+    calls.append(client)
+    return client
+
+
+readiness.PROTECTED_CI.resolve_gh = lambda: (fixture.receipt.GH_PATH,
+                                             fixture.FakeClient().identity)
+readiness.PROTECTED_CI.GhClient = fake_client
+del sys.argv[1:3]
+status = readiness.main()
+print(f"fake-github-clients={len(calls)}", file=sys.stderr)
+sys.exit(status)
+"""
 
 
 def digest(path: Path) -> str:
@@ -152,6 +183,22 @@ class PromotionReadinessTest(unittest.TestCase):
             "overall": "PASS",
             "checks": [{"name": "source", "status": "PASS"}],
         })
+        self.wrapper = self.root / "readiness-with-fake-github.py"
+        self.wrapper.write_text(FAKE_GITHUB_WRAPPER, encoding="utf-8")
+        self.fake_github_client = {
+            "head": self.candidate,
+            "base": self.base,
+            "started": dt.datetime.fromtimestamp(
+                NOW - 180, tz=dt.timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+            "completed": dt.datetime.fromtimestamp(
+                NOW - 120, tz=dt.timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+            "http_date": dt.datetime.fromtimestamp(
+                NOW - 60, tz=dt.timezone.utc
+            ).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+        }
+        self.github_drift = "none"
         self.protected_ci_path = self.evidence_dir / "protected-ci.json"
         self.protected_receipt = self.make_protected_receipt("pull-request")
         write_protected_receipt(self.protected_ci_path, self.protected_receipt)
@@ -179,35 +226,11 @@ class PromotionReadinessTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def make_protected_receipt(self, scope: str) -> dict:
-        client = PROTECTED_TEST.FakeClient()
+        client = PROTECTED_TEST.FakeClient(**self.fake_github_client)
         if scope == "main":
-            client.base_ref_sha = PROTECTED_TEST.HEAD
-            value = PROTECTED_TEST.receipt.build_main_receipt(
-                client, PROTECTED_TEST.HEAD, "main"
-            )
-        else:
-            value = PROTECTED_TEST.receipt.build_receipt(
-                client, 17, PROTECTED_TEST.HEAD, "main"
-            )
-        receipt_stamp = dt.datetime.fromtimestamp(
-            NOW - 60, tz=dt.timezone.utc
-        ).isoformat().replace("+00:00", "Z")
-        provider_date = dt.datetime.fromtimestamp(
-            NOW - 60, tz=dt.timezone.utc
-        ).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        result = replace_fixture_values(value, {
-            PROTECTED_TEST.HEAD: self.candidate,
-            PROTECTED_TEST.BASE: self.base,
-            PROTECTED_TEST.STAMP: dt.datetime.fromtimestamp(
-                NOW - 180, tz=dt.timezone.utc
-            ).isoformat().replace("+00:00", "Z"),
-            "2026-09-01T12:01:00Z": dt.datetime.fromtimestamp(
-                NOW - 120, tz=dt.timezone.utc
-            ).isoformat().replace("+00:00", "Z"),
-            PROTECTED_TEST.HTTP_DATE: provider_date,
-        })
-        result["timestamp"] = receipt_stamp
-        return result
+            client.base_ref_sha = self.candidate
+            return PROTECTED_TEST.receipt.build_main_receipt(client, self.candidate, "main")
+        return PROTECTED_TEST.receipt.build_receipt(client, 17, self.candidate, "main")
 
     def acceptance_record(self, suite: str, test_id: str, *, run: int | None = None) -> dict:
         record = {
@@ -657,7 +680,7 @@ class PromotionReadinessTest(unittest.TestCase):
         receipt_path = self.evidence_dir / "receipt.json"
         write_json(bundle_path, bundle)
         return subprocess.run(
-            [sys.executable, str(SCRIPT),
+            [sys.executable, str(self.wrapper), str(SCRIPT), str(PROTECTED_TEST_SCRIPT),
              "--candidate-dir", str(self.repo),
              "--evidence", str(bundle_path),
              "--receipt", str(receipt_path),
@@ -665,6 +688,8 @@ class PromotionReadinessTest(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+            env={**os.environ, "TEST_FAKE_GITHUB": json.dumps(
+                {"client": self.fake_github_client, "drift": self.github_drift})},
         )
 
     def assert_refused(self, bundle: dict, message: str, *, now: int = NOW) -> None:
@@ -1286,6 +1311,53 @@ class PromotionReadinessTest(unittest.TestCase):
         bundle = copy.deepcopy(self.bundle)
         bundle["evidence_files"]["protected_ci"]["sha256"] = digest(self.protected_ci_path)
         self.assert_refused(bundle, "receipt missing fields")
+
+    def test_valid_bundle_re_verifies_the_receipt_against_github(self) -> None:
+        result = self.invoke(self.bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fake-github-clients=1", result.stderr)
+
+    def test_live_authority_drift_is_refused(self) -> None:
+        for drift, message in (
+            ("check_failure", "did not succeed"),
+            ("ruleset_changed", "rulesets differs from the receipt binding"),
+            ("ruleset_inactive", "is not active"),
+        ):
+            with self.subTest(drift=drift):
+                self.github_drift = drift
+                self.assert_refused(self.bundle, "re-verification against GitHub failed")
+                self.assertIn(message, self.invoke(self.bundle).stderr)
+                self.assertFalse((self.evidence_dir / "receipt.json").exists())
+
+    def test_forged_receipt_without_live_backing_is_refused(self) -> None:
+        self.github_drift = "no_runs"
+        self.assert_refused(self.bundle, "re-verification against GitHub failed")
+        self.assertIn("has no run from app", self.invoke(self.bundle).stderr)
+
+    def test_re_verification_runs_only_after_offline_checks(self) -> None:
+        self.github_drift = "no_runs"
+        bundle = copy.deepcopy(self.bundle)
+        bundle["landing"]["merge_sha"] = self.red_sha
+        result = self.invoke(bundle)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("landing merge_sha does not match candidate", result.stderr)
+        self.assertIn("fake-github-clients=0", result.stderr)
+
+    def test_re_verification_without_pinned_client_is_refused(self) -> None:
+        bundle_path = self.evidence_dir / "bundle.json"
+        write_json(bundle_path, self.bundle)
+        environment = {key: value for key, value in os.environ.items() if key != "GH_TOKEN"}
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--candidate-dir", str(self.repo),
+             "--evidence", str(bundle_path),
+             "--receipt", str(self.evidence_dir / "receipt.json"),
+             "--now", str(NOW)],
+            check=False, capture_output=True, text=True, env=environment,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("re-verification against GitHub failed: GH_TOKEN is required", result.stderr)
+        self.assertFalse((self.evidence_dir / "receipt.json").exists())
 
     def test_noncanonical_protected_ci_receipt_is_refused(self) -> None:
         write_json(self.protected_ci_path, self.protected_receipt)

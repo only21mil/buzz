@@ -602,31 +602,56 @@ spec = importlib.util.spec_from_file_location("protected_ci_deploy_fixture", fix
 assert spec is not None and spec.loader is not None
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
-client = fixture.FakeClient()
-if scenario == "pull_request_protected_receipt":
-    value = fixture.receipt.build_receipt(client, 17, fixture.HEAD, "main")
-else:
-    client.base_ref_sha = fixture.HEAD
-    value = fixture.receipt.build_main_receipt(client, fixture.HEAD, "main")
-
-def replace(item):
-    if isinstance(item, dict):
-        return {key: replace(child) for key, child in item.items()}
-    if isinstance(item, list):
-        return [replace(child) for child in item]
-    if isinstance(item, str):
-        return item.replace(fixture.HEAD, head)
-    return item
-
-value = replace(value)
 parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
 provider_date = parsed.astimezone(dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-value["timestamp"] = timestamp
-for request in value["provider"]["requests"]:
-    request["date"] = provider_date
+client = fixture.FakeClient(head=head, http_date=provider_date)
+if scenario == "pull_request_protected_receipt":
+    value = fixture.receipt.build_receipt(client, 17, head, "main")
+else:
+    client.base_ref_sha = head
+    value = fixture.receipt.build_main_receipt(client, head, "main")
 Path(output_path).write_bytes(fixture.receipt.canonical_json(value))
 Path(output_path).chmod(0o600)
 PY
+  # deploy-local.sh runs the validator from the checkout root. The fake repo
+  # carries a stub that runs the real validator with the pinned GitHub client
+  # replaced by the hermetic FakeClient, so `--reverify` never reaches the network.
+  mkdir -p "${case_dir}/repo/scripts"
+  cat >"${case_dir}/repo/scripts/protected-ci-receipt.py" <<'STUB'
+#!/usr/bin/env python3
+import importlib.util
+import os
+import sys
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location(
+    "protected_ci_receipt_test_fixture", os.environ["TEST_PROTECTED_CI_FIXTURE"])
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+receipt = fixture.receipt
+drift = {
+    "reverify_forged_receipt": "no_runs",
+    "reverify_check_drift": "check_failure",
+    "reverify_ruleset_drift": "ruleset_changed",
+}.get(os.environ.get("TEST_SCENARIO", ""), "none")
+
+
+def fake_client(gh, identity=None, runner=None):
+    with open(os.environ["TEST_COMMAND_LOG"], "a", encoding="utf-8") as log:
+        log.write("protected-ci-receipt live-client " + gh + "\n")
+    client = fixture.FakeClient(head=os.environ["TEST_COMMIT"])
+    client.base_ref_sha = client.head
+    fixture.apply_drift(client, drift)
+    return client
+
+
+with open(os.environ["TEST_COMMAND_LOG"], "a", encoding="utf-8") as log:
+    log.write("protected-ci-receipt " + " ".join(sys.argv[1:]) + "\n")
+receipt.resolve_gh = lambda: (receipt.GH_PATH, fixture.FakeClient().identity)
+receipt.GhClient = fake_client
+sys.exit(receipt.main(sys.argv[1:]))
+STUB
+  chmod 700 "${case_dir}/repo/scripts/protected-ci-receipt.py"
   if [[ ${scenario} == legacy_protected_receipt ]]; then
     python3 - "${case_dir}/protected-ci-receipt.json" "${protected_ci_head}" \
       "${receipt_timestamp}" <<'PY'
@@ -712,6 +737,8 @@ ENV
       TEST_PRIOR_REQUIRED_MIGRATION="${prior_required_migration}" \
       TEST_REPO_ROOT="${case_dir}/repo" \
       TEST_COMMIT=${test_commit} \
+      TEST_PROTECTED_CI_FIXTURE="${compose_dir}/../../scripts/test-protected-ci-receipt.py" \
+      GH_TOKEN=test-github-token \
       TEST_CHECKOUT_HEAD="${checkout_head}" \
       TEST_SOURCE_HEAD="${source_head}" \
       TEST_DIRTY_CHECKOUT="${dirty_checkout}" \
@@ -834,10 +861,25 @@ ENV
 
 for early_failure in stale_checkout stale_source dirty_checkout dirty_receipt \
   short_receipt mismatched_receipt stale_receipt legacy_protected_receipt \
-  noncanonical_protected_receipt pull_request_protected_receipt; do
+  noncanonical_protected_receipt pull_request_protected_receipt \
+  reverify_forged_receipt reverify_check_drift reverify_ruleset_drift; do
   run_case "${early_failure}" failure
   assert_not_contains "${scratch}/${early_failure}/commands.log" '^docker '
 done
+for offline_failure in dirty_receipt mismatched_receipt stale_receipt \
+  legacy_protected_receipt noncanonical_protected_receipt pull_request_protected_receipt; do
+  assert_not_contains "${scratch}/${offline_failure}/commands.log" '^protected-ci-receipt live-client '
+done
+for reverify_failure in reverify_forged_receipt reverify_check_drift reverify_ruleset_drift; do
+  assert_contains "${scratch}/${reverify_failure}/commands.log" \
+    '^protected-ci-receipt validate .* --scope main .* --reverify$'
+  assert_contains "${scratch}/${reverify_failure}/commands.log" \
+    '^protected-ci-receipt live-client /usr/bin/gh$'
+done
+assert_contains "${scratch}/reverify_forged_receipt/output" 'has no run from app 15368'
+assert_contains "${scratch}/reverify_check_drift/output" "required check 'build' did not succeed"
+assert_contains "${scratch}/reverify_ruleset_drift/output" \
+  'live GitHub rulesets differs from the receipt binding'
 assert_contains "${scratch}/stale_checkout/output" 'source checkout is at'
 assert_contains "${scratch}/stale_source/output" 'source ref .* expected'
 assert_contains "${scratch}/dirty_checkout/output" 'source checkout is dirty'
@@ -867,8 +909,23 @@ set -e
 assert_contains "${scratch}/check-missing-protected-receipt.output" \
   'BUZZ_PROTECTED_CI_RECEIPT must name an explicit absolute receipt path'
 
+set +e
+env -u GH_TOKEN BUZZ_PROTECTED_CI_RECEIPT=/nonexistent/protected-ci-receipt.json \
+  BUZZ_COMPOSE_ENV_FILE=/nonexistent/compose.env \
+  "${deploy_script}" --check "${test_commit}" \
+  >"${scratch}/check-missing-gh-token.output" 2>&1
+missing_token_rc=$?
+set -e
+[[ ${missing_token_rc} -ne 0 ]] || fail 'check mode accepted a missing GH_TOKEN'
+assert_contains "${scratch}/check-missing-gh-token.output" \
+  'GH_TOKEN must be set so the protected-CI receipt can be re-verified against GitHub'
+
 run_case check_success success check
 assert_contains "${scratch}/check_success/output" '^PREFLIGHT PASSED:'
+assert_contains "${scratch}/check_success/commands.log" \
+  "^protected-ci-receipt validate --receipt ${scratch}/check_success/protected-ci-receipt.json --repository only21mil/buzz --head ${test_commit} --scope main --max-age-seconds 86400 --reverify$"
+assert_contains "${scratch}/check_success/commands.log" '^protected-ci-receipt live-client /usr/bin/gh$'
+assert_not_contains "${scratch}/check_success/commands.log" 'test-github-token'
 assert_contains "${scratch}/check_success/output" '^CHECK PASSED: no files, images, containers, services, or database state were changed$'
 [[ ! -e ${scratch}/check_success/check-logs ]] || fail 'check mode created its log root'
 [[ ! -e ${scratch}/check_success/check-build ]] || fail 'check mode created its build root'
@@ -1341,7 +1398,7 @@ if find "${scratch}" -name '.relay-binary.*' -type f -print -quit | grep -q .; t
 fi
 
 for secret_value in test-relay-key test-hook-secret test-postgres-password \
-  test-redis-password test-s3-access test-s3-secret test-owner-pubkey; do
+  test-redis-password test-s3-access test-s3-secret test-owner-pubkey test-github-token; do
   if rg -F "${secret_value}" "${scratch}" --glob output --glob commands.log >/dev/null; then
     fail "secret value appeared in output or command logs: ${secret_value}"
   fi

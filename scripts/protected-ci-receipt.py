@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Acquire and validate an exact-head GitHub protected-CI receipt.
 
-The receipt is authenticated point-in-time evidence. GitHub does not sign REST
-responses, and offline validation cannot prove that a later rerun did not occur.
+The receipt is operator-acquired point-in-time evidence. GitHub does not sign
+REST responses, so the receipt retains the exact branch-rule, ruleset, and
+check-run response bodies it was derived from. Offline validation recomputes
+every recorded hash and replays the retained bodies through the acquisition
+logic, so a hand-edited receipt fails without network access. A receipt built
+without contacting GitHub can still be internally consistent, so consumers must
+run `validate --reverify`, which requires the live GitHub authority to match
+the receipt binding exactly.
 """
 
 from __future__ import annotations
@@ -42,6 +48,14 @@ GH_GID = 0
 GH_MODE = 0o755
 GH_SHA256 = "16fdbf30d6f97bc5b0fb94745e00fa06ae68beb6c6653d7f584b32602800397d"
 RENAME_NOREPLACE = 1
+ACQUISITION_SNAPSHOTS = 2
+AUTHORITY_PATHS = [
+    re.compile(rf"^/repos/{re.escape(REPOSITORY)}/rules/branches/main$"),
+    re.compile(rf"^/repos/{re.escape(REPOSITORY)}/commits/[0-9a-f]{{40}}/check-runs$"),
+    re.compile(rf"^/repos/{re.escape(REPOSITORY)}/rulesets/[1-9][0-9]*$"),
+    re.compile(r"^/orgs/only21mil/rulesets/[1-9][0-9]*$"),
+    re.compile(r"^/enterprises/only21mil/rulesets/[1-9][0-9]*$"),
+]
 
 
 class ReceiptError(Exception):
@@ -221,6 +235,16 @@ def api_endpoint(value: str) -> str:
     return value
 
 
+def retains_body(endpoint: str) -> bool:
+    """Whether a request's exact response body is retained in the receipt.
+
+    Only the branch rules, rulesets, and check runs are authority the validator
+    replays; other requests keep just their body hash.
+    """
+    path = urlsplit(endpoint).path
+    return any(pattern.fullmatch(path) for pattern in AUTHORITY_PATHS)
+
+
 def parse_headers(raw: str) -> tuple[int, dict[str, str], str]:
     """Parse the final HTTP response emitted by `gh api -i`."""
     normalized = raw.replace("\r\n", "\n")
@@ -320,6 +344,7 @@ class GhClient:
             "endpoint": endpoint, "page": page, "status": status,
             "request_id": request_id, "date": date, "etag": headers.get("etag"),
             "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "body": body if retains_body(endpoint) else None,
         })
         return parsed, next_link(headers.get("link")), date
 
@@ -331,31 +356,76 @@ class GhClient:
     def pages(self, endpoint: str, kind: str) -> list[Any]:
         current: str | None = endpoint
         seen: set[str] = set()
-        records: list[Any] = []
-        total: int | None = None
+        bodies: list[Any] = []
         for page in range(1, MAX_PAGES + 1):
             assert current is not None
             key = api_endpoint(current)
             refuse(key not in seen, "GitHub pagination cycle", ProviderError)
             seen.add(key)
             body, current, _ = self.request(key, page)
-            if kind == "array":
-                values = array(body, "GitHub page")
-            else:
-                envelope = object_(body, "check-runs page")
-                page_total = integer(envelope.get("total_count"), "check-runs total_count")
-                total = page_total if total is None else total
-                refuse(total == page_total, "check-runs total_count changed during pagination", ProviderError)
-                values = array(envelope.get("check_runs"), "check-runs")
-            records.extend(values)
-            refuse(len(records) <= MAX_RECORDS, "GitHub pagination record cap exceeded", ProviderError)
+            bodies.append(body)
             if current is None:
-                if kind == "checks":
-                    refuse(total == len(records), "check-runs total_count does not match pages", ProviderError)
-                    ids = [positive(object_(item, "check run").get("id"), "check run id") for item in records]
-                    refuse(len(ids) == len(set(ids)), "duplicate check-run id across pages", ProviderError)
-                return records
+                return assemble_pages(bodies, kind)
         raise ProviderError("GitHub pagination page cap exceeded")
+
+
+def assemble_pages(bodies: list[Any], kind: str) -> list[Any]:
+    """Join paginated GitHub bodies into one record list with the same checks live and on replay."""
+    records: list[Any] = []
+    total: int | None = None
+    for body in bodies:
+        if kind == "array":
+            values = array(body, "GitHub page")
+        else:
+            envelope = object_(body, "check-runs page")
+            page_total = integer(envelope.get("total_count"), "check-runs total_count")
+            total = page_total if total is None else total
+            refuse(total == page_total, "check-runs total_count changed during pagination", ProviderError)
+            values = array(envelope.get("check_runs"), "check-runs")
+        records.extend(values)
+        refuse(len(records) <= MAX_RECORDS, "GitHub pagination record cap exceeded", ProviderError)
+    if kind == "checks":
+        refuse(total == len(records), "check-runs total_count does not match pages", ProviderError)
+        ids = [positive(object_(item, "check run").get("id"), "check run id") for item in records]
+        refuse(len(ids) == len(set(ids)), "duplicate check-run id across pages", ProviderError)
+    return records
+
+
+class RetainedClient:
+    """Replay the retained response bodies of a receipt in acquisition order."""
+
+    def __init__(self, records: list[tuple[str, int, Any]]):
+        self.records = records
+        self.position = 0
+
+    def exhausted(self) -> bool:
+        return self.position >= len(self.records)
+
+    def take(self, endpoint: str, page: int) -> Any:
+        refuse(self.position < len(self.records),
+               f"retained provider bodies end before {endpoint}")
+        recorded_endpoint, recorded_page, body = self.records[self.position]
+        if page == 1:
+            refuse(recorded_endpoint == endpoint and recorded_page == 1,
+                   f"retained provider bodies are out of acquisition order at {endpoint}")
+        else:
+            refuse(recorded_page == page and
+                   urlsplit(recorded_endpoint).path == urlsplit(endpoint).path,
+                   f"retained pagination is out of order at {endpoint}")
+        self.position += 1
+        return body
+
+    def one(self, endpoint: str) -> Any:
+        return self.take(endpoint, 1)
+
+    def pages(self, endpoint: str, kind: str) -> list[Any]:
+        path = urlsplit(endpoint).path
+        bodies = [self.take(endpoint, 1)]
+        while (self.position < len(self.records) and
+               self.records[self.position][1] == len(bodies) + 1 and
+               urlsplit(self.records[self.position][0]).path == path):
+            bodies.append(self.take(endpoint, len(bodies) + 1))
+        return assemble_pages(bodies, kind)
 
 
 def resolve_gh() -> tuple[str, dict[str, Any]]:
@@ -751,20 +821,37 @@ def validate_receipt(value: Any, repository: str, head: str,
     positive(provider["repository_id"], "provider repository_id")
     requests = array(provider["requests"], "provider requests")
     refuse(bool(requests), "provider requests are empty")
+    retained: list[tuple[str, int, Any]] = []
     for index, raw_request in enumerate(requests):
         request = object_(raw_request, f"provider request {index}")
         exact_fields(request, {"endpoint", "page", "status", "request_id", "date", "etag",
-                               "body_sha256"}, f"provider request {index}")
-        api_endpoint(text(request["endpoint"], f"provider request {index} endpoint"))
-        positive(request["page"], f"provider request {index} page")
+                               "body_sha256", "body"}, f"provider request {index}")
+        endpoint = api_endpoint(text(request["endpoint"], f"provider request {index} endpoint"))
+        page = positive(request["page"], f"provider request {index} page")
         refuse(request["status"] == 200, f"provider request {index} did not return HTTP 200")
         text(request["request_id"], f"provider request {index} request_id")
         text(request["date"], f"provider request {index} date")
         refuse(request["etag"] is None or isinstance(request["etag"], str) and bool(request["etag"]),
                f"provider request {index} etag is invalid")
-        refuse(SHA256.fullmatch(text(request["body_sha256"],
-                                     f"provider request {index} body_sha256")) is not None,
+        body_sha256 = text(request["body_sha256"], f"provider request {index} body_sha256")
+        refuse(SHA256.fullmatch(body_sha256) is not None,
                f"provider request {index} body_sha256 is invalid")
+        body = request["body"]
+        if not retains_body(endpoint):
+            refuse(body is None, f"provider request {index} must not retain a body")
+            continue
+        text(body, f"provider request {index} body")
+        refuse(len(body.encode("utf-8")) <= MAX_GH_RESPONSE_BYTES,
+               f"provider request {index} body exceeds the byte limit")
+        refuse(hashlib.sha256(body.encode("utf-8")).hexdigest() == body_sha256,
+               f"provider request {index} retained body does not match body_sha256")
+        try:
+            parsed_body = json.loads(body)
+            require_bounded_json_depth(parsed_body)
+        except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
+            raise GateError(f"provider request {index} retained body is not valid JSON") from exc
+        retained.append((endpoint, page, parsed_body))
+    refuse(bool(retained), "receipt retains no provider bodies")
     try:
         final_date = parsedate_to_datetime(requests[-1]["date"])
         refuse(final_date.tzinfo is not None, "final provider Date lacks a timezone")
@@ -881,7 +968,55 @@ def validate_receipt(value: Any, repository: str, head: str,
         refuse(check.get("status") == "PASS" and check.get("provider_status") == "completed" and
                check.get("conclusion") == "success" and check.get("head_sha") == head,
                "check is not an exact-head success")
+    replay_retained_bodies(retained, receipt)
     return receipt
+
+
+def receipt_binding(receipt: dict[str, Any]) -> dict[str, Any]:
+    """The authority a snapshot must reproduce for this receipt."""
+    protection = receipt["protection"]
+    return {
+        "strict": protection["strict"],
+        "branch_rules_sha256": protection["branch_rules_sha256"],
+        "rulesets": protection["rulesets"],
+        "required_checks": protection["required_checks"],
+        "checks": receipt["checks"],
+    }
+
+
+def require_binding_match(actual: dict[str, Any], receipt: dict[str, Any], origin: str) -> None:
+    binding = receipt_binding(receipt)
+    for name in ("strict", "branch_rules_sha256", "required_checks", "rulesets", "checks"):
+        refuse(actual[name] == binding[name], f"{origin} {name} differs from the receipt binding")
+
+
+def replay_retained_bodies(retained: list[tuple[str, int, Any]], receipt: dict[str, Any]) -> None:
+    """Rebuild the binding from retained bodies; every recorded hash is recomputed here."""
+    owner, repo = REPOSITORY.split("/")
+    client = RetainedClient(retained)
+    replays = 0
+    try:
+        while not client.exhausted():
+            require_binding_match(snapshot(client, owner, repo, receipt["head_sha"], "main"),
+                                  receipt, "retained provider bodies")
+            replays += 1
+    except ProviderError as exc:
+        raise GateError(f"retained provider bodies are inconsistent: {exc}") from exc
+    refuse(replays == ACQUISITION_SNAPSHOTS,
+           f"receipt must retain exactly {ACQUISITION_SNAPSHOTS} acquisition snapshots")
+
+
+def reverify_receipt(receipt: dict[str, Any], client: GhClient) -> None:
+    """Require the live GitHub authority to still match an already validated receipt."""
+    owner, repo = REPOSITORY.split("/")
+    repository = object_(client.one(f"/repos/{owner}/{repo}"), "live repository")
+    refuse(repository.get("full_name") == REPOSITORY and
+           positive(repository.get("id"), "live repository id") ==
+           receipt["provider"]["repository_id"] and
+           repository.get("default_branch") == "main",
+           "live repository authority does not match the receipt")
+    require_binding_match(snapshot(client, owner, repo, receipt["head_sha"], "main"),
+                          receipt, "live GitHub")
 
 
 def rename_noreplace(dir_fd: int, source: str, destination: str) -> None:
@@ -1057,6 +1192,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     validate.add_argument("--head", required=True)
     validate.add_argument("--scope", choices=("pull-request", "main"), required=True)
     validate.add_argument("--max-age-seconds", required=True, type=int)
+    validate.add_argument("--reverify", action="store_true",
+                          help="also require the live GitHub authority to match the receipt")
     return parser.parse_args(argv)
 
 
@@ -1085,6 +1222,9 @@ def main(argv: list[str] | None = None) -> int:
                    "receipt is not canonical JSON plus LF")
             validate_receipt(parsed, args.repository, args.head, args.scope,
                              dt.datetime.now(dt.timezone.utc), args.max_age_seconds)
+            if args.reverify:
+                gh, identity = resolve_gh()
+                reverify_receipt(parsed, GhClient(gh, identity))
     except OSError as exc:
         print(f"protected-ci-receipt: {exc}", file=sys.stderr)
         return 5

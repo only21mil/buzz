@@ -1,10 +1,15 @@
 # Promotion acceptance runbook
 
 This runbook closes a Buzz promotion only when every receipt names the same
-immutable commit and the same artifacts. The verifier is intentionally
-source-only: it validates retained evidence and emits a machine-readable
-receipt, but it does not contact GitHub, Docker, the relay, a database, or a
-deployment host. Passing the hermetic tests is not live acceptance.
+immutable commit and the same artifacts. The verifier validates retained
+evidence and emits a machine-readable receipt. It does not contact Docker, the
+relay, a database, or a deployment host. Its one network call is to GitHub,
+after every offline invariant passes: it re-verifies the protected-CI receipt
+against the live rulesets, required contexts, and exact-head check runs through
+the pinned `gh` and `GH_TOKEN`. The protected-CI receipt is operator-acquired
+evidence with the exact GitHub REST bodies retained and hash-bound; GitHub does
+not sign those bodies, so a receipt is accepted only when live GitHub still
+matches it. Passing the hermetic tests is not live acceptance.
 
 ## Inputs and invariants
 
@@ -83,7 +88,10 @@ receipt is written.
 ## Evidence order
 
 1. Freeze a clean full candidate SHA. Retain its pre-freeze receipt and the
-   protected exact-head CI receipt, including their SHA-256 digests.
+   protected exact-head CI receipt, including their SHA-256 digests. Acquire
+   the CI receipt with `scripts/protected-ci-receipt.py acquire` and confirm it
+   with `validate --scope pull-request --reverify`; the verifier repeats that
+   live re-verification when it runs.
 2. Run the final Tier 2 review after exact-head CI. Its checked commit and
    fingerprint must still match the frozen candidate, and its review window
    may not exceed 5,400 seconds or be expired at verification time.

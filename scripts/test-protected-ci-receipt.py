@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import contextlib
 import datetime as dt
+import hashlib
 import importlib.util
 import io
 import json
@@ -28,22 +29,23 @@ SPEC.loader.exec_module(receipt)
 HEAD = "a" * 40
 BASE = "b" * 40
 STAMP = "2026-09-01T12:00:00Z"
+COMPLETED = "2026-09-01T12:01:00Z"
 HTTP_DATE = "Tue, 01 Sep 2026 12:00:00 GMT"
 
 
-def pr_value(number: int = 17) -> dict:
+def pr_value(number: int = 17, head: str = HEAD, base: str = BASE) -> dict:
     return {
         "number": number,
         "state": "open",
         "draft": False,
         "html_url": f"https://github.com/only21mil/buzz/pull/{number}",
         "head": {
-            "sha": HEAD,
+            "sha": head,
             "ref": "sats/protected-ci",
             "repo": {"full_name": receipt.REPOSITORY},
         },
         "base": {
-            "sha": BASE,
+            "sha": base,
             "ref": "main",
             "repo": {"full_name": receipt.REPOSITORY},
         },
@@ -69,15 +71,15 @@ def branch_rules() -> list[dict]:
 
 def check_run(name: str, run_id: int, conclusion: str = "success",
               status: str = "completed", app_id: int = 15368,
-              head: str = HEAD) -> dict:
+              head: str = HEAD, started: str = STAMP, completed: str = COMPLETED) -> dict:
     return {
         "id": run_id,
         "name": name,
         "head_sha": head,
         "status": status,
         "conclusion": conclusion,
-        "started_at": STAMP,
-        "completed_at": "2026-09-01T12:01:00Z" if status == "completed" else None,
+        "started_at": started,
+        "completed_at": completed if status == "completed" else None,
         "html_url": f"https://github.com/only21mil/buzz/runs/{run_id}",
         "details_url": f"https://github.com/only21mil/buzz/actions/runs/{run_id}",
         "app": {"id": app_id, "slug": "github-actions"},
@@ -86,20 +88,32 @@ def check_run(name: str, run_id: int, conclusion: str = "success",
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    """In-memory GitHub authority with the same one/pages contract as GhClient.
+
+    Every served body is recorded the way GhClient records it, so receipts built
+    from this client carry real retained bodies and hashes.
+    """
+
+    def __init__(self, head: str = HEAD, base: str = BASE, started: str = STAMP,
+                 completed: str = COMPLETED, http_date: str = HTTP_DATE) -> None:
         self.identity = {
             "path": receipt.GH_PATH, "uid": receipt.GH_UID, "gid": receipt.GH_GID,
             "mode": "0755", "sha256": receipt.GH_SHA256,
         }
+        self.head = head
+        self.base = base
+        self.started = started
+        self.completed = completed
+        self.http_date = http_date
         self.requests: list[dict] = []
-        self.pr = pr_value()
-        self.base_ref_sha = BASE
+        self.pr = pr_value(head=head, base=base)
+        self.base_ref_sha = base
         self.rules = branch_rules()
         self.runs = [
-            check_run("build", 101), check_run("build", 100, "failure"),
-            check_run("relay_e2e_canary", 301),
-            check_run("relay_e2e_canary", 300, "failure"),
-            check_run("test", 201),
+            self.run("build", 101), self.run("build", 100, "failure"),
+            self.run("relay_e2e_canary", 301),
+            self.run("relay_e2e_canary", 300, "failure"),
+            self.run("test", 201),
         ]
         self.snapshot_calls = 0
         self.repository_calls = 0
@@ -112,18 +126,29 @@ class FakeClient:
         self.mutate_final_head_ref = None
         self.ruleset_calls = 0
         self.ruleset_enforcement = "active"
+        self.ruleset_bypass_actors: list[dict] = []
         self.mutate_second_ruleset = None
         self.mutate_second_snapshot = None
 
-    def record(self, endpoint: str, page: int = 1) -> None:
+    def run(self, name: str, run_id: int, conclusion: str = "success") -> dict:
+        return check_run(name, run_id, conclusion, head=self.head,
+                         started=self.started, completed=self.completed)
+
+    def record(self, endpoint: str, value, page: int = 1) -> None:
+        body = json.dumps(value)
         self.requests.append({
             "endpoint": endpoint, "page": page, "status": 200,
-            "request_id": f"request-{len(self.requests) + 1}", "date": HTTP_DATE,
-            "etag": None, "body_sha256": "c" * 64,
+            "request_id": f"request-{len(self.requests) + 1}", "date": self.http_date,
+            "etag": None, "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "body": body if receipt.retains_body(endpoint) else None,
         })
 
     def one(self, endpoint: str):
-        self.record(endpoint)
+        value = self.serve(endpoint)
+        self.record(endpoint, value)
+        return value
+
+    def serve(self, endpoint: str):
         if endpoint == "/user":
             return {"login": "sats", "id": 42}
         if endpoint == "/repos/only21mil/buzz":
@@ -148,21 +173,22 @@ class FakeClient:
         if endpoint.endswith("/git/ref/heads/sats%2Fprotected-ci"):
             self.head_ref_calls += 1
             value = {"ref": "refs/heads/sats/protected-ci",
-                     "object": {"type": "commit", "sha": HEAD}}
+                     "object": {"type": "commit", "sha": self.head}}
             if self.head_ref_calls == 3 and self.mutate_final_head_ref:
                 self.mutate_final_head_ref(value)
             return value
-        if endpoint.endswith(f"/commits/{HEAD}"):
-            return {"sha": HEAD}
+        if endpoint.endswith(f"/commits/{self.head}"):
+            return {"sha": self.head}
         if "/compare/" in endpoint:
-            return {"merge_base_commit": {"sha": BASE}, "behind_by": 0}
+            return {"merge_base_commit": {"sha": self.base}, "behind_by": 0}
         if endpoint.endswith("/rulesets/20246414"):
             self.ruleset_calls += 1
             value = {
                 "id": 20246414, "source_type": "Repository",
                 "source": receipt.REPOSITORY, "enforcement": self.ruleset_enforcement,
                 "name": "main protection", "target": "branch",
-                "bypass_actors": [], "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"]}},
+                "bypass_actors": copy.deepcopy(self.ruleset_bypass_actors),
+                "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"]}},
                 "rules": [{"type": "required_status_checks"}],
             }
             if self.ruleset_calls == 2 and self.mutate_second_ruleset:
@@ -171,17 +197,44 @@ class FakeClient:
         raise AssertionError(endpoint)
 
     def pages(self, endpoint: str, kind: str):
-        self.record(endpoint)
         if kind == "array":
             self.snapshot_calls += 1
             value = copy.deepcopy(self.rules)
             if self.snapshot_calls == 2 and self.mutate_second_snapshot:
                 self.mutate_second_snapshot(value)
+            self.record(endpoint, value)
             return value
         if "check-runs" in endpoint:
             if "filter=all" not in endpoint:
                 raise AssertionError("check-runs acquisition must retain all attempts")
-        return copy.deepcopy(self.runs)
+        runs = copy.deepcopy(self.runs)
+        self.record(endpoint, {"total_count": len(runs), "check_runs": runs})
+        return runs
+
+
+DRIFTS = ("none", "no_runs", "check_failure", "ruleset_changed", "ruleset_inactive",
+          "required_checks_changed")
+
+
+def apply_drift(client: FakeClient, name: str) -> None:
+    """Move a FakeClient's live authority away from a receipt it could have produced."""
+    if name == "none":
+        return
+    if name == "no_runs":
+        client.runs = []
+    elif name == "check_failure":
+        client.runs.insert(0, client.run("build", 102, "failure"))
+    elif name == "ruleset_changed":
+        client.ruleset_bypass_actors = [
+            {"actor_id": 1, "actor_type": "Integration", "bypass_mode": "always"},
+        ]
+    elif name == "ruleset_inactive":
+        client.ruleset_enforcement = "evaluate"
+    elif name == "required_checks_changed":
+        client.rules[0]["parameters"]["required_status_checks"].append(
+            {"context": "extra", "integration_id": 15368})
+    else:
+        raise ValueError(f"unknown drift {name!r}")
 
 
 class ReceiptTests(unittest.TestCase):
@@ -540,6 +593,151 @@ class ReceiptTests(unittest.TestCase):
                     self.assertEqual(receipt.main(arguments), 5)
                 self.assertEqual(stderr.getvalue(),
                                  "protected-ci-receipt: receipt is not valid bounded UTF-8 JSON\n")
+
+    def test_receipt_retains_authority_bodies_only(self) -> None:
+        value = self.build()
+        by_endpoint = {}
+        for request in value["provider"]["requests"]:
+            by_endpoint.setdefault(receipt.urlsplit(request["endpoint"]).path, request)
+        self.assertIsNone(by_endpoint["/user"]["body"])
+        self.assertIsNone(by_endpoint["/repos/only21mil/buzz/pulls/17"]["body"])
+        for path in ("/repos/only21mil/buzz/rules/branches/main",
+                     "/repos/only21mil/buzz/rulesets/20246414",
+                     f"/repos/only21mil/buzz/commits/{HEAD}/check-runs"):
+            body = by_endpoint[path]["body"]
+            self.assertIsInstance(body, str)
+            self.assertEqual(hashlib.sha256(body.encode()).hexdigest(),
+                             by_endpoint[path]["body_sha256"])
+        retained = [request for request in value["provider"]["requests"] if request["body"]]
+        self.assertEqual(len(retained), 2 * 3)
+
+    def validate(self, value: dict) -> None:
+        now = dt.datetime(2026, 9, 1, 12, 5, tzinfo=dt.timezone.utc)
+        receipt.validate_receipt(value, receipt.REPOSITORY, HEAD, "pull-request", now, 600)
+
+    def test_offline_validate_recomputes_hashes_from_retained_bodies(self) -> None:
+        value = self.build()
+        self.validate(value)
+        check_runs = next(request for request in value["provider"]["requests"]
+                          if request["endpoint"].endswith("check-runs?filter=all&per_page=100"))
+        self.assertIn('"id": 101', check_runs["body"])
+
+        edited = copy.deepcopy(value)
+        request = next(item for item in edited["provider"]["requests"]
+                       if item["endpoint"] == check_runs["endpoint"])
+        request["body"] = request["body"].replace('"id": 101', '"id": 105')
+        with self.assertRaisesRegex(receipt.GateError, "retained body does not match body_sha256"):
+            self.validate(edited)
+
+        request["body_sha256"] = hashlib.sha256(request["body"].encode()).hexdigest()
+        with self.assertRaisesRegex(receipt.GateError, "differs from the receipt binding"):
+            self.validate(edited)
+
+        edited = copy.deepcopy(value)
+        edited["checks"][0]["check_run_id"] = 105
+        with self.assertRaisesRegex(receipt.GateError, "checks differs from the receipt binding"):
+            self.validate(edited)
+
+        edited = copy.deepcopy(value)
+        edited["protection"]["rulesets"][0]["bypass_actors_sha256"] = "0" * 64
+        with self.assertRaisesRegex(receipt.GateError, "rulesets differs from the receipt binding"):
+            self.validate(edited)
+
+        edited = copy.deepcopy(value)
+        edited["protection"]["branch_rules_sha256"] = "0" * 64
+        with self.assertRaisesRegex(receipt.GateError, "branch_rules_sha256 differs"):
+            self.validate(edited)
+
+        edited = copy.deepcopy(value)
+        next(item for item in edited["provider"]["requests"]
+             if item["endpoint"] == check_runs["endpoint"])["body"] = None
+        with self.assertRaisesRegex(receipt.GateError, "body must be a non-empty string"):
+            self.validate(edited)
+
+        edited = copy.deepcopy(value)
+        edited["provider"]["requests"][0]["body"] = "{}"
+        with self.assertRaisesRegex(receipt.GateError, "must not retain a body"):
+            self.validate(edited)
+
+        edited = copy.deepcopy(value)
+        first_rules = next(index for index, item in enumerate(edited["provider"]["requests"])
+                           if item["body"] is not None)
+        second_rules = next(index for index, item in enumerate(edited["provider"]["requests"])
+                            if item["body"] is not None and index > first_rules
+                            and item["endpoint"] == edited["provider"]["requests"][first_rules]["endpoint"])
+        del edited["provider"]["requests"][second_rules:second_rules + 3]
+        with self.assertRaisesRegex(receipt.GateError, "exactly 2 acquisition snapshots"):
+            self.validate(edited)
+
+    def test_reverify_requires_matching_live_authority(self) -> None:
+        value = self.build()
+        self.validate(value)
+        receipt.reverify_receipt(value, FakeClient())
+        for drift, message in (
+            ("no_runs", "has no run from app"),
+            ("check_failure", "did not succeed"),
+            ("ruleset_changed", "rulesets differs from the receipt binding"),
+            ("ruleset_inactive", "is not active"),
+            ("required_checks_changed", "has no run from app"),
+        ):
+            with self.subTest(drift=drift):
+                live = FakeClient()
+                apply_drift(live, drift)
+                with self.assertRaisesRegex(receipt.GateError, message):
+                    receipt.reverify_receipt(value, live)
+        live = FakeClient()
+        live.mutate_final_repository = lambda repo: repo.update(id=78)
+        live.repository_calls = 1
+        with self.assertRaisesRegex(receipt.GateError, "live repository authority"):
+            receipt.reverify_receipt(value, live)
+        forged = copy.deepcopy(value)
+        forged_live = FakeClient()
+        forged_live.runs = [run for run in forged_live.runs if run["name"] != "test"]
+        forged_live.runs.append(check_run("test", 202))
+        with self.assertRaisesRegex(receipt.GateError, "checks differs from the receipt binding"):
+            receipt.reverify_receipt(forged, forged_live)
+
+    def test_validate_cli_reverify_uses_the_pinned_client(self) -> None:
+        http_date = dt.datetime.now(dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        value = self.build(FakeClient(http_date=http_date))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            os.chmod(root, 0o700)
+            path = root / "receipt.json"
+            receipt.safe_publish(path, value)
+            arguments = [
+                "validate", "--receipt", str(path), "--repository", receipt.REPOSITORY,
+                "--head", HEAD, "--scope", "pull-request", "--max-age-seconds", "600",
+            ]
+            clients = []
+            drift = "none"
+
+            def make_client(gh, identity=None, runner=None):
+                self.assertEqual(gh, receipt.GH_PATH)
+                client = FakeClient()
+                apply_drift(client, drift)
+                clients.append(client)
+                return client
+
+            with mock.patch.object(receipt, "resolve_gh") as resolve_gh, \
+                 mock.patch.object(receipt, "GhClient", side_effect=make_client):
+                resolve_gh.return_value = (receipt.GH_PATH, FakeClient().identity)
+                self.assertEqual(receipt.main(arguments), 0)
+                resolve_gh.assert_not_called()
+                self.assertEqual(receipt.main(arguments + ["--reverify"]), 0)
+                resolve_gh.assert_called_once()
+                self.assertEqual(len(clients), 1)
+                drift = "check_failure"
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(receipt.main(arguments + ["--reverify"]), 4)
+                self.assertIn("did not succeed", stderr.getvalue())
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(receipt.shutil, "which", return_value=receipt.GH_PATH):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(receipt.main(arguments + ["--reverify"]), 3)
+                self.assertIn("GH_TOKEN is required", stderr.getvalue())
 
     def test_generated_receipt_matches_closed_schema(self) -> None:
         checker = receipt.shutil.which("check-jsonschema")

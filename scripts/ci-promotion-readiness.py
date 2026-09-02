@@ -536,6 +536,19 @@ def validate_protected_ci_receipt(
     return actual_digest, receipt
 
 
+def reverify_protected_ci_receipt(receipt: dict[str, Any], label: str) -> None:
+    """Require live GitHub to still back the receipt; this is the verifier's only network call.
+
+    GitHub does not sign REST responses, so an offline receipt can be internally
+    consistent without ever having contacted GitHub. Needs GH_TOKEN and the pinned gh.
+    """
+    try:
+        gh, identity = PROTECTED_CI.resolve_gh()
+        PROTECTED_CI.reverify_receipt(receipt, PROTECTED_CI.GhClient(gh, identity))
+    except (PROTECTED_CI.ReceiptError, OSError) as error:
+        refuse(f"{label} re-verification against GitHub failed: {error}")
+
+
 def validate_acceptance_verdict(
     descriptor: dict[str, Any], candidate: str
 ) -> tuple[str, dict[str, Any]]:
@@ -1594,6 +1607,7 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
         obj(field(bundle, "rollback", "evidence"), "rollback"), candidate, artifacts,
     )
     landing = validate_landing(obj(field(bundle, "landing", "evidence"), "landing"), candidate)
+    reverify_protected_ci_receipt(protected_receipt, "evidence_files.protected_ci")
 
     return {
         "schema_version": 1,

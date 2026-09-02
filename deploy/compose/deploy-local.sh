@@ -42,11 +42,17 @@ probe_timeout=${BUZZ_DEPLOY_PROBE_TIMEOUT:-5}
 source_ref=${BUZZ_DEPLOY_SOURCE_REF:-refs/remotes/origin/main}
 pre_freeze_receipt=${BUZZ_PRE_FREEZE_RECEIPT:-${repo_root}/pre-freeze-receipt.json}
 protected_ci_receipt=${BUZZ_PROTECTED_CI_RECEIPT-}
-protected_ci_tool=$(cd "${script_dir}/../.." && pwd)/scripts/protected-ci-receipt.py
+protected_ci_tool=${repo_root}/scripts/protected-ci-receipt.py
 receipt_max_age=${BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS:-86400}
 prior_migration_override=${BUZZ_PRIOR_MIGRATION_OVERRIDE-}
 if [[ -z ${protected_ci_receipt} || ${protected_ci_receipt} != /* ]]; then
   printf 'REFUSED: BUZZ_PROTECTED_CI_RECEIPT must name an explicit absolute receipt path\n' >&2
+  exit 64
+fi
+# The receipt is re-verified against live GitHub through the pinned gh; GitHub
+# does not sign REST responses, so an offline-consistent receipt is not enough.
+if [[ -z ${GH_TOKEN-} ]]; then
+  printf 'REFUSED: GH_TOKEN must be set so the protected-CI receipt can be re-verified against GitHub\n' >&2
   exit 64
 fi
 
@@ -133,7 +139,8 @@ validate_protected_ci_receipt() {
     --repository only21mil/buzz \
     --head "${commit}" \
     --scope main \
-    --max-age-seconds "${receipt_max_age}"
+    --max-age-seconds "${receipt_max_age}" \
+    --reverify
 }
 
 build_worktree=
